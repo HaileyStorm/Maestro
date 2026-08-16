@@ -64,6 +64,7 @@ import {
   type ProjectReferenceCharacterAnatomy,
   type ProjectReferenceCharacterGender,
   type ProjectReferenceCharacterProfileInput,
+  type ProjectReferenceCharacterSheetProfileStatus,
   type ProjectReferenceAdditionalLora,
   type ProjectReferenceAnchorBasis,
   type ProjectReferenceDepth,
@@ -96,6 +97,18 @@ const ASSET_TYPES = [
   { value: 'wardrobe', label: 'Wardrobe / Accessory', icon: Package },
   { value: 'world', label: 'Style / World', icon: ImagePlus },
 ] as const
+
+function characterSheetProfileStatusCopy(
+  status: ProjectReferenceCharacterSheetProfileStatus,
+): string {
+  if (status === 'requires_server_authorization') {
+    return 'Unavailable until server authorization and model terms are complete'
+  }
+  if (status === 'legal_blocked') {
+    return 'Unavailable while legal use is unresolved'
+  }
+  return 'Planned for later'
+}
 
 const INTENT_OPTIONS: Array<{ value: ProjectReferenceIntent; label: string; description: string }> = [
   { value: 'exact_spec', label: 'Follow my description', description: 'Stick closely to the details I provide.' },
@@ -1287,6 +1300,10 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
   const loraScopes = referenceCapabilities?.lora_scopes ?? []
   const contentCapabilities = referenceCapabilities?.content_capabilities ?? []
   const intelligencePolicies = referenceCapabilities?.intelligence_policies ?? []
+  const characterSheetCapabilities = referenceCapabilities?.character_sheet ?? null
+  const characterSheetProfile = characterSheetCapabilities?.profiles.find(profile => (
+    profile.id === characterSheetCapabilities.selection.default_profile_id
+  )) ?? null
   const hasInvalidLoraMultiplier = additionalLoras.some(lora => (
     !Number.isFinite(lora.multiplier) || lora.multiplier < -10 || lora.multiplier > 10
   ))
@@ -2973,6 +2990,37 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                   hidden={creationPanelStates.image_pack.hidden}
                   inert={creationPanelStates.image_pack.inert}
                 >
+                {assetType === 'character' && (
+                  <fieldset className="mt-3 rounded-md border border-accent-blue/30 bg-accent-blue/5 p-2">
+                    <legend className="px-1 text-[10px] font-medium text-text-secondary">Character Sheet workflow</legend>
+                    <label htmlFor="project-reference-character-sheet-profile" className="text-[9px] text-text-muted">Workflow
+                      <select
+                        id="project-reference-character-sheet-profile"
+                        aria-describedby="project-reference-character-sheet-help"
+                        value={characterSheetCapabilities?.selection.default_profile_id ?? ''}
+                        disabled
+                        className="mt-0.5 min-h-11 w-full cursor-not-allowed rounded border border-border bg-bg-primary px-2 py-1 text-[9px] text-text-muted md:min-h-0"
+                      >
+                        {!characterSheetCapabilities && <option value="">Unavailable</option>}
+                        {characterSheetCapabilities?.profiles.map(profile => (
+                          <option key={profile.id} value={profile.id} disabled>
+                            {profile.label}{profile.default ? ' · planned default' : ''} — {characterSheetProfileStatusCopy(profile.status)}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <p id="project-reference-character-sheet-help" className="mt-1 text-[8px] leading-relaxed text-text-muted">
+                      {characterSheetProfile
+                        ? 'Character Sheet generation is not enabled yet. Quad FLUX is the planned default, but it still needs server authorization and model terms. The ordinary Reference Pack settings below remain available.'
+                        : 'Character Sheet choices are unavailable, so no Character Sheet workflow will be sent. The ordinary Reference Pack settings below remain available.'}
+                    </p>
+                    {characterSheetCapabilities && (
+                      <p className="mt-1 text-[8px] leading-relaxed text-text-muted">
+                        Quad Krea and Dynamic Krea are unavailable while legal use is unresolved. Dynamic is experimental and will not be selected automatically. Triple FLUX is planned for later. When enabled, the workflow will create an anchor, review it locally with the VLM, then use Qwen Image Edit only for roles that need repair.
+                      </p>
+                    )}
+                  </fieldset>
+                )}
                 <fieldset className="mt-3">
                   <legend className="mb-1.5 text-[10px] font-medium text-text-secondary">Intent</legend>
                   <div className="grid grid-cols-3 gap-1">

@@ -23460,6 +23460,9 @@ def _project_reference_explicit_generation_model():
 
 
 def _project_reference_capabilities():
+    from services.character_sheet_capabilities import (
+        character_sheet_capability_projection,
+    )
     from services.reference_sheets import (
         CHARACTER_EXPLICIT_ANATOMY,
         CHARACTER_GENDERS,
@@ -23562,6 +23565,7 @@ def _project_reference_capabilities():
                 "version": "managed-layout-v1",
             },
         },
+        "character_sheet": character_sheet_capability_projection(),
     }
 
 

@@ -2673,6 +2673,45 @@ export interface ProjectReferenceGenerationResponse {
   plan?: ProjectReferencePackPlan
 }
 
+export type ProjectReferenceCharacterSheetProfileId =
+  | 'quad_flux2_klein'
+  | 'quad_krea2'
+  | 'dynamic_krea2_experimental'
+  | 'triple_flux2_klein'
+
+export type ProjectReferenceCharacterSheetProfileStatus =
+  | 'requires_server_authorization'
+  | 'legal_blocked'
+  | 'later_unavailable'
+
+export interface ProjectReferenceCharacterSheetCapabilities {
+  schema_version: 1
+  capability_id: 'character_sheet'
+  server_authored: true
+  selection: {
+    default_profile_id: 'quad_flux2_klein'
+    client_may_enable_profiles: false
+  }
+  workflow: Array<{
+    id: 'anchor' | 'local_vlm_review' | 'qwen_image_edit_repair'
+    label: string
+    order: number
+    required: boolean
+    condition?: 'review_finds_failed_roles'
+  }>
+  profiles: Array<{
+    id: ProjectReferenceCharacterSheetProfileId
+    label: string
+    order: number
+    status: ProjectReferenceCharacterSheetProfileStatus
+    available: false
+    executable: false
+    experimental: boolean
+    default: boolean
+    requires_explicit_selection: boolean
+  }>
+}
+
 export interface ProjectReferenceCapabilities {
   schema_version: 2
   planner_version: string
@@ -2766,6 +2805,8 @@ export interface ProjectReferenceCapabilities {
     generation_model: string
     editor_model: string
   }
+  /** Null means the nested server contract was absent or changed; never infer availability. */
+  character_sheet: ProjectReferenceCharacterSheetCapabilities | null
 }
 
 export interface ProjectReferenceAuthoringSnapshot {
@@ -3764,12 +3805,143 @@ export async function fetchProjectAssets(project: string): Promise<ProjectAsset[
   return data.assets || []
 }
 
+const CHARACTER_SHEET_WORKFLOW_CONTRACT = [
+  {
+    id: 'anchor', label: 'Create the anchor image',
+    order: 0, required: true, condition: undefined,
+  },
+  {
+    id: 'local_vlm_review', label: 'Review locally with the VLM',
+    order: 1, required: true, condition: undefined,
+  },
+  {
+    id: 'qwen_image_edit_repair', label: 'Repair with Qwen Image Edit',
+    order: 2, required: false,
+    condition: 'review_finds_failed_roles',
+  },
+] as const
+
+const CHARACTER_SHEET_PROFILE_CONTRACT = [
+  {
+    id: 'quad_flux2_klein', label: 'Quad — FLUX.2 Klein',
+    order: 0, status: 'requires_server_authorization',
+    experimental: false, default: true, requires_explicit_selection: false,
+  },
+  {
+    id: 'quad_krea2', label: 'Quad — Krea 2',
+    order: 1, status: 'legal_blocked',
+    experimental: false, default: false, requires_explicit_selection: true,
+  },
+  {
+    id: 'dynamic_krea2_experimental', label: 'Dynamic — Krea 2 (experimental)',
+    order: 2, status: 'legal_blocked',
+    experimental: true, default: false, requires_explicit_selection: true,
+  },
+  {
+    id: 'triple_flux2_klein', label: 'Triple — FLUX.2 Klein',
+    order: 3, status: 'later_unavailable',
+    experimental: false, default: false, requires_explicit_selection: true,
+  },
+] as const
+
+function isPlainJsonObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
+  const prototype = Object.getPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null
+}
+
+function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const actual = Object.keys(value).sort()
+  const required = [...expected].sort()
+  return actual.length === required.length
+    && actual.every((key, index) => key === required[index])
+}
+
+/**
+ * Fail closed for any changed, reordered, client-enableable, or privately
+ * extended Character Sheet contract. Ordinary Reference Packs stay usable.
+ */
+export function decodeProjectReferenceCharacterSheetCapabilities(
+  value: unknown,
+): ProjectReferenceCharacterSheetCapabilities | null {
+  if (!isPlainJsonObject(value) || !hasExactKeys(value, [
+    'schema_version', 'capability_id', 'server_authored', 'selection',
+    'workflow', 'profiles',
+  ])) return null
+  if (
+    value.schema_version !== 1
+    || value.capability_id !== 'character_sheet'
+    || value.server_authored !== true
+  ) return null
+
+  const selection = value.selection
+  if (
+    !isPlainJsonObject(selection)
+    || !hasExactKeys(selection, ['default_profile_id', 'client_may_enable_profiles'])
+    || selection.default_profile_id !== 'quad_flux2_klein'
+    || selection.client_may_enable_profiles !== false
+  ) return null
+
+  if (!Array.isArray(value.workflow) || value.workflow.length !== CHARACTER_SHEET_WORKFLOW_CONTRACT.length) {
+    return null
+  }
+  for (const [index, expected] of CHARACTER_SHEET_WORKFLOW_CONTRACT.entries()) {
+    const step = value.workflow[index]
+    const expectedKeys = expected.condition === undefined
+      ? ['id', 'label', 'order', 'required']
+      : ['id', 'label', 'order', 'required', 'condition']
+    if (
+      !isPlainJsonObject(step)
+      || !hasExactKeys(step, expectedKeys)
+      || step.id !== expected.id
+      || step.label !== expected.label
+      || step.order !== expected.order
+      || step.required !== expected.required
+      || step.condition !== expected.condition
+    ) return null
+  }
+
+  if (!Array.isArray(value.profiles) || value.profiles.length !== CHARACTER_SHEET_PROFILE_CONTRACT.length) {
+    return null
+  }
+  for (const [index, expected] of CHARACTER_SHEET_PROFILE_CONTRACT.entries()) {
+    const profile = value.profiles[index]
+    if (
+      !isPlainJsonObject(profile)
+      || !hasExactKeys(profile, [
+        'id', 'label', 'order', 'status', 'available', 'executable',
+        'experimental', 'default', 'requires_explicit_selection',
+      ])
+      || profile.id !== expected.id
+      || profile.label !== expected.label
+      || profile.order !== expected.order
+      || profile.status !== expected.status
+      || profile.available !== false
+      || profile.executable !== false
+      || profile.experimental !== expected.experimental
+      || profile.default !== expected.default
+      || profile.requires_explicit_selection !== expected.requires_explicit_selection
+    ) return null
+  }
+  return value as unknown as ProjectReferenceCharacterSheetCapabilities
+}
+
+export function decodeProjectReferenceCapabilities(value: unknown): ProjectReferenceCapabilities {
+  if (!isPlainJsonObject(value) || value.schema_version !== 2) {
+    throw new Error('Reference capabilities changed or are unavailable.')
+  }
+  return {
+    ...value,
+    character_sheet: decodeProjectReferenceCharacterSheetCapabilities(value.character_sheet),
+  } as unknown as ProjectReferenceCapabilities
+}
+
 export async function fetchProjectReferenceCapabilities(
   project: string,
 ): Promise<ProjectReferenceCapabilities> {
   const res = await fetch(`${BASE}/api/v1/projects/${encodeURIComponent(project)}/assets/reference-capabilities`)
   if (!res.ok) throw projectAssetRequestError(res.status, 'Failed to load Reference capabilities')
-  return res.json()
+  return decodeProjectReferenceCapabilities(await res.json())
 }
 
 export async function fetchProjectReferenceAuthoring(

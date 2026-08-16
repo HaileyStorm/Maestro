@@ -10,6 +10,8 @@ import {
   createProjectAsset,
   createProjectReferenceRequestId,
   deleteProjectAssetVariant,
+  decodeProjectReferenceCapabilities,
+  decodeProjectReferenceCharacterSheetCapabilities,
   directorV2Plan,
   fetchProjectAssets,
   fetchProjectReferenceAuthoring,
@@ -71,6 +73,48 @@ const mainViewNavigationUrl = new URL('../src/lib/mainViewNavigation.ts', import
 const manualInstallationUrl = new URL('../src/lib/manualInstallation.ts', import.meta.url)
 const clientUrl = new URL('../src/api/client.ts', import.meta.url)
 const typesUrl = new URL('../src/types/index.ts', import.meta.url)
+
+function characterSheetCapabilities() {
+  return {
+    schema_version: 1,
+    capability_id: 'character_sheet',
+    server_authored: true,
+    selection: {
+      default_profile_id: 'quad_flux2_klein',
+      client_may_enable_profiles: false,
+    },
+    workflow: [
+      { id: 'anchor', label: 'Create the anchor image', order: 0, required: true },
+      { id: 'local_vlm_review', label: 'Review locally with the VLM', order: 1, required: true },
+      {
+        id: 'qwen_image_edit_repair', label: 'Repair with Qwen Image Edit',
+        order: 2, required: false, condition: 'review_finds_failed_roles',
+      },
+    ],
+    profiles: [
+      {
+        id: 'quad_flux2_klein', label: 'Quad — FLUX.2 Klein', order: 0,
+        status: 'requires_server_authorization', available: false, executable: false,
+        experimental: false, default: true, requires_explicit_selection: false,
+      },
+      {
+        id: 'quad_krea2', label: 'Quad — Krea 2', order: 1,
+        status: 'legal_blocked', available: false, executable: false,
+        experimental: false, default: false, requires_explicit_selection: true,
+      },
+      {
+        id: 'dynamic_krea2_experimental', label: 'Dynamic — Krea 2 (experimental)', order: 2,
+        status: 'legal_blocked', available: false, executable: false,
+        experimental: true, default: false, requires_explicit_selection: true,
+      },
+      {
+        id: 'triple_flux2_klein', label: 'Triple — FLUX.2 Klein', order: 3,
+        status: 'later_unavailable', available: false, executable: false,
+        experimental: false, default: false, requires_explicit_selection: true,
+      },
+    ],
+  }
+}
 
 function output(id, role) {
   return {
@@ -1480,6 +1524,7 @@ test('capabilities helper returns authoritative ordered roles for prequeue previ
         off_allowed_for_content_capabilities: ['standard'],
         mandatory_contract: 'explicit_unrestricted_fidelity_v1',
       },
+      character_sheet: characterSheetCapabilities(),
       reference_types: [{
         id: 'character',
         presets: [{
@@ -1534,6 +1579,57 @@ test('capabilities helper returns authoritative ordered roles for prequeue previ
     off_allowed_for_content_capabilities: ['standard'],
     mandatory_contract: 'explicit_unrestricted_fidelity_v1',
   })
+  assert.deepEqual(
+    capabilities.character_sheet.profiles.map(profile => profile.id),
+    [
+      'quad_flux2_klein',
+      'quad_krea2',
+      'dynamic_krea2_experimental',
+      'triple_flux2_klein',
+    ],
+  )
+  assert.equal(capabilities.character_sheet.selection.default_profile_id, 'quad_flux2_klein')
+  assert.deepEqual(
+    capabilities.character_sheet.profiles.map(profile => profile.executable),
+    [false, false, false, false],
+  )
+})
+
+test('Character Sheet capability decoder rejects drift and private fields without disabling Reference Packs', () => {
+  const exact = characterSheetCapabilities()
+  assert.deepEqual(decodeProjectReferenceCharacterSheetCapabilities(exact), exact)
+
+  const cases = [
+    value => { value.profiles[0].available = true },
+    value => { value.profiles[0].executable = true },
+    value => { value.profiles[0].label = 'AVAILABLE NOW: /private/model/path' },
+    value => { value.profiles[0].prompt = 'private' },
+    value => { value.profiles.reverse() },
+    value => { value.selection.default_profile_id = 'quad_krea2' },
+    value => { value.selection.client_may_enable_profiles = true },
+    value => { value.workflow[0].label = 'Read private project prompt' },
+    value => { value.workflow[2].condition = 'always' },
+  ]
+  for (const mutate of cases) {
+    const changed = structuredClone(exact)
+    mutate(changed)
+    const decoded = decodeProjectReferenceCapabilities({
+      schema_version: 2,
+      planner_version: 'reference-pack-v2',
+      reference_types: [{ id: 'character' }],
+      character_sheet: changed,
+    })
+    assert.equal(decoded.character_sheet, null)
+    assert.deepEqual(decoded.reference_types, [{ id: 'character' }])
+  }
+
+  const missing = decodeProjectReferenceCapabilities({
+    schema_version: 2,
+    planner_version: 'reference-pack-v2',
+    reference_types: [{ id: 'character' }],
+  })
+  assert.equal(missing.character_sheet, null)
+  assert.deepEqual(missing.reference_types, [{ id: 'character' }])
 })
 
 test('mandatory retry review fails closed for recorded Off or unavailable reviewers', () => {
@@ -2055,6 +2151,16 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /authoritativeTypeCapabilities\.type_fields\.flatMap/)
   assert.match(source, /authoritativePreset\?\.ordered_roles/)
   assert.match(source, /The sheet plan is unavailable, so generation is disabled/)
+  assert.match(source, /id="project-reference-character-sheet-profile"/)
+  assert.match(source, /value=\{characterSheetCapabilities\?\.selection\.default_profile_id \?\? ''\}/)
+  assert.match(source, /<select[\s\S]*?id="project-reference-character-sheet-profile"[\s\S]*?disabled/)
+  assert.match(source, /profile\.label\}\{profile\.default \? ' · planned default' : ''\}/)
+  assert.match(source, /Quad FLUX is the planned default, but it still needs server authorization and model terms/)
+  assert.match(source, /Quad Krea and Dynamic Krea are unavailable while legal use is unresolved/)
+  assert.match(source, /Dynamic is experimental and will not be selected automatically/)
+  assert.match(source, /Triple FLUX is planned for later/)
+  assert.match(source, /review it locally with the VLM, then use Qwen Image Edit only for roles that need repair/)
+  assert.doesNotMatch(source, />legal_blocked</)
   assert.match(source, /Anatomy \/ Nude/)
   assert.match(source, /underwear \/ underlayers/)
   assert.match(source, /individual garments/)
@@ -2181,6 +2287,7 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /explicit_convenience: assetType === 'character'[\s\S]*?explicitConvenience/)
   const freshRequest = source.slice(source.indexOf('const generate = async'), source.indexOf('const generateFromVariant = async'))
   assert.doesNotMatch(freshRequest, /managed_character_callouts:/)
+  assert.doesNotMatch(freshRequest, /character_sheet|characterSheet/)
   assert.match(source, /normalizeProjectReferenceAnchorPrivacy\(/)
   assert.match(source, /Main image visibility:/)
   assert.match(source, /Processing:/)

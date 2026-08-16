@@ -2821,6 +2821,10 @@ class ProjectReferenceRouteTests(unittest.TestCase):
                 self.assertEqual(raised.exception.status_code, 400)
 
     def test_v2_capabilities_publish_exact_defaults_bounds_and_layout_off(self):
+        from services.character_sheet_capabilities import (
+            character_sheet_capability_projection,
+        )
+
         response = self.ns["get_project_reference_capabilities"](
             "project", _Request({}),
         )
@@ -2836,6 +2840,34 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         })
         self.assertEqual(response["managed_layout_assist"]["mode"], "off")
         self.assertEqual(response["managed_layout_assist"]["allowlisted"], [])
+        self.assertEqual(
+            response["character_sheet"],
+            character_sheet_capability_projection(),
+        )
+        self.assertEqual(
+            [profile["id"] for profile in response["character_sheet"]["profiles"]],
+            [
+                "quad_flux2_klein",
+                "quad_krea2",
+                "dynamic_krea2_experimental",
+                "triple_flux2_klein",
+            ],
+        )
+        self.assertEqual(
+            [profile["default"] for profile in response["character_sheet"]["profiles"]],
+            [True, False, False, False],
+        )
+        self.assertTrue(all(
+            profile["available"] is False and profile["executable"] is False
+            for profile in response["character_sheet"]["profiles"]
+        ))
+        public_character_sheet = json.dumps(
+            response["character_sheet"], sort_keys=True,
+        )
+        for private_field in (
+            "prompt", "project_id", "anchor_id", "artifact", "path", "sha256",
+        ):
+            self.assertNotIn(f'"{private_field}"', public_character_sheet)
         self.assertEqual(response["review_policy"], {
             "mandatory_for_content_capabilities": ["unrestricted_local"],
             "mandatory_when_explicit_output": True,
