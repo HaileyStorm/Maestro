@@ -27,6 +27,8 @@ from .account_auth import (
     resolve_account_capabilities,
 )
 from .entitlements import (
+    DEVELOPMENT_COST_RECOVERY_CURRENCY,
+    DEVELOPMENT_COST_RECOVERY_TARGET_MINOR,
     FULFILLMENT_STATES,
     MANUAL_CONTRIBUTION_KINDS,
     MANUAL_CONTRIBUTION_SOURCES,
@@ -59,6 +61,8 @@ _FULFILLMENT_REFERENCE_RE = re.compile(r"key_[0-9a-f]{64}\Z")
 _STORE_SEAL_DOMAIN = b"maestro-support-responsible-use-store-v1\0"
 _ADMIN_CAPABILITIES = frozenset({"accounts.admin", "services.admin"})
 _STORE_KEYS = frozenset({"schema_version", "generation", "records", "seal"})
+_RECOVERY_PROJECTION_KEYS = frozenset({"target_minor", "currency", "state"})
+_DIRECT_COMPUTE_PROVIDER_ID = "direct_compute_sponsorship"
 
 
 class SupportPortalError(ValueError):
@@ -419,8 +423,48 @@ class SupportPortal:
             ).strip().lower() == "hosted"
         )
 
-    def _priority_policy(self) -> dict[str, Any]:
+    def _development_cost_recovery_projection(self) -> dict[str, Any]:
+        """Read the global recovery gate, failing closed on every bad shape."""
+
+        locked = {
+            "target_minor": DEVELOPMENT_COST_RECOVERY_TARGET_MINOR,
+            "currency": DEVELOPMENT_COST_RECOVERY_CURRENCY,
+            "state": "locked",
+        }
+        ledger = getattr(self, "_ledger", None)
+        if ledger is None:
+            return locked
+        try:
+            projection = ledger.development_cost_recovery_projection()
+        except Exception:
+            return locked
+        if (
+            type(projection) is not dict
+            or set(projection) != _RECOVERY_PROJECTION_KEYS
+            or type(projection.get("target_minor")) is not int
+            or projection["target_minor"] != DEVELOPMENT_COST_RECOVERY_TARGET_MINOR
+            or type(projection.get("currency")) is not str
+            or projection["currency"] != DEVELOPMENT_COST_RECOVERY_CURRENCY
+            or type(projection.get("state")) is not str
+            or projection["state"] not in {"locked", "recovered"}
+        ):
+            return locked
+        return {
+            "target_minor": projection["target_minor"],
+            "currency": projection["currency"],
+            "state": projection["state"],
+        }
+
+    @staticmethod
+    def _recovery_is_complete(projection: Mapping[str, Any]) -> bool:
+        return projection.get("state") == "recovered"
+
+    def _priority_policy_for_recovery(
+        self,
+        recovery: Mapping[str, Any],
+    ) -> dict[str, Any]:
         enforcement_enabled = self._scheduler_enforcement_enabled()
+        recovered = SupportPortal._recovery_is_complete(recovery)
         exclusions = [
             support_priority_capability_marker(capability_id)
             for capability_id in sorted(SUPPORT_PRIORITY_IDENTITY_CONTRACTS)
@@ -428,23 +472,43 @@ class SupportPortal:
         return {
             "scheduler_enforcement_enabled": enforcement_enabled,
             "effective_priority_boost": False,
-            "state": "enabled" if enforcement_enabled else "not_enabled",
+            "state": (
+                "development_cost_recovery_locked"
+                if not recovered else (
+                    "enabled" if enforcement_enabled else "not_enabled"
+                )
+            ),
             "exclusions": exclusions,
             "notice": (
                 "Eligible hosted work may receive bounded support-derived "
-                "queue priority when enforcement is enabled. Some exact "
-                "models, including Moody, are excluded by their terms or "
-                "creator policy. Submission remains available for every "
-                "otherwise-valid job."
+                "queue priority only after development costs are recovered "
+                "and hosted enforcement is enabled. Some exact models, "
+                "including Moody, are excluded by their terms or creator "
+                "policy. Submission remains available for every otherwise-valid "
+                "job."
             ),
         }
 
-    def public_catalog_projection(self) -> dict[str, Any]:
+    def _priority_policy(self) -> dict[str, Any]:
+        return SupportPortal._priority_policy_for_recovery(
+            self,
+            SupportPortal._development_cost_recovery_projection(self),
+        )
+
+    def _public_catalog_projection(
+        self,
+        recovery: Mapping[str, Any],
+    ) -> dict[str, Any]:
         catalog = self._catalog_snapshot()
+        recovered = SupportPortal._recovery_is_complete(recovery)
         providers = []
         for status in catalog.providers:
             item = status.public_projection()
             support_url = item["support_url"]
+            direct_compute_locked = (
+                item["provider_id"] == _DIRECT_COMPUTE_PROVIDER_ID
+                and not recovered
+            )
             providers.append({
                 "provider_id": item["provider_id"],
                 "display_name": item["display_name"],
@@ -452,12 +516,12 @@ class SupportPortal:
                 "description": item["description"],
                 "enabled": item["enabled"],
                 "configured": item["configured"],
-                "state": item["state"],
+                "state": "locked" if direct_compute_locked else item["state"],
                 # The catalog already validates HTTPS host/port/userinfo.  A
                 # disabled or incomplete provider never gets an actionable URL.
                 "support_url": (
                     support_url
-                    if item["state"] == "available"
+                    if item["state"] == "available" and not direct_compute_locked
                     else None
                 ),
             })
@@ -473,20 +537,34 @@ class SupportPortal:
                 "scheduler_enforcement_enabled": enforcement_enabled,
                 "effective_benefits": [],
                 "state": (
-                    "hosted_priority_available"
-                    if enforcement_enabled else "recorded_not_enforced"
+                    "development_cost_recovery_locked"
+                    if not recovered else (
+                        "hosted_priority_available"
+                        if enforcement_enabled else "recorded_not_enforced"
+                    )
                 ),
             },
-            "support_priority": self._priority_policy(),
+            "development_cost_recovery": dict(recovery),
+            "support_priority": SupportPortal._priority_policy_for_recovery(
+                self, recovery,
+            ),
         }
+
+    def public_catalog_projection(self) -> dict[str, Any]:
+        recovery = SupportPortal._development_cost_recovery_projection(self)
+        return SupportPortal._public_catalog_projection(self, recovery)
 
     def _benefit_projection(
         self,
         recorded: Mapping[str, Any],
         *,
+        development_cost_recovery: Mapping[str, Any],
         priority_eligible: bool = True,
     ) -> dict[str, Any]:
         enforcement_enabled = self._scheduler_enforcement_enabled()
+        recovered = SupportPortal._recovery_is_complete(
+            development_cost_recovery,
+        )
         allowance = recorded.get("recorded_allowance")
         effective_allowance = (
             allowance.get("effective_allowance", 0)
@@ -494,17 +572,20 @@ class SupportPortal:
         )
         priority_active = bool(
             priority_eligible
+            and recovered
             and enforcement_enabled
             and type(effective_allowance) is int
             and effective_allowance > 0
         )
         return {
-            "state": "owner_exempt" if (
-                enforcement_enabled and not priority_eligible
-            ) else (
-                "active" if priority_active else (
-                "hosted_priority_available"
-                if enforcement_enabled else "recorded_not_enforced"
+            "state": "development_cost_recovery_locked" if not recovered else (
+                "owner_exempt" if (
+                    enforcement_enabled and not priority_eligible
+                ) else (
+                    "active" if priority_active else (
+                        "hosted_priority_available"
+                        if enforcement_enabled else "recorded_not_enforced"
+                    )
                 )
             ),
             "scheduler_enforcement_enabled": enforcement_enabled,
@@ -518,6 +599,7 @@ class SupportPortal:
         self,
         recorded: Mapping[str, Any],
         *,
+        development_cost_recovery: Mapping[str, Any],
         priority_eligible: bool = True,
     ) -> dict[str, Any]:
         projection = {
@@ -527,7 +609,8 @@ class SupportPortal:
         }
         allowance = projection.get("recorded_allowance")
         if (
-            self._scheduler_enforcement_enabled()
+            SupportPortal._recovery_is_complete(development_cost_recovery)
+            and self._scheduler_enforcement_enabled()
             and priority_eligible
             and isinstance(allowance, Mapping)
             and type(allowance.get("effective_allowance")) is int
@@ -549,15 +632,20 @@ class SupportPortal:
         principal, _ = self._resolve_access(account_session_id, remote=remote)
         subject_key = self._subject_key(principal["id"])
         recorded = self._ledger.privacy_safe_user_projection(subject_key)
+        recovery = SupportPortal._development_cost_recovery_projection(self)
         priority_eligible = principal.get("role") != "owner"
         return {
-            **self.public_catalog_projection(),
+            **SupportPortal._public_catalog_projection(self, recovery),
             "account_support": {
                 "recorded": self._recorded_projection(
-                    recorded, priority_eligible=priority_eligible,
+                    recorded,
+                    development_cost_recovery=recovery,
+                    priority_eligible=priority_eligible,
                 ),
                 "benefits": self._benefit_projection(
-                    recorded, priority_eligible=priority_eligible,
+                    recorded,
+                    development_cost_recovery=recovery,
+                    priority_eligible=priority_eligible,
                 ),
             },
             "responsible_use": {
@@ -652,18 +740,26 @@ class SupportPortal:
         priority_eligible: bool,
     ) -> dict[str, Any]:
         recorded = self._ledger.reauthenticated_admin_projection(subject_key)
+        recovery = SupportPortal._development_cost_recovery_projection(self)
         return {
             "schema_version": SUPPORT_PORTAL_SCHEMA_VERSION,
             "account_support": {
                 "recorded": self._recorded_projection(
-                    recorded, priority_eligible=priority_eligible,
+                    recorded,
+                    development_cost_recovery=recovery,
+                    priority_eligible=priority_eligible,
                 ),
                 "benefits": self._benefit_projection(
-                    recorded, priority_eligible=priority_eligible,
+                    recorded,
+                    development_cost_recovery=recovery,
+                    priority_eligible=priority_eligible,
                 ),
             },
             "responsible_use": self._acceptance_store.status(subject_key),
-            "support_priority": self._priority_policy(),
+            "development_cost_recovery": recovery,
+            "support_priority": SupportPortal._priority_policy_for_recovery(
+                self, recovery,
+            ),
         }
 
     def transition_owner_fulfillment(

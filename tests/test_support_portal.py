@@ -179,6 +179,27 @@ class SupportPortalTests(unittest.TestCase):
             amount_minor=amount,
         ), received_at=NOW)
 
+    def direct_compute_portal(self) -> SupportPortal:
+        return SupportPortal(
+            account_store=self.account_store,
+            ledger=self.ledger,
+            acceptance_store=self.store,
+            identity_key=IDENTITY_KEY,
+            catalog=load_support_catalog(env={
+                "MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_ENABLED": "true",
+                "MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_URL": (
+                    "https://support.operator.com/maestro"
+                ),
+            }, local_config_path=None),
+        )
+
+    @staticmethod
+    def provider(projection, provider_id):
+        return next(
+            item for item in projection["provider_catalog"]["providers"]
+            if item["provider_id"] == provider_id
+        )
+
     def test_default_public_catalog_is_truthfully_disabled_and_has_no_links(self):
         projection = self.portal.public_catalog_projection()
         providers = projection["provider_catalog"]["providers"]
@@ -190,8 +211,24 @@ class SupportPortalTests(unittest.TestCase):
                 "direct_compute_sponsorship",
             ],
         )
-        self.assertEqual({item["state"] for item in providers}, {"disabled"})
+        self.assertEqual(
+            {item["provider_id"]: item["state"] for item in providers},
+            {
+                "buy_me_a_coffee": "disabled",
+                "patreon": "disabled",
+                "direct_compute_sponsorship": "locked",
+            },
+        )
         self.assertTrue(all(item["support_url"] is None for item in providers))
+        self.assertEqual(projection["development_cost_recovery"], {
+            "target_minor": 100_000,
+            "currency": "USD",
+            "state": "locked",
+        })
+        self.assertEqual(
+            set(projection["development_cost_recovery"]),
+            {"target_minor", "currency", "state"},
+        )
         self.assertFalse(
             projection["benefit_availability"]["scheduler_enforcement_enabled"]
         )
@@ -209,6 +246,10 @@ class SupportPortalTests(unittest.TestCase):
                 "https://buymeacoffee.com/example"
             ),
             "MAESTRO_SUPPORT_PATREON_ENABLED": "true",
+            "MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_ENABLED": "true",
+            "MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_URL": (
+                "https://support.operator.com/maestro"
+            ),
         }, local_config_path=None)
         portal = SupportPortal(
             account_store=self.account_store,
@@ -234,6 +275,14 @@ class SupportPortalTests(unittest.TestCase):
         )
         self.assertEqual(patreon["state"], "unconfigured")
         self.assertIsNone(patreon["support_url"])
+        direct = next(
+            item for item in providers
+            if item["provider_id"] == "direct_compute_sponsorship"
+        )
+        self.assertTrue(direct["enabled"])
+        self.assertTrue(direct["configured"])
+        self.assertEqual(direct["state"], "locked")
+        self.assertIsNone(direct["support_url"])
         self.assertTrue(all("public_home_url" not in item for item in providers))
 
     def test_catalog_loader_refreshes_public_and_self_projection_together(self):
@@ -262,10 +311,213 @@ class SupportPortalTests(unittest.TestCase):
             item for item in public["providers"]
             if item["provider_id"] == "direct_compute_sponsorship"
         )
+        self.assertEqual(direct["state"], "locked")
+        self.assertIsNone(direct["support_url"])
+        self.add_contribution(self.user_id, "recovered", amount=100_000)
+        public = portal.public_catalog_projection()["provider_catalog"]
+        authenticated = portal.self_projection(
+            self.user_session, remote=True,
+        )["provider_catalog"]
+        self.assertEqual(authenticated, public)
+        direct = next(
+            item for item in public["providers"]
+            if item["provider_id"] == "direct_compute_sponsorship"
+        )
         self.assertEqual(direct["state"], "available")
         self.assertEqual(
             direct["support_url"],
             "https://support.operator.com/maestro",
+        )
+
+    def test_recovery_boundary_is_server_owned_private_and_surface_invariant(self):
+        portal = self.direct_compute_portal()
+        self.add_contribution(self.user_id, "boundary-low", amount=99_999)
+        with mock.patch.dict(os.environ, {
+            "MAESTRO_DEVELOPMENT_COST_RECOVERY_TARGET_MINOR": "1",
+            "MAESTRO_DEVELOPMENT_COST_RECOVERY_STATE": "recovered",
+        }, clear=False):
+            public = portal.public_catalog_projection()
+            remote = portal.self_projection(self.user_session, remote=True)
+            local = portal.self_projection(self.user_session, remote=False)
+
+        expected_locked = {
+            "target_minor": 100_000,
+            "currency": "USD",
+            "state": "locked",
+        }
+        self.assertEqual(public["development_cost_recovery"], expected_locked)
+        self.assertEqual(remote["development_cost_recovery"], expected_locked)
+        self.assertEqual(local["development_cost_recovery"], expected_locked)
+        self.assertEqual(
+            self.provider(public, "direct_compute_sponsorship")["state"],
+            "locked",
+        )
+        serialized = json.dumps(
+            public["development_cost_recovery"], sort_keys=True,
+        )
+        self.assertNotIn("99999", serialized)
+        self.assertNotIn("subject", serialized.lower())
+        self.assertNotIn("event", serialized.lower())
+
+        self.add_contribution(self.other_id, "boundary-one", amount=1)
+        recovered = portal.public_catalog_projection()
+        self.assertEqual(recovered["development_cost_recovery"], {
+            "target_minor": 100_000,
+            "currency": "USD",
+            "state": "recovered",
+        })
+        direct = self.provider(recovered, "direct_compute_sponsorship")
+        self.assertEqual(direct["state"], "available")
+        self.assertEqual(
+            direct["support_url"], "https://support.operator.com/maestro",
+        )
+
+    def test_recovery_read_or_shape_failure_keeps_every_unlock_closed(self):
+        portal = self.direct_compute_portal()
+        self.add_contribution(self.user_id, "malformed-gate-allowance")
+        hosted = {
+            "MAESTRO_ACCOUNTS_ENABLED": "true",
+            "MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED": "true",
+            "MAESTRO_COMPUTE_EXECUTION_REALM": "hosted",
+        }
+        invalid = (
+            None,
+            {"target_minor": 100_000, "currency": "USD"},
+            {
+                "target_minor": 100_000,
+                "currency": "USD",
+                "state": "recovered",
+                "recovered_minor": 100_000,
+            },
+            {"target_minor": True, "currency": "USD", "state": "recovered"},
+            {"target_minor": 1, "currency": "USD", "state": "recovered"},
+            {"target_minor": 100_000, "currency": "usd", "state": "recovered"},
+            {"target_minor": 100_000, "currency": "USD", "state": "open"},
+        )
+        with mock.patch.dict(os.environ, hosted, clear=False):
+            for value in invalid:
+                with self.subTest(value=value), mock.patch.object(
+                    self.ledger,
+                    "development_cost_recovery_projection",
+                    return_value=value,
+                ):
+                    public = portal.public_catalog_projection()
+                    remote = portal.self_projection(
+                        self.user_session, remote=True,
+                    )
+                    local = portal.self_projection(
+                        self.user_session, remote=False,
+                    )
+                    for projection in (public, remote, local):
+                        self.assertEqual(
+                            projection["development_cost_recovery"]["state"],
+                            "locked",
+                        )
+                        self.assertEqual(
+                            self.provider(
+                                projection, "direct_compute_sponsorship",
+                            )["state"],
+                            "locked",
+                        )
+                        self.assertEqual(
+                            projection["benefit_availability"]["state"],
+                            "development_cost_recovery_locked",
+                        )
+                        self.assertEqual(
+                            projection["support_priority"]["state"],
+                            "development_cost_recovery_locked",
+                        )
+                    self.assertEqual(
+                        remote["account_support"]["benefits"]["state"],
+                        "development_cost_recovery_locked",
+                    )
+                    self.assertEqual(
+                        local["account_support"]["benefits"]["state"],
+                        "development_cost_recovery_locked",
+                    )
+                    self.assertEqual(
+                        remote["account_support"]["recorded"][
+                            "recorded_allowance"
+                        ]["state"],
+                        "recorded_not_enforced",
+                    )
+            with mock.patch.object(
+                self.ledger,
+                "development_cost_recovery_projection",
+                side_effect=OSError("synthetic ledger outage"),
+            ):
+                projection = portal.self_projection(
+                    self.user_session, remote=True,
+                )
+        self.assertEqual(
+            projection["development_cost_recovery"]["state"], "locked",
+        )
+        self.assertEqual(
+            projection["account_support"]["benefits"]["state"],
+            "development_cost_recovery_locked",
+        )
+
+    def test_one_recovery_snapshot_controls_each_projection_atomically(self):
+        portal = self.direct_compute_portal()
+        recovered = {
+            "target_minor": 100_000,
+            "currency": "USD",
+            "state": "recovered",
+        }
+        with mock.patch.object(
+            self.ledger,
+            "development_cost_recovery_projection",
+            side_effect=[recovered, AssertionError("read twice")],
+        ) as projection_reader:
+            projection = portal.self_projection(
+                self.user_session, remote=True,
+            )
+        self.assertEqual(projection_reader.call_count, 1)
+        self.assertEqual(
+            projection["development_cost_recovery"]["state"], "recovered",
+        )
+        self.assertEqual(
+            self.provider(
+                projection, "direct_compute_sponsorship",
+            )["state"],
+            "available",
+        )
+        self.assertNotEqual(
+            projection["benefit_availability"]["state"],
+            "development_cost_recovery_locked",
+        )
+
+    def test_catalog_only_adapter_has_no_implicit_unlock_authority(self):
+        catalog = load_support_catalog(env={
+            "MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_ENABLED": "true",
+            "MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_URL": (
+                "https://support.operator.com/maestro"
+            ),
+        }, local_config_path=None)
+
+        class CatalogOnlyAdapter:
+            def _catalog_snapshot(self):
+                return catalog
+
+            @staticmethod
+            def _scheduler_enforcement_enabled():
+                return True
+
+        projection = SupportPortal.public_catalog_projection(
+            CatalogOnlyAdapter(),
+        )
+        self.assertEqual(
+            projection["development_cost_recovery"]["state"], "locked",
+        )
+        self.assertEqual(
+            self.provider(
+                projection, "direct_compute_sponsorship",
+            )["state"],
+            "locked",
+        )
+        self.assertEqual(
+            projection["benefit_availability"]["state"],
+            "development_cost_recovery_locked",
         )
 
     def test_self_projection_is_principal_bound_and_private(self):
@@ -331,7 +583,8 @@ class SupportPortalTests(unittest.TestCase):
         self.assertEqual(allowance["sources"][1]["source"], "one_time_support")
         self.assertEqual(allowance["sources"][1]["status"], "active")
         self.assertEqual(
-            account_support["benefits"]["state"], "recorded_not_enforced",
+            account_support["benefits"]["state"],
+            "development_cost_recovery_locked",
         )
         self.assertFalse(
             account_support["benefits"]["scheduler_enforcement_enabled"],
@@ -352,7 +605,9 @@ class SupportPortalTests(unittest.TestCase):
         benefits = self.portal.self_projection(self.user_session, remote=True)[
             "account_support"
         ]["benefits"]
-        self.assertEqual(benefits["state"], "recorded_not_enforced")
+        self.assertEqual(
+            benefits["state"], "development_cost_recovery_locked",
+        )
         self.assertFalse(benefits["scheduler_enforcement_enabled"])
         self.assertEqual(benefits["effective_benefits"], [])
         self.assertIn("retention_eligibility", benefits["recorded_eligibility"])
@@ -380,6 +635,9 @@ class SupportPortalTests(unittest.TestCase):
 
     def test_hosted_credit_policy_projects_active_allowance_truthfully(self):
         self.add_contribution(self.user_id, "hosted-credit-active")
+        self.add_contribution(
+            self.other_id, "hosted-recovery", amount=97_500,
+        )
         with mock.patch.dict(os.environ, {
             "MAESTRO_ACCOUNTS_ENABLED": "true",
             "MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED": "true",
@@ -409,9 +667,13 @@ class SupportPortalTests(unittest.TestCase):
             self.owner_session, remote=True,
         )["account_support"]
         self.assertEqual(
-            default_owner["benefits"]["state"], "recorded_not_enforced",
+            default_owner["benefits"]["state"],
+            "development_cost_recovery_locked",
         )
         self.assertIn("recorded_allowance", default_owner["recorded"])
+        self.add_contribution(
+            self.user_id, "owner-recovery", amount=97_500,
+        )
         hosted = {
             "MAESTRO_ACCOUNTS_ENABLED": "true",
             "MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED": "true",
@@ -437,6 +699,35 @@ class SupportPortalTests(unittest.TestCase):
         self.assertEqual(zero["benefits"]["effective_benefits"], [])
         self.assertEqual(
             zero["recorded"]["recorded_allowance"]["state"],
+            "recorded_not_enforced",
+        )
+
+    def test_hosted_benefits_remain_inert_below_recovery_target(self):
+        self.add_contribution(self.user_id, "hosted-but-locked")
+        with mock.patch.dict(os.environ, {
+            "MAESTRO_ACCOUNTS_ENABLED": "true",
+            "MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED": "true",
+            "MAESTRO_COMPUTE_EXECUTION_REALM": "hosted",
+        }, clear=False):
+            projection = self.portal.self_projection(
+                self.user_session, remote=True,
+            )
+
+        self.assertTrue(projection["benefit_availability"][
+            "scheduler_enforcement_enabled"
+        ])
+        self.assertEqual(
+            projection["benefit_availability"]["state"],
+            "development_cost_recovery_locked",
+        )
+        account = projection["account_support"]
+        self.assertEqual(
+            account["benefits"]["state"],
+            "development_cost_recovery_locked",
+        )
+        self.assertEqual(account["benefits"]["effective_benefits"], [])
+        self.assertEqual(
+            account["recorded"]["recorded_allowance"]["state"],
             "recorded_not_enforced",
         )
 
@@ -663,7 +954,7 @@ class SupportPortalTests(unittest.TestCase):
         self.assertNotIn(self.user_id, stored)
         self.assertEqual(
             projection["account_support"]["benefits"]["state"],
-            "recorded_not_enforced",
+            "development_cost_recovery_locked",
         )
 
     def test_owner_manual_contribution_revalidates_authority_and_body_semantics(self):
