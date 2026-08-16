@@ -5,14 +5,13 @@ are settled.
 
 ## Questions
 
-- May the shared-harness successor take over the unfinished old scanner
-  reservation without marking that old work complete? This preserves the files
-  and unblocks Maestro's launcher work.
+- May the new shared-harness task take over the old, unfinished scanner repair?
+  It will preserve the files and will not mark the old work complete.
 
 ## Needed now
 
-- Sign in to Cloudflare in the open browser tab. I will handle the staged
-  Worker deployment and log Wrangler out afterward.
+- Enter the six-digit Cloudflare authenticator code in the open tab. I will do
+  the staged Worker deployment and log Wrangler out afterward.
 
 ## I will ask later, if needed
 
