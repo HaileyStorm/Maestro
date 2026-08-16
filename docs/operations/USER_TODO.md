@@ -5,20 +5,18 @@ are settled.
 
 ## Questions
 
-- May the new shared-harness task take over the old, unfinished scanner repair?
-  It will preserve the files and will not mark the old work complete.
+- None right now.
 
 ## Needed now
 
-- Tell me when you are ready to retry Cloudflare login. I will reopen the tab;
-  enter the six-digit authenticator code there.
+- Nothing. I will try the existing `EmberCollet@gmail.com` Vivaldi session first.
 
 ## I will ask later, if needed
 
-- H3 needs a separate written MiniMax license to run in the United States.
-  Accepting ordinary Hugging Face terms is not enough.
-- Krea 2's license requirements conflict with Maestro's no-moderation rule. I
-  will only bring this back when there is a clear choice to make.
+- If H3 runs from a license-excluded country, I may need actual written MiniMax
+  permission. A manual location setting will avoid VPN mistakes.
+- If Cloudflare asks you to sign in or approve access in Vivaldi, I will point
+  out that exact step.
 - Music and Character Sheet quality checks can wait until there are real outputs
   to review.
 
@@ -34,8 +32,13 @@ are settled.
 - Direct compute stays locked until verified development-cost recovery reaches
   $1,000.
 - The only owner account cannot be disabled.
+- The new shared-harness task may take over the unfinished scanner repair
+  without pretending the old work was complete.
+- Use Krea where its terms allow, with one server-wide owner attestation and no
+  Maestro prompt scanning.
 
 ## Nothing for you to do
 
 - Existing projects are already connected to the owner account.
 - Beads repair is mine to handle; do not initialize or migrate it.
+- I am checking the reported signed-out mobile project/content exposure now.
