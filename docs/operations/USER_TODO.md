@@ -7,6 +7,11 @@ are settled.
 
 None right now.
 
+## Needed now
+
+- Sign in to Cloudflare in the open browser tab. I will handle the staged
+  Worker deployment and log Wrangler out afterward.
+
 ## I will ask later, if needed
 
 - H3 needs a separate written MiniMax license to run in the United States.
@@ -31,6 +36,5 @@ None right now.
 
 ## Nothing for you to do
 
-- Cloudflare is deployed and Wrangler is logged out.
 - Existing projects are already connected to the owner account.
-- Beads is working. Do not initialize or migrate it.
+- Beads repair is mine to handle; do not initialize or migrate it.
