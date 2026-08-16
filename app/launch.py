@@ -743,6 +743,10 @@ _REMOTE_LOCAL_ONLY_EXACT = frozenset({
     ("GET", "/api/v1/llm/stream-status"),
     ("POST", "/api/v1/queue/pause-after-output"),
     ("POST", "/api/v1/queue/resume"),
+    ("GET", "/api/v1/h3/legal-access"),
+    ("PUT", "/api/v1/h3/legal-access"),
+    ("GET", "/api/v1/krea/owner-policy"),
+    ("PUT", "/api/v1/krea/owner-policy"),
 })
 _REMOTE_OWNER_REAUTH_ALLOWED_EXACT = frozenset({
     ("PUT", "/api/v1/model-visibility"),
@@ -750,6 +754,10 @@ _REMOTE_OWNER_REAUTH_ALLOWED_EXACT = frozenset({
     ("POST", "/api/v1/llm/unload"),
     ("POST", "/api/v1/queue/pause-after-output"),
     ("POST", "/api/v1/queue/resume"),
+    ("GET", "/api/v1/h3/legal-access"),
+    ("PUT", "/api/v1/h3/legal-access"),
+    ("GET", "/api/v1/krea/owner-policy"),
+    ("PUT", "/api/v1/krea/owner-policy"),
 })
 
 
@@ -1130,6 +1138,8 @@ def _recovery_response_requires_no_store(path: str) -> bool:
         or path.startswith("/api/v1/local-recovery/")
         or path == "/api/v1/sample-campaign"
         or path.startswith("/api/v1/sample-campaign/")
+        or path == "/api/v1/h3/legal-access"
+        or path == "/api/v1/krea/owner-policy"
         or path in {"/api/v1/jobs", "/api/v1/queue"}
         or path.startswith("/api/v1/status/")
         or path.startswith("/api/v1/cancel/")
@@ -1396,10 +1406,26 @@ from services.h3_offload_plan import (
 )
 from services.h3_legal_access import (
     H3LegalAccessError,
+    H3LocationDeclarationError,
     H3_LEGAL_BLOCKED_DETAIL,
+    H3_LICENSE_SHA256,
+    H3_LICENSE_URL,
+    H3_UPSTREAM_REVISION,
+    h3_legal_access_decision,
+    h3_operating_location_status,
     h3_public_availability,
     is_registered_h3_family,
+    record_h3_operating_location,
     require_h3_execution_allowed,
+)
+from services.krea_owner_policy import (
+    KREA_AUP_URL,
+    KREA_LICENSE_DATE,
+    KREA_LICENSE_URL,
+    KREA_LICENSE_VERSION,
+    KreaOwnerPolicyError,
+    krea_owner_policy_status,
+    record_krea_owner_policy,
 )
 from services.h3_duration_plan import (
     GeneratedFrameCount,
@@ -10566,6 +10592,7 @@ def _require_h3_legal_execution(model_types) -> None:
             requested,
             model_defs=wgp.models_def,
             architectures=_h3_registered_architectures(requested),
+            services=wgp.server_config.get("services", {}),
         )
     except H3LegalAccessError as error:
         raise HTTPException(status_code=451, detail=str(error)) from error
@@ -11006,7 +11033,10 @@ def list_models(request: Request):
             )
         model_terms = model_terms_statuses({}, mt, wgp.models_def)
         legal_availability = h3_public_availability(
-            mt, model_def=md, architecture=architecture,
+            mt,
+            model_def=md,
+            architecture=architecture,
+            services=wgp.server_config.get("services", {}),
         )
         manual_verification_required = False
         manual_required = getattr(
@@ -12661,7 +12691,7 @@ def _director_require_visible_model(
             status_code=451,
             code="director_model_unavailable",
             component=component,
-            message=H3_LEGAL_BLOCKED_DETAIL,
+            message=str(error.detail),
         )
 
 
@@ -15004,6 +15034,13 @@ def _h3_checkpoint_options() -> list[dict]:
             model_type,
             model_def=model_def,
             architecture=wgp.get_base_model_type(model_type),
+            services=wgp.server_config.get("services", {}),
+        )
+        legal_decision = h3_legal_access_decision(
+            model_type,
+            model_def=model_def,
+            architecture=wgp.get_base_model_type(model_type),
+            services=wgp.server_config.get("services", {}),
         )
         downloaded = _h3_checkpoint_downloaded(model_type)
         urls = model_def.get("URLs")
@@ -15017,7 +15054,10 @@ def _h3_checkpoint_options() -> list[dict]:
         unavailable_reason = ""
         if legal_availability.get("execution_allowed") is False:
             available = False
-            unavailable_reason = H3_LEGAL_BLOCKED_DETAIL
+            unavailable_reason = (
+                legal_decision.detail
+                if legal_decision is not None else H3_LEGAL_BLOCKED_DETAIL
+            )
         if available and model_type == _H3_W4A8_FL2VA_MODEL:
             if w4a8_capability is None:
                 from services.h3_acceleration import get_h3_acceleration_status
@@ -15076,6 +15116,13 @@ def _h3_generation_requirements(body: dict, plan: dict | None = None) -> dict:
                     model_def if isinstance(model_def, dict) else None
                 ),
                 architecture=wgp.get_base_model_type(model_type),
+                services=wgp.server_config.get("services", {}),
+            )
+            legal_decision = h3_legal_access_decision(
+                model_type,
+                model_def=(model_def if isinstance(model_def, dict) else None),
+                architecture=wgp.get_base_model_type(model_type),
+                services=wgp.server_config.get("services", {}),
             )
             entry = {
                 "model_type": model_type,
@@ -15087,7 +15134,10 @@ def _h3_generation_requirements(body: dict, plan: dict | None = None) -> dict:
             if legal_availability.get("execution_allowed") is False:
                 entry.update({
                     "available": False,
-                    "unavailable_reason": H3_LEGAL_BLOCKED_DETAIL,
+                    "unavailable_reason": (
+                        legal_decision.detail
+                        if legal_decision is not None else H3_LEGAL_BLOCKED_DETAIL
+                    ),
                 })
             entries.append(entry)
         else:
@@ -20483,6 +20533,133 @@ def _public_account_context(request: Request) -> dict:
 @api.get("/api/v1/account/context")
 def get_account_context(request: Request):
     return _public_account_context(request)
+
+
+def _require_owner_policy_control(request: Request) -> dict:
+    """Require a recently reauthenticated owner for host-wide legal choices."""
+    _require_account_store(request)
+    principal = _require_account_principal(request)
+    if not _request_has_account_capability(request, "owner.admin"):
+        raise HTTPException(status_code=403, detail="Owner access is required")
+    if not _request_has_recent_account_reauth(request):
+        raise HTTPException(
+            status_code=403,
+            detail="Confirm your password before changing model legal settings",
+        )
+    return principal
+
+
+@api.get("/api/v1/h3/legal-access")
+def get_h3_legal_access(request: Request):
+    """Return the owner-declared H3 operating location and current decision."""
+    _require_owner_policy_control(request)
+    with _services_config_lock:
+        status = h3_operating_location_status(
+            wgp.server_config.get("services", {}),
+        )
+    return {
+        **status,
+        "license_revision": H3_UPSTREAM_REVISION,
+        "license_sha256": H3_LICENSE_SHA256,
+        "license_url": H3_LICENSE_URL,
+        "location_source": "manual_owner_declaration",
+        "network_location_used": False,
+        "written_authorization_supported": False,
+    }
+
+
+@api.put("/api/v1/h3/legal-access")
+async def update_h3_legal_access(request: Request):
+    """Persist one owner-attested physical operating country for H3."""
+    _require_owner_policy_control(request)
+    body = await _account_request_body(request)
+    if set(body) != {
+        "territory_code", "owner_attested", "license_revision", "license_sha256",
+    }:
+        raise HTTPException(status_code=400, detail="H3 location request is invalid")
+    try:
+        with _services_config_lock:
+            services = copy.deepcopy(wgp.server_config.get("services", {}))
+            if not isinstance(services, dict):
+                services = {}
+            record_h3_operating_location(
+                services,
+                territory_code=body.get("territory_code"),
+                owner_attested=body.get("owner_attested"),
+                license_revision=body.get("license_revision"),
+                license_sha256=body.get("license_sha256"),
+            )
+            staged_config = dict(wgp.server_config)
+            staged_config["services"] = services
+            _atomic_write_json(wgp.server_config_filename, staged_config)
+            wgp.server_config["services"] = services
+            status = h3_operating_location_status(services)
+    except H3LocationDeclarationError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {
+        "status": "ok",
+        **status,
+        "location_source": "manual_owner_declaration",
+        "network_location_used": False,
+    }
+
+
+@api.get("/api/v1/krea/owner-policy")
+def get_krea_owner_policy(request: Request):
+    """Return Krea's owner-attestation state without inspecting content."""
+    _require_owner_policy_control(request)
+    with _services_config_lock:
+        status = krea_owner_policy_status(
+            wgp.server_config.get("services", {}),
+        )
+    return {
+        **status,
+        "license_version": KREA_LICENSE_VERSION,
+        "license_date": KREA_LICENSE_DATE,
+        "license_url": KREA_LICENSE_URL,
+        "acceptable_use_url": KREA_AUP_URL,
+        "content_handling": "manual_owner_review",
+    }
+
+
+@api.put("/api/v1/krea/owner-policy")
+async def update_krea_owner_policy(request: Request):
+    """Record server-wide manual-review responsibility for local Krea use."""
+    _require_owner_policy_control(request)
+    body = await _account_request_body(request)
+    expected_keys = {
+        "owner_attested", "manual_review_accepted", "local_content_stays_local",
+        "attribution_accepted", "use_scope", "license_version", "license_date",
+    }
+    if set(body) != expected_keys:
+        raise HTTPException(status_code=400, detail="Krea owner policy request is invalid")
+    try:
+        with _services_config_lock:
+            services = copy.deepcopy(wgp.server_config.get("services", {}))
+            if not isinstance(services, dict):
+                services = {}
+            record_krea_owner_policy(
+                services,
+                owner_attested=body.get("owner_attested"),
+                manual_review_accepted=body.get("manual_review_accepted"),
+                local_content_stays_local=body.get("local_content_stays_local"),
+                attribution_accepted=body.get("attribution_accepted"),
+                use_scope=body.get("use_scope"),
+                license_version=body.get("license_version"),
+                license_date=body.get("license_date"),
+            )
+            staged_config = dict(wgp.server_config)
+            staged_config["services"] = services
+            _atomic_write_json(wgp.server_config_filename, staged_config)
+            wgp.server_config["services"] = services
+            status = krea_owner_policy_status(services)
+    except KreaOwnerPolicyError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {
+        "status": "ok",
+        **status,
+        "content_handling": "manual_owner_review",
+    }
 
 
 def _require_account_project_migration_owner(request: Request) -> dict:

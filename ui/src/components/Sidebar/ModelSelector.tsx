@@ -106,7 +106,9 @@ export function ModelSelector() {
   const audioSubMode = useStore(s => s.audioSubMode)
 
   const currentModel = models.find(m => m.model_type === currentModelType)
-  const currentModelLegalBlocked = currentModel?.availability_status === 'legal_blocked'
+  const currentModelNeedsLocation = currentModel?.availability_status === 'location_declaration_required'
+  const currentModelLegalBlocked = currentModelNeedsLocation
+    || currentModel?.availability_status === 'legal_blocked'
     || currentModel?.execution_allowed === false
   const pendingRequirements = currentModelLegalBlocked
     ? []
@@ -166,6 +168,7 @@ export function ModelSelector() {
     const avail = getModelsForFamily(family.id, models, generationMode, effectiveSubMode)
     return n + avail.filter(m => (
       !enabledModels.has(m.model_type)
+      && m.availability_status !== 'location_declaration_required'
       && m.availability_status !== 'legal_blocked'
       && m.execution_allowed !== false
     )).length
@@ -192,7 +195,9 @@ export function ModelSelector() {
 
       {currentModelLegalBlocked && (
         <div role="status" className="mt-1 rounded border border-red-500/35 bg-red-500/10 px-2 py-1.5 text-[9px] leading-relaxed text-red-100">
-          MiniMax H3 cannot run on this installation because its current license excludes the United States. Accepting model terms does not grant access; a separate written MiniMax license is required.
+          {currentModelNeedsLocation
+            ? 'Choose the country where this computer will actually run MiniMax H3. Maestro does not use IP or VPN location.'
+            : 'MiniMax H3 is not licensed in the owner-declared operating country. Accepting model terms does not grant access; separate written MiniMax authorization is required.'}
         </div>
       )}
 
@@ -299,7 +304,9 @@ export function ModelSelector() {
                     model.model_type === 'minimax_h3_w4a8_fl2va'
                     && w4a8Capability?.available !== true
                   )
-                  const legalBlocked = model.availability_status === 'legal_blocked'
+                  const locationRequired = model.availability_status === 'location_declaration_required'
+                  const legalBlocked = locationRequired
+                    || model.availability_status === 'legal_blocked'
                     || model.execution_allowed === false
                   const isPinkCherry = model.model_type === 'minimax_h3_pinkcherry_fl2va'
                   const pinkProfileIncompatible = isPinkCherry
@@ -327,7 +334,9 @@ export function ModelSelector() {
                         aria-pressed={isSelected}
                         title={
                           legalBlocked
-                            ? 'A separate written MiniMax H3 license is required on this installation.'
+                            ? locationRequired
+                              ? 'Choose the country where this computer will actually run MiniMax H3.'
+                              : 'Separate written MiniMax authorization is required in the owner-declared country.'
                             : w4a8Unavailable
                             ? (w4a8Capability?.reason || 'Checking W4A8 runtime support…')
                             : pinkReconciliationLabel || model.selector_help || model.description
@@ -346,7 +355,7 @@ export function ModelSelector() {
                           <span className="text-[9px] text-amber-300">{pinkReconciliationLabel}</span>
                         )}
                         {w4a8Unavailable && <span className="text-[9px] text-amber-300">Unavailable</span>}
-                        {legalBlocked && <span className="text-[9px] text-red-300">License required</span>}
+                        {legalBlocked && <span className="text-[9px] text-red-300">{locationRequired ? 'Location needed' : 'License required'}</span>}
                         {isSelected && <Check size={12} className="shrink-0 text-accent-blue" />}
                       </button>
                       {(model.selector_help || model.description) && (
@@ -374,9 +383,13 @@ function ModelBadges({ model }: {
   else if (model.model_type === 'minimax_h3_w4a8_fl2va') badges.push({ label: 'Experimental' })
   else if (model.model_type === 'minimax_h3_ref2va') badges.push({ label: 'Reference media' })
   else if (model.model_type.startsWith('minimax_h3')) badges.push({ label: 'H3' })
-  if (model.availability_status === 'legal_blocked' || model.execution_allowed === false) badges.push({
+  if (model.availability_status === 'location_declaration_required') badges.push({
+    label: 'Location needed',
+    title: 'Choose the country where this computer will actually run MiniMax H3; IP and VPN location are ignored',
+  })
+  else if (model.availability_status === 'legal_blocked' || model.execution_allowed === false) badges.push({
     label: 'License required',
-    title: 'This installation needs a separate written MiniMax H3 license before it can run this model',
+    title: 'Separate written MiniMax authorization is required in the owner-declared operating country',
   })
   if (model.is_i2v && model.supports_end_frame) badges.push({ label: 'Start + end', title: 'Uses start and end images to guide the video' })
   else if (model.is_i2v) badges.push({ label: 'Image to video', title: 'Creates video from an image' })

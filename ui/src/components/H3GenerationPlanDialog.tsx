@@ -251,11 +251,16 @@ export function H3GenerationPlanDialog() {
         managed_download: false,
         auto_download: false,
         terms_required: model.model_type === 'minimax_h3_ref2va',
-        available: model.execution_allowed !== false && model.is_downloaded === true,
+        available: model.availability_status !== 'location_declaration_required'
+          && model.availability_status !== 'legal_blocked'
+          && model.execution_allowed !== false
+          && model.is_downloaded === true,
         availability_status: model.availability_status,
         execution_allowed: model.execution_allowed,
-        unavailable_reason: model.execution_allowed === false
-          ? 'A separate written MiniMax H3 license is required on this installation.'
+        unavailable_reason: model.availability_status === 'location_declaration_required'
+          ? 'Choose the country where this computer will actually run MiniMax H3.'
+          : model.execution_allowed === false
+          ? 'Separate written MiniMax authorization is required in the owner-declared country.'
           : model.is_downloaded === true
             ? ''
             : 'This model is not available for the current plan.',
@@ -342,8 +347,12 @@ export function H3GenerationPlanDialog() {
     ? 0
     : Number(planEstimate?.model_load_seconds || 0)
   const needsRef2VA = editsReady && models.includes('minimax_h3_ref2va')
+  const locationRequired = checkpointOptions.some(
+    option => option.availability_status === 'location_declaration_required',
+  )
   const legalBlocked = checkpointOptions.some(option => (
-    option.availability_status === 'legal_blocked'
+    option.availability_status === 'location_declaration_required'
+    || option.availability_status === 'legal_blocked'
     || option.execution_allowed === false
   ))
   const modelStatus = (option: H3CheckpointOption) => (
@@ -436,7 +445,9 @@ export function H3GenerationPlanDialog() {
           </div>
           {legalBlocked && (
             <div role="status" className="mb-3 rounded-lg border border-red-500/35 bg-red-500/10 p-2.5 text-[10px] leading-relaxed text-red-100">
-              MiniMax H3 cannot run on this installation because its current license excludes the United States. Accepting model terms does not grant access; a separate written MiniMax license is required. You can cancel this saved plan without deleting completed outputs.
+              {locationRequired
+                ? 'Choose the country where this computer will actually run MiniMax H3. Maestro does not use IP or VPN location.'
+                : 'MiniMax H3 is not licensed in the owner-declared operating country. Accepting model terms does not grant access; separate written MiniMax authorization is required.'} You can cancel this saved plan without deleting completed outputs.
             </div>
           )}
           {needsRef2VA && !legalBlocked && (
@@ -661,7 +672,9 @@ export function H3GenerationPlanDialog() {
             <p className="truncate">Job {planJobId} · Project {planWorkspace}</p>
             <p role="status" aria-live="polite" className="mt-1 text-amber-200">
               {legalBlocked
-                ? 'This plan is held until this installation has a separate written MiniMax H3 license'
+                ? locationRequired
+                  ? 'This plan is held until the owner records the actual operating country'
+                  : 'This plan is held until MiniMax grants written authorization for the owner-declared country'
                 : reviewSecondsRemaining == null
                 ? !ref2vaTermsAccepted && (planReviewTermsRequired || needsRef2VA)
                   ? 'Accept the Ref2VA terms before approving'

@@ -194,10 +194,12 @@ function ModelVisibilitySection() {
 
   // Group every installed/registered model by generation mode.
   const visibleModels = models
-  const legalBlockedModelIds = visibleModels.filter(model => (
-    model.availability_status === 'legal_blocked'
+  const isExecutionBlocked = (model: { availability_status?: string; execution_allowed?: boolean }) => (
+    model.availability_status === 'location_declaration_required'
+    || model.availability_status === 'legal_blocked'
     || model.execution_allowed === false
-  )).map(model => model.model_type)
+  )
+  const legalBlockedModelIds = visibleModels.filter(isExecutionBlocked).map(model => model.model_type)
   const modelsByMode = new Map<GenerationMode, { familyId: string; familyLabel: string; models: { model_type: string; name: string; is_downloaded?: boolean; architecture?: string; downloadable?: boolean; manual_checkpoint_verified?: boolean; availability_status?: string; execution_allowed?: boolean }[] }[]>()
   for (const { mode } of MODE_LABELS) {
     const modeFamilies = getFamiliesForMode(mode, families)
@@ -253,8 +255,7 @@ function ModelVisibilitySection() {
         <button
           onClick={() => setModelsEnabled(
             visibleModels.filter(model => (
-              model.availability_status !== 'legal_blocked'
-              && model.execution_allowed !== false
+              !isExecutionBlocked(model)
             )).map(model => model.model_type),
             true,
           )}
@@ -302,8 +303,7 @@ function ModelVisibilitySection() {
                   const famCollapsed = collapsedFamilies.has(famKey)
                   const famEnabled = group.models.filter(m => enabledModels.has(m.model_type)).length
                   const executableModels = group.models.filter(m => (
-                    m.availability_status !== 'legal_blocked'
-                    && m.execution_allowed !== false
+                    !isExecutionBlocked(m)
                   ))
                   const executableEnabled = executableModels.filter(m => enabledModels.has(m.model_type)).length
                   const famAllEnabled = executableModels.length > 0 && executableEnabled === executableModels.length
@@ -346,7 +346,7 @@ function ModelVisibilitySection() {
                           <input
                             type="checkbox"
                             checked={enabledModels.has(m.model_type)}
-                            disabled={m.availability_status === 'legal_blocked' || m.execution_allowed === false}
+                            disabled={isExecutionBlocked(m)}
                             onChange={() => toggleModelEnabled(m.model_type)}
                             className="w-3.5 h-3.5 rounded border-border bg-bg-tertiary accent-accent-blue shrink-0"
                           />
@@ -355,8 +355,11 @@ function ModelVisibilitySection() {
                               enable checkbox. MMAudio rows are virtual entries
                               with no backend model def, so no button there —
                               their files fetch on first SFX generation. */}
-                          {m.availability_status === 'legal_blocked' || m.execution_allowed === false ? (
-                            <span className="text-[9px] text-red-300" title="A separate written MiniMax H3 license is required">License required</span>
+                          {isExecutionBlocked(m) ? (
+                            <span
+                              className="text-[9px] text-red-300"
+                              title={m.availability_status === 'location_declaration_required' ? 'Choose the country where this computer will actually run MiniMax H3' : 'Separate written MiniMax authorization is required'}
+                            >{m.availability_status === 'location_declaration_required' ? 'Location needed' : 'License required'}</span>
                           ) : m.is_downloaded ? (
                             <Check size={10} className="text-indicator-success shrink-0" />
                           ) : downloading.has(m.model_type) ? (

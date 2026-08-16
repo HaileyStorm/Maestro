@@ -5,18 +5,18 @@ are settled.
 
 ## Questions
 
-- None right now.
+- What country is this computer physically in when H3 runs? Please answer with
+  the two-letter country code. Maestro will use your answer, not IP/VPN data.
+- Will Krea use be noncommercial, or commercial with annual revenue under $1M?
 
 ## Needed now
 
-- Nothing. I will try the existing `EmberCollet@gmail.com` Vivaldi session first.
+- Just the two answers above.
 
 ## I will ask later, if needed
 
-- If H3 runs from a license-excluded country, I may need actual written MiniMax
-  permission. A manual location setting will avoid VPN mistakes.
-- If Cloudflare asks you to sign in or approve access in Vivaldi, I will point
-  out that exact step.
+- If H3 runs from a license-excluded country, actual written MiniMax permission
+  will still be needed. I can draft the request, but MiniMax must approve it.
 - Music and Character Sheet quality checks can wait until there are real outputs
   to review.
 
@@ -39,6 +39,8 @@ are settled.
 
 ## Nothing for you to do
 
+- Cloudflare is deployed through the correct EmberCollet account and Wrangler
+  is logged out.
+- The signed-out Uploads leak is fixed and verified on local and stable URLs.
 - Existing projects are already connected to the owner account.
 - Beads repair is mine to handle; do not initialize or migrate it.
-- I am checking the reported signed-out mobile project/content exposure now.

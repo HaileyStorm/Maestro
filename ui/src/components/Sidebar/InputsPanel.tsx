@@ -217,9 +217,12 @@ export function InputsPanel() {
   const filePickerRef = useRef<HTMLInputElement>(null)
   const pendingFilePickRef = useRef<((files: File[]) => void) | null>(null)
   const h3TermsAccepted = hostTerms?.minimax_h3_ref2va.accepted === true
+  const h3LocationRequired = h3StudioWorkflow
+    && activeModel?.availability_status === 'location_declaration_required'
   const h3ExecutionBlocked = h3StudioWorkflow
     && (
-      activeModel?.availability_status === 'legal_blocked'
+      activeModel?.availability_status === 'location_declaration_required'
+      || activeModel?.availability_status === 'legal_blocked'
       || activeModel?.execution_allowed === false
     )
 
@@ -877,7 +880,9 @@ export function InputsPanel() {
           </div>
           {h3ExecutionBlocked && (
             <p role="status" className="rounded border border-red-500/35 bg-red-500/10 px-2 py-1 text-[9px] leading-relaxed text-red-100">
-              MiniMax H3 cannot run on this installation because its current license excludes the United States. Accepting model terms does not grant access; a separate written MiniMax license is required.
+              {h3LocationRequired
+                ? 'Choose the country where this computer will actually run MiniMax H3. Maestro does not use IP or VPN location.'
+                : 'MiniMax H3 is not licensed in the owner-declared operating country. Accepting model terms does not grant access; separate written MiniMax authorization is required.'}
             </p>
           )}
           <p className="text-[9px] leading-relaxed text-text-muted">

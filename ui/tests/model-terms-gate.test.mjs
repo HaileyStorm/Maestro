@@ -154,17 +154,20 @@ test('manual-only catalog metadata suppresses generic download affordance', asyn
   assert.match(store, /revenue_eligible:\s*m\.revenue_eligible/)
   assert.match(store, /fine_tuning_eligible:\s*m\.fine_tuning_eligible/)
   assert.match(store, /derivative_tooling:\s*m\.derivative_tooling/)
+  assert.match(settings, /availability_status === 'location_declaration_required'/)
+  assert.match(settings, /const isExecutionBlocked =/)
 
   const row = settings.slice(
-    settings.indexOf("{m.availability_status === 'legal_blocked' || m.execution_allowed === false ? ("),
+    settings.indexOf('{isExecutionBlocked(m) ? ('),
     settings.indexOf("m.is_downloaded\n                              ? 'text-text-primary'"),
   )
   assert.match(row, /License required/)
-  assert.match(row, /separate written MiniMax H3 license is required/)
+  assert.match(row, /Location needed/)
+  assert.match(row, /Separate written MiniMax authorization is required/)
   assert.match(row, /m\.downloadable === false/)
   assert.match(row, /Manual model setup required/)
   assert.ok(
-    row.indexOf("m.availability_status === 'legal_blocked'")
+    row.indexOf('isExecutionBlocked(m)')
       < row.indexOf('m.downloadable === false'),
   )
   assert.ok(

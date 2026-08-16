@@ -10,14 +10,23 @@ export function GenerateButton() {
   const setSidebarOpen = useStore(s => s.setSidebarOpen)
   const modelOptionsLoading = useStore(s => s.modelOptionsLoading)
   const activeWorkspace = useStore(s => s.activeWorkspace)
+  const h3LocationRequired = useStore(s => {
+    const model = s.models.find(candidate => candidate.model_type === s.params.model_type)
+    return model?.availability_status === 'location_declaration_required'
+  })
   const legalBlocked = useStore(s => {
     const model = s.models.find(candidate => candidate.model_type === s.params.model_type)
-    return model?.availability_status === 'legal_blocked'
+    return model?.availability_status === 'location_declaration_required'
+      || model?.availability_status === 'legal_blocked'
       || model?.execution_allowed === false
   })
   const needsModelTerms = useStore(s => {
     const model = s.models.find(candidate => candidate.model_type === s.params.model_type)
-    if (model?.availability_status === 'legal_blocked' || model?.execution_allowed === false) return false
+    if (
+      model?.availability_status === 'location_declaration_required'
+      || model?.availability_status === 'legal_blocked'
+      || model?.execution_allowed === false
+    ) return false
     return (model?.required_host_terms || []).some(
       requirement => s.hostTerms?.[requirement.term]?.accepted !== true,
     )
@@ -95,7 +104,7 @@ export function GenerateButton() {
       : needsProject
       ? 'Select project'
       : legalBlocked
-      ? 'License required'
+      ? h3LocationRequired ? 'Location needed' : 'License required'
       : needsModelTerms
       ? 'Review terms'
       : needsManualCheckpointVerification
@@ -112,7 +121,9 @@ export function GenerateButton() {
       : needsProject
       ? 'Choose or create a project first.'
       : legalBlocked
-      ? 'MiniMax H3 cannot run on this installation. Accepting model terms does not grant access; a separate written MiniMax license is required.'
+      ? h3LocationRequired
+        ? 'Choose the country where this computer will actually run MiniMax H3. Maestro does not use IP or VPN location.'
+        : 'MiniMax H3 is not licensed in the owner-declared operating country. Separate written MiniMax authorization is required.'
       : needsModelTerms
       ? 'Read and accept the selected model\'s terms for this Maestro installation.'
       : needsManualCheckpointVerification
