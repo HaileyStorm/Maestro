@@ -68,6 +68,8 @@ export interface ModelDef {
   /** The source contract is complete enough for owner-managed installation. */
   manual_installation_ready?: boolean
   availability_status?: string
+  /** Server-owned legal/runtime admission; false means no execution path. */
+  execution_allowed?: boolean
   manual_checkpoint_verification_required?: boolean
   manual_checkpoint_verified?: boolean
   /** Public, host-path-neutral instructions for owner-managed checkpoints. */
@@ -1094,6 +1096,8 @@ export interface H3GenerationRequirements {
     is_downloaded: boolean
     terms_required: boolean
     auto_download: boolean
+    availability_status?: string
+    execution_allowed?: boolean
   }>
   ref2va_terms_required: boolean
   all_downloaded: boolean

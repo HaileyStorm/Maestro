@@ -2182,6 +2182,18 @@ class LaunchSecurityContractTests(unittest.TestCase):
             "image_creator_lora", "continuity_editor_lora",
             "character_reference", "location_reference", "starting_image",
         })
+
+        legal_detail = "A separate written MiniMax H3 license is required"
+
+        def require_h3_legal(model_types):
+            if any(
+                str(model_type or "").startswith("minimax_h3")
+                for model_type in model_types or ()
+            ):
+                raise FakeHTTPException(
+                    status_code=451, detail=legal_detail,
+                )
+
         namespace = self._function_namespace(
             (
                 "_remote_visible_model_ids",
@@ -2193,16 +2205,34 @@ class LaunchSecurityContractTests(unittest.TestCase):
                 "Request": object,
                 "HTTPException": FakeHTTPException,
                 "_model_visibility_response": lambda: configured,
+                "_require_h3_legal_execution": require_h3_legal,
+                "H3_LEGAL_BLOCKED_DETAIL": legal_detail,
                 "_DIRECTOR_FAILURE_CODES": failure_codes,
                 "_DIRECTOR_FAILURE_COMPONENTS": failure_components,
             },
         )
-        remote = types.SimpleNamespace(
-            state=types.SimpleNamespace(maestro_remote=True),
-        )
-        local = types.SimpleNamespace(
-            state=types.SimpleNamespace(maestro_remote=False),
-        )
+        transports = {
+            "local": types.SimpleNamespace(
+                state=types.SimpleNamespace(
+                    maestro_remote=False,
+                    maestro_transport="local",
+                ),
+            ),
+            "lan": types.SimpleNamespace(
+                state=types.SimpleNamespace(
+                    maestro_remote=True,
+                    maestro_transport="lan",
+                ),
+            ),
+            "stable": types.SimpleNamespace(
+                state=types.SimpleNamespace(
+                    maestro_remote=True,
+                    maestro_transport="stable",
+                ),
+            ),
+        }
+        local = transports["local"]
+        remote = transports["lan"]
         selected = (
             ("minimax_h3_pinkcherry_fl2va", "video_model"),
             ("krea2_moody_mix_v7_fp8", "image_creator_model"),
@@ -2211,7 +2241,19 @@ class LaunchSecurityContractTests(unittest.TestCase):
         require = namespace["_director_require_visible_model"]
         configured["enabled_models"] = [model for model, _component in selected]
         for model, component in selected:
-            require(remote, model, component)
+            if model.startswith("minimax_h3"):
+                for transport, request in transports.items():
+                    with self.subTest(transport=transport):
+                        with self.assertRaises(FakeHTTPException) as raised:
+                            require(request, model, component)
+                        self.assertEqual(raised.exception.status_code, 451)
+                        self.assertEqual(raised.exception.detail, {
+                            "code": "director_model_unavailable",
+                            "component": component,
+                            "message": legal_detail,
+                        })
+            else:
+                require(remote, model, component)
 
         for omitted_model, omitted_component in selected:
             with self.subTest(omitted_component=omitted_component):
@@ -2227,7 +2269,12 @@ class LaunchSecurityContractTests(unittest.TestCase):
                     "component": omitted_component,
                     "message": "Selected Director model is unavailable in this session.",
                 })
-                require(local, omitted_model, omitted_component)
+                if omitted_model.startswith("minimax_h3"):
+                    with self.assertRaises(FakeHTTPException) as local_error:
+                        require(local, omitted_model, omitted_component)
+                    self.assertEqual(local_error.exception.status_code, 451)
+                else:
+                    require(local, omitted_model, omitted_component)
 
         configured["enabled_models"] = []
         public_errors = []

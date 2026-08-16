@@ -101,6 +101,7 @@ export interface ApiModel {
   downloadable?: boolean
   manual_installation_ready?: boolean
   availability_status?: string
+  execution_allowed?: boolean
   manual_checkpoint_verification_required?: boolean
   manual_checkpoint_verified?: boolean
   manual_installation?: ModelManualInstallation
@@ -836,7 +837,9 @@ export async function downloadModel(modelType: string, workspace: string): Promi
   const query = new URLSearchParams({ workspace })
   const res = await fetch(`${BASE}/api/v1/models/${encodeURIComponent(modelType)}/download?${query}`, { method: 'POST' })
   if (!res.ok) {
-    const message = res.status === 409
+    const message = res.status === 451
+      ? 'MiniMax H3 cannot run on this installation. Accepting model terms does not grant access; a separate written MiniMax license is required.'
+      : res.status === 409
       ? 'Review this model recipe\'s terms and supported installation method.'
       : res.status === 423
         ? 'Unlock the selected project before downloading models.'
@@ -861,7 +864,9 @@ export async function verifyManualCheckpoint(modelType: string): Promise<{
     { method: 'POST' },
   )
   if (!res.ok) {
-    const message = res.status === 403
+    const message = res.status === 451
+      ? 'MiniMax H3 cannot run on this installation. Accepting model terms does not grant access; a separate written MiniMax license is required.'
+      : res.status === 403
       ? 'Manual checkpoint verification is available only on the local host.'
       : res.status === 404
         ? 'This model is unavailable.'
@@ -973,6 +978,7 @@ export async function approveGenerationPlan(
     body: JSON.stringify(params),
   })
   if (!res.ok) {
+    if (res.status === 451) throw new Error('MiniMax H3 cannot run on this installation. Accepting model terms does not grant access; a separate written MiniMax license is required.')
     if (res.status === 404) throw new Error('That plan review is no longer available.')
     if (res.status === 409) throw new Error('The plan review state changed. Refresh and try again.')
     if (res.status === 423) throw new Error('Unlock the plan\'s project and try again.')

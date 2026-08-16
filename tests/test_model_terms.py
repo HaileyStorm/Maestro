@@ -942,6 +942,9 @@ class ImageRecipeGateBoundaryTests(unittest.TestCase):
                 "get_model_def": staticmethod(lambda _model_type: model_def),
                 "models_def": definitions,
             })(),
+            "_require_h3_legal_execution": lambda model_types: (
+                side_effects.append(("legal", tuple(model_types)))
+            ),
             "_require_model_recipe_terms": lambda model_types: side_effects.append(
                 ("terms", tuple(model_types)),
             ),
@@ -965,6 +968,7 @@ class ImageRecipeGateBoundaryTests(unittest.TestCase):
                 PORNMASTER_V4_PONPOKE_RECIPE,
             )
         self.assertEqual(side_effects, [
+            ("legal", (PORNMASTER_V4_PONPOKE_RECIPE,)),
             ("terms", (PORNMASTER_V4_PONPOKE_RECIPE,)),
         ])
 
@@ -978,7 +982,10 @@ class ImageRecipeGateBoundaryTests(unittest.TestCase):
         side_effects.clear()
         with self.assertRaises(namespace["ModelDownloadUnavailableError"]):
             namespace["_download_model_files"](alias_id)
-        self.assertEqual(side_effects, [("terms", (alias_id,))])
+        self.assertEqual(side_effects, [
+            ("legal", (alias_id,)),
+            ("terms", (alias_id,)),
+        ])
 
         # Removing the registered target cannot turn its exact alias into a
         # generic downloadable model or reach updater/network resolution.
@@ -990,7 +997,10 @@ class ImageRecipeGateBoundaryTests(unittest.TestCase):
         side_effects.clear()
         with self.assertRaises(namespace["ModelDownloadUnavailableError"]):
             namespace["_download_model_files"](alias_id)
-        self.assertEqual(side_effects, [("terms", (alias_id,))])
+        self.assertEqual(side_effects, [
+            ("legal", (alias_id,)),
+            ("terms", (alias_id,)),
+        ])
 
         class FakeHTTPException(Exception):
             def __init__(self, *, status_code, detail):
@@ -1068,6 +1078,9 @@ class ImageRecipeGateBoundaryTests(unittest.TestCase):
             "wgp": wgp,
             "_request_is_cloudflare_remote": lambda request: request.remote,
             "_runtime_share_registration_is_local": lambda request: request.local,
+            "_require_h3_legal_execution": lambda values: calls.append(
+                ("legal", tuple(values)),
+            ),
             "_require_model_recipe_terms": lambda values: calls.append(
                 ("terms", tuple(values)),
             ),
@@ -1085,6 +1098,7 @@ class ImageRecipeGateBoundaryTests(unittest.TestCase):
             "is_downloaded": False,
         })
         self.assertEqual(calls, [
+            ("legal", ("manual_alias",)),
             ("terms", ("manual_alias",)),
             "required",
             "verify",

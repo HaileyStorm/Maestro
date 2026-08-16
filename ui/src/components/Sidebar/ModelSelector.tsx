@@ -106,11 +106,16 @@ export function ModelSelector() {
   const audioSubMode = useStore(s => s.audioSubMode)
 
   const currentModel = models.find(m => m.model_type === currentModelType)
-  const pendingRequirements = (currentModel?.required_host_terms || []).filter(
-    requirement => hostTerms?.[requirement.term]?.accepted !== true,
-  )
+  const currentModelLegalBlocked = currentModel?.availability_status === 'legal_blocked'
+    || currentModel?.execution_allowed === false
+  const pendingRequirements = currentModelLegalBlocked
+    ? []
+    : (currentModel?.required_host_terms || []).filter(
+        requirement => hostTerms?.[requirement.term]?.accepted !== true,
+      )
   const manualVerificationPending = Boolean(
-    currentModel?.downloadable === false
+    !currentModelLegalBlocked
+    && currentModel?.downloadable === false
     && currentModel.manual_checkpoint_verification_required
     && !currentModel.manual_checkpoint_verified,
   )
@@ -159,7 +164,11 @@ export function ModelSelector() {
   // "+N" hint that nudges users toward Settings → Enabled Models.
   const disabledCount = modeFamilies.reduce((n, family) => {
     const avail = getModelsForFamily(family.id, models, generationMode, effectiveSubMode)
-    return n + avail.filter(m => !enabledModels.has(m.model_type)).length
+    return n + avail.filter(m => (
+      !enabledModels.has(m.model_type)
+      && m.availability_status !== 'legal_blocked'
+      && m.execution_allowed !== false
+    )).length
   }, 0)
 
   return (
@@ -181,6 +190,12 @@ export function ModelSelector() {
         <ChevronDown size={14} className={`shrink-0 text-text-muted transition-transform ${open ? 'rotate-180' : ''}`} />
       </button>
 
+      {currentModelLegalBlocked && (
+        <div role="status" className="mt-1 rounded border border-red-500/35 bg-red-500/10 px-2 py-1.5 text-[9px] leading-relaxed text-red-100">
+          MiniMax H3 cannot run on this installation because its current license excludes the United States. Accepting model terms does not grant access; a separate written MiniMax license is required.
+        </div>
+      )}
+
       {pendingRequirements.map(requirement => (
         <div key={requirement.term} role="status" className="mt-1 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[9px] leading-relaxed text-amber-100">
           <p>{requirement.notice}</p>
@@ -200,7 +215,7 @@ export function ModelSelector() {
       {pendingRequirements.length > 0 && hostTermsError && (
         <p role="status" className="mt-1 text-[9px] text-red-300">{hostTermsError}</p>
       )}
-      {currentModel?.downloadable === false && (
+      {currentModel?.downloadable === false && !currentModelLegalBlocked && (
         <div role="status" className="mt-1 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[9px] leading-relaxed text-amber-100">
           {currentModel.manual_installation && (
             <dl className="mb-1.5 grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5">
@@ -284,6 +299,8 @@ export function ModelSelector() {
                     model.model_type === 'minimax_h3_w4a8_fl2va'
                     && w4a8Capability?.available !== true
                   )
+                  const legalBlocked = model.availability_status === 'legal_blocked'
+                    || model.execution_allowed === false
                   const isPinkCherry = model.model_type === 'minimax_h3_pinkcherry_fl2va'
                   const pinkProfileIncompatible = isPinkCherry
                     && pinkCompatibility?.requestedProfileId === h3SelectedProfile
@@ -306,10 +323,12 @@ export function ModelSelector() {
                     >
                       <button
                         type="button"
-                        disabled={w4a8Unavailable}
+                        disabled={w4a8Unavailable || legalBlocked}
                         aria-pressed={isSelected}
                         title={
-                          w4a8Unavailable
+                          legalBlocked
+                            ? 'A separate written MiniMax H3 license is required on this installation.'
+                            : w4a8Unavailable
                             ? (w4a8Capability?.reason || 'Checking W4A8 runtime support…')
                             : pinkReconciliationLabel || model.selector_help || model.description
                         }
@@ -327,6 +346,7 @@ export function ModelSelector() {
                           <span className="text-[9px] text-amber-300">{pinkReconciliationLabel}</span>
                         )}
                         {w4a8Unavailable && <span className="text-[9px] text-amber-300">Unavailable</span>}
+                        {legalBlocked && <span className="text-[9px] text-red-300">License required</span>}
                         {isSelected && <Check size={12} className="shrink-0 text-accent-blue" />}
                       </button>
                       {(model.selector_help || model.description) && (
@@ -347,13 +367,17 @@ export function ModelSelector() {
 }
 
 function ModelBadges({ model }: {
-  model: { model_type: string; is_i2v: boolean; is_t2v: boolean; supports_end_frame?: boolean; supports_audio?: boolean; supports_audio_input?: boolean; generates_audio?: boolean; supports_ref_images?: boolean; downloadable?: boolean; manual_checkpoint_verified?: boolean }
+  model: { model_type: string; is_i2v: boolean; is_t2v: boolean; supports_end_frame?: boolean; supports_audio?: boolean; supports_audio_input?: boolean; generates_audio?: boolean; supports_ref_images?: boolean; downloadable?: boolean; manual_checkpoint_verified?: boolean; availability_status?: string; execution_allowed?: boolean }
 }) {
   const badges: Array<{ label: string; title?: string }> = []
   if (model.model_type === 'minimax_h3_pinkcherry_fl2va') badges.push({ label: 'Explicit' })
   else if (model.model_type === 'minimax_h3_w4a8_fl2va') badges.push({ label: 'Experimental' })
   else if (model.model_type === 'minimax_h3_ref2va') badges.push({ label: 'Reference media' })
   else if (model.model_type.startsWith('minimax_h3')) badges.push({ label: 'H3' })
+  if (model.availability_status === 'legal_blocked' || model.execution_allowed === false) badges.push({
+    label: 'License required',
+    title: 'This installation needs a separate written MiniMax H3 license before it can run this model',
+  })
   if (model.is_i2v && model.supports_end_frame) badges.push({ label: 'Start + end', title: 'Uses start and end images to guide the video' })
   else if (model.is_i2v) badges.push({ label: 'Image to video', title: 'Creates video from an image' })
   if (model.generates_audio) badges.push({ label: 'Makes audio', title: 'Creates audio with the video' })

@@ -217,6 +217,11 @@ export function InputsPanel() {
   const filePickerRef = useRef<HTMLInputElement>(null)
   const pendingFilePickRef = useRef<((files: File[]) => void) | null>(null)
   const h3TermsAccepted = hostTerms?.minimax_h3_ref2va.accepted === true
+  const h3ExecutionBlocked = h3StudioWorkflow
+    && (
+      activeModel?.availability_status === 'legal_blocked'
+      || activeModel?.execution_allowed === false
+    )
 
   useEffect(() => {
     const input = filePickerRef.current
@@ -870,6 +875,11 @@ export function InputsPanel() {
                 ? 'This model uses reference media and cannot use start or end frames.'
                 : 'This model uses start and end frames and cannot use reference media.'}
           </div>
+          {h3ExecutionBlocked && (
+            <p role="status" className="rounded border border-red-500/35 bg-red-500/10 px-2 py-1 text-[9px] leading-relaxed text-red-100">
+              MiniMax H3 cannot run on this installation because its current license excludes the United States. Accepting model terms does not grant access; a separate written MiniMax license is required.
+            </p>
+          )}
           <p className="text-[9px] leading-relaxed text-text-muted">
             Reference media can guide characters, objects, settings, style, motion, or sound. It does not set the first or last frame.
             {h3AdaptiveConditioning && ' An end frame always guides the end of the video.'}
@@ -885,7 +895,7 @@ export function InputsPanel() {
               This model choice cannot use the attached start or end frames. Turn Automatic back on or remove those frames before generating.
             </p>
           )}
-          <div className="flex flex-col items-stretch gap-2 text-[9px] leading-relaxed text-text-secondary sm:flex-row sm:items-start">
+          {!h3ExecutionBlocked && <div className="flex flex-col items-stretch gap-2 text-[9px] leading-relaxed text-text-secondary sm:flex-row sm:items-start">
             <span className="flex-1">
               {h3TermsAccepted ? 'MiniMax H3 Ref2VA model terms are accepted for this Maestro installation. ' : `${HOST_TERM_NOTICES.minimax_h3_ref2va.text} Notice v${HOST_TERM_NOTICES.minimax_h3_ref2va.version}. `}
               <a href={HOST_TERM_NOTICES.minimax_h3_ref2va.href} target="_blank" rel="noreferrer" className="mobile-control-target inline-flex items-center rounded text-accent-blue hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">{HOST_TERM_NOTICES.minimax_h3_ref2va.linkLabel}</a>.
@@ -900,11 +910,11 @@ export function InputsPanel() {
                 Accept for this Maestro installation
               </button>
             )}
-          </div>
-          {!h3TermsAccepted && hostTermsError && (
+          </div>}
+          {!h3ExecutionBlocked && !h3TermsAccepted && hostTermsError && (
             <p className="text-[9px] text-red-300">{hostTermsError}</p>
           )}
-          {ref2vaModel?.is_downloaded !== true && (h3AdaptiveConditioning || dedicatedRef2VAMode || h3HasSemanticInputs) && (
+          {!h3ExecutionBlocked && ref2vaModel?.is_downloaded !== true && (h3AdaptiveConditioning || dedicatedRef2VAMode || h3HasSemanticInputs) && (
             <button type="button" disabled={!h3TermsAccepted || h3DownloadStatus === 'downloading'} onClick={installH3Ref2VA}
               className="w-full rounded-md border border-accent-blue/50 bg-accent-blue/10 px-2 py-1 text-[10px] text-accent-blue hover:bg-accent-blue/20 disabled:opacity-45 disabled:cursor-not-allowed">
               {h3DownloadStatus === 'downloading' ? 'Installing MiniMax H3 Ref2VA…'

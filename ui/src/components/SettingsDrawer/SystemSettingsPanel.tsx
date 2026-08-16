@@ -194,17 +194,21 @@ function ModelVisibilitySection() {
 
   // Group every installed/registered model by generation mode.
   const visibleModels = models
-  const modelsByMode = new Map<GenerationMode, { familyId: string; familyLabel: string; models: { model_type: string; name: string; is_downloaded?: boolean; architecture?: string; downloadable?: boolean; manual_checkpoint_verified?: boolean }[] }[]>()
+  const legalBlockedModelIds = visibleModels.filter(model => (
+    model.availability_status === 'legal_blocked'
+    || model.execution_allowed === false
+  )).map(model => model.model_type)
+  const modelsByMode = new Map<GenerationMode, { familyId: string; familyLabel: string; models: { model_type: string; name: string; is_downloaded?: boolean; architecture?: string; downloadable?: boolean; manual_checkpoint_verified?: boolean; availability_status?: string; execution_allowed?: boolean }[] }[]>()
   for (const { mode } of MODE_LABELS) {
     const modeFamilies = getFamiliesForMode(mode, families)
-    const groups: { familyId: string; familyLabel: string; models: { model_type: string; name: string; is_downloaded?: boolean; architecture?: string; downloadable?: boolean; manual_checkpoint_verified?: boolean }[] }[] = []
+    const groups: { familyId: string; familyLabel: string; models: { model_type: string; name: string; is_downloaded?: boolean; architecture?: string; downloadable?: boolean; manual_checkpoint_verified?: boolean; availability_status?: string; execution_allowed?: boolean }[] }[] = []
     for (const fam of modeFamilies) {
       const familyModels = getModelsForFamily(fam.id, visibleModels, mode)
       if (familyModels.length > 0) {
         groups.push({
           familyId: fam.id,
           familyLabel: fam.label,
-          models: familyModels.map(m => ({ model_type: m.model_type, name: m.name, is_downloaded: m.is_downloaded, architecture: m.architecture, downloadable: m.downloadable, manual_checkpoint_verified: m.manual_checkpoint_verified })),
+          models: familyModels.map(m => ({ model_type: m.model_type, name: m.name, is_downloaded: m.is_downloaded, architecture: m.architecture, downloadable: m.downloadable, manual_checkpoint_verified: m.manual_checkpoint_verified, availability_status: m.availability_status, execution_allowed: m.execution_allowed })),
         })
       }
     }
@@ -237,14 +241,23 @@ function ModelVisibilitySection() {
       <div className="mt-3 space-y-3">
       <div className="flex gap-2">
         <button
-          onClick={resetEnabledModels}
+          onClick={() => {
+            resetEnabledModels()
+            setModelsEnabled(legalBlockedModelIds, false)
+          }}
           className="flex items-center gap-1 px-2 py-1 text-[10px] border border-border rounded text-text-secondary hover:text-text-primary hover:border-border-light transition-colors"
         >
           <RotateCcw size={10} />
           Reset
         </button>
         <button
-          onClick={() => setAllModelsEnabled(true)}
+          onClick={() => setModelsEnabled(
+            visibleModels.filter(model => (
+              model.availability_status !== 'legal_blocked'
+              && model.execution_allowed !== false
+            )).map(model => model.model_type),
+            true,
+          )}
           className="px-2 py-1 text-[10px] border border-border rounded text-text-secondary hover:text-text-primary hover:border-border-light transition-colors"
         >
           All
@@ -288,7 +301,12 @@ function ModelVisibilitySection() {
                   const famKey = `${mode}:${group.familyId}`
                   const famCollapsed = collapsedFamilies.has(famKey)
                   const famEnabled = group.models.filter(m => enabledModels.has(m.model_type)).length
-                  const famAllEnabled = famEnabled === group.models.length && group.models.length > 0
+                  const executableModels = group.models.filter(m => (
+                    m.availability_status !== 'legal_blocked'
+                    && m.execution_allowed !== false
+                  ))
+                  const executableEnabled = executableModels.filter(m => enabledModels.has(m.model_type)).length
+                  const famAllEnabled = executableModels.length > 0 && executableEnabled === executableModels.length
                   // Single-family modes render flat — a header would be noise.
                   const showFamilyHeader = groups.length > 1
                   return (
@@ -301,10 +319,11 @@ function ModelVisibilitySection() {
                         <input
                           type="checkbox"
                           checked={famAllEnabled}
-                          ref={el => { if (el) el.indeterminate = famEnabled > 0 && !famAllEnabled }}
-                          onChange={() => setModelsEnabled(group.models.map(m => m.model_type), !famAllEnabled)}
+                          disabled={executableModels.length === 0}
+                          ref={el => { if (el) el.indeterminate = executableEnabled > 0 && !famAllEnabled }}
+                          onChange={() => setModelsEnabled(executableModels.map(m => m.model_type), !famAllEnabled)}
                           className="w-3 h-3 rounded border-border bg-bg-tertiary accent-accent-blue shrink-0"
-                          title={famAllEnabled ? `Disable all ${group.familyLabel} models` : `Enable all ${group.familyLabel} models`}
+                          title={executableModels.length === 0 ? `${group.familyLabel} models need separate legal authorization` : famAllEnabled ? `Disable all ${group.familyLabel} models` : `Enable all ${group.familyLabel} models`}
                         />
                         <button
                           onClick={() => toggleFamily(famKey)}
@@ -327,6 +346,7 @@ function ModelVisibilitySection() {
                           <input
                             type="checkbox"
                             checked={enabledModels.has(m.model_type)}
+                            disabled={m.availability_status === 'legal_blocked' || m.execution_allowed === false}
                             onChange={() => toggleModelEnabled(m.model_type)}
                             className="w-3.5 h-3.5 rounded border-border bg-bg-tertiary accent-accent-blue shrink-0"
                           />
@@ -335,7 +355,9 @@ function ModelVisibilitySection() {
                               enable checkbox. MMAudio rows are virtual entries
                               with no backend model def, so no button there —
                               their files fetch on first SFX generation. */}
-                          {m.is_downloaded ? (
+                          {m.availability_status === 'legal_blocked' || m.execution_allowed === false ? (
+                            <span className="text-[9px] text-red-300" title="A separate written MiniMax H3 license is required">License required</span>
+                          ) : m.is_downloaded ? (
                             <Check size={10} className="text-indicator-success shrink-0" />
                           ) : downloading.has(m.model_type) ? (
                             <Loader2 size={10} className="text-accent-blue shrink-0 animate-spin" />

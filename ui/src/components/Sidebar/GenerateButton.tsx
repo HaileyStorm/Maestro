@@ -10,8 +10,14 @@ export function GenerateButton() {
   const setSidebarOpen = useStore(s => s.setSidebarOpen)
   const modelOptionsLoading = useStore(s => s.modelOptionsLoading)
   const activeWorkspace = useStore(s => s.activeWorkspace)
+  const legalBlocked = useStore(s => {
+    const model = s.models.find(candidate => candidate.model_type === s.params.model_type)
+    return model?.availability_status === 'legal_blocked'
+      || model?.execution_allowed === false
+  })
   const needsModelTerms = useStore(s => {
     const model = s.models.find(candidate => candidate.model_type === s.params.model_type)
+    if (model?.availability_status === 'legal_blocked' || model?.execution_allowed === false) return false
     return (model?.required_host_terms || []).some(
       requirement => s.hostTerms?.[requirement.term]?.accepted !== true,
     )
@@ -63,7 +69,7 @@ export function GenerateButton() {
   )
   const needsOutpaintArea = isOutpaint && !!editVideoPath && !hasOutpaintArea
   const needsProject = !activeWorkspace
-  const blocked = modelOptionsLoading || needsProject || needsModelTerms || needsManualCheckpointVerification || needsImage || needsOutpaintSource || needsOutpaintArea
+  const blocked = modelOptionsLoading || needsProject || legalBlocked || needsModelTerms || needsManualCheckpointVerification || needsImage || needsOutpaintSource || needsOutpaintArea
 
   // Brief gray flash after clicking
   useEffect(() => {
@@ -88,6 +94,8 @@ export function GenerateButton() {
       ? 'Loading model'
       : needsProject
       ? 'Select project'
+      : legalBlocked
+      ? 'License required'
       : needsModelTerms
       ? 'Review terms'
       : needsManualCheckpointVerification
@@ -103,6 +111,8 @@ export function GenerateButton() {
       ? 'Choose a larger output aspect or resize the source to create an area for Outpaint to generate.'
       : needsProject
       ? 'Choose or create a project first.'
+      : legalBlocked
+      ? 'MiniMax H3 cannot run on this installation. Accepting model terms does not grant access; a separate written MiniMax license is required.'
       : needsModelTerms
       ? 'Read and accept the selected model\'s terms for this Maestro installation.'
       : needsManualCheckpointVerification

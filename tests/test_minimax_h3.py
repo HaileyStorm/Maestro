@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import threading
 import types
 import unittest
 from unittest import mock
@@ -117,6 +118,16 @@ def _w4a8_admission_namespace():
         project_access_permissions.append(permission)
         return "/tmp/project"
 
+    def require_h3_legal(model_types):
+        if any(
+            str(model_type or "").startswith("minimax_h3")
+            for model_type in model_types or ()
+        ):
+            raise _HTTPException(
+                status_code=451,
+                detail="A separate written MiniMax H3 license is required",
+            )
+
     namespace = {
         "Request": _AdmissionRequest,
         "_GenerationPreparationRequest": object,
@@ -143,6 +154,7 @@ def _w4a8_admission_namespace():
         "_validate_h3_lightx2v_recovery_identity": lambda body: None,
         "_get_active_workspace": lambda: "default",
         "_require_project_access": require_project_generation,
+        "_require_h3_legal_execution": require_h3_legal,
         "_project_access_permissions": project_access_permissions,
         "_reject_client_h3_internal_state": lambda body: None,
         "_reject_client_h3_turbo_validation_controls": lambda body: None,
@@ -177,6 +189,16 @@ def _w4a8_admission_namespace():
             worker_admissions.append(str(job.get("id") or "")) or True
         ),
         "_queue_recovery_delivery_pending": lambda job: None,
+        "_queue_recovery_checkpoint": (
+            lambda job, **updates: job.update(updates) or True
+        ),
+        "_hold_h3_job_for_legal_access": lambda job: job.update({
+            "status": "queued",
+            "queue_held": True,
+            "recovery_state": "blocked",
+            "reruns_denoise": False,
+            "_recovery_reason_code": "h3_legal_access_required",
+        }) or True,
         "_director_image_role_wire_mode": lambda body: "legacy",
         "_require_h3_offload_plan_parity": lambda job: None,
         "_require_job_model_recipe_terms": lambda job: None,
@@ -203,6 +225,7 @@ def _w4a8_admission_namespace():
         {
             "_trusted_h3_prepared_plan",
             "_require_job_runtime_model_admission",
+            "_h3_job_model_types",
             "_h3_effective_model_types",
             "_require_h3_acceleration_available",
             "_plan_generation_submission",
@@ -555,6 +578,7 @@ class TestMiniMaxH3Definition(unittest.TestCase):
 
         catalog = builtin_catalog()
         namespace = {
+            "Request": object,
             "HTTPException": _HTTPException,
             "_H3_LONG_STUDIO_MODELS": {
                 "minimax_h3", "minimax_h3_ref2va",
@@ -617,12 +641,14 @@ class TestMiniMaxH3Definition(unittest.TestCase):
             '_resolve_h3_style_workflow_request(body, model_field="video_model")',
             launch,
         )
+        director_plan = launch.split(
+            "async def director_v2_plan", 1,
+        )[1].split("@api.", 1)[0]
         self.assertIn(
-            "workflow = _resolve_h3_style_workflow_request(\n"
-            "        body, model_field=\"video_model\",\n"
-            "    )",
-            launch,
+            "workflow = _resolve_h3_style_workflow_request(",
+            director_plan,
         )
+        self.assertIn('body, model_field="video_model"', director_plan)
         self.assertGreaterEqual(
             launch.count("_resolve_h3_style_workflow_request(body)"), 2,
         )
@@ -838,6 +864,9 @@ class TestMiniMaxH3Definition(unittest.TestCase):
             "_PLAN_REVIEW_TIMEOUT_SECONDS": 16.0,
             "_jobs": {job["id"]: job},
             "is_cancel_requested": lambda _job: False,
+            "_queue_recovery_delivery_pending": lambda _job: None,
+            "_h3_job_model_types": lambda _job: ("minimax_h3",),
+            "_require_h3_legal_execution": lambda _models: None,
             "update_preparation_job": lambda _job, **_updates: True,
             "llm_enhance_prompt": enhance,
             "_require_h3_native_boundary_experimental": lambda _body: None,
@@ -896,7 +925,7 @@ class TestMiniMaxH3Definition(unittest.TestCase):
         )
         self.assertNotIn("photorealistic realism", planned_body["prompt"])
 
-    def test_w4a8_rejects_public_planning_before_work_and_worker_before_model(self):
+    def test_h3_legal_gate_precedes_w4a8_planning_and_worker_work(self):
         launch = _read(_LAUNCH_PATH)
         selector = _read(_MODEL_SELECTOR_PATH)
         advanced = _read(_ADVANCED_SETTINGS_PATH)
@@ -966,23 +995,148 @@ class TestMiniMaxH3Definition(unittest.TestCase):
             admission["_jobs"] = {"w4a8-worker": worker_job}
             self.assertFalse(admission["_run_generation"]("w4a8-worker"))
 
-        self.assertEqual(preview_error.exception.status_code, 400)
-        self.assertIn("W4A8 FL2VA is unavailable", preview_error.exception.detail)
+        self.assertEqual(preview_error.exception.status_code, 451)
+        self.assertIn(
+            "separate written MiniMax H3 license",
+            preview_error.exception.detail,
+        )
         self.assertEqual(
             admission["_project_access_permissions"],
             ["project.generate"],
         )
-        self.assertEqual(probes, [False, False, False])
-        self.assertEqual(worker_admissions, ["w4a8-worker"])
+        self.assertEqual(probes, [])
+        self.assertEqual(worker_admissions, [])
         self.assertEqual(forbidden_events, [])
-        self.assertEqual(len(failed), 1)
-        self.assertEqual(failed[0]["phase"], "preparation_failed")
-        self.assertEqual(len(finished), 1)
-        self.assertEqual(finished[0][0][1], "failed")
-        self.assertIn("W4A8 FL2VA is unavailable", finished[0][1]["error"])
+        self.assertEqual(failed, [])
+        self.assertEqual(finished, [])
+        for held in (preparation_job, worker_job):
+            self.assertEqual(held["status"], "queued")
+            self.assertIs(held["queue_held"], True)
+            self.assertEqual(held["recovery_state"], "blocked")
+            self.assertIs(held["reruns_denoise"], False)
+            self.assertEqual(
+                held["_recovery_reason_code"],
+                "h3_legal_access_required",
+            )
         self.assertIn("w4a8Capability?.available !== true", selector)
-        self.assertIn("disabled={w4a8Unavailable}", selector)
+        self.assertIn("disabled={w4a8Unavailable || legalBlocked}", selector)
         self.assertIn("setH3Custom('h3_sol_dense_steps', 0)", advanced)
+
+    def test_legal_block_parks_waiting_plan_before_terms_arm_timer_or_approval(self):
+        sys.path.insert(0, str(_APP))
+        try:
+            from services.host_terms import (
+                REF2VA_TERM,
+                accept_host_term,
+                host_term_accepted,
+            )
+        finally:
+            sys.path.pop(0)
+        services = {}
+        accept_host_term(
+            services,
+            REF2VA_TERM,
+            1,
+            accepted_at="2026-08-15T00:00:00Z",
+        )
+        self.assertTrue(host_term_accepted(services, REF2VA_TERM))
+        holds = []
+        project_checks = []
+
+        def legal_block(_model_types):
+            raise _HTTPException(
+                status_code=451,
+                detail="A separate written MiniMax H3 license is required",
+            )
+
+        def hold(job):
+            holds.append(str(job.get("id") or ""))
+            job.update({
+                "status": "queued",
+                "queue_held": True,
+                "recovery_state": "blocked",
+                "reruns_denoise": False,
+                "_recovery_reason_code": "h3_legal_access_required",
+            })
+            return True
+
+        def waiting_job(*, deadline=None):
+            return {
+                "id": "held-plan",
+                "status": "waiting_for_plan_approval",
+                "params": {"model_type": "minimax_h3_ref2va"},
+                "plan_review_required": True,
+                "plan_review_terms_required": True,
+                "plan_review_deadline": deadline,
+            }
+
+        def project_is_current(_job):
+            project_checks.append(str(_job.get("id") or ""))
+            return True
+
+        job = waiting_job()
+        namespace = {
+            "HTTPException": _HTTPException,
+            "math": __import__("math"),
+            "threading": threading,
+            "time": types.SimpleNamespace(time=lambda: 2.0),
+            "hmac": __import__("hmac"),
+            "copy": copy,
+            "_jobs": {job["id"]: job},
+            "_plan_review_timer_lock": threading.Lock(),
+            "_plan_review_timers": {},
+            "_plan_terms_reconciliation_lock": threading.RLock(),
+            "_PLAN_REVIEW_TIMEOUT_SECONDS": 16.0,
+            "_ref2va_host_terms_accepted": lambda: host_term_accepted(
+                services, REF2VA_TERM,
+            ),
+            "_require_h3_legal_execution": legal_block,
+            "_h3_job_model_types": lambda _job: ("minimax_h3_ref2va",),
+            "_hold_h3_job_for_legal_access": hold,
+            "_waiting_plan_project_is_current": project_is_current,
+            "_queue_recovery_revalidate_job": lambda _job: True,
+            "arm_prepared_job_plan_review": (
+                lambda *_args, **_kwargs: self.fail(
+                    "plan arm ran after legal block",
+                )
+            ),
+            "fail_preparation": lambda *_args, **_kwargs: self.fail(
+                "legal block became terminal preparation failure",
+            ),
+        }
+        _load_launch_functions({
+            "_arm_ref2va_waiting_plan_review",
+            "_reconcile_ref2va_waiting_plan_reviews",
+            "_approve_waiting_generation_plan",
+            "_expire_plan_review",
+            "_schedule_plan_review_auto_approval",
+        }, namespace)
+
+        namespace["_reconcile_ref2va_waiting_plan_reviews"](
+            schedule_timers=True,
+        )
+        self.assertEqual(job["_recovery_reason_code"], "h3_legal_access_required")
+        self.assertEqual(job["status"], "queued")
+        self.assertEqual(namespace["_plan_review_timers"], {})
+        self.assertEqual(project_checks, ["held-plan"])
+
+        job.update(waiting_job())
+        self.assertFalse(namespace["_arm_ref2va_waiting_plan_review"](
+            job, deadline=10.0,
+        ))
+        self.assertEqual(job["_recovery_reason_code"], "h3_legal_access_required")
+        self.assertEqual(project_checks, ["held-plan"])
+
+        job.update(waiting_job(deadline=1.0))
+        namespace["_schedule_plan_review_auto_approval"](job)
+        self.assertEqual(job["_recovery_reason_code"], "h3_legal_access_required")
+        self.assertEqual(namespace["_plan_review_timers"], {})
+
+        job.update(waiting_job(deadline=1.0))
+        namespace["_expire_plan_review"](job["id"])
+        self.assertEqual(job["_recovery_reason_code"], "h3_legal_access_required")
+        self.assertEqual(job["status"], "queued")
+        self.assertGreaterEqual(holds.count("held-plan"), 4)
 
     def test_frame_aligner_preserves_h3_and_legacy_grids(self):
         align = _load_frame_aligner()

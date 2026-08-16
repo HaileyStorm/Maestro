@@ -28,6 +28,8 @@ type H3CheckpointOption = {
   terms_required: boolean
   available: boolean
   unavailable_reason: string
+  availability_status?: string
+  execution_allowed?: boolean
 }
 type H3PlanWithCheckpointOptions = H3SegmentPlan & {
   checkpoint_options?: H3CheckpointOption[]
@@ -249,10 +251,14 @@ export function H3GenerationPlanDialog() {
         managed_download: false,
         auto_download: false,
         terms_required: model.model_type === 'minimax_h3_ref2va',
-        available: model.is_downloaded === true,
-        unavailable_reason: model.is_downloaded === true
-          ? ''
-          : 'This model is not available for the current plan.',
+        available: model.execution_allowed !== false && model.is_downloaded === true,
+        availability_status: model.availability_status,
+        execution_allowed: model.execution_allowed,
+        unavailable_reason: model.execution_allowed === false
+          ? 'A separate written MiniMax H3 license is required on this installation.'
+          : model.is_downloaded === true
+            ? ''
+            : 'This model is not available for the current plan.',
       }))
   const optionByModel = new Map(checkpointOptions.map(option => [option.model_type, option]))
   const getModelBlockedReason = (index: number, model: H3Model) => {
@@ -336,6 +342,10 @@ export function H3GenerationPlanDialog() {
     ? 0
     : Number(planEstimate?.model_load_seconds || 0)
   const needsRef2VA = editsReady && models.includes('minimax_h3_ref2va')
+  const legalBlocked = checkpointOptions.some(option => (
+    option.availability_status === 'legal_blocked'
+    || option.execution_allowed === false
+  ))
   const modelStatus = (option: H3CheckpointOption) => (
     option.is_downloaded
       ? 'installed'
@@ -356,7 +366,7 @@ export function H3GenerationPlanDialog() {
   const missingModels = Array.from(new Set(models))
     .map(model => optionByModel.get(model))
     .filter((option): option is H3CheckpointOption => Boolean(
-      option && !option.is_downloaded && option.auto_download,
+      option && option.available && !option.is_downloaded && option.auto_download,
     ))
 
   const changeModel = (index: number, model: H3Model) => {
@@ -424,7 +434,12 @@ export function H3GenerationPlanDialog() {
             <AlertTriangle size={14} className="mt-0.5 shrink-0 text-amber-400" />
             <span>Choose FL2VA when exact start or end frames matter. Choose Ref2VA when reference images and recent motion matter. If you supplied a final frame, the last segment must use FL2VA. FL2VA keeps your references saved but does not use them.</span>
           </div>
-          {needsRef2VA && (
+          {legalBlocked && (
+            <div role="status" className="mb-3 rounded-lg border border-red-500/35 bg-red-500/10 p-2.5 text-[10px] leading-relaxed text-red-100">
+              MiniMax H3 cannot run on this installation because its current license excludes the United States. Accepting model terms does not grant access; a separate written MiniMax license is required. You can cancel this saved plan without deleting completed outputs.
+            </div>
+          )}
+          {needsRef2VA && !legalBlocked && (
             <div className="mb-3 rounded-lg border border-violet-500/30 bg-violet-500/5 p-2.5 text-[10px] text-text-secondary">
               <div className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-start">
                 <span className="flex-1">
@@ -645,7 +660,9 @@ export function H3GenerationPlanDialog() {
           <div className="mr-auto min-w-0 text-[10px] text-text-muted">
             <p className="truncate">Job {planJobId} · Project {planWorkspace}</p>
             <p role="status" aria-live="polite" className="mt-1 text-amber-200">
-              {reviewSecondsRemaining == null
+              {legalBlocked
+                ? 'This plan is held until this installation has a separate written MiniMax H3 license'
+                : reviewSecondsRemaining == null
                 ? !ref2vaTermsAccepted && (planReviewTermsRequired || needsRef2VA)
                   ? 'Accept the Ref2VA terms before approving'
                   : 'Review the plan, then approve to continue'
@@ -656,7 +673,7 @@ export function H3GenerationPlanDialog() {
             {reviewError && <p role="alert" className="mt-1 text-red-300">{reviewError}</p>}
           </div>
           <button type="button" disabled={reviewLoading} onClick={cancelGeneration} className="min-h-11 w-full rounded border border-red-400/40 px-3 py-2 text-xs text-red-300 transition-colors hover:bg-red-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-300 disabled:cursor-wait disabled:opacity-50 sm:w-auto">Cancel generation</button>
-          <button type="button" disabled={reviewLoading || reviewSecondsRemaining === 0 || invalidSelections.length > 0 || durationBlocked} onClick={submit} className="flex min-h-11 w-full items-center justify-center gap-1.5 rounded bg-accent-blue px-3 py-2 text-xs font-medium text-white transition-[filter] hover:brightness-110 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2 focus-visible:ring-offset-bg-secondary disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto"><Check size={13} aria-hidden="true" />{reviewLoading ? 'Applying…' : 'Approve & resume'}</button>
+          <button type="button" disabled={legalBlocked || reviewLoading || reviewSecondsRemaining === 0 || invalidSelections.length > 0 || durationBlocked} onClick={submit} className="flex min-h-11 w-full items-center justify-center gap-1.5 rounded bg-accent-blue px-3 py-2 text-xs font-medium text-white transition-[filter] hover:brightness-110 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-2 focus-visible:ring-offset-bg-secondary disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto"><Check size={13} aria-hidden="true" />{reviewLoading ? 'Applying…' : 'Approve & resume'}</button>
         </div>
       </div>
     </div>

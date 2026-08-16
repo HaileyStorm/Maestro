@@ -1388,6 +1388,13 @@ from services.h3_offload_plan import (
     seal_h3_offload_plan,
     validate_h3_offload_plan,
 )
+from services.h3_legal_access import (
+    H3LegalAccessError,
+    H3_LEGAL_BLOCKED_DETAIL,
+    h3_public_availability,
+    is_registered_h3_family,
+    require_h3_execution_allowed,
+)
 from services.h3_duration_plan import (
     GeneratedFrameCount,
     H3DurationOraclePlan,
@@ -6282,6 +6289,28 @@ def _queue_recovery_materialize_job(
         runtime["recovery_state"] = "terminal"
         return runtime, False
 
+    # Executable H3 recovery remains visible but held.  Preserve its prior
+    # attempt counter and never start a model worker.  Verified delivery-only
+    # recovery is handled from retained native bytes on terminal source jobs.
+    if _job_uses_registered_h3(runtime):
+        try:
+            legal_attempt = max(
+                0, int(snapshot.get("recovery_attempt", 0) or 0),
+            )
+        except (TypeError, ValueError):
+            legal_attempt = 0
+        runtime.update({
+            "status": "queued",
+            "queue_held": True,
+            "recovery_state": "blocked",
+            "recovery_attempt": legal_attempt,
+            "reruns_denoise": False,
+            "_recovery_reason_code": "h3_legal_access_required",
+            "message": "MiniMax H3 needs a separate written license",
+            "error": None,
+        })
+        return runtime, False
+
     try:
         prior_attempt = max(
             0, int(snapshot.get("recovery_attempt", 0) or 0),
@@ -7239,11 +7268,13 @@ def _restore_queue_recovery_on_startup(
             if not project_reference_finalization:
                 try:
                     _require_job_runtime_model_admission(job)
-                except HTTPException:
+                except HTTPException as error:
                     role_mode = _director_image_role_wire_mode(
                         job.get("params") or {},
                     ) == "roles"
                     job["_recovery_reason_code"] = (
+                        "h3_legal_access_required"
+                        if error.status_code == 451 else
                         "director_role_admission_required"
                         if role_mode else "model_terms_required"
                     )
@@ -7251,8 +7282,10 @@ def _restore_queue_recovery_on_startup(
                         job,
                         queue_held=True,
                         recovery_state="blocked",
-                        reruns_denoise=True,
+                        reruns_denoise=error.status_code != 451,
                         message=(
+                            "MiniMax H3 needs a separate written license"
+                            if error.status_code == 451 else
                             "Director image role setup changed"
                             if role_mode
                             else "Model terms acceptance is required"
@@ -10477,6 +10510,98 @@ def _require_remote_visible_models(request: Request, model_types) -> None:
         raise HTTPException(status_code=404, detail="Model not found")
 
 
+def _h3_registered_architectures(model_types) -> dict[str, str]:
+    """Resolve only server-registered architecture identities for policy."""
+    resolved = {}
+    for value in model_types or ():
+        model_type = str(value or "").strip()
+        if not model_type:
+            continue
+        try:
+            architecture = str(wgp.get_base_model_type(model_type) or "")
+        except Exception:
+            architecture = ""
+        if architecture:
+            resolved[model_type] = architecture
+    return resolved
+
+
+def _require_h3_legal_execution(model_types) -> None:
+    """Project the source-owned H3 policy through an ordinary HTTP denial."""
+    requested = tuple(
+        str(value or "").strip()
+        for value in (model_types or ())
+        if str(value or "").strip()
+    )
+    try:
+        require_h3_execution_allowed(
+            requested,
+            model_defs=wgp.models_def,
+            architectures=_h3_registered_architectures(requested),
+        )
+    except H3LegalAccessError as error:
+        raise HTTPException(status_code=451, detail=str(error)) from error
+
+
+def _h3_job_model_types(job: dict) -> tuple[str, ...]:
+    """Collect executable model identities without inspecting creative data."""
+    params = job.get("params") if isinstance(job.get("params"), dict) else {}
+    values = [
+        job.get("model_type"), params.get("model_type"),
+        params.get("video_model"), params.get("image_model"),
+        params.get("image_creator_model"), params.get("image_editor_model"),
+    ]
+    long_plan = params.get("_h3_longform")
+    if isinstance(long_plan, dict):
+        segment_models = long_plan.get("segment_models")
+        if isinstance(segment_models, list):
+            values.extend(
+                segment.get("model_type")
+                if isinstance(segment, dict) else segment
+                for segment in segment_models
+            )
+    return tuple(
+        dict.fromkeys(
+            str(value or "").strip() for value in values
+            if str(value or "").strip()
+        )
+    )
+
+
+def _hold_h3_job_for_legal_access(job: dict) -> bool:
+    """Park executable H3 work without consuming an execution/retry attempt."""
+    updates = {
+        "status": "queued",
+        "queue_held": True,
+        "recovery_state": "blocked",
+        "reruns_denoise": False,
+        "message": "MiniMax H3 needs a separate written license",
+        "error": None,
+        "_recovery_reason_code": "h3_legal_access_required",
+    }
+    job.update(updates)
+    try:
+        return bool(_queue_recovery_checkpoint(job, **updates))
+    except Exception:
+        # The in-memory hold remains fail-closed. Startup materialization
+        # repeats the same legal decision from the durable pre-transition job.
+        return False
+
+
+def _job_uses_registered_h3(job: dict) -> bool:
+    for model_type in _h3_job_model_types(job):
+        model_def = wgp.get_model_def(model_type)
+        if is_registered_h3_family(
+            model_type,
+            model_def=model_def if isinstance(model_def, dict) else None,
+            architecture=_h3_registered_architectures((model_type,)).get(
+                model_type,
+            ),
+        ):
+            return True
+    return False
+
+
 def _require_remote_visible_job_models(job: dict) -> None:
     """Fail closed if a remote-origin job could load a hidden checkpoint."""
     if not bool(job.get("source_remote")):
@@ -10766,6 +10891,9 @@ def list_models(request: Request):
                 architecture=architecture,
             )
         model_terms = model_terms_statuses({}, mt, wgp.models_def)
+        legal_availability = h3_public_availability(
+            mt, model_def=md, architecture=architecture,
+        )
         manual_verification_required = False
         manual_required = getattr(
             wgp, "manual_checkpoint_integrity_required", None,
@@ -10799,6 +10927,7 @@ def list_models(request: Request):
             "director": director,
             "is_downloaded": _check_model_downloaded(mt),
             **model_availability_policy(mt, wgp.models_def),
+            **legal_availability,
             "supported_operations": [
                 operation
                 for operation in (
@@ -10973,6 +11102,15 @@ async def update_model_visibility(request: Request):
             detail="defaults_version must be an integer.",
         ) from error
 
+    # Keep legacy enabled identifiers readable, but do not let a visibility
+    # write newly opt a legally blocked H3 recipe back into the selector.
+    previous_enabled = set(_model_visibility_response()["enabled_models"])
+    newly_enabled = [
+        model_type for model_type in enabled_models
+        if model_type not in previous_enabled
+    ]
+    _require_h3_legal_execution(newly_enabled)
+
     with _MODEL_VISIBILITY_WRITE_LOCK:
         wgp.server_config[_MODEL_VISIBILITY_CONFIG_KEY] = {
             "enabled_models": enabled_models,
@@ -11068,6 +11206,7 @@ def verify_manual_checkpoint(model_type: str, request: Request):
     model_def = wgp.get_model_def(model_type)
     if not isinstance(model_def, dict):
         raise HTTPException(status_code=404, detail="Model not found")
+    _require_h3_legal_execution([model_type])
     _require_model_recipe_terms([model_type])
     availability = _public_model_availability(
         model_type, model_def, wgp.models_def,
@@ -11109,7 +11248,9 @@ def _download_model_files(model_type: str):
     Mirrors the file-resolution block at the top of wgp.load_models()
     (wgp.py:4041-4143) — keep the two in sync.
     """
-    # Recheck in the worker before updater metadata or weight network access.
+    # Recheck legal access in the worker before updater metadata, network
+    # access, or any model file mutation.
+    _require_h3_legal_execution([model_type])
     _require_model_recipe_terms([model_type])
     model_def = wgp.get_model_def(model_type)
     _require_model_download_available(model_type, model_def, wgp.models_def)
@@ -11195,6 +11336,7 @@ def download_model(model_type: str, request: Request, workspace: str = ""):
             return JSONResponse({"error": "Model not found"}, status_code=404)
         # Authority and exact host acceptance precede registry mutation,
         # thread creation, updater checks, or any weight network activity.
+        _require_h3_legal_execution([model_type])
         _require_model_recipe_terms([model_type])
         try:
             _require_model_download_available(model_type, md, wgp.models_def)
@@ -12372,6 +12514,17 @@ def _director_require_visible_model(
             component=component,
             message="Selected Director model is unavailable in this session.",
         )
+    try:
+        _require_h3_legal_execution([model_type])
+    except HTTPException as error:
+        if error.status_code != 451:
+            raise
+        _director_component_error(
+            status_code=451,
+            code="director_model_unavailable",
+            component=component,
+            message=H3_LEGAL_BLOCKED_DETAIL,
+        )
 
 
 def _director_validate_workflow_or_raise(body: dict) -> None:
@@ -12889,6 +13042,11 @@ def _director_recovery_runtime_admission(
     source_remote: bool = False,
 ) -> None:
     """Apply the same model/LoRA gates to startup and direct service recovery."""
+    _require_h3_legal_execution([
+        params.get("video_model"), params.get("model_type"),
+        params.get("image_model"), params.get("image_creator_model"),
+        params.get("image_editor_model"),
+    ])
     request = type("DirectorRecoveryRequest", (), {})()
     request.state = type(
         "DirectorRecoveryState", (), {"maestro_remote": bool(source_remote)},
@@ -12898,6 +13056,7 @@ def _director_recovery_runtime_admission(
 
 def _require_job_runtime_model_admission(job: dict) -> None:
     """Revalidate generic role snapshots and legacy terms before execution."""
+    _require_h3_legal_execution(_h3_job_model_types(job))
     params = job.get("params")
     params = params if isinstance(params, dict) else {}
     if _director_image_role_wire_mode(params) == "roles":
@@ -12937,13 +13096,12 @@ def _authorize_director_media_inputs(
                     request, str(model_type).strip(), component,
                 )
     else:
-        _require_remote_visible_models(
-            request,
-            [
-                body.get("video_model"), body.get("image_model"),
-                body.get("image_creator_model"), body.get("image_editor_model"),
-            ],
-        )
+        requested_models = [
+            body.get("video_model"), body.get("image_model"),
+            body.get("image_creator_model"), body.get("image_editor_model"),
+        ]
+        _require_remote_visible_models(request, requested_models)
+        _require_h3_legal_execution(requested_models)
     fields = (
         "reference_image_path", "character_ref_paths", "location_ref_paths",
         "audio_path", "voice_reference", "voice_ref_paths",
@@ -14696,6 +14854,11 @@ def _h3_checkpoint_options() -> list[dict]:
         model_def = wgp.get_model_def(model_type)
         if not isinstance(model_def, dict):
             continue
+        legal_availability = h3_public_availability(
+            model_type,
+            model_def=model_def,
+            architecture=wgp.get_base_model_type(model_type),
+        )
         downloaded = _h3_checkpoint_downloaded(model_type)
         urls = model_def.get("URLs")
         managed_download = bool(
@@ -14706,7 +14869,10 @@ def _h3_checkpoint_options() -> list[dict]:
         )
         available = True
         unavailable_reason = ""
-        if model_type == _H3_W4A8_FL2VA_MODEL:
+        if legal_availability.get("execution_allowed") is False:
+            available = False
+            unavailable_reason = H3_LEGAL_BLOCKED_DETAIL
+        if available and model_type == _H3_W4A8_FL2VA_MODEL:
             if w4a8_capability is None:
                 from services.h3_acceleration import get_h3_acceleration_status
                 w4a8_capability = (
@@ -14741,6 +14907,7 @@ def _h3_checkpoint_options() -> list[dict]:
             "terms_required": model_type == _H3_REF2VA_MODEL,
             "available": available,
             "unavailable_reason": unavailable_reason,
+            **legal_availability,
         })
     return options
 
@@ -14756,19 +14923,36 @@ def _h3_generation_requirements(body: dict, plan: dict | None = None) -> dict:
     for model_type in models:
         option = by_model.get(model_type)
         if option is None:
-            entries.append({
+            model_def = wgp.get_model_def(model_type)
+            legal_availability = h3_public_availability(
+                model_type,
+                model_def=(
+                    model_def if isinstance(model_def, dict) else None
+                ),
+                architecture=wgp.get_base_model_type(model_type),
+            )
+            entry = {
                 "model_type": model_type,
                 "is_downloaded": _h3_checkpoint_downloaded(model_type),
                 "terms_required": model_type == _H3_REF2VA_MODEL,
                 "auto_download": False,
-            })
+                **legal_availability,
+            }
+            if legal_availability.get("execution_allowed") is False:
+                entry.update({
+                    "available": False,
+                    "unavailable_reason": H3_LEGAL_BLOCKED_DETAIL,
+                })
+            entries.append(entry)
         else:
             entries.append({
                 key: option[key]
                 for key in (
                     "model_type", "is_downloaded", "terms_required",
                     "auto_download", "available", "unavailable_reason",
+                    "availability_status", "execution_allowed",
                 )
+                if key in option
             })
     return {
         "models": entries,
@@ -14780,6 +14964,9 @@ def _h3_generation_requirements(body: dict, plan: dict | None = None) -> dict:
 
 def _require_h3_generation_terms(body: dict, plan: dict | None = None) -> None:
     requirements = _h3_generation_requirements(body, plan)
+    _require_h3_legal_execution(
+        entry.get("model_type") for entry in requirements["models"]
+    )
     if (
         requirements["ref2va_terms_required"]
         and not _ref2va_host_terms_accepted()
@@ -36410,17 +36597,18 @@ async def preview_generation_plan(request: Request):
     _require_project_access(
         request, workspace, permission="project.generate",
     )
+    model_type = str(body.get("model_type") or "")
+    if not model_type or wgp.get_model_def(model_type) is None:
+        raise HTTPException(status_code=400, detail="A valid model_type is required")
+    _require_remote_visible_models(request, [model_type])
+    _require_h3_legal_execution([model_type])
     _reject_client_h3_internal_state(body)
     _reject_client_h3_turbo_validation_controls(body)
     _authorize_generation_media_inputs(request, body, workspace)
-    _require_remote_visible_models(request, [body.get("model_type")])
     try:
         _apply_h3_adaptive_checkpoint(body)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    model_type = str(body.get("model_type") or "")
-    if not model_type or wgp.get_model_def(model_type) is None:
-        raise HTTPException(status_code=400, detail="A valid model_type is required")
     _resolve_h3_style_workflow_request(body)
     _normalize_video_prompt_type(body)
     _normalize_image_prompt_type(body)
@@ -37835,6 +38023,7 @@ async def h3_estimate(request: Request):
     _require_remote_visible_models(request, [selected_model])
     if selected_model not in _H3_LONG_STUDIO_MODELS:
         raise HTTPException(status_code=400, detail="H3 estimates require a managed MiniMax H3 model")
+    _require_h3_legal_execution([selected_model])
     from services.h3_profiles import H3_NATIVE_RESOLUTIONS
     if str(body.get("resolution") or "1344x768") not in H3_NATIVE_RESOLUTIONS:
         raise HTTPException(status_code=400, detail="H3 estimates require a model-native resolution")
@@ -37901,6 +38090,9 @@ async def h3_evaluation_preflight(request: Request):
     body = await request.json()
     workspace = str(body.pop("workspace", None) or _get_active_workspace())
     _require_project_access(request, workspace)
+    _require_h3_legal_execution([
+        str(body.get("model_type") or "minimax_h3"),
+    ])
     allowed = {
         "job_id", "model_type", "resolved_seed", "prompt", "frame_count",
         "resolution", "fps", "sampling_steps", "conditioning",
@@ -38001,6 +38193,13 @@ def _arm_ref2va_waiting_plan_review(
     schedule_timer: bool = True,
 ) -> bool:
     """Durably arm one frozen plan, then attach its process-local timer."""
+    try:
+        _require_h3_legal_execution(_h3_job_model_types(job))
+    except HTTPException as error:
+        if error.status_code != 451:
+            raise
+        _hold_h3_job_for_legal_access(job)
+        return False
     if not _waiting_plan_project_is_current(job):
         return False
     armed = arm_prepared_job_plan_review(
@@ -38135,6 +38334,17 @@ def _expire_plan_review(job_id: str) -> None:
             accepted=None,
             name_prefix="studio-generation-auto-approved",
         )
+    except HTTPException as error:
+        if error.status_code == 451:
+            _hold_h3_job_for_legal_access(job)
+            return
+        if job.get("status") == "waiting_for_plan_approval":
+            fail_preparation(
+                job,
+                error="Automatic plan approval failed",
+                message="Automatic plan approval failed",
+                phase="preparation_failed",
+            )
     except Exception:
         if job.get("status") == "waiting_for_plan_approval":
             fail_preparation(
@@ -38147,6 +38357,13 @@ def _expire_plan_review(job_id: str) -> None:
 
 def _schedule_plan_review_auto_approval(job: dict) -> None:
     """Arm one process-local timer from the journaled absolute deadline."""
+    try:
+        _require_h3_legal_execution(_h3_job_model_types(job))
+    except HTTPException as error:
+        if error.status_code != 451:
+            raise
+        _hold_h3_job_for_legal_access(job)
+        return
     job_id = str(job.get("id") or "")
     deadline = job.get("plan_review_deadline")
     if (
@@ -38362,6 +38579,8 @@ def _generation_enhancement_request(body: dict, workspace: str) -> dict:
 
 def _start_generation_worker(job: dict, *, name_prefix: str) -> None:
     """Start the ordinary GPU worker after a durable queued transition."""
+    if _queue_recovery_delivery_pending(job) is None:
+        _require_h3_legal_execution(_h3_job_model_types(job))
     _require_h3_offload_plan_parity(job)
     if "credit_queue" not in job:
         if _credit_prepare_submission(job) and isinstance(
@@ -38411,6 +38630,16 @@ def _run_generation_preparation(
     job = _jobs.get(job_id)
     if not isinstance(job, dict) or is_cancel_requested(job):
         return
+    if _queue_recovery_delivery_pending(job) is None:
+        try:
+            _require_h3_legal_execution(_h3_job_model_types(job))
+        except HTTPException as error:
+            if error.status_code != 451:
+                raise
+            # Preparation is model work. Park before progress, enhancement,
+            # planning, or a worker attempt changes.
+            _hold_h3_job_for_legal_access(job)
+            return
     request.state.maestro_cpu_text_job = job
     request.state.maestro_cpu_text_operation = (
         "prompt_enhancement" if enhance else "generation_preparation"
@@ -38799,6 +39028,7 @@ def _prepare_sample_campaign_arm(
     if wgp.get_model_def(params["model_type"]) is None:
         raise SampleCampaignSubmissionError("Campaign arm model is unavailable.")
     _require_remote_visible_models(request, [params.get("model_type")])
+    _require_h3_legal_execution([params["model_type"]])
     _require_model_recipe_terms([params["model_type"]])
     _reject_client_h3_internal_state(params)
     _reject_client_h3_turbo_validation_controls(params)
@@ -39833,6 +40063,12 @@ async def generate(request: Request):
             status_code=400,
             detail="Director image role fields require image generation mode",
         )
+    if director_role_mode:
+        _require_h3_legal_execution([
+            body.get("video_model"), body.get("model_type"),
+            body.get("image_model"), body.get("image_creator_model"),
+            body.get("image_editor_model"),
+        ])
     if not director_role_mode:
         if not body.get("model_type"):
             raise HTTPException(status_code=400, detail="model_type is required")
@@ -39841,6 +40077,7 @@ async def generate(request: Request):
             raise HTTPException(status_code=400, detail=f"Unknown model: {body['model_type']}")
         _require_remote_visible_models(request, [body.get("model_type")])
         if not is_sfx:
+            _require_h3_legal_execution([body["model_type"]])
             _require_model_recipe_terms([body["model_type"]])
     _reject_client_h3_internal_state(body)
     _reject_client_h3_turbo_validation_controls(body)
@@ -54580,6 +54817,14 @@ def _run_generation(
     import inspect
 
     job = _jobs[job_id]
+    if _queue_recovery_delivery_pending(job) is None:
+        try:
+            _require_h3_legal_execution(_h3_job_model_types(job))
+        except HTTPException as error:
+            if error.status_code != 451:
+                raise
+            _hold_h3_job_for_legal_access(job)
+            return False
     sample_worker = job.get("kind") == _SAMPLE_CAMPAIGN_JOB_KIND
     worker_execution_attempt = expected_execution_attempt
     if sample_worker and (
@@ -54806,6 +55051,14 @@ def _run_generation(
                     role_mode = _director_image_role_wire_mode(
                         job.get("params") or {},
                     ) == "roles"
+                    if error.status_code == 451:
+                        credit_release = globals().get(
+                            "_credit_release_accounting"
+                        )
+                        if callable(credit_release):
+                            credit_release(job, persist_baseline=True)
+                        _hold_h3_job_for_legal_access(job)
+                        return False
                     finish_job(
                         job,
                         "failed",
@@ -54965,6 +55218,14 @@ def _run_generation(
                 )
                 _require_h3_generation_terms(raw_params, trusted_h3_plan)
             except HTTPException as exc:
+                if exc.status_code == 451:
+                    credit_release = globals().get(
+                        "_credit_release_accounting"
+                    )
+                    if callable(credit_release):
+                        credit_release(job, persist_baseline=True)
+                    _hold_h3_job_for_legal_access(job)
+                    return False
                 finish_job(
                     job,
                     "failed",
@@ -60172,6 +60433,9 @@ _QUEUE_RECOVERY_REASON_TEXT = {
     "project_missing_or_recreated": "The recovery project is missing or was recreated",
     "worker_start_failed": "The recovery worker could not be started",
     "model_terms_required": "Review and accept this model recipe's terms",
+    "h3_legal_access_required": (
+        "A separate written MiniMax H3 license is required"
+    ),
     "director_role_admission_required": (
         "Review the Director image role model and LoRA setup"
     ),
@@ -61326,6 +61590,12 @@ def _approve_waiting_generation_plan(
     duration_redistribution: str | None = None,
 ) -> dict | None:
     """Promote one immutable prepared plan; the lifecycle decides the race."""
+    try:
+        _require_h3_legal_execution(_h3_job_model_types(job))
+    except HTTPException as error:
+        if error.status_code == 451:
+            _hold_h3_job_for_legal_access(job)
+        raise
     job_id = str(job.get("id") or "")
     workspace = str(job.get("workspace") or "default")
     try:
@@ -62113,6 +62383,8 @@ def resume_held_job(job_id: str, request: Request, response: Response):
     _set_recovery_no_store(response)
     job = _require_generic_queue_control_job(job_id, request)
     _reject_generic_sample_campaign_release(job)
+    if _queue_recovery_delivery_pending(job) is None:
+        _require_job_runtime_model_admission(job)
     mode = set_job_hold(job, False)
     if mode is None:
         raise HTTPException(
@@ -62137,8 +62409,11 @@ def _resume_recovered_job(
                 detail="This held sample requires dedicated pair release",
             )
         state = str(job.get("recovery_state") or "")
+        reason = _queue_recovery_reason_code(job)
+        legal_resume = reason == "h3_legal_access_required"
         expected_action = (
             "resume" if state == "blocked_remote_reauth"
+            else "resume" if state == "blocked" and legal_resume
             else "retry" if state == "blocked"
             else ""
         )
@@ -62152,7 +62427,6 @@ def _resume_recovered_job(
                 status_code=409,
                 detail=f"Use the {expected_action} recovery action for this job",
             )
-        reason = _queue_recovery_reason_code(job)
         allowed_reasons = (
             {"owner_reauthentication_required"}
             if state == "blocked_remote_reauth"
@@ -62161,6 +62435,7 @@ def _resume_recovered_job(
                 "h3_generation_recovery_authorization_required",
                 "h3_peak_calibration_required",
                 "h3_generation_oom_replanned",
+                "h3_legal_access_required",
                 "model_terms_required",
                 "director_role_admission_required",
             }
@@ -62237,7 +62512,16 @@ def _resume_recovered_job(
                 status_code=409,
                 detail="This interrupted preparation must be resubmitted",
             )
-        attempt, may_retry = next_recovery_attempt(job)
+        if legal_resume:
+            try:
+                attempt = max(
+                    0, int(job.get("recovery_attempt", 0) or 0),
+                )
+            except (TypeError, ValueError):
+                attempt = 0
+            may_retry = True
+        else:
+            attempt, may_retry = next_recovery_attempt(job)
         if not may_retry:
             job["_recovery_reason_code"] = "attempt_limit_reached"
             _queue_recovery_checkpoint(
@@ -62584,6 +62868,7 @@ def prepare_local_h3_generation_recovery(
                 raise QueueRecoveryRuntimeError(
                     "Recovery evidence changed before local preparation."
                 )
+            _require_h3_legal_execution(_h3_job_model_types(candidate))
             job = _register_discovered_local_h3_recovery(
                 candidate,
                 project_digest=project_digest,
@@ -62608,6 +62893,7 @@ def prepare_local_h3_generation_recovery(
         if not isinstance(job, dict):
             raise QueueRecoveryRuntimeError("Recovery job is unavailable.")
         try:
+            _require_h3_legal_execution(_h3_job_model_types(job))
             pointer = job.get("_recovery_manifest_pointer")
             if (
                 not isinstance(pointer, dict)
@@ -63093,6 +63379,8 @@ def start_queued_job_next(job_id: str, request: Request, response: Response):
     _set_recovery_no_store(response)
     job = _require_generic_queue_control_job(job_id, request)
     _reject_generic_sample_campaign_release(job)
+    if _queue_recovery_delivery_pending(job) is None:
+        _require_job_runtime_model_admission(job)
     remote = bool(getattr(request.state, "maestro_remote", False))
     if remote:
         raise HTTPException(
