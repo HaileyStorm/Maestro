@@ -2676,12 +2676,14 @@ class AccountCapabilityTests(unittest.TestCase):
             "_session_secret": lambda: secret,
             "_request_is_https": lambda _request: False,
             "_request_is_cloudflare_remote": lambda _request: False,
+            "_note_listener_request": lambda: None,
             "_research_local_only_denial": lambda _request: None,
             "_local_recovery_control_denial": lambda _request: None,
             "_reject_cross_origin_mutation": lambda _request: None,
             "_remote_local_only_denial": lambda _request: None,
             "_stamp_recovery_no_store_response": lambda _request, response: response,
             "_call_next_with_recovery_no_store": call_next_with_no_store,
+            "_startup_recovery_gate_response": lambda _request: None,
             "_REMOTE_OWNER_REAUTH_ALLOWED_EXACT": frozenset(),
             "_request_session_id": contextvars.ContextVar("route_session"),
             "_request_remote": contextvars.ContextVar("route_remote"),
@@ -3175,11 +3177,13 @@ class AccountCapabilityTests(unittest.TestCase):
             "_request_is_cloudflare_remote": lambda request: (
                 request.client.host != "127.0.0.1"
             ),
+            "_note_listener_request": lambda: None,
             "_research_local_only_denial": lambda _request: None,
             "_local_recovery_control_denial": lambda _request: None,
             "_reject_cross_origin_mutation": lambda _request: None,
             "_stamp_recovery_no_store_response": lambda _request, response: response,
             "_call_next_with_recovery_no_store": call_next_with_no_store,
+            "_startup_recovery_gate_response": lambda _request: None,
             "_request_session_id": contextvars.ContextVar("matrix_session"),
             "_request_remote": contextvars.ContextVar("matrix_remote"),
             "_request_account_id": contextvars.ContextVar(
