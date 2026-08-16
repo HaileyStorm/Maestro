@@ -584,6 +584,15 @@ class AccountAuthStoreTests(unittest.TestCase):
         boot = self._bootstrap()
         owner_session = boot["account_session_id"]
         owner_id = boot["account"]["id"]
+        peer_browser = "7" * 32
+        peer_session = self.store.login(
+            username="Owner",
+            password=PASSWORD,
+            device_label="Owner tablet",
+            nonce_session_id=peer_browser,
+            nonce=self.store.issue_nonce(peer_browser, "login")["nonce"],
+            remote=False,
+        )["account_session_id"]
         nonce = self.store.issue_nonce(
             owner_session, "disable_account",
         )["nonce"]
@@ -604,6 +613,7 @@ class AccountAuthStoreTests(unittest.TestCase):
         self.assertFalse(principal["disabled"])
         self.assertTrue(principal["recently_reauthenticated"])
         self.assertEqual(self.store.list_accounts(owner_session), [boot["account"]])
+        self.assertIsNotNone(self.store.resolve_session(peer_session))
 
         with self.assertRaises(AccountAuthError) as replay:
             self.store.set_account_disabled(
@@ -613,6 +623,7 @@ class AccountAuthStoreTests(unittest.TestCase):
                 nonce=nonce,
             )
         self.assertEqual(replay.exception.code, "invalid_nonce")
+        self.assertIsNotNone(self.store.resolve_session(peer_session))
 
         with self.assertRaises(AccountAuthError) as fresh_rejection:
             self.store.set_account_disabled(
@@ -627,6 +638,7 @@ class AccountAuthStoreTests(unittest.TestCase):
             fresh_rejection.exception.code, "self_disable_rejected",
         )
         self.assertIsNotNone(self.store.resolve_session(owner_session))
+        self.assertIsNotNone(self.store.resolve_session(peer_session))
 
     def test_recovery_consumes_code_revokes_sessions_and_rotates_credentials(self):
         boot = self._bootstrap()
@@ -2868,6 +2880,13 @@ class AccountCapabilityTests(unittest.TestCase):
                 jar[ACCOUNT_SESSION_COOKIE_NAME], secret,
             )
             owner_account_id = store.resolve_session(owner_session)["id"]
+            peer_browser = "7" * 32
+            peer_session = store.login(
+                username="Owner", password=SECOND_PASSWORD,
+                device_label="Owner tablet", nonce_session_id=peer_browser,
+                nonce=store.issue_nonce(peer_browser, "login")["nonce"],
+                remote=False,
+            )["account_session_id"]
             self_disable_nonce = await request(
                 "/api/v1/account/nonce", {"purpose": "disable_account"},
             )
@@ -2887,6 +2906,7 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertEqual(principal["id"], owner_account_id)
             self.assertEqual(principal["role"], "owner")
             self.assertFalse(principal["disabled"])
+            self.assertIsNotNone(store.resolve_session(peer_session))
 
             with self.assertRaises(_HTTPException) as replay:
                 await request(
@@ -2897,6 +2917,7 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertEqual(replay.exception.status_code, 409)
             self.assertEqual(replay.exception.detail["code"], "invalid_nonce")
             self.assertIsNotNone(store.resolve_session(owner_session))
+            self.assertIsNotNone(store.resolve_session(peer_session))
 
             created = await request_nonce_and_mutate(
                 "create_account", "/api/v1/account/users", {

@@ -1473,7 +1473,9 @@ async function loadAccountButton() {
             export const useId = () => 'account-title'
             export const useMemo = value => value()
             export const useRef = value => ({ current: value })
-            export const useState = value => [value, () => {}]
+            export const useState = value => value === 'support' && globalThis.__accountActiveTab
+              ? [globalThis.__accountActiveTab, () => {}]
+              : [value, () => {}]
           ` }
           if (args.path === 'jsx-runtime') return { contents: `
             export const Fragment = Symbol.for('fragment')
@@ -2161,6 +2163,86 @@ test('Support trigger stays discoverable with accounts off and describes optiona
   }
   const authenticated = AccountSupportButton({ compact: false })
   assert.equal(authenticated.props['aria-label'], 'Open Support and account for LAN Owner')
+})
+
+test('account drawer cannot dispatch a disable mutation for the current owner but can disable another user', async t => {
+  const { AccountSupportDrawer } = await loadAccountButton()
+  const previousWindow = globalThis.window
+  const previousDocument = globalThis.document
+  const mutationCalls = []
+  const owner = {
+    id: 'owner-account', username: 'Owner', role: 'owner', disabled: false,
+    created_at: 1, has_email: false, passkey_credentials: 0,
+    passkey_authentication_available: false,
+  }
+  const other = {
+    ...owner, id: 'other-account', username: 'Other user', role: 'user',
+  }
+  const noOp = async () => null
+  globalThis.window = { location: { hostname: '127.0.0.1' } }
+  globalThis.document = {}
+  globalThis.__accountActiveTab = 'account'
+  globalThis.__accountStore = {
+    accountDrawerOpen: true,
+    setAccountDrawerOpen: () => {},
+    accountContext: {
+      enabled: true, authenticated: true, account: owner,
+      capabilities: ['account.self', 'accounts.admin', 'services.admin', 'owner.admin'],
+      reauthenticated: true, passkey_authentication_available: false,
+      activation_state: 'ready', bootstrap_available: false,
+    },
+    accessContext: { remote: false, accounts: { enabled: true } },
+    accountProjectMigration: null,
+    accountProjectMigrationLoading: false,
+    accountContextLoading: false,
+    accountSessions: [],
+    accountUsers: [owner, other],
+    accountDetailsLoading: false,
+    loadAccountContext: noOp,
+    loadAccountProjectMigration: noOp,
+    migrateAccountProjects: noOp,
+    bootstrapAccount: noOp,
+    loginAccount: noOp,
+    logoutAccount: noOp,
+    reauthenticateAccount: noOp,
+    recoverAccount: noOp,
+    changeAccountPassword: noOp,
+    rotateAccountRecoveryCodes: noOp,
+    loadAccountSessions: noOp,
+    revokeAccountSession: noOp,
+    revokeAllAccountSessions: noOp,
+    loadAccountUsers: noOp,
+    createServerAccount: noOp,
+    setServerAccountDisabled: async (accountId, disabled) => {
+      mutationCalls.push({ accountId, disabled })
+    },
+  }
+  t.after(() => {
+    globalThis.window = previousWindow
+    globalThis.document = previousDocument
+    delete globalThis.__accountActiveTab
+    delete globalThis.__accountStore
+  })
+
+  const tree = expandElement(AccountSupportDrawer())
+  const disableButtons = findElements(
+    tree,
+    node => node.type === 'button' && elementText(node) === 'Disable',
+  )
+  assert.equal(disableButtons.length, 2)
+  assert.equal(disableButtons[0].props.disabled, true)
+  assert.equal(disableButtons[1].props.disabled, false)
+  assert.match(elementText(tree), /current owner account cannot be disabled/)
+
+  const activate = async button => {
+    if (button.props.disabled) return
+    button.props.onClick()
+    await new Promise(resolve => setImmediate(resolve))
+  }
+  await activate(disableButtons[0])
+  assert.deepEqual(mutationCalls, [], 'disabled owner control must not reach the mutation/nonce path')
+  await activate(disableButtons[1])
+  assert.deepEqual(mutationCalls, [{ accountId: other.id, disabled: true }])
 })
 
 test('account and Support error copy maps backend codes and HTTP states without exposing raw server jargon', async () => {
