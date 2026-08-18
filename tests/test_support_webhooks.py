@@ -29,7 +29,10 @@ from services.support_webhooks import (  # noqa: E402
     FakeSignedWebhookAdapter,
     FileWebhookReplayGuard,
     ManualContributionAdapter,
+    STRIPE_BMAC_CREATOR_SURFACE,
+    STRIPE_BMAC_DEPLOYMENT_SCOPE,
     STRIPE_BMAC_SUPPORT_EVIDENCE_CONTRACT,
+    STRIPE_RUNTIME_CONFIG_SCHEMA_VERSION,
     StripeAssociationIntegrityError,
     StripeBmacSupportWebhookAdapter,
     StripeBmacWebhookConfig,
@@ -144,7 +147,9 @@ class SupportWebhookTests(unittest.TestCase):
     ) -> StripeBmacSupportWebhookAdapter:
         config = StripeBmacWebhookConfig.from_runtime_json(
             json.dumps({
-                "schema_version": 1,
+                "schema_version": STRIPE_RUNTIME_CONFIG_SCHEMA_VERSION,
+                "creator_surface": STRIPE_BMAC_CREATOR_SURFACE,
+                "deployment_scope": STRIPE_BMAC_DEPLOYMENT_SCOPE,
                 "livemode": False,
                 "payment_links": {
                     payment_link: {"currency": "USD"},
@@ -216,6 +221,49 @@ class SupportWebhookTests(unittest.TestCase):
         serialized = json.dumps(projection, sort_keys=True).lower()
         self.assertNotIn("secret", serialized)
         self.assertNotIn("email", serialized)
+        self.assertNotIn(STRIPE_BMAC_CREATOR_SURFACE, serialized)
+        self.assertNotIn(STRIPE_BMAC_DEPLOYMENT_SCOPE, serialized)
+        self.assertNotIn("benefit_policy", serialized)
+
+    def test_stripe_runtime_boundary_reuses_shared_creator_and_stays_private(self):
+        base = {
+            "schema_version": STRIPE_RUNTIME_CONFIG_SCHEMA_VERSION,
+            "creator_surface": STRIPE_BMAC_CREATOR_SURFACE,
+            "deployment_scope": STRIPE_BMAC_DEPLOYMENT_SCOPE,
+            "livemode": False,
+            "payment_links": {
+                "plink_test_support": {"currency": "USD"},
+            },
+            "prices": {"price_test_support": {"currency": "USD"}},
+            "account_links": {"cus_test_linked": self.account_subject},
+        }
+
+        def load(payload):
+            return StripeBmacWebhookConfig.from_runtime_json(
+                json.dumps(payload),
+                signing_secret=STRIPE_SECRET,
+                identity_secret=IDENTITY_KEY,
+                association_integrity_key=INTEGRITY_KEY,
+            )
+
+        config = load(base)
+        self.assertEqual(config.creator_surface, STRIPE_BMAC_CREATOR_SURFACE)
+        self.assertEqual(config.deployment_scope, STRIPE_BMAC_DEPLOYMENT_SCOPE)
+        self.assertNotIn(STRIPE_BMAC_CREATOR_SURFACE, repr(config))
+        self.assertNotIn(STRIPE_BMAC_DEPLOYMENT_SCOPE, repr(config))
+
+        with self.assertRaisesRegex(SupportWebhookError, "shared BMaC"):
+            load({**base, "creator_surface": "create_second_creator_account"})
+        with self.assertRaisesRegex(SupportWebhookError, "private usable"):
+            load({**base, "deployment_scope": "public_release"})
+        with self.assertRaisesRegex(SupportWebhookError, "shape"):
+            load({**base, "schema_version": 1})
+        for forbidden in (
+            "benefit_policy", "create_creator_account", "kyc", "bank_account",
+        ):
+            with self.subTest(forbidden=forbidden):
+                with self.assertRaisesRegex(SupportWebhookError, "shape"):
+                    load({**base, forbidden: {}})
 
     def test_stripe_verifier_requires_exact_raw_body_signature_and_freshness(self):
         verifier = StripeWebhookVerifier(STRIPE_SECRET)
@@ -491,7 +539,9 @@ class SupportWebhookTests(unittest.TestCase):
         root = Path(self.temp.name)
         config_path = root / "stripe-runtime.json"
         config_path.write_text(json.dumps({
-            "schema_version": 1,
+            "schema_version": STRIPE_RUNTIME_CONFIG_SCHEMA_VERSION,
+            "creator_surface": STRIPE_BMAC_CREATOR_SURFACE,
+            "deployment_scope": STRIPE_BMAC_DEPLOYMENT_SCOPE,
             "livemode": False,
             "payment_links": {"plink_test_support": {"currency": "USD"}},
             "prices": {"price_test_support": {"currency": "USD"}},

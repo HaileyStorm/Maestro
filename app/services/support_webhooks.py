@@ -43,8 +43,12 @@ MAX_STRIPE_ASSOCIATION_ENTRIES = 50_000
 DEFAULT_TIMESTAMP_TOLERANCE_SECONDS = 300
 DEFAULT_REPLAY_RETENTION_SECONDS = 24 * 60 * 60
 REPLAY_SCHEMA_VERSION = 1
-STRIPE_RUNTIME_CONFIG_SCHEMA_VERSION = 1
+STRIPE_RUNTIME_CONFIG_SCHEMA_VERSION = 2
 STRIPE_ASSOCIATION_SCHEMA_VERSION = 1
+STRIPE_BMAC_CREATOR_SURFACE = (
+    "reuse_verified_shared_buy_me_a_coffee_creator_account_and_page"
+)
+STRIPE_BMAC_DEPLOYMENT_SCOPE = "private_usable_checkpoint"
 _SIGNATURE_RE = re.compile(r"v1=([0-9a-f]{64})\Z")
 _OPAQUE_KEY_RE = re.compile(r"key_[0-9a-f]{64}\Z")
 _STRIPE_ID_RE = re.compile(
@@ -272,8 +276,10 @@ def _stripe_identifier(value: Any, *prefixes: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class StripeBmacWebhookConfig:
-    """Runtime-only production adapter configuration; all private fields hide."""
+    """Runtime-only adapter config for the shared BMaC private checkpoint."""
 
+    creator_surface: str = field(repr=False)
+    deployment_scope: str = field(repr=False)
     livemode: bool
     payment_links: Mapping[str, str] = field(repr=False)
     prices: Mapping[str, str] = field(repr=False)
@@ -284,6 +290,14 @@ class StripeBmacWebhookConfig:
     timestamp_tolerance_seconds: int = DEFAULT_TIMESTAMP_TOLERANCE_SECONDS
 
     def __post_init__(self) -> None:
+        if self.creator_surface != STRIPE_BMAC_CREATOR_SURFACE:
+            raise SupportWebhookError(
+                "Stripe support must reuse the verified shared BMaC creator surface"
+            )
+        if self.deployment_scope != STRIPE_BMAC_DEPLOYMENT_SCOPE:
+            raise SupportWebhookError(
+                "Stripe support is limited to the private usable checkpoint"
+            )
         if not isinstance(self.livemode, bool):
             raise SupportWebhookError("Stripe livemode setting is invalid")
         object.__setattr__(
@@ -366,8 +380,8 @@ class StripeBmacWebhookConfig:
         encoded = raw.encode("utf-8") if isinstance(raw, str) else raw
         payload = _runtime_json(encoded, label="Stripe support config")
         if set(payload) != {
-            "schema_version", "livemode", "payment_links", "prices",
-            "account_links",
+            "schema_version", "creator_surface", "deployment_scope",
+            "livemode", "payment_links", "prices", "account_links",
         } or payload.get("schema_version") != STRIPE_RUNTIME_CONFIG_SCHEMA_VERSION:
             raise SupportWebhookError("Stripe support config shape is invalid")
 
@@ -385,6 +399,8 @@ class StripeBmacWebhookConfig:
             return result
 
         return cls(
+            creator_surface=payload.get("creator_surface"),
+            deployment_scope=payload.get("deployment_scope"),
             livemode=payload.get("livemode"),
             payment_links=mappings("payment_links"),
             prices=mappings("prices"),
@@ -1084,7 +1100,7 @@ def _stripe_occurred_at(payload: Mapping[str, Any]) -> str:
 
 
 class StripeBmacSupportWebhookAdapter:
-    """Production Stripe/BMaC translation with no payment-derived auth."""
+    """Shared-creator private Stripe/BMaC translation; never provider setup."""
 
     provider_id = STRIPE_BMAC_SUPPORT_EVIDENCE_CONTRACT.provider_id
     production_ready = True
