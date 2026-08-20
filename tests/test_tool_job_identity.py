@@ -23,6 +23,7 @@ from services.queue_recovery_adapter import (  # noqa: E402
 )
 from services.tool_job_identity import (  # noqa: E402
     JOB_ID_HEX_LENGTH,
+    TOOL_JOB_KINDS,
     is_unique_generation_job_id,
     new_unique_job_id,
     tool_job_requires_recovery_registration,
@@ -62,8 +63,19 @@ class ToolJobIdentityTests(unittest.TestCase):
     def test_eight_hex_ids_are_not_generation_style(self):
         self.assertFalse(is_unique_generation_job_id("deadbeef"))
         self.assertFalse(is_unique_generation_job_id("g" * 32))
+        self.assertFalse(is_unique_generation_job_id("a" * 40))
+        self.assertFalse(is_unique_generation_job_id("A" * JOB_ID_HEX_LENGTH))
+
+    def test_exhausted_collision_fallback_never_mints_non_32_hex(self):
+        class AlwaysOccupied:
+            def __contains__(self, _value):
+                return True
+
+        with self.assertRaisesRegex(RuntimeError, "32-hex job id unavailable"):
+            new_unique_job_id(AlwaysOccupied())
 
     def test_tool_kinds_require_recovery_registration(self):
+        self.assertEqual(TOOL_JOB_KINDS, {"tool_upscale", "tool_revoice"})
         self.assertTrue(tool_job_requires_recovery_registration(
             {"kind": "tool_upscale"},
         ))
@@ -73,6 +85,15 @@ class ToolJobIdentityTests(unittest.TestCase):
         self.assertFalse(tool_job_requires_recovery_registration(
             {"kind": "studio_generation"},
         ))
+        self.assertFalse(tool_job_requires_recovery_registration(
+            {"kind": ["tool_upscale"]},
+        ))
+
+        class HostileJob:
+            def get(self, _key):
+                raise RuntimeError("/private/tool-kind")
+
+        self.assertFalse(tool_job_requires_recovery_registration(HostileJob()))
 
     def test_transition_without_register_raises_exact_recovery_error(self):
         job = _tool_job(new_unique_job_id())
