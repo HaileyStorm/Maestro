@@ -81,6 +81,17 @@ class H3VisualContinuityTests(unittest.TestCase):
         self.assertEqual(strip_opening_visual_carry(prefixed), body)
         self.assertEqual(strip_opening_visual_carry(body), body)
 
+    def test_strip_opening_visual_carry_handles_line_only_and_ignores_mid_body(self):
+        body = "[Shot 2] Macro of the cap."
+        line_only = SAME_SOURCE_VISUAL_CARRY_LINE + "\n" + body
+        self.assertEqual(strip_opening_visual_carry(line_only), body)
+        mid = f"{body} mentions {SAME_SOURCE_VISUAL_CARRY_LINE} later."
+        self.assertEqual(strip_opening_visual_carry(mid), mid)
+        self.assertEqual(
+            strip_opening_visual_carry(strip_opening_visual_carry(line_only)),
+            body,
+        )
+
     def test_independent_non_temporal_boundary_skips_visual_carry(self):
         prompts = ["[0-10s] Opening.", "[0-10s] Unrelated beat."]
         boundaries = [

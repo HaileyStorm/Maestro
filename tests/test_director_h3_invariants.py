@@ -1664,6 +1664,53 @@ non_diegetic_music: N/A"""
             [],
         )
 
+    def test_canonicalize_drops_planner_carry_then_executable_replaces_it(self):
+        from services.h3_visual_continuity import apply_visual_carry_to_shot_plan
+        from services.h3_shot_planner import validate_h3_shot_plan_seal
+
+        clips, planned = self._scene(20.0)
+        body = self._base_generation_params()
+        plan = pipeline._prepare_director_h3_longform(
+            body,
+            params={"h3_ref2va_terms_accepted": True},
+            clip_plans=clips,
+            planned_clips=planned,
+            fps=24,
+        )
+        carried = copy.deepcopy(plan["shot_plan"])
+        apply_visual_carry_to_shot_plan(carried)
+        self.assertIn(
+            SAME_SOURCE_VISUAL_CARRY_LINE,
+            carried["clip_prompts"][1],
+        )
+        carried_prompts = list(carried["clip_prompts"])
+        pipeline._director_h3_drop_planner_carry(carried)
+        self.assertEqual(
+            carried["clip_prompts"],
+            plan["shot_plan"]["clip_prompts"],
+        )
+        self.assertNotIn(
+            SAME_SOURCE_VISUAL_CARRY_LINE,
+            carried["clip_prompts"][1],
+        )
+        self.assertEqual(
+            authored_shot_markers(carried_prompts[1]),
+            authored_shot_markers(carried["clip_prompts"][1]),
+        )
+        validate_h3_shot_plan_seal(carried)
+        canonical = pipeline._canonicalize_director_h3_shot_plan(carried)
+        self.assertEqual(canonical, carried["clip_prompts"])
+        self.assertNotIn(SAME_SOURCE_VISUAL_CARRY_LINE, canonical[1])
+        executable = pipeline._director_h3_executable_clip_prompts(
+            carried, canonical,
+        )
+        self.assertIn(SAME_SOURCE_VISUAL_CARRY_LINE, executable[1])
+        self.assertEqual(
+            authored_shot_markers(canonical[1]),
+            authored_shot_markers(executable[1]),
+        )
+        self.assertEqual(carried["clip_prompts"], canonical)
+
     def test_seamless_keyframes_require_ref2va_prompt_schema(self):
         clips = [{"video_prompt": "One continuous tracking shot."}]
         planned = [{"start": 0, "end": 20, "duration_sec": 20}]
