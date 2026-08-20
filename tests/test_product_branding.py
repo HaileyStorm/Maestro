@@ -22,7 +22,7 @@ class ProductBrandingTests(unittest.TestCase):
         self.assertRegex(CONTINUUM_VERSION, r"^\d+\.\d+\.\d+$")
         self.assertRegex(MAESTRO_VERSION, r"^\d+\.\d+\.\d+$")
         self.assertEqual(CONTINUUM_VERSION, "0.3.0")
-        self.assertEqual(MAESTRO_VERSION, "1.6.5")
+        self.assertEqual(MAESTRO_VERSION, "1.9.0")
         self.assertIn("readVersion('../CONTINUUM_VERSION')", VITE)
         self.assertIn("readVersion('../VERSION')", VITE)
         self.assertIn("__CONTINUUM_VERSION__", VITE)
