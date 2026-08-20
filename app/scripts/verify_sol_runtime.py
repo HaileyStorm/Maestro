@@ -14,6 +14,28 @@ def _version_tuple(value: object, parts: int = 2) -> tuple[int, ...]:
     return tuple(numbers + [0] * (parts - len(numbers)))
 
 
+def normalize_capability(capability: Sequence[int] | None) -> tuple[int, int] | None:
+    if capability is None:
+        return None
+    try:
+        values = tuple(int(value) for value in capability[:2])
+    except (TypeError, ValueError):
+        return None
+    if len(values) != 2:
+        return None
+    return values
+
+
+def format_required_runtime_failure(problems: Sequence[str]) -> str:
+    detail = "; ".join(problems) if problems else (
+        "the GPU does not expose an H3 Sol-compatible CUDA capability"
+    )
+    return (
+        "[Sol Runtime] Error: required runtime verification failed: "
+        f"{detail}."
+    )
+
+
 def validate_required_runtime(
     *,
     python_version: object,
@@ -34,13 +56,7 @@ def validate_required_runtime(
         problems.append("Triton 3.6 or newer is required")
     if not cuda_available:
         problems.append("PyTorch cannot access the NVIDIA GPU")
-    normalized_capability = None
-    if capability is not None:
-        try:
-            normalized_capability = tuple(int(value) for value in capability[:2])
-        except (TypeError, ValueError):
-            normalized_capability = None
-    if normalized_capability not in SUPPORTED_CAPABILITIES:
+    if normalize_capability(capability) not in SUPPORTED_CAPABILITIES:
         problems.append("the GPU does not expose an H3 Sol-compatible CUDA capability")
     return problems
 
@@ -69,11 +85,12 @@ def main() -> int:
         cuda_available=cuda_available,
         capability=capability,
     )
-    if problems:
-        print(f"[Sol Runtime] Error: required runtime verification failed: {'; '.join(problems)}.")
+    normalized_capability = normalize_capability(capability)
+    if problems or normalized_capability is None:
+        print(format_required_runtime_failure(problems))
         return 1
 
-    capability_label = f"sm_{capability[0]}{capability[1]}"
+    capability_label = f"sm_{normalized_capability[0]}{normalized_capability[1]}"
     print(
         "[Sol Runtime] Required CUDA 13 runtime verified "
         f"(PyTorch {torch.__version__}, Triton {triton.__version__}, {capability_label})."

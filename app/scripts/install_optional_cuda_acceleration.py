@@ -58,17 +58,18 @@ def install_optional_wheel(
             text=True,
             check=False,
         )
-    except OSError as exc:
+    except (OSError, subprocess.SubprocessError) as exc:
         print(
             f"[Optional acceleration] {label} was skipped because the package "
             f"installer could not start ({type(exc).__name__})."
         )
         return False
 
-    if result.returncode != 0:
+    returncode = getattr(result, "returncode", 1)
+    if returncode != 0:
         print(
             f"[Optional acceleration] {label} was not installed (installer exit "
-            f"{result.returncode}). Maestro will continue with Sol/SDPA; use "
+            f"{returncode}). Maestro will continue with Sol/SDPA; use "
             "Advanced > Repair H3 Performance Runtime to retry later."
         )
         return False
