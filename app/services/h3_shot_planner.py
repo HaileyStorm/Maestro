@@ -2698,6 +2698,10 @@ def plan_h3_native_shots(
         "dialogue_manifest": dialogue_manifest,
         "shots": native_shots,
     }
+    if clip_boundaries:
+        from services.h3_visual_continuity import apply_visual_carry_to_shot_plan
+
+        apply_visual_carry_to_shot_plan(result)
     seal_h3_shot_plan(result)
     return result
 

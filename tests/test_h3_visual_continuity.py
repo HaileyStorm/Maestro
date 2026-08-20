@@ -11,7 +11,10 @@ _APP = Path(__file__).resolve().parents[1] / "app"
 if str(_APP) not in sys.path:
     sys.path.insert(0, str(_APP))
 
-from services.h3_shot_planner import plan_h3_native_shots  # noqa: E402
+from services.h3_shot_planner import (  # noqa: E402
+    plan_h3_native_shots,
+    validate_h3_shot_plan_seal,
+)
 from services.h3_visual_continuity import (  # noqa: E402
     H3_SEAM_LOCK_KEYS,
     SAME_SOURCE_VISUAL_CARRY_LINE,
@@ -116,10 +119,6 @@ class H3VisualContinuityTests(unittest.TestCase):
             fps=24,
             clip_boundaries=classified,
         )
-        self.assertNotIn(
-            SAME_SOURCE_VISUAL_CARRY_LINE, plan["clip_prompts"][1],
-        )
-        apply_visual_carry_to_shot_plan(plan)
         self.assertTrue(
             plan["clip_prompts"][1].startswith(same_source_visual_carry_line()),
         )
@@ -267,6 +266,7 @@ class H3VisualContinuityTests(unittest.TestCase):
         )
         before = list(plan["clip_prompts"])
         apply_visual_carry_to_shot_plan(plan)
+        self.assertEqual(plan["clip_prompts"], before)
         self.assertIsNone(plan["clip_seam_locks"][0])
         self.assertEqual(
             tuple(plan["clip_seam_locks"][1]),
@@ -277,6 +277,81 @@ class H3VisualContinuityTests(unittest.TestCase):
         self.assertIn(SEGMENT_SEAM_LOCKS_HEADER, plan["clip_prompts"][1])
         self.assertIn("[Shot 2]", plan["clip_prompts"][1])
         self.assertIn("[Shot 3]", plan["clip_prompts"][2])
+
+    def test_plan_h3_native_shots_prefixes_same_source_cuts_then_seals(self):
+        prompt = (
+            "[Shot 1] A traveler stands in a hallway.\n"
+            "[Shot 2] At 00:10.000, the camera cuts to a macro of a cap.\n"
+            "[Shot 3] At 00:20.000, cut back to a tracking shot."
+        )
+        frames = [240, 240, 240]
+        classified = classify_timeline_clip_boundaries(
+            prompt, clip_frame_counts=frames, fps=24,
+        )
+        plan = plan_h3_native_shots(
+            global_prompt=prompt,
+            clip_frame_counts=frames,
+            fps=24,
+            clip_boundaries=classified,
+        )
+        self.assertEqual(plan["clip_prompts"][0].count("[Shot 1]"), 1)
+        self.assertFalse(
+            plan["clip_prompts"][0].startswith(SAME_SOURCE_VISUAL_CARRY_LINE),
+        )
+        self.assertTrue(
+            plan["clip_prompts"][1].startswith(SAME_SOURCE_VISUAL_CARRY_LINE),
+        )
+        self.assertIn(SEGMENT_SEAM_LOCKS_HEADER, plan["clip_prompts"][1])
+        self.assertIn("[Shot 2]", plan["clip_prompts"][1])
+        self.assertTrue(
+            plan["clip_prompts"][2].startswith(SAME_SOURCE_VISUAL_CARRY_LINE),
+        )
+        self.assertIn("[Shot 3]", plan["clip_prompts"][2])
+        self.assertEqual(
+            authored_shot_markers(plan["clip_prompts"][1]),
+            ("[Shot 2]",),
+        )
+        self.assertIsNone(plan["clip_seam_locks"][0])
+        self.assertEqual(
+            tuple(plan["clip_seam_locks"][1]),
+            H3_SEAM_LOCK_KEYS,
+        )
+        validate_h3_shot_plan_seal(plan)
+        apply_visual_carry_to_shot_plan(plan)
+        validate_h3_shot_plan_seal(plan)
+
+    def test_plan_h3_native_shots_leaves_implicit_splits_uncarried(self):
+        plan = plan_h3_native_shots(
+            global_prompt="[Shot 1] A traveler stands in a hallway.",
+            clip_frame_counts=[240, 240],
+            fps=24,
+        )
+        self.assertTrue(all(
+            SAME_SOURCE_VISUAL_CARRY_LINE not in prompt
+            for prompt in plan["clip_prompts"]
+        ))
+        self.assertNotIn("clip_seam_locks", plan)
+        validate_h3_shot_plan_seal(plan)
+
+    def test_plan_h3_native_shots_skips_carry_across_authored_sources(self):
+        plan = plan_h3_native_shots(
+            global_prompt="First scene.\n\nSecond scene.",
+            source_prompts=["First scene.", "Second scene."],
+            source_indices=[0, 1],
+            clip_frame_counts=[240, 240],
+            clip_boundaries=[{
+                "type": "cut",
+                "source": "director_scene_boundary",
+                "at_frame": 240,
+                "at_seconds": 10.0,
+            }],
+            fps=24,
+        )
+        self.assertEqual(plan["clip_prompts"][0], "First scene.")
+        self.assertEqual(plan["clip_prompts"][1], "Second scene.")
+        self.assertNotIn(SAME_SOURCE_VISUAL_CARRY_LINE, plan["clip_prompts"][1])
+        self.assertEqual(plan["clip_seam_locks"], [None, None])
+        validate_h3_shot_plan_seal(plan)
 
     def test_module_forbids_rewriter_shot_avoidance_and_keeps_prefix_only(self):
         source = MODULE.read_text(encoding="utf-8")

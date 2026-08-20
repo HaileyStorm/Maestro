@@ -299,6 +299,24 @@ def apply_same_source_visual_carry(
     return updated
 
 
+def _source_indices_for_clip_prompts(
+    shot_plan: Mapping[str, Any],
+    prompts: Sequence[str],
+) -> list[int] | None:
+    shots = shot_plan.get("shots")
+    if not isinstance(shots, list) or len(shots) != len(prompts):
+        return None
+    indices: list[int] = []
+    for shot in shots:
+        if not isinstance(shot, Mapping):
+            return None
+        try:
+            indices.append(int(shot.get("source_index", 0)))
+        except (TypeError, ValueError):
+            return None
+    return indices
+
+
 def apply_visual_carry_to_shot_plan(
     shot_plan: MutableMapping[str, Any],
 ) -> MutableMapping[str, Any]:
@@ -307,11 +325,26 @@ def apply_visual_carry_to_shot_plan(
     prompts = shot_plan.get("clip_prompts")
     if not isinstance(prompts, list):
         return shot_plan
-    boundaries = shot_plan.get("clip_boundaries") or []
-    carried = apply_same_source_visual_carry(
-        prompts,
-        clip_boundaries=boundaries,
-    )
+    boundaries = list(shot_plan.get("clip_boundaries") or [])
+    source_indices = _source_indices_for_clip_prompts(shot_plan, prompts)
+    if source_indices is None:
+        carried = apply_same_source_visual_carry(
+            prompts,
+            clip_boundaries=boundaries,
+        )
+    else:
+        carried = list(prompts)
+        start = 0
+        while start < len(prompts):
+            source = source_indices[start]
+            end = start + 1
+            while end < len(prompts) and source_indices[end] == source:
+                end += 1
+            carried[start:end] = apply_same_source_visual_carry(
+                prompts[start:end],
+                clip_boundaries=boundaries[start:end - 1],
+            )
+            start = end
     shot_plan["clip_prompts"] = carried
     seam_locks: list[dict[str, str] | None] = []
     for index, prompt in enumerate(carried):
