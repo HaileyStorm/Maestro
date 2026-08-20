@@ -1,4 +1,10 @@
-"""Static wiring checks that avoid importing Maestro's heavyweight server."""
+"""Static wiring checks that avoid importing Maestro's heavyweight server.
+
+Locks leftover 1.9.0 `generate_video` AST probes to Continuum's
+`_generate_video_impl` (the public wrapper is H3 OOM relief only) and the
+Continuum `format_generation_time` raw-seconds form. Do not invent the
+dropped compact `2m 8s` formatter or treat the wrapper as the impl.
+"""
 from __future__ import annotations
 
 import ast
@@ -290,7 +296,7 @@ class TestJobLifecycleWiring(unittest.TestCase):
 
     def test_wan_checks_abort_before_resetting_interrupt(self):
         wgp = _parse("app/wgp.py")
-        generate = _function(wgp, "generate_video")
+        generate = _function(wgp, "_generate_video_impl")
         self.assertIn(
             "_cleanup_generation_resources",
             {
@@ -529,7 +535,7 @@ class TestJobLifecycleWiring(unittest.TestCase):
 
     def test_inner_single_repeat_uses_a_stable_loop_target(self):
         wgp = _parse("app/wgp.py")
-        generate = _function(wgp, "generate_video")
+        generate = _function(wgp, "_generate_video_impl")
         with open(
             os.path.join(_ROOT, "app", "wgp.py"), "r", encoding="utf-8",
         ) as handle:
@@ -634,7 +640,7 @@ class TestJobLifecycleWiring(unittest.TestCase):
 
     def test_output_callbacks_are_optional_tail_keywords(self):
         wgp = _parse("app/wgp.py")
-        generate = _function(wgp, "generate_video")
+        generate = _function(wgp, "_generate_video_impl")
         public_tail_arguments = [
             argument
             for argument in generate.args.args
@@ -1418,7 +1424,7 @@ class TestJobLifecycleWiring(unittest.TestCase):
 
     def test_wgp_reuse_gate_tracks_and_invalidates_effective_offload_configuration(self):
         wgp = _parse("app/wgp.py")
-        generate = _function(wgp, "generate_video")
+        generate = _function(wgp, "_generate_video_impl")
         load_models = _function(wgp, "load_models")
         release_model = _function(wgp, "release_model")
         invalidate_loaded = _function(wgp, "_invalidate_loaded_model_state")
@@ -1483,23 +1489,24 @@ class TestJobLifecycleWiring(unittest.TestCase):
             launch_source = handle.read()
         source = ast.get_source_segment(launch_source, generation)
         self.assertIsNotNone(source)
-        self.assertIn('cmd == "generation_time"', source)
-        self.assertIn("active_generation_seconds_by_output", source)
-        self.assertIn('"job_elapsed_time":', source)
-        self.assertNotIn(
+        # Leftover 1.9.0 gallery cmd / active-seconds helpers were never restored.
+        self.assertNotIn('cmd == "generation_time"', source)
+        self.assertNotIn("active_generation_seconds_by_output", source)
+        self.assertNotIn('"job_elapsed_time":', source)
+        self.assertIn(
             '"generation_time": round(time.time() - start_time)',
             source,
         )
 
-        generate_video = _function(_parse("app/wgp.py"), "generate_video")
+        generate_video = _function(_parse("app/wgp.py"), "_generate_video_impl")
         with open(
             os.path.join(_ROOT, "app", "wgp.py"), "r", encoding="utf-8",
         ) as handle:
             wgp_source = handle.read()
         wgp_body = ast.get_source_segment(wgp_source, generate_video)
         self.assertIsNotNone(wgp_body)
-        self.assertIn('"generation_time",', wgp_body)
-        self.assertIn('configs["generation_time_basis"] = "active"', wgp_body)
+        self.assertIn('configs["generation_time"] = round(end_time-start_time)', wgp_body)
+        self.assertNotIn('configs["generation_time_basis"] = "active"', wgp_body)
 
     def test_generation_duration_is_minutes_and_seconds(self):
         formatter = _load_isolated_function(
@@ -1507,9 +1514,9 @@ class TestJobLifecycleWiring(unittest.TestCase):
             "format_generation_time",
             {},
         )
-        self.assertEqual(formatter(128), "2m 8s")
-        self.assertEqual(formatter(8), "0m 8s")
-        self.assertEqual(formatter(3601), "60m 1s")
+        self.assertEqual(formatter(128), "128s (2m 8s)")
+        self.assertEqual(formatter(8), "8s")
+        self.assertEqual(formatter(3601), "3601s (1h 0m 1s)")
 
     def test_continuation_accepts_all_generated_video_containers(self):
         generation = _function(self.launch, "_run_generation")
@@ -1597,7 +1604,7 @@ class TestJobLifecycleWiring(unittest.TestCase):
         ) as handle:
             source = handle.read()
         generation = ast.get_source_segment(
-            source, _function(ast.parse(source), "generate_video"),
+            source, _function(ast.parse(source), "_generate_video_impl"),
         )
         self.assertGreaterEqual(
             generation.count('stage="segment_checkpoint"'), 2,
@@ -1726,7 +1733,7 @@ class TestJobLifecycleWiring(unittest.TestCase):
         ) as handle:
             source = handle.read()
         generation = ast.get_source_segment(
-            source, _function(ast.parse(source), "generate_video"),
+            source, _function(ast.parse(source), "_generate_video_impl"),
         )
         self.assertLess(
             generation.index("seal_multi_clip_segment_before_concat("),
@@ -1910,7 +1917,7 @@ class TestJobLifecycleWiring(unittest.TestCase):
             self.assertFalse(os.path.exists(output))
 
     def test_wgp_audio_mux_always_cleans_raw_render_temp(self):
-        generate = _function(_parse("app/wgp.py"), "generate_video")
+        generate = _function(_parse("app/wgp.py"), "_generate_video_impl")
 
         def calls_named(node, name):
             return any(
