@@ -3260,8 +3260,20 @@ def _checkpoint_child_entry(
     _require_pipeline_checkpoint(pid, boundary)
 
 
-def _submit_and_wait(params: dict, timeout_s: float = 600, workspace: str = None, out_dir: str = None) -> list[str]:
+def _submit_and_wait(
+    params: dict,
+    timeout_s: float = 600,
+    workspace: str = None,
+    out_dir: str = None,
+    job_id: str = None,
+) -> list[str]:
     """Submit a generation job and block until it completes.
+
+    ``timeout_s`` is a no-progress timeout, not a total batch-duration cap.
+    Long Director batches can keep running while clips still finish. A durable
+    resource re-admission still receives a fresh window. A caller that must
+    follow a blocking request from the browser may reserve ``job_id`` so the
+    UI can poll ``/status`` while this waiter is still running.
 
     Returns list of output filenames. Raises on failure/timeout.
     """
@@ -3332,7 +3344,14 @@ def _submit_and_wait(params: dict, timeout_s: float = 600, workspace: str = None
             external_parent_id, recovery_unit, recovery_attempt,
         )
     else:
-        job_id = uuid.uuid4().hex[:8]
+        reserved_job_id = str(job_id or uuid.uuid4().hex[:8]).strip()
+        if not reserved_job_id:
+            raise ValueError("Generation job id cannot be empty")
+        if reserved_job_id in _jobs:
+            raise RuntimeError(
+                f"Generation job id already exists: {reserved_job_id}"
+            )
+        job_id = reserved_job_id
     pipeline_params = {}
     pipeline_snapshot = {}
     if pipeline_id:
@@ -3462,7 +3481,20 @@ def _submit_and_wait(params: dict, timeout_s: float = 600, workspace: str = None
         raise
 
     # Wait for completion, mirroring job progress to pipeline status
-    deadline = time.time() + timeout_s
+    def _activity_signature(current_job: dict) -> tuple:
+        clip_outputs = current_job.get("clip_output_files") or {}
+        return (
+            current_job.get("status"),
+            current_job.get("step", 0),
+            current_job.get("total_steps", 0),
+            current_job.get("phase", ""),
+            current_job.get("message", ""),
+            len(current_job.get("output_files") or []),
+            len(clip_outputs) if isinstance(clip_outputs, dict) else 0,
+        )
+
+    deadline = time.monotonic() + timeout_s
+    last_activity = _activity_signature(job)
     _abort_signalled = False
     _resource_retry_seen = 0
 
@@ -3480,6 +3512,10 @@ def _submit_and_wait(params: dict, timeout_s: float = 600, workspace: str = None
         j = _jobs.get(job_id)
         if not j:
             raise RuntimeError("Job disappeared")
+        activity = _activity_signature(j)
+        if activity != last_activity:
+            last_activity = activity
+            deadline = time.monotonic() + timeout_s
         try:
             resource_retry_attempt = max(
                 0, int(j.get("resource_retry_attempt", 0) or 0),
@@ -3491,7 +3527,7 @@ def _submit_and_wait(params: dict, timeout_s: float = 600, workspace: str = None
             # The child remains the same durable unit/job. Grant its bounded
             # resource re-admission a fresh wait window without creating a
             # second Director child or resetting parent progress.
-            deadline = max(deadline, time.time() + timeout_s)
+            deadline = max(deadline, time.monotonic() + timeout_s)
         if j["status"] == "completed":
             outputs = _director_job_outputs(j)
             if recovery_managed:
@@ -3593,7 +3629,7 @@ def _submit_and_wait(params: dict, timeout_s: float = 600, workspace: str = None
         # Reaching the old deadline is not sufficient to cancel: the retry
         # counter above is re-read in this same iteration first, so a durable
         # requeue committed at the edge receives its complete fresh window.
-        if time.time() >= deadline:
+        if time.monotonic() >= deadline:
             cancel_result = request_cancel(
                 job,
                 job_id=job_id,
@@ -3616,7 +3652,7 @@ def _submit_and_wait(params: dict, timeout_s: float = 600, workspace: str = None
                         refreshed_retry_attempt = _resource_retry_seen
                     if refreshed_retry_attempt > _resource_retry_seen:
                         _resource_retry_seen = refreshed_retry_attempt
-                        deadline = time.time() + timeout_s
+                        deadline = time.monotonic() + timeout_s
                         continue
                     if refreshed.get("status") in {
                         "completed", "failed", "cancelled",
@@ -3654,7 +3690,7 @@ def _submit_and_wait(params: dict, timeout_s: float = 600, workspace: str = None
                     p["progress"]["overall_progress"] = j.get(
                         "overall_progress", j.get("progress", 0),
                     )
-        time.sleep(min(1.0, max(0.01, deadline - time.time())))
+        time.sleep(min(1.0, max(0.01, deadline - time.monotonic())))
 
     if thread is not None:
         thread.join(timeout=_GENERATION_SETTLE_GRACE_S)
