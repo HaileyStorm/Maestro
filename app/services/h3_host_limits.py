@@ -363,6 +363,25 @@ def reason_if_blocked(**kwargs: Any) -> str | None:
     return evaluate_setup(**kwargs).reason
 
 
+def is_true_denoise_limit(
+    *,
+    after_unwind: bool = True,
+    step_now: Any = None,
+) -> bool:
+    """Return whether a failure is a mid-denoise host limit.
+
+    Step-0, load, contended, and missing-progress OOMs must not persist a
+    setup denial. A withheld quality is only honest when unwind already
+    ran and denoising had a positive step index.
+    """
+    if not after_unwind:
+        return False
+    try:
+        return step_now is not None and int(step_now) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def record_denoise_failure(
     *,
     model_type: Any,
@@ -380,12 +399,7 @@ def record_denoise_failure(
     epoch: Mapping[str, Any] | None = None,
 ) -> None:
     """Persist a true denoise limit. Step-0 / load / contended OOMs are ignored."""
-    if not after_unwind:
-        return
-    try:
-        if step_now is not None and int(step_now) <= 0:
-            return
-    except (TypeError, ValueError):
+    if not is_true_denoise_limit(after_unwind=after_unwind, step_now=step_now):
         return
     identity = setup_identity(
         model_type=model_type,

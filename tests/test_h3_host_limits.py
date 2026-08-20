@@ -15,8 +15,10 @@ if APP not in sys.path:
 
 from services.h3_host_limits import (  # noqa: E402
     HOST_LIMITS_CODE_EPOCH,
+    USER_SETUP_UNSUPPORTED,
     evaluate_setup,
     host_limit_reason_for_profile,
+    is_true_denoise_limit,
     orient_resolution,
     record_denoise_failure,
     record_denoise_success,
@@ -52,6 +54,7 @@ class H3HostLimitTests(unittest.TestCase):
             video_length=241,
             attention_engine="sdpa",
             after_unwind=True,
+            step_now=49,
             path=self.path,
             epoch=FIXED_EPOCH,
         )
@@ -86,6 +89,7 @@ class H3HostLimitTests(unittest.TestCase):
             duration_seconds=10,
             attention_engine="sdpa",
             after_unwind=True,
+            step_now=39,
             path=self.path,
             epoch=FIXED_EPOCH,
         )
@@ -204,12 +208,12 @@ class H3HostLimitTests(unittest.TestCase):
             path=self.path,
             epoch=FIXED_EPOCH,
         )
-        record_denoise_failure(after_unwind=True, **kwargs)
+        record_denoise_failure(after_unwind=True, step_now=47, **kwargs)
         self.assertFalse(evaluate_setup(**kwargs).runnable)
         record_denoise_success(**kwargs)
         self.assertTrue(evaluate_setup(**kwargs).runnable)
 
-        record_denoise_failure(after_unwind=True, **kwargs)
+        record_denoise_failure(after_unwind=True, step_now=47, **kwargs)
         stale = dict(FIXED_EPOCH)
         stale["attention"] = {"sdpa": True, "sol_attn": True, "sage2": False}
         reopened = evaluate_setup(
@@ -231,6 +235,7 @@ class H3HostLimitTests(unittest.TestCase):
             duration_seconds=10,
             attention_engine="sol_attn",
             after_unwind=True,
+            step_now=27,
             path=self.path,
             epoch=FIXED_EPOCH,
         )
@@ -269,6 +274,39 @@ class H3HostLimitTests(unittest.TestCase):
             ).count("could not finish"),
             1,
         )
+        self.assertEqual(
+            host_limit_reason_for_profile(
+                by_id["high"]["settings"],
+                context,
+                path=self.path,
+                epoch=FIXED_EPOCH,
+            ),
+            USER_SETUP_UNSUPPORTED,
+        )
+
+    def test_missing_or_non_positive_step_now_is_not_a_host_limit(self):
+        self.assertFalse(is_true_denoise_limit(after_unwind=True, step_now=None))
+        self.assertFalse(is_true_denoise_limit(after_unwind=True, step_now=0))
+        self.assertFalse(is_true_denoise_limit(after_unwind=True, step_now="load"))
+        self.assertFalse(is_true_denoise_limit(after_unwind=False, step_now=19))
+        self.assertTrue(is_true_denoise_limit(after_unwind=True, step_now=19))
+        kwargs = dict(
+            model_type="minimax_h3_ref2va",
+            resolution="768x1344",
+            num_inference_steps=50,
+            duration_seconds=10,
+            attention_engine="sdpa",
+            path=self.path,
+            epoch=FIXED_EPOCH,
+        )
+        record_denoise_failure(after_unwind=True, **kwargs)
+        record_denoise_failure(after_unwind=True, step_now=0, **kwargs)
+        self.assertTrue(evaluate_setup(**kwargs).runnable)
+        record_denoise_failure(after_unwind=True, step_now=19, **kwargs)
+        denied = evaluate_setup(**kwargs)
+        self.assertFalse(denied.runnable)
+        self.assertEqual(denied.reason, USER_SETUP_UNSUPPORTED)
+        self.assertNotIn("prompt", denied.reason.casefold())
 
 
 if __name__ == "__main__":
