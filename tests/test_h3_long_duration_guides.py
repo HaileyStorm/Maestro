@@ -1,4 +1,8 @@
-"""Model-free regressions for MiniMax H3 long-duration prompt contracts."""
+"""Model-free regressions for MiniMax H3 long-duration prompt contracts.
+
+Locks leftover 1.9.0 VERSION probes to Continuum 0.3.0 plus the included
+1.6.5 H3 archive. Do not invent a 1.9.0 maestro-base H3 contract heading.
+"""
 from __future__ import annotations
 
 import importlib.util
@@ -1946,35 +1950,56 @@ non_diegetic_music: N/A""")
         self.assertFalse(calls[0]["preserve_global_timeline"])
 
     def test_current_release_docs_describe_the_shipped_h3_contract(self):
+        # Leftover 1.9.0 bumped VERSION; Continuum still ships 0.3.0 and the
+        # included 1.6.5 H3 archive. Do not treat leftover ## [1.9.0] notes as
+        # the current Maestro-base H3 contract, and do not invent a 1.9.0
+        # archive heading just to match the file.
         def read(relative_path):
             with open(
                 os.path.join(_REPO_DIR, relative_path), "r", encoding="utf-8",
             ) as handle:
                 return handle.read()
 
+        version = read("VERSION").strip()
+        continuum_version = read("CONTINUUM_VERSION").strip()
         readme = read("README.md")
         changelog = read("CHANGELOG.md")
         research = read("docs/development/minimax-h3-fast-runtime-research.md")
-        readme_current = readme.split(
+        self.assertEqual(version, "1.9.0")
+        self.assertEqual(continuum_version, "0.3.0")
+        self.assertIn(
+            "This build is Continuum 0.3.0 on Maestro base 1.6.5",
+            readme,
+        )
+        self.assertIn("## [1.9.0] - 2026-08-19", changelog)
+        leftover_notes = changelog.split(
+            "## [1.9.0] - 2026-08-19", 1,
+        )[1].split("## [1.8.7.1] - 2026-08-17", 1)[0]
+        readme_archive = readme.split(
             "### v1.6.5 (2026-08-08)", 1,
         )[1].split("### v1.6.1 (2026-08-06)", 1)[0]
-        changelog_current = changelog.split(
+        changelog_archive = changelog.split(
             "## [1.6.5] - 2026-08-08", 1,
         )[1].split("## [1.6.1] - 2026-08-06", 1)[0]
         readme_h3_overview = readme.split(
             "### 🤖 LLM Chat and prompting", 1,
         )[0]
 
-        for current_notes in (readme_current, changelog_current):
-            with self.subTest(document=current_notes[:32]):
+        self.assertNotIn("four-step Turbo", leftover_notes)
+        self.assertNotIn("eight-step Turbo", leftover_notes)
+        for label in ("Draft", "Fast", "Quality", "High", "Delivery"):
+            self.assertNotIn(f"**{label}**", leftover_notes)
+
+        for archive_notes in (readme_archive, changelog_archive):
+            with self.subTest(document=archive_notes[:32]):
                 for label in ("Draft", "Fast", "Quality", "High", "Delivery"):
-                    self.assertIn(label, current_notes)
-                self.assertIn("four-step Turbo", current_notes)
-                self.assertIn("eight-step Turbo", current_notes)
-                self.assertIn("server", current_notes.lower())
-                self.assertNotIn("Full 33B", current_notes)
-                self.assertNotIn("Full checkpoint", current_notes)
-                self.assertNotIn("window-local storyboard", current_notes)
+                    self.assertIn(label, archive_notes)
+                self.assertIn("four-step Turbo", archive_notes)
+                self.assertIn("eight-step Turbo", archive_notes)
+                self.assertIn("server", archive_notes.lower())
+                self.assertNotIn("Full 33B", archive_notes)
+                self.assertNotIn("Full checkpoint", archive_notes)
+                self.assertNotIn("window-local storyboard", archive_notes)
 
         self.assertIn("one coherent global prompt", readme_h3_overview)
         self.assertIn("deterministic planner", readme_h3_overview)
