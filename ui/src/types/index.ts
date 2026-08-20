@@ -1018,6 +1018,8 @@ export interface GenerationJob {
   /** Server creation time in epoch seconds when known. */
   createdAt?: number
   status: 'preparing' | 'waiting_for_plan_approval' | 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
+  /** Continuum hold flag. 1.9.0 UI used status === 'held'; we keep both. */
+  held?: boolean
   progress: number
   step: number
   totalSteps: number

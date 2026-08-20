@@ -1415,6 +1415,7 @@ function _queueJobDetails(
   const resetDiscardedProgress = _resourceProgressMustReset(resourceDescriptor, previous)
   return {
     status: status.status,
+    held: status.held === true,
     queueWaitReason: status.wait_reason,
     ...(resourceDescriptor !== undefined
       ? { resourceDescriptor }
@@ -3009,6 +3010,15 @@ interface AppState {
   approveH3Plan: (decision: H3PlanDecision) => Promise<void>
   cancelH3Plan: () => Promise<void>
   startGeneration: () => Promise<void>
+  startStudioQueue: () => Promise<void>
+  directorQueue: api.DirectorQueueState | null
+  directorQueueLoading: boolean
+  loadDirectorQueue: () => Promise<void>
+  loadDirectorQueueEntry: (entryId: string) => Promise<void>
+  startDirectorQueue: () => Promise<void>
+  pauseDirectorQueue: () => Promise<void>
+  removeDirectorQueueEntry: (entryId: string) => Promise<void>
+  moveDirectorQueueEntry: (entryId: string, direction: -1 | 1) => Promise<void>
   stopGeneration: (jobId?: string) => void
   dismissJob: (jobId: string) => void
   reconcileQueueState: (queue: api.QueueState) => void
@@ -4770,6 +4780,8 @@ function _scrubAccountBoundProjectUi(state: AppState): Partial<AppState> {
     selectedOutputKeys: [],
     gallerySelectionMode: false,
     jobs: [],
+    directorQueue: null,
+    directorQueueLoading: false,
     presets: [],
     presetsLoading: false,
     recipes: [],
@@ -7327,6 +7339,8 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   jobs: [],
+  directorQueue: null,
+  directorQueueLoading: false,
   isGenerating: false,
   sampleCampaignPairs: [],
   refreshSampleCampaignQueue: async (signal) => {
@@ -8825,6 +8839,58 @@ export const useStore = create<AppState>((set, get) => ({
         isGenerating: s.jobs.some(j => j !== newJob && _isActiveGenerationJob(j)),
       }))
     }
+  },
+
+  startStudioQueue: async () => {
+    await api.startStudioQueue()
+    await get().reconnectJobs()
+  },
+
+  loadDirectorQueue: async () => {
+    try {
+      const directorQueue = await api.fetchDirectorQueue()
+      set({ directorQueue, directorQueueLoading: false })
+    } catch (error) {
+      console.error('Director queue load failed:', error)
+      set({ directorQueueLoading: false })
+    }
+  },
+
+  loadDirectorQueueEntry: async (entryId) => {
+    const entry = await api.fetchDirectorQueueEntry(entryId)
+    const pipelineId = typeof entry?.pipeline_id === 'string' ? entry.pipeline_id : ''
+    if (pipelineId) {
+      await get().loadSavedPipeline(pipelineId)
+    }
+    await get().loadDirectorQueue()
+  },
+
+  startDirectorQueue: async () => {
+    const directorQueue = await api.startDirectorQueue()
+    set({ directorQueue })
+  },
+
+  pauseDirectorQueue: async () => {
+    const directorQueue = await api.pauseDirectorQueue()
+    set({ directorQueue })
+  },
+
+  removeDirectorQueueEntry: async (entryId) => {
+    await api.deleteDirectorQueueEntry(entryId)
+    await get().loadDirectorQueue()
+  },
+
+  moveDirectorQueueEntry: async (entryId, direction) => {
+    const entries = get().directorQueue?.entries || []
+    const index = entries.findIndex(entry => entry.id === entryId)
+    if (index < 0) return
+    const next = index + direction
+    if (next < 0 || next >= entries.length) return
+    const ids = entries.map(entry => entry.id)
+    const [moved] = ids.splice(index, 1)
+    ids.splice(next, 0, moved)
+    const directorQueue = await api.reorderDirectorQueue(ids)
+    set({ directorQueue })
   },
 
   stopGeneration: (jobId) => {

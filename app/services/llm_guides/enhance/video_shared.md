@@ -3,7 +3,7 @@ The video model has no memory of who anyone is; it renders only what the words d
 - Visual prose only: relationships, roles, and names → appearance: "husband" → "the man in the blue shirt"; "her boss" → "the older man in the grey suit"; "Sarah" → "the young woman with red hair". Do not leave a relationship word, role, or personal name in non-dialogue action/camera prose.
 - Visual prose only: pronouns → the same descriptor; do not leave a bare "he", "she", or "they" where the renderer needs a visible subject anchor.
 - Use the user's own distinguishing details when given (a husband "in blue", a wife "in red") as the descriptor; otherwise invent a simple, consistent one that fits the scene.
-- Re-state each character's descriptor in EVERY window — windows are rendered with no memory of one another.
+- Re-state each character's descriptor in EVERY window — rolling visual state may continue, but each window receives only its own text prompt.
 
 SPOKEN/VOCAL DIALOGUE OVERRIDES THE VISUAL-NAME RULE:
 - Inside quoted speech, vocal lines, and their speaker cues/tags, preserve every user-specified name and every authored word exactly. Never replace a known speaker name with a visual descriptor or pronoun; never rename a named character.

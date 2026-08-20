@@ -17,7 +17,9 @@ import time
 import json
 import uuid
 import math
+import copy
 import hashlib
+import shutil
 import threading
 import traceback
 from contextlib import nullcontext
@@ -37,6 +39,7 @@ from services.director_model_compat import (
     DIRECTOR_PIPELINE_TYPES,
     assess_director_model,
 )
+from services.text_integrity import repair_payload
 from services.director_video_strategy import (
     SHOT_IMAGE_GENERATE,
     SHOT_IMAGE_PROMPT_ONLY,
@@ -64,6 +67,26 @@ _runtime_admission = None
 _director_native_gpu_slot_state = threading.local()
 
 _pipelines: dict = {}
+
+_director_queue_lock = threading.RLock()
+_director_queue_state = None
+_director_queue_base = None
+_director_queue_worker = None
+_DIRECTOR_QUEUE_FILENAME = "_director_queue.json"
+_DIRECTOR_QUEUE_VERSION = 1
+_DIRECTOR_QUEUE_TERMINAL = {"completed", "failed", "cancelled"}
+_DIRECTOR_SINGLE_ASSET_KEYS = (
+    "audio_path",
+    "audio_vocals_path",
+    "reference_image_path",
+    "voice_reference",
+)
+_DIRECTOR_LIST_ASSET_KEYS = (
+    "character_ref_paths",
+    "location_ref_paths",
+    "prepared_clip_image_paths",
+)
+
 _pipeline_lock = threading.Lock()
 _pipeline_file_lock = threading.RLock()
 _pipeline_threads: dict[str, threading.Thread] = {}
@@ -935,9 +958,19 @@ def _write_initial_pipeline_state(pid: str, pipeline: dict) -> tuple[dict, dict]
         # launch always supplies the recovery registrar and never recreates a
         # missing project here.
         os.makedirs(out_dir, exist_ok=True)
+    prepared_clips = params.get("prepared_clip_plans")
+    if not isinstance(prepared_clips, list):
+        prepared_clips = list(pipeline.get("clip_plans") or [])
+    ui_snapshot = params.get("director_ui_snapshot")
+    if not isinstance(ui_snapshot, dict):
+        ui_snapshot = {}
+    asset_manifest = params.get("_director_asset_manifest")
+    if not isinstance(asset_manifest, dict):
+        asset_manifest = {}
     state = {
-        "version": PIPELINE_STATE_VERSION,
+        "version": 2 if (prepared_clips or asset_manifest or ui_snapshot) else PIPELINE_STATE_VERSION,
         "pipeline_id": pid,
+        "project_id": pid,
         "created_at": pipeline.get("created_at"),
         "completed_at": None,
         "status": "queued",
@@ -951,6 +984,8 @@ def _write_initial_pipeline_state(pid: str, pipeline: dict) -> tuple[dict, dict]
         "generated_reference_image_filename": None,
         "character_ref_paths": params.get("character_ref_paths", []),
         "location_ref_paths": params.get("location_ref_paths", []),
+        "director_ui_snapshot": copy.deepcopy(ui_snapshot),
+        "asset_manifest": copy.deepcopy(asset_manifest),
         "auto_mode": params.get("auto_mode", True),
         "seamless": params.get("seamless", True),
         "video_model": params.get("video_model", ""),
@@ -967,7 +1002,7 @@ def _write_initial_pipeline_state(pid: str, pipeline: dict) -> tuple[dict, dict]
         "image_params": params.get("image_params", {}),
         "video_params": params.get("video_params", {}),
         "llm_log": None,
-        "clips": [],
+        "clips": copy.deepcopy(prepared_clips),
         "output_files": [],
         "total_time_sec": 0,
         "_params_snapshot": params,
@@ -3955,6 +3990,550 @@ def _start_pipeline_worker(pid: str, *, resume: bool = False) -> None:
         raise
 
 
+def _resolve_director_asset_path(value: object, out_dir: str) -> Optional[str]:
+    """Resolve one submitted Director asset without accepting a directory.
+
+    Browser uploads are normally relative to ``app/`` while restored projects
+    can point into an output workspace.  A bounded basename search across the
+    configured output root keeps v1 projects restorable after their workspace
+    is no longer active, without treating an arbitrary user-provided path as a
+    directory to copy.
+    """
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = os.path.expanduser(value.strip())
+    candidates = [
+        raw,
+        os.path.abspath(raw),
+        os.path.join(os.getcwd(), raw),
+        os.path.join(out_dir, raw),
+    ]
+    save_root = getattr(_wgp, "save_path", None)
+    if save_root:
+        candidates.append(os.path.join(str(save_root), raw))
+    for candidate in candidates:
+        try:
+            resolved = os.path.realpath(candidate)
+        except (OSError, TypeError, ValueError):
+            continue
+        if os.path.isfile(resolved):
+            return resolved
+
+    # Older pipeline JSON often retained only a workspace-relative filename.
+    # Search one directory level under the output root; avoid an unbounded walk
+    # through model folders or the rest of the user's machine.
+    basename = os.path.basename(raw.replace("\\", os.sep))
+    roots = [out_dir]
+    if save_root and os.path.realpath(str(save_root)) != os.path.realpath(out_dir):
+        roots.append(str(save_root))
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        direct = os.path.join(root, basename)
+        if os.path.isfile(direct):
+            return os.path.realpath(direct)
+        try:
+            children = os.listdir(root)
+        except OSError:
+            continue
+        for child in children:
+            candidate = os.path.join(root, child, basename)
+            if os.path.isfile(candidate):
+                return os.path.realpath(candidate)
+    return None
+
+
+# ── Persistent Director project queue ────────────────────────────────────
+
+def _director_queue_path(base_out_dir: str) -> str:
+    return os.path.join(base_out_dir, _DIRECTOR_QUEUE_FILENAME)
+
+def _write_director_queue_locked(base_out_dir: str, state: dict) -> None:
+    os.makedirs(base_out_dir, exist_ok=True)
+    _write_pipeline_json_unlocked(_director_queue_path(base_out_dir), state)
+
+def _load_director_queue_locked(base_out_dir: str) -> dict:
+    global _director_queue_state, _director_queue_base
+    resolved_base = os.path.realpath(base_out_dir)
+    if (
+        _director_queue_state is not None
+        and _director_queue_base == resolved_base
+    ):
+        return _director_queue_state
+
+    state = {
+        "version": _DIRECTOR_QUEUE_VERSION,
+        "paused": True,
+        "running": False,
+        "entries": [],
+    }
+    path = _director_queue_path(resolved_base)
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                loaded = repair_payload(json.load(handle))
+            if isinstance(loaded, dict):
+                state.update(loaded)
+        except Exception as exc:
+            print(f"[Director Queue] Could not load saved queue: {exc}")
+
+    entries = state.get("entries")
+    if not isinstance(entries, list):
+        entries = []
+    # A process restart cannot retain the parent worker.  Preserve the entry
+    # but put it back in the held queue; the user can restart the batch without
+    # losing its inputs or accidentally launching work during app startup.
+    interrupted = False
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("status") == "running":
+            entry["status"] = "held"
+            entry["message"] = "Interrupted when Maestro stopped; ready to resume"
+            entry["pipeline_id"] = None
+            interrupted = True
+    state["entries"] = entries
+    state["paused"] = True
+    state["running"] = False
+    state["version"] = _DIRECTOR_QUEUE_VERSION
+    _director_queue_state = state
+    _director_queue_base = resolved_base
+    if interrupted:
+        _write_director_queue_locked(resolved_base, state)
+    return state
+
+def _public_director_queue_state(state: dict) -> dict:
+    entries = []
+    for raw in state.get("entries") or []:
+        if not isinstance(raw, dict):
+            continue
+        entry = {key: copy.deepcopy(value) for key, value in raw.items() if key != "params"}
+        params = raw.get("params") if isinstance(raw.get("params"), dict) else {}
+        entry.setdefault("scene_description", params.get("scene_description", ""))
+        entry.setdefault("pipeline_type", params.get("pipeline_type", "music_video"))
+        entry.setdefault("image_model", params.get("image_model", ""))
+        entry.setdefault("video_model", params.get("video_model", ""))
+        entries.append(entry)
+    return {
+        "version": state.get("version", _DIRECTOR_QUEUE_VERSION),
+        "paused": bool(state.get("paused", True)),
+        "running": bool(state.get("running", False)),
+        "entries": entries,
+    }
+
+def list_director_queue(base_out_dir: str) -> dict:
+    with _director_queue_lock:
+        return _public_director_queue_state(
+            _load_director_queue_locked(base_out_dir)
+        )
+
+def get_director_queue_entry(base_out_dir: str, entry_id: str) -> Optional[dict]:
+    with _director_queue_lock:
+        state = _load_director_queue_locked(base_out_dir)
+        for entry in state.get("entries") or []:
+            if isinstance(entry, dict) and entry.get("id") == entry_id:
+                return copy.deepcopy(entry)
+    return None
+
+def enqueue_director_pipeline(base_out_dir: str, params: dict) -> dict:
+    """Freeze one complete Director request in the held render queue."""
+
+    entry_id = uuid.uuid4().hex[:8]
+    frozen = copy.deepcopy(params)
+    frozen["auto_mode"] = True  # queued work must not wait for browser review
+    frozen["_director_queue_entry_id"] = entry_id
+    _materialize_director_assets(
+        frozen,
+        base_out_dir,
+        entry_id,
+        container="_director_queue_assets",
+    )
+    entry = {
+        "id": entry_id,
+        "status": "held",
+        "message": "Ready",
+        "created_at": time.time(),
+        "started_at": None,
+        "completed_at": None,
+        "pipeline_id": None,
+        "error": None,
+        "params": frozen,
+    }
+    with _director_queue_lock:
+        state = _load_director_queue_locked(base_out_dir)
+        state.setdefault("entries", []).append(entry)
+        _write_director_queue_locked(base_out_dir, state)
+        return _public_director_queue_state(state)
+
+def update_director_queue_entry(
+    base_out_dir: str,
+    entry_id: str,
+    params: dict,
+) -> dict:
+    """Replace a non-running held project with a newly frozen edit."""
+
+    frozen = copy.deepcopy(params)
+    frozen["auto_mode"] = True
+    frozen["_director_queue_entry_id"] = entry_id
+    with _director_queue_lock:
+        state = _load_director_queue_locked(base_out_dir)
+        entry = next(
+            (
+                item for item in state.get("entries") or []
+                if isinstance(item, dict) and item.get("id") == entry_id
+            ),
+            None,
+        )
+        if entry is None:
+            raise ValueError("Director queue entry not found")
+        if entry.get("status") == "running":
+            raise PipelineBusyError(
+                "The queued Director project has already started and cannot be edited."
+            )
+        # Reuse the entry-owned directory. Unchanged restored assets are
+        # already there (copy_one safely no-ops for source == target), while
+        # replacements receive deterministic names. Any superseded files stay
+        # isolated inside this entry and are reclaimed when it is removed.
+        _materialize_director_assets(
+            frozen,
+            base_out_dir,
+            entry_id,
+            container="_director_queue_assets",
+        )
+        should_run = bool(state.get("running") and not state.get("paused"))
+        entry.update({
+            "status": "queued" if should_run else "held",
+            "message": "Queued" if should_run else "Ready (edited)",
+            "updated_at": time.time(),
+            "started_at": None,
+            "completed_at": None,
+            "pipeline_id": None,
+            "error": None,
+            "params": frozen,
+        })
+        _write_director_queue_locked(base_out_dir, state)
+        return _public_director_queue_state(state)
+
+def _set_director_queue_entry(
+    base_out_dir: str,
+    entry_id: str,
+    **updates,
+) -> Optional[dict]:
+    with _director_queue_lock:
+        state = _load_director_queue_locked(base_out_dir)
+        for entry in state.get("entries") or []:
+            if isinstance(entry, dict) and entry.get("id") == entry_id:
+                entry.update(updates)
+                _write_director_queue_locked(base_out_dir, state)
+                return copy.deepcopy(entry)
+    return None
+
+def _run_director_queue(base_out_dir: str) -> None:
+    global _director_queue_worker
+    try:
+        while True:
+            wait_for_active_pipeline = False
+            with _director_queue_lock:
+                state = _load_director_queue_locked(base_out_dir)
+                if state.get("paused"):
+                    state["running"] = False
+                    _write_director_queue_locked(base_out_dir, state)
+                    return
+                entry = next(
+                    (
+                        item for item in state.get("entries") or []
+                        if isinstance(item, dict)
+                        and item.get("status") in {"held", "queued"}
+                    ),
+                    None,
+                )
+                if entry is None:
+                    state["running"] = False
+                    _write_director_queue_locked(base_out_dir, state)
+                    return
+                # A revision queued from an active Director render belongs
+                # behind that render. Starting its planning worker immediately
+                # can otherwise load a second local LLM beside the first run,
+                # even though the generation-job GPU lock has not been reached
+                # yet. Treat every live Director pipeline as the head of this
+                # project queue, including a manual run started outside it.
+                with _pipeline_lock:
+                    active_pipeline = any(
+                        str(item.get("status") or "").lower()
+                        in _ACTIVE_PIPELINE_STATUSES
+                        for item in _pipelines.values()
+                        if isinstance(item, dict)
+                    )
+                if active_pipeline:
+                    state["running"] = True
+                    entry["message"] = "Waiting for the active Director project"
+                    _write_director_queue_locked(base_out_dir, state)
+                    wait_for_active_pipeline = True
+                else:
+                    entry["status"] = "running"
+                    entry["message"] = "Starting Director project"
+                    entry["started_at"] = time.time()
+                    entry_id = str(entry["id"])
+                    params = copy.deepcopy(entry.get("params") or {})
+                    state["running"] = True
+                    _write_director_queue_locked(base_out_dir, state)
+
+            if wait_for_active_pipeline:
+                time.sleep(1.0)
+                continue
+
+            try:
+                params["_director_queue_entry_id"] = entry_id
+                pid = start_pipeline(params)
+                _set_director_queue_entry(
+                    base_out_dir,
+                    entry_id,
+                    pipeline_id=pid,
+                    message="Director project running",
+                )
+                last_queue_message = "Director project running"
+                terminal = None
+                while terminal is None:
+                    current = get_pipeline(pid)
+                    if current is None:
+                        saved = load_pipeline_state(base_out_dir, pid)
+                        current = saved or {}
+                    status = str(current.get("status") or "").lower()
+                    if status in _DIRECTOR_QUEUE_TERMINAL:
+                        terminal = current
+                        break
+                    progress = current.get("progress") or {}
+                    progress_message = str(
+                        progress.get("message") or ""
+                    ).strip()
+                    if (
+                        progress_message
+                        and progress_message != last_queue_message
+                    ):
+                        _set_director_queue_entry(
+                            base_out_dir,
+                            entry_id,
+                            message=progress_message,
+                        )
+                        last_queue_message = progress_message
+                    time.sleep(1.0)
+                status = str(terminal.get("status") or "failed").lower()
+                _set_director_queue_entry(
+                    base_out_dir,
+                    entry_id,
+                    status=status,
+                    message=(
+                        "Completed" if status == "completed"
+                        else "Cancelled" if status == "cancelled"
+                        else "Failed"
+                    ),
+                    error=terminal.get("error"),
+                    completed_at=time.time(),
+                )
+            except Exception as exc:
+                traceback.print_exc()
+                _set_director_queue_entry(
+                    base_out_dir,
+                    entry_id,
+                    status="failed",
+                    message="Failed to start",
+                    error=str(exc),
+                    completed_at=time.time(),
+                )
+    finally:
+        with _director_queue_lock:
+            state = _load_director_queue_locked(base_out_dir)
+            state["running"] = False
+            _write_director_queue_locked(base_out_dir, state)
+            if _director_queue_worker is threading.current_thread():
+                _director_queue_worker = None
+
+def start_director_queue(base_out_dir: str) -> dict:
+    global _director_queue_worker
+    with _director_queue_lock:
+        state = _load_director_queue_locked(base_out_dir)
+        state["paused"] = False
+        for entry in state.get("entries") or []:
+            if isinstance(entry, dict) and entry.get("status") == "held":
+                entry["status"] = "queued"
+                entry["message"] = "Queued"
+        state["running"] = any(
+            isinstance(entry, dict) and entry.get("status") in {"queued", "running"}
+            for entry in state.get("entries") or []
+        )
+        _write_director_queue_locked(base_out_dir, state)
+        if state["running"] and (
+            _director_queue_worker is None
+            or not _director_queue_worker.is_alive()
+        ):
+            _director_queue_worker = threading.Thread(
+                target=_run_director_queue,
+                args=(base_out_dir,),
+                daemon=False,
+                name="maestro-director-queue",
+            )
+            _director_queue_worker.start()
+        return _public_director_queue_state(state)
+
+def pause_director_queue(base_out_dir: str) -> dict:
+    """Stop dispatching after the currently running Director project."""
+
+    with _director_queue_lock:
+        state = _load_director_queue_locked(base_out_dir)
+        state["paused"] = True
+        for entry in state.get("entries") or []:
+            if isinstance(entry, dict) and entry.get("status") == "queued":
+                entry["status"] = "held"
+                entry["message"] = "Ready"
+        _write_director_queue_locked(base_out_dir, state)
+        return _public_director_queue_state(state)
+
+def remove_director_queue_entry(base_out_dir: str, entry_id: str) -> bool:
+    with _director_queue_lock:
+        state = _load_director_queue_locked(base_out_dir)
+        entries = state.get("entries") or []
+        target = next(
+            (entry for entry in entries if isinstance(entry, dict) and entry.get("id") == entry_id),
+            None,
+        )
+        if target is None:
+            return False
+        if target.get("status") == "running":
+            raise PipelineBusyError(
+                "The queued Director project is running; stop its pipeline first."
+            )
+        state["entries"] = [
+            entry for entry in entries
+            if not isinstance(entry, dict) or entry.get("id") != entry_id
+        ]
+        _write_director_queue_locked(base_out_dir, state)
+    asset_dir = os.path.realpath(
+        os.path.join(base_out_dir, "_director_queue_assets", entry_id)
+    )
+    expected_root = os.path.realpath(
+        os.path.join(base_out_dir, "_director_queue_assets")
+    )
+    try:
+        if os.path.commonpath([asset_dir, expected_root]) == expected_root:
+            shutil.rmtree(asset_dir, ignore_errors=True)
+    except ValueError:
+        pass
+    return True
+
+def reorder_director_queue(base_out_dir: str, entry_ids: list[str]) -> dict:
+    with _director_queue_lock:
+        state = _load_director_queue_locked(base_out_dir)
+        entries = state.get("entries") or []
+        by_id = {
+            str(entry.get("id")): entry
+            for entry in entries if isinstance(entry, dict)
+        }
+        requested = [by_id[item] for item in entry_ids if item in by_id]
+        remainder = [entry for entry in entries if entry not in requested]
+        running = [entry for entry in entries if isinstance(entry, dict) and entry.get("status") == "running"]
+        state["entries"] = running + [entry for entry in requested if entry not in running] + [entry for entry in remainder if entry not in running]
+        _write_director_queue_locked(base_out_dir, state)
+        return _public_director_queue_state(state)
+
+def _director_asset_filename(key: str, index: Optional[int], source: str) -> str:
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", key).strip("._") or "asset"
+    suffix = f"_{index + 1}" if index is not None else ""
+    original = re.sub(
+        r"[^A-Za-z0-9_.-]+", "_", os.path.basename(source)
+    ).strip("._") or "file"
+    return f"{stem}{suffix}_{original}"
+
+def _materialize_director_assets(
+    params: dict,
+    out_dir: str,
+    owner_id: str,
+    *,
+    container: str = "_director_assets",
+) -> dict:
+    """Copy input media into durable project-owned storage.
+
+    The saved JSON is only a dependable project file if its references do not
+    point at browser upload scratch space.  This function rewrites submitted
+    paths to owned absolute files and records a UI-safe relative path for each
+    one.  Missing legacy inputs are left untouched so the caller can surface a
+    precise validation error rather than silently dropping a reference.
+    """
+
+    asset_dir = os.path.join(out_dir, container, owner_id)
+    manifest: dict[str, object] = {}
+
+    def copy_one(key: str, value: object, index: Optional[int] = None):
+        source = _resolve_director_asset_path(value, out_dir)
+        if not source:
+            return value, None
+        os.makedirs(asset_dir, exist_ok=True)
+        filename = _director_asset_filename(key, index, source)
+        target = os.path.join(asset_dir, filename)
+        source_real = os.path.realpath(source)
+        target_real = os.path.realpath(target)
+        if source_real != target_real:
+            shutil.copy2(source_real, target_real)
+        serve_path = os.path.relpath(target_real, out_dir).replace(os.sep, "/")
+        return target_real, {
+            "path": target_real,
+            "serve_path": serve_path,
+            "original_name": os.path.basename(source_real),
+        }
+
+    for key in _DIRECTOR_SINGLE_ASSET_KEYS:
+        if not params.get(key):
+            continue
+        rewritten, item = copy_one(key, params.get(key))
+        params[key] = rewritten
+        if item:
+            manifest[key] = item
+
+    for key in _DIRECTOR_LIST_ASSET_KEYS:
+        values = params.get(key)
+        if not isinstance(values, list):
+            continue
+        rewritten_values = []
+        manifest_values = []
+        for index, value in enumerate(values):
+            rewritten, item = copy_one(key, value, index)
+            rewritten_values.append(rewritten)
+            manifest_values.append(item)
+        params[key] = rewritten_values
+        if any(item is not None for item in manifest_values):
+            manifest[key] = manifest_values
+
+    params["_director_asset_manifest"] = manifest
+    return manifest
+
+
+def _create_director_video_execution_profile(
+    params: dict,
+    *,
+    model_def: Optional[dict] = None,
+    hardware: Optional[dict] = None,
+) -> dict:
+    """Record a lightweight execution profile without replacing Continuum H3 plans.
+
+    1.9.0 used this hook for hardware-normalized canvas and Turbo presets.
+    Continuum already owns H3 profiles/shot planning; keep a compatible
+    snapshot so queued revisions and tests can patch or inspect it.
+    """
+
+    video_model = str(params.get("video_model") or "")
+    video_params = dict(params.get("video_params") or {})
+    is_h3 = "minimax_h3" in video_model or video_model.endswith("_h3")
+    profile = {
+        "is_minimax_h3": is_h3,
+        "normalized_resolution": video_params.get("resolution"),
+        "gpu_vram_gb": float((hardware or {}).get("gpu_vram_gb") or 0),
+        "effective_max_frames": params.get("director_max_shot_frames"),
+        "effective_max_seconds": 0,
+        "manual_override": bool(params.get("director_max_shot_frames")),
+        "turbo_mode": False,
+    }
+    params["_director_video_execution_profile"] = profile
+    return profile
+
+
 def start_pipeline(params: dict) -> str:
     """Start a new director pipeline. Returns pipeline_id."""
     # Internal resume metadata must never be accepted from a fresh API request.
@@ -3982,6 +4561,7 @@ def start_pipeline(params: dict) -> str:
     if callable(_runtime_admission):
         _runtime_admission(params, source_remote=False)
     _validate_director_models(params)
+    _create_director_video_execution_profile(params)
     pid = uuid.uuid4().hex[:8]
 
     # Capture workspace at submission time — not at execution time
@@ -4016,13 +4596,23 @@ def start_pipeline(params: dict) -> str:
         workspace = None
         print(f"[Pipeline] No workspace, using wgp.save_path={out_dir}")
 
+    params.setdefault("_director_project_id", pid)
+    _materialize_director_assets(params, out_dir, pid)
+    prepared_plans = params.get("prepared_clip_plans")
+    if not isinstance(prepared_plans, list):
+        prepared_plans = []
+    prepared_timeline = params.get("prepared_planned_clips")
+    if not isinstance(prepared_timeline, list):
+        prepared_timeline = []
+
     pipeline = {
         "id": pid,
         "status": "queued",
         "phase": "registered",
         "auto_mode": params.get("auto_mode", True),
         "progress": {"current": 0, "total": 0, "message": "Starting...", "step": 0, "total_steps": 0},
-        "clip_plans": [],
+        "clip_plans": copy.deepcopy(prepared_plans),
+        "_planned_clips": copy.deepcopy(prepared_timeline),
         "clip_images": [],         # filenames of generated start images
         "output_files": [],
         "error": None,

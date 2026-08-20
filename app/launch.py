@@ -37068,6 +37068,118 @@ async def director_preflight(request: Request):
         "components": components,
     }
 
+def _director_queue_base(request: Request, workspace: str = "") -> str:
+    selected_workspace = _request_project_workspace(request, workspace)
+    return _require_project_access(request, selected_workspace)
+
+
+@api.get("/api/v1/director/queue")
+def director_queue_list(request: Request, workspace: str = ""):
+    """Return the persistent, project-level Director render queue."""
+    _init_pipeline()
+    from services.director_pipeline import list_director_queue
+    return list_director_queue(_director_queue_base(request, workspace))
+
+
+@api.post("/api/v1/director/queue")
+async def director_queue_add(request: Request, workspace: str = ""):
+    """Freeze a Director project revision in the held queue."""
+    _init_pipeline()
+    from services.director_pipeline import enqueue_director_pipeline
+    body = await request.json()
+    params = body.get("params") if isinstance(body, dict) else None
+    if not isinstance(params, dict):
+        raise HTTPException(status_code=400, detail="Director queue params are required")
+    if not params.get("workspace"):
+        params["workspace"] = _request_project_workspace(request, workspace)
+    try:
+        return await asyncio.to_thread(
+            enqueue_director_pipeline,
+            _director_queue_base(request, workspace),
+            params,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@api.post("/api/v1/director/queue/start")
+def director_queue_start(request: Request, workspace: str = ""):
+    _init_pipeline()
+    from services.director_pipeline import start_director_queue
+    return start_director_queue(_director_queue_base(request, workspace))
+
+
+@api.post("/api/v1/director/queue/pause")
+def director_queue_pause(request: Request, workspace: str = ""):
+    _init_pipeline()
+    from services.director_pipeline import pause_director_queue
+    return pause_director_queue(_director_queue_base(request, workspace))
+
+
+@api.post("/api/v1/director/queue/reorder")
+async def director_queue_reorder(request: Request, workspace: str = ""):
+    _init_pipeline()
+    from services.director_pipeline import reorder_director_queue
+    body = await request.json()
+    entry_ids = body.get("entry_ids") if isinstance(body, dict) else None
+    if not isinstance(entry_ids, list) or not all(isinstance(item, str) for item in entry_ids):
+        raise HTTPException(status_code=400, detail="entry_ids must be a list of queue IDs")
+    return reorder_director_queue(_director_queue_base(request, workspace), entry_ids)
+
+
+@api.get("/api/v1/director/queue/{entry_id}")
+def director_queue_get(request: Request, entry_id: str, workspace: str = ""):
+    _init_pipeline()
+    from services.director_pipeline import get_director_queue_entry
+    entry = get_director_queue_entry(_director_queue_base(request, workspace), entry_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Director queue entry not found")
+    return entry
+
+
+@api.put("/api/v1/director/queue/{entry_id}")
+async def director_queue_update(request: Request, entry_id: str, workspace: str = ""):
+    """Replace a held queue entry with the edited Director snapshot."""
+    _init_pipeline()
+    from services.director_pipeline import (
+        PipelineBusyError,
+        update_director_queue_entry,
+    )
+    body = await request.json()
+    params = body.get("params") if isinstance(body, dict) else None
+    if not isinstance(params, dict):
+        raise HTTPException(status_code=400, detail="Director queue params are required")
+    try:
+        return await asyncio.to_thread(
+            update_director_queue_entry,
+            _director_queue_base(request, workspace),
+            entry_id,
+            params,
+        )
+    except PipelineBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@api.delete("/api/v1/director/queue/{entry_id}")
+def director_queue_delete(request: Request, entry_id: str, workspace: str = ""):
+    _init_pipeline()
+    from services.director_pipeline import (
+        PipelineBusyError,
+        remove_director_queue_entry,
+    )
+    try:
+        removed = remove_director_queue_entry(
+            _director_queue_base(request, workspace), entry_id,
+        )
+    except PipelineBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not removed:
+        raise HTTPException(status_code=404, detail="Director queue entry not found")
+    return {"deleted": entry_id}
+
+
 @api.post("/api/v1/director/pipeline/start")
 async def director_pipeline_start(request: Request):
     """Start a Director pipeline (LLM planning → image gen → video gen).
@@ -64276,6 +64388,33 @@ def hold_queued_job(job_id: str, request: Request, response: Response):
         "held": mode == "held",
         "hold_after_output": mode == "after_output",
     }
+
+
+@api.post("/api/v1/jobs/queue/start")
+def start_studio_queue(request: Request, response: Response):
+    """Release every authorized held Studio job into the Continuum queue."""
+    _set_recovery_no_store(response)
+    _require_remote_queue_project(request)
+    released = []
+    for job in list(_jobs.values()):
+        if not job.get("queue_held"):
+            continue
+        job_id = str(job.get("id") or "")
+        if not job_id:
+            continue
+        try:
+            owned = _require_generic_queue_control_job(job_id, request)
+        except HTTPException:
+            continue
+        if _queue_recovery_delivery_pending(owned) is None:
+            try:
+                _require_job_runtime_model_admission(owned)
+            except HTTPException:
+                continue
+        mode = set_job_hold(owned, False)
+        if mode:
+            released.append(job_id)
+    return {"released": released, "job_ids": released}
 
 
 @api.post("/api/v1/queue/{job_id}/resume")

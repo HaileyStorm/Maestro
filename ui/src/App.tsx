@@ -15,6 +15,7 @@ import { H3GenerationPlanDialog } from './components/H3GenerationPlanDialog'
 import { RecipesOverlay } from './components/Recipes/RecipesOverlay'
 import { WhatsNewButton, WhatsNewDialogHost } from './components/WhatsNewDialog'
 import { AccountSupportButton, AccountSupportDrawer } from './components/AccountSupport/AccountSupportDrawer'
+import { GlobalQueuePopover } from './components/GlobalQueuePopover'
 import { useStore } from './stores/useStore'
 import { useIsMobile } from './lib/useIsMobile'
 import { POLL_INTERVAL_MS, useVisibilityPolling } from './lib/useVisibilityPolling'
@@ -373,6 +374,7 @@ function App() {
             <WhatsNewButton compact />
           </div>
           <div className="flex items-center gap-1">
+            <GlobalQueuePopover iconSize={20} panelAlign="header-edge" />
             <AccountSupportButton compact />
             {machineControls ? (
               <button
@@ -399,7 +401,8 @@ function App() {
       <H3GenerationPlanDialog />
       <WhatsNewDialogHost />
       {!isMobile && (
-        <div className="fixed right-3 top-3 z-40">
+        <div className="fixed right-3 top-3 z-40 flex items-center gap-1">
+          <GlobalQueuePopover iconSize={16} />
           <AccountSupportButton />
         </div>
       )}

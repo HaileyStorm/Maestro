@@ -818,6 +818,87 @@ export async function resumeQueueJob(jobId: string) {
   return res.json()
 }
 
+export async function startStudioQueue() {
+  const res = await fetch(`${BASE}/api/v1/jobs/queue/start`, { method: 'POST' })
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Start studio queue failed')
+  return res.json()
+}
+
+export type DirectorQueueEntry = {
+  id: string
+  status: string
+  message?: string
+  pipeline_id?: string | null
+  scene_description?: string
+  params?: Record<string, unknown>
+}
+
+export type DirectorQueueState = {
+  paused?: boolean
+  running?: boolean
+  entries: DirectorQueueEntry[]
+}
+
+export async function fetchDirectorQueue(): Promise<DirectorQueueState> {
+  const res = await fetch(`${BASE}/api/v1/director/queue`)
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Director queue failed')
+  return res.json()
+}
+
+export async function fetchDirectorQueueEntry(entryId: string) {
+  const res = await fetch(`${BASE}/api/v1/director/queue/${encodeURIComponent(entryId)}`)
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Director queue entry failed')
+  return res.json()
+}
+
+export async function enqueueDirectorPipeline(params: Record<string, unknown>) {
+  const res = await fetch(`${BASE}/api/v1/director/queue`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ params }),
+  })
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Queue Director project failed')
+  return res.json()
+}
+
+export async function startDirectorQueue() {
+  const res = await fetch(`${BASE}/api/v1/director/queue/start`, { method: 'POST' })
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Start Director queue failed')
+  return res.json()
+}
+
+export async function pauseDirectorQueue() {
+  const res = await fetch(`${BASE}/api/v1/director/queue/pause`, { method: 'POST' })
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Pause Director queue failed')
+  return res.json()
+}
+
+export async function reorderDirectorQueue(entryIds: string[]) {
+  const res = await fetch(`${BASE}/api/v1/director/queue/reorder`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ entry_ids: entryIds }),
+  })
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Reorder Director queue failed')
+  return res.json()
+}
+
+export async function updateDirectorQueueEntry(entryId: string, params: Record<string, unknown>) {
+  const res = await fetch(`${BASE}/api/v1/director/queue/${encodeURIComponent(entryId)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ params }),
+  })
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Update Director queue failed')
+  return res.json()
+}
+
+export async function deleteDirectorQueueEntry(entryId: string) {
+  const res = await fetch(`${BASE}/api/v1/director/queue/${encodeURIComponent(entryId)}`, { method: 'DELETE' })
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Remove Director queue failed')
+  return res.json()
+}
+
 export async function startQueueJobNext(jobId: string) {
   const res = await fetch(`${BASE}/api/v1/queue/${encodeURIComponent(jobId)}/start-next`, { method: 'POST' })
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Start next failed')
