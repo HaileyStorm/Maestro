@@ -788,6 +788,7 @@ def validate_turbo_request(
     loras_multipliers: Any = None,
     skip_steps_cache_type: Any = None,
     _h3_turbo_validation_authorized: bool = False,
+    allow_unvalidated_ref2va: bool = False,
 ) -> bool:
     """Validate the initial fail-closed Turbo compatibility matrix."""
     if not turbo_requested(custom_settings):
@@ -813,6 +814,7 @@ def validate_turbo_request(
         if (
             not validation["passed"]
             and _h3_turbo_validation_authorized is not True
+            and allow_unvalidated_ref2va is not True
         ):
             raise H3TurboCompatibilityError(
                 "H3 Turbo Ref2VA is structurally compatible but unavailable by default until its 4/8 "

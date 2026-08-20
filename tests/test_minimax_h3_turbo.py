@@ -560,6 +560,21 @@ class TestH3TurboSchedulingAndPolicy(unittest.TestCase):
                     authored_steps=4,
                 )
             )
+            with tempfile.TemporaryDirectory() as unauthorized:
+                with mock.patch.object(
+                    h3_turbo,
+                    "_DEFAULT_MANAGED_ROOT",
+                    Path(unauthorized),
+                ):
+                    self.assertTrue(
+                        h3_turbo.validate_turbo_request(
+                            base_model_type="minimax_h3_ref2va",
+                            model_def=model_def,
+                            custom_settings=_turbo_settings(),
+                            authored_steps=4,
+                            allow_unvalidated_ref2va=True,
+                        )
+                    )
             matrix = h3_turbo.turbo_compatibility_matrix()
             self.assertEqual(matrix["variants"]["ref2va_fp8"]["status"], "ready")
             self.assertEqual(matrix["cache"]["tea"]["status"], "unsupported")
@@ -705,6 +720,123 @@ class TestH3TurboIntegrationSource(unittest.TestCase):
         self.assertIn(h3_turbo.H3_TURBO_NODE_COMMIT, source)
         self.assertIn(h3_turbo.H3_TURBO_LORA_SHA256, source)
         self.assertIn(h3_turbo.H3_TURBO_GRID_SHA256, source)
+
+
+class TestH3TurboContinuumHonesty(unittest.TestCase):
+    def _ref2va_model_def(self) -> dict:
+        return {
+            "URLs": [h3_turbo.H3_TURBO_REF2VA_CHECKPOINT],
+            "minimax_h3_reference_mode": True,
+        }
+
+    def test_incomplete_asset_update_never_reports_available_or_verified(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            missing = h3_turbo.turbo_assets_status(root)
+            self.assertFalse(missing["available"])
+            self.assertIsNone(missing.get("verified"))
+            self.assertNotIn("verified", json.dumps(missing).lower())
+
+            (root / h3_turbo._MANIFEST_FILENAME).write_text(
+                json.dumps({
+                    "version": h3_turbo._MANIFEST_VERSION,
+                    "profile_id": h3_turbo.H3_TURBO_PROFILE_ID,
+                    "lora_revision": h3_turbo.H3_TURBO_LORA_REVISION,
+                    "node_commit": h3_turbo.H3_TURBO_NODE_COMMIT,
+                    "release": h3_turbo._release_name(),
+                }),
+                encoding="utf-8",
+            )
+            (root / "releases" / h3_turbo._release_name()).mkdir(parents=True)
+            stale = h3_turbo.turbo_assets_status(root)
+            self.assertFalse(stale["available"])
+            self.assertIsNone(stale.get("verified"))
+            self.assertNotIn("verified", json.dumps(stale).lower())
+            self.assertNotIn("ready", str(stale["reason"]).lower())
+
+    def test_unvalidated_bypass_is_exact_true_and_does_not_publish_gates(self):
+        model_def = self._ref2va_model_def()
+        request = {
+            "base_model_type": "minimax_h3_ref2va",
+            "model_def": model_def,
+            "custom_settings": _turbo_settings(),
+            "authored_steps": 4,
+        }
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            h3_turbo,
+            "_DEFAULT_MANAGED_ROOT",
+            Path(temporary),
+        ):
+            for forged in ("true", 1, "1"):
+                with self.subTest(forged=forged):
+                    with self.assertRaisesRegex(
+                        h3_turbo.H3TurboCompatibilityError,
+                        "visual gates",
+                    ):
+                        h3_turbo.validate_turbo_request(
+                            **request,
+                            allow_unvalidated_ref2va=forged,
+                        )
+                    with self.assertRaisesRegex(
+                        h3_turbo.H3TurboCompatibilityError,
+                        "visual gates",
+                    ):
+                        h3_turbo.validate_turbo_request(
+                            **request,
+                            _h3_turbo_validation_authorized=forged,
+                        )
+            self.assertTrue(
+                h3_turbo.validate_turbo_request(
+                    **request,
+                    allow_unvalidated_ref2va=True,
+                )
+            )
+            status = h3_turbo.ref2va_live_validation_status()
+            self.assertFalse(status["passed"])
+            self.assertIsNone(status.get("verified"))
+            matrix = h3_turbo.turbo_compatibility_matrix()
+            self.assertEqual(
+                matrix["variants"]["ref2va_fp8"]["status"],
+                "live_visual_gate_required",
+            )
+            self.assertNotIn("verified", json.dumps(matrix).lower())
+            self.assertFalse(
+                (Path(temporary) / h3_turbo._REF2VA_VALIDATION_FILENAME).exists()
+            )
+
+    def test_custom_settings_cannot_inject_unvalidated_bypass(self):
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            h3_turbo,
+            "_DEFAULT_MANAGED_ROOT",
+            Path(temporary),
+        ):
+            with self.assertRaisesRegex(
+                h3_turbo.H3TurboCompatibilityError,
+                "visual gates",
+            ) as raised:
+                h3_turbo.validate_turbo_request(
+                    base_model_type="minimax_h3_ref2va",
+                    model_def=self._ref2va_model_def(),
+                    custom_settings={
+                        **_turbo_settings(),
+                        "allow_unvalidated_ref2va": True,
+                        "h3_turbo_validation_authorized": True,
+                    },
+                    authored_steps=4,
+                )
+            message = str(raised.exception)
+            self.assertNotIn("cuda_oom", message)
+            self.assertNotIn("GPU OOM", message)
+            self.assertNotIn("verified", message.lower())
+
+    def test_continuum_start_is_not_replaced_by_sol_or_turbo(self):
+        start = (_ROOT / "start.js").read_text(encoding="utf-8")
+        self.assertIn("python launch.py", start)
+        self.assertIn('venv: "env"', start)
+        self.assertNotIn("require(\"./start_sol\")", start)
+        self.assertNotIn("MAESTRO_SOL_RUNTIME", start)
+        self.assertNotIn("allow_unvalidated_ref2va", start)
+        self.assertNotIn("h3_turbo", start)
 
 
 if __name__ == "__main__":
