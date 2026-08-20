@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef, useMemo, useEffect } from 'react'
-import { Upload, Loader2, Music, RotateCcw, Check, X, ChevronRight, ChevronDown, ImageIcon, Play, Film, Mic, Sparkles, Send, Users, FileText, Clock, Download, HardDrive, Settings } from 'lucide-react'
+import { Upload, Loader2, Music, RotateCcw, Check, X, ChevronRight, ChevronDown, ImageIcon, Play, ListPlus, Film, Mic, Sparkles, Send, Users, FileText, Clock, Download, HardDrive, Settings } from 'lucide-react'
 import { useStore, getFamiliesForMode, getModelsForFamily, isDirectorPipelineActive, resolveDeclaredResolution } from '../../stores/useStore'
 import { downloadModel, estimateH3Performance, fetchDefaults, fetchModelOptions, getDirectorHostActionAccessState, getFileUrl, verifyManualCheckpoint, waitForModelDownloadTerminal } from '../../api/client'
 import type { DirectorFailureComponent, DirectorImageRoleCandidate, DirectorReadinessReason } from '../../api/client'
@@ -458,6 +458,7 @@ export function DirectorChat() {
   const generateStartImages = useStore(s => s.directorGenerateStartImages)
   const applyToClips = useStore(s => s.directorApplyToClips)
   const directorGenerate = useStore(s => s.directorGenerate)
+  const queueCurrentDirectorPipeline = useStore(s => s.queueCurrentDirectorPipeline)
   const editClipPlan = useStore(s => s.directorEditClipPlan)
   const reset = useStore(s => s.directorReset)
   const speakers = useStore(s => s.directorSpeakers)
@@ -1148,6 +1149,7 @@ export function DirectorChat() {
               editClipPlan={editClipPlan}
               planVideoPrompts={isShortFilm ? shortFilmPlanVideoPrompts : planVideoPrompts}
               directorGenerate={directorGenerate}
+              queueCurrentDirectorPipeline={queueCurrentDirectorPipeline}
               applyToClips={applyToClips}
               loading={loading}
               isShortFilm={isShortFilm}
@@ -3281,7 +3283,7 @@ function ImageGenView({
 
 function VideoPromptsReview({
   clipPlans, plannedClips, clipImages, speakerMappings, editClipPlan,
-  planVideoPrompts, directorGenerate, applyToClips, loading, isShortFilm,
+  planVideoPrompts, directorGenerate, queueCurrentDirectorPipeline, applyToClips, loading, isShortFilm,
   isGenerating, isAutoGenerating,
 }: {
   clipPlans: ReturnType<typeof useStore.getState>['directorClipPlans']
@@ -3291,6 +3293,7 @@ function VideoPromptsReview({
   editClipPlan: (index: number, field: 'video_prompt' | 'image_prompt', value: string) => void
   planVideoPrompts: () => Promise<void>
   directorGenerate: () => void
+  queueCurrentDirectorPipeline: () => Promise<void>
   applyToClips: () => void
   loading: boolean
   isShortFilm?: boolean
@@ -3399,12 +3402,22 @@ function VideoPromptsReview({
             {isAutoGenerating ? 'Auto Generating...' : 'Generating...'}
           </button>
         ) : (
-          <button
-            onClick={directorGenerate}
-            className="w-full py-2.5 rounded-lg bg-accent-green hover:bg-accent-green-hover text-white text-sm font-semibold transition-colors flex items-center justify-center gap-1.5"
-          >
-            <Play size={14} fill="white" /> Generate
-          </button>
+          <div className="grid grid-cols-[1fr_auto] gap-1.5">
+            <button
+              onClick={directorGenerate}
+              className="w-full py-2.5 rounded-lg bg-accent-green hover:bg-accent-green-hover text-white text-sm font-semibold transition-colors flex items-center justify-center gap-1.5"
+            >
+              <Play size={14} fill="white" /> Generate
+            </button>
+            <button
+              type="button"
+              onClick={() => { void queueCurrentDirectorPipeline() }}
+              title="Hold this complete project in the persistent queue without starting it"
+              className="px-3 py-2.5 rounded-lg border border-border text-text-secondary hover:bg-bg-hover hover:text-text-primary transition-colors"
+            >
+              <ListPlus size={14} />
+            </button>
+          </div>
         )}
         <button
           onClick={applyToClips}

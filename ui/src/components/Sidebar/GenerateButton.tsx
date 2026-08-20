@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Play, AlertTriangle } from 'lucide-react'
+import { Play, AlertTriangle, ListPlus } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import { H3EstimateBadge } from './H3PerformanceProfiles'
 import { projectLogicalQueue } from '../../lib/queueProjection'
@@ -87,15 +87,19 @@ export function GenerateButton() {
     return () => clearTimeout(timer)
   }, [cooldown])
 
-  const handleClick = () => {
+  const imageMode = useStore(s => s.params.image_mode)
+  const queueSupported = generationMode !== 'avatar' && imageMode !== 4
+
+  const handleClick = (mode: 'now' | 'queue' = 'now') => {
     if (blocked) return
+    if (mode === 'queue' && !queueSupported) return
     setCooldown(true)
-    startGeneration()
-    setSidebarOpen(false)
+    startGeneration(mode)
+    if (mode === 'now') setSidebarOpen(false)
   }
 
   const queueCount = projectLogicalQueue(jobs).visibleJobs.filter(job =>
-    job.status === 'queued' || job.status === 'running'
+    job.status === 'queued' || job.status === 'running' || job.held
   ).length
 
   if (blocked) {
@@ -131,14 +135,23 @@ export function GenerateButton() {
       : undefined
     return (
       <div className="flex flex-col items-end gap-0.5">
-        <button
-          disabled
-          title={title}
-          className="px-4 py-2 rounded-lg flex items-center gap-1.5 bg-amber-500/20 text-indicator-warning cursor-not-allowed text-xs font-medium whitespace-nowrap"
-        >
-          <AlertTriangle size={13} />
-          {label}
-        </button>
+        <div className="grid grid-cols-[1fr_auto] overflow-hidden rounded-lg">
+          <button
+            disabled
+            title={title}
+            className="px-4 py-2 flex items-center gap-1.5 bg-amber-500/20 text-indicator-warning cursor-not-allowed text-xs font-medium whitespace-nowrap"
+          >
+            <AlertTriangle size={13} />
+            {label}
+          </button>
+          <button
+            disabled
+            title={title || 'Need a complete request before adding to the queue'}
+            className="px-2.5 py-2 bg-amber-500/15 text-indicator-warning cursor-not-allowed border-l border-amber-500/20"
+          >
+            <ListPlus size={13} />
+          </button>
+        </div>
         {isH3 && <H3EstimateBadge estimate={h3Estimate} loading={h3EstimateLoading} downloadRequired={h3DownloadRequired} />}
       </div>
     )
@@ -146,21 +159,34 @@ export function GenerateButton() {
 
   return (
     <div className="flex flex-col items-end gap-0.5">
-      <button
-        onClick={handleClick}
-        disabled={cooldown}
-        className={`px-4 py-2 rounded-lg flex items-center gap-1.5 font-medium text-xs transition-all whitespace-nowrap ${
-          cooldown
-            ? 'bg-bg-active text-text-muted cursor-not-allowed'
-            // The CTA gradient, foreground, and glow all resolve through
-            // theme tokens so the label stays readable without changing
-            // the current theme's action identity.
-            : 'bg-cta shadow-accent-glow text-cta-foreground hover:ring-2 hover:ring-accent-blue/40'
-        }`}
-      >
-        <Play size={13} fill="currentColor" />
-        {cooldown ? 'Queued' : queueCount > 0 ? `Go (${queueCount})` : 'Generate'}
-      </button>
+      <div className="grid grid-cols-[1fr_auto] overflow-hidden rounded-lg shadow-accent-glow">
+        <button
+          onClick={() => handleClick('now')}
+          disabled={cooldown}
+          className={`px-4 py-2 flex items-center gap-1.5 font-medium text-xs transition-all whitespace-nowrap ${
+            cooldown
+              ? 'bg-bg-active text-text-muted cursor-not-allowed'
+              : 'bg-cta text-cta-foreground hover:ring-2 hover:ring-accent-blue/40'
+          }`}
+        >
+          <Play size={13} fill="currentColor" />
+          {cooldown ? 'Queued' : queueCount > 0 ? `Go (${queueCount})` : 'Generate'}
+        </button>
+        <button
+          onClick={() => handleClick('queue')}
+          disabled={cooldown || !queueSupported}
+          title={queueSupported
+            ? 'Hold current Studio settings in the queue without starting generation'
+            : 'Hold is unavailable for this Avatar or edit workflow'}
+          className={`px-2.5 py-2 border-l border-white/10 ${
+            cooldown || !queueSupported
+              ? 'bg-bg-active text-text-muted cursor-not-allowed'
+              : 'bg-cta text-cta-foreground hover:ring-2 hover:ring-accent-blue/40'
+          }`}
+        >
+          <ListPlus size={13} />
+        </button>
+      </div>
       {isH3 && <H3EstimateBadge estimate={h3Estimate} loading={h3EstimateLoading} downloadRequired={h3DownloadRequired} />}
     </div>
   )

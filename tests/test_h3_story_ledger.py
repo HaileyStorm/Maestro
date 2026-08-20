@@ -21,7 +21,7 @@ from services.h3_story_ledger import (  # noqa: E402
     sanitize_h3_prompt_text,
     segment_violations,
 )
-from services.h3_window_planner import (  # noqa: E402
+from services.h3_planner_helpers import (  # noqa: E402
     compile_h3_window_prompts,
     compute_h3_window_boundaries,
 )

@@ -19,7 +19,7 @@ from services.h3_story_ledger import (
     plan_h3_story_segments,
     recover_h3_plain_story,
 )
-from services.h3_window_planner import (
+from services.h3_planner_helpers import (
     _UNREQUESTED_SPECTACLE_PATTERNS,
     _compact,
     _fallback_plan,

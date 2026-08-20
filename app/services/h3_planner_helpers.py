@@ -1,0 +1,615 @@
+"""Continuum-safe H3 planner helpers extracted from 1.9.0 window planning.
+
+This is not the deleted sliding-window architecture. Sequence and story
+planners only need geometry, shot compilation, and JSON repair helpers.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import re
+from typing import Any, Iterable
+
+from services.h3_story_ledger import (
+    UNREQUESTED_SPECTACLE_PATTERNS,
+    sanitize_h3_prompt_text,
+)
+
+_CAMERA_COVERAGE_VALUES = {"auto", "continuous", "multi_shot"}
+_UNREQUESTED_SPECTACLE_PATTERNS = UNREQUESTED_SPECTACLE_PATTERNS
+
+
+def normalize_h3_camera_coverage(value: Any) -> str:
+    """Return the stable camera-coverage value used by UI and API callers."""
+
+    normalized = str(value or "auto").strip().casefold().replace("-", "_")
+    return normalized if normalized in _CAMERA_COVERAGE_VALUES else "auto"
+
+
+def compute_h3_window_boundaries(
+    total_frames: int,
+    window_frames: int,
+    *,
+    fps: float = 24.0,
+    overlap_frames: int = 1,
+    discard_frames: int = 0,
+) -> list[dict[str, Any]]:
+    """Return the exact committed-output span owned by every H3 pass."""
+
+    total = max(1, int(total_frames))
+    window = max(1, int(window_frames))
+    fps_value = max(1.0, float(fps))
+    overlap = max(0, min(window - 1, int(overlap_frames)))
+    discard = max(0, min(window - overlap - 1, int(discard_frames)))
+    stride = max(1, window - overlap - discard)
+
+    if total <= window:
+        count = 1
+    else:
+        left_after_first = total - window + discard
+        count = 1 + int(math.ceil(left_after_first / float(stride)))
+
+    boundaries: list[dict[str, Any]] = []
+    committed_start = 0
+    for index in range(count):
+        committed_length = window if index == 0 else stride
+        committed_end = min(total, committed_start + committed_length)
+        boundaries.append(
+            {
+                "index": index + 1,
+                "start_frame": committed_start,
+                "end_frame": committed_end,
+                "start_seconds": round(committed_start / fps_value, 3),
+                "end_seconds": round(committed_end / fps_value, 3),
+            }
+        )
+        committed_start = committed_end
+    return boundaries
+
+
+def _compact(value: Any, limit: int) -> str:
+    text = sanitize_h3_prompt_text(value).strip(" \t\r\n-.,;:!?")
+    if len(text) <= limit:
+        return text
+    prefix = text[: limit + 1]
+    # Prefer a complete sentence, then a complete clause. The old hard word
+    # cut produced fragments such as "The road continues toward the.." and
+    # "His posture is..", which are actively harmful inside an H3 prompt.
+    sentence_ends = [
+        match.end()
+        for match in re.finditer(r"[.!?](?=\s|$)", prefix)
+        if match.end() >= max(36, int(limit * 0.35))
+    ]
+    if sentence_ends:
+        shortened = prefix[: sentence_ends[-1]]
+    else:
+        clause_ends = [
+            match.start()
+            for match in re.finditer(r"[,;:](?=\s|$)", prefix)
+            if match.start() >= max(36, int(limit * 0.45))
+        ]
+        if clause_ends:
+            shortened = prefix[: clause_ends[-1]]
+        else:
+            shortened = prefix[:limit].rsplit(" ", 1)[0]
+    return shortened.rstrip(" \t\r\n-.,;:!?")
+
+
+def _dialogue_sentence(item: Any, speaker_ids: dict[str, str]) -> str:
+    if not isinstance(item, dict):
+        return ""
+    text = " ".join(str(item.get("text") or "").split()).strip()
+    if not text:
+        return ""
+    speaker = _compact(item.get("speaker") or "Speaker", 80)
+    key = speaker.casefold()
+    requested_id = str(item.get("speaker_id") or "").upper().strip("() ")
+    if not re.fullmatch(r"S\d+", requested_id):
+        requested_id = speaker_ids.get(key) or f"S{len(speaker_ids) + 1}"
+    speaker_ids.setdefault(key, requested_id)
+    stable_id = speaker_ids[key]
+    language = _compact(item.get("language") or "English", 30)
+    delivery = _compact(item.get("delivery") or "speaks naturally", 100)
+    action = _compact(item.get("action") or "", 120)
+    lead = f"{speaker} ({stable_id}) {delivery}"
+    if action:
+        lead += f" while {action}"
+    return f"{lead}: <d>[{language}] {text}</d>. Immediately after the line, the speaker closes their mouth."
+
+
+def _window_dialogue_items(item: dict[str, Any]) -> list[Any]:
+    """Read dialogue from the v2 shot list or a v1 saved planner object."""
+
+    nested: list[Any] = []
+    for shot in item.get("shots") or []:
+        if isinstance(shot, dict):
+            nested.extend(shot.get("dialogue") or [])
+    if nested:
+        return nested
+    return list(item.get("dialogue") or [])
+
+
+def _normalized_window_shots(
+    item: dict[str, Any],
+    duration: float,
+) -> list[dict[str, Any]]:
+    """Normalize planner shots and retain compatibility with v1 plans."""
+
+    raw_shots = [
+        shot for shot in (item.get("shots") or [])
+        if isinstance(shot, dict)
+    ]
+    if not raw_shots:
+        action = _compact(item.get("action"), 430)
+        if not action:
+            return []
+        raw_shots = [{
+            "shot": 1,
+            "start_seconds": 0.0,
+            "end_seconds": duration,
+            "transition": "opening composition",
+            "framing": "the established cinematic composition",
+            "camera": "the camera follows the visible action naturally",
+            "action": action,
+            "dialogue": item.get("dialogue") or [],
+            "sound_effects": item.get("sound_effects") or "N/A",
+        }]
+
+    normalized: list[dict[str, Any]] = []
+    cursor = 0.0
+    count = len(raw_shots)
+    minimum_shot = min(0.75, max(0.1, duration / max(1, count * 2)))
+    for index, raw in enumerate(raw_shots):
+        # The planner proposes cut points, but the compiler owns a complete
+        # local timeline. Snap every shot to the preceding end so malformed
+        # LLM times cannot leave dead gaps or overlapping instructions.
+        start = 0.0 if index == 0 else cursor
+        start = min(max(0.0, start), max(0.0, duration - minimum_shot))
+        default_end = duration * (index + 1) / max(1, count)
+        try:
+            requested_end = float(raw.get("end_seconds", default_end))
+        except (TypeError, ValueError):
+            requested_end = default_end
+        end = duration if index + 1 == count else requested_end
+        remaining_shots = count - index - 1
+        latest_end = duration - minimum_shot * remaining_shots
+        end = min(latest_end, max(start + minimum_shot, end))
+        normalized.append({
+            "shot": index + 1,
+            "start_seconds": round(start, 3),
+            "end_seconds": round(end, 3),
+            "transition": _compact(
+                raw.get("transition") or ("opening composition" if index == 0 else "hard cut"),
+                70,
+            ),
+            "framing": _compact(raw.get("framing") or "cinematic medium shot", 130),
+            "camera": _compact(raw.get("camera") or "the camera follows the action", 170),
+            "action": _compact(raw.get("action"), 330),
+            "dialogue": list(raw.get("dialogue") or []),
+            "sound_effects": _compact(raw.get("sound_effects") or "N/A", 130),
+        })
+        cursor = end
+    normalized[-1]["end_seconds"] = round(duration, 3)
+    return normalized
+
+
+def _shot_prompt_sentence(
+    shot: dict[str, Any],
+    *,
+    speaker_ids: dict[str, str],
+    preamble: str = "",
+) -> str:
+    number = int(shot["shot"])
+    start = float(shot["start_seconds"])
+    end = float(shot["end_seconds"])
+    transition = _compact(shot.get("transition"), 70)
+    framing = _compact(shot.get("framing"), 130)
+    camera = _compact(shot.get("camera"), 170)
+    action = _compact(shot.get("action"), 330)
+
+    if number == 1:
+        lead = f"[Shot 1] {preamble} From {start:.2f} to {end:.2f} seconds, {framing}".strip()
+    elif transition.casefold().startswith(("continuous", "without a cut", "reframe")):
+        lead = (
+            f"[Shot {number}] At {start:.2f} seconds, without a cut, "
+            f"reframe to {framing}; continue through {end:.2f} seconds"
+        )
+    else:
+        lead = (
+            f"[Shot {number}] At {start:.2f} seconds, {transition or 'hard cut'} "
+            f"to {framing}; continue through {end:.2f} seconds"
+        )
+    details = "; ".join(part for part in (camera, action) if part)
+    sentence = f"{lead}; {details}." if details else f"{lead}."
+    dialogue = " ".join(
+        value
+        for value in (
+            _dialogue_sentence(line, speaker_ids)
+            for line in (shot.get("dialogue") or [])
+        )
+        if value
+    )
+    return f"{sentence} {dialogue}".strip()
+
+
+def compile_h3_window_prompts(
+    plan: dict[str, Any],
+    boundaries: Iterable[dict[str, Any]],
+    *,
+    has_start_image: bool = False,
+    has_end_image: bool = False,
+    injected_keyframes: Iterable[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Compile a planner JSON object into complete, window-local H3 prompts."""
+
+    spans = list(boundaries)
+    windows = plan.get("windows") if isinstance(plan, dict) else None
+    if not isinstance(windows, list) or len(windows) != len(spans):
+        raise ValueError(
+            f"H3 window planner returned {len(windows or [])} windows; expected {len(spans)}."
+        )
+
+    subjects = _compact(plan.get("subject_continuity"), 260)
+    setting = _compact(plan.get("setting_continuity"), 190)
+    visual = _compact(plan.get("visual_continuity"), 150)
+    initial_state = _compact(plan.get("initial_state"), 170)
+    ambient = _compact(plan.get("ambient_audio") or "Natural location ambience", 150)
+    music = _compact(plan.get("music") or "N/A", 100)
+    shared_visual = ". ".join(item for item in (subjects, setting, visual) if item)
+    speaker_ids: dict[str, str] = {}
+    compiled: list[dict[str, Any]] = []
+    timed_keyframes = list(injected_keyframes or [])
+    previous_closing = initial_state or "The requested scene is established in its opening composition"
+
+    for position, (span, item) in enumerate(zip(spans, windows)):
+        if not isinstance(item, dict):
+            raise ValueError(f"H3 window {position + 1} is not an object.")
+        closing = _compact(item.get("closing_state"), 180)
+        if not closing:
+            closing = "The action holds in a concrete state ready to continue" if position + 1 < len(spans) else "The requested final beat settles naturally"
+
+        duration = max(0.1, float(span["end_seconds"]) - float(span["start_seconds"]))
+        shots = _normalized_window_shots(item, duration)
+        if not shots or not any(shot.get("action") for shot in shots):
+            raise ValueError(f"H3 window {position + 1} has no visible action.")
+        effects = "; ".join(
+            effect
+            for effect in (
+                _compact(shot.get("sound_effects"), 130)
+                for shot in shots
+            )
+            if effect.casefold() not in {"", "n/a", "none", "no one-time effect"}
+        )
+        if not effects:
+            effects = _compact(
+                item.get("sound_effects") or "No one-time effect",
+                150,
+            )
+        continuity_instruction = (
+            "This is the opening continuation window."
+            if position == 0
+            else "Begin by matching the supplied previous frame exactly; do not restart, recap, or repeat earlier action."
+        )
+        outcome_instruction = (
+            "The central outcome remains unresolved at this boundary."
+            if position + 1 < len(spans)
+            else "Complete the requested outcome only in this final window."
+        )
+        dialogue_items = _window_dialogue_items(item)
+        dialogue = any(
+            isinstance(dialogue_item, dict)
+            and str(dialogue_item.get("text") or "").strip()
+            for dialogue_item in dialogue_items
+        )
+        silence = (
+            "Only the tagged lines are spoken once in order. Outside those lines, everyone is silent with mouths closed; no background voices, muttering, or gibberish."
+            if dialogue
+            else "Everyone remains silent with mouths closed throughout this window; no voices, muttering, or gibberish."
+        )
+
+        picture_instructions: list[str] = []
+        next_picture_index = 1
+        if position > 0 or has_start_image:
+            picture_instructions.append(
+                f"For the target video, at 0.00 seconds into the target video, "
+                f"<Picture {next_picture_index}> is fully referenced."
+            )
+            next_picture_index += 1
+        if has_end_image and position + 1 == len(spans):
+            picture_instructions.append(
+                f"At {duration:.2f} seconds, <Picture {next_picture_index}> "
+                "is the required final-frame destination."
+            )
+            next_picture_index += 1
+        window_keyframes: list[dict[str, Any]] = []
+        for keyframe in timed_keyframes:
+            if not isinstance(keyframe, dict) or int(keyframe.get("window") or 0) != position + 1:
+                continue
+            local_seconds = max(0.0, float(keyframe.get("local_seconds") or 0.0))
+            mapped = {
+                **keyframe,
+                "picture_index": next_picture_index,
+            }
+            window_keyframes.append(mapped)
+            picture_instructions.append(
+                f"At {local_seconds:.2f} seconds into this window, "
+                f"<Picture {next_picture_index}> is fully referenced as an exact "
+                "injected frame; the visible action must arrive at it naturally "
+                "and continue from it without an unrequested cut."
+            )
+            next_picture_index += 1
+
+        coverage = _compact(item.get("coverage") or "auto cinematic coverage", 80)
+        pacing = _compact(item.get("pacing") or "natural real-time pacing", 100)
+        preamble = " ".join([
+            f"{shared_visual or 'A coherent cinematic scene'}.",
+            continuity_instruction,
+            f"At 0.00 seconds, {previous_closing}.",
+            f"Coverage is {coverage}; pacing is {pacing}. Slow motion occurs only when explicitly requested.",
+        ])
+        visual_parts = [
+            _shot_prompt_sentence(
+                shot,
+                speaker_ids=speaker_ids,
+                preamble=preamble if shot_index == 0 else "",
+            )
+            for shot_index, shot in enumerate(shots)
+        ]
+        visual_parts.extend(
+            [
+                silence,
+                outcome_instruction,
+                f"The window ends with {closing}.",
+            ]
+        )
+        soundscape = ambient
+        if position > 0:
+            soundscape += "; the same ambience continues seamlessly without restarting"
+        if effects and effects.casefold() not in {"n/a", "none", "no one-time effect"}:
+            soundscape += f". Synchronized effects in this window: {effects}"
+        music_value = music
+        if music.casefold() != "n/a" and position > 0:
+            music_value = f"{music}; continue seamlessly from the preceding window without restarting"
+
+        prompt_parts = picture_instructions + [
+            f"integrated_multimodal_description: {' '.join(visual_parts)}",
+            f"overall_soundscape: {soundscape}.",
+            f"non_diegetic_music: {music_value}",
+        ]
+        prompt = "\n\n".join(prompt_parts)
+        compiled.append(
+            {
+                **span,
+                "title": _compact(item.get("title") or f"Window {position + 1}", 80),
+                "opening_state": previous_closing,
+                "closing_state": closing,
+                "coverage": coverage,
+                "pacing": pacing,
+                "shot_count": len(shots),
+                "shots": shots,
+                "injected_keyframes": window_keyframes,
+                "prompt": prompt,
+            }
+        )
+        previous_closing = closing
+    return compiled
+
+
+def _parse_json_object(text: str) -> dict[str, Any] | None:
+    cleaned = str(text or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    candidates = [cleaned]
+    match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+    if match and match.group(0) != cleaned:
+        candidates.append(match.group(0))
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate)
+            if isinstance(value, dict):
+                return value
+        except json.JSONDecodeError:
+            continue
+    try:
+        import json_repair
+
+        value = json_repair.loads(cleaned)
+        return value if isinstance(value, dict) else None
+    except Exception:
+        return None
+
+
+def _narrative_dialogue_expected(prompt: str, window_count: int) -> bool:
+    """Return whether a long character interaction should not be all-mute."""
+
+    source = " ".join(str(prompt or "").split())
+    lowered = source.casefold()
+    if int(window_count) < 2:
+        return False
+    if re.search(
+        r"\b(?:silent|silently|no dialogue|without dialogue|nonverbal|"
+        r"music video|montage|instrumental|landscape|establishing shot)\b",
+        lowered,
+    ):
+        return False
+    if re.search(r"\".+?\"", source):
+        return True
+    interaction = re.search(
+        r"\b(?:talk|speak|say|ask|answer|discuss|argue|confront|attack|"
+        r"threaten|rescue|save|protect|warn|interview|can't believe|"
+        r"cannot believe|disbelie|astonish|surpris)\w*\b",
+        lowered,
+    )
+    # Two distinct multi-token proper names are a conservative signal that
+    # this is a character scene rather than a generic action montage.
+    names = {
+        match.group(0).casefold()
+        for match in re.finditer(
+            r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b",
+            source,
+        )
+    }
+    return bool(interaction and len(names) >= 2)
+
+
+def _infer_camera_coverage(prompt: str, requested: str = "auto") -> str:
+    requested = normalize_h3_camera_coverage(requested)
+    if requested != "auto":
+        return requested
+    lowered = str(prompt or "").casefold()
+    if re.search(
+        r"\b(?:single[- ]take|one[- ]take|unbroken|continuous tracking|no cuts?)\b",
+        lowered,
+    ):
+        return "continuous"
+    if re.search(
+        r"\b(?:fight|battle|chase|attack|trailer|montage|high[- ]speed|"
+        r"fast[- ]paced|rapid|dynamic action|argument|interview|conversation|"
+        r"talk|dialogue|multi[- ]shot|camera cuts?|shot[- /]reverse[- ]shot)\b",
+        lowered,
+    ):
+        return "multi_shot"
+    return "continuous"
+
+
+def _fallback_plan(
+    prompt: str,
+    window_count: int,
+    *,
+    window_durations: list[float] | None = None,
+    camera_coverage: str = "auto",
+) -> dict[str, Any]:
+    """A no-LLM fallback that never exposes the full plot to every window."""
+
+    source = " ".join(str(prompt or "").split()).strip()
+    source = re.sub(
+        r"^(?:integrated_multimodal_description|overall_soundscape|non_diegetic_music):\s*",
+        "",
+        source,
+        flags=re.IGNORECASE,
+    )
+    # Split explicit temporal transitions and common "setup + obligation"
+    # concepts.  The latter matters for prompts such as "walks through town
+    # and has to save a truck": leaving that whole sentence in pass one lets
+    # H3 see (and finish) the rescue before a continuation begins.
+    beat_separator = re.compile(
+        r"(?<=[.!?])\s+|\s*;\s*|"
+        r"\s+(?:and\s+then|then|after\s+that|next)\s+|"
+        r"\s+and\s+(?:has|needs|must|tries|attempts)\s+to\s+",
+        flags=re.IGNORECASE,
+    )
+    beats = [
+        part.strip(" ,;:-")
+        for part in beat_separator.split(source)
+        if part.strip(" ,;:-")
+    ]
+    if not beats:
+        beats = ["Establish and begin the requested action"]
+    beat_buckets: list[list[str]] = [[] for _ in range(window_count)]
+    if len(beats) == 1:
+        beat_buckets[0].append(beats[0])
+    else:
+        for beat_index, beat in enumerate(beats):
+            target = int(round(beat_index * (window_count - 1) / (len(beats) - 1)))
+            beat_buckets[min(window_count - 1, max(0, target))].append(beat)
+    resolved_coverage = _infer_camera_coverage(prompt, camera_coverage)
+    lowered_source = source.casefold()
+    fast_action = bool(re.search(
+        r"\b(?:fight|battle|chase|attack|high[- ]speed|fast[- ]paced|rapid)\b",
+        lowered_source,
+    ))
+    windows = []
+    for index in range(window_count):
+        assigned = beat_buckets[index]
+        if index == 0:
+            opening_beat = assigned or beats[:1]
+            action = f"Establish the scene and begin: {' '.join(opening_beat)}. Do not complete the central outcome"
+        elif index + 1 == window_count:
+            remaining = " ".join(assigned).strip()
+            action = "Continue from the prior physical state and complete the requested central action and outcome"
+            if remaining:
+                action += f": {remaining}"
+        else:
+            middle = " ".join(assigned).strip()
+            action = "Continue from the prior physical state and visibly advance toward the central outcome"
+            if middle:
+                action += f": {middle}"
+            action += ". Keep the outcome unresolved"
+        duration = (
+            float(window_durations[index])
+            if window_durations and index < len(window_durations)
+            else 10.0
+        )
+        shot_count = 1
+        if resolved_coverage == "multi_shot":
+            shot_count = 3 if fast_action else 2
+        shots = []
+        for shot_index in range(shot_count):
+            start = duration * shot_index / shot_count
+            end = duration * (shot_index + 1) / shot_count
+            if shot_count == 1:
+                framing = "a coherent cinematic composition"
+                camera = "a motivated tracking or locked camera follows the action"
+                shot_action = action
+            elif shot_index == 0:
+                framing = "a readable wide or medium-wide view of the geography"
+                camera = "a fast tracking move establishes positions and direction"
+                shot_action = f"Begin this window's assigned beat: {action}"
+            elif shot_index + 1 == shot_count:
+                framing = "a tighter impact or reaction angle"
+                camera = "a responsive handheld or low-angle move follows through, then settles clearly"
+                shot_action = "Complete only this window's assigned beat without repeating its opening"
+            else:
+                framing = "a dynamic medium action angle"
+                camera = "a hard cut and rapid lateral tracking move maintain real-time speed"
+                shot_action = "Continue the same beat with new physical choreography and no slow motion"
+            shots.append({
+                "shot": shot_index + 1,
+                "start_seconds": round(start, 3),
+                "end_seconds": round(end, 3),
+                "transition": "opening composition" if shot_index == 0 else "hard cut",
+                "framing": framing,
+                "camera": camera,
+                "action": shot_action,
+                "dialogue": [],
+                "sound_effects": "Natural synchronized effects for the visible action",
+            })
+        windows.append(
+            {
+                "window": index + 1,
+                "title": f"Continuation {index + 1}",
+                "coverage": resolved_coverage,
+                "pacing": (
+                    "fast real-time action with sharp impacts and no slow motion"
+                    if fast_action
+                    else "natural real-time pacing"
+                ),
+                # Keep the legacy summary for saved plans and older callers;
+                # inference uses the structured shot list below.
+                "action": action,
+                "shots": shots,
+                "closing_state": (
+                    "The visible action pauses in a concrete position ready for the next continuation"
+                    if index + 1 < window_count
+                    else "The requested outcome settles into a clear final beat"
+                ),
+            }
+        )
+    return {
+        "subject_continuity": "Keep every established subject's identity, appearance, wardrobe, and carried objects unchanged",
+        "setting_continuity": "Keep the established location, geography, time of day, and background elements unchanged",
+        "visual_continuity": "Keep lighting, color, screen direction, and established geography coherent across coverage",
+        "editing_style": (
+            "Motivated cinematic cuts and dynamic H3 camera coverage"
+            if resolved_coverage == "multi_shot"
+            else "One continuous motivated camera move"
+        ),
+        "initial_state": "The requested scene is established and the subjects begin in natural positions",
+        "ambient_audio": "Continuous natural ambience appropriate to the established location",
+        "music": "N/A",
+        "windows": windows,
+    }
+
+

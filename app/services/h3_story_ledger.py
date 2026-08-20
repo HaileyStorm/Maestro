@@ -1030,7 +1030,7 @@ def plan_h3_story_segments(
             presence_penalty=0.0,
             json_schema=ledger_schema,
         )
-        from services.h3_window_planner import _parse_json_object
+        from services.h3_planner_helpers import _parse_json_object
 
         ledger = _parse_json_object(raw)
         violations = ledger_violations(
@@ -1179,7 +1179,7 @@ def plan_h3_story_segments(
                 presence_penalty=0.0,
                 json_schema=schema,
             )
-            from services.h3_window_planner import _parse_json_object
+            from services.h3_planner_helpers import _parse_json_object
 
             segment = _parse_json_object(raw)
             segment_errors = segment_violations(

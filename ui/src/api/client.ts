@@ -851,7 +851,7 @@ export async function fetchDirectorQueueEntry(entryId: string) {
   return res.json()
 }
 
-export async function enqueueDirectorPipeline(params: Record<string, unknown>) {
+export async function enqueueDirectorPipeline(params: Record<string, unknown>): Promise<DirectorQueueState> {
   const res = await fetch(`${BASE}/api/v1/director/queue`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -1139,15 +1139,22 @@ export async function fetchDefaults(modelType: string): Promise<Record<string, u
 
 // --- Generation ---
 
-export async function submitGeneration(params: Record<string, unknown>): Promise<{
+export async function submitGeneration(
+  params: Record<string, unknown>,
+  holdForQueue = false,
+): Promise<{
   job_id: string
   status?: 'preparing' | 'queued'
+  held?: boolean
   h3_estimate?: import('../types').H3PerformanceEstimate | null
 }> {
   const res = await fetch(`${BASE}/api/v1/generate`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(params),
+    body: JSON.stringify({
+      ...params,
+      _queue_mode: holdForQueue ? 'held' : 'now',
+    }),
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: 'Generation failed' }))

@@ -99,7 +99,7 @@ function summarize(
     const target = targets.get(publicJob.id)
     const queueJob = target?.queueJob
     const status = queueJob?.status ?? target?.schedulerJob?.status ?? publicJob.status
-    if (queueJob?.held) summary.held += 1
+    if (queueJob?.held || publicJob.held) summary.held += 1
     else if (status === 'running') summary.running += 1
     else if (status === 'preparing') summary.preparing += 1
     else if (status === 'waiting_for_plan_approval') summary.approval_waiting += 1

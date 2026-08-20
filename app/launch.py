@@ -42012,6 +42012,13 @@ async def generate(request: Request):
             status_code=400,
             detail="enhance_before_generate must be a boolean",
         )
+    queue_mode = str(body.pop("_queue_mode", "now") or "now").strip().lower()
+    if queue_mode not in {"now", "held"}:
+        raise HTTPException(
+            status_code=400,
+            detail="_queue_mode must be either 'now' or 'held'",
+        )
+    hold_for_queue = queue_mode == "held"
     job_out_dir = _require_project_access(
         request, workspace, permission="project.generate",
     )
@@ -42097,7 +42104,10 @@ async def generate(request: Request):
     # anchor flags cannot leak into the generated clip manifest.
     _h3_long_plan = None
     _submitted_h3_estimate = None
-    if not durable_generation_preparation:
+    # Hold freezes a complete Studio request without starting the LLM/GPU
+    # preparation worker. Still seal H3 clip geometry here so Start Queue
+    # can run the ordinary generation worker against a finished plan.
+    if hold_for_queue or not durable_generation_preparation:
         try:
             _h3_long_plan, _submitted_h3_estimate = (
                 _plan_generation_submission(
@@ -42272,21 +42282,25 @@ async def generate(request: Request):
                 getattr(request.state, "maestro_remote", False)
             ),
         )["current"]["estimate"]
+    effective_prepare = durable_generation_preparation and not hold_for_queue
     job = {
         "id": job_id,
         "status": (
-            "preparing" if durable_generation_preparation else "queued"
+            "preparing" if effective_prepare else "queued"
         ),
+        "queue_held": bool(hold_for_queue),
         "progress": 0,
         "step": 0,
         "total_steps": 0,
         "phase": (
-            "enhancing_prompt" if enhance_before_generate
+            "" if hold_for_queue
+            else "enhancing_prompt" if enhance_before_generate
             else "planning_generation" if durable_generation_preparation
             else ""
         ),
         "message": (
-            "Enhancing prompt" if enhance_before_generate
+            "Ready - waiting for Start Queue" if hold_for_queue
+            else "Enhancing prompt" if enhance_before_generate
             else "Planning generation" if durable_generation_preparation
             else "Queued"
         ),
@@ -42301,7 +42315,7 @@ async def generate(request: Request):
         "private": access_policy["private"],
         "explicit": access_policy["explicit"],
         "prompt_preview": (
-            "" if durable_generation_preparation else str(
+            "" if effective_prepare else str(
                 _long_plan.get("global_prompt") or body.get("prompt") or ""
             )[:500]
         ),
@@ -42339,24 +42353,30 @@ async def generate(request: Request):
     }
     # Registration, owner/project identity, and the request manifest are
     # durable before the job becomes observable or its worker can run.
-    if durable_generation_preparation:
-        preparation_request = _GenerationPreparationRequest(request)
-        _queue_recovery_register_and_publish(
-            job,
-            worker=lambda queued_job_id: _run_generation_preparation(
-                queued_job_id,
-                preparation_request,
-                enhance=enhance_before_generate,
-            ),
-            recovery_kind="studio_generation_preparation",
-            thread_name=f"studio-generation-preparation-{job_id}",
-        )
+    # A user hold starts the ordinary generation worker so try_start waits
+    # on Continuum queue_held; Start Queue only clears that flag.
+    if not hold_for_queue:
+        if durable_generation_preparation:
+            preparation_request = _GenerationPreparationRequest(request)
+            _queue_recovery_register_and_publish(
+                job,
+                worker=lambda queued_job_id: _run_generation_preparation(
+                    queued_job_id,
+                    preparation_request,
+                    enhance=enhance_before_generate,
+                ),
+                recovery_kind="studio_generation_preparation",
+                thread_name=f"studio-generation-preparation-{job_id}",
+            )
+        else:
+            _queue_recovery_register_and_publish(job, worker=_run_generation)
     else:
-        _queue_recovery_register_and_publish(job)
+        _queue_recovery_register_and_publish(job, worker=_run_generation)
 
     return {
         "job_id": job_id,
         "status": job["status"],
+        "held": bool(job.get("queue_held")),
         "h3_estimate": _submitted_h3_estimate,
     }
 

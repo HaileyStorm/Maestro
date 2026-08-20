@@ -261,7 +261,9 @@ export function GlobalQueuePopover({
                 <div className="space-y-1">
                   {studioJobs.map((job, index) => {
                     const percent = progressPercent(job.step, job.totalSteps, job.progress)
-                    const label = job.phase || job.message || (
+                    const label = job.held
+                      ? (job.message || 'Ready - waiting for Start Queue')
+                      : job.phase || job.message || (
                       job.status === 'held'
                         ? 'Ready - waiting for Start Queue'
                         : job.status === 'queued'

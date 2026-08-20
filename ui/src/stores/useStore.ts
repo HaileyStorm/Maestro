@@ -373,7 +373,8 @@ const ACTIVE_GENERATION_JOB_STATUSES = new Set<GenerationJob['status']>([
 let _h3PlanReviewSequence = 0
 let _workspaceLoadSequence = 0
 
-function _isActiveGenerationJob(job: Pick<GenerationJob, 'status'>): boolean {
+function _isActiveGenerationJob(job: Pick<GenerationJob, 'status' | 'held'>): boolean {
+  if (job.held) return false
   return ACTIVE_GENERATION_JOB_STATUSES.has(job.status)
 }
 
@@ -3009,7 +3010,8 @@ interface AppState {
   closeH3PlanReview: () => void
   approveH3Plan: (decision: H3PlanDecision) => Promise<void>
   cancelH3Plan: () => Promise<void>
-  startGeneration: () => Promise<void>
+  startGeneration: (mode?: 'now' | 'queue') => Promise<void>
+  queueCurrentDirectorPipeline: () => Promise<void>
   startStudioQueue: () => Promise<void>
   directorQueue: api.DirectorQueueState | null
   directorQueueLoading: boolean
@@ -3443,7 +3445,7 @@ interface AppState {
   pipelineId: string | null
   pipelineStatus: import('../api/client').PipelineStatus | null
   pipelinePolling: boolean
-  startDirectorPipeline: () => Promise<void>
+  startDirectorPipeline: (mode?: 'now' | 'queue') => Promise<void>
   continuePipeline: (updates?: { clip_plans?: Array<{ video_prompt: string; image_prompt: string }> }) => Promise<void>
   stopPipeline: () => Promise<void>
   pollPipelineStatus: () => void
@@ -7587,7 +7589,7 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
-  startGeneration: async () => {
+  startGeneration: async (mode = 'now') => {
     const accountIdentityEpoch = _accountIdentityEpoch
     const ownsSubmission = () => _accountIdentityIsCurrent(accountIdentityEpoch)
     let state = get()
@@ -8753,19 +8755,25 @@ export const useStore = create<AppState>((set, get) => ({
     if (!ownsSubmission() || get().activeWorkspace !== submissionWorkspace) return
     params.enhance_before_generate = enhanceBeforeGenerate
     params.h3_ref2va_terms_accepted = h3Ref2VATermsAccepted()
-    const durablePreparationExpected = enhanceBeforeGenerate
+    const holdForQueue = mode === 'queue'
+    const durablePreparationExpected = !holdForQueue && (
+      enhanceBeforeGenerate
       || String(params.model_type || '').startsWith('minimax_h3')
+    )
     const newJob: GenerationJob = {
       id: '',
       createdAt: Date.now() / 1000,
       status: durablePreparationExpected ? 'preparing' : 'queued',
+      held: holdForQueue,
       progress: 0,
       step: 0,
       totalSteps: 0,
       phase: durablePreparationExpected
         ? enhanceBeforeGenerate ? 'enhancing_prompt' : 'planning_generation'
         : '',
-      message: durablePreparationExpected
+      message: holdForQueue
+        ? 'Ready - waiting for Start Queue'
+        : durablePreparationExpected
         ? enhanceBeforeGenerate ? 'Enhancing prompt' : 'Planning generation'
         : 'Submitting...',
       outputFiles: [],
@@ -8780,13 +8788,13 @@ export const useStore = create<AppState>((set, get) => ({
     }
 
     set(s => ({
-      isGenerating: true,
+      isGenerating: holdForQueue ? s.isGenerating : true,
       jobs: [newJob, ...s.jobs],
     }))
 
     try {
       applyH3SegmentCeilingPolicy(params, state.slidingWindowLocked)
-      const { job_id, status, h3_estimate } = await api.submitGeneration(params)
+      const { job_id, status, held, h3_estimate } = await api.submitGeneration(params, holdForQueue)
       if (!ownsSubmission()) {
         _discardStaleGenerationPlaceholder(newJob)
         return
@@ -8803,10 +8811,13 @@ export const useStore = create<AppState>((set, get) => ({
               ...job,
               id: job_id,
               status: status || 'queued',
+              held: held === true || holdForQueue,
               phase: status === 'preparing'
                 ? enhanceBeforeGenerate ? 'enhancing_prompt' : 'planning_generation'
                 : job.phase,
-              message: status === 'preparing'
+              message: (held === true || holdForQueue)
+                ? 'Ready - waiting for Start Queue'
+                : status === 'preparing'
                 ? enhanceBeforeGenerate ? 'Enhancing prompt' : 'Planning generation'
                 : 'Queued...',
               h3Estimate: submittedEstimate,
@@ -16045,7 +16056,11 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   // ── Director Pipeline (server-side) ──────────────────────────────
-  startDirectorPipeline: async () => {
+  queueCurrentDirectorPipeline: async () => {
+    await get().startDirectorPipeline('queue')
+  },
+
+  startDirectorPipeline: async (mode = 'now') => {
     const state = get()
     const requestWorkspace = state.activeWorkspace
     const { directorPlannedClips, directorSceneDescription,
@@ -16337,6 +16352,24 @@ export const useStore = create<AppState>((set, get) => ({
     }
 
       if (!lifecycle.ownsWorkspace()) return
+      if (mode === 'queue') {
+        const queued = await api.enqueueDirectorPipeline(pipelineParams)
+        if (!lifecycle.ownsWorkspace()) return
+        set({
+          directorQueue: queued,
+          directorQueueLoading: false,
+          directorLoading: false,
+          directorError: null,
+          directorComponentError: null,
+        })
+        const waiting = queued.entries?.filter(entry => (
+          entry.status === 'held' || entry.status === 'queued'
+        )).length || 0
+        window.alert(
+          `Added to Queue · ${waiting} Director project(s) waiting. Open the queue in the top bar when ready.`,
+        )
+        return
+      }
       const { pipeline_id } = await api.startPipeline(pipelineParams)
       if (!lifecycle.ownsWorkspace()) return
       get().activateDirectorImageRoles()
