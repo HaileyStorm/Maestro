@@ -1,7 +1,8 @@
-"""Contract tests for LLM-provider credential resolution."""
+"""Continuum credential mapping lives on launch.py, not llm_service."""
 
 from __future__ import annotations
 
+import ast
 import os
 import sys
 import unittest
@@ -9,54 +10,68 @@ import unittest
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _APP = os.path.join(_ROOT, "app")
+_LAUNCH_PATH = os.path.join(_APP, "launch.py")
+_DIRECTOR_PATH = os.path.join(_APP, "services", "director_pipeline.py")
 if _APP not in sys.path:
     sys.path.insert(0, _APP)
 
 from services import llm_service
 
 
+def _launch_provider_api_key():
+    with open(_LAUNCH_PATH, "r", encoding="utf-8") as handle:
+        tree = ast.parse(handle.read(), filename="launch.py")
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "_llm_provider_api_key":
+            module = ast.Module(body=[node], type_ignores=[])
+            ast.fix_missing_locations(module)
+            namespace = {}
+            exec(compile(module, "launch.py", "exec"), namespace)
+            return namespace["_llm_provider_api_key"]
+    raise AssertionError("Continuum launch.py is missing _llm_provider_api_key")
+
+
 class TestProviderApiKey(unittest.TestCase):
     def setUp(self):
+        self.pick_key = _launch_provider_api_key()
         self.services = {
             "llm_remote_api_key": "sk-remote",
             "openai_api_key": "sk-openai",
             "anthropic_api_key": "sk-anthropic",
         }
 
-    def test_each_provider_gets_only_its_own_credential(self):
-        for provider, expected in (
-            ("remote", "sk-remote"),
-            ("openai", "sk-openai"),
-            ("anthropic", "sk-anthropic"),
-        ):
+    def test_llm_service_does_not_keep_a_second_mapping(self):
+        self.assertFalse(hasattr(llm_service, "provider_api_key"))
+        self.assertFalse(hasattr(llm_service, "PROVIDER_API_KEY_SETTING"))
+        self.assertFalse(hasattr(llm_service, "_llm_api_key_for_provider"))
+
+    def test_openai_and_anthropic_use_only_their_own_credentials(self):
+        self.assertEqual(self.pick_key("openai", self.services), "sk-openai")
+        self.assertEqual(self.pick_key("anthropic", self.services), "sk-anthropic")
+        self.assertEqual(self.pick_key("openai", {}), "")
+        self.assertEqual(self.pick_key("anthropic", {}), "")
+
+    def test_remote_and_unknown_providers_do_not_read_llm_remote_api_key(self):
+        for provider in ("remote", "local", "", "bogus", None):
             with self.subTest(provider=provider):
-                self.assertEqual(
-                    llm_service.provider_api_key(provider, self.services),
-                    expected,
-                )
+                self.assertEqual(self.pick_key(provider, self.services), "")
 
-    def test_local_unknown_and_unconfigured_providers_send_no_key(self):
-        for provider in ("local", "", "bogus", None):
-            with self.subTest(provider=provider):
-                self.assertEqual(
-                    llm_service.provider_api_key(provider, self.services),
-                    "",
-                )
-        self.assertEqual(llm_service.provider_api_key("remote", {}), "")
-
-    def test_every_credential_setting_is_persistable(self):
-        launch_path = os.path.join(_APP, "launch.py")
-        with open(launch_path, "r", encoding="utf-8") as handle:
+    def test_openai_and_anthropic_settings_remain_in_launch_source(self):
+        with open(_LAUNCH_PATH, "r", encoding="utf-8") as handle:
             source = handle.read()
-        for setting in llm_service.PROVIDER_API_KEY_SETTING.values():
-            with self.subTest(setting=setting):
-                self.assertIn(f'"{setting}"', source)
+        self.assertIn('"openai_api_key"', source)
+        self.assertIn('"anthropic_api_key"', source)
+        helper = ast.get_source_segment(source, next(
+            node for node in ast.parse(source).body
+            if isinstance(node, ast.FunctionDef) and node.name == "_llm_provider_api_key"
+        ))
+        self.assertIsNotNone(helper)
+        self.assertNotIn("llm_remote_api_key", helper)
 
-    def test_director_uses_the_shared_mapping(self):
-        path = os.path.join(_APP, "services", "director_pipeline.py")
-        with open(path, "r", encoding="utf-8") as handle:
+    def test_director_does_not_call_a_missing_llm_service_helper(self):
+        with open(_DIRECTOR_PATH, "r", encoding="utf-8") as handle:
             source = handle.read()
-        self.assertIn("llm_service.provider_api_key(", source)
+        self.assertNotIn("llm_service.provider_api_key(", source)
 
 
 class TestApiHeaders(unittest.TestCase):
