@@ -25,6 +25,7 @@ from services.llm_cancellation import (
     LlmCancellationHandle,
     LlmRequestCancelled,
 )
+from services.text_integrity import repair_text
 from services.llm_response_assist import (
     PrefixEchoStripper,
     RequestProgress,
@@ -4210,8 +4211,20 @@ def _start_log_reader(proc: subprocess.Popen) -> threading.Event:
     return done
 
 
+_GEMMA_TEMPLATE_COMPAT_MARKER = "detected an outdated gemma4 chat template"
+
+
+def _is_benign_gemma_template_warning(line: str) -> bool:
+    """Identify llama.cpp's non-fatal Gemma 4 compatibility notice."""
+
+    return _GEMMA_TEMPLATE_COMPAT_MARKER in str(line or "").lower()
+
+
 def _server_log_tail(n: int = 20) -> str:
-    lines = list(_server_log)[-n:]
+    lines = [
+        line for line in list(_server_log)[-n:]
+        if not _is_benign_gemma_template_warning(line)
+    ]
     return "\n".join(lines) if lines else "(no diagnostic chunks captured)"
 
 
@@ -6373,6 +6386,375 @@ def _h3_exact_repair_payload_errors(before: str, after: str) -> list[str]:
     return list(dict.fromkeys(errors))
 
 
+_H3_LANGUAGE_ALIASES = (
+    ("mandarin chinese", "Mandarin Chinese"),
+    ("mandarin", "Mandarin Chinese"),
+    ("cantonese", "Cantonese"),
+    ("brazilian portuguese", "Brazilian Portuguese"),
+    ("portuguese", "Portuguese"),
+    ("french", "French"),
+    ("spanish", "Spanish"),
+    ("german", "German"),
+    ("italian", "Italian"),
+    ("japanese", "Japanese"),
+    ("korean", "Korean"),
+    ("chinese", "Chinese"),
+    ("hindi", "Hindi"),
+    ("arabic", "Arabic"),
+    ("russian", "Russian"),
+    ("dutch", "Dutch"),
+    ("polish", "Polish"),
+    ("turkish", "Turkish"),
+    ("swedish", "Swedish"),
+    ("norwegian", "Norwegian"),
+    ("danish", "Danish"),
+    ("finnish", "Finnish"),
+    ("greek", "Greek"),
+    ("hebrew", "Hebrew"),
+    ("ukrainian", "Ukrainian"),
+    ("czech", "Czech"),
+    ("romanian", "Romanian"),
+    ("hungarian", "Hungarian"),
+    ("thai", "Thai"),
+    ("vietnamese", "Vietnamese"),
+    ("indonesian", "Indonesian"),
+    ("filipino", "Filipino"),
+    ("tagalog", "Tagalog"),
+    ("english", "English"),
+)
+_H3_VISUAL_CATEGORY_PATTERNS = (
+    r"\b(?:camera|shot|frame|framing|foreground|midground|background|screen[- ](?:left|right)|"
+    r"close[- ]?up|medium[- ]?shot|wide[- ]?shot|angle|lens|composition)\b",
+    r"\b(?:woman|man|person|people|child|face|hair|eyes?|build|silhouette|subject|character)\b",
+    r"\b(?:wearing|dressed|wardrobe|shirt|jacket|coat|dress|suit|trousers|pants|skirt|shoes?|hat)\b",
+    r"\b(?:interior|exterior|room|street|kitchen|office|building|wall|window|door|furniture|"
+    r"table|desk|landscape|environment|setting)\b",
+    r"\b(?:light|lighting|lit|shadow|sunlight|neon|warm|cool|bright|dim|color|palette|contrast)\b",
+)
+
+
+def _canonical_h3_language_tag(value: str) -> str:
+    normalized = " ".join(str(value or "").strip().casefold().split())
+    for alias, canonical in _H3_LANGUAGE_ALIASES:
+        if normalized == alias or normalized == canonical.casefold():
+            return canonical
+    return str(value or "").strip()
+
+
+def _detect_h3_dialogue_language(prompt: str) -> str:
+    """Return the explicitly requested H3 speech language, else English."""
+
+    text = repair_text(prompt)
+    explicit = re.search(r"<d>\s*\[([^\]\r\n]+)\]", text, flags=re.IGNORECASE)
+    if explicit:
+        return _canonical_h3_language_tag(explicit.group(1)) or "English"
+
+    context_word = re.compile(
+        r"\b(?:in|speak|speaks|speaking|spoken|say|says|saying|talk|talks|"
+        r"talking|dialogue|sentence|line|words?|language|speech|voice|voiced)\b",
+        flags=re.IGNORECASE,
+    )
+    suffix_word = re.compile(
+        r"\b(?:dialogue|language|sentence|line|words?|speech|voice|speaking|spoken)\b",
+        flags=re.IGNORECASE,
+    )
+    lowered = text.casefold()
+    for alias, canonical in _H3_LANGUAGE_ALIASES:
+        for match in re.finditer(rf"\b{re.escape(alias)}\b", lowered):
+            before = lowered[max(0, match.start() - 60):match.start()]
+            after = lowered[match.end():match.end() + 40]
+            if context_word.search(before) or suffix_word.search(after):
+                return canonical
+    return "English"
+
+
+def _extract_h3_quoted_dialogue(text: str) -> list[str]:
+    matches = []
+    for match in re.finditer(r'"([^"\r\n]{1,500})"|“([^”\r\n]{1,500})”', str(text or "")):
+        value = (match.group(1) or match.group(2) or "").strip()
+        if value:
+            matches.append(value)
+    return matches
+
+
+def _h3_requests_speech(text: str) -> bool:
+    return bool(
+        _extract_h3_quoted_dialogue(text)
+        or re.search(
+            r"\b(?:say|says|speak|speaks|talk|talks|discuss|discusses|discussion|"
+            r"argue|argues|announce|announces|ask|asks|reply|replies|tell|tells|"
+            r"conversation|dialogue)\b",
+            str(text or ""),
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _extract_h3_dialogue_blocks(text: str) -> list[str]:
+    return [
+        match.strip()
+        for match in re.findall(
+            r"<d>\s*\[[^\]]+\]\s*(.*?)\s*</d>",
+            str(text or ""),
+            flags=re.DOTALL,
+        )
+        if match.strip()
+    ]
+
+
+def _extract_h3_dialogue_entries(text: str) -> list[tuple[str, str]]:
+    return [
+        (_canonical_h3_language_tag(language), words.strip())
+        for language, words in re.findall(
+            r"<d>\s*\[([^\]]+)\]\s*(.*?)\s*</d>",
+            str(text or ""),
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        if words.strip()
+    ]
+
+
+def _h3_dialogue_schedule(prompt: str, duration_seconds: Optional[float]) -> tuple[float, float, float]:
+    duration = max(2.0, float(duration_seconds or 8.0))
+    quotes = _extract_h3_quoted_dialogue(prompt)
+    if quotes:
+        word_count = sum(len(line.split()) for line in quotes)
+    else:
+        word_count = max(4, int(duration))
+    speech_duration = max(1.0, word_count / 2.0)
+    speech_duration = min(speech_duration, max(1.0, duration * 0.55))
+    start = max(0.5, duration * 0.2)
+    start = min(start, max(0.25, duration - speech_duration - 0.75))
+    end = min(duration - 0.25, start + speech_duration)
+    return duration, start, end
+
+
+def _build_h3_timed_silence_clause(prompt: str, duration_seconds: Optional[float]) -> str:
+    if not _h3_requests_speech(prompt):
+        return ""
+    duration, start, end = _h3_dialogue_schedule(prompt, duration_seconds)
+    return (
+        f"From 0.00 to {start:.2f} seconds, show active scene-appropriate nonverbal action rather "
+        "than idle staring; every mouth stays completely closed and the audio contains no human "
+        "voice. Begin the first tagged line at approximately "
+        f"{start:.2f} seconds and finish all <d> dialogue by approximately {end:.2f} seconds. "
+        f"From {end:.2f} to {duration:.2f} seconds, fill the remaining timeline with concrete "
+        "nonverbal action, reactions, camera development, ambience, and synchronized practical "
+        "effects. Outside the tagged interval there are no voices, whispers, grunts, audible "
+        "breathing, or speech-like vocalizations, and every mouth remains closed."
+    )
+
+
+def _compile_h3_explicit_dialogue(prompt: str) -> str:
+    """Replace user quotation marks with literal H3 dialogue blocks."""
+
+    counter = 0
+    language = _detect_h3_dialogue_language(prompt)
+
+    def replace(match):
+        nonlocal counter
+        counter += 1
+        value = (match.group(1) or match.group(2) or "").strip()
+        return f"(S{counter}) <d>[{language}] {value}</d>"
+
+    return re.sub(
+        r'"([^"\r\n]{1,500})"|“([^”\r\n]{1,500})”',
+        replace,
+        str(prompt or ""),
+    )
+
+
+def _build_h3_dialogue_requirement(
+    prompt: str,
+    duration_seconds: Optional[float] = None,
+) -> str:
+    quotes = _extract_h3_quoted_dialogue(prompt)
+    language = _detect_h3_dialogue_language(prompt)
+    timed_clause = _build_h3_timed_silence_clause(prompt, duration_seconds)
+    if quotes:
+        required = "\n".join(
+            f"- REQUIRED VERBATIM: <d>[{language}] {line}</d>" for line in quotes
+        )
+        return (
+            "IMMUTABLE H3 DIALOGUE CONTRACT: The user supplied the spoken lines below. "
+            "Every line must appear verbatim inside a <d> block in the output; do not summarize, "
+            "paraphrase, censor, omit, or add speech. Give each line a stable (S1), (S2), etc. "
+            f"speaker outside its tag. Never repeat these words as ordinary quoted text in summary "
+            f"or any other field.\n{required}\n{timed_clause}"
+        )
+    if _h3_requests_speech(prompt):
+        return (
+            "MANDATORY H3 DIALOGUE CONTRACT: The user explicitly requests speech but supplied no "
+            "script. Write concise, meaningful dialogue that communicates the requested subject, "
+            f"using stable speaker IDs and one or more <d>[{language}] literal words</d> blocks. "
+            "Writing only 'speaks', 'talks', or 'they discuss' makes the output invalid. "
+            f"{timed_clause}"
+        )
+    return ""
+
+
+def _h3_dialogue_contract_satisfied(prompt: str, result: str) -> bool:
+    quotes = _extract_h3_quoted_dialogue(prompt)
+    blocks = _extract_h3_dialogue_blocks(result)
+    entries = _extract_h3_dialogue_entries(result)
+    language = _detect_h3_dialogue_language(prompt)
+    has_speaker_id = bool(re.search(r"\(S\d+\)", str(result or "")))
+    if quotes:
+        return has_speaker_id and all(
+            any(entry_language == language and words == line for entry_language, words in entries)
+            for line in quotes
+        )
+    if _h3_requests_speech(prompt):
+        return has_speaker_id and bool(blocks) and all(
+            entry_language == language for entry_language, _words in entries
+        )
+    return True
+
+
+def _repair_h3_dialogue_language(result: str, prompt: str) -> str:
+    """Rewrite mismatched <d> language tags to the requested speech language."""
+
+    language = _detect_h3_dialogue_language(prompt)
+    quotes = set(_extract_h3_quoted_dialogue(prompt))
+
+    def replace(match):
+        words = (match.group(2) or "").strip()
+        if quotes and words not in quotes:
+            return match.group(0)
+        return f"<d>[{language}] {words}</d>"
+
+    return re.sub(
+        r"<d>\s*\[([^\]]+)\]\s*(.*?)\s*</d>",
+        replace,
+        str(result or ""),
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+
+def _h3_visual_category_count(text: str) -> int:
+    return sum(
+        1 for pattern in _H3_VISUAL_CATEGORY_PATTERNS
+        if re.search(pattern, str(text or ""), flags=re.IGNORECASE)
+    )
+
+
+def _h3_visual_description_body(result: str) -> str:
+    match = re.search(
+        r"(?ms)^\s*integrated_multimodal_description\s*:(.*?)"
+        r"(?=^\s*overall_soundscape\s*:)",
+        str(result or ""),
+    )
+    return match.group(1) if match else ""
+
+
+def _h3_visual_grounding_contract_satisfied(prompt: str, result: str) -> bool:
+    if "Attached-frame visual evidence" in str(result or ""):
+        return True
+    description = _h3_visual_description_body(result)
+    if not description:
+        return False
+    category_count = _h3_visual_category_count(description)
+    if category_count < 4:
+        return False
+    source_words = {
+        word for word in re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]{4,}", str(prompt or "").casefold())
+    }
+    description_words = {
+        word for word in re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]{4,}", description.casefold())
+    }
+    novel_words = description_words - source_words - {
+        "shot", "video", "seconds", "target", "picture", "requested",
+        "scene", "shows", "visible", "camera", "final", "frame",
+    }
+    return len(novel_words) >= 12
+
+
+def _inject_h3_visual_anchor(result: str, anchor: str) -> str:
+    from services.director.h3_dialogue import (
+        _augment_h3_record_description,
+        _extract_h3_fields,
+    )
+
+    anchor = repair_text(anchor)
+    anchor = re.sub(r"(?is)<\s*d\s*>.*?<\s*/\s*d\s*>", "", anchor)
+    anchor = re.sub(r"(?is)<\s*/?\s*d\s*>", "", anchor)
+    anchor = re.sub(r"(?m)^\s*(?:#{1,4}\s*)?(?:visual anchor|description)\s*:\s*", "", anchor)
+    anchor = " ".join(anchor.replace("**", "").split()).strip()
+    if not anchor or _h3_visual_category_count(anchor) < 3:
+        return result
+    anchor = anchor[:1800].rstrip()
+    prefix = "Attached-frame visual evidence in supplied timeline order: "
+    fields = _extract_h3_fields(result)
+    body = fields.get("integrated_multimodal_description", "")
+    if not body:
+        return result
+    updated = _augment_h3_record_description(body, prefix + anchor)
+    if updated == body:
+        match = re.search(
+            r"(?mi)^\s*integrated_multimodal_description\s*:\s*",
+            str(result or ""),
+        )
+        if not match:
+            return result
+        insert_at = match.end()
+        remainder = result[insert_at:]
+        shot = re.match(r"\[Shot\s+1\]\s*", remainder, flags=re.IGNORECASE)
+        if shot:
+            insert_at += shot.end()
+        return result[:insert_at] + prefix + anchor + ". " + result[insert_at:]
+    pattern = re.compile(
+        r"(?ms)(^\s*integrated_multimodal_description\s*:)(.*?)(?=^\s*overall_soundscape\s*:)",
+    )
+    return pattern.sub(
+        lambda match: match.group(1) + "\n" + updated + "\n",
+        result,
+        count=1,
+    )
+
+
+def _ensure_h3_visual_grounding(
+    result: str,
+    prompt: str,
+    image_paths: Optional[list],
+    *,
+    generate_fn,
+) -> str:
+    """Run one focused vision pass when the main H3 rewrite ignored images."""
+
+    if not image_paths or _h3_visual_grounding_contract_satisfied(prompt, result):
+        return result
+    print("[Enhance] H3 rewrite lacked concrete frame evidence; grounding from attached image(s).")
+    try:
+        anchor = generate_fn(
+            prompt=(
+                f"There are {len(image_paths)} attached target-frame image(s), in order. "
+                "Describe only concrete visible facts needed to preserve them in a generated video. "
+                f"The separate action request is: {prompt}"
+            ),
+            system_prompt=(
+                "Act as a visual continuity observer. Return one compact factual paragraph. "
+                "For every attached image, describe visible subject count and appearance, wardrobe, "
+                "screen position and composition, setting and important objects, lighting and color, "
+                "and camera framing. Do not invent identity, dialogue, action, emotion, or unseen facts. "
+                "Do not output markdown, field labels, quotation marks, or model instructions."
+            ),
+            max_new_tokens=max(240, min(700, len(image_paths) * 220)),
+            temperature=0.15,
+            image_paths=image_paths,
+            enable_thinking=False,
+            thinking_budget=2048,
+            frequency_penalty=0.2,
+            presence_penalty=0.0,
+        )
+    except Exception as exc:
+        print(f"[Enhance] Focused H3 visual grounding was unavailable: {exc}")
+        return result
+    grounded = _inject_h3_visual_anchor(result, repair_text(anchor))
+    if grounded == result:
+        print("[Enhance] Focused H3 visual pass returned no usable grounding details.")
+    return grounded
+
+
 def _h3_enhance_contract_errors(
     candidate: str,
     source_prompt: str,
@@ -7022,6 +7404,15 @@ def enhance_prompt(
                 progress_callback=progress_callback,
                 cancel_handle=cancel_handle,
             )
+            result = _repair_h3_dialogue_language(result, prompt)
+            if image_paths:
+                result = _ensure_h3_visual_grounding(
+                    result,
+                    prompt,
+                    image_paths,
+                    generate_fn=generate,
+                )
+            result = repair_text(result)
         else:
             result = _clean_enhance_output(result)
     if preserve_global_timeline and result:

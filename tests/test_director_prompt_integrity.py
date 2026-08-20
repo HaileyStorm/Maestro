@@ -117,11 +117,13 @@ class TestH3PromptIntegrity(unittest.TestCase):
     def test_h3_enhancer_repairs_language_and_grounds_attached_frame(self):
         prompt = 'A woman speaks perfect French and says, "Bonjour, comment ça va ?"'
         weak = (
-            "integrated_multimodal_description: [Shot 1] A woman speaks to camera. "
-            "From 0.00 to 1.50 seconds, her mouth stays closed and there is no human voice. "
-            "Woman (S1): <d>[English] Bonjour, comment ça va ?</d> "
-            "From 4.50 to 8.00 seconds, she remains silent with her mouth closed.\n\n"
-            "overall_soundscape: Quiet room tone with no other voices.\n\n"
+            "subject_definitions:\n"
+            "<Subject 1> is a woman: adult woman speaking to camera\n\n"
+            "integrated_multimodal_description:\n"
+            "[Shot 1] [0.00s-8.00s] shot_name: Kitchen address | audiovisual_description: "
+            "<Subject 1> stands in a kitchen and speaks to camera. | "
+            "dialogue_and_vocalizations: Woman (S1): <d>[English] Bonjour, comment ça va ?</d>\n\n"
+            "overall_soundscape: Quiet room tone with no other voices.\n"
             "non_diegetic_music: N/A"
         )
         visual_anchor = (
@@ -157,7 +159,7 @@ class TestH3PromptIntegrity(unittest.TestCase):
         self.assertEqual(enhanced.count("Bonjour, comment ça va ?"), 1)
         self.assertIn("Attached-frame visual evidence", enhanced)
         self.assertIn("shoulder-length auburn hair", enhanced)
-        self.assertEqual(len(calls), 3)  # initial rewrite, one repair, one vision grounding pass
+        self.assertEqual(len(calls), 2)  # Context-IR rewrite plus one vision grounding pass
         self.assertEqual(calls[-1]["image_paths"], ["frame.png"])
 
     def test_optional_visual_grounding_failure_preserves_valid_main_result(self):

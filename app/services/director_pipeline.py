@@ -75,6 +75,17 @@ _director_queue_worker = None
 _DIRECTOR_QUEUE_FILENAME = "_director_queue.json"
 _DIRECTOR_QUEUE_VERSION = 1
 _DIRECTOR_QUEUE_TERMINAL = {"completed", "failed", "cancelled"}
+_LTX25_MUSIC_VIDEO_SYNC_CONTRACT = (
+    "SOURCE-AUDIO LIP SYNC: Any person visibly singing or rapping "
+    "lip-syncs every vocal syllable to the supplied source soundtrack with "
+    "exact timing, natural mouth shapes, and matching breaths. People who "
+    "are not performing vocals keep their mouths closed."
+)
+_DIRECTOR_VOCAL_PERFORMANCE_RE = re.compile(
+    r"\b(?:lip[-\s]?sync(?:s|ing|ed)?|sing(?:s|ing|er|ers)?|"
+    r"rap(?:s|ping|per|pers)?|vocalist(?:s)?|lyrics?|chorus|verse)\b",
+    re.IGNORECASE,
+)
 _DIRECTOR_SINGLE_ASSET_KEYS = (
     "audio_path",
     "audio_vocals_path",
@@ -800,7 +811,7 @@ def _pipeline_state_descriptor(out_dir: str, pid: str) -> dict:
 
 def _pipeline_state_payload(state: dict) -> bytes:
     return json.dumps(
-        state, indent=2, ensure_ascii=False, default=str,
+        repair_payload(state), indent=2, ensure_ascii=False, default=str,
     ).encode("utf-8")
 
 
@@ -1366,8 +1377,12 @@ def _load_pipeline_state_locked(out_dir: str, pid: str) -> Optional[dict]:
     if os.path.isfile(filepath):
         with _pipeline_file_lock:
             with open(filepath, "r", encoding="utf-8") as f:
-                state = json.load(f)
-            if _normalize_interrupted_repair(state, pid):
+                loaded_state = json.load(f)
+            state = repair_payload(loaded_state)
+            if (
+                _normalize_interrupted_repair(state, pid)
+                or state != loaded_state
+            ):
                 _commit_pipeline_json_unlocked(filepath, pid, state)
             return _backfill_clip_video_filenames(state, out_dir)
     # Search subdirectories (workspaces)
@@ -1377,8 +1392,12 @@ def _load_pipeline_state_locked(out_dir: str, pid: str) -> Optional[dict]:
             if os.path.isfile(sub):
                 with _pipeline_file_lock:
                     with open(sub, "r", encoding="utf-8") as f:
-                        state = json.load(f)
-                    if _normalize_interrupted_repair(state, pid):
+                        loaded_state = json.load(f)
+                    state = repair_payload(loaded_state)
+                    if (
+                        _normalize_interrupted_repair(state, pid)
+                        or state != loaded_state
+                    ):
                         _commit_pipeline_json_unlocked(sub, pid, state)
                     return _backfill_clip_video_filenames(
                         state, os.path.join(out_dir, name),
@@ -1877,6 +1896,126 @@ def _slice_audio_segment(src_path: str, start_sec: float, duration_sec: float, d
     subprocess.run(cmd, check=True, capture_output=True, text=True)
 
 
+def _apply_ltx25_music_video_sync_contract(
+    prompts: list[str],
+    *,
+    video_model: str,
+    model_def: Optional[dict],
+    pipeline_type: str,
+    audio_path: Optional[str],
+) -> list[str]:
+    """Give LTX-2.5 the explicit trigger it needs for source-audio lip sync."""
+
+    identifiers = (
+        str(video_model or "").lower(),
+        str((model_def or {}).get("architecture") or "").lower(),
+    )
+    if (
+        pipeline_type != "music_video"
+        or not audio_path
+        or not any(value.startswith("ltx2_25") for value in identifiers)
+    ):
+        return list(prompts)
+
+    contracted: list[str] = []
+    for prompt in prompts:
+        text = str(prompt or "").strip()
+        if _LTX25_MUSIC_VIDEO_SYNC_CONTRACT not in text:
+            text = f"{text.rstrip()} {_LTX25_MUSIC_VIDEO_SYNC_CONTRACT}".strip()
+        contracted.append(text)
+    return contracted
+
+
+def _is_ltx25_model(video_model: str, model_def: Optional[dict]) -> bool:
+    identifiers = (
+        str(video_model or "").lower(),
+        str((model_def or {}).get("architecture") or "").lower(),
+    )
+    return any(value.startswith("ltx2_25") for value in identifiers)
+
+
+def _director_requests_vocal_performance(params: dict) -> bool:
+    lyrics = params.get("lyrics")
+    if isinstance(lyrics, (list, tuple)):
+        for entry in lyrics:
+            if isinstance(entry, dict):
+                value = entry.get("text") or entry.get("lyrics") or ""
+            else:
+                value = entry
+            if str(value or "").strip():
+                return True
+    elif str(lyrics or "").strip():
+        return True
+    return bool(
+        _DIRECTOR_VOCAL_PERFORMANCE_RE.search(
+            str(params.get("scene_description") or "")
+        )
+    )
+
+
+def _ltx25_music_video_max_shot_frames(
+    params: dict,
+    model_def: Optional[dict],
+    *,
+    pipeline_type: str,
+) -> Optional[int]:
+    """Use one native LTX-2.5 pass per vocal-performance Director shot."""
+
+    video_model = str(params.get("video_model") or "")
+    audio_path = str(params.get("audio_path") or "").strip()
+    if (
+        pipeline_type != "music_video"
+        or not audio_path
+        or not _is_ltx25_model(video_model, model_def)
+        or not _director_requests_vocal_performance(params)
+    ):
+        return None
+
+    defaults = (model_def or {}).get("sliding_window_defaults") or {}
+    minimum = max(1, int((model_def or {}).get("frames_minimum") or 17))
+    step = max(1, int((model_def or {}).get("frames_steps") or 8))
+    requested = int(defaults.get("window_default") or round(10 * 24))
+    maximum = int(defaults.get("window_max") or requested)
+    requested = min(maximum, max(minimum, requested))
+    valid = list(range(minimum, maximum + 1, step)) or [minimum]
+    return min(valid, key=lambda value: (abs(value - requested), value))
+
+
+def _ltx25_vocal_conditioning_path(
+    params: dict,
+    model_def: Optional[dict],
+    *,
+    pipeline_type: str,
+) -> Optional[str]:
+    """Find Audio Analysis' reusable vocal stem for LTX-2.5 Director."""
+
+    video_model = str(params.get("video_model") or "")
+    audio_path = str(params.get("audio_path") or "").strip()
+    if (
+        pipeline_type != "music_video"
+        or not audio_path
+        or not _is_ltx25_model(video_model, model_def)
+        or not _director_requests_vocal_performance(params)
+    ):
+        return None
+
+    candidates: list[str] = []
+    stem, _ = os.path.splitext(os.path.basename(audio_path))
+    if stem:
+        candidates.append(
+            os.path.join(
+                os.path.dirname(audio_path),
+                "vocals",
+                f"{stem}_vocals.wav",
+            )
+        )
+    candidates.append(str(params.get("audio_vocals_path") or "").strip())
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return None
+
+
 def _audio_timeline_start(planned_clips: list[dict]) -> float:
     """Return the source-audio time represented by video frame zero."""
     if not planned_clips:
@@ -1961,8 +2100,9 @@ def _rerun_clip_video_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
     # as many as latent_size-1 frames every time (over a second on a 32-frame
     # lattice). Those losses shifted every later cut against the soundtrack.
     fps = snapshot.get("fps", 16)
+    model_def = {}
     try:
-        model_def = _wgp.get_model_def(video_model)
+        model_def = _wgp.get_model_def(video_model) or {}
         if model_def and model_def.get("fps"):
             fps = model_def["fps"]
     except Exception:
@@ -2080,6 +2220,7 @@ def _rerun_clip_video_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
     ) / fps
     clip_duration_sec = video_length / fps
     slice_path = None
+    vocal_slice_path = None
     if pipeline_type != "short_film_story" and audio_path and os.path.isfile(audio_path):
         pid_token = re.sub(r"[^A-Za-z0-9_-]", "_", pid)[:32]
         slice_path = os.path.join(
@@ -2092,6 +2233,32 @@ def _rerun_clip_video_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
             )
             gen_params["audio_prompt_type"] = "A"
             gen_params["audio_guide"] = slice_path
+            vocal_source = _ltx25_vocal_conditioning_path(
+                snapshot,
+                model_def,
+                pipeline_type=pipeline_type,
+            )
+            if vocal_source:
+                vocal_slice_path = os.path.join(
+                    clip_out_dir,
+                    f"_rerun_vocals_{pid_token}_c{clip_index}_"
+                    f"{uuid.uuid4().hex[:8]}.wav",
+                )
+                try:
+                    _slice_audio_segment(
+                        vocal_source,
+                        clip_start,
+                        clip_duration_sec,
+                        vocal_slice_path,
+                    )
+                    gen_params["audio_conditioning_guide"] = vocal_slice_path
+                except Exception as vocal_error:
+                    gen_params["audio_conditioning_guide"] = vocal_source
+                    print(
+                        f"[Pipeline {pid}] Clip {clip_index} vocal-stem "
+                        "slice failed; using the original stem: "
+                        f"{vocal_error}"
+                    )
             if snapshot.get("audio_scale") is not None:
                 gen_params["audio_scale"] = snapshot["audio_scale"]
             print(f"[Pipeline {pid}] Clip {clip_index} rerun conditioned on song segment "
@@ -2101,6 +2268,16 @@ def _rerun_clip_video_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
             print(f"[Pipeline {pid}] Clip {clip_index} audio slice failed; "
                   f"regenerating without soundtrack conditioning: {e}")
 
+    if gen_params.get("audio_guide"):
+        rerun_prompts = _apply_ltx25_music_video_sync_contract(
+            [gen_params.get("prompt", "")],
+            video_model=video_model,
+            model_def=model_def,
+            pipeline_type=pipeline_type,
+            audio_path=audio_path,
+        )
+        gen_params["prompt"] = rerun_prompts[0] if rerun_prompts else ""
+
     try:
         output_files = _submit_and_wait(
             gen_params, timeout_s=3600, out_dir=clip_out_dir,
@@ -2109,6 +2286,11 @@ def _rerun_clip_video_impl(out_dir: str, pid: str, clip_index: int, prompt_overr
         if slice_path and os.path.isfile(slice_path):
             try:
                 os.remove(slice_path)
+            except OSError:
+                pass
+        if vocal_slice_path and os.path.isfile(vocal_slice_path):
+            try:
+                os.remove(vocal_slice_path)
             except OSError:
                 pass
     # Sliding-window generations save CUMULATIVE progress files (each save
@@ -9314,8 +9496,9 @@ def _run_video_generation(pid: str, params: dict, clip_plans: list[dict],
     pipeline_type = params.get("pipeline_type", "music_video")
     # Get FPS from model definition (reliable) — don't trust frontend default of 16
     fps = params.get("fps", 16)
+    model_def = {}
     try:
-        model_def = _wgp.get_model_def(video_model)
+        model_def = _wgp.get_model_def(video_model) or {}
         if model_def and model_def.get("fps"):
             fps = model_def["fps"]
     except Exception:
@@ -9407,6 +9590,13 @@ def _run_video_generation(pid: str, params: dict, clip_plans: list[dict],
             if os.path.isfile(first_path):
                 first_start = first_path
 
+        window_prompts_all = _apply_ltx25_music_video_sync_contract(
+            window_prompts_all,
+            video_model=video_model,
+            model_def=model_def,
+            pipeline_type=pipeline_type,
+            audio_path=audio_path,
+        )
         prompt_text = "\n".join(window_prompts_all)
 
         print(f"[Pipeline {pid}] Seamless mode: {len(window_prompts_all)} windows, "
@@ -9419,13 +9609,20 @@ def _run_video_generation(pid: str, params: dict, clip_plans: list[dict],
         image_start_paths = []
         image_end_paths = []
         per_clip_frames = []
+        per_clip_prompt_modes = []
         has_sliding_window = False
+        ltx25_max_frames = _ltx25_music_video_max_shot_frames(
+            params,
+            model_def,
+            pipeline_type=pipeline_type,
+        )
 
         for i, plan in enumerate(clip_plans):
             wp = plan.get("window_prompts") or []
             wp = [w.get("prompt", w.get("text", str(w))) if isinstance(w, dict) else str(w) for w in wp]
             if len(wp) > 1:
                 prompts.append("\n".join(wp))
+                per_clip_prompt_modes.append(1)
             else:
                 vp = plan.get("video_prompt", "")
                 pc = planned_clips[i] if i < len(planned_clips) else {}
@@ -9433,6 +9630,7 @@ def _run_video_generation(pid: str, params: dict, clip_plans: list[dict],
                 if dur > 32 and vp:
                     print(f"[Pipeline] WARNING: Clip {i+1} is {dur:.0f}s but has no window_prompts")
                 prompts.append(vp)
+                per_clip_prompt_modes.append(0)
 
             img_file = clip_images[i] if i < len(clip_images) else ""
             if img_file:
@@ -9455,6 +9653,8 @@ def _run_video_generation(pid: str, params: dict, clip_plans: list[dict],
                 if shot_duration <= 0:
                     shot_duration = 20 * max(window_count, num_keyframes + 1)
                 clip_frames = max(round(shot_duration * fps), round(5 * fps))
+                if ltx25_max_frames:
+                    clip_frames = min(clip_frames, ltx25_max_frames)
                 per_clip_frames.append(clip_frames)
                 has_sliding_window = True
             else:
@@ -9472,7 +9672,10 @@ def _run_video_generation(pid: str, params: dict, clip_plans: list[dict],
                 clip_frames = round(dur_sec * fps) if dur_sec > 0 else pc.get("duration_frames", round(20 * fps))
                 if clip_frames > round(32 * fps):
                     has_sliding_window = True
-                per_clip_frames.append(max(clip_frames, round(5 * fps)))
+                clip_frames = max(clip_frames, round(5 * fps))
+                if ltx25_max_frames:
+                    clip_frames = min(clip_frames, ltx25_max_frames)
+                per_clip_frames.append(clip_frames)
 
         # Quantize to the model's (latent*n + 1) frame lattice WITHOUT letting
         # the error compound. Floor-snapping each clip independently lost 0-7
@@ -9526,6 +9729,13 @@ def _run_video_generation(pid: str, params: dict, clip_plans: list[dict],
     elif audio_path:
         audio_params["audio_prompt_type"] = "A"
         audio_params["audio_guide"] = audio_path
+        audio_conditioning_path = _ltx25_vocal_conditioning_path(
+            params,
+            model_def,
+            pipeline_type=pipeline_type,
+        )
+        if audio_conditioning_path:
+            audio_params["audio_conditioning_guide"] = audio_conditioning_path
         # Music analysis may intentionally omit a silent intro. Align model
         # conditioning to the source-audio time represented by video frame 0.
         audio_params["audio_frame_offset"] = round(audio_start_sec * fps)
@@ -9580,6 +9790,26 @@ def _run_video_generation(pid: str, params: dict, clip_plans: list[dict],
     else:
         # Standard: separate per-clip generation jobs
         CLIP_SEPARATOR = "\n---CLIP_BOUNDARY---\n"
+        contracted_prompts: list[str] = []
+        for prompt_index, prompt in enumerate(prompts):
+            is_windowed = (
+                prompt_index < len(per_clip_prompt_modes)
+                and per_clip_prompt_modes[prompt_index] == 1
+            )
+            prompt_parts = (
+                [line for line in str(prompt).splitlines() if line.strip()]
+                if is_windowed
+                else [prompt]
+            )
+            contracted_parts = _apply_ltx25_music_video_sync_contract(
+                prompt_parts,
+                video_model=video_model,
+                model_def=model_def,
+                pipeline_type=pipeline_type,
+                audio_path=audio_path,
+            )
+            contracted_prompts.append("\n".join(contracted_parts))
+        prompts = contracted_prompts
         prompt_text = CLIP_SEPARATOR.join(prompts)
 
         has_any_start = any(p for p in image_start_paths)
@@ -9603,6 +9833,7 @@ def _run_video_generation(pid: str, params: dict, clip_plans: list[dict],
             "video_length": total_frames,
             "sliding_window_size": sliding_window_frames,
             "per_clip_frames": per_clip_frames,
+            "per_clip_prompt_modes": per_clip_prompt_modes,
             "multi_clip_audio_start_sec": audio_start_sec,
             "seed": -1,
             "settings_version": 2.52,

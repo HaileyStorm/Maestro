@@ -14,6 +14,7 @@ from abc import ABC, abstractmethod
 from typing import Optional, Any
 
 from services.llm_cancellation import LlmRequestCancelled
+from services.text_integrity import repair_payload, repair_text
 
 # Optional dependency: json_repair handles common LLM JSON mistakes
 # (missing commas between properties, trailing commas, single quotes,
@@ -118,6 +119,8 @@ class BasePlanner(ABC):
           - Other / unknown: budget=0, thinking off (conservative default).
         Callers can still pass an explicit thinking_budget to override.
         """
+        user_prompt = repair_text(user_prompt)
+        system_prompt = repair_text(system_prompt)
         gen_fn = self._generate_streaming if (streaming and self._generate_streaming) else self._generate
         if gen_fn is None:
             raise RuntimeError("No LLM generate function provided to planner")
@@ -173,7 +176,7 @@ class BasePlanner(ABC):
 
         parsed = self._parse_json_response(response)
         if parsed is not None:
-            return parsed
+            return repair_payload(parsed)
 
         # Retry once with explicit JSON fix instruction + a hard JSON
         # grammar. The grammar (caller's schema, or the generic array-of-
@@ -215,7 +218,7 @@ class BasePlanner(ABC):
             response2 = gen_fn(**retry_kwargs)
         parsed2 = self._parse_json_response(response2)
         if parsed2 is not None:
-            return parsed2
+            return repair_payload(parsed2)
 
         print("[Planner] JSON parse failed on retry, returning empty list")
         return []
