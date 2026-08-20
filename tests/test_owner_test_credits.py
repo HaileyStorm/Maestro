@@ -14,7 +14,10 @@ APP = ROOT / "app"
 if str(APP) not in sys.path:
     sys.path.insert(0, str(APP))
 
-from services.owner_test_credits import OwnerTestCreditLedger  # noqa: E402
+from services.owner_test_credits import (  # noqa: E402
+    OwnerTestCreditError,
+    OwnerTestCreditLedger,
+)
 
 
 def _key(label: str) -> str:
@@ -86,6 +89,52 @@ class OwnerTestCreditLedgerTests(unittest.TestCase):
         projection = self.settle("second", second, "completed")
         self.assertEqual(projection["available_units"], 7)
         self.assertEqual(projection["used_units"], 13)
+
+    def test_projection_stays_test_only_and_does_not_echo_job_keys(self):
+        projection = self.ledger.public_projection(self.account)
+        self.assertEqual(projection["schema_version"], 1)
+        self.assertEqual(projection["unit"], "maestro_test_credits")
+        self.assertEqual(projection["target_balance"], 10)
+        self.assertTrue(projection["test_only"])
+        self.assertNotIn("admission", projection)
+        self.assertNotIn("priority", projection)
+        receipt = self.dispatch("large-over-target", 25)
+        self.assertTrue(receipt.reservation_id.startswith("reservation_"))
+        self.assertNotIn("large-over-target", receipt.reservation_id)
+        self.assertNotIn(self.account, receipt.reservation_id)
+        after = self.ledger.public_projection(self.account)
+        self.assertEqual(after["available_units"], 0)
+        self.assertEqual(after["used_units"], 25)
+        self.assertTrue(after["test_only"])
+
+    def test_invalid_request_and_cancel_without_start_fail_closed(self):
+        with self.assertRaisesRegex(OwnerTestCreditError, "test credit request is invalid"):
+            self.dispatch("zero", 0)
+        with self.assertRaisesRegex(OwnerTestCreditError, "test credit request is invalid"):
+            self.dispatch("bool", True)
+        with self.assertRaisesRegex(OwnerTestCreditError, "test target balance is invalid"):
+            OwnerTestCreditLedger(
+                Path(self.temporary.name) / "bad-target.json",
+                integrity_key=b"owner-test-integrity-key-32-bytes!",
+                target_balance=0,
+            )
+        receipt = self.dispatch("cancel-no-start", 2)
+        with self.assertRaisesRegex(
+            OwnerTestCreditError,
+            "cancelled test credit settlement has no start time",
+        ):
+            self.ledger.settle(
+                account_key=self.account,
+                job_key="cancel-no-start",
+                reservation_id=receipt.reservation_id,
+                expected_revision=receipt.reservation_revision,
+                terminal_status="cancelled",
+                started_at=None,
+                finished_at=101.0,
+            )
+        still = self.ledger.public_projection(self.account)
+        self.assertEqual(still["used_units"], 2)
+        self.assertTrue(still["test_only"])
 
 
 if __name__ == "__main__":

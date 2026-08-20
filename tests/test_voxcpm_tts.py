@@ -77,6 +77,49 @@ class VoxCpmCatalogTests(unittest.TestCase):
         self.assertNotIn("[warm]", text)
         self.assertFalse(text.startswith("warm, unhurried"))
 
+    def test_catalog_defaults_match_handler_and_script_shape(self):
+        payload = json.loads(_DEFAULTS.read_text(encoding="utf-8"))
+        handler = _HANDLER.read_text(encoding="utf-8")
+        self.assertEqual(payload["duration_seconds"], 20)
+        self.assertEqual(payload["multi_prompts_gen_type"], 2)
+        self.assertEqual(
+            payload["prompt"],
+            "Speaker 1 [warm]: I checked the schedule twice, and everything still lines up.",
+        )
+        self.assertEqual(payload["alt_prompt"], "warm, unhurried, slightly amused")
+        self.assertIn('"duration_seconds": 20', handler)
+        self.assertIn('"multi_prompts_gen_type": 2', handler)
+        self.assertIn('"video_length": 0', handler)
+        self.assertIn('"num_inference_steps": 0', handler)
+        self.assertIn('"audio_prompt_type": "A"', handler)
+        self.assertIn('"audio_only": True', handler)
+        self.assertIn('"image_outputs": False', handler)
+        self.assertIn('"inference_steps": False', handler)
+        self.assertIn('"default": 20', handler)
+        self.assertIn('"placeholder": "warm, unhurried, slightly amused"', handler)
+
+        import sys
+
+        if str(_APP) not in sys.path:
+            sys.path.insert(0, str(_APP))
+        from services.tts_script_breakdown import (
+            format_voxcpm_turn_text,
+            parse_tts_script_turns,
+        )
+
+        turns = parse_tts_script_turns(payload["prompt"])
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0]["speaker"], "Speaker 1")
+        self.assertEqual(turns[0]["emotion"], "warm")
+        spoken = format_voxcpm_turn_text(
+            turns[0]["line"],
+            emotion=turns[0]["emotion"],
+            alt_prompt=payload["alt_prompt"],
+        )
+        self.assertTrue(spoken.startswith("(warm, unhurried, slightly amused, warm)"))
+        self.assertIn(turns[0]["line"], spoken)
+        self.assertNotIn("[warm]", spoken)
+
 
 if __name__ == "__main__":
     unittest.main()
