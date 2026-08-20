@@ -46,6 +46,11 @@ def _load_isolated_function(relative_path: str, name: str, namespace: dict):
     return namespace[name]
 
 
+def _generic_job_visible(job: dict) -> bool:
+    """Mirror the generic endpoint's dedicated sample-campaign exclusion."""
+    return job.get("kind") != "sample_campaign_generation"
+
+
 class _PostDecodeStageError(RuntimeError):
     def __init__(self, message: str, *, stage: str, code: str):
         super().__init__(message)
@@ -218,7 +223,7 @@ class TestJobLifecycleWiring(unittest.TestCase):
             launch_source = handle.read()
         source = ast.get_source_segment(launch_source, generation)
         self.assertIsNotNone(source)
-        publish_at = source.index("record_job_outputs(\n                    job,")
+        publish_at = source.index("published_outputs = record_job_outputs(")
         stamp_at = source.index("_write_output_sidecars(new_files)", publish_at)
         cancel_at = source.index("if cancelled or is_cancel_requested(job):", stamp_at)
         cancel_return = source.index("return False", cancel_at)
@@ -512,11 +517,21 @@ class TestJobLifecycleWiring(unittest.TestCase):
     def test_output_callbacks_are_optional_tail_keywords(self):
         wgp = _parse("app/wgp.py")
         generate = _function(wgp, "generate_video")
+        public_tail_arguments = [
+            argument
+            for argument in generate.args.args
+            if not argument.arg.startswith("_")
+        ][-2:]
         self.assertEqual(
-            [argument.arg for argument in generate.args.args[-2:]],
+            [argument.arg for argument in public_tail_arguments],
             ["after_repeat_output", "after_segment_output"],
         )
-        for default in generate.args.defaults[-2:]:
+        defaults_by_name = dict(zip(
+            [argument.arg for argument in generate.args.args[-len(generate.args.defaults):]],
+            generate.args.defaults,
+        ))
+        for name in ("after_repeat_output", "after_segment_output"):
+            default = defaults_by_name[name]
             self.assertIsInstance(default, ast.Constant)
             self.assertIsNone(default.value)
         with open(
@@ -851,6 +866,7 @@ class TestJobLifecycleWiring(unittest.TestCase):
                     "owner-child": child_job,
                     "other-job": other_job,
                 },
+                "_generic_job_visible": _generic_job_visible,
                 "_require_remote_queue_project": require_remote_project,
                 "queue_scheduler_snapshot": scheduler_snapshot,
                 "_job_owned_by_request": lambda job, request: (
@@ -1013,6 +1029,7 @@ class TestJobLifecycleWiring(unittest.TestCase):
                 "api": fake_api, "Request": object, "Response": object,
                 "HTTPException": RuntimeError, "math": math,
                 "_jobs": {item["id"]: item for item in physical},
+                "_generic_job_visible": _generic_job_visible,
                 "_set_recovery_no_store": lambda _response: None,
                 "queue_scheduler_snapshot": lambda _jobs: scheduler,
                 "_job_owned_by_request": lambda item, request: (

@@ -1,5 +1,5 @@
 import { useRef, useCallback, useState, useEffect, useId, useLayoutEffect, useMemo, type JSX, type ReactNode } from 'react'
-import { Film, Play, Square, FolderOpen, Plus, Check, Loader2, X, BookMarked, Upload, Trash2, ListChecks, Eye, EyeOff, FolderInput, Lock, LockOpen, KeyRound, Pause, ArrowUp, ArrowDown } from 'lucide-react'
+import { Film, Play, Square, FolderOpen, Plus, Check, Loader2, X, BookMarked, Upload, Trash2, ListChecks, Eye, EyeOff, FolderInput, Lock, LockOpen, KeyRound, Pause, ArrowUp, ArrowDown, Sparkles } from 'lucide-react'
 import { TabFilter } from './TabFilter'
 import { ThumbnailGallery } from './ThumbnailGallery'
 import { MediaFeedItem } from './MediaFeedItem'
@@ -510,6 +510,7 @@ function WorkspaceSelector() {
   const [passwordError, setPasswordError] = useState<string | null>(null)
   const [passwordNotice, setPasswordNotice] = useState<string | null>(null)
   const [confirmRemovePassword, setConfirmRemovePassword] = useState(false)
+  const createProjectInFlightRef = useRef(false)
   const dropdownRef = useRef<HTMLDivElement>(null)
   const projectDialogRef = useRef<HTMLDivElement>(null)
   const projectDialogTitleId = useId()
@@ -718,12 +719,25 @@ function WorkspaceSelector() {
     }
   }, [open, requiredProject])
 
+  const normalizedNewProjectName = newName.trim().replace(/\s+/g, '-')
+  const createProjectDisabled = creatingProject || !normalizedNewProjectName || (
+    legacyProjectPasswordAccess
+    && ((newPassword.length > 0 && newPassword.length < 8) || (remote && !newPassword))
+  )
+
   const handleCreate = async () => {
-    const name = newName.trim().replace(/\s+/g, '-')
+    const name = normalizedNewProjectName
     const legacyPasswordInvalid = legacyProjectPasswordAccess && (
       (newPassword.length > 0 && newPassword.length < 8) || (remote && !newPassword)
     )
-    if (!canCreateProject || !name || legacyPasswordInvalid || creatingProject) return
+    if (
+      !canCreateProject
+      || !name
+      || legacyPasswordInvalid
+      || creatingProject
+      || createProjectInFlightRef.current
+    ) return
+    createProjectInFlightRef.current = true
     setCreateError(null)
     setCreatingProject(true)
     try {
@@ -735,6 +749,7 @@ function WorkspaceSelector() {
     } catch (error) {
       setCreateError(error instanceof Error ? error.message : 'Project creation failed')
     } finally {
+      createProjectInFlightRef.current = false
       setCreatingProject(false)
     }
   }
@@ -1182,13 +1197,19 @@ function WorkspaceSelector() {
           </div>}
           {canCreateProject && <div className="border-t border-border p-2">
             {creating ? (
-              <div className="space-y-1.5">
+              <form
+                className="space-y-1.5"
+                onSubmit={event => {
+                  event.preventDefault()
+                  void handleCreate()
+                }}
+              >
                 <input
                   type="text"
                   value={newName}
-                  onChange={e => setNewName(e.target.value)}
-                  onKeyDown={e => e.key === 'Enter' && handleCreate()}
+                  onInput={event => setNewName(event.currentTarget.value)}
                   placeholder="workspace-name"
+                  aria-label="Project name"
                   className="w-full bg-bg-tertiary border border-border rounded px-2 py-1 text-xs text-text-primary focus:outline-none focus:border-accent-blue"
                   autoFocus
                 />
@@ -1196,15 +1217,14 @@ function WorkspaceSelector() {
                     type="password"
                     value={newPassword}
                     onChange={event => setNewPassword(event.target.value)}
-                    onKeyDown={event => event.key === 'Enter' && void handleCreate()}
                     placeholder={remote ? 'Required password (8+ chars)' : 'Optional password (8+ chars)'}
                     className="w-full bg-bg-tertiary border border-border rounded px-2 py-1 text-xs text-text-primary focus:outline-none focus:border-accent-blue"
                   />}
                 {createError && <p className="text-[10px] leading-snug text-red-400">{createError}</p>}
-                <button onClick={() => void handleCreate()} disabled={creatingProject || !newName.trim() || (legacyProjectPasswordAccess && ((newPassword.length > 0 && newPassword.length < 8) || (remote && !newPassword)))} className="flex w-full items-center justify-center gap-1 px-2 py-1 text-xs bg-accent-blue text-white rounded hover:bg-accent-blue-hover disabled:opacity-50">
+                <button type="submit" disabled={createProjectDisabled} className="flex w-full items-center justify-center gap-1 px-2 py-1 text-xs bg-accent-blue text-white rounded hover:bg-accent-blue-hover disabled:opacity-50">
                   {creatingProject && <Loader2 size={11} className="animate-spin" />} {creatingProject ? 'Creating…' : 'Create project'}
                 </button>
-              </div>
+              </form>
             ) : (
               <button
                 onClick={() => setCreating(true)}
@@ -1838,6 +1858,81 @@ function SampleCampaignQueueSection({ pairs }: { pairs: api.SampleCampaignQueueP
   )
 }
 
+function PromptEnhanceQueueCard() {
+  const card = useStore(state => state.enhanceQueueCard)
+  const activeWorkspace = useStore(state => state.activeWorkspace)
+  const cancel = useStore(state => state.cancelEnhancePrompt)
+  const handleUseAndGenerate = useStore(state => state.useCompletedEnhanceAndGenerate)
+  if (!card || card.workspace !== activeWorkspace) return null
+
+  const operation = card.status && 'request_id' in card.status ? card.status : null
+  const text = card.result?.enhanced || operation?.partial_text || ''
+  const stage = operation?.stage || operation?.phase || card.status?.phase || card.phase
+  const stateLabel = card.phase === 'preparing'
+    ? 'Preparing'
+    : card.phase === 'queued'
+      ? 'Queued'
+    : card.phase === 'running'
+      ? 'Writing'
+      : card.phase === 'completed' ? 'Completed' : 'Needs attention'
+  const isActive = card.phase === 'preparing' || card.phase === 'queued' || card.phase === 'running'
+
+  return (
+    <article
+      data-prompt-enhance-queue-card
+      className="rounded-lg border border-accent-blue/30 bg-accent-blue/5 px-3 py-3"
+      aria-labelledby="prompt-enhance-queue-title"
+    >
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <Sparkles size={14} className="shrink-0 text-accent-blue" aria-hidden="true" />
+            <h2 id="prompt-enhance-queue-title" className="text-xs font-medium text-text-primary">Prompt Enhance</h2>
+          </div>
+          <p className="mt-1 text-[10px] text-text-muted">
+            {stateLabel} · {stage.replaceAll('_', ' ')} · {card.workspace}
+          </p>
+        </div>
+        {isActive && (
+          <button
+            type="button"
+            onClick={() => void cancel()}
+            className="rounded-md border border-border px-2.5 py-1 text-[10px] text-text-secondary hover:bg-bg-hover hover:text-text-primary"
+          >
+            Cancel
+          </button>
+        )}
+      </div>
+      {text && (
+        <div
+          role="status"
+          aria-live={isActive ? 'polite' : 'off'}
+          className="mt-2 whitespace-pre-wrap break-words rounded-md border border-border bg-bg-primary/45 px-3 py-2 text-xs leading-relaxed text-text-secondary"
+        >
+          {text}
+        </div>
+      )}
+      {card.error && <p className="mt-2 text-[10px] leading-relaxed text-red-300">{card.error}</p>}
+      {card.phase === 'completed' && card.result && (
+        <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
+          <p className="text-[10px] leading-relaxed text-text-muted">
+            {card.resultApplied
+              ? 'Applied to the open Generate prompt. No generation was started.'
+              : 'Ready for Generate. Opening Generate applies this exact scoped result; it will not start by itself.'}
+          </p>
+          <button
+            type="button"
+            onClick={() => void handleUseAndGenerate()}
+            className="rounded-md bg-accent-blue px-3 py-1.5 text-[10px] font-medium text-white hover:bg-accent-blue-hover"
+          >
+            Use &amp; Generate
+          </button>
+        </div>
+      )}
+    </article>
+  )
+}
+
 function QueuePanel({
   jobs,
   sampleCampaignPairs,
@@ -1863,6 +1958,8 @@ function QueuePanel({
   const retryJobRecovery = useStore(s => s.retryJobRecovery)
   const openH3PlanReview = useStore(s => s.openH3PlanReview)
   const planReviewError = useStore(s => s.h3PlanReviewError)
+  const enhanceQueueCard = useStore(s => s.enhanceQueueCard)
+  const queueActiveWorkspace = useStore(s => s.activeWorkspace)
   const projectPermissionsProjected = workspaces.some(
     workspace => workspace.project_permissions !== undefined,
   )
@@ -1883,6 +1980,8 @@ function QueuePanel({
     queueLastSuccessAt,
     visibleJobs.length,
   )
+  const hasEnhanceCard = enhanceQueueCard?.workspace === queueActiveWorkspace
+  const panelEmptyState = hasEnhanceCard && emptyState === 'empty' ? 'none' : emptyState
   const referenceQualityTargetKey = JSON.stringify(visibleJobs.flatMap(job => (
     job.logicalJobKind === 'reference_pack_parent'
       && job.status === 'completed'
@@ -2021,6 +2120,7 @@ function QueuePanel({
           </div>}
         </div>
         <SampleCampaignQueueSection pairs={sampleCampaignPairs} />
+        <PromptEnhanceQueueCard />
         {queueError && (
           <div
             className={`rounded-md border px-3 py-2 text-xs ${queue ? 'border-amber-500/30 bg-amber-500/10 text-amber-200' : 'border-red-500/30 bg-red-500/10 text-red-300'}`}
@@ -2035,7 +2135,7 @@ function QueuePanel({
         )}
         {(error || planReviewError) && <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">{error || planReviewError}</div>}
         <PipelinePlaceholder />
-        {emptyState === 'pending' ? (
+        {panelEmptyState === 'pending' ? (
           <div className="flex min-h-56 flex-col items-center justify-center rounded-xl border border-dashed border-border bg-bg-secondary/60 px-6 py-10 text-center">
             <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-border bg-bg-tertiary text-text-muted" aria-hidden="true">
               <Loader2 size={22} className="animate-spin" />
@@ -2045,7 +2145,7 @@ function QueuePanel({
               Checking queued and running generations.
             </p>
           </div>
-        ) : emptyState === 'unavailable' ? (
+        ) : panelEmptyState === 'unavailable' ? (
           <div className="flex min-h-56 flex-col items-center justify-center rounded-xl border border-dashed border-border bg-bg-secondary/60 px-6 py-10 text-center">
             <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-border bg-bg-tertiary text-text-muted" aria-hidden="true">
               <Loader2 size={22} className="animate-spin" />
@@ -2055,7 +2155,7 @@ function QueuePanel({
               The queue is unavailable. Maestro is retrying automatically.
             </p>
           </div>
-        ) : emptyState === 'cached-stale' ? (
+        ) : panelEmptyState === 'cached-stale' ? (
           <div className="flex min-h-56 flex-col items-center justify-center rounded-xl border border-dashed border-border bg-bg-secondary/60 px-6 py-10 text-center">
             <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-border bg-bg-tertiary text-text-muted" aria-hidden="true">
               <ListChecks size={22} />
@@ -2065,7 +2165,7 @@ function QueuePanel({
               The latest refresh failed. Maestro is retrying automatically.
             </p>
           </div>
-        ) : emptyState === 'empty' ? (
+        ) : panelEmptyState === 'empty' ? (
           <div className="flex min-h-56 flex-col items-center justify-center rounded-xl border border-dashed border-border bg-bg-secondary/60 px-6 py-10 text-center">
             <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-accent-blue/30 bg-accent-blue/10 text-accent-blue" aria-hidden="true">
               <ListChecks size={22} />
@@ -2448,7 +2548,10 @@ export function MainContent() {
   const gallerySelectionMode = useStore(s => s.gallerySelectionMode)
   const setGallerySelectionMode = useStore(s => s.setGallerySelectionMode)
   const openQueueAfterSubmit = useStore(s => s.openQueueAfterSubmit)
+  const enhanceQueueCard = useStore(s => s.enhanceQueueCard)
   const accessContext = useStore(s => s.accessContext)
+  const accountContext = useStore(s => s.accountContext)
+  const accountProjectMigration = useStore(s => s.accountProjectMigration)
   const loadAccessContext = useStore(s => s.loadAccessContext)
   const reconcileQueueState = useStore(s => s.reconcileQueueState)
   const sampleCampaignPairs = useStore(s => s.sampleCampaignPairs)
@@ -2468,6 +2571,13 @@ export function MainContent() {
   const queuePollSequence = useRef(0)
   const queuePollAbort = useRef<AbortController | null>(null)
   const seenJobIds = useRef(new Set(jobs.map(job => job.id).filter(Boolean)))
+  const queuePollingReady = api.protectedProjectReadsReady(
+    accessContext,
+    accountContext,
+    activeProject ? [activeProject] : [],
+    activeWorkspace,
+    accountProjectMigration,
+  )
   const hasActiveGalleryFilters = mediaFilter !== 'all'
     || outputArtifactScope !== 'final'
     || outputSearchQuery.trim().length > 0
@@ -2530,6 +2640,7 @@ export function MainContent() {
   }, [jobs, openQueueAfterSubmit])
 
   const refreshQueue = useCallback(async (pollSignal?: AbortSignal) => {
+    if (!queuePollingReady) return
     const sequence = ++queuePollSequence.current
     queuePollAbort.current?.abort()
     const controller = new AbortController()
@@ -2558,6 +2669,22 @@ export function MainContent() {
       }))
     } catch (reason) {
       if (queueRefreshIsStale(sequence, queuePollSequence.current, controller.signal.aborted)) return
+      const recoveryStatus = api.queueAccessRecoveryStatus(reason)
+      if (recoveryStatus !== null) {
+        setQueueTabSnapshot({
+          state: null,
+          jobs: [],
+          error: null,
+          lastSuccessAt: null,
+        })
+        useStore.setState({
+          jobs: [],
+          sampleCampaignPairs: [],
+          isGenerating: false,
+        })
+        api.requestAccessRecovery(recoveryStatus)
+        return
+      }
       setQueueTabSnapshot(current => reduceQueueTabSnapshot(current, {
         kind: 'failure',
         error: reason instanceof Error ? reason.message : 'Queue update failed',
@@ -2567,32 +2694,75 @@ export function MainContent() {
       pollSignal?.removeEventListener('abort', relayAbort)
       if (queuePollAbort.current === controller) queuePollAbort.current = null
     }
-  }, [reconcileQueueState, refreshSampleCampaignQueue])
+  }, [queuePollingReady, reconcileQueueState, refreshSampleCampaignQueue])
+
+  useEffect(() => {
+    if (queuePollingReady) return
+    queuePollSequence.current += 1
+    queuePollAbort.current?.abort()
+    queuePollAbort.current = null
+    setQueueTabSnapshot({
+      state: null,
+      jobs: [],
+      error: null,
+      lastSuccessAt: null,
+    })
+    useStore.setState({
+      jobs: [],
+      sampleCampaignPairs: [],
+      isGenerating: false,
+    })
+  }, [queuePollingReady])
 
   useEffect(() => {
     const refresh = () => {
-      if (!document.hidden) void refreshQueue().catch(() => {})
+      if (queuePollingReady && !document.hidden) void refreshQueue().catch(() => {})
     }
     window.addEventListener(QUEUE_REFRESH_EVENT, refresh)
     return () => window.removeEventListener(QUEUE_REFRESH_EVENT, refresh)
-  }, [refreshQueue])
+  }, [queuePollingReady, refreshQueue])
 
   const sampleCampaignJobIds = useMemo(
     () => new Set(sampleCampaignPairs.flatMap(entry => entry.arms.map(arm => arm.job_id))),
     [sampleCampaignPairs],
   )
+  const enhanceOrdinaryJobId = (
+    enhanceQueueCard?.scope?.requestId || enhanceQueueCard?.requestId || ''
+  ).replaceAll('-', '')
   const queueDisplayJobs = queueTabDisplayJobs(queueTabSnapshot, jobs)
-    .filter(job => !sampleCampaignJobIds.has(job.id))
+    .filter(job => (
+      !sampleCampaignJobIds.has(job.id)
+      && !(
+        enhanceOrdinaryJobId
+        && job.logicalJobKind === 'prompt_enhancement'
+        && job.id.replaceAll('-', '') === enhanceOrdinaryJobId
+      )
+    ))
   const ordinaryQueueState = useMemo(() => queueTabState ? {
     ...queueTabState,
-    jobs: queueTabState.jobs.filter(job => !sampleCampaignJobIds.has(job.job_id)),
-  } : null, [queueTabState, sampleCampaignJobIds])
+    jobs: queueTabState.jobs.filter(job => (
+      !sampleCampaignJobIds.has(job.job_id)
+      && !(
+        enhanceOrdinaryJobId
+        && job.logical_job_kind === 'prompt_enhancement'
+        && job.job_id.replaceAll('-', '') === enhanceOrdinaryJobId
+      )
+    )),
+  } : null, [queueTabState, sampleCampaignJobIds, enhanceOrdinaryJobId])
   const logicalQueue = useMemo(
     () => projectLogicalQueue(queueDisplayJobs, ordinaryQueueState?.jobs),
     [queueDisplayJobs, ordinaryQueueState?.jobs],
   )
   const activeQueueJobs = logicalQueue.visibleJobs.filter(isActiveLogicalQueueJob)
+  const enhanceQueueActive = enhanceQueueCard?.workspace === activeWorkspace
+    && (
+      enhanceQueueCard.phase === 'preparing'
+      || enhanceQueueCard.phase === 'queued'
+      || enhanceQueueCard.phase === 'running'
+    )
+  const activeQueueCount = logicalQueue.activeCount + (enhanceQueueActive ? 1 : 0)
   const queueActivity = logicalQueue.activeCount > 0
+    || enhanceQueueActive
     || sampleCampaignPairs.some(entry => entry.queue_state === 'running_arm')
 
   useVisibilityPolling(
@@ -2600,6 +2770,7 @@ export function MainContent() {
     queueActivity
       ? POLL_INTERVAL_MS.queueActiveVisible
       : POLL_INTERVAL_MS.queueIdleVisible,
+    { enabled: queuePollingReady },
   )
 
   useEffect(() => () => {
@@ -2642,6 +2813,8 @@ export function MainContent() {
       ? 'review needed'
       : queueSummary.preparing > 0
         ? 'preparing'
+    : enhanceQueueActive
+      ? 'prompt enhance'
     : ordinaryQueueState?.paused
       ? 'paused'
       : queueSummary.held > 0
@@ -2657,11 +2830,13 @@ export function MainContent() {
     ? 'bg-accent-green'
     : queueSummary.approval_waiting > 0 || queueTabState?.paused || queueSummary.held > 0
       ? 'bg-amber-400'
+      : enhanceQueueActive
+        ? 'bg-accent-blue'
       : logicalQueue.visibleJobs.some(job => job.status === 'failed')
         ? 'bg-red-400'
         : logicalQueue.activeCount > 0 ? 'bg-accent-blue' : 'bg-text-muted'
   const queueTooltip = ordinaryQueueState
-    ? `Queue: ${logicalQueue.activeCount} active · ${queueSummaryLabel(queueSummary)}${ordinaryQueueState.paused ? ' · paused' : ordinaryQueueState.pause_after_current ? ' · pauses after current output' : ''}`
+    ? `Queue: ${activeQueueCount} active · ${queueSummaryLabel(queueSummary)}${enhanceQueueActive ? ' · Prompt Enhance active' : ''}${ordinaryQueueState.paused ? ' · paused' : ordinaryQueueState.pause_after_current ? ' · pauses after current output' : ''}`
     : 'Queue status loading'
   const ownedJobEtaTooltip = currentJob
     ? ` · Your job: overall ETA ${formatApproximateDuration(currentEtaSeconds)}${currentSubtaskEtaSeconds != null ? ` · current task ${formatApproximateDuration(currentSubtaskEtaSeconds)}` : ''}`
@@ -3032,7 +3207,7 @@ export function MainContent() {
               onSelect={setMainView}
               queueTitle={`${queueTooltip}${ownedJobEtaTooltip}`}
               queueStateColor={queueStateColor}
-              activeQueueCount={logicalQueue.activeCount}
+              activeQueueCount={activeQueueCount}
               queueStateLabel={queueStateLabel}
               queueDetails={currentJob ? (
                 <span className="hidden text-[9px] xl:inline">

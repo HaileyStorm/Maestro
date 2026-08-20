@@ -120,9 +120,7 @@ export function Sidebar() {
 
   const productIdentity = (
     <div className="flex min-w-0 items-center gap-2">
-      <div aria-hidden="true" className="w-7 h-7 shrink-0 rounded-lg bg-accent-blue flex items-center justify-center text-white font-bold text-sm">
-        M
-      </div>
+      <img aria-hidden="true" src="/maestro.svg" alt="" className="h-7 w-7 shrink-0" />
       <div className="min-w-0">
         <span className="sr-only">{PRODUCT_NAME}. {PRODUCT_PROVENANCE}</span>
         <span aria-hidden="true" className="block truncate text-[11px] font-semibold leading-tight">{PRODUCT_NAME_VISUAL}</span>
@@ -163,13 +161,13 @@ export function Sidebar() {
         type="button"
         onClick={() => setSidebarMode('reference')}
         disabled={!activeWorkspace || browsingUploads || referenceLocked}
-        aria-label={referenceLocked ? 'Unlock project to open Reference' : 'Open Reference'}
+        aria-label={referenceLocked ? 'Unlock project to open References' : 'Open References'}
         aria-pressed={isReference}
         className={`mobile-control-target min-w-0 px-1.5 py-1 text-[10px] md:px-2.5 md:text-[11px] rounded-md transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:cursor-not-allowed disabled:opacity-40 ${
           isReference ? 'bg-toggle-active shadow-accent-glow text-toggle-active-foreground' : 'text-text-secondary hover:text-text-primary'
         }`}
       >
-        Reference
+        References
       </button>
     </div>
   )
@@ -356,7 +354,7 @@ export function Sidebar() {
           ref={mobileSidebarRef}
           role="dialog"
           aria-modal="true"
-          aria-label="Generate, Director, and Reference menu"
+          aria-label="Generate, Director, and References menu"
           aria-hidden={!sidebarOpen}
           inert={!sidebarOpen}
           className={`fixed top-0 left-0 h-[100vh] supports-[height:100dvh]:h-[100dvh] w-[380px] max-w-[85vw] bg-bg-secondary border-r border-border z-[60] flex flex-col overflow-hidden transform transition-transform duration-300 ease-in-out pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)] ${

@@ -179,7 +179,6 @@ sys.argv = _original_argv
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
-from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import stat
 
@@ -226,6 +225,10 @@ from services.credit_accounting import (
     CreditAccountingPolicy,
     CreditSourceBalance,
 )
+from services.owner_test_credits import (
+    OwnerTestCreditError,
+    OwnerTestCreditLedger,
+)
 from services.credit_runtime import (
     CreditRuntimeError,
     CreditRuntimePolicy,
@@ -244,6 +247,17 @@ from services.support_portal import (
     SupportAuthorizationError,
     SupportPortal,
     SupportPortalError,
+)
+from services.support_webhooks import (
+    BmacSupportWebhookAdapter,
+    FileWebhookReplayGuard,
+    SupportAssociationIntegrityError,
+    SupportWebhookError,
+    WebhookPayloadError,
+    WebhookReplayError,
+    WebhookReplayIntegrityError,
+    WebhookSignatureError,
+    process_signed_webhook,
 )
 
 # The shared filter deliberately keeps bearer/security traffic visible:
@@ -280,6 +294,10 @@ _account_project_membership_lock = threading.Lock()
 _account_project_membership_value = None
 _support_portal_lock = threading.Lock()
 _support_portal_value = None
+_owner_test_credit_lock = threading.Lock()
+_owner_test_credit_value = None
+_support_bmac_webhook_lock = threading.Lock()
+_support_bmac_webhook_value = None
 _output_share_manager_lock = threading.Lock()
 _output_share_manager_value = None
 _project_unlock_limiter = ProjectUnlockRateLimiter()
@@ -340,6 +358,13 @@ def _accounts_enabled() -> bool:
 def _account_bootstrap_enabled() -> bool:
     return _accounts_enabled() and _env_flag_enabled(
         "MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED"
+    )
+
+
+def _public_registration_enabled() -> bool:
+    """Public signup is an explicit account-host opt in."""
+    return _accounts_enabled() and _env_flag_enabled(
+        "MAESTRO_PUBLIC_REGISTRATION_ENABLED"
     )
 
 
@@ -481,6 +506,57 @@ def _public_support_catalog_projection() -> dict:
     ).project()
 
 
+def _owner_test_credit_target() -> int:
+    try:
+        value = int(os.environ.get("MAESTRO_OWNER_TEST_CREDIT_TARGET") or 1_000)
+    except (TypeError, ValueError):
+        value = 1_000
+    return min(1_000_000, max(1, value))
+
+
+def _owner_test_credit_account_key(account_id: str) -> str:
+    return opaque_key(
+        "maestro_owner_test_credit",
+        account_id,
+        _support_domain_key("owner-test-credit-account"),
+    )
+
+
+def _owner_test_credit_source_key(account_id: str) -> str:
+    return opaque_key(
+        "maestro_owner_test_credit_source",
+        account_id,
+        _support_domain_key("owner-test-credit-source"),
+    )
+
+
+def _owner_test_credit_ledger() -> OwnerTestCreditLedger:
+    global _owner_test_credit_value
+    if _owner_test_credit_value is None:
+        with _owner_test_credit_lock:
+            if _owner_test_credit_value is None:
+                configured = str(
+                    os.environ.get("MAESTRO_OWNER_TEST_CREDIT_PATH") or ""
+                ).strip()
+                path = configured or os.path.join(
+                    _app_dir, "storage", "support", "owner_test_credits.json",
+                )
+                if not os.path.isabs(path):
+                    path = os.path.join(_app_dir, path)
+                _owner_test_credit_value = OwnerTestCreditLedger(
+                    path,
+                    integrity_key=_support_domain_key("owner-test-credit-ledger"),
+                    target_balance=_owner_test_credit_target(),
+                )
+    return _owner_test_credit_value
+
+
+def _owner_test_credit_projection(account_id: str) -> dict:
+    return _owner_test_credit_ledger().public_projection(
+        _owner_test_credit_account_key(account_id),
+    )
+
+
 def _support_portal() -> SupportPortal | None:
     """Return the process-local facade over sealed, process-safe stores."""
     global _support_portal_value
@@ -503,8 +579,29 @@ def _support_portal() -> SupportPortal | None:
                     scheduler_enforcement_resolver=(
                         lambda: _credit_support_scheduler_enforcement_enabled()
                     ),
+                    owner_test_credit_resolver=_owner_test_credit_projection,
                 )
     return _support_portal_value
+
+
+def _support_bmac_webhook_runtime():
+    """Return the private native BMaC webhook runtime when explicitly enabled."""
+    global _support_bmac_webhook_value
+    if str(os.environ.get("MAESTRO_SUPPORT_BMAC_WEBHOOK_ENABLED") or "").strip().lower() != "true":
+        return None
+    if _support_bmac_webhook_value is None:
+        with _support_bmac_webhook_lock:
+            if _support_bmac_webhook_value is None:
+                _support_bmac_webhook_value = (
+                    BmacSupportWebhookAdapter.from_environment(),
+                    ContributionLedger(
+                        integrity_key=_support_domain_key("ledger"),
+                    ),
+                    FileWebhookReplayGuard(
+                        integrity_key=_support_domain_key("bmac-webhook-replay"),
+                    ),
+                )
+    return _support_bmac_webhook_value
 
 
 def _attach_account_request_state(
@@ -591,9 +688,13 @@ def _server_bind_is_widened() -> bool:
 def _remote_sharing_enabled() -> bool:
     """Whether Maestro is deliberately reachable beyond loopback."""
     widened = globals().get("_server_bind_is_widened")
-    return _env_flag_enabled("PINOKIO_SHARE_CLOUDFLARE") or _env_flag_enabled(
-        "PINOKIO_SHARE_LOCAL"
-    ) or bool(callable(widened) and widened())
+    registered = globals().get("_runtime_share_registration")
+    return (
+        _env_flag_enabled("PINOKIO_SHARE_CLOUDFLARE")
+        or bool(callable(registered) and registered()[0])
+        or _env_flag_enabled("PINOKIO_SHARE_LOCAL")
+        or bool(callable(widened) and widened())
+    )
 
 
 _runtime_share_url_lock = threading.Lock()
@@ -691,7 +792,11 @@ def _request_is_cloudflare_remote(request: Request) -> bool:
     accept a non-loopback peer directly.  Neither path may inherit local
     machine-owner capabilities.
     """
-    cloudflare = _env_flag_enabled("PINOKIO_SHARE_CLOUDFLARE")
+    registered = globals().get("_runtime_share_registration")
+    cloudflare = (
+        _env_flag_enabled("PINOKIO_SHARE_CLOUDFLARE")
+        or bool(callable(registered) and registered()[0])
+    )
     # Cloudflare adds CF-Ray to origin requests and CF-Connecting-IP only on
     # edge-to-origin traffic. Treat either marker as remote even if a tunnel
     # or origin rule rewrites Host/X-Forwarded-Host to loopback. A direct
@@ -731,7 +836,6 @@ _REMOTE_LOCAL_ONLY_PREFIXES = (
     "/api/v1/huggingface",
     "/api/v1/civitai",
     "/api/v1/checkpoints",
-    "/api/v1/presets",
 )
 _REMOTE_LOCAL_ONLY_EXACT = frozenset({
     ("PUT", "/api/v1/services-config"),
@@ -995,6 +1099,32 @@ def _configured_app_origins() -> frozenset[str]:
     return frozenset(origins)
 
 
+def _verified_runtime_cloudflare_origin(origin: str | None) -> bool:
+    """Admit only the exact Quick or verified stable origin for this launch."""
+    candidate = _canonical_http_origin(origin, allow_path=False)
+    if candidate is None:
+        return False
+    share, quick, stable_verified = _runtime_share_registration()
+    return bool(
+        (candidate == quick and _is_quick_tunnel_origin(candidate))
+        or (
+            stable_verified
+            and candidate == share
+            and _is_workers_dev_origin(candidate)
+        )
+    )
+
+
+def _cors_origin_allowed(origin: str | None) -> bool:
+    """Evaluate the exact credentialed-origin allowlist at request time."""
+    candidate = _canonical_http_origin(origin, allow_path=False)
+    if candidate is None:
+        return False
+    if _is_quick_tunnel_origin(candidate) or _is_workers_dev_origin(candidate):
+        return _verified_runtime_cloudflare_origin(candidate)
+    return candidate in _configured_app_origins()
+
+
 def _account_exact_origin_allowed(request: Request) -> bool:
     """Bind credentialed account traffic to this app's exact origin."""
     supplied = _canonical_http_origin(
@@ -1003,10 +1133,107 @@ def _account_exact_origin_allowed(request: Request) -> bool:
     if supplied is None:
         return False
     request_origins = _request_external_origins(request)
-    approved = _configured_app_origins()
-    if supplied in approved and supplied in request_origins:
+    if _cors_origin_allowed(supplied) and supplied in request_origins:
         return True
     return _matches_verified_stable_redirect_origin(supplied, request_origins)
+
+
+def _public_registration_ready() -> bool:
+    return bool(
+        _public_registration_enabled()
+        and _account_project_access_state()["enforced"]
+    )
+
+
+def _loopback_registration_ready() -> bool:
+    """Direct loopback can create a user after project cutover."""
+    return bool(
+        _accounts_enabled() and _account_project_access_state()["enforced"]
+    )
+
+
+def _registration_request_is_remote(request: Request) -> bool:
+    return bool(
+        getattr(request.state, "maestro_remote", False)
+        or _request_is_cloudflare_remote(request)
+    )
+
+
+def _registration_request_ready(request: Request) -> bool:
+    if _registration_request_is_remote(request):
+        return _public_registration_ready()
+    return bool(
+        _loopback_registration_ready()
+        and _is_loopback_request_client(request)
+    )
+
+
+def _public_registration_origin_allowed(
+    request: Request,
+    *,
+    mutation: bool,
+) -> bool:
+    if isinstance(
+        getattr(request.state, "maestro_account_principal", None), dict,
+    ):
+        return False
+    if _registration_request_is_remote(request):
+        request_origins = _request_external_origins(request)
+        if not any(
+            _verified_runtime_cloudflare_origin(origin)
+            for origin in request_origins
+        ):
+            return False
+        if not mutation:
+            return True
+        supplied = _canonical_http_origin(
+            str(request.headers.get("origin") or ""), allow_path=False,
+        )
+        return bool(
+            _verified_runtime_cloudflare_origin(supplied)
+            and _account_exact_origin_allowed(request)
+        )
+    if not _is_loopback_request_client(request):
+        return False
+    if not mutation:
+        return True
+    direct = _canonical_http_origin(str(request.base_url), allow_path=True)
+    supplied = _canonical_http_origin(
+        str(request.headers.get("origin") or ""), allow_path=False,
+    )
+    return bool(
+        direct
+        and supplied
+        and direct == supplied
+        and _approved_local_origin(supplied)
+    )
+
+
+def _public_registration_available(request: Request) -> bool:
+    return bool(
+        _registration_request_ready(request)
+        and _public_registration_origin_allowed(request, mutation=False)
+    )
+
+
+def _public_registration_rate_source(request: Request) -> str:
+    """Use Cloudflare's canonical client address only for abuse throttling."""
+    supplied = str(request.headers.get("cf-connecting-ip") or "").strip()
+    try:
+        if supplied:
+            return f"cf:{ipaddress.ip_address(supplied).compressed}"
+    except ValueError:
+        pass
+    return _account_request_source(request)
+
+
+def _audit_public_registration(outcome: str) -> None:
+    allowed = {
+        "success", "username_unavailable", "rate_limited", "rejected",
+        "store_unavailable",
+    }
+    safe = outcome if outcome in allowed else "rejected"
+    print(f"[Account registration] outcome={safe}")
 
 
 def _request_external_origins(request: Request) -> set[str]:
@@ -1036,12 +1263,17 @@ def _matches_verified_stable_redirect_origin(
     request_origins: set[str],
 ) -> bool:
     """Allow only this launch's verified stable-to-Quick redirect pair."""
-    if not _env_flag_enabled("PINOKIO_SHARE_CLOUDFLARE"):
+    registered = globals().get("_runtime_share_registration")
+    if not (
+        _env_flag_enabled("PINOKIO_SHARE_CLOUDFLARE")
+        or bool(callable(registered) and registered()[0])
+    ):
         return False
     share_url, quick_tunnel, stable_verified = _runtime_share_registration()
     return bool(
         stable_verified
         and origin == share_url
+        and _verified_runtime_cloudflare_origin(origin)
         and _is_workers_dev_origin(origin)
         and _is_quick_tunnel_origin(quick_tunnel)
         and quick_tunnel in request_origins
@@ -1106,6 +1338,12 @@ def _reject_cross_origin_mutation(request: Request) -> JSONResponse | None:
     for header_name, raw_value, allow_path in present:
         origin = _canonical_http_origin(raw_value, allow_path=allow_path)
         if origin is None or (
+            (
+                _is_quick_tunnel_origin(origin)
+                or _is_workers_dev_origin(origin)
+            )
+            and not _verified_runtime_cloudflare_origin(origin)
+        ) or (
             origin not in expected_origins
             and not (local_request and _approved_local_origin(origin))
             and not _matches_verified_stable_redirect_origin(
@@ -1168,19 +1406,64 @@ async def _call_next_with_recovery_no_store(request: Request, call_next):
     )
 
 
-# Add CORS before the session middleware so Starlette wraps CORS inside the
-# local-control/no-store boundary. Research OPTIONS responses cannot bypass
-# remote denial or cache stamping.
-_cors_origin_regex = "^(?:" + "|".join(
-    re.escape(origin) for origin in sorted(_configured_app_origins())
-) + ")$"
-api.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=_cors_origin_regex,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Credentialed CORS must be evaluated after the launcher registers the current
+# Quick Tunnel and verified stable Worker. A startup-frozen regex cannot admit
+# that exact stable origin and caused valid browser POSTs to fail after launch.
+_CORS_ALLOWED_METHODS = frozenset({
+    "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS",
+})
+
+
+@api.middleware("http")
+async def _exact_runtime_cors_middleware(request: Request, call_next):
+    origin = _canonical_http_origin(
+        str(request.headers.get("origin") or ""), allow_path=False,
+    )
+    allowed = bool(origin and _cors_origin_allowed(origin))
+    requested_method = str(
+        request.headers.get("access-control-request-method") or ""
+    ).strip().upper()
+    if request.method.upper() == "OPTIONS" and requested_method:
+        if not allowed or requested_method not in _CORS_ALLOWED_METHODS:
+            return JSONResponse(
+                {"detail": "CORS origin or method is not allowed"},
+                status_code=400,
+            )
+        requested_headers = str(
+            request.headers.get("access-control-request-headers") or ""
+        ).strip()
+        if len(requested_headers) > 4096 or any(
+            re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", item.strip()) is None
+            for item in requested_headers.split(",")
+            if item.strip()
+        ):
+            return JSONResponse(
+                {"detail": "CORS request headers are invalid"},
+                status_code=400,
+            )
+        headers = {
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Allow-Methods": requested_method,
+            "Access-Control-Max-Age": "600",
+            "Vary": "Origin",
+        }
+        if requested_headers:
+            headers["Access-Control-Allow-Headers"] = requested_headers
+        return Response(status_code=200, headers=headers)
+
+    response = await call_next(request)
+    if allowed:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        vary = {
+            item.strip()
+            for item in str(response.headers.get("Vary") or "").split(",")
+            if item.strip()
+        }
+        vary.add("Origin")
+        response.headers["Vary"] = ", ".join(sorted(vary))
+    return response
 
 
 @api.middleware("http")
@@ -1335,14 +1618,18 @@ from services.job_lifecycle import (
     _credit_queue_fingerprint,
     _credit_queue_metadata_from_quote,
     apply_credit_queue_decision,
+    acquire_and_start_generation_slot,
     authorized_logical_queue_projection,
     arm_prepared_job_plan_review,
     approve_prepared_job,
     block_generation_recovery,
     block_resource_admission_failure,
+    complete_prompt_enhancement_resource_release,
     complete_preparation,
     configure_credit_lifecycle_callback,
+    configure_credit_settlement_callback,
     consume_credit_queue_reservation,
+    consume_prompt_enhancement_result,
     DurableTransition,
     GENERATED_MEDIA_EXTENSIONS,
     clear_job_residency,
@@ -1351,6 +1638,7 @@ from services.job_lifecycle import (
     configure_durability_hook,
     durable_queue_state,
     finish_job,
+    fail_queued_job,
     fail_preparation,
     generation_slot,
     is_cancel_requested,
@@ -1364,6 +1652,7 @@ from services.job_lifecycle import (
     record_job_outputs,
     residency_configuration_update,
     register_abort_state,
+    release_generation_slot,
     request_sample_preemption,
     request_cancel,
     restore_scheduler_state,
@@ -1377,6 +1666,7 @@ from services.job_lifecycle import (
     set_queue_pause_after_current,
     set_queue_paused,
     settle_sample_preemption,
+    settle_terminal_credit,
     stamp_job_residency,
     try_requeue,
     try_resource_retry,
@@ -1438,6 +1728,11 @@ from services.h3_duration_plan import (
     snap_published_duration,
 )
 from services.queue_recovery_adapter import (
+    PromptEnhancementRecoveryCapacityError,
+    PromptEnhancementRecoveryConflictError,
+    PromptEnhancementRecoveryError,
+    PromptEnhancementRecoveryStore,
+    PromptEnhancementResultStore,
     QueueRecoveryAdapterError,
     QueueRecoveryCoordinator,
     ensure_project_instance_marker,
@@ -1526,7 +1821,6 @@ _queue_recovery_journal = QueueRecoveryJournal(
 )
 _queue_recovery_coordinator = QueueRecoveryCoordinator(_queue_recovery_journal)
 _queue_recovery_restored = _queue_recovery_coordinator.restore()
-
 
 def _queue_recovery_with_bounded_compaction(operation):
     try:
@@ -1638,6 +1932,8 @@ def _startup_recovery_sensitive_path(path: str, method: str = "") -> bool:
         )
         or path == "/api/v1/director/preparation"
         or path.startswith("/api/v1/director/preparation/")
+        or path == "/api/v1/llm/enhance-prompt"
+        or path.startswith("/api/v1/llm/operations/")
         or path == "/api/v1/sample-campaign"
         or path.startswith("/api/v1/sample-campaign/")
         or path in {"/api/v1/jobs", "/api/v1/queue"}
@@ -1826,6 +2122,461 @@ class _JobRegistry(dict):
 _jobs: dict = _JobRegistry()
 
 
+class _CanonicalPromptEnhancementStore:
+    """Account/project-scoped façade over the ordinary durable job queue."""
+
+    _PRIVATE_KEY = "_prompt_enhancement_operation"
+
+    def __init__(self, result_store, legacy_store) -> None:
+        self._results = result_store
+        self._legacy = legacy_store
+
+    @staticmethod
+    def _request_id(value: str) -> str:
+        try:
+            return uuid.UUID(value).hex
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ValueError("Prompt Enhance request_id must be a UUID") from error
+
+    @staticmethod
+    def _private(job: Mapping[str, Any]) -> dict[str, Any] | None:
+        params = job.get("params")
+        private = params.get(
+            _CanonicalPromptEnhancementStore._PRIVATE_KEY,
+        ) if isinstance(params, Mapping) else None
+        return dict(private) if isinstance(private, Mapping) else None
+
+    @staticmethod
+    def _same_scope(
+        private: Mapping[str, Any] | None,
+        *,
+        account_key: str,
+        project_instance_key: str,
+        **_scope: Any,
+    ) -> bool:
+        return bool(
+            isinstance(private, Mapping)
+            and isinstance(account_key, str)
+            and isinstance(project_instance_key, str)
+            and hmac.compare_digest(
+                str(private.get("account_key") or ""), account_key,
+            )
+            and hmac.compare_digest(
+                str(private.get("project_instance_key") or ""),
+                project_instance_key,
+            )
+        )
+
+    @staticmethod
+    def _public(job: Mapping[str, Any]) -> dict[str, Any]:
+        status = str(job.get("status") or "failed")
+        phase = (
+            status
+            if status in {"completed", "failed", "cancelled"}
+            else str(job.get("phase") or status)
+        )
+        public = {
+            "request_id": str(job.get("id") or ""),
+            "operation_kind": "enhance",
+            "status": status,
+            "phase": phase,
+            "stage": phase,
+            "partial_text": "",
+            "generated_tokens_approx": 0,
+            "elapsed_seconds": 0.0,
+            "live_tps": None,
+            "average_tps": None,
+            "result_available": isinstance(
+                job.get("prompt_result_reference"), Mapping,
+            ),
+            "result_consumed": job.get("prompt_result_consumed") is True,
+            "retryable": status == "failed",
+        }
+        if status == "failed":
+            public["error"] = {
+                "code": "prompt_enhancement_failed",
+                "message": "Prompt enhancement failed",
+                "retryable": True,
+            }
+        return public
+
+    def _canonical(
+        self,
+        request_id: str,
+        **scope: Any,
+    ) -> dict | None:
+        job = _jobs.get(self._request_id(request_id))
+        if (
+            not isinstance(job, dict)
+            or job.get("kind") != "prompt_enhancement"
+            or not self._same_scope(self._private(job), **scope)
+        ):
+            return None
+        return job
+
+    def _legacy_status(self, request_id: str, **scope: Any) -> dict | None:
+        try:
+            status = self._legacy.status(request_id, **scope)
+        except PromptEnhancementRecoveryError:
+            return None
+        return self._project_legacy_status(status)
+
+    @staticmethod
+    def _project_legacy_status(status: Mapping[str, Any] | None) -> dict | None:
+        if status is None:
+            return None
+        status = dict(status)
+        # Legacy active records are historical evidence only. Project them as
+        # retryable interruption without mutating or executing the sidecar.
+        if status.get("status") in {"queued", "running"}:
+            status.update({
+                "status": "failed",
+                "phase": "failed",
+                "stage": "failed",
+                "partial_text": "",
+                "generated_tokens_approx": 0,
+                "result_available": False,
+                "retryable": True,
+                "error": {
+                    "code": "prompt_enhancement_failed",
+                    "message": "Prompt enhancement failed",
+                    "retryable": True,
+                },
+            })
+        return status
+
+    def bind(
+        self,
+        *,
+        request_id: str,
+        account_key: str,
+        project_instance_key: str,
+        session_key: str,
+        request_digest: str,
+        job_context: Mapping[str, Any] | None = None,
+    ) -> tuple[dict[str, Any] | None, bool, str | None]:
+        normalized = self._request_id(request_id)
+        existing = _jobs.get(normalized)
+        if existing is not None:
+            if (
+                not isinstance(existing, dict)
+                or existing.get("kind") != "prompt_enhancement"
+            ):
+                raise PromptEnhancementRecoveryConflictError(
+                    "Prompt Enhance request_id is already bound."
+                )
+            private = self._private(existing)
+            if not self._same_scope(
+                private,
+                account_key=account_key,
+                project_instance_key=project_instance_key,
+            ):
+                return None, False, None
+            if not hmac.compare_digest(
+                str((private or {}).get("request_digest") or ""),
+                request_digest,
+            ):
+                raise PromptEnhancementRecoveryConflictError(
+                    "Prompt Enhance request_id is already bound."
+                )
+            return self._public(existing), False, None
+        legacy = self._legacy.replay(
+            request_id=normalized,
+            account_key=account_key,
+            project_instance_key=project_instance_key,
+            session_key=session_key,
+            request_digest=request_digest,
+        )
+        legacy = self._project_legacy_status(legacy)
+        if legacy is not None:
+            return legacy, False, None
+        if not isinstance(job_context, Mapping):
+            raise PromptEnhancementRecoveryError(
+                "Prompt Enhance job context is unavailable."
+            )
+        workspace = str(job_context.get("workspace") or "")
+        out_dir = str(job_context.get("out_dir") or "")
+        session_id = str(job_context.get("session_id") or "")
+        body = job_context.get("body")
+        if (
+            not workspace or not out_dir or not session_id
+            or not isinstance(body, Mapping)
+        ):
+            raise PromptEnhancementRecoveryError(
+                "Prompt Enhance job context is incomplete."
+            )
+        private = {
+            "account_key": account_key,
+            "project_instance_key": project_instance_key,
+            "request_digest": request_digest,
+            "body": copy.deepcopy(dict(body)),
+        }
+        job = {
+            "id": normalized,
+            "status": "queued",
+            "kind": "prompt_enhancement",
+            "logical_job_kind": "prompt_enhancement",
+            "tool": "prompt_enhancement",
+            "workspace": workspace,
+            "out_dir": out_dir,
+            "session_id": session_id,
+            "source_remote": bool(job_context.get("source_remote", False)),
+            "created_at": time.time(),
+            "queue_class": "user",
+            "queue_priority": 0,
+            "queue_held": False,
+            "requested_outputs": 1,
+            "phase": "queued",
+            "message": "Waiting to enhance prompt",
+            "progress": 0,
+            "resource_intent": RESOURCE_INTENT_TEXT,
+            "resource_execution": RESOURCE_EXECUTION_STANDARD,
+            "preemption_mode": "none",
+            "resource_state": "queued",
+            "execution_attempt": 1,
+            "generation_mode": str(job_context.get("generation_mode") or ""),
+            "params": {self._PRIVATE_KEY: private},
+            "access_policy": {
+                "private": bool(job_context.get("private", False)),
+                "explicit": bool(job_context.get("explicit", False)),
+            },
+            "private": bool(job_context.get("private", False)),
+            "explicit": bool(job_context.get("explicit", False)),
+        }
+        try:
+            _queue_recovery_register_and_publish(
+                job,
+                recovery_kind="prompt_enhancement",
+                defer_worker=True,
+            )
+        except (
+            QueueRecoveryRuntimeError,
+            QueueRecoveryAdapterError,
+            OSError,
+        ) as error:
+            raise PromptEnhancementRecoveryError(
+                "Prompt Enhance durable admission is unavailable."
+            ) from error
+        return self._public(_jobs[normalized]), True, uuid.uuid4().hex
+
+    def status(self, request_id: str, **scope: Any) -> dict[str, Any] | None:
+        try:
+            job = self._canonical(request_id, **scope)
+        except ValueError:
+            return None
+        if job is not None:
+            return self._public(job)
+        return self._legacy_status(request_id, **scope)
+
+    def mark_running(self, request_id: str, **scope: Any) -> dict | None:
+        job = self._canonical(request_id, **scope)
+        if job is None:
+            return None
+        if job.get("status") != "queued":
+            return self._public(job)
+        try:
+            _credit_prepare_admission(job)
+        except Exception:
+            block_resource_admission_failure(job)
+            return self._public(job)
+        if not acquire_and_start_generation_slot(
+            _gen_lock,
+            job,
+            block_on_persistence_failure=True,
+            phase="loading",
+            message="Loading prompt enhancer",
+        ):
+            return self._public(job)
+        try:
+            _credit_prepare_dispatch(job)
+        except Exception:
+            finish_job(
+                job, "failed",
+                phase="failed",
+                message="Prompt enhancement failed",
+                error="Prompt enhancement failed",
+                recovery_state="terminal",
+            )
+            raise
+        return self._public(job)
+
+    def progress(
+        self,
+        request_id: str,
+        *,
+        event: Mapping[str, Any],
+        **scope: Any,
+    ) -> dict | None:
+        job = self._canonical(request_id, **scope)
+        if job is None:
+            return None
+        phase = str(event.get("phase") or "inference")
+        if phase not in {
+            "queued", "loading", "prefill", "inference", "thinking",
+            "generating", "detecting", "retrying", "finalizing",
+        }:
+            phase = "inference"
+        update_job(
+            job,
+            phase=phase,
+            message="Enhancing prompt",
+        )
+        return self._public(job)
+
+    def runtime_context(self, request_id: str, **scope: Any) -> dict | None:
+        job = self._canonical(request_id, **scope)
+        if job is None:
+            return None
+        return {"job": job, "generation_slot_owned": True}
+
+    def complete(
+        self,
+        request_id: str,
+        *,
+        result: Any,
+        **scope: Any,
+    ) -> dict | None:
+        job = self._canonical(request_id, **scope)
+        if job is None:
+            return None
+        try:
+            reference = self._results.write(request_id, copy.deepcopy(result))
+        except PromptEnhancementRecoveryCapacityError:
+            if not self._evict_expired_terminal_results(exclude=job):
+                raise
+            reference = self._results.write(request_id, copy.deepcopy(result))
+        try:
+            finished = finish_job(
+                job,
+                "completed",
+                phase="completed",
+                progress=100,
+                message="Prompt enhancement complete",
+                prompt_result_reference=reference,
+                recovery_state="terminal",
+                reruns_denoise=False,
+            )
+        except Exception:
+            self._results.remove(reference)
+            raise
+        if not finished:
+            self._results.remove(reference)
+        return self._public(job)
+
+    def _evict_expired_terminal_results(self, *, exclude: dict) -> bool:
+        cutoff = time.time() - float(self._results.retention_seconds)
+        candidates = sorted(
+            (
+                candidate for candidate in _jobs.values()
+                if isinstance(candidate, dict)
+                and candidate is not exclude
+                and candidate.get("kind") == "prompt_enhancement"
+                and candidate.get("status") == "completed"
+                and isinstance(
+                    candidate.get("prompt_result_reference"), Mapping,
+                )
+                and float(
+                    candidate.get("finished_at")
+                    or candidate.get("created_at")
+                    or time.time()
+                ) <= cutoff
+            ),
+            key=lambda candidate: float(
+                candidate.get("finished_at")
+                or candidate.get("created_at")
+                or 0.0
+            ),
+        )
+        for candidate in candidates:
+            reference = consume_prompt_enhancement_result(candidate)
+            if reference is not None:
+                self._results.remove(reference)
+                return True
+        return False
+
+    def fail(
+        self,
+        request_id: str,
+        *,
+        failure_code: str = "execution_failed",
+        **scope: Any,
+    ) -> dict | None:
+        del failure_code
+        job = self._canonical(request_id, **scope)
+        if job is None:
+            return None
+        updates = {
+            "phase": "failed",
+            "message": "Prompt enhancement failed",
+            "error": "Prompt enhancement failed",
+            "recovery_state": "terminal",
+            "reruns_denoise": False,
+        }
+        if job.get("status") == "running":
+            finish_job(job, "failed", **updates)
+        elif job.get("status") == "queued":
+            fail_queued_job(job, **updates)
+        return self._public(job)
+
+    def cancel(self, request_id: str, **scope: Any) -> dict | None:
+        job = self._canonical(request_id, **scope)
+        if job is None:
+            return self._legacy_status(request_id, **scope)
+        request_cancel(job, job_id=str(job.get("id") or ""))
+        return self._public(job)
+
+    def result(
+        self,
+        request_id: str,
+        *,
+        consume: bool = False,
+        **scope: Any,
+    ) -> Any:
+        job = self._canonical(request_id, **scope)
+        if job is None:
+            if consume:
+                return None
+            try:
+                return self._legacy.result(
+                    request_id, consume=False, **scope,
+                )
+            except PromptEnhancementRecoveryError:
+                return None
+        reference = job.get("prompt_result_reference")
+        if not isinstance(reference, Mapping):
+            return None
+        result = self._results.read(request_id, reference)
+        if consume:
+            consumed = consume_prompt_enhancement_result(job)
+            if consumed is not None:
+                self._results.remove(consumed)
+        return result
+
+    def release(self, request_id: str, **scope: Any) -> None:
+        job = self._canonical(request_id, **scope)
+        if job is not None:
+            if release_generation_slot(_gen_lock, job):
+                complete_prompt_enhancement_resource_release(job)
+
+
+from services.llm_operations import PromptEnhancementOperationManager
+
+_prompt_enhancement_legacy_store = PromptEnhancementRecoveryStore(
+    os.path.join(_app_dir, "storage", "prompt-enhancement"),
+    _session_secret(),
+    read_only=True,
+)
+_prompt_enhancement_result_store = PromptEnhancementResultStore(
+    os.path.join(_app_dir, "storage", "prompt-enhancement-queue-results"),
+)
+_prompt_enhancement_operation_manager = PromptEnhancementOperationManager(
+    _CanonicalPromptEnhancementStore(
+        _prompt_enhancement_result_store,
+        _prompt_enhancement_legacy_store,
+    ),
+)
+
+
 def _stamp_job_origin(job: dict) -> dict:
     """Capture local-vs-Cloudflare origin before a worker thread is spawned."""
     job.setdefault("source_remote", bool(_request_remote.get()))
@@ -1897,7 +2648,18 @@ def _credit_accounting_journal() -> CreditAccountingJournal | None:
     """Lazily bind the journal and lifecycle seam only behind the hard gate."""
     global _credit_accounting_value
     if not _credit_accounting_enabled():
-        configure_credit_lifecycle_callback(None)
+        existing_opener = globals().get("_credit_accounting_existing_journal")
+        existing = existing_opener() if callable(existing_opener) else None
+        callback = (
+            _credit_accounting_lifecycle_callback
+            if existing is not None else None
+        )
+        configure_credit_lifecycle_callback(callback)
+        settlement_configurer = globals().get(
+            "configure_credit_settlement_callback",
+        )
+        if callable(settlement_configurer):
+            settlement_configurer(callback)
         return None
     with _credit_accounting_lock:
         if _credit_accounting_value is None:
@@ -1913,12 +2675,22 @@ def _credit_accounting_journal() -> CreditAccountingJournal | None:
             except (CreditAccountingError, OSError):
                 _credit_mark_accounting_health(False)
                 configure_credit_lifecycle_callback(None)
+                settlement_configurer = globals().get(
+                    "configure_credit_settlement_callback",
+                )
+                if callable(settlement_configurer):
+                    settlement_configurer(None)
                 return None
             _credit_accounting_value = journal
             _credit_mark_accounting_health(True)
         configure_credit_lifecycle_callback(
             _credit_accounting_lifecycle_callback,
         )
+        settlement_configurer = globals().get(
+            "configure_credit_settlement_callback",
+        )
+        if callable(settlement_configurer):
+            settlement_configurer(_credit_accounting_lifecycle_callback)
         return _credit_accounting_value
 
 
@@ -2140,11 +2912,14 @@ def _credit_recorded_allowance(job: dict) -> dict:
         )
         return ContributionLedger(
             integrity_key=_support_domain_key("ledger"),
-        ).privacy_safe_user_projection(subject)["recorded_allowance"]
+        ).privacy_safe_user_projection(
+            subject,
+            policy=_load_server_support_catalog().benefit_policy,
+        )["recorded_allowance"]
     return {
         "state": "recorded_not_enforced",
         "enforcement_enabled": False,
-        "unit": "compute_seconds",
+        "unit": "maestro_credits",
         "as_of": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "effective_allowance": 0,
         "sources": [{
@@ -2237,13 +3012,19 @@ def _credit_restore_recovery_lineage(job: dict) -> bool:
 def _credit_accounting_hydrate_job(job: dict) -> bool:
     """Recover the private reservation/account association server-side."""
     _credit_restore_recovery_lineage(job)
-    if _credit_owner_exempt(job):
-        _credit_retire_owner_state(job)
-        return False
     credit_queue = job.get("credit_queue")
     if not isinstance(credit_queue, dict) or credit_queue.get(
         "schema_version"
     ) != 2:
+        return False
+    # Current owner exemption disables new reservations and releases holds
+    # that have not run. It must not erase settlement authority for work that
+    # was already consumed under its original non-owner lineage.
+    if (
+        credit_queue.get("reservation_state") != "consumed"
+        and _credit_owner_exempt(job)
+    ):
+        _credit_retire_owner_state(job)
         return False
     reservation_id = str(
         credit_queue.get("accounting_reservation_id") or ""
@@ -2258,7 +3039,17 @@ def _credit_accounting_hydrate_job(job: dict) -> bool:
 
 def _credit_accounting_lifecycle_callback(event: dict) -> dict:
     """Bridge the opaque lifecycle event to the private durable journal."""
-    journal = _credit_accounting_journal()
+    action = str(event.get("action") or "")
+    if action not in {"consume", "release", "settle"}:
+        raise CreditAccountingError("credit lifecycle action is invalid")
+    journal = (
+        _credit_accounting_journal()
+        if action == "consume" else (
+            globals().get("_credit_accounting_existing_journal") or (
+                lambda: None
+            )
+        )()
+    )
     if journal is None:
         raise CreditAccountingError("credit accounting is unavailable")
     reservation_id = str(event.get("accounting_reservation_id") or "")
@@ -2275,17 +3066,20 @@ def _credit_accounting_lifecycle_callback(event: dict) -> dict:
                 )
     if not account_key:
         raise CreditAccountingError("credit account association is unavailable")
-    action = str(event.get("action") or "")
-    if action not in {"consume", "release"}:
-        raise CreditAccountingError("credit lifecycle action is invalid")
     try:
-        receipt = getattr(journal, action)(
-            account_key=account_key,
-            reservation_id=reservation_id,
-            operation_id=str(event.get("operation_id") or ""),
-            expected_revision=event.get("expected_revision"),
-            as_of=str(event.get("as_of") or ""),
-        )
+        arguments = {
+            "account_key": account_key,
+            "reservation_id": reservation_id,
+            "operation_id": str(event.get("operation_id") or ""),
+            "expected_revision": event.get("expected_revision"),
+            "as_of": str(event.get("as_of") or ""),
+        }
+        if action == "settle":
+            arguments.update({
+                "terminal_status": str(event.get("terminal_status") or ""),
+                "server_billable_units": event.get("server_billable_units"),
+            })
+        receipt = getattr(journal, action)(**arguments)
     except (CreditAccountingError, OSError) as error:
         _credit_mark_accounting_health(False)
         raise CreditAccountingError(
@@ -2296,6 +3090,8 @@ def _credit_accounting_lifecycle_callback(event: dict) -> dict:
         action == "consume" and receipt.allocation_satisfied is True
     ) or (
         action == "release" and receipt.terminal_satisfied is True
+    ) or (
+        action == "settle" and receipt.terminal_satisfied is True
     ):
         with _credit_accounting_lock:
             _credit_accounting_reservation_accounts.pop(
@@ -3071,6 +3867,18 @@ def _credit_prepare_dispatch(job: dict) -> bool:
         return False
     if _credit_owner_exempt(job):
         _credit_retire_owner_state(job)
+        account_id = _credit_account_id(job)
+        if account_id:
+            try:
+                receipt = _owner_test_credit_ledger().record_dispatch(
+                    account_key=_owner_test_credit_account_key(account_id),
+                    source_key=_owner_test_credit_source_key(account_id),
+                    job_key=str(job.get("id") or ""),
+                    requested_units=_credit_requested_units(job),
+                )
+                job["_owner_test_credit"] = receipt.private_mapping()
+            except OwnerTestCreditError:
+                job["_owner_test_credit_unavailable"] = True
         return False
     reclassified_guard = globals().get(
         "_credit_require_linked_reclassified_lineage"
@@ -3125,6 +3933,11 @@ def _credit_prepare_dispatch(job: dict) -> bool:
             # Retain the durable v2 cleanup obligation on the job, but prevent
             # the same unavailable callback from poisoning terminalization.
             configure_credit_lifecycle_callback(None)
+            settlement_configurer = globals().get(
+                "configure_credit_settlement_callback",
+            )
+            if callable(settlement_configurer):
+                settlement_configurer(None)
         return False
     if not consumed and not is_cancel_requested(job):
         raise CreditRuntimeError(
@@ -4265,7 +5078,8 @@ def _queue_recovery_register_and_publish(
     worker=None,
     recovery_kind: str = "studio_generation",
     thread_name: str | None = None,
-) -> threading.Thread:
+    defer_worker: bool = False,
+) -> threading.Thread | None:
     """Durably register one Studio job before publication or thread start."""
     # Internal/direct callers share this pre-publication gate with HTTP
     # submissions. It runs before registry, manifest, thread, or network work.
@@ -4372,6 +5186,8 @@ def _queue_recovery_register_and_publish(
             if request_manifest is not None and released:
                 remove_request_manifest(project_dir, request_manifest)
             raise
+    if defer_worker:
+        return None
     worker = worker or _run_generation
     thread = threading.Thread(
         target=worker,
@@ -4669,6 +5485,10 @@ def _queue_recovery_worker(job: dict):
         # Only a future dedicated pair-release path may attach a worker.
         return None
     if kind == "studio_generation_preparation":
+        return None
+    if kind == "prompt_enhancement":
+        # Private prompt execution is never reconstructed from durable bytes.
+        # A fresh explicit route submission creates a new canonical job.
         return None
     if kind == "studio_blend":
         return globals().get("_run_blend_generation")
@@ -6218,6 +7038,26 @@ def _queue_recovery_materialize_job(
             runtime["artifact_files"] = artifacts
 
     status = str(snapshot.get("status") or "queued").casefold()
+    if (
+        snapshot.get("kind") == "prompt_enhancement"
+        and status not in {"completed", "failed", "cancelled", "canceled"}
+    ):
+        # The queue owns restart visibility and credit finality, but never
+        # guesses or auto-runs private content after process interruption.
+        runtime.update({
+            "status": "failed",
+            "finished_at": time.time(),
+            "queue_held": False,
+            "recovery_state": "terminal",
+            "reruns_denoise": False,
+            "phase": "failed",
+            "message": "Prompt enhancement was interrupted",
+            "error": "Prompt enhancement was interrupted",
+            "resource_execution": "standard",
+            "preemption_mode": "none",
+            "resource_state": "released",
+        })
+        return runtime, False
     if snapshot.get("kind") == "sample_campaign_generation":
         if status == "completed" and not blocked_reason:
             runtime.update({
@@ -7099,6 +7939,23 @@ def _restore_queue_recovery_on_startup(
             in {"completed", "failed", "cancelled", "canceled"}
             and isinstance(credit_queue, dict)
             and credit_queue.get("schema_version") == 2
+            and credit_queue.get("reservation_state") == "consumed"
+        ):
+            try:
+                if not settle_terminal_credit(job):
+                    unsettled_terminal_credit = True
+            except (
+                CreditAccountingError,
+                CreditLifecycleCallbackError,
+                OSError,
+            ):
+                unsettled_terminal_credit = True
+            credit_queue = job.get("credit_queue")
+        if (
+            str(job.get("status") or "").casefold()
+            in {"completed", "failed", "cancelled", "canceled"}
+            and isinstance(credit_queue, dict)
+            and credit_queue.get("schema_version") == 2
             and credit_queue.get("reservation_state") == "reserved"
         ):
             credit_release = globals().get("_credit_release_accounting")
@@ -7125,6 +7982,12 @@ def _restore_queue_recovery_on_startup(
             or str(snapshot.get("status") or "").casefold() in {
                 "preparing", "waiting_for_plan_approval",
             }
+            or (
+                job.get("kind") == "prompt_enhancement"
+                and job.get("status") == "failed"
+                and str(snapshot.get("status") or "").casefold()
+                    in {"queued", "running"}
+            )
         ):
             _queue_recovery_checkpoint(
                 job,
@@ -7153,6 +8016,20 @@ def _restore_queue_recovery_on_startup(
         if auto_resume:
             resumable.append(job)
     restore_scheduler_state(restored_jobs, _queue_recovery_restored.global_state)
+    prompt_results = globals().get("_prompt_enhancement_result_store")
+    if prompt_results is not None:
+        try:
+            prompt_results.cleanup_unreferenced(tuple(
+                reference
+                for candidate in restored_jobs
+                if candidate.get("kind") == "prompt_enhancement"
+                for reference in (candidate.get("prompt_result_reference"),)
+                if isinstance(reference, Mapping)
+            ))
+        except Exception:
+            # Uncertain result cleanup preserves bytes and leaves admission
+            # fail-closed at the store's hard bound.
+            pass
     for snapshot in director_parents:
         resumable_pid = _director_recovery_restore_parent(snapshot, projects)
         if resumable_pid:
@@ -10333,6 +11210,34 @@ def finish_job(job, *args, **kwargs):
             job["credit_queue"] = deferred_credit_queue
         raise
     _stamp_job_output_access(job)
+    owner_test = job.get("_owner_test_credit")
+    if isinstance(owner_test, dict):
+        account_id = _credit_account_id(job)
+        status = str(job.get("status") or "")
+        finished_at = job.get("finished_at")
+        if (
+            account_id
+            and status in {"completed", "failed", "cancelled"}
+            and isinstance(finished_at, (int, float))
+        ):
+            try:
+                _owner_test_credit_ledger().settle(
+                    account_key=_owner_test_credit_account_key(account_id),
+                    job_key=str(job.get("id") or ""),
+                    reservation_id=str(owner_test.get("reservation_id") or ""),
+                    expected_revision=int(
+                        owner_test.get("reservation_revision") or 0
+                    ),
+                    terminal_status=status,
+                    started_at=(
+                        float(job["started_at"])
+                        if isinstance(job.get("started_at"), (int, float))
+                        else None
+                    ),
+                    finished_at=float(finished_at),
+                )
+            except (OwnerTestCreditError, TypeError, ValueError):
+                job["_owner_test_credit_unavailable"] = True
     return result
 
 
@@ -11549,11 +12454,36 @@ def list_resolutions():
 
 
 @api.get("/api/v1/defaults/{model_type}")
-def get_defaults(model_type: str):
+def get_defaults(model_type: str, request: Request):
     """Get default settings for a model type."""
     if wgp.get_model_def(model_type) is None:
         raise HTTPException(status_code=404, detail=f"Unknown model: {model_type}")
-    defaults = wgp.get_default_settings(model_type)
+    defaults = copy.deepcopy(wgp.get_default_settings(model_type))
+    if str(model_type or "") in globals().get(
+        "_H3_LONG_STUDIO_MODELS", frozenset(),
+    ):
+        from services.h3_profiles import (
+            fresh_profile_id_for_account_role,
+            profile_settings,
+        )
+
+        principal = getattr(
+            request.state, "maestro_account_principal", None,
+        )
+        role = (
+            principal.get("role")
+            if isinstance(principal, dict)
+            else ("user" if _accounts_enabled() else None)
+        )
+        profile_id = fresh_profile_id_for_account_role(role)
+        curated = profile_settings(model_type, profile_id)
+        for key in (
+            "num_inference_steps", "resolution", "custom_settings",
+            "tea_cache", "activated_loras", "loras_multipliers",
+            "spatial_upsampling", "delivery_resolution", "delivery_fit",
+        ):
+            defaults[key] = copy.deepcopy(curated[key])
+        defaults["h3_default_profile_id"] = profile_id
     return defaults
 
 
@@ -13442,7 +14372,7 @@ def _validate_h3_sampling_steps(body: dict) -> int | None:
     """Reject invalid H3 schedules before any download or model load."""
     if str(body.get("model_type") or "") not in _H3_LONG_STUDIO_MODELS:
         return None
-    raw_steps = body.get("num_inference_steps", 20)
+    raw_steps = body.get("num_inference_steps", 28)
     if isinstance(raw_steps, bool):
         raise ValueError("MiniMax H3 inference steps must be an integer from 2 to 50.")
     try:
@@ -13456,10 +14386,49 @@ def _validate_h3_sampling_steps(body: dict) -> int | None:
     if not 2 <= steps <= 50:
         raise ValueError(
             "MiniMax H3 inference steps must be between 2 and 50 "
-            "scheduler grid points (20 is the default)."
+            "scheduler grid points."
         )
     body["num_inference_steps"] = steps
     return steps
+
+
+def _apply_fresh_h3_role_defaults(body: dict, request: Request) -> str | None:
+    """Fill only omitted H3 settings from the caller's fresh role bundle.
+
+    Explicit API, manual, and saved-preset values always win. Accounts-off and
+    machine-local callers retain the owner-compatible High bundle.
+    """
+    model_type = str(body.get("model_type") or "")
+    if model_type not in _H3_LONG_STUDIO_MODELS:
+        return None
+    from services.h3_profiles import (
+        fresh_profile_id_for_account_role,
+        profile_settings,
+    )
+
+    principal = getattr(request.state, "maestro_account_principal", None)
+    role = (
+        principal.get("role")
+        if isinstance(principal, dict)
+        else ("user" if _accounts_enabled() else None)
+    )
+    profile_id = fresh_profile_id_for_account_role(role)
+    settings = profile_settings(model_type, profile_id)
+    for key in (
+        "num_inference_steps", "resolution", "tea_cache",
+        "activated_loras", "loras_multipliers", "spatial_upsampling",
+        "delivery_resolution", "delivery_fit",
+    ):
+        if key not in body:
+            body[key] = copy.deepcopy(settings[key])
+    if "custom_settings" not in body:
+        body["custom_settings"] = copy.deepcopy(settings["custom_settings"])
+    elif isinstance(body.get("custom_settings"), dict):
+        body["custom_settings"] = {
+            **copy.deepcopy(settings["custom_settings"]),
+            **body["custom_settings"],
+        }
+    return profile_id
 
 
 def _reject_client_h3_internal_state(body: dict) -> None:
@@ -13774,6 +14743,10 @@ def _apply_h3_adaptive_checkpoint(body: dict) -> str:
         "supplied frame anchor" if has_frame_anchor else
         "text/audio-video generation profile"
     )
+    if effective == _H3_REF2VA_MODEL:
+        custom = body.get("custom_settings")
+        if isinstance(custom, dict) and custom.get("h3_attention_engine") == "sage2":
+            body["custom_settings"] = {**custom, "h3_attention_engine": "sdpa"}
     return effective
 
 
@@ -19400,65 +20373,140 @@ def get_model_options(model_type: str, request: Request):
 
 # ── Generation Presets ───────────────────────────────────────────────────
 
-_PRESETS_FILE = os.path.join(os.path.dirname(__file__), "presets.json")
+_generation_preset_store_lock = threading.Lock()
+_generation_preset_store_value = None
 
 
-def _load_presets() -> list[dict]:
-    if os.path.isfile(_PRESETS_FILE):
-        try:
-            with open(_PRESETS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return []
+def _generation_preset_store():
+    """Return the host-keyed atomic preset store."""
+    global _generation_preset_store_value
+    if _generation_preset_store_value is None:
+        with _generation_preset_store_lock:
+            if _generation_preset_store_value is None:
+                from services.generation_presets import GenerationPresetStore
+
+                scope_key = hmac.new(
+                    _session_secret(),
+                    b"maestro-generation-presets-scope-v1",
+                    hashlib.sha256,
+                ).digest()
+                _generation_preset_store_value = GenerationPresetStore(
+                    os.path.join(_app_dir, "storage"),
+                    scope_key=scope_key,
+                )
+    return _generation_preset_store_value
 
 
-def _save_presets(presets: list[dict]):
-    with open(_PRESETS_FILE, "w", encoding="utf-8") as f:
-        json.dump(presets, f, indent=2)
+def _generation_preset_scope(
+    request: Request,
+    workspace: str,
+    *,
+    permission: str,
+) -> tuple[str, str]:
+    """Authorize and derive content-free exact account/project scope keys."""
+    selected = _request_project_workspace(request, workspace)
+    project_dir = _require_project_access(
+        request, selected, existing_only=True, permission=permission,
+    )
+    principal = getattr(request.state, "maestro_account_principal", None)
+    if isinstance(principal, dict) and isinstance(principal.get("id"), str):
+        account_scope = f"account:{principal['id']}"
+    else:
+        session_id = str(getattr(request.state, "maestro_session_id", "") or "")
+        if not session_id:
+            raise HTTPException(status_code=404, detail="Project not found")
+        account_scope = f"session:{session_id}"
+    try:
+        project_scope = _queue_recovery_existing_project_identity(project_dir)
+    except QueueRecoveryAdapterError as error:
+        raise HTTPException(status_code=404, detail="Project not found") from error
+    return account_scope, project_scope
+
+
+def _raise_generation_preset_error(error: Exception) -> None:
+    from services.generation_presets import (
+        GenerationPresetCommitIndeterminate,
+        GenerationPresetConflict,
+        GenerationPresetError,
+        GenerationPresetIntegrityError,
+        GenerationPresetLimitError,
+    )
+
+    if isinstance(error, GenerationPresetCommitIndeterminate):
+        raise HTTPException(
+            status_code=503,
+            detail="Preset mutation may have completed; retry the same request",
+        ) from error
+    if isinstance(error, GenerationPresetConflict):
+        raise HTTPException(status_code=409, detail="Preset request conflicts") from error
+    if isinstance(error, GenerationPresetLimitError):
+        raise HTTPException(status_code=409, detail="Preset limit reached") from error
+    if isinstance(error, GenerationPresetIntegrityError):
+        raise HTTPException(
+            status_code=503, detail="Preset storage is temporarily unavailable",
+        ) from error
+    if isinstance(error, GenerationPresetError):
+        raise HTTPException(status_code=400, detail="Preset settings are invalid") from error
+    raise error
 
 
 @api.get("/api/v1/presets")
-def list_presets():
-    """List all saved generation presets."""
-    return {"presets": _load_presets()}
+def list_presets(request: Request, workspace: str = ""):
+    """List saved settings for exactly one authorized account project."""
+    account_scope, project_scope = _generation_preset_scope(
+        request, workspace, permission="project.read",
+    )
+    try:
+        presets = _generation_preset_store().list(
+            account_scope=account_scope,
+            project_scope=project_scope,
+        )
+    except Exception as error:
+        _raise_generation_preset_error(error)
+    return {"presets": presets}
 
 
 @api.post("/api/v1/presets")
-async def create_preset(request: Request):
-    """Save a new generation preset."""
-    body = await request.json()
-    name = body.get("name", "").strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="name is required")
-
-    preset = {
-        "id": uuid.uuid4().hex[:8],
-        "name": name,
-        "mode": body.get("mode", "video"),
-        "model_type": body.get("model_type", ""),
-        "prompt": body.get("prompt", ""),
-        "activated_loras": body.get("activated_loras", []),
-        "loras_multipliers": body.get("loras_multipliers", ""),
-        "lora_weights": body.get("lora_weights", {}),
-        "params": body.get("params", {}),
-        "created_at": time.time(),
-    }
-
-    presets = _load_presets()
-    presets.append(preset)
-    _save_presets(presets)
-    return preset
+async def create_preset(request: Request, workspace: str = ""):
+    """Atomically save content-free settings in one authorized project."""
+    account_scope, project_scope = _generation_preset_scope(
+        request, workspace, permission="project.mutate",
+    )
+    try:
+        body = await request.json()
+    except Exception as error:
+        raise HTTPException(status_code=400, detail="Invalid preset request") from error
+    if not isinstance(body, dict) or set(body) != {
+        "id", "name", "mode", "model_type", "activated_loras",
+        "loras_multipliers", "lora_weights", "spatial_upsampling", "params",
+    }:
+        raise HTTPException(status_code=400, detail="Invalid preset request")
+    preset_id = body.pop("id")
+    try:
+        return _generation_preset_store().create(
+            account_scope=account_scope,
+            project_scope=project_scope,
+            preset=body,
+            preset_id=preset_id,
+        )
+    except Exception as error:
+        _raise_generation_preset_error(error)
 
 
 @api.delete("/api/v1/presets/{preset_id}")
-def delete_preset(preset_id: str):
-    """Delete a preset by ID."""
-    presets = _load_presets()
-    new_presets = [p for p in presets if p.get("id") != preset_id]
-    if len(new_presets) == len(presets):
-        raise HTTPException(status_code=404, detail="Preset not found")
-    _save_presets(new_presets)
+def delete_preset(preset_id: str, request: Request, workspace: str = ""):
+    """Idempotently delete within one exact authorized account project."""
+    account_scope, project_scope = _generation_preset_scope(
+        request, workspace, permission="project.mutate",
+    )
+    try:
+        _generation_preset_store().delete(
+            account_scope=account_scope,
+            project_scope=project_scope,
+            preset_id=preset_id,
+        )
+    except Exception as error:
+        _raise_generation_preset_error(error)
     return {"deleted": preset_id}
 
 
@@ -20371,6 +21419,8 @@ def _raise_account_http_error(error: AccountAuthError) -> None:
         "authentication_required": 401,
         "invalid_credentials": 401,
         "invalid_recovery": 401,
+        "username_unavailable": 409,
+        "registration_unavailable": 404,
         "owner_required": 403,
         "reauth_required": 403,
         "rate_limited": 429,
@@ -20526,6 +21576,7 @@ def _public_account_context(request: Request) -> dict:
         "capabilities": capabilities,
         "reauthenticated": _request_has_recent_account_reauth(request),
         "passkey_authentication_available": False,
+        "public_registration_available": _public_registration_available(request),
         **_account_activation_context(request),
     }
 
@@ -20793,11 +21844,17 @@ async def issue_account_nonce(request: Request):
             raise HTTPException(status_code=404, detail="Account bootstrap is not enabled")
         if not _account_local_bootstrap_allowed(request):
             raise HTTPException(status_code=403, detail="Account bootstrap requires direct loopback")
+    elif purpose == "register":
+        if not _registration_request_ready(request):
+            raise HTTPException(status_code=404, detail="Public registration is not enabled")
+        if not _public_registration_origin_allowed(request, mutation=True):
+            _audit_public_registration("rejected")
+            raise HTTPException(status_code=403, detail="Public registration origin is not allowed")
     elif purpose not in {"login", "recover"}:
         _require_account_principal(request)
     nonce_session_id = (
         request.state.maestro_session_id
-        if purpose in {"bootstrap", "login", "recover"}
+        if purpose in {"bootstrap", "login", "recover", "register"}
         else request.state.maestro_account_session_id
     )
     try:
@@ -20852,6 +21909,40 @@ async def login_account(request: Request):
     except AccountAuthError as error:
         _raise_account_http_error(error)
     _rotate_account_session(request, result.pop("account_session_id"))
+    return result
+
+
+@api.post("/api/v1/account/register")
+async def register_public_account(request: Request):
+    if not _registration_request_ready(request):
+        raise HTTPException(status_code=404, detail="Public registration is not enabled")
+    if not _public_registration_origin_allowed(request, mutation=True):
+        _audit_public_registration("rejected")
+        raise HTTPException(status_code=403, detail="Public registration origin is not allowed")
+    store = _require_account_store(request)
+    body = await _account_request_body(request)
+    if set(body) - {
+        "username", "password", "email", "device_label", "nonce",
+    }:
+        _audit_public_registration("rejected")
+        raise HTTPException(status_code=400, detail="Registration request is invalid")
+    try:
+        result = await asyncio.to_thread(
+            store.register_account,
+            username=body.get("username"),
+            password=body.get("password"),
+            email=body.get("email", ""),
+            device_label=body.get("device_label", "Browser"),
+            nonce_session_id=request.state.maestro_session_id,
+            nonce=body.get("nonce"),
+            remote=bool(request.state.maestro_remote),
+            source_id=_public_registration_rate_source(request),
+        )
+    except AccountAuthError as error:
+        _audit_public_registration(error.code)
+        _raise_account_http_error(error)
+    _rotate_account_session(request, result.pop("account_session_id"))
+    _audit_public_registration("success")
     return result
 
 
@@ -21171,6 +22262,46 @@ def get_account_support(request: Request):
         _raise_support_http_error(error)
 
 
+@api.post("/api/v1/support/webhooks/buy-me-a-coffee")
+async def receive_buy_me_a_coffee_webhook(request: Request):
+    """Accept one exact signed BMaC event without projecting private fields."""
+    try:
+        runtime = _support_bmac_webhook_runtime()
+    except (OSError, SupportWebhookError) as error:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "support_webhook_unavailable", "message": "Support webhook is unavailable."},
+        ) from error
+    if runtime is None:
+        raise HTTPException(status_code=404, detail="Support webhook is not enabled")
+    adapter, ledger, replay_guard = runtime
+    raw_body = await request.body()
+    received_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        await asyncio.to_thread(
+            process_signed_webhook,
+            adapter,
+            ledger,
+            replay_guard,
+            raw_body,
+            dict(request.headers.items()),
+            received_at=received_at,
+        )
+    except WebhookReplayError:
+        return {"status": "accepted", "duplicate": True}
+    except (WebhookReplayIntegrityError, SupportAssociationIntegrityError, OSError) as error:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "support_webhook_storage_unavailable", "message": "Support webhook storage is unavailable."},
+        ) from error
+    except (WebhookSignatureError, WebhookPayloadError, SupportWebhookError) as error:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_support_webhook", "message": "Support webhook was not accepted."},
+        ) from error
+    return {"status": "accepted", "duplicate": False}
+
+
 @api.get("/api/v1/support/responsible-use")
 def get_account_responsible_use(request: Request):
     projection = get_account_support(request)
@@ -21389,7 +22520,13 @@ def get_access_context(request: Request):
         "custom_model_sources": not remote,
         "catalog_model_downloads": True,
         "classic_ui": not remote,
-        "cloudflare_enabled": _env_flag_enabled("PINOKIO_SHARE_CLOUDFLARE"),
+        "cloudflare_enabled": (
+            _env_flag_enabled("PINOKIO_SHARE_CLOUDFLARE")
+            or bool(
+                callable(globals().get("_public_share_url"))
+                and globals()["_public_share_url"]()
+            )
+        ),
         "share_url": _public_share_url() if not remote else "",
         "share_flow": (
             "Sign in and select a project"
@@ -21658,10 +22795,20 @@ async def create_workspace(request: Request):
     body = await request.json()
     name = body.get("name", "").strip()
     remote = bool(getattr(request.state, "maestro_remote", False))
-    password = str(body.get("password") or "")
-    remember = _workspace_remember_policy(body)
     project_account_state = _account_project_access_state()
     account_projects_enforced = project_account_state["enforced"]
+    if account_projects_enforced and any(
+        key in body for key in ("password", "remember")
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Project passwords are disabled after account migration",
+        )
+    password = str(body.get("password") or "")
+    remember = (
+        "session" if account_projects_enforced
+        else _workspace_remember_policy(body)
+    )
 
     if not name:
         raise HTTPException(status_code=400, detail="Workspace name is required")
@@ -21789,13 +22936,15 @@ def _require_remote_project_mutation_access(
 
 @api.put("/api/v1/workspaces/{name}/password")
 async def set_workspace_password(name: str, request: Request):
+    account_project_state = _account_project_access_state()
+    if account_project_state["enforced"]:
+        raise HTTPException(status_code=404, detail="Project not found")
     from services.win_safe_files import is_safe_workspace_name
     if not is_safe_workspace_name(name):
         raise HTTPException(status_code=400, detail="Invalid workspace name")
     remote = bool(getattr(request.state, "maestro_remote", False))
     # A remote password change may protect an existing project, but it must
     # never create or reserve a project name as a side effect of authorization.
-    account_project_state = _account_project_access_state()
     workspace_dir = (
         _existing_workspace_dir(name)
         if remote or account_project_state["enforced"]
@@ -21847,6 +22996,8 @@ async def set_workspace_password(name: str, request: Request):
 
 @api.post("/api/v1/workspaces/{name}/unlock")
 async def unlock_workspace(name: str, request: Request):
+    if _account_project_access_state()["enforced"]:
+        raise HTTPException(status_code=404, detail="Project not found")
     remote = bool(getattr(request.state, "maestro_remote", False))
     if remote and name == "default":
         raise HTTPException(status_code=404, detail="Project not found")
@@ -21914,14 +23065,7 @@ async def unlock_workspace(name: str, request: Request):
 def lock_workspace(name: str, request: Request):
     account_project_state = _account_project_access_state()
     if account_project_state["enforced"]:
-        workspace_dir = _existing_workspace_dir(name)
-        _require_account_project_permission(
-            request,
-            workspace_dir,
-            "project.open",
-            state=account_project_state,
-        )
-        return {"unlocked": True, "locked_count": 0}
+        raise HTTPException(status_code=404, detail="Project not found")
     remote = bool(getattr(request.state, "maestro_remote", False))
     locked_count = _project_access.lock(
         name, request.state.maestro_session_id, remote,
@@ -21935,7 +23079,7 @@ def lock_workspace(name: str, request: Request):
 @api.post("/api/v1/workspaces/lock-all")
 def lock_all_workspaces(request: Request):
     if _account_project_access_state()["enforced"]:
-        return {"unlocked": True, "locked_count": 0}
+        raise HTTPException(status_code=404, detail="Project not found")
     remote = bool(getattr(request.state, "maestro_remote", False))
     locked_count = _project_access.lock_all(
         request.state.maestro_session_id, remote,
@@ -30771,19 +31915,23 @@ def _run_authorized_llm_with_selection(
             return None
         return operation(*args, **kwargs)
 
+    generation_slot_owned = bool(getattr(
+        request.state, "maestro_llm_generation_slot_owned", False,
+    ))
     return _run_llm_with_selection(
         selection,
         run_after_load,
         _cpu_text_job=getattr(
             request.state, "maestro_cpu_text_job", None,
         ),
-        _cpu_text_operation=str(getattr(
+        _cpu_text_operation=("" if generation_slot_owned else str(getattr(
             request.state, "maestro_cpu_text_operation", "",
-        ) or ""),
+        ) or "")),
         _cpu_text_text_only=bool(getattr(
             request.state, "maestro_cpu_text_text_only", False,
         )),
-        _coordinate_generation=True,
+        _coordinate_generation=not generation_slot_owned,
+        _precoordinated_generation=generation_slot_owned,
     )
 
 
@@ -30793,6 +31941,7 @@ def _run_llm_with_selection(
     /,
     *args,
     _coordinate_generation: bool = True,
+    _precoordinated_generation: bool = False,
     _cpu_text_job: dict | None = None,
     _cpu_text_operation: str = "",
     _cpu_text_text_only: bool = False,
@@ -30823,13 +31972,10 @@ def _run_llm_with_selection(
     # when neither is using much VRAM. Serialize with the generation owner and
     # retire H3 before the local model lease begins. Remote providers own no
     # local model memory and intentionally skip this path.
-    if (
-        _coordinate_generation
-        and str(selection.get("provider") or "local").casefold() == "local"
+    if str(selection.get("provider") or "local").casefold() == "local" and (
+        _coordinate_generation or _precoordinated_generation
     ):
-        with _gen_lock, _WgpNativeGpuExecutionSlot(
-            _local_llm_uses_native_gpu(selection),
-        ):
+        def run_local_operation():
             resident_type = str(
                 getattr(wgp, "transformer_type", "") or ""
             ).casefold()
@@ -30850,6 +31996,15 @@ def _run_llm_with_selection(
                 if operation is None:
                     return None
                 return operation(*args, **kwargs)
+        if _precoordinated_generation:
+            with _WgpNativeGpuExecutionSlot(
+                _local_llm_uses_native_gpu(selection),
+            ):
+                return run_local_operation()
+        with _gen_lock, _WgpNativeGpuExecutionSlot(
+            _local_llm_uses_native_gpu(selection),
+        ):
+            return run_local_operation()
 
     load_args = {
         key: selection.get(key, "")
@@ -30886,6 +32041,27 @@ def _llm_operation_scope(
         hashlib.sha256,
     ).hexdigest()
     return owner_key, project_key
+
+
+def _prompt_enhancement_operation_scope(
+    request: Request,
+    workspace: str,
+) -> tuple[str, str, str]:
+    """Return separate opaque account, project, and session scope keys."""
+    session_key, project_key = _llm_operation_scope(request, workspace)
+    principal = getattr(request.state, "maestro_account_principal", None)
+    account_id = str(
+        principal.get("id")
+        if isinstance(principal, dict)
+        else ""
+    ).strip()
+    account_material = account_id or session_key
+    account_key = hmac.new(
+        _session_secret(),
+        f"prompt-enhance-account-v1\0{account_material}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    return account_key, project_key, session_key
 
 
 _LLM_ROUTE_OPERATION_KINDS = frozenset({"enhance", "director_preview"})
@@ -30968,17 +32144,28 @@ def llm_route_operation_status(
     workspace: str = "",
 ):
     """Return bounded telemetry for one exact owner/project operation."""
-    from services.llm_operations import llm_route_operation_manager
-
-    _selected, owner_key, project_key = _llm_route_operation_scope_or_404(
+    selected, owner_key, project_key = _llm_route_operation_scope_or_404(
         request, operation_kind, workspace,
     )
-    status = llm_route_operation_manager.status(
-        request_id,
-        owner_key=owner_key,
-        project_instance_key=project_key,
-        operation_kind=operation_kind,
-    )
+    if operation_kind == "enhance":
+        account_key, project_key, session_key = (
+            _prompt_enhancement_operation_scope(request, selected)
+        )
+        status = _prompt_enhancement_operation_manager.status(
+            request_id,
+            account_key=account_key,
+            project_instance_key=project_key,
+            session_key=session_key,
+        )
+    else:
+        from services.llm_operations import llm_route_operation_manager
+
+        status = llm_route_operation_manager.status(
+            request_id,
+            owner_key=owner_key,
+            project_instance_key=project_key,
+            operation_kind=operation_kind,
+        )
     if status is None:
         raise HTTPException(status_code=404, detail="LLM operation not found")
     return _llm_route_public_status(operation_kind, status)
@@ -30992,29 +32179,48 @@ def llm_route_operation_result(
     workspace: str = "",
 ):
     """Return the private result only after exact-scope terminal recovery."""
-    from services.llm_operations import llm_route_operation_manager
-
-    _selected, owner_key, project_key = _llm_route_operation_scope_or_404(
+    selected, owner_key, project_key = _llm_route_operation_scope_or_404(
         request, operation_kind, workspace,
     )
-    status = llm_route_operation_manager.status(
-        request_id,
-        owner_key=owner_key,
-        project_instance_key=project_key,
-        operation_kind=operation_kind,
-    )
+    if operation_kind == "enhance":
+        account_key, project_key, session_key = (
+            _prompt_enhancement_operation_scope(request, selected)
+        )
+        status = _prompt_enhancement_operation_manager.status(
+            request_id,
+            account_key=account_key,
+            project_instance_key=project_key,
+            session_key=session_key,
+        )
+    else:
+        from services.llm_operations import llm_route_operation_manager
+
+        status = llm_route_operation_manager.status(
+            request_id,
+            owner_key=owner_key,
+            project_instance_key=project_key,
+            operation_kind=operation_kind,
+        )
     if status is None:
         raise HTTPException(status_code=404, detail="LLM operation not found")
     if status.get("status") != "completed":
         return JSONResponse(_llm_route_public_status(operation_kind, status), status_code=(
             202 if status.get("status") == "running" else 409
         ))
-    result = llm_route_operation_manager.result(
-        request_id,
-        owner_key=owner_key,
-        project_instance_key=project_key,
-        operation_kind=operation_kind,
-    )
+    if operation_kind == "enhance":
+        result = _prompt_enhancement_operation_manager.result(
+            request_id,
+            account_key=account_key,
+            project_instance_key=project_key,
+            session_key=session_key,
+        )
+    else:
+        result = llm_route_operation_manager.result(
+            request_id,
+            owner_key=owner_key,
+            project_instance_key=project_key,
+            operation_kind=operation_kind,
+        )
     if result is None:
         raise HTTPException(status_code=404, detail="LLM operation not found")
     return result
@@ -31028,17 +32234,28 @@ def cancel_llm_route_operation(
     workspace: str = "",
 ):
     """Cancel one exact transient operation without touching other requests."""
-    from services.llm_operations import llm_route_operation_manager
-
-    _selected, owner_key, project_key = _llm_route_operation_scope_or_404(
+    selected, owner_key, project_key = _llm_route_operation_scope_or_404(
         request, operation_kind, workspace,
     )
-    status = llm_route_operation_manager.cancel(
-        request_id,
-        owner_key=owner_key,
-        project_instance_key=project_key,
-        operation_kind=operation_kind,
-    )
+    if operation_kind == "enhance":
+        account_key, project_key, session_key = (
+            _prompt_enhancement_operation_scope(request, selected)
+        )
+        status = _prompt_enhancement_operation_manager.cancel(
+            request_id,
+            account_key=account_key,
+            project_instance_key=project_key,
+            session_key=session_key,
+        )
+    else:
+        from services.llm_operations import llm_route_operation_manager
+
+        status = llm_route_operation_manager.cancel(
+            request_id,
+            owner_key=owner_key,
+            project_instance_key=project_key,
+            operation_kind=operation_kind,
+        )
     if status is None:
         raise HTTPException(status_code=404, detail="LLM operation not found")
     return _llm_route_public_status(operation_kind, status)
@@ -32750,6 +33967,8 @@ class _ScopedPromptEnhancementRequest:
         runtime_snapshot: dict,
         image_seals: list[dict[str, Any]],
         materialized_image_paths: list[str],
+        canonical_job: dict | None = None,
+        generation_slot_owned: bool = False,
     ) -> None:
         from types import SimpleNamespace
 
@@ -32786,6 +34005,10 @@ class _ScopedPromptEnhancementRequest:
             ),
             "maestro_cpu_text_text_only": bool(
                 authority.get("cpu_text_text_only", False)
+            ),
+            "maestro_cpu_text_job": canonical_job,
+            "maestro_llm_generation_slot_owned": bool(
+                generation_slot_owned
             ),
         }
         self.state = SimpleNamespace(**state)
@@ -33046,10 +34269,7 @@ async def llm_enhance_prompt(request: Request):
 
     if raw_request_id is not None:
         from services.llm_operations import (
-            LlmOperationCapacityError,
             LlmRouteAdmissionError,
-            LlmRouteOperationConflictError,
-            llm_route_operation_manager,
         )
 
         try:
@@ -33063,8 +34283,10 @@ async def llm_enhance_prompt(request: Request):
                     != expected_project_instance
             ):
                 raise ValueError("project_instance must be canonical")
-            owner_key, project_instance_key = _llm_operation_scope(
-                request, workspace,
+            account_key, project_instance_key, session_key = (
+                _prompt_enhancement_operation_scope(
+                    request, workspace,
+                )
             )
             if not hmac.compare_digest(
                 expected_project_instance, project_instance_key,
@@ -33102,7 +34324,11 @@ async def llm_enhance_prompt(request: Request):
             _ScopedPromptEnhancementRequest.snapshot_authority(request)
         )
 
-        async def execute(progress_callback, operation_cancellation):
+        async def execute(
+            progress_callback,
+            operation_cancellation,
+            execution_context=None,
+        ):
             materialized_images = await run_blocking_shielded(
                 _materialize_prompt_enhancement_images,
                 image_seals,
@@ -33118,21 +34344,47 @@ async def llm_enhance_prompt(request: Request):
                     runtime_snapshot=runtime_snapshot,
                     image_seals=image_seals,
                     materialized_image_paths=materialized_images,
+                    canonical_job=(
+                        execution_context.get("job")
+                        if isinstance(execution_context, Mapping) else None
+                    ),
+                    generation_slot_owned=bool(
+                        isinstance(execution_context, Mapping)
+                        and execution_context.get("generation_slot_owned")
+                    ),
                 )
                 return await llm_enhance_prompt(detached_request)
             finally:
                 _remove_prompt_enhancement_snapshots(materialized_images)
 
         try:
-            status = llm_route_operation_manager.submit(
+            status = _prompt_enhancement_operation_manager.submit(
                 request_id=request_id,
-                owner_key=owner_key,
+                account_key=account_key,
                 project_instance_key=project_instance_key,
-                operation_kind="enhance",
-                effective_input_digest=effective_input_digest,
+                session_key=session_key,
+                request_digest=effective_input_digest,
                 execute=execute,
+                job_context={
+                    "workspace": workspace,
+                    "out_dir": (
+                        globals()["_existing_workspace_dir"](workspace)
+                        if callable(globals().get("_existing_workspace_dir"))
+                        else workspace
+                    ),
+                    "session_id": str(getattr(
+                        request.state, "maestro_session_id", "",
+                    ) or ""),
+                    "source_remote": bool(getattr(
+                        request.state, "maestro_remote", False,
+                    )),
+                    "generation_mode": str(body.get("mode") or ""),
+                    "private": bool(body.get("private_output", False)),
+                    "explicit": bool(body.get("explicit_output", False)),
+                    "body": worker_body,
+                },
             )
-        except LlmRouteOperationConflictError as error:
+        except PromptEnhancementRecoveryConflictError as error:
             raise HTTPException(
                 status_code=409, detail="Prompt Enhance request does not match",
             ) from error
@@ -33141,10 +34393,15 @@ async def llm_enhance_prompt(request: Request):
                 status_code=429,
                 detail="Prompt Enhance is busy; retry shortly",
             ) from error
-        except LlmOperationCapacityError as error:
+        except PromptEnhancementRecoveryCapacityError as error:
             raise HTTPException(
                 status_code=503,
                 detail="Prompt Enhance recovery is busy",
+            ) from error
+        except PromptEnhancementRecoveryError as error:
+            raise HTTPException(
+                status_code=503,
+                detail="Prompt Enhance recovery is unavailable",
             ) from error
         if status is None:
             raise HTTPException(status_code=404, detail="LLM operation not found")
@@ -33489,9 +34746,10 @@ async def llm_enhance_prompt(request: Request):
                 result = _validate_standalone_enhanced_prompt_cardinality(
                     body, model_type, result,
                 )
-            except ValueError as error:
+            except ValueError:
                 raise HTTPException(
-                    status_code=422, detail=str(error),
+                    status_code=422,
+                    detail="Prompt enhancement did not match the requested structure",
                 ) from None
         return {"original": prompt, "enhanced": result}
     except LlmRequestCancelled:
@@ -36890,6 +38148,7 @@ def _plan_generation_submission(
     require_terms: bool = True,
 ) -> tuple[dict | None, dict | None]:
     """Apply the authoritative H3 plan and return its bounded estimate."""
+    _apply_fresh_h3_role_defaults(body, request)
     _require_h3_native_boundary_experimental(body)
     _apply_h3_style_workflow_to_request(body)
     _validate_h3_sampling_steps(body)
@@ -36900,6 +38159,9 @@ def _plan_generation_submission(
     _validate_h3_turbo_estimate_context(
         estimate_context,
         _h3_turbo_validation_authorized=turbo_validation_authorized,
+        allow_unvalidated_ref2va=_local_owner_may_run_unvalidated_h3_turbo_ref2va(
+            request,
+        ),
     )
     _validate_h3_spectrum_estimate_context(estimate_context)
     _validate_h3_lightx2v_estimate_context(estimate_context)
@@ -38171,10 +39433,31 @@ def _h3_profile_estimate_payload(
     }
 
 
+def _local_owner_may_run_unvalidated_h3_turbo_ref2va(request: Request) -> bool:
+    """Local owners may run Draft/Fast Ref2VA before a recorded visual gate."""
+    if getattr(request.state, "maestro_remote", False):
+        return False
+    if _request_is_cloudflare_remote(request):
+        return False
+    if not _accounts_enabled():
+        return True
+    return _request_has_account_capability(request, "owner.admin")
+
+
+def _new_generation_job_id() -> str:
+    """Mint an opaque job id that is unique in the live process table."""
+    for _attempt in range(8):
+        candidate = uuid.uuid4().hex
+        if candidate not in _jobs:
+            return candidate
+    return uuid.uuid4().hex + uuid.uuid4().hex[:8]
+
+
 def _validate_h3_turbo_estimate_context(
     context: dict,
     *,
     _h3_turbo_validation_authorized: bool = False,
+    allow_unvalidated_ref2va: bool = False,
 ) -> None:
     """Use the runtime's single compatibility matrix for estimate parity."""
     from services.h3_turbo import turbo_requested, validate_turbo_request
@@ -38201,6 +39484,7 @@ def _validate_h3_turbo_estimate_context(
                 _h3_turbo_validation_authorized=(
                     _h3_turbo_validation_authorized
                 ),
+                allow_unvalidated_ref2va=allow_unvalidated_ref2va,
             )
         return
     selected = str(context.get("model_type") or _H3_BASE_FL2VA_MODEL)
@@ -38223,6 +39507,7 @@ def _validate_h3_turbo_estimate_context(
         _h3_turbo_validation_authorized=bool(
             _h3_turbo_validation_authorized
         ),
+        allow_unvalidated_ref2va=bool(allow_unvalidated_ref2va),
     )
 
 
@@ -38453,16 +39738,63 @@ class _GenerationPreparationRequest:
     """Minimal immutable request authority retained by one preparation worker."""
 
     def __init__(self, request: Request, body: dict | None = None):
+        from collections import namedtuple
+        import re as _re
         from types import SimpleNamespace
+        from services.account_auth import ACCOUNT_ROLES
 
-        self.headers = dict(request.headers)
-        self.base_url = str(request.base_url)
-        self.client = getattr(request, "client", None)
+        principal = getattr(
+            request.state, "maestro_account_principal", None,
+        )
+        principal_id = (
+            str(principal.get("id") or "")
+            if isinstance(principal, dict) else ""
+        )
+        if _re.fullmatch(r"[0-9a-f]{32}", principal_id) is None:
+            principal_id = ""
+        principal_role = (
+            str(principal.get("role") or "").strip().casefold()
+            if isinstance(principal, dict) else ""
+        )
+        bounded_principal = (
+            {"id": principal_id, "role": principal_role}
+            if principal_id and principal_role in ACCOUNT_ROLES
+            else None
+        )
+
+        source_headers = getattr(request, "headers", {}) or {}
+        self.headers = {
+            name: str(source_headers.get(name) or "")[:512]
+            for name in ("x-forwarded-proto", "x-forwarded-host")
+            if source_headers.get(name)
+        }
+        self.base_url = str(request.base_url)[:2048]
+        raw_peer_host = str(
+            getattr(getattr(request, "client", None), "host", "") or ""
+        ).strip()
+        try:
+            peer_host = ipaddress.ip_address(
+                raw_peer_host.split("%", 1)[0],
+            ).compressed
+        except ValueError:
+            peer_host = (
+                "localhost"
+                if raw_peer_host.casefold() == "localhost"
+                else ""
+            )
+        ImmutablePeer = namedtuple(
+            "_GenerationPreparationPeer", ("host",),
+        )
+        self.client = ImmutablePeer(peer_host) if peer_host else None
         self.state = SimpleNamespace(
-            maestro_session_id=str(request.state.maestro_session_id),
+            maestro_session_id=str(request.state.maestro_session_id)[:128],
             maestro_remote=bool(
                 getattr(request.state, "maestro_remote", False)
             ),
+            # Preserve only the immutable account facts required for role
+            # defaults. Usernames, reauthentication state, and capabilities
+            # are deliberately absent from this detached worker request.
+            maestro_account_principal=bounded_principal,
             maestro_llm_progress_callback=None,
             # Local LLM/H3 exclusion is provided by llm_service's lease.
             # Preparation must never occupy the generation scheduler lock.
@@ -38961,6 +40293,13 @@ def _run_generation_preparation(
     enhance: bool,
 ) -> None:
     """Enhance and plan a published job without entering GPU queue admission."""
+    from collections.abc import Mapping as _PreparationMapping
+    from services.planning_failure import (
+        planning_failure_event,
+        public_planning_failure_message,
+        remove_exact_request_manifest,
+    )
+
     job = _jobs.get(job_id)
     if not isinstance(job, dict) or is_cancel_requested(job):
         return
@@ -38981,10 +40320,141 @@ def _run_generation_preparation(
     request.state.maestro_cpu_text_text_only = True
     phase = "enhancing_prompt" if enhance else "planning_generation"
     sealed_pointer = None
+    committed_pointer = None
     enhance_window_count = None
-    previous_pointer = dict(job.get("_recovery_manifest_pointer") or {})
+    raw_previous_pointer = job.get("_recovery_manifest_pointer")
+    previous_pointer = (
+        dict(raw_previous_pointer)
+        if isinstance(raw_previous_pointer, _PreparationMapping)
+        else {}
+    )
+    project_directory = str(job.get("out_dir") or "")
+    expected_execution_attempt = int(job.get("execution_attempt") or 1)
+    waiting = False
+    terms_blocked = False
+    needs_plan_timer = False
+    postcommit_error_event = None
+
+    def emit_event(event: str) -> None:
+        try:
+            print(f"[Generation preparation] {event}")
+        except BaseException:
+            pass
+
+    def cleanup_pointer(pointer) -> bool:
+        if not isinstance(pointer, dict) or not pointer:
+            return True
+        try:
+            cleaned = remove_exact_request_manifest(
+                project_directory,
+                pointer,
+                expected_job_id=job_id,
+            )
+        except BaseException:
+            cleaned = False
+        if not cleaned:
+            emit_event(
+                "phase=preparation "
+                "reason=planning_manifest_cleanup_failed"
+            )
+        return cleaned
+
+    def terminalize_failure(error: BaseException, message: str) -> bool:
+        reason_code, safe_event = planning_failure_event(
+            error, phase=phase,
+        )
+        if is_cancel_requested(job):
+            return False
+        finality_event = None
+        for _attempt in range(3):
+            try:
+                transitioned = fail_preparation(
+                    job,
+                    error=message,
+                    message=message,
+                    phase="preparation_failed",
+                    _recovery_reason_code=reason_code,
+                    _recovery_manifest_pointer={},
+                    expected_execution_attempt=expected_execution_attempt,
+                )
+            except Exception as finality_error:
+                _finality_code, finality_event = planning_failure_event(
+                    finality_error, phase="preparation",
+                )
+                if is_cancel_requested(job):
+                    return False
+                continue
+            if transitioned:
+                emit_event(safe_event)
+                if finality_event is not None:
+                    emit_event(finality_event)
+                return True
+            if (
+                is_cancel_requested(job)
+                or str(job.get("status") or "")
+                not in {"preparing", "waiting_for_plan_approval"}
+            ):
+                return False
+            break
+        emit_event(safe_event)
+        if finality_event is not None:
+            emit_event(finality_event)
+        raise QueueRecoveryRuntimeError(
+            "Generation preparation could not be finalized."
+        ) from None
+
+    def normalized_mode(name: str, maximum: int) -> int:
+        raw = prepared_params.get(name)
+        if raw in (None, ""):
+            value = 0
+        elif type(raw) is int:
+            value = raw
+        elif (
+            type(raw) is str
+            and len(raw) == 1
+            and "0" <= raw <= str(maximum)
+        ):
+            value = ord(raw) - ord("0")
+        else:
+            raise ValueError("Generation planning mode is invalid.") from None
+        if not 0 <= value <= maximum:
+            raise ValueError("Generation planning mode is invalid.") from None
+        prepared_params[name] = value
+        return value
+
     try:
-        prepared_params = copy.deepcopy(dict(job.get("params") or {}))
+        raw_params = job.get("params")
+        if not isinstance(raw_params, _PreparationMapping):
+            raise TypeError("Generation parameters are invalid.") from None
+        prepared_params = copy.deepcopy(dict(raw_params))
+        image_mode = normalized_mode("image_mode", 4)
+        prompt_mode = normalized_mode("multi_prompts_gen_type", 3)
+        custom_settings = prepared_params.get("custom_settings")
+        if custom_settings is not None:
+            if not isinstance(custom_settings, _PreparationMapping):
+                raise TypeError(
+                    "Generation custom settings are invalid."
+                ) from None
+            prepared_params["custom_settings"] = dict(custom_settings)
+        if "activated_loras" in prepared_params:
+            activated_loras = prepared_params.get("activated_loras")
+            if activated_loras is None:
+                prepared_params["activated_loras"] = []
+            elif (
+                not isinstance(activated_loras, (list, tuple))
+                or len(activated_loras) > 1024
+                or any(
+                    not isinstance(item, str)
+                    or not item
+                    or len(item) > 4096
+                    for item in activated_loras
+                )
+            ):
+                raise TypeError(
+                    "Generation LoRA selection is invalid."
+                ) from None
+            else:
+                prepared_params["activated_loras"] = list(activated_loras)
         if enhance:
             if not update_preparation_job(
                 job,
@@ -39028,22 +40498,20 @@ def _run_generation_preparation(
             ),
         ):
             return
-        if (
-            int(prepared_params.get("image_mode") or 0) != 2
-            and int(prepared_params.get("multi_prompts_gen_type") or 0) != 3
-        ):
+        if image_mode != 2 and prompt_mode != 3:
             from shared.utils import prompt_parser as _studio_prompt_parser
             if _studio_prompt_parser.has_global_timeline(
                 prepared_params.get("prompt", "")
             ):
                 prepared_params["multi_prompts_gen_type"] = 2
+                prompt_mode = 2
         if (
             enhance
             and str(prepared_params.get("model_type") or "")
             not in _H3_LONG_STUDIO_MODELS
             and str(prepared_params.get("generation_mode") or "video")
             in {"video", "avatar"}
-            and int(prepared_params.get("multi_prompts_gen_type") or 0) == 1
+            and prompt_mode == 1
             and isinstance(enhance_window_count, int)
             and enhance_window_count > 1
         ):
@@ -39068,8 +40536,18 @@ def _run_generation_preparation(
             ),
             require_terms=False,
         )
-        clip_count = max(0, int((plan or {}).get("clip_count") or 0))
-        waiting = bool(plan and clip_count > 1)
+        if plan is not None and not isinstance(plan, _PreparationMapping):
+            raise RuntimeError(
+                "Generation planner returned an invalid plan."
+            ) from None
+        clip_count = max(
+            0,
+            int(plan.get("clip_count") or 0)
+            if isinstance(plan, _PreparationMapping) else 0,
+        )
+        waiting = bool(
+            isinstance(plan, _PreparationMapping) and clip_count > 1
+        )
         if not waiting:
             _require_h3_generation_terms(prepared_params, plan)
         if waiting:
@@ -39079,6 +40557,11 @@ def _run_generation_preparation(
                 enhanced_source_params
             )
         requirements = _h3_generation_requirements(prepared_params, plan)
+        if not isinstance(requirements, _PreparationMapping):
+            raise RuntimeError(
+                "Generation requirements are invalid."
+            ) from None
+        requirements = dict(requirements)
         terms_blocked = bool(
             waiting
             and requirements.get("ref2va_terms_required")
@@ -39086,7 +40569,6 @@ def _run_generation_preparation(
         )
         remote_visible = _remote_visible_model_ids(request)
         if remote_visible is not None:
-            requirements = dict(requirements)
             requirements["checkpoint_options"] = [
                 option
                 for option in requirements.get("checkpoint_options") or []
@@ -39097,7 +40579,7 @@ def _run_generation_preparation(
         manifest_job = dict(job)
         manifest_job["params"] = prepared_params
         sealed_pointer = write_sealed_request_manifest(
-            str(job.get("out_dir") or ""),
+            project_directory,
             job_id=job_id,
             params=prepared_params,
             inputs=_queue_recovery_input_descriptors(
@@ -39110,9 +40592,7 @@ def _run_generation_preparation(
         try:
             completed = complete_preparation(
                 job,
-                expected_execution_attempt=int(
-                    job.get("execution_attempt") or 1
-                ),
+                expected_execution_attempt=expected_execution_attempt,
                 request_manifest=sealed_pointer,
                 waiting_for_approval=waiting,
                 plan_review_deadline=(
@@ -39150,64 +40630,98 @@ def _run_generation_preparation(
                 ),
             )
             if not completed:
-                remove_request_manifest(
-                    str(job.get("out_dir") or ""), sealed_pointer,
-                )
+                cleanup_pointer(sealed_pointer)
                 return
             # The coordinator now owns this pointer. Never remove it from an
             # error path after the atomic pointer/job transition has committed.
+            committed_pointer = dict(sealed_pointer)
             sealed_pointer = None
-            if terms_blocked and _ref2va_host_terms_accepted():
-                _arm_ref2va_waiting_plan_review(
-                    job,
-                    deadline=time.time() + _PLAN_REVIEW_TIMEOUT_SECONDS,
-                )
+            try:
+                if terms_blocked and _ref2va_host_terms_accepted():
+                    needs_plan_timer = bool(
+                        _arm_ref2va_waiting_plan_review(
+                            job,
+                            deadline=(
+                                time.time()
+                                + _PLAN_REVIEW_TIMEOUT_SECONDS
+                            ),
+                            schedule_timer=False,
+                        )
+                    )
+            except Exception as postcommit_error:
+                postcommit_error_event = planning_failure_event(
+                    postcommit_error, phase="planning_generation",
+                )[1]
+            if waiting and not terms_blocked:
+                needs_plan_timer = True
         finally:
             if terms_blocked:
-                _plan_terms_reconciliation_lock.release()
-        remove_request_manifest(
-            str(job.get("out_dir") or ""), previous_pointer,
-        )
-        if waiting and not terms_blocked:
-            _schedule_plan_review_auto_approval(job)
-        elif not waiting:
-            try:
-                _stamp_requested_generation_residency(job, replace=True)
-                _start_generation_worker(
-                    job, name_prefix="studio-generation-prepared",
-                )
-            except Exception:
-                if not _queue_recovery_is_blocked(job):
-                    job["_recovery_reason_code"] = "worker_start_failed"
-                    _queue_recovery_checkpoint(
-                        job,
-                        queue_held=True,
-                        recovery_state="blocked",
-                        reruns_denoise=False,
-                        message="Generation worker could not be started",
-                    )
-                return
-    except Exception:
-        if sealed_pointer is not None:
-            remove_request_manifest(
-                str(job.get("out_dir") or ""), sealed_pointer,
+                try:
+                    _plan_terms_reconciliation_lock.release()
+                except Exception as release_error:
+                    if committed_pointer is None:
+                        raise
+                    postcommit_error_event = planning_failure_event(
+                        release_error, phase="planning_generation",
+                    )[1]
+    except Exception as error:
+        if committed_pointer is not None:
+            postcommit_error_event = planning_failure_event(
+                error, phase="planning_generation",
+            )[1]
+        else:
+            fallback = (
+                "Prompt enhancement failed"
+                if enhance and phase == "enhancing_prompt"
+                else "Generation planning failed"
             )
-        if is_cancel_requested(job):
+            message = public_planning_failure_message(
+                error, fallback=fallback,
+            )
+            if terminalize_failure(error, message):
+                cleanup_pointer(sealed_pointer)
+                cleanup_pointer(previous_pointer)
             return
-        message = (
-            "Prompt enhancement failed"
-            if enhance and phase == "enhancing_prompt"
-            else "Generation planning failed"
-        )
-        fail_preparation(
-            job,
-            error=message,
-            message=message,
-            phase="preparation_failed",
-            expected_execution_attempt=int(
-                job.get("execution_attempt") or 1
-            ),
-        )
+
+    # Everything below runs after complete_preparation committed. Failures in
+    # cleanup or timer attachment must never re-enter the precommit catch and
+    # turn a queued job into a workerless orphan.
+    cleanup_pointer(previous_pointer)
+    if postcommit_error_event is not None:
+        emit_event(postcommit_error_event)
+        if waiting:
+            return
+    if needs_plan_timer:
+        try:
+            _schedule_plan_review_auto_approval(job)
+        except Exception as timer_error:
+            if str(job.get("status") or "") == "waiting_for_plan_approval":
+                if terminalize_failure(
+                    timer_error, "Generation planning failed",
+                ):
+                    cleanup_pointer(committed_pointer)
+            else:
+                emit_event(planning_failure_event(
+                    timer_error, phase="planning_generation",
+                )[1])
+        return
+    if not waiting:
+        try:
+            _stamp_requested_generation_residency(job, replace=True)
+            _start_generation_worker(
+                job, name_prefix="studio-generation-prepared",
+            )
+        except Exception:
+            if not _queue_recovery_is_blocked(job):
+                job["_recovery_reason_code"] = "worker_start_failed"
+                _queue_recovery_checkpoint(
+                    job,
+                    queue_held=True,
+                    recovery_state="blocked",
+                    reruns_denoise=False,
+                    message="Generation worker could not be started",
+                )
+            return
 
 
 def _require_sample_campaign_owner(request: Request) -> None:
@@ -40627,7 +42141,7 @@ async def generate(request: Request):
         owner_session_id=session_id,
     )
 
-    job_id = uuid.uuid4().hex[:8]
+    job_id = _new_generation_job_id()
     _long_plan = body.get("_h3_longform")
     if not isinstance(_long_plan, dict):
         _long_plan = {}
@@ -54936,10 +56450,11 @@ async def tools_upscale(request: Request):
     if body.get("explicit_output") is None:
         body["explicit_output"] = inherited["explicit"]
 
-    job_id = uuid.uuid4().hex[:8]
-    _jobs[job_id] = {
+    job_id = _new_generation_job_id()
+    job = {
         "id": job_id, "status": "queued", "progress": 0, "step": 0, "total_steps": 0,
         "kind": "tool_upscale",
+        "session_id": request.state.maestro_session_id,
         "source_remote": bool(_request_remote.get()),
         "phase": "", "message": "Queued (upscale)", "created_at": time.time(),
         "params": {
@@ -54952,7 +56467,12 @@ async def tools_upscale(request: Request):
         "output_files": [], "error": None,
         "workspace": workspace, "out_dir": job_out_dir,
     }
-    threading.Thread(target=_run_tool_upscale, args=(job_id,), daemon=False).start()
+    _queue_recovery_register_and_publish(
+        job,
+        worker=_run_tool_upscale,
+        recovery_kind="tool_upscale",
+        thread_name=f"tool-upscale-{job_id}",
+    )
     return {"job_id": job_id, "status": "queued"}
 
 
@@ -55002,10 +56522,11 @@ async def tools_revoice(request: Request):
     if body.get("explicit_output") is None:
         body["explicit_output"] = inherited["explicit"]
 
-    job_id = uuid.uuid4().hex[:8]
-    _jobs[job_id] = {
+    job_id = _new_generation_job_id()
+    job = {
         "id": job_id, "status": "queued", "progress": 0, "step": 0, "total_steps": 0,
         "kind": "tool_revoice",
+        "session_id": request.state.maestro_session_id,
         "source_remote": bool(_request_remote.get()),
         "phase": "", "message": "Queued (revoice)", "created_at": time.time(),
         "params": {
@@ -55020,7 +56541,12 @@ async def tools_revoice(request: Request):
         "output_files": [], "error": None,
         "workspace": workspace, "out_dir": job_out_dir,
     }
-    threading.Thread(target=_run_tool_revoice, args=(job_id,), daemon=False).start()
+    _queue_recovery_register_and_publish(
+        job,
+        worker=_run_tool_revoice,
+        recovery_kind="tool_revoice",
+        thread_name=f"tool-revoice-{job_id}",
+    )
     return {"job_id": job_id, "status": "queued"}
 
 
@@ -60857,6 +62383,23 @@ def _job_owned_by_request(job: dict | None, request: Request) -> bool:
     """Preserve local legacy jobs while hiding them from remote tenants."""
     if not job:
         return False
+    if job.get("kind") == "prompt_enhancement":
+        workspace = str(job.get("workspace") or "default")
+        private = _CanonicalPromptEnhancementStore._private(job)
+        try:
+            account_key, project_key, _session_key = (
+                _prompt_enhancement_operation_scope(request, workspace)
+            )
+        except Exception:
+            return False
+        return bool(
+            _CanonicalPromptEnhancementStore._same_scope(
+                private,
+                account_key=account_key,
+                project_instance_key=project_key,
+            )
+            and _recovered_job_remote_project_accessible(job, request)
+        )
     owner = job.get("session_id")
     recovered_owner = str(job.get("_recovery_owner_digest") or "")
     if recovered_owner:
@@ -60989,8 +62532,14 @@ def _public_parent_job_id(job: dict) -> str | None:
 
 
 def _public_logical_job_kind(job: dict) -> str | None:
-    """Expose only server-authored Reference relation markers."""
+    """Expose only closed server-authored logical job markers."""
     kind = job.get("logical_job_kind")
+    if (
+        kind == "prompt_enhancement"
+        and job.get("kind") == "prompt_enhancement"
+        and job.get("resource_intent") == "text"
+    ):
+        return kind
     if kind == "reference_pack_parent":
         reference = (job.get("params") or {}).get("reference_pack")
         if isinstance(reference, dict) and _public_parent_job_id(job) is None:
@@ -61148,8 +62697,8 @@ def get_status(job_id: str, request: Request, response: Response):
         "total_steps": j.get("total_steps", 0),
         "phase": j.get("phase", ""),
         "message": j["message"],
-        "output_files": j["output_files"],
-        "error": j["error"],
+        "output_files": list(j.get("output_files") or []),
+        "error": j.get("error"),
         "failure_details": j.get("failure_details"),
         # Present only on failed jobs that look like CUDA OOMs. UI
         # renders the OOM recovery banner when this is non-null.
@@ -61251,6 +62800,21 @@ def cancel_job(job_id: str, request: Request, response: Response):
             status_code=409,
             detail="This held sample requires dedicated pair release",
         )
+    if job.get("kind") == "prompt_enhancement":
+        workspace = str(job.get("workspace") or "default")
+        account_key, project_key, session_key = (
+            _prompt_enhancement_operation_scope(request, workspace)
+        )
+        was_running = job.get("status") == "running"
+        status = _prompt_enhancement_operation_manager.cancel(
+            job_id,
+            account_key=account_key,
+            project_instance_key=project_key,
+            session_key=session_key,
+        )
+        if status is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return {"status": status["status"], "was_running": was_running}
 
     result = request_cancel(
         job,
@@ -61352,8 +62916,8 @@ def list_jobs(
                 "total_steps": j.get("total_steps", 0),
                 "phase": j.get("phase", ""),
                 "message": j["message"],
-                "output_files": j["output_files"],
-                "error": j["error"],
+                "output_files": list(j.get("output_files") or []),
+                "error": j.get("error"),
                 "failure_details": j.get("failure_details"),
                 "oom_info": j.get("oom_info"),
                 "created_at": _public_job_created_at(j),
@@ -66124,6 +67688,16 @@ if __name__ == "__main__":
             f"the Pinokio menu, then Start again.\n"
             f"  • On Windows you can see what holds a port with: "
             f"netstat -ano | findstr :{port}\n",
+            flush=True,
+        )
+        sys.exit(1)
+    strict_port = str(
+        os.environ.get("MAESTRO_STRICT_SERVER_PORT") or ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if resolved_port != port and strict_port:
+        print(
+            f"[Maestro] ERROR: required port {port} is busy; refusing to "
+            "move the stable-share backend to another port.",
             flush=True,
         )
         sys.exit(1)

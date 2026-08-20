@@ -598,30 +598,34 @@ and closure procedure.
 
 After clicking **Start**, the launcher shows an **Open Web UI** button once the server is up.
 
-- **Sidebar** — peer workspaces (Generate / Director / Reference), model picker, prompt, LoRAs, and advanced settings
+- **Sidebar** — peer workspaces (Generate / Director / References), model picker, prompt, LoRAs, and advanced settings
 - **Recipes** — open the bundled preset library from the empty Gallery or Generate sidebar; applying a recipe deliberately returns to Generate with editable settings and prompt
 - **Main feed** — generated outputs, dashboard, Director pipeline status
 - **Settings drawer** (gear icon) — model visibility, performance auto-tune, services (LLM, API keys, mature prompt guidance, theme)
 - **Pinokio menu** — Update, Reset, Install Inpaint Support, LoRA folder shortcuts
 
-## Optional Support links
+## Optional support
 
-Maestro can show three operator-configured ways to support the project: **Buy Me a Coffee**, **Patreon**, and **direct compute sponsorship**. Support first helps recoup the hundreds spent on Codex while building Maestro; when that becomes sustainable, it can help fund hosting Maestro Continuum with more compute. These are passive links to external pages, not payment integrations: Maestro does not call provider APIs, receive webhooks, or process billing. Owner-recorded contribution events can produce a bounded compute allowance from Maestro's server-owned policy. That allowance affects queue priority only when accounts are enabled, `MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED=true`, and `MAESTRO_COMPUTE_EXECUTION_REALM=hosted`; otherwise it remains recorded but unenforced.
+Maestro can show the project's shared **Buy Me a Coffee** creator page, an optional **Patreon** page, and a public **Vast.ai compute sponsorship** option. Vast.ai compute sponsorship stays visibly locked until the sealed support ledger confirms at least $1,000 in net USD support from other sources after refunds and chargebacks. Once unlocked, it may link to an operator-configured public Vast.ai donation or account destination.
+
+The Vast.ai option is not a payment processor, a dollar-to-credit exchange, or a promise of compute or service. Maestro does not infer a Vast.ai payment, create provider credentials, or automatically grant promotional Maestro credits from a direct-compute record. Owner-attested direct-compute records are limited to a one-time contribution and its refund/chargeback lifecycle. The initial record requires the recovery gate to be unlocked; later adjustments to that existing record remain available so the audit trail can stay truthful after a relock.
+
+Other signed provider events or owner-verified records may grant recognition, bounded queue priority, early access, convenience features, and explicitly promotional Maestro credits under the server-owned benefit policy. These are thank-you benefits, not purchased compute, transferable value, a service guarantee, or expanded authority. Buy Me a Coffee remains the existing shared creator page; no second creator account is introduced.
 
 Hosted credits are never a paywall. Fully funded work can receive bounded priority, while zero, partial, refunded, or expired allowance still creates an otherwise-valid durable job in the lowest ordinary queue band with starvation-bounded capacity. The sealed owner account and local/authenticated-LAN execution are exempt. Safe defaults are credit enforcement off and execution realm `local`.
 
-All three options default to `disabled`. Enabling an option without a URL makes it truthfully `unconfigured`; a malformed or disallowed URL makes the catalog configuration fail closed. Only an enabled option with a valid URL is `available` and actionable. Configure the links in Pinokio's per-app **Configure** tab:
+The three operator-configured public links default to `disabled`. Enabling an option without a URL makes it truthfully `unconfigured`; a malformed or disallowed URL makes the catalog configuration fail closed. Only an enabled option with a valid URL is `available` and actionable, and the Vast.ai URL remains non-actionable until recovery is confirmed. Configure the links in Pinokio's per-app **Configure** tab:
 
 ```dotenv
 MAESTRO_SUPPORT_BUY_ME_A_COFFEE_ENABLED=true
-MAESTRO_SUPPORT_BUY_ME_A_COFFEE_URL=https://buymeacoffee.com/YOUR_PAGE
+MAESTRO_SUPPORT_BUY_ME_A_COFFEE_URL=https://buymeacoffee.com/threadspan
 MAESTRO_SUPPORT_PATREON_ENABLED=true
 MAESTRO_SUPPORT_PATREON_URL=https://www.patreon.com/YOUR_PAGE
 MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_ENABLED=true
-MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_URL=https://support.YOURDOMAIN.com/maestro
+MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_URL=https://cloud.vast.ai/
 ```
 
-Buy Me a Coffee URLs must use exactly `buymeacoffee.com` or `www.buymeacoffee.com`; Patreon URLs must use exactly `patreon.com` or `www.patreon.com`. A direct-compute URL may use an operator-controlled, public-looking DNS hostname with valid labels, at least one dot, and an alphabetic top-level label of at least two characters. It cannot use an IP address, an all-numeric address, or a hostname ending in `.arpa`, `.corp`, `.example`, `.home`, `.internal`, `.invalid`, `.lan`, `.local`, `.localdomain`, `.localhost`, `.onion`, `.private`, or `.test`. Every URL must be at most 2,048 characters, use HTTPS, contain no credentials, whitespace, query string, fragment, control characters, or backslashes, and use no explicit port other than 443. Validation is syntactic and does not perform a DNS lookup or contact the destination.
+Buy Me a Coffee URLs must use exactly `buymeacoffee.com` or `www.buymeacoffee.com`; Patreon URLs must use exactly `patreon.com` or `www.patreon.com`; Vast.ai URLs must use exactly `vast.ai`, `www.vast.ai`, or `cloud.vast.ai`. Every URL must be at most 2,048 characters, use HTTPS, contain no credentials, whitespace, query string, fragment, control characters, or backslashes, and use no explicit port other than 443. Validation is syntactic and does not perform a DNS lookup or contact the destination. Keep account IDs and credentials out of tracked configuration and documentation.
 
 As an alternative to environment values, create the ignored local file `app/settings/support.json` with this exact public-only schema:
 
@@ -639,7 +643,7 @@ As an alternative to environment values, create the ignored local file `app/sett
     },
     "direct_compute_sponsorship": {
       "enabled": true,
-      "support_url": "https://support.YOURDOMAIN.com/maestro"
+      "support_url": "https://cloud.vast.ai/"
     }
   }
 }

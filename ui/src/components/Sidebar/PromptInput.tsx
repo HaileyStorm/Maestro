@@ -1,8 +1,9 @@
 import { useState, useRef, useEffect } from 'react'
-import { Sparkles, Loader2, ChevronUp, Brain, PenLine } from 'lucide-react'
+import { Sparkles, Loader2, ChevronUp } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import { controlFpsTotalFrames, effectiveSlidingWindowGeometry, globalTimelineEndSeconds, hasGlobalTimeline, usesStudioSegments } from '../../lib/timelinePrompt'
 import { h3StyleWorkflowCatalogStateLabel, h3StyleWorkflowSupportsModel } from '../../lib/h3StyleWorkflows'
+import { requestQueueView } from '../../lib/mainViewNavigation'
 
 const placeholders: Record<string, string> = {
   image: 'Describe your image...',
@@ -86,8 +87,6 @@ export function PromptInput() {
   const editSubMode = useStore(s => s.editSubMode)
   const enhancePrompt = useStore(s => s.enhancePrompt)
   const isEnhancing = useStore(s => s.isEnhancing)
-  const enhanceStatus = useStore(s => s.enhanceStatus)
-  const cancelEnhancePrompt = useStore(s => s.cancelEnhancePrompt)
   const durationSeconds = useStore(s => s.durationSeconds)
   const slidingWindowSeconds = useStore(s => s.slidingWindowSeconds)
   const slidingWindowOverlap = useStore(s => s.slidingWindowOverlap)
@@ -98,12 +97,8 @@ export function PromptInput() {
   const videoGuide = useStore(s => s.params.video_guide)
   const studioPromptEnhance = useStore(s => s.studioPromptEnhance)
   const setStudioPromptEnhance = useStore(s => s.setStudioPromptEnhance)
-  const servicesConfig = useStore(s => s.servicesConfig)
-  const systemConfig = useStore(s => s.systemConfig)
-  const llmModels = useStore(s => s.llmModels)
   const imageMode = useStore(s => s.params.image_mode)
   const effectiveVideoModel = useStore(s => s.params.model_type)
-  const h3StyleWorkflowCatalog = useStore(s => s.h3StyleWorkflowCatalog)
   const migrateLegacyH3StylePrompt = useStore(s => s.migrateLegacyH3StylePrompt)
   const [ttsMenuOpen, setTtsMenuOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
@@ -156,44 +151,6 @@ export function PromptInput() {
       setDurationSeconds(authoredTimelineEnd)
     }
   }, [authoredTimelineEnd, durationSeconds, generationMode, imageMode, setDurationSeconds])
-  const enhancerModeLabels: Record<number, string> = {
-    1: 'Llama 3.2 + Florence2',
-    2: 'LlamaJoy + Florence2',
-    3: 'Qwen3.5 4B Abliterated',
-    4: 'Qwen3.5 9B Abliterated',
-  }
-  const needsH3Guide = generationMode === 'video'
-    && h3StyleWorkflowSupportsModel(h3StyleWorkflowCatalog, effectiveVideoModel)
-  const wangpEnhancerMode = Number(systemConfig?.enhancer_enabled || 0)
-  const dedicatedEnhancerId = modelOptions?.prompt_enhancer_model || servicesConfig?.enhance_llm_model_id || ''
-  const configuredEnhancerId = dedicatedEnhancerId || servicesConfig?.llm_model_id || ''
-  const configuredEnhancerLabel = llmModels.find(model => model.id === configuredEnhancerId)?.label || configuredEnhancerId
-  const enhancerModelLabel = wangpEnhancerMode > 0 && !needsH3Guide
-    ? enhancerModeLabels[wangpEnhancerMode] || `Wan2GP enhancer mode ${wangpEnhancerMode}`
-    : configuredEnhancerLabel || 'Writing assistant'
-  const routeEnhanceStatus = enhanceStatus && 'request_id' in enhanceStatus
-    ? enhanceStatus
-    : null
-  const enhancePhase = String(enhanceStatus?.phase || 'loading')
-  const enhanceIsThinking = enhancePhase === 'thinking' || enhancePhase === 'detecting'
-  const enhanceIsWriting = Boolean(routeEnhanceStatus?.partial_text)
-    || ['prefill', 'inference', 'generating', 'finalizing', 'retrying'].includes(enhancePhase)
-  const enhanceStageLabels: Record<string, string> = {
-    queued: 'Queued',
-    loading: 'Preparing writing tools',
-    wangp: 'Drafting with the prompt enhancer',
-    llm: 'Drafting with your writing assistant',
-    llm_fallback: 'Continuing with your writing assistant',
-    inference: 'Writing your revision',
-  }
-  const enhanceStage = routeEnhanceStatus
-    ? enhanceStageLabels[routeEnhanceStatus.stage]
-      || enhanceStageLabels[routeEnhanceStatus.phase]
-      || 'Writing your revision'
-    : enhanceStatus?.phase === 'ready'
-      ? 'Writing your revision'
-      : `Preparing ${enhancerModelLabel}`
-  const enhanceTps = routeEnhanceStatus?.live_tps ?? routeEnhanceStatus?.average_tps
   const enhancerFooter = !isAudioOnly
   const modePlaceholder = generationMode === 'avatar' && editSubMode === 'recast'
     ? 'Describe the finished video and replacement characters...'
@@ -229,7 +186,13 @@ export function PromptInput() {
   const runTtsEnhancement = (mode: 'monologue' | 'monologue_fast' | 'dialogue' | 'dialogue_fast') => {
     ttsMenuTriggerRef.current?.focus()
     setTtsMenuOpen(false)
-    enhancePrompt(mode)
+    requestQueueView()
+    void enhancePrompt(mode)
+  }
+
+  const runEnhancement = () => {
+    requestQueueView()
+    void enhancePrompt()
   }
 
   // grow shrink-0: fill spare vertical space when the sidebar is roomy, but
@@ -239,47 +202,6 @@ export function PromptInput() {
   return (
     <div className="relative grow shrink-0 flex flex-col">
       {generationMode === 'video' && <div className="mb-1.5"><H3StyleWorkflowField effectiveVideoModel={effectiveVideoModel} surface="Generate" /></div>}
-      {/* Enhance status indicator */}
-      {isEnhancing && (
-        <div className="flex min-h-11 items-center gap-2 rounded-t-lg border border-b-0 border-border bg-bg-tertiary/80 px-2 py-1 text-[10px] text-text-muted">
-          {!enhanceIsThinking && !enhanceIsWriting ? (
-            <>
-              <Loader2 size={10} className="text-text-muted animate-spin" />
-              <span>{enhanceStage}…</span>
-            </>
-          ) : enhanceIsThinking ? (
-            <>
-              <Brain size={10} className="text-chip-purple animate-pulse" />
-              <span>Working on your prompt · {enhanceStage}…</span>
-            </>
-          ) : (
-            <>
-              <PenLine size={10} className="text-accent-blue animate-pulse" />
-              <span>{enhanceStage}…</span>
-            </>
-          )}
-          {enhanceTps != null && (
-            <span className="whitespace-nowrap tabular-nums">{enhanceTps.toFixed(1)} tok/s</span>
-          )}
-          <button
-            type="button"
-            onClick={() => void cancelEnhancePrompt()}
-            className="mobile-control-target ml-auto inline-flex min-h-11 shrink-0 items-center rounded px-2 text-[10px] text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
-            aria-label="Cancel prompt enhancement"
-          >
-            Cancel
-          </button>
-        </div>
-      )}
-      {isEnhancing && routeEnhanceStatus?.partial_text && (
-        <div
-          role="status"
-          aria-live="polite"
-          className="line-clamp-2 border-x border-border bg-bg-tertiary/60 px-2 py-1 text-[10px] leading-relaxed text-text-secondary"
-        >
-          {routeEnhanceStatus.partial_text}
-        </div>
-      )}
       <textarea
         value={prompt}
         onChange={e => setParam('prompt', e.target.value)}
@@ -330,7 +252,7 @@ export function PromptInput() {
             <div className="flex items-center">
               <button
                 type="button"
-                onClick={() => enhancePrompt(defaultMode)}
+                onClick={() => runTtsEnhancement(defaultMode)}
                 disabled={isEnhancing}
                 title={isMultiVoice
                   ? `Write ${voiceCount}-person dialogue (use dropdown to switch to speech)`
@@ -399,7 +321,7 @@ export function PromptInput() {
         ) : (
           <button
             type="button"
-            onClick={() => enhancePrompt()}
+            onClick={runEnhancement}
             disabled={isEnhancing}
             title="Improve prompt"
             aria-label="Improve prompt"

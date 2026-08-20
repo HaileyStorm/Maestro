@@ -1,11 +1,18 @@
 import { useState, useMemo, useEffect, useRef } from 'react'
-import { X, Upload, Plus, Music, Film, Mic } from 'lucide-react'
+import { X, Upload, Plus, Music, Film, Mic, Library } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import * as api from '../../api/client'
 import { controlFpsTotalFrames, effectiveSlidingWindowGeometry } from '../../lib/timelinePrompt'
 import { HOST_TERM_NOTICES } from '../../lib/hostTerms'
 import { DOWNLOAD_REFRESH_EVENT } from '../../lib/useVisibilityPolling'
 import { cancelFileSelection, consumeFileSelection } from '../shared/FileUploadZone'
+import { classifyStudioReferenceMedia } from '../../lib/studioSemanticReferences'
+import {
+  filterProjectReferenceChoices,
+  GENERATE_ATTACHMENT_DISABLED_TILE_CLASS,
+  orderGenerateAttachmentOptions,
+  resolveGenerateAttachmentCapabilities,
+} from '../../lib/generateAttachmentOptions'
 
 // Unified, media-driven "Inputs" panel for Studio Frames mode (image_mode 0).
 //
@@ -131,6 +138,7 @@ export function InputsPanel() {
   const params = useStore(s => s.params)
   const setParam = useStore(s => s.setParam)
   const activeModel = useStore(s => s.models.find(model => model.model_type === s.params.model_type))
+  const h3SelectedProfile = useStore(s => s.h3SelectedProfile)
   const ref2vaModel = useStore(s => s.models.find(model => model.model_type === 'minimax_h3_ref2va'))
   const loadModels = useStore(s => s.loadModels)
   const durationSeconds = useStore(s => s.durationSeconds)
@@ -202,6 +210,28 @@ export function InputsPanel() {
   )
   const canAttachFrameAnchors = !dedicatedRef2VAMode || h3AdaptiveConditioning
   const showFrameAnchorControls = canAttachFrameAnchors || h3HasFrameInputs
+  const attachmentCaps = useMemo(() => resolveGenerateAttachmentCapabilities({
+    modelType: params.model_type,
+    architecture: modelOptions?.architecture,
+    supportsEndFrame: modelOptions?.supports_end_frame ?? activeModel?.supports_end_frame,
+    supportsRefImages: activeModel?.supports_ref_images,
+    supportsAudioInput: activeModel?.supports_audio_input ?? modelOptions?.any_audio_prompt,
+    hasImageRefChoices: !!modelOptions?.image_ref_choices,
+    maxImageRefs: modelOptions?.max_image_refs,
+    referenceImageMaxCount: modelOptions?.reference_image_max_count,
+    referenceVideoMaxCount: modelOptions?.reference_video_max_count,
+    referenceAudioMaxCount: modelOptions?.reference_audio_max_count,
+    conditioningMode: modelOptions?.minimax_h3_conditioning_mode,
+    mutuallyExclusiveConditioning: modelOptions?.minimax_h3_conditioning_modes_mutually_exclusive,
+    adaptiveConditioning: h3AdaptiveConditioning,
+    directorReferenceMode: activeModel?.director?.reference_mode,
+    directorSupportsAudioInput: activeModel?.director?.supports_audio_input,
+    h3ProfileId: h3SelectedProfile === 'custom' ? null : h3SelectedProfile,
+  }), [params.model_type, modelOptions, activeModel, h3AdaptiveConditioning, h3SelectedProfile])
+  const attachmentOptions = useMemo(
+    () => orderGenerateAttachmentOptions(attachmentCaps),
+    [attachmentCaps],
+  )
 
   const [selected, setSelected] = useState<string | null>(null)
   const [injectedFrames, setInjectedFrames] = useState<InjectedFrame[]>([])
@@ -214,6 +244,18 @@ export function InputsPanel() {
   const [h3DownloadStatus, setH3DownloadStatus] = useState<'idle' | 'downloading' | 'failed'>('idle')
   const [audioUploadTarget, setAudioUploadTarget] = useState<string | null>(null)
   const [audioUploadError, setAudioUploadError] = useState<string | null>(null)
+  const [projectRefPickerOpen, setProjectRefPickerOpen] = useState(false)
+  const [projectRefLoading, setProjectRefLoading] = useState(false)
+  const [projectRefError, setProjectRefError] = useState<string | null>(null)
+  const [projectRefChoices, setProjectRefChoices] = useState<Array<{
+    key: string
+    name: string
+    assetType: string
+    label: string
+    kind: ReturnType<typeof classifyStudioReferenceMedia>
+    asset: api.ProjectAsset
+    variant: api.ProjectAsset['variants'][number]
+  }>>([])
   const filePickerRef = useRef<HTMLInputElement>(null)
   const pendingFilePickRef = useRef<((files: File[]) => void) | null>(null)
   const h3TermsAccepted = hostTerms?.minimax_h3_ref2va.accepted === true
@@ -241,6 +283,10 @@ export function InputsPanel() {
   useEffect(() => {
     setSelected(null)
   }, [semanticReferenceMode])
+
+  useEffect(() => {
+    setProjectRefChoices(current => filterProjectReferenceChoices(current, attachmentCaps))
+  }, [attachmentCaps])
 
   useEffect(() => {
     if (h3DownloadStatus !== 'downloading') return
@@ -436,6 +482,42 @@ export function InputsPanel() {
       const room = maxRefs == null ? files.length : Math.max(0, maxRefs - semanticImageCount)
       files.slice(0, room).forEach(addImageRef)
     }, true)
+  }
+
+  const loadProjectReferences = async () => {
+    if (!activeWorkspace) {
+      setProjectRefError('Choose a project before using Continuum references.')
+      setProjectRefPickerOpen(true)
+      return
+    }
+    setProjectRefPickerOpen(true)
+    setProjectRefLoading(true)
+    setProjectRefError(null)
+    try {
+      const assets = await api.fetchProjectAssets(activeWorkspace)
+      const choices = assets.flatMap(asset => (
+        asset.variants
+          .filter(variant => variant.status === 'kept' && api.getProjectAssetApplyOutputs(variant).length > 0)
+          .map(variant => {
+            const output = api.getProjectAssetApplyOutputs(variant)[0]
+            return {
+              key: `${asset.id}:${variant.id}`,
+              name: asset.name,
+              assetType: String(asset.asset_type),
+              label: variant.label || output.label || output.filename,
+              kind: classifyStudioReferenceMedia(output.media_type, output.filename),
+              asset,
+              variant,
+            }
+          })
+      ))
+      setProjectRefChoices(filterProjectReferenceChoices(choices, attachmentCaps))
+    } catch (reason) {
+      setProjectRefChoices([])
+      setProjectRefError(api.projectReferenceSafeErrorMessage(reason, 'Could not load project references.'))
+    } finally {
+      setProjectRefLoading(false)
+    }
   }
 
   // Extend mode: the source video to continue from.
@@ -835,6 +917,27 @@ export function InputsPanel() {
       setAudioUploadTarget(null)
     }
   }
+  const applyProjectReferenceChoice = async (choice: (typeof projectRefChoices)[number]) => {
+    if (!activeWorkspace || !canAttachSemanticReferences) return
+    try {
+      const outputs = api.getProjectAssetApplyOutputs(choice.variant)
+      for (const output of outputs) {
+        const url = api.getProjectAssetMediaUrl(activeWorkspace, output.relative_path)
+        const response = await fetch(url)
+        if (!response.ok) throw api.projectAssetRequestError(response.status, 'Could not load reference media')
+        const blob = await response.blob()
+        const file = new File([blob], output.filename, { type: blob.type || output.media_type })
+        const kind = classifyStudioReferenceMedia(output.media_type, output.filename)
+        if (kind === 'video') await handleAddSemanticVideo(file)
+        else if (kind === 'audio') await handleAddSemanticAudio(file)
+        else if (canAddRef) addImageRef(file)
+      }
+      setProjectRefPickerOpen(false)
+    } catch (reason) {
+      setProjectRefError(api.projectReferenceSafeErrorMessage(reason, 'Could not use this project reference.'))
+    }
+  }
+
   const removeSemanticAudio = (index: number) => {
     setAudioUploadError(null)
     const removed = semanticAudioPaths[index]
@@ -973,31 +1076,17 @@ export function InputsPanel() {
             </div>
           </div>
         ))}
-        {canAttachFrameAnchors && canAddFrame && (
-          <AddTile label={frameUploading ? 'Uploading…' : 'Frame'} icon={<Plus size={18} />}
-            onClick={() => pickImage(handleAddFrameSmart)} onDropFile={handleAddFrameSmart} dropAccept="image" />
-        )}
-
         {/* H3 Ref2VA media are semantic context, never timeline controls. */}
         {semanticReferenceMode && (h3TermsAccepted || h3HasSemanticInputs) && semanticVideoPaths.map((path, index) => (
           <Tile key={`semantic-video-${path}`} role={`Reference video ${index + 1}`} filledIcon={<Film size={20} />} filledLabel={basename(path)}
             imgSrc={null} selected={selected === `semantic-video-${index}`} onClear={() => removeSemanticVideo(index)}
             onSelect={() => setSelected(selected === `semantic-video-${index}` ? null : `semantic-video-${index}`)} />
         ))}
-        {semanticReferenceMode && canAttachSemanticReferences && h3TermsAccepted && semanticVideoPaths.length < H3_REF2VA_LIMITS.videos && semanticMixedCount < H3_REF2VA_LIMITS.mixed && (
-          <AddTile label="Reference video" icon={<Film size={18} />} onClick={() => pickFile('.mp4,.webm,.mkv,.mov', handleAddSemanticVideo)} onDropFile={handleAddSemanticVideo} dropAccept="video" />
-        )}
         {semanticReferenceMode && (h3TermsAccepted || h3HasSemanticInputs) && semanticAudioPaths.map((path, index) => (
           <Tile key={`semantic-audio-${path}`} role={`Reference audio ${index + 1}`} filledIcon={<Music size={20} />} filledLabel={basename(path)}
             imgSrc={null} selected={selected === `semantic-audio-${index}`} onClear={() => removeSemanticAudio(index)}
             onSelect={() => setSelected(selected === `semantic-audio-${index}` ? null : `semantic-audio-${index}`)} />
         ))}
-        {semanticReferenceMode && canAttachSemanticReferences && h3TermsAccepted && semanticAudioPaths.length < H3_REF2VA_LIMITS.audio && semanticMixedCount < H3_REF2VA_LIMITS.mixed && (
-          <AddTile label={audioUploadTarget === 'semantic-audio' ? 'Uploading…' : 'Reference audio'} icon={<Music size={18} />}
-            onClick={() => pickFile('.wav,.mp3,.flac,.ogg,.m4a', handleAddSemanticAudio)} onDropFile={handleAddSemanticAudio}
-            dropAccept="audio" disabled={audioUploadTarget !== null} />
-        )}
-
         {/* Soundtrack (audio) */}
         {!semanticReferenceMode && (hasSoundtrack ? (
           <Tile role="Soundtrack" filledIcon={<Music size={20} />} filledLabel={soundtrackName ?? undefined}
@@ -1074,10 +1163,126 @@ export function InputsPanel() {
             </div>
           </div>
         ))}
-        {supportsRefs && canAddRef && (!semanticReferenceMode || (canAttachSemanticReferences && h3TermsAccepted)) && <AddTile label="Reference" icon={<Plus size={18} />} onClick={pickReferences} onDropFile={file => {
-          if (canAddRef && (!semanticReferenceMode || semanticMixedCount < H3_REF2VA_LIMITS.mixed)) addImageRef(file)
-        }} dropAccept="image" />}
+        {attachmentOptions.map(option => {
+          const incompatibleClass = option.enabled ? undefined : GENERATE_ATTACHMENT_DISABLED_TILE_CLASS
+          if (option.id === 'project_reference') {
+            return (
+              <AddTile
+                key={option.id}
+                label="Project reference"
+                icon={<Library size={18} />}
+                disabled={!option.enabled}
+                title={option.reason ?? undefined}
+                disabledClassName={incompatibleClass}
+                onClick={() => { void loadProjectReferences() }}
+              />
+            )
+          }
+          if (option.id === 'first_last_frame') {
+            const atCapacity = !canAddFrame
+            const disabled = !option.enabled || frameUploading || atCapacity
+            return (
+              <AddTile
+                key={option.id}
+                label={frameUploading ? 'Uploading…' : 'First / last frame'}
+                icon={<Plus size={18} />}
+                disabled={disabled}
+                title={!option.enabled ? (option.reason ?? undefined) : frameUploading ? 'Uploading…' : atCapacity ? 'First and last frames are already set.' : undefined}
+                disabledClassName={incompatibleClass}
+                busy={frameUploading}
+                onClick={() => pickImage(handleAddFrameSmart)}
+                onDropFile={handleAddFrameSmart}
+                dropAccept="image"
+              />
+            )
+          }
+          if (option.id === 'reference_image') {
+            const needsTerms = semanticReferenceMode && !h3TermsAccepted
+            const atCapacity = !canAddRef || (semanticReferenceMode && semanticMixedCount >= H3_REF2VA_LIMITS.mixed)
+            const disabled = !option.enabled || needsTerms || atCapacity
+            return (
+              <AddTile
+                key={option.id}
+                label="Reference image"
+                icon={<Plus size={18} />}
+                disabled={disabled}
+                title={!option.enabled ? (option.reason ?? undefined) : needsTerms ? 'Accept the MiniMax H3 terms to add reference images.' : atCapacity ? 'Reference image limit reached.' : undefined}
+                disabledClassName={incompatibleClass}
+                onClick={pickReferences}
+                onDropFile={file => {
+                  if (canAddRef && (!semanticReferenceMode || semanticMixedCount < H3_REF2VA_LIMITS.mixed)) addImageRef(file)
+                }}
+                dropAccept="image"
+              />
+            )
+          }
+          if (option.id === 'reference_video') {
+            const needsTerms = semanticReferenceMode && !h3TermsAccepted
+            const atCapacity = semanticVideoPaths.length >= H3_REF2VA_LIMITS.videos || semanticMixedCount >= H3_REF2VA_LIMITS.mixed
+            const disabled = !option.enabled || needsTerms || atCapacity
+            return (
+              <AddTile
+                key={option.id}
+                label="Reference video"
+                icon={<Film size={18} />}
+                disabled={disabled}
+                title={!option.enabled ? (option.reason ?? undefined) : needsTerms ? 'Accept the MiniMax H3 terms to add reference videos.' : atCapacity ? 'Reference video limit reached.' : undefined}
+                disabledClassName={incompatibleClass}
+                onClick={() => pickFile('.mp4,.webm,.mkv,.mov', handleAddSemanticVideo)}
+                onDropFile={handleAddSemanticVideo}
+                dropAccept="video"
+              />
+            )
+          }
+          const needsTerms = semanticReferenceMode && !h3TermsAccepted
+          const atCapacity = semanticAudioPaths.length >= H3_REF2VA_LIMITS.audio || semanticMixedCount >= H3_REF2VA_LIMITS.mixed
+          const disabled = !option.enabled || needsTerms || atCapacity || audioUploadTarget !== null
+          return (
+            <AddTile
+              key={option.id}
+              label={audioUploadTarget === 'semantic-audio' ? 'Uploading…' : 'Reference audio'}
+              icon={<Music size={18} />}
+              disabled={disabled}
+              title={!option.enabled ? (option.reason ?? undefined) : audioUploadTarget === 'semantic-audio' ? 'Uploading…' : needsTerms ? 'Accept the MiniMax H3 terms to add reference audio.' : atCapacity ? 'Reference audio limit reached.' : undefined}
+              disabledClassName={incompatibleClass}
+              busy={audioUploadTarget === 'semantic-audio'}
+              onClick={() => pickFile('.wav,.mp3,.flac,.ogg,.m4a', handleAddSemanticAudio)}
+              onDropFile={handleAddSemanticAudio}
+              dropAccept="audio"
+            />
+          )
+        })}
       </div>
+      {projectRefPickerOpen && (
+        <div className="mt-2 rounded-lg border border-border bg-bg-secondary p-2" role="listbox" aria-label="Project references">
+          <div className="mb-1 flex items-center justify-between gap-2">
+            <p className="text-[10px] text-text-muted">Use a Continuum project reference — images, videos, audio, or packs.</p>
+            <button type="button" onClick={() => setProjectRefPickerOpen(false)} className="rounded px-1.5 py-0.5 text-[10px] text-text-muted hover:bg-bg-hover" aria-label="Close project references">Close</button>
+          </div>
+          {projectRefLoading && <p className="text-[10px] text-text-muted">Loading project references…</p>}
+          {projectRefError && <p role="alert" className="text-[10px] text-red-300">{projectRefError}</p>}
+          {!projectRefLoading && !projectRefError && projectRefChoices.length === 0 && (
+            <p className="text-[10px] text-text-muted">No kept project references yet. Create them in References.</p>
+          )}
+          <div className="mt-1 max-h-40 space-y-1 overflow-y-auto">
+            {projectRefChoices.map(choice => (
+              <button
+                key={choice.key}
+                type="button"
+                role="option"
+                onClick={() => { void applyProjectReferenceChoice(choice) }}
+                className="flex w-full items-center justify-between gap-2 rounded border border-border px-2 py-1 text-left hover:border-accent-blue"
+              >
+                <span className="min-w-0">
+                  <span className="block truncate text-[10px] text-text-primary">{choice.name}</span>
+                  <span className="block truncate text-[9px] text-text-muted">{choice.assetType} · {choice.kind} · {choice.label}</span>
+                </span>
+                <span className="shrink-0 text-[9px] text-accent-blue">Add</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
       {audioUploadTarget && (
         <p role="status" className="mt-1 text-[9px] text-text-muted">Audio selection accepted; processing…</p>
       )}
@@ -1253,10 +1458,13 @@ function Row({ label, value }: { label: string; value: string }) {
   )
 }
 
-function AddTile({ label, icon, onClick, onDropFile, dropAccept, disabled = false }: {
+function AddTile({ label, icon, onClick, onDropFile, dropAccept, disabled = false, title, disabledClassName, busy = false }: {
   label: string; icon?: React.ReactNode; onClick: () => void
   onDropFile?: (f: File) => void; dropAccept?: 'image' | 'audio' | 'video'
   disabled?: boolean
+  title?: string
+  disabledClassName?: string
+  busy?: boolean
 }) {
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault()
@@ -1266,10 +1474,13 @@ function AddTile({ label, icon, onClick, onDropFile, dropAccept, disabled = fals
     onDropFile(f)
   }
   return (
-    <button type="button" onClick={onClick} disabled={disabled} aria-busy={disabled}
+    <button type="button" onClick={onClick} disabled={disabled} aria-label={label} aria-busy={busy}
+      title={title}
       onDrop={onDropFile ? handleDrop : undefined}
       onDragOver={onDropFile ? (e => e.preventDefault()) : undefined}
-      className="w-[90px] h-[90px] shrink-0 rounded-xl border border-dashed border-border hover:border-accent-blue flex flex-col items-center justify-center gap-1 text-text-muted hover:text-text-primary transition-colors disabled:cursor-wait disabled:opacity-60">
+      className={`w-[90px] h-[90px] shrink-0 rounded-xl border border-dashed border-border hover:border-accent-blue flex flex-col items-center justify-center gap-1 text-text-muted hover:text-text-primary transition-colors ${
+        disabledClassName ?? 'disabled:cursor-wait disabled:opacity-60'
+      }`}>
       {icon ?? <Plus size={18} />}
       <span className="text-[10px] text-center px-1">{label}</span>
     </button>

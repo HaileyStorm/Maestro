@@ -102,7 +102,7 @@ module.exports = {
           const capturedQuick = local.$share && local.$share.cloudflare
             ? local.$share.cloudflare[local.url]
             : undefined
-          const quick = capturedQuick || (local.share_kind === "quick" ? local.share_url : undefined)
+          const quick = local.quick_share_url || capturedQuick || (local.share_kind === "quick" ? local.share_url : undefined)
           const remoteMenu = []
           if (stable) {
             remoteMenu.push({

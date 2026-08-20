@@ -48,6 +48,8 @@ import type {
   SupportAdminProjection,
   SupportPublicProjection,
   SupportSelfProjection,
+  SupportH3LegalAccessLocationInput,
+  SupportH3LegalAccessProjection,
 } from '../types'
 import { developmentCostRecoveryProjection } from '../types/index.ts'
 
@@ -644,8 +646,8 @@ export async function fetchSampleCampaignQueue(
     cache: 'no-store',
     headers: { Accept: 'application/json' },
   })
-  if (res.status === 403 || res.status === 404) return null
-  if (!res.ok) throw new Error('Sample campaign queue is unavailable')
+  if (res.status === 404) return null
+  if (!res.ok) throw protectedReadApiError('sample_queue', res.status)
   return decodeSampleCampaignQueue(await res.json())
 }
 
@@ -669,9 +671,129 @@ export type QueueReorderReason =
   | 'resident_affinity'
   | 'starvation_guard'
 
+export const ACCESS_RECOVERY_EVENT = 'maestro:access-recovery'
+
+export type AccessRecoveryStatus = 401 | 403 | 423
+export type AccessRecoveryKind = 'account' | 'project'
+
+export type ProtectedReadSurface =
+  | 'access'
+  | 'workspaces'
+  | 'queue'
+  | 'sample_queue'
+  | 'jobs'
+  | 'models'
+  | 'loras'
+  | 'h3_estimate'
+
+const PROTECTED_READ_MESSAGES: Record<ProtectedReadSurface, string> = {
+  access: 'Maestro access is unavailable.',
+  workspaces: 'Project access is unavailable.',
+  queue: 'Queue update failed.',
+  sample_queue: 'Sample queue update failed.',
+  jobs: 'Job recovery is unavailable.',
+  models: 'Model access is unavailable.',
+  loras: 'LoRA access is unavailable.',
+  h3_estimate: 'Could not estimate H3 performance.',
+}
+
+export class ProtectedReadApiError extends Error {
+  readonly surface: ProtectedReadSurface
+  readonly status: number
+
+  constructor(surface: ProtectedReadSurface, status: number) {
+    super(PROTECTED_READ_MESSAGES[surface])
+    this.name = 'ProtectedReadApiError'
+    this.surface = surface
+    this.status = Number.isInteger(status) ? status : 0
+  }
+}
+
+export function requestAccessRecovery(
+  status: AccessRecoveryStatus,
+  recovery: AccessRecoveryKind = status === 423 ? 'project' : 'account',
+): void {
+  window.dispatchEvent(new CustomEvent(ACCESS_RECOVERY_EVENT, {
+    detail: { status, recovery },
+  }))
+}
+
+function notifyProtectedAccessFailure(
+  surface: ProtectedReadSurface,
+  status: number,
+): void {
+  if (
+    status === 403
+    && (surface === 'loras' || surface === 'sample_queue')
+  ) return
+  if (
+    (status === 401 || status === 403 || status === 423)
+    && typeof window !== 'undefined'
+  ) requestAccessRecovery(
+    status,
+    status === 423 || (status === 403 && surface === 'workspaces')
+      ? 'project'
+      : 'account',
+  )
+}
+
+function protectedReadApiError(
+  surface: ProtectedReadSurface,
+  status: number,
+): ProtectedReadApiError {
+  notifyProtectedAccessFailure(surface, status)
+  return new ProtectedReadApiError(surface, status)
+}
+
+const QUEUE_STATUS_MESSAGES: Partial<Record<number, string>> = {
+  401: 'Sign in again to view the queue.',
+  403: 'Sign in again to view the queue.',
+  423: 'Choose an available project, then try the queue again.',
+}
+
+export class QueueApiError extends ProtectedReadApiError {
+  constructor(status: number) {
+    super('queue', status)
+    this.name = 'QueueApiError'
+    this.message = QUEUE_STATUS_MESSAGES[status] || PROTECTED_READ_MESSAGES.queue
+  }
+}
+
+export function accessRecoveryStatus(error: unknown): AccessRecoveryStatus | null {
+  const status = error instanceof AccountApiError || error instanceof ProtectedReadApiError
+    ? error.status
+    : 0
+  return status === 401 || status === 403 || status === 423
+    ? status
+    : null
+}
+
+export function accessRecoveryKind(error: unknown): AccessRecoveryKind | null {
+  const status = accessRecoveryStatus(error)
+  if (status === null) return null
+  if (status === 423) return 'project'
+  if (
+    status === 403
+    && error instanceof ProtectedReadApiError
+    && error.surface === 'workspaces'
+  ) return 'project'
+  return 'account'
+}
+
+export const queueAccessRecoveryStatus = accessRecoveryStatus
+
+export function protectedReadFailureIsTransient(error: unknown): boolean {
+  return error instanceof TypeError || (
+    error instanceof ProtectedReadApiError
+    && (error.status === 0 || error.status >= 500)
+  )
+}
+
 export async function fetchQueueState(signal?: AbortSignal): Promise<QueueState> {
   const res = await fetch(`${BASE}/api/v1/queue`, { signal })
-  if (!res.ok) throw new Error('Failed to load queue')
+  if (!res.ok) {
+    throw new QueueApiError(res.status)
+  }
   return res.json()
 }
 
@@ -789,7 +911,7 @@ export async function resumeQueue() {
 
 export async function fetchModels(): Promise<{ families: ApiFamily[]; models: ApiModel[] }> {
   const res = await fetch(`${BASE}/api/v1/models`)
-  if (!res.ok) throw new Error('Failed to fetch models')
+  if (!res.ok) throw protectedReadApiError('models', res.status)
   return res.json()
 }
 
@@ -801,7 +923,7 @@ export interface ModelVisibilitySettings {
 
 export async function fetchModelVisibility(): Promise<ModelVisibilitySettings> {
   const res = await fetch(`${BASE}/api/v1/model-visibility`)
-  if (!res.ok) throw new Error('Failed to fetch model visibility')
+  if (!res.ok) throw protectedReadApiError('models', res.status)
   return res.json()
 }
 
@@ -930,7 +1052,7 @@ export async function fetchResolutions(): Promise<ApiResolution[]> {
 
 export async function fetchDefaults(modelType: string): Promise<Record<string, unknown>> {
   const res = await fetch(`${BASE}/api/v1/defaults/${encodeURIComponent(modelType)}`)
-  if (!res.ok) throw new Error(`Failed to fetch defaults for ${modelType}`)
+  if (!res.ok) throw protectedReadApiError('models', res.status)
   return res.json()
 }
 
@@ -1408,8 +1530,28 @@ export function isAccountProjectAccessActive(
   migration: AccountProjectMigrationStatus | null = null,
 ): boolean {
   if (context?.accounts?.enabled !== true) return false
-  if (migration !== null) return migration.state === 'active' && migration.enforced === true
-  return context.account_project_access_active === true
+  return context.account_project_access_active === true || (
+    migration?.state === 'active' && migration.enforced === true
+  )
+}
+
+export function protectedProjectReadsReady(
+  context: AccessContext | null,
+  account: AccountContext | null,
+  workspaces: readonly Workspace[],
+  activeWorkspace: string,
+  migration: AccountProjectMigrationStatus | null = null,
+): boolean {
+  if (context === null) return false
+  if (!context.remote) return true
+  const project = workspaces.find(workspace => workspace.name === activeWorkspace)
+  if (!project) return false
+  const canRead = project.project_permissions === undefined
+    || project.project_permissions.includes('project.read')
+  if (!canRead) return false
+  return isAccountProjectAccessActive(context, migration)
+    ? account?.authenticated === true
+    : project.unlocked !== false
 }
 
 export function getDirectorHostActionAccessState(
@@ -1437,7 +1579,7 @@ export async function fetchAccessContext(): Promise<AccessContext> {
     const res = await fetch(`${BASE}/api/v1/access-context`, {
       credentials: 'same-origin',
     })
-    if (!res.ok) throw new Error('Failed to determine access capabilities')
+    if (!res.ok) throw protectedReadApiError('access', res.status)
     return res.json() as Promise<AccessContext>
   })()
   accessContextRequest = pending
@@ -1558,6 +1700,20 @@ export async function loginAccount(input: {
   })
 }
 
+export async function registerAccount(input: {
+  username: string
+  password: string
+  email?: string
+  deviceLabel?: string
+}): Promise<AccountAuthResult> {
+  return accountNonceMutation<AccountAuthResult>('register', '/api/v1/account/register', {
+    username: input.username,
+    password: input.password,
+    email: input.email || '',
+    device_label: input.deviceLabel || 'Browser',
+  })
+}
+
 export async function logoutAccount(): Promise<{ status: 'logged_out' }> {
   return accountNonceMutation('revoke_session', '/api/v1/account/logout', {})
 }
@@ -1656,6 +1812,7 @@ export async function setServerAccountDisabled(accountId: string, disabled: bool
 interface RawSupportAccountProjection {
   recorded?: Record<string, unknown>
   benefits?: Record<string, unknown>
+  owner_test_credits?: unknown
 }
 
 function stringList(value: unknown): string[] {
@@ -1987,6 +2144,32 @@ function supportAccountSummary(value: RawSupportAccountProjection | undefined): 
   const recorded = value?.recorded || {}
   const benefits = value?.benefits || {}
   const recordedAllowance = supportRecordedAllowance(recorded.recorded_allowance)
+  const ownerTestRaw = value?.owner_test_credits
+  const ownerTest = (() => {
+    if (!ownerTestRaw || typeof ownerTestRaw !== 'object' || Array.isArray(ownerTestRaw)) return undefined
+    const raw = ownerTestRaw as Record<string, unknown>
+    const numbers = ['target_balance', 'available_units', 'reserved_units', 'used_units', 'pending_reservations'] as const
+    if (
+      (raw.state !== 'active' && raw.state !== 'unavailable')
+      || raw.test_only !== true
+      || raw.auto_top_up !== true
+      || raw.unit !== 'maestro_test_credits'
+      || numbers.some(key => safeAllowanceNumber(raw[key]) === null)
+      || (raw.last_activity_at !== null && safeAllowanceTimestamp(raw.last_activity_at) === null)
+    ) return undefined
+    return {
+      state: raw.state as 'active' | 'unavailable',
+      test_only: true as const,
+      auto_top_up: true as const,
+      unit: 'maestro_test_credits' as const,
+      target_balance: raw.target_balance as number,
+      available_units: raw.available_units as number,
+      reserved_units: raw.reserved_units as number,
+      used_units: raw.used_units as number,
+      pending_reservations: raw.pending_reservations as number,
+      last_activity_at: raw.last_activity_at as string | null,
+    }
+  })()
   const benefitState = typeof benefits.state === 'string' ? benefits.state : ''
   const schedulerEnforcementEnabled = benefits.scheduler_enforcement_enabled === true
   const effectiveBenefits = stringList(benefits.effective_benefits)
@@ -2021,6 +2204,7 @@ function supportAccountSummary(value: RawSupportAccountProjection | undefined): 
       ? recorded.active_recurring_count
       : 0,
     ...(benefitsCoherent && recordedAllowance ? { recorded_allowance: recordedAllowance } : {}),
+    ...(ownerTest ? { owner_test_credits: ownerTest } : {}),
     benefits: benefitsCoherent
       ? {
           state: benefitState,
@@ -2143,6 +2327,29 @@ export async function recordAdminAccountContribution(
   return supportAdminProjection(raw)
 }
 
+export async function fetchH3LegalAccessState(): Promise<SupportH3LegalAccessProjection> {
+  return accountRequest('/api/v1/h3/legal-access')
+}
+
+export async function setH3LegalAccessLocation(
+  input: SupportH3LegalAccessLocationInput,
+): Promise<SupportH3LegalAccessProjection> {
+  const projection = await accountRequest<SupportH3LegalAccessProjection>('/api/v1/h3/legal-access', {
+    method: 'PUT',
+    body: JSON.stringify({
+      territory_code: input.territory_code,
+      owner_attested: input.owner_attested,
+      license_revision: input.license_revision,
+      license_sha256: input.license_sha256,
+    }),
+  })
+  return {
+    ...projection,
+    license_revision: input.license_revision,
+    license_sha256: input.license_sha256,
+  }
+}
+
 export interface Workspace {
   name: string
   path?: string
@@ -2183,7 +2390,7 @@ export async function fetchWorkspaces(): Promise<{ workspaces: Workspace[]; acti
     credentials: 'same-origin',
     cache: 'no-store',
   })
-  if (!res.ok) throw new Error('Failed to fetch workspaces')
+  if (!res.ok) throw protectedReadApiError('workspaces', res.status)
   return res.json()
 }
 
@@ -2201,10 +2408,13 @@ export async function createWorkspace(
   password?: string,
   remember: WorkspaceRememberPolicy = 'device',
 ): Promise<void> {
+  const body = password
+    ? { name, password, remember }
+    : { name }
   const res = await fetch(`${BASE}/api/v1/workspaces`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, password: password || undefined, remember }),
+    body: JSON.stringify(body),
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: 'Failed to create workspace' }))
@@ -4196,7 +4406,7 @@ export async function cancelJob(jobId: string): Promise<void> {
 
 export async function fetchActiveJobs(): Promise<{ jobs: ApiJobStatus[] }> {
   const res = await fetch(`${BASE}/api/v1/jobs`)
-  if (!res.ok) throw new Error('Failed to fetch jobs')
+  if (!res.ok) throw protectedReadApiError('jobs', res.status)
   return res.json()
 }
 
@@ -5408,40 +5618,63 @@ export interface GenerationPreset {
   name: string
   mode: string
   model_type: string
-  prompt: string
   activated_loras: string[]
   loras_multipliers: string
   lora_weights: Record<string, number[]>
+  spatial_upsampling: string
   params: Record<string, unknown>
   created_at: number
 }
 
-export async function fetchPresets(): Promise<{ presets: GenerationPreset[] }> {
-  const res = await fetch(`${BASE}/api/v1/presets`)
+function newGenerationPresetId(): string {
+  const random = new Uint8Array(16)
+  crypto.getRandomValues(random)
+  return `preset_${Array.from(random, value => value.toString(16).padStart(2, '0')).join('')}`
+}
+
+export async function fetchPresets(workspace: string): Promise<{ presets: GenerationPreset[] }> {
+  const query = new URLSearchParams({ workspace })
+  const res = await fetch(`${BASE}/api/v1/presets?${query.toString()}`)
   if (!res.ok) throw new Error('Failed to fetch presets')
   return res.json()
 }
 
-export async function createPreset(preset: Omit<GenerationPreset, 'id' | 'created_at'>): Promise<GenerationPreset> {
-  const res = await fetch(`${BASE}/api/v1/presets`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(preset),
-  })
-  if (!res.ok) throw new Error('Failed to create preset')
-  return res.json()
+export async function createPreset(
+  workspace: string,
+  preset: Omit<GenerationPreset, 'id' | 'created_at'>,
+): Promise<GenerationPreset> {
+  const presetId = newGenerationPresetId()
+  const query = new URLSearchParams({ workspace })
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const res = await fetch(`${BASE}/api/v1/presets?${query.toString()}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: presetId, ...preset }),
+    })
+    if (res.ok) return res.json()
+    if (res.status !== 503 || attempt === 1) {
+      throw new Error('Failed to create preset')
+    }
+  }
+  throw new Error('Failed to create preset')
 }
 
-export async function deletePreset(id: string): Promise<void> {
-  const res = await fetch(`${BASE}/api/v1/presets/${encodeURIComponent(id)}`, { method: 'DELETE' })
-  if (!res.ok) throw new Error('Failed to delete preset')
+export async function deletePreset(id: string, workspace: string): Promise<void> {
+  const query = new URLSearchParams({ workspace })
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const res = await fetch(`${BASE}/api/v1/presets/${encodeURIComponent(id)}?${query.toString()}`, { method: 'DELETE' })
+    if (res.ok) return
+    if (res.status !== 503 || attempt === 1) {
+      throw new Error('Failed to delete preset')
+    }
+  }
 }
 
 // --- LoRAs ---
 
 export async function fetchLoras(modelType: string): Promise<{ loras: string[]; guidance_max_phases: number }> {
   const res = await fetch(`${BASE}/api/v1/loras/${encodeURIComponent(modelType)}`)
-  if (!res.ok) throw new Error('Failed to fetch loras')
+  if (!res.ok) throw protectedReadApiError('loras', res.status)
   return res.json()
 }
 
@@ -5449,7 +5682,7 @@ export async function fetchLoras(modelType: string): Promise<{ loras: string[]; 
 
 export async function fetchModelOptions(modelType: string): Promise<import('../types').ModelOptions> {
   const res = await fetch(`${BASE}/api/v1/model-options/${encodeURIComponent(modelType)}`)
-  if (!res.ok) throw new Error('Failed to fetch model options')
+  if (!res.ok) throw protectedReadApiError('models', res.status)
   return res.json()
 }
 
@@ -5461,10 +5694,7 @@ export async function estimateH3Performance(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(params),
   })
-  if (!res.ok) {
-    const error = await res.json().catch(() => ({ detail: 'Could not estimate H3 performance' }))
-    throw new Error(error.detail || 'Could not estimate H3 performance')
-  }
+  if (!res.ok) throw protectedReadApiError('h3_estimate', res.status)
   return res.json()
 }
 
@@ -6939,7 +7169,7 @@ export interface LlmEnhanceOperationScope {
 export interface LlmEnhanceOperationStatus {
   request_id: string
   operation_kind: 'enhance'
-  status: 'running' | 'completed' | 'failed' | 'cancelled'
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
   phase: string
   stage: string
   pass: number
@@ -6961,6 +7191,26 @@ export interface LlmEnhanceResult {
   enhanced: string
 }
 
+export type LlmEnhanceQueueCardPhase = 'preparing' | 'queued' | 'running' | 'completed' | 'failed'
+
+/**
+ * Browser-owned presentation state for the dedicated Prompt Enhance operation.
+ *
+ * Backend contract assumption: prompt/result text remains available only from
+ * the dedicated `/api/v1/llm/operations/enhance/...` status and result routes.
+ * The generic `/api/v1/queue` projection must stay content-free.
+ */
+export interface LlmEnhanceQueueCard {
+  requestId: string
+  workspace: string
+  scope: LlmEnhanceOperationScope | null
+  phase: LlmEnhanceQueueCardPhase
+  status: LlmPreparationStatus | LlmEnhanceOperationStatus | null
+  result: LlmEnhanceResult | null
+  resultApplied: boolean
+  error: string | null
+}
+
 export interface LlmEnhanceRequestOptions extends LlmRequestOptions {
   projectInstance: string
   onOperationStatus?: (status: LlmEnhanceOperationStatus) => void
@@ -6971,6 +7221,10 @@ function canonicalLlmRequestId(requestId: string): string {
   return requestId.replaceAll('-', '').toLowerCase()
 }
 
+const LLM_ENHANCE_OPERATION_STATUSES = new Set([
+  'queued', 'running', 'completed', 'failed', 'cancelled',
+])
+
 function assertLlmEnhanceStatusScope(
   status: LlmEnhanceOperationStatus,
   scope: LlmEnhanceOperationScope,
@@ -6978,6 +7232,7 @@ function assertLlmEnhanceStatusScope(
   if (
     canonicalLlmRequestId(status.request_id) !== canonicalLlmRequestId(scope.requestId)
     || status.operation_kind !== 'enhance'
+    || !LLM_ENHANCE_OPERATION_STATUSES.has(status.status)
   ) {
     throw new LlmEnhanceScopeError()
   }
@@ -7118,7 +7373,7 @@ export async function waitForLlmEnhanceOperation(
   }
   assertLlmEnhanceStatusScope(operation, scope)
   onStatus?.(operation)
-  while (operation.status === 'running') {
+  while (operation.status === 'queued' || operation.status === 'running') {
     if (Date.now() - startedAt >= LLM_PREPARATION_MAX_WAIT_MS) {
       throw new LlmEnhanceWaitError(
         'Prompt Enhance is still running. Reload to resume waiting.',
@@ -7205,7 +7460,11 @@ export async function cancelLlmEnhancePrompt(
       throwIfAborted(signal)
       if (!isTransientRequestError(error)) throw error
     }
-    if (admitted && admitted.status !== 'running') {
+    if (
+      admitted
+      && admitted.status !== 'queued'
+      && admitted.status !== 'running'
+    ) {
       return admitted
     }
     if (Date.now() - startedAt >= LLM_ENHANCE_CANCEL_ADMISSION_WAIT_MS) {
@@ -7793,7 +8052,7 @@ export async function fetchInstalledLoras(): Promise<{
   manifest_last_check_at?: string | null
 }> {
   const res = await fetch(`${BASE}/api/v1/loras/installed`)
-  if (!res.ok) throw new Error('Failed to fetch installed LoRAs')
+  if (!res.ok) throw protectedReadApiError('loras', res.status)
   return res.json()
 }
 
@@ -7948,7 +8207,10 @@ export interface LoraUpdateCheckResult {
 export async function checkLoraUpdates(force = false): Promise<LoraUpdateCheckResult> {
   const url = `${BASE}/api/v1/loras/check-updates${force ? '?force=true' : ''}`
   const res = await fetch(url, { method: 'POST' })
-  if (!res.ok) throw new Error(`Failed to check LoRA updates (${res.status})`)
+  // This is an optional host-control mutation. Remote users normally receive
+  // 403 even with a valid account and project, so it must not trigger global
+  // account/project recovery.
+  if (!res.ok) throw new Error('LoRA update check is unavailable')
   return res.json()
 }
 

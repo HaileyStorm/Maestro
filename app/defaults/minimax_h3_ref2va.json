@@ -8,7 +8,7 @@
         ]
     },
     "prompt": "Use the person from Picture 1 as the main subject in a cinematic medium shot on a windswept overlook at sunrise. Preserve their identity and clothing while the camera slowly arcs around them. Distant birds and soft wind are audible, and they say, \"We made it.\"",
-    "num_inference_steps": 20,
+    "num_inference_steps": 28,
     "video_length": 124,
     "resolution": "1344x768",
     "guidance_scale": 1.0,

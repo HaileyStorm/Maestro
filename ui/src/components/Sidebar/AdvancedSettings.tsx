@@ -55,17 +55,38 @@ function PresetManager() {
   const currentModel = useStore(s => s.params.model_type)
   const [saveName, setSaveName] = useState('')
   const [showSave, setShowSave] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [saveNotice, setSaveNotice] = useState<{
+    kind: 'success' | 'error'
+    text: string
+  } | null>(null)
+  const saveInFlight = useRef(false)
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
 
   useEffect(() => { loadPresets() }, [loadPresets])
 
   const modePresets = presets.filter(p => p.mode === generationMode && p.model_type === currentModel)
 
-  const handleSave = () => {
-    if (!saveName.trim()) return
-    savePreset(saveName.trim())
-    setSaveName('')
-    setShowSave(false)
+  const handleSave = async () => {
+    const name = saveName.trim()
+    if (!name || saveInFlight.current) return
+    saveInFlight.current = true
+    setSaving(true)
+    setSaveNotice(null)
+    try {
+      await savePreset(name)
+      setSaveName('')
+      setShowSave(false)
+      setSaveNotice({ kind: 'success', text: 'Preset saved.' })
+    } catch {
+      setSaveNotice({
+        kind: 'error',
+        text: 'Preset save could not be confirmed. Check your connection and try again.',
+      })
+    } finally {
+      saveInFlight.current = false
+      setSaving(false)
+    }
   }
 
   const handleDelete = (id: string) => {
@@ -84,10 +105,15 @@ function PresetManager() {
         <span className="text-[11px] text-text-muted uppercase tracking-wider">Presets</span>
         <button
           type="button"
-          onClick={() => setShowSave(!showSave)}
+          onClick={() => {
+            const opening = !showSave
+            setShowSave(opening)
+            if (opening) setSaveNotice(null)
+          }}
+          disabled={saving}
           aria-expanded={showSave}
           aria-controls="advanced-preset-save-form"
-          className="mobile-control-target text-[10px] text-accent-blue hover:text-accent-blue-hover flex items-center gap-0.5"
+          className="mobile-control-target text-[10px] text-accent-blue hover:text-accent-blue-hover flex items-center gap-0.5 disabled:cursor-wait disabled:opacity-60"
         >
           <Save aria-hidden="true" size={10} /> Save Current
         </button>
@@ -100,21 +126,37 @@ function PresetManager() {
             aria-label="Preset name"
             value={saveName}
             onChange={e => setSaveName(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && handleSave()}
+            onKeyDown={e => {
+              if (e.key !== 'Enter') return
+              e.preventDefault()
+              void handleSave()
+            }}
+            disabled={saving}
             placeholder="Preset name..."
             className="mobile-control-target min-w-0 flex-1 bg-bg-tertiary border border-border rounded px-2 py-1 text-xs text-text-primary focus:outline-none focus:border-accent-blue focus-visible:ring-2 focus-visible:ring-accent-blue"
             autoFocus
           />
           <button
             type="button"
-            onClick={handleSave}
-            disabled={!saveName.trim()}
-            className="mobile-control-target px-2 py-1 text-xs bg-accent-blue text-white rounded hover:bg-accent-blue-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50"
+            onClick={() => { void handleSave() }}
+            disabled={!saveName.trim() || saving}
+            aria-busy={saving}
+            className="mobile-control-target px-2 py-1 text-xs bg-accent-blue text-white rounded hover:bg-accent-blue-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:cursor-wait disabled:opacity-50"
           >
-            Save
+            {saving ? 'Saving…' : 'Save'}
           </button>
         </div>
       )}
+
+      <p
+        role="status"
+        aria-live="polite"
+        className={`mb-1.5 min-h-4 text-[10px] ${
+          saveNotice?.kind === 'error' ? 'text-red-400' : 'text-text-muted'
+        }`}
+      >
+        {saveNotice?.text || ''}
+      </p>
 
       {modePresets.length > 0 ? (
         <div className="space-y-1 max-h-[120px] overflow-y-auto">
@@ -221,6 +263,20 @@ export function AdvancedSettings() {
   const params = useStore(s => s.params)
   const setParam = useStore(s => s.setParam)
   const modelOptions = useStore(s => s.modelOptions)
+  const hostMaxSteps = Number(
+    (useStore(s => s.h3CurrentEstimate) as { host_max_steps?: number } | null)
+      ?.host_max_steps,
+  )
+  const inferenceStepCeiling = (
+    Number.isFinite(hostMaxSteps) && hostMaxSteps >= 2
+      ? Math.min(50, Math.trunc(hostMaxSteps))
+      : 50
+  )
+  useEffect(() => {
+    if (params.num_inference_steps > inferenceStepCeiling) {
+      setParam('num_inference_steps', inferenceStepCeiling)
+    }
+  }, [inferenceStepCeiling, params.num_inference_steps, setParam])
   const generationMode = useStore(s => s.generationMode)
   const editSubMode = useStore(s => s.editSubMode)
   const audioSubMode = useStore(s => s.audioSubMode)
@@ -921,21 +977,26 @@ export function AdvancedSettings() {
                       id="advanced-inference-steps"
                       aria-labelledby="advanced-inference-steps-label"
                       min={minimumInferenceSteps}
-                      max={50}
+                      max={inferenceStepCeiling}
                       value={params.num_inference_steps}
-                      onChange={e => setParam('num_inference_steps', Math.max(minimumInferenceSteps, Math.min(50, Number(e.target.value) || minimumInferenceSteps)))}
+                      onChange={e => setParam('num_inference_steps', Math.max(minimumInferenceSteps, Math.min(inferenceStepCeiling, Number(e.target.value) || minimumInferenceSteps)))}
                       disabled={!!modelOptions?.lock_inference_steps && !isScailEdit}
                       className="mobile-control-target w-16 bg-bg-tertiary border border-border rounded px-2 py-0.5 text-xs text-text-primary text-center focus:outline-none focus:border-accent-blue focus-visible:ring-2 focus-visible:ring-accent-blue disabled:cursor-not-allowed disabled:opacity-60"
                     />
                   </div>
                   <input
-                    type="range" min={minimumInferenceSteps} max={50} step={1}
+                    type="range" min={minimumInferenceSteps} max={inferenceStepCeiling} step={1}
                     aria-labelledby="advanced-inference-steps-label"
                     value={params.num_inference_steps}
                     onChange={e => setParam('num_inference_steps', Number(e.target.value))}
                     disabled={!!modelOptions?.lock_inference_steps && !isScailEdit}
                     className="w-full disabled:cursor-not-allowed disabled:opacity-60"
                   />
+                  {inferenceStepCeiling < 50 && (
+                    <p className="text-[9px] text-amber-400 mt-0.5">
+                      This computer could not finish MiniMax H3 above {inferenceStepCeiling} steps at the current size. Higher counts will be offered again if a compatible attention mode or a memory-saving update comes online.
+                    </p>
+                  )}
                   {modelOptions?.lock_inference_steps && !isScailEdit && (
                     <p className="text-[9px] text-text-muted mt-0.5">
                       This distilled model uses a fixed {modelOptions.default_num_inference_steps ?? params.num_inference_steps}-step recipe.

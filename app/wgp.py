@@ -60,6 +60,7 @@ import traceback
 import math 
 import typing
 import inspect
+import functools
 from shared.utils import prompt_parser
 import base64
 import io
@@ -1746,6 +1747,13 @@ def validate_settings(state, model_type, single_prompt, inputs):
         if image_refs == None :
             gr.Info("A Reference Image should be an Image") 
             return ret()
+    elif model_def.get("minimax_h3_reference_mode", False) and image_refs:
+        # H3 Ref2VA semantic stills do not use the legacy video_prompt_type "I"
+        # letter. Keep supplied image_refs so <Picture N> tags can resolve.
+        image_refs = clean_image_list(image_refs)
+        if image_refs is None:
+            gr.Info("A Reference Image should be an Image")
+            return ret()
     else:
         image_refs = None
 
@@ -2742,7 +2750,7 @@ def update_generation_status(html_content):
     if(html_content):
         return gr.update(value=html_content)
 
-family_handlers = ["models.wan.wan_handler", "models.wan.ovi_handler", "models.wan.df_handler", "models.hyvideo.hunyuan_handler", "models.ltx_video.ltxv_handler", "models.ltx2.ltx2_handler", "models.ltx2.scenema_audio_handler", "models.ltx2.ltx_audio_tts_handler", "models.minimax_h3.minimax_h3_handler", "models.longcat.longcat_handler", "models.flux.flux_handler", "models.qwen.qwen_handler", "models.kandinsky5.kandinsky_handler",  "models.z_image.z_image_handler", "models.krea2.krea2_handler", "models.hidream.hidream_handler", "models.TTS.ace_step_handler", "models.TTS.chatterbox_handler", "models.TTS.qwen3_handler", "models.TTS.yue_handler", "models.TTS.heartmula_handler", "models.TTS.kugelaudio_handler", "models.TTS.index_tts2_handler"]
+family_handlers = ["models.wan.wan_handler", "models.wan.ovi_handler", "models.wan.df_handler", "models.hyvideo.hunyuan_handler", "models.ltx_video.ltxv_handler", "models.ltx2.ltx2_handler", "models.ltx2.scenema_audio_handler", "models.ltx2.ltx_audio_tts_handler", "models.minimax_h3.minimax_h3_handler", "models.longcat.longcat_handler", "models.flux.flux_handler", "models.qwen.qwen_handler", "models.kandinsky5.kandinsky_handler",  "models.z_image.z_image_handler", "models.krea2.krea2_handler", "models.hidream.hidream_handler", "models.TTS.ace_step_handler", "models.TTS.chatterbox_handler", "models.TTS.qwen3_handler", "models.TTS.yue_handler", "models.TTS.heartmula_handler", "models.TTS.kugelaudio_handler", "models.TTS.index_tts2_handler", "models.TTS.voxcpm_handler"]
 DEFAULT_LORA_ROOT = "loras"
 
 def register_family_lora_args(parser, lora_root):
@@ -4080,6 +4088,36 @@ def find_edit_spatial_upsampler(spatial_upsampling):
 
 def release_flashvsr_vram():
     flashvsr.release_vram()
+
+
+def generation_residency_must_yield_for_postprocess(spatial_upsampling) -> bool:
+    """True when the next tenant is FlashVSR, not another generation load."""
+    try:
+        return bool(flashvsr.is_upsampling(spatial_upsampling))
+    except Exception:
+        text = str(spatial_upsampling or "").strip().lower()
+        return text.startswith("flashvsr")
+
+
+def release_generation_residency_for_postprocess():
+    """Yield generation occupancy so finalization (FlashVSR) can use VRAM.
+
+    ``release_model`` already invalidates WGP and scheduler residency
+    identity. Empty occupancy is a no-op besides allocator flush.
+    """
+    global wan_model, offloadobj
+    if wan_model is None and offloadobj is None:
+        if torch.cuda.is_available():
+            gc.collect()
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+        return False
+    print("[Residency] Yielding generation model before postprocess")
+    release_model()
+    return True
 
 if "loras_root" not in server_config: server_config["loras_root"] = DEFAULT_LORA_ROOT
 if "save_queue_if_crash" not in server_config: server_config["save_queue_if_crash"] = 1
@@ -6015,6 +6053,9 @@ def get_requested_residency_identity(
     if model_type is None:
         return None, None
     profile = compute_profile(override_profile, output_type)
+    if str(model_type or "").startswith("minimax_h3"):
+        from services.h3_oom_relief import apply_h3_baseline_offload_profile
+        profile = apply_h3_baseline_offload_profile(profile, model_type)
     effective_coefficient = (
         args.vram_safety_coefficient
         if vram_safety_coefficient is None
@@ -6309,8 +6350,11 @@ def load_models(
 
 
     profile = compute_profile(override_profile, output_type)
-    load_environment = _model_load_environment_signature(model_type, profile)
     is_h3_load = str(base_model_type or "").startswith("minimax_h3")
+    if is_h3_load:
+        from services.h3_oom_relief import apply_h3_baseline_offload_profile
+        profile = apply_h3_baseline_offload_profile(profile, model_type)
+    load_environment = _model_load_environment_signature(model_type, profile)
     h3_checkpoint_paths = []
     if is_h3_load:
         h3_checkpoint_paths = [*local_model_file_list, text_encoder_filename]
@@ -10048,7 +10092,98 @@ def _resolve_image_ref_fit(model_def, auto_aspect):
         return 1
     return ref_fit
 
-def generate_video(
+def generate_video(*args, **kwargs):
+    """Outer wrapper so H3 denoise OOM can unwind before a safer retry."""
+    from services.h3_oom_relief import (
+        H3OomReliefRetry,
+        apply_h3_baseline_offload_profile,
+        is_h3_model,
+    )
+
+    bound_args = list(args)
+    bound_kwargs = dict(kwargs)
+    param_names = list(inspect.signature(_generate_video_impl).parameters)
+
+    def _bound_value(name, default=None):
+        if name in bound_kwargs:
+            return bound_kwargs[name]
+        if name in param_names:
+            idx = param_names.index(name)
+            if idx < len(bound_args):
+                return bound_args[idx]
+        return default
+
+    def _set_bound(name, value):
+        bound_kwargs[name] = value
+        if name in param_names:
+            idx = param_names.index(name)
+            if idx < len(bound_args):
+                bound_args[idx] = value
+
+    model_type = _bound_value("model_type")
+    if is_h3_model(model_type):
+        current_profile = _bound_value("override_profile", -1)
+        if current_profile in (None, -1):
+            current_profile = get_default_profile(
+                get_output_type_for_model(model_type),
+            )
+        _set_bound(
+            "override_profile",
+            apply_h3_baseline_offload_profile(current_profile, model_type),
+        )
+    while True:
+        try:
+            result = _generate_video_impl(*bound_args, **bound_kwargs)
+            if result:
+                try:
+                    from services.h3_host_limits import record_denoise_success
+                    record_denoise_success(
+                        model_type=bound_kwargs.get("model_type"),
+                        resolution=bound_kwargs.get("resolution"),
+                        num_inference_steps=bound_kwargs.get(
+                            "num_inference_steps",
+                        ),
+                        video_length=bound_kwargs.get("video_length"),
+                        duration_seconds=bound_kwargs.get("duration_seconds"),
+                        attention_engine=(
+                            bound_kwargs.get("custom_settings") or {}
+                        ).get("h3_attention_engine")
+                        if isinstance(bound_kwargs.get("custom_settings"), dict)
+                        else None,
+                    )
+                except Exception:
+                    pass
+            return result
+        except H3OomReliefRetry as retry:
+            relief = retry.relief or {}
+            for key in ("resolution", "num_inference_steps", "override_profile"):
+                if key not in relief:
+                    continue
+                _set_bound(key, relief[key])
+            task = bound_args[0] if bound_args else bound_kwargs.get("task")
+            if isinstance(task, dict):
+                params = task.setdefault("params", {})
+                if isinstance(params, dict):
+                    params.update({
+                        key: relief[key]
+                        for key in (
+                            "resolution",
+                            "num_inference_steps",
+                            "override_profile",
+                        )
+                        if key in relief
+                    })
+                    if "override_profile" in relief:
+                        params["_h3_relief_offload_profile"] = relief[
+                            "override_profile"
+                        ]
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+
+
+def _generate_video_impl(
     task,
     send_cmd,
     image_mode,
@@ -10324,7 +10459,36 @@ def generate_video(
                 gen["abort"] = True
                 return False
 
-        return not gen.get("abort", False)
+        success = not gen.get("abort", False)
+        if success and generation_residency_must_yield_for_postprocess(
+            spatial_upsampling,
+        ):
+            release_generation_residency_for_postprocess()
+        return success
+
+    if str(model_type or "").startswith("minimax_h3"):
+        try:
+            from services.h3_host_limits import reason_if_blocked
+            _h3_attention = None
+            if isinstance(custom_settings, dict):
+                _h3_attention = custom_settings.get("h3_attention_engine")
+            _h3_blocked = reason_if_blocked(
+                model_type=model_type,
+                resolution=resolution,
+                num_inference_steps=num_inference_steps,
+                video_length=video_length,
+                duration_seconds=duration_seconds,
+                attention_engine=_h3_attention,
+            )
+        except Exception:
+            _h3_blocked = None
+        if _h3_blocked:
+            send_cmd("error", {
+                "error": _h3_blocked,
+                "code": "host_setup_unsupported",
+                "stage": "plan",
+            })
+            return False
 
     durable_output_dir = None
     durable_output_prefix = ""
@@ -10604,6 +10768,9 @@ def generate_video(
         if new_vae_upsampling: model_kwargs = {"VAE_upsampling": new_vae_upsampling}
     output_type = get_output_type_for_model(model_type, image_mode)
     profile = compute_profile(override_profile, output_type)
+    if str(model_type or "").startswith("minimax_h3"):
+        from services.h3_oom_relief import apply_h3_baseline_offload_profile
+        profile = apply_h3_baseline_offload_profile(profile, model_type)
     requested_model_configuration = _model_load_configuration(
         args.vram_safety_coefficient,
         profile,
@@ -12491,6 +12658,113 @@ def generate_video(
 
                 gc.collect()
                 torch.cuda.empty_cache()
+                h3_oom = (
+                    str(base_model_type or "").startswith("minimax_h3")
+                    and isinstance(failure_details, dict)
+                    and failure_details.get("is_oom") is True
+                    and str(failure_details.get("stage") or "") == "denoise"
+                )
+                if h3_oom:
+                    from services.h3_oom_relief import (
+                        H3OomReliefRetry,
+                        apply_h3_baseline_offload_profile,
+                        decide_h3_oom_relief,
+                    )
+                    params = task.get("params") if isinstance(task, dict) else {}
+                    params = params if isinstance(params, dict) else {}
+                    try:
+                        attempt = int(params.get("_h3_oom_relief_attempt") or 0)
+                    except (TypeError, ValueError):
+                        attempt = 0
+                    try:
+                        intent_steps = int(
+                            params.get("_h3_oom_relief_intent_steps")
+                            or num_inference_steps
+                        )
+                    except (TypeError, ValueError):
+                        intent_steps = num_inference_steps
+                    try:
+                        same_setup_retries = int(
+                            params.get("_h3_same_setup_retries") or 0
+                        )
+                    except (TypeError, ValueError):
+                        same_setup_retries = 0
+                    step_info = failure_details.get("step") or {}
+                    try:
+                        step_now = int(step_info.get("current") or 0)
+                    except (TypeError, ValueError):
+                        step_now = 0
+                    current_offload = apply_h3_baseline_offload_profile(
+                        params.get("_h3_relief_offload_profile", override_profile),
+                        model_type,
+                    )
+                    relief = decide_h3_oom_relief(
+                        resolution=str(resolution),
+                        num_inference_steps=int(num_inference_steps),
+                        intent_steps=intent_steps,
+                        attempt=attempt,
+                        step_now=step_now,
+                        same_setup_retries=same_setup_retries,
+                        offload_profile=current_offload,
+                        model_type=model_type,
+                    )
+                    true_limit = bool(
+                        relief is None or relief.get("record_denial")
+                    ) and int(step_now) > 0
+                    try:
+                        from services.h3_host_limits import record_denoise_failure
+                        _h3_attention = None
+                        if isinstance(custom_settings, dict):
+                            _h3_attention = custom_settings.get(
+                                "h3_attention_engine",
+                            )
+                        if true_limit:
+                            record_denoise_failure(
+                                model_type=model_type,
+                                resolution=resolution,
+                                num_inference_steps=num_inference_steps,
+                                video_length=video_length,
+                                duration_seconds=duration_seconds,
+                                attention_engine=_h3_attention,
+                                after_unwind=True,
+                                exhausted=relief is None,
+                                intent_steps=intent_steps,
+                                intent_resolution=str(
+                                    (params or {}).get("resolution")
+                                    or resolution
+                                ),
+                                step_now=step_now,
+                            )
+                    except Exception:
+                        pass
+                    if relief is not None:
+                        same_canvas = (
+                            str(relief.get("resolution")) == str(resolution)
+                            and int(relief.get("num_inference_steps"))
+                            == int(num_inference_steps)
+                            and float(relief.get("override_profile", current_offload))
+                            == float(current_offload)
+                        )
+                        params["_h3_oom_relief_attempt"] = attempt + 1
+                        params["_h3_oom_relief_intent_steps"] = intent_steps
+                        params["_h3_same_setup_retries"] = (
+                            same_setup_retries + 1 if same_canvas else 0
+                        )
+                        params["_h3_relief_offload_profile"] = relief.get(
+                            "override_profile", current_offload,
+                        )
+                        if isinstance(task, dict):
+                            task["params"] = params
+                        extra = ""
+                        if relief.get("reason") == "escalate_offload":
+                            extra = f" / offload {relief.get('override_profile')}"
+                        print(
+                            "[H3 OOM relief] Retrying denoise at "
+                            f"{relief['resolution']} / "
+                            f"{relief['num_inference_steps']} steps "
+                            f"({relief['reason']}{extra})"
+                        )
+                        raise H3OomReliefRetry(relief)
                 state["prompt"] = ""
                 traceback.print_exc()
                 send_cmd("error", failure_details)
@@ -13547,7 +13821,16 @@ def generate_video(
         # consumes it only after this complete model task has returned.
         gen["extra_orders"] = pending_extra_orders
 
-    return not gen.get("abort", False)
+    success = not gen.get("abort", False)
+    if (
+        success
+        and not single_repeat_dispatch
+        and generation_residency_must_yield_for_postprocess(spatial_upsampling)
+    ):
+        release_generation_residency_for_postprocess()
+    return success
+
+generate_video = functools.wraps(_generate_video_impl)(generate_video)
 
 def prepare_generate_video(state):
 

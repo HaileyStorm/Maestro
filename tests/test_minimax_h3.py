@@ -289,7 +289,7 @@ class TestMiniMaxH3Definition(unittest.TestCase):
         defaults = json.loads(_DEFAULT_PATH.read_text(encoding="utf-8"))
         model = defaults["model"]
         self.assertEqual(model["architecture"], "minimax_h3")
-        self.assertEqual(defaults["num_inference_steps"], 20)
+        self.assertEqual(defaults["num_inference_steps"], 28)
         self.assertEqual(defaults["video_length"], 124)
         self.assertEqual(defaults["resolution"], "1344x768")
         self.assertIn("minimax_h3_fl2va_pruned_fp8_scaled.safetensors", model["URLs"][0])
@@ -306,7 +306,7 @@ class TestMiniMaxH3Definition(unittest.TestCase):
                 defaults = json.loads(
                     (_APP / "defaults" / filename).read_text(encoding="utf-8")
                 )
-                self.assertEqual(defaults["num_inference_steps"], 20)
+                self.assertEqual(defaults["num_inference_steps"], 28)
                 self.assertEqual(defaults["resolution"], "1344x768")
                 self.assertEqual(
                     defaults["custom_settings"],
@@ -359,7 +359,7 @@ class TestMiniMaxH3Definition(unittest.TestCase):
         self.handler.update_default_settings("minimax_h3", {}, defaults)
         self.assertEqual(defaults["prompt"], "keep me")
         self.assertFalse(defaults["h3_adaptive_conditioning"])
-        self.assertEqual(defaults["num_inference_steps"], 20)
+        self.assertEqual(defaults["num_inference_steps"], 28)
         self.assertEqual(defaults["resolution"], "1344x768")
         self.assertEqual(
             defaults["custom_settings"],
@@ -870,6 +870,7 @@ class TestMiniMaxH3Definition(unittest.TestCase):
             "update_preparation_job": lambda _job, **_updates: True,
             "llm_enhance_prompt": enhance,
             "_require_h3_native_boundary_experimental": lambda _body: None,
+            "_apply_fresh_h3_role_defaults": lambda _body, _request: "high",
             "_validate_h3_sampling_steps": lambda _body: None,
             "_validate_h3_explicit_multiclip_request": lambda _body: None,
             "_prepare_h3_long_studio_request": prepare,
@@ -924,6 +925,48 @@ class TestMiniMaxH3Definition(unittest.TestCase):
             planned_body["prompt"],
         )
         self.assertNotIn("photorealistic realism", planned_body["prompt"])
+
+    def test_h3_omitted_defaults_are_role_aware_and_explicit_steps_win(self):
+        namespace = {
+            "Request": object,
+            "copy": copy,
+            "_H3_LONG_STUDIO_MODELS": {"minimax_h3"},
+        }
+        _load_launch_functions({"_apply_fresh_h3_role_defaults"}, namespace)
+        apply_defaults = namespace["_apply_fresh_h3_role_defaults"]
+
+        owner_request = types.SimpleNamespace(
+            state=types.SimpleNamespace(
+                maestro_account_principal={"role": "owner"},
+            ),
+        )
+        owner_body = {"model_type": "minimax_h3"}
+        self.assertEqual(apply_defaults(owner_body, owner_request), "high")
+        self.assertEqual(owner_body["num_inference_steps"], 28)
+        self.assertEqual(owner_body["resolution"], "1344x768")
+
+        user_request = types.SimpleNamespace(
+            state=types.SimpleNamespace(
+                maestro_account_principal={"role": "user"},
+            ),
+        )
+        user_body = {
+            "model_type": "minimax_h3",
+            "num_inference_steps": 32,
+            "resolution": "768x768",
+            "custom_settings": {"h3_attention_engine": "sdpa"},
+        }
+        self.assertEqual(apply_defaults(user_body, user_request), "quality")
+        self.assertEqual(user_body["num_inference_steps"], 32)
+        self.assertEqual(user_body["resolution"], "768x768")
+        self.assertEqual(
+            user_body["custom_settings"]["h3_attention_engine"], "sdpa",
+        )
+
+        fresh_user_body = {"model_type": "minimax_h3"}
+        apply_defaults(fresh_user_body, user_request)
+        self.assertEqual(fresh_user_body["num_inference_steps"], 23)
+        self.assertEqual(fresh_user_body["resolution"], "960x544")
 
     def test_h3_legal_gate_precedes_w4a8_planning_and_worker_work(self):
         launch = _read(_LAUNCH_PATH)

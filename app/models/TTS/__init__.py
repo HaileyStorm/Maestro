@@ -5,5 +5,6 @@ from . import (
     index_tts2_handler,
     kugelaudio_handler,
     qwen3_handler,
+    voxcpm_handler,
     yue_handler,
 )

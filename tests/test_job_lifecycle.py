@@ -21,19 +21,27 @@ from services.job_lifecycle import (  # noqa: E402
     MAX_RESIDENCY_BYPASSES,
     RESIDENCY_AGE_CEILING_SECONDS,
     _reset_queue_state_for_tests,
+    _credit_queue_fingerprint,
     _select_next_waiter,
+    acquire_and_start_generation_slot,
     acquire_generation_slot,
     arm_prepared_job_plan_review,
     block_generation_recovery,
+    block_resource_admission_failure,
     call_with_sticky_interrupt,
     clear_job_residency,
     checkpoint_recovery_job,
     collect_job_outputs,
     complete_preparation,
+    complete_prompt_enhancement_resource_release,
+    consume_prompt_enhancement_result,
     configure_durability_hook,
+    configure_credit_lifecycle_callback,
+    configure_credit_settlement_callback,
     approve_prepared_job,
     fail_preparation,
     finish_job,
+    fail_queued_job,
     generation_slot,
     invalidate_residency_state,
     job_events,
@@ -47,6 +55,7 @@ from services.job_lifecycle import (  # noqa: E402
     record_job_outputs,
     resource_descriptor,
     register_abort_state,
+    release_generation_slot,
     request_sample_preemption,
     residency_configuration_update,
     request_cancel,
@@ -54,6 +63,7 @@ from services.job_lifecycle import (  # noqa: E402
     set_queue_pause_after_current,
     set_queue_paused,
     settle_sample_preemption,
+    settle_terminal_credit,
     sample_retry_delay_seconds,
     snapshot_job,
     stamp_job_residency,
@@ -73,9 +83,101 @@ def _job() -> dict:
     return {"id": "job-1", "status": "queued", "message": "Queued"}
 
 
+def _consumed_credit_job(job_id: str) -> dict:
+    transition_id = f"transition_{job_id}_consumed"
+    credit_queue = {
+        "schema_version": 2,
+        "realm": "hosted",
+        "enforcement_enabled": True,
+        "metering_applied": True,
+        "decision": "hosted_priority_credit",
+        "requested_units_positive": True,
+        "queue_band": 1,
+        "reservation_state": "consumed",
+        "reservation_revision": "a" * 64,
+        "revalidation_state": None,
+        "allowance_revision": "b" * 64,
+        "allowance_observed_at": "2026-08-11T10:00:00Z",
+        "transition_id": transition_id,
+        "transition_history": [],
+        "accounting_reservation_id": "reservation_" + "c" * 32,
+        "accounting_reservation_revision": 2,
+    }
+    credit_queue["transition_history"] = [[
+        transition_id, _credit_queue_fingerprint(credit_queue),
+    ]]
+    return {
+        "id": job_id,
+        "status": "running",
+        "message": "Running",
+        "started_at": 100.0,
+        "credit_queue": credit_queue,
+    }
+
+
 class TestJobLifecycle(unittest.TestCase):
     def setUp(self):
         _reset_queue_state_for_tests()
+
+    def tearDown(self):
+        configure_credit_lifecycle_callback(None)
+        configure_credit_settlement_callback(None)
+        configure_durability_hook(None)
+        _reset_queue_state_for_tests()
+
+    def test_prompt_style_job_admits_once_and_releases_reserved_credit_on_failure(self):
+        job = _consumed_credit_job("prompt-enhance-credit-failure")
+        job.update({
+            "status": "queued",
+            "message": "Waiting to enhance prompt",
+            "resource_intent": "text",
+            "resource_execution": "standard",
+            "resource_state": "queued",
+            "preemption_mode": "none",
+        })
+        credit = dict(job["credit_queue"])
+        credit.update({
+            "reservation_state": "reserved",
+            "accounting_reservation_revision": 1,
+        })
+        credit["transition_id"] = "transition_prompt_reserved"
+        credit["transition_history"] = []
+        credit["transition_history"] = [[
+            credit["transition_id"], _credit_queue_fingerprint(credit),
+        ]]
+        job["credit_queue"] = credit
+        events = []
+
+        def release(event):
+            events.append(dict(event))
+            return {
+                "reservation_status": "released",
+                "reservation_revision": 2,
+                "fully_funded": False,
+                "allocation_satisfied": False,
+                "terminal_satisfied": True,
+            }
+
+        configure_credit_lifecycle_callback(release)
+        generation_lock = threading.Lock()
+        self.assertTrue(acquire_and_start_generation_slot(
+            generation_lock, job,
+        ))
+        self.assertEqual(job["status"], "running")
+        self.assertTrue(release_generation_slot(generation_lock, job))
+        self.assertFalse(release_generation_slot(generation_lock, job))
+        # A retryable failure before dispatch is a queued terminal transition,
+        # not a consume/settle path.
+        job["status"] = "queued"
+        job["resource_state"] = "queued"
+        self.assertTrue(fail_queued_job(
+            job, phase="failed", message="Prompt enhancement failed",
+        ))
+        self.assertEqual([event["action"] for event in events], ["release"])
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(
+            job["credit_queue"]["reservation_state"], "released",
+        )
 
     def test_generated_media_extension_contract_is_complete(self):
         self.assertEqual(GENERATED_MEDIA_EXTENSIONS, frozenset({
@@ -83,6 +185,142 @@ class TestJobLifecycle(unittest.TestCase):
             ".mov", ".mp3", ".mp4", ".ogg", ".png", ".wav", ".webm",
             ".webp",
         }))
+
+    def test_consumed_terminal_settlement_uses_only_server_lifecycle_time(self):
+        events = []
+
+        def settle(event):
+            events.append(dict(event))
+            return {
+                "reservation_status": "settled",
+                "reservation_revision": event["expected_revision"] + 1,
+                "fully_funded": False,
+                "allocation_satisfied": False,
+                "terminal_satisfied": True,
+            }
+
+        configure_credit_settlement_callback(settle)
+        cases = (
+            ("completed", None),
+            ("failed", None),
+            ("cancelled", 8),
+        )
+        for index, (terminal, measured) in enumerate(cases):
+            with self.subTest(terminal=terminal), patch(
+                "services.job_lifecycle.time.time", return_value=107.01,
+            ):
+                job = _consumed_credit_job(f"credit-terminal-{index}")
+                job.update({
+                    "progress": 99,
+                    "overall_progress": 1,
+                    "eta_seconds": 999999,
+                    "subtask_eta_seconds": 1,
+                    "h3_estimate": {"seconds": 500000},
+                })
+                if terminal == "cancelled":
+                    self.assertTrue(request_cancel(job).changed)
+                else:
+                    self.assertTrue(finish_job(job, terminal))
+                event = events[-1]
+                self.assertEqual(event["terminal_status"], terminal)
+                self.assertEqual(event["server_billable_units"], measured)
+                self.assertEqual(event["action"], "settle")
+                self.assertEqual(
+                    job["credit_queue"]["reservation_state"], "settled",
+                )
+                self.assertEqual(
+                    job["credit_queue"]["revalidation_state"], "settled",
+                )
+
+    def test_terminal_settlement_replays_same_operation_after_persist_failure(self):
+        job = _consumed_credit_job("credit-settlement-replay")
+        events = []
+
+        def settle(event):
+            events.append(dict(event))
+            return {
+                "reservation_status": "settled",
+                "reservation_revision": 3,
+                "fully_funded": False,
+                "allocation_satisfied": False,
+                "terminal_satisfied": True,
+            }
+
+        configure_credit_settlement_callback(settle)
+        configure_durability_hook(
+            lambda _transition: (_ for _ in ()).throw(OSError("offline")),
+        )
+        with patch(
+            "services.job_lifecycle.time.time", return_value=105.0,
+        ), self.assertRaisesRegex(OSError, "offline"):
+            finish_job(job, "failed")
+        self.assertEqual(job["status"], "running")
+        self.assertEqual(job["credit_queue"]["reservation_state"], "consumed")
+
+        configure_durability_hook(None)
+        with patch("services.job_lifecycle.time.time", return_value=109.0):
+            self.assertTrue(finish_job(job, "failed"))
+        self.assertEqual(events[0]["operation_id"], events[1]["operation_id"])
+        self.assertEqual(job["credit_queue"]["reservation_state"], "settled")
+
+    def test_reentrant_cancel_during_finish_cannot_double_settle(self):
+        job = _consumed_credit_job("credit-reentrant-finish")
+        events = []
+        reentrant_results = []
+
+        def settle(event):
+            events.append(dict(event))
+            return {
+                "reservation_status": "settled",
+                "reservation_revision": 3,
+                "fully_funded": False,
+                "allocation_satisfied": False,
+                "terminal_satisfied": True,
+            }
+
+        def persist(proposal):
+            if proposal.name == "finish":
+                reentrant_results.append(request_cancel(job))
+
+        configure_credit_settlement_callback(settle)
+        configure_durability_hook(persist)
+        self.assertTrue(finish_job(job, "completed"))
+        self.assertEqual(job["status"], "completed")
+        self.assertEqual(
+            [event["terminal_status"] for event in events], ["completed"],
+        )
+        self.assertEqual(len(reentrant_results), 1)
+        self.assertFalse(reentrant_results[0].changed)
+
+    def test_restored_terminal_consumed_credit_replays_settlement(self):
+        job = _consumed_credit_job("credit-restored-terminal")
+        job.update({"status": "cancelled", "finished_at": 106.2})
+        events = []
+
+        def settle(event):
+            events.append(dict(event))
+            return {
+                "reservation_status": "settled",
+                "reservation_revision": 3,
+                "fully_funded": False,
+                "allocation_satisfied": False,
+                "terminal_satisfied": True,
+            }
+
+        configure_credit_settlement_callback(settle)
+        self.assertTrue(settle_terminal_credit(job))
+        self.assertEqual(job["status"], "cancelled")
+        self.assertEqual(job["credit_queue"]["reservation_state"], "settled")
+        self.assertEqual(events[0]["server_billable_units"], 7)
+        self.assertFalse(settle_terminal_credit(job))
+
+    def test_exempt_terminal_job_never_calls_credit_settlement(self):
+        callback = Mock(side_effect=AssertionError("ledger must remain idle"))
+        configure_credit_settlement_callback(callback)
+        job = _job()
+        self.assertTrue(try_start(job))
+        self.assertTrue(finish_job(job, "completed"))
+        callback.assert_not_called()
 
     @staticmethod
     def _running_sample(*, attempt=3):
@@ -2095,6 +2333,130 @@ class TestJobLifecycle(unittest.TestCase):
                 self.assertTrue(state["abort"])
                 interrupt.assert_called_once_with()
             unregister_abort_state(job["id"], states, state)
+
+    def test_prompt_cancel_reports_releasing_until_slot_cleanup(self):
+        generation_lock = threading.Lock()
+        job = _job()
+        job.update({
+            "kind": "prompt_enhancement",
+            "resource_intent": "text",
+            "resource_execution": "standard",
+            "resource_state": "queued",
+            "preemption_mode": "none",
+            "execution_attempt": 1,
+        })
+        self.assertTrue(acquire_and_start_generation_slot(
+            generation_lock, job, poll_interval=0.001,
+        ))
+        self.assertTrue(request_cancel(job).changed)
+        self.assertEqual(job["resource_state"], "resources_releasing")
+        self.assertTrue(release_generation_slot(generation_lock, job))
+        self.assertTrue(complete_prompt_enhancement_resource_release(job))
+        self.assertEqual(job["resource_state"], "released")
+
+    def test_prompt_admission_failure_is_terminal_and_releases_credit(self):
+        job = _consumed_credit_job("prompt-admission-failure")
+        job.update({
+            "status": "queued",
+            "kind": "prompt_enhancement",
+            "resource_intent": "text",
+            "resource_execution": "standard",
+            "resource_state": "queued",
+            "preemption_mode": "none",
+            "execution_attempt": 1,
+        })
+        credit = dict(job["credit_queue"])
+        credit.update({
+            "reservation_state": "reserved",
+            "accounting_reservation_revision": 1,
+            "transition_id": "transition_prompt_admission_reserved",
+            "transition_history": [],
+        })
+        credit["transition_history"] = [[
+            credit["transition_id"], _credit_queue_fingerprint(credit),
+        ]]
+        job["credit_queue"] = credit
+        events = []
+
+        def release(event):
+            events.append(dict(event))
+            return {
+                "reservation_status": "released",
+                "reservation_revision": 2,
+                "fully_funded": False,
+                "allocation_satisfied": False,
+                "terminal_satisfied": True,
+            }
+
+        configure_credit_lifecycle_callback(release)
+        self.assertTrue(block_resource_admission_failure(job))
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["resource_state"], "released")
+        self.assertEqual(job["recovery_state"], "terminal")
+        self.assertEqual([event["action"] for event in events], ["release"])
+
+    def test_prompt_result_consumption_is_durable_and_idempotent(self):
+        reference = {
+            "path": "results/example.result.json",
+            "schema": "maestro.prompt-enhancement-result.v1",
+            "sha256": "a" * 64,
+            "size": 12,
+        }
+        job = _job()
+        job.update({
+            "status": "completed",
+            "kind": "prompt_enhancement",
+            "prompt_result_reference": reference,
+        })
+        self.assertEqual(consume_prompt_enhancement_result(job), reference)
+        self.assertTrue(job["prompt_result_consumed"])
+        self.assertNotIn("prompt_result_reference", job)
+        self.assertIsNone(consume_prompt_enhancement_result(job))
+
+    def test_consumed_credit_finish_cancel_race_settles_exactly_once(self):
+        for index in range(25):
+            job = _consumed_credit_job(f"credit-race-{index}")
+            events = []
+
+            def settle(event):
+                events.append(dict(event))
+                return {
+                    "reservation_status": "settled",
+                    "reservation_revision": 3,
+                    "fully_funded": False,
+                    "allocation_satisfied": False,
+                    "terminal_satisfied": True,
+                }
+
+            configure_credit_settlement_callback(settle)
+            barrier = threading.Barrier(3)
+
+            def complete():
+                barrier.wait()
+                finish_job(job, "completed")
+
+            def cancel():
+                barrier.wait()
+                request_cancel(job)
+
+            finish_thread = threading.Thread(target=complete)
+            cancel_thread = threading.Thread(target=cancel)
+            with patch(
+                "services.job_lifecycle.time.time", return_value=105.0,
+            ):
+                finish_thread.start()
+                cancel_thread.start()
+                barrier.wait()
+                finish_thread.join(timeout=1)
+                cancel_thread.join(timeout=1)
+            self.assertFalse(finish_thread.is_alive())
+            self.assertFalse(cancel_thread.is_alive())
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["terminal_status"], job["status"])
+            self.assertEqual(
+                job["credit_queue"]["reservation_state"], "settled",
+            )
+            configure_credit_settlement_callback(None)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 const fs = require("fs")
 const path = require("path")
-const { runtimeSecretEnv, shareHelperSecretEnv } = require("./launcher_secret_env")
+const { runtimeSecretEnv } = require("./launcher_secret_env")
 
 const parseEnvironmentValue = (rawValue) => {
   let quote = ""
@@ -74,12 +74,16 @@ module.exports = async (kernel) => {
   const backendEnvironment = {
     MAESTRO_ACCOUNTS_ENABLED: effectiveEnvironmentValue("MAESTRO_ACCOUNTS_ENABLED"),
     MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED: effectiveEnvironmentValue("MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED"),
+    MAESTRO_PUBLIC_REGISTRATION_ENABLED: effectiveEnvironmentValue("MAESTRO_PUBLIC_REGISTRATION_ENABLED"),
     MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED: effectiveEnvironmentValue("MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED"),
     MAESTRO_COMPUTE_EXECUTION_REALM: effectiveEnvironmentValue("MAESTRO_COMPUTE_EXECUTION_REALM"),
     PINOKIO_SHARE_CLOUDFLARE: effectiveEnvironmentValue("PINOKIO_SHARE_CLOUDFLARE"),
     PINOKIO_SHARE_LOCAL: effectiveEnvironmentValue("PINOKIO_SHARE_LOCAL"),
     PINOKIO_STABLE_SHARE_URL: effectiveEnvironmentValue("PINOKIO_STABLE_SHARE_URL"),
   }
+  const effectiveStableShareUpdateSecret = effectiveEnvironmentValue(
+    "PINOKIO_STABLE_SHARE_UPDATE_SECRET",
+  ).trim()
   const cloudflareEnabled = backendEnvironment.PINOKIO_SHARE_CLOUDFLARE
     .trim().toLowerCase() === "true"
   const localSharingEnabled = backendEnvironment.PINOKIO_SHARE_LOCAL
@@ -141,7 +145,11 @@ module.exports = async (kernel) => {
           url: "{{input.event[1]}}",
           backend_ready: false,
           stable_share_configured: stableShareConfigured,
+          quick_share_url: "",
           share_poll_attempt: 0,
+          share_rotation_published: false,
+          share_rotation_pending: false,
+          share_tunnel_missing: false,
           share_url: "",
           sharing: cloudflareEnabled
             ? (stableShareConfigured
@@ -151,15 +159,21 @@ module.exports = async (kernel) => {
         }
       },
       {
-        method: "process.wait",
+        method: "shell.run",
         params: {
-          url: "{{local.url}}/health"
-        }
-      },
-      {
-        method: "process.wait",
-        params: {
-          url: "{{local.url}}/ready"
+          env: runtimeSecretEnv,
+          venv: "env",
+          path: "app",
+          message: [
+            "python scripts/share_registration_watch.py --origin {{local.url}} --wait-backend-only"
+          ],
+          on: [{
+            "event": "/MAESTRO_BACKEND_READY/",
+            "kill": true
+          }, {
+            "event": "/MAESTRO_BACKEND_WAIT_FAILED ([a-z_]+)/",
+            "break": true
+          }]
         }
       },
       {
@@ -206,20 +220,25 @@ module.exports = async (kernel) => {
         when: cloudflareEnabled
           ? "{{local.$share && local.$share.cloudflare && local.$share.cloudflare[local.url]}}"
           : false,
+        method: "local.set",
+        params: {
+          quick_share_url: "{{local.$share.cloudflare[local.url]}}",
+        }
+      },
+      {
+        when: cloudflareEnabled
+          ? "{{local.quick_share_url}}"
+          : false,
         method: "shell.run",
         params: {
           venv: "env",
           path: "app",
-          env: {
-            ...shareHelperSecretEnv,
-            MAESTRO_LOCAL_ORIGIN: "{{local.url}}",
-            MAESTRO_QUICK_SHARE_URL: "{{local.$share.cloudflare[local.url]}}"
-          },
+          env: runtimeSecretEnv,
           message: [
-            "python scripts/register_share_url.py"
+            "python scripts/quick_tunnel_supervisor.py --origin {{local.url}} --publish-url {{local.quick_share_url}}"
           ],
           on: [{
-            "event": "/MAESTRO_SHARE_READY (https:\/\/[^ ]+) (stable|quick)/",
+            "event": "/MAESTRO_QUICK_TUNNEL_READY (https:\/\/[^ ]+)/",
             "kill": true
           }]
         }
@@ -228,11 +247,67 @@ module.exports = async (kernel) => {
         when: cloudflareEnabled
           ? "{{local.$share && local.$share.cloudflare && local.$share.cloudflare[local.url]}}"
           : false,
+        method: "log",
+        params: {
+          text: "Cloudflare quick tunnel captured: {{local.$share.cloudflare[local.url]}}"
+        }
+      },
+      {
+        when: cloudflareEnabled
+          ? "{{local.quick_share_url}}"
+          : false,
+        method: "log",
+        params: {
+          text: "Registering Cloudflare share URL from quick tunnel: {{local.quick_share_url}}"
+        }
+      },
+      {
+        when: cloudflareEnabled
+          ? "{{local.$share && local.$share.cloudflare && local.$share.cloudflare[local.url]}}"
+          : false,
+        method: "shell.run",
+        params: {
+          venv: "env",
+          path: "app",
+          env: {
+            ...runtimeSecretEnv,
+            PINOKIO_STABLE_SHARE_UPDATE_SECRET: effectiveStableShareUpdateSecret || runtimeSecretEnv.PINOKIO_STABLE_SHARE_UPDATE_SECRET,
+            MAESTRO_LOCAL_ORIGIN: "{{local.url}}",
+            PINOKIO_STABLE_SHARE_URL: backendEnvironment.PINOKIO_STABLE_SHARE_URL,
+          },
+          message: [
+            "python scripts/register_share_url.py --watch"
+          ],
+          on: [{
+            "event": "/MAESTRO_SHARE_READY (https:\/\/[^ ]+) (stable|quick)/",
+            "done": true
+          }, {
+            "event": "/MAESTRO_SHARE_WATCH_ALREADY_RUNNING/",
+            "done": true
+          }, {
+            "event": "/MAESTRO_SHARE_WATCH_FAILED ([a-z_]+)/",
+            "break": true
+          }]
+        }
+      },
+      {
+        when: cloudflareEnabled
+          ? "{{input.event && input.event[1] && input.event[2]}}"
+          : false,
         method: "local.set",
         params: {
           share_url: "{{input.event[1]}}",
           share_kind: "{{input.event[2]}}",
           sharing: "Cloudflare {{input.event[2]}}: {{input.event[1]}}"
+        }
+      },
+      {
+        when: cloudflareEnabled
+          ? "{{local.share_kind === 'quick' || local.share_kind === 'stable'}}"
+          : false,
+        method: "log",
+        params: {
+          text: "Cloudflare share registration completed with {{local.share_kind}} URL {{local.share_url}}."
         }
       },
       {
@@ -255,7 +330,10 @@ module.exports = async (kernel) => {
         params: {
           venv: "env",
           path: "app",
-          env: shareHelperSecretEnv,
+          env: {
+            ...runtimeSecretEnv,
+            PINOKIO_STABLE_SHARE_UPDATE_SECRET: effectiveStableShareUpdateSecret || runtimeSecretEnv.PINOKIO_STABLE_SHARE_UPDATE_SECRET,
+          },
           message: [
             "python scripts/restart_status.py clear --generation {{args.restart_generation}}"
           ],
@@ -284,6 +362,162 @@ module.exports = async (kernel) => {
         method: "log",
         params: {
           text: "MAESTRO_RESTART_STATUS_RETAINED because this launch did not verify the stable route; any matching published status will expire automatically."
+        }
+      },
+      {
+        id: "monitor-cloudflare-share",
+        when: cloudflareEnabled,
+        method: "process.wait",
+        params: {
+          sec: 2
+        }
+      },
+      {
+        when: cloudflareEnabled,
+        method: "local.set",
+        params: {
+          observed_quick_share_url: "{{local.$share && local.$share.cloudflare && local.$share.cloudflare[local.url] ? local.$share.cloudflare[local.url] : ''}}",
+          share_rotation_published: false,
+          share_rotation_pending: "{{!!(local.$share && local.$share.cloudflare && local.$share.cloudflare[local.url] && local.$share.cloudflare[local.url] !== local.quick_share_url)}}",
+          share_tunnel_missing: "{{!!(local.quick_share_url && !(local.$share && local.$share.cloudflare && local.$share.cloudflare[local.url]))}}"
+        }
+      },
+      {
+        when: cloudflareEnabled
+          ? "{{local.share_tunnel_missing}}"
+          : false,
+        method: "shell.run",
+        params: {
+          env: runtimeSecretEnv,
+          venv: "env",
+          path: "app",
+          message: [
+            "python scripts/quick_tunnel_supervisor.py --origin {{local.url}} --clear-url"
+          ],
+          on: [{
+            "event": "/MAESTRO_QUICK_TUNNEL_CLEARED/",
+            "kill": true
+          }, {
+            "event": "/MAESTRO_QUICK_TUNNEL_FAILED ([a-z_]+)/",
+            "kill": true
+          }]
+        }
+      },
+      {
+        when: cloudflareEnabled
+          ? "{{local.share_tunnel_missing && input.event && input.event[0] === 'MAESTRO_QUICK_TUNNEL_CLEARED'}}"
+          : false,
+        method: "local.set",
+        params: {
+          quick_share_url: "",
+          share_url: "",
+          share_kind: "",
+          share_tunnel_missing: false,
+          sharing: "Cloudflare tunnel is reconnecting…"
+        }
+      },
+      {
+        when: cloudflareEnabled
+          ? "{{local.share_rotation_pending}}"
+          : false,
+        method: "shell.run",
+        params: {
+          env: runtimeSecretEnv,
+          venv: "env",
+          path: "app",
+          message: [
+            "python scripts/quick_tunnel_supervisor.py --origin {{local.url}} --publish-url {{local.observed_quick_share_url}}"
+          ],
+          on: [{
+            "event": "/MAESTRO_QUICK_TUNNEL_READY (https:\/\/[^ ]+)/",
+            "kill": true
+          }, {
+            "event": "/MAESTRO_QUICK_TUNNEL_FAILED ([a-z_]+)/",
+            "kill": true
+          }]
+        }
+      },
+      {
+        when: cloudflareEnabled
+          ? "{{local.share_rotation_pending && input.event && input.event[1] === local.observed_quick_share_url}}"
+          : false,
+        method: "local.set",
+        params: {
+          share_rotation_published: true
+        }
+      },
+      {
+        when: cloudflareEnabled
+          ? "{{local.share_rotation_pending && local.share_rotation_published}}"
+          : false,
+        method: "shell.run",
+        params: {
+          venv: "env",
+          path: "app",
+          env: {
+            ...runtimeSecretEnv,
+            PINOKIO_STABLE_SHARE_UPDATE_SECRET: effectiveStableShareUpdateSecret || runtimeSecretEnv.PINOKIO_STABLE_SHARE_UPDATE_SECRET,
+            MAESTRO_LOCAL_ORIGIN: "{{local.url}}",
+            PINOKIO_STABLE_SHARE_URL: backendEnvironment.PINOKIO_STABLE_SHARE_URL,
+          },
+          message: [
+            "python scripts/register_share_url.py --watch"
+          ],
+          on: [{
+            "event": "/MAESTRO_SHARE_READY (https:\/\/[^ ]+) (stable|quick)/",
+            "done": true
+          }, {
+            "event": "/MAESTRO_SHARE_WATCH_ALREADY_RUNNING/",
+            "done": true
+          }, {
+            "event": "/MAESTRO_SHARE_WATCH_FAILED ([a-z_]+)/",
+            "kill": true
+          }]
+        }
+      },
+      {
+        when: cloudflareEnabled
+          ? "{{local.share_rotation_pending && local.share_rotation_published}}"
+          : false,
+        method: "shell.run",
+        params: {
+          venv: "env",
+          path: "app",
+          env: {
+            ...runtimeSecretEnv,
+            MAESTRO_LOCAL_ORIGIN: "{{local.url}}",
+          },
+          message: [
+            "python scripts/register_share_url.py --wait-watch {{local.observed_quick_share_url}}"
+          ],
+          on: [{
+            "event": "/MAESTRO_SHARE_READY (https:\/\/[^ ]+) (stable|quick)/",
+            "kill": true
+          }, {
+            "event": "/MAESTRO_SHARE_WATCH_FAILED registration_timeout/",
+            "kill": true
+          }]
+        }
+      },
+      {
+        when: cloudflareEnabled
+          ? "{{local.share_rotation_pending && input.event && input.event[1] && input.event[2]}}"
+          : false,
+        method: "local.set",
+        params: {
+          quick_share_url: "{{local.observed_quick_share_url}}",
+          share_url: "{{input.event[1]}}",
+          share_kind: "{{input.event[2]}}",
+          share_rotation_published: false,
+          share_rotation_pending: false,
+          sharing: "Cloudflare {{input.event[2]}}: {{input.event[1]}}"
+        }
+      },
+      {
+        when: cloudflareEnabled,
+        method: "jump",
+        params: {
+          id: "monitor-cloudflare-share"
         }
       }
     ]

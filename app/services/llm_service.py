@@ -1869,6 +1869,14 @@ def get_status() -> dict:
             "loading_model_id": _loading_model_id,
         }
     runtime_control = get_local_runtime_control()
+    runtime_ready = bool(
+        status_snapshot["loaded"]
+        and isinstance(runtime_control, dict)
+        and runtime_control.get("phase") == "ready"
+    )
+    active_loading_model_id = (
+        None if runtime_ready else status_snapshot["loading_model_id"]
+    )
     return {
         "loaded": status_snapshot["loaded"],
         "model_id": status_snapshot["model_id"],
@@ -1887,15 +1895,15 @@ def get_status() -> dict:
             "fallback_reason": status_snapshot["fallback_reason"],
             "control": runtime_control,
         },
-        "loading": bool(download or status_snapshot["loading_model_id"]),
+        "loading": bool(download or active_loading_model_id),
         "loading_model_id": (
-            status_snapshot["loading_model_id"]
+            active_loading_model_id
             or (download.get("model_id") if download else None)
         ),
         "loading_phase": (
             str(download.get("phase") or "downloading")
             if download
-            else ("loading model" if status_snapshot["loading_model_id"] else None)
+            else ("loading model" if active_loading_model_id else None)
         ),
         "download": download or None,
     }

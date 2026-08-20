@@ -11,6 +11,28 @@ import unittest
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[1]
+_OPTIONAL_MUSIC3_LAUNCHERS = (
+    "music3_runtime_install.js",
+    "music3_runtime_start.js",
+    "music3_runtime_reset.js",
+)
+
+
+def _load_static_launcher(filename: str) -> dict[str, object]:
+    completed = subprocess.run(
+        [
+            "node",
+            "-e",
+            "process.stdout.write(JSON.stringify(require('./' + process.argv[1])))",
+            filename,
+        ],
+        cwd=_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    return json.loads(completed.stdout)
 
 
 class TestPinokioGpuCompatibility(unittest.TestCase):
@@ -510,7 +532,10 @@ Promise.resolve(build())
         self.assertIn("local.share_kind === 'stable'", clear["when"])
         self.assertIn("--generation {{args.restart_generation}}", clear["params"]["message"][0])
         self.assertEqual(clear["params"]["env"]["CLOUDFLARE_API_TOKEN"], "")
-        self.assertNotIn("PINOKIO_STABLE_SHARE_UPDATE_SECRET", clear["params"]["env"])
+        self.assertIn("PINOKIO_STABLE_SHARE_UPDATE_SECRET", clear["params"]["env"])
+        self.assertEqual(
+            clear["params"]["env"]["PINOKIO_STABLE_SHARE_UPDATE_SECRET"], ""
+        )
 
         handler = clear["params"]["on"][0]
         self.assertTrue(handler["kill"])
@@ -555,6 +580,7 @@ Promise.resolve(build())
                     "PINOKIO_SHARE_CLOUDFLARE=true",
                     "MAESTRO_ACCOUNTS_ENABLED=false",
                     "MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED=false",
+                    "MAESTRO_PUBLIC_REGISTRATION_ENABLED=false",
                     "MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED=false",
                     "MAESTRO_COMPUTE_EXECUTION_REALM=local",
                 },
@@ -565,6 +591,7 @@ Promise.resolve(build())
                 "PINOKIO_SHARE_CLOUDFLARE=false\n"
                 "MAESTRO_ACCOUNTS_ENABLED=true\n"
                 "MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED=true\n"
+                "MAESTRO_PUBLIC_REGISTRATION_ENABLED=true\n"
                 "MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED=true\n"
                 "MAESTRO_COMPUTE_EXECUTION_REALM=hosted\n",
                 encoding="utf-8",
@@ -589,6 +616,7 @@ Promise.resolve(build())
             partial_text = partial.read_text(encoding="utf-8")
             self.assertIn("MAESTRO_ACCOUNTS_ENABLED=true\n", partial_text)
             self.assertIn("MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED=false\n", partial_text)
+            self.assertIn("MAESTRO_PUBLIC_REGISTRATION_ENABLED=false\n", partial_text)
             self.assertIn("MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED=false\n", partial_text)
             self.assertIn("MAESTRO_COMPUTE_EXECUTION_REALM=local\n", partial_text)
 
@@ -597,6 +625,7 @@ Promise.resolve(build())
                 "PINOKIO_SHARE_CLOUDFLARE=false\n"
                 "MAESTRO_ACCOUNTS_ENABLED=maybe\n"
                 "MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED=\n"
+                "MAESTRO_PUBLIC_REGISTRATION_ENABLED=maybe\n"
                 "MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED=maybe\n"
                 "MAESTRO_COMPUTE_EXECUTION_REALM=remote\n",
                 encoding="utf-8",
@@ -664,6 +693,7 @@ Promise.resolve(build())
         first_environment = "\n".join([
             'MAESTRO_ACCOUNTS_ENABLED="true" # double-quoted flag',
             "MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED='true' # single-quoted flag",
+            'MAESTRO_PUBLIC_REGISTRATION_ENABLED="true" # public registration',
             'PINOKIO_SHARE_CLOUDFLARE="true" # cloudflare policy',
             "PINOKIO_SHARE_LOCAL='true' # local policy",
             'PINOKIO_STABLE_SHARE_URL="https://first.example.workers.dev/# release one" # stable policy',
@@ -678,6 +708,7 @@ Promise.resolve(build())
         second_environment = "\n".join([
             "MAESTRO_ACCOUNTS_ENABLED='false' # explicit local false",
             'MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED="" # explicit local empty',
+            "MAESTRO_PUBLIC_REGISTRATION_ENABLED='false' # registration off",
             'PINOKIO_SHARE_CLOUDFLARE="false" # explicit local false',
             "PINOKIO_SHARE_LOCAL='' # explicit local empty",
             'PINOKIO_STABLE_SHARE_URL="" # explicit local empty',
@@ -692,6 +723,7 @@ Promise.resolve(build())
         global_environment = {
             "MAESTRO_ACCOUNTS_ENABLED": "true",
             "MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED": "true",
+            "MAESTRO_PUBLIC_REGISTRATION_ENABLED": "true",
             "PINOKIO_SHARE_CLOUDFLARE": "true",
             "PINOKIO_SHARE_LOCAL": "true",
             "PINOKIO_STABLE_SHARE_URL": "https://global.example.workers.dev",
@@ -750,6 +782,7 @@ const explicitBackendEnvironment = (definition) => {
         expected_params_env_keys = {
             "MAESTRO_ACCOUNTS_ENABLED",
             "MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED",
+            "MAESTRO_PUBLIC_REGISTRATION_ENABLED",
             "MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED",
             "MAESTRO_COMPUTE_EXECUTION_REALM",
             "PINOKIO_SHARE_CLOUDFLARE",
@@ -765,6 +798,7 @@ const explicitBackendEnvironment = (definition) => {
         self.assertEqual(set(captured["second"]), expected_params_env_keys)
         self.assertEqual(captured["first"]["MAESTRO_ACCOUNTS_ENABLED"], "true")
         self.assertEqual(captured["first"]["MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED"], "true")
+        self.assertEqual(captured["first"]["MAESTRO_PUBLIC_REGISTRATION_ENABLED"], "true")
         self.assertEqual(captured["first"]["MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED"], "true")
         self.assertEqual(captured["first"]["MAESTRO_COMPUTE_EXECUTION_REALM"], "hosted")
         self.assertEqual(captured["first"]["PINOKIO_SHARE_CLOUDFLARE"], "true")
@@ -775,6 +809,7 @@ const explicitBackendEnvironment = (definition) => {
         )
         self.assertEqual(captured["second"]["MAESTRO_ACCOUNTS_ENABLED"], "false")
         self.assertEqual(captured["second"]["MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED"], "")
+        self.assertEqual(captured["second"]["MAESTRO_PUBLIC_REGISTRATION_ENABLED"], "false")
         self.assertEqual(captured["second"]["MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED"], "false")
         self.assertEqual(captured["second"]["MAESTRO_COMPUTE_EXECUTION_REALM"], "local")
         self.assertEqual(captured["second"]["PINOKIO_SHARE_CLOUDFLARE"], "false")
@@ -1046,6 +1081,146 @@ Promise.resolve(build({port: async () => 7860}))
             ],
         )
 
+    def test_music3_runtime_launchers_are_plan_only_attested_and_loopback_only(self):
+        present = [(_ROOT / filename).is_file() for filename in _OPTIONAL_MUSIC3_LAUNCHERS]
+        if not any(present):
+            self.skipTest("optional Music3 launcher bundle is not present")
+        self.assertTrue(all(present), "optional Music3 launcher bundle must be complete")
+
+        marker = "../../runtime/maestro/minimax-music3/state/current.json"
+        pinokio_root = "{{path.resolve(cwd, '../..')}}"
+        unsupported = "{{platform !== 'linux' || gpu !== 'nvidia'}}"
+
+        installer = _load_static_launcher("music3_runtime_install.js")
+        self.assertEqual(installer["requires"], {"bundle": "ai"})
+        install_steps = installer["run"]
+        self.assertEqual(install_steps[0]["when"], unsupported)
+        self.assertIsNone(install_steps[0]["next"])
+        plan = next(
+            step for step in install_steps
+            if " provision " in step.get("params", {}).get("message", "")
+        )
+        plan_command = plan["params"]["message"]
+        self.assertEqual(plan["when"], f"{{{{!exists('{marker}')}}}}")
+        self.assertEqual(plan["params"]["path"], "app")
+        self.assertEqual(plan["params"]["venv"], "env")
+        self.assertIn(f'--pinokio-root "{pinokio_root}"', plan_command)
+        self.assertIn(
+            "--runtime-source-revision git:573ce7963fa7b95596459957a195c87cf60cda19",
+            plan_command,
+        )
+        self.assertIn("--ucx-version 1.20.1", plan_command)
+        self.assertIn(
+            "--ucx-source-revision git:d8e50df6651b9ea5b76f23aee0aefbf053a4137a",
+            plan_command,
+        )
+        self.assertNotIn("--stage", plan_command)
+        self.assertNotIn("--apply-token", plan_command)
+        plan_log = install_steps[install_steps.index(plan) + 1]
+        self.assertEqual(plan_log["when"], f"{{{{!exists('{marker}')}}}}")
+        self.assertIn("No install was performed", plan_log["params"]["raw"])
+        self.assertIsNone(plan_log["next"])
+
+        verify = next(
+            step for step in install_steps
+            if " verify " in step.get("params", {}).get("message", "")
+        )
+        self.assertEqual(verify["when"], f"{{{{exists('{marker}')}}}}")
+        self.assertIn(f'--pinokio-root "{pinokio_root}"', verify["params"]["message"])
+
+        start = _load_static_launcher("music3_runtime_start.js")
+        self.assertTrue(start["daemon"])
+        start_steps = start["run"]
+        self.assertEqual(start_steps[0]["when"], unsupported)
+        missing = start_steps[1]
+        self.assertEqual(missing["when"], f"{{{{!exists('{marker}')}}}}")
+        self.assertIsNone(missing["next"])
+        verify_index = next(
+            index for index, step in enumerate(start_steps)
+            if " verify " in step.get("params", {}).get("message", "")
+        )
+        start_index = next(
+            index for index, step in enumerate(start_steps)
+            if " start " in step.get("params", {}).get("message", "")
+        )
+        self.assertLess(verify_index, start_index)
+        start_shell = start_steps[start_index]
+        self.assertEqual(start_shell["when"], f"{{{{exists('{marker}')}}}}")
+        self.assertEqual(start_shell["params"]["path"], "app")
+        self.assertIn("--port {{port}}", start_shell["params"]["message"])
+        self.assertIn(f'--pinokio-root "{pinokio_root}"', start_shell["params"]["message"])
+        event = start_shell["params"]["on"][0]["event"]
+        readiness = re.compile(event[1:-1])
+        self.assertIsNotNone(readiness.fullmatch("http://127.0.0.1:42007"))
+        self.assertIsNone(readiness.fullmatch("http://0.0.0.0:42007"))
+        self.assertTrue(start_shell["params"]["on"][0]["done"])
+        captured = start_steps[start_index + 1]
+        self.assertEqual(captured["method"], "local.set")
+        self.assertEqual(captured["params"]["url"], "{{input.event[1]}}")
+        start_source = (_ROOT / "music3_runtime_start.js").read_text(encoding="utf-8")
+        self.assertNotIn("cloudflare", start_source.lower())
+        self.assertNotIn("0.0.0.0", start_source)
+
+        reset = _load_static_launcher("music3_runtime_reset.js")
+        reset_steps = reset["run"]
+        reset_plan = next(
+            step for step in reset_steps
+            if " reset-plan " in step.get("params", {}).get("message", "")
+            and "--confirm-token" not in step["params"]["message"]
+        )
+        token_event = reset_plan["params"]["on"][0]
+        self.assertTrue(token_event["kill"])
+        token_pattern = re.compile(token_event["event"][1:-1])
+        self.assertIsNotNone(token_pattern.search(
+            '{"confirmation_token":"sha256:' + "a" * 64 + '"}'
+        ))
+        apply = next(
+            step for step in reset_steps
+            if "--confirm-token" in step.get("params", {}).get("message", "")
+        )
+        self.assertIn("--confirm-token {{input.event[1]}}", apply["params"]["message"])
+        self.assertFalse(any(step.get("method") == "fs.rm" for step in reset_steps))
+
+    def test_music3_runtime_wiring_is_optional_and_preserves_main_defaults(self):
+        marker = "../../runtime/maestro/minimax-music3/state/current.json"
+        present = [(_ROOT / filename).is_file() for filename in _OPTIONAL_MUSIC3_LAUNCHERS]
+        self.assertTrue(
+            not any(present) or all(present),
+            "optional Music3 launcher bundle must be entirely present or absent",
+        )
+        updater = _load_static_launcher("update.js")
+        update_steps = [
+            step for step in updater["run"]
+            if step.get("params", {}).get("uri") == "music3_runtime_install.js"
+        ]
+        reset = _load_static_launcher("reset.js")
+        launcher = (_ROOT / "pinokio.js").read_text(encoding="utf-8")
+        if not any(present):
+            self.assertEqual(update_steps, [])
+            self.assertNotIn("music3_runtime_reset.js", json.dumps(reset["run"]))
+            self.assertNotIn("music3_runtime_", launcher)
+            self.assertNotIn(marker, launcher)
+            return
+
+        self.assertEqual(len(update_steps), 2)
+        self.assertTrue(all(
+            step["when"] == f"{{{{exists('{marker}')}}}}"
+            for step in update_steps
+        ))
+
+        reset_step = reset["run"][0]
+        self.assertEqual(reset_step["method"], "script.start")
+        self.assertEqual(reset_step["params"]["uri"], "music3_runtime_reset.js")
+        self.assertEqual(reset_step["when"], f"{{{{exists('{marker}')}}}}")
+        self.assertNotIn("runtime/maestro", json.dumps(reset["run"][1:]))
+
+        self.assertIn(marker, launcher)
+        self.assertIn("Plan Music 3 Setup", launcher)
+        self.assertIn("Start Music 3 Runtime", launcher)
+        self.assertIn("Verify Music 3 Runtime", launcher)
+        self.assertIn("Reset Music 3 Runtime", launcher)
+        self.assertNotIn('default: true,\n            text: "Start Music 3 Runtime"', launcher)
+
     def test_cloudflare_secrets_are_masked_from_every_non_share_child_shell(self):
         files = [
             "install.js", "update.js", "blender_mcp_install.js",
@@ -1053,6 +1228,10 @@ Promise.resolve(build({port: async () => 7860}))
             "sam_install.js", "h3_acceleration_install.js",
             "h3_w4a8_runtime_install.js", "torch.js", "start_classic.js",
         ]
+        files.extend(
+            filename for filename in _OPTIONAL_MUSIC3_LAUNCHERS
+            if (_ROOT / filename).is_file()
+        )
         loader = r"""
 const files = JSON.parse(process.argv[1]);
 (async () => {

@@ -19,8 +19,58 @@ import { useStore } from './stores/useStore'
 import { useIsMobile } from './lib/useIsMobile'
 import { POLL_INTERVAL_MS, useVisibilityPolling } from './lib/useVisibilityPolling'
 import { PRODUCT_NAME, PRODUCT_NAME_VISUAL, PRODUCT_PROVENANCE } from './lib/branding'
+import * as api from './api/client'
 
 const BOOTSTRAP_TIMEOUT_MS = 15_000
+
+type BootstrapState = 'loading' | 'ready' | 'error' | 'account' | 'project'
+
+function clearProtectedBootState(recovery: 'account' | 'project'): void {
+  const current = useStore.getState()
+  const account = current.accountContext ?? current.accessContext?.accounts ?? null
+  const unauthenticatedAccount = account ? {
+    ...account,
+    authenticated: false,
+    account: null,
+    capabilities: [],
+    reauthenticated: false,
+  } : null
+  useStore.setState({
+    workspaces: [],
+    activeWorkspace: '',
+    browsingUploads: false,
+    outputs: [],
+    outputsTotal: 0,
+    outputsLoading: false,
+    selectedOutput: 0,
+    selectedOutputMeta: null,
+    selectedOutputMetaName: null,
+    selectedOutputKeys: [],
+    gallerySelectionMode: false,
+    jobs: [],
+    sampleCampaignPairs: [],
+    isEnhancing: false,
+    enhanceStatus: null,
+    enhanceRequestScope: null,
+    enhanceQueueCard: null,
+    directorPreviewStatus: null,
+    directorPreviewRequestScope: null,
+    presets: [],
+    presetsLoading: false,
+    isGenerating: false,
+    ...(recovery === 'account' ? {
+      accountContext: unauthenticatedAccount,
+      accessContext: current.accessContext ? {
+        ...current.accessContext,
+        accounts: unauthenticatedAccount ?? undefined,
+      } : current.accessContext,
+    } : {}),
+  })
+}
+
+function bootstrapRecoveryFor(error: unknown): Exclude<BootstrapState, 'loading' | 'ready'> {
+  return api.accessRecoveryKind(error) ?? 'error'
+}
 
 function bootstrapWithin<T>(promise: Promise<T>, message: string): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -60,11 +110,39 @@ function App() {
   const isMobile = useIsMobile()
   const machineControls = useStore(s => s.accessContext?.machine_controls === true)
   const remote = useStore(s => s.accessContext?.remote === true)
+  const accessContext = useStore(s => s.accessContext)
+  const accountContext = useStore(s => s.accountContext)
+  const setAccountDrawerOpen = useStore(s => s.setAccountDrawerOpen)
   const workspaces = useStore(s => s.workspaces)
   const activeWorkspace = useStore(s => s.activeWorkspace)
   const [bootstrapAttempt, setBootstrapAttempt] = useState(0)
-  const [bootstrapState, setBootstrapState] = useState<'loading' | 'ready' | 'error'>('loading')
+  const [bootstrapState, setBootstrapState] = useState<BootstrapState>('loading')
   const [bootstrapError, setBootstrapError] = useState('')
+  const [accountGateKind, setAccountGateKind] = useState<'needed' | 'expired'>('needed')
+  const accountAuthenticationRequired = accessContext?.accounts?.enabled === true
+    && accessContext.account_project_access_active === true
+    && accountContext?.authenticated !== true
+
+  useEffect(() => {
+    const recoverAccess = (event: Event) => {
+      const detail = (event as CustomEvent<{
+        status?: api.AccessRecoveryStatus
+        recovery?: api.AccessRecoveryKind
+      }>).detail
+      const status = detail?.status
+      if (status !== 401 && status !== 403 && status !== 423) return
+      const recovery = detail?.recovery === 'project' ? 'project' : 'account'
+      clearProtectedBootState(recovery)
+      setBootstrapError('')
+      setBootstrapState(recovery)
+      if (recovery === 'account') {
+        setAccountGateKind('expired')
+        setAccountDrawerOpen(true)
+      }
+    }
+    window.addEventListener(api.ACCESS_RECOVERY_EVENT, recoverAccess)
+    return () => window.removeEventListener(api.ACCESS_RECOVERY_EVENT, recoverAccess)
+  }, [setAccountDrawerOpen])
 
   useEffect(() => {
     let cancelled = false
@@ -82,9 +160,58 @@ function App() {
         loadWorkspaces(),
         `${PRODUCT_NAME} is taking too long to load your projects.`,
       )
-      if (!workspacesLoaded) throw new Error(`${PRODUCT_NAME} couldn't load your projects.`)
+      if (!workspacesLoaded) {
+        if (context.remote) {
+          clearProtectedBootState('project')
+          setBootstrapError('')
+          setBootstrapState('project')
+          return
+        }
+        throw new Error(`${PRODUCT_NAME} couldn't load your projects.`)
+      }
       if (cancelled) return
       const workspaceState = useStore.getState()
+      const protectedReadsReady = api.protectedProjectReadsReady(
+        context,
+        workspaceState.accountContext,
+        workspaceState.workspaces,
+        workspaceState.activeWorkspace,
+        workspaceState.accountProjectMigration,
+      )
+      if (!protectedReadsReady) {
+        const awaitingProjectSelection = Boolean(
+          context.remote
+          && api.isAccountProjectAccessActive(
+            context,
+            workspaceState.accountProjectMigration,
+          )
+          && workspaceState.accountContext?.authenticated === true
+          && !workspaceState.activeWorkspace,
+        )
+        if (awaitingProjectSelection) {
+          // A signed-in remote account with no selected project is a normal
+          // post-restart and first-use state. Mount the gated shell so its
+          // project picker can create/select an authorized project; do not
+          // start project-scoped polling until that selection exists.
+          loadModels()
+          loadServicesConfig()
+          loadLlmStatus()
+          setBootstrapState('ready')
+          return
+        }
+        const recovery = context.account_project_access_active === true
+          && workspaceState.accountContext?.authenticated !== true
+          ? 'account'
+          : 'project'
+        clearProtectedBootState(recovery)
+        setBootstrapError('')
+        setBootstrapState(recovery)
+        if (recovery === 'account') {
+          setAccountGateKind('needed')
+          setAccountDrawerOpen(true)
+        }
+        return
+      }
       loadModels()
       loadServicesConfig()
       loadLlmStatus()
@@ -100,11 +227,28 @@ function App() {
       setBootstrapState('ready')
     }).catch(error => {
       if (cancelled) return
-      setBootstrapError(error instanceof Error ? error.message : `${PRODUCT_NAME} couldn't open.`)
+      const recovery = bootstrapRecoveryFor(error)
+      if (recovery === 'account' || recovery === 'project') {
+        clearProtectedBootState(recovery)
+        setBootstrapError('')
+        setBootstrapState(recovery)
+        if (recovery === 'account') {
+          setAccountGateKind('expired')
+          setAccountDrawerOpen(true)
+        }
+        return
+      }
+      setBootstrapError(`${PRODUCT_NAME} couldn't connect. Check that it is running, then try again.`)
       setBootstrapState('error')
     })
     return () => { cancelled = true }
-  }, [bootstrapAttempt, loadAccessContext, loadAccountContext, loadModels, loadOutputs, loadSystemConfig, loadServicesConfig, loadLlmStatus, loadLlmModels, loadPipelineList, loadWorkspaces, reconnectJobs])
+  }, [bootstrapAttempt, loadAccessContext, loadAccountContext, loadModels, loadOutputs, loadSystemConfig, loadServicesConfig, loadLlmStatus, loadLlmModels, loadPipelineList, loadWorkspaces, reconnectJobs, setAccountDrawerOpen])
+
+  useEffect(() => {
+    if (bootstrapState === 'ready' && accountAuthenticationRequired) {
+      setAccountDrawerOpen(true)
+    }
+  }, [accountAuthenticationRequired, bootstrapState, setAccountDrawerOpen])
 
   // Backend-driven load/enhance transitions stay responsive; steady state is
   // a low-rate safety refresh. Hidden tabs make no baseline LLM requests.
@@ -122,27 +266,51 @@ function App() {
   // race the first response can leave a just-uploaded reference owned by a
   // different session than the generation request that follows it.
   if (bootstrapState !== 'ready') {
+    const accountRecovery = bootstrapState === 'account'
+    const projectRecovery = bootstrapState === 'project'
     return (
-      <div className="flex h-full w-full items-center justify-center bg-bg-primary px-6 text-text-primary">
+      <main className="flex h-full w-full items-center justify-center bg-bg-primary px-6 text-text-primary">
         <div className="w-full max-w-sm rounded-xl border border-border bg-bg-secondary p-6 text-center shadow-xl">
           <div className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-lg bg-accent-blue text-lg font-bold text-white">
             M
           </div>
           <h1 className="text-base font-semibold" aria-label={bootstrapState === 'loading'
             ? `Connecting to ${PRODUCT_NAME}`
-            : `${PRODUCT_NAME} couldn't open`}>
+            : accountRecovery
+              ? 'Sign in to continue'
+              : projectRecovery
+                ? 'Choose a project to continue'
+                : `${PRODUCT_NAME} couldn't open`}>
             <span aria-hidden="true">
               {bootstrapState === 'loading'
                 ? `Connecting to ${PRODUCT_NAME_VISUAL}…`
-                : `${PRODUCT_NAME_VISUAL} couldn't open`}
+                : accountRecovery
+                  ? 'Sign in to continue'
+                  : projectRecovery
+                    ? 'Choose a project to continue'
+                    : `${PRODUCT_NAME_VISUAL} couldn't open`}
             </span>
           </h1>
           {bootstrapState === 'loading' && (
             <p className="mt-2 text-sm text-text-secondary">Checking your connection and projects.</p>
           )}
+          {accountRecovery && (
+            <p className="mt-2 text-sm leading-relaxed text-text-secondary">
+              {accountGateKind === 'expired'
+                ? 'Your session is no longer valid. Sign in again to restore the projects available to your account.'
+                : 'Sign in to open your projects and creative tools.'}
+            </p>
+          )}
+          {projectRecovery && (
+            <p className="mt-2 text-sm leading-relaxed text-text-secondary">
+              Project access changed. Try again, or sign in again if your access was updated.
+            </p>
+          )}
           {bootstrapState === 'error' && (
-            <>
-              <p className="mt-2 text-sm text-text-secondary">{bootstrapError}</p>
+            <p className="mt-2 text-sm text-text-secondary">{bootstrapError}</p>
+          )}
+          {bootstrapState !== 'loading' && (
+            <div className="mt-4 flex flex-wrap justify-center gap-3">
               <button
                 type="button"
                 onClick={() => {
@@ -150,22 +318,34 @@ function App() {
                   setBootstrapError('')
                   setBootstrapAttempt(value => value + 1)
                 }}
-                className="mt-4 rounded-lg bg-accent-blue px-4 py-2 text-sm font-medium text-white hover:opacity-90"
+                className="min-h-11 rounded-lg bg-accent-blue px-4 py-2 text-sm font-medium text-white hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
               >
                 Try again
               </button>
-            </>
+              {projectRecovery && (
+                <button
+                  type="button"
+                  onClick={() => setAccountDrawerOpen(true)}
+                  className="min-h-11 rounded-lg border border-border px-4 py-2 text-sm font-medium text-text-primary hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+                >
+                  Open sign-in
+                </button>
+              )}
+            </div>
           )}
         </div>
-      </div>
+        {(accountRecovery || projectRecovery) && (
+          <AccountSupportDrawer required={accountRecovery} />
+        )}
+      </main>
     )
   }
 
-  const remoteProjectRequired = remote && (
-    !activeWorkspace
-    || !workspaces.some(workspace => (
-      workspace.name === activeWorkspace && workspace.unlocked !== false
-    ))
+  const remoteProjectRequired = remote && !api.protectedProjectReadsReady(
+    accessContext,
+    accountContext,
+    workspaces,
+    activeWorkspace,
   )
 
   return (
@@ -177,16 +357,14 @@ function App() {
             type="button"
             onClick={toggleSidebar}
             className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
-            aria-label={sidebarOpen ? 'Close creative workspace menu' : 'Open Generate, Director, and Reference menu'}
+            aria-label={sidebarOpen ? 'Close creative workspace menu' : 'Open Generate, Director, and References menu'}
             aria-expanded={sidebarOpen}
             aria-controls="maestro-mobile-sidebar"
           >
             <Menu aria-hidden="true" size={20} />
           </button> : <span className="h-11 w-11 shrink-0" aria-hidden="true" />}
           <div className="mx-1 flex min-w-0 items-center gap-2">
-            <div aria-hidden="true" className="w-7 h-7 shrink-0 rounded-lg bg-accent-blue flex items-center justify-center text-white font-bold text-sm">
-              M
-            </div>
+            <img aria-hidden="true" src="/maestro.svg" alt="" className="h-7 w-7 shrink-0" />
             <div className="min-w-0">
               <span className="sr-only">{PRODUCT_NAME}. {PRODUCT_PROVENANCE}</span>
               <span aria-hidden="true" className="block truncate text-[11px] font-semibold leading-tight">{PRODUCT_NAME_VISUAL}</span>
@@ -225,7 +403,7 @@ function App() {
           <AccountSupportButton />
         </div>
       )}
-      <AccountSupportDrawer />
+      <AccountSupportDrawer required={accountAuthenticationRequired} />
       {/* OomRecoveryBanner is a fixed-position overlay — renders nothing
           unless the latest job/pipeline failure has oom_info attached.
           Lives at the App root so it floats above whichever screen the

@@ -2293,6 +2293,13 @@ class TestOutpaintShotAwarePlanning(unittest.TestCase):
                 job["status"] = status
                 return True
 
+            def enforce_deferred_audio(job, output_path):
+                joined["audio_safety"] = (job["id"], output_path)
+                return None
+
+            class FixtureGenerationStageFailure(RuntimeError):
+                pass
+
             runner = _load_functions(
                 _LAUNCH_PATH,
                 ("_run_outpaint_shot_generation",),
@@ -2314,6 +2321,12 @@ class TestOutpaintShotAwarePlanning(unittest.TestCase):
                     "_write_outpaint_shot_aware_sidecar": (
                         lambda *args, **kwargs: None
                     ),
+                    "_enforce_deferred_h3_final_audio": (
+                        enforce_deferred_audio
+                    ),
+                    "_GenerationStageFailure": (
+                        FixtureGenerationStageFailure
+                    ),
                     "wgp": fake_wgp,
                 },
             )["_run_outpaint_shot_generation"]
@@ -2324,6 +2337,10 @@ class TestOutpaintShotAwarePlanning(unittest.TestCase):
             self.assertEqual(joined["audio"], source_video)
             self.assertTrue(joined["kwargs"]["pad_audio"])
             self.assertEqual(joined["kwargs"]["audio_duration_sec"], 1.0)
+            self.assertEqual(
+                joined["audio_safety"],
+                (job_id, joined["output"]),
+            )
             self.assertEqual(jobs[job_id]["status"], "completed")
             self.assertTrue(jobs[job_id]["params"]["edit_outpaint_shot_aware"])
             self.assertNotIn(
@@ -2378,6 +2395,9 @@ class TestOutpaintShotAwarePlanning(unittest.TestCase):
                     "_active_gen_states": {},
                     "generation_slot": lambda *args, **kwargs: (
                         contextlib.nullcontext(True)
+                    ),
+                    "_WgpNativeGpuExecutionSlot": lambda enabled: (
+                        contextlib.nullcontext(enabled)
                     ),
                     "try_start": try_start,
                     "try_requeue": try_requeue,

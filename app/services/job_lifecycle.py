@@ -105,16 +105,24 @@ _CREDIT_QUEUE_DECISIONS = frozenset({
     "capability_excluded",
     "owner_exempt_release",
 })
-_CREDIT_RESERVATION_STATES = frozenset({"reserved", "released", "consumed"})
-_CREDIT_REVALIDATION_STATES = frozenset({"valid", "downgraded", "released"})
+_CREDIT_RESERVATION_STATES = frozenset({
+    "reserved", "released", "consumed", "settled",
+})
+_CREDIT_REVALIDATION_STATES = frozenset({
+    "valid", "downgraded", "released", "settled",
+})
 _CREDIT_TRANSITION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._~:-]{7,127}\Z")
 _CREDIT_FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}\Z")
 _CREDIT_ACCOUNTING_RESERVATION_RE = re.compile(
     r"reservation_[0-9a-f]{32,64}\Z",
 )
 _MAX_CREDIT_TRANSITION_HISTORY = 32
+_TERMINAL_TRANSITION_MARKER = "_terminal_transition_active"
 _durability_hook: Callable[["DurableTransition"], None] | None = None
 _credit_lifecycle_callback: Callable[
+    [Mapping[str, Any]], Mapping[str, Any]
+] | None = None
+_credit_settlement_callback: Callable[
     [Mapping[str, Any]], Mapping[str, Any]
 ] | None = None
 
@@ -186,6 +194,29 @@ def configure_credit_lifecycle_callback(
         ):
             raise RuntimeError("credit lifecycle callback is already configured")
         _credit_lifecycle_callback = callback
+
+
+def configure_credit_settlement_callback(
+    callback: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None,
+) -> None:
+    """Bind terminal consumed-credit settlement independently of dispatch.
+
+    Keeping this seam separate preserves legacy consume/release callbacks until
+    launch explicitly opts into the settlement API. The event contains only
+    opaque linkage, server-owned timing, and integer units.
+    """
+
+    global _credit_settlement_callback
+    if callback is not None and not callable(callback):
+        raise TypeError("credit settlement callback must be callable or None")
+    with _queue_condition, _lifecycle_lock:
+        if (
+            _credit_settlement_callback is not None
+            and callback is not None
+            and callback != _credit_settlement_callback
+        ):
+            raise RuntimeError("credit settlement callback is already configured")
+        _credit_settlement_callback = callback
 
 
 def _copy_job_for_transition(job: Mapping[str, Any]) -> dict[str, Any]:
@@ -770,7 +801,13 @@ def _validated_credit_queue_metadata(value: Any) -> dict[str, Any]:
             reservation_state in {"reserved", "consumed"}
             and revalidation_state == "downgraded"
         )
-        valid = requested_units_positive and (active or released or downgraded)
+        settled = (
+            reservation_state == "settled"
+            and revalidation_state == "settled"
+        )
+        valid = requested_units_positive and (
+            active or released or downgraded or settled
+        )
         if valid:
             valid = queue_band == (1 if active else -1)
     if not valid:
@@ -950,6 +987,108 @@ def _apply_credit_lifecycle_action_unlocked(
     target_fingerprint = _credit_queue_fingerprint(target)
     history = list(target["transition_history"])
     history.append([transition_id, target_fingerprint])
+    target["transition_history"] = history
+    candidate["credit_queue"] = _validated_credit_queue_metadata(target)
+    return True
+
+
+def _apply_credit_terminal_settlement_unlocked(
+    candidate: MutableMapping[str, Any],
+) -> bool:
+    """Settle one consumed reservation from server lifecycle timestamps."""
+
+    callback = _credit_settlement_callback
+    if callback is None:
+        return False
+    raw = candidate.get("credit_queue")
+    if raw is None:
+        return False
+    credit_queue = _validated_credit_queue_metadata(raw)
+    terminal_status = str(candidate.get("status") or "")
+    if (
+        credit_queue["schema_version"] != 2
+        or credit_queue["reservation_state"] != "consumed"
+        or terminal_status not in TERMINAL_STATUSES
+    ):
+        return False
+    if len(credit_queue["transition_history"]) >= _MAX_CREDIT_TRANSITION_HISTORY:
+        raise CreditQueueTransitionConflict(
+            "credit transition history capacity is exhausted",
+        )
+    finished_at = candidate.get("finished_at")
+    if (
+        not isinstance(finished_at, (int, float))
+        or isinstance(finished_at, bool)
+        or not math.isfinite(float(finished_at))
+    ):
+        raise CreditLifecycleCallbackError(
+            "credit settlement terminal timestamp is invalid",
+        )
+    server_billable_units = None
+    if terminal_status == "cancelled":
+        started_at = candidate.get("started_at")
+        if (
+            not isinstance(started_at, (int, float))
+            or isinstance(started_at, bool)
+            or not math.isfinite(float(started_at))
+        ):
+            raise CreditLifecycleCallbackError(
+                "credit settlement start timestamp is invalid",
+            )
+        elapsed = max(0.0, float(finished_at) - float(started_at))
+        server_billable_units = math.ceil(elapsed)
+    event = {
+        "action": "settle",
+        "job_id": str(candidate.get("id") or ""),
+        "accounting_reservation_id": credit_queue[
+            "accounting_reservation_id"
+        ],
+        "expected_revision": credit_queue[
+            "accounting_reservation_revision"
+        ],
+        "operation_id": _credit_lifecycle_operation_id(
+            candidate, credit_queue, "settle",
+        ),
+        "terminal_status": terminal_status,
+        "server_billable_units": server_billable_units,
+        "as_of": datetime.fromtimestamp(
+            float(finished_at), timezone.utc,
+        ).isoformat().replace("+00:00", "Z"),
+    }
+    result = callback(event)
+    if not isinstance(result, Mapping) or set(result) != {
+        "reservation_status",
+        "reservation_revision",
+        "fully_funded",
+        "allocation_satisfied",
+        "terminal_satisfied",
+    }:
+        raise CreditLifecycleCallbackError(
+            "credit settlement callback result schema is invalid",
+        )
+    revision = result["reservation_revision"]
+    if (
+        result["reservation_status"] != "settled"
+        or type(revision) is not int
+        or revision != event["expected_revision"] + 1
+        or result["fully_funded"] is not False
+        or result["allocation_satisfied"] is not False
+        or result["terminal_satisfied"] is not True
+    ):
+        raise CreditLifecycleCallbackError(
+            "credit settlement callback result is inconsistent",
+        )
+    target = dict(credit_queue)
+    target.update({
+        "reservation_state": "settled",
+        "accounting_reservation_revision": revision,
+        "queue_band": -1,
+        "revalidation_state": "settled",
+        "transition_id": event["operation_id"],
+    })
+    target_fingerprint = _credit_queue_fingerprint(target)
+    history = list(target["transition_history"])
+    history.append([event["operation_id"], target_fingerprint])
     target["transition_history"] = history
     candidate["credit_queue"] = _validated_credit_queue_metadata(target)
     return True
@@ -2239,6 +2378,7 @@ def _reset_queue_state_for_tests() -> None:
     global _queue_paused, _pause_after_current
     global _resident_base_key, _resident_affinity_key
     global _durability_hook, _credit_lifecycle_callback
+    global _credit_settlement_callback
     with _queue_condition, _lifecycle_lock:
         _queue_waiters.clear()
         _registrations.clear()
@@ -2250,6 +2390,7 @@ def _reset_queue_state_for_tests() -> None:
         _resident_affinity_key = None
         _durability_hook = None
         _credit_lifecycle_callback = None
+        _credit_settlement_callback = None
         _queue_condition.notify_all()
 
 
@@ -2910,32 +3051,50 @@ def block_resource_admission_failure(
         if is_cancel_requested(job) or job.get("status") != "queued":
             return False
         candidate = _copy_job_for_transition(job)
-        message = "Resource admission failed; resubmit this request"
+        is_prompt_enhancement = candidate.get("kind") == "prompt_enhancement"
+        message = (
+            "Prompt enhancement failed"
+            if is_prompt_enhancement
+            else "Resource admission failed; resubmit this request"
+        )
         candidate.update({
-            "status": "queued",
-            "queue_held": True,
-            "recovery_state": "blocked_preparation",
+            "status": "failed" if is_prompt_enhancement else "queued",
+            "queue_held": False if is_prompt_enhancement else True,
+            "recovery_state": (
+                "terminal" if is_prompt_enhancement else "blocked_preparation"
+            ),
             "reruns_denoise": False,
             "_recovery_reason_code": "preparation_must_resubmit",
-            "phase": "resource_admission_failed",
+            "phase": "failed" if is_prompt_enhancement else "resource_admission_failed",
             "message": message,
             "error": message,
         })
+        if is_prompt_enhancement:
+            candidate["finished_at"] = time.time()
         if candidate.get("resource_intent") in _RESOURCE_INTENTS:
             candidate["resource_execution"] = RESOURCE_EXECUTION_STANDARD
             candidate["preemption_mode"] = PREEMPTION_MODE_NONE
-            candidate["resource_state"] = "blocked"
+            candidate["resource_state"] = (
+                "released" if is_prompt_enhancement else "blocked"
+            )
         _append_job_event_unlocked(
             candidate,
-            status="queued",
-            phase="resource_admission_failed",
+            status=candidate["status"],
+            phase=candidate["phase"],
             message=message,
         )
-        _apply_credit_lifecycle_action_unlocked(candidate, "release")
+        try:
+            _apply_credit_lifecycle_action_unlocked(candidate, "release")
+        except CreditLifecycleCallbackError:
+            if not is_prompt_enhancement:
+                raise
         persisted = True
         try:
             _persist_prospective_unlocked(
-                "resource_admission_blocked",
+                (
+                    "prompt_resource_admission_failed"
+                    if is_prompt_enhancement else "resource_admission_blocked"
+                ),
                 jobs=(candidate,),
                 global_state=_global_state_unlocked(
                     replacements={id(job): candidate},
@@ -2952,6 +3111,44 @@ def block_resource_admission_failure(
         _queue_waiters.pop(id(job), None)
         _queue_condition.notify_all()
         return persisted
+
+
+def fail_queued_job(
+    job: MutableMapping[str, Any],
+    **updates: Any,
+) -> bool:
+    """Terminalize one admitted-but-not-started ordinary job.
+
+    Reserved credit is released rather than consumed; running work must use
+    :func:`finish_job` so terminal settlement remains authoritative.
+    """
+    if "status" in updates:
+        raise ValueError("status must be changed through a lifecycle transition")
+    with _queue_condition, _lifecycle_lock:
+        if is_cancel_requested(job) or job.get("status") != "queued":
+            return False
+        candidate = _copy_job_for_transition(job)
+        candidate.update(updates)
+        candidate["status"] = "failed"
+        candidate["finished_at"] = time.time()
+        if candidate.get("resource_intent") in _RESOURCE_INTENTS:
+            candidate["resource_state"] = "released"
+            candidate["preemption_mode"] = PREEMPTION_MODE_NONE
+        _append_job_event_unlocked(candidate, status="failed", **updates)
+        _apply_credit_lifecycle_action_unlocked(candidate, "release")
+        _persist_prospective_unlocked(
+            "queue_failed",
+            jobs=(candidate,),
+            global_state=_global_state_unlocked(
+                replacements={id(job): candidate},
+            ),
+        )
+        if is_cancel_requested(job):
+            return False
+        _publish_job_unlocked(job, candidate)
+        _queue_waiters.pop(id(job), None)
+        _queue_condition.notify_all()
+        return True
 
 
 def fail_preparation(
@@ -3561,7 +3758,10 @@ def request_cancel(
         raise ValueError("Invalid expected resource retry attempt")
     with _queue_condition, _lifecycle_lock:
         status = job.get("status")
-        if status in TERMINAL_STATUSES:
+        if (
+            status in TERMINAL_STATUSES
+            or job.get(_TERMINAL_TRANSITION_MARKER) is True
+        ):
             return CancelResult(False, False, False)
         if expected_resource_retry_attempt is not None:
             try:
@@ -3578,23 +3778,33 @@ def request_cancel(
         candidate["cancel_requested"] = True
         candidate["message"] = "Cancelled"
         candidate["status"] = "cancelled"
+        candidate["finished_at"] = time.time()
         candidate["plan_review_required"] = False
         candidate["plan_review_terms_required"] = False
         candidate["plan_review_deadline"] = None
         if candidate.get("resource_intent") in _RESOURCE_INTENTS:
-            candidate["resource_state"] = "released"
+            candidate["resource_state"] = (
+                "resources_releasing"
+                if was_running and candidate.get("kind") == "prompt_enhancement"
+                else "released"
+            )
             candidate["preemption_mode"] = PREEMPTION_MODE_NONE
         _append_job_event_unlocked(
             candidate, status="cancelled", message="Cancelled",
         )
-        _apply_credit_lifecycle_action_unlocked(candidate, "release")
-        _persist_prospective_unlocked(
-            "cancel",
-            jobs=(candidate,),
-            global_state=_global_state_unlocked(
-                replacements={id(job): candidate},
-            ),
-        )
+        job[_TERMINAL_TRANSITION_MARKER] = True
+        try:
+            if not _apply_credit_terminal_settlement_unlocked(candidate):
+                _apply_credit_lifecycle_action_unlocked(candidate, "release")
+            _persist_prospective_unlocked(
+                "cancel",
+                jobs=(candidate,),
+                global_state=_global_state_unlocked(
+                    replacements={id(job): candidate},
+                ),
+            )
+        finally:
+            job.pop(_TERMINAL_TRANSITION_MARKER, None)
 
         # Publish the durable winner before invoking a model callback. Some
         # wrappers re-enter lifecycle helpers from their interrupt hook; they
@@ -3637,6 +3847,8 @@ def finish_job(
     if "status" in updates:
         raise ValueError("status must be changed through a lifecycle transition")
     with _queue_condition, _lifecycle_lock:
+        if job.get(_TERMINAL_TRANSITION_MARKER) is True:
+            return False
         if (
             status == "completed"
             and job.get("kind") == SAMPLE_CAMPAIGN_JOB_KIND
@@ -3649,17 +3861,27 @@ def finish_job(
             candidate = _copy_job_for_transition(job)
             candidate["status"] = "cancelled"
             candidate["message"] = "Cancelled"
+            candidate["finished_at"] = time.time()
             if candidate.get("resource_intent") in _RESOURCE_INTENTS:
-                candidate["resource_state"] = "released"
+                candidate["resource_state"] = (
+                    "resources_releasing"
+                    if candidate.get("kind") == "prompt_enhancement"
+                    else "released"
+                )
                 candidate["preemption_mode"] = PREEMPTION_MODE_NONE
-            _apply_credit_lifecycle_action_unlocked(candidate, "release")
-            _persist_prospective_unlocked(
-                "finish_cancelled",
-                jobs=(candidate,),
-                global_state=_global_state_unlocked(
-                    replacements={id(job): candidate},
-                ),
-            )
+            job[_TERMINAL_TRANSITION_MARKER] = True
+            try:
+                if not _apply_credit_terminal_settlement_unlocked(candidate):
+                    _apply_credit_lifecycle_action_unlocked(candidate, "release")
+                _persist_prospective_unlocked(
+                    "finish_cancelled",
+                    jobs=(candidate,),
+                    global_state=_global_state_unlocked(
+                        replacements={id(job): candidate},
+                    ),
+                )
+            finally:
+                job.pop(_TERMINAL_TRANSITION_MARKER, None)
             _publish_job_unlocked(job, candidate)
             _queue_waiters.pop(id(job), None)
             _queue_condition.notify_all()
@@ -3693,20 +3915,79 @@ def finish_job(
                 "attempt": 0, "not_before": None,
             }
         candidate["status"] = status
+        candidate["finished_at"] = time.time()
         if candidate.get("resource_intent") in _RESOURCE_INTENTS:
-            candidate["resource_state"] = "released"
+            candidate["resource_state"] = (
+                "resources_releasing"
+                if candidate.get("kind") == "prompt_enhancement"
+                else "released"
+            )
             candidate["preemption_mode"] = PREEMPTION_MODE_NONE
         _append_job_event_unlocked(candidate, status=status, **updates)
-        _apply_credit_lifecycle_action_unlocked(candidate, "release")
-        _persist_prospective_unlocked(
-            "finish",
-            jobs=(candidate,),
-            global_state=_global_state_unlocked(
-                replacements={id(job): candidate},
-            ),
-        )
+        job[_TERMINAL_TRANSITION_MARKER] = True
+        try:
+            if not _apply_credit_terminal_settlement_unlocked(candidate):
+                _apply_credit_lifecycle_action_unlocked(candidate, "release")
+            _persist_prospective_unlocked(
+                "finish",
+                jobs=(candidate,),
+                global_state=_global_state_unlocked(
+                    replacements={id(job): candidate},
+                ),
+            )
+        finally:
+            job.pop(_TERMINAL_TRANSITION_MARKER, None)
         _publish_job_unlocked(job, candidate)
         _queue_waiters.pop(id(job), None)
+        _queue_condition.notify_all()
+        return True
+
+
+def settle_terminal_credit(job: MutableMapping[str, Any]) -> bool:
+    """Replay settlement for one restored terminal job still marked consumed.
+
+    Launch recovery calls this only after restoring the private reservation to
+    account association and binding the settlement callback. The same stable
+    operation ID makes a callback-success/process-crash retry idempotent.
+    """
+
+    with _queue_condition, _lifecycle_lock:
+        if (
+            str(job.get("status") or "") not in TERMINAL_STATUSES
+            or job.get(_TERMINAL_TRANSITION_MARKER) is True
+        ):
+            return False
+        raw = job.get("credit_queue")
+        if raw is None:
+            return False
+        current = _validated_credit_queue_metadata(raw)
+        if (
+            current["schema_version"] != 2
+            or current["reservation_state"] != "consumed"
+        ):
+            return False
+        candidate = _copy_job_for_transition(job)
+        job[_TERMINAL_TRANSITION_MARKER] = True
+        try:
+            if not _apply_credit_terminal_settlement_unlocked(candidate):
+                return False
+            _persist_prospective_unlocked(
+                "credit_terminal_settlement",
+                jobs=(candidate,),
+                global_state=_global_state_unlocked(
+                    replacements={id(job): candidate},
+                ),
+            )
+        finally:
+            job.pop(_TERMINAL_TRANSITION_MARKER, None)
+        current_raw = job.get("credit_queue")
+        if (
+            str(job.get("status") or "") != candidate["status"]
+            or not isinstance(current_raw, Mapping)
+            or current_raw.get("reservation_state") != "consumed"
+        ):
+            return False
+        _publish_job_unlocked(job, candidate)
         _queue_condition.notify_all()
         return True
 
@@ -3768,6 +4049,128 @@ def acquire_generation_slot(
             return False
         finally:
             _queue_waiters.pop(waiter_key, None)
+
+
+def acquire_and_start_generation_slot(
+    generation_lock: threading.Lock,
+    job: MutableMapping[str, Any],
+    *,
+    poll_interval: float = 0.1,
+    block_on_persistence_failure: bool = False,
+    **updates: Any,
+) -> bool:
+    """Admit and start one ordinary queued job while retaining its slot.
+
+    The caller must pair every successful return with
+    :func:`release_generation_slot`.  This form is for async façades whose
+    model coroutine runs after the blocking scheduler wait returns.
+    """
+    try:
+        acquired = acquire_generation_slot(
+            generation_lock, job, poll_interval=poll_interval,
+        )
+    except Exception:
+        if not block_on_persistence_failure:
+            raise
+        block_resource_admission_failure(job)
+        return False
+    if not acquired:
+        return False
+    with _queue_condition, _lifecycle_lock:
+        job["_generation_slot_owned"] = True
+    started = try_start(
+        job,
+        generation_lock=generation_lock,
+        poll_interval=poll_interval,
+        block_on_persistence_failure=block_on_persistence_failure,
+        **updates,
+    )
+    if not started:
+        release_generation_slot(generation_lock, job)
+    return started
+
+
+def release_generation_slot(
+    generation_lock: threading.Lock,
+    job: MutableMapping[str, Any],
+) -> bool:
+    """Release only a slot retained by ``acquire_and_start``."""
+    with _queue_condition, _lifecycle_lock:
+        if job.pop("_generation_slot_owned", False) is not True:
+            return False
+        generation_lock.release()
+        _queue_condition.notify_all()
+        return True
+
+
+def complete_prompt_enhancement_resource_release(
+    job: MutableMapping[str, Any],
+) -> bool:
+    """Publish release only after a Prompt Enhance worker drops its slot."""
+    with _queue_condition, _lifecycle_lock:
+        if (
+            job.get("kind") != "prompt_enhancement"
+            or str(job.get("status") or "") not in TERMINAL_STATUSES
+            or job.get("resource_state") != "resources_releasing"
+        ):
+            return False
+        candidate = _copy_job_for_transition(job)
+        candidate["resource_state"] = "released"
+        candidate["preemption_mode"] = PREEMPTION_MODE_NONE
+        _append_job_event_unlocked(candidate, resource_state="released")
+        _persist_prospective_unlocked(
+            "prompt_resource_released",
+            jobs=(candidate,),
+            global_state=_global_state_unlocked(
+                replacements={id(job): candidate},
+            ),
+        )
+        if (
+            str(job.get("status") or "") != candidate["status"]
+            or job.get("resource_state") != "resources_releasing"
+        ):
+            return False
+        _publish_job_unlocked(job, candidate)
+        _queue_condition.notify_all()
+        return True
+
+
+def consume_prompt_enhancement_result(
+    job: MutableMapping[str, Any],
+) -> dict[str, Any] | None:
+    """Durably detach one completed Prompt Enhance private result."""
+    with _queue_condition, _lifecycle_lock:
+        reference = job.get("prompt_result_reference")
+        if (
+            job.get("kind") != "prompt_enhancement"
+            or job.get("status") != "completed"
+            or not isinstance(reference, Mapping)
+        ):
+            return None
+        reference = dict(reference)
+        candidate = _copy_job_for_transition(job)
+        candidate.pop("prompt_result_reference", None)
+        candidate["prompt_result_consumed"] = True
+        _append_job_event_unlocked(
+            candidate,
+            phase=str(candidate.get("phase") or "completed"),
+            message=str(candidate.get("message") or "Prompt enhancement complete"),
+        )
+        _persist_prospective_unlocked(
+            "prompt_result_consumed",
+            jobs=(candidate,),
+            global_state=_global_state_unlocked(
+                replacements={id(job): candidate},
+            ),
+        )
+        if (
+            job.get("status") != "completed"
+            or job.get("prompt_result_reference") != reference
+        ):
+            return None
+        _publish_job_unlocked(job, candidate)
+        _queue_condition.notify_all()
+        return reference
 
 
 def yield_generation_slot_after_output(

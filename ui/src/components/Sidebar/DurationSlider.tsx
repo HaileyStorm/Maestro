@@ -1,9 +1,8 @@
-import { useEffect, useState } from 'react'
+import { useEffect } from 'react'
 import { Lock, Unlock } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import { controlFpsTotalFrames, effectiveSlidingWindowGeometry, hasGlobalTimeline, usesStudioSegments } from '../../lib/timelinePrompt'
 import { formatMediaDuration } from '../../lib/format'
-import * as api from '../../api/client'
 
 export function DurationSlider() {
   const duration = useStore(s => s.durationSeconds)
@@ -52,17 +51,6 @@ export function DurationSlider() {
   const frameOverrides = {
     totalFrames: controlFpsTotalFrames(duration, forceFps, videoGuide, guideVideoFps, guideVideoFrameCount),
   }
-  const [evaluationOpen, setEvaluationOpen] = useState(false)
-  const [evaluationCatalog, setEvaluationCatalog] = useState<Awaited<ReturnType<typeof api.fetchH3EvaluationCatalog>> | null>(null)
-  const [evaluationError, setEvaluationError] = useState('')
-
-  useEffect(() => {
-    if (!usesSegments || !evaluationOpen || evaluationCatalog) return
-    api.fetchH3EvaluationCatalog()
-      .then(value => { setEvaluationCatalog(value); setEvaluationError('') })
-      .catch(error => setEvaluationError(error instanceof Error ? error.message : 'Catalog unavailable'))
-  }, [usesSegments, evaluationOpen, evaluationCatalog])
-
   const geometry = modelOptions
     ? effectiveSlidingWindowGeometry(duration, windowSize, overlap, modelOptions, frameOverrides)
     : null
@@ -220,33 +208,6 @@ export function DurationSlider() {
               <summary className="mobile-control-target inline-flex cursor-pointer items-center rounded text-accent-blue hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Mode details</summary>
               When enabled, Maestro may choose FL2VA or Ref2VA for each shot.
             </details>
-          )}
-          {usesSegments && (
-            <div className="mt-2">
-              <button
-                type="button"
-                aria-expanded={evaluationOpen}
-                aria-controls="h3-evaluated-profiles"
-                onClick={() => setEvaluationOpen(value => !value)}
-                className="mobile-control-target inline-flex items-center rounded text-left text-[9px] text-accent-blue hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
-              >
-                {evaluationOpen ? 'Hide' : 'Show'} technical comparison profiles
-              </button>
-              {evaluationOpen && (
-                <div id="h3-evaluated-profiles" className="mt-1.5 space-y-1 rounded-md border border-border/70 bg-bg-primary/40 p-2">
-                  {evaluationError && <p className="text-[9px] text-red-300">{evaluationError}</p>}
-                  {evaluationCatalog && Object.values(evaluationCatalog.profiles).map(profile => (
-                    <div key={profile.id} className="flex flex-wrap items-start justify-between gap-2 text-[9px]">
-                      <span className="text-text-secondary">{profile.label}</span>
-                      <span className={`shrink-0 rounded px-1 ${profile.experimental ? 'bg-amber-500/15 text-amber-300' : 'bg-accent-green/15 text-accent-green'}`}>
-                        {profile.experimental ? 'experimental · opt-in' : 'official · default'}
-                      </span>
-                    </div>
-                  ))}
-                  {evaluationCatalog && <p className="pt-1 text-[8px] text-text-muted">Evaluation profiles are for comparison only; Maestro will not select them automatically.</p>}
-                </div>
-              )}
-            </div>
           )}
         </div>
       )}

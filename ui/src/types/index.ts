@@ -661,7 +661,7 @@ export interface OomInfo {
   actions?: string[]
 }
 
-export type LogicalJobKind = 'reference_pack_parent' | 'reference_pack_child'
+export type LogicalJobKind = 'reference_pack_parent' | 'reference_pack_child' | 'prompt_enhancement'
 
 export type AccountRole = 'owner' | 'user'
 
@@ -695,6 +695,8 @@ export interface AccountContext {
   activation_state: AccountActivationState
   /** Server-authored bootstrap availability, including the access-context projection. */
   bootstrap_available?: boolean
+  /** Exact-origin public signup is enabled for this request. */
+  public_registration_available?: boolean
 }
 
 export type AccountProjectMigrationState =
@@ -725,6 +727,7 @@ export type AccountNoncePurpose =
   | 'login'
   | 'reauth'
   | 'recover'
+  | 'register'
   | 'change_password'
   | 'rotate_recovery_codes'
   | 'create_account'
@@ -853,6 +856,19 @@ export interface SupportRecordedAllowance {
   sources: SupportRecordedAllowanceSource[]
 }
 
+export interface OwnerTestCreditProjection {
+  state: 'active' | 'unavailable'
+  test_only: true
+  auto_top_up: true
+  unit: 'maestro_test_credits'
+  target_balance: number
+  available_units: number
+  reserved_units: number
+  used_units: number
+  pending_reservations: number
+  last_activity_at: string | null
+}
+
 /** Deliberately excludes raw contribution totals, subjects, and audit events. */
 export interface SupportAccountSummary {
   event_count: number
@@ -860,6 +876,7 @@ export interface SupportAccountSummary {
   recurring_tier: string | null
   active_recurring_count: number
   recorded_allowance?: SupportRecordedAllowance
+  owner_test_credits?: OwnerTestCreditProjection
   benefits: {
     state: string
     scheduler_enforcement_enabled: boolean
@@ -968,6 +985,32 @@ export interface SupportAdminProjection {
   responsible_use: ResponsibleUseStatus
   development_cost_recovery: DevelopmentCostRecoveryProjection | null
   support_priority: SupportPriorityPolicy
+}
+
+export type SupportH3LegalAccessAvailabilityStatus =
+  | 'available'
+  | 'legal_blocked'
+  | 'location_declaration_required'
+
+export interface SupportH3LegalAccessProjection {
+  declared: boolean
+  territory_code: string | null
+  declared_at_unix?: number
+  availability_status: SupportH3LegalAccessAvailabilityStatus
+  execution_allowed: boolean
+  license_revision?: string | null
+  license_sha256?: string | null
+  license_url?: string | null
+  location_source?: string | null
+  network_location_used?: boolean
+  written_authorization_supported?: boolean
+}
+
+export interface SupportH3LegalAccessLocationInput {
+  territory_code: string
+  owner_attested: true
+  license_revision: string
+  license_sha256: string
 }
 
 export interface GenerationJob {

@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import type { StoreApi } from 'zustand'
-import type { GenerateParams, OutputFile, MediaFilter, OutputArtifactScope, AspectRatio, ResolutionPreset, ScailResolutionProfile, GenerationJob, H3SegmentPlan, H3PlanDecision, H3PerformanceEstimate, H3SegmentCountEstimate, H3PerformanceProfile, H3PerformanceProfileId, ModelFamily, ModelDef, GenerationMode, ModelOptions, SystemConfig, SettingsTab, OutputMetadata, MultiClip, ServicesConfig, HostTermId, HostTermsStatus, LlmStatus, LlmModelOption, AudioAnalysisResult, PlannedClip, ClipPlan, DirectorClipImage, DirectorImageGenProgress, DirectorImageRole, DirectorImageRoleLoraSelection, SpeakerMapping, DirectorSkill, DirectorShotImageGuidance, ShortFilmCharacter, ShortFilmPath, CivitAIModel, CivitAIDownload, PipelineListItem, PipelineRepairState, SavedPipelineState, SystemDetectResponse, SystemStats, RecastCharacterMapping, RepaintRegionMapping, AccountAuthResult, AccountContext, AccountProjectMigrationStatus, AccountSession, AccountSummary, ResponsibleUseProjection, SupportAdminProjection, SupportFulfillmentMutationInput, SupportManualContributionInput, SupportPublicProjection, SupportSelfProjection } from '../types'
+import type { GenerateParams, OutputFile, MediaFilter, OutputArtifactScope, AspectRatio, ResolutionPreset, ScailResolutionProfile, GenerationJob, H3SegmentPlan, H3PlanDecision, H3PerformanceEstimate, H3SegmentCountEstimate, H3PerformanceProfile, H3PerformanceProfileId, ModelFamily, ModelDef, GenerationMode, ModelOptions, SystemConfig, SettingsTab, OutputMetadata, MultiClip, ServicesConfig, HostTermId, HostTermsStatus, LlmStatus, LlmModelOption, AudioAnalysisResult, PlannedClip, ClipPlan, DirectorClipImage, DirectorImageGenProgress, DirectorImageRole, DirectorImageRoleLoraSelection, SpeakerMapping, DirectorSkill, DirectorShotImageGuidance, ShortFilmCharacter, ShortFilmPath, CivitAIModel, CivitAIDownload, PipelineListItem, PipelineRepairState, SavedPipelineState, SystemDetectResponse, SystemStats, RecastCharacterMapping, RepaintRegionMapping, AccountAuthResult, AccountContext, AccountProjectMigrationStatus, AccountSession, AccountSummary, ResponsibleUseProjection, SupportAdminProjection, SupportFulfillmentMutationInput, SupportManualContributionInput, SupportPublicProjection, SupportSelfProjection, SupportH3LegalAccessProjection, SupportH3LegalAccessLocationInput } from '../types'
 import * as api from '../api/client'
 import { applyThemePrefs, getStoredPrefs, type FamilyId, type ThemeMode, type ThemePrefs } from '../lib/theme'
 import { HOST_TERM_NOTICES } from '../lib/hostTerms'
@@ -256,6 +256,7 @@ function _beginEnhanceLlmRequest(workspace: string) {
       isEnhancing: false,
       enhanceStatus: null,
       enhanceRequestScope: null,
+      enhanceQueueCard: null,
     })
   })
   _enhanceStopWaiting = lifecycle.stopWaiting
@@ -391,6 +392,22 @@ type StoredEnhanceOperation = api.LlmEnhanceOperationScope & {
   claimToken: string
   settingsFingerprint: string
   storedAt: number
+}
+
+type PromptEnhanceQueueCardState = api.LlmEnhanceQueueCard & {
+  accountFingerprint: string
+  settingsFingerprint: string | null
+  promptEditGeneration: number
+  ttsMode?: string
+}
+
+function _generatePromptSurfaceIsVisible(state: {
+  sidebarMode: SidebarMode
+  sidebarOpen: boolean
+}): boolean {
+  if (state.sidebarMode !== 'studio') return false
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return true
+  return window.matchMedia('(min-width: 768px)').matches || state.sidebarOpen
 }
 
 type StoredDirectorPreviewOperation = api.DirectorV2OperationScope & {
@@ -617,6 +634,15 @@ function _terminalEnhanceStatus(
     live_tps: null,
     average_tps: null,
   }
+}
+
+function _enhanceQueueCardPhase(
+  status: api.LlmEnhanceOperationStatus,
+): api.LlmEnhanceQueueCardPhase {
+  if (status.status === 'queued') return 'queued'
+  if (status.status === 'running') return 'running'
+  if (status.status === 'completed') return 'completed'
+  return 'failed'
 }
 
 function _validStoredDirectorPreviewOperation(
@@ -1884,6 +1910,7 @@ const _PRIMARY_MODEL_DEFAULT_FIELDS: ReadonlyArray<string> = [
 // most recently requested model's options may touch the store.
 let _modelOptionsSeq = 0
 let _modelDefaultsSeq = 0
+let _modelsLoadSeq = 0
 let _directorResolutionOptionsSeq = 0
 let _loraLoadSeq = 0
 let _recipesLoadSeq = 0
@@ -1937,12 +1964,22 @@ const H3_PROFILE_PARAM_KEYS = new Set<keyof GenerateParams>([
   'delivery_resolution',
   'delivery_fit',
 ])
+const H3_PERFORMANCE_PROFILE_IDS = new Set<H3PerformanceProfileId>([
+  'draft', 'fast', 'quality', 'high', '1080p_delivery', 'ultra',
+  '4k_delivery', 'spectrum_experimental', 'lightx2v_experimental',
+])
+
+interface ModelDefaultsApplyOptions {
+  /** Account-role refreshes fill scrubbed fields but never replace authored state. */
+  omittedOnly?: boolean
+}
 
 function _applyModelDefaults(
   storeGet: () => {
     selectedModelPerMode: Partial<Record<GenerationMode, string>>
     generationMode: GenerationMode
     params: GenerateParams
+    h3SelectedProfile: H3PerformanceProfileId | 'custom'
   },
   storeSet: (fn: (s: {
     params: GenerateParams
@@ -1958,45 +1995,95 @@ function _applyModelDefaults(
     spatialUpsampling: string
   }>) => void,
   modelType: string,
+  options: ModelDefaultsApplyOptions = {},
 ): void {
   const seq = ++_modelDefaultsSeq
+  const accountIdentityEpoch = _accountIdentityEpoch
+  const h3ProfileEpoch = _h3ProfileApplySeq
+  const requestedMode = storeGet().generationMode
   api.fetchDefaults(modelType).then((d) => {
     if (seq !== _modelDefaultsSeq) return
+    if (accountIdentityEpoch !== _accountIdentityEpoch) return
+    if (h3ProfileEpoch !== _h3ProfileApplySeq) return
     if (!d || typeof d !== 'object') return
     // Race guard: model may have been switched again while this fetch
     // was in flight. Apply only if still the active model in current mode.
     const state = storeGet()
-    const active = state.selectedModelPerMode[state.generationMode]
+    if (state.generationMode !== requestedMode) return
+    const active = state.selectedModelPerMode[state.generationMode] || state.params.model_type
     if (active !== modelType) return
+    const currentParams = state.params as unknown as Record<string, unknown>
     const overrides: Record<string, unknown> = {}
     for (const field of _PRIMARY_MODEL_DEFAULT_FIELDS) {
-      if ((d as Record<string, unknown>)[field] !== undefined) {
+      if (
+        (d as Record<string, unknown>)[field] !== undefined
+        && (!options.omittedOnly || currentParams[field] == null)
+      ) {
         overrides[field] = (d as Record<string, unknown>)[field]
       }
     }
     const isH3 = H3_STUDIO_MODELS.has(modelType)
+    let selectedProfile: H3PerformanceProfileId | 'custom' = 'custom'
+    let applyH3ProfileState = isH3
     if (isH3) {
       const defaults = d as Record<string, unknown>
-      // Fresh H3 state is the backend's curated High bundle. This is a
+      const roleProfile = defaults.h3_default_profile_id
+      selectedProfile = typeof roleProfile === 'string'
+        && H3_PERFORMANCE_PROFILE_IDS.has(roleProfile as H3PerformanceProfileId)
+        ? roleProfile as H3PerformanceProfileId
+        : 'custom' as const
+      // Fresh H3 state is the backend's role-authored bundle. Account-role
+      // rehydration is omitted-only: identity scrubbing deliberately clears
+      // these fields, while manual, loaded-output, recipe, and preset values
+      // remain defined and therefore authoritative.
+      const h3CoreWasOmitted = (
+        currentParams.num_inference_steps == null
+        && currentParams.resolution == null
+        && currentParams.custom_settings == null
+        && currentParams.tea_cache == null
+      )
       // narrow setting hydration: checkpoint identity, prompt, references,
       // privacy, explicit mode, and adaptive routing remain untouched.
-      overrides.num_inference_steps = defaults.num_inference_steps
-      overrides.resolution = defaults.resolution
-      overrides.custom_settings = { ...(
-        defaults.custom_settings as Record<string, unknown> | undefined
-        || { h3_attention_engine: 'sol_attn' }
-      ) }
-      overrides.tea_cache = defaults.tea_cache ?? 0
-      overrides.activated_loras = []
-      overrides.loras_multipliers = ''
-      overrides.delivery_resolution = undefined
-      overrides.delivery_fit = undefined
+      if (!options.omittedOnly) {
+        overrides.num_inference_steps = defaults.num_inference_steps
+        overrides.resolution = defaults.resolution
+        overrides.custom_settings = { ...(
+          defaults.custom_settings as Record<string, unknown> | undefined
+          || { h3_attention_engine: 'sol_attn' }
+        ) }
+        overrides.tea_cache = defaults.tea_cache ?? 0
+        overrides.activated_loras = []
+        overrides.loras_multipliers = ''
+        overrides.delivery_resolution = undefined
+        overrides.delivery_fit = undefined
+      } else {
+        const omittedDefaults: Record<string, unknown> = {
+          num_inference_steps: defaults.num_inference_steps,
+          resolution: defaults.resolution,
+          custom_settings: { ...(
+            defaults.custom_settings as Record<string, unknown> | undefined
+            || { h3_attention_engine: 'sol_attn' }
+          ) },
+          tea_cache: defaults.tea_cache ?? 0,
+          activated_loras: [],
+          loras_multipliers: '',
+          delivery_resolution: undefined,
+          delivery_fit: undefined,
+        }
+        for (const [field, value] of Object.entries(omittedDefaults)) {
+          if (currentParams[field] == null) overrides[field] = value
+        }
+      }
+      if (options.omittedOnly && !h3CoreWasOmitted) {
+        selectedProfile = state.h3SelectedProfile
+        applyH3ProfileState = false
+      }
     }
     if (Object.keys(overrides).length > 0) {
       storeSet(s => ({
         params: { ...s.params, ...overrides } as GenerateParams,
-        ...(isH3 ? {
-          h3SelectedProfile: 'high' as const,
+        ...(applyH3ProfileState ? {
+          h3SelectedProfile: selectedProfile,
           h3ProfileApplying: null,
           loraWeights: {},
           spatialUpsampling: '',
@@ -3002,6 +3089,9 @@ interface AppState {
   supportCatalogUnavailable: boolean
   supportSelf: SupportSelfProjection | null
   responsibleUse: ResponsibleUseProjection | null
+  supportH3LegalAccess: SupportH3LegalAccessProjection | null
+  supportH3LegalAccessLoading: boolean
+  supportH3LegalAccessError: string | null
   supportAdminAccountId: string | null
   supportAdmin: SupportAdminProjection | null
   supportDetailsLoading: boolean
@@ -3044,6 +3134,10 @@ interface AppState {
   loadSupportSelf: () => Promise<SupportSelfProjection | null>
   loadResponsibleUse: () => Promise<ResponsibleUseProjection | null>
   acceptResponsibleUse: (documentVersion: number, contentSha256: string) => Promise<void>
+  loadH3LegalAccessState: () => Promise<SupportH3LegalAccessProjection | null>
+  setH3LegalAccessLocation: (
+    input: SupportH3LegalAccessLocationInput,
+  ) => Promise<SupportH3LegalAccessProjection | null>
   loadSupportAdmin: (accountId: string) => Promise<SupportAdminProjection>
   transitionSupportFulfillment: (
     accountId: string,
@@ -3173,11 +3267,14 @@ interface AppState {
   isEnhancing: boolean
   enhanceStatus: api.LlmPreparationStatus | api.LlmEnhanceOperationStatus | null
   enhanceRequestScope: api.LlmEnhanceOperationScope | null
+  enhanceQueueCard: PromptEnhanceQueueCardState | null
   studioPromptEnhance: boolean
   setStudioPromptEnhance: (enabled: boolean) => void
   enhancePrompt: (ttsMode?: string) => Promise<boolean>
   resumeEnhancePrompt: () => Promise<boolean>
   cancelEnhancePrompt: () => Promise<void>
+  applyCompletedEnhanceResult: () => Promise<boolean>
+  useCompletedEnhanceAndGenerate: () => Promise<boolean>
 
   // Director (Music Video Director)
   sidebarMode: SidebarMode
@@ -3483,7 +3580,7 @@ const defaultParams: GenerateParams = {
   model_type: 'minimax_h3',
   resolution: '1344x768',
   video_length: 251,
-  num_inference_steps: 20,
+  num_inference_steps: 28,
   guidance_scale: 1.0,
   seed: -1,
   image_mode: 0,
@@ -3796,6 +3893,7 @@ let _supportCatalogRequestSequence = 0
 let _supportSelfRequestSequence = 0
 let _responsibleUseRequestSequence = 0
 let _responsibleUseAcceptanceSequence = 0
+let _supportH3LegalAccessRequestSequence = 0
 let _accountContextRequestSequence = 0
 let _accountSessionsRequestSequence = 0
 let _accountUsersRequestSequence = 0
@@ -3803,6 +3901,11 @@ let _accountMutationRequestSequence = 0
 let _accessContextRequestSequence = 0
 let _accountProjectMigrationRequestSequence = 0
 let _sampleCampaignQueueRequestSequence = 0
+let _presetLoadSequence = 0
+const _presetScopes = new WeakMap<api.GenerationPreset, {
+  accountIdentityEpoch: number
+  workspace: string
+}>()
 const _sampleCampaignKnownJobIds = new Set<string>()
 let _accountIdentityEpoch = 0
 
@@ -4585,6 +4688,20 @@ async function _runDirectorV2Preview(
 
 function _advanceAccountIdentityEpoch(): void {
   _accountIdentityEpoch += 1
+  // Account-role H3 defaults and profile availability are identity-bound.
+  // Invalidate every older writer before the scrub exposes omitted fields:
+  // a pre-auth model-options/default/profile response must not repopulate
+  // them under the newly authenticated account.
+  _modelOptionsSeq += 1
+  _modelDefaultsSeq += 1
+  _modelsLoadSeq += 1
+  _loraLoadSeq += 1
+  _recipesLoadSeq += 1
+  _h3ProfileApplySeq += 1
+  _h3EstimateSeq += 1
+  _h3CompatibilitySeq += 1
+  _h3StyleWorkflowCatalogSeq += 1
+  _presetLoadSequence += 1
   _workspaceLoadSequence += 1
   _accountProjectMigrationRequestSequence += 1
   _sampleCampaignQueueRequestSequence += 1
@@ -4621,6 +4738,7 @@ function _scrubAccountBoundProjectUi(state: AppState): Partial<AppState> {
   // same account. A real scrub/logout always has a previous context and must
   // remove every prior-account recovery fence.
   if (state.accountContext !== null) {
+    try { localStorage.removeItem(STORAGE_KEY) } catch { /* private mode */ }
     void _clearStoredEnhanceOperations()
     const priorAccountFingerprint = _enhanceAccountFingerprint(state)
     void _directorPreviewFingerprintSalt()
@@ -4652,14 +4770,58 @@ function _scrubAccountBoundProjectUi(state: AppState): Partial<AppState> {
     selectedOutputKeys: [],
     gallerySelectionMode: false,
     jobs: [],
+    presets: [],
+    presetsLoading: false,
+    recipes: [],
+    recipesLoading: false,
+    recipesError: null,
     isGenerating: false,
     isEnhancing: false,
     enhanceStatus: null,
     enhanceRequestScope: null,
+    enhanceQueueCard: null,
     directorPreviewStatus: null,
     directorPreviewRequestScope: null,
     sampleCampaignPairs: [],
-    params: { ...state.params, ...BLANK_VIDEO_INPUT_PARAMS },
+    params: {
+      ...state.params,
+      ...BLANK_VIDEO_INPUT_PARAMS,
+      activated_loras: [],
+      loras_multipliers: '',
+      delivery_resolution: undefined,
+      delivery_fit: undefined,
+      ...(H3_STUDIO_MODELS.has(state.params.model_type) ? {
+        num_inference_steps: undefined as unknown as number,
+        resolution: undefined as unknown as string,
+        custom_settings: undefined,
+        tea_cache: undefined,
+      } : {}),
+    },
+    savedParamsPerMode: {},
+    savedLoraPerMode: {},
+    savedPromptPerMode: {},
+    loraWeights: {},
+    availableLoras: [],
+    lorasLoading: false,
+    loraIdByFilename: {},
+    filenameByLoraId: {},
+    spatialUpsampling: '',
+    families: [],
+    models: [],
+    modelsLoaded: false,
+    modelOptions: null,
+    h3StyleWorkflowCatalog: null,
+    h3StyleWorkflowCatalogLoading: false,
+    h3StyleWorkflowCatalogError: null,
+    h3PerformanceProfiles: [],
+    h3CurrentEstimate: null,
+    h3SegmentCountEstimate: null,
+    h3EstimateLoading: false,
+    h3EstimateError: null,
+    h3ModelProfileCompatibility: {},
+    h3SelectedProfile: 'custom',
+    h3ProfileApplying: null,
+    modelOptionsLoading: false,
     startImage: null,
     endImage: null,
     continueVideo: null,
@@ -4734,6 +4896,12 @@ function _invalidateAccountRequests(): void {
   _accountSessionsRequestSequence += 1
   _accountUsersRequestSequence += 1
   _accountProjectMigrationRequestSequence += 1
+  _supportSelfRequestSequence += 1
+  _responsibleUseRequestSequence += 1
+  _responsibleUseAcceptanceSequence += 1
+  _supportAdminRequestSequence += 1
+  _supportH3LegalAccessRequestSequence += 1
+  _accountMutationRequestSequence += 1
 }
 
 function _beginAccountMutation(advanceIdentity = true): number {
@@ -5600,8 +5768,15 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
   sidebarOpen: false,
-  toggleSidebar: () => set(s => ({ sidebarOpen: !s.sidebarOpen })),
-  setSidebarOpen: (open) => set({ sidebarOpen: open }),
+  toggleSidebar: () => {
+    const open = !get().sidebarOpen
+    set({ sidebarOpen: open })
+    if (open && get().sidebarMode === 'studio') void get().applyCompletedEnhanceResult()
+  },
+  setSidebarOpen: (open) => {
+    set({ sidebarOpen: open })
+    if (open && get().sidebarMode === 'studio') void get().applyCompletedEnhanceResult()
+  },
   openQueueAfterSubmit: (() => {
     try { return localStorage.getItem('maestro:open-queue-after-submit') !== 'false' } catch { return true }
   })(),
@@ -7449,7 +7624,7 @@ export const useStore = create<AppState>((set, get) => ({
     if (h3StudioModel) {
       const primarySteps = Number(state.params.num_inference_steps)
       if (!Number.isInteger(primarySteps) || primarySteps < 2 || primarySteps > 50) {
-        window.alert('MiniMax H3 inference steps must be a whole number from 2 to 50. The default is 20.')
+        window.alert('MiniMax H3 inference steps must be a whole number from 2 to 50.')
         return
       }
       if (!h3AdaptiveConditioning && h3FixedRef2VA && h3HasFrameAnchors) {
@@ -9334,48 +9509,99 @@ export const useStore = create<AppState>((set, get) => ({
   presetsLoading: false,
 
   loadPresets: async () => {
+    const requestSequence = ++_presetLoadSequence
+    const accountIdentityEpoch = _accountIdentityEpoch
+    const workspace = get().activeWorkspace
+    if (!workspace) {
+      set({ presets: [], presetsLoading: false })
+      return
+    }
     set({ presetsLoading: true })
     try {
-      const { presets } = await api.fetchPresets()
-      set({ presets })
+      const { presets } = await api.fetchPresets(workspace)
+      if (
+        requestSequence === _presetLoadSequence
+        && accountIdentityEpoch === _accountIdentityEpoch
+        && get().activeWorkspace === workspace
+      ) {
+        for (const preset of presets) {
+          _presetScopes.set(preset, { accountIdentityEpoch, workspace })
+        }
+        set({ presets })
+      }
     } catch (e) {
-      console.error('Failed to load presets:', e)
+      if (requestSequence === _presetLoadSequence) {
+        console.error('Failed to load presets:', e)
+        set({ presets: [] })
+      }
     } finally {
-      set({ presetsLoading: false })
+      if (requestSequence === _presetLoadSequence) {
+        set({ presetsLoading: false })
+      }
     }
   },
 
   savePreset: async (name) => {
-    const { params, loraWeights, generationMode } = get()
-    try {
-      const preset = await api.createPreset({
-        name,
-        mode: generationMode,
-        model_type: params.model_type,
-        prompt: '',
-        activated_loras: params.activated_loras,
-        loras_multipliers: params.loras_multipliers,
-        lora_weights: loraWeights,
-        params: {
-          num_inference_steps: params.num_inference_steps,
-          guidance_scale: params.guidance_scale,
-          resolution: params.resolution,
-          seed: params.seed,
-          negative_prompt: params.negative_prompt,
-          flow_shift: params.flow_shift,
-          self_refiner_setting: params.self_refiner_setting,
-          stage2_steps: params.stage2_steps,
-          tea_cache: params.tea_cache,
-          custom_settings: _restorableH3CustomSettings(params.custom_settings),
-        },
-      })
-      set(s => ({ presets: [...s.presets, preset] }))
-    } catch (e) {
-      console.error('Failed to save preset:', e)
+    const {
+      params, loraWeights, generationMode, activeWorkspace, spatialUpsampling,
+    } = get()
+    const accountIdentityEpoch = _accountIdentityEpoch
+    const presetName = name.trim()
+    if (!activeWorkspace) {
+      throw new Error('Open a project before saving a preset.')
+    }
+    if (!presetName) {
+      throw new Error('Enter a preset name before saving.')
+    }
+    const preset = await api.createPreset(activeWorkspace, {
+      name: presetName,
+      mode: generationMode,
+      model_type: params.model_type,
+      activated_loras: params.activated_loras,
+      loras_multipliers: params.loras_multipliers,
+      lora_weights: loraWeights,
+      spatial_upsampling: spatialUpsampling,
+      params: {
+        num_inference_steps: params.num_inference_steps,
+        guidance_scale: params.guidance_scale,
+        resolution: params.resolution,
+        seed: params.seed,
+        flow_shift: params.flow_shift,
+        self_refiner_setting: params.self_refiner_setting,
+        stage2_steps: params.stage2_steps,
+        tea_cache: params.tea_cache,
+        delivery_resolution: params.delivery_resolution,
+        delivery_fit: params.delivery_fit,
+        custom_settings: _restorableH3CustomSettings(params.custom_settings),
+      },
+    })
+    if (
+      accountIdentityEpoch !== _accountIdentityEpoch
+      || get().activeWorkspace !== activeWorkspace
+    ) {
+      throw new Error('The active project changed before the preset save completed.')
+    }
+    _presetScopes.set(preset, { accountIdentityEpoch, workspace: activeWorkspace })
+    ++_presetLoadSequence
+    set(s => ({
+      presets: s.presets.some(existing => existing.id === preset.id)
+        ? s.presets.map(existing => existing.id === preset.id ? preset : existing)
+        : [...s.presets, preset],
+      presetsLoading: false,
+    }))
+    if (!get().presets.includes(preset)) {
+      throw new Error('The saved preset could not be confirmed in this project.')
     }
   },
 
   loadPreset: (preset) => {
+    const scope = _presetScopes.get(preset)
+    if (
+      !scope
+      || scope.accountIdentityEpoch !== _accountIdentityEpoch
+      || scope.workspace !== get().activeWorkspace
+      || !get().presets.includes(preset)
+    ) return
     ++_h3ProfileApplySeq
     ++_h3CompatibilitySeq
     ++_modelDefaultsSeq
@@ -9384,6 +9610,12 @@ export const useStore = create<AppState>((set, get) => ({
       activated_loras: preset.activated_loras,
       loras_multipliers: preset.loras_multipliers,
       ...(preset.params as Partial<GenerateParams>),
+      delivery_resolution: typeof preset.params.delivery_resolution === 'string'
+        ? preset.params.delivery_resolution
+        : undefined,
+      delivery_fit: typeof preset.params.delivery_fit === 'string'
+        ? preset.params.delivery_fit
+        : undefined,
     }
     if (preset.model_type.startsWith('minimax_h3')) {
       const restored = _restorableH3CustomSettings(newParams.custom_settings)
@@ -9402,18 +9634,25 @@ export const useStore = create<AppState>((set, get) => ({
         [s.generationMode]: preset.model_type,
       },
       loraWeights: preset.lora_weights || {},
+      spatialUpsampling: preset.spatial_upsampling || '',
       h3SelectedProfile: 'custom',
       h3ProfileApplying: null,
     }))
-    if (H3_STUDIO_MODELS.has(preset.model_type)) {
-      void get().normalizeH3EditableProfile()
-    }
+    // A saved preset is explicit authored state. Compatibility feedback may
+    // be refreshed later, but loading must not silently replace its exact
+    // steps or delivery chain with a catalog fallback.
   },
 
   deletePreset: async (id) => {
+    const workspace = get().activeWorkspace
+    const accountIdentityEpoch = _accountIdentityEpoch
+    if (!workspace) return
     try {
-      await api.deletePreset(id)
-      set(s => ({ presets: s.presets.filter(p => p.id !== id) }))
+      await api.deletePreset(id, workspace)
+      if (
+        accountIdentityEpoch === _accountIdentityEpoch
+        && get().activeWorkspace === workspace
+      ) set(s => ({ presets: s.presets.filter(p => p.id !== id) }))
     } catch (e) {
       console.error('Failed to delete preset:', e)
     }
@@ -9427,7 +9666,7 @@ export const useStore = create<AppState>((set, get) => ({
   h3SegmentCountEstimate: null,
   h3EstimateLoading: false,
   h3EstimateError: null,
-  h3SelectedProfile: 'high',
+  h3SelectedProfile: 'custom',
   h3ProfileApplying: null,
   h3ModelProfileCompatibility: {},
 
@@ -9595,6 +9834,7 @@ export const useStore = create<AppState>((set, get) => ({
   loadModelOptions: async (modelType) => {
     const seq = ++_modelOptionsSeq
     const defaultsSeq = _modelDefaultsSeq
+    const accountIdentityEpoch = _accountIdentityEpoch
     set({ modelOptionsLoading: true })
     try {
       const options = await api.fetchModelOptions(modelType)
@@ -9603,7 +9843,11 @@ export const useStore = create<AppState>((set, get) => ({
       // that jumped models). Applying a superseded response would clobber
       // params (default steps/guidance) and modelOptions with the WRONG
       // model's values — last requested wins.
-      if (seq !== _modelOptionsSeq) return
+      if (
+        seq !== _modelOptionsSeq
+        || accountIdentityEpoch !== _accountIdentityEpoch
+        || get().params.model_type !== modelType
+      ) return
       const { durationSeconds, slidingWindowSeconds, slidingWindowLocked } = get()
       const fps = options.fps || 16
       // Set overlap from model defaults
@@ -9646,11 +9890,24 @@ export const useStore = create<AppState>((set, get) => ({
         sliding_window_overlap: overlapDefault,
         sliding_window_discard_last_frames: discardDefault,
       }
-      // Apply model defaults for inference steps and guidance scale
-      if (defaultsSeq === _modelDefaultsSeq && options.default_num_inference_steps != null) {
+      // H3 primaries are role-aware and belong exclusively to /defaults.
+      // The model-options values are static catalog fallbacks; allowing them
+      // to race /defaults makes response order change non-owner Quality 23
+      // back to the owner-oriented 28-step value. Other model families keep
+      // their established model-options fallback.
+      const modelOptionsOwnPrimaryDefaults = !H3_STUDIO_MODELS.has(modelType)
+      if (
+        defaultsSeq === _modelDefaultsSeq
+        && modelOptionsOwnPrimaryDefaults
+        && options.default_num_inference_steps != null
+      ) {
         paramUpdates.num_inference_steps = options.default_num_inference_steps
       }
-      if (defaultsSeq === _modelDefaultsSeq && options.default_guidance_scale != null) {
+      if (
+        defaultsSeq === _modelDefaultsSeq
+        && modelOptionsOwnPrimaryDefaults
+        && options.default_guidance_scale != null
+      ) {
         paramUpdates.guidance_scale = options.default_guidance_scale
       }
       // TTS default duration. Prefer the model's declared `default` (DramaBox
@@ -9700,7 +9957,11 @@ export const useStore = create<AppState>((set, get) => ({
     } catch {
       // Same staleness rule as the success path — a superseded request's
       // failure must not null out the newer request's options.
-      if (seq === _modelOptionsSeq) {
+      if (
+        seq === _modelOptionsSeq
+        && accountIdentityEpoch === _accountIdentityEpoch
+        && get().params.model_type === modelType
+      ) {
         set({ modelOptions: null, modelOptionsLoading: false })
       }
     }
@@ -9737,6 +9998,7 @@ export const useStore = create<AppState>((set, get) => ({
       _responsibleUseRequestSequence += 1
       _responsibleUseAcceptanceSequence += 1
       _supportAdminRequestSequence += 1
+      _supportH3LegalAccessRequestSequence += 1
     } else if (supportAdminUnavailable) {
       _supportAdminRequestSequence += 1
     }
@@ -9755,6 +10017,9 @@ export const useStore = create<AppState>((set, get) => ({
         accountDetailsLoading: false,
         supportSelf: null,
         responsibleUse: null,
+        supportH3LegalAccess: null,
+        supportH3LegalAccessLoading: false,
+        supportH3LegalAccessError: null,
         supportAdminAccountId: null,
         supportAdmin: null,
         supportDetailsLoading: false,
@@ -9767,6 +10032,9 @@ export const useStore = create<AppState>((set, get) => ({
     })
     if (accountIdentityChanged && refreshProjectsOnIdentityChange) {
       await get().loadWorkspaces()
+      const modelType = get().params.model_type
+      _applyModelDefaults(get, set, modelType, { omittedOnly: true })
+      void get().loadModelOptions(modelType)
     }
     return context
   },
@@ -9783,6 +10051,9 @@ export const useStore = create<AppState>((set, get) => ({
   supportCatalogUnavailable: false,
   supportSelf: null,
   responsibleUse: null,
+  supportH3LegalAccess: null,
+  supportH3LegalAccessLoading: false,
+  supportH3LegalAccessError: null,
   supportAdminAccountId: null,
   supportAdmin: null,
   supportDetailsLoading: false,
@@ -9823,6 +10094,9 @@ export const useStore = create<AppState>((set, get) => ({
         accountUsers: [],
         supportSelf: null,
         responsibleUse: null,
+        supportH3LegalAccess: null,
+        supportH3LegalAccessLoading: false,
+        supportH3LegalAccessError: null,
         supportAdminAccountId: null,
         supportAdmin: null,
         supportDetailsLoading: false,
@@ -9856,6 +10130,7 @@ export const useStore = create<AppState>((set, get) => ({
         _responsibleUseRequestSequence += 1
         _responsibleUseAcceptanceSequence += 1
         _supportAdminRequestSequence += 1
+        _supportH3LegalAccessRequestSequence += 1
       } else if (supportAdminUnavailable) {
         _supportAdminRequestSequence += 1
       }
@@ -9876,6 +10151,9 @@ export const useStore = create<AppState>((set, get) => ({
             accountDetailsLoading: false,
             supportSelf: null,
             responsibleUse: null,
+            supportH3LegalAccess: null,
+            supportH3LegalAccessLoading: false,
+            supportH3LegalAccessError: null,
             supportAdminAccountId: null,
             supportAdmin: null,
             supportDetailsLoading: false,
@@ -9893,6 +10171,9 @@ export const useStore = create<AppState>((set, get) => ({
       })
       if (accountIdentityChanged && refreshProjectsOnIdentityChange) {
         await get().loadWorkspaces()
+        const modelType = get().params.model_type
+        _applyModelDefaults(get, set, modelType, { omittedOnly: true })
+        void get().loadModelOptions(modelType)
       }
       return context
     } catch (error) {
@@ -10006,6 +10287,9 @@ export const useStore = create<AppState>((set, get) => ({
     ) return null
     const resolvedIdentityEpoch = _accountIdentityEpoch
     await get().loadWorkspaces()
+    const modelType = get().params.model_type
+    _applyModelDefaults(get, set, modelType, { omittedOnly: true })
+    void get().loadModelOptions(modelType)
     if (
       mutationSequence !== _accountMutationRequestSequence
       || !_accountIdentityIsCurrent(resolvedIdentityEpoch)
@@ -10039,6 +10323,9 @@ export const useStore = create<AppState>((set, get) => ({
     await get().loadAccountContext(false).catch(() => null)
     if (mutationSequence !== _accountMutationRequestSequence) return result
     await get().loadWorkspaces()
+    const modelType = get().params.model_type
+    _applyModelDefaults(get, set, modelType, { omittedOnly: true })
+    void get().loadModelOptions(modelType)
     if (mutationSequence !== _accountMutationRequestSequence) return result
     await Promise.all([
       get().loadAccountSessions().catch(() => undefined),
@@ -10063,6 +10350,7 @@ export const useStore = create<AppState>((set, get) => ({
     _responsibleUseRequestSequence += 1
     _responsibleUseAcceptanceSequence += 1
     _supportAdminRequestSequence += 1
+    _supportH3LegalAccessRequestSequence += 1
     set(state => ({
       accountContext: state.accountContext
         ? {
@@ -10081,12 +10369,20 @@ export const useStore = create<AppState>((set, get) => ({
       accountDetailsLoading: false,
       supportSelf: null,
       responsibleUse: null,
+      supportH3LegalAccess: null,
+      supportH3LegalAccessLoading: false,
+      supportH3LegalAccessError: null,
       supportAdminAccountId: null,
       supportAdmin: null,
       supportDetailsLoading: false,
     }))
     await get().loadAccountContext(false).catch(() => null)
-    if (mutationSequence === _accountMutationRequestSequence) await get().loadWorkspaces()
+    if (mutationSequence === _accountMutationRequestSequence) {
+      await get().loadWorkspaces()
+      const modelType = get().params.model_type
+      _applyModelDefaults(get, set, modelType, { omittedOnly: true })
+      void get().loadModelOptions(modelType)
+    }
   },
   reauthenticateAccount: async (password) => {
     const mutationSequence = _beginAccountMutation(false)
@@ -10128,6 +10424,9 @@ export const useStore = create<AppState>((set, get) => ({
     ) return null
     const resolvedIdentityEpoch = _accountIdentityEpoch
     await get().loadWorkspaces()
+    const modelType = get().params.model_type
+    _applyModelDefaults(get, set, modelType, { omittedOnly: true })
+    void get().loadModelOptions(modelType)
     if (
       mutationSequence !== _accountMutationRequestSequence
       || !_accountIdentityIsCurrent(resolvedIdentityEpoch)
@@ -10378,6 +10677,126 @@ export const useStore = create<AppState>((set, get) => ({
     } catch (error) {
       if (requestSequence === _supportSelfRequestSequence) {
         set({ supportSelf: null, supportDetailsLoading: false })
+      }
+      throw error
+    }
+  },
+  loadH3LegalAccessState: async () => {
+    const context = get().accountContext
+    const accountId = context?.authenticated === true ? context.account?.id : null
+    const authorized = context?.authenticated === true
+      && context.account?.role === 'owner'
+      && context.reauthenticated === true
+      && context.capabilities.includes('account.self')
+      && context.capabilities.includes('accounts.admin')
+      && context.capabilities.includes('services.admin')
+    if (!authorized || !accountId) {
+      _supportH3LegalAccessRequestSequence += 1
+      set({
+        supportH3LegalAccess: null,
+        supportH3LegalAccessLoading: false,
+        supportH3LegalAccessError: null,
+      })
+      return null
+    }
+    const requestSequence = ++_supportH3LegalAccessRequestSequence
+    set({ supportH3LegalAccessLoading: true, supportH3LegalAccessError: null })
+    try {
+      const projection = await api.fetchH3LegalAccessState()
+      if (requestSequence !== _supportH3LegalAccessRequestSequence) return null
+      const current = get().accountContext
+      const stillAuthorized = current?.authenticated === true
+        && current.account?.id === accountId
+        && current.account?.role === 'owner'
+        && current.reauthenticated === true
+        && current.capabilities.includes('account.self')
+        && current.capabilities.includes('accounts.admin')
+        && current.capabilities.includes('services.admin')
+      if (!stillAuthorized) {
+        set({
+          supportH3LegalAccess: null,
+          supportH3LegalAccessLoading: false,
+          supportH3LegalAccessError: null,
+        })
+        return null
+      }
+      set({
+        supportH3LegalAccess: projection,
+        supportH3LegalAccessLoading: false,
+      })
+      return projection
+    } catch (error) {
+      if (requestSequence === _supportH3LegalAccessRequestSequence) {
+        set({
+          supportH3LegalAccess: null,
+          supportH3LegalAccessLoading: false,
+          supportH3LegalAccessError: error instanceof api.AccountApiError
+            ? error.message
+            : 'H3 legal-access location could not be refreshed.',
+        })
+      }
+      throw error
+    }
+  },
+  setH3LegalAccessLocation: async (input) => {
+    const context = get().accountContext
+    const accountId = context?.authenticated === true ? context.account?.id : null
+    const mutationEpoch = ++_supportH3LegalAccessRequestSequence
+    const authorized = context?.authenticated === true
+      && context.account?.role === 'owner'
+      && context.reauthenticated === true
+      && context.capabilities.includes('account.self')
+      && context.capabilities.includes('accounts.admin')
+      && context.capabilities.includes('services.admin')
+    if (!authorized || !accountId) {
+      set({
+        supportH3LegalAccessError: 'Sign in as a reauthenticated owner to update H3 location.',
+        supportH3LegalAccessLoading: false,
+      })
+      throw new Error('Sign in as a reauthenticated owner to update H3 location.')
+    }
+    set({ supportH3LegalAccessLoading: true, supportH3LegalAccessError: null })
+    try {
+      const projection = await api.setH3LegalAccessLocation(input)
+      if (mutationEpoch !== _supportH3LegalAccessRequestSequence) return null
+      const current = get().accountContext
+      const stillAuthorized = current?.authenticated === true
+        && current.account?.id === accountId
+        && current.account?.role === 'owner'
+        && current.reauthenticated === true
+        && current.capabilities.includes('account.self')
+        && current.capabilities.includes('accounts.admin')
+        && current.capabilities.includes('services.admin')
+      if (!stillAuthorized) {
+        set({
+          supportH3LegalAccess: null,
+          supportH3LegalAccessLoading: false,
+          supportH3LegalAccessError: null,
+        })
+        throw new Error('Owner access changed while updating H3 legal-access location.')
+      }
+      set({
+        supportH3LegalAccess: projection,
+        supportH3LegalAccessLoading: false,
+      })
+      return projection
+    } catch (error) {
+      if (mutationEpoch === _supportH3LegalAccessRequestSequence) {
+        if (error instanceof api.AccountApiError && (error.status === 401 || error.status === 403)) {
+          _supportH3LegalAccessRequestSequence += 1
+          set({
+            supportH3LegalAccess: null,
+            supportH3LegalAccessError: error.message || 'Owner authorization could not be confirmed.',
+            supportH3LegalAccessLoading: false,
+          })
+        } else {
+          set({
+            supportH3LegalAccessError: error instanceof Error
+              ? error.message
+              : 'H3 legal-access location could not be updated.',
+            supportH3LegalAccessLoading: false,
+          })
+        }
       }
       throw error
     }
@@ -10938,11 +11357,13 @@ export const useStore = create<AppState>((set, get) => ({
   isEnhancing: false,
   enhanceStatus: null,
   enhanceRequestScope: null,
+  enhanceQueueCard: null,
   studioPromptEnhance: false,
   setStudioPromptEnhance: (enabled) => set({ studioPromptEnhance: enabled }),
   enhancePrompt: async (ttsMode?: string) => {
     const { params, generationMode, startImage, imageRefs, activeWorkspace } = get()
     if (!params.prompt.trim()) return false
+    const requestId = api.createLlmRequestId()
     const accountIdentityEpoch = _accountIdentityEpoch
     const accountFingerprint = _enhanceAccountFingerprint(get())
     const promptEditGeneration = _enhancePromptEditGeneration
@@ -10958,9 +11379,35 @@ export const useStore = create<AppState>((set, get) => ({
     let submissionAttempted = false
     let durableRecoveryStored = false
     let settingsFingerprint = ''
-    set({ isEnhancing: true, enhanceStatus: null, enhanceRequestScope: null })
+    const updateQueueCard = (partial: Partial<PromptEnhanceQueueCardState>) => {
+      set(state => ({
+        enhanceQueueCard: state.enhanceQueueCard?.requestId === requestId
+          ? { ...state.enhanceQueueCard, ...partial }
+          : state.enhanceQueueCard,
+      }))
+    }
+    set({
+      isEnhancing: true,
+      enhanceStatus: null,
+      enhanceRequestScope: null,
+      enhanceQueueCard: {
+        requestId,
+        workspace: activeWorkspace,
+        scope: null,
+        phase: 'preparing',
+        status: null,
+        result: null,
+        resultApplied: false,
+        error: null,
+        accountFingerprint,
+        settingsFingerprint: null,
+        promptEditGeneration,
+        ...(ttsMode ? { ttsMode } : {}),
+      },
+    })
     try {
       settingsFingerprint = await _enhanceSettingsFingerprint(requestState)
+      updateQueueCard({ settingsFingerprint })
       if (
         !lifecycle.ownsWorkspace()
         || _enhancePromptEditGeneration !== promptEditGeneration
@@ -10973,11 +11420,12 @@ export const useStore = create<AppState>((set, get) => ({
         throw new api.LlmEnhanceScopeError('Could not open this project for Prompt Enhance')
       }
       scope = {
-        requestId: api.createLlmRequestId(),
+        requestId,
         workspace: activeWorkspace,
         projectInstance: catalog.project_instance,
       }
       set({ enhanceRequestScope: scope })
+      updateQueueCard({ scope })
 
       // Collect images relevant to the CURRENT mode only
       const imagePaths: string[] = []
@@ -11075,7 +11523,10 @@ export const useStore = create<AppState>((set, get) => ({
             lifecycle.ownsWorkspace()
             && scope
             && _sameEnhanceScope(get().enhanceRequestScope, scope)
-          ) set({ enhanceStatus: status })
+          ) {
+            set({ enhanceStatus: status })
+            updateQueueCard({ phase: 'preparing', status, error: null })
+          }
         },
         onSubmissionAttempted: async () => {
           if (
@@ -11107,7 +11558,15 @@ export const useStore = create<AppState>((set, get) => ({
             lifecycle.ownsWorkspace()
             && scope
             && _sameEnhanceScope(get().enhanceRequestScope, scope)
-          ) set({ enhanceStatus: _terminalEnhanceStatus(status) })
+          ) {
+            const terminalStatus = _terminalEnhanceStatus(status)
+            set({ enhanceStatus: terminalStatus })
+            updateQueueCard({
+              phase: _enhanceQueueCardPhase(status),
+              status: terminalStatus,
+              error: status.error?.message ?? null,
+            })
+          }
         },
       })
       if (
@@ -11124,12 +11583,28 @@ export const useStore = create<AppState>((set, get) => ({
         || !inputsRemainCurrent()
       ) {
         await _removeStoredEnhanceOperation(scope)
+        updateQueueCard({
+          phase: 'failed',
+          status: null,
+          result: null,
+          error: 'This result no longer matches the current Generate inputs.',
+        })
         return false
       }
-      await _removeStoredEnhanceOperation(scope)
+      const resultApplied = _generatePromptSurfaceIsVisible(get())
+      if (resultApplied) await _removeStoredEnhanceOperation(scope)
       set(s => ({
-        params: { ...s.params, prompt: result.enhanced },
+        ...(resultApplied ? { params: { ...s.params, prompt: result.enhanced } } : {}),
         enhanceStatus: null,
+        enhanceQueueCard: s.enhanceQueueCard?.requestId === requestId
+          ? {
+              ...s.enhanceQueueCard,
+              phase: 'completed',
+              result,
+              resultApplied,
+              error: null,
+            }
+          : s.enhanceQueueCard,
       }))
       // Auto-parse speaker names from the enhanced text whenever there are
       // voice slots to fill. Previously gated to dialogue mode only; the user
@@ -11137,7 +11612,7 @@ export const useStore = create<AppState>((set, get) => ({
       // voice slot 1 with "Peter". `force=true` overrides the manual flag
       // — enhance creates a fresh script, so previous user-edited names are
       // no longer relevant.
-      if (ttsMode && get().ttsVoiceCount > 0) {
+      if (resultApplied && ttsMode && get().ttsVoiceCount > 0) {
         get()._autoParseSpkeakerNames(result.enhanced, true)
       }
       return true
@@ -11153,17 +11628,26 @@ export const useStore = create<AppState>((set, get) => ({
       }
       if (e instanceof api.LlmEnhanceScopeError) return false
       console.error('Failed to enhance prompt:', e)
+      updateQueueCard({
+        phase: e instanceof api.LlmEnhanceWaitError && submissionAttempted ? 'running' : 'failed',
+        error: e instanceof Error ? e.message : 'Prompt enhancement failed',
+      })
       window.alert(reloadRecoveryUnavailable
         ? 'Prompt Enhance stopped waiting. This browser could not reserve private reload recovery, so reloading will not resume this request. You can try Prompt Enhance again.'
         : (e instanceof Error ? e.message : 'Prompt enhancement failed'))
       return false
     } finally {
       if (lifecycle.ownsWorkspace()) {
-        set({
+        set(state => ({
           isEnhancing: false,
           enhanceStatus: null,
           enhanceRequestScope: null,
-        })
+          enhanceQueueCard: !submissionAttempted
+            && state.enhanceQueueCard?.requestId === requestId
+            && state.enhanceQueueCard.phase === 'preparing'
+            ? null
+            : state.enhanceQueueCard,
+        }))
       }
       lifecycle.dispose()
     }
@@ -11201,10 +11685,30 @@ export const useStore = create<AppState>((set, get) => ({
     const promptEditGeneration = _enhancePromptEditGeneration
     const lifecycle = _beginEnhanceLlmRequest(scope.workspace)
     _enhanceSubmissionAttemptedRequestId = scope.requestId
+    const updateQueueCard = (partial: Partial<PromptEnhanceQueueCardState>) => {
+      set(state => ({
+        enhanceQueueCard: state.enhanceQueueCard?.requestId === scope.requestId
+          ? { ...state.enhanceQueueCard, ...partial }
+          : state.enhanceQueueCard,
+      }))
+    }
     set({
       isEnhancing: true,
       enhanceStatus: null,
       enhanceRequestScope: scope,
+      enhanceQueueCard: {
+        requestId: scope.requestId,
+        workspace: scope.workspace,
+        scope,
+        phase: 'queued',
+        status: null,
+        result: null,
+        resultApplied: false,
+        error: null,
+        accountFingerprint: stored.accountFingerprint,
+        settingsFingerprint: stored.settingsFingerprint,
+        promptEditGeneration,
+      },
     })
     try {
       const result = await api.resumeLlmEnhancePrompt(scope, {
@@ -11213,7 +11717,15 @@ export const useStore = create<AppState>((set, get) => ({
           if (
             lifecycle.ownsWorkspace()
             && _sameEnhanceScope(get().enhanceRequestScope, scope)
-          ) set({ enhanceStatus: _terminalEnhanceStatus(status) })
+          ) {
+            const terminalStatus = _terminalEnhanceStatus(status)
+            set({ enhanceStatus: terminalStatus })
+            updateQueueCard({
+              phase: _enhanceQueueCardPhase(status),
+              status: terminalStatus,
+              error: status.error?.message ?? null,
+            })
+          }
         },
       })
       if (
@@ -11228,6 +11740,12 @@ export const useStore = create<AppState>((set, get) => ({
         || (await _enhanceSettingsFingerprint(get())) !== stored.settingsFingerprint
       ) {
         await _removeStoredEnhanceOperation(scope)
+        updateQueueCard({
+          phase: 'failed',
+          status: null,
+          result: null,
+          error: 'This recovered result no longer matches the current Generate inputs.',
+        })
         if (_enhanceFingerprintClaimRotatedStored) {
           window.alert(
             'Prompt Enhance recovery was not applied because this tab could not exclusively reclaim its original private recovery key. The prior result was left unchanged.',
@@ -11235,12 +11753,22 @@ export const useStore = create<AppState>((set, get) => ({
         }
         return false
       }
-      await _removeStoredEnhanceOperation(scope)
+      const resultApplied = _generatePromptSurfaceIsVisible(get())
+      if (resultApplied) await _removeStoredEnhanceOperation(scope)
       set(state => ({
-        params: { ...state.params, prompt: result.enhanced },
+        ...(resultApplied ? { params: { ...state.params, prompt: result.enhanced } } : {}),
         enhanceStatus: null,
+        enhanceQueueCard: state.enhanceQueueCard?.requestId === scope.requestId
+          ? {
+              ...state.enhanceQueueCard,
+              phase: 'completed',
+              result,
+              resultApplied,
+              error: null,
+            }
+          : state.enhanceQueueCard,
       }))
-      if (get().generationMode === 'audio' && get().ttsVoiceCount > 0) {
+      if (resultApplied && get().generationMode === 'audio' && get().ttsVoiceCount > 0) {
         get()._autoParseSpkeakerNames(result.enhanced, true)
       }
       return true
@@ -11251,6 +11779,10 @@ export const useStore = create<AppState>((set, get) => ({
       }
       if (!(error instanceof api.LlmEnhanceScopeError)) {
         console.error('Failed to resume prompt enhancement:', error)
+        updateQueueCard({
+          phase: error instanceof api.LlmEnhanceWaitError ? 'running' : 'failed',
+          error: error instanceof Error ? error.message : 'Prompt enhancement failed',
+        })
         window.alert(error instanceof Error ? error.message : 'Prompt enhancement failed')
       }
       return false
@@ -11279,7 +11811,7 @@ export const useStore = create<AppState>((set, get) => ({
     if (!scope) {
       if (get().isEnhancing) {
         _enhanceStopWaiting?.()
-        set({ isEnhancing: false, enhanceStatus: null, enhanceRequestScope: null })
+        set({ isEnhancing: false, enhanceStatus: null, enhanceRequestScope: null, enhanceQueueCard: null })
       }
       return
     }
@@ -11289,7 +11821,7 @@ export const useStore = create<AppState>((set, get) => ({
       && _enhanceSubmissionAttemptedRequestId !== scope.requestId
     ) {
       _enhanceStopWaiting?.()
-      set({ isEnhancing: false, enhanceStatus: null, enhanceRequestScope: null })
+      set({ isEnhancing: false, enhanceStatus: null, enhanceRequestScope: null, enhanceQueueCard: null })
       await _removeStoredEnhanceOperation(scope)
       return
     }
@@ -11307,7 +11839,59 @@ export const useStore = create<AppState>((set, get) => ({
     }
     await _removeStoredEnhanceOperation(scope)
     _enhanceStopWaiting?.()
-    set({ isEnhancing: false, enhanceStatus: null, enhanceRequestScope: null })
+    set({ isEnhancing: false, enhanceStatus: null, enhanceRequestScope: null, enhanceQueueCard: null })
+  },
+  applyCompletedEnhanceResult: async () => {
+    const card = get().enhanceQueueCard
+    if (
+      !card
+      || card.phase !== 'completed'
+      || !card.result
+      || !card.settingsFingerprint
+      || card.workspace !== get().activeWorkspace
+      || card.accountFingerprint !== _enhanceAccountFingerprint(get())
+      || card.promptEditGeneration !== _enhancePromptEditGeneration
+    ) return false
+    const expectedPrompt = card.resultApplied ? card.result.enhanced : card.result.original
+    if (get().params.prompt !== expectedPrompt) return false
+    if ((await _enhanceSettingsFingerprint(get())) !== card.settingsFingerprint) return false
+    const current = get().enhanceQueueCard
+    if (
+      !current
+      || !current.result
+      || current.requestId !== card.requestId
+      || current.workspace !== get().activeWorkspace
+      || current.accountFingerprint !== _enhanceAccountFingerprint(get())
+      || current.promptEditGeneration !== _enhancePromptEditGeneration
+      || get().params.prompt !== expectedPrompt
+    ) return false
+    const currentResult = current.result
+    if (!current.resultApplied) {
+      set(state => ({
+        params: { ...state.params, prompt: currentResult.enhanced },
+        enhanceQueueCard: state.enhanceQueueCard?.requestId === current.requestId
+          ? { ...state.enhanceQueueCard, resultApplied: true }
+          : state.enhanceQueueCard,
+      }))
+      if (current.ttsMode && get().ttsVoiceCount > 0) {
+        get()._autoParseSpkeakerNames(currentResult.enhanced, true)
+      }
+      if (current.scope) await _removeStoredEnhanceOperation(current.scope)
+    }
+    return true
+  },
+  useCompletedEnhanceAndGenerate: async () => {
+    const card = get().enhanceQueueCard
+    if (!card || card.phase !== 'completed' || !card.result) return false
+    if (get().sidebarMode !== 'studio') get().setSidebarMode('studio')
+    if (!get().sidebarOpen) get().setSidebarOpen(true)
+    if (!await get().applyCompletedEnhanceResult()) {
+      window.alert('This Prompt Enhance result no longer matches the current Generate inputs.')
+      return false
+    }
+    set({ studioPromptEnhance: false })
+    await get().startGeneration()
+    return true
   },
 
   // Director (Music Video Director)
@@ -11983,6 +12567,7 @@ export const useStore = create<AppState>((set, get) => ({
         referenceReturnMode: transition.referenceReturnMode,
       })
     }
+    if (transition.sidebarMode === 'studio') void get().applyCompletedEnhanceResult()
   },
 
   directorUploadAndAnalyze: async (file) => {
@@ -13705,6 +14290,8 @@ export const useStore = create<AppState>((set, get) => ({
           gallerySelectionMode: false,
           ...(projectChanged || previousAccessRevoked ? {
             browsingUploads: false,
+            presets: [],
+            presetsLoading: false,
             outputs: [],
             outputsTotal: 0,
             selectedOutput: 0,
@@ -13738,6 +14325,9 @@ export const useStore = create<AppState>((set, get) => ({
         ...(projectChanged && previousActive ? [previousActive] : []),
         ...(previousAccessRevoked ? [previousActive] : []),
       ])) hidePrivatePreviewsForWorkspace(workspace)
+      if ((projectChanged || previousAccessRevoked) && data.active) {
+        void get().loadPresets()
+      }
       // Reload recovery retains only opaque request fences. Resume status
       // waiting after the authoritative active project has been restored.
       void get().resumeEnhancePrompt()
@@ -13776,6 +14366,7 @@ export const useStore = create<AppState>((set, get) => ({
       set({
         browsingUploads: false,
         activeWorkspace: name,
+        presets: [],
         outputs: [],
         outputsTotal: 0,
         selectedOutput: 0,
@@ -13791,6 +14382,7 @@ export const useStore = create<AppState>((set, get) => ({
         dashboardSelectedPipeline: null,
         dashboardLoading: false,
       })
+      void get().loadPresets()
       const loaded = await get().loadOutputs()
       void get().loadWorkspaces()
       return loaded && get().activeWorkspace === name && !get().browsingUploads
@@ -13818,6 +14410,7 @@ export const useStore = create<AppState>((set, get) => ({
       set({
         browsingUploads: false,
         activeWorkspace: name,
+        presets: [],
         outputs: [],
         outputsTotal: 0,
         selectedOutput: 0,
@@ -13833,6 +14426,7 @@ export const useStore = create<AppState>((set, get) => ({
         dashboardSelectedPipeline: null,
         dashboardLoading: false,
       })
+      void get().loadPresets()
       get().loadOutputs()
       get().loadWorkspaces()
     } catch (e) {
@@ -13887,6 +14481,8 @@ export const useStore = create<AppState>((set, get) => ({
       _dashboardPipelineListLoadToken += 1
       set({
         browsingUploads: false,
+        presets: [],
+        presetsLoading: false,
         outputs: [],
         outputsTotal: 0,
         selectedOutput: 0,
@@ -13942,6 +14538,8 @@ export const useStore = create<AppState>((set, get) => ({
         ...(lockedActiveWorkspace && state.accessContext?.remote ? { activeWorkspace: '' } : {}),
         ...(lockedActiveWorkspace ? {
           browsingUploads: false,
+          presets: [],
+          presetsLoading: false,
           outputs: [],
           outputsTotal: 0,
           selectedOutput: 0,
@@ -13992,6 +14590,8 @@ export const useStore = create<AppState>((set, get) => ({
       set({
         browsingUploads: false,
         activeWorkspace: 'default',
+        presets: [],
+        presetsLoading: false,
         outputs: [],
         outputsTotal: 0,
         selectedOutput: 0,
@@ -14007,6 +14607,7 @@ export const useStore = create<AppState>((set, get) => ({
         dashboardSelectedPipeline: null,
         dashboardLoading: false,
       })
+      void get().loadPresets()
       get().loadOutputs()
     }
     get().loadWorkspaces()
@@ -15911,3 +16512,12 @@ export const useStore = create<AppState>((set, get) => ({
     setTimeout(poll, 1000)
   },
 }))
+
+useStore.subscribe(state => {
+  const card = state.enhanceQueueCard
+  if (!card) return
+  if (
+    card.workspace !== state.activeWorkspace
+    || card.accountFingerprint !== _enhanceAccountFingerprint(state)
+  ) useStore.setState({ enhanceQueueCard: null })
+})
