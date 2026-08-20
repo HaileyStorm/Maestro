@@ -117,6 +117,7 @@ class H3OomReliefTests(unittest.TestCase):
         self.assertEqual(mid_denoise["resolution"], "640x1152")
         self.assertEqual(mid_denoise["num_inference_steps"], 23)
         self.assertEqual(mid_denoise["reason"], "next_native_canvas")
+        self.assertTrue(mid_denoise["record_denial"])
 
     def test_mid_denoise_near_miss_nibbles_after_same_setup_and_offload(self):
         same = decide_h3_oom_relief(
@@ -156,6 +157,7 @@ class H3OomReliefTests(unittest.TestCase):
         self.assertEqual(nibble["resolution"], "768x1344")
         self.assertEqual(nibble["num_inference_steps"], 48)
         self.assertEqual(nibble["reason"], "keep_canvas_fewer_steps")
+        self.assertTrue(nibble["record_denial"])
 
         next_nibble = decide_h3_oom_relief(
             resolution="768x1344",
@@ -264,6 +266,38 @@ class H3OomReliefTests(unittest.TestCase):
         self.assertTrue(all(steps >= 23 for _res, steps in seen))
         self.assertTrue(all("x" in res and "1920" not in res for res, _steps in seen))
         self.assertTrue(all(res != "768x1024" for res, _steps in seen))
+
+    def test_invalid_step_now_is_same_setup_not_exhaustion(self):
+        for step_now in (None, "load", "", "step-0", object()):
+            with self.subTest(step_now=step_now):
+                nxt = decide_h3_oom_relief(
+                    resolution="768x1344",
+                    num_inference_steps=50,
+                    intent_steps=50,
+                    attempt=0,
+                    step_now=step_now,
+                    same_setup_retries=0,
+                    offload_profile=4.5,
+                )
+                self.assertIsNotNone(nxt)
+                self.assertEqual(nxt["reason"], "same_setup_after_unwind")
+                self.assertEqual(nxt["resolution"], "768x1344")
+                self.assertEqual(nxt["num_inference_steps"], 50)
+                self.assertFalse(nxt["record_denial"])
+
+        after_same = decide_h3_oom_relief(
+            resolution="768x1344",
+            num_inference_steps=50,
+            intent_steps=50,
+            attempt=3,
+            step_now="load",
+            same_setup_retries=1,
+            offload_profile=5,
+        )
+        self.assertEqual(after_same["reason"], "keep_canvas_fewer_steps")
+        self.assertEqual(after_same["num_inference_steps"], 48)
+        self.assertFalse(after_same["record_denial"])
+        self.assertNotEqual(after_same["reason"], "next_native_canvas")
 
     def test_exhausted_relief_returns_none(self):
         self.assertIsNone(

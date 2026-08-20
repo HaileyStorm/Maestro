@@ -308,6 +308,45 @@ class H3HostLimitTests(unittest.TestCase):
         self.assertEqual(denied.reason, USER_SETUP_UNSUPPORTED)
         self.assertNotIn("prompt", denied.reason.casefold())
 
+    def test_double_persist_is_idempotent_and_invalid_retry_does_not_recover(self):
+        kwargs = dict(
+            model_type="minimax_h3_ref2va",
+            resolution="768x1344",
+            num_inference_steps=50,
+            duration_seconds=10,
+            attention_engine="sdpa",
+            path=self.path,
+            epoch=FIXED_EPOCH,
+        )
+        record_denoise_failure(after_unwind=True, step_now=19, **kwargs)
+        first = evaluate_setup(**kwargs)
+        record_denoise_failure(after_unwind=True, step_now=19, **kwargs)
+        second = evaluate_setup(**kwargs)
+        self.assertFalse(first.runnable)
+        self.assertEqual(first.reason, second.reason)
+        self.assertEqual(first.max_steps, second.max_steps)
+        self.assertEqual(second.reason, USER_SETUP_UNSUPPORTED)
+
+        record_denoise_failure(after_unwind=True, **kwargs)
+        record_denoise_failure(after_unwind=True, step_now=0, **kwargs)
+        record_denoise_failure(after_unwind=True, step_now="load", **kwargs)
+        record_denoise_failure(after_unwind=False, step_now=19, **kwargs)
+        still_denied = evaluate_setup(**kwargs)
+        self.assertFalse(still_denied.runnable)
+        self.assertEqual(still_denied.reason, USER_SETUP_UNSUPPORTED)
+        self.assertEqual(still_denied.max_steps, first.max_steps)
+
+        record_denoise_success(**kwargs)
+        recovered = evaluate_setup(**kwargs)
+        self.assertTrue(recovered.runnable)
+        self.assertIsNone(recovered.reason)
+
+        record_denoise_failure(after_unwind=True, step_now=None, **kwargs)
+        record_denoise_failure(after_unwind=True, step_now="load", **kwargs)
+        still_open = evaluate_setup(**kwargs)
+        self.assertTrue(still_open.runnable)
+        self.assertIsNone(still_open.reason)
+
 
 if __name__ == "__main__":
     unittest.main()

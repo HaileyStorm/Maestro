@@ -227,10 +227,15 @@ def decide_h3_oom_relief(
         return None
     try:
         steps = int(num_inference_steps)
-        step_index = int(step_now)
         same_retries = int(same_setup_retries)
     except (TypeError, ValueError):
         return None
+    try:
+        # Missing or unparseable progress is a load/contention OOM, not a
+        # finished-quality failure. Do not treat it as relief exhaustion.
+        step_index = 0 if step_now is None else int(step_now)
+    except (TypeError, ValueError):
+        step_index = 0
     if steps < 2:
         return None
     original_steps = int(intent_steps or steps)
