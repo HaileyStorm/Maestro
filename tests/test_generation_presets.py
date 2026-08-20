@@ -581,10 +581,17 @@ class GenerationPresetStoreTests(unittest.TestCase):
         private_text = "PRIVATE-PROMPT-SENTINEL"
         for mutate in (
             lambda payload: payload.update({"prompt": private_text}),
+            lambda payload: payload.update({"alt_prompt": private_text}),
+            lambda payload: payload.update({"duration_seconds": 20}),
             lambda payload: payload["params"].update({"negative_prompt": private_text}),
             lambda payload: payload["params"].update({"image_refs": [private_text]}),
+            lambda payload: payload["params"].update({"duration_seconds": 20}),
+            lambda payload: payload["params"].update({"video_length": 0}),
             lambda payload: payload["params"]["custom_settings"].update(
                 {"prompt": private_text},
+            ),
+            lambda payload: payload["params"]["custom_settings"].update(
+                {"voxcpm_speaker_count": 1},
             ),
         ):
             payload = preset_payload()
@@ -594,6 +601,8 @@ class GenerationPresetStoreTests(unittest.TestCase):
 
         created = self.create(payload=preset_payload(name="Content free"))
         self.assertNotIn("prompt", created)
+        self.assertNotIn("sequence", created)
+        self.assertEqual(set(created), set(presets._PUBLIC_RECORD_KEYS))
         raw = self.store.path.read_bytes()
         self.assertNotIn(private_text.encode("utf-8"), raw)
         self.assertNotIn(ACCOUNT_A.encode("utf-8"), raw)

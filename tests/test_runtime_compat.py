@@ -13,6 +13,7 @@ if _APP_DIR not in sys.path:
 
 from services.runtime_compat import (  # noqa: E402
     evaluate_runtime,
+    format_runtime_warnings,
     is_mmgp_lora_pinning_assertion,
     is_rtx50_capability,
     recommend_h3_lora_pin_budget_mb,
@@ -87,8 +88,59 @@ class TestRuntimeCompatibility(unittest.TestCase):
 
     def test_capability_and_version_parsing(self):
         self.assertTrue(is_rtx50_capability("sm_120"))
+        self.assertTrue(is_rtx50_capability((12, 0)))
         self.assertFalse(is_rtx50_capability("sm_89"))
+        self.assertFalse(is_rtx50_capability(("bad",)))
+        self.assertFalse(is_rtx50_capability(None))
         self.assertEqual(version_tuple("2.10.0+cu130"), (2, 10))
+        self.assertEqual(version_tuple(""), (0, 0))
+
+    def test_rtx50_warnings_name_the_missing_piece_and_stay_joined(self):
+        warnings = evaluate_runtime(
+            python_version="3.11.14",
+            torch_version="2.10.0+cu130",
+            cuda_version="13.0",
+            capability=(12, 0),
+            triton_available=False,
+            sage_available=True,
+            lightx2v_available=True,
+        )
+        self.assertEqual(warnings, ["Triton is unavailable"])
+
+        warnings = evaluate_runtime(
+            python_version="3.11.14",
+            torch_version="2.9.1+cu128",
+            cuda_version="12.8",
+            capability="sm_120",
+            triton_available=True,
+            sage_available=False,
+            lightx2v_available=True,
+        )
+        self.assertEqual(
+            warnings,
+            [
+                "PyTorch 2.10 or newer is required for the tested RTX 50 runtime",
+                "a CUDA 13 PyTorch build is required for native RTX 50 kernels",
+            ],
+        )
+        self.assertEqual(
+            format_runtime_warnings(warnings),
+            "PyTorch 2.10 or newer is required for the tested RTX 50 runtime; "
+            "a CUDA 13 PyTorch build is required for native RTX 50 kernels",
+        )
+        self.assertEqual(format_runtime_warnings(["", "  "]), "")
+        self.assertEqual(
+            evaluate_runtime(
+                python_version="3.10.11",
+                torch_version="2.7.1",
+                cuda_version="12.8",
+                capability=(8, 9),
+                triton_available=False,
+                sage_available=False,
+                lightx2v_available=False,
+            ),
+            [],
+        )
 
 
 class TestOptionalAccelerationCompatibility(unittest.TestCase):

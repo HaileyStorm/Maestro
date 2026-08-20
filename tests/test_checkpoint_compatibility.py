@@ -44,6 +44,24 @@ KLEIN9_SHAPES = {
     "txt_in.weight": (4096, 12288),
     "double_blocks.0.img_attn.qkv.weight": (12288, 4096),
 }
+LTX_SHAPES = {
+    "patchify_proj.weight": (4096, 128),
+    "transformer_blocks.0.attn1.to_q.weight": (4096, 4096),
+    "adaln_single.emb.timestep_embedder.linear_1.weight": (4096, 256),
+}
+KREA2_SHAPES = {
+    "first.weight": (6144, 64),
+    "blocks.0.attn.wq.weight": (6144, 6144),
+    "blocks.0.attn.wk.weight": (1536, 6144),
+}
+QWEN_SHAPES = {
+    "img_in.weight": (3072, 64),
+    "transformer_blocks.0.attn.to_q.weight": (3072, 3072),
+}
+Z_IMAGE_SHAPES = {
+    "x_embedder.weight": (3840, 64),
+    "cap_embedder.1.weight": (3840, 2560),
+}
 
 
 def _write_safetensors(path: str, shapes: dict[str, tuple[int, ...]]) -> None:
@@ -123,6 +141,40 @@ class TestCheckpointMappings(unittest.TestCase):
                 "Flux.1 D", "flux2_dev"
             )
 
+    def test_unidentified_and_ltx_bases_stay_explicit(self):
+        self.assertIn(
+            "cannot safely choose a compatible pipeline",
+            compatibility.unsupported_checkpoint_reason(""),
+        )
+        self.assertIn(
+            "verified checkpoint-import pipeline",
+            compatibility.unsupported_checkpoint_reason("Wan 2.2"),
+        )
+        self.assertEqual(
+            compatibility.suggested_checkpoint_architecture("LTXV2"),
+            "ltx2_19B",
+        )
+        self.assertEqual(
+            compatibility.suggested_checkpoint_architecture("LTXV 2.3"),
+            "ltx2_22B",
+        )
+        self.assertEqual(
+            compatibility.checkpoint_template_model_type("Flux.1 D", "flux"),
+            "flux",
+        )
+        self.assertEqual(
+            compatibility.checkpoint_template_model_type("Krea 2", "krea2_turbo"),
+            "krea2_turbo",
+        )
+        self.assertIsNone(
+            compatibility.checkpoint_template_model_type("Krea 2", "flux")
+        )
+        with self.assertRaisesRegex(
+            compatibility.CheckpointCompatibilityError,
+            "compatible with ltx2_19B, not 'ltx2_22B'",
+        ):
+            compatibility.ensure_allowed_checkpoint_target("LTXV2", "ltx2_22B")
+
 
 class TestCheckpointTensorSignatures(unittest.TestCase):
     def _validate(
@@ -165,6 +217,72 @@ class TestCheckpointTensorSignatures(unittest.TestCase):
             ):
                 compatibility.validate_checkpoint_file(
                     path, "Flux.2 Klein 9B", "flux2_klein_9b"
+                )
+
+    def test_shared_layouts_still_require_the_metadata_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            flux_path = os.path.join(directory, "flux1.safetensors")
+            ltx_path = os.path.join(directory, "ltx.safetensors")
+            krea_path = os.path.join(directory, "krea.safetensors")
+            _write_safetensors(flux_path, FLUX1_SHAPES)
+            _write_safetensors(ltx_path, LTX_SHAPES)
+            _write_safetensors(krea_path, KREA2_SHAPES)
+
+            self.assertEqual(
+                set(compatibility.detect_checkpoint_architectures(flux_path)),
+                {"flux", "flux_schnell", "flux_dev_kontext"},
+            )
+            self.assertEqual(
+                set(compatibility.detect_checkpoint_architectures(ltx_path)),
+                {"ltx2_19B", "ltx2_22B"},
+            )
+            self.assertEqual(
+                set(compatibility.detect_checkpoint_architectures(krea_path)),
+                {"krea2_raw", "krea2_turbo"},
+            )
+
+            flux_receipt = compatibility.validate_checkpoint_file(
+                flux_path, "Flux.1 D", "flux"
+            )
+            self.assertEqual(flux_receipt["status"], "verified")
+            self.assertEqual(flux_receipt["architecture"], "flux")
+            with self.assertRaisesRegex(
+                compatibility.CheckpointCompatibilityError,
+                "compatible with flux, not 'flux_schnell'",
+            ):
+                compatibility.validate_checkpoint_file(
+                    flux_path, "Flux.1 D", "flux_schnell"
+                )
+            with self.assertRaisesRegex(
+                compatibility.CheckpointCompatibilityError,
+                "compatible with ltx2_19B, not 'ltx2_22B'",
+            ):
+                compatibility.validate_checkpoint_file(
+                    ltx_path, "LTXV2", "ltx2_22B"
+                )
+            krea_receipt = compatibility.validate_checkpoint_file(
+                krea_path, "Krea 2", "krea2_raw"
+            )
+            self.assertEqual(krea_receipt["architecture"], "krea2_raw")
+            self.assertEqual(
+                set(krea_receipt["matched_layouts"]),
+                {"krea2_raw", "krea2_turbo"},
+            )
+
+    def test_qwen_z_image_and_ltx_generations_validate_their_own_shapes(self):
+        self._validate(QWEN_SHAPES, "Qwen", "qwen_image_20B")
+        self._validate(Z_IMAGE_SHAPES, "ZImageTurbo", "z_image")
+        self._validate(LTX_SHAPES, "LTXV2", "ltx2_19B")
+        self._validate(LTX_SHAPES, "LTXV 2.3", "ltx2_22B")
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "qwen.safetensors")
+            _write_safetensors(path, QWEN_SHAPES)
+            with self.assertRaisesRegex(
+                compatibility.CheckpointCompatibilityError,
+                "matches qwen_image_20B, not the selected z_image",
+            ):
+                compatibility.validate_checkpoint_file(
+                    path, "ZImageTurbo", "z_image"
                 )
 
     def test_wrapped_and_quantized_tensor_names_are_normalized(self):
@@ -261,6 +379,14 @@ class TestLegacyCheckpointQuarantine(unittest.TestCase):
             self.assertFalse(quarantined["visible"])
             self.assertEqual(
                 quarantined["civitai"]["compatibility_status"], "blocked"
+            )
+            self.assertIn(
+                "compatible with flux, not 'flux2_dev'",
+                quarantined["civitai"]["compatibility_reason"],
+            )
+            self.assertEqual(
+                quarantined["maestro_checkpoint_quarantine"]["reason"],
+                quarantined["civitai"]["compatibility_reason"],
             )
             self.assertIn("maestro_checkpoint_quarantine", quarantined)
             self.assertTrue(os.path.isfile(weight_path))
