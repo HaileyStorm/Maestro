@@ -34,7 +34,10 @@ from services.job_lifecycle import (  # noqa: E402
     update_preparation_job,
 )
 from services.planning_failure import (  # noqa: E402
+    PLANNING_FAILURE_ENVELOPE_KEYS,
     PLANNING_FAILURE_REASON_CODES,
+    normalize_planning_failure_envelope,
+    planning_failure_envelope,
     planning_failure_event,
     public_planning_failure_message,
     remove_exact_request_manifest,
@@ -303,6 +306,120 @@ class GenerationPlanningFailureTests(unittest.TestCase):
             event,
             "phase=preparation reason=planning_runtime_failed",
         )
+
+    def test_planning_envelope_stays_failed_redacted_and_not_gpu_oom(self):
+        private_marker = "synthetic-private-exception-text"
+        private_path = "/private/prompt-dump.json"
+
+        class SuccessShapedOom(RuntimeError):
+            status_code = 200
+            code = "cuda_oom"
+            ok = True
+            is_oom = True
+
+            def __str__(self):
+                raise AssertionError("exception text must not be read")
+
+        class LegalAccess(RuntimeError):
+            status_code = 451
+
+        memory = MemoryError(private_marker)
+        memory.code = "hip_oom"
+        envelope = planning_failure_envelope(
+            SuccessShapedOom(private_marker + private_path),
+            phase="planning_generation",
+        )
+        self.assertEqual(set(envelope), PLANNING_FAILURE_ENVELOPE_KEYS)
+        self.assertIs(envelope["ok"], False)
+        self.assertEqual(envelope["status"], "failed")
+        self.assertEqual(envelope["stage"], "planning_generation")
+        self.assertEqual(envelope["code"], "planning_runtime_failed")
+        self.assertIs(envelope["is_oom"], False)
+        self.assertEqual(envelope["message"], "Generation planning failed")
+        self.assertEqual(
+            envelope["event"],
+            "phase=planning_generation reason=planning_runtime_failed",
+        )
+        self.assertNotIn(private_marker, repr(envelope))
+        self.assertNotIn(private_path, repr(envelope))
+        self.assertNotIn("cuda_oom", repr(envelope))
+        self.assertNotIn("hip_oom", repr(envelope))
+        self.assertNotIn("content", repr(envelope).lower())
+
+        legal = planning_failure_envelope(
+            LegalAccess(private_marker),
+            phase="enhancing_prompt",
+            fallback="Prompt enhancement failed",
+        )
+        self.assertIs(legal["ok"], False)
+        self.assertEqual(legal["status"], "failed")
+        self.assertEqual(legal["code"], "planning_authority_rejected")
+        self.assertEqual(legal["stage"], "enhancing_prompt")
+        self.assertIs(legal["is_oom"], False)
+        self.assertEqual(legal["message"], "Prompt enhancement failed")
+        self.assertNotIn("moderat", repr(legal).lower())
+        self.assertNotIn("content_rejected", repr(legal))
+
+        ram = planning_failure_envelope(memory, phase="untrusted-phase")
+        self.assertEqual(ram["code"], "planning_memory_unavailable")
+        self.assertEqual(ram["stage"], "preparation")
+        self.assertIs(ram["is_oom"], False)
+        self.assertEqual(ram["status"], "failed")
+        self.assertNotIn(private_marker, repr(ram))
+
+        allowed = planning_failure_envelope(
+            ValueError("Generation planning mode is invalid."),
+            phase="planning_generation",
+        )
+        self.assertEqual(
+            allowed["message"],
+            "Generation planning mode is invalid.",
+        )
+        self.assertEqual(allowed["code"], "planning_validation_rejected")
+        self.assertIs(allowed["ok"], False)
+
+    def test_planning_envelope_normalizer_strips_success_and_oom_codes(self):
+        private_marker = "synthetic-private-prompt"
+        restored = normalize_planning_failure_envelope({
+            "ok": True,
+            "status": "queued",
+            "stage": "delivery",
+            "code": "cuda_oom",
+            "is_oom": True,
+            "message": private_marker,
+            "event": "phase=delivery reason=success",
+            "allocator": {"device_type": "cuda", "free_bytes": 1024},
+            "prompt": private_marker,
+            "moderation": "content_rejected",
+        })
+        self.assertEqual(set(restored), PLANNING_FAILURE_ENVELOPE_KEYS)
+        self.assertIs(restored["ok"], False)
+        self.assertEqual(restored["status"], "failed")
+        self.assertEqual(restored["stage"], "preparation")
+        self.assertEqual(restored["code"], "planning_unclassified")
+        self.assertIs(restored["is_oom"], False)
+        self.assertEqual(restored["message"], "Generation planning failed")
+        self.assertEqual(
+            restored["event"],
+            "phase=preparation reason=planning_unclassified",
+        )
+        self.assertNotIn(private_marker, repr(restored))
+        self.assertNotIn("cuda_oom", repr(restored))
+        self.assertNotIn("allocator", restored)
+        self.assertNotIn("prompt", restored)
+        self.assertNotIn("moderation", restored)
+
+        honest = normalize_planning_failure_envelope({
+            "stage": "planning_generation",
+            "code": "planning_timeout",
+            "message": "Generation planning failed",
+        })
+        self.assertEqual(honest["code"], "planning_timeout")
+        self.assertEqual(
+            honest["event"],
+            "phase=planning_generation reason=planning_timeout",
+        )
+        self.assertIs(honest["ok"], False)
 
     def test_exact_manifest_removal_rejects_pointer_drift_and_races(self):
         if not _manifest_dir_fd_supported():

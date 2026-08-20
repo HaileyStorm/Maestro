@@ -45,6 +45,24 @@ _SAFE_PHASES: Final[frozenset[str]] = frozenset({
     "enhancing_prompt",
     "planning_generation",
 })
+_DEFAULT_FALLBACK: Final[str] = "Generation planning failed"
+_PUBLIC_FALLBACKS: Final[frozenset[str]] = frozenset({
+    _DEFAULT_FALLBACK,
+    "Prompt enhancement failed",
+})
+_GPU_OOM_CODES: Final[frozenset[str]] = frozenset({
+    "cuda_oom",
+    "hip_oom",
+})
+PLANNING_FAILURE_ENVELOPE_KEYS: Final[frozenset[str]] = frozenset({
+    "ok",
+    "status",
+    "stage",
+    "code",
+    "is_oom",
+    "message",
+    "event",
+})
 
 _PUBLIC_FAILURE_TYPES: Final[tuple[type[BaseException], ...]] = (
     ValueError,
@@ -120,24 +138,134 @@ def public_planning_failure_message(
         return fallback
 
 
+def _safe_phase(phase: str) -> str:
+    return phase if type(phase) is str and phase in _SAFE_PHASES else "preparation"
+
+
+def _safe_reason(reason: str) -> str:
+    if (
+        type(reason) is str
+        and reason in PLANNING_FAILURE_REASON_CODES
+        and reason not in _GPU_OOM_CODES
+    ):
+        return reason
+    return "planning_unclassified"
+
+
+def _safe_public_message(text: object, fallback: str) -> str:
+    safe_fallback = (
+        fallback
+        if (
+            type(fallback) is str
+            and fallback in _PUBLIC_FALLBACKS
+        )
+        else _DEFAULT_FALLBACK
+    )
+    if type(text) is not str or not text or len(text) > 240 or "\n" in text:
+        return safe_fallback
+    if text in _PUBLIC_FALLBACKS or text.startswith(_PUBLIC_FAILURE_PREFIXES):
+        return text
+    return safe_fallback
+
+
 def planning_failure_event(error: BaseException, *, phase: str) -> tuple[str, str]:
     """Return one bounded internal reason and a safe content-free event line."""
 
     try:
-        reason = classify_planning_failure(error)
-        if reason not in PLANNING_FAILURE_REASON_CODES:
-            reason = "planning_unclassified"
-        safe_phase = (
-            phase
-            if type(phase) is str and phase in _SAFE_PHASES
-            else "preparation"
-        )
+        reason = _safe_reason(classify_planning_failure(error))
+        safe_phase = _safe_phase(phase)
         return reason, f"phase={safe_phase} reason={reason}"
     except BaseException:
         return (
             "planning_unclassified",
             "phase=preparation reason=planning_unclassified",
         )
+
+
+def planning_failure_envelope(
+    error: BaseException,
+    *,
+    phase: str,
+    fallback: str = _DEFAULT_FALLBACK,
+) -> dict[str, object]:
+    """Return one failed, redacted, content-free planning envelope.
+
+    Planning never publishes success, GPU OOM codes, allocator facts, or a
+    content-moderation label. Exception text stays out unless the public
+    planner-contract allowlist already accepts it.
+    """
+
+    try:
+        reason, event = planning_failure_event(error, phase=phase)
+        envelope = {
+            "ok": False,
+            "status": "failed",
+            "stage": _safe_phase(phase),
+            "code": reason,
+            "is_oom": False,
+            "message": public_planning_failure_message(
+                error, fallback=_safe_public_message(fallback, _DEFAULT_FALLBACK),
+            ),
+            "event": event,
+        }
+        if set(envelope) != PLANNING_FAILURE_ENVELOPE_KEYS:
+            raise RuntimeError("planning envelope contract drifted")
+        return envelope
+    except BaseException:
+        return {
+            "ok": False,
+            "status": "failed",
+            "stage": "preparation",
+            "code": "planning_unclassified",
+            "is_oom": False,
+            "message": _DEFAULT_FALLBACK,
+            "event": "phase=preparation reason=planning_unclassified",
+        }
+
+
+def normalize_planning_failure_envelope(
+    value,
+    *,
+    fallback: str = _DEFAULT_FALLBACK,
+) -> dict[str, object]:
+    """Force a producer envelope back onto the failed, redacted contract."""
+
+    try:
+        raw = dict(value) if isinstance(value, dict) else {}
+    except BaseException:
+        raw = {}
+    try:
+        stage = _safe_phase(raw.get("stage"))
+        code = _safe_reason(raw.get("code"))
+        message = _safe_public_message(raw.get("message"), fallback)
+        event = raw.get("event")
+        if (
+            type(event) is not str
+            or event != f"phase={stage} reason={code}"
+        ):
+            event = f"phase={stage} reason={code}"
+        envelope = {
+            "ok": False,
+            "status": "failed",
+            "stage": stage,
+            "code": code,
+            "is_oom": False,
+            "message": message,
+            "event": event,
+        }
+        if set(envelope) != PLANNING_FAILURE_ENVELOPE_KEYS:
+            raise RuntimeError("planning envelope contract drifted")
+        return envelope
+    except BaseException:
+        return {
+            "ok": False,
+            "status": "failed",
+            "stage": "preparation",
+            "code": "planning_unclassified",
+            "is_oom": False,
+            "message": _DEFAULT_FALLBACK,
+            "event": "phase=preparation reason=planning_unclassified",
+        }
 
 
 def remove_exact_request_manifest(
@@ -258,8 +386,11 @@ def remove_exact_request_manifest(
 
 
 __all__ = [
+    "PLANNING_FAILURE_ENVELOPE_KEYS",
     "PLANNING_FAILURE_REASON_CODES",
     "classify_planning_failure",
+    "normalize_planning_failure_envelope",
+    "planning_failure_envelope",
     "planning_failure_event",
     "public_planning_failure_message",
     "remove_exact_request_manifest",
