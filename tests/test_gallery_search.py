@@ -1,4 +1,9 @@
-"""Deterministic, model-free gallery search and artifact filter regressions."""
+"""Deterministic, model-free gallery search and artifact filter regressions.
+
+Locks leftover 1.9.0 `jobs/` fetch-order probes to Continuum's Start Queue
+path plus the guarded job-log helper. Starlette lives only in ./app/env, so
+a default-interpreter ModuleNotFoundError is not a gallery-search failure.
+"""
 from __future__ import annotations
 
 import ast
@@ -18,20 +23,41 @@ _APP_DIR = os.path.join(_ROOT, "app")
 if _APP_DIR not in sys.path:
     sys.path.insert(0, _APP_DIR)
 
-from services.search_index import (  # noqa: E402
-    ArtifactScope,
-    SearchIndex,
-    artifact_matches_scope,
-    classify_gallery_artifacts,
-    linked_component_names,
-    load_media_sidecars,
-)
-from services.win_safe_files import (  # noqa: E402
-    is_safe_direct_basename,
-    is_safe_workspace_name,
-    safe_direct_file_under,
-    safe_join_under,
-)
+# starlette is a FastAPI/runtime dep in ./app/env, not the default interpreter.
+# Skip only that missing dep so real gallery-search failures still fail the suite.
+_STARLETTE_IMPORT_ERROR: ModuleNotFoundError | None = None
+try:
+    from services.search_index import (  # noqa: E402
+        ArtifactScope,
+        SearchIndex,
+        artifact_matches_scope,
+        classify_gallery_artifacts,
+        linked_component_names,
+        load_media_sidecars,
+    )
+    from services.win_safe_files import (  # noqa: E402
+        is_safe_direct_basename,
+        is_safe_workspace_name,
+        safe_direct_file_under,
+        safe_join_under,
+    )
+except ModuleNotFoundError as error:
+    if getattr(error, "name", None) != "starlette":
+        raise
+    ArtifactScope = SearchIndex = None  # type: ignore[assignment]
+    artifact_matches_scope = classify_gallery_artifacts = None  # type: ignore[assignment]
+    linked_component_names = load_media_sidecars = None  # type: ignore[assignment]
+    is_safe_direct_basename = is_safe_workspace_name = None  # type: ignore[assignment]
+    safe_direct_file_under = safe_join_under = None  # type: ignore[assignment]
+    _STARLETTE_IMPORT_ERROR = error
+
+
+def setUpModule() -> None:
+    if _STARLETTE_IMPORT_ERROR is not None:
+        raise unittest.SkipTest(
+            "starlette is provided by ./app/env; run this module with "
+            "./app/env/bin/python"
+        ) from _STARLETTE_IMPORT_ERROR
 
 
 def _touch_media(workspace: str, name: str, size: int = 4) -> None:
@@ -662,8 +688,17 @@ class GalleryApiUiContractTests(unittest.TestCase):
         self.assertIn("Load job event history", main)
         self.assertIn("if (!api.isBackendJobId(job.id)) return", main)
         self.assertIn("if (!isBackendJobId(jobId))", client)
-        self.assertIn("const res = await fetch(`${BASE}/api/v1/jobs/", client)
-        self.assertLess(client.index("if (!isBackendJobId(jobId))"), client.index("const res = await fetch(`${BASE}/api/v1/jobs/"))
+        # Leftover 1.9.0 assumed the first jobs/ fetch was the guarded log helper.
+        # Continuum's Start Queue fetch lives earlier and is not that helper.
+        queue_start = client.index(
+            "const res = await fetch(`${BASE}/api/v1/jobs/queue/start`"
+        )
+        log_guard = client.index("if (!isBackendJobId(jobId))")
+        log_fetch = client.index(
+            "const res = await fetch(`${BASE}/api/v1/jobs/${encodeURIComponent(jobId)}/log"
+        )
+        self.assertLess(queue_start, log_guard)
+        self.assertLess(log_guard, log_fetch)
 
     def test_gallery_selection_is_cleared_atomically_with_visible_scope_changes(self):
         store = (Path(_ROOT) / "ui" / "src" / "stores" / "useStore.ts").read_text(encoding="utf-8")
