@@ -31,6 +31,7 @@ _GPU_OOM_SIGNATURES = (
     "cudnn_status_alloc_failed",
 )
 _SAFE_TOKEN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+_GPU_OOM_CODES = frozenset({"cuda_oom", "hip_oom"})
 _FAILURE_STAGES = {
     "model_load", "denoise", "vae_decode", "segment_checkpoint", "concat",
     "audio_mux", "postprocess", "flashvsr", "delivery", "publication",
@@ -112,6 +113,20 @@ def safe_allocator_facts() -> dict:
         return {}
 
 
+def _honest_failure_code(code: str, *, is_oom: bool, stage: str) -> str:
+    """Keep GPU OOM codes aligned with the detected ``is_oom`` boolean.
+
+    Callers and exception attributes may pass ``cuda_oom`` for host, ffmpeg, or
+    generic delivery failures. Remote status must not advertise VRAM exhaustion
+    unless ``is_oom`` is actually true.
+    """
+    if is_oom:
+        return "cuda_oom"
+    if _SAFE_TOKEN_RE.fullmatch(code) is None or code in _GPU_OOM_CODES:
+        return f"{stage}_failed"
+    return code
+
+
 def _position(current, total, *, variant=None) -> Optional[dict]:
     try:
         current_value = max(0, int(current or 0))
@@ -152,10 +167,8 @@ def build_failure_details(
     )
     detected_oom = is_oom(exception)
     declared_code = str(getattr(exception, "code", code or ""))
-    normalized_code = (
-        declared_code
-        if _SAFE_TOKEN_RE.fullmatch(declared_code)
-        else ("cuda_oom" if detected_oom else f"{normalized_stage}_failed")
+    normalized_code = _honest_failure_code(
+        declared_code, is_oom=detected_oom, stage=normalized_stage,
     )
     identity = exception
     seen: set[int] = set()
@@ -169,7 +182,7 @@ def build_failure_details(
     if _SAFE_TOKEN_RE.fullmatch(exception_type) is None:
         exception_type = "Exception"
     details = {
-        "code": "cuda_oom" if detected_oom else normalized_code,
+        "code": normalized_code,
         "stage": normalized_stage,
         "detail": _STAGE_DETAILS[normalized_stage],
         "exception_type": exception_type,
@@ -237,14 +250,14 @@ def normalize_failure_details(
     if stage not in _FAILURE_STAGES:
         stage = "generation"
     is_oom_value = value.get("is_oom") is True
-    code = str(value.get("code") or "")
-    if _SAFE_TOKEN_RE.fullmatch(code) is None:
-        code = "cuda_oom" if is_oom_value else f"{stage}_failed"
+    code = _honest_failure_code(
+        str(value.get("code") or ""), is_oom=is_oom_value, stage=stage,
+    )
     exception_type = str(value.get("exception_type") or "Exception")
     if _SAFE_TOKEN_RE.fullmatch(exception_type) is None:
         exception_type = "Exception"
     details = {
-        "code": "cuda_oom" if is_oom_value else code,
+        "code": code,
         "stage": stage,
         "detail": _STAGE_DETAILS[stage],
         "exception_type": exception_type,
