@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import sys
@@ -12,11 +13,48 @@ from unittest.mock import patch
 
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_APP_DIR = os.path.abspath(os.path.join(_HERE, "..", "app"))
+_ROOT = os.path.abspath(os.path.join(_HERE, ".."))
+_APP_DIR = os.path.join(_ROOT, "app")
 if _APP_DIR not in sys.path:
     sys.path.insert(0, _APP_DIR)
 
 from services import director_pipeline as pipeline  # noqa: E402
+from services.job_lifecycle import (  # noqa: E402
+    _reset_queue_state_for_tests,
+    set_job_hold,
+    try_requeue,
+    try_start,
+)
+from services.tool_job_identity import (  # noqa: E402
+    JOB_ID_HEX_LENGTH,
+    is_unique_generation_job_id,
+    new_unique_job_id,
+)
+
+_THIRTY_TWO_HEX = "c" * 32
+_HEX_ID_RE = r"^[0-9a-f]+$"
+_THIRTY_TWO_HEX_RE = r"^[0-9a-f]{32}$"
+
+
+def _parse_launch() -> ast.Module:
+    path = os.path.join(_APP_DIR, "launch.py")
+    with open(path, "r", encoding="utf-8") as handle:
+        return ast.parse(handle.read(), filename="app/launch.py")
+
+
+def _function(tree: ast.AST, name: str) -> ast.FunctionDef:
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return node
+    raise AssertionError(f"Function {name!r} not found")
+
+
+def _load_isolated_function(name: str, namespace: dict):
+    function = _function(_parse_launch(), name)
+    module = ast.Module(body=[function], type_ignores=[])
+    ast.fix_missing_locations(module)
+    exec(compile(module, "app/launch.py", "exec"), namespace)
+    return namespace[name]
 
 
 class TestDirectorProjectRevisionsAndQueue(unittest.TestCase):
@@ -48,6 +86,18 @@ class TestDirectorProjectRevisionsAndQueue(unittest.TestCase):
         with open(path, "wb") as handle:
             handle.write(b"director-test-asset")
         return path
+
+    def _forget_director_queue_cache(self) -> None:
+        pipeline._director_queue_state = None
+        pipeline._director_queue_base = None
+        pipeline._director_queue_worker = None
+
+    def _queue_path(self) -> str:
+        return os.path.join(self.temp_dir.name, "_director_queue.json")
+
+    def _read_queue_file(self) -> dict:
+        with open(self._queue_path(), "r", encoding="utf-8") as handle:
+            return json.load(handle)
 
     def test_start_persists_complete_revision_before_worker(self):
         reference = self._asset()
@@ -157,27 +207,89 @@ class TestDirectorProjectRevisionsAndQueue(unittest.TestCase):
         self.assertEqual([entry["id"] for entry in remaining["entries"]], [second_id])
 
     def test_restart_returns_running_entry_to_held_queue(self):
-        path = os.path.join(self.temp_dir.name, "_director_queue.json")
+        path = self._queue_path()
         with open(path, "w", encoding="utf-8") as handle:
             json.dump({
                 "version": 1,
                 "paused": False,
                 "running": True,
                 "entries": [{
-                    "id": "overnight",
+                    "id": _THIRTY_TWO_HEX,
                     "status": "running",
                     "message": "Rendering",
+                    "pipeline_id": "live-worker",
                     "params": {"scene_description": "Overnight project"},
                 }],
             }, handle)
 
-        pipeline._director_queue_state = None
-        pipeline._director_queue_base = None
+        self._forget_director_queue_cache()
         restored = pipeline.list_director_queue(self.temp_dir.name)
         self.assertTrue(restored["paused"])
         self.assertFalse(restored["running"])
+        self.assertEqual(restored["entries"][0]["id"], _THIRTY_TWO_HEX)
         self.assertEqual(restored["entries"][0]["status"], "held")
         self.assertIn("Interrupted", restored["entries"][0]["message"])
+        self.assertIsNone(restored["entries"][0].get("pipeline_id"))
+
+        persisted = self._read_queue_file()
+        self.assertTrue(persisted["paused"])
+        self.assertFalse(persisted["running"])
+        self.assertEqual(persisted["entries"][0]["id"], _THIRTY_TWO_HEX)
+        self.assertEqual(persisted["entries"][0]["status"], "held")
+        self.assertIsNone(persisted["entries"][0]["pipeline_id"])
+
+        self._forget_director_queue_cache()
+        reloaded = pipeline.list_director_queue(self.temp_dir.name)
+        self.assertTrue(reloaded["paused"])
+        self.assertFalse(reloaded["running"])
+        self.assertEqual(reloaded["entries"][0]["status"], "held")
+        self.assertEqual(reloaded["entries"][0]["id"], _THIRTY_TWO_HEX)
+
+    def test_enqueue_persists_complete_project_across_reload(self):
+        queued = pipeline.enqueue_director_pipeline(self.temp_dir.name, {
+            "scene_description": "Frozen overnight project",
+            "pipeline_type": "music_video",
+            "reference_image_path": self._asset("persist.png"),
+        })
+        entry_id = queued["entries"][0]["id"]
+        self.assertRegex(entry_id, _HEX_ID_RE)
+        self.assertTrue(queued["paused"])
+        self.assertEqual(queued["entries"][0]["status"], "held")
+        self.assertTrue(os.path.isfile(self._queue_path()))
+
+        persisted = self._read_queue_file()
+        self.assertEqual(persisted["entries"][0]["id"], entry_id)
+        self.assertEqual(persisted["entries"][0]["status"], "held")
+        self.assertEqual(
+            persisted["entries"][0]["params"]["scene_description"],
+            "Frozen overnight project",
+        )
+
+        self._forget_director_queue_cache()
+        restored = pipeline.list_director_queue(self.temp_dir.name)
+        self.assertEqual([entry["id"] for entry in restored["entries"]], [entry_id])
+        self.assertEqual(restored["entries"][0]["status"], "held")
+        detail = pipeline.get_director_queue_entry(self.temp_dir.name, entry_id)
+        self.assertEqual(detail["params"]["scene_description"], "Frozen overnight project")
+
+    def test_start_director_queue_persists_held_projects_as_queued(self):
+        queued = pipeline.enqueue_director_pipeline(self.temp_dir.name, {
+            "scene_description": "Start this batch",
+        })
+        entry_id = queued["entries"][0]["id"]
+        fake_thread = SimpleNamespace(is_alive=lambda: False, start=lambda: None)
+
+        with patch.object(pipeline.threading, "Thread", return_value=fake_thread):
+            started = pipeline.start_director_queue(self.temp_dir.name)
+
+        self.assertFalse(started["paused"])
+        self.assertTrue(started["running"])
+        self.assertEqual(started["entries"][0]["id"], entry_id)
+        self.assertEqual(started["entries"][0]["status"], "queued")
+        persisted = self._read_queue_file()
+        self.assertFalse(persisted["paused"])
+        self.assertEqual(persisted["entries"][0]["status"], "queued")
+        self.assertEqual(persisted["entries"][0]["id"], entry_id)
 
     def test_queue_dispatches_complete_projects_sequentially(self):
         pipeline.enqueue_director_pipeline(self.temp_dir.name, {
@@ -352,6 +464,156 @@ class TestDirectorProjectRevisionsAndQueue(unittest.TestCase):
             pipeline._pipelines[pid]["progress"]["message"],
             "Waiting for GPU (generation queue)...",
         )
+
+
+class TestContinuumHoldQueueContracts(unittest.TestCase):
+    """Studio/Continuum holds use queue_held, not leftover status==held."""
+
+    def setUp(self):
+        _reset_queue_state_for_tests()
+
+    def tearDown(self):
+        _reset_queue_state_for_tests()
+
+    def _queued_hold(self, job_id: str | None = None) -> dict:
+        return {
+            "id": job_id or new_unique_job_id(),
+            "status": "queued",
+            "queue_held": True,
+            "message": "Ready - waiting for Start Queue",
+            "created_at": 10,
+        }
+
+    def test_generation_job_ids_are_32_hex(self):
+        minted = new_unique_job_id()
+        self.assertTrue(is_unique_generation_job_id(minted))
+        self.assertRegex(minted, _THIRTY_TWO_HEX_RE)
+        self.assertEqual(len(minted), JOB_ID_HEX_LENGTH)
+        self.assertFalse(is_unique_generation_job_id("deadbeef"))
+        self.assertFalse(is_unique_generation_job_id("held"))
+
+        mint = _function(_parse_launch(), "_new_generation_job_id")
+        launch_path = os.path.join(_APP_DIR, "launch.py")
+        with open(launch_path, encoding="utf-8") as handle:
+            launch_source = handle.read()
+        source = ast.get_source_segment(launch_source, mint)
+        self.assertIsNotNone(source)
+        self.assertIn("uuid.uuid4().hex", source)
+        self.assertNotIn("status == \"held\"", source)
+
+    def test_set_job_hold_keeps_queued_status_and_toggles_queue_held(self):
+        job = self._queued_hold()
+        self.assertEqual(set_job_hold(job, True), "held")
+        self.assertEqual(job["status"], "queued")
+        self.assertTrue(job["queue_held"])
+        self.assertNotEqual(job["status"], "held")
+
+        self.assertEqual(set_job_hold(job, False), "resumed")
+        self.assertEqual(job["status"], "queued")
+        self.assertFalse(job["queue_held"])
+        self.assertNotEqual(job["status"], "held")
+
+    def test_restart_converts_running_work_to_queued_hold(self):
+        job = {
+            "id": new_unique_job_id(),
+            "status": "queued",
+            "queue_held": False,
+            "message": "Queued",
+        }
+        self.assertTrue(try_start(job))
+        self.assertEqual(job["status"], "running")
+        self.assertTrue(try_requeue(job, queue_held=True, message="Interrupted"))
+        self.assertEqual(job["status"], "queued")
+        self.assertTrue(job["queue_held"])
+        self.assertNotEqual(job["status"], "held")
+        self.assertRegex(job["id"], _THIRTY_TWO_HEX_RE)
+
+    def test_start_studio_queue_releases_32_hex_holds_via_set_job_hold(self):
+        earlier = self._queued_hold()
+        later = self._queued_hold()
+        later["created_at"] = 20
+        running = {
+            "id": new_unique_job_id(),
+            "status": "running",
+            "queue_held": False,
+            "created_at": 5,
+        }
+        leftover_status = {
+            "id": new_unique_job_id(),
+            "status": "held",
+            "queue_held": False,
+            "created_at": 1,
+        }
+        jobs = {
+            earlier["id"]: earlier,
+            later["id"]: later,
+            running["id"]: running,
+            leftover_status["id"]: leftover_status,
+        }
+        released_ids = []
+
+        def set_hold(job, held):
+            if job.get("queue_held") is not True or held is not False:
+                return None
+            if job.get("status") == "held":
+                raise AssertionError("Start Queue must not key off status==held")
+            job["queue_held"] = False
+            released_ids.append(job["id"])
+            return "resumed"
+
+        start_queue = _load_isolated_function(
+            "start_studio_queue",
+            {
+                "api": SimpleNamespace(
+                    post=lambda *_args, **_kwargs: (lambda function: function),
+                ),
+                "Request": object,
+                "Response": object,
+                "_jobs": jobs,
+                "_set_recovery_no_store": lambda _response: None,
+                "_require_remote_queue_project": lambda _request: None,
+                "_require_generic_queue_control_job": (
+                    lambda job_id, _request: jobs[job_id]
+                ),
+                "_queue_recovery_delivery_pending": lambda _job: None,
+                "_require_job_runtime_model_admission": lambda _job: None,
+                "set_job_hold": set_hold,
+                "HTTPException": RuntimeError,
+            },
+        )
+
+        result = start_queue(SimpleNamespace(), SimpleNamespace())
+        self.assertEqual(set(result["released"]), {earlier["id"], later["id"]})
+        self.assertEqual(set(result["job_ids"]), {earlier["id"], later["id"]})
+        self.assertTrue(all(is_unique_generation_job_id(job_id) for job_id in result["job_ids"]))
+        self.assertFalse(earlier["queue_held"])
+        self.assertFalse(later["queue_held"])
+        self.assertEqual(earlier["status"], "queued")
+        self.assertEqual(later["status"], "queued")
+        self.assertEqual(running["status"], "running")
+        self.assertEqual(leftover_status["status"], "held")
+        self.assertNotIn(leftover_status["id"], released_ids)
+        self.assertNotIn(running["id"], released_ids)
+
+    def test_start_studio_queue_source_calls_set_job_hold(self):
+        start_queue = _function(_parse_launch(), "start_studio_queue")
+        called = set()
+        for child in ast.walk(start_queue):
+            if not isinstance(child, ast.Call):
+                continue
+            if isinstance(child.func, ast.Name):
+                called.add(child.func.id)
+            elif isinstance(child.func, ast.Attribute):
+                called.add(child.func.attr)
+        self.assertIn("set_job_hold", called)
+        self.assertNotIn("release_held", called)
+        constants = {
+            node.value
+            for node in ast.walk(start_queue)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+        self.assertIn("queue_held", constants)
+        self.assertNotIn("release_held", constants)
 
 
 if __name__ == "__main__":
