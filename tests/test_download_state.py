@@ -1,4 +1,11 @@
-"""Model-free regressions for CivitAI/HuggingFace download state wiring."""
+"""Continuum CivitAI/HuggingFace download-state wiring.
+
+Locks leftover 1.9.0 `ensure_allowed_checkpoint_target` /
+`_list_checkpoint_architectures(base_model)` / `unsupported_checkpoint_reason`
+/ `validate_checkpoint_file` probes onto Continuum `_scan_defaults_by_arch`
+membership, `_guess_arch_for_base`, and `_validate_safetensors_payload`.
+Do not invent leftover base-model checkpoint gates.
+"""
 from __future__ import annotations
 
 import ast
@@ -393,18 +400,21 @@ class TestDownloadState(unittest.TestCase):
         with open(_MODEL_DETAIL_PATH, "r", encoding="utf-8") as handle:
             detail_source = handle.read()
 
-        self.assertIn(
-            "ensure_allowed_checkpoint_target(base_model, target_architecture)",
-            endpoint,
-        )
-        self.assertIn(
-            "_list_checkpoint_architectures(base_model)", endpoint,
-        )
-        self.assertIn(
-            "unsupported_checkpoint_reason(base_model)",
-            architecture_endpoint,
-        )
-        validate_at = worker.index("validate_checkpoint_file(")
+        # Leftover 1.9.0 gated imports with ensure_allowed_checkpoint_target
+        # and listed architectures by leftover base_model. Continuum fail-closes
+        # on the shipped defaults index and only suggests an architecture.
+        self.assertNotIn("ensure_allowed_checkpoint_target", endpoint)
+        self.assertNotIn("unsupported_checkpoint_reason", architecture_endpoint)
+        self.assertNotIn("_list_checkpoint_architectures(base_model)", endpoint)
+        self.assertIn("arch_index = _scan_defaults_by_arch()", endpoint)
+        self.assertIn("target_architecture not in arch_index", endpoint)
+        self.assertIn("_list_checkpoint_architectures()", architecture_endpoint)
+        self.assertIn("_guess_arch_for_base(base_model", architecture_endpoint)
+        self.assertIn("suggested_architecture", architecture_endpoint)
+        # Leftover 1.9.0 used validate_checkpoint_file before publish.
+        # Continuum validates the safetensors payload, then atomically replaces.
+        self.assertNotIn("validate_checkpoint_file(", worker)
+        validate_at = worker.index("_validate_safetensors_payload(")
         publish_at = worker.index("os.replace(partial_path, save_path)")
         self.assertLess(validate_at, publish_at)
         self.assertNotIn(
