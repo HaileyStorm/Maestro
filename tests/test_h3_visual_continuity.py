@@ -28,6 +28,7 @@ from services.h3_visual_continuity import (  # noqa: E402
     ref2va_handoff_uses_temporal_tail,
     same_source_visual_carry_line,
     shot_markers_preserved,
+    strip_opening_visual_carry,
 )
 from shared.utils.prompt_parser import (  # noqa: E402
     classify_timeline_clip_boundaries,
@@ -73,6 +74,12 @@ class H3VisualContinuityTests(unittest.TestCase):
             updated, clip_boundaries=boundaries,
         )
         self.assertEqual(again[1].count(SAME_SOURCE_VISUAL_CARRY_LINE), 1)
+
+    def test_strip_opening_visual_carry_restores_body(self):
+        body = "[Shot 2] Macro of the cap."
+        prefixed = opening_carry_prefix("[Shot 1] Hallway start.") + "\n" + body
+        self.assertEqual(strip_opening_visual_carry(prefixed), body)
+        self.assertEqual(strip_opening_visual_carry(body), body)
 
     def test_independent_non_temporal_boundary_skips_visual_carry(self):
         prompts = ["[0-10s] Opening.", "[0-10s] Unrelated beat."]

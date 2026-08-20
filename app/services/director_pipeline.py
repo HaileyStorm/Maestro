@@ -8010,6 +8010,76 @@ def _canonicalize_director_h3_v2_shot_plan(
     return canonical
 
 
+def _director_h3_keep_context_ir_with_carry(original: str, carried: str) -> str:
+    """Keep carry inside a Context-IR record so extra field lines are not added."""
+
+    from services.h3_visual_continuity import (
+        SAME_SOURCE_VISUAL_CARRY_LINE,
+        shot_markers_preserved,
+    )
+
+    if carried == original or SAME_SOURCE_VISUAL_CARRY_LINE not in carried:
+        return carried
+    body = str(original or "").strip()
+    if not body or not carried.endswith(body):
+        return carried
+    if SAME_SOURCE_VISUAL_CARRY_LINE in original:
+        return original
+    match = re.search(r"(?i)(audiovisual_description:\s*)", original)
+    if match:
+        updated = (
+            f"{original[:match.end()]}{SAME_SOURCE_VISUAL_CARRY_LINE} "
+            f"{original[match.end():]}"
+        )
+        if shot_markers_preserved(original, updated):
+            return updated
+    return original
+
+
+def _director_h3_drop_planner_carry(shot_plan: dict) -> None:
+    """Undo planner carry so Director canonicalize can see sealed body bytes."""
+
+    from services.h3_visual_continuity import strip_opening_visual_carry
+
+    prompts = list(shot_plan.get("clip_prompts") or [])
+    cleaned = [strip_opening_visual_carry(item) for item in prompts]
+    if cleaned == prompts:
+        return
+    shot_plan["clip_prompts"] = cleaned
+    shots = shot_plan.get("shots")
+    if isinstance(shots, list):
+        for index, shot in enumerate(shots):
+            if (
+                isinstance(shot, dict)
+                and index < len(prompts)
+                and shot.get("prompt") == prompts[index]
+            ):
+                shot["prompt"] = cleaned[index]
+    from services.h3_shot_planner import seal_h3_shot_plan
+
+    seal_h3_shot_plan(shot_plan)
+
+
+def _director_h3_executable_clip_prompts(
+    shot_plan: dict,
+    prompts: list[str],
+) -> list[str]:
+    """Prefix generate-time clips after canonicalize without mutating the seal."""
+
+    from services.h3_visual_continuity import apply_visual_carry_to_shot_plan
+
+    scratch = {
+        "clip_prompts": list(prompts),
+        "clip_boundaries": list(shot_plan.get("clip_boundaries") or []),
+        "shots": shot_plan.get("shots"),
+    }
+    apply_visual_carry_to_shot_plan(scratch)
+    return [
+        _director_h3_keep_context_ir_with_carry(original, carried)
+        for original, carried in zip(prompts, scratch["clip_prompts"])
+    ]
+
+
 def _canonicalize_director_h3_shot_plan(
     shot_plan: dict,
     *,
@@ -8562,9 +8632,10 @@ def _rehydrate_director_h3_longform(
     first_anchor = plan.get("original_image_start")
     last_anchor = plan.get("original_image_end")
     native = plan.get("native_boundary_conditioning") is True
+    executable_prompts = _director_h3_executable_clip_prompts(shot_plan, prompts)
     gen_params.update({
-        "prompt": _DIRECTOR_CLIP_SEPARATOR.join(prompts),
-        "per_clip_prompts": prompts,
+        "prompt": _DIRECTOR_CLIP_SEPARATOR.join(executable_prompts),
+        "per_clip_prompts": executable_prompts,
         "per_clip_frames": frames,
         "video_length": int(plan.get("requested_frames") or 0),
         "sliding_window_size": int(
@@ -8908,9 +8979,13 @@ def _prepare_director_h3_longform(
         segment_frames_maximum=segment_maximum,
         segment_policy=segment_policy,
     )
+    _director_h3_drop_planner_carry(shot_plan)
     segment_prompts = _canonicalize_director_h3_shot_plan(
         shot_plan,
         h3_style_workflow=h3_style_workflow,
+    )
+    executable_prompts = _director_h3_executable_clip_prompts(
+        shot_plan, segment_prompts,
     )
     segment_boundaries = list(shot_plan["clip_boundaries"])
     clip_published_frames = list(shot_plan["clip_published_frames"])
@@ -8963,8 +9038,8 @@ def _prepare_director_h3_longform(
             gen_params["model_type"] = effective
         if h3_style_workflow is not None:
             gen_params["h3_style_workflow"] = dict(h3_style_workflow)
-        gen_params["prompt"] = segment_prompts[0]
-        gen_params["per_clip_prompts"] = list(segment_prompts)
+        gen_params["prompt"] = executable_prompts[0]
+        gen_params["per_clip_prompts"] = list(executable_prompts)
         if (
             effective == _H3_REF2VA_MODEL
             and params.get("h3_native_boundary_conditioning") is not True
@@ -9058,8 +9133,8 @@ def _prepare_director_h3_longform(
         raise ValueError("Unable to preserve the requested Director duration on the H3 frame grid")
 
     gen_params.update({
-        "prompt": _DIRECTOR_CLIP_SEPARATOR.join(segment_prompts),
-        "per_clip_prompts": segment_prompts,
+        "prompt": _DIRECTOR_CLIP_SEPARATOR.join(executable_prompts),
+        "per_clip_prompts": executable_prompts,
         "per_clip_frames": segment_frames,
         "video_length": requested_frames,
         "sliding_window_size": segment_maximum,

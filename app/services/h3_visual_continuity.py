@@ -253,6 +253,25 @@ def opening_carry_prefix(previous_prompt: object = "") -> str:
     return f"{SAME_SOURCE_VISUAL_CARRY_LINE}\n{format_segment_seam_locks(locks)}"
 
 
+def strip_opening_visual_carry(prompt: object) -> str:
+    """Remove a leading planner carry prefix. Body bytes stay intact."""
+
+    text = str(prompt or "")
+    stripped = text.lstrip()
+    if SAME_SOURCE_VISUAL_CARRY_LINE not in stripped:
+        return text
+    match = re.match(
+        rf"{re.escape(SAME_SOURCE_VISUAL_CARRY_LINE)}\n"
+        rf"{re.escape(SEGMENT_SEAM_LOCKS_HEADER)}[^\n]*\n?",
+        stripped,
+    )
+    if match:
+        return stripped[match.end():]
+    if stripped.startswith(SAME_SOURCE_VISUAL_CARRY_LINE):
+        return stripped[len(SAME_SOURCE_VISUAL_CARRY_LINE):].lstrip("\n")
+    return text
+
+
 def _prefix_without_rewriting_body(prefix: str, prompt: str) -> str:
     body = str(prompt or "").strip()
     if not body:

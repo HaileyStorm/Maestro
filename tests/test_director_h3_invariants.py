@@ -27,6 +27,10 @@ from services.h3_upstream_skills import (  # noqa: E402
     builtin_catalog,
     resolve_h3_style_workflow,
 )
+from services.h3_visual_continuity import (  # noqa: E402
+    SAME_SOURCE_VISUAL_CARRY_LINE,
+    authored_shot_markers,
+)
 
 
 class _H3Wgp:
@@ -659,7 +663,7 @@ non_diegetic_music: N/A"""
         self.assertEqual(restored, original)
         self.assertEqual(
             fresh_body["per_clip_prompts"],
-            original["shot_plan"]["clip_prompts"],
+            first_body["per_clip_prompts"],
         )
         self.assertEqual(
             restored["segment_policy"], original["segment_policy"],
@@ -1009,16 +1013,17 @@ non_diegetic_music: N/A"""
                 ),
                 [],
             )
+            sealed = restored["shot_plan"]["clip_prompts"][index]
             self.assertEqual(
-                restored["shot_plan"]["shots"][index]["prompt"], prompt,
+                restored["shot_plan"]["shots"][index]["prompt"], sealed,
             )
-            self.assertNotRegex(prompt, r"(?m)^\[\d+(?:\.\d+)?-")
+            self.assertNotRegex(sealed, r"(?m)^\[\d+(?:\.\d+)?-")
         self.assertEqual(
             replay_params["_h3_longform"]["shot_plan"]["clip_prompts"],
-            replay_body["per_clip_prompts"],
+            restored["shot_plan"]["clip_prompts"],
         )
         canonical_global = pipeline._DIRECTOR_CLIP_SEPARATOR.join(
-            replay_body["per_clip_prompts"],
+            restored["shot_plan"]["clip_prompts"],
         )
         self.assertEqual(restored["global_prompt"], canonical_global)
         self.assertEqual(
@@ -1627,7 +1632,36 @@ non_diegetic_music: N/A"""
         self.assertEqual(recovered_body["per_clip_frames"], [158, 345])
         self.assertEqual(
             recovered_body["per_clip_prompts"],
-            director["shot_plan"]["clip_prompts"],
+            director_body["per_clip_prompts"],
+        )
+
+    def test_director_executable_prompts_carry_after_canonicalize(self):
+        clips, planned = self._scene(20.0)
+        body = self._base_generation_params()
+        plan = pipeline._prepare_director_h3_longform(
+            body,
+            params={"h3_ref2va_terms_accepted": True},
+            clip_plans=clips,
+            planned_clips=planned,
+            fps=24,
+        )
+        self.assertGreater(len(body["per_clip_prompts"]), 1)
+        self.assertNotIn(
+            SAME_SOURCE_VISUAL_CARRY_LINE,
+            plan["shot_plan"]["clip_prompts"][1],
+        )
+        self.assertIn(SAME_SOURCE_VISUAL_CARRY_LINE, body["per_clip_prompts"][1])
+        self.assertEqual(
+            authored_shot_markers(plan["shot_plan"]["clip_prompts"][1]),
+            authored_shot_markers(body["per_clip_prompts"][1]),
+        )
+        self.assertEqual(
+            validate_h3_context_ir_records(
+                body["per_clip_prompts"][1],
+                mode="t2va",
+                duration_seconds=plan["clip_published_frames"][1] / 24,
+            ),
+            [],
         )
 
     def test_seamless_keyframes_require_ref2va_prompt_schema(self):
