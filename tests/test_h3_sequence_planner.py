@@ -103,16 +103,26 @@ class H3ReferenceSequencePlannerTests(unittest.TestCase):
         self.assertEqual(restored, "Alex takes a different route through town")
 
     def test_independent_h3_clips_receive_only_their_local_prompt(self):
-        launch = (APP / "launch.py").read_text(encoding="utf-8")
-        store = (ROOT / "ui" / "src" / "stores" / "useStore.ts").read_text(
+        planner = (APP / "services" / "h3_sequence_planner.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn(
-            'clip_params["h3_window_prompts"] = [',
-            launch,
+        launch = (APP / "launch.py").read_text(encoding="utf-8")
+        result = build_manual_h3_reference_sequence_plan(
+            "clip one\nclip two",
+            model_type="minimax_h3_ref2va",
+            resolution="864x480",
+            total_frames=500,
+            references=[],
+            native_continuation=False,
         )
-        self.assertIn('clip_params["prompt"]', launch)
-        self.assertIn("restoredH3SourcePrompt", store)
+        self.assertEqual(result["window_prompts"], ["clip one", "clip two"])
+        self.assertEqual(
+            [window["prompt"] for window in result["windows"]],
+            ["clip one", "clip two"],
+        )
+        self.assertFalse(result["native_continuation"])
+        self.assertIn("def compile_h3_reference_sequence_prompts(", planner)
+        self.assertNotIn('clip_params["h3_window_prompts"] = [', launch)
 
     def test_native_sequence_geometry_accounts_for_overlap(self):
         windows = compute_h3_native_sequence_windows(
@@ -428,17 +438,15 @@ class H3ReferenceSequencePlannerTests(unittest.TestCase):
         self.assertEqual(len(result["window_prompts"]), result["window_count"])
 
     def test_sequence_endpoint_uses_planning_not_generation_reference_rules(self):
-        launch = (APP / "launch.py").read_text(encoding="utf-8")
-        store = (ROOT / "ui" / "src" / "stores" / "useStore.ts").read_text(
+        planner = (APP / "services" / "h3_sequence_planner.py").read_text(
             encoding="utf-8"
         )
-        prompt_input = (
-            ROOT / "ui" / "src" / "components" / "Sidebar" / "PromptInput.tsx"
-        ).read_text(encoding="utf-8")
-        self.assertIn("allow_empty=True", launch)
-        self.assertIn("require_visual=False", launch)
-        self.assertIn("promptEnhanceError", store)
-        self.assertIn('role="alert"', prompt_input)
+        launch = (APP / "launch.py").read_text(encoding="utf-8")
+        self.assertIn("require_visual=False", planner)
+        self.assertIn("allow_empty=True", planner)
+        self.assertIn("require_files=False", planner)
+        self.assertNotIn("/api/v1/llm/plan-h3-sequence", launch)
+        self.assertNotIn("require_visual=False", launch)
 
     @patch("services.llm_service.generate")
     def test_staged_omni_planner_assigns_each_event_to_one_clip(self, generate):
@@ -568,33 +576,40 @@ class H3ReferenceSequencePlannerTests(unittest.TestCase):
         self.assertIn("not an identity source", augmented)
         self.assertIn("<Picture 1> defines Alex", augmented)
 
-    def test_studio_sequence_wiring_preserves_source_settings(self):
+    def test_studio_sequence_wiring_uses_continuum_planner_path(self):
         launch = (APP / "launch.py").read_text(encoding="utf-8")
-        handler = (APP / "wgp.py").read_text(encoding="utf-8")
-        store = (ROOT / "ui" / "src" / "stores" / "useStore.ts").read_text(
+        planner = (APP / "services" / "h3_sequence_planner.py").read_text(
             encoding="utf-8"
         )
+        helpers = (APP / "services" / "h3_planner_helpers.py").read_text(
+            encoding="utf-8"
+        )
+        controls = (
+            ROOT
+            / "ui"
+            / "src"
+            / "components"
+            / "Sidebar"
+            / "H3MultiWindowControls.tsx"
+        ).read_text(encoding="utf-8")
         duration = (
             ROOT / "ui" / "src" / "components" / "Sidebar" / "DurationSlider.tsx"
         ).read_text(encoding="utf-8")
-        self.assertIn('/api/v1/llm/plan-h3-sequence', launch)
-        self.assertIn('"per_clip_minimax_h3_references"', launch)
-        self.assertIn('sequence_plan.get("source_prompt")', handler)
-        self.assertIn('video_duration_sec=target_duration_sec', handler)
-        self.assertIn('api.planH3Sequence', store)
-        self.assertIn('h3ReferenceSequence', store)
-        self.assertIn('minimax_h3_sequence_clip_frames', store)
-        self.assertIn('apply_h3_omni_sequence_memory_policy', launch)
-        self.assertIn('body["sliding_window_size"] = min(', launch)
-        self.assertIn('omniReferenceSequence', duration)
-        self.assertIn(
-            "{isH3 || isLtx ? 'Window Length' : 'Window Size'}",
-            duration,
-        )
-        self.assertIn('Recommended {formatSeconds(safeWindowSeconds)}', duration)
-        self.assertIn('native Omni windows', duration)
-        self.assertIn('body["multi_prompts_gen_type"] = 0', launch)
-        self.assertIn('body["sliding_window_overlap"] = h3_sequence_overlap', launch)
+        self.assertNotIn("/api/v1/llm/plan-h3-sequence", launch)
+        self.assertNotIn("api.planH3Sequence", launch)
+        self.assertIn("def plan_h3_reference_sequence(", planner)
+        self.assertIn("def compile_h3_reference_sequence_prompts(", planner)
+        self.assertIn("def compile_h3_window_prompts(", helpers)
+        self.assertIn("def _parse_json_object(", helpers)
+        self.assertIn("_plan_generation_submission(", launch)
+        self.assertIn("plan_h3_native_shots", launch)
+        self.assertIn("plan_h3_clip_frames", launch)
+        self.assertIn("minimax_h3_reference_sequence", controls)
+        self.assertIn("minimax_h3_sequence_prompt_mode", controls)
+        self.assertIn("Maximum shot length", duration)
+        self.assertIn("Maximum section length", duration)
+        self.assertNotIn("omniReferenceSequence", duration)
+        self.assertNotIn("AI-planned window prompts", duration)
 
 
 if __name__ == "__main__":

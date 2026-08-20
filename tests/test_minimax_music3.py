@@ -5,7 +5,6 @@ from __future__ import annotations
 import ast
 import importlib.util
 import json
-import math
 import os
 from pathlib import Path
 import re
@@ -133,18 +132,17 @@ def _load_prompt_helpers():
     return namespace
 
 
-def _load_launch_music_helpers():
+def _load_write_song_namespace():
     tree = ast.parse(_read(_LAUNCH), filename=str(_LAUNCH))
     selected = [
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "_music3_writer_duration_instruction"
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "llm_write_song"
     ]
-    namespace = {"math": math}
     module = ast.Module(body=selected, type_ignores=[])
-    exec(compile(ast.fix_missing_locations(module), str(_LAUNCH), "exec"), namespace)
-    return namespace
+    ast.fix_missing_locations(module)
+    return selected[0]
 
 
 def _load_engine_resolver(*, vllm_supported: bool):
@@ -385,7 +383,9 @@ class MiniMaxMusic3Tests(unittest.TestCase):
         quanto = _read(_QUANTO_INT8)
         handler = _read(_HANDLER)
         launch = _read(_LAUNCH)
-        self.assertIn('"models.TTS.minimax_music3_handler"', wgp)
+        self.assertNotIn('"models.TTS.minimax_music3_handler"', wgp)
+        self.assertIn("minimax_music3_handler", _read(_APP / "models" / "TTS" / "__init__.py"))
+        self.assertIn("def _music3_virtual_catalog_model(", launch)
         self.assertIn("Qwen2TokenizerFast.from_pretrained", pipeline)
         self.assertIn("Qwen3Config.from_pretrained", pipeline)
         self.assertIn("normalize_music3_qwen_config", pipeline)
@@ -414,49 +414,55 @@ class MiniMaxMusic3Tests(unittest.TestCase):
         self.assertIn("torch.inference_mode()", cuda_graph)
         self.assertIn("scaled_dot_product_attention", attention)
         self.assertIn("configure_tiny_m_shape_overrides", quanto)
-        self.assertIn("compute_music3_weight_budget", launch)
-        self.assertIn("resident Music3 profile will reload", launch)
-        self.assertIn("music3_kv_cache_gb", launch)
-        self.assertIn("MiniMax-Music3 ran out of VRAM while planning the song", wgp)
+        self.assertIn("this entry cannot be enabled, downloaded, selected, or run", launch)
+        self.assertIn("LOCAL_EXPERIMENT_AUTHORIZATION_SCOPE", launch)
+        self.assertNotIn("compute_music3_weight_budget", launch)
+        self.assertNotIn("resident Music3 profile will reload", launch)
+        self.assertNotIn("MiniMax-Music3 ran out of VRAM while planning the song", wgp)
 
     def test_music_ui_and_song_writer_are_model_aware(self):
         store = _read(_STORE)
         ui = _read(_MUSIC_UI)
         client = _read(_CLIENT)
         launch = _read(_LAUNCH)
-        self.assertIn("'minimax_music3'", store)
-        self.assertIn("const DEFAULTS_VERSION = 10", store)
-        self.assertIn("music3_structured_caption", ui)
-        self.assertIn("model_type: params.model_type", ui)
-        self.assertIn("duration_seconds: durationSeconds", ui)
-        self.assertIn("model_type?: string", client)
+        self.assertIn("const DEFAULTS_VERSION = 9", store)
+        self.assertNotIn("directorMusicModel", store)
+        self.assertNotIn("'minimax_music3'", store)
+        self.assertIn("api.writeSong({", ui)
+        self.assertIn("description: description.trim()", ui)
+        self.assertNotIn("music3_structured_caption", ui)
         self.assertIn("duration_seconds?: number", client)
-        self.assertIn('load_guide("music", "song_writer_minimax_music3")', launch)
-        self.assertIn("_music3_writer_duration_instruction", launch)
-        self.assertIn("music3=is_minimax_music3", launch)
+        self.assertIn("model_type?: string", client)
+        self.assertIn('load_guide("music", "song_writer")', launch)
+        self.assertIn('load_guide("music", "song_writer_instrumental")', launch)
+        self.assertNotIn('load_guide("music", "song_writer_minimax_music3")', launch)
+        self.assertNotIn("_music3_writer_duration_instruction", launch)
 
     def test_music3_writer_receives_a_bounded_runtime_contract(self):
-        runtime = _load_launch_music_helpers()["_music3_writer_duration_instruction"]
-        self.assertIn("30 seconds long", runtime(30))
-        self.assertIn("ending near 30 seconds", runtime(30))
-        self.assertIn("120 seconds long", runtime(None))
-        self.assertIn("300 seconds long", runtime(999))
+        write_song = _load_write_song_namespace()
+        constants = {
+            node.value
+            for node in ast.walk(write_song)
+            if isinstance(node, ast.Constant)
+        }
+        self.assertIn("song_writer", constants)
+        self.assertIn("song_writer_instrumental", constants)
+        self.assertIn(1024, constants)
+        self.assertNotIn("song_writer_minimax_music3", constants)
+        self.assertNotIn("_music3_writer_duration_instruction", constants)
 
     def test_director_can_select_and_submit_music3(self):
         store = _read(_STORE)
         setup = _read(_DIRECTOR_MUSIC_UI)
         launch = _read(_LAUNCH)
-        self.assertIn("directorMusicModel: string", store)
-        self.assertIn("directorMusicModel: 'ace_step_v1_5_xl_sft_lm_4b'", store)
-        self.assertGreaterEqual(
-            store.count("model_type: s.directorMusicModel"),
-            2,
-        )
         self.assertIn("'minimax_music3'", setup)
         self.assertIn("Music model", setup)
         self.assertIn("maximumDuration = isMusic3 ? 300 : 360", setup)
-        self.assertIn("generation_timeout_s", launch)
-        self.assertIn("1536 if is_minimax_music3 else 1024", launch)
+        self.assertIn("directorSongDuration", store)
+        self.assertIn("duration_seconds: s.directorSongDuration", store)
+        self.assertNotIn("directorMusicModel", store)
+        self.assertIn("_music3_virtual_catalog_model", launch)
+        self.assertNotIn("1536 if is_minimax_music3 else 1024", launch)
 
     def test_music3_guides_follow_official_structure(self):
         guide = _read(_GUIDE)

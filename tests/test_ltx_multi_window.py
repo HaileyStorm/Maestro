@@ -194,13 +194,12 @@ class LtxWindowPlannerTests(unittest.TestCase):
             120,
             6,
             20,
-            "ltx2_25",
         )
-        self.assertIn("LTX STANDALONE-WINDOW CONTRACT", request)
-        self.assertIn("short audiovisual overlap", request)
-        self.assertIn("never any previous prompt text", request)
-        self.assertIn("EVERY paragraph", request)
-        self.assertIn("must not slow, settle, stop, or resolve", request)
+        self.assertIn("Duration: 120 seconds", request)
+        self.assertIn("6 sliding windows of ~20s each", request)
+        self.assertIn("Write EXACTLY 6 paragraphs (one per window)", request)
+        self.assertIn("A continuous journey through many rooms.", request)
+        self.assertNotIn("LTX STANDALONE-WINDOW CONTRACT", request)
 
 
 class LtxMultiWindowWiringTests(unittest.TestCase):
@@ -220,13 +219,15 @@ class LtxMultiWindowWiringTests(unittest.TestCase):
         self.assertIn('"infer_audio_prompt_from_guide": True', handler)
 
     def test_api_and_backend_publish_the_sequence_contract(self):
+        planner = (
+            APP / "services/ltx_window_planner.py"
+        ).read_text(encoding="utf-8")
         launch = (APP / "launch.py").read_text(encoding="utf-8")
-        self.assertIn('"multi_window_sequence_controls"', launch)
-        self.assertIn('body.get("ltx_multi_window") is True', launch)
-        self.assertIn('body["multi_prompts_gen_type"] = 1', launch)
-        self.assertIn('response["ltx_window_plan"]', launch)
-        self.assertIn("needs_ltx_window_plan", launch)
-        self.assertIn("reinforce_ltx_window_invariants", launch)
+        self.assertIn("def reinforce_ltx_window_invariants(", planner)
+        self.assertIn("def compute_ltx_window_count(", planner)
+        self.assertNotIn('"multi_window_sequence_controls"', launch)
+        self.assertNotIn("needs_ltx_window_plan", launch)
+        self.assertNotIn("response[\"ltx_window_plan\"]", launch)
 
     def test_studio_exposes_toggle_modes_counts_and_manual_validation(self):
         controls = (
@@ -236,18 +237,14 @@ class LtxMultiWindowWiringTests(unittest.TestCase):
         duration = (
             ROOT / "ui/src/components/Sidebar/DurationSlider.tsx"
         ).read_text(encoding="utf-8")
-        prompt = (
-            ROOT / "ui/src/components/Sidebar/PromptInput.tsx"
-        ).read_text(encoding="utf-8")
-        store = (ROOT / "ui/src/stores/useStore.ts").read_text(encoding="utf-8")
         self.assertIn("multi_window_sequence_controls", controls)
         self.assertIn("ltx_multi_window", controls)
         self.assertIn("ltx_window_prompt_mode", controls)
-        self.assertIn("AI-planned window prompts", duration)
-        self.assertIn("LTX long-form Auto follows Duration", duration)
+        self.assertIn("Auto plan (AI)", controls)
+        self.assertIn("Manual - one per line", controls)
+        self.assertNotIn("AI-planned window prompts", duration)
+        self.assertNotIn("LTX long-form Auto follows Duration", duration)
         self.assertNotIn("if (isLtx && ltxMultiWindow) return", duration)
-        self.assertIn("usesLtxManualPrompts", prompt)
-        self.assertIn("Manual LTX sequence needs exactly", store)
 
     def test_ltx_guide_distributes_actions_chronologically(self):
         guide = (

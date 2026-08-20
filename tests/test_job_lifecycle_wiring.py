@@ -127,7 +127,7 @@ class TestJobLifecycleWiring(unittest.TestCase):
             for node in ast.walk(cancel)
         ))
 
-    def test_studio_queue_uses_explicit_held_lifecycle(self):
+    def test_studio_queue_uses_continuum_queue_held(self):
         generate = _function(self.launch, "generate")
         generate_constants = {
             node.value
@@ -136,6 +136,13 @@ class TestJobLifecycleWiring(unittest.TestCase):
         }
         self.assertIn("_queue_mode", generate_constants)
         self.assertIn("held", generate_constants)
+        self.assertIn("queue_held", generate_constants)
+        self.assertIn("Ready - waiting for Start Queue", generate_constants)
+        mint = _function(self.launch, "_new_generation_job_id")
+        self.assertTrue(any(
+            isinstance(node, ast.Attribute) and node.attr == "hex"
+            for node in ast.walk(mint)
+        ))
         self.assertTrue(any(
             isinstance(node, ast.If)
             and isinstance(node.test, ast.UnaryOp)
@@ -150,69 +157,73 @@ class TestJobLifecycleWiring(unittest.TestCase):
             for node in ast.walk(generate)
         ))
 
-        release_queue = _function(self.launch, "_start_held_studio_queue")
-        self.assertIn("release_held", _called_names(release_queue))
-
-        dispatcher = _function(self.launch, "_run_held_studio_jobs")
-        self.assertIn("_run_generation", _called_names(dispatcher))
+        launch_names = {
+            node.name
+            for node in ast.walk(self.launch)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        self.assertNotIn("_start_held_studio_queue", launch_names)
+        self.assertNotIn("_run_held_studio_jobs", launch_names)
+        self.assertNotIn("release_held", launch_names)
 
         endpoint = _function(self.launch, "start_studio_queue")
-        self.assertIn("_start_held_studio_queue", _called_names(endpoint))
+        self.assertIn("set_job_hold", _called_names(endpoint))
+        self.assertNotIn("release_held", _called_names(endpoint))
+        self.assertNotIn("_start_held_studio_queue", _called_names(endpoint))
 
-        list_jobs = _function(self.launch, "list_jobs")
-        list_constants = {
+        get_queue = _function(self.launch, "get_queue_state")
+        queue_constants = {
             node.value
-            for node in ast.walk(list_jobs)
+            for node in ast.walk(get_queue)
             if isinstance(node, ast.Constant) and isinstance(node.value, str)
         }
-        self.assertIn("held", list_constants)
+        self.assertIn("held", queue_constants)
+        self.assertIn("queue_held", queue_constants)
 
-    def test_studio_queue_release_preserves_submission_order(self):
-        started_threads = []
-
-        class FakeThread:
-            def __init__(self, **kwargs):
-                self.kwargs = kwargs
-                started_threads.append(self)
-
-            def start(self):
-                self.started = True
-
+    def test_studio_queue_release_clears_queue_held_via_set_job_hold(self):
         jobs = {
-            "later": {"status": "held", "created_at": 20},
-            "active": {"status": "running", "created_at": 5},
-            "earlier": {"status": "held", "created_at": 10},
+            "later": {"id": "later", "status": "queued", "queue_held": True, "created_at": 20},
+            "active": {"id": "active", "status": "running", "queue_held": False, "created_at": 5},
+            "earlier": {"id": "earlier", "status": "queued", "queue_held": True, "created_at": 10},
+            "blank": {"id": "", "status": "queued", "queue_held": True},
         }
+        released_ids = []
 
-        def release(job, **updates):
-            if job.get("status") != "held":
-                return False
-            job.update(updates)
-            job["status"] = "queued"
-            return True
+        def set_hold(job, held):
+            if job.get("queue_held") is not True or held is not False:
+                return None
+            job["queue_held"] = False
+            released_ids.append(job["id"])
+            return "resumed"
 
         start_queue = _load_isolated_function(
             "app/launch.py",
-            "_start_held_studio_queue",
+            "start_studio_queue",
             {
+                "api": SimpleNamespace(
+                    post=lambda *_args, **_kwargs: (lambda function: function),
+                ),
+                "Request": object,
+                "Response": object,
                 "_jobs": jobs,
-                "snapshot_job": lambda job: dict(job),
-                "release_held": release,
-                "threading": SimpleNamespace(Thread=FakeThread),
-                "_run_held_studio_jobs": object(),
+                "_set_recovery_no_store": lambda _response: None,
+                "_require_remote_queue_project": lambda _request: None,
+                "_require_generic_queue_control_job": lambda job_id, _request: jobs[job_id],
+                "_queue_recovery_delivery_pending": lambda _job: None,
+                "_require_job_runtime_model_admission": lambda _job: None,
+                "set_job_hold": set_hold,
+                "HTTPException": RuntimeError,
             },
         )
 
-        self.assertEqual(start_queue(), ["earlier", "later"])
-        self.assertEqual(jobs["earlier"]["status"], "queued")
-        self.assertEqual(jobs["later"]["status"], "queued")
+        result = start_queue(SimpleNamespace(), SimpleNamespace())
+        self.assertEqual(set(result["released"]), {"earlier", "later"})
+        self.assertEqual(set(result["job_ids"]), {"earlier", "later"})
+        self.assertFalse(jobs["earlier"]["queue_held"])
+        self.assertFalse(jobs["later"]["queue_held"])
+        self.assertTrue(jobs["active"]["queue_held"] is False)
         self.assertEqual(jobs["active"]["status"], "running")
-        self.assertEqual(len(started_threads), 1)
-        self.assertEqual(
-            started_threads[0].kwargs["args"],
-            (["earlier", "later"],),
-        )
-        self.assertTrue(started_threads[0].started)
+        self.assertEqual(set(released_ids), {"earlier", "later"})
 
     def test_director_music_progress_validation_imports_regex_module(self):
         imported_modules = {
