@@ -15,6 +15,9 @@ ROOT = Path(__file__).resolve().parents[1]
 LAUNCH = (ROOT / "app/launch.py").read_text(encoding="utf-8")
 CLIENT = (ROOT / "ui/src/api/client.ts").read_text(encoding="utf-8")
 STORE = (ROOT / "ui/src/stores/useStore.ts").read_text(encoding="utf-8")
+QUEUE_PROJECTION = (
+    ROOT / "ui/src/lib/queueProjection.ts"
+).read_text(encoding="utf-8")
 GENERATE_BUTTON = (
     ROOT / "ui/src/components/Sidebar/GenerateButton.tsx"
 ).read_text(encoding="utf-8")
@@ -94,6 +97,21 @@ class StudioHoldQueueModeTests(unittest.TestCase):
         )
         self.assertIn("${BASE}/api/v1/director/queue", enqueue)
         self.assertIn("method: 'POST'", enqueue)
+
+    def test_queue_projection_counts_continuum_held_flag_not_status_held(self):
+        statuses = _slice(
+            QUEUE_PROJECTION,
+            "const ACTIVE_STATUSES = new Set<GenerationJob['status']>([",
+            "])",
+        )
+        self.assertIn("'queued'", statuses)
+        self.assertIn("'running'", statuses)
+        self.assertNotIn("'held'", statuses)
+        self.assertIn("if (queueJob?.held || publicJob.held) summary.held += 1", QUEUE_PROJECTION)
+        self.assertIn(
+            "job.status === 'queued' || job.status === 'running' || job.held",
+            GENERATE_BUTTON,
+        )
 
 
 if __name__ == "__main__":
