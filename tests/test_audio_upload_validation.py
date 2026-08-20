@@ -17,8 +17,26 @@ LAUNCH_PATH = APP_ROOT / "launch.py"
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
-from services import audio_upload_validation as validation  # noqa: E402
-from services.output_access import write_upload_access_sidecar  # noqa: E402
+# starlette is a FastAPI/runtime dep in ./app/env, not the default interpreter.
+# Skip only that missing dep so real validation failures still fail the suite.
+_STARLETTE_IMPORT_ERROR: ModuleNotFoundError | None = None
+try:
+    from services import audio_upload_validation as validation  # noqa: E402
+    from services.output_access import write_upload_access_sidecar  # noqa: E402
+except ModuleNotFoundError as error:
+    if getattr(error, "name", None) != "starlette":
+        raise
+    validation = None  # type: ignore[assignment]
+    write_upload_access_sidecar = None  # type: ignore[assignment]
+    _STARLETTE_IMPORT_ERROR = error
+
+
+def setUpModule() -> None:
+    if _STARLETTE_IMPORT_ERROR is not None:
+        raise unittest.SkipTest(
+            "starlette is provided by ./app/env; run this module with "
+            "./app/env/bin/python"
+        ) from _STARLETTE_IMPORT_ERROR
 
 
 def _chunk(kind: bytes, payload: bytes) -> bytes:
