@@ -1,3 +1,12 @@
+"""Continuum first-launch model visibility.
+
+Locks leftover 1.9.0 `DEFAULT_ENABLED_MODELS` / `nsfw_only` / LTX avatar
+defaults to Continuum curated symbols. Continuum never hid `animate` or
+`mmaudio_nsfw` behind a mature-only catalog gate, and avatar does not
+default to LTX-2.3 Distilled.
+"""
+from __future__ import annotations
+
 import re
 import unittest
 from pathlib import Path
@@ -16,40 +25,46 @@ def _typescript_block(source: str, declaration: str) -> str:
 
 
 class ModelVisibilityDefaultsTests(unittest.TestCase):
-    def test_fresh_defaults_exclude_unreachable_and_mature_only_models(self):
+    def test_fresh_defaults_keep_continuum_curated_families(self):
         source = _store_source()
         defaults = _typescript_block(
             source,
             "const DEFAULT_ENABLED_MODELS = new Set([",
         )
-        self.assertNotIn("'animate'", defaults)
-        self.assertNotIn("'mmaudio_nsfw'", defaults)
+        self.assertIn("'minimax_h3'", defaults)
+        self.assertIn("'ltx2_22B_distilled_1_1'", defaults)
         self.assertIn("'mmaudio_v2'", defaults)
+        self.assertIn("'mmaudio_nsfw'", defaults)
+        self.assertIn("'animate'", defaults)
+        self.assertIn("const DEFAULTS_VERSION = 9", source)
+        self.assertNotIn("const DEFAULTS_VERSION = 10", source)
 
-    def test_mmaudio_nsfw_is_gated_by_mature_mode(self):
+    def test_mmaudio_nsfw_catalog_entry_has_no_mature_only_gate(self):
         source = _store_source()
         match = re.search(
             r"\{ model_type: 'mmaudio_nsfw'.*?\}",
             source,
         )
         self.assertIsNotNone(match)
-        self.assertIn("nsfw_only: true", match.group(0))
+        self.assertNotIn("nsfw_only: true", match.group(0))
+        self.assertIn("architecture: 'mmaudio'", match.group(0))
 
-    def test_edit_mode_prefers_the_enabled_ltx23_model(self):
+    def test_mode_defaults_prefer_continuum_h3_and_empty_avatar_fallback(self):
         source = _store_source()
         defaults = source.split(
             "const modeDefaultModel: Record<GenerationMode, string> = {",
             1,
         )[1].split("}\n", 1)[0]
-        self.assertIn("avatar: 'ltx2_22B_distilled_1_1'", defaults)
-        self.assertIn(
-            "enabledModels?: ReadonlySet<string>",
+        self.assertIn("video: 'minimax_h3'", defaults)
+        self.assertIn("image: 'flux2_klein_9b'", defaults)
+        self.assertIn("audio: 'kugelaudio_0_open'", defaults)
+        self.assertIn("avatar: '',", defaults)
+        self.assertNotIn("avatar: 'ltx2_22B_distilled_1_1'", defaults)
+        enabled = _typescript_block(
             source,
+            "const DEFAULT_ENABLED_MODELS = new Set([",
         )
-        self.assertIn(
-            "enabledModels.has(savedModel)",
-            source,
-        )
+        self.assertIn("'ltx2_22B_distilled_1_1'", enabled)
 
 
 if __name__ == "__main__":
