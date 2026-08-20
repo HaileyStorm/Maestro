@@ -1,4 +1,9 @@
-"""Regressions for Classic UI generation-status state."""
+"""Continuum Classic UI generation-status helpers.
+
+Locks leftover 1.9.0 `initialize_gen_info` / required-field factory
+expectations to Continuum `get_gen_info` plus fail-open `prompt_no`
+reads. Partial queue state must not KeyError.
+"""
 from __future__ import annotations
 
 import ast
@@ -8,13 +13,12 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 WGP_PATH = ROOT / "app" / "wgp.py"
+WGP_SOURCE = WGP_PATH.read_text(encoding="utf-8")
 
 
 def _load_status_helpers() -> dict:
-    source = WGP_PATH.read_text(encoding="utf-8")
-    tree = ast.parse(source, filename=str(WGP_PATH))
+    tree = ast.parse(WGP_SOURCE, filename=str(WGP_PATH))
     function_names = {
-        "initialize_gen_info",
         "get_gen_info",
         "get_generation_status",
         "get_new_refresh_id",
@@ -30,7 +34,7 @@ def _load_status_helpers() -> dict:
             assigned_names = {
                 target.id for target in node.targets if isinstance(target, ast.Name)
             }
-            if assigned_names & {"_GENERATION_STATUS_DEFAULTS", "refresh_id"}:
+            if assigned_names & {"refresh_id"}:
                 selected.append(node)
     module = ast.Module(body=selected, type_ignores=[])
     ast.fix_missing_locations(module)
@@ -44,20 +48,33 @@ class ClassicUiStatusTests(unittest.TestCase):
     def setUpClass(cls):
         cls.helpers = _load_status_helpers()
 
-    def test_fresh_status_state_has_every_required_field(self):
-        gen = self.helpers["initialize_gen_info"]({"queue": []})
+    def test_continuum_has_no_initialize_gen_info(self):
+        tree = ast.parse(WGP_SOURCE, filename=str(WGP_PATH))
+        names = {
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+        self.assertNotIn("initialize_gen_info", names)
+        self.assertIn("get_gen_info", names)
+        self.assertIn("prompt_no = gen.get(\"prompt_no\", 0)", WGP_SOURCE)
+        self.assertNotIn('prompt_no = gen["prompt_no"]', WGP_SOURCE)
 
-        self.assertEqual(0, gen["prompt_no"])
-        self.assertEqual(0, gen["prompts_max"])
-        self.assertEqual(1, gen["total_generation"])
-        self.assertEqual("", gen["progress_status"])
+    def test_get_gen_info_creates_empty_cache_without_invented_defaults(self):
+        state = {"queue": []}
+        gen = self.helpers["get_gen_info"](state)
+
+        self.assertIs(gen, state["gen"])
+        self.assertEqual({}, gen)
+        self.assertNotIn("prompt_no", gen)
+        self.assertNotIn("progress_status", gen)
 
     def test_add_to_queue_status_accepts_legacy_partial_state(self):
         state = {"gen": {"queue": [], "prompts_max": 2}}
 
         self.helpers["update_status"](state)
 
-        self.assertEqual(0, state["gen"]["prompt_no"])
+        self.assertEqual(0, state["gen"].get("prompt_no", 0))
         self.assertEqual("Prompt 0/2", state["gen"]["progress_status"])
         self.assertGreater(state["gen"]["refresh"], 0)
 
@@ -66,8 +83,9 @@ class ClassicUiStatusTests(unittest.TestCase):
 
         status = self.helpers["get_latest_status"](state)
 
-        self.assertEqual("", status)
-        self.assertEqual(0, state["gen"]["prompt_no"])
+        self.assertEqual("Prompt 0/0", status)
+        self.assertIn("gen", state)
+        self.assertEqual(0, state["gen"].get("prompt_no", 0))
 
 
 if __name__ == "__main__":
