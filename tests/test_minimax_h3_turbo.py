@@ -619,10 +619,12 @@ class TestH3TurboSchedulingAndPolicy(unittest.TestCase):
         self.assertFalse(h3_turbo.turbo_requested(None))
 
     def test_sage2_turbo_reports_release_bound_base_four_and_eight_validation(self):
-        with mock.patch(
-            "services.h3_acceleration.sage2_validation_status",
-            return_value={"passed": True, "reason": None},
-        ):
+        acceleration = types.ModuleType("services.h3_acceleration")
+        acceleration.sage2_validation_status = lambda: {
+            "passed": True,
+            "reason": None,
+        }
+        with mock.patch.dict(sys.modules, {"services.h3_acceleration": acceleration}):
             matrix = h3_turbo.turbo_compatibility_matrix()
         self.assertEqual(
             matrix["attention"]["sage2"]["status"],
