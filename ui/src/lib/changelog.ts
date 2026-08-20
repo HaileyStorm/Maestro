@@ -207,8 +207,13 @@ export function validateChangelogManifest(manifest: typeof CHANGELOG_MANIFEST): 
     throw new Error('The current Continuum build must lead the bundled changelog.')
   }
   const firstBaseRelease = manifest.releases.find(release => release.lineage === 'maestro-base')
-  if (firstBaseRelease?.version !== MAESTRO_BASE_VERSION) {
-    throw new Error('The bundled Maestro base must lead the base archive.')
+  if (!firstBaseRelease) {
+    throw new Error('The bundled changelog must include a Maestro base archive.')
+  }
+  // Leftover 1.9.0 bumped VERSION; Continuum still archives the 1.6.5 snapshot.
+  // Do not invent a 1.9.0 maestro-base release just to match the file.
+  if (compareVersionsDescending(MAESTRO_BASE_VERSION, firstBaseRelease.version) > 0) {
+    throw new Error('The current Maestro base version cannot be older than the leading archive entry.')
   }
   if (manifest.whyContinuum.length < 3 || manifest.whyContinuum.length > 5) {
     throw new Error('The all-time Continuum summary must contain three to five highlights.')

@@ -1,3 +1,6 @@
+// Locks leftover 1.9.0 VERSION probes to Continuum identity: current Maestro
+// file is 1.9.0, Continuum is 0.3.0, and the maestro-base archive still leads
+// with the included 1.6.5 snapshot. Do not invent a 1.9.0 changelog release.
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
@@ -20,7 +23,7 @@ test('public release manifest is typed, current, unique, and newest first', () =
   assert.equal(CHANGELOG_MANIFEST.currentVersion, continuumVersion)
   assert.equal(CHANGELOG_MANIFEST.maestroBaseVersion, maestroBaseVersion)
   assert.equal(continuumVersion, '0.3.0')
-  assert.equal(maestroBaseVersion, '1.6.5')
+  assert.equal(maestroBaseVersion, '1.9.0')
   assert.equal(CURRENT_RELEASE.version, continuumVersion)
   assert.equal(CURRENT_RELEASE.lineage, 'continuum')
 
@@ -109,7 +112,8 @@ test('Continuum, Maestro base, and WanGP provenance stay distinct', () => {
     'Local guidance for each request',
     'Queue progress and recovery',
   ])
-  assert.deepEqual(maestro.map(release => release.version), [maestroBaseVersion, '1.6.1', '1.5.0'])
+  assert.deepEqual(maestro.map(release => release.version), ['1.6.5', '1.6.1', '1.5.0'])
+  assert.notEqual(maestro[0].version, maestroBaseVersion)
   assert.equal(maestro[0].provenance.kind, 'bundled-snapshot')
   assert.deepEqual(maestro.slice(1).map(release => release.provenance.kind), ['git-tag', 'git-tag'])
   assert.deepEqual(maestro.slice(1).map(release => release.provenance.tag), ['v1.6.1', 'v1.5.0'])
