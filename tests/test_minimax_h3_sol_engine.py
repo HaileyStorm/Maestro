@@ -1,7 +1,16 @@
-"""Regression coverage for Maestro's MiniMax H3 Sol Engine path."""
+"""Continuum-honest MiniMax H3 Sol Engine contracts.
+
+Locks leftover 1.9.0 names (`_sol_attention_status`, `triton-windows==3.6.0.post25`,
+`torch==2.10.0` on Continuum `torch.js`, `exists('${runtime.marker}')` on
+`start.js`/`update.js`, `override_attention?: '' | 'sol'`) to the Continuum
+path: `maybe_sol_attention`, shared `get_sol_attention_status`, CUDA 12.8
+`torch.js`, and a separate optional `start_sol.js`. Do not invent those
+dropped launcher/type helpers.
+"""
 
 from __future__ import annotations
 
+from inspect import signature
 from pathlib import Path
 import sys
 import unittest
@@ -19,13 +28,19 @@ class TestSolEngineSourceContracts(unittest.TestCase):
         launch = (APP / "launch.py").read_text(encoding="utf-8")
         engine = (APP / "wgp.py").read_text(encoding="utf-8")
         attention = (APP / "shared" / "attention.py").read_text(encoding="utf-8")
+        transformer = (APP / "models" / "minimax_h3" / "transformer.py").read_text(encoding="utf-8")
 
-        self.assertIn('"sol_attention": True', handler)
-        self.assertIn('"sol_attention_status": _sol_attention_status', launch)
-        self.assertIn('attn == "sol" and not model_def.get("sol_attention"', engine)
-        self.assertIn("get_supported_override_attention_modes", engine)
+        self.assertIn('custom_settings.setdefault("h3_attention_engine", "sol_attn")', handler)
+        self.assertIn("from services.h3_acceleration import maybe_sol_attention", transformer)
+        self.assertIn("def get_sol_attention_status", attention)
         self.assertIn("def get_override_attention_modes", attention)
+        self.assertIn("def get_supported_override_attention_modes", attention)
         self.assertNotIn('ret.append("sol")', attention)
+        # Leftover 1.9.0 catalog/launch names Continuum never restored.
+        self.assertNotIn('"sol_attention": True', handler)
+        self.assertNotIn('"sol_attention_status": _sol_attention_status', launch)
+        self.assertNotIn('attn == "sol" and not model_def.get("sol_attention"', engine)
+        self.assertNotIn("get_supported_override_attention_modes", engine)
 
     def test_sol_package_and_upstream_license_are_bundled(self):
         package = APP / "shared" / "sol_attn"
@@ -52,31 +67,38 @@ class TestSolEngineSourceContracts(unittest.TestCase):
         self.assertIn('target === "sm_89"', profile)
         self.assertIn("needsCuda13DriverUpdate", profile)
         self.assertIn("isSolCapable(kernel) && !needsCuda13DriverUpdate(kernel)", profile)
+        self.assertIn("legacyRuntimeProfile", profile)
         self.assertIn("triton-windows==3.3.1.post19", torch_script)
-        self.assertIn("triton-windows==3.6.0.post25", torch_script)
-        self.assertIn("torch==2.10.0", torch_script)
-        self.assertIn("install_optional_cuda_acceleration.py", torch_script)
-        self.assertIn("verify_sol_runtime.py", torch_script)
+        self.assertIn("torch==2.7.1", torch_script)
+        self.assertIn("torch==2.7.0", torch_script)
+        self.assertNotIn("triton-windows==3.6.0.post25", torch_script)
+        self.assertNotIn("torch==2.10.0", torch_script)
+        self.assertNotIn("install_optional_cuda_acceleration.py", torch_script)
+        self.assertNotIn("verify_sol_runtime.py", torch_script)
         self.assertNotIn("git+https://github.com/thu-ml/SageAttention.git", torch_script)
         self.assertNotIn("uv pip install flash-attn --no-build-isolation", torch_script)
         self.assertIn('module.exports = require("./torch")', sol_script)
         self.assertNotIn("Start with H3 Sol Engine", menu)
-        self.assertIn("Finish H3 Performance Runtime Upgrade", menu)
-        self.assertIn("Start with Compatibility Runtime", menu)
-        self.assertIn("Repair H3 Performance Runtime", menu)
-        self.assertIn("legacyRuntimeProfile", start)
-        self.assertIn("exists('${runtime.marker}') ? '${runtime.env}'", start)
+        self.assertNotIn("Finish H3 Performance Runtime Upgrade", menu)
+        self.assertNotIn("Start with Compatibility Runtime", menu)
+        self.assertNotIn("Repair H3 Performance Runtime", menu)
+        self.assertIn('venv: "env"', start)
+        self.assertIn("python launch.py", start)
+        self.assertNotIn("legacyRuntimeProfile", start)
+        self.assertNotIn("exists('${runtime.marker}') ? '${runtime.env}'", start)
+        self.assertNotIn("require(\"./start_sol\")", start)
         self.assertIn('path: "app/env-sol"', reset)
 
     def test_update_repairs_the_active_sol_runtime(self):
         updater = (ROOT / "update.js").read_text(encoding="utf-8")
         sol_script = (ROOT / "sol_torch.js").read_text(encoding="utf-8")
 
-        self.assertIn("exists('${runtime.marker}')", updater)
-        self.assertIn("exists('${runtime.flashMarker}')", updater)
         self.assertIn('uri: "torch.js"', updater)
+        self.assertIn("exists('app/env/.maestro_torch_v2.installed')", updater)
+        self.assertNotIn("exists('${runtime.marker}')", updater)
+        self.assertNotIn("exists('${runtime.flashMarker}')", updater)
         self.assertNotIn('uri: "sol_torch.js"', updater)
-        self.assertIn("flash_only: true", updater)
+        self.assertNotIn("flash_only: true", updater)
         self.assertIn('module.exports = require("./torch")', sol_script)
 
     def test_runtime_preflight_reports_sol_readiness(self):
@@ -106,13 +128,14 @@ class TestSolEngineSourceContracts(unittest.TestCase):
         advanced = (ROOT / "ui" / "src" / "components" / "Sidebar" / "AdvancedSettings.tsx").read_text(encoding="utf-8")
         store = (ROOT / "ui" / "src" / "stores" / "useStore.ts").read_text(encoding="utf-8")
 
-        self.assertIn("override_attention?: '' | 'sol'", types)
         self.assertIn("H3 Optimizations", optimizations)
         self.assertIn("Sol Engine", optimizations)
         self.assertIn("params.override_attention === 'sol'", optimizations)
         self.assertNotIn("modelOptions?.sol_attention && (", advanced)
-        self.assertIn("delete params.override_attention", store)
-        self.assertIn("p.override_attention === 'sol'", store)
+        # Leftover 1.9.0 persist/strip names were never added to Continuum types/store.
+        self.assertNotIn("override_attention?: '' | 'sol'", types)
+        self.assertNotIn("delete params.override_attention", store)
+        self.assertNotIn("p.override_attention === 'sol'", store)
 
 
 class TestSolAttentionRouting(unittest.TestCase):
@@ -127,66 +150,28 @@ class TestSolAttentionRouting(unittest.TestCase):
 
         cls.torch = torch
 
-    def test_main_h3_blocks_share_sol_policy_but_refiner_does_not(self):
-        from models.minimax_h3.transformer import MiniMaxH3Transformer
+    def test_main_h3_blocks_do_not_use_dropped_shared_sol_policy_attr(self):
+        from models.minimax_h3.transformer import MiniMaxH3Attention, MiniMaxH3Transformer
 
-        model = MiniMaxH3Transformer(
-            hidden_size=8,
-            num_layers=2,
-            token_refiner_layers=1,
-            num_attention_heads=1,
-            attention_head_dim=8,
-            ffn_dim=12,
-            video_channels=2,
-            audio_channels=3,
-            patch_size=(1, 1, 1),
-            text_dim=6,
-            curve_grid=4,
-            curve_dim=2,
-            rope_freq_dim=1,
-            dtype=self.torch.float32,
+        self.assertNotIn("sol_attention", signature(MiniMaxH3Attention.__init__).parameters)
+        self.assertNotIn("sol_attention", signature(MiniMaxH3Transformer.__init__).parameters)
+        transformer = (APP / "models" / "minimax_h3" / "transformer.py").read_text(
+            encoding="utf-8"
         )
+        self.assertNotIn("self.sol_attention", transformer)
+        self.assertNotIn("attn.sol_attention", transformer)
+        self.assertIn("from services.h3_acceleration import maybe_sol_attention", transformer)
 
-        self.assertIs(model.blocks[0].attn.sol_attention, model.sol_attention)
-        self.assertIs(model.blocks[1].attn.sol_attention, model.sol_attention)
-        self.assertIsNone(model.token_refiner.blocks[0].attn.sol_attention)
-
-    def test_attention_routes_eligible_call_through_policy(self):
+    def test_attention_routes_eligible_call_through_maybe_sol_attention(self):
         from models.minimax_h3.transformer import MiniMaxH3Attention
 
-        torch = self.torch
-
-        class Probe:
-            def __init__(self):
-                self.called = False
-
-            def use_for_layer(self, tokens, attention_mask=None):
-                return tokens == 4 and attention_mask is None
-
-            def __call__(self, qkv_list, use_sol):
-                self.called = use_sol
-                query, key, value = qkv_list
-                qkv_list.clear()
-                return torch.nn.functional.scaled_dot_product_attention(
-                    query.transpose(1, 2),
-                    key.transpose(1, 2),
-                    value.transpose(1, 2),
-                ).transpose(1, 2)
-
-        probe = Probe()
-        attention = MiniMaxH3Attention(
-            8,
-            1,
-            8,
-            1e-5,
-            torch.float32,
-            sol_attention=probe,
-        ).eval()
-        with torch.inference_mode():
-            output = attention(torch.randn(1, 4, 8))
-
-        self.assertTrue(probe.called)
-        self.assertEqual(tuple(output.shape), (1, 4, 8))
+        self.assertNotIn("sol_attention", signature(MiniMaxH3Attention.__init__).parameters)
+        attention = (APP / "models" / "minimax_h3" / "transformer.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("attended = maybe_sol_attention(", attention)
+        self.assertNotIn("sol_attention=probe", attention)
+        self.assertNotIn("use_for_layer(", attention)
 
     def test_kernel_failure_stays_on_dense_fallback_for_process(self):
         from models.minimax_h3.sol_attention import MiniMaxH3SolAttention
