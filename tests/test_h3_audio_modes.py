@@ -1,4 +1,9 @@
-"""Model-free contracts for clean-room H3 source-audio behavior."""
+"""Model-free contracts for clean-room H3 source-audio behavior.
+
+Locks leftover 1.9.0 isolated `generate_video` repeat dispatch onto
+Continuum `_generate_video_impl`. Recursive one-output repeats still
+call public `generate_video`; do not treat the OOM wrapper as the impl.
+"""
 
 from __future__ import annotations
 
@@ -587,7 +592,7 @@ class H3AudioSourceWiringTests(unittest.TestCase):
         node = next(
             item for item in tree.body
             if isinstance(item, ast.FunctionDef)
-            and item.name == "generate_video"
+            and item.name == "_generate_video_impl"
         )
         module = ast.Module(body=[node], type_ignores=[])
         ast.fix_missing_locations(module)
@@ -595,9 +600,11 @@ class H3AudioSourceWiringTests(unittest.TestCase):
         namespace = {
             "inspect": inspect,
             "get_gen_info": lambda current: current["gen"],
+            "generation_residency_must_yield_for_postprocess": lambda *_a, **_k: False,
+            "release_generation_residency_for_postprocess": lambda *_a, **_k: None,
         }
         exec(compile(module, str(APP / "wgp.py"), "exec"), namespace)
-        dispatch = namespace["generate_video"]
+        dispatch = namespace["_generate_video_impl"]
         signature = inspect.signature(dispatch)
 
         seen = []

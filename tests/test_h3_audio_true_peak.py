@@ -1,4 +1,9 @@
-"""Model-free regression coverage for H3 final-container true-peak safety."""
+"""Model-free regression coverage for H3 final-container true-peak safety.
+
+Locks leftover 1.9.0 `generate_video` AST probes to Continuum's
+`_generate_video_impl`. The public wrapper is H3 OOM relief only; mux,
+true-peak metadata, and deferred-safety symbols live in the impl.
+"""
 
 from __future__ import annotations
 
@@ -340,7 +345,7 @@ class H3TruePeakWiringTests(unittest.TestCase):
         self.assertIn('"Verifying H3 Audio Safety"', helper)
 
     def test_mux_verifies_before_success_and_cleanup(self):
-        generate = self._function_source("generate_video")
+        generate = self._function_source("_generate_video_impl")
         combine = generate.index("combine_and_concatenate_video_with_audio_tracks(")
         verify = generate.index("enforce_h3_final_audio_safety(", combine)
         success = generate.index("h3_mux_succeeded = True", verify)
@@ -353,7 +358,7 @@ class H3TruePeakWiringTests(unittest.TestCase):
         self.assertLess(resume_verify, cleanup)
 
     def test_metadata_status_retake_and_multiclip_paths_are_covered(self):
-        generate = self._function_source("generate_video")
+        generate = self._function_source("_generate_video_impl")
         self.assertIn('configs["h3_audio_true_peak"]', generate)
         self.assertIn('gen["h3_audio_true_peak"]', generate)
         self.assertIn("retake_safety_stats = enforce_h3_final_audio_safety", generate)
@@ -361,7 +366,7 @@ class H3TruePeakWiringTests(unittest.TestCase):
         self.assertIn('concat_configs["h3_audio_true_peak"]', generate)
 
     def test_components_defer_safety_without_skipping_retake_stitching(self):
-        generate = self._function_source("generate_video")
+        generate = self._function_source("_generate_video_impl")
         self.assertIn(
             "h3_audio_safety_deferred_to_multiclip_final = (", generate,
         )
