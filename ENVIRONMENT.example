@@ -22,6 +22,9 @@ PINOKIO_SCRIPT_DEFAULT=true
 GRADIO_TEMP_DIR=./cache/GRADIO_TEMP_DIR
 HF_HOME=
 TORCH_HOME=./cache/TORCH_HOME
+# Optional owner-supplied, ignored JSON plan for future storage tiers. The
+# inspector is read-only and does nothing when this is blank.
+MAESTRO_STORAGE_TIER_PLAN_FILE=
 PINOKIO_SHARE_LOCAL=false
 PINOKIO_SHARE_LOCAL_PORT=
 

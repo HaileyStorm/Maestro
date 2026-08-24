@@ -307,6 +307,9 @@ Maestro Continuum has its own product release version, separate from the bundled
 
 **Storage and space optimization**
 - Added a full Storage Manager with usage analytics and cleanup recommendations.
+- Future SSD/HDD placement can be prepared with the dormant, read-only
+  [storage-tier plan](docs/operations/STORAGE_TIERS.md); it never creates,
+  migrates, or applies storage bindings by itself.
 - Added safe deletion for workspaces, saved Director projects, models, and LoRAs.
 - Added duplicate model and LoRA detection across linked installations.
 - Added safe duplicate reclamation while preserving a verified copy.

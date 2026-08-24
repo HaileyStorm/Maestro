@@ -99,24 +99,40 @@ Report evidence honestly:
 
 ## Before you open a PR
 
-Run the full applicable suite, not a filtered test as the final gate. These are
-the CI-equivalent checks:
+Maestro uses trusted local CI only. The repository currently defines no GitHub
+Actions workflows, so pushes, pull requests, and schedules allocate no hosted
+worker. See [Trusted Local CI](docs/operations/LOCAL_CI.md). A future self-hosted
+runner is a separate activation and must not execute unreviewed pull-request
+code.
+
+Run the full applicable suite, not a filtered test as the final gate. The
+wrapper reuses `app/env/` and `ui/node_modules/`, masks its named GPU-related
+environment variables for every child process, and never installs dependencies.
+The defined gates contain no generation command; masking is not hardware
+isolation and cannot prove what arbitrary future tests will access:
 
 ```bash
-python scripts/verify_clean_repo.py
-python -m compileall -q -x '(^|/)(env|node_modules)/' app/services app/launch.py scripts
-python -m unittest discover -s tests -p "test_*.py"
-python tests/test_call_llm_json_grammar.py
-(cd ui && npm ci && npm run build)
+app/env/bin/python scripts/run_local_ci.py --gate all
+```
+
+Its CI-equivalent commands are:
+
+```bash
+app/env/bin/python scripts/verify_clean_repo.py
+app/env/bin/python -m compileall -q -x '(^|/)(env|node_modules)/' app/services app/launch.py scripts
+app/env/bin/python -m unittest discover -s tests -p "test_*.py"
+app/env/bin/python tests/test_call_llm_json_grammar.py
+(cd ui && npm test && npm run build)
 ```
 
 The exclusion keeps embedded helper runtimes (for example SAM's separately
 managed Python environment) out of the host interpreter's source check.
 
-Also run `(cd ui && npm test)` when frontend behavior is in scope, and the
-applicable browser/E2E checks when their dependencies are available. Record any
-gate you could not run and why; do not relabel static or mocked evidence as live
-acceptance.
+Run the applicable browser/E2E checks when their dependencies are available.
+Record any gate you could not run and why; do not relabel static or mocked
+evidence as live acceptance. Missing app or UI dependencies are a local
+preflight failure; update the normal Pinokio-managed environment rather than
+teaching CI to install a partial replacement.
 
 Once all intended changes are committed, finish repository state changes
 serially—never in parallel:
