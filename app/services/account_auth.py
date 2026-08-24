@@ -40,6 +40,7 @@ ACCOUNT_NONCE_PURPOSES = frozenset({
     "login",
     "reauth",
     "recover",
+    "register",
     "change_password",
     "rotate_recovery_codes",
     "create_account",
@@ -68,6 +69,9 @@ _MAX_ATTEMPTS = 8192
 _MAX_PASSKEYS_PER_ACCOUNT = 32
 _MAX_RECOVERY_CODES_PER_ACCOUNT = 32
 _GLOBAL_KDF_FREE_FAILURES = 12
+_PUBLIC_REGISTRATION_BROWSER_FREE = 2
+_PUBLIC_REGISTRATION_SOURCE_FREE = 8
+_PUBLIC_REGISTRATION_GLOBAL_FREE = 64
 _STORE_SEAL_DOMAIN = b"maestro-account-store-v1\0"
 _BOOTSTRAP_MARKER_VERSION = 1
 _BOOTSTRAP_MARKER_MAX_BYTES = 4096
@@ -1500,6 +1504,13 @@ class AccountAuthStore:
             account = self._account_by_id(self._load(), account_id)
             return None if account is None else self._public_account(account)
 
+    def resolve_account_username(self, username: Any) -> dict[str, Any] | None:
+        """Resolve one exact normalized username without listing accounts."""
+        _, username_key = _normalize_username(username)
+        with self._lock:
+            account = self._find_account(self._load(), username_key)
+            return None if account is None else self._public_account(account)
+
     def bootstrap_owner(
         self,
         *,
@@ -1645,6 +1656,151 @@ class AccountAuthStore:
                 payload["accounts"].append(account)
                 self._save(payload)
         return {"account": self._public_account(account), "recovery_codes": recovery_codes}
+
+    def register_account(
+        self,
+        *,
+        username: Any,
+        password: Any,
+        email: Any,
+        device_label: Any,
+        nonce_session_id: str,
+        nonce: Any,
+        remote: bool,
+        source_id: str = "",
+    ) -> dict[str, Any]:
+        """Create and sign in one ordinary account on Cloudflare or loopback."""
+        username, username_key = _normalize_username(username)
+        email = _normalize_email(email)
+        password = _validate_password(password)
+        label = _normalize_device_label(device_label)
+        identity_rate_key, browser_rate_key = self._rate_keys(
+            "register", username_key, nonce_session_id,
+        )
+        source_rate_key = self._rate_key(
+            "register-source", str(source_id)[:256], "",
+        )
+        global_rate_key = self._rate_key("register-global", "", "")
+        protected = frozenset({
+            identity_rate_key,
+            browser_rate_key,
+            source_rate_key,
+            global_rate_key,
+        })
+        with self._kdf_lock:
+            now = float(self._clock())
+            with self._lock:
+                payload = self._load()
+                now = self._monotonic_event_time(payload, now)
+                self._prune(payload, now)
+                self._consume_nonce_for_mutation_locked(
+                    payload,
+                    session_id=nonce_session_id,
+                    nonce=nonce,
+                    purpose="register",
+                    now=now,
+                )
+                retry_after = max(
+                    self._retry_after(payload, identity_rate_key, now),
+                    self._retry_after(payload, browser_rate_key, now),
+                    self._retry_after(payload, source_rate_key, now),
+                    self._retry_after(payload, global_rate_key, now),
+                )
+                if retry_after:
+                    self._save(payload)
+                    raise AccountAuthError(
+                        "Registration is temporarily limited.",
+                        code="rate_limited",
+                        retry_after=retry_after,
+                    )
+                try:
+                    self._reserve_attempt_capacity(payload, protected, now)
+                except AccountAuthError:
+                    self._save(payload)
+                    raise
+                delays = [
+                    self._record_failure(
+                        payload,
+                        browser_rate_key,
+                        now,
+                        _PUBLIC_REGISTRATION_BROWSER_FREE,
+                        protected=protected,
+                    ),
+                    self._record_failure(
+                        payload,
+                        source_rate_key,
+                        now,
+                        _PUBLIC_REGISTRATION_SOURCE_FREE,
+                        protected=protected,
+                    ),
+                    self._record_failure(
+                        payload,
+                        global_rate_key,
+                        now,
+                        _PUBLIC_REGISTRATION_GLOBAL_FREE,
+                        protected=protected,
+                    ),
+                ]
+                if self._find_account(payload, username_key) is not None:
+                    delays.append(self._record_failure(
+                        payload,
+                        identity_rate_key,
+                        now,
+                        1,
+                        protected=protected,
+                    ))
+                    self._save(payload)
+                    raise AccountAuthError(
+                        "Username is unavailable.",
+                        code="username_unavailable",
+                        retry_after=max(delays),
+                    )
+                if len(payload["accounts"]) >= _MAX_ACCOUNTS:
+                    self._save(payload)
+                    raise AccountStoreCapacityError()
+                self._save(payload)
+
+            password_record = self._password_record(password)
+            now = float(self._clock())
+            with self._lock:
+                payload = self._load()
+                now = self._monotonic_event_time(payload, now)
+                self._prune(payload, now)
+                if self._find_account(payload, username_key) is not None:
+                    raise AccountAuthError(
+                        "Username is unavailable.",
+                        code="username_unavailable",
+                    )
+                if len(payload["accounts"]) >= _MAX_ACCOUNTS:
+                    raise AccountStoreCapacityError()
+                account = {
+                    "id": secrets.token_hex(16),
+                    "username": username,
+                    "username_key": username_key,
+                    "email": email,
+                    "role": "user",
+                    "disabled": False,
+                    "created_at": now,
+                    "password": password_record,
+                    "passkey_credentials": [],
+                    "recovery_codes": [],
+                }
+                recovery_codes, account["recovery_codes"] = self._recovery_codes(now)
+                payload["accounts"].append(account)
+                session_id, _ = self._new_session(
+                    payload,
+                    account_id=account["id"],
+                    device_label=label,
+                    remote=bool(remote),
+                    now=now,
+                    reauthenticated=True,
+                )
+                self._save(payload)
+        return {
+            "account": self._public_account(account),
+            "account_session_id": session_id,
+            "recovery_codes": recovery_codes,
+        }
 
     def login(
         self,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import os
 from typing import Any, Callable
 
@@ -169,6 +170,18 @@ class FlashVSRBridge:
             vae=self.files_locator.locate_file(self.VAE_FILENAME) if variant == "full" else None,
         )
 
+    @staticmethod
+    def decode_frame_budget(
+        output_height: int,
+        output_width: int,
+        total_frames: int,
+        *,
+        budget_bytes: int = 8 << 30,
+    ) -> int:
+        """Keep VAE decode occupancy inside a finalization VRAM budget."""
+        bytes_per_frame = max(1, 3 * int(output_height) * int(output_width) * 16)
+        return max(17, min(int(total_frames), int(budget_bytes // bytes_per_frame)))
+
     def vae_tile_size(self, vae_config: int, output_height: int | None = None, output_width: int | None = None) -> int:
         import torch
         from models.wan.modules.vae import WanVAE
@@ -179,9 +192,18 @@ class FlashVSRBridge:
         # output_height/output_width args. Use them when available (better
         # output-resolution-aware tiling), fall back to the 3-arg signature.
         try:
-            return WanVAE.get_VAE_tile_size(vae_config, device_mem_capacity, mixed_precision, output_height=output_height, output_width=output_width)
+            tile = WanVAE.get_VAE_tile_size(vae_config, device_mem_capacity, mixed_precision, output_height=output_height, output_width=output_width)
         except TypeError:
-            return WanVAE.get_VAE_tile_size(vae_config, device_mem_capacity, mixed_precision)
+            tile = WanVAE.get_VAE_tile_size(vae_config, device_mem_capacity, mixed_precision)
+        # 32GB cards skip tiling, but FlashVSR denoise still occupies VRAM.
+        # Force tiles on large 2x canvases so VAE interpolate can fit.
+        if (
+            output_height
+            and output_width
+            and int(output_height) * int(output_width) >= 1536 * 1344
+        ):
+            tile = max(int(tile or 0), 256)
+        return tile
 
     def download(self, process_files: Callable[..., Any], send_cmd=None, status_text: str | None = None) -> bool:
         flashvsr_def = self.query_download_def()
@@ -205,6 +227,18 @@ class FlashVSRBridge:
         enabled, variant, persistence = self.settings()
         if not enabled:
             raise RuntimeError("FlashVSR spatial upsampling is disabled in Configuration > Extensions.")
+        # Finalization is a different residency tenant than denoise. Yield
+        # generation occupancy through WGP's release path (identity invalidate
+        # + MMGP unload) before FlashVSR decides an offload profile.
+        try:
+            import wgp as _wgp
+            yield_fn = getattr(
+                _wgp, "release_generation_residency_for_postprocess", None,
+            )
+            if callable(yield_fn):
+                yield_fn()
+        except Exception:
+            pass
         # The caller's profile is tuned for the MAIN diffusion model (often a
         # low-VRAM profile for 20B+ models). Under profiles 2/4/5, wgp's
         # init_pipe budgets the transformer to ~100 MB of VRAM, so mmgp
@@ -232,15 +266,12 @@ class FlashVSRBridge:
         output_height = int(sample.shape[-2] * scale)
         output_width = int(sample.shape[-1] * scale)
         flashvsr_tile_size = self.vae_tile_size(vae_config, output_height, output_width)
-        return upscale_video(
-            sample,
-            scale,
-            self.paths(variant),
+        kwargs = dict(
+            scale=scale,
+            paths=self.paths(variant),
             variant=variant,
             seed=seed,
-            continue_cache=continue_cache,
-            return_continue_cache=return_continue_cache,
-            persistent_models=persistence == self.PERSIST_RAM,
+            persistent_models=True,
             vae_tile_size=flashvsr_tile_size,
             topk_ratio=self.topk_ratio(),
             init_pipe=init_pipe,
@@ -250,6 +281,59 @@ class FlashVSRBridge:
             abort_callback=abort_callback,
             progress_callback=progress_callback,
         )
+        total_frames = int(sample.shape[1])
+        max_frames = self.decode_frame_budget(
+            output_height, output_width, total_frames,
+        )
+        if total_frames <= max_frames:
+            kwargs["persistent_models"] = persistence == self.PERSIST_RAM
+            return upscale_video(
+                sample,
+                continue_cache=continue_cache,
+                return_continue_cache=return_continue_cache,
+                **kwargs,
+            )
+
+        from postprocessing.flashvsr.runtime import FLASHVSR_CONTINUE_CACHE_FRAMES
+        import torch
+        overlap = FLASHVSR_CONTINUE_CACHE_FRAMES
+        print(
+            f"[FlashVSR] Splitting {total_frames} frames into "
+            f"{max_frames}-frame finalization windows"
+        )
+        written = 0
+        cache = continue_cache
+        parts = []
+        try:
+            while written < total_frames:
+                ov = overlap if written > 0 else 0
+                start = max(0, written - ov)
+                end = min(total_frames, start + max_frames)
+                last = end >= total_frames
+                piece = sample[:, start:end]
+                out, cache = upscale_video(
+                    piece,
+                    continue_cache=cache,
+                    return_continue_cache=(not last) or return_continue_cache,
+                    **kwargs,
+                )
+                if out is None:
+                    return None, None
+                if ov:
+                    out = out[:, ov:]
+                parts.append(out)
+                written = end
+                if torch.cuda.is_available():
+                    gc.collect()
+                    torch.cuda.empty_cache()
+            stacked = torch.cat(parts, dim=1)
+            return stacked, cache if return_continue_cache else None
+        finally:
+            if persistence != self.PERSIST_RAM:
+                try:
+                    self.release_vram()
+                except Exception:
+                    pass
 
     def release_vram(self) -> None:
         from postprocessing.flashvsr.runtime import release_models

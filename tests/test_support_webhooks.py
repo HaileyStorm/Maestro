@@ -26,16 +26,20 @@ from services.entitlements import (  # noqa: E402
     opaque_key,
 )
 from services.support_webhooks import (  # noqa: E402
+    BMAC_RUNTIME_CONFIG_SCHEMA_VERSION,
+    BMAC_SUPPORT_EVIDENCE_CONTRACT,
+    BmacSupportWebhookAdapter,
+    BmacWebhookConfig,
+    BmacWebhookVerifier,
+    DIRECT_STRIPE_SUPPORT_EVIDENCE_CONTRACT,
+    DirectStripeSupportWebhookAdapter,
     FakeSignedWebhookAdapter,
     FileWebhookReplayGuard,
     ManualContributionAdapter,
     STRIPE_BMAC_CREATOR_SURFACE,
     STRIPE_BMAC_DEPLOYMENT_SCOPE,
     STRIPE_BMAC_SUPPORT_EVIDENCE_CONTRACT,
-    STRIPE_RUNTIME_CONFIG_SCHEMA_VERSION,
-    StripeAssociationIntegrityError,
-    StripeBmacSupportWebhookAdapter,
-    StripeBmacWebhookConfig,
+    SupportAssociationIntegrityError,
     StripeWebhookVerifier,
     WebhookPayloadError,
     WebhookReplayError,
@@ -53,6 +57,7 @@ SIGNING_KEY = b"fake-webhook-signing-key-000000000000000"
 IDENTITY_KEY = b"fake-webhook-identity-key-00000000000000"
 INTEGRITY_KEY = b"support-storage-integrity-key-00000000000"
 STRIPE_SECRET = b"whsec_test_only_000000000000000000000000"
+BMAC_SECRET = b"bmac_test_only_0000000000000000000000000"
 
 
 def body(**overrides) -> bytes:
@@ -108,13 +113,39 @@ def stripe_headers(raw: bytes, at: datetime = NOW) -> dict[str, str]:
     return {"Stripe-Signature": f"t={timestamp},v1={digest}"}
 
 
+def bmac_event(
+    event_id: int,
+    event_type: str,
+    data: dict,
+    *,
+    attempt: int = 1,
+    live_mode: bool = False,
+) -> bytes:
+    return json.dumps({
+        "event_id": event_id,
+        "type": event_type,
+        "live_mode": live_mode,
+        "created": int(NOW.timestamp()),
+        "attempt": attempt,
+        "data": data,
+    }, sort_keys=True, separators=(",", ":")).encode()
+
+
+def bmac_headers(raw: bytes) -> dict[str, str]:
+    return {
+        "x-signature-sha256": hmac.new(
+            BMAC_SECRET, raw, hashlib.sha256,
+        ).hexdigest(),
+    }
+
+
 class SupportWebhookTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
         self.ledger_path = root / "contributions.json"
         self.replay_path = root / "replay.json"
-        self.association_path = root / "stripe-associations.json"
+        self.association_path = root / "bmac-associations.json"
         self.account_subject = opaque_key(
             "maestro_account_support", "existing-maestro-account", IDENTITY_KEY,
         )
@@ -139,85 +170,106 @@ class SupportWebhookTests(unittest.TestCase):
     def signed(self, raw: bytes, at: datetime = NOW) -> dict[str, str]:
         return self.adapter.headers(raw, int(at.timestamp()))
 
-    def stripe_adapter(
-        self,
-        *,
-        payment_link: str = "plink_test_support",
-        customer: str = "cus_test_linked",
-    ) -> StripeBmacSupportWebhookAdapter:
-        config = StripeBmacWebhookConfig.from_runtime_json(
+    def bmac_adapter(self, *, linked: bool = True) -> BmacSupportWebhookAdapter:
+        supporter_key = opaque_key("bmac_supporter", "42", IDENTITY_KEY)
+        config = BmacWebhookConfig.from_runtime_json(
             json.dumps({
-                "schema_version": STRIPE_RUNTIME_CONFIG_SCHEMA_VERSION,
+                "schema_version": BMAC_RUNTIME_CONFIG_SCHEMA_VERSION,
                 "creator_surface": STRIPE_BMAC_CREATOR_SURFACE,
                 "deployment_scope": STRIPE_BMAC_DEPLOYMENT_SCOPE,
-                "livemode": False,
-                "payment_links": {
-                    payment_link: {"currency": "USD"},
-                },
-                "prices": {
-                    "price_test_support": {"currency": "USD"},
-                },
-                "account_links": {customer: self.account_subject},
+                "live_mode": False,
+                "account_links": (
+                    {supporter_key: self.account_subject} if linked else {}
+                ),
             }),
-            signing_secret=STRIPE_SECRET,
+            signing_secret=BMAC_SECRET,
             identity_secret=IDENTITY_KEY,
             association_integrity_key=INTEGRITY_KEY,
         )
-        return StripeBmacSupportWebhookAdapter(
+        return BmacSupportWebhookAdapter(
             config,
             association_path=self.association_path,
             allow_test_path=True,
         )
 
     @staticmethod
-    def checkout_object(**overrides) -> dict:
+    def donation_data(**overrides) -> dict:
         payload = {
-            "id": "cs_test_support",
-            "object": "checkout.session",
-            "livemode": False,
-            "mode": "payment",
-            "status": "complete",
-            "payment_status": "paid",
-            "payment_link": "plink_test_support",
-            "customer": "cus_test_linked",
-            "payment_intent": "pi_test_support",
-            "amount_total": 2_500,
-            "currency": "usd",
+            "id": 98765,
+            "object": "payment",
+            "transaction_id": "pi_private_transaction",
+            "status": "succeeded",
+            "refunded": "false",
+            "amount": 15.0,
+            "currency": "USD",
+            "supporter_id": 42,
+            "supporter_name": "Private Name",
+            "supporter_email": "private@example.test",
+            "message": "Private message",
         }
         payload.update(overrides)
         return payload
 
     @staticmethod
-    def invoice_object(**overrides) -> dict:
+    def membership_data(**overrides) -> dict:
         payload = {
-            "id": "in_test_support",
-            "object": "invoice",
-            "livemode": False,
-            "status": "paid",
-            "paid": True,
-            "customer": "cus_test_linked",
-            "subscription": "sub_test_support",
-            "billing_reason": "subscription_create",
-            "amount_paid": 1_200,
-            "currency": "usd",
-            "lines": {"data": [{"price": {"id": "price_test_support"}}]},
-            "payments": {"data": [{
-                "status": "paid",
-                "payment": {"payment_intent": "pi_test_invoice"},
-            }]},
+            "id": 555,
+            "psp_id": "sub_private_membership",
+            "object": "membership",
+            "status": "active",
+            "canceled": "false",
+            "paused": "false",
+            "amount": 12.5,
+            "currency": "USD",
+            "supporter_id": 42,
+            "supporter_name": "Private Name",
+            "supporter_email": "private@example.test",
+            "membership_level_id": 7,
+            "membership_level_name": "Private Level",
         }
         payload.update(overrides)
         return payload
 
-    def test_stripe_bmac_contract_is_disabled_non_authorizing_and_public_safe(self):
-        projection = STRIPE_BMAC_SUPPORT_EVIDENCE_CONTRACT.public_projection()
+    @classmethod
+    def recurring_data(cls, **overrides) -> dict:
+        payload = cls.membership_data(
+            id=777,
+            psp_id="sub_private_recurring",
+            object="recurring_donation",
+        )
+        payload.pop("membership_level_id", None)
+        payload.pop("membership_level_name", None)
+        payload.update(overrides)
+        return payload
+
+    def test_native_bmac_evidence_is_distinct_from_optional_direct_stripe(self):
+        projection = BMAC_SUPPORT_EVIDENCE_CONTRACT.public_projection()
+        self.assertIs(
+            STRIPE_BMAC_SUPPORT_EVIDENCE_CONTRACT,
+            BMAC_SUPPORT_EVIDENCE_CONTRACT,
+        )
         self.assertFalse(projection["enabled"])
-        self.assertEqual(projection["verification"], "signed_webhook_required")
-        self.assertEqual(projection["radar_role"], "fraud_screening_only")
-        self.assertFalse(projection["grants_app_or_account_authorization"])
-        self.assertFalse(projection["projects_personal_address_or_phone"])
-        self.assertFalse(projection["projects_api_keys_or_provider_subjects"])
-        self.assertEqual(projection["server_mapping_keys"], ["payment_link", "price"])
+        self.assertEqual(projection["provider_id"], "buy_me_a_coffee")
+        self.assertEqual(projection["transport"], "native_buy_me_a_coffee_webhook")
+        self.assertEqual(projection["signature_header"], "x-signature-sha256")
+        self.assertNotIn("fraud_screening_role", projection)
+        self.assertEqual(set(projection["positive_event_types"]), {
+            "donation.created", "membership.started", "membership.updated",
+            "recurring_donation.started", "recurring_donation.updated",
+        })
+        self.assertEqual(set(projection["reversal_event_types"]), {
+            "donation.refunded", "membership.cancelled", "membership.paused",
+            "recurring_donation.cancelled",
+        })
+        direct = DIRECT_STRIPE_SUPPORT_EVIDENCE_CONTRACT.public_projection()
+        self.assertFalse(direct["enabled"])
+        self.assertFalse(DirectStripeSupportWebhookAdapter.production_ready)
+        self.assertEqual(direct["provider_id"], "direct_stripe_support")
+        self.assertEqual(direct["transport"], "optional_direct_stripe_webhook")
+        self.assertEqual(
+            direct["fraud_screening_role"],
+            "radar_fraud_screening_only_never_authorization",
+        )
         serialized = json.dumps(projection, sort_keys=True).lower()
         self.assertNotIn("secret", serialized)
         self.assertNotIn("email", serialized)
@@ -225,332 +277,320 @@ class SupportWebhookTests(unittest.TestCase):
         self.assertNotIn(STRIPE_BMAC_DEPLOYMENT_SCOPE, serialized)
         self.assertNotIn("benefit_policy", serialized)
 
-    def test_stripe_runtime_boundary_reuses_shared_creator_and_stays_private(self):
+    def test_native_bmac_config_reuses_shared_creator_and_rejects_provider_policy(self):
+        supporter_key = opaque_key("bmac_supporter", "42", IDENTITY_KEY)
         base = {
-            "schema_version": STRIPE_RUNTIME_CONFIG_SCHEMA_VERSION,
+            "schema_version": BMAC_RUNTIME_CONFIG_SCHEMA_VERSION,
             "creator_surface": STRIPE_BMAC_CREATOR_SURFACE,
             "deployment_scope": STRIPE_BMAC_DEPLOYMENT_SCOPE,
-            "livemode": False,
-            "payment_links": {
-                "plink_test_support": {"currency": "USD"},
-            },
-            "prices": {"price_test_support": {"currency": "USD"}},
-            "account_links": {"cus_test_linked": self.account_subject},
+            "live_mode": False,
+            "account_links": {supporter_key: self.account_subject},
         }
 
         def load(payload):
-            return StripeBmacWebhookConfig.from_runtime_json(
+            return BmacWebhookConfig.from_runtime_json(
                 json.dumps(payload),
-                signing_secret=STRIPE_SECRET,
+                signing_secret=BMAC_SECRET,
                 identity_secret=IDENTITY_KEY,
                 association_integrity_key=INTEGRITY_KEY,
             )
 
         config = load(base)
-        self.assertEqual(config.creator_surface, STRIPE_BMAC_CREATOR_SURFACE)
-        self.assertEqual(config.deployment_scope, STRIPE_BMAC_DEPLOYMENT_SCOPE)
+        self.assertEqual(config.account_links[supporter_key], self.account_subject)
         self.assertNotIn(STRIPE_BMAC_CREATOR_SURFACE, repr(config))
         self.assertNotIn(STRIPE_BMAC_DEPLOYMENT_SCOPE, repr(config))
-
-        with self.assertRaisesRegex(SupportWebhookError, "shared BMaC"):
-            load({**base, "creator_surface": "create_second_creator_account"})
+        with self.assertRaisesRegex(SupportWebhookError, "shared creator"):
+            load({**base, "creator_surface": "create_second_creator"})
         with self.assertRaisesRegex(SupportWebhookError, "private usable"):
             load({**base, "deployment_scope": "public_release"})
-        with self.assertRaisesRegex(SupportWebhookError, "shape"):
-            load({**base, "schema_version": 1})
         for forbidden in (
             "benefit_policy", "create_creator_account", "kyc", "bank_account",
         ):
             with self.subTest(forbidden=forbidden):
                 with self.assertRaisesRegex(SupportWebhookError, "shape"):
                     load({**base, forbidden: {}})
+        with self.assertRaisesRegex(SupportWebhookError, "opaque associations"):
+            load({**base, "account_links": {"private@example.test": self.account_subject}})
 
-    def test_stripe_verifier_requires_exact_raw_body_signature_and_freshness(self):
-        verifier = StripeWebhookVerifier(STRIPE_SECRET)
-        raw = stripe_body()
-        verified = verifier.verify_event(
-            raw, stripe_headers(raw), received_at=NOW,
-        )
-        self.assertEqual(verified["id"], "evt_testSupport123")
+    def test_native_bmac_signature_covers_exact_raw_body(self):
+        verifier = BmacWebhookVerifier(BMAC_SECRET)
+        raw = bmac_event(1, "donation.created", self.donation_data())
+        verified = verifier.verify_event(raw, bmac_headers(raw), received_at=NOW)
+        self.assertEqual(verified["event_id"], 1)
         with self.assertRaises(WebhookSignatureError):
-            verifier.verify_event(
-                raw + b" ", stripe_headers(raw), received_at=NOW,
-            )
-        with self.assertRaises(WebhookTimestampError):
-            verifier.verify_event(
-                raw,
-                stripe_headers(raw, NOW - timedelta(minutes=6)),
-                received_at=NOW,
-            )
-        unsupported = stripe_body(type="radar.early_fraud_warning.created")
+            verifier.verify_event(raw + b" ", bmac_headers(raw), received_at=NOW)
+        with self.assertRaises(WebhookSignatureError):
+            verifier.verify_event(raw, {"x-signature-sha256": "0" * 64}, received_at=NOW)
+        unsupported = bmac_event(
+            2, "checkout.session.completed", self.donation_data(),
+        )
         with self.assertRaises(WebhookPayloadError):
             verifier.verify_event(
-                unsupported, stripe_headers(unsupported), received_at=NOW,
+                unsupported, bmac_headers(unsupported), received_at=NOW,
+            )
+        excessive_retry = bmac_event(
+            3, "donation.created", self.donation_data(), attempt=6,
+        )
+        with self.assertRaises(WebhookPayloadError):
+            verifier.verify_event(
+                excessive_retry, bmac_headers(excessive_retry), received_at=NOW,
             )
 
-    def test_stripe_verifier_accepts_declared_refund_reversal_evidence(self):
+    def test_direct_stripe_verifier_remains_optional_generic_infrastructure(self):
         verifier = StripeWebhookVerifier(STRIPE_SECRET)
-        raw = stripe_body(type="charge.refunded")
-        verified = verifier.verify_event(
-            raw, stripe_headers(raw), received_at=NOW,
+        raw = stripe_body()
+        self.assertEqual(
+            verifier.verify_event(raw, stripe_headers(raw), received_at=NOW)["id"],
+            "evt_testSupport123",
         )
-        self.assertEqual(verified["type"], "charge.refunded")
+        with self.assertRaises(WebhookSignatureError):
+            verifier.verify_event(raw + b" ", stripe_headers(raw), received_at=NOW)
 
-    def test_production_stripe_checkout_records_only_approved_opaque_support(self):
-        adapter = self.stripe_adapter()
-        checkout = self.checkout_object(
-            metadata={"maestro_account": "attacker-controlled"},
-            customer_details={"email": "private@example.test"},
-        )
-        raw = stripe_event(
-            "evt_checkout_success", "checkout.session.completed", checkout,
-        )
+    def test_native_bmac_linked_donation_records_opaque_support_without_pii(self):
+        adapter = self.bmac_adapter(linked=True)
+        raw = bmac_event(10, "donation.created", self.donation_data())
         event = process_signed_webhook(
             adapter, self.ledger, self.guard,
-            raw, stripe_headers(raw), received_at=NOW,
+            raw, bmac_headers(raw), received_at=NOW,
         )
-        self.assertTrue(adapter.production_ready)
         self.assertEqual(event.kind, "one_time_contribution")
         self.assertEqual(event.subject_key, self.account_subject)
-        self.assertEqual(event.amount_minor, 2_500)
+        self.assertEqual(event.amount_minor, 1_500)
         self.assertEqual(event.currency, "USD")
         self.assertEqual(self.association_path.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(
-            self.association_path.with_suffix(".json.lock").stat().st_mode & 0o777,
-            0o600,
-        )
         stored = self.association_path.read_text(encoding="utf-8")
+        ledger = self.ledger_path.read_text(encoding="utf-8")
         for private in (
-            "cs_test_support", "cus_test_linked", "pi_test_support",
-            "private@example.test", "attacker-controlled",
-            STRIPE_SECRET.decode("ascii"),
+            "Private Name", "private@example.test", "Private message",
+            "pi_private_transaction", "98765", BMAC_SECRET.decode("ascii"),
         ):
             self.assertNotIn(private, stored)
-        self.assertNotIn(STRIPE_SECRET.decode("ascii"), repr(adapter))
-        self.assertNotIn(IDENTITY_KEY.decode("ascii"), repr(adapter.config))
+            self.assertNotIn(private, ledger)
 
-    def test_production_stripe_rejects_unknown_mapping_and_missing_account_link(self):
-        adapter = self.stripe_adapter()
-        unknown_mapping = self.checkout_object(payment_link="plink_unknown_support")
-        raw = stripe_event(
-            "evt_unknown_mapping", "checkout.session.completed", unknown_mapping,
+    def test_native_bmac_unlinked_donation_is_pending_without_account_benefit(self):
+        adapter = self.bmac_adapter(linked=False)
+        raw = bmac_event(11, "donation.created", self.donation_data())
+        event = process_signed_webhook(
+            adapter, self.ledger, self.guard,
+            raw, bmac_headers(raw), received_at=NOW,
         )
-        with self.assertRaisesRegex(WebhookPayloadError, "not approved"):
-            adapter.verify_and_translate(
-                raw, stripe_headers(raw), received_at=NOW,
-            )
+        supporter_key = opaque_key("bmac_supporter", "42", IDENTITY_KEY)
+        self.assertEqual(event.subject_key, supporter_key)
+        account_projection = self.ledger.privacy_safe_user_projection(
+            self.account_subject, as_of=NOW,
+        )
+        self.assertEqual(account_projection["currency_totals_minor"], {})
+        pending_projection = self.ledger.privacy_safe_user_projection(
+            supporter_key, as_of=NOW,
+        )
+        self.assertEqual(pending_projection["currency_totals_minor"], {"USD": 1_500})
 
-        missing_link = self.checkout_object(
-            customer="cus_unlinked_customer",
-            metadata={"maestro_account": self.account_subject},
-            customer_details={"email": "linked-looking@example.test"},
-        )
-        raw = stripe_event(
-            "evt_missing_account", "checkout.session.completed", missing_link,
-        )
-        with self.assertRaisesRegex(WebhookPayloadError, "no existing opaque"):
-            adapter.verify_and_translate(
-                raw, stripe_headers(raw), received_at=NOW,
-            )
-
-    def test_production_stripe_replay_is_restart_safe(self):
-        adapter = self.stripe_adapter()
-        raw = stripe_event(
-            "evt_checkout_replay", "checkout.session.completed",
-            self.checkout_object(),
-        )
+    def test_native_bmac_retry_attempt_is_restart_safe_and_replay_rejected(self):
+        adapter = self.bmac_adapter()
+        first_raw = bmac_event(12, "donation.created", self.donation_data())
         first = process_signed_webhook(
             adapter, self.ledger, self.guard,
-            raw, stripe_headers(raw), received_at=NOW,
+            first_raw, bmac_headers(first_raw), received_at=NOW,
         )
-        restarted = self.stripe_adapter()
-        restarted_ledger = ContributionLedger(
-            self.ledger_path,
-            integrity_key=INTEGRITY_KEY,
-            allow_test_path=True,
-        )
-        restarted_guard = FileWebhookReplayGuard(
-            self.replay_path,
-            integrity_key=INTEGRITY_KEY,
-            allow_test_path=True,
+        retry_raw = bmac_event(
+            12, "donation.created", self.donation_data(), attempt=2,
         )
         with self.assertRaises(WebhookReplayError):
             process_signed_webhook(
-                restarted, restarted_ledger, restarted_guard,
-                raw, stripe_headers(raw), received_at=NOW,
+                self.bmac_adapter(),
+                ContributionLedger(
+                    self.ledger_path,
+                    integrity_key=INTEGRITY_KEY,
+                    allow_test_path=True,
+                ),
+                FileWebhookReplayGuard(
+                    self.replay_path,
+                    integrity_key=INTEGRITY_KEY,
+                    allow_test_path=True,
+                ),
+                retry_raw,
+                bmac_headers(retry_raw),
+                received_at=NOW,
             )
-        self.assertEqual(restarted_ledger.events(), (first,))
+        self.assertEqual(self.ledger.events(), (first,))
 
-    def test_production_stripe_refund_and_dispute_target_exact_funding(self):
-        adapter = self.stripe_adapter()
-        funding_raw = stripe_event(
-            "evt_checkout_original", "checkout.session.completed",
-            self.checkout_object(),
-        )
+    def test_native_bmac_refund_targets_exact_original_contribution(self):
+        adapter = self.bmac_adapter()
+        created_raw = bmac_event(20, "donation.created", self.donation_data())
         funding = process_signed_webhook(
             adapter, self.ledger, self.guard,
-            funding_raw, stripe_headers(funding_raw), received_at=NOW,
+            created_raw, bmac_headers(created_raw), received_at=NOW,
         )
-        refund_raw = stripe_event(
-            "evt_refund_original", "charge.refunded",
-            {
-                "id": "ch_test_support",
-                "object": "charge",
-                "livemode": False,
-                "payment_intent": "pi_test_support",
-                "amount_refunded": 500,
-                "currency": "usd",
-                "metadata": {"radar": "fraud-screening-only"},
-            },
+        refund_raw = bmac_event(
+            21,
+            "donation.refunded",
+            self.donation_data(status="refunded", refunded="true"),
         )
         refund = process_signed_webhook(
             adapter, self.ledger, self.guard,
-            refund_raw, stripe_headers(refund_raw), received_at=NOW,
-        )
-        dispute_raw = stripe_event(
-            "evt_dispute_original", "charge.dispute.created",
-            {
-                "id": "du_test_support",
-                "object": "dispute",
-                "livemode": False,
-                "charge": "ch_test_support",
-                "payment_intent": "pi_test_support",
-                "amount": 700,
-                "currency": "usd",
-                "status": "needs_response",
-                "metadata": {"maestro_account": "must-not-authorize"},
-            },
-        )
-        dispute = process_signed_webhook(
-            adapter, self.ledger, self.guard,
-            dispute_raw, stripe_headers(dispute_raw), received_at=NOW,
+            refund_raw, bmac_headers(refund_raw), received_at=NOW,
         )
         self.assertEqual(refund.kind, "refund")
-        self.assertEqual(dispute.kind, "chargeback")
         self.assertEqual(refund.related_event_key, funding.source_event_key)
-        self.assertEqual(dispute.related_event_key, funding.source_event_key)
         self.assertEqual(refund.subject_key, funding.subject_key)
-        self.assertEqual(dispute.subject_key, funding.subject_key)
-        stored = self.association_path.read_text(encoding="utf-8")
-        self.assertNotIn("ch_test_support", stored)
-        self.assertNotIn("pi_test_support", stored)
-        self.assertNotIn("radar", stored.lower())
+        projection = self.ledger.privacy_safe_user_projection(
+            self.account_subject, as_of=NOW,
+        )
+        source = next(
+            row for row in projection["recorded_allowance"]["sources"]
+            if row["source_event_id"] == funding.event_id
+        )
+        self.assertEqual(source["refund_state"], "full")
+        with self.assertRaisesRegex(WebhookPayloadError, "exact original"):
+            unknown = bmac_event(
+                22,
+                "donation.refunded",
+                self.donation_data(
+                    id=99999,
+                    transaction_id="pi_unknown",
+                    status="refunded",
+                    refunded="true",
+                ),
+            )
+            adapter.verify_and_translate(
+                unknown, bmac_headers(unknown), received_at=NOW,
+            )
 
-    def test_production_stripe_subscription_deletion_targets_original_start(self):
-        adapter = self.stripe_adapter()
-        invoice_raw = stripe_event(
-            "evt_invoice_start", "invoice.paid", self.invoice_object(),
-        )
-        started = process_signed_webhook(
+    def test_native_bmac_refund_crash_before_ledger_append_retries_exactly(self):
+        adapter = self.bmac_adapter()
+        created_raw = bmac_event(23, "donation.created", self.donation_data())
+        funding = process_signed_webhook(
             adapter, self.ledger, self.guard,
-            invoice_raw, stripe_headers(invoice_raw), received_at=NOW,
+            created_raw, bmac_headers(created_raw), received_at=NOW,
         )
-        renewal_raw = stripe_event(
-            "evt_invoice_renewal",
-            "invoice.paid",
-            self.invoice_object(
-                id="in_test_renewal",
-                billing_reason="subscription_cycle",
-                payments={"data": [{
-                    "status": "paid",
-                    "payment": {"payment_intent": "pi_test_renewal"},
-                }]},
-            ),
+        refund_raw = bmac_event(
+            24,
+            "donation.refunded",
+            self.donation_data(status="refunded", refunded="true"),
         )
-        renewed = process_signed_webhook(
-            adapter, self.ledger, self.guard,
-            renewal_raw, stripe_headers(renewal_raw), received_at=NOW,
+        expected = adapter.verify_and_translate(
+            refund_raw, bmac_headers(refund_raw), received_at=NOW,
         )
-        deleted_raw = stripe_event(
-            "evt_subscription_deleted", "customer.subscription.deleted",
-            {
-                "id": "sub_test_support",
-                "object": "subscription",
-                "livemode": False,
-                "status": "canceled",
-                "customer": "cus_untrusted_payload_only",
-            },
+        self.assertEqual(len(self.ledger.events()), 1)
+        refund = process_signed_webhook(
+            self.bmac_adapter(), self.ledger, self.guard,
+            refund_raw, bmac_headers(refund_raw), received_at=NOW,
         )
-        canceled = process_signed_webhook(
-            adapter, self.ledger, self.guard,
-            deleted_raw, stripe_headers(deleted_raw), received_at=NOW,
+        self.assertEqual(refund.related_event_key, funding.source_event_key)
+        self.assertEqual(refund.amount_minor, expected.amount_minor)
+        self.assertEqual(len(self.ledger.events()), 2)
+
+    def test_native_bmac_membership_maps_started_updated_paused_cancelled(self):
+        adapter = self.bmac_adapter()
+
+        def process(event_id, event_type, data):
+            raw = bmac_event(event_id, event_type, data)
+            return process_signed_webhook(
+                adapter, self.ledger, self.guard,
+                raw, bmac_headers(raw), received_at=NOW,
+            )
+
+        started = process(30, "membership.started", self.membership_data())
+        updated = process(31, "membership.updated", self.membership_data())
+        paused = process(
+            32, "membership.paused",
+            self.membership_data(status="paused", paused="true"),
+        )
+        cancelled = process(
+            33, "membership.cancelled",
+            self.membership_data(status="canceled", canceled="true"),
         )
         self.assertEqual(started.kind, "recurring_started")
-        self.assertEqual(renewed.kind, "recurring_renewed")
-        self.assertEqual(renewed.related_event_key, started.source_event_key)
-        self.assertEqual(canceled.kind, "recurring_canceled")
-        self.assertEqual(canceled.related_event_key, started.source_event_key)
-        self.assertEqual(canceled.contract_key, started.contract_key)
-        self.assertEqual(canceled.subject_key, started.subject_key)
+        self.assertEqual(updated.kind, "recurring_renewed")
+        self.assertEqual(updated.related_event_key, started.source_event_key)
+        for event in (paused, cancelled):
+            self.assertEqual(event.kind, "recurring_canceled")
+            self.assertEqual(event.related_event_key, started.source_event_key)
+            self.assertEqual(event.contract_key, started.contract_key)
+        stored = self.association_path.read_text(encoding="utf-8")
+        self.assertNotIn("Private Name", stored)
+        self.assertNotIn("private@example.test", stored)
+        self.assertNotIn("Private Level", stored)
 
-    def test_production_stripe_association_tamper_fails_closed(self):
-        adapter = self.stripe_adapter()
-        raw = stripe_event(
-            "evt_tamper_origin", "checkout.session.completed",
-            self.checkout_object(),
+    def test_native_bmac_recurring_donation_maps_full_lifecycle(self):
+        adapter = self.bmac_adapter()
+
+        def process(event_id, event_type, data):
+            raw = bmac_event(event_id, event_type, data)
+            return process_signed_webhook(
+                adapter, self.ledger, self.guard,
+                raw, bmac_headers(raw), received_at=NOW,
+            )
+
+        started = process(
+            40, "recurring_donation.started", self.recurring_data(),
         )
+        updated = process(
+            41, "recurring_donation.updated", self.recurring_data(),
+        )
+        cancelled = process(
+            42,
+            "recurring_donation.cancelled",
+            self.recurring_data(status="canceled", canceled="true"),
+        )
+        self.assertEqual(started.kind, "recurring_started")
+        self.assertEqual(updated.kind, "recurring_renewed")
+        self.assertEqual(updated.related_event_key, started.source_event_key)
+        self.assertEqual(cancelled.kind, "recurring_canceled")
+        self.assertEqual(cancelled.related_event_key, started.source_event_key)
+
+    def test_native_bmac_association_tamper_fails_closed(self):
+        adapter = self.bmac_adapter()
+        raw = bmac_event(50, "donation.created", self.donation_data())
         process_signed_webhook(
             adapter, self.ledger, self.guard,
-            raw, stripe_headers(raw), received_at=NOW,
+            raw, bmac_headers(raw), received_at=NOW,
         )
         payload = json.loads(self.association_path.read_text(encoding="utf-8"))
-        target = next(iter(payload["targets"].values()))
-        target["subject_key"] = opaque_key(
+        next(iter(payload["targets"].values()))["subject_key"] = opaque_key(
             "maestro_account_support", "tampered-account", IDENTITY_KEY,
         )
         self.association_path.write_text(json.dumps(payload), encoding="utf-8")
-        refund_raw = stripe_event(
-            "evt_tamper_refund", "charge.refunded",
-            {
-                "id": "ch_test_tamper",
-                "object": "charge",
-                "livemode": False,
-                "payment_intent": "pi_test_support",
-                "amount_refunded": 500,
-                "currency": "usd",
-            },
+        refund_raw = bmac_event(
+            51,
+            "donation.refunded",
+            self.donation_data(status="refunded", refunded="true"),
         )
-        with self.assertRaises(StripeAssociationIntegrityError):
+        with self.assertRaises(SupportAssociationIntegrityError):
             adapter.verify_and_translate(
-                refund_raw, stripe_headers(refund_raw), received_at=NOW,
+                refund_raw, bmac_headers(refund_raw), received_at=NOW,
             )
 
-    def test_production_stripe_crash_before_ledger_append_retries_exactly(self):
-        adapter = self.stripe_adapter()
-        raw = stripe_event(
-            "evt_crash_association", "checkout.session.completed",
-            self.checkout_object(),
-        )
+    def test_native_bmac_crash_before_ledger_append_retries_exactly(self):
+        adapter = self.bmac_adapter()
+        raw = bmac_event(60, "donation.created", self.donation_data())
         expected = adapter.verify_and_translate(
-            raw, stripe_headers(raw), received_at=NOW,
+            raw, bmac_headers(raw), received_at=NOW,
         )
         self.assertEqual(self.ledger.events(), ())
-        restarted = self.stripe_adapter()
         event = process_signed_webhook(
-            restarted, self.ledger, self.guard,
-            raw, stripe_headers(raw), received_at=NOW,
+            self.bmac_adapter(), self.ledger, self.guard,
+            raw, bmac_headers(raw), received_at=NOW,
         )
         self.assertEqual(event.source_event_key, expected.source_event_key)
         self.assertEqual(event.subject_key, expected.subject_key)
         self.assertEqual(len(self.ledger.events()), 1)
 
     @unittest.skipIf(sys.platform == "win32", "POSIX permission semantics")
-    def test_production_stripe_runtime_files_require_0600_and_no_symlinks(self):
+    def test_native_bmac_runtime_files_require_0600_and_no_symlinks(self):
         root = Path(self.temp.name)
-        config_path = root / "stripe-runtime.json"
+        config_path = root / "bmac-runtime.json"
         config_path.write_text(json.dumps({
-            "schema_version": STRIPE_RUNTIME_CONFIG_SCHEMA_VERSION,
+            "schema_version": BMAC_RUNTIME_CONFIG_SCHEMA_VERSION,
             "creator_surface": STRIPE_BMAC_CREATOR_SURFACE,
             "deployment_scope": STRIPE_BMAC_DEPLOYMENT_SCOPE,
-            "livemode": False,
-            "payment_links": {"plink_test_support": {"currency": "USD"}},
-            "prices": {"price_test_support": {"currency": "USD"}},
-            "account_links": {"cus_test_linked": self.account_subject},
+            "live_mode": False,
+            "account_links": {},
         }), encoding="utf-8")
         config_path.chmod(0o600)
         secret_paths = {}
         for name, value in {
-            "WEBHOOK": STRIPE_SECRET,
+            "WEBHOOK": BMAC_SECRET,
             "IDENTITY": IDENTITY_KEY,
             "ASSOCIATION": INTEGRITY_KEY,
         }.items():
@@ -559,28 +599,22 @@ class SupportWebhookTests(unittest.TestCase):
             path.chmod(0o600)
             secret_paths[name] = path
         env = {
-            "MAESTRO_SUPPORT_STRIPE_BMAC_CONFIG_FILE": str(config_path),
-            "MAESTRO_SUPPORT_STRIPE_WEBHOOK_SECRET_FILE": str(
-                secret_paths["WEBHOOK"],
-            ),
-            "MAESTRO_SUPPORT_STRIPE_IDENTITY_HMAC_KEY_FILE": str(
-                secret_paths["IDENTITY"],
-            ),
-            "MAESTRO_SUPPORT_STRIPE_ASSOCIATION_HMAC_KEY_FILE": str(
-                secret_paths["ASSOCIATION"],
-            ),
+            "MAESTRO_SUPPORT_BMAC_CONFIG_FILE": str(config_path),
+            "MAESTRO_SUPPORT_BMAC_WEBHOOK_SECRET_FILE": str(secret_paths["WEBHOOK"]),
+            "MAESTRO_SUPPORT_BMAC_IDENTITY_HMAC_KEY_FILE": str(secret_paths["IDENTITY"]),
+            "MAESTRO_SUPPORT_BMAC_ASSOCIATION_HMAC_KEY_FILE": str(secret_paths["ASSOCIATION"]),
         }
-        loaded = StripeBmacWebhookConfig.from_environment(env)
-        self.assertFalse(loaded.livemode)
+        loaded = BmacWebhookConfig.from_environment(env)
+        self.assertFalse(loaded.live_mode)
         config_path.chmod(0o644)
         with self.assertRaisesRegex(SupportWebhookError, "0600"):
-            StripeBmacWebhookConfig.from_environment(env)
+            BmacWebhookConfig.from_environment(env)
         config_path.chmod(0o600)
         symlink = root / "linked-runtime.json"
         symlink.symlink_to(config_path)
-        env["MAESTRO_SUPPORT_STRIPE_BMAC_CONFIG_FILE"] = str(symlink)
+        env["MAESTRO_SUPPORT_BMAC_CONFIG_FILE"] = str(symlink)
         with self.assertRaisesRegex(SupportWebhookError, "symlink"):
-            StripeBmacWebhookConfig.from_environment(env)
+            BmacWebhookConfig.from_environment(env)
 
     def test_exact_raw_body_signature_and_timestamp_are_required(self):
         raw = body()

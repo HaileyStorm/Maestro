@@ -1,7 +1,34 @@
 const { runtimeSecretEnv } = require("./launcher_secret_env")
+const {
+  isRtx50,
+  isSolCapable,
+  needsCuda13DriverUpdate,
+  runtimeProfile,
+} = require("./launcher_profile")
 
-module.exports = {
-  run: [{
+module.exports = async (kernel) => {
+  const runtime = runtimeProfile(kernel)
+  const cuda13DriverUpdateRequired = (
+    isSolCapable(kernel) && needsCuda13DriverUpdate(kernel)
+  )
+  const alreadyCurrentAndReady =
+    `{{/already up[- ]to[- ]date/i.test(input.stdout) && exists('${runtime.marker}') && exists('${runtime.flashMarker}') ? 'uptodate' : 'build'}}`
+  return {
+    run: [{
+    when: cuda13DriverUpdateRequired && isRtx50(kernel),
+    method: "input",
+    params: {
+      title: "NVIDIA driver update required",
+      description: `RTX 50 requires NVIDIA driver 580 or newer for Maestro's CUDA 13 runtime (found ${kernel.gpu_driver}). Update the driver, then run Update again.`
+    },
+    next: null
+  }, {
+    when: cuda13DriverUpdateRequired && !isRtx50(kernel),
+    method: "log",
+    params: {
+      raw: `NVIDIA driver ${kernel.gpu_driver} cannot use Maestro's preferred CUDA 13 H3 runtime; Update will build or repair the preserved CUDA 12.8 compatibility runtime.`
+    }
+  }, {
     // Pull the latest launcher + app code (single monorepo, so this one
     // pull covers both `ui/` and `app/`). The NEXT step inspects this
     // pull's output: if the repo was already current, there is nothing
@@ -25,7 +52,10 @@ module.exports = {
     // never a wrongly-skipped rebuild.
     method: "jump",
     params: {
-      id: "{{/already up[- ]to[- ]date/i.test(input.stdout) ? 'uptodate' : 'build'}}"
+      // An already-current checkout still enters the build path when either
+      // its hardware runtime or optional FlashAttention repair marker is
+      // missing. This keeps interrupted installs and one-time repairs resumable.
+      id: alreadyCurrentAndReady
     }
   }, {
     id: "uptodate",
@@ -48,16 +78,28 @@ module.exports = {
     }
   }, {
     method: "script.start",
-    params: { uri: "blender_mcp_install.js" }
+    params: {
+      uri: "blender_mcp_install.js",
+      params: { venv: runtime.env, venv_python: runtime.python }
+    }
   }, {
     method: "script.start",
-    params: { uri: "blender_runtime_install.js" }
+    params: {
+      uri: "blender_runtime_install.js",
+      params: { venv: runtime.env, venv_python: runtime.python }
+    }
   }, {
     method: "script.start",
-    params: { uri: "h3_acceleration_install.js" }
+    params: {
+      uri: "h3_acceleration_install.js",
+      params: { venv: runtime.env, venv_python: runtime.python }
+    }
   }, {
     method: "script.start",
-    params: { uri: "h3_w4a8_runtime_install.js" }
+    params: {
+      uri: "h3_w4a8_runtime_install.js",
+      params: { venv: runtime.env, venv_python: runtime.python }
+    }
   }, {
     method: "log",
     params: {
@@ -87,46 +129,37 @@ module.exports = {
     method: "shell.run",
     params: {
       env: runtimeSecretEnv,
-      venv: "env",
+      venv: runtime.env,
+      venv_python: runtime.python,
       path: "app",
       message: "uv pip install -r requirements.txt"
     }
   }, {
-    method: "script.start",
-    params: { uri: "blender_mcp_install.js" }
-  }, {
-    method: "script.start",
-    params: { uri: "blender_runtime_install.js" }
-  }, {
-    method: "script.start",
-    params: { uri: "h3_acceleration_install.js" }
-  }, {
-    method: "script.start",
-    params: { uri: "h3_w4a8_runtime_install.js" }
-  }, {
-    // Skip torch.js when the marker file written by torch.js's last
-    // successful run is still present — `torch + triton + sage + flash`
-    // are already installed at the versions torch.js wants to install.
-    // Saves ~60-120s + ~3 GB of redundant downloads on routine updates.
-    //
-    // When bumping ANY of those package versions inside torch.js, ALSO
-    // bump the marker suffix here AND in torch.js's fs.write step. The
-    // old marker becomes stale, this `!exists(new_marker)` gate evaluates
-    // true on the next update, torch.js runs, and the new marker is
-    // written. Old marker stays as harmless cruft until reset.js (which
-    // wipes app/env entirely).
-    //
-    // Recovery path: if torch ever ends up in a broken state (e.g. CPU
-    // wheel installed where CUDA is expected) AND the marker is still
-    // present, the user can manually delete
-    // `app/env/.maestro_torch_v2.installed` and re-run Update to force
-    // a full reinstall — or run Reset for a clean slate.
-    when: "{{!exists('app/env/.maestro_torch_v2.installed')}}",
+    // Existing installs may have the main runtime marker but still contain a
+    // Windows FlashAttention wheel whose CUDA DLL cannot load. Repair only
+    // that optional wheel once; a normal torch.js run writes both markers.
+    when: `{{exists('${runtime.marker}') && !exists('${runtime.flashMarker}')}}`,
     method: "script.start",
     params: {
       uri: "torch.js",
       params: {
-        venv: "env",
+        venv: runtime.env,
+        venv_python: runtime.python,
+        path: "app",
+        flash_only: true
+      }
+    }
+  }, {
+    // Skip the full torch.js path when its hardware-specific marker is
+    // present. Deleting the marker and running Update remains the bounded
+    // recovery path for a damaged required runtime.
+    when: `{{!exists('${runtime.marker}')}}`,
+    method: "script.start",
+    params: {
+      uri: "torch.js",
+      params: {
+        venv: runtime.env,
+        venv_python: runtime.python,
         path: "app",
         xformers: true
       }
@@ -138,9 +171,34 @@ module.exports = {
     method: "shell.run",
     params: {
       env: runtimeSecretEnv,
-      venv: "env",
+      venv: runtime.env,
+      venv_python: runtime.python,
       path: "app",
       message: "python scripts/install_gguf_kernels.py"
+    }
+  }, {
+    method: "script.start",
+    params: {
+      uri: "blender_mcp_install.js",
+      params: { venv: runtime.env, venv_python: runtime.python }
+    }
+  }, {
+    method: "script.start",
+    params: {
+      uri: "blender_runtime_install.js",
+      params: { venv: runtime.env, venv_python: runtime.python }
+    }
+  }, {
+    method: "script.start",
+    params: {
+      uri: "h3_acceleration_install.js",
+      params: { venv: runtime.env, venv_python: runtime.python }
+    }
+  }, {
+    method: "script.start",
+    params: {
+      uri: "h3_w4a8_runtime_install.js",
+      params: { venv: runtime.env, venv_python: runtime.python }
     }
   }, {
     when: "{{exists('ui/package.json')}}",
@@ -170,5 +228,6 @@ module.exports = {
     params: {
       uri: "sam_install.js"
     }
-  }]
+    }]
+  }
 }

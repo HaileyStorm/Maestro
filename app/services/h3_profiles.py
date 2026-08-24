@@ -12,7 +12,12 @@ H3_NATIVE_RESOLUTIONS = (
     "480x864", "640x640", "608x352", "352x608",
 )
 
-DEFAULT_H3_PROFILE_ID = "high"
+OWNER_DEFAULT_H3_PROFILE_ID = "high"
+NON_OWNER_DEFAULT_H3_PROFILE_ID = "quality"
+# Compatibility authority for accounts-off and machine-local callers. HTTP
+# admission resolves authenticated non-owner defaults explicitly instead of
+# changing this long-standing local-owner fallback.
+DEFAULT_H3_PROFILE_ID = OWNER_DEFAULT_H3_PROFILE_ID
 
 _PROFILES = (
     {
@@ -36,9 +41,9 @@ _PROFILES = (
     {
         "id": "quality",
         "label": "Quality",
-        "description": "Native H3 at its standard 20-step quality setting.",
+        "description": "Native H3 at a balanced 23-step quality setting.",
         "accelerator": "native",
-        "num_inference_steps": 20,
+        "num_inference_steps": 23,
         "resolution": "960x544",
         "attention_engine": "sol_attn",
     },
@@ -46,11 +51,11 @@ _PROFILES = (
         "id": "high",
         "label": "High",
         "description": (
-            "Maximum native H3 canvas at 20 steps with Sol attention; "
+            "Maximum native H3 canvas at 28 steps with Sol attention; "
             "no learned upscale or delivery crop."
         ),
         "accelerator": "native",
-        "num_inference_steps": 20,
+        "num_inference_steps": 28,
         "resolution": "1344x768",
         "attention_engine": "sol_attn",
     },
@@ -59,13 +64,13 @@ _PROFILES = (
         "label": "Spectrum Experimental",
         "description": (
             "Experimental clean-room H3 forecast accelerator: the High 1344x768 "
-            "20-step Sol bundle captures 11 paired hidden-feature anchors and nine "
+            "28-step Sol bundle captures 11 paired hidden-feature anchors and nine "
             "causal forecast slots, then replays every step without transformer blocks. "
             "Audio uses local interpolation only; "
             "quality and speed still require live validation."
         ),
         "accelerator": "spectrum",
-        "num_inference_steps": 20,
+        "num_inference_steps": 28,
         "resolution": "1344x768",
         "attention_engine": "sol_attn",
     },
@@ -85,12 +90,12 @@ _PROFILES = (
         "id": "1080p_delivery",
         "label": "1080p Delivery",
         "description": (
-            "The same 1344x768 native, 20-step Sol inference as High; "
+            "A 1344x768 native, 32-step Sol inference above High; "
             "FlashVSR 1.5x reaches 2016x1152, then a small center crop/downsample delivers "
             "exact 1920x1080. The added time/download is delivery-only."
         ),
         "accelerator": "native",
-        "num_inference_steps": 20,
+        "num_inference_steps": 32,
         "resolution": "1344x768",
         "attention_engine": "sol_attn",
         "spatial_upsampling": "flashvsr1.5",
@@ -101,11 +106,11 @@ _PROFILES = (
         "id": "ultra",
         "label": "Ultra",
         "description": (
-            "1344x768 native H3 with dense attention and 30 steps, then "
+            "1344x768 native H3 with dense attention and 32 steps, then "
             "FlashVSR shifted two-pass 2x delivery at exactly 2688x1536 (2.7K, not 4K)."
         ),
         "accelerator": "native",
-        "num_inference_steps": 30,
+        "num_inference_steps": 32,
         "resolution": "1344x768",
         "attention_engine": "sdpa",
         "spatial_upsampling": "flashvsr2pass2",
@@ -116,12 +121,12 @@ _PROFILES = (
         "id": "4k_delivery",
         "label": "4K Delivery",
         "description": (
-            "1344x768 native H3 with dense attention and 30 steps; learned "
+            "1344x768 native H3 with dense attention and 32 steps; learned "
             "FlashVSR 3x detail synthesis reaches 4032x2304, then an explicit "
             "center crop/downsample delivers exact 3840x2160. Upscaled, not native 4K."
         ),
         "accelerator": "native",
-        "num_inference_steps": 30,
+        "num_inference_steps": 32,
         "resolution": "1344x768",
         "attention_engine": "sdpa",
         "spatial_upsampling": "flashvsr3",
@@ -187,6 +192,15 @@ def profile_settings(
 def default_profile_settings(model_type: str = "minimax_h3") -> dict[str, Any]:
     """Return H3's fresh/omitted High bundle for ``model_type``."""
     return profile_settings(model_type, DEFAULT_H3_PROFILE_ID)
+
+
+def fresh_profile_id_for_account_role(account_role: str | None) -> str:
+    """Resolve a fresh role-aware H3 bundle without replacing authored state."""
+    return (
+        NON_OWNER_DEFAULT_H3_PROFILE_ID
+        if str(account_role or "").strip().casefold() == "user"
+        else OWNER_DEFAULT_H3_PROFILE_ID
+    )
 
 
 def _reference_count(reference_shape: Mapping[str, Any]) -> int:
@@ -330,6 +344,15 @@ def build_profile_options(
         if turbo:
             if available and turbo_compatibility is not None:
                 available, reason = turbo_compatibility(settings)
+        if available:
+            try:
+                from services.h3_host_limits import host_limit_reason_for_profile
+                host_reason = host_limit_reason_for_profile(settings, context)
+            except Exception:
+                host_reason = None
+            if host_reason:
+                available = False
+                reason = host_reason
         upscale = str(settings.get("spatial_upsampling") or "")
         if (
             available and upscale and upscale_status
@@ -396,7 +419,9 @@ def build_profile_options(
 
 
 __all__ = [
-    "DEFAULT_H3_PROFILE_ID", "H3_NATIVE_RESOLUTIONS", "build_profile_options",
-    "default_profile_settings", "profile_definition", "profile_definitions",
-    "profile_settings",
+    "DEFAULT_H3_PROFILE_ID", "OWNER_DEFAULT_H3_PROFILE_ID",
+    "NON_OWNER_DEFAULT_H3_PROFILE_ID", "H3_NATIVE_RESOLUTIONS",
+    "build_profile_options", "default_profile_settings",
+    "fresh_profile_id_for_account_role", "profile_definition",
+    "profile_definitions", "profile_settings",
 ]

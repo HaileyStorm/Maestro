@@ -1,13 +1,19 @@
 // Official Blender 5.1.2 portable runtime, pinned by Blender Foundation SHA-256.
 const { runtimeSecretEnv } = require("./launcher_secret_env")
+const { runtimeProfile } = require("./launcher_profile")
 
-module.exports = {
-  run: [
+module.exports = async (kernel) => {
+  const runtime = runtimeProfile(kernel)
+  const selectedVenv = `{{args && args.venv ? args.venv : '${runtime.env}'}}`
+  const selectedPython = `{{args && args.venv_python ? args.venv_python : '${runtime.python}'}}`
+  return {
+    run: [
     {
       method: "shell.run",
       params: {
         env: runtimeSecretEnv,
-        venv: "env",
+        venv: selectedVenv,
+        venv_python: selectedPython,
         path: "app",
         message: "python -m services.blender_mcp_service provision-runtime --checkout services/blender_mcp --marker tools/blender/runtime.json"
       }
@@ -25,7 +31,8 @@ module.exports = {
       method: "shell.run",
       params: {
         env: runtimeSecretEnv,
-        venv: "env",
+        venv: selectedVenv,
+        venv_python: selectedPython,
         path: "app",
         message: "python scripts/install_blender_runtime.py --archive tools/blender/downloads/blender-5.1.2-linux-x64.tar.xz --sha256 aaccb355f50183979b698bcce7467103a76261b5fa59f4972295842662a285fb --checkout services/blender_mcp --version 5.1.2"
       }
@@ -43,10 +50,12 @@ module.exports = {
       method: "shell.run",
       params: {
         env: runtimeSecretEnv,
-        venv: "env",
+        venv: selectedVenv,
+        venv_python: selectedPython,
         path: "app",
         message: "python scripts/install_blender_runtime.py --archive tools/blender/downloads/blender-5.1.2-windows-x64.zip --sha256 345bedea7b0acf7cc9666423d8553f9129622aea34ded65c23e8cb70f83f14ff --checkout services/blender_mcp --version 5.1.2"
       }
     }
-  ]
+    ]
+  }
 }

@@ -249,6 +249,47 @@ class QueueFinalAdoptionTests(unittest.TestCase):
             copied.append((destination_media, destination_sidecar))
         return copied
 
+    def test_adopts_complete_ordinary_repeat_without_h3_concat_fields(self):
+        output = "unit-ordinary-final-t0-r0-w1.mp4"
+        payload = b"complete-ordinary-final"
+        unit_id = recovery_unit_id(
+            "job-ordinary",
+            "ordinary_repeat",
+            variant=0,
+            index=0,
+            dependencies=[],
+            settings={},
+        )
+        meta = {
+            "artifact_class": "final",
+            "job_id": "job-ordinary",
+            "params": {},
+            "private": False,
+            "producer_artifact_class": "final",
+            "producer_unit_artifact_names": [output],
+            "producer_unit_dependencies": None,
+            "producer_unit_id": unit_id,
+            "producer_unit_index": 0,
+            "producer_unit_kind": "ordinary_repeat",
+            "producer_unit_settings": None,
+            "producer_unit_variant": 0,
+            "workspace": self.workspace,
+        }
+        media, sidecar = self._quarantined_pair(output, payload, meta)
+
+        summary = adopt_quarantined_final_groups(
+            self.project,
+            workspace=self.workspace,
+        )
+
+        self.assertEqual(summary["declared_groups"], 1)
+        self.assertEqual(summary["adopted_groups"], 1)
+        self.assertEqual(summary["missing_groups"], 0)
+        self.assertTrue((self.project / output).is_file())
+        self.assertEqual((self.project / output).read_bytes(), payload)
+        self.assertTrue((self.project / f"{Path(output).stem}.meta.json").is_file())
+        self.assertEqual(media.name.split("-", 1)[1], output)
+
     def test_adopts_exact_four_plus_one_and_keeps_components_quarantined(self):
         first = self._concat_job("job-four", 4)
         second = self._concat_job("job-one", 1)

@@ -2307,7 +2307,8 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /Best fit/)
   assert.match(source, /Main image/)
   assert.match(source, /Variations/)
-  assert.doesNotMatch(source, /selectedModelPerMode/)
+  assert.match(source, /const selectedDirectorVideoModel = useStore\(s => s\.selectedModelPerMode\.video \|\| ''\)/)
+  assert.match(source, /s\.models\.find\(model => model\.model_type === s\.selectedModelPerMode\.video\)\?\.director\?\.max_image_refs/)
   assert.match(source, /aria-label=\{`Import media for \$\{asset\.name\}`\}/)
   assert.doesNotMatch(source, /accept="image\/\*,video\/\*"\s+className="hidden"/)
   assert.match(source, /aria-expanded=\{editing\}/)
@@ -2329,7 +2330,7 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /response\.authored_settings\.explicit_convenience/)
   assert.doesNotMatch(source, /response\.authored_settings\.managed_character_callouts/)
   assert.match(source, /The private creation settings for this candidate are unavailable/)
-  assert.match(source, /disabled=\{Boolean\(pendingAction\) \|\| !exactRetryReady\}/)
+  assert.match(source, /disabled=\{sceneKitApplying \|\| Boolean\(pendingAction\) \|\| !exactRetryReady\}/)
   assert.match(source, /resolveProjectReferenceRetryReview\(/)
   assert.match(source, /if \(!retryReview\.ready\)/)
   assert.match(source, /The original visual review model is unavailable\. Retry or Edit will use the current compatible model/)
@@ -2358,7 +2359,7 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /source mode, model, privacy, and repair policy were preserved;/)
   assert.match(source, /reuse the saved style, models, privacy, fixes, planning, and quality-check choices/)
   assert.doesNotMatch(source, /One bounded repair/)
-  assert.equal(source.match(/setActionError\(''\)/g)?.length, 3)
+  assert.equal(source.match(/setActionError\(''\)/g)?.length, 4)
   assert.doesNotMatch(source, /job\?\.error/)
   assert.match(source, /projectReferenceSafeErrorMessage\(reason/)
   assert.doesNotMatch(source, /localStorage/)
@@ -2378,7 +2379,7 @@ test('Reference peer, catalog races, Moody cards, manifests, and Blender contrac
   assert.equal(sidebar.match(/<ProjectReferenceLibrary active=\{isReference\} \/>/g)?.length, 1)
   assert.doesNotMatch(sidebar, /sidebarOpen && <ProjectReferenceLibrary/)
   assert.match(source, /const open = active/)
-  for (const label of ['Generate', 'Director', 'Reference']) {
+  for (const label of ['Generate', 'Director', 'References']) {
     assert.match(sidebar, new RegExp(`>\\s*${label}\\s*<`))
   }
   assert.match(sidebar, /role="group" aria-label="Creative workspace"/)

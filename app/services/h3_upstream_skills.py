@@ -101,7 +101,7 @@ _BUILTIN_STYLES = [
         "id": "3d-animation-short-generator",
         "label": "Stylized 3D animation short",
         "description": "Narrative 3D shorts with character, environment, shot, continuity, performance, camera, and audio planning.",
-        "prompt_brief": "Stylized 3D narrative animation with consistent character cards, environments, performances, camera language, continuity, and sound.",
+        "prompt_brief": "Stylized 3D narrative animation with consistent character cards, environments, and camera language; stage readable poses and action with anticipation, purposeful holds, clear motion arcs, follow-through, and continuity.",
     },
     {
         "id": "minimalist-product-ad-generator",
@@ -113,13 +113,13 @@ _BUILTIN_STYLES = [
         "id": "brand-promo-video-generator",
         "label": "Brand / product promo",
         "description": "Fact-grounded promotional shorts for products, sites, apps, shops, and personal projects.",
-        "prompt_brief": "Fact-grounded promotional short with a clear narrative direction, capability and use-case beats, authorized assets, and a call to action.",
+        "prompt_brief": "Fact-grounded promotional short with a clear narrative direction, capability and use-case beats, and a call to action; use one-reference-one-job roles for approved assets such as identity, world, props, performance, typography, or storyboard.",
     },
     {
         "id": "music-video-subtitle-generator",
         "label": "Music video + lyric typography",
         "description": "Beat-aware connected music-video shots with lyric typography and long-work stitching guidance.",
-        "prompt_brief": "Beat-reactive connected shots, spatial lyric typography, stable character and scene references, and audio-timed transitions.",
+        "prompt_brief": "Beat-reactive connected shots with beat-owned cut and transition timing, spatial lyric typography planned as its own visual layer, stable character and scene references, and readable continuity.",
     },
     {
         "id": "co-op-game-intro-generator",

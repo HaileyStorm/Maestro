@@ -18,7 +18,7 @@ import glob
 import json
 import os
 import struct
-from typing import Iterable
+from typing import Callable, Iterable
 
 
 class CheckpointCompatibilityError(ValueError):
@@ -193,6 +193,25 @@ def read_safetensors_header(path: str) -> dict:
     if not isinstance(header, dict):
         raise CheckpointCompatibilityError("SafeTensor header is not a tensor index")
     payload_size = file_size - 8 - header_length
+    dtype_sizes = {
+        "BOOL": 1,
+        "U8": 1,
+        "I8": 1,
+        "F8_E4M3": 1,
+        "F8_E5M2": 1,
+        "F8_E8M0": 1,
+        "I16": 2,
+        "U16": 2,
+        "F16": 2,
+        "BF16": 2,
+        "I32": 4,
+        "U32": 4,
+        "F32": 4,
+        "I64": 8,
+        "U64": 8,
+        "F64": 8,
+    }
+    ranges: list[tuple[int, int, str]] = []
     for key, value in header.items():
         if key == "__metadata__":
             continue
@@ -201,10 +220,12 @@ def read_safetensors_header(path: str) -> dict:
                 f"SafeTensor entry {key!r} is not a tensor descriptor"
             )
         offsets = value.get("data_offsets")
+        shape = value.get("shape")
+        dtype = value.get("dtype")
         if (
             not isinstance(offsets, list)
             or len(offsets) != 2
-            or not all(isinstance(offset, int) for offset in offsets)
+            or not all(type(offset) is int for offset in offsets)
             or offsets[0] < 0
             or offsets[1] < offsets[0]
             or offsets[1] > payload_size
@@ -212,6 +233,34 @@ def read_safetensors_header(path: str) -> dict:
             raise CheckpointCompatibilityError(
                 f"SafeTensor entry {key!r} points outside the downloaded payload"
             )
+        if (
+            not isinstance(shape, list)
+            or not all(type(dimension) is int and dimension >= 0 for dimension in shape)
+            or dtype not in dtype_sizes
+        ):
+            raise CheckpointCompatibilityError(
+                f"SafeTensor entry {key!r} has an invalid dtype or shape"
+            )
+        element_count = 1
+        for dimension in shape:
+            element_count *= dimension
+        expected_size = element_count * dtype_sizes[dtype]
+        if offsets[1] - offsets[0] != expected_size:
+            raise CheckpointCompatibilityError(
+                f"SafeTensor entry {key!r} has an inconsistent byte range"
+            )
+        ranges.append((offsets[0], offsets[1], key))
+    cursor = 0
+    for start, end, key in sorted(ranges):
+        if start != cursor:
+            raise CheckpointCompatibilityError(
+                f"SafeTensor entry {key!r} has an overlapping or gapped byte range"
+            )
+        cursor = end
+    if cursor != payload_size:
+        raise CheckpointCompatibilityError(
+            "SafeTensor tensor ranges do not cover the downloaded payload"
+        )
     return header
 
 
@@ -390,10 +439,69 @@ def validate_checkpoint_file(
 
 
 _QUARANTINE_KEY = "maestro_checkpoint_quarantine"
+_QUARANTINE_SCHEMA_VERSION = 2
+
+
+def _field_snapshot(container: dict, key: str) -> dict:
+    """Capture presence separately so rollback can restore an absent field."""
+
+    return {
+        "present": key in container,
+        "value": container.get(key),
+    }
+
+
+def _restore_field(container: dict, key: str, snapshot: dict) -> None:
+    if snapshot.get("present"):
+        container[key] = snapshot.get("value")
+    else:
+        container.pop(key, None)
+
+
+def _new_quarantine_marker(model: dict, civitai: dict) -> dict:
+    return {
+        "schema_version": _QUARANTINE_SCHEMA_VERSION,
+        "previous": {
+            "visible": _field_snapshot(model, "visible"),
+            "compatibility_status": _field_snapshot(
+                civitai, "compatibility_status"
+            ),
+            "compatibility_reason": _field_snapshot(
+                civitai, "compatibility_reason"
+            ),
+            # The compatibility receipt carries its signature version. Keep
+            # the whole prior value so a successful later audit restores the
+            # exact provenance instead of silently manufacturing a new one.
+            "compatibility": _field_snapshot(civitai, "compatibility"),
+        },
+    }
+
+
+def _upgrade_quarantine_marker(marker: dict, model: dict, civitai: dict) -> dict:
+    """Upgrade the historical visibility-only marker without losing intent."""
+
+    if marker.get("schema_version") == _QUARANTINE_SCHEMA_VERSION and isinstance(
+        marker.get("previous"), dict
+    ):
+        return dict(marker)
+    previous_visible = bool(marker.get("previous_visible", True))
+    return {
+        "schema_version": _QUARANTINE_SCHEMA_VERSION,
+        "previous": {
+            "visible": {"present": True, "value": previous_visible},
+            # Historical quarantine created these fields, so an old marker
+            # means they were absent before the block was applied.
+            "compatibility_status": {"present": False, "value": None},
+            "compatibility_reason": {"present": False, "value": None},
+            "compatibility": _field_snapshot(civitai, "compatibility"),
+        },
+    }
 
 
 def _definition_compatibility(
-    model: dict, checkpoint_root: str
+    model: dict,
+    checkpoint_root: str,
+    resolve_checkpoint: Callable[[str], str | None] | None = None,
 ) -> tuple[bool, str, bool]:
     civitai = model.get("civitai")
     if not isinstance(civitai, dict) or civitai.get("modelType") != "Checkpoint":
@@ -402,24 +510,66 @@ def _definition_compatibility(
     architecture = str(model.get("architecture") or "")
     try:
         ensure_allowed_checkpoint_target(base_model, architecture)
-        filename = os.path.basename(str(civitai.get("filename") or ""))
-        candidate = os.path.join(checkpoint_root, filename) if filename else ""
-        # Re-validate legacy SafeTensor registrations. Older GGUF/custom
-        # imports cannot be shape-inspected with this reader, so preserve them
-        # when their CivitAI base-to-pipeline mapping itself is valid.
-        if candidate and os.path.isfile(candidate):
-            if os.path.splitext(filename)[1].casefold() in {
-                ".safetensors",
-                ".sft",
-            }:
-                validate_checkpoint_file(candidate, base_model, architecture)
-            return True, "", True
+        filename = str(civitai.get("filename") or "")
+        if not filename:
+            raise CheckpointCompatibilityError(
+                "Checkpoint registration does not identify a weight file."
+            )
+        if (
+            filename != os.path.basename(filename)
+            or "/" in filename
+            or "\\" in filename
+            or filename in {".", ".."}
+        ):
+            raise CheckpointCompatibilityError(
+                "Checkpoint provenance filename is not a safe local component."
+            )
+        if os.path.splitext(filename)[1].casefold() not in {
+            ".safetensors",
+            ".sft",
+        }:
+            raise CheckpointCompatibilityError(
+                "Legacy checkpoint registration is not a SafeTensor file and "
+                "cannot be verified. Its weights were preserved."
+            )
+        urls = model.get("URLs")
+        if not isinstance(urls, list) or len(urls) != 1:
+            raise CheckpointCompatibilityError(
+                "Checkpoint definition does not declare exactly one local weight."
+            )
+        declared = urls[0]
+        if not isinstance(declared, str) or declared != filename:
+            raise CheckpointCompatibilityError(
+                "Checkpoint definition weight does not match its verified "
+                "CivitAI provenance."
+            )
+        try:
+            candidate = (
+                resolve_checkpoint(filename)
+                if resolve_checkpoint is not None
+                else os.path.join(checkpoint_root, filename)
+            )
+        except Exception as exc:
+            raise CheckpointCompatibilityError(
+                "Checkpoint lookup failed. The definition remains hidden."
+            ) from exc
+        if not candidate or not os.path.isfile(candidate):
+            raise CheckpointCompatibilityError(
+                "Checkpoint weight is unavailable. The definition remains "
+                "hidden until a later audit can verify it."
+            )
+        validate_checkpoint_file(candidate, base_model, architecture)
+        return True, "", True
     except CheckpointCompatibilityError as exc:
         return False, str(exc), True
-    return True, "", False
 
 
-def quarantine_incompatible_checkpoint_definitions(app_dir: str) -> list[dict]:
+def quarantine_incompatible_checkpoint_definitions(
+    app_dir: str,
+    *,
+    checkpoint_root: str | None = None,
+    resolve_checkpoint: Callable[[str], str | None] | None = None,
+) -> list[dict]:
     """Hide unsafe legacy CivitAI imports before WanGP builds its model list.
 
     The checkpoint itself is never deleted.  A marker records the prior
@@ -428,7 +578,7 @@ def quarantine_incompatible_checkpoint_definitions(app_dir: str) -> list[dict]:
     """
 
     finetunes_dir = os.path.join(app_dir, "finetunes")
-    checkpoint_root = os.path.join(app_dir, "ckpts")
+    checkpoint_root = checkpoint_root or os.path.join(app_dir, "ckpts")
     changes: list[dict] = []
     for path in glob.glob(os.path.join(finetunes_dir, "*.json")):
         try:
@@ -444,17 +594,17 @@ def quarantine_incompatible_checkpoint_definitions(app_dir: str) -> list[dict]:
             continue
 
         compatible, reason, verified = _definition_compatibility(
-            model, checkpoint_root
+            model,
+            checkpoint_root,
+            resolve_checkpoint,
         )
         marker = model.get(_QUARANTINE_KEY)
         changed = False
         if not compatible:
             if isinstance(marker, dict):
-                marker = dict(marker)
+                marker = _upgrade_quarantine_marker(marker, model, civitai)
             else:
-                marker = {
-                    "previous_visible": bool(model.get("visible", True)),
-                }
+                marker = _new_quarantine_marker(model, civitai)
             marker["reason"] = reason
             marker["signature_version"] = 1
             if model.get(_QUARANTINE_KEY) != marker:
@@ -470,16 +620,30 @@ def quarantine_incompatible_checkpoint_definitions(app_dir: str) -> list[dict]:
                 civitai["compatibility_reason"] = reason
                 changed = True
         elif isinstance(marker, dict) and verified:
-            previous_visible = bool(marker.get("previous_visible", True))
-            model["visible"] = previous_visible
+            marker = _upgrade_quarantine_marker(marker, model, civitai)
+            previous = marker["previous"]
+            _restore_field(model, "visible", previous["visible"])
+            _restore_field(
+                civitai,
+                "compatibility_status",
+                previous["compatibility_status"],
+            )
+            _restore_field(
+                civitai,
+                "compatibility_reason",
+                previous["compatibility_reason"],
+            )
+            _restore_field(
+                civitai,
+                "compatibility",
+                previous["compatibility"],
+            )
             model.pop(_QUARANTINE_KEY, None)
-            civitai.pop("compatibility_status", None)
-            civitai.pop("compatibility_reason", None)
             changed = True
 
         if not changed:
             continue
-        temporary = f"{path}.maestro-{os.getpid()}.tmp"
+        temporary = f"{path}.maestro-{os.getpid()}-{id(definition)}.tmp"
         try:
             with open(temporary, "w", encoding="utf-8") as handle:
                 json.dump(definition, handle, indent=4)
@@ -496,7 +660,8 @@ def quarantine_incompatible_checkpoint_definitions(app_dir: str) -> list[dict]:
                 "compatible": compatible,
                 "applied": False,
                 "reason": reason,
-                "error": str(exc),
+                # Do not expose a host path through startup or API errors.
+                "error": f"atomic definition update failed ({type(exc).__name__})",
             })
         finally:
             if os.path.isfile(temporary):

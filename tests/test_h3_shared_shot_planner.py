@@ -16,6 +16,7 @@ from services.h3_shot_planner import (  # noqa: E402
     H3_COMPILER_INPUT_REPLAY_VERSION,
     H3_SEMANTIC_PHYSICAL_CONTRACT_VERSION,
     H3ShotPlanError,
+    _fold_short_terminal_clip,
     build_h3_visual_context,
     estimate_h3_segment_count,
     plan_h3_clip_frames,
@@ -24,6 +25,7 @@ from services.h3_shot_planner import (  # noqa: E402
 )
 from shared.utils.prompt_parser import (  # noqa: E402
     classify_timeline_clip_boundaries,
+    parse_global_timeline_prompt,
 )
 
 
@@ -899,6 +901,71 @@ class H3SharedShotPlannerTests(unittest.TestCase):
                 clip_frame_counts=[24],
                 fps=24,
             )
+
+    def test_inner_point_cues_may_nest_inside_shot_ranges(self):
+        plan = plan_h3_native_shots(
+            global_prompt=(
+                "[Shot 1] An adult traveler stands in a hallway.\n"
+                "[Shot 2] At 00:10.500, the camera cuts closer.\n"
+                "At approximately 00:14.000, a paper edge rustles.\n"
+                "[Shot 3] At 00:20.000, the traveler keeps walking.\n"
+            ),
+            clip_frame_counts=[241, 241],
+            fps=24,
+        )
+        self.assertTrue(plan)
+        self.assertGreaterEqual(len(plan.get("segments") or plan.get("clips") or [plan]), 1)
+
+    def test_clock_times_past_ninety_nine_seconds_keep_full_seconds(self):
+        _, events = parse_global_timeline_prompt(
+            "[Shot 9] At 00:106.500, they turn around.\n"
+            "At approximately 00:111.500, a small sound answers.\n"
+        )
+        starts = sorted(float(event["start"]) for event in events)
+        self.assertEqual(starts, [106.5, 111.5])
+
+    def test_two_minute_shot_list_with_inner_beats_plans(self):
+        prompt = (
+            "Generate a 120-second 16:9 live-action film.\n"
+            "[Shot 1] An adult traveler stands in a hallway.\n"
+            "[Shot 2] At 00:10.500, they look closer.\n"
+            "[Shot 3] At 00:20.000, they walk on.\n"
+            "[Shot 4] At 00:33.000, the hall opens.\n"
+            "[Shot 5] At 00:48.000, paper flutters.\n"
+            "At approximately 00:54.000, scraps rustle.\n"
+            "[Shot 6] At 00:63.500, the pace lifts.\n"
+            "At 00:73.000, they cross a row of keys.\n"
+            "[Shot 7] At 00:78.500, they enter a crowded room.\n"
+            "At approximately 00:84.500 they step back.\n"
+            "[Shot 8] At 00:94.000, the room is quiet.\n"
+            "[Shot 9] At 00:106.500, they turn around.\n"
+            "At approximately 00:111.500, a small sound answers.\n"
+            "[Shot 10] At 00:114.500, they return to the hall.\n"
+            "At 00:118.600, the frame holds.\n"
+        )
+        clip_frames = [345] * 8 + [241]
+        plan = plan_h3_native_shots(
+            global_prompt=prompt,
+            clip_frame_counts=clip_frames,
+            fps=24,
+        )
+        self.assertTrue(plan)
+
+    def test_short_terminal_hold_folds_into_previous_native_window(self):
+        generated, published = _fold_short_terminal_clip(
+            [260, 192, 141],
+            [252, 192, 133],
+            maximum_frames=345,
+        )
+        self.assertEqual(published, [252, 325])
+        self.assertEqual(generated, [260, 333])
+        unchanged_g, unchanged_p = _fold_short_terminal_clip(
+            [260, 345],
+            [252, 133],
+            maximum_frames=345,
+        )
+        self.assertEqual(unchanged_p, [252, 133])
+        self.assertEqual(unchanged_g, [260, 345])
 
     def test_authored_ranges_cannot_extend_past_published_geometry(self):
         canonical = (

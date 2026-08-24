@@ -1,8 +1,9 @@
 import { useLayoutEffect, useRef, useState } from 'react'
-import { Music, Sparkles, Loader2 } from 'lucide-react'
+import { Clapperboard, Music, Sparkles, Loader2 } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import * as api from '../../api/client'
 import type { GenerateParams } from '../../types'
+import { MusicLyricPlayground } from './MusicLyricPlayground'
 
 const TEXTAREA_BASE =
   'w-full bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm text-text-primary ' +
@@ -16,11 +17,13 @@ export function AutoGrowTextarea({
   onChange,
   placeholder,
   extraClass = '',
+  ariaLabel,
 }: {
   value: string
   onChange: (v: string) => void
   placeholder?: string
   extraClass?: string
+  ariaLabel: string
 }) {
   const ref = useRef<HTMLTextAreaElement>(null)
   useLayoutEffect(() => {
@@ -35,6 +38,7 @@ export function AutoGrowTextarea({
       value={value}
       onChange={e => onChange(e.target.value)}
       placeholder={placeholder}
+      aria-label={ariaLabel}
       className={`${TEXTAREA_BASE} ${extraClass}`}
     />
   )
@@ -49,6 +53,7 @@ function StyleField({ value, onChange }: { value: string; onChange: (v: string) 
         onChange={onChange}
         placeholder="Describe it like you're briefing musicians — genre, instruments, mood, production, vocals. e.g. dreamy bedroom-pop with shimmering reverb guitars and warm analog synths, soft breathy female vocals, nostalgic and intimate, gently mid-tempo"
         extraClass="min-h-[3.5rem]"
+        ariaLabel="Style and music caption"
       />
     </div>
   )
@@ -63,6 +68,7 @@ function LyricsField({ value, onChange }: { value: string; onChange: (v: string)
         onChange={onChange}
         placeholder={'[Verse]\nYour lyrics here…\n[Chorus]\n…'}
         extraClass="min-h-[8rem] font-mono"
+        ariaLabel="Lyrics"
       />
     </div>
   )
@@ -76,14 +82,17 @@ export function MusicControls() {
   const params = useStore(s => s.params)
   const setParam = useStore(s => s.setParam)
   const activeWorkspace = useStore(s => s.activeWorkspace)
+  const sendMusicToDirector = useStore(s => s.sendMusicToDirector)
 
   const style = (params.alt_prompt as string) || ''
   const lyrics = (params.prompt as string) || ''
+  const modelType = String(params.model_type || '')
+  const isMusic3 = modelType === 'minimax_music3'
   const [writing, setWriting] = useState(false)
   const [writeError, setWriteError] = useState<string | null>(null)
 
-  // alt_prompt = Music Caption (style); prompt = Lyrics. Both flow straight
-  // to ACE-Step's generate (input_prompt=lyrics, alt_prompt=caption).
+  // alt_prompt = Music Caption (style); prompt = Lyrics. Both remain the
+  // shared music-model submission fields.
   const setStyle = (v: string) => setParam('alt_prompt' as keyof GenerateParams, v)
   const setLyrics = (v: string) => setParam('prompt', v)
 
@@ -99,23 +108,38 @@ export function MusicControls() {
   const handleWriteSong = async () => {
     if (!description.trim() || writing) return
     const requestWorkspace = activeWorkspace
+    const requestDescription = description.trim()
+    const requestInstrumental = instrumental
+    const requestModelType = modelType
+    const requestStyle = style
+    const requestLyrics = lyrics
     const controller = new AbortController()
     const unsubscribe = useStore.subscribe(state => {
       if (state.activeWorkspace !== requestWorkspace) controller.abort()
     })
+    const requestIsCurrent = () => {
+      const current = useStore.getState()
+      return current.activeWorkspace === requestWorkspace
+        && current.musicDescription.trim() === requestDescription
+        && current.musicInstrumental === requestInstrumental
+        && String(current.params.model_type || '') === requestModelType
+        && String(current.params.alt_prompt || '') === requestStyle
+        && String(current.params.prompt || '') === requestLyrics
+    }
     setWriting(true)
     setWriteError(null)
     try {
       const r = await api.writeSong({
         workspace: requestWorkspace,
-        description: description.trim(),
-        instrumental,
+        description: requestDescription,
+        instrumental: requestInstrumental,
+        model_type: requestModelType || undefined,
       }, { signal: controller.signal })
-      if (useStore.getState().activeWorkspace !== requestWorkspace) return
+      if (!requestIsCurrent()) return
       if (r.style) setStyle(r.style)
-      setLyrics(instrumental ? '[Instrumental]' : (r.lyrics || ''))
+      setLyrics(requestInstrumental ? '[Instrumental]' : (r.lyrics || ''))
     } catch (e) {
-      if (controller.signal.aborted) return
+      if (controller.signal.aborted || !requestIsCurrent()) return
       setWriteError(e instanceof Error ? e.message : 'Song writing failed')
     } finally {
       unsubscribe()
@@ -150,6 +174,7 @@ export function MusicControls() {
             onChange={setDescription}
             placeholder="e.g. an upbeat synthwave track about late-night city driving — nostalgic but hopeful"
             extraClass="min-h-[4.5rem]"
+            ariaLabel="Describe your song"
           />
         </div>
         <button
@@ -172,7 +197,19 @@ export function MusicControls() {
 
       {/* Style + Lyrics (editable, auto-sizing). Lyrics hidden when instrumental. */}
       <StyleField value={style} onChange={setStyle} />
-      {!instrumental && <LyricsField value={lyrics} onChange={setLyrics} />}
+      {isMusic3
+        ? instrumental
+          ? (
+              <section aria-label="Instrumental Music3 handoff" className="rounded-xl border border-accent-blue/20 bg-bg-secondary/70 p-2.5">
+                <p className="text-[10px] text-text-secondary">Instrumental mode uses the Music Caption and the canonical [Instrumental] control tag.</p>
+                <button type="button" onClick={sendMusicToDirector} className="mobile-control-target mt-2 flex w-full items-center justify-center gap-1.5 rounded-lg bg-accent-blue px-3 text-[10px] font-semibold text-white hover:bg-accent-blue-hover">
+                  <Clapperboard size={12} /> Send to Director
+                </button>
+                <p className="mt-1 text-[9px] text-text-muted">Copies this setup into Music Video Director. It does not start generation.</p>
+              </section>
+            )
+          : <MusicLyricPlayground lyrics={lyrics} onChange={setLyrics} onSendToDirector={sendMusicToDirector} />
+        : !instrumental && <LyricsField value={lyrics} onChange={setLyrics} />}
     </div>
   )
 }

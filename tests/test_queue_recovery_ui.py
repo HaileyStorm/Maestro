@@ -167,13 +167,32 @@ class QueueRecoveryUiContracts(unittest.TestCase):
 
     def test_reconnect_updates_in_place_and_deduplicates_cards(self):
         reconnect = source_slice(STORE, "reconnectJobs: async", "// LoRA state")
-        self.assertIn("new Map(data.jobs.map(job => [job.job_id, job]))", reconnect)
+        self.assertIn("const ordinaryStatuses = data.jobs.filter(status => (", reconnect)
+        self.assertIn("!_sampleCampaignKnownJobIds.has(status.job_id)", reconnect)
+        self.assertIn(
+            "s.jobs.filter(job => !_sampleCampaignKnownJobIds.has(job.id))",
+            reconnect,
+        )
+        self.assertIn(
+            "for (const jobId of _sampleCampaignKnownJobIds) "
+            "_recoveryJobPolls.get(jobId)?.stop()",
+            reconnect,
+        )
+        self.assertIn(
+            "new Map(ordinaryStatuses.map(job => [job.job_id, job]))",
+            reconnect,
+        )
         self.assertIn("_mergeJobStatus(job, status)", reconnect)
         self.assertIn("const existingIds = new Set(get().jobs.map(j => j.id))", reconnect)
-        self.assertIn(".filter(j => !existingIds.has(j.job_id))", reconnect)
+        new_jobs = source_slice(
+            reconnect,
+            "const newJobs: GenerationJob[] = ordinaryStatuses",
+            "if (newJobs.length > 0)",
+        )
+        self.assertIn(".filter(j => !existingIds.has(j.job_id))", new_jobs)
         # Existing cards merge against their prior state above; genuinely new
         # reconnect cards have no prior client state and map the server record.
-        self.assertIn(".map(_newGenerationJobFromStatus)", reconnect)
+        self.assertIn(".map(_newGenerationJobFromStatus)", new_jobs)
         terminal_poll = source_slice(STORE, "_pollRecoveredJob: (jobId)", "reconnectJobs: async")
         self.assertIn("_recoveryJobPolls.get(jobId)", terminal_poll)
         self.assertIn("api.fetchJobStatus(jobId)", terminal_poll)

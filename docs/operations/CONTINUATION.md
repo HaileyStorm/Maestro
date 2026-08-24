@@ -95,6 +95,61 @@ activation state. Relevant values are `disabled`, `setup_available`,
 `setup_requires_loopback`, `disable_bootstrap`, and `ready`; do not infer them
 from client state.
 
+### Owner-authorized CPU-safe activation checkpoint
+
+On 2026-08-24 the owner explicitly authorized making accounts, existing-project
+membership, implemented supporter-benefit projections, sharing, and hosted
+credit scheduling live to the fullest extent that does not require a GPU. This
+authorization supersedes the earlier hold on those deployment features. It does
+not turn static or test evidence into live acceptance, permit an agent to choose
+owner credentials, or authorize a generation while the GPU is unavailable.
+
+Use this serial activation sequence:
+
+1. Read the live account context and exact pre-restart project census. If an
+   owner already exists, keep `MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED=false`; do not
+   reopen bootstrap or ask the owner to repeat setup.
+2. In ignored operator configuration, keep `MAESTRO_ACCOUNTS_ENABLED=true`, set
+   `MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED=true`, and set
+   `MAESTRO_COMPUTE_EXECUTION_REALM=hosted`. Configure only the intended public
+   support destinations. These flags activate the runtime policy; they are not
+   proof that the restarted process received it.
+3. Use the coordinated restart-status protocol in this guide, restart Maestro
+   through the existing Pinokio path, and dynamically resolve the new ready URL.
+4. Confirm `GET /api/v1/account/context` reports `ready` and
+   `GET /api/v1/account/projects/migration` reports `active`, with the complete
+   pre-restart project census still present. Stop rather than publishing a
+   partial or quarantined migration.
+5. Confirm `GET /api/v1/support/catalog` and the signed-in
+   `GET /api/v1/support/self` projection show the configured support choices,
+   supporter recognition, bounded queue-priority state, and promotional Maestro
+   credit allowance. A direct-compute record must not change recovery, tiers,
+   benefits, queue priority, or allowance. A public Vast.ai destination must
+   remain locked until eligible non-Vast support reaches the recovery target.
+6. Read the existing H3 legal-access projection. Japan (`JP`) is the owner's
+   current declaration; if the live signed record matches the current document,
+   do not ask for another country attestation. This step does not run H3.
+7. Exercise sign-in, project membership, private output/project sharing, and the
+   account/support presentation on each configured direct, LAN, and Cloudflare
+   surface. Keep first-owner setup loopback-only.
+8. Verify the hosted scheduler and durable accounting journal initialize
+   cleanly. Model-free tests may prove the three-band ordering and restart
+   contract; real queue behavior under GPU demand remains the separate
+   acceptance in [GPU_ACCEPTANCE.md](GPU_ACCEPTANCE.md).
+9. Clear only the matching restart-status generation after local health and
+   every claimed access surface pass. Record live browser and human acceptance
+   separately.
+
+Evidence labels are not interchangeable:
+
+| Label | What it proves |
+| --- | --- |
+| Source/static | The reviewed configuration and code contain the intended contract. |
+| Synthetic/model-free | Tests exercise the contract without model load, generation, or live deployment. |
+| Local runtime | The restarted local process reports health, readiness, account state, support state, and hosted-credit policy from its actual configuration. |
+| Live access surface | An authenticated client completes the intended flow on the specific direct, LAN, or Cloudflare surface named in the record. |
+| Human acceptance | The owner personally confirms sign-in/recovery handling and the visible account, supporter recognition, queue-priority, credit, sharing, and generated-output experience. |
+
 ## Preserve a future SSO migration path
 
 Current account work must keep Maestro's opaque internal `account_id` as the
@@ -160,7 +215,9 @@ Maestro has an operator-controlled hosted-credit scheduler. It activates only
 when accounts are enabled, `MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED=true`, and
 `MAESTRO_COMPUTE_EXECUTION_REALM=hosted`. The safe tracked defaults are `false`
 and `local`; account activation or a recorded contribution alone never changes
-the runtime policy. Local and authenticated-LAN execution remain unmetered.
+the runtime policy. The owner-authorized activation above deliberately changes
+both ignored runtime values for this deployment. Local and authenticated-LAN
+execution remain unmetered.
 
 The activation contract is:
 
@@ -178,16 +235,40 @@ The activation contract is:
   (the recovered intent was approximately 15/10/5-second bands), but that is a
   separate server-authored contract, not permission to deny submission.
 
-Support contribution records may produce a bounded compute allowance only from
-the server-owned allowance policy. Fully funded hosted work receives bounded
-priority, while zero, partial, refunded, or expired allowance never causes a
-flat `402` or rejects an otherwise-valid submission. The durable credit journal
-must conserve units across reserve, consume, release, restart, and recovery.
+Eligible support contribution records may produce promotional Maestro credits
+only through the server-owned allowance policy. These credits are a bounded
+hosted queue allowance, never purchased compute, cash value, or guaranteed
+service. Fully funded hosted work receives bounded priority, while zero,
+partial, refunded, or expired allowance never causes a flat `402` or rejects an
+otherwise-valid submission. The durable credit journal must conserve units
+across reserve, consume, release, restart, and recovery.
+
+The shipped default benefit policy implements only supporter recognition and
+bounded queue priority, plus the separately projected promotional Maestro
+credit allowance. Compatibility parsing may retain the historical/custom
+benefit IDs `early_access_updates` and `supporter_convenience`, but the default
+policy does not grant or advertise them. Treat either ID as inactive unless a
+separate implementation, projection, UI, and acceptance wave explicitly makes
+it real.
+
+Owner-attested Vast.ai direct-compute records are accepted before or after the
+$1,000 recovery goal solely to keep the ledger truthful. They are excluded from
+development-cost recovery, supporter tiers and implemented benefits, queue
+priority, and promotional Maestro credits. Refund and chargeback entries are
+manual adjustments to an existing owner-attested Vast.ai record. Maestro has no
+Vast.ai payment detector and performs no automatic refund; the public Vast.ai
+destination remains locked until the recovery goal is met by eligible other
+sources.
 
 For a release, verify the configured realm, all three queue bands, the
 cross-band starvation bound, owner exemption from the sealed account store,
 local/LAN exemptions, and restart/recovery behavior. Duration shaping and SSO
 remain separate later waves.
+
+GPU-dependent acceptance for H3, Music3, Scene Kit/Director, Krea, attention
+runtimes, FlashVSR delivery, and real queue demand is tracked in
+[GPU_ACCEPTANCE.md](GPU_ACCEPTANCE.md). Do not relist already-passing CPU-safe
+tests there as blocked work.
 
 ## GPU-idle comparative sample campaign
 

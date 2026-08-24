@@ -458,7 +458,21 @@ class OutputShareRouteContractTests(unittest.TestCase):
         self.assertIn("export async function revokeOutputShare", self.client)
         self.assertIn("createOutputShare(file.name, file.workspace, file.revision)", self.card)
         self.assertIn("revokeOutputShare(file.name, file.workspace)", self.card)
-        self.assertIn("it also works through your Cloudflare address", self.card)
+        self.assertIn("It does not grant project access", self.card)
+        self.assertIn("this link itself may not open off your network", self.card)
+        self.assertIn("navigator.share", self.card)
+
+    def test_share_mutations_reject_non_object_json_through_the_bounded_parser(self):
+        create = self.source[
+            self.source.index('async def create_output_share'):
+            self.source.index('@api.delete("/api/v1/output-shares")')
+        ]
+        revoke = self.source[
+            self.source.index('async def revoke_output_share'):
+            self.source.index('@api.get("/api/v1/output-shares/{token}/media"')
+        ]
+        self.assertIn("body = await _account_request_body(request)", create)
+        self.assertIn("body = await _account_request_body(request)", revoke)
 
 
 if __name__ == "__main__":

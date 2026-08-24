@@ -9,6 +9,7 @@ import { createServer } from 'vite'
 
 const componentSource = await readFile(new URL('../src/components/H3DurationPlanBar.tsx', import.meta.url), 'utf8')
 const server = await createServer({
+  configFile: false,
   root: fileURLToPath(new URL('../', import.meta.url)),
   appType: 'custom',
   logLevel: 'silent',

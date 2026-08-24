@@ -130,21 +130,25 @@ test("what's-new dialog has persistent triggers and modal focus isolation", () =
   assert.match(dialogSource, /installModalFocus\(\{/)
 })
 
-test("mobile what's-new trigger remains reachable while the sidebar drawer is closed", () => {
+test("mobile what's-new trigger remains reachable in the existing workspace drawer", () => {
   const mobileHeaderStart = appSource.indexOf('{isMobile && (')
   const sidebarMount = appSource.indexOf('<Sidebar />', mobileHeaderStart)
   assert.ok(mobileHeaderStart >= 0)
   assert.ok(sidebarMount > mobileHeaderStart)
 
   const mobileHeader = appSource.slice(mobileHeaderStart, sidebarMount)
-  const remoteMenuGateEnd = mobileHeader.indexOf('</button> : <span className="h-11 w-11 shrink-0" aria-hidden="true" />}')
-  const trigger = mobileHeader.indexOf('<WhatsNewButton compact />')
-  const machineSettingsGate = mobileHeader.indexOf('{machineControls ? (')
+  const mobileSidebarStart = sidebarSource.indexOf('if (isMobile) {')
+  const desktopSidebarStart = sidebarSource.indexOf('// Desktop: static sidebar', mobileSidebarStart)
+  assert.ok(mobileSidebarStart >= 0)
+  assert.ok(desktopSidebarStart > mobileSidebarStart)
+  const mobileSidebar = sidebarSource.slice(mobileSidebarStart, desktopSidebarStart)
+  const trigger = mobileSidebar.indexOf('<WhatsNewButton compact />')
+  const machineSettingsGate = mobileSidebar.indexOf('{machineControls && (')
 
-  assert.ok(remoteMenuGateEnd >= 0)
-  assert.ok(trigger > remoteMenuGateEnd, 'trigger must sit outside the remote project menu gate')
-  assert.ok(machineSettingsGate > trigger, 'trigger must sit outside the machine-controls gate')
-  assert.equal(mobileHeader.match(/<WhatsNewButton compact \/>/g)?.length, 1)
+  assert.match(mobileHeader, /<\/button> : <WhatsNewButton compact \/>}/)
+  assert.ok(trigger >= 0, 'trigger remains in the mobile drawer')
+  assert.ok(machineSettingsGate > trigger, 'trigger remains outside the machine-controls gate')
+  assert.equal(mobileSidebar.match(/<WhatsNewButton compact \/>/g)?.length, 1)
 })
 
 test('current notes and collapsed archive remain reachable on mobile', () => {

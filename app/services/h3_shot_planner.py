@@ -599,6 +599,42 @@ def infer_h3_profile_id(params: Mapping[str, Any] | None) -> str:
     return "high"
 
 
+_H3_TERMINAL_HOLD_FRAMES = 192  # eight seconds at 24 fps
+
+
+def _fold_short_terminal_clip(
+    generated: list[int],
+    published: list[int],
+    *,
+    maximum_frames: int,
+    hold_frames: int = _H3_TERMINAL_HOLD_FRAMES,
+) -> tuple[list[int], list[int]]:
+    """Absorb a short closing remainder into the previous native window.
+
+    Authored last shots that only cover a few seconds otherwise become their
+    own 5s native clip. If previous+last still fit the model ceiling, keep
+    the published duration exact and avoid that extra seam.
+    """
+    if len(generated) < 2 or len(published) != len(generated):
+        return generated, published
+    last_pub = int(published[-1])
+    prev_pub = int(published[-2])
+    last_gen = int(generated[-1])
+    prev_gen = int(generated[-2])
+    if (
+        last_pub >= int(hold_frames)
+        or last_pub < 1
+        or prev_pub + last_pub > int(maximum_frames)
+        or prev_gen + last_gen > int(maximum_frames)
+    ):
+        return generated, published
+    folded_generated = list(generated[:-1])
+    folded_published = list(published[:-1])
+    folded_generated[-1] = prev_gen + last_gen
+    folded_published[-1] = prev_pub + last_pub
+    return folded_generated, folded_published
+
+
 def floor_h3_frame_count(
     value: int,
     *,
@@ -771,6 +807,17 @@ def plan_h3_clip_frames(
                 if section_index < len(requested_sections) - 1:
                     boundary_after.append(len(exact_frames) - 1)
             if exact_frames:
+                before = len(exact_frames)
+                exact_frames, exact_published = _fold_short_terminal_clip(
+                    exact_frames,
+                    exact_published,
+                    maximum_frames=int(maximum_frames),
+                )
+                if len(exact_frames) < before and boundary_after:
+                    boundary_after = [
+                        index for index in boundary_after
+                        if index < len(exact_frames) - 1
+                    ]
                 policy.update({
                     "id": "authored_timeline_exact_v1",
                     "clip_requested_frames": exact_published,
@@ -1816,6 +1863,8 @@ def _compile_segment_local_prompts(
                 "published physical geometry"
             )
     previous_event_end = 0
+    open_shot_start = 0
+    open_shot_end = 0
     for event, (event_start, event_end) in zip(events, event_ranges):
         kind = str(event.get("kind") or "")
         raw_start = min(total_frames, _h3_frame_at(event.get("start"), fps))
@@ -1823,12 +1872,25 @@ def _compile_segment_local_prompts(
             min(total_frames, _h3_frame_at(event.get("end"), fps))
             if kind == "range" else event_end
         )
-        if raw_end <= raw_start or event_start < previous_event_end:
+        nested_point = (
+            kind == "point"
+            and open_shot_end > open_shot_start
+            and event_start >= open_shot_start
+            and event_end <= open_shot_end
+        )
+        if raw_end <= raw_start or (
+            event_start < previous_event_end and not nested_point
+        ):
             raise H3ShotPlanError(
                 "H3 timed event timestamps collapse or overlap on the "
                 "published frame grid"
             )
+        if nested_point:
+            continue
         previous_event_end = event_end
+        if kind == "shot":
+            open_shot_start = event_start
+            open_shot_end = event_end
     ownership: list[dict[str, Any]] = []
     owned_by_local: list[
         list[tuple[Mapping[str, Any], int, int, str, bool]]

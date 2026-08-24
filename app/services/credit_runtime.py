@@ -17,7 +17,10 @@ from typing import Any
 
 SCHEMA_VERSION = 1
 REALMS = frozenset({"local", "lan", "hosted"})
-SOURCE_KINDS = frozenset({"free", "one_time_support", "recurring_support"})
+SOURCE_KINDS = frozenset({
+    "free", "one_time_support", "recurring_support",
+    "supporter_tier_bonus",
+})
 SOURCE_STATUSES = frozenset({
     "active", "inactive", "refunded", "expired", "capped", "canceled",
 })
@@ -29,6 +32,8 @@ CAPABILITY_MARKERS = frozenset({
 _ITEM_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _OPAQUE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._~:-]{7,127}\Z")
 _CAPABILITY_RE = re.compile(r"[a-z0-9][a-z0-9._:-]{0,127}\Z")
+MAX_SUPPORTER_TIER_BONUS_UNITS = 1_000_000
+MAX_SUPPORTER_TIER_BONUS_SOURCES = 1_024
 
 
 class CreditRuntimeError(ValueError):
@@ -135,6 +140,14 @@ class CreditRevalidationResult:
     reason: str
 
 
+@dataclass(frozen=True, slots=True)
+class CreditTerminalSettlement:
+    terminal_status: str
+    reserved_units: int
+    settled_units: int
+    refunded_units: int
+
+
 def _exact_keys(value: Mapping[str, Any], expected: set[str], name: str) -> None:
     if set(value) != expected:
         raise CreditRuntimeError(f"{name} schema is invalid")
@@ -187,6 +200,7 @@ def parse_recorded_allowance(value: Mapping[str, Any]) -> AllowanceSnapshot:
     sources: list[AllowanceSource] = []
     seen: set[tuple[str, str | None]] = set()
     calculated_total = 0
+    supporter_bonus_sources = 0
     for raw in raw_sources:
         if not isinstance(raw, Mapping):
             raise CreditRuntimeError("recorded allowance source must be an object")
@@ -220,6 +234,20 @@ def parse_recorded_allowance(value: Mapping[str, Any]) -> AllowanceSnapshot:
             expected_status = "active" if effective else "inactive"
             if status != expected_status:
                 raise CreditRuntimeError("free allowance source state is inconsistent")
+        elif source == "supporter_tier_bonus":
+            supporter_bonus_sources += 1
+            if (
+                supporter_bonus_sources > MAX_SUPPORTER_TIER_BONUS_SOURCES
+                or granted > MAX_SUPPORTER_TIER_BONUS_UNITS
+                or effective > MAX_SUPPORTER_TIER_BONUS_UNITS
+            ):
+                raise CreditRuntimeError(
+                    "supporter tier bonus exceeds its policy bound",
+                )
+            if refund_state != "not_applicable" or status == "refunded":
+                raise CreditRuntimeError(
+                    "supporter tier bonus must remain promotional",
+                )
         elif refund_state == "not_applicable":
             raise CreditRuntimeError("funded allowance refund state is invalid")
         if status in {"inactive", "refunded", "expired", "canceled"} and effective:
@@ -236,6 +264,8 @@ def parse_recorded_allowance(value: Mapping[str, Any]) -> AllowanceSnapshot:
             expires_at = _utc(raw["expires_at"], "allowance source expiry")
             if effective and expires_at <= as_of:
                 raise CreditRuntimeError("expired allowance cannot remain effective")
+        if source == "supporter_tier_bonus" and expires_at is None:
+            raise CreditRuntimeError("supporter tier bonus expiry is required")
         identity = (source, event_id)
         if identity in seen:
             raise CreditRuntimeError("allowance source identity is duplicated")
@@ -500,6 +530,42 @@ def transition_reservation(
         reserved_units=state.reserved_units,
         snapshot_as_of=state.snapshot_as_of,
         allocations=state.allocations,
+    )
+
+
+def terminal_credit_settlement(
+    *,
+    terminal_status: str,
+    reserved_units: int,
+    server_billable_units: int | None = None,
+) -> CreditTerminalSettlement:
+    """Resolve one terminal charge without accepting progress or ETA input.
+
+    Successful work preserves the intended full consume. Failed work settles
+    to zero. Cancellation alone accepts a server measurement, capped by the
+    original reservation so the terminal charge can never create units.
+    """
+
+    reserved = _non_negative_int(reserved_units, "reserved units")
+    if terminal_status not in {"completed", "failed", "cancelled"}:
+        raise CreditRuntimeError("terminal settlement status is invalid")
+    if terminal_status == "cancelled":
+        measured = _non_negative_int(
+            server_billable_units,
+            "server billable units",
+        )
+        settled = min(reserved, measured)
+    else:
+        if server_billable_units is not None:
+            raise CreditRuntimeError(
+                "server billable units apply only to cancellation",
+            )
+        settled = reserved if terminal_status == "completed" else 0
+    return CreditTerminalSettlement(
+        terminal_status=terminal_status,
+        reserved_units=reserved,
+        settled_units=settled,
+        refunded_units=reserved - settled,
     )
 
 

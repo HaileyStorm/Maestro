@@ -9,14 +9,22 @@ import {
   acceptResponsibleUse,
   bootstrapAccount,
   changeAccountPassword,
+  fetchH3LegalAccessState,
+  fetchKreaOwnerPolicy,
   createServerAccount,
+  createWorkspace,
   fetchAdminAccountSupport,
   fetchAccountContext,
   fetchAccountProjectMigration,
+  fetchProjectAssets,
+  fetchWorkspaces,
+  setH3LegalAccessLocation,
+  setKreaOwnerPolicy,
   fetchResponsibleUse,
   fetchSupportCatalog,
   fetchSupportSelf,
   loginAccount,
+  registerAccount,
   logoutAccount,
   migrateAccountProjects,
   reauthenticateAccount,
@@ -33,12 +41,21 @@ import {
   affectedPriorityNotice,
   nextAccountSupportTab,
   responsibleUseIsAccepted,
+  supporterTierLabels,
   verifiedDevelopmentCostRecovery,
   visibleSupportProviders,
 } from '../src/components/AccountSupport/supportPresentation.ts'
 
+test('supporter tier labels humanize server identifiers for account and welcome copy', () => {
+  assert.deepEqual(supporterTierLabels({
+    one_time_tier: 'studio_supporter',
+    recurring_tier: 'continuum-supporter',
+  }), ['One-time Studio supporter', 'Recurring Continuum supporter'])
+})
+
 const componentUrl = new URL('../src/components/AccountSupport/AccountSupportDrawer.tsx', import.meta.url)
 const supportPanelUrl = new URL('../src/components/AccountSupport/SupportPanel.tsx', import.meta.url)
+const welcomeUrl = new URL('../src/components/WelcomeModal.tsx', import.meta.url)
 const appUrl = new URL('../src/App.tsx', import.meta.url)
 const uiRoot = new URL('..', import.meta.url).pathname
 
@@ -68,6 +85,96 @@ function deferred() {
   })
   return { promise, reject, resolve }
 }
+
+test('account browser flow preserves account-owned projects and cross-user opacity across logout', async () => {
+  let currentAccount = null
+  let nonceSequence = 0
+  const memberships = new Map([
+    ['owner', new Set(['owner-project'])],
+    ['member', new Set()],
+  ])
+  const createBodies = []
+
+  await withFetchMock(async (url, init = {}) => {
+    const path = String(url)
+    const method = init.method || 'GET'
+    const body = init.body ? JSON.parse(String(init.body)) : {}
+    if (path.endsWith('/api/v1/account/nonce')) {
+      nonceSequence += 1
+      return jsonResponse({ nonce: `nonce-${nonceSequence}`, purpose: body.purpose, expires_in: 300 })
+    }
+    if (path.endsWith('/api/v1/account/login')) {
+      currentAccount = body.username === 'Owner' ? 'owner' : 'member'
+      return jsonResponse({
+        account: {
+          id: currentAccount, username: body.username, role: currentAccount === 'owner' ? 'owner' : 'user', disabled: false,
+        },
+        recovery_codes: [],
+      })
+    }
+    if (path.endsWith('/api/v1/account/register')) {
+      currentAccount = 'member'
+      return jsonResponse({
+        account: { id: 'member', username: body.username, role: 'user', disabled: false },
+        recovery_codes: ['one-time-public-code'],
+      })
+    }
+    if (path.endsWith('/api/v1/account/logout')) {
+      currentAccount = null
+      return jsonResponse({ status: 'logged_out' })
+    }
+    if (path.endsWith('/api/v1/workspaces') && method === 'POST') {
+      if (!currentAccount) return jsonResponse({ detail: 'Authentication is required' }, 401)
+      createBodies.push(body)
+      memberships.get(currentAccount).add(body.name)
+      return jsonResponse({ status: 'ok', name: body.name })
+    }
+    if (path.endsWith('/api/v1/workspaces')) {
+      const names = currentAccount ? [...memberships.get(currentAccount)] : []
+      return jsonResponse({
+        workspaces: names.map(name => ({
+          name, password_protected: false, unlocked: true,
+          remember_policy: null, unlock_expires_at: null, unlock_idle_expires_at: null,
+          project_role: 'owner', project_permissions: ['project.list', 'project.open'],
+        })),
+        active: names[0] || '',
+      })
+    }
+    const assets = path.match(/\/api\/v1\/projects\/([^/]+)\/assets$/)
+    if (assets) {
+      const project = decodeURIComponent(assets[1])
+      if (!currentAccount || !memberships.get(currentAccount).has(project)) {
+        return jsonResponse({ detail: 'Project not found' }, 404)
+      }
+      return jsonResponse({ assets: [] })
+    }
+    throw new Error(`Unexpected browser-flow request: ${method} ${path}`)
+  }, async () => {
+    await loginAccount({ username: 'Owner', password: 'owner-password' })
+    assert.deepEqual((await fetchWorkspaces()).workspaces.map(item => item.name), ['owner-project'])
+
+    await logoutAccount()
+    assert.deepEqual((await fetchWorkspaces()).workspaces, [])
+
+    const registration = await registerAccount({ username: 'Member', password: 'member-password' })
+    assert.equal(registration.account.role, 'user')
+    assert.deepEqual(registration.recovery_codes, ['one-time-public-code'])
+    assert.deepEqual((await fetchWorkspaces()).workspaces, [])
+    await createWorkspace('member-project')
+    assert.deepEqual(createBodies, [{ name: 'member-project' }])
+    assert.deepEqual((await fetchWorkspaces()).workspaces.map(item => item.name), ['member-project'])
+    await assert.rejects(fetchProjectAssets('owner-project'))
+
+    await logoutAccount()
+    await loginAccount({ username: 'Member', password: 'member-password' })
+    assert.deepEqual((await fetchWorkspaces()).workspaces.map(item => item.name), ['member-project'])
+
+    await logoutAccount()
+    await loginAccount({ username: 'Owner', password: 'owner-password' })
+    assert.deepEqual((await fetchWorkspaces()).workspaces.map(item => item.name), ['owner-project'])
+    await assert.rejects(fetchProjectAssets('member-project'))
+  })
+})
 
 test('account wrappers keep credentials in same-origin no-store bodies and bind one nonce per mutation', async () => {
   const calls = []
@@ -111,6 +218,33 @@ test('account wrappers keep credentials in same-origin no-store bodies and bind 
     device_label: 'LAN browser',
     nonce: 'single-use-nonce',
   })
+})
+
+test('public registration wrapper uses a register-bound nonce and cannot request a role', async () => {
+  const calls = []
+  await withFetchMock(async (url, init = {}) => {
+    calls.push({ url: String(url), init })
+    if (calls.length === 1) {
+      return jsonResponse({ nonce: 'register-nonce', purpose: 'register', expires_in: 300 })
+    }
+    return jsonResponse({
+      account: { id: 'public-user', username: 'NewUser', role: 'user', disabled: false },
+      recovery_codes: ['one-time-code'],
+    })
+  }, async () => {
+    const result = await registerAccount({
+      username: 'NewUser', password: 'new-password', email: 'new@example.test', deviceLabel: 'Public browser',
+    })
+    assert.equal(result.account.role, 'user')
+  })
+
+  assert.deepEqual(JSON.parse(calls[0].init.body), { purpose: 'register' })
+  assert.equal(calls[1].url, '/api/v1/account/register')
+  assert.deepEqual(JSON.parse(calls[1].init.body), {
+    username: 'NewUser', password: 'new-password', email: 'new@example.test',
+    device_label: 'Public browser', nonce: 'register-nonce',
+  })
+  assert.equal('role' in JSON.parse(calls[1].init.body), false)
 })
 
 test('recovery and path-bound session revocation use exact purpose and encoded routes', async () => {
@@ -247,6 +381,13 @@ test('a successful sign-in hydrates current sessions and owner users without reo
     }] })
     if (url.endsWith('/account/users')) return jsonResponse({ accounts: [account] })
     if (url.endsWith('/workspaces')) return jsonResponse({ workspaces: [{ name: 'owned-project', project_role: 'owner', project_permissions: ['project.read'] }], active: 'owned-project' })
+    if (url.endsWith('/presets?workspace=owned-project')) return jsonResponse({ presets: [] })
+    if (url.endsWith('/defaults/minimax_h3')) return jsonResponse({
+      h3_default_profile_id: 'high', num_inference_steps: 28,
+      resolution: '1344x768', custom_settings: { h3_attention_engine: 'sol_attn' },
+      tea_cache: 0,
+    })
+    if (url.endsWith('/model-options/minimax_h3')) return jsonResponse({})
     throw new Error(`Unexpected account request: ${url} ${init.method || 'GET'}`)
   }
   t.after(() => {
@@ -280,16 +421,21 @@ test('a successful sign-in hydrates current sessions and owner users without reo
   })
   await useStore.getState().loginAccount({ username: 'Owner', password: 'long enough password' })
 
-  assert.deepEqual(calls.slice(-6), [
-    '/api/v1/account/nonce',
+  assert.deepEqual(calls.slice(-8), [
     '/api/v1/account/login',
     '/api/v1/account/context',
     '/api/v1/workspaces',
+    '/api/v1/presets?workspace=owned-project',
+    '/api/v1/defaults/minimax_h3',
+    '/api/v1/model-options/minimax_h3',
     '/api/v1/account/sessions',
     '/api/v1/account/users',
   ])
   assert.equal(useStore.getState().accountSessions[0].id, 'current-handle')
   assert.equal(useStore.getState().accountUsers[0].username, 'Owner')
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(useStore.getState().h3SelectedProfile, 'high')
+  assert.equal(useStore.getState().params.num_inference_steps, 28)
 })
 
 test('account loaders ignore reverse-order and post-logout responses from a stale identity', async t => {
@@ -357,6 +503,9 @@ test('account loaders ignore reverse-order and post-logout responses from a stal
         active: 'project-b',
       } : { workspaces: [], active: '' })
     }
+    if (url.endsWith('/presets?workspace=project-b')) return jsonResponse({ presets: [] })
+    if (url.endsWith('/defaults/minimax_h3')) return jsonResponse({})
+    if (url.endsWith('/model-options/minimax_h3')) return jsonResponse({})
     if (url.endsWith('/account/nonce')) {
       return jsonResponse({ nonce: 'logout-nonce', purpose: 'revoke_session', expires_in: 300 })
     }
@@ -692,6 +841,9 @@ test('account identity fences reverse-order projects and logout scrubs before pr
     if (url.endsWith('/account/context')) return jsonResponse(accountContext(loggedOut ? null : accountB))
     if (url.endsWith('/account/sessions')) return jsonResponse({ sessions: [] })
     if (url.endsWith('/account/users')) return jsonResponse({ accounts: [accountB] })
+    if (url.endsWith('/presets?workspace=project-b')) return jsonResponse({ presets: [] })
+    if (url.endsWith('/defaults/minimax_h3')) return jsonResponse({})
+    if (url.endsWith('/model-options/minimax_h3')) return jsonResponse({})
     throw new Error(`Unexpected account/project request: ${url}`)
   }
   t.after(() => {
@@ -872,6 +1024,41 @@ const publicSupport = {
       state: 'locked', support_url: null,
     }],
   },
+  supporter_benefits: {
+    schema_version: 1,
+    currency: 'USD',
+    credit_unit: 'maestro_credits',
+    promotional_credits_enabled: true,
+    one_time_bonus_cap: 1_000,
+    one_time_validity_seconds: 90 * 24 * 60 * 60,
+    recurring_validity_seconds: 35 * 24 * 60 * 60,
+    one_time_tiers: [{
+      tier: 'supporter', minimum_minor: 500, promotional_maestro_credits: 25,
+      benefits: ['supporter_recognition', 'bounded_queue_priority', 'early_access_updates'],
+    }, {
+      tier: 'backer', minimum_minor: 2_500, promotional_maestro_credits: 150,
+      benefits: ['supporter_recognition', 'bounded_queue_priority', 'early_access_updates', 'supporter_convenience'],
+    }, {
+      tier: 'sponsor', minimum_minor: 10_000, promotional_maestro_credits: 500,
+      benefits: ['supporter_recognition', 'bounded_queue_priority', 'early_access_updates', 'supporter_convenience'],
+    }],
+    recurring_tiers: [{
+      tier: 'member', minimum_minor: 300, promotional_maestro_credits: 25,
+      benefits: ['supporter_recognition', 'bounded_queue_priority', 'early_access_updates'],
+    }, {
+      tier: 'sustainer', minimum_minor: 1_000, promotional_maestro_credits: 100,
+      benefits: ['supporter_recognition', 'bounded_queue_priority', 'early_access_updates', 'supporter_convenience'],
+    }, {
+      tier: 'patron', minimum_minor: 2_500, promotional_maestro_credits: 250,
+      benefits: ['supporter_recognition', 'bounded_queue_priority', 'early_access_updates', 'supporter_convenience'],
+    }],
+    terms: {
+      cash_value: false, transferable: false, refundable: false,
+      guaranteed_compute: false, guaranteed_service: false,
+      unused_bonus_may_expire_or_be_revoked: true,
+    },
+    notice: 'Support is optional. Jobs remain schedulable without credits.',
+  },
   benefit_availability: {
     scheduler_enforcement_enabled: false, effective_benefits: [], state: 'recorded_not_enforced',
   },
@@ -898,7 +1085,7 @@ const responsibleUse = {
 const recordedAllowance = {
   state: 'recorded_not_enforced',
   enforcement_enabled: false,
-  unit: 'compute_seconds',
+  unit: 'maestro_credits',
   as_of: '2026-08-11T09:00:00Z',
   effective_allowance: 460,
   sources: [
@@ -915,6 +1102,36 @@ const recordedAllowance = {
       expires_at: '2026-08-11T09:30:00Z', status: 'active', refund_state: 'none',
     },
   ],
+}
+
+const h3LegalAccessProjection = {
+  declared: true,
+  territory_code: 'US',
+  availability_status: 'available',
+  execution_allowed: true,
+  license_revision: 'r12.3',
+  license_sha256: '5f'.repeat(32),
+  license_url: 'https://licenses.maestro/mini-max-h3-us.txt',
+  location_source: 'manual_owner_declaration',
+  network_location_used: false,
+  written_authorization_supported: false,
+}
+
+const kreaOwnerPolicyProjection = {
+  attested: true,
+  availability_status: 'license_conditions_recorded',
+  migration_required: false,
+  local_execution_allowed: true,
+  hosted_execution_allowed: false,
+  maestro_content_filtering: false,
+  manual_owner_review: true,
+  role_use_scopes: { owner: 'noncommercial', user: 'commercial_under_1m' },
+  declared_at_unix: 1_700_000_000,
+  license_version: 'v1',
+  license_date: '2026-06-22',
+  license_url: 'https://www.krea.ai/krea-2-licensing',
+  acceptable_use_url: 'https://www.krea.ai/krea-2-use-policy',
+  content_handling: 'manual_owner_review',
 }
 
 const opaqueSupportKey = value => `key_${value.repeat(64)}`
@@ -949,7 +1166,7 @@ test('Support wrappers use exact no-store envelopes and discard private contribu
         },
         benefits: {
           state: 'recorded_not_enforced', scheduler_enforcement_enabled: false,
-          effective_benefits: [], recorded_eligibility: ['one_time_credit_eligibility'],
+          effective_benefits: [], recorded_eligibility: ['supporter_recognition', 'bounded_queue_priority', 'early_access_updates', 'supporter_convenience'],
         },
       },
       responsible_use: responsibleUse,
@@ -957,6 +1174,17 @@ test('Support wrappers use exact no-store envelopes and discard private contribu
     if (String(url).endsWith('/support/responsible-use')) return jsonResponse(responsibleUse)
     if (String(url).endsWith('/support/responsible-use/accept')) {
       return jsonResponse({ status: { ...responsibleUse.status, accepted: true, state: 'accepted' } })
+    }
+    if (String(url).endsWith('/h3/legal-access')) {
+      if ((init.method || 'GET') === 'PUT') {
+        const body = JSON.parse(String(init.body))
+        return jsonResponse({
+          ...h3LegalAccessProjection,
+          territory_code: body.territory_code,
+          availability_status: 'available',
+        })
+      }
+      return jsonResponse(h3LegalAccessProjection)
     }
     if (String(url).includes('/support/admin/accounts/')) return jsonResponse({
       account_support: {
@@ -1011,7 +1239,7 @@ test('Support wrappers use exact no-store envelopes and discard private contribu
         },
         benefits: {
           state: 'recorded_not_enforced', scheduler_enforcement_enabled: false,
-          effective_benefits: [], recorded_eligibility: ['periodic_credit_eligibility'],
+          effective_benefits: [], recorded_eligibility: ['supporter_recognition', 'bounded_queue_priority', 'early_access_updates'],
         },
       },
       responsible_use: responsibleUse.status,
@@ -1043,7 +1271,19 @@ test('Support wrappers use exact no-store envelopes and discard private contribu
       target_event_id: null,
       idempotency_key: opaqueSupportKey('8'),
     })
+    const h3LegalAccess = await fetchH3LegalAccessState()
+    const updatedH3LegalAccess = await setH3LegalAccessLocation({
+      territory_code: 'JP',
+      owner_attested: true,
+      license_revision: h3LegalAccess.license_revision,
+      license_sha256: h3LegalAccess.license_sha256,
+    })
     assert.equal(catalog.provider_catalog.provider_neutral, true)
+    assert.equal(catalog.supporter_benefits.schema_version, 1)
+    assert.equal(catalog.supporter_benefits.one_time_tiers[1].tier, 'backer')
+    assert.deepEqual(catalog.supporter_benefits.one_time_tiers[1].benefits, [
+      'supporter_recognition', 'bounded_queue_priority', 'early_access_updates', 'supporter_convenience',
+    ])
     assert.deepEqual(catalog.development_cost_recovery, {
       target_minor: 100_000, currency: 'USD', state: 'locked',
     })
@@ -1073,6 +1313,9 @@ test('Support wrappers use exact no-store envelopes and discard private contribu
       proof_reference: opaqueSupportKey('c'),
       changed_at: '2026-08-11T09:10:00Z',
     }])
+    assert.equal(h3LegalAccess.territory_code, 'US')
+    assert.equal(updatedH3LegalAccess.territory_code, 'JP')
+    assert.equal(updatedH3LegalAccess.availability_status, 'available')
     assert.deepEqual(admin.audit.events, [{
       sequence: 1, event_id: supportEventId('a'), provider: 'github_sponsors',
       source_reference: opaqueSupportKey('a'), kind: 'one_time_contribution',
@@ -1116,6 +1359,8 @@ test('Support wrappers use exact no-store envelopes and discard private contribu
     ['GET', '/api/v1/support/admin/accounts/account%2Fid'],
     ['POST', '/api/v1/support/admin/accounts/account%2Fid/fulfillment'],
     ['POST', '/api/v1/support/admin/accounts/account%2Fid/contributions'],
+    ['GET', '/api/v1/h3/legal-access'],
+    ['PUT', '/api/v1/h3/legal-access'],
   ])
   for (const call of calls) {
     assert.equal(call.init.credentials, 'same-origin')
@@ -1141,7 +1386,75 @@ test('Support wrappers use exact no-store envelopes and discard private contribu
     target_event_id: null,
     idempotency_key: opaqueSupportKey('8'),
   })
+  assert.equal(calls[7].init.method || 'GET', 'GET')
+  assert.equal(calls[8].init.method || 'GET', 'PUT')
+  assert.deepEqual(JSON.parse(calls[8].init.body), {
+    territory_code: 'JP',
+    owner_attested: true,
+    license_revision: h3LegalAccessProjection.license_revision,
+    license_sha256: h3LegalAccessProjection.license_sha256,
+  })
   assert.equal(calls[0].init.body, undefined)
+})
+
+test('Krea owner-policy wrappers use the exact v2 role map and no-store route', async () => {
+  const calls = []
+  await withFetchMock(async (url, init = {}) => {
+    calls.push({ url: String(url), init })
+    if ((init.method || 'GET') === 'PUT') {
+      return jsonResponse({
+        status: 'ok',
+        attested: true,
+        availability_status: 'license_conditions_recorded',
+        migration_required: false,
+        local_execution_allowed: true,
+        hosted_execution_allowed: false,
+        maestro_content_filtering: false,
+        manual_owner_review: true,
+        role_use_scopes: { owner: 'noncommercial', user: 'commercial_under_1m' },
+        declared_at_unix: 1_700_000_001,
+        content_handling: 'manual_owner_review',
+      })
+    }
+    return jsonResponse(kreaOwnerPolicyProjection)
+  }, async () => {
+    const current = await fetchKreaOwnerPolicy()
+    assert.deepEqual(current.role_use_scopes, {
+      owner: 'noncommercial', user: 'commercial_under_1m',
+    })
+    const updated = await setKreaOwnerPolicy({
+      owner_attested: true,
+      manual_review_accepted: true,
+      local_content_stays_local: true,
+      attribution_accepted: true,
+      role_use_scopes: { owner: 'noncommercial', user: 'commercial_under_1m' },
+      license_version: current.license_version,
+      license_date: current.license_date,
+    })
+    assert.equal(updated.status, 'ok')
+    assert.equal('license_url' in updated, false)
+    assert.equal('acceptable_use_url' in updated, false)
+    assert.equal('license_version' in updated, false)
+  })
+  assert.equal(calls.length, 2)
+  assert.equal(calls[0].url, '/api/v1/krea/owner-policy')
+  assert.equal(calls[0].init.method || 'GET', 'GET')
+  assert.equal(calls[1].url, '/api/v1/krea/owner-policy')
+  assert.equal(calls[1].init.method, 'PUT')
+  for (const call of calls) {
+    assert.equal(call.init.credentials, 'same-origin')
+    assert.equal(call.init.cache, 'no-store')
+  }
+  assert.deepEqual(JSON.parse(calls[1].init.body), {
+    owner_attested: true,
+    manual_review_accepted: true,
+    local_content_stays_local: true,
+    attribution_accepted: true,
+    role_use_scopes: { owner: 'noncommercial', user: 'commercial_under_1m' },
+    license_version: 'v1',
+    license_date: '2026-06-22',
+  })
+  assert.equal('use_scope' in JSON.parse(calls[1].init.body), false)
 })
 
 test('Support recovery projections reject malformed or privacy-bearing shapes without retaining them', async () => {
@@ -1186,6 +1499,53 @@ test('Support recovery projections reject malformed or privacy-bearing shapes wi
   })
 })
 
+test('Supporter benefit policy decoder rejects unknown perks and privacy-bearing fields as one closed projection', async () => {
+  await withFetchMock(async () => jsonResponse({
+    ...publicSupport,
+    supporter_benefits: {
+      ...publicSupport.supporter_benefits,
+      private_subject: 'private-account',
+      one_time_tiers: [{
+        ...publicSupport.supporter_benefits.one_time_tiers[0],
+        benefits: ['supporter_recognition', 'future_unknown_perk'],
+      }],
+    },
+  }), async () => {
+    const catalog = await fetchSupportCatalog()
+    assert.equal(catalog.supporter_benefits, null)
+    assert.doesNotMatch(JSON.stringify(catalog), /private_subject|private-account|future_unknown_perk/)
+  })
+})
+
+test('Support self preserves the server-authored unmetered realm without activating queue perks', async () => {
+  await withFetchMock(async () => jsonResponse({
+    ...publicSupport,
+    account_support: {
+      recorded: {
+        event_count: 1,
+        one_time_tier: 'supporter',
+        recurring_tier: null,
+        active_recurring_count: 0,
+        recorded_allowance: recordedAllowance,
+      },
+      benefits: {
+        state: 'unmetered_realm',
+        scheduler_enforcement_enabled: true,
+        effective_benefits: [],
+        recorded_eligibility: ['supporter_recognition', 'bounded_queue_priority'],
+      },
+    },
+    responsible_use: responsibleUse,
+  }), async () => {
+    const self = await fetchSupportSelf()
+    assert.equal(self.account.benefits.state, 'unmetered_realm')
+    assert.deepEqual(self.account.benefits.effective_benefits, [])
+    assert.deepEqual(self.account.benefits.recorded_eligibility, [
+      'supporter_recognition', 'bounded_queue_priority',
+    ])
+  })
+})
+
 test('Support self preserves a server-authored active hosted allowance', async () => {
   await withFetchMock(async () => jsonResponse({
     ...publicSupport,
@@ -1205,7 +1565,7 @@ test('Support self preserves a server-authored active hosted allowance', async (
         state: 'active',
         scheduler_enforcement_enabled: true,
         effective_benefits: ['bounded_queue_priority'],
-        recorded_eligibility: ['one_time_credit_eligibility'],
+        recorded_eligibility: ['supporter_recognition', 'bounded_queue_priority'],
       },
     },
     responsible_use: responsibleUse,
@@ -1527,13 +1887,28 @@ async function loadAccountButton() {
         bundle.onLoad({ filter: /.*/, namespace: 'account-button' }, args => {
           if (args.path === 'react') return { contents: `
             export const useCallback = value => value
-            export const useEffect = () => {}
+            export const useEffect = effect => {
+              if (globalThis.__accountRunEffects) effect()
+            }
             export const useId = () => 'account-title'
             export const useMemo = value => value()
-            export const useRef = value => ({ current: value })
-            export const useState = value => value === 'support' && globalThis.__accountActiveTab
-              ? [globalThis.__accountActiveTab, () => {}]
-              : [value, () => {}]
+            export const useRef = value => {
+              globalThis.__accountRefs ??= []
+              const index = globalThis.__accountRefIndex ?? 0
+              globalThis.__accountRefIndex = index + 1
+              globalThis.__accountRefs[index] ??= { current: value }
+              return globalThis.__accountRefs[index]
+            }
+            export const useState = value => {
+              const initial = value === 'support' && globalThis.__accountActiveTab
+                ? globalThis.__accountActiveTab
+                : value === 'login' && globalThis.__accountEntryMode
+                  ? globalThis.__accountEntryMode
+                  : value
+              return [initial, next => {
+                globalThis.__accountStateWrites?.push({ initial, next: typeof next === 'function' ? next(initial) : next })
+              }]
+            }
           ` }
           if (args.path === 'jsx-runtime') return { contents: `
             export const Fragment = Symbol.for('fragment')
@@ -1546,6 +1921,9 @@ async function loadAccountButton() {
           ` }
           if (args.path === 'api') return { contents: `
             export class AccountApiError extends Error {}
+            export const registerAccount = async input => globalThis.__registerAccount?.(input) ?? null
+            export const fetchKreaOwnerPolicy = async () => globalThis.__kreaOwnerPolicy ?? null
+            export const setKreaOwnerPolicy = async input => globalThis.__setKreaOwnerPolicy?.(input) ?? null
             export const isDirectLoopbackHostname = hostname => hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1'
             export const isAccountProjectAccessActive = (context, migration = null) => context?.accounts?.enabled === true && (migration !== null ? migration.state === 'active' && migration.enforced === true : context.account_project_access_active === true)
           ` }
@@ -1589,6 +1967,12 @@ async function loadSupportPanel() {
               if (value === null && globalThis.__supportNotice !== undefined) {
                 return [globalThis.__supportNotice, () => {}]
               }
+              if (value === 'buy_me_a_coffee' && globalThis.__supportManualSource !== undefined) {
+                return [globalThis.__supportManualSource, () => {}]
+              }
+              if (value === 'one_time_contribution' && globalThis.__supportManualKind !== undefined) {
+                return [globalThis.__supportManualKind, () => {}]
+              }
               return [value, () => {}]
             }
           ` }
@@ -1603,8 +1987,19 @@ async function loadSupportPanel() {
           if (args.path === 'api') return { contents: `
             export class AccountApiError extends Error {}
             export const isAccountProjectAccessActive = (context, migration = null) => context?.accounts?.enabled === true && (migration !== null ? migration.state === 'active' && migration.enforced === true : context.account_project_access_active === true)
+            export const fetchKreaOwnerPolicy = async () => globalThis.__kreaOwnerPolicy ?? null
+            export const setKreaOwnerPolicy = async input => globalThis.__setKreaOwnerPolicy?.(input) ?? null
           ` }
-          if (args.path === 'store') return { contents: 'export const useStore = selector => selector(globalThis.__supportStore)' }
+          if (args.path === 'store') return { contents: `
+            export const useStore = selector => selector({
+              supportH3LegalAccess: null,
+              supportH3LegalAccessLoading: false,
+              supportH3LegalAccessError: null,
+              loadH3LegalAccessState: async () => null,
+              setH3LegalAccessLocation: async () => null,
+              ...globalThis.__supportStore,
+            })
+          ` }
           return null
         })
       },
@@ -1725,9 +2120,15 @@ test('Support panel renders a semantic mobile-safe recorded allowance without ov
   const account = {
     event_count: 2, one_time_tier: 'backer', recurring_tier: 'member', active_recurring_count: 1,
     recorded_allowance: recordedAllowance,
+    owner_test_credits: {
+      state: 'active', available_units: 900, used_units: 100, target_balance: 1_000,
+      last_activity_at: '2026-08-24T12:00:00Z',
+    },
     benefits: {
       state: 'recorded_not_enforced', scheduler_enforcement_enabled: false,
-      effective_benefits: [], recorded_eligibility: [],
+      effective_benefits: [], recorded_eligibility: [
+        'supporter_recognition', 'bounded_queue_priority', 'early_access_updates', 'supporter_convenience',
+      ],
     },
   }
   globalThis.__supportStore = {
@@ -1750,14 +2151,27 @@ test('Support panel renders a semantic mobile-safe recorded allowance without ov
   assert.match(text, /Support first helps cover \$1,000 in development costs/)
   assert.match(text, /After that, it can help fund hosting Maestro Continuum with more compute/)
   assert.match(text, /\$1,000 development-cost target/)
-  assert.match(text, /Direct compute sponsorship stays locked until that target is reached/)
+  assert.match(text, /Direct compute sponsorship/i)
+  assert.match(text, /Vast\.ai compute sponsorship stays locked/i)
+  assert.match(text, /Zero-credit work remains schedulable/i)
   assert.match(text, /checks net recorded USD support after refunds/)
   assert.match(text, /running total and contribution history stay private/)
-  assert.match(text, /Locked until the \$1,000 development-cost target is reached/)
-  assert.match(text, /offers no guarantees or perks/)
+  assert.match(text, /thank-you benefits/)
+  assert.match(text, /Supporter tiers and perks/)
+  assert.match(text, /One-time support/)
+  assert.match(text, /Recurring support/)
+  assert.match(text, /Supporter\$5\+/)
+  assert.match(text, /Backer\$25\+/)
+  assert.match(text, /Sponsor\$100\+/)
+  assert.match(text, /Member\$3\+/)
+  assert.match(text, /Published eligibility/)
+  assert.match(text, /Early-access and convenience items remain recorded eligibility until Maestro explicitly delivers them/)
+  assert.match(text, /One-time Backer/)
+  assert.match(text, /Recurring Member/)
+  assert.match(text, /Delivered or active now: Supporter recognition/)
+  assert.match(text, /Recorded eligibility, not active yet: Bounded hosted queue priority · Early access updates · Supporter convenience features/)
   assert.match(text, /Buy Me a Coffee/)
   assert.match(text, /Patreon/)
-  assert.match(text, /Direct compute sponsorship/)
   const supportLinks = findElements(tree, node => node.type === 'a' && String(node.props?.href || '').includes('maestro'))
   assert.deepEqual(supportLinks.map(node => node.props.href), [
     'https://buymeacoffee.com/maestro',
@@ -1771,21 +2185,24 @@ test('Support panel renders a semantic mobile-safe recorded allowance without ov
   }
   const unavailableSupport = findElements(tree, node => node.props?.['aria-disabled'] === 'true')
   assert.equal(unavailableSupport.length, 1)
-  assert.match(unavailableSupport[0].props.className, /\bmin-h-11\b/)
-  assert.match(text, /Recorded informational compute allowance/)
-  assert.match(text, /Recorded amount: 460 compute seconds/)
-  assert.match(text, /460 compute seconds/)
+  assert.match(text, /Hosted queue allowance · inactive/)
+  assert.match(text, /Recorded amount: 460 maestro credits/)
+  assert.match(text, /460 maestro credits/)
   assert.match(text, /Recorded as of/)
   assert.match(text, /not active on the current host and does not change generation, queueing, or retries/)
   assert.match(text, /Recorded status: active/)
-  assert.match(text, /Recorded informational amount:/)
+  assert.match(text, /Recorded amount:/)
   assert.match(text, /Free allowance/)
   assert.match(text, /One-time support/)
   assert.match(text, /Recurring support/)
   assert.match(text, /Partial refund recorded/)
+  assert.match(text, /Technical details · owner credit test/)
+  assert.match(text, /900 available · 100 used/)
+  assert.match(text, /without changing real credits, access, or queue priority/)
+  assert.equal(findElements(tree, node => node.props?.['aria-label'] === 'Owner credit test details').length, 1)
   assert.doesNotMatch(text, /spendable|remaining|private-source|source-event|provider/i)
 
-  const allowanceSection = findElements(tree, node => node.props?.['aria-label'] === 'Recorded informational compute allowance')
+  const allowanceSection = findElements(tree, node => node.props?.['aria-label'] === 'Recorded hosted queue allowance')
   assert.equal(allowanceSection.length, 1)
   assert.match(allowanceSection[0].props.className, /\bmin-w-0\b/)
   const sourceList = findElements(tree, node => node.type === 'ul' && node.props?.['aria-label'] === 'Allowance breakdown')
@@ -1812,12 +2229,12 @@ test('Support panel renders a semantic mobile-safe recorded allowance without ov
   }
   const activeTree = expandElement(SupportPanel())
   const activeText = elementText(activeTree)
-  assert.match(activeText, /active hosted compute allowance/i)
-  assert.match(activeText, /Eligible jobs can receive bounded queue priority/)
+  assert.match(activeText, /active hosted queue allowance/i)
+  assert.match(activeText, /Eligible jobs can receive bounded priority/)
   assert.match(activeText, /jobs without enough allowance still remain eligible/)
   assert.equal(findElements(
     activeTree,
-    node => node.props?.['aria-label'] === 'Active hosted compute allowance',
+    node => node.props?.['aria-label'] === 'Active hosted queue allowance',
   ).length, 1)
 
   globalThis.__supportStore.supportSelf = {
@@ -1838,11 +2255,21 @@ test('Support panel renders a semantic mobile-safe recorded allowance without ov
 
   globalThis.__supportStore.supportSelf = {
     public: publicSupport,
+    account: {
+      ...account,
+      owner_test_credits: { ...account.owner_test_credits, state: 'unavailable' },
+    },
+    responsible_use: responsibleUse,
+  }
+  assert.match(elementText(expandElement(SupportPanel())), /Test accounting is temporarily unavailable/)
+
+  globalThis.__supportStore.supportSelf = {
+    public: publicSupport,
     account: { ...account, recorded_allowance: undefined },
     responsible_use: responsibleUse,
   }
   const legacyText = elementText(expandElement(SupportPanel()))
-  assert.doesNotMatch(legacyText, /Recorded informational compute allowance|Allowance breakdown/)
+  assert.doesNotMatch(legacyText, /Recorded hosted queue allowance|Allowance breakdown/)
 
   const recoveredPublic = structuredClone(publicSupport)
   recoveredPublic.development_cost_recovery.state = 'recovered'
@@ -1862,12 +2289,129 @@ test('Support panel renders a semantic mobile-safe recorded allowance without ov
   const recoveredTree = expandElement(SupportPanel())
   const recoveredText = elementText(recoveredTree)
   assert.match(recoveredText, /Development costs recovered/)
-  assert.match(recoveredText, /The \$1,000 target has been reached/)
-  assert.match(recoveredText, /Direct compute sponsorship can be offered when it is configured/)
+  assert.match(recoveredText, /initial \$1,000 development-cost target has been reached/)
+  assert.match(recoveredText, /Vast\.ai compute sponsorship may now use the operator-configured destination/)
   assert.equal(
     findElements(recoveredTree, node => node.type === 'a' && node.props?.href === 'https://support.operator.com/maestro').length,
     1,
   )
+})
+
+test('Support panel shows owner-only H3 legal-access controls and hides them for non-owners', async t => {
+  const { SupportPanel } = await loadSupportPanel()
+  t.after(() => {
+    delete globalThis.__supportStore
+    delete globalThis.__supportNotice
+  })
+  let h3PanelState = {
+    ...h3LegalAccessProjection,
+    territory_code: 'US',
+    availability_status: 'legal_blocked',
+    execution_allowed: false,
+  }
+  const ownerContext = {
+    enabled: true, authenticated: true, account: { id: 'owner-account', role: 'owner' },
+    capabilities: ['account.self', 'accounts.admin', 'services.admin'], reauthenticated: true,
+    passkey_authentication_available: false,
+  }
+  globalThis.__supportStore = {
+    accountContext: ownerContext,
+    accountUsers: [], supportCatalog: publicSupport, supportCatalogLoading: false,
+    supportCatalogUnavailable: false, supportSelf: null, responsibleUse: null,
+    supportAdmin: null, supportAdminAccountId: null, supportDetailsLoading: false,
+    supportH3LegalAccessLoading: false, supportH3LegalAccessError: null,
+    supportH3LegalAccess: h3PanelState,
+    loadSupportCatalog: async () => null, loadSupportSelf: async () => null,
+    loadResponsibleUse: async () => null, acceptResponsibleUse: async () => null,
+    loadSupportAdmin: async () => null, clearSupportAdmin: () => {},
+    loadH3LegalAccessState: async () => h3PanelState,
+    setH3LegalAccessLocation: async input => {
+      h3PanelState = { ...h3PanelState, ...input, availability_status: 'available', execution_allowed: true }
+      globalThis.__supportStore.supportH3LegalAccess = h3PanelState
+      return h3PanelState
+    },
+  }
+  let tree = expandElement(SupportPanel())
+  const h3Section = findElements(tree, node => node.props?.['aria-label'] === 'H3 legal-access location')
+  assert.equal(h3Section.length, 1)
+  assert.match(elementText(tree), /H3 legal-access location/)
+  assert.match(elementText(h3Section[0]), /Availability: Blocked by the current license/)
+  assert.match(elementText(h3Section[0]), /I confirm that the selected country is where this computer will physically run MiniMax H3/)
+  assert.match(elementText(h3Section[0]), /does not infer this declaration from an IP address, VPN, or network location/)
+  assert.doesNotMatch(elementText(h3Section[0]), /Use network-detected location/)
+  const attestation = findElements(h3Section[0], node => node.type === 'input' && node.props?.type === 'checkbox')[0]
+  assert.equal(attestation.props.checked, false)
+  const saveButton = findElements(tree, node => node.type === 'button' && elementText(node) === 'Confirm and save')[0]
+  assert.equal(saveButton.props.disabled, true)
+
+  h3PanelState = {
+    ...h3PanelState,
+    territory_code: 'JP',
+    availability_status: 'available',
+    execution_allowed: true,
+  }
+  globalThis.__supportStore.supportH3LegalAccess = h3PanelState
+  tree = expandElement(SupportPanel())
+  const jpSelect = findElements(tree, node => node.type === 'select')[0]
+  assert.equal(jpSelect.props.value, 'JP')
+  assert.match(elementText(tree), /Availability: Allowed/)
+  assert.match(elementText(tree), /MiniMax H3 execution: allowed/)
+
+  globalThis.__supportStore.accountContext = {
+    ...ownerContext,
+    account: { ...ownerContext.account, role: 'user', reauthenticated: false },
+  }
+  tree = expandElement(SupportPanel())
+  assert.equal(findElements(tree, node => node.props?.['aria-label'] === 'H3 legal-access location').length, 0)
+})
+
+test('Support panel shows an owner-only fixed Krea v2 role map with fenced direct API state', async t => {
+  const { SupportPanel } = await loadSupportPanel()
+  t.after(() => {
+    delete globalThis.__supportStore
+  })
+  const ownerContext = {
+    enabled: true, authenticated: true, account: { id: 'owner-account', role: 'owner' },
+    capabilities: ['account.self', 'accounts.admin', 'services.admin'], reauthenticated: true,
+    passkey_authentication_available: false,
+  }
+  globalThis.__supportStore = {
+    accountContext: ownerContext,
+    accountUsers: [], supportCatalog: publicSupport, supportCatalogLoading: false,
+    supportCatalogUnavailable: false, supportSelf: null, responsibleUse: null,
+    supportAdmin: null, supportAdminAccountId: null, supportDetailsLoading: false,
+    loadSupportCatalog: async () => null, loadSupportSelf: async () => null,
+    loadResponsibleUse: async () => null, acceptResponsibleUse: async () => null,
+    loadSupportAdmin: async () => null, clearSupportAdmin: () => {},
+  }
+  let tree = expandElement(SupportPanel())
+  const sections = findElements(tree, node => node.props?.['aria-label'] === 'Krea 2 license roles')
+  assert.equal(sections.length, 1)
+  const text = elementText(sections[0])
+  assert.match(text, /Owner accountNoncommercial use/)
+  assert.match(text, /User accountCommercial use under \$1M/)
+  assert.match(text, /browser request cannot choose or change its own scope/)
+  assert.doesNotMatch(text, /execution ready/i)
+
+  globalThis.__supportStore.accountContext = {
+    ...ownerContext,
+    account: { ...ownerContext.account, role: 'user' },
+    reauthenticated: false,
+  }
+  tree = expandElement(SupportPanel())
+  assert.equal(findElements(tree, node => node.props?.['aria-label'] === 'Krea 2 license roles').length, 0)
+
+  const source = await readFile(supportPanelUrl, 'utf8')
+  assert.match(source, /owner: 'noncommercial',[^]*user: 'commercial_under_1m'/)
+  assert.match(source, /owner_attested: true,[^]*manual_review_accepted: true,[^]*local_content_stays_local: true,[^]*attribution_accepted: true/)
+  assert.match(source, /await setKreaOwnerPolicy\([^]*const refreshed = await fetchKreaOwnerPolicy\(\)/)
+  assert.match(source, /const epoch = \+\+kreaOwnerPolicyEpochRef\.current/)
+  assert.match(source, /if \(epoch !== kreaOwnerPolicyEpochRef\.current\) return/)
+  assert.match(source, /kreaOwnerPolicyEpochRef\.current \+= 1[^]*\}, \[accountId, ownerSupport\]\)/)
+  assert.match(source, /I attest that locally processed content remains on this host\./)
+  assert.match(source, /Krea 2 license conditions recorded\. Model files, creator terms, project access, and runtime readiness remain separate\./)
+  assert.equal([...source.matchAll(/checked=\{krea(?:OwnerAttested|ManualReviewAccepted|LocalContentAccepted|AttributionAccepted)\}/g)].length, 4)
+  assert.doesNotMatch(source, /content_classifier|prompt_filter|execution ready/i)
 })
 
 test('Support panel renders a bounded owner audit with fulfillment controls, loading, empty, error, and stale-selection states', async t => {
@@ -1884,6 +2428,8 @@ test('Support panel renders a bounded owner audit with fulfillment controls, loa
     delete globalThis.__supportManualContributions
     delete globalThis.__supportManualDeferred
     delete globalThis.__supportManualReject
+    delete globalThis.__supportManualSource
+    delete globalThis.__supportManualKind
   })
   globalThis.__supportSelectedUserIndex = '0'
   const account = {
@@ -1895,7 +2441,7 @@ test('Support panel renders a bounded owner audit with fulfillment controls, loa
     event_count: 42, one_time_tier: 'supporter', recurring_tier: null, active_recurring_count: 0,
     benefits: {
       state: 'recorded_not_enforced', scheduler_enforcement_enabled: false,
-      effective_benefits: [], recorded_eligibility: ['one_time_credit_eligibility'],
+      effective_benefits: [], recorded_eligibility: ['supporter_recognition', 'bounded_queue_priority'],
     },
   }
   const events = Array.from({ length: 42 }, (_, index) => ({
@@ -1964,8 +2510,8 @@ test('Support panel renders a bounded owner audit with fulfillment controls, loa
   const text = elementText(tree)
   assert.match(text, /Private support history and follow-up/)
   assert.match(text, /never processes a payment here/i)
-  assert.match(text, /Contribution records can update the compute allowance/i)
-  assert.match(text, /does not process a payment[^]*may update the account's compute allowance/i)
+  assert.match(text, /Contribution records can grant Maestro queue credits/i)
+  assert.match(text, /does not process a payment[^]*may grant Maestro queue credits/i)
   assert.doesNotMatch(text, /recorded_not_enforced|opaque|audit|proof|loopback|cookie|fulfillment|minor unit|terminal|sequence/i)
   const manualOptionValues = findElements(tree, node => node.type === 'option')
     .map(node => node.props.value)
@@ -1977,8 +2523,33 @@ test('Support panel renders a bounded owner audit with fulfillment controls, loa
     tree,
     node => node.type === 'option' && node.props?.value === 'direct_compute_sponsorship',
   )[0]
-  assert.equal(directManualOption.props.disabled, true)
-  assert.match(elementText(directManualOption), /locked until \$1,000 is recovered/)
+  assert.equal(directManualOption.props.disabled, undefined)
+  assert.match(elementText(directManualOption), /record only; excluded from target and perks/i)
+  assert.match(text, /does not detect, collect, or automatically refund Vast\.ai sponsorships/i)
+
+  globalThis.__supportManualSource = 'direct_compute_sponsorship'
+  globalThis.__supportManualKind = 'one_time_contribution'
+  const lockedDirectTree = expandElement(SupportPanel())
+  const lockedKinds = findElements(
+    lockedDirectTree,
+    node => node.type === 'option' && ['one_time_contribution', 'refund', 'chargeback'].includes(node.props?.value),
+  ).map(node => node.props.value)
+  assert.deepEqual(lockedKinds, ['one_time_contribution', 'refund', 'chargeback'])
+  const lockedDirectRecordButton = findElements(lockedDirectTree, node => (
+    node.type === 'button' && elementText(node) === 'Save contribution record'
+  ))[0]
+  lockedDirectRecordButton.props.onClick()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual({
+    ...globalThis.__supportManualContributions.at(-1),
+    idempotency_key: '<opaque>',
+  }, {
+    source: 'direct_compute_sponsorship', kind: 'one_time_contribution', amount_minor: 1,
+    currency: 'USD', target_event_id: null, idempotency_key: '<opaque>',
+  })
+  delete globalThis.__supportManualSource
+  delete globalThis.__supportManualKind
+  globalThis.__supportManualContributions = []
 
   globalThis.__supportStore.supportAdmin = {
     ...globalThis.__supportStore.supportAdmin,
@@ -1991,8 +2562,8 @@ test('Support panel renders a bounded owner audit with fulfillment controls, loa
     recoveredOwnerTree,
     node => node.type === 'option' && node.props?.value === 'direct_compute_sponsorship',
   )[0]
-  assert.equal(recoveredDirectOption.props.disabled, false)
-  assert.doesNotMatch(elementText(recoveredDirectOption), /locked/)
+  assert.equal(recoveredDirectOption.props.disabled, undefined)
+  assert.doesNotMatch(elementText(recoveredDirectOption), /locked/i)
 
   globalThis.__supportStore.supportAdmin = {
     ...globalThis.__supportStore.supportAdmin,
@@ -2004,7 +2575,7 @@ test('Support panel renders a bounded owner audit with fulfillment controls, loa
   assert.equal(findElements(
     relockedOwnerTree,
     node => node.type === 'option' && node.props?.value === 'direct_compute_sponsorship',
-  )[0].props.disabled, true)
+  )[0].props.disabled, undefined)
 
   const recoveredCatalog = structuredClone(publicSupport)
   recoveredCatalog.development_cost_recovery.state = 'recovered'
@@ -2046,7 +2617,7 @@ test('Support panel renders a bounded owner audit with fulfillment controls, loa
   assert.equal(findElements(
     malformedOwnerTree,
     node => node.type === 'option' && node.props?.value === 'direct_compute_sponsorship',
-  )[0].props.disabled, true)
+  )[0].props.disabled, undefined)
   assert.equal(findElements(
     malformedOwnerTree,
     node => node.type === 'a' && node.props?.href === 'https://support.operator.com/maestro',
@@ -2061,7 +2632,7 @@ test('Support panel renders a bounded owner audit with fulfillment controls, loa
   assert.equal(findElements(
     missingOwnerTree,
     node => node.type === 'option' && node.props?.value === 'direct_compute_sponsorship',
-  )[0].props.disabled, true)
+  )[0].props.disabled, undefined)
   assert.equal(findElements(
     missingOwnerTree,
     node => node.type === 'a' && node.props?.href === 'https://support.operator.com/maestro',
@@ -2071,7 +2642,7 @@ test('Support panel renders a bounded owner audit with fulfillment controls, loa
     ['one_time_contribution', 'recurring_started', 'recurring_renewed', 'recurring_canceled', 'refund', 'chargeback']
       .filter(value => manualOptionValues.includes(value)),
     ['one_time_contribution', 'recurring_started', 'recurring_renewed', 'recurring_canceled', 'refund', 'chargeback'],
-    'all manual sources retain all lifecycle kinds independently of public-link marketing modes',
+    'ordinary support sources retain every lifecycle kind independently of public-link marketing modes',
   )
   const recordOptionLabels = findElements(tree, node => node.type === 'option')
     .map(elementText)
@@ -2335,14 +2906,16 @@ test('Support trigger stays discoverable with accounts off and describes optiona
     accountContext: { enabled: false }, accountDrawerOpen: false, setAccountDrawerOpen: setOpen,
   }
   const disabled = AccountSupportButton({ compact: false })
-  assert.equal(disabled.props['aria-label'], 'Open Support')
+  assert.equal(disabled.props['aria-label'], 'Open support')
+  assert.equal(elementText(disabled), 'Support')
   disabled.props.onClick()
   assert.equal(globalThis.__accountOpen, true)
 
   globalThis.__accountStore.accountContext = { enabled: true, authenticated: false, account: null }
   const anonymous = AccountSupportButton({ compact: false })
   assert.equal(anonymous.props['aria-haspopup'], 'dialog')
-  assert.equal(anonymous.props['aria-label'], 'Open Support')
+  assert.equal(anonymous.props['aria-label'], 'Open sign in and account help')
+  assert.equal(elementText(anonymous), 'Sign in')
   anonymous.props.onClick()
   assert.equal(globalThis.__accountOpen, true)
 
@@ -2350,7 +2923,110 @@ test('Support trigger stays discoverable with accounts off and describes optiona
     enabled: true, authenticated: true, account: { username: 'LAN Owner' },
   }
   const authenticated = AccountSupportButton({ compact: false })
-  assert.equal(authenticated.props['aria-label'], 'Open Support and account for LAN Owner')
+  assert.equal(authenticated.props['aria-label'], 'Open account and support')
+  assert.equal(elementText(authenticated), 'Account & support')
+})
+
+test('public registration preserves one-time codes when post-registration hydration fails', async t => {
+  const { AccountSupportDrawer } = await loadAccountButton()
+  const previousWindow = globalThis.window
+  const previousDocument = globalThis.document
+  const previousHTMLElement = globalThis.HTMLElement
+  globalThis.window = { location: { hostname: '127.0.0.1' } }
+  globalThis.document = { activeElement: null }
+  globalThis.HTMLElement = class HTMLElementFake {}
+  globalThis.__accountActiveTab = 'account'
+  globalThis.__accountEntryMode = 'register'
+  globalThis.__accountRunEffects = true
+  globalThis.__accountRefs = []
+  globalThis.__accountRefIndex = 0
+  globalThis.__accountStateWrites = []
+  globalThis.__registerAccount = async () => ({
+    account: { id: 'registered-account', username: 'New user', role: 'user' },
+    recovery_codes: ['code-one', 'code-two'],
+  })
+  let authenticatedHandoffs = 0
+  const noOp = async () => null
+  globalThis.__accountStore = {
+    accountDrawerOpen: true,
+    setAccountDrawerOpen() {},
+    accountContext: {
+      enabled: true, authenticated: false, account: null, capabilities: [],
+      reauthenticated: false, activation_state: 'ready', bootstrap_available: false,
+      public_registration_available: true,
+    },
+    accessContext: { remote: false, accounts: { enabled: true } },
+    accountProjectMigration: null,
+    accountProjectMigrationLoading: false,
+    accountContextLoading: false,
+    accountSessions: [],
+    accountUsers: [],
+    accountDetailsLoading: false,
+    loadAccountContext: async () => { throw new Error('temporary refresh failure') },
+    loadAccountProjectMigration: noOp,
+    migrateAccountProjects: noOp,
+    bootstrapAccount: noOp,
+    loginAccount: noOp,
+    logoutAccount: noOp,
+    reauthenticateAccount: noOp,
+    recoverAccount: noOp,
+    changeAccountPassword: noOp,
+    rotateAccountRecoveryCodes: noOp,
+    loadAccountSessions: noOp,
+    revokeAccountSession: noOp,
+    revokeAllAccountSessions: noOp,
+    loadAccountUsers: noOp,
+    createServerAccount: noOp,
+    setServerAccountDisabled: noOp,
+  }
+  t.after(() => {
+    globalThis.window = previousWindow
+    globalThis.document = previousDocument
+    globalThis.HTMLElement = previousHTMLElement
+    delete globalThis.__accountActiveTab
+    delete globalThis.__accountEntryMode
+    delete globalThis.__accountRunEffects
+    delete globalThis.__accountRefs
+    delete globalThis.__accountRefIndex
+    delete globalThis.__accountStateWrites
+    delete globalThis.__registerAccount
+    delete globalThis.__accountStore
+  })
+
+  const tree = expandElement(AccountSupportDrawer({
+    required: true,
+    onAuthenticated: () => { authenticatedHandoffs += 1 },
+  }))
+  const registerForm = findElements(
+    tree,
+    node => node.type === 'form' && /Create account/.test(elementText(node)),
+  )[0]
+  assert.ok(registerForm)
+  registerForm.props.onSubmit({ preventDefault() {} })
+  await new Promise(resolve => setImmediate(resolve))
+
+  assert.ok(globalThis.__accountStateWrites.some(write => (
+    Array.isArray(write.next) && write.next.join(',') === 'code-one,code-two'
+  )), JSON.stringify(globalThis.__accountStateWrites))
+  assert.equal(authenticatedHandoffs, 0, 'required bootstrap must wait until the codes are acknowledged')
+
+  globalThis.__accountStore.accountContext = {
+    ...globalThis.__accountStore.accountContext,
+    authenticated: true,
+    account: { id: 'registered-account', username: 'New user', role: 'user' },
+  }
+  globalThis.__accountStateWrites = []
+  globalThis.__accountRefIndex = 0
+  globalThis.__registerAccount = async () => ({
+    account: globalThis.__accountStore.accountContext.account,
+    recovery_codes: ['code-one', 'code-two'],
+  })
+  AccountSupportDrawer({ required: true, onAuthenticated: () => { authenticatedHandoffs += 1 } })
+  assert.equal(
+    globalThis.__accountStateWrites.some(write => Array.isArray(write.initial) && Array.isArray(write.next)),
+    false,
+    'the exact post-registration identity transition must not clear the newly issued codes',
+  )
 })
 
 test('account drawer cannot dispatch a disable mutation for the current owner but can disable another user', async t => {
@@ -2457,7 +3133,7 @@ test('account and Support error copy maps backend codes and HTTP states without 
   )
   assert.equal(
     safeAccountHttpErrorMessage(423, 'account_request_failed', 0, 'project-migration'),
-    'Unlock the project in this browser, then try again.',
+    'Project access changed while setup was running. Refresh project access, then try again.',
   )
   assert.equal(
     safeAccountHttpErrorMessage(503, 'account_request_failed', 9, 'project-migration'),
@@ -2465,7 +3141,7 @@ test('account and Support error copy maps backend codes and HTTP states without 
   )
   assert.equal(
     safeAccountHttpErrorMessage(409, 'project_migration_needs_attention', 0, 'project-migration'),
-    'Some existing project folders need attention. Fix or remove them on this computer, then retry. Account-based project filtering remains off, and existing project access stays unchanged.',
+    'Some existing project folders need attention. Resolve each listed project on this computer, then retry. Removing a project is a separate action that Maestro will ask you to confirm. Account-based project filtering remains off, and existing project access stays unchanged.',
   )
   assert.equal(
     safeAccountHttpErrorMessage(409, 'project_migration_needs_attention'),
@@ -2536,10 +3212,7 @@ test('Support links require an available server HTTPS URL and priority copy requ
 
   const recovered = structuredClone(staleDirect)
   recovered.development_cost_recovery.state = 'recovered'
-  assert.equal(
-    visibleSupportProviders(recovered)[2].support_url,
-    'https://support.operator.com/maestro',
-  )
+  assert.equal(visibleSupportProviders(recovered)[2].support_url, 'https://support.operator.com/maestro')
 
   const policy = {
     ...publicSupport.support_priority,
@@ -2561,7 +3234,7 @@ test('Support links require an available server HTTPS URL and priority copy requ
   assert.equal(affectedPriorityNotice(baseAccount, policy), null)
   assert.equal(affectedPriorityNotice({
     ...baseAccount,
-    benefits: { ...baseAccount.benefits, recorded_eligibility: ['one_time_credit_eligibility'] },
+    benefits: { ...baseAccount.benefits, recorded_eligibility: ['bounded_queue_priority'] },
   }, policy), policy.notice)
 
   assert.equal(nextAccountSupportTab('support', 'ArrowRight'), 'account')
@@ -3020,6 +3693,110 @@ test('Support store loads public catalog with accounts off and gates self and ad
   assert.equal(responsibleUseIsAccepted(useStore.getState().responsibleUse), false)
 })
 
+test('Support store can load and mutate H3 legal-access location with owner gating', async t => {
+  const originalFetch = globalThis.fetch
+  const calls = []
+  let h3Location = h3LegalAccessProjection
+  const ownerContext = {
+    enabled: true,
+    authenticated: true,
+    account: { id: 'owner-account', username: 'Owner', role: 'owner', disabled: false },
+    capabilities: ['account.self', 'accounts.admin', 'services.admin'],
+    reauthenticated: true,
+    passkey_authentication_available: false,
+  }
+  const userContext = {
+    ...ownerContext,
+    account: { ...ownerContext.account, id: 'user-account', role: 'user' },
+    reauthenticated: false,
+  }
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input)
+    calls.push({ url, init })
+    if (url.endsWith('/h3/legal-access')) {
+      if ((init.method || 'GET') === 'PUT') {
+        h3Location = {
+          ...h3Location,
+          territory_code: init?.body ? JSON.parse(init.body).territory_code : h3Location.territory_code,
+        }
+        return jsonResponse(h3Location)
+      }
+      return jsonResponse(h3Location)
+    }
+    throw new Error(`Unexpected Support request: ${url}`)
+  }
+  t.after(() => {
+    globalThis.fetch = originalFetch
+  })
+
+  const bundled = await build({
+    stdin: {
+      contents: "export { useStore } from './src/stores/useStore.ts'",
+      resolveDir: uiRoot,
+      loader: 'js',
+    },
+    bundle: true,
+    format: 'esm',
+    logLevel: 'silent',
+    platform: 'node',
+    treeShaking: true,
+    write: false,
+  })
+  const { useStore } = await import(`${asDataModule(bundled.outputFiles[0].text)}#support-store-h3`)
+
+  useStore.setState({
+    accessContext: { accounts: ownerContext },
+    accountContext: userContext,
+    supportH3LegalAccess: null,
+    supportH3LegalAccessLoading: false,
+    supportH3LegalAccessError: null,
+  })
+  assert.equal(await useStore.getState().loadH3LegalAccessState(), null)
+  assert.equal(calls.length, 0)
+
+  useStore.setState({
+    accountContext: ownerContext,
+    accessContext: { accounts: ownerContext },
+  })
+  const loaded = await useStore.getState().loadH3LegalAccessState()
+  assert.equal(loaded?.territory_code, 'US')
+  assert.equal(calls.at(-1).url, '/api/v1/h3/legal-access')
+  assert.equal(calls.at(-1).init.method || 'GET', 'GET')
+  assert.equal(useStore.getState().supportH3LegalAccess?.territory_code, 'US')
+  assert.equal(useStore.getState().supportH3LegalAccess?.availability_status, 'available')
+
+  const updated = await useStore.getState().setH3LegalAccessLocation({
+    territory_code: 'JP',
+    owner_attested: true,
+    license_revision: h3LegalAccessProjection.license_revision,
+    license_sha256: h3LegalAccessProjection.license_sha256,
+  })
+  assert.equal(updated?.territory_code, 'JP')
+  assert.equal(updated?.availability_status, 'available')
+  assert.equal(useStore.getState().supportH3LegalAccess?.territory_code, 'JP')
+  assert.equal(calls.at(-1).url, '/api/v1/h3/legal-access')
+  assert.equal(calls.at(-1).init.method || 'GET', 'PUT')
+  assert.deepEqual(JSON.parse(calls.at(-1).init.body), {
+    territory_code: 'JP',
+    owner_attested: true,
+    license_revision: h3LegalAccessProjection.license_revision,
+    license_sha256: h3LegalAccessProjection.license_sha256,
+  })
+
+  useStore.setState({
+    accountContext: { ...ownerContext, account: { ...ownerContext.account, role: 'user' }, reauthenticated: false },
+  })
+  await assert.rejects(useStore.getState().setH3LegalAccessLocation({
+    territory_code: 'CA',
+    owner_attested: true,
+    license_revision: h3LegalAccessProjection.license_revision,
+    license_sha256: h3LegalAccessProjection.license_sha256,
+  }))
+  assert.equal(useStore.getState().supportH3LegalAccessLoading, false)
+  assert.equal(useStore.getState().supportH3LegalAccessError, 'Sign in as a reauthenticated owner to update H3 location.')
+  assert.equal(calls.filter(call => call.url.endsWith('/h3/legal-access')).length, 2)
+})
+
 test('account drawer keeps secrets ephemeral and uses the shared accessible modal contract', async () => {
   const [source, supportSource, appSource] = await Promise.all([
     readFile(componentUrl, 'utf8'),
@@ -3032,6 +3809,16 @@ test('account drawer keeps secrets ephemeral and uses the shared accessible moda
   assert.match(source, /aria-modal="true"/)
   assert.match(source, /setOneTimeCodes\(\[\]\)/)
   assert.match(source, /Maestro will not show this set again/)
+  assert.match(source, /registerAccount\(\{ username, password, email, deviceLabel \}\)/)
+  assert.match(source, /const dismissOneTimeCodes = useCallback\([\s\S]*setOneTimeCodes\(\[\]\)[\s\S]*onAuthenticated\?\.\(\)/)
+  assert.match(source, /registerAccount\([\s\S]*setOneTimeCodes\(codes\)[\s\S]*await loadContext\(\)/)
+  assert.match(appSource, /onAuthenticated=\{accountRecovery \? finishAccountRecovery : undefined\}/)
+  assert.match(appSource, /const finishAccountRecovery = \(\) => \{[\s\S]*setAccountDrawerOpen\(false\)[\s\S]*retryBootstrap\(\)/)
+  assert.match(appSource, /const retryBootstrap = \(\) => \{[\s\S]*setBootstrapAttempt\(value => value \+ 1\)/)
+  assert.match(source, /await loadContext\(\)/)
+  assert.match(source, /await login\(\{ username, password, deviceLabel \}\)[\s\S]*await loadSessions\(\)/)
+  assert.match(source, /await loadContext\(\)[\s\S]*await loadSessions\(\)/)
+  assert.doesNotMatch(source, /state => state\.registerAccount/)
   assert.match(source, /context\.capabilities\.includes\('accounts\.admin'\)/)
   assert.match(source, /context\.bootstrap_available === true/)
   assert.match(source, /user\.has_email \? ' · email recorded' : ''/)
@@ -3071,12 +3858,15 @@ test('account drawer keeps secrets ephemeral and uses the shared accessible moda
   assert.match(supportSource, /Support first helps cover \$1,000 in development costs/)
   assert.match(supportSource, /After that, it can help fund hosting Maestro Continuum with more compute/)
   assert.match(supportSource, /running total and contribution history stay private/)
-  assert.match(supportSource, /Direct compute sponsorship stays locked until that target is reached/)
-  assert.match(supportSource, /offers no guarantees or perks/)
+  assert.doesNotMatch(supportSource, /direct compute sponsorship/i)
+  assert.match(supportSource, /thank-you benefits/)
   assert.match(supportSource, /Support benefits are not active/)
   assert.match(supportSource, /not active on the current host and does not change generation, queueing, or retries/)
   assert.match(supportSource, /summary\.benefits\.state === 'active'/)
-  assert.match(supportSource, /Active hosted compute allowance/)
+  assert.match(supportSource, /Active hosted queue allowance/)
+  assert.match(supportSource, /Technical details · owner credit test/)
+  assert.match(supportSource, /Auto-refills to/)
+  assert.match(supportSource, /without changing real credits, access, or queue priority/)
   assert.doesNotMatch(supportSource, /localStorage|sessionStorage|console\.|subject_key|source_event_key|account_id|email|customer|invoice|payment_method|credential|secret|@|\$600|tax|end-to-end|passkey/i)
   assert.doesNotMatch(supportSource, /['"]SLA['"]/)
   assert.match(supportSource, /available only after the owner recently confirmed their password/i)
@@ -3111,8 +3901,28 @@ test('account drawer keeps secrets ephemeral and uses the shared accessible moda
 
 test('account drawer uses the eight-character minimum for every account password-setting field', async () => {
   const source = await readFile(componentUrl, 'utf8')
-  assert.equal([...source.matchAll(/minLength=\{8\}/g)].length, 4)
+  assert.equal([...source.matchAll(/minLength=\{8\}/g)].length, 9)
   assert.doesNotMatch(source, /minLength=\{12\}/)
+  assert.equal([...source.matchAll(/label="Confirm password"/g)].length, 2)
+  assert.equal([...source.matchAll(/label="Confirm new password"/g)].length, 2)
+  assert.match(source, /aria-label=\{passwordVisible \? `Hide \$\{label\.toLowerCase\(\)\}` : `Show \$\{label\.toLowerCase\(\)\}`\}/)
+  assert.match(source, /className="[^\"]*min-h-11[^\"]*min-w-11[^\"]*"/)
+  assert.match(source, /Copy all/)
+  assert.match(source, /Download/)
+  assert.match(source, /I stored these recovery codes somewhere private/)
+  assert.match(source, /disabled=\{!savedAcknowledged\}/)
+  assert.match(source, /Continue with saved codes/)
+})
+
+test('Welcome shows account membership, donor tier, and only delivered or active perks without financial detail', async () => {
+  const source = await readFile(welcomeUrl, 'utf8')
+  assert.match(source, /Account membership and supporter status/)
+  assert.match(source, /supporterTierLabels\(supporterAccount\)/)
+  assert.match(source, /supporter_recognition/)
+  assert.match(source, /effective_benefits/)
+  assert.match(source, /Delivered or active now/)
+  assert.match(source, /No supporter tier is currently recorded/)
+  assert.doesNotMatch(source, /amount_minor|currency_totals|audit|event_count|recorded_allowance|effective_allowance/)
 })
 
 test('account tab skips the scroll region while keeping the first sign-in field tabbable', async () => {

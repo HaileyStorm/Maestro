@@ -258,6 +258,17 @@ VALID_SOURCE_MODES = {"t2v", "i2v", "a2v", "retake", "extend"}
 VALID_IMAGE_STRATEGIES = {"reference_edit", "reference_inspired", "fresh_generation", "none"}
 VALID_CONTINUITY_STRATEGIES = {"independent", "continuous", "extend_previous"}
 
+
+def _is_owned_h3_workflow_template(value: Any) -> bool:
+    """Identify the exact derived Maestro v1 advisory projection."""
+    return (
+        isinstance(value, dict)
+        and value.get("type") == "minimax_h3_shot_table"
+        and value.get("version") == 1
+        and value.get("surface") == "api_persisted_plan"
+        and value.get("authority") == "advisory"
+    )
+
 @dataclass
 class ShotPlan:
     shot_id: str
@@ -404,6 +415,8 @@ class ProductionPlan:
     reference_assets: Optional[ReferenceAssets] = None
     characters: Optional[list[CharacterProfile]] = None
     continuity_notes: Optional[list[str]] = None
+    # Derived API/persisted advisory projection. It is not execution authority.
+    workflow_template: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict:
         d = {
@@ -422,11 +435,18 @@ class ProductionPlan:
             d["characters"] = [c.to_dict() for c in self.characters]
         if self.continuity_notes:
             d["continuity_notes"] = self.continuity_notes
+        if self.workflow_template is not None:
+            if _is_owned_h3_workflow_template(self.workflow_template):
+                from .workflow_templates import build_h3_shot_table_template
+
+                d["workflow_template"] = build_h3_shot_table_template(self)
+            else:
+                d["workflow_template"] = self.workflow_template
         return d
 
     @staticmethod
     def from_dict(d: dict) -> "ProductionPlan":
-        return ProductionPlan(
+        plan = ProductionPlan(
             skill_type=d["skill_type"],
             shots=[ShotPlan.from_dict(s) for s in d.get("shots", [])],
             title=d.get("title"),
@@ -435,7 +455,13 @@ class ProductionPlan:
             reference_assets=None,  # reconstructed externally if needed
             characters=[CharacterProfile.from_dict(c) for c in d.get("characters", [])] if d.get("characters") else None,
             continuity_notes=d.get("continuity_notes"),
+            workflow_template=d.get("workflow_template"),
         )
+        if _is_owned_h3_workflow_template(plan.workflow_template):
+            from .workflow_templates import build_h3_shot_table_template
+
+            plan.workflow_template = build_h3_shot_table_template(plan)
+        return plan
 
     def get_character(self, character_id: str) -> Optional[CharacterProfile]:
         if not self.characters:

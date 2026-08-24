@@ -307,7 +307,15 @@ def snap_published_duration(
                     "unavailable", "Duration oracle call limit was reached."
                 )
             candidate = grid.value_at(index)
-            plan = oracle(candidate)
+            try:
+                plan = oracle(candidate)
+            except H3DurationPlanError:
+                raise
+            except ValueError:
+                # The generation planner rejects some shorter totals when
+                # authored events would fall outside that candidate. That is
+                # "no legal candidate", not a snap-contract failure.
+                plan = None
             if plan is not None and not isinstance(plan, H3DurationOraclePlan):
                 raise H3DurationPlanError(
                     "Duration oracle returned an unsupported result type."

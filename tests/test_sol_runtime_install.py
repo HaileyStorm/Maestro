@@ -4,6 +4,7 @@ import io
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -77,15 +78,69 @@ class TestOptionalLinuxAccelerationInstall(unittest.TestCase):
 
     def test_optional_main_never_fails_the_required_runtime(self):
         buffer = io.StringIO()
-        with patch(
-            "scripts.install_optional_cuda_acceleration.install_optional_wheel",
-            return_value=False,
-        ) as mocked:
-            with redirect_stdout(buffer):
-                self.assertEqual(optional_install_main(["--flash-only"]), 0)
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = Path(temporary) / "env-sol" / ".maestro_flash.installed"
+            marker.parent.mkdir(parents=True)
+            marker.write_text("stale", encoding="utf-8")
+            with patch(
+                "scripts.install_optional_cuda_acceleration.install_optional_wheel",
+                return_value=False,
+            ) as mocked:
+                with redirect_stdout(buffer):
+                    self.assertEqual(
+                        optional_install_main(
+                            ["--flash-only", "--marker", "env-sol/.maestro_flash.installed"],
+                            app_root=Path(temporary),
+                        ),
+                        0,
+                    )
+            self.assertFalse(marker.exists())
         mocked.assert_called_once()
         self.assertNotIn("Required CUDA 13 runtime verified", buffer.getvalue())
         self.assertNotIn("is ready", buffer.getvalue())
+
+    def test_optional_main_publishes_marker_only_after_all_requested_success(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = Path(temporary) / "env-sol" / ".maestro_flash.installed"
+            with patch(
+                "scripts.install_optional_cuda_acceleration.install_optional_wheel",
+                side_effect=[True, True],
+            ) as mocked:
+                self.assertEqual(
+                    optional_install_main(
+                        ["--marker", "env-sol/.maestro_flash.installed"],
+                        app_root=Path(temporary),
+                    ),
+                    0,
+                )
+            self.assertEqual(mocked.call_count, 2)
+            self.assertTrue(marker.is_file())
+
+    def test_sage_failure_keeps_shared_marker_missing_until_full_retry_succeeds(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = Path(temporary) / "env-sol" / ".maestro_flash.installed"
+            args = ["--marker", "env-sol/.maestro_flash.installed"]
+            with patch(
+                "scripts.install_optional_cuda_acceleration.install_optional_wheel",
+                side_effect=[False, True],
+            ) as first_attempt:
+                self.assertEqual(
+                    optional_install_main(args, app_root=Path(temporary)),
+                    0,
+                )
+            self.assertEqual(first_attempt.call_count, 2)
+            self.assertFalse(marker.exists())
+
+            with patch(
+                "scripts.install_optional_cuda_acceleration.install_optional_wheel",
+                side_effect=[True, True],
+            ) as retry:
+                self.assertEqual(
+                    optional_install_main(args, app_root=Path(temporary)),
+                    0,
+                )
+            self.assertEqual(retry.call_count, 2)
+            self.assertTrue(marker.is_file())
 
 
 class TestRequiredSolRuntimeVerification(unittest.TestCase):
@@ -153,18 +208,47 @@ class TestRequiredSolRuntimeVerification(unittest.TestCase):
         self.assertIn("CUDA 13", output)
         self.assertNotIn("verified", output)
 
-    def test_continuum_start_is_not_replaced_by_sol(self):
+    def test_normal_start_selects_ready_sol_runtime_with_legacy_fallback(self):
         start = (_ROOT / "start.js").read_text(encoding="utf-8")
         start_sol = (_ROOT / "start_sol.js").read_text(encoding="utf-8")
-        self.assertNotEqual(start, start_sol)
-        self.assertIn('venv: "env"', start)
+        sol_install = (_ROOT / "sol_install.js").read_text(encoding="utf-8")
+        self.assertIn('require("./launcher_profile")', start)
+        self.assertIn("runtimeProfile(kernel)", start)
+        self.assertIn("legacyRuntimeProfile(kernel)", start)
+        self.assertIn("exists('${runtime.marker}') ? '${runtime.env}'", start)
+        self.assertIn("venv: selectedEnv", start)
+        self.assertIn("venv_python: selectedPython", start)
         self.assertIn("python launch.py", start)
         self.assertIn('"event": "/(http:\\/\\/[0-9.:]+)/"', start)
         self.assertIn('url: "{{input.event[1]}}"', start)
         self.assertNotIn("require(\"./start_sol\")", start)
         self.assertNotIn("MAESTRO_SOL_RUNTIME", start)
-        self.assertIn("The optimized H3 Sol Engine requires", start_sol)
-        self.assertIn('MAESTRO_SOL_RUNTIME: "1"', start_sol)
+        self.assertIn('module.exports = require("./start")', start_sol)
+        self.assertIn('module.exports = require("./update")', sol_install)
+        self.assertNotIn("MAESTRO_SOL_RUNTIME", start_sol)
+
+    def test_standard_install_and_update_own_profile_markers(self):
+        install = (_ROOT / "install.js").read_text(encoding="utf-8")
+        update = (_ROOT / "update.js").read_text(encoding="utf-8")
+        torch_script = (_ROOT / "torch.js").read_text(encoding="utf-8")
+
+        self.assertIn("runtimeProfile(kernel)", install)
+        self.assertIn("venv: runtime.env", install)
+        self.assertIn("venv_python: runtime.python", install)
+        self.assertIn("needsCuda13DriverUpdate(kernel)", install)
+        self.assertIn("runtimeProfile(kernel)", update)
+        self.assertIn("exists('${runtime.marker}')", update)
+        self.assertIn("exists('${runtime.flashMarker}')", update)
+        self.assertIn("flash_only: true", update)
+        self.assertIn("runtimeProfile(kernel)", torch_script)
+        self.assertIn("path: runtime.marker", torch_script)
+        self.assertIn("path: runtime.flashMarker", torch_script)
+        self.assertIn("--marker ${appRelativeFlashMarker}", torch_script)
+        self.assertIn("...(optionalMessage ? [] : [{", torch_script)
+        self.assertNotIn(
+            "install_optional_cuda_acceleration.py --flash-only",
+            torch_script,
+        )
 
 
 if __name__ == "__main__":

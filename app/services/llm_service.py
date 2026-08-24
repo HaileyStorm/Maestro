@@ -1547,6 +1547,7 @@ def get_available_models(provider: str = "local", remote_url: str = "", api_key:
     (_PUBLIC_MODEL_ORDER). For remote/openai, queries the server's
     /v1/models endpoint. For anthropic, returns a curated Claude list.
     """
+    provider = str(provider or "local").strip().lower()
     local_models = [
         {
             "id": repo_id,
@@ -1569,12 +1570,17 @@ def get_available_models(provider: str = "local", remote_url: str = "", api_key:
     remote_models: list[dict] = []
 
     # Query remote OpenAI-compatible server (LM Studio, etc.)
-    if provider in ("remote", "openai") and remote_url:
+    if provider in ("remote", "openai"):
+        url = str(remote_url or "").strip().rstrip("/")
+        if provider == "openai" and not url:
+            url = "https://api.openai.com"
+    else:
+        url = ""
+    if url:
         try:
             headers = {}
             if api_key:
                 headers["Authorization"] = f"Bearer {api_key}"
-            url = remote_url.rstrip("/")
             resp = requests.get(f"{url}/v1/models", headers=headers, timeout=10)
             if resp.ok:
                 data = resp.json()
@@ -1586,6 +1592,7 @@ def get_available_models(provider: str = "local", remote_url: str = "", api_key:
                             "label": f"{mid} (Remote)" if provider == "remote" else f"{mid} (OpenAI)",
                             "size_hint": provider,
                             "provider": provider,
+                            "vision_capable": False,
                         })
         except Exception as e:
             print(f"[LLM] Failed to query remote models at {remote_url}: {e}")
@@ -1593,8 +1600,8 @@ def get_available_models(provider: str = "local", remote_url: str = "", api_key:
     # Anthropic models (curated list — no /models endpoint)
     if provider == "anthropic" and api_key:
         remote_models.extend([
-            {"id": "claude-sonnet-4-6", "label": "Claude Sonnet 4.6", "size_hint": "anthropic", "provider": "anthropic"},
-            {"id": "claude-haiku-4-5-20251001", "label": "Claude Haiku 4.5", "size_hint": "anthropic", "provider": "anthropic"},
+            {"id": "claude-sonnet-4-6", "label": "Claude Sonnet 4.6", "size_hint": "anthropic", "provider": "anthropic", "vision_capable": False},
+            {"id": "claude-haiku-4-5-20251001", "label": "Claude Haiku 4.5", "size_hint": "anthropic", "provider": "anthropic", "vision_capable": False},
         ])
 
     return local_models + remote_models
@@ -1613,9 +1620,58 @@ def get_model_dir() -> str:
     return d
 
 
+_OPENAI_CHAT_FIELDS = frozenset({
+    "messages",
+    "model",
+    "max_tokens",
+    "max_completion_tokens",
+    "temperature",
+    "top_p",
+    "n",
+    "stream",
+    "stream_options",
+    "stop",
+    "presence_penalty",
+    "frequency_penalty",
+    "logit_bias",
+    "logprobs",
+    "top_logprobs",
+    "seed",
+    "response_format",
+    "tools",
+    "tool_choice",
+    "user",
+})
+
+
+def _finalize_payload(payload: dict) -> dict:
+    """Copy a request into the standard OpenAI-compatible transport shape.
+
+    Local llama-server accepts native cache, sampler, template, and thinking
+    extensions, so its payload remains untouched. Remote and OpenAI endpoints
+    receive only standard chat-completion fields plus the selected model.
+    Anthropic requests use their separate native payload builders. Preserving
+    multimodal message structure here is transport normalization only; remote
+    and OpenAI provider loading remains text-only until separately implemented.
+    """
+
+    if _provider not in ("remote", "openai"):
+        return payload
+    prepared = {
+        key: value
+        for key, value in payload.items()
+        if key in _OPENAI_CHAT_FIELDS
+    }
+    prepared["model"] = _model_id
+    return prepared
+
+
 def _server_url() -> str:
-    if _provider in ("remote", "openai") and _remote_url:
-        return _remote_url.rstrip("/")
+    configured_url = str(_remote_url or "").strip().rstrip("/")
+    if _provider == "openai":
+        return configured_url or "https://api.openai.com"
+    if _provider == "remote" and configured_url:
+        return configured_url
     return f"http://127.0.0.1:{_server_port}"
 
 
@@ -3846,7 +3902,8 @@ def load_model(
     global _runtime_request_started_at, _runtime_request_finished_at
     global _runtime_abort_requested_at, _runtime_last_release
 
-    provider = str(provider or "local").lower()
+    provider = str(provider or "local").strip().lower()
+    remote_url = str(remote_url or "").strip().rstrip("/")
     if cpu_coexistence and provider != "local":
         raise ValueError("CPU coexistence is available only for local LLMs")
     local_path_key = (
@@ -3861,7 +3918,7 @@ def load_model(
     # Handle remote/API providers — no subprocess needed
     if provider in ("remote", "openai", "anthropic"):
         load_key = (
-            provider, model_id, provider, remote_url.rstrip("/"),
+            provider, model_id, provider, remote_url,
             credential_key, "", "",
         )
         with _lock:
@@ -4472,6 +4529,18 @@ def _diagnose_llm_request_failure(exc: Exception) -> "RuntimeError":
     return RuntimeError(f"LLM request failed: {exc}")
 
 
+def _log_provider_output_summary(label: str, output: str) -> None:
+    """Log successful provider output metadata without exposing its content."""
+    length = len(output) if isinstance(output, str) else 0
+    print(f"[LLM] {label}: {length} chars received")
+
+
+def _log_provider_input_summary(label: str, content: str) -> None:
+    """Log provider input metadata without exposing prompt or transcript text."""
+    length = len(content) if isinstance(content, str) else 0
+    print(f"[LLM] {label}: {length} chars prepared")
+
+
 def _unload_inner():
     global _runtime_phase, _runtime_last_release
     _cancel_idle_timer()
@@ -4728,7 +4797,7 @@ def generate_chat(
                 _cancellation_checkpoint(cancel_handle)
                 response = requests.post(
                     f"{_server_url()}/v1/chat/completions",
-                    json=attempt_payload,
+                    json=_finalize_payload(attempt_payload),
                     headers=_api_headers(),
                     timeout=(10, 600),
                     stream=True,
@@ -4855,7 +4924,7 @@ def generate_chat(
             _cancellation_checkpoint(cancel_handle)
             response = requests.post(
                 f"{_server_url()}/v1/chat/completions",
-                json=payload,
+                json=_finalize_payload(payload),
                 headers=_api_headers(),
                 timeout=(10, 600),
                 stream=True,
@@ -5072,7 +5141,7 @@ def generate(
             _cancellation_checkpoint(cancel_handle)
             resp = requests.post(
                 f"{_server_url()}/v1/chat/completions",
-                json=attempt_payload,
+                json=_finalize_payload(attempt_payload),
                 headers=_api_headers(),
                 # (connect, read): fail fast if the server socket is gone;
                 # allow a long read for actual generation.
@@ -5362,7 +5431,7 @@ def generate_streaming(
             _cancellation_checkpoint(cancel_handle)
             resp = requests.post(
                 f"{_server_url()}/v1/chat/completions",
-                json=attempt_payload,
+                json=_finalize_payload(attempt_payload),
                 headers=_api_headers(),
                 timeout=(10, 600),
                 stream=True,
@@ -8338,7 +8407,7 @@ def classify_song_sections(
     if not transcript_text:
         return {"labels": fallback_labels, "song_structure": []}
 
-    print(f"[Classification] Transcript ({len(transcript_text.splitlines())} lines):\n{transcript_text}")
+    _log_provider_input_summary("Classification transcript", transcript_text)
 
     # --- Primary: repetition-based classification ---
     rep_structure = _classify_by_repetition(lyrics, duration)
@@ -8401,7 +8470,7 @@ def classify_song_sections(
         cancel_handle=cancel_handle,
     )
 
-    print(f"[LLM] Raw classification output:\n{raw}")
+    _log_provider_output_summary("Classification output", raw)
 
     llm_sections = []
     for line in raw.split("\n"):
@@ -9009,7 +9078,7 @@ def plan_clip_prompts_and_images(
 
         print(f"[LLM] --- Batch clips {batch_start + 1}-{batch_start + batch_size} ({prompt_type}) ---")
         print(f"[LLM] Token budget: {tokens_for_batch} content + {thinking_budget} thinking")
-        print(f"[LLM] User prompt:\n{user_prompt}")
+        _log_provider_input_summary("Batch prompt", user_prompt)
 
         raw = generate(
             prompt=user_prompt,
@@ -9026,7 +9095,7 @@ def plan_clip_prompts_and_images(
             cancel_handle=cancel_handle,
         )
 
-        print(f"[LLM] Output:\n{raw}")
+        _log_provider_output_summary("Batch output", raw)
 
         if prompt_type in ("image", "video"):
             # Parse simple numbered list: "1. prompt" or "1) prompt"
@@ -9456,7 +9525,7 @@ def plan_short_film_prompts(
 
     thinking_budget = 8192
     print(f"[LLM] Token budget: {tokens_for_batch} content + {thinking_budget} thinking")
-    print(f"[LLM] User prompt:\n{user_prompt}")
+    _log_provider_input_summary("Short-film prompt", user_prompt)
 
     raw = generate(
         prompt=user_prompt,
@@ -9473,7 +9542,7 @@ def plan_short_film_prompts(
         cancel_handle=cancel_handle,
     )
 
-    print(f"[LLM] Output:\n{raw}")
+    _log_provider_output_summary("Short-film prompt output", raw)
 
     if prompt_type in ("image", "video"):
         prompts_list: list = []
@@ -9799,7 +9868,7 @@ def plan_short_film_from_story(
     )
 
     print(f"[LLM] Planning short film from story: {target_scenes} scenes, {target_duration}s")
-    print(f"[LLM] Story: {story_description}")
+    _log_provider_input_summary("Story", story_description)
     print(f"[LLM] Token budget: {target_scenes * 400 + 256} content + 8192 thinking = {target_scenes * 400 + 256 + 8192} total")
 
     # Scale tokens to scene count — each scene needs ~200 tokens of JSON
@@ -9826,7 +9895,7 @@ def plan_short_film_from_story(
     )
 
     _cancellation_checkpoint(cancel_handle)
-    print(f"[LLM] Story plan output:\n{raw}")
+    _log_provider_output_summary("Story-plan output", raw)
 
     # ── Parse JSON response ───────────────────────────────────────
     cleaned = raw.strip()
@@ -9962,7 +10031,7 @@ def plan_short_film_from_story(
             progress_callback=progress_callback,
             cancel_handle=cancel_handle,
         )
-        print(f"[LLM] Rewrite output:\n{rewrite_raw}")
+        _log_provider_output_summary("Rewrite output", rewrite_raw)
 
         # Parse rewritten prompts and apply them
         for line in rewrite_raw.strip().split("\n"):

@@ -449,8 +449,8 @@ class ResearchLaunchApiContracts(unittest.TestCase):
             self.assertEqual(stamped.headers["Cache-Control"], "private, no-store")
             self.assertEqual(stamped.headers["Pragma"], "no-cache")
         self.assertLess(
-            LAUNCH.index("api.add_middleware(\n    CORSMiddleware"),
-            LAUNCH.index('@api.middleware("http")'),
+            LAUNCH.index("async def _exact_runtime_cors_middleware"),
+            LAUNCH.index("async def _maestro_session_middleware"),
         )
 
     def test_routes_are_local_controls_and_client_payload_cannot_choose_scope(self):

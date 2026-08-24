@@ -2361,6 +2361,13 @@ class TestMultiPersonRecast(unittest.TestCase):
                 handle.write(b"joined")
             return True
 
+        def enforce_deferred_audio(job, output_path):
+            calls["audio_safety"] = (job["id"], output_path)
+            return None
+
+        class FixtureGenerationStageFailure(RuntimeError):
+            pass
+
         with tempfile.TemporaryDirectory() as outer:
             shot_dir = tempfile.mkdtemp(
                 prefix="maestro-repaint-shots-",
@@ -2438,7 +2445,15 @@ class TestMultiPersonRecast(unittest.TestCase):
                     "_recast_video_has_audio": lambda _path: True,
                     "_recast_video_frame_count": lambda _path: 48,
                     "_write_repaint_shot_aware_sidecar": (
-                        lambda *_args: calls.setdefault("sidecar", True)
+                        lambda *_args, **_kwargs: calls.setdefault(
+                            "sidecar", True
+                        )
+                    ),
+                    "_enforce_deferred_h3_final_audio": (
+                        enforce_deferred_audio
+                    ),
+                    "_GenerationStageFailure": (
+                        FixtureGenerationStageFailure
                     ),
                     "wgp": fake_wgp,
                 },
@@ -2453,6 +2468,10 @@ class TestMultiPersonRecast(unittest.TestCase):
             self.assertEqual(concat[3]["audio_duration_sec"], 2.0)
             self.assertTrue(concat[3]["pad_audio"])
             self.assertEqual(calls["finish"][0], "completed")
+            self.assertEqual(
+                calls["audio_safety"],
+                ("paint", concat[1]),
+            )
             self.assertTrue(calls["sidecar"])
             self.assertFalse(os.path.exists(shot_dir))
             self.assertTrue(

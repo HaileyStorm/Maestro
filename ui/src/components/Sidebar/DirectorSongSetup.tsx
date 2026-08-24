@@ -32,7 +32,8 @@ export function DirectorSongSetup() {
     ? musicModel
     : (musicModels[0]?.model_type || '')
   const selectedModel = musicModels.find(model => model.model_type === effectiveModel)
-  const isMusic3 = selectedModel?.architecture === 'minimax_music3'
+  const isMusic3 = selectedModel?.model_type === 'minimax_music3'
+  const executionUnavailable = selectedModel?.execution_allowed === false
   const maximumDuration = isMusic3 ? 300 : 360
 
   useEffect(() => {
@@ -75,8 +76,8 @@ export function DirectorSongSetup() {
               className="w-full bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-xs text-text-primary focus:outline-none focus:border-accent-blue"
             >
               {musicModels.map(model => (
-                <option key={model.model_type} value={model.model_type}>
-                  {model.name}
+                <option key={model.model_type} value={model.model_type} disabled={model.execution_allowed === false && model.model_type !== effectiveModel}>
+                  {model.name}{model.execution_allowed === false ? ' · authoring only' : ''}
                 </option>
               ))}
             </select>
@@ -84,6 +85,7 @@ export function DirectorSongSetup() {
               {selectedModel?.selector_help || selectedModel?.description}
               {selectedModel?.is_downloaded === false ? ' Downloads on first use.' : ''}
             </p>
+            {executionUnavailable && <p role="status" className="mt-1 text-[10px] leading-snug text-amber-300">Song setup is available for authoring and handoff, but this model is not executable on the current host yet.</p>}
           </>
         ) : (
           <p className="text-[10px] text-amber-400 leading-snug">
@@ -111,7 +113,7 @@ export function DirectorSongSetup() {
       <p className="text-[10px] text-text-muted leading-snug">
         Describe your music video in the box below and hit Generate — the song
         {instrumental ? '' : ' + lyrics'} is written for you, then the full video is
-        produced with {isMusic3 ? 'MiniMax-Music3' : 'ACE-Step'}. For hands-on
+        {executionUnavailable ? 'prepared for a later executable Music3 runtime' : `produced with ${isMusic3 ? 'MiniMax-Music3' : 'ACE-Step'}`}. For hands-on
         control of style and lyrics, use Studio → Audio → Music.
       </p>
     </div>

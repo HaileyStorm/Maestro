@@ -52,6 +52,7 @@ class modelsManagerPlugin(WAN2GPPlugin):
         self.request_global("get_model_recursive_prop")
         self.request_global("get_model_filename")
         self.request_global("get_local_model_filename")
+        self.request_global("get_compatible_local_model_filename")
         self.request_global("get_lora_dir")
         self.request_global("compact_name")
         self.request_global("create_models_hierarchy")
@@ -779,9 +780,10 @@ class modelsManagerPlugin(WAN2GPPlugin):
             get_model_family=self.get_model_family,
             get_model_name=self.get_model_name,
             get_transformer_dtype=self.get_transformer_dtype,
+            get_compatible_local_model_filename=self.get_compatible_local_model_filename,
         )
 
-    def _resolve_expected_entry_path(self, entry):
+    def _resolve_expected_entry_path(self, entry, model_type):
         if not isinstance(entry, dict):
             return None
         local_path = entry.get("path", None)
@@ -789,7 +791,13 @@ class modelsManagerPlugin(WAN2GPPlugin):
             return self._normalize_path(local_path)
         filename = entry.get("filename", "")
         extra_paths = entry.get("extra_paths", None)
-        return self._resolve_path(filename, force_folder=extra_paths)
+        file_type = entry.get("file_type", None)
+        return self._resolve_path(
+            filename,
+            force_folder=extra_paths,
+            model_type=model_type,
+            file_type=file_type,
+        )
 
     def _collect_expected_missing_files(self, model_type):
         deps = self._build_dropdown_deps([model_type])
@@ -814,7 +822,7 @@ class modelsManagerPlugin(WAN2GPPlugin):
                 self._errors.append(f"Missing handler file check failed for {model_type}: {exc}")
 
         for entry in expected_entries:
-            resolved_path = self._resolve_expected_entry_path(entry)
+            resolved_path = self._resolve_expected_entry_path(entry, model_type)
             if resolved_path and not os.path.isfile(resolved_path):
                 missing_paths.add(resolved_path)
         return missing_paths
@@ -1190,7 +1198,7 @@ class modelsManagerPlugin(WAN2GPPlugin):
                         URLs=urls,
                     )
                 if filename:
-                    self._add_file(files, filename)
+                    self._add_file(files, filename, model_type=model_type, file_type=1)
         elif isinstance(module, list):
             filename = ""
             if token_match and is_exotic:
@@ -1203,7 +1211,7 @@ class modelsManagerPlugin(WAN2GPPlugin):
                     URLs=module,
                 )
             if filename:
-                self._add_file(files, filename)
+                self._add_file(files, filename, model_type=model_type, file_type=1)
         else:
             filename = ""
             if token_match and is_exotic:
@@ -1234,7 +1242,7 @@ class modelsManagerPlugin(WAN2GPPlugin):
                 except Exception:
                     filename = ""
             if filename:
-                self._add_file(files, filename)
+                self._add_file(files, filename, model_type=model_type, file_type=1)
         return files
 
     def _collect_transformer_choice_lists(self, model_type, model_def):
@@ -1312,8 +1320,8 @@ class modelsManagerPlugin(WAN2GPPlugin):
                 dtype_policy=dtype_policy,
             )
         if model_filename:
-            self._add_file(files, model_filename)
-            primary_path = self._resolve_path(model_filename)
+            self._add_file(files, model_filename, model_type=model_type, file_type=0)
+            primary_path = self._resolve_path(model_filename, model_type=model_type, file_type=0)
             if primary_path and primary_path in files:
                 primary_paths.append(primary_path)
 
@@ -1332,8 +1340,8 @@ class modelsManagerPlugin(WAN2GPPlugin):
                     submodel_no=2,
                 )
             if model_filename2:
-                self._add_file(files, model_filename2)
-                primary_path2 = self._resolve_path(model_filename2)
+                self._add_file(files, model_filename2, model_type=model_type, file_type=0)
+                primary_path2 = self._resolve_path(model_filename2, model_type=model_type, file_type=0)
                 if primary_path2 and primary_path2 in files:
                     primary_paths.append(primary_path2)
 
@@ -1355,7 +1363,7 @@ class modelsManagerPlugin(WAN2GPPlugin):
                             URLs=urls1,
                         )
                     if filename:
-                        self._add_file(files, filename)
+                        self._add_file(files, filename, model_type=model_type, file_type=1)
                 if urls2 and not has_module_source2:
                     filename = ""
                     if token_match and is_exotic:
@@ -1368,7 +1376,7 @@ class modelsManagerPlugin(WAN2GPPlugin):
                             URLs=urls2,
                         )
                     if filename:
-                        self._add_file(files, filename)
+                        self._add_file(files, filename, model_type=model_type, file_type=1)
             elif isinstance(module, list):
                 if has_module_source:
                     continue
@@ -1383,7 +1391,7 @@ class modelsManagerPlugin(WAN2GPPlugin):
                         URLs=module,
                     )
                 if filename:
-                    self._add_file(files, filename)
+                    self._add_file(files, filename, model_type=model_type, file_type=1)
             else:
                 if has_module_source:
                     continue
@@ -1417,7 +1425,7 @@ class modelsManagerPlugin(WAN2GPPlugin):
                 except Exception:
                     filename = ""
                 if filename:
-                    self._add_file(files, filename)
+                    self._add_file(files, filename, model_type=model_type, file_type=1)
 
         return files, primary_paths
 
@@ -1449,7 +1457,11 @@ class modelsManagerPlugin(WAN2GPPlugin):
                         continue
                     files = set()
                     self._add_file(
-                        files, filename, force_folder=text_encoder_folder
+                        files,
+                        filename,
+                        force_folder=text_encoder_folder,
+                        model_type=model_type,
+                        file_type=2,
                     )
                     if not files:
                         continue
@@ -1494,7 +1506,11 @@ class modelsManagerPlugin(WAN2GPPlugin):
                         continue
                     files = set()
                     self._add_file(
-                        files, filename, force_folder=text_encoder_folder
+                        files,
+                        filename,
+                        force_folder=text_encoder_folder,
+                        model_type=model_type,
+                        file_type=2,
                     )
                     if not files:
                         continue
@@ -1534,7 +1550,11 @@ class modelsManagerPlugin(WAN2GPPlugin):
                         continue
                     files = set()
                     self._add_file(
-                        files, filename, force_folder=text_encoder_folder
+                        files,
+                        filename,
+                        force_folder=text_encoder_folder,
+                        model_type=model_type,
+                        file_type=2,
                     )
                     if not files:
                         continue
@@ -1922,7 +1942,13 @@ class modelsManagerPlugin(WAN2GPPlugin):
                 except Exception:
                     text_encoder_filename = None
         if text_encoder_filename:
-            self._add_file(files, text_encoder_filename, force_folder=text_encoder_folder)
+            self._add_file(
+                files,
+                text_encoder_filename,
+                force_folder=text_encoder_folder,
+                model_type=model_type,
+                file_type=2,
+            )
         return files
 
     def _collect_handler_file_paths(self, model_type, model_def):
@@ -2903,8 +2929,20 @@ class modelsManagerPlugin(WAN2GPPlugin):
             return ["UNC"] + parts
         return parts
 
-    def _add_file(self, files_set, value, force_folder=None):
-        path = self._resolve_path(value, force_folder=force_folder)
+    def _add_file(
+        self,
+        files_set,
+        value,
+        force_folder=None,
+        model_type=None,
+        file_type=None,
+    ):
+        path = self._resolve_path(
+            value,
+            force_folder=force_folder,
+            model_type=model_type,
+            file_type=file_type,
+        )
         if path and os.path.isfile(path):
             files_set.add(path)
 
@@ -2932,7 +2970,13 @@ class modelsManagerPlugin(WAN2GPPlugin):
             return self._normalize_path(os.path.join(self._repo_root, rel_norm))
         return None
 
-    def _resolve_path(self, value, force_folder=None):
+    def _resolve_path(
+        self,
+        value,
+        force_folder=None,
+        model_type=None,
+        file_type=None,
+    ):
         if not value:
             return None
         if not isinstance(value, str):
@@ -2948,7 +2992,17 @@ class modelsManagerPlugin(WAN2GPPlugin):
             return repo_rel
 
         try:
-            local_path = self.get_local_model_filename(value, extra_paths=force_folder)
+            if model_type is not None and file_type in (0, 2):
+                local_path = self.get_compatible_local_model_filename(
+                    value,
+                    model_type,
+                    file_type=file_type,
+                    extra_paths=force_folder,
+                )
+            else:
+                local_path = self.get_local_model_filename(
+                    value, extra_paths=force_folder
+                )
         except Exception:
             local_path = None
         if local_path:

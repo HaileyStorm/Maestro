@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import os
 import sys
 import threading
@@ -655,6 +656,11 @@ class TestCPUTextLane(unittest.TestCase):
             item for item in module.body
             if isinstance(item, ast.FunctionDef) and item.name == "_run_generation"
         )
+
+        @contextlib.contextmanager
+        def native_gpu_slot(acquired, **_kwargs):
+            yield acquired
+
         for failed_transition in ("queue_register", "start"):
             with self.subTest(failed_transition=failed_transition):
                 _reset_queue_state_for_tests()
@@ -689,10 +695,15 @@ class TestCPUTextLane(unittest.TestCase):
                     "CreditRuntimeError": ValueError,
                     "EntitlementError": ValueError,
                     "_credit_block_runtime_error": lambda _job: None,
+                    "_queue_recovery_delivery_pending": lambda _job: None,
+                    "_h3_job_model_types": lambda _job: (),
+                    "_require_h3_legal_execution": lambda _models: None,
                     "_stamp_requested_generation_residency": (
                         lambda _job, replace=False: None
                     ),
                     "generation_slot": generation_slot,
+                    "_WgpNativeGpuExecutionSlot": native_gpu_slot,
+                    "_SAMPLE_CAMPAIGN_JOB_KIND": "sample_campaign_generation",
                     "try_start": try_start,
                     "_active_gen_states": {},
                     "_restore_base_coefficient": lambda: None,

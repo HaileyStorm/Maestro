@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Menu, Settings } from 'lucide-react'
+import { Menu } from 'lucide-react'
 import { Sidebar } from './components/Sidebar/Sidebar'
 import { MainContent } from './components/MainContent/MainContent'
 import { SettingsDrawer } from './components/SettingsDrawer/SettingsDrawer'
@@ -19,7 +19,7 @@ import { GlobalQueuePopover } from './components/GlobalQueuePopover'
 import { useStore } from './stores/useStore'
 import { useIsMobile } from './lib/useIsMobile'
 import { POLL_INTERVAL_MS, useVisibilityPolling } from './lib/useVisibilityPolling'
-import { PRODUCT_NAME, PRODUCT_NAME_VISUAL, PRODUCT_PROVENANCE } from './lib/branding'
+import { PRODUCT_NAME, PRODUCT_NAME_VISUAL } from './lib/branding'
 import * as api from './api/client'
 
 const BOOTSTRAP_TIMEOUT_MS = 15_000
@@ -103,8 +103,6 @@ function App() {
   const loadPipelineList = useStore(s => s.loadPipelineList)
   const toggleSidebar = useStore(s => s.toggleSidebar)
   const sidebarOpen = useStore(s => s.sidebarOpen)
-  const setSidebarOpen = useStore(s => s.setSidebarOpen)
-  const toggleSettings = useStore(s => s.toggleSettings)
   const llmLoading = useStore(s => s.llmLoading)
   const llmEnhancing = useStore(s => s.isEnhancing)
   const llmStatusLoading = useStore(s => s.llmStatus?.loading === true)
@@ -123,6 +121,15 @@ function App() {
   const accountAuthenticationRequired = accessContext?.accounts?.enabled === true
     && accessContext.account_project_access_active === true
     && accountContext?.authenticated !== true
+  const retryBootstrap = () => {
+    setBootstrapState('loading')
+    setBootstrapError('')
+    setBootstrapAttempt(value => value + 1)
+  }
+  const finishAccountRecovery = () => {
+    setAccountDrawerOpen(false)
+    retryBootstrap()
+  }
 
   useEffect(() => {
     const recoverAccess = (event: Event) => {
@@ -314,11 +321,7 @@ function App() {
             <div className="mt-4 flex flex-wrap justify-center gap-3">
               <button
                 type="button"
-                onClick={() => {
-                  setBootstrapState('loading')
-                  setBootstrapError('')
-                  setBootstrapAttempt(value => value + 1)
-                }}
+                onClick={retryBootstrap}
                 className="min-h-11 rounded-lg bg-accent-blue px-4 py-2 text-sm font-medium text-white hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
               >
                 Try again
@@ -336,7 +339,10 @@ function App() {
           )}
         </div>
         {(accountRecovery || projectRecovery) && (
-          <AccountSupportDrawer required={accountRecovery} />
+          <AccountSupportDrawer
+            required={accountRecovery}
+            onAuthenticated={accountRecovery ? finishAccountRecovery : undefined}
+          />
         )}
       </main>
     )
@@ -353,7 +359,7 @@ function App() {
     <div className="flex min-w-0 flex-col md:flex-row h-full w-full bg-bg-primary overflow-hidden">
       {/* Mobile header */}
       {isMobile && (
-        <header className="h-12 shrink-0 border-b border-border bg-bg-secondary px-4 flex items-center justify-between">
+        <header className="grid h-12 shrink-0 grid-cols-[2.75rem_minmax(0,1fr)_5.5rem] items-center border-b border-border bg-bg-secondary px-1 sm:px-2">
           {!remoteProjectRequired ? <button
             type="button"
             onClick={toggleSidebar}
@@ -363,29 +369,17 @@ function App() {
             aria-controls="maestro-mobile-sidebar"
           >
             <Menu aria-hidden="true" size={20} />
-          </button> : <span className="h-11 w-11 shrink-0" aria-hidden="true" />}
-          <div className="mx-1 flex min-w-0 items-center gap-2">
-            <img aria-hidden="true" src="/maestro.svg" alt="" className="h-7 w-7 shrink-0" />
+          </button> : <WhatsNewButton compact />}
+          <div className="flex min-w-0 items-center gap-2 px-2">
+            <img aria-hidden="true" src="/maestro.svg" alt="" className="h-6 w-6 shrink-0" />
             <div className="min-w-0">
-              <span className="sr-only">{PRODUCT_NAME}. {PRODUCT_PROVENANCE}</span>
-              <span aria-hidden="true" className="block truncate text-[11px] font-semibold leading-tight">{PRODUCT_NAME_VISUAL}</span>
-              <span aria-hidden="true" className="block truncate text-[8px] font-normal leading-tight text-text-muted">{PRODUCT_PROVENANCE}</span>
+              <span className="sr-only">{PRODUCT_NAME}</span>
+              <span aria-hidden="true" className="block truncate text-[11px] font-semibold leading-tight tracking-tight">{PRODUCT_NAME_VISUAL}</span>
             </div>
-            <WhatsNewButton compact />
           </div>
-          <div className="flex items-center gap-1">
+          <div className="flex items-center justify-self-end">
             <GlobalQueuePopover iconSize={20} panelAlign="header-edge" />
             <AccountSupportButton compact />
-            {machineControls ? (
-              <button
-                type="button"
-                onClick={() => { setSidebarOpen(false); toggleSettings() }}
-                className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
-                aria-label="Open machine settings"
-              >
-                <Settings aria-hidden="true" size={20} />
-              </button>
-            ) : <span className="h-11 w-11 shrink-0" aria-hidden="true" />}
           </div>
         </header>
       )}

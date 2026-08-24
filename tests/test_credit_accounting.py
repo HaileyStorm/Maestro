@@ -170,6 +170,26 @@ class CreditAccountingJournalTests(unittest.TestCase):
             as_of=at,
         )
 
+    def settle(
+        self,
+        index: int,
+        op: int,
+        terminal_status: str,
+        server_billable_units: int | None,
+        *,
+        at="2026-08-11T10:03:00Z",
+        expected_revision: int = 2,
+    ):
+        return self.enabled.settle(
+            account_key=ACCOUNT,
+            reservation_id=reservation(index),
+            operation_id=operation(op),
+            terminal_status=terminal_status,
+            server_billable_units=server_billable_units,
+            expected_revision=expected_revision,
+            as_of=at,
+        )
+
     def test_default_is_hard_off_and_does_not_create_state(self):
         disabled = CreditAccountingJournal(self.path, integrity_key=SECRET)
         reconciled = disabled.reconcile(
@@ -352,6 +372,127 @@ class CreditAccountingJournalTests(unittest.TestCase):
         self.assertFalse(consumed.fully_funded)
         self.assertTrue(consumed.allocation_satisfied)
         self.assertFalse(consumed.terminal_satisfied)
+
+    def test_terminal_settlement_refunds_failure_and_bounds_cancelled_use(self):
+        self.reconcile([CreditSourceBalance(SOURCE_A, 40)])
+
+        self.reserve(1, 10)
+        self.transition("consume", 1, 30)
+        failed = self.settle(1, 31, "failed", None)
+        self.assertEqual(
+            (
+                failed.reservation_status,
+                failed.affected_units,
+                failed.reservation_revision,
+                failed.allocation_satisfied,
+                failed.terminal_satisfied,
+            ),
+            ("settled", 0, 3, False, True),
+        )
+        self.assertEqual(
+            self.enabled.public_projection(ACCOUNT)["consumed_units"], 0,
+        )
+
+        self.reserve(2, 10)
+        self.transition("consume", 2, 32)
+        cancelled = self.settle(2, 33, "cancelled", 4)
+        self.assertEqual(cancelled.affected_units, 4)
+        self.assertEqual(
+            self.settle(
+                2, 33, "cancelled", 9,
+                at="2026-08-11T10:04:00Z",
+            ),
+            cancelled,
+        )
+        self.assertEqual(
+            self.enabled.public_projection(ACCOUNT)["consumed_units"], 4,
+        )
+
+        self.reserve(3, 10)
+        self.transition("consume", 3, 34)
+        capped = self.settle(3, 35, "cancelled", 99)
+        self.assertEqual(capped.affected_units, 10)
+        self.assertEqual(
+            self.enabled.public_projection(ACCOUNT)["consumed_units"], 14,
+        )
+
+    def test_success_settlement_and_legacy_receipts_survive_restart_replay(self):
+        self.reconcile([CreditSourceBalance(SOURCE_A, 10)])
+        self.reserve(1, 10)
+        consumed = self.transition("consume", 1, 30)
+        before = json.loads(self.path.read_text(encoding="utf-8"))["state"][
+            "operations"
+        ][operation(30)]["receipt"]
+
+        settled = self.settle(1, 31, "completed", None)
+        self.assertEqual(settled.reservation_status, "settled")
+        self.assertEqual(settled.affected_units, 10)
+        self.assertTrue(settled.terminal_satisfied)
+        self.assertEqual(
+            self.enabled.public_projection(ACCOUNT)["consumed_units"], 10,
+        )
+
+        restarted = CreditAccountingJournal(
+            self.path,
+            integrity_key=SECRET,
+            policy=CreditAccountingPolicy(enforcement_enabled=True),
+        )
+        replayed_settlement = restarted.settle(
+            account_key=ACCOUNT,
+            reservation_id=reservation(1),
+            operation_id=operation(31),
+            terminal_status="completed",
+            server_billable_units=None,
+            expected_revision=2,
+            as_of="2026-08-11T10:09:00Z",
+        )
+        self.assertEqual(replayed_settlement, settled)
+        with self.assertRaises(CreditAccountingConflict):
+            restarted.settle(
+                account_key=ACCOUNT,
+                reservation_id=reservation(1),
+                operation_id=operation(31),
+                terminal_status="cancelled",
+                server_billable_units=0,
+                expected_revision=2,
+                as_of="2026-08-11T10:09:00Z",
+            )
+        replayed_consume = restarted.consume(
+            account_key=ACCOUNT,
+            reservation_id=reservation(1),
+            operation_id=operation(30),
+            expected_revision=1,
+            as_of="2026-08-11T10:02:00Z",
+        )
+        self.assertEqual(replayed_consume, consumed)
+        after = json.loads(self.path.read_text(encoding="utf-8"))["state"][
+            "operations"
+        ][operation(30)]["receipt"]
+        self.assertEqual(after, before)
+
+    def test_cancel_settlement_refunds_the_exact_lot_remainder(self):
+        self.reconcile([
+            CreditSourceBalance(
+                SOURCE_A, 13, "2026-08-11T12:00:00Z",
+            ),
+            CreditSourceBalance(
+                SOURCE_B, 7, "2026-08-11T11:00:00Z",
+            ),
+        ])
+        self.reserve(1, 20)
+        self.transition("consume", 1, 30)
+        settled = self.settle(1, 31, "cancelled", 8)
+        self.assertEqual(settled.affected_units, 8)
+        state = json.loads(self.path.read_text(encoding="utf-8"))["state"]
+        self.assertEqual(
+            state["accounts"][ACCOUNT]["reservations"][reservation(1)][
+                "allocations"
+            ],
+            [
+                {"source_key": SOURCE_B, "units": 7},
+                {"source_key": SOURCE_A, "units": 1},
+            ],
+        )
 
     def test_expired_consume_persists_clock_and_backdated_retry_stays_rejected(self):
         expiring = [
@@ -820,6 +961,26 @@ class CreditAccountingJournalTests(unittest.TestCase):
             "prompt", "job", "media", "output", "provider", "email", "name",
         ):
             self.assertNotIn(forbidden, encoded.lower())
+
+    def test_supporter_tier_bonus_is_an_opaque_non_monetary_source_lot(self):
+        supporter_bonus = "key_" + hashlib.sha256(
+            b"supporter-tier-bonus-grant",
+        ).hexdigest()
+        self.reconcile([
+            CreditSourceBalance(
+                supporter_bonus,
+                25,
+                "2026-09-11T10:00:00Z",
+            ),
+        ])
+        reserved = self.reserve(1, 20)
+        self.assertEqual(reserved.affected_units, 20)
+        encoded = self.path.read_text(encoding="utf-8").lower()
+        for forbidden in (
+            "amount_minor", "currency", "cash_value", "purchase",
+            "transferable", "refundable", "guaranteed_compute",
+        ):
+            self.assertNotIn(forbidden, encoded)
 
     def test_only_opaque_keyed_ids_and_integer_units_are_accepted(self):
         with self.assertRaises(CreditAccountingError):

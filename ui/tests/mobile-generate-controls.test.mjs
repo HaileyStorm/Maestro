@@ -100,14 +100,13 @@ function loadRenderedControls() {
 
 test('H3 duration controls retain planning callbacks and expose mobile targets', () => {
   const automatic = openingTag(duration, 'button', 'setLocked(!locked)')
-  const disclosure = openingTag(duration, 'button', 'setEvaluationOpen(value => !value)')
+  const disclosure = duration.match(/<summary[^>]*>Mode details<\/summary>/)?.[0]
+  assert.ok(disclosure, 'found native mode-details disclosure')
 
   assertMobileTarget(automatic, 'Automatic/Manual segment control')
   assert.match(automatic, /aria-pressed=\{locked\}/)
-  assertMobileTarget(disclosure, 'evaluated profile disclosure')
-  assert.match(disclosure, /aria-expanded=\{evaluationOpen\}/)
-  assert.match(disclosure, /aria-controls="h3-evaluated-profiles"/)
-  assert.match(duration, /id="h3-evaluated-profiles"/)
+  assertMobileTarget(disclosure, 'mode details disclosure')
+  assert.match(duration, /<details[^>]*>[\s\S]*<summary[^>]*>Mode details<\/summary>[\s\S]*FL2VA or Ref2VA[\s\S]*<\/details>/)
   assert.match(duration, /htmlFor="studio-duration-seconds"/)
   assert.match(duration, /id="studio-duration-seconds"/)
   assert.match(duration, /htmlFor="studio-window-seconds"/)
@@ -122,7 +121,6 @@ test('H3 duration controls retain planning callbacks and expose mobile targets',
   assert.match(duration, /Match each shot to its references automatically/)
   assert.match(duration, /appears on its card immediately[\s\S]*pause briefly for plan review[\s\S]*continue automatically if you leave the plan unchanged and accept any required model terms/)
   assert.match(duration, /Mode details[\s\S]*FL2VA or Ref2VA/)
-  assert.match(duration, /technical comparison profiles/)
 })
 
 test('performance profile and resolution selection remain exact at compact and narrow widths', () => {
@@ -132,7 +130,7 @@ test('performance profile and resolution selection remain exact at compact and n
   assert.match(profileSelect, /onChange=\{event => \{/)
   assert.match(profiles, /void applyProfile\(event\.target\.value as H3PerformanceProfileId\)/)
 
-  const nativeResolution = openingTag(resolution, 'select', 'value={resolution}')
+  const nativeResolution = openingTag(resolution, 'select', 'value={normalizedResolution}')
   assertMobileTarget(nativeResolution, 'H3 resolution select')
   assert.match(nativeResolution, /onChange=\{event => setH3NativeResolution\(event\.target\.value\)\}/)
   assert.match(resolution, /Loading supported creation sizes/)
@@ -152,24 +150,34 @@ test('performance profile and resolution selection remain exact at compact and n
 })
 
 test('creative-guide provenance and prompt-writing actions are reachable without changing request semantics', () => {
-  const workflowSelect = openingTag(prompt, 'select', 'value={selection}')
+  const workflowCard = openingTag(prompt, 'button', 'data-workflow-id={style.id}')
+  const surprise = openingTag(prompt, 'button', 'onClick={chooseSurprise}')
+  const clear = openingTag(prompt, 'button', "onClick={() => setSelection('')}")
   const workflowSource = openingTag(prompt, 'a', 'href={catalog.source}')
-  const enhance = openingTag(prompt, 'button', 'onClick={() => enhancePrompt()}')
+  const enhance = openingTag(prompt, 'button', 'onClick={runEnhancement}')
 
-  assertMobileTarget(workflowSelect, 'creative guide select')
-  assert.match(workflowSelect, /onChange=\{event => setSelection\(event\.target\.value\)\}/)
+  assertMobileTarget(workflowCard, 'creative guide card')
+  assert.match(workflowCard, /aria-pressed=\{isSelected\}/)
+  assert.match(workflowCard, /onClick=\{\(\) => setSelection\(style\.id\)\}/)
+  assertMobileTarget(surprise, 'creative guide Surprise helper')
+  assert.match(surprise, /disabled=\{loading \|\| styles\.length === 0\}/)
+  assertMobileTarget(clear, 'creative guide Clear action')
+  assert.match(clear, /disabled=\{!selection\}/)
   assertMobileTarget(workflowSource, 'creative guide source')
   assert.match(workflowSource, /target="_blank"/)
   assert.match(workflowSource, /rel="noreferrer"/)
-  assert.match(prompt, /Creative guide/)
+  assert.match(prompt, /Creative guide jukebox/)
+  assert.match(prompt, /grid-cols-\[repeat\(auto-fit,minmax\(132px,1fr\)\)\]/)
+  assert.match(prompt, /max-h-\[28rem\].*overflow-y-auto/)
+  assert.match(prompt, /Workflow ID: \{style\.id\}/)
+  assert.match(prompt, /<span aria-hidden="true">✓<\/span> Selected/)
+  assert.match(prompt, /No guide selected · prompt only/)
   assert.match(prompt, /Choose an optional guide for pacing, framing, and finish/)
   assert.match(prompt, /Source details[\s\S]*MiniMax H3 recipe library/)
-  assert.match(prompt, /Writing assistant/)
   assertMobileTarget(enhance, 'prompt improvement button')
+  assert.match(prompt, /const runEnhancement = \(\) => \{\s*requestQueueView\(\)\s*void enhancePrompt\(\)\s*\}/)
   assert.match(enhance, /aria-label="Improve prompt"/)
   assert.match(prompt, /aria-label="Choose writing mode"/)
-  assert.match(prompt, /Working on your prompt/)
-  assert.match(prompt, /Writing your revision/)
   assert.match(prompt, /Improve before Generate/)
   assert.match(prompt, /Single speaker, more detailed/)
   assert.match(prompt, /More detailed and creative/)
@@ -295,4 +303,34 @@ test('rendered narrow controls expose non-overflowing estimate and exact preset 
   assert.equal(buttons.length, 5)
   assert.equal(buttons.filter(button => button.props['aria-pressed'] === true).length, 1)
   assert.ok(buttons.every(button => /mobile-control-target/.test(button.props.className)))
+})
+
+test('H3 resolution control survives model options arriving before resolution hydration', async t => {
+  const { ResolutionPresets } = await loadRenderedControls()
+  const previousStore = globalThis.__maestroMobileGenerateStore
+  t.after(() => { globalThis.__maestroMobileGenerateStore = previousStore })
+  globalThis.__maestroMobileGenerateStore = {
+    resolutionPreset: 'high',
+    setResolutionPreset() {},
+    params: {
+      resolution: undefined,
+      model_type: 'minimax_h3',
+      delivery_resolution: '',
+      delivery_fit: '',
+    },
+    modelOptions: {
+      model_type: 'minimax_h3',
+      resolutions: [{ value: '1344x768' }, { value: '960x544' }],
+    },
+    generationMode: 'video',
+    spatialUpsampling: 'none',
+    setH3NativeResolution() {},
+  }
+
+  let tree
+  assert.doesNotThrow(() => { tree = ResolutionPresets() })
+  const select = flattenElements(tree).find(node => node.type === 'select')
+  assert.equal(select?.props.value, '')
+  const options = flattenElements(tree).filter(node => node.type === 'option')
+  assert.equal(options[0]?.props.children, 'Choose a supported size')
 })

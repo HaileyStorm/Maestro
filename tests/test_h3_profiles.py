@@ -12,8 +12,11 @@ if str(APP) not in sys.path:
 
 from services.h3_profiles import (  # noqa: E402
     DEFAULT_H3_PROFILE_ID,
+    NON_OWNER_DEFAULT_H3_PROFILE_ID,
+    OWNER_DEFAULT_H3_PROFILE_ID,
     build_profile_options,
     default_profile_settings,
+    fresh_profile_id_for_account_role,
     profile_definitions,
     profile_settings,
 )
@@ -21,12 +24,14 @@ from services.h3_profiles import (  # noqa: E402
 class H3ProfileTests(unittest.TestCase):
     def test_high_is_the_single_fresh_default_bundle(self):
         self.assertEqual(DEFAULT_H3_PROFILE_ID, "high")
+        self.assertEqual(OWNER_DEFAULT_H3_PROFILE_ID, "high")
+        self.assertEqual(NON_OWNER_DEFAULT_H3_PROFILE_ID, "quality")
         settings = default_profile_settings("minimax_h3_ref2va")
         self.assertEqual(
             settings,
             {
                 "model_type": "minimax_h3_ref2va",
-                "num_inference_steps": 20,
+                "num_inference_steps": 28,
                 "resolution": "1344x768",
                 "custom_settings": {"h3_attention_engine": "sol_attn"},
                 "tea_cache": 0,
@@ -38,6 +43,12 @@ class H3ProfileTests(unittest.TestCase):
                 "delivery_fit": "",
             },
         )
+
+    def test_fresh_default_is_high_for_owner_and_quality_for_non_owner(self):
+        self.assertEqual(fresh_profile_id_for_account_role("owner"), "high")
+        self.assertEqual(fresh_profile_id_for_account_role("user"), "quality")
+        self.assertEqual(fresh_profile_id_for_account_role(None), "high")
+        self.assertEqual(fresh_profile_id_for_account_role(""), "high")
 
     def test_profile_contract_matches_curated_settings(self):
         definitions = profile_definitions()
@@ -60,11 +71,11 @@ class H3ProfileTests(unittest.TestCase):
         )
         self.assertEqual(
             (profiles["quality"]["attention_engine"], profiles["quality"]["num_inference_steps"], profiles["quality"]["resolution"]),
-            ("sol_attn", 20, "960x544"),
+            ("sol_attn", 23, "960x544"),
         )
         self.assertEqual(
             (profiles["high"]["attention_engine"], profiles["high"]["num_inference_steps"], profiles["high"]["resolution"]),
-            ("sol_attn", 20, "1344x768"),
+            ("sol_attn", 28, "1344x768"),
         )
         self.assertEqual(
             (
@@ -73,13 +84,13 @@ class H3ProfileTests(unittest.TestCase):
                 profiles["spectrum_experimental"]["num_inference_steps"],
                 profiles["spectrum_experimental"]["resolution"],
             ),
-            ("spectrum", "sol_attn", 20, "1344x768"),
+            ("spectrum", "sol_attn", 28, "1344x768"),
         )
         self.assertIn("11 paired hidden-feature anchors", profiles["spectrum_experimental"]["description"])
         self.assertIn("quality and speed still require live validation", profiles["spectrum_experimental"]["description"])
         self.assertEqual(
             (profiles["ultra"]["attention_engine"], profiles["ultra"]["num_inference_steps"], profiles["ultra"]["resolution"]),
-            ("sdpa", 30, "1344x768"),
+            ("sdpa", 32, "1344x768"),
         )
         self.assertEqual(
             (
@@ -90,7 +101,7 @@ class H3ProfileTests(unittest.TestCase):
             ),
             ("1344x768", "flashvsr1.5", "1920x1080", "center_crop"),
         )
-        self.assertIn("same 1344x768", profiles["1080p_delivery"]["description"])
+        self.assertIn("1344x768 native", profiles["1080p_delivery"]["description"])
         self.assertIn("High", profiles["1080p_delivery"]["description"])
         self.assertEqual(
             (
@@ -447,7 +458,7 @@ class H3ProfileTests(unittest.TestCase):
             "minimax_h3_pinkcherry_fl2va",
         )
 
-    def test_fresh_ui_hydration_marks_high_without_touching_policy_fields(self):
+    def test_fresh_ui_hydration_uses_role_profile_without_touching_policy_fields(self):
         store = (ROOT / "ui" / "src" / "stores" / "useStore.ts").read_text(
             encoding="utf-8"
         )
@@ -463,7 +474,9 @@ class H3ProfileTests(unittest.TestCase):
         self.assertIn("overrides.delivery_resolution = undefined", hydration)
         self.assertIn("overrides.delivery_fit = undefined", hydration)
         self.assertIn("spatialUpsampling: ''", hydration)
-        self.assertIn("h3SelectedProfile: 'high'", hydration)
+        self.assertIn("defaults.h3_default_profile_id", hydration)
+        self.assertIn("h3SelectedProfile: selectedProfile", hydration)
+        self.assertIn("H3_PERFORMANCE_PROFILE_IDS.has", hydration)
         self.assertNotIn("overrides.model_type", hydration)
         self.assertNotIn("prompt:", hydration)
         self.assertNotIn("privateOutput", hydration)
@@ -481,6 +494,9 @@ class H3ProfileTests(unittest.TestCase):
         ]
         self.assertIn("++_modelDefaultsSeq", preset)
         self.assertIn("h3SelectedProfile: 'custom'", preset)
+        self.assertIn("delivery_resolution: typeof preset.params.delivery_resolution", preset)
+        self.assertIn("delivery_fit: typeof preset.params.delivery_fit", preset)
+        self.assertIn("spatialUpsampling: preset.spatial_upsampling || ''", preset)
         self.assertIn("++_modelDefaultsSeq", output)
         self.assertIn("h3SelectedProfile: 'custom'", output)
 

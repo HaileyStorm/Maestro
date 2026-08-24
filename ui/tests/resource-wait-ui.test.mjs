@@ -55,7 +55,7 @@ async function loadJobPlaceholder() {
         bundle.onResolve({ filter: /^react\/jsx-runtime$/ }, () => ({ path: 'jsx-runtime', namespace: 'resource-wait' }))
         bundle.onResolve({ filter: /^lucide-react$/ }, () => ({ path: 'lucide', namespace: 'resource-wait' }))
         bundle.onResolve({ filter: /stores\/useStore$/ }, () => ({ path: 'store', namespace: 'resource-wait' }))
-        bundle.onResolve({ filter: /^(\.\/TabFilter|\.\/ThumbnailGallery|\.\/MediaFeedItem|\.\.\/LlmChat|\.\.\/H3DeliveryRecoveryStatus)$/ }, () => ({ path: 'components', namespace: 'resource-wait' }))
+        bundle.onResolve({ filter: /^(\.\/TabFilter|\.\/ThumbnailGallery|\.\/MediaFeedItem|\.\/ProjectAccessPanel|\.\.\/LlmChat|\.\.\/H3DeliveryRecoveryStatus)$/ }, () => ({ path: 'components', namespace: 'resource-wait' }))
         bundle.onResolve({ filter: /api\/client$/ }, () => ({ path: 'api', namespace: 'resource-wait' }))
         bundle.onResolve({ filter: /lib\/(privatePreview|useVisibilityPolling)$/ }, () => ({ path: 'lib', namespace: 'resource-wait' }))
         bundle.onResolve({ filter: /lib\/clipboard$/ }, () => ({ path: 'clipboard', namespace: 'resource-wait' }))
@@ -86,12 +86,12 @@ async function loadJobPlaceholder() {
           }
           if (args.path === 'lucide') {
             return { contents: `
-              export const Film = 'Film', Play = 'Play', Square = 'Square', FolderOpen = 'FolderOpen', Plus = 'Plus', Check = 'Check', Loader2 = 'Loader2', X = 'X', BookMarked = 'BookMarked', Upload = 'Upload', Trash2 = 'Trash2', ListChecks = 'ListChecks', Eye = 'Eye', EyeOff = 'EyeOff', FolderInput = 'FolderInput', Lock = 'Lock', LockOpen = 'LockOpen', KeyRound = 'KeyRound', Pause = 'Pause', ArrowUp = 'ArrowUp', ArrowDown = 'ArrowDown'
+              export const Film = 'Film', Play = 'Play', Square = 'Square', FolderOpen = 'FolderOpen', Plus = 'Plus', Check = 'Check', Loader2 = 'Loader2', X = 'X', BookMarked = 'BookMarked', Upload = 'Upload', Trash2 = 'Trash2', ListChecks = 'ListChecks', Eye = 'Eye', EyeOff = 'EyeOff', FolderInput = 'FolderInput', Lock = 'Lock', LockOpen = 'LockOpen', KeyRound = 'KeyRound', Pause = 'Pause', ArrowUp = 'ArrowUp', ArrowDown = 'ArrowDown', Sparkles = 'Sparkles', Share2 = 'Share2'
             ` }
           }
           if (args.path === 'components') {
             return { contents: `
-              export const TabFilter = () => null, ThumbnailGallery = () => null, MediaFeedItem = () => null, LlmChat = () => null, H3DeliveryRecoveryStatus = () => null
+              export const TabFilter = () => null, ThumbnailGallery = () => null, MediaFeedItem = () => null, ProjectAccessPanel = () => null, LlmChat = () => null, H3DeliveryRecoveryStatus = () => null
               export const OPEN_GALLERY_EVENT = 'open-gallery'
             ` }
           }
@@ -153,7 +153,7 @@ async function loadGenerateButton() {
         bundle.onLoad({ filter: /.*/, namespace: 'generate-button' }, args => {
           if (args.path === 'react') return { contents: 'export const useEffect = () => {}; export const useState = initial => [initial, () => {}]' }
           if (args.path === 'jsx-runtime') return { contents: 'export const jsx = (type, props, key) => ({ type, key, props: props || {} }); export const jsxs = jsx' }
-          if (args.path === 'lucide') return { contents: "export const Play = 'Play', AlertTriangle = 'AlertTriangle'" }
+          if (args.path === 'lucide') return { contents: "export const Play = 'Play', AlertTriangle = 'AlertTriangle', ListPlus = 'ListPlus'" }
           if (args.path === 'h3') return { contents: 'export const H3EstimateBadge = () => null' }
           return { contents: 'export const useStore = selector => selector(globalThis.__resourceWaitStore)' }
         })
@@ -1070,6 +1070,38 @@ test('running recovery never presents itself as merely queued', async t => {
   assert.doesNotMatch(elementText(tree), /Recovery Queued/)
 })
 
+test('blocked recovery omits an invented zero-of-zero attempt count', async t => {
+  const previousStore = globalThis.__resourceWaitStore
+  globalThis.__resourceWaitStore = {
+    accessContext: { machine_controls: false },
+    hostTerms: { minimax_h3_ref2va: { accepted: true } },
+  }
+  t.after(() => { globalThis.__resourceWaitStore = previousStore })
+
+  const { JobPlaceholder } = await loadJobPlaceholder()
+  const text = elementText(JobPlaceholder({
+    job: {
+      id: 'blocked-without-attempt-counts',
+      status: 'queued',
+      recoveryState: 'blocked_manual',
+      recoveryBlocked: true,
+      recoveryReasonText: 'Choose how to continue.',
+      progress: 0,
+      step: 0,
+      totalSteps: 0,
+      phase: '',
+      message: '',
+      outputFiles: [],
+      error: null,
+    },
+    onStop() {},
+    onDismiss() {},
+  }))
+  assert.match(text, /Choose how to continue/)
+  assert.doesNotMatch(text, /Recovery attempt/)
+  assert.doesNotMatch(text, /0 of 0/)
+})
+
 test('project recovery follows active account access while retaining legacy unlock copy', async t => {
   const previousStore = globalThis.__resourceWaitStore
   t.after(() => { globalThis.__resourceWaitStore = previousStore })
@@ -1220,7 +1252,7 @@ test('owner queue row shows the same resource wait while global summary stays ag
   ))
   assert.ok(ownerRow)
   const summaryElement = elements.find(element => (
-    elementText(element) === '0 running · 0 preparing · 0 awaiting review · 1 waiting · 0 held · 0 registering'
+    elementText(element) === '0 running · 0 preparing · 0 awaiting review · 1 waiting · 0 held · 0 being added'
   ))
   assert.ok(summaryElement)
   assert.doesNotMatch(elementText(summaryElement), /resource|generation lane|standard|preempt/i)
@@ -1304,13 +1336,14 @@ test('owner queue row exposes CPU preemption truth while queue help stays bounde
   assert.match(renderedText, /Ready jobs start by priority. When priorities match, Maestro usually keeps their queue order/)
   assert.match(renderedText, /A job may start sooner when it can reuse a model that is already loaded/)
   assert.match(renderedText, /Jobs that have waited a long time keep their place/)
+  assert.match(renderedText, /Queue order and time estimates can change/)
   assert.match(renderedText, /Queued generations do not interrupt work already running/)
   assert.match(renderedText, /Only a restartable CPU text task may start over with GPU acceleration/)
   assert.doesNotMatch(renderedText, /residency|starvation|authoritative|fair share|preemptible/i)
   assert.doesNotMatch(renderedText, /user[_ -]?id|device[_ -]?id|model[_ -]?id|VRAM|RAM|hostname|path/i)
 
   const summaryElement = elements.find(element => (
-    elementText(element) === '1 running · 0 preparing · 0 awaiting review · 0 waiting · 0 held · 0 registering'
+    elementText(element) === '1 running · 0 preparing · 0 awaiting review · 0 waiting · 0 held · 0 being added'
   ))
   assert.ok(summaryElement)
   assert.doesNotMatch(elementText(summaryElement), /CPU|GPU|resource|model|fair|preempt/i)

@@ -64,7 +64,7 @@
         ]
     },
     "prompt": "A cinematic scene with expressive adult performers, natural motion, clear synchronized dialogue, and detailed environmental sound.",
-    "num_inference_steps": 20,
+    "num_inference_steps": 28,
     "video_length": 124,
     "resolution": "1344x768",
     "guidance_scale": 1.0,

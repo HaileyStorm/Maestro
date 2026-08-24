@@ -39,6 +39,7 @@ from services.h3_boundary_policy import (
     generation_frames_for_segment,
     verify_boundary_file,
 )
+from services.sample_campaign_coordinator import SAMPLE_JOB_KIND
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -100,6 +101,7 @@ def _native_admission_namespace():
     events: list[str] = []
     project_access_permissions: list[str] = []
     worker_admissions: list[str] = []
+    legal_admissions: list[tuple[str, ...]] = []
 
     def forbidden(name: str):
         def reject(*args, **kwargs):
@@ -135,6 +137,7 @@ def _native_admission_namespace():
         },
         "_H3_TURBO_BENCHMARK_REFERENCE_BYTES": 0,
         "_H3_TURBO_BENCHMARK_REFERENCE_SHA256": "",
+        "_SAMPLE_CAMPAIGN_JOB_KIND": SAMPLE_JOB_KIND,
         "_get_active_workspace": lambda: "default",
         "_require_project_access": require_project_generation,
         "_project_access_permissions": project_access_permissions,
@@ -144,6 +147,11 @@ def _native_admission_namespace():
             lambda request, body, workspace: None
         ),
         "_require_remote_visible_models": lambda request, models: None,
+        "_require_h3_legal_execution": lambda model_types: legal_admissions.append(
+            tuple(str(model_type) for model_type in model_types)
+        ),
+        "_h3_legal_admissions": legal_admissions,
+        "_apply_fresh_h3_role_defaults": lambda body, request: None,
         "_apply_h3_adaptive_checkpoint": lambda body: None,
         "_resolve_h3_style_workflow_request": lambda body: None,
         "_apply_h3_style_workflow_to_request": lambda body: None,
@@ -164,6 +172,11 @@ def _native_admission_namespace():
         "generation_slot": (
             lambda lock, job, **kwargs: contextlib.nullcontext(True)
         ),
+        "_WgpNativeGpuExecutionSlot": (
+            lambda acquired, **kwargs: contextlib.nullcontext(bool(acquired))
+        ),
+        "_generation_native_gpu_cancel_checkpoint": lambda job: None,
+        "_credit_admission_evaluations": {},
         "_gen_lock": object(),
         "_active_gen_states": {"other-worker": {}},
         "_stamp_requested_generation_residency": lambda job, **kwargs: None,
@@ -177,6 +190,11 @@ def _native_admission_namespace():
         "_apply_per_job_coefficient": lambda job: None,
         "finish_job": (
             lambda *args, **kwargs: finished_jobs.append((args, kwargs))
+        ),
+        "_lifecycle_finish_job": (
+            lambda *args, **kwargs: (
+                finished_jobs.append((args, kwargs)) or True
+            )
         ),
         "_restore_base_coefficient": lambda: None,
     }
@@ -199,6 +217,7 @@ def _native_admission_namespace():
         APP / "launch.py",
         {
             "_trusted_h3_prepared_plan",
+            "_h3_job_model_types",
             "_require_job_runtime_model_admission",
             "_require_h3_native_boundary_experimental",
             "_plan_generation_submission",
@@ -208,6 +227,12 @@ def _native_admission_namespace():
         },
         namespace,
     )
+    # Pure prerequisite checks are outside this test's native-boundary focus.
+    # Keep them successful so the experimental boundary remains the first
+    # deliberately rejected worker condition.
+    namespace["_require_h3_offload_plan_parity"] = lambda job: None
+    namespace["_require_job_model_recipe_terms"] = lambda job: None
+    namespace["_apply_h3_adaptive_checkpoint"] = lambda body: None
     return (
         namespace,
         events,
@@ -683,6 +708,7 @@ class NativeBoundaryPlanningTests(unittest.TestCase):
             admission["_project_access_permissions"],
             ["project.generate"],
         )
+        self.assertEqual(admission["_h3_legal_admissions"], [("minimax_h3",)])
         self.assertEqual(forbidden_events, [])
         self.assertEqual(worker_admissions, [])
 
@@ -942,6 +968,10 @@ class NativeBoundaryRecoveryTests(unittest.TestCase):
                 calls.append((paths, output, audio, kwargs))
                 return True
 
+        true_peak_policy = _load_functions(
+            APP / "launch.py", {"_h3_true_peak_policy_identity"}, {},
+        )["_h3_true_peak_policy_identity"]
+        true_peak_stats = {**true_peak_policy(), "verified": True}
         namespace = {
             "os": os,
             "job": {"id": "job"},
@@ -954,6 +984,15 @@ class NativeBoundaryRecoveryTests(unittest.TestCase):
             "wgp": Wgp,
             "QueueRecoveryRuntimeError": RuntimeError,
             "is_cancel_requested": lambda job: False,
+            "_enforce_deferred_h3_final_audio": (
+                lambda job, output_path, update_job_fn=None: dict(
+                    true_peak_stats
+                )
+            ),
+            "_sample_campaign_transition_lock": contextlib.nullcontext(),
+            "sample_safe_unit_current": lambda abort_state: True,
+            "abort_state": object(),
+            "update_job": lambda job, **updates: (job.update(updates) or True),
             "_queue_recovery_unit_matches": lambda job, **kwargs: units[kwargs["index"]],
             "recovery_unit_id": lambda *args, **kwargs: (
                 recovery_calls.append(kwargs) or "concat-unit"
@@ -966,6 +1005,7 @@ class NativeBoundaryRecoveryTests(unittest.TestCase):
             "_queue_recovery_checkpoint_unit": lambda *args, **kwargs: {
                 "unit_id": "concat-unit",
             },
+            "_h3_true_peak_policy_identity": true_peak_policy,
         }
         replay = _load_nested_function(
             APP / "launch.py", "_replay_h3_concat_from_verified_segments",
@@ -983,6 +1023,11 @@ class NativeBoundaryRecoveryTests(unittest.TestCase):
             recovery_calls[0]["settings"]["component_hashes"],
             ["hash0", "hash1"],
         )
+        self.assertEqual(
+            recovery_calls[0]["settings"]["h3_audio_true_peak_policy"],
+            true_peak_policy(),
+        )
+        self.assertEqual(namespace["job"]["h3_audio_true_peak"], true_peak_stats)
 
 
 class NativeBoundaryDecodeTests(unittest.TestCase):

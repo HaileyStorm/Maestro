@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+from contextlib import contextmanager
 from pathlib import Path
 import sys
 import unittest
@@ -62,6 +63,45 @@ def _shot(*, visual_style: str = "", image_strategy: str = "fresh_generation") -
         "ending_beat": "the workbench fills the frame",
         "image_strategy": image_strategy,
     })
+
+
+@contextmanager
+def _live_planning_pipeline(pid: str):
+    """Provide the process-local owner required by pipeline LLM calls."""
+    selection = {
+        "model_id": "synthetic-test-model",
+        "device": "cpu",
+        "provider": "local",
+        "remote_url": "",
+        "api_key": "",
+        "local_gguf_path": "",
+        "gguf_file_override": "",
+    }
+
+    @contextmanager
+    def model_lease(**_selection):
+        yield
+
+    with (
+        mock.patch.object(
+            director_pipeline,
+            "_pipelines",
+            {pid: {"id": pid, "status": "planning"}},
+        ),
+        mock.patch.object(
+            director_pipeline,
+            "_pipeline_llm_contexts",
+            {pid: {"selection": selection, "response_assist": None}},
+        ),
+        mock.patch.object(director_pipeline, "_pipeline_llm_tokens", {}),
+        mock.patch.object(
+            director_pipeline,
+            "_pipeline_llm_cancel_handles",
+            {},
+        ),
+        mock.patch.object(llm_service, "loaded_model_lease", model_lease),
+    ):
+        yield
 
 
 class VisualStylePolicyTests(unittest.TestCase):
@@ -839,7 +879,7 @@ class StudioEnhanceStyleTests(unittest.TestCase):
             "visual_style": "",
             "target_duration": 5,
         }
-        with mock.patch.object(
+        with _live_planning_pipeline("legacy-h3-style"), mock.patch.object(
             llm_service, "generate", side_effect=generate,
         ), mock.patch.object(
             llm_service, "generate_streaming", side_effect=generate_streaming,
@@ -848,7 +888,7 @@ class StudioEnhanceStyleTests(unittest.TestCase):
                 "music_video", "short_film_audio", "short_film_story",
             ):
                 director_pipeline._run_planning_legacy(
-                    "no-live-pipeline",
+                    "legacy-h3-style",
                     dict(params),
                     pipeline_type,
                 )

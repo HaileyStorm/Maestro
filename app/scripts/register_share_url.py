@@ -9,6 +9,7 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import sys
 import time
 from collections.abc import Callable
 from typing import Any
@@ -196,6 +197,43 @@ def _confirms_target(response: dict[str, Any], quick_url: str) -> bool:
     )
 
 
+def replay_share_url(
+    origin: str,
+    quick_tunnel_url: str,
+    selected_url: str,
+    *,
+    stable_verified: bool,
+    open_request: Callable = _default_open,
+) -> tuple[str, str]:
+    """Replay a previously verified selection into one backend process."""
+
+    local_origin = _canonical_loopback_origin(origin)
+    quick_url = _canonical_quick_tunnel_url(quick_tunnel_url)
+    if stable_verified:
+        selected = _canonical_workers_dev_url(selected_url)
+        kind = "stable"
+    else:
+        selected = _canonical_quick_tunnel_url(selected_url)
+        if selected != quick_url:
+            raise ValueError("Quick share replay did not match the current tunnel")
+        kind = "quick"
+    payload: dict[str, Any] = {
+        "share_url": selected,
+        "quick_tunnel_url": quick_url,
+        "stable_verified": stable_verified,
+    }
+    result = _json_request(
+        local_origin + _LOCAL_REGISTRATION_PATH,
+        method="PUT",
+        payload=payload,
+        headers={"Content-Type": "application/json", "Origin": local_origin},
+        open_request=open_request,
+    )
+    if result.get("status") != "ok" or result.get("share_url") != selected:
+        raise ValueError("Maestro rejected the runtime share URL")
+    return selected, kind
+
+
 def register_share_url(
     origin: str,
     quick_tunnel_url: str,
@@ -215,25 +253,27 @@ def register_share_url(
         sleep=sleep,
     )
     selected = stable or quick_url
-    kind = "stable" if stable else "quick"
-    payload: dict[str, Any] = {
-        "share_url": selected,
-        "quick_tunnel_url": quick_url,
-        "stable_verified": bool(stable),
-    }
-    result = _json_request(
-        local_origin + _LOCAL_REGISTRATION_PATH,
-        method="PUT",
-        payload=payload,
-        headers={"Content-Type": "application/json", "Origin": local_origin},
+    return replay_share_url(
+        local_origin,
+        quick_url,
+        selected,
+        stable_verified=bool(stable),
         open_request=open_request,
     )
-    if result.get("status") != "ok" or result.get("share_url") != selected:
-        raise ValueError("Maestro rejected the runtime share URL")
-    return selected, kind
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    arguments = list(argv or ())
+    if arguments == ["--watch"]:
+        from share_registration_watch import main as watch_main
+
+        return watch_main([])
+    if len(arguments) == 2 and arguments[0] == "--wait-watch":
+        from share_registration_watch import main as watch_main
+
+        return watch_main(["--wait-registered-url", arguments[1]])
+    if arguments:
+        raise SystemExit("Maestro share registration failed")
     try:
         selected, kind = register_share_url(
             os.environ.get("MAESTRO_LOCAL_ORIGIN", ""),
@@ -241,11 +281,11 @@ def main() -> int:
             stable_url=os.environ.get("PINOKIO_STABLE_SHARE_URL", ""),
             update_secret=os.environ.get("PINOKIO_STABLE_SHARE_UPDATE_SECRET", ""),
         )
-    except (HTTPError, URLError, OSError, TimeoutError, ValueError, TypeError, json.JSONDecodeError) as error:
-        raise SystemExit("Maestro share registration failed") from error
+    except (HTTPError, URLError, OSError, TimeoutError, ValueError, TypeError, json.JSONDecodeError):
+        raise SystemExit("Maestro share registration failed") from None
     print(f"MAESTRO_SHARE_READY {selected} {kind}")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

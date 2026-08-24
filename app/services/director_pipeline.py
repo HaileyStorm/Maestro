@@ -75,6 +75,18 @@ _director_queue_worker = None
 _DIRECTOR_QUEUE_FILENAME = "_director_queue.json"
 _DIRECTOR_QUEUE_VERSION = 1
 _DIRECTOR_QUEUE_TERMINAL = {"completed", "failed", "cancelled"}
+_DIRECTOR_LEGACY_SECRET_FIELDS = {
+    "_director_llm_selection_digest",
+    "api_key",
+    "authorization",
+    "authorization_header",
+    "bearer_token",
+    "access_token",
+    "api_token",
+    "client_secret",
+    "secret_key",
+    "password",
+}
 _LTX25_MUSIC_VIDEO_SYNC_CONTRACT = (
     "SOURCE-AUDIO LIP SYNC: Any person visibly singing or rapping "
     "lip-syncs every vocal syllable to the supplied source soundtrack with "
@@ -92,6 +104,50 @@ _DIRECTOR_SINGLE_ASSET_KEYS = (
     "reference_image_path",
     "voice_reference",
 )
+
+
+def scrub_director_public_credentials(value):
+    """Deep-copy public Director state while removing legacy credentials."""
+    if isinstance(value, dict):
+        scrubbed = {}
+        for key, item in value.items():
+            normalized = str(key).strip().lower()
+            compact = re.sub(r"[^a-z0-9]", "", normalized)
+            if (
+                normalized in _DIRECTOR_LEGACY_SECRET_FIELDS
+                or normalized.endswith("_api_key")
+                or normalized.endswith("_access_token")
+                or normalized.endswith("_auth_token")
+                or normalized.endswith("_bearer_token")
+                or normalized.endswith("_client_secret")
+                or compact.endswith("apikey")
+                or compact in {
+                    "authorization",
+                    "authorizationheader",
+                    "token",
+                    "apitoken",
+                    "accesstoken",
+                    "authtoken",
+                    "bearertoken",
+                    "auth",
+                    "authentication",
+                    "credential",
+                    "credentials",
+                    "clientcredential",
+                    "clientcredentials",
+                    "clientsecret",
+                    "secretkey",
+                    "password",
+                }
+            ):
+                continue
+            scrubbed[key] = scrub_director_public_credentials(item)
+        return scrubbed
+    if isinstance(value, list):
+        return [scrub_director_public_credentials(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(scrub_director_public_credentials(item) for item in value)
+    return copy.deepcopy(value)
 _DIRECTOR_LIST_ASSET_KEYS = (
     "character_ref_paths",
     "location_ref_paths",
@@ -203,6 +259,171 @@ class _DirectorLlmSelection(dict):
     """Exact Director load arguments with one ephemeral resident identity."""
 
     resident_identity = None
+
+
+_DIRECTOR_LLM_SELECTION_RECEIPT_KEY = "_director_llm_selection_receipt"
+_DEFAULT_DIRECTOR_LLM_MODEL = "Abhiray/gemma-4-E4B-it-heretic-GGUF"
+
+
+def _director_llm_services_snapshot() -> dict:
+    """Copy the complete current services selection before resolving it."""
+    server_config = getattr(_wgp, "server_config", {}) if _wgp else {}
+    configured = (
+        server_config.get("services", {})
+        if isinstance(server_config, dict)
+        else {}
+    )
+    return dict(configured) if isinstance(configured, dict) else {}
+
+
+def _director_llm_selection_from_snapshot(
+    services_cfg: dict,
+    params: dict,
+) -> dict:
+    """Resolve one provider/model/endpoint/key tuple from one snapshot."""
+    configured_provider = str(
+        services_cfg.get("llm_provider") or ""
+    ).strip().lower()
+    queued_provider = str(params.get("llm_provider") or "").strip().lower()
+    desired_provider = configured_provider or queued_provider or "local"
+    if desired_provider not in {"local", "remote", "openai", "anthropic"}:
+        raise RuntimeError("Director LLM provider settings are invalid")
+
+    if configured_provider:
+        desired_model = (
+            services_cfg.get("llm_model_id") or _DEFAULT_DIRECTOR_LLM_MODEL
+        )
+        desired_device = services_cfg.get("llm_device") or "cpu"
+    else:
+        # Isolated legacy/test configurations with no provider use their
+        # explicit request selection and carry no cross-provider credential.
+        desired_model = (
+            params.get("llm_model_id")
+            or services_cfg.get("llm_model_id")
+            or _DEFAULT_DIRECTOR_LLM_MODEL
+        )
+        desired_device = (
+            params.get("llm_device")
+            or services_cfg.get("llm_device")
+            or "cpu"
+        )
+
+    configured_url = str(
+        services_cfg.get("llm_remote_url") or ""
+    ).strip().rstrip("/")
+    if desired_provider == "remote" and not configured_url:
+        raise RuntimeError("Director remote LLM endpoint is unavailable")
+    desired_remote_url = (
+        configured_url if desired_provider in {"remote", "openai"} else ""
+    )
+    key_name = {
+        "remote": "llm_remote_api_key",
+        "openai": "openai_api_key",
+        "anthropic": "anthropic_api_key",
+    }.get(desired_provider)
+    desired_api_key = str(services_cfg.get(key_name, "") or "") if key_name else ""
+    return {
+        "model_id": str(desired_model),
+        "device": str(desired_device),
+        "provider": desired_provider,
+        "remote_url": desired_remote_url,
+        "api_key": desired_api_key,
+        "local_gguf_path": "",
+        "gguf_file_override": "",
+    }
+
+
+def _director_llm_selection_receipt(
+    selection: dict,
+    services_cfg: dict,
+) -> dict:
+    """Return a non-secret receipt bound to the server-owned revision."""
+    provider = str(selection.get("provider") or "local").strip().lower()
+    configured_url = str(
+        selection.get("remote_url") or ""
+    ).strip().rstrip("/")
+    if provider == "openai":
+        endpoint = configured_url or "https://api.openai.com"
+    elif provider == "anthropic":
+        endpoint = "https://api.anthropic.com"
+    elif provider == "remote":
+        endpoint = configured_url
+    else:
+        endpoint = "local"
+    revision = str(services_cfg.get("llm_selection_revision") or "").strip()
+    if provider != "local" and not revision:
+        raise RuntimeError("Director LLM selection revision is unavailable")
+    return {
+        "provider": provider,
+        "model_id": str(selection.get("model_id") or ""),
+        "device": str(selection.get("device") or ""),
+        "endpoint": endpoint,
+        "revision": revision,
+    }
+
+
+def _strip_director_llm_secrets(params: dict) -> None:
+    """Remove client-supplied credentials before any durable Director write."""
+    sanitized = scrub_director_public_credentials(params)
+    params.clear()
+    params.update(sanitized)
+
+
+def _bind_director_llm_selection(
+    params: dict,
+    services_cfg: Optional[dict] = None,
+) -> dict:
+    """Persist a non-secret submission receipt for the current selection."""
+    snapshot = (
+        dict(services_cfg)
+        if isinstance(services_cfg, dict)
+        else _director_llm_services_snapshot()
+    )
+    configured_provider = str(
+        snapshot.get("llm_provider") or ""
+    ).strip().lower()
+    queued_provider = str(params.get("llm_provider") or "").strip().lower()
+    if configured_provider and queued_provider and (
+        configured_provider != queued_provider
+    ):
+        raise RuntimeError(
+            "Director LLM provider settings changed before submission; "
+            "review the current Services selection and retry."
+        )
+    selection = _director_llm_selection_from_snapshot(snapshot, params)
+    _strip_director_llm_secrets(params)
+    params["llm_provider"] = selection["provider"]
+    params["llm_model_id"] = selection["model_id"]
+    params["llm_device"] = selection["device"]
+    params[_DIRECTOR_LLM_SELECTION_RECEIPT_KEY] = (
+        _director_llm_selection_receipt(selection, snapshot)
+    )
+    return selection
+
+
+def _missing_director_llm_receipt_is_safe(
+    params: dict,
+    services_cfg: dict,
+) -> bool:
+    """Permit only an unambiguously local legacy continuation."""
+    queued_provider = str(params.get("llm_provider") or "local").strip().lower()
+    configured_provider = str(
+        services_cfg.get("llm_provider") or "local"
+    ).strip().lower()
+    remote_configured = any(
+        str(services_cfg.get(key) or "").strip()
+        for key in (
+            "llm_remote_url",
+            "llm_remote_api_key",
+            "openai_api_key",
+            "anthropic_api_key",
+        )
+    )
+    return (
+        queued_provider == "local"
+        and configured_provider == "local"
+        and not remote_configured
+    )
 
 
 def _director_resident_identity_locked(llm_service):
@@ -570,7 +791,9 @@ def _validate_director_models(
 
 def _director_params_from_saved_state(state: dict) -> dict:
     """Reconstruct compatibility-relevant params from a saved pipeline."""
-    params = dict(state.get("_params_snapshot") or {})
+    params = scrub_director_public_credentials(
+        state.get("_params_snapshot") or {}
+    )
     for key in (
         "pipeline_type", "seamless", "image_model", "video_model",
         "image_creator_model", "image_editor_model",
@@ -810,8 +1033,9 @@ def _pipeline_state_descriptor(out_dir: str, pid: str) -> dict:
 
 
 def _pipeline_state_payload(state: dict) -> bytes:
+    durable_state = scrub_director_public_credentials(state)
     return json.dumps(
-        repair_payload(state), indent=2, ensure_ascii=False, default=str,
+        repair_payload(durable_state), indent=2, ensure_ascii=False, default=str,
     ).encode("utf-8")
 
 
@@ -864,7 +1088,8 @@ def _commit_pipeline_json_unlocked(
     recovery_required: bool = False,
 ) -> dict:
     """Two-phase commit semantic JSON against its journal-owned descriptor."""
-    payload = _pipeline_state_payload(state)
+    durable_state = scrub_director_public_credentials(state)
+    payload = _pipeline_state_payload(durable_state)
     descriptor = _pipeline_payload_descriptor(pid, payload)
     previous_payload = None
     try:
@@ -876,7 +1101,7 @@ def _commit_pipeline_json_unlocked(
     prepare_available = callable(_recovery_prepare_parent_state)
     if prepare_available:
         prepared = bool(
-            _recovery_prepare_parent_state(pid, state, descriptor)
+            _recovery_prepare_parent_state(pid, durable_state, descriptor)
         )
     if recovery_required and prepare_available and not prepared:
         raise RuntimeError("Director recovery parent is unavailable")
@@ -887,7 +1112,7 @@ def _commit_pipeline_json_unlocked(
         if not callable(_recovery_checkpoint_parent):
             raise RuntimeError("Director recovery checkpoint is unavailable")
         try:
-            _recovery_checkpoint_parent(pid, state, descriptor)
+            _recovery_checkpoint_parent(pid, durable_state, descriptor)
         except BaseException:
             # A rejected final cursor commit must not leave the caller's live
             # rollback contradicted by newer semantic bytes. The already
@@ -960,7 +1185,9 @@ def _save_pipeline_state(pid: str) -> bool:
 
 def _write_initial_pipeline_state(pid: str, pipeline: dict) -> tuple[dict, dict]:
     """Commit a recoverable parent before it becomes observable in memory."""
-    params = dict(pipeline.get("params") or {})
+    params = scrub_director_public_credentials(
+        pipeline.get("params") or {}
+    )
     out_dir = str(pipeline.get("out_dir") or "")
     if not out_dir or not os.path.isdir(out_dir):
         if callable(_recovery_register_parent):
@@ -1043,7 +1270,7 @@ def _save_pipeline_state_locked(pid: str) -> bool:
         p = dict(p)  # shallow copy for safe access outside lock
 
     out_dir = p.get("out_dir") or (_wgp.save_path if _wgp else "outputs")
-    params = p.get("params", {})
+    params = scrub_director_public_credentials(p.get("params", {}))
 
     # Build per-clip state
     clip_plans = p.get("clip_plans", [])
@@ -4324,8 +4551,9 @@ def _public_director_queue_state(state: dict) -> dict:
     for raw in state.get("entries") or []:
         if not isinstance(raw, dict):
             continue
-        entry = {key: copy.deepcopy(value) for key, value in raw.items() if key != "params"}
-        params = raw.get("params") if isinstance(raw.get("params"), dict) else {}
+        safe_raw = scrub_director_public_credentials(raw)
+        entry = {key: value for key, value in safe_raw.items() if key != "params"}
+        params = safe_raw.get("params") if isinstance(safe_raw.get("params"), dict) else {}
         entry.setdefault("scene_description", params.get("scene_description", ""))
         entry.setdefault("pipeline_type", params.get("pipeline_type", "music_video"))
         entry.setdefault("image_model", params.get("image_model", ""))
@@ -4349,7 +4577,7 @@ def get_director_queue_entry(base_out_dir: str, entry_id: str) -> Optional[dict]
         state = _load_director_queue_locked(base_out_dir)
         for entry in state.get("entries") or []:
             if isinstance(entry, dict) and entry.get("id") == entry_id:
-                return copy.deepcopy(entry)
+                return scrub_director_public_credentials(entry)
     return None
 
 def enqueue_director_pipeline(base_out_dir: str, params: dict) -> dict:
@@ -4359,6 +4587,7 @@ def enqueue_director_pipeline(base_out_dir: str, params: dict) -> dict:
     frozen = copy.deepcopy(params)
     frozen["auto_mode"] = True  # queued work must not wait for browser review
     frozen["_director_queue_entry_id"] = entry_id
+    _bind_director_llm_selection(frozen)
     _materialize_director_assets(
         frozen,
         base_out_dir,
@@ -4407,6 +4636,7 @@ def update_director_queue_entry(
             raise PipelineBusyError(
                 "The queued Director project has already started and cannot be edited."
             )
+        _bind_director_llm_selection(frozen)
         # Reuse the entry-owned directory. Unchanged restored assets are
         # already there (copy_one safely no-ops for source == target), while
         # replacements receive deterministic names. Any superseded files stay
@@ -4754,12 +4984,14 @@ def _create_director_video_execution_profile(
 
 def start_pipeline(params: dict) -> str:
     """Start a new director pipeline. Returns pipeline_id."""
+    params = scrub_director_public_credentials(params)
     # Internal resume metadata must never be accepted from a fresh API request.
     # Otherwise a caller could nominate unrelated workspace media as this
     # pipeline's generated anchor and later influence repair/cleanup behavior.
     params.pop("generated_reference_image_filename", None)
     params.pop("_director_shot_image_policy", None)
     from services.director.nsfw_guidance import EXPLICIT_GUIDANCE_SNAPSHOT_KEY
+    llm_services_snapshot = _director_llm_services_snapshot()
     # A caller may not nominate this private decision bit. Recompute it from
     # the literal request flag and authoritative consent/provider policy, then
     # persist the result in the initial Director state snapshot.
@@ -4771,10 +5003,17 @@ def start_pipeline(params: dict) -> str:
         # passed the gate. This prevents a client provider override—and a
         # later settings change during recovery—from sending explicit guidance
         # to a public provider.
-        services = getattr(_wgp, "server_config", {}).get("services", {})
         params["llm_provider"] = str(
-            services.get("llm_provider") or "local"
+            llm_services_snapshot.get("llm_provider") or "local"
         ).strip().lower()
+    if params.get(_DIRECTOR_LLM_SELECTION_RECEIPT_KEY) is not None:
+        held_selection = _director_llm_selection(params)
+        params["llm_provider"] = held_selection["provider"]
+        params["llm_model_id"] = held_selection["model_id"]
+        params["llm_device"] = held_selection["device"]
+        _strip_director_llm_secrets(params)
+    else:
+        _bind_director_llm_selection(params, llm_services_snapshot)
     params["_director_shot_image_policy"] = _resolve_fresh_shot_image_policy(params)
     if callable(_runtime_admission):
         _runtime_admission(params, source_remote=False)
@@ -5141,7 +5380,9 @@ def restore_registered_pipeline(
     raw_params = data.get("_params_snapshot")
     if not isinstance(raw_params, dict):
         raise ValueError("Director recovery request is unavailable")
-    params = _normalize_explicit_guidance_snapshot(dict(raw_params))
+    params = _normalize_explicit_guidance_snapshot(
+        scrub_director_public_credentials(raw_params)
+    )
     saved_status = str(data.get("status") or "queued")
     terminal = saved_status in {"completed", "failed", "cancelled"}
     paused = saved_status == "paused"
@@ -5990,26 +6231,27 @@ def _wait_for_gpu(pid: str, poll_interval: float = 2.0):
 # ── Planning Phase ──────────────────────────────────────────────────────
 
 def _director_llm_selection(params: dict) -> dict:
-    """Resolve one exact server-owned model/provider identity for this run."""
-    services_cfg = _wgp.server_config.get("services", {}) if _wgp else {}
-    desired_model = params.get("llm_model_id") or services_cfg.get("llm_model_id", "Abhiray/gemma-4-E4B-it-heretic-GGUF")
-    desired_device = params.get("llm_device") or services_cfg.get("llm_device", "cpu")
-    desired_provider = params.get("llm_provider") or services_cfg.get("llm_provider", "local")
-    desired_remote_url = services_cfg.get("llm_remote_url", "")
-    desired_api_key = ""
-    if desired_provider == "openai":
-        desired_api_key = services_cfg.get("openai_api_key", "")
-    elif desired_provider == "anthropic":
-        desired_api_key = services_cfg.get("anthropic_api_key", "")
-    return {
-        "model_id": desired_model,
-        "device": desired_device,
-        "provider": desired_provider,
-        "remote_url": desired_remote_url,
-        "api_key": desired_api_key,
-        "local_gguf_path": "",
-        "gguf_file_override": "",
-    }
+    """Resolve one coherent current service selection for this run.
+
+    A submission receipt binds provider, model, device, effective endpoint,
+    and the opaque server revision. Drift fails closed before loading.
+    """
+    services_cfg = _director_llm_services_snapshot()
+    selection = _director_llm_selection_from_snapshot(services_cfg, params)
+    current_receipt = _director_llm_selection_receipt(selection, services_cfg)
+    queued_receipt = params.get(_DIRECTOR_LLM_SELECTION_RECEIPT_KEY)
+    if queued_receipt is not None:
+        if not isinstance(queued_receipt, dict) or queued_receipt != current_receipt:
+            raise RuntimeError(
+                "Director LLM settings changed after this run was queued; "
+                "review the current Services selection and retry."
+            )
+    elif not _missing_director_llm_receipt_is_safe(params, services_cfg):
+        raise RuntimeError(
+            "Director LLM selection receipt is unavailable for this saved run; "
+            "review the current Services selection and retry."
+        )
+    return selection
 
 
 def _resolve_pipeline_llm_context(

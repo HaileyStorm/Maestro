@@ -1,10 +1,15 @@
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 
 import { build } from 'esbuild'
 
-import { approveGenerationPlan, submitGeneration } from '../src/api/client.ts'
+import {
+  approveGenerationPlan,
+  submitGeneration,
+  waitForLlmEnhanceOperation,
+} from '../src/api/client.ts'
 
 const UI_ROOT = fileURLToPath(new URL('..', import.meta.url))
 
@@ -346,6 +351,99 @@ test('generation admission carries enhancement intent in the single durable requ
   assert.equal(requests[0].body.enhance_before_generate, true)
 })
 
+test('Prompt Enhance waits through queued then running before fetching its scoped result', async t => {
+  const originalFetch = globalThis.fetch
+  const originalWindow = globalThis.window
+  const requestId = '0f6f2163-42f7-41d0-a260-79b697081d96'
+  const canonicalRequestId = requestId.replaceAll('-', '')
+  const projectInstance = 'a'.repeat(64)
+  const scope = {
+    requestId,
+    workspace: 'queued-project',
+    projectInstance,
+  }
+  const statuses = []
+  let statusPolls = 0
+  let resultFetches = 0
+  globalThis.window = {
+    setTimeout: (callback, _delay) => setTimeout(callback, 0),
+    clearTimeout,
+  }
+  globalThis.fetch = async input => {
+    const url = String(input)
+    if (url.includes('/api/v1/llm/models?')) {
+      assert.match(url, /workspace=queued-project/)
+      return jsonResponse({ models: [], guides: [], project_instance: projectInstance })
+    }
+    if (url.includes(`/api/v1/llm/operations/enhance/${requestId}/result?`)) {
+      resultFetches += 1
+      assert.match(url, /workspace=queued-project/)
+      return jsonResponse({ original: 'private original', enhanced: 'private enhanced' })
+    }
+    if (url.includes(`/api/v1/llm/operations/enhance/${requestId}?`)) {
+      statusPolls += 1
+      assert.match(url, /workspace=queued-project/)
+      const status = statusPolls === 1 ? 'running' : 'completed'
+      return jsonResponse({
+        request_id: canonicalRequestId,
+        operation_kind: 'enhance',
+        status,
+        phase: status,
+        stage: status,
+        pass: 1,
+        pass_limit: 1,
+        attempt: 1,
+        attempt_limit: 1,
+        partial_text: status === 'running' ? 'private partial' : '',
+        generated_tokens_approx: status === 'running' ? 2 : 0,
+        elapsed_seconds: 1,
+        live_tps: null,
+        average_tps: null,
+        result_available: status === 'completed',
+        retryable: false,
+      })
+    }
+    throw new Error(`unexpected queued Enhance request ${url}`)
+  }
+  t.after(() => {
+    globalThis.fetch = originalFetch
+    if (originalWindow === undefined) delete globalThis.window
+    else globalThis.window = originalWindow
+  })
+
+  const result = await waitForLlmEnhanceOperation(
+    scope,
+    undefined,
+    {
+      request_id: canonicalRequestId,
+      operation_kind: 'enhance',
+      status: 'queued',
+      phase: 'queued',
+      stage: 'queued',
+      pass: 0,
+      pass_limit: 1,
+      attempt: 0,
+      attempt_limit: 1,
+      partial_text: '',
+      generated_tokens_approx: 0,
+      elapsed_seconds: 0,
+      live_tps: null,
+      average_tps: null,
+      result_available: false,
+      retryable: false,
+    },
+    status => statuses.push(status.status),
+  )
+
+  assert.deepEqual(statuses, ['queued', 'running', 'completed'])
+  assert.equal(statusPolls, 2)
+  assert.equal(resultFetches, 1)
+  assert.deepEqual(result, {
+    original: 'private original',
+    enhanced: 'private enhanced',
+  })
+})
+
 test('standalone Enhance sends exact count only for type-1 sliding prompts', async t => {
   const originalFetch = globalThis.fetch
   const originalWindow = globalThis.window
@@ -468,6 +566,155 @@ test('standalone Enhance sends exact count only for type-1 sliding prompts', asy
   assert.equal(enhancedRequests.length, 2)
   assert.equal('window_count' in enhancedRequests[0], false)
   assert.equal(enhancedRequests[1].window_count, 4)
+})
+
+test('standalone Enhance hands status to Queue and defers a scoped result until Generate opens', async t => {
+  const originalFetch = globalThis.fetch
+  const originalWindow = globalThis.window
+  const originalDocument = globalThis.document
+  const originalLocalStorage = globalThis.localStorage
+  const originalSessionStorage = globalThis.sessionStorage
+  const originalNavigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  class StorageFake {
+    values = new Map()
+    getItem(key) { return this.values.get(key) ?? null }
+    setItem(key, value) { this.values.set(key, String(value)) }
+    removeItem(key) { this.values.delete(key) }
+  }
+  globalThis.window = Object.assign(new EventTarget(), {
+    setTimeout, clearTimeout, setInterval, clearInterval, alert() {},
+    location: { hostname: 'localhost' },
+    matchMedia: () => ({ matches: false }),
+  })
+  globalThis.document = Object.assign(new EventTarget(), { hidden: false })
+  globalThis.localStorage = new StorageFake()
+  globalThis.sessionStorage = new StorageFake()
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { locks: { request: (name, options, callback) => Promise.resolve(callback({ name })) } },
+  })
+
+  const projectInstance = 'e'.repeat(64)
+  let enhancePosts = 0
+  let enhanceStatusReads = 0
+  let generationCalls = 0
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input)
+    if (url.includes('/api/v1/llm/models?')) {
+      return jsonResponse({ models: [], guides: [], project_instance: projectInstance })
+    }
+    if (url.endsWith('/api/v1/llm/prepare')) {
+      return jsonResponse({ operation_id: 'queue-card-ready', status: 'ready', phase: 'ready', retryable: false }, 202)
+    }
+    if (url.endsWith('/api/v1/llm/enhance-prompt')) {
+      enhancePosts += 1
+      const body = JSON.parse(String(init.body))
+      return jsonResponse({
+        request_id: body.request_id.replaceAll('-', ''), operation_kind: 'enhance',
+        status: 'queued', phase: 'queued', stage: 'queued',
+        pass: 1, pass_limit: 1, attempt: 1, attempt_limit: 1,
+        partial_text: '', generated_tokens_approx: 0,
+        elapsed_seconds: 0, live_tps: null, average_tps: null,
+        result_available: false, retryable: false,
+      }, 202)
+    }
+    if (url.includes('/api/v1/llm/operations/enhance/') && !url.includes('/result?')) {
+      enhanceStatusReads += 1
+      const completed = enhanceStatusReads > 1
+      return jsonResponse({
+        request_id: url.match(/enhance\/([^?]+)/)?.[1] || '', operation_kind: 'enhance',
+        status: completed ? 'completed' : 'running',
+        phase: completed ? 'completed' : 'generating',
+        stage: completed ? 'completed' : 'llm',
+        pass: 1, pass_limit: 1, attempt: 1, attempt_limit: 1,
+        partial_text: completed ? 'exact enhanced result' : '',
+        generated_tokens_approx: completed ? 3 : 0,
+        elapsed_seconds: completed ? 1 : 0,
+        live_tps: null, average_tps: completed ? 3 : null,
+        result_available: completed, retryable: false,
+      })
+    }
+    if (url.includes('/api/v1/llm/operations/enhance/') && url.includes('/result?')) {
+      return jsonResponse({ original: 'exact original', enhanced: 'exact enhanced result' })
+    }
+    throw new Error(`unexpected queue-card request ${url}`)
+  }
+
+  const { useStore } = await loadStoreModuleFresh()
+  const baseState = useStore.getState()
+  t.after(() => {
+    useStore.setState(baseState, true)
+    globalThis.fetch = originalFetch
+    globalThis.window = originalWindow
+    globalThis.document = originalDocument
+    globalThis.localStorage = originalLocalStorage
+    globalThis.sessionStorage = originalSessionStorage
+    if (originalNavigatorDescriptor) {
+      Object.defineProperty(globalThis, 'navigator', originalNavigatorDescriptor)
+    } else {
+      delete globalThis.navigator
+    }
+  })
+
+  useStore.setState({
+    activeWorkspace: 'queue-card-project',
+    generationMode: 'video',
+    sidebarMode: 'director',
+    sidebarOpen: true,
+    startImage: null,
+    imageRefs: [],
+    modelOptions: null,
+    params: { ...baseState.params, prompt: 'exact original', model_type: 'test-model' },
+    startGeneration: async () => { generationCalls += 1 },
+  })
+
+  const pendingEnhance = useStore.getState().enhancePrompt()
+  await waitForCondition(
+    () => useStore.getState().enhanceQueueCard?.phase === 'queued',
+    'queued Enhance card phase',
+  )
+  assert.equal(useStore.getState().enhanceQueueCard?.phase, 'queued')
+  assert.equal(await pendingEnhance, true)
+  assert.equal(enhancePosts, 1)
+  assert.equal(generationCalls, 0)
+  assert.equal(useStore.getState().params.prompt, 'exact original')
+  assert.deepEqual(useStore.getState().enhanceQueueCard?.result, {
+    original: 'exact original', enhanced: 'exact enhanced result',
+  })
+  assert.equal(useStore.getState().enhanceQueueCard?.resultApplied, false)
+  const pendingRecovery = globalThis.localStorage.getItem('maestro:prompt-enhance-operations-v2')
+  assert.notEqual(pendingRecovery, null)
+  assert.equal(pendingRecovery.includes('exact original'), false)
+  assert.equal(pendingRecovery.includes('exact enhanced result'), false)
+
+  useStore.getState().setSidebarMode('studio')
+  await waitForCondition(
+    () => useStore.getState().params.prompt === 'exact enhanced result',
+    'deferred Enhance result applied when Generate opened',
+  )
+  assert.equal(generationCalls, 0, 'opening Generate must not auto-generate')
+  assert.equal(useStore.getState().enhanceQueueCard?.resultApplied, true)
+  assert.equal(globalThis.localStorage.getItem('maestro:prompt-enhance-operations-v2'), null)
+
+  assert.equal(await useStore.getState().useCompletedEnhanceAndGenerate(), true)
+  assert.equal(generationCalls, 1)
+  useStore.setState({ activeWorkspace: 'different-project' })
+  assert.equal(useStore.getState().enhanceQueueCard, null)
+})
+
+test('Prompt Enhance UI opens Queue synchronously and keeps result text out of generic queue metadata', async () => {
+  const [promptInput, mainContent, client] = await Promise.all([
+    readFile(new URL('../src/components/Sidebar/PromptInput.tsx', import.meta.url), 'utf8'),
+    readFile(new URL('../src/components/MainContent/MainContent.tsx', import.meta.url), 'utf8'),
+    readFile(new URL('../src/api/client.ts', import.meta.url), 'utf8'),
+  ])
+  assert.match(promptInput, /requestQueueView\(\)\s*\n\s*void enhancePrompt/)
+  assert.doesNotMatch(promptInput, /line-clamp-2/)
+  assert.match(mainContent, /data-prompt-enhance-queue-card/)
+  assert.match(mainContent, /Use &amp; Generate/)
+  assert.match(mainContent, /logicalJobKind === 'prompt_enhancement'/)
+  assert.match(mainContent, /enhanceQueueCard\.phase === 'queued'/)
+  assert.match(client, /generic `\/api\/v1\/queue` projection must stay content-free/)
 })
 
 test('Prompt Enhance fences project instances, keeps stale results inert, and cancels explicitly', async t => {
@@ -667,6 +914,7 @@ test('Prompt Enhance fences project instances, keeps stale results inert, and ca
   useStore.setState({ activeWorkspace: 'project one' })
   useStore.getState().setParam('prompt', 'first prompt')
   assert.equal(await useStore.getState().resumeEnhancePrompt(), true)
+  assert.equal(posts.length, 4, 'reload recovery must not issue a duplicate Enhance POST')
   assert.equal(useStore.getState().params.prompt, 'reloaded first enhancement')
   assert.equal(globalThis.localStorage.getItem(persistenceKey), null)
 })
@@ -1962,6 +2210,7 @@ test('account identity changes fence deferred generation submission and active-j
   assert.equal(globalThis.localStorage.getItem('maestro:prompt-enhance-operations-v2'), null)
   assert.equal(useStore.getState().isEnhancing, false)
   assert.equal(useStore.getState().enhanceRequestScope, null)
+  assert.equal(useStore.getState().enhanceQueueCard, null)
   assert.deepEqual(useStore.getState().jobs, [], 'logout synchronously scrubs the old placeholder')
   const newerIdentityJob = {
     id: 'newer-identity-job', status: 'queued', progress: 0, step: 0, totalSteps: 0,

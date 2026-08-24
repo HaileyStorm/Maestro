@@ -61,6 +61,16 @@ test('approximate durations roll seconds, minutes, and hours without boundary ar
   assert.equal(formatApproximateDuration(Number.POSITIVE_INFINITY), 'unknown')
 })
 
+test('gallery generation durations preserve the compact minutes and seconds contract', async () => {
+  const { formatGenerationDuration } = await loadFormatters()
+
+  assert.equal(formatGenerationDuration(0), '0m 0s')
+  assert.equal(formatGenerationDuration(59.5), '1m 0s')
+  assert.equal(formatGenerationDuration(128.4), '2m 8s')
+  assert.equal(formatGenerationDuration(-3), '0m 0s')
+  assert.equal(formatGenerationDuration(Number.NaN), '0m 0s')
+})
+
 test('Generate duration surfaces share the canonical display formatters', async () => {
   const [slider, profiles, plan, queue] = await Promise.all([
     readFile(new URL('../src/components/Sidebar/DurationSlider.tsx', import.meta.url), 'utf8'),

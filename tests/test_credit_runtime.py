@@ -22,6 +22,7 @@ from services.credit_runtime import (
     quote_reservation,
     reserve_quote,
     revalidate_reservation,
+    terminal_credit_settlement,
     transition_reservation,
 )
 
@@ -105,6 +106,105 @@ class CreditRuntimeTests(unittest.TestCase):
             requested_units=25,
             policy=CreditRuntimePolicy(enforcement_enabled=True),
         )
+
+    def test_terminal_settlement_uses_only_status_and_server_measurement(self):
+        completed = terminal_credit_settlement(
+            terminal_status="completed", reserved_units=20,
+        )
+        failed = terminal_credit_settlement(
+            terminal_status="failed", reserved_units=20,
+        )
+        cancelled = terminal_credit_settlement(
+            terminal_status="cancelled",
+            reserved_units=20,
+            server_billable_units=7,
+        )
+        capped = terminal_credit_settlement(
+            terminal_status="cancelled",
+            reserved_units=20,
+            server_billable_units=99,
+        )
+
+        self.assertEqual(
+            (completed.settled_units, completed.refunded_units), (20, 0),
+        )
+        self.assertEqual(
+            (failed.settled_units, failed.refunded_units), (0, 20),
+        )
+        self.assertEqual(
+            (cancelled.settled_units, cancelled.refunded_units), (7, 13),
+        )
+        self.assertEqual(
+            (capped.settled_units, capped.refunded_units), (20, 0),
+        )
+        with self.assertRaises(CreditRuntimeError):
+            terminal_credit_settlement(
+                terminal_status="cancelled",
+                reserved_units=20,
+                server_billable_units=-1,
+            )
+        with self.assertRaises(CreditRuntimeError):
+            terminal_credit_settlement(
+                terminal_status="failed",
+                reserved_units=20,
+                server_billable_units=1,
+            )
+        with self.assertRaises(TypeError):
+            terminal_credit_settlement(
+                terminal_status="cancelled",
+                reserved_units=20,
+                server_billable_units=7,
+                progress=99,
+            )
+
+    def test_supporter_tier_bonus_is_bounded_expiring_and_not_purchased(self):
+        bonus = source(
+            "supporter_tier_bonus",
+            "evt_supporter_bonus_0001",
+            25,
+            expires_at="2026-09-11T10:00:00Z",
+            refund_state="not_applicable",
+        )
+        quote = self.quote(
+            snapshot(FREE_ZERO, bonus),
+            requested_units=20,
+            policy=CreditRuntimePolicy(enforcement_enabled=True),
+        )
+        self.assertTrue(quote.submission_allowed)
+        self.assertTrue(quote.priority_boost)
+        self.assertEqual(quote.decision, "hosted_priority_credit")
+        self.assertEqual(quote.allocations[0].source, "supporter_tier_bonus")
+
+        revoked = dict(bonus)
+        revoked.update({"effective_allowance": 0, "status": "canceled"})
+        baseline = self.quote(
+            snapshot(FREE_ZERO, revoked),
+            requested_units=20,
+            policy=CreditRuntimePolicy(enforcement_enabled=True),
+        )
+        self.assertTrue(baseline.submission_allowed)
+        self.assertFalse(baseline.priority_boost)
+
+        for forbidden in (
+            "amount_minor", "currency", "cash_value", "transferable",
+            "refundable", "guaranteed_compute",
+        ):
+            with self.subTest(forbidden=forbidden):
+                purchased = dict(bonus)
+                purchased[forbidden] = 1
+                with self.assertRaises(CreditRuntimeError):
+                    self.quote(snapshot(FREE_ZERO, purchased))
+        missing_expiry = dict(bonus)
+        missing_expiry["expires_at"] = None
+        with self.assertRaises(CreditRuntimeError):
+            self.quote(snapshot(FREE_ZERO, missing_expiry))
+        oversized = dict(bonus)
+        oversized.update({
+            "granted_allowance": 1_000_001,
+            "effective_allowance": 1_000_001,
+        })
+        with self.assertRaises(CreditRuntimeError):
+            self.quote(snapshot(FREE_ZERO, oversized))
 
     def test_local_and_lan_are_unmetered_by_explicit_realm(self):
         for realm in ("local", "lan"):

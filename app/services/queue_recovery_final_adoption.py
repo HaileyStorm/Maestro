@@ -32,7 +32,7 @@ _QUARANTINE_PREFIX = re.compile(r"^[0-9a-f]{32}-(.+)$")
 _JOB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
 _UNIT_ID = re.compile(r"^unit:v1:[0-9a-f]{64}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_FINAL_KINDS = {"h3_concat", "h3_delivery"}
+_FINAL_KINDS = {"h3_concat", "h3_delivery", "ordinary_repeat"}
 _UNIT_KINDS = _FINAL_KINDS | {"h3_segment"}
 _thread_lock = threading.RLock()
 
@@ -366,11 +366,21 @@ def _candidate(
     variant = meta.get("producer_unit_variant")
     index = meta.get("producer_unit_index")
     dependencies = meta.get("producer_unit_dependencies")
+    if dependencies is None and kind == "ordinary_repeat":
+        dependencies = []
     settings = meta.get("producer_unit_settings")
+    if settings is None and kind == "ordinary_repeat":
+        settings = {}
     artifacts = meta.get("producer_unit_artifact_names")
     continuation = meta.get("producer_unit_continuation")
     position = _declared_position(meta)
+    if position is None and kind == "ordinary_repeat":
+        position = (1, 0)
     expected_role = "component" if kind == "h3_segment" else "final"
+    private_ok = (
+        meta.get("private") is True
+        or (kind == "ordinary_repeat" and meta.get("private") is False)
+    )
     if (
         type(job_id) is not str
         or _JOB_ID.fullmatch(job_id) is None
@@ -389,7 +399,7 @@ def _candidate(
         or len(artifacts) > 4096
         or len(set(artifacts)) != len(artifacts)
         or any(_direct_name(value) is None for value in artifacts)
-        or meta.get("private") is not True
+        or not private_ok
         or meta.get("workspace") != workspace
         or meta.get("artifact_class") != expected_role
         or meta.get("producer_artifact_class") != expected_role
@@ -614,7 +624,9 @@ def _complete_groups(candidates: list[dict]) -> tuple[list[dict], list[dict]]:
     for job_id, raw_items in sorted(by_job.items()):
         preferred = "h3_delivery" if any(
             item["kind"] == "h3_delivery" for item in raw_items
-        ) else "h3_concat"
+        ) else "h3_concat" if any(
+            item["kind"] == "h3_concat" for item in raw_items
+        ) else "ordinary_repeat"
         items = [item for item in raw_items if item["kind"] == preferred]
         totals = {item["output_total"] for item in items}
         total = next(iter(totals)) if len(totals) == 1 else 0
@@ -640,11 +652,18 @@ def _complete_groups(candidates: list[dict]) -> tuple[list[dict], list[dict]]:
                 and item["unit_index"] == 0
                 for item in items
             )
-        closed = exact_shape and all(
-            item["dependencies"]
-            and _semantic_dependencies_valid(item["unit_id"], valid_units)
-            for item in items
-        )
+        if preferred == "ordinary_repeat":
+            closed = exact_shape and all(
+                not item["dependencies"]
+                or _semantic_dependencies_valid(item["unit_id"], valid_units)
+                for item in items
+            )
+        else:
+            closed = exact_shape and all(
+                item["dependencies"]
+                and _semantic_dependencies_valid(item["unit_id"], valid_units)
+                for item in items
+            )
         group = {
             "job_id": job_id,
             "kind": preferred,

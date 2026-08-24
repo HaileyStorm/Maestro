@@ -2700,20 +2700,33 @@ class LlmRuntimeTests(unittest.TestCase):
         self.assertTrue(result.endswith("nested/enhancer.gguf"))
         self.assertFalse(llm_service.get_status()["loading"])
 
-    def test_prompt_enhancer_uses_request_scoped_stage_and_throughput_status(self):
+    def test_prompt_enhancer_opens_queue_before_enqueueing_each_request(self):
         prompt_input = (
             Path(__file__).resolve().parents[1]
             / "ui" / "src" / "components" / "Sidebar" / "PromptInput.tsx"
         ).read_text(encoding="utf-8")
-        self.assertIn("const enhanceStatus = useStore", prompt_input)
-        self.assertIn("'request_id' in enhanceStatus", prompt_input)
-        self.assertIn("routeEnhanceStatus?.partial_text", prompt_input)
-        self.assertIn("routeEnhanceStatus?.live_tps", prompt_input)
-        self.assertIn("routeEnhanceStatus?.average_tps", prompt_input)
-        self.assertIn("llm_fallback: 'Continuing with your writing assistant'", prompt_input)
-        self.assertIn("cancelEnhancePrompt", prompt_input)
-        self.assertNotIn("loadingId === expectedModelId", prompt_input)
-        self.assertNotIn("fetchLlmStatus", prompt_input)
+        self.assertIn(
+            "import { requestQueueView } from '../../lib/mainViewNavigation'",
+            prompt_input,
+        )
+        tts_enhancement = prompt_input[
+            prompt_input.index("const runTtsEnhancement ="):
+            prompt_input.index("const runEnhancement =")
+        ]
+        enhancement = prompt_input[
+            prompt_input.index("const runEnhancement ="):
+            prompt_input.index("// grow shrink-0")
+        ]
+        self.assertLess(
+            tts_enhancement.index("requestQueueView()"),
+            tts_enhancement.index("void enhancePrompt(mode)"),
+        )
+        self.assertLess(
+            enhancement.index("requestQueueView()"),
+            enhancement.index("void enhancePrompt()"),
+        )
+        self.assertIn("onClick={runEnhancement}", prompt_input)
+        self.assertIn("onClick={() => runTtsEnhancement(defaultMode)}", prompt_input)
 
     def test_runtime_build_status_ignores_unrelated_safe_download(self):
         from services import safe_download
@@ -2765,6 +2778,23 @@ class LlmRuntimeTests(unittest.TestCase):
         self.assertEqual(status["loading_model_id"], "example/catalog-model")
         self.assertEqual(status["loading_phase"], "loading model")
         self.assertIsNone(status["download"])
+
+    def test_ready_runtime_suppresses_stale_loading_marker(self):
+        previous = llm_service._loading_model_id
+        self.addCleanup(
+            lambda: setattr(llm_service, "_loading_model_id", previous)
+        )
+        llm_service._loading_model_id = "example/catalog-model"
+
+        with mock.patch.object(llm_service, "is_loaded", return_value=True), mock.patch.object(
+            llm_service, "get_local_runtime_control", return_value={"phase": "ready"},
+        ):
+            status = llm_service.get_status()
+
+        self.assertTrue(status["loaded"])
+        self.assertFalse(status["loading"])
+        self.assertIsNone(status["loading_model_id"])
+        self.assertIsNone(status["loading_phase"])
 
     def test_global_timeline_enhancement_locks_timestamps_not_window_paragraphs(self):
         built = llm_service._build_enhance_user_prompt(

@@ -40,6 +40,8 @@ import type {
   AccountNoncePurpose,
   AccountSession,
   AccountSummary,
+  ProjectAccessProjection,
+  ProjectAccessRole,
   ResponsibleUseProjection,
   ResponsibleUseStatus,
   SupportAccountSummary,
@@ -48,8 +50,13 @@ import type {
   SupportAdminProjection,
   SupportPublicProjection,
   SupportSelfProjection,
+  SupporterBenefit,
+  SupporterBenefitPolicy,
   SupportH3LegalAccessLocationInput,
   SupportH3LegalAccessProjection,
+  SupportKreaOwnerPolicyInput,
+  SupportKreaOwnerPolicyMutationResult,
+  SupportKreaOwnerPolicyProjection,
 } from '../types'
 import { developmentCostRecoveryProjection } from '../types/index.ts'
 
@@ -646,7 +653,7 @@ export async function fetchSampleCampaignQueue(
     cache: 'no-store',
     headers: { Accept: 'application/json' },
   })
-  if (res.status === 404) return null
+  if (res.status === 403 || res.status === 404) return null
   if (!res.ok) throw protectedReadApiError('sample_queue', res.status)
   return decodeSampleCampaignQueue(await res.json())
 }
@@ -1450,6 +1457,7 @@ export async function writeSong(params: {
   workspace: string
   description: string
   instrumental?: boolean
+  model_type?: string
   seed?: number
   reference_image_path?: string
 }, options?: LlmRequestOptions): Promise<{ style: string; lyrics: string; raw: string }> {
@@ -1871,6 +1879,114 @@ export async function fetchServerAccounts(): Promise<{ accounts: AccountSummary[
   return accountRequest('/api/v1/account/users')
 }
 
+const PROJECT_ACCESS_ROLES = new Set<ProjectAccessRole>(['owner', 'editor', 'viewer'])
+
+function invalidProjectAccessResponse(): never {
+  throw new AccountApiError('Project access returned an invalid response.', {
+    code: 'project_access_invalid_response',
+    status: 502,
+  })
+}
+
+export function decodeProjectAccessProjection(
+  value: unknown,
+  expectedWorkspace: string,
+): ProjectAccessProjection {
+  if (!isPlainJsonObject(value) || !hasExactKeys(value, ['workspace', 'revision', 'members'])) {
+    invalidProjectAccessResponse()
+  }
+  if (
+    value.workspace !== expectedWorkspace
+    || !Number.isSafeInteger(value.revision)
+    || Number(value.revision) < 1
+    || !Array.isArray(value.members)
+    || value.members.length > 256
+  ) invalidProjectAccessResponse()
+  const members = value.members.map(member => {
+    if (!isPlainJsonObject(member) || !hasExactKeys(member, ['account_id', 'username', 'role'])) {
+      invalidProjectAccessResponse()
+    }
+    if (
+      typeof member.account_id !== 'string'
+      || !/^[0-9a-f]{32}$/.test(member.account_id)
+      || typeof member.username !== 'string'
+      || member.username !== member.username.trim()
+      || member.username.length < 3
+      || member.username.length > 64
+      || typeof member.role !== 'string'
+      || !PROJECT_ACCESS_ROLES.has(member.role as ProjectAccessRole)
+    ) invalidProjectAccessResponse()
+    return {
+      account_id: member.account_id,
+      username: member.username,
+      role: member.role as ProjectAccessRole,
+    }
+  })
+  if (
+    new Set(members.map(member => member.account_id)).size !== members.length
+    || new Set(members.map(member => member.username)).size !== members.length
+  ) invalidProjectAccessResponse()
+  return {
+    workspace: expectedWorkspace,
+    revision: Number(value.revision),
+    members,
+  }
+}
+
+export async function fetchProjectMembers(workspace: string): Promise<ProjectAccessProjection> {
+  const value = await accountRequest<unknown>(
+    `/api/v1/workspaces/${encodeURIComponent(workspace)}/members`,
+  )
+  return decodeProjectAccessProjection(value, workspace)
+}
+
+export async function addProjectMember(
+  workspace: string,
+  username: string,
+  role: ProjectAccessRole,
+  expectedRevision: number,
+): Promise<ProjectAccessProjection> {
+  const value = await accountRequest<unknown>(
+    `/api/v1/workspaces/${encodeURIComponent(workspace)}/members`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ username, role, expected_revision: expectedRevision }),
+    },
+  )
+  return decodeProjectAccessProjection(value, workspace)
+}
+
+export async function setProjectMember(
+  workspace: string,
+  accountId: string,
+  role: ProjectAccessRole,
+  expectedRevision: number,
+): Promise<ProjectAccessProjection> {
+  const value = await accountRequest<unknown>(
+    `/api/v1/workspaces/${encodeURIComponent(workspace)}/members/${encodeURIComponent(accountId)}`,
+    {
+      method: 'PUT',
+      body: JSON.stringify({ role, expected_revision: expectedRevision }),
+    },
+  )
+  return decodeProjectAccessProjection(value, workspace)
+}
+
+export async function removeProjectMember(
+  workspace: string,
+  accountId: string,
+  expectedRevision: number,
+): Promise<ProjectAccessProjection> {
+  const value = await accountRequest<unknown>(
+    `/api/v1/workspaces/${encodeURIComponent(workspace)}/members/${encodeURIComponent(accountId)}`,
+    {
+      method: 'DELETE',
+      body: JSON.stringify({ expected_revision: expectedRevision }),
+    },
+  )
+  return decodeProjectAccessProjection(value, workspace)
+}
+
 export async function createServerAccount(input: {
   username: string
   password: string
@@ -1903,8 +2019,135 @@ interface RawSupportAccountProjection {
   owner_test_credits?: unknown
 }
 
-function stringList(value: unknown): string[] {
-  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
+const SUPPORTER_BENEFITS = new Set<SupporterBenefit>([
+  'supporter_recognition',
+  'bounded_queue_priority',
+  'early_access_updates',
+  'supporter_convenience',
+])
+const SUPPORT_BENEFIT_STATES = new Set<SupportAccountSummary['benefits']['state']>([
+  'active',
+  'hosted_priority_available',
+  'owner_exempt',
+  'unmetered_realm',
+  'recorded_not_enforced',
+])
+
+function exactObject(value: unknown, expectedKeys: readonly string[]): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const prototype = Object.getPrototypeOf(value)
+  if (prototype !== Object.prototype && prototype !== null) return null
+  const keys = Object.keys(value).sort()
+  const expected = [...expectedKeys].sort()
+  return keys.length === expected.length && keys.every((key, index) => key === expected[index])
+    ? value as Record<string, unknown>
+    : null
+}
+
+function closedSupporterBenefits(value: unknown): SupporterBenefit[] | null {
+  if (!Array.isArray(value) || value.length < 1 || value.length > SUPPORTER_BENEFITS.size) return null
+  if (!value.every((item): item is SupporterBenefit => (
+    typeof item === 'string' && SUPPORTER_BENEFITS.has(item as SupporterBenefit)
+  ))) return null
+  return new Set(value).size === value.length ? [...value] : null
+}
+
+function supporterBenefitPolicy(value: unknown): SupporterBenefitPolicy | null {
+  const raw = exactObject(value, [
+    'schema_version', 'currency', 'credit_unit', 'promotional_credits_enabled',
+    'one_time_bonus_cap', 'one_time_validity_seconds', 'recurring_validity_seconds',
+    'one_time_tiers', 'recurring_tiers', 'terms', 'notice',
+  ])
+  if (
+    raw === null
+    || raw.schema_version !== 1
+    || typeof raw.currency !== 'string'
+    || !/^[A-Z]{3}$/.test(raw.currency)
+    || typeof raw.credit_unit !== 'string'
+    || !/^[a-z][a-z0-9_]{1,63}$/.test(raw.credit_unit)
+    || typeof raw.promotional_credits_enabled !== 'boolean'
+    || safeAllowanceNumber(raw.one_time_bonus_cap) === null
+    || safeAllowanceNumber(raw.one_time_validity_seconds) === null
+    || safeAllowanceNumber(raw.recurring_validity_seconds) === null
+    || (raw.one_time_bonus_cap as number) > 1_000_000
+    || (raw.one_time_validity_seconds as number) > 315_360_000
+    || (raw.recurring_validity_seconds as number) > 315_360_000
+    || typeof raw.notice !== 'string'
+    || raw.notice.length < 1
+    || raw.notice.length > 2_000
+  ) return null
+
+  const terms = exactObject(raw.terms, [
+    'cash_value', 'transferable', 'refundable', 'guaranteed_compute',
+    'guaranteed_service', 'unused_bonus_may_expire_or_be_revoked',
+  ])
+  if (
+    terms === null
+    || terms.cash_value !== false
+    || terms.transferable !== false
+    || terms.refundable !== false
+    || terms.guaranteed_compute !== false
+    || terms.guaranteed_service !== false
+    || terms.unused_bonus_may_expire_or_be_revoked !== true
+  ) return null
+
+  const decodeTiers = (input: unknown): SupporterBenefitPolicy['one_time_tiers'] | null => {
+    if (!Array.isArray(input) || input.length < 1 || input.length > 32) return null
+    const tiers = input.flatMap(item => {
+      const tier = exactObject(item, ['tier', 'minimum_minor', 'promotional_maestro_credits', 'benefits'])
+      const minimumMinor = tier === null ? null : safeAllowanceNumber(tier.minimum_minor)
+      const promotionalCredits = tier === null ? null : safeAllowanceNumber(tier.promotional_maestro_credits)
+      if (
+        tier === null
+        || typeof tier.tier !== 'string'
+        || !/^[a-z][a-z0-9_]{1,63}$/.test(tier.tier)
+        || minimumMinor === null
+        || promotionalCredits === null
+        || minimumMinor > 10_000_000_000
+        || promotionalCredits > 1_000_000
+      ) return []
+      const benefits = closedSupporterBenefits(tier.benefits)
+      if (benefits === null) return []
+      return [{
+        tier: tier.tier,
+        minimum_minor: minimumMinor,
+        promotional_maestro_credits: promotionalCredits,
+        benefits,
+      }]
+    })
+    if (
+      tiers.length !== input.length
+      || new Set(tiers.map(tier => tier.tier)).size !== tiers.length
+      || tiers.some((tier, index) => index > 0 && tier.minimum_minor <= tiers[index - 1].minimum_minor)
+      || (raw.promotional_credits_enabled === false
+        && tiers.some(tier => tier.promotional_maestro_credits !== 0))
+    ) return null
+    return tiers
+  }
+
+  const oneTimeTiers = decodeTiers(raw.one_time_tiers)
+  const recurringTiers = decodeTiers(raw.recurring_tiers)
+  if (oneTimeTiers === null || recurringTiers === null) return null
+  return {
+    schema_version: 1,
+    currency: raw.currency,
+    credit_unit: raw.credit_unit,
+    promotional_credits_enabled: raw.promotional_credits_enabled,
+    one_time_bonus_cap: raw.one_time_bonus_cap as number,
+    one_time_validity_seconds: raw.one_time_validity_seconds as number,
+    recurring_validity_seconds: raw.recurring_validity_seconds as number,
+    one_time_tiers: oneTimeTiers,
+    recurring_tiers: recurringTiers,
+    terms: {
+      cash_value: false,
+      transferable: false,
+      refundable: false,
+      guaranteed_compute: false,
+      guaranteed_service: false,
+      unused_bonus_may_expire_or_be_revoked: true,
+    },
+    notice: raw.notice,
+  }
 }
 
 const SUPPORT_ALLOWANCE_SOURCES = new Set(['free', 'one_time_support', 'recurring_support'])
@@ -2258,12 +2501,23 @@ function supportAccountSummary(value: RawSupportAccountProjection | undefined): 
       last_activity_at: raw.last_activity_at as string | null,
     }
   })()
-  const benefitState = typeof benefits.state === 'string' ? benefits.state : ''
+  const benefitState = typeof benefits.state === 'string'
+    && SUPPORT_BENEFIT_STATES.has(benefits.state as SupportAccountSummary['benefits']['state'])
+    ? benefits.state as SupportAccountSummary['benefits']['state']
+    : null
   const schedulerEnforcementEnabled = benefits.scheduler_enforcement_enabled === true
-  const effectiveBenefits = stringList(benefits.effective_benefits)
-  const recordedEligibility = stringList(benefits.recorded_eligibility)
+  const effectiveBenefits = Array.isArray(benefits.effective_benefits)
+    && benefits.effective_benefits.length === 0
+    ? []
+    : closedSupporterBenefits(benefits.effective_benefits)
+  const recordedEligibility = Array.isArray(benefits.recorded_eligibility)
+    && benefits.recorded_eligibility.length === 0
+    ? []
+    : closedSupporterBenefits(benefits.recorded_eligibility)
   const benefitsCoherent = (
-    benefitState === 'active'
+    effectiveBenefits !== null
+    && recordedEligibility !== null
+    && (benefitState === 'active'
       ? schedulerEnforcementEnabled
         && effectiveBenefits.length === 1
         && effectiveBenefits[0] === 'bounded_queue_priority'
@@ -2279,10 +2533,14 @@ function supportAccountSummary(value: RawSupportAccountProjection | undefined): 
           ? schedulerEnforcementEnabled
             && effectiveBenefits.length === 0
             && recordedAllowance?.enforcement_enabled !== true
-        : benefitState === 'recorded_not_enforced'
-          && !schedulerEnforcementEnabled
-          && effectiveBenefits.length === 0
-          && recordedAllowance?.enforcement_enabled !== true
+        : benefitState === 'unmetered_realm'
+          ? schedulerEnforcementEnabled
+            && effectiveBenefits.length === 0
+            && recordedAllowance?.enforcement_enabled !== true
+          : benefitState === 'recorded_not_enforced'
+            && !schedulerEnforcementEnabled
+            && effectiveBenefits.length === 0
+            && recordedAllowance?.enforcement_enabled !== true)
   )
   return {
     event_count: typeof recorded.event_count === 'number' ? recorded.event_count : 0,
@@ -2295,7 +2553,7 @@ function supportAccountSummary(value: RawSupportAccountProjection | undefined): 
     ...(ownerTest ? { owner_test_credits: ownerTest } : {}),
     benefits: benefitsCoherent
       ? {
-          state: benefitState,
+          state: benefitState as SupportAccountSummary['benefits']['state'],
           scheduler_enforcement_enabled: schedulerEnforcementEnabled,
           effective_benefits: effectiveBenefits,
           recorded_eligibility: recordedEligibility,
@@ -2304,7 +2562,7 @@ function supportAccountSummary(value: RawSupportAccountProjection | undefined): 
           state: 'recorded_not_enforced',
           scheduler_enforcement_enabled: false,
           effective_benefits: [],
-          recorded_eligibility: recordedEligibility,
+          recorded_eligibility: recordedEligibility || [],
         },
   }
 }
@@ -2314,14 +2572,16 @@ export async function fetchSupportCatalog(): Promise<SupportPublicProjection> {
   return supportPublicProjection(raw)
 }
 
-type RawSupportPublicProjection = Omit<SupportPublicProjection, 'development_cost_recovery'> & {
+type RawSupportPublicProjection = Omit<SupportPublicProjection, 'development_cost_recovery' | 'supporter_benefits'> & {
   development_cost_recovery?: unknown
+  supporter_benefits?: unknown
 }
 
 function supportPublicProjection(raw: RawSupportPublicProjection): SupportPublicProjection {
   return {
     schema_version: raw.schema_version,
     provider_catalog: raw.provider_catalog,
+    supporter_benefits: supporterBenefitPolicy(raw.supporter_benefits),
     benefit_availability: raw.benefit_availability,
     development_cost_recovery: developmentCostRecoveryProjection(raw.development_cost_recovery),
     support_priority: raw.support_priority,
@@ -2436,6 +2696,27 @@ export async function setH3LegalAccessLocation(
     license_revision: input.license_revision,
     license_sha256: input.license_sha256,
   }
+}
+
+export async function fetchKreaOwnerPolicy(): Promise<SupportKreaOwnerPolicyProjection> {
+  return accountRequest('/api/v1/krea/owner-policy')
+}
+
+export async function setKreaOwnerPolicy(
+  input: SupportKreaOwnerPolicyInput,
+): Promise<SupportKreaOwnerPolicyMutationResult> {
+  return accountRequest('/api/v1/krea/owner-policy', {
+    method: 'PUT',
+    body: JSON.stringify({
+      owner_attested: input.owner_attested,
+      manual_review_accepted: input.manual_review_accepted,
+      local_content_stays_local: input.local_content_stays_local,
+      attribution_accepted: input.attribution_accepted,
+      role_use_scopes: input.role_use_scopes,
+      license_version: input.license_version,
+      license_date: input.license_date,
+    }),
+  })
 }
 
 export interface Workspace {
@@ -7922,12 +8203,16 @@ export interface CheckpointArchitecture {
   template_model_type: string
 }
 
-// List the architectures a full checkpoint can be imported as (video/image
-// models we already support) + a best-guess default for the given CivitAI
-// baseModel so the picker can pre-select it.
+// List only architectures verified for the exact CivitAI baseModel, plus an
+// unambiguous default and a user-facing reason when import is unsupported.
 export async function fetchCheckpointArchitectures(
   baseModel?: string
-): Promise<{ architectures: CheckpointArchitecture[]; suggested_architecture: string | null }> {
+): Promise<{
+  architectures: CheckpointArchitecture[]
+  suggested_architecture: string | null
+  supported: boolean
+  unsupported_reason: string | null
+}> {
   const qs = baseModel ? `?base_model=${encodeURIComponent(baseModel)}` : ''
   const res = await fetch(`${BASE}/api/v1/civitai/checkpoint-architectures${qs}`)
   if (!res.ok) throw new Error('Failed to fetch checkpoint architectures')

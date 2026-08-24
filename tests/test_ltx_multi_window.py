@@ -229,19 +229,28 @@ class LtxMultiWindowWiringTests(unittest.TestCase):
         self.assertNotIn("needs_ltx_window_plan", launch)
         self.assertNotIn("response[\"ltx_window_plan\"]", launch)
 
-    def test_studio_exposes_toggle_modes_counts_and_manual_validation(self):
-        controls = (
-            ROOT
-            / "ui/src/components/Sidebar/H3MultiWindowControls.tsx"
+    def test_studio_uses_server_authored_profiles_and_plan_review(self):
+        retired_controls = (
+            ROOT / "ui/src/components/Sidebar/H3MultiWindowControls.tsx"
+        )
+        sidebar = (
+            ROOT / "ui/src/components/Sidebar/Sidebar.tsx"
+        ).read_text(encoding="utf-8")
+        profiles = (
+            ROOT / "ui/src/components/Sidebar/H3PerformanceProfiles.tsx"
+        ).read_text(encoding="utf-8")
+        plan_review = (
+            ROOT / "ui/src/components/H3GenerationPlanDialog.tsx"
         ).read_text(encoding="utf-8")
         duration = (
             ROOT / "ui/src/components/Sidebar/DurationSlider.tsx"
         ).read_text(encoding="utf-8")
-        self.assertIn("multi_window_sequence_controls", controls)
-        self.assertIn("ltx_multi_window", controls)
-        self.assertIn("ltx_window_prompt_mode", controls)
-        self.assertIn("Auto plan (AI)", controls)
-        self.assertIn("Manual - one per line", controls)
+        self.assertFalse(retired_controls.exists())
+        self.assertIn("<H3PerformanceProfiles />", sidebar)
+        self.assertIn("state.h3PerformanceProfiles", profiles)
+        self.assertIn("state.applyH3PerformanceProfile", profiles)
+        self.assertIn("s.pendingH3Plan", plan_review)
+        self.assertIn("?.checkpoint_options", plan_review)
         self.assertNotIn("AI-planned window prompts", duration)
         self.assertNotIn("LTX long-form Auto follows Duration", duration)
         self.assertNotIn("if (isLtx && ltxMultiWindow) return", duration)

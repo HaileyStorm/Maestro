@@ -17,6 +17,7 @@ import {
   resolveH3StyleWorkflowRequest,
   stripLegacyH3StylePrefix,
 } from '../lib/h3StyleWorkflows'
+import { h3ShotDeckFromProductionPlan, type ScopedH3ShotDeck } from '../lib/h3ShotDeck'
 
 const CIVIT_DOWNLOAD_POLL_MS = 2000
 const CIVIT_DOWNLOAD_COMPLETED_VISIBLE_MS = 30_000
@@ -170,6 +171,7 @@ const _directorRepairDiscoveries = new Map<string, object>()
 const _recoveryJobPolls = new Map<string, ActiveJobPoll>()
 const _terminalJobWaiters = new Map<string, TerminalJobWaiter>()
 let _directorPreparationPoll: ReturnType<typeof setInterval> | null = null
+let _directorTrackRequestToken: symbol | null = null
 type DirectorCapabilitiesKey = 'standard' | 'explicit'
 const _directorCapabilitiesSeq: Record<DirectorCapabilitiesKey, number> = {
   standard: 0,
@@ -964,6 +966,20 @@ function _stopDirectorPreparationPoll(): void {
     clearInterval(_directorPreparationPoll)
     _directorPreparationPoll = null
   }
+}
+
+function _retireDirectorMusicPreparation() {
+  _directorTrackRequestToken = null
+  _stopDirectorPreparationPoll()
+  _storeDirectorPreparation(null, null)
+  return {
+    directorRequestId: null,
+    directorRequestWorkspace: null,
+    directorPreparationStatus: null,
+    directorTrackGenerating: false,
+    directorLoading: false,
+    directorLoadingMessage: null,
+  } as const
 }
 
 type OutpaintAspect = 'source' | '16:9' | '9:16' | '1:1' | '4:3' | '3:4'
@@ -2743,6 +2759,7 @@ interface AppState {
   setMusicDescription: (s: string) => void
   musicInstrumental: boolean
   setMusicInstrumental: (b: boolean) => void
+  sendMusicToDirector: () => void
   selectedModelPerAudioSubMode: Partial<Record<import('../types').AudioSubMode, string>>
   selectedModelPerMode: Partial<Record<GenerationMode, string>>
   savedLoraPerMode: Partial<Record<GenerationMode, { activated_loras: string[]; loras_multipliers: string; loraWeights: Record<string, number[]>; availableLoras: string[] }>>
@@ -3299,6 +3316,8 @@ interface AppState {
   directorPlannedClips: PlannedClip[]
   directorEnergyBias: number
   directorClipPlans: ClipPlan[]
+  /** Exact server-owned H3 v1 advisory deck, scoped to its project. */
+  directorShotDeck: ScopedH3ShotDeck | null
   directorSceneDescription: string
   /** Empty means the Realistic product default unless freeform copy defines a style. */
   directorVisualStyle: string
@@ -3381,6 +3400,7 @@ interface AppState {
   directorUploadAndAnalyze: (file: File) => Promise<void>
   // Music Video: generate-the-track source + song setup
   directorMusicSource: 'upload' | 'generate' | null
+  directorMusicModel: string
   directorSongDescription: string
   directorSongInstrumental: boolean
   directorSongStyle: string
@@ -3391,6 +3411,7 @@ interface AppState {
   directorRequestWorkspace: string | null
   directorPreparationStatus: api.DirectorPreparationStatus | null
   setDirectorMusicSource: (s: 'upload' | 'generate' | null) => void
+  setDirectorMusicModel: (modelType: string) => void
   setDirectorSongDescription: (v: string) => void
   setDirectorSongInstrumental: (v: boolean) => void
   setDirectorSongStyle: (v: string) => void
@@ -3407,6 +3428,11 @@ interface AppState {
   setDirectorCustomVisualStyle: (style: string) => void
   directorSetReferenceImage: (file: File | null) => void
   directorAddCharacterRef: (file: File) => void
+  directorApplyReferenceKit: (entries: Array<{
+    kind: 'character' | 'location'
+    file: File
+    label: string
+  }>, expectedReferenceCount: number, expectedVideoModel: string) => boolean
   directorRemoveCharacterRef: (index: number) => void
   directorSetCharacterRefLabel: (index: number, label: string) => void
   directorReorderCharacterRefs: (from: number, to: number) => void
@@ -3920,6 +3946,10 @@ const _presetScopes = new WeakMap<api.GenerationPreset, {
 }>()
 const _sampleCampaignKnownJobIds = new Set<string>()
 let _accountIdentityEpoch = 0
+
+export function currentAccountIdentityEpoch(): number {
+  return _accountIdentityEpoch
+}
 
 function _accountIdentity(context: AccountContext | null | undefined): string {
   return context?.authenticated === true && context.account ? context.account.id : ''
@@ -4856,6 +4886,7 @@ function _scrubAccountBoundProjectUi(state: AppState): Partial<AppState> {
     directorAnalysis: null,
     directorPlannedClips: [],
     directorClipPlans: [],
+    directorShotDeck: null,
     directorSceneDescription: '',
     directorVisualStyle: '',
     directorCustomVisualStyle: '',
@@ -4877,6 +4908,7 @@ function _scrubAccountBoundProjectUi(state: AppState): Partial<AppState> {
     directorSpeakers: [],
     directorSpeakerMappings: [],
     directorMusicSource: null,
+    directorMusicModel: '',
     directorSongDescription: '',
     directorSongStyle: '',
     directorSongLyrics: '',
@@ -5313,6 +5345,33 @@ export const useStore = create<AppState>((set, get) => ({
   setMusicDescription: (s) => set({ musicDescription: s }),
   musicInstrumental: false,
   setMusicInstrumental: (b) => set({ musicInstrumental: b }),
+  sendMusicToDirector: () => {
+    const state = get()
+    const modelType = String(state.params.model_type || '')
+    const musicModel = modelType === 'minimax_music3'
+      || modelType.startsWith('ace_step')
+      ? modelType
+      : ''
+    const maximum = modelType === 'minimax_music3' ? 300 : 360
+    set({
+      ..._retireDirectorMusicPreparation(),
+      sidebarMode: 'director',
+      referenceReturnMode: 'studio',
+      directorSkill: 'music_video',
+      directorMusicSource: 'generate',
+      directorMusicModel: musicModel,
+      directorSongDescription: state.musicDescription,
+      directorSongStyle: String(state.params.alt_prompt || ''),
+      directorSongLyrics: state.musicInstrumental
+        ? '[Instrumental]'
+        : String(state.params.prompt || ''),
+      directorSongInstrumental: state.musicInstrumental,
+      directorSongDuration: Math.min(maximum, Math.max(5, state.durationSeconds || 120)),
+      directorStep: 'upload',
+      directorError: null,
+      directorShotDeck: null,
+    })
+  },
   audioSubMode: 'speech' as import('../types').AudioSubMode,
   selectedModelPerAudioSubMode: {} as Partial<Record<import('../types').AudioSubMode, string>>,
   setAudioSubMode: (subMode) => {
@@ -5353,12 +5412,13 @@ export const useStore = create<AppState>((set, get) => ({
       _storeH3StyleWorkflow('')
       set({
         h3StyleWorkflow: '',
+        directorShotDeck: null,
         h3StyleWorkflowCatalogError: 'That H3 workflow is no longer in the server catalog. Choose another workflow.',
       })
       return
     }
     _storeH3StyleWorkflow(id)
-    set({ h3StyleWorkflow: id, h3StyleWorkflowCatalogError: null })
+    set({ h3StyleWorkflow: id, h3StyleWorkflowCatalogError: null, directorShotDeck: null })
   },
 
   loadH3StyleWorkflowCatalog: async (force = false) => {
@@ -5376,6 +5436,7 @@ export const useStore = create<AppState>((set, get) => ({
         h3StyleWorkflowCatalog: catalog,
         h3StyleWorkflowCatalogLoading: false,
         h3StyleWorkflow: selectionCurrent ? selected : '',
+        ...(!selectionCurrent ? { directorShotDeck: null } : {}),
         h3StyleWorkflowCatalogError: selectionCurrent
           ? null
           : 'Your saved H3 workflow is no longer in the server catalog and was cleared.',
@@ -6115,6 +6176,7 @@ export const useStore = create<AppState>((set, get) => ({
         pipelineId: pid,
         pipelineStatus: null,
         pipelinePolling: true,
+        directorShotDeck: null,
       })
       get().pollPipelineStatus()
     } finally {
@@ -6600,6 +6662,7 @@ export const useStore = create<AppState>((set, get) => ({
         downloadable: m.downloadable ?? true,
         manual_installation_ready: m.manual_installation_ready ?? false,
         availability_status: m.availability_status,
+        execution_allowed: m.execution_allowed,
         manual_checkpoint_verification_required: m.manual_checkpoint_verification_required ?? false,
         manual_checkpoint_verified: m.manual_checkpoint_verified ?? false,
         manual_installation: m.manual_installation,
@@ -11286,6 +11349,7 @@ export const useStore = create<AppState>((set, get) => ({
       directorCapabilitiesLoading: false,
       directorCapabilitiesLoadingExplicitOutput: null,
       directorCapabilitiesError: null,
+      directorShotDeck: null,
       // A deliberate Private-off after this remains honored. Only the
       // transition into explicit intent applies the safe default.
       ...(enabled ? { privateOutput: true } : {}),
@@ -11981,6 +12045,7 @@ export const useStore = create<AppState>((set, get) => ({
   directorPlannedClips: [],
   directorEnergyBias: 0,
   directorClipPlans: [],
+  directorShotDeck: null,
   directorSceneDescription: '',
   directorVisualStyle: '',
   directorCustomVisualStyle: '',
@@ -12127,6 +12192,10 @@ export const useStore = create<AppState>((set, get) => ({
         video_prompt: plan.video_prompt || '',
         image_prompt: plan.image_prompt || '',
       }))
+      const recoveredShotDeck = h3ShotDeckFromProductionPlan(
+        result.production_plan,
+        scope.workspace,
+      )
       let recoveredClips: PlannedClip[] | undefined
       const shots = (result.production_plan as {
         shots?: Array<{
@@ -12170,6 +12239,7 @@ export const useStore = create<AppState>((set, get) => ({
         directorSkill: recoveredSkill,
         directorPlannedClips: recoveredClips || get().directorPlannedClips,
         directorClipPlans: plans,
+        directorShotDeck: recoveredShotDeck,
         directorStep: 'review',
         directorLoading: false,
         directorLoadingMessage: null,
@@ -12302,12 +12372,12 @@ export const useStore = create<AppState>((set, get) => ({
   directorIdentityGuidanceScale: 3.0,
   setDirectorVoiceRef: (file) => {
     if (file) {
-      set({ directorVoiceRef: file, directorVoiceRefPath: null })
+      set({ directorVoiceRef: file, directorVoiceRefPath: null, directorShotDeck: null })
     } else {
-      set({ directorVoiceRef: null, directorVoiceRefPath: null })
+      set({ directorVoiceRef: null, directorVoiceRefPath: null, directorShotDeck: null })
     }
   },
-  setDirectorIdentityGuidanceScale: (v) => set({ directorIdentityGuidanceScale: v }),
+  setDirectorIdentityGuidanceScale: (v) => set({ directorIdentityGuidanceScale: v, directorShotDeck: null }),
   directorClipImages: [],
   directorImageGenProgress: null,
   directorSpeakers: [],
@@ -12319,6 +12389,7 @@ export const useStore = create<AppState>((set, get) => ({
   directorShotImageGuidance: 'auto' as DirectorShotImageGuidance,
   directorSkill: null,
   directorMusicSource: null,
+  directorMusicModel: '',
   directorSongDescription: '',
   directorSongInstrumental: false,
   directorSongStyle: '',
@@ -12328,12 +12399,13 @@ export const useStore = create<AppState>((set, get) => ({
   directorRequestId: _storedDirectorPreparation?.requestId ?? null,
   directorRequestWorkspace: _storedDirectorPreparation?.workspace ?? null,
   directorPreparationStatus: null,
-  setDirectorMusicSource: (s) => set({ directorMusicSource: s }),
-  setDirectorSongDescription: (v) => set({ directorSongDescription: v }),
-  setDirectorSongInstrumental: (v) => set({ directorSongInstrumental: v }),
-  setDirectorSongStyle: (v) => set({ directorSongStyle: v }),
-  setDirectorSongLyrics: (v) => set({ directorSongLyrics: v }),
-  setDirectorSongDuration: (v) => set({ directorSongDuration: v }),
+  setDirectorMusicSource: (s) => set({ directorMusicSource: s, directorShotDeck: null }),
+  setDirectorMusicModel: (modelType) => set({ ..._retireDirectorMusicPreparation(), directorMusicModel: modelType, directorShotDeck: null }),
+  setDirectorSongDescription: (v) => set({ ..._retireDirectorMusicPreparation(), directorSongDescription: v, directorShotDeck: null }),
+  setDirectorSongInstrumental: (v) => set({ ..._retireDirectorMusicPreparation(), directorSongInstrumental: v, directorShotDeck: null }),
+  setDirectorSongStyle: (v) => set({ ..._retireDirectorMusicPreparation(), directorSongStyle: v, directorShotDeck: null }),
+  setDirectorSongLyrics: (v) => set({ ..._retireDirectorMusicPreparation(), directorSongLyrics: v, directorShotDeck: null }),
+  setDirectorSongDuration: (v) => set({ ..._retireDirectorMusicPreparation(), directorSongDuration: v, directorShotDeck: null }),
   reconnectDirectorPreparation: async () => {
     const accountIdentityEpoch = _accountIdentityEpoch
     const { directorRequestId, directorRequestWorkspace } = get()
@@ -12344,9 +12416,8 @@ export const useStore = create<AppState>((set, get) => ({
         directorRequestWorkspace,
       )
       if (!_accountIdentityIsCurrent(accountIdentityEpoch)) return
-      if (get().directorRequestId === directorRequestId) {
-        set({ directorPreparationStatus: status })
-      }
+      if (get().directorRequestId !== directorRequestId) return
+      set({ directorPreparationStatus: status })
       if (status.status === 'completed') {
         _stopDirectorPreparationPoll()
       } else if (_directorPreparationPoll === null) {
@@ -12397,7 +12468,7 @@ export const useStore = create<AppState>((set, get) => ({
   setDirectorSeamless: (v) => set({ directorSeamless: v }),
   setDirectorShotImageGuidance: (v) => set({ directorShotImageGuidance: v }),
   setDirectorSkill: (skill) => {
-    set({ directorSkill: skill })
+    set({ directorSkill: skill, directorShotDeck: null })
     void get().resumeDirectorPreview()
     // Music director default for image-to-video reference strength is
     // 0.7 (loosens the lock to the start frame so motion can develop
@@ -12547,8 +12618,8 @@ export const useStore = create<AppState>((set, get) => ({
 
   setDirectorImageRoleModel: (role, modelType) => {
     set(role === 'creator'
-      ? { directorImageCreatorModelOverride: modelType, directorComponentError: null, directorError: null }
-      : { directorImageEditorModelOverride: modelType, directorComponentError: null, directorError: null })
+      ? { directorImageCreatorModelOverride: modelType, directorComponentError: null, directorError: null, directorShotDeck: null }
+      : { directorImageEditorModelOverride: modelType, directorComponentError: null, directorError: null, directorShotDeck: null })
     get().activateDirectorImageRoles()
   },
 
@@ -12557,12 +12628,13 @@ export const useStore = create<AppState>((set, get) => ({
       directorImageRoleLoras: { ...s.directorImageRoleLoras, [role]: selections },
       directorComponentError: null,
       directorError: null,
+      directorShotDeck: null,
     }))
     get().activateDirectorImageRoles()
   },
 
   selectDirectorVideoModel: async (modelType) => {
-    set({ directorComponentError: null, directorError: null })
+    set({ directorComponentError: null, directorError: null, directorShotDeck: null })
     if (get().generationMode === 'video') {
       await get().selectModel(modelType)
       return
@@ -12588,6 +12660,7 @@ export const useStore = create<AppState>((set, get) => ({
     }
     set({
       savedLoraPerMode: updatedLoraPerMode,
+      directorShotDeck: null,
     })
     _saveSettings({
       generationMode: s.generationMode,
@@ -12602,6 +12675,7 @@ export const useStore = create<AppState>((set, get) => ({
       directorSpeakerMappings: s.directorSpeakerMappings.map(m =>
         m.speakerId === speakerId ? { ...m, name, role } : m
       ),
+      directorShotDeck: null,
     }))
   },
 
@@ -12610,6 +12684,7 @@ export const useStore = create<AppState>((set, get) => ({
       directorSceneDescription: s.directorSceneDescription
         ? `${s.directorSceneDescription} @${speakerId}`
         : `@${speakerId}`,
+      directorShotDeck: null,
     }))
   },
 
@@ -12820,6 +12895,10 @@ export const useStore = create<AppState>((set, get) => ({
     const description = s.directorSongDescription.trim()
     if (!description) return
     const lifecycle = _beginDirectorLlmRequest(s.activeWorkspace)
+    const requestModel = s.directorMusicModel
+    const requestInstrumental = s.directorSongInstrumental
+    const requestStyle = s.directorSongStyle
+    const requestLyrics = s.directorSongLyrics
     let refPath = s.directorReferenceImagePath
     try {
       if (!refPath && s.directorReferenceImage) {
@@ -12833,13 +12912,22 @@ export const useStore = create<AppState>((set, get) => ({
       const r = await api.writeSong({
         workspace: s.activeWorkspace,
         description,
-        instrumental: s.directorSongInstrumental,
+        instrumental: requestInstrumental,
+        model_type: requestModel || undefined,
         reference_image_path: refPath || undefined,
       }, { signal: lifecycle.signal })
-      if (!lifecycle.ownsWorkspace()) return
+      const current = get()
+      if (
+        !lifecycle.ownsWorkspace()
+        || current.directorSongDescription.trim() !== description
+        || current.directorMusicModel !== requestModel
+        || current.directorSongInstrumental !== requestInstrumental
+        || current.directorSongStyle !== requestStyle
+        || current.directorSongLyrics !== requestLyrics
+      ) return
       set({
         directorSongStyle: r.style || '',
-        directorSongLyrics: s.directorSongInstrumental ? '[Instrumental]' : (r.lyrics || ''),
+        directorSongLyrics: requestInstrumental ? '[Instrumental]' : (r.lyrics || ''),
       })
     } catch (error) {
       if (_isBrowserAbort(error) || !lifecycle.ownsWorkspace()) return
@@ -12857,14 +12945,23 @@ export const useStore = create<AppState>((set, get) => ({
     const accountIdentityEpoch = _accountIdentityEpoch
     const s = get()
     const workspace = s.activeWorkspace
-    const ownsTrackRequest = () => (
-      _accountIdentityIsCurrent(accountIdentityEpoch)
-      && get().activeWorkspace === workspace
-    )
     const instrumental = s.directorSongInstrumental
     const description = s.directorSongDescription.trim()
     const style = s.directorSongStyle.trim()
     const lyrics = s.directorSongLyrics.trim()
+    const requestModel = s.directorMusicModel
+    const requestDuration = s.directorSongDuration
+    const requestInputsCurrent = () => {
+      const current = get()
+      return _accountIdentityIsCurrent(accountIdentityEpoch)
+        && current.activeWorkspace === workspace
+        && current.directorSongInstrumental === instrumental
+        && current.directorSongDescription.trim() === description
+        && current.directorSongStyle.trim() === style
+        && current.directorSongLyrics.trim() === lyrics
+        && current.directorMusicModel === requestModel
+        && current.directorSongDuration === requestDuration
+    }
     const restoredRequest = s.directorRequestWorkspace === s.activeWorkspace
       && !!s.directorRequestId
     if (!description && !style && !lyrics && !restoredRequest) {
@@ -12876,14 +12973,19 @@ export const useStore = create<AppState>((set, get) => ({
     if (!refPath && s.directorReferenceImage) {
       try {
         refPath = (await api.uploadImage(s.directorReferenceImage)).path
-        if (!ownsTrackRequest()) return
+        if (!requestInputsCurrent()) return
         set({ directorReferenceImagePath: refPath })
       } catch {
-        if (!ownsTrackRequest()) return
+        if (!requestInputsCurrent()) return
         /* image upload is best-effort */
       }
     }
-    if (!ownsTrackRequest()) return
+    if (!requestInputsCurrent()) return
+    const trackToken = Symbol('director-track-request')
+    _directorTrackRequestToken = trackToken
+    const ownsTrackRequest = () => (
+      _directorTrackRequestToken === trackToken && requestInputsCurrent()
+    )
     set({
       directorTrackGenerating: true,
       directorError: null,
@@ -12893,6 +12995,7 @@ export const useStore = create<AppState>((set, get) => ({
     })
     try {
       const musicRequest: api.DirectorMusicRequest = {
+        model_type: s.directorMusicModel || undefined,
         description: description || undefined,
         style: style || undefined,
         lyrics: instrumental ? '[Instrumental]' : (lyrics || undefined),
@@ -12982,6 +13085,15 @@ export const useStore = create<AppState>((set, get) => ({
         directorError: msg,
         directorStep: 'upload',
       })
+    } finally {
+      if (_directorTrackRequestToken === trackToken) {
+        _directorTrackRequestToken = null
+        set({
+          directorTrackGenerating: false,
+          directorLoading: false,
+          directorLoadingMessage: null,
+        })
+      }
     }
   },
 
@@ -12989,7 +13101,7 @@ export const useStore = create<AppState>((set, get) => ({
     const { directorAnalysis, activeWorkspace } = get()
     if (!directorAnalysis) return
     const lifecycle = _beginDirectorLlmRequest(activeWorkspace)
-    set({ directorLoading: true, directorEnergyBias: bias })
+    set({ directorLoading: true, directorEnergyBias: bias, directorShotDeck: null })
     try {
       const structure = await api.planClipStructure({
         analysis: directorAnalysis,
@@ -13021,20 +13133,57 @@ export const useStore = create<AppState>((set, get) => ({
   directorSetReferenceImage: (file) => set({
     directorReferenceImage: file,
     directorReferenceImagePath: null,
+    directorShotDeck: null,
   }),
-  directorAddCharacterRef: (file) => set(s => ({
+  directorAddCharacterRef: (file) => set(s => s.directorCharacterRefPaths.length > s.directorCharacterRefs.length ? {
+    directorError: 'A recovered Character reference is available by saved path only. Remove it or finish that Director plan before adding another Character reference.',
+  } : {
     directorCharacterRefs: [...s.directorCharacterRefs, file],
+    directorCharacterRefPaths: [],
     directorCharacterRefLabels: [...s.directorCharacterRefLabels, ''],
-  })),
+    directorShotDeck: null,
+  }),
+  directorApplyReferenceKit: (entries, expectedReferenceCount, expectedVideoModel) => {
+    let applied = false
+    set(s => {
+      const currentReferenceCount = Number(Boolean(s.directorReferenceImage || s.directorReferenceImagePath))
+        + Math.max(s.directorCharacterRefs.length, s.directorCharacterRefPaths.length)
+        + Math.max(s.directorLocationRefs.length, s.directorLocationRefPaths.length)
+      const hasPathOnlyRows = s.directorCharacterRefPaths.length > s.directorCharacterRefs.length
+        || s.directorLocationRefPaths.length > s.directorLocationRefs.length
+      const currentVideoModel = s.selectedModelPerMode.video || ''
+      const maxReferenceCount = s.models.find(
+        model => model.model_type === currentVideoModel,
+      )?.director?.max_image_refs ?? null
+      if (hasPathOnlyRows
+        || currentReferenceCount !== expectedReferenceCount
+        || currentVideoModel !== expectedVideoModel
+        || (maxReferenceCount != null && currentReferenceCount + entries.length > maxReferenceCount)) return s
+      applied = true
+    const characters = entries.filter(entry => entry.kind === 'character')
+    const locations = entries.filter(entry => entry.kind === 'location')
+    return {
+      directorCharacterRefs: [...s.directorCharacterRefs, ...characters.map(entry => entry.file)],
+      directorCharacterRefPaths: [],
+      directorCharacterRefLabels: [...s.directorCharacterRefLabels, ...characters.map(entry => entry.label)],
+      directorLocationRefs: [...s.directorLocationRefs, ...locations.map(entry => entry.file)],
+      directorLocationRefPaths: [],
+      directorLocationRefLabels: [...s.directorLocationRefLabels, ...locations.map(entry => entry.label)],
+      directorShotDeck: null,
+    }
+    })
+    return applied
+  },
   directorRemoveCharacterRef: (index) => set(s => ({
     directorCharacterRefs: s.directorCharacterRefs.filter((_, i) => i !== index),
     directorCharacterRefPaths: s.directorCharacterRefPaths.filter((_, i) => i !== index),
     directorCharacterRefLabels: s.directorCharacterRefLabels.filter((_, i) => i !== index),
+    directorShotDeck: null,
   })),
   directorSetCharacterRefLabel: (index, label) => set(s => {
     const labels = [...s.directorCharacterRefLabels]
     labels[index] = label
-    return { directorCharacterRefLabels: labels }
+    return { directorCharacterRefLabels: labels, directorShotDeck: null }
   }),
   directorReorderCharacterRefs: (from, to) => set(s => {
     const refs = [...s.directorCharacterRefs]
@@ -13043,21 +13192,26 @@ export const useStore = create<AppState>((set, get) => ({
     const [rF] = refs.splice(from, 1); refs.splice(to, 0, rF)
     const [pF] = paths.splice(from, 1); paths.splice(to, 0, pF)
     const [lF] = labels.splice(from, 1); labels.splice(to, 0, lF)
-    return { directorCharacterRefs: refs, directorCharacterRefPaths: paths, directorCharacterRefLabels: labels }
+    return { directorCharacterRefs: refs, directorCharacterRefPaths: paths, directorCharacterRefLabels: labels, directorShotDeck: null }
   }),
-  directorAddLocationRef: (file) => set(s => ({
+  directorAddLocationRef: (file) => set(s => s.directorLocationRefPaths.length > s.directorLocationRefs.length ? {
+    directorError: 'A recovered Location reference is available by saved path only. Remove it or finish that Director plan before adding another Location reference.',
+  } : {
     directorLocationRefs: [...s.directorLocationRefs, file],
+    directorLocationRefPaths: [],
     directorLocationRefLabels: [...s.directorLocationRefLabels, ''],
-  })),
+    directorShotDeck: null,
+  }),
   directorRemoveLocationRef: (index) => set(s => ({
     directorLocationRefs: s.directorLocationRefs.filter((_, i) => i !== index),
     directorLocationRefPaths: s.directorLocationRefPaths.filter((_, i) => i !== index),
     directorLocationRefLabels: s.directorLocationRefLabels.filter((_, i) => i !== index),
+    directorShotDeck: null,
   })),
   directorSetLocationRefLabel: (index, label) => set(s => {
     const labels = [...s.directorLocationRefLabels]
     labels[index] = label
-    return { directorLocationRefLabels: labels }
+    return { directorLocationRefLabels: labels, directorShotDeck: null }
   }),
   directorReorderLocationRefs: (from, to) => set(s => {
     const refs = [...s.directorLocationRefs]
@@ -13066,12 +13220,12 @@ export const useStore = create<AppState>((set, get) => ({
     const [rF] = refs.splice(from, 1); refs.splice(to, 0, rF)
     const [pF] = paths.splice(from, 1); paths.splice(to, 0, pF)
     const [lF] = labels.splice(from, 1); labels.splice(to, 0, lF)
-    return { directorLocationRefs: refs, directorLocationRefPaths: paths, directorLocationRefLabels: labels }
+    return { directorLocationRefs: refs, directorLocationRefPaths: paths, directorLocationRefLabels: labels, directorShotDeck: null }
   }),
 
-  directorSetSceneDescription: (prompt) => set({ directorSceneDescription: prompt }),
-  setDirectorVisualStyle: (style) => set({ directorVisualStyle: style }),
-  setDirectorCustomVisualStyle: (style) => set({ directorCustomVisualStyle: style }),
+  directorSetSceneDescription: (prompt) => set({ directorSceneDescription: prompt, directorShotDeck: null }),
+  setDirectorVisualStyle: (style) => set({ directorVisualStyle: style, directorShotDeck: null }),
+  setDirectorCustomVisualStyle: (style) => set({ directorCustomVisualStyle: style, directorShotDeck: null }),
 
   // Helper: upload all Director reference images (main + characters + locations)
   _uploadDirectorRefs: async (lifecycle, requestFence) => {
@@ -13129,7 +13283,7 @@ export const useStore = create<AppState>((set, get) => ({
     const requestFence = useV2
       ? _captureDirectorPreviewRequestFence(get, 'music_video')
       : null
-    set({ directorLoading: true, directorError: null, directorStep: 'plan' })
+    set({ directorLoading: true, directorError: null, directorStep: 'plan', directorShotDeck: null })
     try {
       await _ensureSelectedH3StyleWorkflowReady(get)
       if (requestFence) _requireCurrentDirectorPreviewRequestFence(requestFence)
@@ -13155,6 +13309,7 @@ export const useStore = create<AppState>((set, get) => ({
 
       // Generate both image and video prompts
       let plans: Array<{ video_prompt: string; image_prompt: string }>
+      let shotDeck: ScopedH3ShotDeck | null = null
 
       if (useV2) {
         const imageRoleRequest = await _captureDirectorImageRoleRequest(
@@ -13191,6 +13346,7 @@ export const useStore = create<AppState>((set, get) => ({
           video_prompt: p.video_prompt || '',
           image_prompt: p.image_prompt || '',
         }))
+        shotDeck = h3ShotDeckFromProductionPlan(result.production_plan, activeWorkspace)
       } else {
         // Legacy: direct LLM prompt generation
         const result = await api.planClipPromptsAndImages({
@@ -13216,6 +13372,7 @@ export const useStore = create<AppState>((set, get) => ({
       if (!lifecycle.ownsWorkspace()) return
       set({
         directorClipPlans: plans,
+        directorShotDeck: shotDeck,
         directorStep: 'review',
         directorLoading: false,
       })
@@ -13304,7 +13461,7 @@ export const useStore = create<AppState>((set, get) => ({
       if (plans[index]) {
         plans[index] = { ...plans[index], [field]: value }
       }
-      return { directorClipPlans: plans }
+      return { directorClipPlans: plans, directorShotDeck: null }
     })
   },
 
@@ -13729,6 +13886,7 @@ export const useStore = create<AppState>((set, get) => ({
       directorPlannedClips: [],
       directorEnergyBias: 0,
       directorClipPlans: [],
+      directorShotDeck: null,
       directorSceneDescription: '',
       directorVisualStyle: '',
       directorCustomVisualStyle: '',
@@ -13758,6 +13916,7 @@ export const useStore = create<AppState>((set, get) => ({
       directorShotImageGuidance: 'auto' as DirectorShotImageGuidance,
       directorSkill: null,
       directorMusicSource: null,
+      directorMusicModel: '',
       directorSongDescription: '',
       directorSongInstrumental: false,
       directorSongStyle: '',
@@ -13779,10 +13938,10 @@ export const useStore = create<AppState>((set, get) => ({
 
   // --- Short Film Director actions ---
 
-  shortFilmSetCharacters: (characters) => set({ shortFilmCharacters: characters }),
-  shortFilmSetPath: (path) => set({ shortFilmPath: path }),
-  shortFilmSetTargetDuration: (duration) => set({ shortFilmTargetDuration: duration }),
-  shortFilmSetNarrative: (v) => set({ shortFilmNarrative: v }),
+  shortFilmSetCharacters: (characters) => set({ shortFilmCharacters: characters, directorShotDeck: null }),
+  shortFilmSetPath: (path) => set({ shortFilmPath: path, directorShotDeck: null }),
+  shortFilmSetTargetDuration: (duration) => set({ shortFilmTargetDuration: duration, directorShotDeck: null }),
+  shortFilmSetNarrative: (v) => set({ shortFilmNarrative: v, directorShotDeck: null }),
 
   shortFilmUploadAndAnalyze: async (file) => {
     const requestWorkspace = get().activeWorkspace
@@ -13880,7 +14039,7 @@ export const useStore = create<AppState>((set, get) => ({
     const { directorAnalysis, activeWorkspace } = get()
     if (!directorAnalysis) return
     const lifecycle = _beginDirectorLlmRequest(activeWorkspace)
-    set({ directorLoading: true, directorEnergyBias: bias })
+    set({ directorLoading: true, directorEnergyBias: bias, directorShotDeck: null })
     try {
       const structure = await api.planDialogueScenes({
         workspace: activeWorkspace,
@@ -13915,7 +14074,7 @@ export const useStore = create<AppState>((set, get) => ({
     const requestFence = useV2
       ? _captureDirectorPreviewRequestFence(get, 'short_film')
       : null
-    set({ directorLoading: true, directorError: null, directorStep: 'plan' })
+    set({ directorLoading: true, directorError: null, directorStep: 'plan', directorShotDeck: null })
     try {
       await _ensureSelectedH3StyleWorkflowReady(get)
       if (requestFence) _requireCurrentDirectorPreviewRequestFence(requestFence)
@@ -13941,6 +14100,7 @@ export const useStore = create<AppState>((set, get) => ({
 
       // Generate prompts
       let plans: Array<{ video_prompt: string; image_prompt: string }>
+      let shotDeck: ScopedH3ShotDeck | null = null
 
       if (useV2) {
         const imageRoleRequest = await _captureDirectorImageRoleRequest(
@@ -13976,6 +14136,7 @@ export const useStore = create<AppState>((set, get) => ({
           video_prompt: p.video_prompt || '',
           image_prompt: p.image_prompt || '',
         }))
+        shotDeck = h3ShotDeckFromProductionPlan(result.production_plan, activeWorkspace)
       } else {
         const result = await api.planShortFilmPrompts({
           workspace: activeWorkspace,
@@ -14000,6 +14161,7 @@ export const useStore = create<AppState>((set, get) => ({
       if (!lifecycle.ownsWorkspace()) return
       set({
         directorClipPlans: plans,
+        directorShotDeck: shotDeck,
         directorStep: 'review',
         directorLoading: false,
       })
@@ -14095,7 +14257,7 @@ export const useStore = create<AppState>((set, get) => ({
     const requestFence = useV2
       ? _captureDirectorPreviewRequestFence(get, 'short_film')
       : null
-    set({ directorLoading: true, directorError: null, directorStep: 'plan' })
+    set({ directorLoading: true, directorError: null, directorStep: 'plan', directorShotDeck: null })
     try {
       await _ensureSelectedH3StyleWorkflowReady(get)
       if (requestFence) _requireCurrentDirectorPreviewRequestFence(requestFence)
@@ -14113,6 +14275,7 @@ export const useStore = create<AppState>((set, get) => ({
 
       let plans: Array<{ video_prompt: string; image_prompt: string }>
       let storyClips: PlannedClip[] | undefined
+      let shotDeck: ScopedH3ShotDeck | null = null
 
       if (useV2) {
         const imageRoleRequest = await _captureDirectorImageRoleRequest(
@@ -14151,6 +14314,7 @@ export const useStore = create<AppState>((set, get) => ({
           video_prompt: p.video_prompt || '',
           image_prompt: p.image_prompt || '',
         }))
+        shotDeck = h3ShotDeckFromProductionPlan(result.production_plan, activeWorkspace)
         // Extract clips from production plan shots
         const pp = result.production_plan as {
           shots?: Array<{
@@ -14202,6 +14366,7 @@ export const useStore = create<AppState>((set, get) => ({
       set({
         directorPlannedClips: storyClips || get().directorPlannedClips,
         directorClipPlans: plans,
+        directorShotDeck: shotDeck,
         directorStep: 'review',
         directorLoading: false,
       })
@@ -14377,6 +14542,15 @@ export const useStore = create<AppState>((set, get) => ({
             pipelineStatus: null,
             pipelinePolling: false,
             directorLoading: false,
+            directorShotDeck: null,
+            directorReferenceImage: null,
+            directorReferenceImagePath: null,
+            directorCharacterRefs: [],
+            directorCharacterRefPaths: [],
+            directorCharacterRefLabels: [],
+            directorLocationRefs: [],
+            directorLocationRefPaths: [],
+            directorLocationRefLabels: [],
             dashboardOpen: false,
             dashboardPipelineList: [],
             dashboardPipelineListRead: { workspace: '', generation: _dashboardPipelineListLoadToken, status: 'idle' },
@@ -14453,6 +14627,15 @@ export const useStore = create<AppState>((set, get) => ({
         pipelineStatus: null,
         pipelinePolling: false,
         directorLoading: false,
+        directorShotDeck: null,
+        directorReferenceImage: null,
+        directorReferenceImagePath: null,
+        directorCharacterRefs: [],
+        directorCharacterRefPaths: [],
+        directorCharacterRefLabels: [],
+        directorLocationRefs: [],
+        directorLocationRefPaths: [],
+        directorLocationRefLabels: [],
         dashboardOpen: false,
         dashboardPipelineList: [],
         dashboardPipelineListRead: { workspace: '', generation: _dashboardPipelineListLoadToken, status: 'idle' },
@@ -14497,6 +14680,15 @@ export const useStore = create<AppState>((set, get) => ({
         pipelineStatus: null,
         pipelinePolling: false,
         directorLoading: false,
+        directorShotDeck: null,
+        directorReferenceImage: null,
+        directorReferenceImagePath: null,
+        directorCharacterRefs: [],
+        directorCharacterRefPaths: [],
+        directorCharacterRefLabels: [],
+        directorLocationRefs: [],
+        directorLocationRefPaths: [],
+        directorLocationRefLabels: [],
         dashboardOpen: false,
         dashboardPipelineList: [],
         dashboardPipelineListRead: { workspace: '', generation: _dashboardPipelineListLoadToken, status: 'idle' },
@@ -14570,6 +14762,7 @@ export const useStore = create<AppState>((set, get) => ({
         pipelineStatus: null,
         pipelinePolling: false,
         directorLoading: false,
+        directorShotDeck: null,
         dashboardOpen: false,
         dashboardPipelineList: [],
         dashboardPipelineListRead: { workspace: '', generation: _dashboardPipelineListLoadToken, status: 'idle' },
@@ -14627,6 +14820,7 @@ export const useStore = create<AppState>((set, get) => ({
           pipelineStatus: null,
           pipelinePolling: false,
           directorLoading: false,
+          directorShotDeck: null,
           dashboardOpen: false,
           dashboardPipelineList: [],
           dashboardPipelineListRead: { workspace: '', generation: _dashboardPipelineListLoadToken, status: 'idle' },
@@ -14678,6 +14872,7 @@ export const useStore = create<AppState>((set, get) => ({
         pipelineStatus: null,
         pipelinePolling: false,
         directorLoading: false,
+        directorShotDeck: null,
         dashboardOpen: false,
         dashboardPipelineList: [],
         dashboardPipelineListRead: { workspace: '', generation: _dashboardPipelineListLoadToken, status: 'idle' },
@@ -16378,6 +16573,7 @@ export const useStore = create<AppState>((set, get) => ({
       set({
         pipelineId: pipeline_id,
         pipelineStatus: null,
+        directorShotDeck: null,
         pipelinePolling: true,
         directorStep: 'plan',
         directorLoading: true,
@@ -16414,7 +16610,7 @@ export const useStore = create<AppState>((set, get) => ({
     try {
       await api.continuePipeline(pid, updates)
       if (get().pipelineId !== pid || get().activeWorkspace !== workspace) return
-      set({ directorLoading: true, pipelineStatus: null })
+      set({ directorLoading: true, pipelineStatus: null, directorShotDeck: null })
     } catch (e) {
       console.error('Failed to continue pipeline:', e)
     }
@@ -16428,7 +16624,7 @@ export const useStore = create<AppState>((set, get) => ({
     try {
       await api.stopPipeline(pid)
       if (get().pipelineId !== pid || get().activeWorkspace !== workspace) return
-      set({ pipelineId: null, pipelineStatus: null, pipelinePolling: false, directorLoading: false })
+      set({ pipelineId: null, pipelineStatus: null, pipelinePolling: false, directorLoading: false, directorShotDeck: null })
     } catch (e) {
       console.error('Failed to stop pipeline:', e)
     }
@@ -16445,6 +16641,7 @@ export const useStore = create<AppState>((set, get) => ({
     }
     let outputSignature = ''
     let nextPollMs = 2000
+    let shotDeckAdopted = false
 
     const poll = async () => {
       if (
@@ -16469,8 +16666,15 @@ export const useStore = create<AppState>((set, get) => ({
           || status.status === 'cancelled'
         const pipelineBlocked = status.status === 'blocked'
         const pipelineFailed = status.status === 'failed' || status.status === 'cancelled'
+        const pipelineShotDeck = h3ShotDeckFromProductionPlan(
+          (status as unknown as { production_plan?: unknown }).production_plan,
+          workspace,
+        )
+        const adoptPipelineShotDeck = !shotDeckAdopted && pipelineShotDeck !== null
+        if (adoptPipelineShotDeck) shotDeckAdopted = true
         set({
           pipelineStatus: status,
+          ...(adoptPipelineShotDeck ? { directorShotDeck: pipelineShotDeck } : {}),
           ...(pipelineActive ? {
             directorLoading: true,
           } : {

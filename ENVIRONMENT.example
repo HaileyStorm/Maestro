@@ -43,6 +43,9 @@ MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_URL=
 # or signing secrets in this file.
 MAESTRO_ACCOUNTS_ENABLED=false
 MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED=false
+# Enable only after owner bootstrap and active project migration. Signup remains
+# limited to this launch's exact registered stable/Quick Cloudflare origins.
+MAESTRO_PUBLIC_REGISTRATION_ENABLED=false
 
 # Hosted credit enforcement is an optional operator policy and remains off for
 # local installs. Enabling it is meaningful only with accounts, a hosted

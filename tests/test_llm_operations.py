@@ -5,8 +5,12 @@ from __future__ import annotations
 import ast
 import asyncio
 import copy
+from collections.abc import Mapping
 from contextlib import contextmanager
+import hashlib
+import json
 import sys
+from tempfile import TemporaryDirectory
 import threading
 import time
 import types
@@ -32,9 +36,18 @@ from services.llm_operations import (
     LlmRouteAdmissionError,
     LlmRouteOperationConflictError,
     LlmRouteOperationManager,
+    PromptEnhancementOperationManager,
     ROUTE_OPERATION_TTL_SECONDS,
     run_blocking_shielded,
 )
+from services.queue_recovery_adapter import (
+    PromptEnhancementRecoveryCapacityError,
+    PromptEnhancementRecoveryError,
+    PromptEnhancementRecoveryConflictError,
+    PromptEnhancementRecoveryStore,
+    QueueRecoveryAdapterError,
+)
+from services.queue_recovery_runtime import QueueRecoveryRuntimeError
 
 
 async def _wait_for_status(manager, operation_id, status):
@@ -1246,7 +1259,7 @@ class PromptEnhanceScopedRouteTests(unittest.IsolatedAsyncioTestCase):
             route.index("_revalidate_prompt_enhancement_images,"),
             route.index("expected_project_instance ="),
         )
-        self.assertIn("llm_route_operation_manager.submit(", route)
+        self.assertIn("_prompt_enhancement_operation_manager.submit(", route)
         self.assertIn("return JSONResponse(status, status_code=202)", route)
         self.assertIn("cancel_handle=cancel_handle", route)
         self.assertIn(
@@ -2213,7 +2226,7 @@ class PromptEnhanceScopedRouteTests(unittest.IsolatedAsyncioTestCase):
                 captured.update(kwargs)
                 return {
                     "request_id": kwargs["request_id"],
-                    "operation_kind": kwargs["operation_kind"],
+                    "operation_kind": "enhance",
                     "status": "running",
                 }
 
@@ -2257,6 +2270,10 @@ class PromptEnhanceScopedRouteTests(unittest.IsolatedAsyncioTestCase):
             "_llm_operation_scope": (
                 lambda *_args: ("owner", "b" * 64)
             ),
+            "_prompt_enhancement_operation_scope": (
+                lambda *_args: ("account", "b" * 64, "session")
+            ),
+            "_prompt_enhancement_operation_manager": Manager(),
             "_ScopedPromptEnhancementRequest": types.SimpleNamespace(
                 snapshot_authority=lambda _request: {"session_id": "owner"},
             ),
@@ -2278,17 +2295,17 @@ class PromptEnhanceScopedRouteTests(unittest.IsolatedAsyncioTestCase):
                     "prompt": "private prompt",
                 }
 
-        with mock.patch.object(
-            llm_operations, "llm_route_operation_manager", Manager(),
-        ):
-            response = await namespace["llm_enhance_prompt"](Request())
+        response = await namespace["llm_enhance_prompt"](Request())
         self.assertEqual(response.status_code, 202)
         self.assertEqual(captured["request_id"], uuid.UUID(request_id).hex)
-        self.assertEqual(captured["operation_kind"], "enhance")
-        self.assertEqual(
-            captured["effective_input_digest"], "effective-digest",
-        )
+        self.assertEqual(captured["account_key"], "account")
+        self.assertEqual(captured["session_key"], "session")
+        self.assertEqual(captured["request_digest"], "effective-digest")
         self.assertTrue(callable(captured["execute"]))
+        self.assertEqual(captured["job_context"]["workspace"], "project")
+        self.assertEqual(
+            captured["job_context"]["body"]["prompt"], "private prompt",
+        )
         self.assertLess(events.index("authorize"), events.index("runtime"))
         self.assertLess(events.index("images"), events.index("runtime"))
         self.assertLess(events.index("seal"), events.index("runtime"))
@@ -2327,6 +2344,10 @@ class PromptEnhanceScopedRouteTests(unittest.IsolatedAsyncioTestCase):
             "_llm_operation_scope": (
                 lambda *_args: ("owner", recreated_instance)
             ),
+            "_prompt_enhancement_operation_scope": (
+                lambda *_args: ("account", recreated_instance, "session")
+            ),
+            "_prompt_enhancement_operation_manager": Manager(),
             "_seal_prompt_enhancement_images": lambda *_args: [],
             "_prompt_enhancement_runtime_snapshot": (
                 lambda *_args, **_kwargs: runtime_calls.append(True)
@@ -2349,9 +2370,7 @@ class PromptEnhanceScopedRouteTests(unittest.IsolatedAsyncioTestCase):
                     "prompt": "private prompt",
                 }
 
-        with mock.patch.object(
-            llm_operations, "llm_route_operation_manager", Manager(),
-        ), self.assertRaises(HTTPException) as raised:
+        with self.assertRaises(HTTPException) as raised:
             await namespace["llm_enhance_prompt"](Request())
         self.assertEqual(raised.exception.status_code, 409)
         self.assertEqual(
@@ -2381,7 +2400,6 @@ class PromptEnhanceScopedRouteTests(unittest.IsolatedAsyncioTestCase):
             ):
                 node.decorator_list = []
                 nodes.append(node)
-        manager = LlmRouteOperationManager()
         request_id = str(uuid.uuid4())
         gate = asyncio.Event()
 
@@ -2391,35 +2409,45 @@ class PromptEnhanceScopedRouteTests(unittest.IsolatedAsyncioTestCase):
             cancellation.checkpoint()
             return {"enhanced": "private result"}
 
-        manager.submit(
-            request_id=request_id,
-            owner_key="owner",
-            project_instance_key="project-one",
-            operation_kind="enhance",
-            effective_input_digest="digest",
-            execute=execute,
-        )
-        namespace = {
-            "Request": object,
-            "HTTPException": HTTPException,
-            "JSONResponse": JSONResponse,
-            "_LLM_ROUTE_OPERATION_KINDS": frozenset({
-                "enhance", "director_preview",
-            }),
-            "_promote_external_llm_request": lambda _request: None,
-            "_request_project_workspace": lambda _request, value: value,
-            "_require_project_access": lambda *_args, **_kwargs: None,
-            "_llm_operation_scope": (
-                lambda _request, workspace: ("owner", workspace)
-            ),
-        }
-        exec(compile(ast.fix_missing_locations(ast.Module(
-            body=nodes, type_ignores=[],
-        )), "launch.py", "exec"), namespace)
-        request = types.SimpleNamespace(state=types.SimpleNamespace())
-        with mock.patch.object(
-            llm_operations, "llm_route_operation_manager", manager,
-        ):
+        with TemporaryDirectory() as temp_dir:
+            manager = PromptEnhancementOperationManager(
+                PromptEnhancementRecoveryStore(
+                    Path(temp_dir) / "prompt-enhancement",
+                    b"scope-test-secret-material-32b",
+                )
+            )
+            manager.submit(
+                request_id=request_id,
+                account_key="account",
+                project_instance_key="project-one",
+                session_key="session",
+                request_digest="d" * 64,
+                execute=execute,
+            )
+            namespace = {
+                "Request": object,
+                "HTTPException": HTTPException,
+                "JSONResponse": JSONResponse,
+                "_LLM_ROUTE_OPERATION_KINDS": frozenset({
+                    "enhance", "director_preview",
+                }),
+                "_promote_external_llm_request": lambda _request: None,
+                "_request_project_workspace": lambda _request, value: value,
+                "_require_project_access": lambda *_args, **_kwargs: None,
+                "_llm_operation_scope": (
+                    lambda _request, workspace: ("owner", workspace)
+                ),
+                "_prompt_enhancement_operation_scope": (
+                    lambda _request, workspace: (
+                        "account", workspace, "session",
+                    )
+                ),
+                "_prompt_enhancement_operation_manager": manager,
+            }
+            exec(compile(ast.fix_missing_locations(ast.Module(
+                body=nodes, type_ignores=[],
+            )), "launch.py", "exec"), namespace)
+            request = types.SimpleNamespace(state=types.SimpleNamespace())
             for _ in range(100):
                 status = namespace["llm_route_operation_status"](
                     request, "enhance", request_id, "project-one",
@@ -2445,8 +2473,8 @@ class PromptEnhanceScopedRouteTests(unittest.IsolatedAsyncioTestCase):
                 request, "enhance", request_id, "project-one",
             )
             self.assertEqual(terminal.status_code, 409)
-        gate.set()
-        await asyncio.sleep(0)
+            gate.set()
+            await asyncio.sleep(0)
 
 
 class DirectorV2LeaseTests(unittest.IsolatedAsyncioTestCase):
@@ -2897,6 +2925,619 @@ class PrepareRouteScopeTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(raised.exception.status_code, 404)
         self.assertEqual(raised.exception.detail, "LLM preparation not found")
+
+
+class DurablePromptEnhancementOperationTests(unittest.IsolatedAsyncioTestCase):
+    SECRET = b"prompt-enhance-test-secret-material"
+    SCOPE = {
+        "account_key": "account-one",
+        "project_instance_key": "project-one",
+        "session_key": "session-one",
+    }
+
+    async def _wait_for(
+        self,
+        manager: PromptEnhancementOperationManager,
+        request_id: str,
+        expected: str,
+    ) -> dict:
+        for _ in range(300):
+            status = manager.status(request_id, **self.SCOPE)
+            if status is not None and status["status"] == expected:
+                return status
+            await asyncio.sleep(0.001)
+        raise AssertionError(f"Prompt Enhance did not reach {expected}")
+
+    def test_canonical_job_store_enqueue_failure_restart_and_retry(self):
+        source = (APP / "launch.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        node = next(
+            item for item in tree.body
+            if isinstance(item, ast.ClassDef)
+            and item.name == "_CanonicalPromptEnhancementStore"
+        )
+        jobs = {}
+        events = []
+
+        class Results:
+            retention_seconds = 3600.0
+
+            @staticmethod
+            def write(request_id, _result):
+                return {
+                    "path": f"results/{request_id}.result.json",
+                    "schema": "maestro.prompt-enhancement-result.v1",
+                    "sha256": "a" * 64,
+                    "size": 10,
+                }
+
+            @staticmethod
+            def read(_request_id, _reference):
+                return {"enhanced": "private result"}
+
+            @staticmethod
+            def remove(_reference):
+                events.append("remove-result")
+
+        class Legacy:
+            replay_result = None
+
+            @staticmethod
+            def replay(*_args, **_kwargs):
+                return Legacy.replay_result
+
+            @staticmethod
+            def status(*_args, **_kwargs):
+                return None
+
+            @staticmethod
+            def result(*_args, **_kwargs):
+                return None
+
+        def register(job, *, recovery_kind, defer_worker):
+            events.append(("register", recovery_kind, defer_worker))
+            job["kind"] = recovery_kind
+            jobs[job["id"]] = job
+
+        def acquire(_lock, job, **_kwargs):
+            events.append("start")
+            job["status"] = "running"
+            job["phase"] = "loading"
+            job["_generation_slot_owned"] = True
+            return True
+
+        def finish(job, status, **updates):
+            events.append(("refund", status))
+            job.update(updates)
+            job["status"] = status
+            return True
+
+        namespace = {
+            "Mapping": Mapping,
+            "Any": object,
+            "uuid": uuid,
+            "hmac": __import__("hmac"),
+            "copy": copy,
+            "time": time,
+            "os": __import__("os"),
+            "_jobs": jobs,
+            "RESOURCE_INTENT_TEXT": "text",
+            "RESOURCE_EXECUTION_STANDARD": "standard",
+            "PromptEnhancementRecoveryError": PromptEnhancementRecoveryError,
+            "PromptEnhancementRecoveryConflictError": (
+                PromptEnhancementRecoveryConflictError
+            ),
+            "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+            "QueueRecoveryAdapterError": QueueRecoveryAdapterError,
+            "_queue_recovery_register_and_publish": register,
+            "_credit_prepare_admission": lambda _job: events.append("credit-admit"),
+            "acquire_and_start_generation_slot": acquire,
+            "_gen_lock": object(),
+            "_credit_prepare_dispatch": lambda _job: events.append("credit-dispatch"),
+            "fail_queued_job": finish,
+            "finish_job": finish,
+            "block_resource_admission_failure": finish,
+            "update_job": lambda job, **updates: job.update(updates) or True,
+            "request_cancel": lambda job, **_kwargs: job.update(status="cancelled"),
+            "consume_prompt_enhancement_result": lambda _job: None,
+            "complete_prompt_enhancement_resource_release": lambda _job: True,
+            "release_generation_slot": lambda _lock, job: (
+                job.pop("_generation_slot_owned", False)
+            ),
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[node], type_ignores=[],
+        )), "canonical-prompt-store", "exec"), namespace)
+        store = namespace["_CanonicalPromptEnhancementStore"](
+            Results(), Legacy(),
+        )
+        request_id = str(uuid.uuid4())
+        scope = {
+            "account_key": "account",
+            "project_instance_key": "project",
+            "session_key": "session-a",
+        }
+        context = {
+            "workspace": "workspace",
+            "out_dir": "/project",
+            "session_id": "session-a",
+            "body": {"prompt": "private prompt"},
+        }
+        queued, created, _claim = store.bind(
+            request_id=request_id,
+            request_digest="b" * 64,
+            job_context=context,
+            **scope,
+        )
+        self.assertTrue(created)
+        self.assertEqual(queued["status"], "queued")
+        replay, created, _claim = store.bind(
+            request_id=request_id,
+            request_digest="b" * 64,
+            job_context=context,
+            **{**scope, "session_key": "session-b"},
+        )
+        self.assertFalse(created)
+        self.assertEqual(replay["request_id"], uuid.UUID(request_id).hex)
+        self.assertEqual(events.count(("register", "prompt_enhancement", True)), 1)
+        self.assertEqual(store.mark_running(request_id, **scope)["status"], "running")
+        failed = store.fail(request_id, **scope)
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(events.count(("refund", "failed")), 1)
+
+        restarted = namespace["_CanonicalPromptEnhancementStore"](
+            Results(), Legacy(),
+        )
+        self.assertEqual(restarted.status(request_id, **scope)["status"], "failed")
+        retry_id = str(uuid.uuid4())
+        retry, retry_created, _claim = restarted.bind(
+            request_id=retry_id,
+            request_digest="c" * 64,
+            job_context=context,
+            **scope,
+        )
+        self.assertTrue(retry_created)
+        self.assertEqual(retry["status"], "queued")
+        namespace["_credit_prepare_admission"] = lambda _job: (
+            (_ for _ in ()).throw(OSError("journal unavailable"))
+        )
+        namespace["block_resource_admission_failure"] = lambda job: (
+            job.update(
+                status="failed",
+                phase="failed",
+                recovery_state="terminal",
+                resource_state="released",
+                finished_at=1234.5,
+            ) or True
+        )
+        admission_failed = restarted.mark_running(retry_id, **scope)
+        self.assertEqual(admission_failed["status"], "failed")
+        self.assertTrue(admission_failed["retryable"])
+        Legacy.replay_result = {
+            "request_id": uuid.uuid4().hex,
+            "status": "queued",
+            "phase": "queued",
+        }
+        historical, historical_created, _claim = restarted.bind(
+            request_id=Legacy.replay_result["request_id"],
+            request_digest="d" * 64,
+            job_context=context,
+            **scope,
+        )
+        self.assertFalse(historical_created)
+        self.assertEqual(historical["status"], "failed")
+        self.assertTrue(historical["retryable"])
+
+    def test_canonical_result_reads_are_idempotent_after_lost_response(self):
+        source = (APP / "launch.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        node = next(
+            item for item in tree.body
+            if isinstance(item, ast.ClassDef)
+            and item.name == "_CanonicalPromptEnhancementStore"
+        )
+        request_id = uuid.uuid4().hex
+        reference = {
+            "path": f"results/{request_id}.result.json",
+            "schema": "maestro.prompt-enhancement-result.v1",
+            "sha256": "a" * 64,
+            "size": 10,
+        }
+        jobs = {
+            request_id: {
+                "id": request_id,
+                "kind": "prompt_enhancement",
+                "status": "completed",
+                "params": {"_prompt_enhancement_operation": {
+                    "account_key": "account",
+                    "project_instance_key": "project",
+                    "request_digest": "b" * 64,
+                }},
+                "prompt_result_reference": reference,
+            },
+        }
+
+        class Results:
+            retention_seconds = 3600.0
+
+            @staticmethod
+            def read(_request_id, _reference):
+                return {"enhanced": "private result"}
+
+        namespace = {
+            "Mapping": Mapping,
+            "Any": object,
+            "uuid": uuid,
+            "hmac": __import__("hmac"),
+            "copy": copy,
+            "time": time,
+            "_jobs": jobs,
+            "consume_prompt_enhancement_result": lambda _job: None,
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[node], type_ignores=[],
+        )), "canonical-prompt-store", "exec"), namespace)
+        store = namespace["_CanonicalPromptEnhancementStore"](
+            Results(), object(),
+        )
+        scope = {
+            "account_key": "account",
+            "project_instance_key": "project",
+            "session_key": "session",
+        }
+        self.assertEqual(store.result(request_id, **scope), {
+            "enhanced": "private result",
+        })
+        self.assertEqual(store.result(request_id, **scope), {
+            "enhanced": "private result",
+        })
+        self.assertEqual(jobs[request_id]["prompt_result_reference"], reference)
+        cancelled = dict(jobs[request_id], status="cancelled", phase="inference")
+        public = store._public(cancelled)
+        self.assertEqual(public["phase"], "cancelled")
+        self.assertEqual(public["stage"], "cancelled")
+
+    def test_canonical_capacity_cleanup_evicts_only_expired_terminal_result(self):
+        source = (APP / "launch.py").read_text(encoding="utf-8")
+        node = next(
+            item for item in ast.parse(source).body
+            if isinstance(item, ast.ClassDef)
+            and item.name == "_CanonicalPromptEnhancementStore"
+        )
+        old_id = uuid.uuid4().hex
+        current_id = uuid.uuid4().hex
+        old_reference = {"path": f"results/{old_id}.result.json"}
+        jobs = {
+            old_id: {
+                "id": old_id,
+                "kind": "prompt_enhancement",
+                "status": "completed",
+                "finished_at": 1.0,
+                "prompt_result_reference": old_reference,
+            },
+            current_id: {
+                "id": current_id,
+                "kind": "prompt_enhancement",
+                "status": "running",
+                "params": {"_prompt_enhancement_operation": {
+                    "account_key": "account-b",
+                    "project_instance_key": "project-b",
+                    "request_digest": "b" * 64,
+                }},
+            },
+        }
+        events = []
+
+        class Results:
+            retention_seconds = 60.0
+            attempts = 0
+
+            def write(self, request_id, _result):
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise PromptEnhancementRecoveryCapacityError("full")
+                return {"path": f"results/{request_id}.result.json"}
+
+            @staticmethod
+            def remove(reference):
+                events.append(("removed", dict(reference)))
+
+        def consume(job):
+            reference = job.pop("prompt_result_reference", None)
+            if reference is not None:
+                job["prompt_result_consumed"] = True
+            return reference
+
+        def finish(job, status, **updates):
+            job.update(updates)
+            job["status"] = status
+            return True
+
+        namespace = {
+            "Mapping": Mapping,
+            "Any": object,
+            "uuid": uuid,
+            "hmac": __import__("hmac"),
+            "copy": copy,
+            "time": types.SimpleNamespace(time=lambda: 10_000.0),
+            "_jobs": jobs,
+            "PromptEnhancementRecoveryCapacityError": (
+                PromptEnhancementRecoveryCapacityError
+            ),
+            "consume_prompt_enhancement_result": consume,
+            "finish_job": finish,
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[node], type_ignores=[],
+        )), "canonical-prompt-store", "exec"), namespace)
+        store = namespace["_CanonicalPromptEnhancementStore"](
+            Results(), object(),
+        )
+        completed = store.complete(
+            current_id,
+            result={"enhanced": "private"},
+            account_key="account-b",
+            project_instance_key="project-b",
+            session_key="session-b",
+        )
+        self.assertEqual(completed["status"], "completed")
+        self.assertTrue(jobs[old_id]["prompt_result_consumed"])
+        self.assertEqual(events, [("removed", old_reference)])
+
+    async def test_completed_result_survives_restart_outside_generic_journal(self):
+        private_prompt = "private prompt must not enter operation metadata"
+        private_result = "private enhanced result survives by reference"
+        request_id = str(uuid.uuid4())
+        request_digest = hashlib.sha256(private_prompt.encode()).hexdigest()
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "prompt-enhancement"
+            store = PromptEnhancementRecoveryStore(root, self.SECRET)
+            manager = PromptEnhancementOperationManager(store)
+
+            async def execute(progress, _cancellation):
+                progress({
+                    "phase": "generating",
+                    "stage": "enhance",
+                    "text": "bounded live output",
+                })
+                return {"original": private_prompt, "enhanced": private_result}
+
+            queued = manager.submit(
+                request_id=request_id,
+                request_digest=request_digest,
+                execute=execute,
+                **self.SCOPE,
+            )
+            self.assertEqual(queued["status"], "queued")
+            completed = await manager.wait(request_id, **self.SCOPE)
+            self.assertEqual(completed["status"], "completed")
+            self.assertTrue(completed["result_available"])
+
+            metadata = store.metadata_path.read_text(encoding="ascii")
+            self.assertNotIn(private_prompt, metadata)
+            self.assertNotIn(private_result, metadata)
+            self.assertNotIn("original", metadata)
+            self.assertNotIn("enhanced", metadata)
+            parsed = json.loads(metadata)
+            record = parsed["records"][uuid.UUID(request_id).hex]
+            self.assertEqual(record["operation_kind"], "prompt_enhancement")
+            self.assertEqual(record["status"], "completed")
+            self.assertEqual(
+                set(record["result_reference"]),
+                {"path", "schema", "sha256", "size"},
+            )
+
+            restarted = PromptEnhancementOperationManager(
+                PromptEnhancementRecoveryStore(root, self.SECRET),
+            )
+            self.assertEqual(
+                restarted.status(request_id, **self.SCOPE)["status"],
+                "completed",
+            )
+            self.assertEqual(
+                restarted.result(request_id, **self.SCOPE),
+                {"original": private_prompt, "enhanced": private_result},
+            )
+            for field, foreign in (
+                ("account_key", "account-two"),
+                ("project_instance_key", "project-two"),
+                ("session_key", "session-two"),
+            ):
+                scope = dict(self.SCOPE)
+                scope[field] = foreign
+                with self.subTest(foreign_field=field):
+                    self.assertIsNone(restarted.status(request_id, **scope))
+                    self.assertIsNone(restarted.result(request_id, **scope))
+
+    def test_legacy_store_read_only_mode_never_reconciles_or_rewrites(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "legacy-prompt-enhancement"
+            writable = PromptEnhancementRecoveryStore(root, self.SECRET)
+            request_id = str(uuid.uuid4())
+            writable.bind(
+                request_id=request_id,
+                request_digest="a" * 64,
+                **self.SCOPE,
+            )
+            before = writable.metadata_path.read_bytes()
+            legacy = PromptEnhancementRecoveryStore(
+                root, self.SECRET, read_only=True,
+            )
+            self.assertEqual(
+                legacy.status(request_id, **self.SCOPE)["status"], "queued",
+            )
+            self.assertEqual(legacy.metadata_path.read_bytes(), before)
+            self.assertFalse((root / ".operations.lock").exists())
+            with self.assertRaises(PromptEnhancementRecoveryError):
+                legacy.reconcile_interrupted()
+            with self.assertRaises(PromptEnhancementRecoveryError):
+                legacy.bind(
+                    request_id=str(uuid.uuid4()),
+                    request_digest="b" * 64,
+                    **self.SCOPE,
+                )
+
+    async def test_binding_is_idempotent_and_restart_never_auto_generates(self):
+        request_id = str(uuid.uuid4())
+        digest = "a" * 64
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "prompt-enhancement"
+            store = PromptEnhancementRecoveryStore(root, self.SECRET)
+            manager = PromptEnhancementOperationManager(store)
+
+            async def execute(_progress, cancellation):
+                calls.append("first")
+                entered.set()
+                await release.wait()
+                cancellation.checkpoint()
+                return {"enhanced": "done"}
+
+            def duplicate_admission():
+                raise AssertionError("idempotent replay re-ran admission")
+
+            first = manager.submit(
+                request_id=request_id,
+                request_digest=digest,
+                execute=execute,
+                **self.SCOPE,
+            )
+            replay = manager.submit(
+                request_id=request_id,
+                request_digest=digest,
+                execute=lambda *_args: (_ for _ in ()).throw(
+                    AssertionError("idempotent replay started another worker")
+                ),
+                admit=duplicate_admission,
+                **self.SCOPE,
+            )
+            self.assertEqual(first["request_id"], replay["request_id"])
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            self.assertEqual(calls, ["first"])
+            with self.assertRaises(PromptEnhancementRecoveryConflictError):
+                manager.submit(
+                    request_id=request_id,
+                    request_digest="b" * 64,
+                    execute=execute,
+                    **self.SCOPE,
+                )
+            manager.cancel(request_id, **self.SCOPE)
+            release.set()
+            cancelled = await manager.wait(request_id, **self.SCOPE)
+            self.assertEqual(cancelled["status"], "cancelled")
+
+            orphan_id = str(uuid.uuid4())
+            orphan_store = PromptEnhancementRecoveryStore(
+                Path(directory) / "orphan", self.SECRET,
+            )
+            bound, created, claim = orphan_store.bind(
+                request_id=orphan_id,
+                request_digest="c" * 64,
+                **self.SCOPE,
+            )
+            self.assertEqual(bound["status"], "queued")
+            self.assertTrue(created)
+            self.assertIsNotNone(claim)
+            restarted = PromptEnhancementOperationManager(
+                PromptEnhancementRecoveryStore(
+                    Path(directory) / "orphan", self.SECRET,
+                ),
+            )
+            # Construction is read-only compatibility: canonical queue
+            # startup owns interruption terminalization, while a legacy
+            # sidecar remains inert and unchanged.
+            self.assertEqual(
+                restarted.status(orphan_id, **self.SCOPE)["status"], "queued",
+            )
+            no_auto_calls = []
+            replayed = restarted.submit(
+                request_id=orphan_id,
+                request_digest="c" * 64,
+                execute=lambda *_args: no_auto_calls.append(True),
+                **self.SCOPE,
+            )
+            await asyncio.sleep(0)
+            self.assertEqual(replayed["status"], "queued")
+            self.assertEqual(no_auto_calls, [])
+
+    async def test_all_states_are_explicit_and_consumption_is_bounded(self):
+        now = [0.0]
+        with TemporaryDirectory() as directory:
+            store = PromptEnhancementRecoveryStore(
+                Path(directory) / "prompt-enhancement",
+                self.SECRET,
+                retention_seconds=10,
+                max_records=4,
+                clock=lambda: now[0],
+            )
+            manager = PromptEnhancementOperationManager(store)
+            completed_id = str(uuid.uuid4())
+
+            async def complete(_progress, _cancellation):
+                return {"enhanced": "one-use private result"}
+
+            queued = manager.submit(
+                request_id=completed_id,
+                request_digest="d" * 64,
+                execute=complete,
+                **self.SCOPE,
+            )
+            self.assertEqual(queued["status"], "queued")
+            completed = await self._wait_for(manager, completed_id, "completed")
+            self.assertTrue(completed["result_available"])
+            self.assertEqual(
+                manager.consume_result(completed_id, **self.SCOPE),
+                {"enhanced": "one-use private result"},
+            )
+            self.assertIsNone(manager.consume_result(completed_id, **self.SCOPE))
+            consumed = manager.status(completed_id, **self.SCOPE)
+            self.assertEqual(consumed["status"], "completed")
+            self.assertFalse(consumed["result_available"])
+            self.assertTrue(consumed["result_consumed"])
+
+            failed_id = str(uuid.uuid4())
+
+            async def fail(_progress, _cancellation):
+                raise RuntimeError("private engine detail")
+
+            manager.submit(
+                request_id=failed_id,
+                request_digest="e" * 64,
+                execute=fail,
+                **self.SCOPE,
+            )
+            failed = await self._wait_for(manager, failed_id, "failed")
+            self.assertTrue(failed["retryable"])
+            self.assertNotIn("engine detail", repr(failed))
+
+            running_id = str(uuid.uuid4())
+            gate = asyncio.Event()
+
+            async def run(_progress, cancellation):
+                await gate.wait()
+                cancellation.checkpoint()
+                return {"enhanced": "late"}
+
+            manager.submit(
+                request_id=running_id,
+                request_digest="f" * 64,
+                execute=run,
+                **self.SCOPE,
+            )
+            await self._wait_for(manager, running_id, "running")
+            cancelled = manager.cancel(running_id, **self.SCOPE)
+            self.assertEqual(cancelled["status"], "cancelled")
+            gate.set()
+            await manager.wait(running_id, **self.SCOPE)
+
+            now[0] = 11.0
+            self.assertIsNone(manager.status(completed_id, **self.SCOPE))
+            self.assertIsNone(manager.status(failed_id, **self.SCOPE))
+            self.assertIsNone(manager.status(running_id, **self.SCOPE))
 
 
 if __name__ == "__main__":

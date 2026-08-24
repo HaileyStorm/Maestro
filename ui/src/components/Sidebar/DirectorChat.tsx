@@ -5,6 +5,7 @@ import { downloadModel, estimateH3Performance, fetchDefaults, fetchModelOptions,
 import type { DirectorFailureComponent, DirectorImageRoleCandidate, DirectorReadinessReason } from '../../api/client'
 import { DirectorImageRoleLoraSelector, DirectorLoraSelector } from '../SettingsDrawer/DirectorLoraSelector'
 import { DirectorSongSetup } from './DirectorSongSetup'
+import { DirectorShotDeck } from '../DirectorShotDeck'
 import { InfoTooltip } from './InfoTooltip'
 import { H3StyleWorkflowField } from './PromptInput'
 import { formatManualInstallationBytes, manualInstallationDestination } from '../../lib/manualInstallation'
@@ -443,6 +444,11 @@ export function DirectorChat() {
   const plannedClips = useStore(s => s.directorPlannedClips)
   const energyBias = useStore(s => s.directorEnergyBias)
   const clipPlans = useStore(s => s.directorClipPlans)
+  const shotDeck = useStore(s => (
+    s.directorShotDeck?.workspace === s.activeWorkspace
+      ? s.directorShotDeck.deck
+      : null
+  ))
   const sceneDescription = useStore(s => s.directorSceneDescription)
   const audioFile = useStore(s => s.directorAudioFile)
   const referenceImage = useStore(s => s.directorReferenceImage)
@@ -1099,6 +1105,8 @@ export function DirectorChat() {
             </div>
           </SystemBubble>
         )}
+
+        {reviewReached && shotDeck && <DirectorShotDeck deck={shotDeck} />}
 
         {/* Review step (image prompts) */}
         {usesShotImages && (atStep('review') || pastStep('review')) && (

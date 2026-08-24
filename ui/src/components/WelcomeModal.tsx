@@ -17,9 +17,11 @@ import {
   X,
 } from 'lucide-react'
 import { useStore } from '../stores/useStore'
+import { isAccountProjectAccessActive } from '../api/client'
 import { PRODUCT_NAME, PRODUCT_NAME_VISUAL, PRODUCT_PROVENANCE } from '../lib/branding'
 import { CHANGELOG_MANIFEST, CURRENT_RELEASE } from '../lib/changelog'
 import { closeModalIfTop, installModalFocus } from '../lib/modalFocus'
+import { supporterBenefitLabels, supporterTierLabels } from './AccountSupport/supportPresentation'
 
 const SEEN_KEY = 'maestro_welcome_seen_v1'
 
@@ -28,6 +30,10 @@ const SEEN_KEY = 'maestro_welcome_seen_v1'
  */
 export function WelcomeModal() {
   const accessContext = useStore(state => state.accessContext)
+  const accountContext = useStore(state => state.accountContext)
+  const accountProjectMigration = useStore(state => state.accountProjectMigration)
+  const supportSelf = useStore(state => state.supportSelf)
+  const loadSupportSelf = useStore(state => state.loadSupportSelf)
   const activeWorkspace = useStore(state => state.activeWorkspace)
   const setSidebarMode = useStore(state => state.setSidebarMode)
   const titleId = useId()
@@ -68,16 +74,40 @@ export function WelcomeModal() {
     })
   }, [dismiss, open])
 
+  const accountId = accountContext?.authenticated === true ? accountContext.account?.id || '' : ''
+  const accountCanViewSupport = accountContext?.authenticated === true
+    && accountContext.capabilities?.includes('account.self') === true
+
+  useEffect(() => {
+    if (!open || !accountId || !accountCanViewSupport || typeof loadSupportSelf !== 'function') return
+    void loadSupportSelf().catch(() => null)
+  }, [accountCanViewSupport, accountId, loadSupportSelf, open])
+
   if (!open) return null
 
   const accessLabel = accessContext?.remote
     ? `Remote project · ${activeWorkspace}`
     : 'Local access · on this computer'
+  const accountProjectAccessActive = isAccountProjectAccessActive(
+    accessContext,
+    accountProjectMigration,
+  )
   const accessDetail = accessContext?.remote
-    ? 'This browser can open only the projects you unlock. Settings for this computer stay on the computer.'
+    ? accountProjectAccessActive
+      ? accountContext?.authenticated
+        ? 'Your signed-in account can open projects assigned to it. Settings for this computer stay on the computer.'
+        : 'Sign in to open projects assigned to your account. Settings for this computer stay on the computer.'
+      : 'Before account setup is complete, this browser can open only projects unlocked here. Settings for this computer stay on the computer.'
     : accessContext?.cloudflare_enabled
       ? 'Your local studio keeps working even if its Cloudflare share link is unavailable.'
       : `Open ${PRODUCT_NAME} from Pinokio for the most direct, dependable local connection.`
+  const supporterAccount = accountContext?.authenticated === true ? supportSelf?.account || null : null
+  const supporterTiers = supporterTierLabels(supporterAccount)
+  const supporterRecognitionActive = supporterAccount?.benefits.recorded_eligibility.includes('supporter_recognition') === true
+  const activeSupporterBenefits = [
+    ...(supporterRecognitionActive ? [supporterBenefitLabels.supporter_recognition] : []),
+    ...(supporterAccount?.benefits.effective_benefits.map(benefit => supporterBenefitLabels[benefit]) || []),
+  ]
 
   return createPortal(
     <div
@@ -108,8 +138,8 @@ export function WelcomeModal() {
         <div className="relative overflow-hidden border-b border-border px-5 pb-5 pt-6 sm:px-7 sm:pb-6 sm:pt-7">
           <div className="pointer-events-none absolute -right-16 -top-24 h-64 w-64 rounded-full bg-accent-blue/15 blur-3xl" />
           <div className="relative flex items-start gap-3 sm:gap-4">
-            <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-gradient-toggle-from to-gradient-toggle-to text-xl font-bold text-toggle-active-foreground shadow-lg sm:h-14 sm:w-14">
-              M
+            <div className="flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden rounded-2xl border border-accent-blue/30 bg-gradient-to-br from-gradient-toggle-from to-gradient-toggle-to p-1.5 shadow-lg sm:h-14 sm:w-14">
+              <img aria-hidden="true" src="/maestro.svg" alt="" className="h-full w-full object-contain" />
             </div>
             <div className="min-w-0 flex-1">
               <div className="mb-1 flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.2em] text-accent-blue">
@@ -144,6 +174,35 @@ export function WelcomeModal() {
               {accessDetail}
             </p>
           </div>
+          {accountContext?.authenticated === true && accountContext.account && (
+            <section aria-label="Account membership and supporter status" className="relative mt-2 rounded-xl border border-border bg-bg-primary/45 px-3 py-2.5">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-[10px] font-semibold uppercase tracking-[0.14em] text-text-muted">Account membership</span>
+                <span className="rounded-full border border-border bg-bg-tertiary/70 px-2 py-1 text-[9px] font-semibold text-text-secondary">
+                  {accountContext.account.role === 'owner' ? 'Owner account' : 'Member account'}
+                </span>
+                {supporterTiers.map(tier => (
+                  <span key={tier} className="rounded-full border border-accent-blue/35 bg-accent-blue/10 px-2 py-1 text-[9px] font-semibold text-accent-blue">
+                    {tier}
+                  </span>
+                ))}
+              </div>
+              <p className="mt-2 text-[10px] leading-relaxed text-text-secondary">
+                {accountProjectAccessActive
+                  ? 'Project access follows this account membership.'
+                  : 'Project access may still depend on this browser until account setup is complete.'}
+              </p>
+              <p className="mt-1 text-[9px] leading-relaxed text-text-muted">
+                {supporterAccount === null
+                  ? 'Supporter status is being refreshed.'
+                  : supporterTiers.length === 0
+                    ? 'No supporter tier is currently recorded.'
+                    : activeSupporterBenefits.length > 0
+                      ? `Delivered or active now: ${activeSupporterBenefits.join(' · ')}.`
+                      : 'A supporter tier is recorded; no delivered or host-active perk is shown yet.'}
+              </p>
+            </section>
+          )}
         </div>
 
         <div className="grid gap-2.5 px-5 pt-5 sm:grid-cols-2 sm:px-7 sm:pt-6">

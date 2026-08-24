@@ -134,6 +134,7 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
   const privateRevealed = file.private && revealedPrivateKey === privateRevealKey
   const privateBlurred = file.private && !privateRevealed
   const [shareUrl, setShareUrl] = useState('')
+  const [sharePublicOrigin, setSharePublicOrigin] = useState<boolean | null>(null)
   const [sharing, setSharing] = useState(false)
   const [shareMessage, setShareMessage] = useState('')
   const moveRef = useRef<HTMLDivElement>(null)
@@ -336,8 +337,13 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
 
   const copyText = async (value: string) => {
     if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(value)
-      return
+      try {
+        await navigator.clipboard.writeText(value)
+        return
+      } catch {
+        // Insecure/local browser contexts often expose Clipboard but reject
+        // writes. Fall through to the older, synchronous copy path.
+      }
     }
     const area = document.createElement('textarea')
     area.value = value
@@ -345,8 +351,19 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
     area.style.opacity = '0'
     document.body.appendChild(area)
     area.select()
-    document.execCommand('copy')
+    const copied = document.execCommand('copy')
     document.body.removeChild(area)
+    if (!copied) throw new Error('Clipboard is unavailable in this browser')
+  }
+
+  const shareResultMessage = (method: 'shared' | 'copied', publicOrigin: boolean) => {
+    if (publicOrigin) {
+      return `Public read-only output link ${method}. It does not grant project access.`
+    }
+    if (accessContext?.cloudflare_enabled) {
+      return `Local-address output link ${method}. The same path works through Maestro's Cloudflare address, but this link itself may not open off your network. It does not grant project access.`
+    }
+    return `Local-network output link ${method}. It may not open outside this network. It does not grant project access.`
   }
 
   const handleShare = async () => {
@@ -358,17 +375,35 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
     setShareMessage('')
     try {
       let url = shareUrl
-      let publicOrigin = true
+      let publicOrigin = sharePublicOrigin ?? false
       if (!url) {
         const result = await createOutputShare(file.name, file.workspace, file.revision)
         publicOrigin = result.configured_public_origin
         url = result.public_url || new URL(result.share_path, window.location.origin).toString()
         setShareUrl(url)
+        setSharePublicOrigin(publicOrigin)
+      }
+      if (navigator.share) {
+        try {
+          await navigator.share({
+            title: file.name,
+            text: 'Read-only link to this output. It does not grant project access.',
+            url,
+          })
+          setShareMessage(shareResultMessage('shared', publicOrigin))
+          return
+        } catch (error) {
+          if (error instanceof DOMException && error.name === 'AbortError') {
+            setShareMessage('Share cancelled. The output link is still active and project access is unchanged.')
+            return
+          }
+          // Native sharing may reject unsupported payloads or fail after its
+          // sheet opens. Preserve the already-created capability and provide
+          // the dependable copy fallback.
+        }
       }
       await copyText(url)
-      setShareMessage(publicOrigin || !accessContext?.cloudflare_enabled
-        ? 'Share link copied'
-        : 'Link copied from this local address; it also works through your Cloudflare address. Configure a public share address in Maestro for one-click links.')
+      setShareMessage(shareResultMessage('copied', publicOrigin))
     } catch (error) {
       setShareMessage(error instanceof Error ? error.message : 'Could not create share link')
     } finally {
@@ -378,11 +413,18 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
 
   const handleRevokeShare = async () => {
     if (sharing) return
+    if (!window.confirm(
+      'Revoke any active read-only link for this output? Anyone using one will lose access to this output. Project access will not change.',
+    )) return
     setSharing(true)
+    setShareMessage('')
     try {
-      await revokeOutputShare(file.name, file.workspace)
+      const revoked = await revokeOutputShare(file.name, file.workspace)
       setShareUrl('')
-      setShareMessage('Share link revoked')
+      setSharePublicOrigin(null)
+      setShareMessage(revoked > 0
+        ? 'Output link revoked. Project access is unchanged.'
+        : 'No active output link was found. Project access is unchanged.')
     } catch (error) {
       setShareMessage(error instanceof Error ? error.message : 'Could not revoke share link')
     } finally {
@@ -663,7 +705,7 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
       </div>
 
       {/* Inline info bar */}
-      <div className="px-3 py-2 flex items-center gap-2 min-h-[40px]">
+      <div className="flex min-h-[40px] flex-col gap-2 px-3 py-2 md:flex-row md:items-center">
         {imageStartFile && (
           <img
             src={getUploadUrl(imageStartFile)}
@@ -691,9 +733,7 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
                 {generationTime != null && (
                   <span
                   className="text-text-muted"
-                  title={meta?.generation_time_basis === 'active'
-                    ? 'Generation time (excluding queue wait and model loading)'
-                    : 'Recorded generation time'}
+                  title="Recorded generation time"
                   >
                     {' '}&middot; {formatGenerationDuration(generationTime)}
                   </span>
@@ -745,7 +785,12 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
         </div>
 
         {/* Action buttons */}
-        <div className="flex items-center gap-0.5 shrink-0" onClick={e => e.stopPropagation()}>
+        <div
+          className="flex shrink-0 flex-wrap items-center justify-end gap-0.5"
+          role="group"
+          aria-label={`Actions for ${file.name}`}
+          onClick={e => e.stopPropagation()}
+        >
           {params && (
             <>
               <button
@@ -766,14 +811,18 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
               </button>
               <button
                 onClick={handleLoadSettings}
-                className="p-1.5 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-colors"
+                type="button"
+                aria-label={`Load generation settings from ${file.name}`}
+                className="min-h-11 min-w-11 rounded-lg p-1.5 text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary md:min-h-0 md:min-w-0"
                 title="Load settings"
               >
                 <Pencil size={13} />
               </button>
               <button
                 onClick={handleReroll}
-                className="p-1.5 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-colors"
+                type="button"
+                aria-label={`Regenerate ${file.name} with the same settings`}
+                className="min-h-11 min-w-11 rounded-lg p-1.5 text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary md:min-h-0 md:min-w-0"
                 title="Re-generate with same settings"
               >
                 <RefreshCw size={13} />
@@ -795,7 +844,9 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
                   </button>
                   <button
                     onClick={handleContinueFrom}
-                    className="p-1.5 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-accent-blue transition-colors"
+                    type="button"
+                    aria-label={`Extend ${file.name} with new content`}
+                    className="min-h-11 min-w-11 rounded-lg p-1.5 text-text-secondary transition-colors hover:bg-bg-hover hover:text-accent-blue md:min-h-0 md:min-w-0"
                     title="Extend this video with new content"
                   >
                     <FastForward size={13} />
@@ -806,7 +857,9 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
                 <button
                   onClick={handleRejoin}
                   disabled={rejoining}
-                  className="p-1.5 rounded-lg hover:bg-bg-hover text-accent-blue hover:text-accent-blue-hover transition-colors disabled:opacity-50"
+                  type="button"
+                  aria-label={`Rejoin all ${clipTotal} clips for ${file.name}`}
+                  className="min-h-11 min-w-11 rounded-lg p-1.5 text-accent-blue transition-colors hover:bg-bg-hover hover:text-accent-blue-hover disabled:opacity-50 md:min-h-0 md:min-w-0"
                   title={`Rejoin all ${clipTotal} clips in this group`}
                 >
                   {rejoining ? <Loader2 size={13} className="animate-spin" /> : <Combine size={13} />}
@@ -814,7 +867,9 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
               )}
               <button
                 onClick={handleCopyPrompt}
-                className="p-1.5 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-colors"
+                type="button"
+                aria-label={copied ? `Prompt copied from ${file.name}` : `Copy prompt from ${file.name}`}
+                className="min-h-11 min-w-11 rounded-lg p-1.5 text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary md:min-h-0 md:min-w-0"
                 title="Copy prompt"
               >
                 {copied ? <Check size={13} className="text-accent-green" /> : <Copy size={13} />}
@@ -824,7 +879,11 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
           {file.type === 'image' && (
             <button
               onClick={(e) => { e.stopPropagation(); handleSendToInput() }}
-              className={`p-1.5 rounded-lg transition-colors ${
+              type="button"
+              aria-label={generationMode === 'image'
+                ? `Use ${file.name} as an input image`
+                : `Use ${file.name} as a start frame`}
+              className={`min-h-11 min-w-11 rounded-lg p-1.5 transition-colors md:min-h-0 md:min-w-0 ${
                 sentToInput
                   ? 'text-accent-green'
                   : 'hover:bg-bg-hover text-text-secondary hover:text-accent-blue'
@@ -837,7 +896,9 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
           {file.type === 'video' && (
             <button
               onClick={(e) => { e.stopPropagation(); handleSendFrameToRefs() }}
-              className={`p-1.5 rounded-lg transition-colors ${
+              type="button"
+              aria-label={`Use the current frame from ${file.name} as a reference image`}
+              className={`min-h-11 min-w-11 rounded-lg p-1.5 transition-colors md:min-h-0 md:min-w-0 ${
                 sentToInput
                   ? 'text-accent-green'
                   : 'hover:bg-bg-hover text-text-secondary hover:text-accent-blue'
@@ -857,7 +918,8 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
               link.click()
               document.body.removeChild(link)
             }}
-            className="p-1.5 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-colors"
+            aria-label={`Download ${file.name}`}
+            className="min-h-11 min-w-11 rounded-lg p-1.5 text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary md:min-h-0 md:min-w-0"
             title="Download"
           >
             <Download size={13} />
@@ -867,7 +929,10 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
               <button
                 onClick={(event) => { event.stopPropagation(); void handleShare() }}
                 disabled={sharing}
-                className={`p-1.5 rounded-lg transition-colors ${
+                aria-label={shareUrl
+                  ? `Share ${file.name} again — output-only link, not project access`
+                  : `Share ${file.name} — create an output-only link, not project access`}
+                className={`min-h-11 min-w-11 rounded-lg p-1.5 transition-colors md:min-h-0 md:min-w-0 ${
                   shareUrl
                     ? 'text-accent-green hover:bg-bg-hover'
                     : 'hover:bg-bg-hover text-text-secondary hover:text-accent-blue'
@@ -876,16 +941,15 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
               >
                 {sharing ? <Loader2 size={13} className="animate-spin" /> : shareUrl ? <Check size={13} /> : <Share2 size={13} />}
               </button>
-              {shareUrl && (
-                <button
-                  onClick={(event) => { event.stopPropagation(); void handleRevokeShare() }}
-                  disabled={sharing}
-                  className="p-1.5 rounded-lg text-text-secondary transition-colors hover:bg-bg-hover hover:text-red-400 disabled:opacity-50"
-                  title="Revoke this output’s share link"
-                >
-                  <Link2Off size={13} />
-                </button>
-              )}
+              <button
+                onClick={(event) => { event.stopPropagation(); void handleRevokeShare() }}
+                disabled={sharing}
+                aria-label={`Revoke any active output-only link for ${file.name}`}
+                className="min-h-11 min-w-11 rounded-lg p-1.5 text-text-secondary transition-colors hover:bg-bg-hover hover:text-red-400 disabled:opacity-50 md:min-h-0 md:min-w-0"
+                title="Revoke any active share link for this output"
+              >
+                <Link2Off size={13} />
+              </button>
             </>
           )}
           {/* Move to workspace */}
@@ -894,7 +958,11 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
             <button
               onClick={(e) => { e.stopPropagation(); setShowMoveMenu(!showMoveMenu) }}
               disabled={moving}
-              className={`p-1.5 rounded-lg transition-colors ${
+              type="button"
+              aria-haspopup="menu"
+              aria-expanded={showMoveMenu}
+              aria-label={`Move ${file.name} to another project`}
+              className={`min-h-11 min-w-11 rounded-lg p-1.5 transition-colors md:min-h-0 md:min-w-0 ${
                 moving ? 'text-accent-blue animate-pulse' : 'hover:bg-bg-hover text-text-secondary hover:text-text-primary'
               }`}
               title="Move to workspace"
@@ -902,7 +970,7 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
               <FolderInput size={13} />
             </button>
             {showMoveMenu && (
-              <div className="absolute right-0 bottom-full mb-1 w-40 bg-bg-secondary border border-border rounded-lg shadow-lg z-50 overflow-hidden" onClick={e => e.stopPropagation()}>
+              <div className="absolute right-0 bottom-full mb-1 w-48 bg-bg-secondary border border-border rounded-lg shadow-lg z-50 overflow-hidden" role="menu" onClick={e => e.stopPropagation()}>
                 <div className="px-2 py-1 border-b border-border">
                   <span className="text-[9px] text-text-muted uppercase tracking-wider">Move to</span>
                 </div>
@@ -911,7 +979,8 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
                     <button
                       key={ws.name}
                       onClick={() => handleMove(ws.name)}
-                      className="w-full text-left px-3 py-1.5 text-xs text-text-secondary hover:bg-bg-hover hover:text-text-primary transition-colors"
+                      role="menuitem"
+                      className="min-h-11 w-full px-3 py-1.5 text-left text-xs text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary md:min-h-0"
                     >
                       {ws.name}
                     </button>
@@ -930,7 +999,11 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
           <button
             onClick={(e) => { e.stopPropagation(); handleComponentCleanup() }}
             disabled={cleaningComponents}
-            className={`px-2 py-1.5 rounded-lg transition-colors text-[10px] font-medium ${
+            type="button"
+            aria-label={confirmCleanup
+              ? `Confirm removal of ${file.linked_component_count} related files for ${file.name}; keep the finished output`
+              : `Remove ${file.linked_component_count} related files for ${file.name}; keep the finished output`}
+            className={`min-h-11 min-w-11 rounded-lg px-2 py-1.5 text-[10px] font-medium transition-colors md:min-h-0 md:min-w-0 ${
               confirmCleanup
                 ? 'bg-amber-500/20 text-amber-300'
                 : 'hover:bg-bg-hover text-text-secondary hover:text-amber-300'
@@ -950,7 +1023,10 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
           {!browsingUploads && (
           <button
             onClick={(e) => { e.stopPropagation(); toggleFavorite(file.name) }}
-            className={`p-1.5 rounded-lg transition-colors ${
+            type="button"
+            aria-pressed={file.favorite}
+            aria-label={file.favorite ? `Remove ${file.name} from favorites` : `Add ${file.name} to favorites`}
+            className={`min-h-11 min-w-11 rounded-lg p-1.5 transition-colors md:min-h-0 md:min-w-0 ${
               file.favorite
                 ? 'text-red-400 hover:text-red-300'
                 : 'hover:bg-bg-hover text-text-secondary hover:text-red-400'
@@ -963,7 +1039,11 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
           {!browsingUploads && (
           <button
             onClick={handleDelete}
-            className={`p-1.5 rounded-lg transition-colors flex items-center gap-1 ${
+            type="button"
+            aria-label={confirmDelete
+              ? `Confirm permanent deletion of ${file.name}`
+              : `Delete ${file.name}`}
+            className={`flex min-h-11 min-w-11 items-center gap-1 rounded-lg p-1.5 transition-colors md:min-h-0 md:min-w-0 ${
               confirmDelete
                 ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30'
                 : 'hover:bg-bg-hover text-text-secondary hover:text-red-400'
@@ -983,7 +1063,12 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
           </button>
           )}
           {shareMessage && (
-            <span className="max-w-56 truncate text-[9px] text-text-muted" title={shareMessage}>
+            <span
+              className="w-full text-right text-[10px] leading-4 text-text-muted md:max-w-56 md:truncate"
+              role="status"
+              aria-live="polite"
+              title={shareMessage}
+            >
               {shareMessage}
             </span>
           )}

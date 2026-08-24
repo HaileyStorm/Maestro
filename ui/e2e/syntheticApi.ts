@@ -120,9 +120,11 @@ export type SyntheticAccountScenario =
   | 'disabled'
   | 'local-pristine'
   | 'local-anonymous'
+  | 'public-anonymous'
   | 'owner'
   | 'owner-reauth-required'
   | 'user'
+  | 'remote-user'
   | 'remote-anonymous'
 
 const SYNTHETIC_OWNER = {
@@ -143,6 +145,17 @@ const SYNTHETIC_USER = {
   disabled: false,
   created_at: 1_725_000_100,
   has_email: false,
+  passkey_credentials: 0,
+  passkey_authentication_available: false,
+}
+
+const SYNTHETIC_REGISTERED_USER = {
+  id: 'synthetic-registered-account',
+  username: 'Synthetic New User',
+  role: 'user' as const,
+  disabled: false,
+  created_at: 1_725_000_150,
+  has_email: true,
   passkey_credentials: 0,
   passkey_authentication_available: false,
 }
@@ -169,18 +182,20 @@ interface SyntheticAccountState {
   enabled: boolean
   remote: boolean
   bootstrapAvailable: boolean
-  account: typeof SYNTHETIC_OWNER | typeof SYNTHETIC_USER | null
+  account: typeof SYNTHETIC_OWNER | typeof SYNTHETIC_USER | typeof SYNTHETIC_REGISTERED_USER | null
   reauthenticated: boolean
   sessions: typeof SYNTHETIC_SESSIONS
+  projectAccessActive: boolean
+  publicRegistrationAvailable: boolean
 }
 
 function accountStateFor(scenario: SyntheticAccountScenario): SyntheticAccountState {
   const enabled = scenario !== 'disabled'
-  const remote = scenario === 'remote-anonymous'
+  const remote = scenario === 'public-anonymous' || scenario === 'remote-anonymous' || scenario === 'remote-user'
   const bootstrapAvailable = scenario === 'local-pristine'
   const account = scenario === 'owner' || scenario === 'owner-reauth-required'
     ? SYNTHETIC_OWNER
-    : scenario === 'user'
+    : scenario === 'user' || scenario === 'remote-user'
       ? SYNTHETIC_USER
       : null
   return {
@@ -188,8 +203,10 @@ function accountStateFor(scenario: SyntheticAccountScenario): SyntheticAccountSt
     remote,
     bootstrapAvailable,
     account,
-    reauthenticated: scenario === 'owner' || scenario === 'user',
+    reauthenticated: scenario === 'owner' || scenario === 'user' || scenario === 'remote-user',
     sessions: account ? SYNTHETIC_SESSIONS.map(session => ({ ...session })) : [],
+    projectAccessActive: scenario === 'remote-user',
+    publicRegistrationAvailable: scenario === 'public-anonymous',
   }
 }
 
@@ -207,6 +224,8 @@ function accountProjection(state: SyntheticAccountState, dedicated = false) {
     capabilities,
     reauthenticated: authenticated && state.reauthenticated,
     passkey_authentication_available: false,
+    activation_state: state.enabled ? 'ready' : 'disabled',
+    public_registration_available: state.publicRegistrationAvailable,
     ...(dedicated ? { bootstrap_available: state.bootstrapAvailable && !state.remote } : {}),
   }
 }
@@ -216,21 +235,134 @@ const SYNTHETIC_SUPPORT_PUBLIC = {
   provider_catalog: {
     schema_version: 1,
     provider_neutral: true,
-    providers: [],
+    providers: [{
+      provider_id: 'threadspan',
+      display_name: 'Threadspan',
+      funding_modes: ['crypto'],
+      description: 'Optional direct support. This synthetic fixture never processes a payment.',
+      enabled: true,
+      configured: true,
+      state: 'available',
+      support_url: 'https://support.example.invalid/threadspan',
+    }, {
+      provider_id: 'direct_compute_sponsorship',
+      display_name: 'Vast.ai direct compute sponsorship',
+      funding_modes: ['direct_compute'],
+      description: 'Manually recorded compute sponsorship. Maestro neither detects nor automatically refunds it.',
+      enabled: true,
+      configured: false,
+      state: 'locked',
+      support_url: null,
+    }],
+  },
+  supporter_benefits: {
+    schema_version: 1,
+    currency: 'USD',
+    credit_unit: 'maestro_credits',
+    promotional_credits_enabled: true,
+    one_time_bonus_cap: 10_000,
+    one_time_validity_seconds: 2_592_000,
+    recurring_validity_seconds: 2_592_000,
+    one_time_tiers: [{
+      tier: 'studio_supporter',
+      minimum_minor: 2_500,
+      promotional_maestro_credits: 1_000,
+      benefits: ['supporter_recognition', 'bounded_queue_priority'],
+    }],
+    recurring_tiers: [{
+      tier: 'continuum_supporter',
+      minimum_minor: 1_000,
+      promotional_maestro_credits: 2_000,
+      benefits: ['supporter_recognition', 'bounded_queue_priority', 'early_access_updates'],
+    }],
+    terms: {
+      cash_value: false,
+      transferable: false,
+      refundable: false,
+      guaranteed_compute: false,
+      guaranteed_service: false,
+      unused_bonus_may_expire_or_be_revoked: true,
+    },
+    notice: 'Synthetic supporter benefits exercise presentation only.',
   },
   benefit_availability: {
-    scheduler_enforcement_enabled: false,
-    effective_benefits: [],
-    state: 'recorded_not_enforced',
+    scheduler_enforcement_enabled: true,
+    effective_benefits: ['bounded_queue_priority'],
+    state: 'hosted_priority_available',
+  },
+  development_cost_recovery: {
+    target_minor: 100_000,
+    currency: 'USD',
+    state: 'locked',
   },
   support_priority: {
-    scheduler_enforcement_enabled: false,
-    effective_priority_boost: false,
-    state: 'recorded_not_enforced',
+    scheduler_enforcement_enabled: true,
+    effective_priority_boost: true,
+    state: 'hosted_priority_available',
     exclusions: [],
-    notice: 'Synthetic fixture does not apply support priority.',
+    notice: 'Synthetic fixture models bounded hosted queue priority without running a job.',
   },
 }
+
+const SYNTHETIC_DONOR_SUPPORT = {
+  recorded: {
+    event_count: 2,
+    one_time_tier: 'studio_supporter',
+    recurring_tier: 'continuum_supporter',
+    active_recurring_count: 1,
+    recorded_allowance: {
+      state: 'active',
+      enforcement_enabled: true,
+      unit: 'maestro_credits',
+      as_of: '2026-08-24T18:00:00Z',
+      effective_allowance: 2_400,
+      sources: [{
+        source: 'one_time_support',
+        granted_allowance: 1_000,
+        effective_allowance: 800,
+        expires_at: '2026-09-23T18:00:00Z',
+        status: 'active',
+        refund_state: 'none',
+      }, {
+        source: 'recurring_support',
+        granted_allowance: 2_000,
+        effective_allowance: 1_600,
+        expires_at: '2026-09-23T18:00:00Z',
+        status: 'active',
+        refund_state: 'none',
+      }],
+    },
+  },
+  benefits: {
+    state: 'active',
+    scheduler_enforcement_enabled: true,
+    effective_benefits: ['bounded_queue_priority'],
+    recorded_eligibility: ['supporter_recognition', 'bounded_queue_priority', 'early_access_updates'],
+  },
+}
+
+const SYNTHETIC_OUTPUT = {
+  name: 'synthetic-share.png',
+  url: '/api/v1/file/synthetic-share.png?workspace=Synthetic%20project',
+  type: 'image',
+  mode: 'image',
+  edit_sub_mode: null,
+  artifact_class: 'final',
+  linked_component_count: 0,
+  favorite: false,
+  size: 68,
+  created_at: 1_725_000_400,
+  revision: 'synthetic-output-revision-v1',
+  workspace: 'Synthetic project',
+  private: false,
+  explicit: false,
+}
+
+const SYNTHETIC_SHARE_TOKEN = 'synthetic-output-share-token'
+const SYNTHETIC_PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+  'base64',
+)
 
 const SYNTHETIC_RESPONSIBLE_USE = {
   notice: {
@@ -253,9 +385,31 @@ const SYNTHETIC_RESPONSIBLE_USE = {
 
 export interface SyntheticApiController {
   setAccountScenario(scenario: SyntheticAccountScenario): void
+  setOutputScenario(scenario: 'empty' | 'shareable'): void
+  setSupportScenario(scenario: 'none' | 'donor'): void
+  setBootFailures(failures: {
+    account?: 403 | null
+    project?: 403 | null
+    queue?: 423 | null
+    jobs?: 403 | null
+    estimate?: 403 | null
+    loras?: 403 | null
+  }): void
   setQueueFailure(failing: boolean): void
   setQueueHeld(held: boolean): void
   setQueueDelay(delayMs: number): void
+  requestCount(pathname:
+    | '/api/v1/account/context'
+    | '/api/v1/account/nonce'
+    | '/api/v1/account/register'
+    | '/api/v1/account/recover'
+    | '/api/v1/workspaces'
+    | '/api/v1/queue'
+    | '/api/v1/jobs'
+    | '/api/v1/h3/estimate'
+    | '/api/v1/loras/check-updates'
+    | '/api/v1/output-shares'
+  ): number
   assertClean(): Promise<void>
   takeUnexpected(): string[]
 }
@@ -265,9 +419,25 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
   let queueFailure = false
   let queueHeld = false
   let queueDelayMs = 0
+  let accountFailureStatus: 403 | null = null
+  let projectFailureStatus: 403 | null = null
+  let queueAccessFailureStatus: 423 | null = null
+  let jobsFailureStatus: 403 | null = null
+  let estimateFailureStatus: 403 | null = null
+  let loraFailureStatus: 403 | null = null
   let accountState = accountStateFor('disabled')
+  let outputScenario: 'empty' | 'shareable' = 'empty'
+  let supportScenario: 'none' | 'donor' = 'none'
+  let outputShareActive = false
+  let projectMemberRevision = 1
+  let projectMembers = [{
+    account_id: '11111111111111111111111111111111',
+    username: 'Synthetic User',
+    role: 'owner',
+  }]
   let nonceSequence = 0
   const accountNonces = new Map<string, string>()
+  const requestCounts = new Map<string, number>()
   const context = page.context()
 
   const rejectAccountContract = async (route: Route, message: string) => {
@@ -328,6 +498,19 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
       return
     }
 
+    if (request.method() === 'GET' && url.pathname === `/share/${SYNTHETIC_SHARE_TOKEN}`) {
+      if (!outputShareActive) {
+        await route.fulfill({ status: 404, contentType: 'text/plain', body: 'Shared output not found' })
+        return
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/html; charset=utf-8',
+        body: `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Shared Maestro output</title></head><body><main><h1>Shared Maestro output</h1><img src="/api/v1/output-shares/${SYNTHETIC_SHARE_TOKEN}/media" alt="Shared Maestro output"><p>${SYNTHETIC_OUTPUT.name}</p></main></body></html>`,
+      })
+      return
+    }
+
     if (!url.pathname.startsWith('/api/')) {
       unexpected.push(`unknown ${request.method()} ${url.pathname}`)
       await route.abort('blockedbyclient')
@@ -335,6 +518,7 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
     }
 
     const key = `${request.method()} ${url.pathname}`
+    requestCounts.set(url.pathname, (requestCounts.get(url.pathname) || 0) + 1)
     switch (key) {
       case 'GET /api/v1/access-context':
         await json(route, {
@@ -348,12 +532,29 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
           cloudflare_enabled: false,
           share_url: '',
           share_flow: 'disabled',
+          account_project_access_active: accountState.projectAccessActive,
+          account_project_creation_requires_account: accountState.projectAccessActive,
           accounts: accountProjection(accountState),
         })
         return
       case 'GET /api/v1/workspaces':
+        if (projectFailureStatus !== null) {
+          await json(route, { detail: 'Synthetic project access changed.' }, projectFailureStatus)
+          return
+        }
         await json(route, {
-          workspaces: [{ name: 'Synthetic project', password_protected: false, unlocked: true }],
+          workspaces: [{
+            name: 'Synthetic project',
+            password_protected: accountState.projectAccessActive,
+            unlocked: !accountState.projectAccessActive,
+            ...(accountState.projectAccessActive ? {
+              project_role: 'owner',
+              project_permissions: [
+                'project.open', 'project.read', 'project.mutate', 'project.generate',
+                'project.lifecycle', 'project.delete', 'project.membership.manage',
+              ],
+            } : {}),
+          }],
           active: 'Synthetic project',
         })
         return
@@ -403,6 +604,10 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
         await json(route, { loras: [], guidance_max_phases: 1, manifest_last_check_at: null })
         return
       case 'POST /api/v1/loras/check-updates':
+        if (loraFailureStatus !== null) {
+          await json(route, { detail: 'Synthetic LoRA access changed.' }, loraFailureStatus)
+          return
+        }
         await json(route, {
           checked: 0,
           updates_available: 0,
@@ -451,6 +656,10 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
         await json(route, { models: [], guides: [], project_instance: 'synthetic-project-instance' })
         return
       case 'GET /api/v1/jobs':
+        if (jobsFailureStatus !== null) {
+          await json(route, { detail: 'Synthetic job access changed.' }, jobsFailureStatus)
+          return
+        }
         await json(route, { jobs: [{
           job_id: 'synthetic-queue-item',
           created_at: 1,
@@ -530,6 +739,10 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
         if (queueDelayMs > 0) {
           await new Promise(resolve => setTimeout(resolve, queueDelayMs))
         }
+        if (queueAccessFailureStatus !== null) {
+          await json(route, { detail: 'Synthetic project selection is required.' }, queueAccessFailureStatus)
+          return
+        }
         if (queueFailure) {
           await json(route, { detail: 'Synthetic transient queue failure' }, 503)
           return
@@ -548,17 +761,60 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
           })),
         })
         return
+      case 'GET /api/v1/sample-campaign/queue':
+        await json(route, { detail: 'No synthetic sample campaign queue is available.' }, 404)
+        return
       case 'GET /api/v1/presets':
         await json(route, { presets: [] })
         return
       case 'GET /api/v1/outputs':
-        await json(route, { outputs: [], total: 0 })
+        await json(route, outputScenario === 'shareable'
+          ? { outputs: [SYNTHETIC_OUTPUT], total: 1 }
+          : { outputs: [], total: 0 })
         return
+      case 'POST /api/v1/output-shares': {
+        if (outputScenario !== 'shareable') {
+          await json(route, { detail: 'Synthetic output was not found.' }, 404)
+          return
+        }
+        const body = accountBody(route)
+        if (
+          body.name !== SYNTHETIC_OUTPUT.name
+          || body.workspace !== SYNTHETIC_OUTPUT.workspace
+          || body.revision !== SYNTHETIC_OUTPUT.revision
+        ) {
+          await json(route, { detail: 'Synthetic output changed; refresh before sharing.' }, 409)
+          return
+        }
+        outputShareActive = true
+        await json(route, {
+          share_path: `/share/${SYNTHETIC_SHARE_TOKEN}`,
+          public_url: '',
+          configured_public_origin: false,
+          created_at: 1_725_000_500,
+          explicit: false,
+        })
+        return
+      }
+      case 'DELETE /api/v1/output-shares': {
+        const body = accountBody(route)
+        if (body.name !== SYNTHETIC_OUTPUT.name || body.workspace !== SYNTHETIC_OUTPUT.workspace) {
+          await json(route, { detail: 'Synthetic output was not found.' }, 404)
+          return
+        }
+        const revoked = outputShareActive ? 1 : 0
+        outputShareActive = false
+        await json(route, { revoked })
+        return
+      }
       case 'GET /api/v1/recipes':
         await json(route, { recipes: [] })
         return
       case 'GET /api/v1/director/pipelines':
         await json(route, { pipelines: [] })
+        return
+      case 'GET /api/v1/director/queue':
+        await json(route, { paused: false, running: false, entries: [] })
         return
       case 'GET /api/v1/support/catalog':
         await json(route, SYNTHETIC_SUPPORT_PUBLIC)
@@ -571,18 +827,22 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
         await json(route, {
           ...SYNTHETIC_SUPPORT_PUBLIC,
           account_support: {
-            recorded: {
-              event_count: 0,
-              one_time_tier: null,
-              recurring_tier: null,
-              active_recurring_count: 0,
-            },
-            benefits: {
-              state: 'recorded_not_enforced',
-              scheduler_enforcement_enabled: false,
-              effective_benefits: [],
-              recorded_eligibility: [],
-            },
+            ...(supportScenario === 'donor'
+              ? SYNTHETIC_DONOR_SUPPORT
+              : {
+                  recorded: {
+                    event_count: 0,
+                    one_time_tier: null,
+                    recurring_tier: null,
+                    active_recurring_count: 0,
+                  },
+                  benefits: {
+                    state: 'hosted_priority_available',
+                    scheduler_enforcement_enabled: true,
+                    effective_benefits: [],
+                    recorded_eligibility: [],
+                  },
+                }),
           },
           responsible_use: SYNTHETIC_RESPONSIBLE_USE,
         })
@@ -595,6 +855,10 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
         await json(route, SYNTHETIC_RESPONSIBLE_USE)
         return
       case 'GET /api/v1/account/context':
+        if (accountFailureStatus !== null) {
+          await json(route, { detail: 'Synthetic session is no longer valid.' }, accountFailureStatus)
+          return
+        }
         if (!accountState.enabled) {
           await json(route, { detail: 'Synthetic accounts are disabled.' }, 404)
           return
@@ -609,7 +873,7 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
         const body = accountBody(route)
         const purpose = typeof body.purpose === 'string' ? body.purpose : ''
         const allowed = new Set([
-          'bootstrap', 'login', 'reauth', 'revoke_session', 'revoke_all_sessions',
+          'bootstrap', 'login', 'recover', 'register', 'reauth', 'revoke_session', 'revoke_all_sessions',
         ])
         if (!allowed.has(purpose)) {
           await rejectAccountContract(route, `unsupported nonce purpose ${purpose || '(missing)'}`)
@@ -626,9 +890,20 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
           }, accountState.remote ? 403 : 404)
           return
         }
+        if (purpose === 'register' && !accountState.publicRegistrationAvailable) {
+          await json(route, {
+            detail: {
+              code: 'registration_unavailable',
+              message: 'Synthetic public registration is not available.',
+            },
+          }, 404)
+          return
+        }
         if (
           purpose !== 'bootstrap'
           && purpose !== 'login'
+          && purpose !== 'recover'
+          && purpose !== 'register'
           && accountState.account === null
         ) {
           await json(route, {
@@ -679,6 +954,58 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
           sessions: SYNTHETIC_SESSIONS.map(session => ({ ...session })),
         }
         await json(route, { account: SYNTHETIC_OWNER })
+        return
+      }
+      case 'POST /api/v1/account/register': {
+        const body = await consumeNonce(route, 'register')
+        if (!body) return
+        if (
+          !accountState.publicRegistrationAvailable
+          || body.username !== SYNTHETIC_REGISTERED_USER.username
+          || body.password !== 'synthetic-new-password'
+        ) {
+          await json(route, {
+            detail: { code: 'registration_rejected', message: 'Synthetic registration details did not match.' },
+          }, 400)
+          return
+        }
+        accountState = {
+          ...accountState,
+          account: SYNTHETIC_REGISTERED_USER,
+          reauthenticated: true,
+          sessions: SYNTHETIC_SESSIONS.map(session => ({ ...session })),
+          projectAccessActive: true,
+        }
+        await json(route, {
+          account: SYNTHETIC_REGISTERED_USER,
+          recovery_codes: ['synthetic-recovery-code-one', 'synthetic-recovery-code-two'],
+        })
+        return
+      }
+      case 'POST /api/v1/account/recover': {
+        const body = await consumeNonce(route, 'recover')
+        if (!body) return
+        if (
+          body.username !== SYNTHETIC_REGISTERED_USER.username
+          || body.recovery_code !== 'synthetic-recovery-code-one'
+          || body.new_password !== 'synthetic-recovered-password'
+        ) {
+          await json(route, {
+            detail: { code: 'invalid_recovery', message: 'Synthetic recovery details did not match.' },
+          }, 401)
+          return
+        }
+        accountState = {
+          ...accountState,
+          account: SYNTHETIC_REGISTERED_USER,
+          reauthenticated: true,
+          sessions: SYNTHETIC_SESSIONS.map(session => ({ ...session })),
+          projectAccessActive: true,
+        }
+        await json(route, {
+          account: SYNTHETIC_REGISTERED_USER,
+          recovery_codes: ['synthetic-replacement-code-one', 'synthetic-replacement-code-two'],
+        })
         return
       }
       case 'POST /api/v1/account/reauth': {
@@ -761,6 +1088,10 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
         })
         return
       case 'POST /api/v1/h3/estimate':
+        if (estimateFailureStatus !== null) {
+          await json(route, { detail: 'Synthetic private estimate detail.' }, estimateFailureStatus)
+          return
+        }
         await json(route, { detail: 'Synthetic fixture does not estimate runtime.' }, 503)
         return
       case 'GET /api/v1/h3/acceleration':
@@ -888,6 +1219,92 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
         })
         return
       default:
+        if (url.pathname === '/api/v1/workspaces/Synthetic%20project/members') {
+          if (!accountState.projectAccessActive || accountState.account === null) {
+            await json(route, { detail: 'Synthetic project was not found.' }, 404)
+            return
+          }
+          if (request.method() === 'GET') {
+            await json(route, {
+              workspace: 'Synthetic project',
+              revision: projectMemberRevision,
+              members: projectMembers,
+            })
+            return
+          }
+          if (request.method() === 'POST') {
+            const body = accountBody(route)
+            if (body.expected_revision !== projectMemberRevision || body.username !== 'Synthetic Collaborator') {
+              await json(route, { detail: 'Synthetic project members changed; refresh and try again.' }, 409)
+              return
+            }
+            projectMemberRevision += 1
+            projectMembers = [...projectMembers, {
+              account_id: '22222222222222222222222222222222',
+              username: 'Synthetic Collaborator',
+              role: String(body.role || 'viewer'),
+            }]
+            await json(route, {
+              workspace: 'Synthetic project',
+              revision: projectMemberRevision,
+              members: projectMembers,
+            })
+            return
+          }
+        }
+        if (url.pathname === '/api/v1/workspaces/Synthetic%20project/members/22222222222222222222222222222222') {
+          const body = accountBody(route)
+          if (body.expected_revision !== projectMemberRevision) {
+            await json(route, { detail: 'Synthetic project members changed; refresh and try again.' }, 409)
+            return
+          }
+          if (request.method() === 'PUT') {
+            projectMemberRevision += 1
+            projectMembers = projectMembers.map(member => member.account_id === '22222222222222222222222222222222'
+              ? { ...member, role: String(body.role || member.role) }
+              : member)
+            await json(route, {
+              workspace: 'Synthetic project',
+              revision: projectMemberRevision,
+              members: projectMembers,
+            })
+            return
+          }
+          if (request.method() === 'DELETE') {
+            projectMemberRevision += 1
+            projectMembers = projectMembers.filter(member => member.account_id !== '22222222222222222222222222222222')
+            await json(route, {
+              workspace: 'Synthetic project',
+              revision: projectMemberRevision,
+              members: projectMembers,
+            })
+            return
+          }
+        }
+        if (request.method() === 'GET' && url.pathname === `/api/v1/file/${SYNTHETIC_OUTPUT.name}`) {
+          if (outputScenario !== 'shareable') {
+            await json(route, { detail: 'Synthetic output was not found.' }, 404)
+            return
+          }
+          await route.fulfill({ status: 200, contentType: 'image/png', body: SYNTHETIC_PNG })
+          return
+        }
+        if (request.method() === 'GET' && url.pathname === `/api/v1/outputs/${SYNTHETIC_OUTPUT.name}/metadata`) {
+          if (outputScenario !== 'shareable') {
+            await json(route, { detail: 'Synthetic output was not found.' }, 404)
+            return
+          }
+          await json(route, { source: 'none', params: null })
+          return
+        }
+        if (request.method() === 'GET' && url.pathname === `/api/v1/output-shares/${SYNTHETIC_SHARE_TOKEN}/media`) {
+          if (!outputShareActive) {
+            await route.fulfill({ status: 404, contentType: 'text/plain', body: 'Shared output not found' })
+            return
+          }
+          await route.fulfill({ status: 200, contentType: 'image/png', body: SYNTHETIC_PNG })
+          return
+        }
         if (request.method() === 'DELETE' && url.pathname.startsWith('/api/v1/account/sessions/')) {
           const body = await consumeNonce(route, 'revoke_session')
           if (!body) return
@@ -916,6 +1333,21 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
       accountState = accountStateFor(scenario)
       accountNonces.clear()
     },
+    setOutputScenario(scenario) {
+      outputScenario = scenario
+      outputShareActive = false
+    },
+    setSupportScenario(scenario) {
+      supportScenario = scenario
+    },
+    setBootFailures(failures) {
+      accountFailureStatus = failures.account ?? null
+      projectFailureStatus = failures.project ?? null
+      queueAccessFailureStatus = failures.queue ?? null
+      jobsFailureStatus = failures.jobs ?? null
+      estimateFailureStatus = failures.estimate ?? null
+      loraFailureStatus = failures.loras ?? null
+    },
     setQueueFailure(failing) {
       queueFailure = failing
     },
@@ -924,6 +1356,9 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
     },
     setQueueDelay(delayMs) {
       queueDelayMs = Math.max(0, Math.floor(delayMs))
+    },
+    requestCount(pathname) {
+      return requestCounts.get(pathname) || 0
     },
     async assertClean() {
       expect(unexpected, 'No unknown API or external requests may escape the synthetic harness').toEqual([])

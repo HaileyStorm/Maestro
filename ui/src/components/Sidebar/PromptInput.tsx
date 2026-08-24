@@ -2,8 +2,10 @@ import { useState, useRef, useEffect } from 'react'
 import { Sparkles, Loader2, ChevronUp } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import { controlFpsTotalFrames, effectiveSlidingWindowGeometry, globalTimelineEndSeconds, hasGlobalTimeline, usesStudioSegments } from '../../lib/timelinePrompt'
-import { h3StyleWorkflowCatalogStateLabel, h3StyleWorkflowSupportsModel } from '../../lib/h3StyleWorkflows'
+import { h3StyleWorkflowCatalogStateLabel, h3StyleWorkflowSupportsModel, h3StyleWorkflowSwatch, nextH3StyleWorkflowSurprise } from '../../lib/h3StyleWorkflows'
 import { requestQueueView } from '../../lib/mainViewNavigation'
+import { isExactH3PromptReviewTarget } from '../../lib/h3PromptReview'
+import { H3PromptCoach } from './H3PromptCoach'
 
 const placeholders: Record<string, string> = {
   image: 'Describe your image...',
@@ -32,32 +34,96 @@ export function H3StyleWorkflowField({
 
   const supported = h3StyleWorkflowSupportsModel(catalog, effectiveVideoModel)
   if (!supported) {
-    if (!error || loading) return null
+    if (!loading && !error) return null
     return (
-      <div className="rounded border border-amber-400/30 bg-amber-400/5 px-2 py-1 text-[9px] leading-relaxed text-amber-200">
-        <p role="status">{error}</p>
-        <button type="button" onClick={() => void loadCatalog(true)} className="mobile-control-target mt-1 rounded border border-amber-400/40 px-2 py-0.5 text-[8px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Retry creative guides</button>
-      </div>
+      <fieldset aria-label={`${surface} creative guide`} className="rounded-lg border border-border bg-bg-tertiary/50 p-2">
+        <legend className="px-1 text-[10px] font-medium text-text-secondary">Creative guide jukebox</legend>
+        {loading ? (
+          <p role="status" className="text-[9px] text-text-muted">Loading creative guides…</p>
+        ) : (
+          <div className="rounded border border-amber-400/30 bg-amber-400/5 px-2 py-1 text-[9px] leading-relaxed text-amber-200">
+            <p role="status">{error}</p>
+            <button type="button" onClick={() => void loadCatalog(true)} className="mobile-control-target mt-1 rounded border border-amber-400/40 px-2 py-0.5 text-[8px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Retry creative guides</button>
+          </div>
+        )}
+      </fieldset>
     )
   }
 
   const selected = catalog?.styles.find(style => style.id === selection)
   const sourceRevision = catalog?.source_revision || catalog?.revision || 'unknown'
   const provenance = catalog?.provenance
+  const styles = catalog?.styles || []
+  const chooseSurprise = () => {
+    const nextId = nextH3StyleWorkflowSurprise(styles, selection, sourceRevision)
+    if (nextId) setSelection(nextId)
+  }
   return (
     <fieldset aria-label={`${surface} creative guide`} className="rounded-lg border border-border bg-bg-tertiary/50 p-2">
-      <legend className="px-1 text-[10px] font-medium text-text-secondary">Creative guide</legend>
-      <select
-        aria-label={`${surface} creative guide`}
-        value={selection}
-        disabled={loading}
-        onChange={event => setSelection(event.target.value)}
-        className="mobile-control-target w-full rounded border border-border bg-bg-secondary px-2 py-1.5 text-[10px] text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50"
-      >
-        <option value="">Follow my prompt without a guide</option>
-        {catalog?.styles.map(style => <option key={style.id} value={style.id}>{style.label}</option>)}
-      </select>
-      {selected && <p className="mt-1 text-[9px] leading-relaxed text-text-muted">{selected.description}</p>}
+      <legend className="px-1 text-[10px] font-medium text-text-secondary">Creative guide jukebox</legend>
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-1.5">
+        <p className="text-[9px] text-text-muted">Pick a recipe or let the jukebox choose.</p>
+        <div className="flex gap-1">
+          <button
+            type="button"
+            onClick={chooseSurprise}
+            disabled={loading || styles.length === 0}
+            className="mobile-control-target inline-flex min-w-11 items-center justify-center gap-1 rounded border border-accent-blue/35 bg-accent-blue/10 px-2 py-1 text-[9px] font-medium text-accent-blue transition-colors hover:bg-accent-blue/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:cursor-not-allowed disabled:opacity-50 md:min-h-0"
+          >
+            <span aria-hidden="true" className="text-[11px]">✦</span> Surprise me
+          </button>
+          <button
+            type="button"
+            onClick={() => setSelection('')}
+            disabled={!selection}
+            className="mobile-control-target min-w-11 rounded border border-border px-2 py-1 text-[9px] text-text-muted transition-colors hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:cursor-not-allowed disabled:opacity-40 md:min-h-0"
+          >
+            Clear
+          </button>
+        </div>
+      </div>
+      <div className="grid max-h-[28rem] grid-cols-[repeat(auto-fit,minmax(132px,1fr))] gap-1.5 overflow-y-auto overscroll-contain pr-0.5" role="group" aria-label={`${surface} creative guide choices`}>
+        {styles.map(style => {
+          const isSelected = style.id === selection
+          const swatch = h3StyleWorkflowSwatch(style.id)
+          return (
+            <button
+              key={style.id}
+              type="button"
+              data-workflow-id={style.id}
+              aria-pressed={isSelected}
+              onClick={() => setSelection(style.id)}
+              disabled={loading}
+              className={`mobile-control-target group relative min-h-11 overflow-hidden rounded-lg border p-2 text-left transition-[border-color,background-color,transform] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue focus-visible:ring-offset-1 focus-visible:ring-offset-bg-tertiary disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none ${isSelected ? 'border-accent-blue bg-accent-blue/10' : 'border-border bg-bg-secondary hover:border-accent-blue/45 hover:bg-bg-hover'}`}
+            >
+              <span className={`relative mb-1.5 block h-9 overflow-hidden rounded-md border border-border/80 ${
+                swatch === 'paper' ? 'bg-gradient-to-br from-accent-green/35 via-bg-hover to-accent-blue/20'
+                  : swatch === 'dimensional' ? 'bg-gradient-to-br from-accent-blue/40 via-bg-active to-accent-green/20'
+                    : swatch === 'polished' ? 'bg-gradient-to-r from-bg-active via-accent-blue/30 to-bg-hover'
+                      : swatch === 'rhythmic' ? 'bg-gradient-to-br from-accent-blue/35 via-accent-green/25 to-bg-active'
+                        : 'bg-gradient-to-r from-accent-green/25 via-bg-active to-accent-blue/40'
+              }`} aria-hidden="true">
+                <span className={`absolute bg-text-primary/20 ${swatch === 'paper' ? '-left-2 top-2 h-7 w-16 rotate-[-8deg] rounded-sm' : swatch === 'dimensional' ? 'left-4 top-1 h-7 w-7 rotate-12 rounded-lg shadow-lg' : swatch === 'polished' ? 'inset-x-3 top-3 h-2 rounded-full' : swatch === 'rhythmic' ? 'bottom-1 left-2 h-6 w-1.5 skew-x-[-12deg] shadow-[10px_-5px_0_var(--color-text-primary),20px_3px_0_var(--color-text-primary),30px_-2px_0_var(--color-text-primary)]' : '-right-2 top-2 h-8 w-20 rotate-6 rounded-[50%]'}`} />
+              </span>
+              <span className="block text-[10px] font-medium leading-tight text-text-primary">{style.label}</span>
+              <span className="mt-1 block text-[8px] leading-snug text-text-muted">{style.description}</span>
+              <span className="sr-only">Workflow ID: {style.id}.</span>
+              {isSelected && (
+                <span className="mt-1.5 inline-flex items-center gap-1 text-[8px] font-semibold uppercase tracking-wide text-accent-blue">
+                  <span aria-hidden="true">✓</span> Selected
+                </span>
+              )}
+            </button>
+          )
+        })}
+      </div>
+      {styles.length === 0 && !loading && <p className="rounded border border-border bg-bg-secondary px-2 py-2 text-[9px] text-text-muted">No creative guides are available right now.</p>}
+      {loading && <p role="status" className="mt-1 text-[9px] text-text-muted">Loading creative guides…</p>}
+      {selected ? (
+        <p className="mt-1.5 text-[9px] leading-relaxed text-text-muted"><span className="font-medium text-text-secondary">Now playing: {selected.label}.</span> {selected.description}</p>
+      ) : (
+        <p className="mt-1.5 text-[9px] font-medium text-text-secondary">No guide selected · prompt only</p>
+      )}
       <p className="mt-1 text-[9px] leading-relaxed text-text-muted">
         Choose an optional guide for pacing, framing, and finish. It works alongside Visual style; the original recipe may include details this guide does not apply.
       </p>
@@ -91,6 +157,19 @@ export function PromptInput() {
   const slidingWindowSeconds = useStore(s => s.slidingWindowSeconds)
   const slidingWindowOverlap = useStore(s => s.slidingWindowOverlap)
   const modelOptions = useStore(s => s.modelOptions)
+  const h3ReviewImageCount = useStore(s => Math.max(
+    s.imageRefs.length,
+    Array.isArray(s.params.image_refs) ? s.params.image_refs.length : 0,
+  ))
+  const h3ReviewVideoCount = useStore(s => [s.params.video_guide, s.params.video_guide2, s.params.video_guide3].filter(Boolean).length)
+  const h3ReviewAudioCount = useStore(s => [s.params.audio_guide, s.params.audio_guide2, s.params.audio_guide3].filter(Boolean).length)
+  const h3ReviewHasStartAnchor = useStore(s => Boolean(s.startImage) || (Array.isArray(s.params.image_start)
+    ? s.params.image_start.some(Boolean)
+    : Boolean(s.params.image_start)))
+  const h3ReviewHasEndAnchor = useStore(s => Boolean(s.endImage) || (Array.isArray(s.params.image_end)
+    ? s.params.image_end.some(Boolean)
+    : Boolean(s.params.image_end)))
+  const h3ReviewAdaptiveConditioning = useStore(s => s.params.h3_adaptive_conditioning !== false)
   const guideVideoFps = useStore(s => s.guideVideoFps)
   const guideVideoFrameCount = useStore(s => s.guideVideoFrameCount)
   const forceFps = useStore(s => s.params.force_fps)
@@ -125,6 +204,8 @@ export function PromptInput() {
   // either way regardless of voice slot count.
   const defaultMode: 'dialogue' | 'monologue' = isMultiVoice ? 'dialogue' : 'monologue'
   const usesSegmentedStudio = usesStudioSegments(modelOptions)
+  const showH3PromptCoach = Boolean(prompt.trim())
+    && isExactH3PromptReviewTarget(effectiveVideoModel, modelOptions?.architecture)
   const supportsSlidingWindows = modelOptions?.sliding_window === true || usesSegmentedStudio
   const windowCount = modelOptions
     ? effectiveSlidingWindowGeometry(
@@ -211,6 +292,22 @@ export function PromptInput() {
         className="w-full flex-1 rounded-lg border border-border bg-bg-tertiary px-3 py-2 pr-14 text-sm text-text-primary placeholder:text-text-muted transition-colors focus:border-accent-blue focus:outline-none md:pr-10"
         style={{ resize: 'none', minHeight: 112 }}
       />
+      {generationMode === 'video' && showH3PromptCoach && (
+        <div className="mt-1.5">
+          <H3PromptCoach
+            prompt={prompt}
+            modelType={effectiveVideoModel}
+            architecture={modelOptions?.architecture}
+            imageCount={h3ReviewImageCount}
+            videoCount={h3ReviewVideoCount}
+            audioCount={h3ReviewAudioCount}
+            hasStartAnchor={h3ReviewHasStartAnchor}
+            hasEndAnchor={h3ReviewHasEndAnchor}
+            durationSeconds={durationSeconds}
+            adaptiveConditioning={h3ReviewAdaptiveConditioning}
+          />
+        </div>
+      )}
       {usesWindows && (
         <div className="px-1 pt-1 text-[10px] text-text-muted">
           {usesGlobalTimeline

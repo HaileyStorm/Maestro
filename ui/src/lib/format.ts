@@ -62,3 +62,10 @@ export function formatApproximateDuration(
   if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return fallback
   return formatRoundedDuration(Math.max(1, Math.round(seconds)), 0)
 }
+
+/** Gallery generation duration as whole minutes + seconds: "2m 8s". */
+export function formatGenerationDuration(seconds: number): string {
+  const rounded = Number.isFinite(seconds) ? Math.max(0, Math.round(seconds)) : 0
+  const minutes = Math.floor(rounded / 60)
+  return `${minutes}m ${rounded % 60}s`
+}

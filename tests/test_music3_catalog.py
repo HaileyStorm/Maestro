@@ -46,6 +46,7 @@ class _Updater:
 
 class _Registry:
     def __init__(self, *, music3_collision: bool = False) -> None:
+        self.server_config = {"services": {}}
         self.displayed_model_types = ["ordinary_model"]
         self.models_def = {
             "ordinary_model": {

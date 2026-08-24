@@ -21,6 +21,39 @@ _REF2VA_TRANSFORMER = "minimax_h3_ref2va_pruned_fp8_scaled.safetensors"
 _TEXT_ENCODER = "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
 _VIDEO_VAE = "minimax_h3_video_vae_fp16.safetensors"
 _AUDIO_VAE = "minimax_h3_audio_vae_fp32.safetensors"
+_PROCESSOR_FILES = (
+    "chat_template.json",
+    "merges.txt",
+    "preprocessor_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "video_preprocessor_config.json",
+    "vocab.json",
+)
+_REQUIRED_RUNTIME_ASSETS = {
+    "video_vae": os.path.join(_ASSETS_ROOT, "vae", _VIDEO_VAE),
+    "audio_vae": os.path.join(_ASSETS_ROOT, "vae", _AUDIO_VAE),
+    "text_encoder_config": os.path.join(
+        _ASSETS_ROOT, "text_encoder", "config.json"
+    ),
+    "processor": tuple(
+        os.path.join(_ASSETS_ROOT, "processor", filename)
+        for filename in _PROCESSOR_FILES
+    ),
+}
+_WANGP_TEXT_ENCODER_FOLDER = "Qwen3-VL-32B-Instruct"
+_WANGP_FL2VA_PRUNED_TRANSFORMER = (
+    "MiniMax-H3-FL2VA-pruned_rank8_int8_convrot.safetensors"
+)
+_WANGP_REF2VA_PRUNED_TRANSFORMER = (
+    "MiniMax-H3-Ref2VA-pruned_rank8_int8_convrot.safetensors"
+)
+_WANGP_FL2VA_PRUNED_BF16_TRANSFORMER = (
+    "MiniMax-H3-FL2VA-pruned_rank8_bf16.safetensors"
+)
+_WANGP_REF2VA_PRUNED_BF16_TRANSFORMER = (
+    "MiniMax-H3-Ref2VA-pruned_rank8_bf16.safetensors"
+)
 
 # H3 packs video, audio, and text into one unusually long transformer
 # sequence.  At 480p / 10 seconds the token-wise activations alone need
@@ -48,6 +81,25 @@ def _is_reference_mode(base_model_type: str) -> bool:
 def _hf_url(repo_id: str, revision: str, *parts: str) -> str:
     path = "/".join(part.strip("/\\") for part in parts if part)
     return f"https://huggingface.co/{repo_id}/resolve/{revision}/{path}"
+
+
+def _required_runtime_asset_manifest() -> dict:
+    """Return the one canonical H3 auxiliary-asset contract."""
+
+    return {
+        role: list(paths) if isinstance(paths, tuple) else paths
+        for role, paths in _REQUIRED_RUNTIME_ASSETS.items()
+    }
+
+
+def _required_asset_filenames(folder: str) -> list[str]:
+    prefix = os.path.join(_ASSETS_ROOT, folder) + os.sep
+    return [
+        os.path.relpath(path, prefix)
+        for value in _REQUIRED_RUNTIME_ASSETS.values()
+        for path in (value if isinstance(value, tuple) else (value,))
+        if path.startswith(prefix)
+    ]
 
 
 _RESOLUTIONS = [
@@ -248,6 +300,7 @@ class family_handler:
             "auto_resolution_fallbacks": _AUTO_RESOLUTION_FALLBACKS,
             "profiles_dir": ["minimax_h3"],
             "minimax_h3_assets_root": _ASSETS_ROOT,
+            "required_runtime_assets": _required_runtime_asset_manifest(),
             "minimax_h3_reference_mode": reference_mode,
             # The two H3 checkpoints accept different kinds of conditioning.
             # Keep this machine-readable so Studio can render semantic refs
@@ -261,6 +314,44 @@ class family_handler:
             "text_encoder_URLs": [
                 _hf_url(_COMFY_REPO, _COMFY_REVISION, "text_encoders", _TEXT_ENCODER)
             ],
+            # The runtime supports both Comfy's scaled-FP8 export and WanGP's
+            # pruned INT8 ConvRot export. Keep these exact names as declared,
+            # bidirectional read aliases without changing the download target.
+            "compatible_model_paths": {
+                (
+                    _REF2VA_TRANSFORMER if reference_mode else _TRANSFORMER
+                ): [
+                    _WANGP_REF2VA_PRUNED_TRANSFORMER
+                    if reference_mode
+                    else _WANGP_FL2VA_PRUNED_TRANSFORMER
+                ],
+                (
+                    _WANGP_REF2VA_PRUNED_TRANSFORMER
+                    if reference_mode
+                    else _WANGP_FL2VA_PRUNED_TRANSFORMER
+                ): [
+                    _REF2VA_TRANSFORMER if reference_mode else _TRANSFORMER
+                ],
+            },
+            "compatible_model_qkv_layouts": {
+                (
+                    _WANGP_REF2VA_PRUNED_TRANSFORMER
+                    if reference_mode
+                    else _WANGP_FL2VA_PRUNED_TRANSFORMER
+                ): "interleaved",
+                (
+                    _WANGP_REF2VA_PRUNED_BF16_TRANSFORMER
+                    if reference_mode
+                    else _WANGP_FL2VA_PRUNED_BF16_TRANSFORMER
+                ): "interleaved",
+            },
+            # WanGP stores the same published Qwen weight in its upstream
+            # folder, while Maestro keeps the canonical file under H3 assets.
+            "compatible_text_encoder_paths": {
+                _TEXT_ENCODER: [
+                    os.path.join(_WANGP_TEXT_ENCODER_FOLDER, _TEXT_ENCODER)
+                ]
+            },
             "runtime_custom_settings": [
                 "h3_attention_engine",
                 "h3_sol_tau",
@@ -598,29 +689,23 @@ class family_handler:
 
     @staticmethod
     def query_model_files(computeList, base_model_type, model_def=None):
-        processor_files = [
-            "chat_template.json",
-            "merges.txt",
-            "preprocessor_config.json",
-            "tokenizer.json",
-            "tokenizer_config.json",
-            "video_preprocessor_config.json",
-            "vocab.json",
-        ]
         return [
             {
                 "repoId": _COMFY_REPO,
                 "revision": _COMFY_REVISION,
                 "sourceFolderList": ["vae"],
                 "targetFolderList": [_ASSETS_ROOT],
-                "fileList": [[_VIDEO_VAE, _AUDIO_VAE]],
+                "fileList": [_required_asset_filenames("vae")],
             },
             {
                 "repoId": _OFFICIAL_REPO,
                 "revision": _OFFICIAL_REVISION,
                 "sourceFolderList": ["processor", "text_encoder"],
                 "targetFolderList": [_ASSETS_ROOT, _ASSETS_ROOT],
-                "fileList": [processor_files, ["config.json"]],
+                "fileList": [
+                    _required_asset_filenames("processor"),
+                    _required_asset_filenames("text_encoder"),
+                ],
             },
         ]
 

@@ -17,6 +17,15 @@ APP = os.path.join(ROOT, "app")
 if APP not in sys.path:
     sys.path.insert(0, APP)
 
+from services.h3_legal_access import (
+    H3_LEGAL_BLOCKED_DETAIL,
+    H3_LICENSE_SHA256,
+    H3_UPSTREAM_REVISION,
+    h3_legal_access_decision,
+    h3_public_availability,
+    record_h3_operating_location,
+)
+
 # Load the dependency-light module directly. Importing shared.utils first
 # executes its package initializer, which intentionally imports Torch-backed
 # solver modules that the lightweight CI job does not install.
@@ -61,6 +70,22 @@ class _GlobalTimelineParserTestMixin:
         self.assertEqual(
             [(event["kind"], event["start"], event["end"]) for event in events],
             [("range", 0.0, 12.0), ("range", 12.0, 24.0), ("point", 37.0, 37.0)],
+        )
+        self.assertTrue(has_global_timeline(prompt))
+
+    def test_aspect_ratio_tokens_are_not_clock_times(self):
+        prompt = "\n".join([
+            "Generate a 120-second 16:9 live-action film.",
+            "9:16 vertical composition stays locked.",
+            "16:9 framing of an adult traveler in a hallway.",
+            "[Shot 2] At 00:10.500, they look closer.",
+            "At 00:118.600, the frame holds.",
+        ])
+        global_lines, events = parse_global_timeline_prompt(prompt)
+        starts = sorted(float(event["start"]) for event in events)
+        self.assertEqual(starts, [10.5, 118.6])
+        self.assertTrue(
+            any("16:9" in line or "9:16" in line for line in global_lines),
         )
         self.assertTrue(has_global_timeline(prompt))
 
@@ -311,7 +336,11 @@ class EnhancedPromptCardinalityTests(unittest.TestCase):
             route.count("_validate_standalone_enhanced_prompt_cardinality("),
             2,
         )
-        self.assertIn("status_code=422, detail=str(error)", route)
+        self.assertIn(
+            'detail="Prompt enhancement did not match the requested structure"',
+            route,
+        )
+        self.assertNotIn("detail=str(error)", route)
 
     def test_authoritative_validator_accepts_exact_nonblank_windows(self):
         validate = self._load_wgp_validator()
@@ -748,7 +777,19 @@ class H3LongStudioPlanningTests(unittest.TestCase):
             if isinstance(node, ast.FunctionDef) and node.name in helper_names
         ]
 
+        h3_services = {}
+        record_h3_operating_location(
+            h3_services,
+            territory_code="CA",
+            owner_attested=True,
+            license_revision=H3_UPSTREAM_REVISION,
+            license_sha256=H3_LICENSE_SHA256,
+            declared_at_unix=1,
+        )
+
         class FakeWgp:
+            server_config = {"services": h3_services}
+
             @staticmethod
             def get_model_def(model_type):
                 reference = model_type == "minimax_h3_ref2va"
@@ -770,6 +811,14 @@ class H3LongStudioPlanningTests(unittest.TestCase):
                 }
 
             @staticmethod
+            def get_base_model_type(model_type):
+                return (
+                    "minimax_h3_ref2va"
+                    if model_type == "minimax_h3_ref2va"
+                    else "minimax_h3"
+                )
+
+            @staticmethod
             def align_model_frame_count(value, model_def):
                 return _h3_align(
                     value,
@@ -780,6 +829,9 @@ class H3LongStudioPlanningTests(unittest.TestCase):
         namespace = {
             "math": __import__("math"),
             "wgp": FakeWgp,
+            "H3_LEGAL_BLOCKED_DETAIL": H3_LEGAL_BLOCKED_DETAIL,
+            "h3_legal_access_decision": h3_legal_access_decision,
+            "h3_public_availability": h3_public_availability,
             "_H3_LONG_STUDIO_MODELS": {
                 "minimax_h3", "minimax_h3_pinkcherry_fl2va",
                 "minimax_h3_w4a8_fl2va", "minimax_h3_ref2va",
@@ -1689,11 +1741,13 @@ process.stdout.write(JSON.stringify(effectiveSlidingWindowGeometry(10, 5, 5, opt
         self.assertIn("Full-video timing detected", prompt_ui)
         self.assertIn("[00:00-00:10]", prompt_ui)
 
-    def test_studio_prompt_improvement_is_explicit_and_uses_plain_status_copy(self):
+    def test_studio_prompt_improvement_is_explicit_and_routes_status_to_queue(self):
         with open(os.path.join(ROOT, "ui", "src", "stores", "useStore.ts"), encoding="utf-8") as handle:
             store = handle.read()
         with open(os.path.join(ROOT, "ui", "src", "components", "Sidebar", "PromptInput.tsx"), encoding="utf-8") as handle:
             prompt_ui = handle.read()
+        with open(os.path.join(APP, "launch.py"), encoding="utf-8") as handle:
+            launch = handle.read()
         self.assertIn("studioPromptEnhance: false", store)
         generation = store[store.index("startGeneration: async"):store.index("stopGeneration: (jobId)")]
         self.assertIn("enhance_before_generate", generation)
@@ -1711,10 +1765,12 @@ process.stdout.write(JSON.stringify(effectiveSlidingWindowGeometry(10, 5, 5, opt
         self.assertIn("Improve before Generate", prompt_ui)
         self.assertIn("Adds detail and structure to your prompt", prompt_ui)
         self.assertIn("Keeps your full-video timing and timestamps", prompt_ui)
-        self.assertIn("Working on your prompt", prompt_ui)
+        self.assertIn("requestQueueView()", prompt_ui)
+        self.assertNotIn("Working on your prompt", prompt_ui)
         self.assertNotIn("loadingPhase.replaceAll", prompt_ui)
         self.assertNotIn("vision projector", prompt_ui)
-        self.assertIn("modelOptions?.prompt_enhancer_model", prompt_ui)
+        self.assertNotIn("modelOptions?.prompt_enhancer_model", prompt_ui)
+        self.assertIn("_resolve_prompt_enhancer_runtime_selection(", launch)
 
     def test_backend_slicing_is_gated_to_structured_studio_prompt_mode(self):
         with open(os.path.join(APP, "wgp.py"), encoding="utf-8") as handle:

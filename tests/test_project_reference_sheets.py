@@ -750,6 +750,114 @@ class ReferenceSheetTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._pack_plan(reference_type="prop", anchor_basis="anatomy")
 
+    def test_identity_focus_is_opt_in_face_and_body_probe(self):
+        self.assertEqual(reference_sheets.PACK_DEFAULT_PRESETS["character"], "identity")
+        self.assertIn(
+            "identity_focus", reference_sheets.PACK_TYPE_PRESETS["character"],
+        )
+        self.assertEqual(
+            reference_sheets.reference_pack_ordered_roles(
+                "character", "identity",
+            ),
+            (
+                "canonical_identity", "turnaround", "expressions",
+                "wardrobe", "identity_details",
+            ),
+        )
+
+        plan = self._pack_plan(preset="identity_focus")
+        self.assertEqual(plan.schema_version, 2)
+        self.assertEqual(plan.planner_version, "reference-pack-v2")
+        self.assertEqual(plan.preset, "identity_focus")
+        self.assertEqual(
+            plan.sheet_roles, ("frontal_face", "body_front", "body_back"),
+        )
+        self.assertEqual(plan.anchor_role, "frontal_face")
+        self.assertEqual(plan.anchor_strategy, "layout_probe_anchor")
+        self.assertEqual(plan.anchor_basis, "primary_outfit")
+        self.assertEqual(
+            [(sheet.role, sheet.label) for sheet in plan.sheets],
+            [
+                ("frontal_face", "FRONTAL FACE"),
+                ("body_front", "BODY FRONT"),
+                ("body_back", "BODY BACK"),
+            ],
+        )
+        self.assertEqual(
+            plan.public_preview()["ordered_output_roles"],
+            ["frontal_face", "body_front", "body_back"],
+        )
+        self.assertEqual(
+            plan.public_preview()["anchor_strategy"], "layout_probe_anchor",
+        )
+        self.assertEqual(
+            reference_sheets.reference_pack_ordered_roles(
+                "character", "identity_focus", 5,
+            ),
+            (
+                "frontal_face", "body_front", "body_back",
+                "identity_details", "expressions",
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "preset does not match"):
+            self._pack_plan(reference_type="prop", preset="identity_focus")
+
+        # The archival collage contract remains separate and unchanged.
+        self.assertEqual(
+            tuple(recipe.role for recipe in reference_sheets.ROLE_RECIPES["character"]),
+            (
+                "identity_front", "three_quarter", "profile", "full_body",
+                "expression", "accessory_detail",
+            ),
+        )
+
+    def test_identity_focus_artifact_provenance_stays_layout_probe_specific(self):
+        plan = self._pack_plan(
+            preset="identity_focus", depth="compact",
+        )
+        generated = []
+        review_count = 0
+
+        def generate(request):
+            generated.append(request)
+            return self._image(
+                f"identity-focus-anchor-{len(generated)}.png",
+                (40 + len(generated), 50, 60),
+                plan.sheet_size,
+            )
+
+        def review(_request):
+            nonlocal review_count
+            review_count += 1
+            return review_count != 1
+
+        result = create_reference_pack(
+            plan,
+            generate_sheet=generate,
+            edit_sheet=lambda *_args: self.fail("compact cannot edit"),
+            repair_sheet=lambda *_args: self.fail(
+                "anchor rejection regenerates instead of repairing",
+            ),
+            reviewer=review,
+            max_repair_attempts=1,
+        )
+        self.assertEqual(
+            [request.strategy for request in generated],
+            ["layout_probe_anchor", "layout_probe_anchor_regeneration"],
+        )
+        self.assertTrue(all(
+            request.routing_operation == "generation" for request in generated
+        ))
+        self.assertEqual(
+            result.artifacts[0].provenance.strategy,
+            "layout_probe_anchor_regeneration",
+        )
+        ordinary = self._pack_plan(depth="compact")
+        self.assertEqual(ordinary.anchor_strategy, "canonical_anchor")
+        self.assertEqual(
+            ordinary.public_preview()["anchor_strategy"], "canonical_anchor",
+        )
+
     def test_v2_private_output_and_blur_define_truthful_sealed_anchor_privacy(self):
         seals = set()
         for private, blurred, expected in (

@@ -251,6 +251,47 @@ non_diegetic_music: N/A"""
                     compile_h3_style_workflow(compiled, resolved)[0], compiled,
                 )
 
+    def test_selected_craft_guides_only_enrich_visuals_and_preserve_audio(self):
+        catalog = builtin_catalog()
+        prompt = """subject_definitions: <Subject 1> is Ava: an adult in a blue coat.
+integrated_multimodal_description:
+[Shot 1] [0.00s-8.00s] shot_name: Ava presents | audiovisual_description: <Subject 1> (Ava) presents the object. | dialogue_and_vocalizations: <d>[English] Keep the original line.</d>
+overall_soundscape: Exact room tone and a soft mechanical hum.
+non_diegetic_music: Exact authored music cue."""
+        original_audio = prompt.split(" | dialogue_and_vocalizations:", 1)[1]
+        cases = {
+            "3d-animation-short-generator": (
+                "anticipation", "purposeful holds", "motion arcs",
+                "follow-through", "stage readable poses",
+            ),
+            "music-video-subtitle-generator": (
+                "beat-owned cut and transition timing",
+                "lyric typography", "its own visual layer",
+            ),
+            "brand-promo-video-generator": (
+                "one-reference-one-job roles",
+                "identity", "props", "storyboard",
+            ),
+        }
+
+        for style_id, concepts in cases.items():
+            with self.subTest(style_id=style_id):
+                resolved = resolve_h3_style_workflow(style_id, catalog)
+                compiled, schema = compile_h3_style_workflow(prompt, resolved)
+                visual = compiled.split(
+                    "audiovisual_description:", 1,
+                )[1].split(" | dialogue_and_vocalizations:", 1)[0].lower()
+                dialogue_and_audio = compiled.split(
+                    " | dialogue_and_vocalizations:", 1,
+                )[1]
+
+                self.assertEqual(schema, "base_context_ir")
+                self.assertEqual(dialogue_and_audio, original_audio)
+                self.assertEqual(compiled.count("H3 workflow guidance ["), 1)
+                for concept in concepts:
+                    self.assertIn(concept, visual)
+                    self.assertNotIn(concept, dialogue_and_audio.lower())
+
     def test_freeform_workflow_guidance_is_explicit_bounded_and_idempotent(self):
         catalog = builtin_catalog()
         resolved = resolve_h3_style_workflow(

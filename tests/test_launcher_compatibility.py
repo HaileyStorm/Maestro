@@ -19,13 +19,24 @@ _OPTIONAL_MUSIC3_LAUNCHERS = (
 
 
 def _load_static_launcher(filename: str) -> dict[str, object]:
+    loader = r"""
+const filename = process.argv[1];
+const exported = require('./' + filename);
+const kernel = {
+  port: async () => 7860,
+  envs: {},
+  platform: 'linux',
+  gpu: 'nvidia',
+  gpu_target: 'sm_89',
+  gpu_model: 'RTX 4090',
+  gpu_driver: '580',
+};
+Promise.resolve(typeof exported === 'function' ? exported(kernel) : exported)
+  .then((definition) => process.stdout.write(JSON.stringify(definition)))
+  .catch((error) => { console.error(error); process.exit(1); });
+"""
     completed = subprocess.run(
-        [
-            "node",
-            "-e",
-            "process.stdout.write(JSON.stringify(require('./' + process.argv[1])))",
-            filename,
-        ],
+        ["node", "-e", loader, filename],
         cwd=_ROOT,
         check=True,
         capture_output=True,
@@ -494,6 +505,11 @@ Promise.resolve(build())
             if step.get("method") == "local.set"
             and step.get("params") == {"backend_ready": True}
         )
+        backend_wait_index = next(
+            index for index, step in enumerate(steps)
+            if "share_registration_watch.py --origin {{local.url}} --wait-backend-only"
+            in " ".join(step.get("params", {}).get("message", []))
+        )
         health_indexes = [
             index for index, step in enumerate(steps)
             if step.get("method") == "process.wait"
@@ -519,13 +535,14 @@ Promise.resolve(build())
 
         self.assertEqual(local_url_index, capture_index + 1)
         self.assertFalse(steps[local_url_index]["params"]["backend_ready"])
-        self.assertEqual(health_indexes[0], local_url_index + 1)
-        self.assertEqual(ready_indexes[0], health_indexes[0] + 1)
-        self.assertEqual(backend_ready_index, ready_indexes[0] + 1)
+        self.assertEqual(backend_wait_index, local_url_index + 1)
+        self.assertEqual(backend_ready_index, backend_wait_index + 1)
         self.assertLess(backend_ready_index, register_index)
-        self.assertLess(register_index, health_indexes[1])
-        self.assertEqual(ready_indexes[1], health_indexes[1] + 1)
-        self.assertEqual(clear_index, ready_indexes[1] + 1)
+        self.assertEqual(len(health_indexes), 1)
+        self.assertEqual(len(ready_indexes), 1)
+        self.assertLess(register_index, health_indexes[0])
+        self.assertEqual(ready_indexes[0], health_indexes[0] + 1)
+        self.assertEqual(clear_index, ready_indexes[0] + 1)
         clear = steps[clear_index]
         self.assertIn("args.restart_generation", clear["when"])
         self.assertIn("[A-Za-z0-9_-]{16,64}", clear["when"])
@@ -741,6 +758,10 @@ Promise.resolve(build())
                 (_ROOT / "launcher_secret_env.js").read_text(encoding="utf-8"),
                 encoding="utf-8",
             )
+            (root / "launcher_profile.js").write_text(
+                (_ROOT / "launcher_profile.js").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
             loader = r"""
 const fs = require('fs');
 const build = require('./start.js');
@@ -831,6 +852,10 @@ const explicitBackendEnvironment = (definition) => {
             (root / "start.js").write_text(source, encoding="utf-8")
             (root / "launcher_secret_env.js").write_text(
                 (_ROOT / "launcher_secret_env.js").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            (root / "launcher_profile.js").write_text(
+                (_ROOT / "launcher_profile.js").read_text(encoding="utf-8"),
                 encoding="utf-8",
             )
             (root / "ENVIRONMENT").write_text(app_environment, encoding="utf-8")
@@ -1236,9 +1261,18 @@ Promise.resolve(build({port: async () => 7860}))
 const files = JSON.parse(process.argv[1]);
 (async () => {
   const failures = [];
+  const kernel = {
+    port: async () => 7860,
+    envs: {},
+    platform: 'linux',
+    gpu: 'nvidia',
+    gpu_target: 'sm_89',
+    gpu_model: 'RTX 4090',
+    gpu_driver: '580',
+  };
   for (const file of files) {
     let definition = require('./' + file);
-    if (typeof definition === 'function') definition = await definition({port: async () => 7860});
+    if (typeof definition === 'function') definition = await definition(kernel);
     for (const [index, step] of (definition.run || []).entries()) {
       if (step.method !== 'shell.run') continue;
       const env = (step.params || {}).env || {};

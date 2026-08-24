@@ -40,7 +40,7 @@ test('creative workspace tabs and Recipes retain exact actions with mobile targe
   for (const [label, setter] of [
     ['Open Generate', "setSidebarMode('studio')"],
     ['Open Director', "setSidebarMode('director')"],
-    ['Open Reference', "setSidebarMode('reference')"],
+    ['Open References', "setSidebarMode('reference')"],
   ]) {
     const button = openingTag(sidebar, 'button', setter)
     assert.match(button, /type="button"/)
@@ -49,11 +49,11 @@ test('creative workspace tabs and Recipes retain exact actions with mobile targe
     assert.match(button, /focus-visible:ring-2/)
     assert.match(button, /focus-visible:ring-accent-blue/)
     assert.match(button, new RegExp(setter.replace(/[()]/g, '\\$&')))
-    if (label !== 'Open Reference') assert.match(button, new RegExp(`aria-label="${label}"`))
+    if (label !== 'Open References') assert.match(button, new RegExp(`aria-label="${label}"`))
   }
 
   assert.match(sidebar, /disabled=\{!activeWorkspace \|\| browsingUploads \|\| referenceLocked\}/)
-  assert.match(sidebar, /aria-label=\{referenceLocked \? 'Unlock project to open Reference' : 'Open Reference'\}/)
+  assert.match(sidebar, /aria-label=\{referenceLocked \? 'Unlock project to open References' : 'Open References'\}/)
 
   const recipes = openingTag(sidebar, 'button', 'aria-label="Browse recipes"')
   assert.match(recipes, /type="button"/)
@@ -77,7 +77,7 @@ test('Explicit and Private use their complete wrapping labels as mobile targets'
   }
 
   assert.match(explicit, /checked=\{explicitOutput\}/)
-  assert.match(explicit, /setExplicitOutput\(event\.target\.checked\)/)
+  assert.match(explicit, /setExplicitOutput\(enabled\)/)
   assert.match(explicit, /Explicit \{explicitOutput \? 'On' : 'Off'\}/)
   assert.match(privatePreview, /checked=\{privateOutput\}/)
   assert.match(privatePreview, /setPrivateOutput\(event\.target\.checked\)/)

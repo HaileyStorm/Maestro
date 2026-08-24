@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import { EyeOff, Flame } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import { HOST_TERM_NOTICES } from '../../lib/hostTerms'
@@ -15,6 +15,13 @@ export function GenerationPrivacyControls() {
   const loadHostTerms = useStore(s => s.loadHostTerms)
   const acceptHostTerm = useStore(s => s.acceptHostTerm)
   const llmProvider = useStore(s => s.servicesConfig?.llm_provider || 'local')
+  const sidebarMode = useStore(s => s.sidebarMode)
+  const currentModelType = useStore(s => s.params.model_type)
+  const models = useStore(s => s.models)
+  const selectModel = useStore(s => s.selectModel)
+  const initialModelType = useRef(currentModelType)
+  const modelSelectionCustomized = useRef(false)
+  const automaticModelSelection = useRef(false)
   const baseH3Selected = useStore(s => (
     s.sidebarMode === 'director'
       ? s.selectedModelPerMode.video === 'minimax_h3'
@@ -24,6 +31,19 @@ export function GenerationPrivacyControls() {
   useEffect(() => {
     if (activeWorkspace && !hostTerms && !hostTermsLoading) void loadHostTerms()
   }, [activeWorkspace, hostTerms, hostTermsLoading, loadHostTerms])
+
+  useEffect(() => {
+    if (automaticModelSelection.current) {
+      if (currentModelType === 'minimax_h3_pinkcherry_fl2va') {
+        automaticModelSelection.current = false
+        return
+      }
+      automaticModelSelection.current = false
+    }
+    if (currentModelType !== initialModelType.current) {
+      modelSelectionCustomized.current = true
+    }
+  }, [currentModelType])
 
   const lawfulUseAccepted = hostTerms?.lawful_use.accepted === true
 
@@ -41,7 +61,29 @@ export function GenerationPrivacyControls() {
           <input
             type="checkbox"
             checked={explicitOutput}
-            onChange={event => setExplicitOutput(event.target.checked)}
+            onChange={event => {
+              const enabled = event.target.checked
+              setExplicitOutput(enabled)
+              const pinkCherryAvailable = models.some(model => (
+                model.model_type === 'minimax_h3_pinkcherry_fl2va'
+                && model.execution_allowed !== false
+                && model.availability_status !== 'legal_blocked'
+                && model.availability_status !== 'location_declaration_required'
+              ))
+              if (
+                enabled
+                && !explicitOutput
+                && sidebarMode === 'studio'
+                && !modelSelectionCustomized.current
+                && currentModelType === 'minimax_h3'
+                && pinkCherryAvailable
+              ) {
+                automaticModelSelection.current = true
+                void selectModel('minimax_h3_pinkcherry_fl2va').then(selected => {
+                  if (!selected) automaticModelSelection.current = false
+                })
+              }
+            }}
             className="sr-only"
           />
           <Flame aria-hidden="true" className="shrink-0" size={12} />

@@ -69,6 +69,11 @@ function findNodes(node, predicate, matches = []) {
   return matches
 }
 
+function nodeText(node) {
+  if (typeof node === 'string' || typeof node === 'number') return String(node)
+  return treeChildren(node).map(nodeText).join(' ')
+}
+
 async function loadOverlayComponent(entryUrl, exportName) {
   const modules = new Map([
     ['react', `
@@ -142,7 +147,12 @@ async function loadOverlayComponent(entryUrl, exportName) {
       export const CURRENT_RELEASE = { version: 'test', summary: 'summary', highlights: [] }
       export const CHANGELOG_MANIFEST = { whyContinuum: [] }
     `],
-    ['api', `export async function importRecipe() {}`],
+    ['api', `
+      export async function importRecipe() {}
+      export function isAccountProjectAccessActive(context) {
+        return context?.accounts?.enabled === true && context?.account_project_access_active === true
+      }
+    `],
     ['focus', `
       export function installModalFocus(options) {
         globalThis.__overlayInstalls.push(options)
@@ -283,6 +293,44 @@ test('rendered Welcome and Recipes capture their actual openers, priorities, por
   recipesCloseControls[0].props.onClick()
   assert.equal(recipesSetOpenCalls, 1)
   assert.equal(globalThis.__overlayTopCloseDialogs.at(-1), recipesDialog)
+})
+
+test('Welcome remote access copy follows account project access and uses the canonical mark', async () => {
+  const WelcomeModal = await loadOverlayComponent(welcomeUrl, 'WelcomeModal')
+  const render = store => {
+    const document = new FakeDocument()
+    resetOverlayHarness(
+      [{ current: new FakeElement(document, 'welcome') }, { current: new FakeElement(document, 'start') }],
+      store,
+      new FakeElement(document, 'opener'),
+    )
+    return WelcomeModal()
+  }
+
+  const legacy = render({
+    accessContext: { remote: true, accounts: { enabled: true }, account_project_access_active: false },
+    accountContext: { authenticated: false },
+    activeWorkspace: 'project-a',
+    setSidebarMode() {},
+  })
+  assert.match(nodeText(legacy), /Before account setup is complete/)
+
+  const signedOut = render({
+    accessContext: { remote: true, accounts: { enabled: true }, account_project_access_active: true },
+    accountContext: { authenticated: false },
+    activeWorkspace: 'project-a',
+    setSidebarMode() {},
+  })
+  assert.match(nodeText(signedOut), /Sign in to open projects assigned to your account/)
+
+  const signedIn = render({
+    accessContext: { remote: true, accounts: { enabled: true }, account_project_access_active: true },
+    accountContext: { authenticated: true },
+    activeWorkspace: 'project-a',
+    setSidebarMode() {},
+  })
+  assert.match(nodeText(signedIn), /Your signed-in account can open projects assigned to it/)
+  assert.equal(findNodes(signedIn, node => node.type === 'img' && node.props?.src === '/maestro.svg').length, 1)
 })
 
 test('Welcome at priority 120 covers Recipes at 100 without losing locks or exact focus restoration', () => {

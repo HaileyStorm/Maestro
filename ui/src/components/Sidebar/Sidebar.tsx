@@ -118,6 +118,13 @@ export function Sidebar() {
     useStore.getState().setRecipesOpen(true)
   }
 
+  const openMobileMachineSettings = useCallback(() => {
+    closeModalIfTop(document, mobileSidebarRef.current, () => {
+      setSidebarOpen(false)
+      toggleSettings()
+    })
+  }, [setSidebarOpen, toggleSettings])
+
   const productIdentity = (
     <div className="flex min-w-0 items-center gap-2">
       <img aria-hidden="true" src="/maestro.svg" alt="" className="h-7 w-7 shrink-0" />
@@ -373,6 +380,26 @@ export function Sidebar() {
               <X aria-hidden="true" size={16} />
             </button>
             <div className="col-span-2 min-w-0">{modeToggle('sm')}</div>
+            <nav
+              aria-label="More Maestro tools"
+              className={`col-span-2 grid min-w-0 gap-2 ${machineControls ? 'grid-cols-2' : 'grid-cols-1'}`}
+            >
+              <div className="mobile-sidebar-whats-new min-w-0">
+                <WhatsNewButton compact />
+                <span aria-hidden="true">What's new</span>
+              </div>
+              {machineControls && (
+                <button
+                  type="button"
+                  onClick={openMobileMachineSettings}
+                  className="flex h-11 min-w-0 items-center justify-start gap-2 rounded-md border border-border/80 px-3 text-[10px] font-medium text-text-muted transition-colors hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+                  aria-label="Open machine settings"
+                >
+                  <Settings aria-hidden="true" size={13} />
+                  <span className="truncate">Machine settings</span>
+                </button>
+              )}
+            </nav>
           </div>
           <div className={`flex flex-1 min-h-0 flex-col overscroll-contain [-webkit-overflow-scrolling:touch] ${
             isDirector || isReference ? 'overflow-hidden' : 'overflow-y-auto'

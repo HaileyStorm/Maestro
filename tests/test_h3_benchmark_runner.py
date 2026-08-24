@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import struct
 import sys
 import tempfile
 import types
@@ -618,6 +619,34 @@ class TestH3BenchmarkSafety(unittest.TestCase):
         self.assertNotIn(runner.SYNTHETIC_REF_PROMPT, output)
         self.assertNotIn("password", output.lower())
 
+    def test_live_matrix_requires_both_media_tools_before_client_access(self):
+        for missing in ({"ffmpeg"}, {"ffprobe"}, {"ffmpeg", "ffprobe"}):
+            stderr = io.StringIO()
+            with self.subTest(missing=missing), mock.patch.object(
+                runner.shutil, "which",
+                side_effect=lambda command: None if command in missing else command,
+            ) as discover, mock.patch.object(
+                runner, "MaestroClient",
+            ) as client, contextlib.redirect_stderr(stderr):
+                result = runner.main([
+                    "--base-url", "http://127.0.0.1:42016",
+                    "--project", "synthetic-project",
+                    "--case", "base_native_sdpa",
+                ])
+            self.assertEqual(result, 1)
+            client.assert_not_called()
+            self.assertEqual(
+                [call.args[0] for call in discover.call_args_list],
+                ["ffmpeg", "ffprobe"],
+            )
+            self.assertIn(
+                "media_tools_required:" + ",".join(
+                    command for command in ("ffmpeg", "ffprobe")
+                    if command in missing
+                ),
+                stderr.getvalue(),
+            )
+
     def test_live_4k_acceptance_selects_only_exact_unmodified_delivery_case(self):
         stdout = io.StringIO()
         with mock.patch.object(
@@ -700,8 +729,11 @@ class TestH3BenchmarkRecords(unittest.TestCase):
             height=352,
             duration="5.166667",
             frames="124",
+            avg_frame_rate="24/1",
+            r_frame_rate="24/1",
             sample_rate="32000",
             channels=2,
+            audio_duration=None,
         ):
             return types.SimpleNamespace(stdout=json.dumps({
                 "streams": [
@@ -711,53 +743,269 @@ class TestH3BenchmarkRecords(unittest.TestCase):
                         "height": height,
                         "duration": duration,
                         "nb_read_frames": frames,
+                        "avg_frame_rate": avg_frame_rate,
+                        "r_frame_rate": r_frame_rate,
                     },
                     {
                         "codec_type": "audio",
                         "sample_rate": sample_rate,
                         "channels": channels,
+                        "duration": audio_duration or duration,
                     },
                 ],
                 "format": {"duration": duration},
             }))
 
-        with mock.patch.object(runner.shutil, "which", return_value="ffprobe"), mock.patch.object(
-            runner.subprocess, "run", return_value=completed(),
-        ):
-            valid = runner.probe_video(
-                Path("synthetic.mp4"), expected_resolution="608x352",
-            )
-        self.assertEqual(valid["validation"], "valid")
-        self.assertTrue(all(valid["checks"].values()))
-
-        mismatches = (
-            completed(width=864),
-            completed(duration="8.0"),
-            completed(frames="123"),
-            completed(sample_rate="48000"),
-            completed(channels=1),
-        )
-        for result in mismatches:
-            with self.subTest(result=result.stdout), mock.patch.object(
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary) / "synthetic.mp4"
+            artifact.write_bytes(b"content-free-artifact")
+            with mock.patch.object(
                 runner.shutil, "which", return_value="ffprobe",
-            ), mock.patch.object(runner.subprocess, "run", return_value=result):
+            ), mock.patch.object(
+                runner.subprocess, "run", return_value=completed(),
+            ):
+                valid = runner.probe_video(
+                    artifact, expected_resolution="608x352",
+                )
+            self.assertEqual(valid["validation"], "valid")
+            self.assertTrue(all(valid["checks"].values()))
+            self.assertEqual(valid["fps"], 24.0)
+            self.assertEqual(valid["video_stream_count"], 1)
+            self.assertEqual(valid["audio_stream_count"], 1)
+            self.assertEqual(valid["artifact_size_bytes"], artifact.stat().st_size)
+            self.assertRegex(valid["artifact_sha256"], r"^sha256:[0-9a-f]{64}$")
+
+            fallback_rate = completed(avg_frame_rate="0/0", r_frame_rate="24/1")
+            with mock.patch.object(
+                runner.shutil, "which", return_value="ffprobe",
+            ), mock.patch.object(
+                runner.subprocess, "run", return_value=fallback_rate,
+            ):
+                fallback = runner.probe_video(
+                    artifact, expected_resolution="608x352",
+                )
+            self.assertEqual(fallback["validation"], "valid")
+            self.assertEqual(fallback["fps"], 24.0)
+
+            mismatches = (
+                completed(width=864),
+                completed(duration="8.0"),
+                completed(frames="123"),
+                completed(avg_frame_rate="25/1"),
+                completed(sample_rate="48000"),
+                completed(channels=1),
+                completed(audio_duration="0.1"),
+            )
+            for result in mismatches:
+                with self.subTest(result=result.stdout), mock.patch.object(
+                    runner.shutil, "which", return_value="ffprobe",
+                ), mock.patch.object(
+                    runner.subprocess, "run", return_value=result,
+                ):
+                    invalid = runner.probe_video(
+                        artifact, expected_resolution="608x352",
+                    )
+                self.assertEqual(invalid["validation"], "invalid")
+
+            for duplicate_type in ("video", "audio"):
+                duplicate = completed()
+                decoded = json.loads(duplicate.stdout)
+                decoded["streams"].append(next(
+                    dict(stream) for stream in decoded["streams"]
+                    if stream["codec_type"] == duplicate_type
+                ))
+                duplicate.stdout = json.dumps(decoded)
+                with self.subTest(duplicate_type=duplicate_type), mock.patch.object(
+                    runner.shutil, "which", return_value="ffprobe",
+                ), mock.patch.object(
+                    runner.subprocess, "run", return_value=duplicate,
+                ):
+                    invalid = runner.probe_video(
+                        artifact, expected_resolution="608x352",
+                    )
+                self.assertEqual(invalid["validation"], "invalid")
+                self.assertFalse(
+                    invalid["checks"][f"one_{duplicate_type}_stream"]
+                )
+
+            without_audio = completed()
+            decoded = json.loads(without_audio.stdout)
+            decoded["streams"] = [decoded["streams"][0]]
+            without_audio.stdout = json.dumps(decoded)
+            with mock.patch.object(
+                runner.shutil, "which", return_value="ffprobe",
+            ), mock.patch.object(
+                runner.subprocess, "run", return_value=without_audio,
+            ):
                 invalid = runner.probe_video(
-                    Path("synthetic.mp4"), expected_resolution="608x352",
+                    artifact, expected_resolution="608x352",
                 )
             self.assertEqual(invalid["validation"], "invalid")
+            self.assertFalse(invalid["checks"]["audio_preserved"])
 
-        without_audio = completed()
-        decoded = json.loads(without_audio.stdout)
-        decoded["streams"] = [decoded["streams"][0]]
-        without_audio.stdout = json.dumps(decoded)
-        with mock.patch.object(runner.shutil, "which", return_value="ffprobe"), mock.patch.object(
-            runner.subprocess, "run", return_value=without_audio,
-        ):
-            invalid = runner.probe_video(
-                Path("synthetic.mp4"), expected_resolution="608x352",
+            artifact.write_bytes(b"")
+            with mock.patch.object(
+                runner.shutil, "which", return_value="ffprobe",
+            ), mock.patch.object(
+                runner.subprocess, "run", return_value=completed(),
+            ):
+                empty = runner.probe_video(
+                    artifact, expected_resolution="608x352",
+                )
+            self.assertEqual(empty["validation"], "invalid")
+            self.assertFalse(empty["checks"]["artifact_nonempty"])
+
+    def test_probe_signal_sampling_is_bounded_and_audio_is_opt_in(self):
+        probe_payload = types.SimpleNamespace(stdout=json.dumps({
+            "streams": [
+                {
+                    "codec_type": "video", "width": 608, "height": 352,
+                    "duration": "1.0", "nb_read_frames": "3",
+                    "avg_frame_rate": "3/1", "r_frame_rate": "3/1",
+                },
+                {
+                    "codec_type": "audio", "sample_rate": "32000",
+                    "channels": 2, "duration": "1.0",
+                },
+            ],
+            "format": {"duration": "1.0"},
+        }))
+        moving_frames = b"".join(
+            bytes([luma]) * (32 * 32) for luma in (24, 112, 224)
+        )
+        antiphase_samples = []
+        for index in range(8000):
+            value = 0.1 if index % 2 else -0.1
+            antiphase_samples.extend((value, -value))
+        audible_audio = struct.pack(
+            f"<{len(antiphase_samples)}f", *antiphase_samples,
+        )
+
+        def completed_run(command, **_kwargs):
+            if command[0] == "ffprobe":
+                return probe_payload
+            if "-vf" in command:
+                return types.SimpleNamespace(stdout=moving_frames)
+            return types.SimpleNamespace(stdout=audible_audio)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary) / "synthetic.mp4"
+            artifact.write_bytes(b"content-free-artifact")
+            with mock.patch.object(
+                runner.shutil, "which", side_effect=lambda command: command,
+            ), mock.patch.object(
+                runner.subprocess, "run", side_effect=completed_run,
+            ) as execute:
+                validity = runner.probe_video(
+                    artifact,
+                    expected_resolution="608x352",
+                    expected_frames=3,
+                    expected_fps=3,
+                    sample_video_signal=True,
+                    require_audible_audio=True,
+                )
+            self.assertEqual(validity["validation"], "valid")
+            self.assertEqual(validity["sampled_video_frames"], 3)
+            self.assertGreater(validity["sampled_max_mean_luma"], 0)
+            self.assertGreater(validity["sampled_max_motion_delta"], 0)
+            self.assertEqual(validity["sampled_audio_values"], 16000)
+            self.assertEqual(validity["decoded_audio_seconds"], 1.0)
+            self.assertGreater(validity["sampled_audio_left_ac_rms"], 0)
+            self.assertGreater(validity["sampled_audio_right_ac_rms"], 0)
+            self.assertEqual(execute.call_count, 3)
+            self.assertNotIn(str(artifact), json.dumps(validity))
+
+            signal_failures = (
+                (
+                    bytes([96]) * (32 * 32 * 3),
+                    audible_audio,
+                    "sampled_motion",
+                ),
+                (
+                    moving_frames,
+                    struct.pack(
+                        "<16000f", *((0.2, -0.2) * 8000),
+                    ),
+                    "audible_audio",
+                ),
             )
-        self.assertEqual(invalid["validation"], "invalid")
-        self.assertFalse(invalid["checks"]["audio_preserved"])
+            for frames, audio, failed_check in signal_failures:
+                with self.subTest(failed_check=failed_check), mock.patch.object(
+                    runner.shutil, "which", side_effect=lambda command: command,
+                ), mock.patch.object(
+                    runner.subprocess, "run",
+                    side_effect=(
+                        probe_payload,
+                        types.SimpleNamespace(stdout=frames),
+                        types.SimpleNamespace(stdout=audio),
+                    ),
+                ):
+                    invalid = runner.probe_video(
+                        artifact,
+                        expected_resolution="608x352",
+                        expected_frames=3,
+                        expected_fps=3,
+                        sample_video_signal=True,
+                        require_audible_audio=True,
+                    )
+                self.assertEqual(invalid["validation"], "invalid")
+                self.assertFalse(invalid["checks"][failed_check])
+
+            short_payload_data = json.loads(probe_payload.stdout)
+            short_payload_data["streams"][1]["duration"] = "0.1"
+            short_payload = types.SimpleNamespace(
+                stdout=json.dumps(short_payload_data),
+            )
+            with mock.patch.object(
+                runner.shutil, "which", side_effect=lambda command: command,
+            ), mock.patch.object(
+                runner.subprocess, "run",
+                side_effect=(
+                    short_payload,
+                    types.SimpleNamespace(stdout=moving_frames),
+                    types.SimpleNamespace(stdout=audible_audio[:800 * 2 * 4]),
+                ),
+            ):
+                short_audio = runner.probe_video(
+                    artifact,
+                    expected_resolution="608x352",
+                    expected_frames=3,
+                    expected_fps=3,
+                    sample_video_signal=True,
+                    require_audible_audio=True,
+                )
+            self.assertEqual(short_audio["validation"], "invalid")
+            self.assertFalse(short_audio["checks"]["audio_duration"])
+            self.assertFalse(
+                short_audio["checks"]["decoded_audio_coverage"]
+            )
+
+            with mock.patch.object(
+                runner.shutil, "which", side_effect=lambda command: command,
+            ), mock.patch.object(
+                runner.subprocess, "run",
+                side_effect=(
+                    probe_payload,
+                    types.SimpleNamespace(stdout=bytes(32 * 32 * 3)),
+                    types.SimpleNamespace(stdout=audible_audio),
+                ),
+            ) as execute:
+                silent_not_requested = runner.probe_video(
+                    artifact,
+                    expected_resolution="608x352",
+                    expected_frames=3,
+                    expected_fps=3,
+                    sample_video_signal=True,
+                    require_audible_audio=False,
+                )
+            self.assertEqual(silent_not_requested["validation"], "invalid")
+            self.assertFalse(silent_not_requested["checks"]["sampled_non_black"])
+            self.assertFalse(silent_not_requested["checks"]["sampled_motion"])
+            self.assertNotIn("audible_audio", silent_not_requested["checks"])
+            self.assertTrue(
+                silent_not_requested["checks"]["decoded_audio_coverage"]
+            )
+            self.assertEqual(execute.call_count, 3)
 
     def test_postprocess_stage_timing_is_reduced_without_timestamps(self):
         result = runner.summarize_postprocess_phase_times([
@@ -781,7 +1029,7 @@ class TestH3BenchmarkRecords(unittest.TestCase):
                 "validation": "valid", "duration_seconds": 5.0,
                 "width": 608, "height": 352,
             },
-        ), mock.patch.object(
+        ) as probe, mock.patch.object(
             runner, "export_representative_frames",
             return_value=["start.png", "middle.png", "end.png"],
         ):
@@ -803,6 +1051,8 @@ class TestH3BenchmarkRecords(unittest.TestCase):
         self.assertNotIn("must not be retained", encoded)
         self.assertNotIn("private server detail", encoded)
         self.assertNotIn("synthetic.png", encoded)
+        self.assertTrue(probe.call_args.kwargs["sample_video_signal"])
+        self.assertFalse(probe.call_args.kwargs["require_audible_audio"])
 
     def test_completed_ref_case_requires_valid_probe_and_all_three_frames(self):
         client = _FakeClient({
@@ -923,7 +1173,7 @@ class TestH3BenchmarkRecords(unittest.TestCase):
                     "audio_32khz_stereo": True,
                 },
             },
-        ):
+        ) as probe:
             record = runner.run_case(
                 client, case, project="synthetic-project", seed=9,
                 reference_path=None, output_dir=Path(temporary),
@@ -942,6 +1192,8 @@ class TestH3BenchmarkRecords(unittest.TestCase):
         self.assertEqual(
             acceptance["public_finality"]["validation"], "valid",
         )
+        self.assertTrue(probe.call_args.kwargs["sample_video_signal"])
+        self.assertTrue(probe.call_args.kwargs["require_audible_audio"])
 
     def test_delivery_native_reference_is_rejected_before_download(self):
         client = _FakeClient({

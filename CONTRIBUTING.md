@@ -104,11 +104,14 @@ the CI-equivalent checks:
 
 ```bash
 python scripts/verify_clean_repo.py
-python -m compileall -q app/services app/launch.py scripts
+python -m compileall -q -x '(^|/)(env|node_modules)/' app/services app/launch.py scripts
 python -m unittest discover -s tests -p "test_*.py"
 python tests/test_call_llm_json_grammar.py
 (cd ui && npm ci && npm run build)
 ```
+
+The exclusion keeps embedded helper runtimes (for example SAM's separately
+managed Python environment) out of the host interpreter's source check.
 
 Also run `(cd ui && npm test)` when frontend behavior is in scope, and the
 applicable browser/E2E checks when their dependencies are available. Record any

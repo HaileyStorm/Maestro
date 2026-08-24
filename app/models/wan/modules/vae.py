@@ -659,9 +659,55 @@ class WanVAE_(nn.Module):
         if scale is not None and isinstance(scale[0], torch.Tensor):
             scale = [u.to(device=device) for u in scale]
         z = latent_source.to(device=device, dtype=dtype)
-        frames = self.decode(z, scale, any_end_frame=any_end_frame)[:, :, frame_start:target_end, :target_height, :target_width]
-        frames.clamp_(-1.0, 1.0).add_(1.0).mul_(127.5).round_().clamp_(0.0, 255.0)
-        return frames.to(device="cpu", dtype=torch.uint8)
+        if int(tile_size or 0) > 0:
+            frames = self.spatial_tiled_decode(
+                z, scale, int(tile_size), any_end_frame=any_end_frame,
+            )
+            frames = frames[:, :, frame_start:target_end, :target_height, :target_width]
+            frames.clamp_(-1.0, 1.0).add_(1.0).mul_(127.5).round_().clamp_(0.0, 255.0)
+            return frames.to(device="cpu", dtype=torch.uint8)
+        self.clear_cache()
+        if scale is not None:
+            if isinstance(scale[0], torch.Tensor):
+                z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(
+                    1, self.z_dim, 1, 1, 1,
+                )
+            else:
+                z = z / scale[1] + scale[0]
+        x = self.conv2(z)
+        cpu_parts = []
+        latent_count = x.shape[2]
+        for index in range(latent_count):
+            self._conv_idx = [0]
+            if index == 0:
+                gpu_out = self.decoder(
+                    x[:, :, index:index + 1, :, :],
+                    feat_cache=self._feat_map,
+                    feat_idx=self._conv_idx,
+                )
+            elif any_end_frame and index == latent_count - 1:
+                gpu_out = self.decoder(
+                    x[:, :, -1:, :, :],
+                    feat_cache=None,
+                    feat_idx=self._conv_idx,
+                )
+            else:
+                gpu_out = self.decoder(
+                    x[:, :, index:index + 1, :, :],
+                    feat_cache=self._feat_map,
+                    feat_idx=self._conv_idx,
+                )
+            if self.upsampler_factor > 1:
+                gpu_out = F.pixel_shuffle(
+                    gpu_out.movedim(2, 1), upscale_factor=self.upsampler_factor,
+                ).movedim(1, 2)
+            gpu_out = gpu_out[:, :, :, :target_height, :target_width]
+            gpu_out.clamp_(-1.0, 1.0).add_(1.0).mul_(127.5).round_().clamp_(0.0, 255.0)
+            cpu_parts.append(gpu_out.to(device="cpu", dtype=torch.uint8))
+            del gpu_out
+        self.clear_cache()
+        frames = torch.cat(cpu_parts, 2)
+        return frames[:, :, frame_start:target_end]
 
     def blend_v(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
         blend_extent = min(a.shape[-2], b.shape[-2], blend_extent)

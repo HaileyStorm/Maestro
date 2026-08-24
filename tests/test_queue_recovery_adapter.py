@@ -13,6 +13,10 @@ if str(APP) not in sys.path:
 
 from services.queue_recovery import QueueRecoveryJournal  # noqa: E402
 from services.queue_recovery_adapter import (  # noqa: E402
+    PromptEnhancementRecoveryConflictError,
+    PromptEnhancementRecoveryCorruptionError,
+    PromptEnhancementRecoveryStore,
+    PromptEnhancementResultStore,
     QueueRecoveryAdapterError,
     QueueRecoveryCoordinator,
     _durable_order_key,
@@ -37,6 +41,138 @@ def _serialize(job):
 
 
 class LogicalReferenceRecoveryTests(unittest.TestCase):
+    def test_legacy_read_only_replay_requires_exact_request_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "legacy"
+            writable = PromptEnhancementRecoveryStore(root, SECRET)
+            request_id = "0f6f2163-42f7-41d0-a260-79b697081d96"
+            writable.bind(
+                request_id=request_id,
+                account_key="account",
+                project_instance_key="project",
+                session_key="session",
+                request_digest="a" * 64,
+            )
+            legacy = PromptEnhancementRecoveryStore(
+                root, SECRET, read_only=True,
+            )
+            replay = legacy.replay(
+                request_id=request_id,
+                account_key="account",
+                project_instance_key="project",
+                session_key="session",
+                request_digest="a" * 64,
+            )
+            self.assertEqual(replay["status"], "queued")
+            with self.assertRaises(PromptEnhancementRecoveryConflictError):
+                legacy.replay(
+                    request_id=request_id,
+                    account_key="account",
+                    project_instance_key="project",
+                    session_key="session",
+                    request_digest="b" * 64,
+                )
+
+    def test_legacy_read_only_replay_fails_closed_on_corrupt_ledger(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "legacy"
+            root.mkdir()
+            (root / "operations.json").write_text(
+                "not a sealed ledger", encoding="ascii",
+            )
+            legacy = PromptEnhancementRecoveryStore(
+                root, SECRET, read_only=True,
+            )
+            with self.assertRaises(PromptEnhancementRecoveryCorruptionError):
+                legacy.replay(
+                    request_id="0f6f2163-42f7-41d0-a260-79b697081d96",
+                    account_key="account",
+                    project_instance_key="project",
+                    session_key="session",
+                    request_digest="a" * 64,
+                )
+
+    def test_result_store_saturation_preserves_other_unread_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            results = PromptEnhancementResultStore(
+                Path(directory) / "prompt-results", max_records=1,
+            )
+            first = results.write(
+                "0f6f2163-42f7-41d0-a260-79b697081d96", {"value": "first"},
+            )
+            with self.assertRaises(Exception) as raised:
+                results.write(
+                    "1f6f2163-42f7-41d0-a260-79b697081d96",
+                    {"value": "second"},
+                )
+            self.assertIn("full", str(raised.exception))
+            self.assertEqual(
+                results.read(
+                    "0f6f2163-42f7-41d0-a260-79b697081d96", first,
+                ),
+                {"value": "first"},
+            )
+            results.remove(first)
+            second = results.write(
+                "1f6f2163-42f7-41d0-a260-79b697081d96",
+                {"value": "second"},
+            )
+            self.assertEqual(
+                results.read(
+                    "1f6f2163-42f7-41d0-a260-79b697081d96", second,
+                ),
+                {"value": "second"},
+            )
+
+    def test_prompt_enhancement_queue_snapshot_is_content_free_and_result_is_private(self):
+        with tempfile.TemporaryDirectory() as directory:
+            results = PromptEnhancementResultStore(
+                Path(directory) / "prompt-results",
+            )
+            reference = results.write(
+                "0f6f2163-42f7-41d0-a260-79b697081d96",
+                {"original": "private original", "enhanced": "private result"},
+            )
+            snapshot = _serialize({
+                "id": "0f6f216342f741d0a26079b697081d96",
+                "status": "completed",
+                "kind": "prompt_enhancement",
+                "logical_job_kind": "prompt_enhancement",
+                "phase": "completed",
+                "resource_intent": "text",
+                "resource_execution": "standard",
+                "resource_state": "released",
+                "preemption_mode": "none",
+                "execution_attempt": 1,
+                "params": {
+                    "_prompt_enhancement_operation": {
+                        "body": {"prompt": "private original"},
+                    },
+                },
+                "prompt_result_reference": reference,
+            })
+            self.assertNotIn("params", snapshot)
+            self.assertNotIn("private original", repr(snapshot))
+            self.assertNotIn("private result", repr(snapshot))
+            self.assertEqual(
+                snapshot["logical_job_kind"], "prompt_enhancement",
+            )
+            self.assertEqual(snapshot["prompt_result_reference"], reference)
+            self.assertEqual(
+                results.read(
+                    "0f6f2163-42f7-41d0-a260-79b697081d96", reference,
+                )["enhanced"],
+                "private result",
+            )
+            with self.assertRaises(QueueRecoveryAdapterError):
+                _serialize({
+                    "id": "spoofed-prompt-kind",
+                    "status": "queued",
+                    "kind": "generation",
+                    "logical_job_kind": "prompt_enhancement",
+                    "resource_intent": "generation",
+                })
+
     def test_atomic_registration_restores_both_held_sample_arms_or_neither(self):
         with tempfile.TemporaryDirectory() as directory:
             journal = QueueRecoveryJournal(Path(directory) / "queue.json")

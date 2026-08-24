@@ -153,6 +153,7 @@ def _list_models_namespace(registry):
         "_versioned_model_update_status": {},
         "_check_model_downloaded": lambda model_type: True,
         "_public_manual_installation_manifest": lambda model_def: None,
+        "h3_public_availability": lambda *_args, **_kwargs: {},
     }
     exec(compile(module, str(LAUNCH_PATH), "exec"), namespace)
     return namespace
@@ -224,6 +225,7 @@ class _CatalogRegistry(_Registry):
         super().__init__(models)
         self.models_def = self.models
         self.displayed_model_types = list(models)
+        self.server_config = {"services": {}}
         self.families_infos = {
             "test": (1, "Test"),
             "unknown": (99, "Unknown"),
@@ -776,13 +778,25 @@ class TestDirectorPreviewFailureContract(unittest.TestCase):
             "strip_sex_act_leet_tokens",
             "_SEX_ACT_LEET_TOKENS",
         )
-        for path in APP_DIR.rglob("*"):
-            if not path.is_file() or path.suffix not in {".py", ".md"}:
+        skip_dirs = {"env", "venv", ".venv", "site-packages", "__pycache__"}
+        stack = [APP_DIR]
+        while stack:
+            current = stack.pop()
+            try:
+                children = list(current.iterdir())
+            except OSError:
                 continue
-            relative = path.relative_to(APP_DIR)
-            source = path.read_text(encoding="utf-8", errors="replace")
-            for symbol in forbidden_symbols:
-                self.assertNotIn(symbol, source, msg=f"{relative}: {symbol}")
+            for child in children:
+                if child.is_dir():
+                    if child.name not in skip_dirs:
+                        stack.append(child)
+                    continue
+                if child.suffix not in {".py", ".md"}:
+                    continue
+                relative = child.relative_to(APP_DIR)
+                source = child.read_text(encoding="utf-8", errors="replace")
+                for symbol in forbidden_symbols:
+                    self.assertNotIn(symbol, source, msg=f"{relative}: {symbol}")
 
     def test_unexpected_preview_failure_is_stable_and_keeps_local_traceback(self):
         private_detail = (
@@ -1365,6 +1379,7 @@ class TestDirectorPreflightContract(unittest.TestCase):
             _DIRECTOR_FAILURE_CODES=self.FAILURE_CODES,
             _DIRECTOR_FAILURE_COMPONENTS=self.FAILURE_COMPONENTS,
             _require_remote_visible_models=require_visible,
+            _require_h3_legal_execution=lambda _models: None,
             _migrate_director_final_video_postprocess=lambda body: None,
             _director_image_role_wire_mode=lambda body: "roles",
             _director_explicit_creator_resolution=lambda unrestricted: {},
@@ -2024,6 +2039,9 @@ class TestDirectorBackendCompatibility(unittest.TestCase):
 
         namespace = _launch_functions_namespace(
             ["_require_job_runtime_model_admission"],
+            _h3_job_model_types=lambda _job: (),
+            _require_h3_legal_execution=lambda _models: None,
+            _require_job_krea_actor_admission=lambda _job: None,
             _director_image_role_wire_mode=lambda params: (
                 "roles" if "image_creator_model" in params else "legacy"
             ),

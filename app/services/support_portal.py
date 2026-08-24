@@ -29,7 +29,6 @@ from .account_auth import (
 from .entitlements import (
     DEVELOPMENT_COST_RECOVERY_CURRENCY,
     DEVELOPMENT_COST_RECOVERY_TARGET_MINOR,
-    DevelopmentCostRecoveryLockedError,
     FULFILLMENT_STATES,
     MANUAL_CONTRIBUTION_KINDS,
     MANUAL_CONTRIBUTION_SOURCES,
@@ -48,7 +47,7 @@ from .responsible_use import (
 )
 from .support_catalog import SupportCatalog, load_support_catalog
 
-SUPPORT_PORTAL_SCHEMA_VERSION = 1
+SUPPORT_PORTAL_SCHEMA_VERSION = 2
 RESPONSIBLE_USE_STORE_SCHEMA_VERSION = 1
 MAX_RESPONSIBLE_USE_STORE_BYTES = 1024 * 1024
 MAX_RESPONSIBLE_USE_ACCOUNTS = 512
@@ -62,8 +61,8 @@ _FULFILLMENT_REFERENCE_RE = re.compile(r"key_[0-9a-f]{64}\Z")
 _STORE_SEAL_DOMAIN = b"maestro-support-responsible-use-store-v1\0"
 _ADMIN_CAPABILITIES = frozenset({"accounts.admin", "services.admin"})
 _STORE_KEYS = frozenset({"schema_version", "generation", "records", "seal"})
-_RECOVERY_PROJECTION_KEYS = frozenset({"target_minor", "currency", "state"})
 _DIRECT_COMPUTE_PROVIDER_ID = "direct_compute_sponsorship"
+_RECOVERY_PROJECTION_KEYS = frozenset({"target_minor", "currency", "state"})
 
 
 class SupportPortalError(ValueError):
@@ -345,6 +344,7 @@ class SupportPortal:
         catalog: SupportCatalog | None = None,
         catalog_loader: Callable[[], SupportCatalog] | None = None,
         scheduler_enforcement_resolver: Callable[[], bool] | None = None,
+        owner_test_credit_resolver: Callable[[str], Mapping[str, Any]] | None = None,
     ) -> None:
         if not isinstance(account_store, AccountAuthStore):
             raise SupportPortalError("A server account store is required")
@@ -366,6 +366,11 @@ class SupportPortal:
         ):
             raise SupportPortalError("Scheduler enforcement resolver is invalid")
         self._scheduler_enforcement_resolver = scheduler_enforcement_resolver
+        if owner_test_credit_resolver is not None and not callable(
+            owner_test_credit_resolver
+        ):
+            raise SupportPortalError("Owner test credit resolver is invalid")
+        self._owner_test_credit_resolver = owner_test_credit_resolver
         if self._catalog is None and self._catalog_loader is None:
             self._catalog = load_support_catalog()
 
@@ -460,12 +465,8 @@ class SupportPortal:
     def _recovery_is_complete(projection: Mapping[str, Any]) -> bool:
         return projection.get("state") == "recovered"
 
-    def _priority_policy_for_recovery(
-        self,
-        recovery: Mapping[str, Any],
-    ) -> dict[str, Any]:
+    def _priority_policy(self) -> dict[str, Any]:
         enforcement_enabled = self._scheduler_enforcement_enabled()
-        recovered = SupportPortal._recovery_is_complete(recovery)
         exclusions = [
             support_priority_capability_marker(capability_id)
             for capability_id in sorted(SUPPORT_PRIORITY_IDENTITY_CONTRACTS)
@@ -473,38 +474,28 @@ class SupportPortal:
         return {
             "scheduler_enforcement_enabled": enforcement_enabled,
             "effective_priority_boost": False,
-            "state": (
-                "development_cost_recovery_locked"
-                if not recovered else (
-                    "enabled" if enforcement_enabled else "not_enabled"
-                )
-            ),
+            "state": "enabled" if enforcement_enabled else "not_enabled",
             "exclusions": exclusions,
             "notice": (
                 "Eligible hosted work may receive bounded support-derived "
-                "queue priority only after development costs are recovered "
-                "and hosted enforcement is enabled. Some exact models, "
+                "queue priority when hosted enforcement is enabled. Credits "
+                "do not guarantee compute or service. Some exact models, "
                 "including Moody, are excluded by their terms or creator "
                 "policy. Submission remains available for every otherwise-valid "
                 "job."
             ),
         }
 
-    def _priority_policy(self) -> dict[str, Any]:
-        return SupportPortal._priority_policy_for_recovery(
-            self,
-            SupportPortal._development_cost_recovery_projection(self),
-        )
-
     def _public_catalog_projection(
         self,
-        recovery: Mapping[str, Any],
+        catalog: SupportCatalog | None = None,
     ) -> dict[str, Any]:
-        catalog = self._catalog_snapshot()
+        catalog = self._catalog_snapshot() if catalog is None else catalog
+        recovery = SupportPortal._development_cost_recovery_projection(self)
         recovered = SupportPortal._recovery_is_complete(recovery)
         providers = []
         for status in catalog.providers:
-            item = status.public_projection()
+            item = status.public_projection(recovery_confirmed=recovered)
             support_url = item["support_url"]
             direct_compute_locked = (
                 item["provider_id"] == _DIRECT_COMPUTE_PROVIDER_ID
@@ -525,6 +516,9 @@ class SupportPortal:
                     if item["state"] == "available" and not direct_compute_locked
                     else None
                 ),
+                "destinations": list(item["destinations"]),
+                "membership_contract": item["membership_contract"],
+                "support_evidence": item["support_evidence"],
             })
         enforcement_enabled = self._scheduler_enforcement_enabled()
         return {
@@ -534,38 +528,32 @@ class SupportPortal:
                 "provider_neutral": True,
                 "providers": providers,
             },
+            "supporter_benefits": catalog.public_projection()[
+                "supporter_benefits"
+            ],
             "benefit_availability": {
                 "scheduler_enforcement_enabled": enforcement_enabled,
                 "effective_benefits": [],
                 "state": (
-                    "development_cost_recovery_locked"
-                    if not recovered else (
-                        "hosted_priority_available"
-                        if enforcement_enabled else "recorded_not_enforced"
-                    )
+                    "hosted_priority_available"
+                    if enforcement_enabled else "recorded_not_enforced"
                 ),
             },
-            "development_cost_recovery": dict(recovery),
-            "support_priority": SupportPortal._priority_policy_for_recovery(
-                self, recovery,
-            ),
+            "development_cost_recovery": recovery,
+            "support_priority": self._priority_policy(),
         }
 
     def public_catalog_projection(self) -> dict[str, Any]:
-        recovery = SupportPortal._development_cost_recovery_projection(self)
-        return SupportPortal._public_catalog_projection(self, recovery)
+        return SupportPortal._public_catalog_projection(self)
 
     def _benefit_projection(
         self,
         recorded: Mapping[str, Any],
         *,
-        development_cost_recovery: Mapping[str, Any],
         priority_eligible: bool = True,
+        metering_eligible: bool = False,
     ) -> dict[str, Any]:
         enforcement_enabled = self._scheduler_enforcement_enabled()
-        recovered = SupportPortal._recovery_is_complete(
-            development_cost_recovery,
-        )
         allowance = recorded.get("recorded_allowance")
         effective_allowance = (
             allowance.get("effective_allowance", 0)
@@ -573,19 +561,23 @@ class SupportPortal:
         )
         priority_active = bool(
             priority_eligible
-            and recovered
+            and metering_eligible
             and enforcement_enabled
             and type(effective_allowance) is int
             and effective_allowance > 0
         )
         return {
-            "state": "development_cost_recovery_locked" if not recovered else (
+            "state": (
                 "owner_exempt" if (
                     enforcement_enabled and not priority_eligible
                 ) else (
-                    "active" if priority_active else (
-                        "hosted_priority_available"
-                        if enforcement_enabled else "recorded_not_enforced"
+                    "unmetered_realm" if (
+                        enforcement_enabled and not metering_eligible
+                    ) else (
+                        "active" if priority_active else (
+                            "hosted_priority_available"
+                            if enforcement_enabled else "recorded_not_enforced"
+                        )
                     )
                 )
             ),
@@ -600,8 +592,8 @@ class SupportPortal:
         self,
         recorded: Mapping[str, Any],
         *,
-        development_cost_recovery: Mapping[str, Any],
         priority_eligible: bool = True,
+        metering_eligible: bool = False,
     ) -> dict[str, Any]:
         projection = {
             key: value
@@ -610,9 +602,9 @@ class SupportPortal:
         }
         allowance = projection.get("recorded_allowance")
         if (
-            SupportPortal._recovery_is_complete(development_cost_recovery)
-            and self._scheduler_enforcement_enabled()
+            self._scheduler_enforcement_enabled()
             and priority_eligible
+            and metering_eligible
             and isinstance(allowance, Mapping)
             and type(allowance.get("effective_allowance")) is int
             and allowance["effective_allowance"] > 0
@@ -632,21 +624,47 @@ class SupportPortal:
     ) -> dict[str, Any]:
         principal, _ = self._resolve_access(account_session_id, remote=remote)
         subject_key = self._subject_key(principal["id"])
-        recorded = self._ledger.privacy_safe_user_projection(subject_key)
-        recovery = SupportPortal._development_cost_recovery_projection(self)
+        catalog = self._catalog_snapshot()
+        recorded = self._ledger.privacy_safe_user_projection(
+            subject_key, policy=catalog.benefit_policy,
+        )
         priority_eligible = principal.get("role") != "owner"
+        owner_test_credits = None
+        if not priority_eligible and self._owner_test_credit_resolver is not None:
+            try:
+                candidate = self._owner_test_credit_resolver(principal["id"])
+                if isinstance(candidate, Mapping):
+                    owner_test_credits = dict(candidate)
+            except Exception:
+                owner_test_credits = {
+                    "schema_version": 1,
+                    "state": "unavailable",
+                    "test_only": True,
+                    "auto_top_up": True,
+                    "unit": "maestro_test_credits",
+                    "target_balance": 0,
+                    "available_units": 0,
+                    "reserved_units": 0,
+                    "used_units": 0,
+                    "pending_reservations": 0,
+                    "last_activity_at": None,
+                }
         return {
-            **SupportPortal._public_catalog_projection(self, recovery),
+            **SupportPortal._public_catalog_projection(self, catalog),
             "account_support": {
                 "recorded": self._recorded_projection(
                     recorded,
-                    development_cost_recovery=recovery,
                     priority_eligible=priority_eligible,
+                    metering_eligible=remote,
                 ),
                 "benefits": self._benefit_projection(
                     recorded,
-                    development_cost_recovery=recovery,
                     priority_eligible=priority_eligible,
+                    metering_eligible=remote,
+                ),
+                **(
+                    {"owner_test_credits": owner_test_credits}
+                    if owner_test_credits is not None else {}
                 ),
             },
             "responsible_use": {
@@ -740,27 +758,27 @@ class SupportPortal:
         *,
         priority_eligible: bool,
     ) -> dict[str, Any]:
-        recorded = self._ledger.reauthenticated_admin_projection(subject_key)
+        recorded = self._ledger.reauthenticated_admin_projection(
+            subject_key, policy=self._catalog_snapshot().benefit_policy,
+        )
         recovery = SupportPortal._development_cost_recovery_projection(self)
         return {
             "schema_version": SUPPORT_PORTAL_SCHEMA_VERSION,
             "account_support": {
                 "recorded": self._recorded_projection(
                     recorded,
-                    development_cost_recovery=recovery,
                     priority_eligible=priority_eligible,
+                    metering_eligible=True,
                 ),
                 "benefits": self._benefit_projection(
                     recorded,
-                    development_cost_recovery=recovery,
                     priority_eligible=priority_eligible,
+                    metering_eligible=True,
                 ),
             },
             "responsible_use": self._acceptance_store.status(subject_key),
             "development_cost_recovery": recovery,
-            "support_priority": SupportPortal._priority_policy_for_recovery(
-                self, recovery,
-            ),
+            "support_priority": self._priority_policy(),
         }
 
     def transition_owner_fulfillment(
@@ -835,7 +853,11 @@ class SupportPortal:
         target_event_id: Any,
         idempotency_key: Any,
     ) -> dict[str, Any]:
-        """Append one owner-recorded contribution and refresh its audit view."""
+        """Append one owner-attested contribution and refresh its audit view.
+
+        This path records the owner's attestation only. It never upgrades the
+        event to provider-verified; that requires ``process_signed_webhook``.
+        """
 
         actor, subject_key, target_role = self._resolve_owner_target(
             actor_session_id,
@@ -878,31 +900,33 @@ class SupportPortal:
                 kind in {"refund", "chargeback"}
                 and (amount_minor <= 0 or target_event_id is None)
             )
+            or (source == "patreon" and kind == "one_time_contribution")
+            or (
+                source in {"threadspan", "direct_compute_sponsorship"}
+                and kind in {
+                    "recurring_started", "recurring_renewed",
+                    "recurring_canceled",
+                }
+            )
         ):
             raise SupportPortalError("Manual contribution is invalid")
-        try:
-            self._ledger.record_manual_contribution(
-                subject_key=subject_key,
-                source=source,
-                kind=kind,
-                amount_minor=amount_minor,
-                currency=currency,
-                target_event_id=target_event_id,
-                source_event_key=opaque_key(
-                    "manual_contribution_idempotency",
-                    idempotency_key,
-                    self._identity_key,
-                ),
-                actor_key=opaque_key(
-                    "manual_contribution_actor", actor["id"], self._identity_key,
-                ),
-                occurred_at=datetime.now(timezone.utc),
-            )
-        except DevelopmentCostRecoveryLockedError as error:
-            raise SupportAuthorizationError(
-                "Direct compute sponsorship is unavailable until "
-                "development costs are recovered"
-            ) from error
+        self._ledger.record_manual_contribution(
+            subject_key=subject_key,
+            source=source,
+            kind=kind,
+            amount_minor=amount_minor,
+            currency=currency,
+            target_event_id=target_event_id,
+            source_event_key=opaque_key(
+                "manual_contribution_idempotency",
+                idempotency_key,
+                self._identity_key,
+            ),
+            actor_key=opaque_key(
+                "manual_contribution_actor", actor["id"], self._identity_key,
+            ),
+            occurred_at=datetime.now(timezone.utc),
+        )
         return self._admin_projection_for_subject(
             subject_key, priority_eligible=target_role != "owner",
         )

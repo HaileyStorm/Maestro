@@ -110,8 +110,8 @@ def main() -> int:
             "the dedicated RTX 50 Python 3.11 / CUDA 13 environment automatically."
         )
         print(
-            "[Runtime][ACTION REQUIRED] If Update already completed, use "
-            "Advanced > Repair RTX 50 Runtime in Maestro's Pinokio menu."
+            "[Runtime][ACTION REQUIRED] If Update already completed, run the normal Update action again; "
+            "it repairs missing runtime and optional-kernel markers."
         )
     return 0
 

@@ -6,8 +6,10 @@ import { compile } from 'tailwindcss'
 import { build } from 'esbuild'
 
 const uiRoot = new URL('../', import.meta.url)
-const [appSource, whatsNewSource, accountSupportSource] = await Promise.all([
+const [appSource, sidebarSource, stylesSource, whatsNewSource, accountSupportSource] = await Promise.all([
   readFile(new URL('src/App.tsx', uiRoot), 'utf8'),
+  readFile(new URL('src/components/Sidebar/Sidebar.tsx', uiRoot), 'utf8'),
+  readFile(new URL('src/index.css', uiRoot), 'utf8'),
   readFile(new URL('src/components/WhatsNewDialog.tsx', uiRoot), 'utf8'),
   readFile(new URL('src/components/AccountSupport/AccountSupportDrawer.tsx', uiRoot), 'utf8'),
 ])
@@ -112,6 +114,7 @@ async function loadAccountSupportRuntime() {
           if (args.path === 'client') return { contents: `
             export class AccountApiError extends Error { retryAfter = 0 }
             export const isAccountProjectAccessActive = () => false
+            export const registerAccount = async () => ({ recovery_codes: [] })
           ` }
           if (args.path === 'focus') return { contents: 'export const closeModalIfTop = () => true; export const installModalFocus = () => () => {}' }
           if (args.path === 'store') return { contents: 'export const useStore = selector => selector(globalThis.__mobileHeaderAccountStore)' }
@@ -141,18 +144,22 @@ function buttonSource(source, marker) {
 
 test('mobile shell actions retain dialog semantics and expose 44px compact targets', () => {
   const menu = buttonSource(appSource, 'onClick={toggleSidebar}')
-  const settings = buttonSource(appSource, 'aria-label="Open machine settings"')
+  const settings = buttonSource(sidebarSource, 'onClick={openMobileMachineSettings}')
 
   for (const [name, source] of [
     ['workspace menu', menu],
     ['machine settings', settings],
   ]) {
-    assert.match(source, /flex h-11 w-11 shrink-0 items-center justify-center/, `${name} remains a centered 44px action`)
+    assert.match(source, /\bh-11\b/, `${name} retains a 44px target`)
     assert.match(source, /focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue/, `${name} has a visible focus indicator`)
   }
   assert.match(menu, /aria-expanded=\{sidebarOpen\}/)
   assert.match(menu, /aria-controls="maestro-mobile-sidebar"/)
-  assert.match(settings, /<Settings aria-hidden="true" size=\{20\} \/>/)
+  assert.match(settings, /<Settings aria-hidden="true" size=\{13\} \/>/)
+  assert.match(settings, /Machine settings/)
+  assert.match(sidebarSource, /aria-label="More Maestro tools"/)
+  assert.match(sidebarSource, /<WhatsNewButton compact \/>/)
+  assert.match(stylesSource, /\.mobile-sidebar-whats-new > button \{[^}]*width: 100%;[^}]*justify-content: flex-start;[^}]*padding-inline: 0\.75rem;/s)
 
   for (const [name, source] of [
     ["What's New", whatsNewSource],
@@ -167,13 +174,16 @@ test('mobile shell actions retain dialog semantics and expose 44px compact targe
   assert.match(whatsNewSource, /data-responsive-dialog-focus-return="whats-new"/)
   assert.match(whatsNewSource, /closeModalIfTop\(document, dialogRef\.current, onClose\)/)
   assert.match(accountSupportSource, /aria-controls="account-support-drawer"/)
-  assert.match(accountSupportSource, /'Open Support'/)
+  assert.match(accountSupportSource, /'Open sign in and account help'/)
+  assert.match(accountSupportSource, /'Open account and support'/)
   assert.match(accountSupportSource, /restoreFocusRef\.current = document\.activeElement instanceof HTMLElement/)
   assert.match(accountSupportSource, /data-responsive-dialog-trigger=\{`account-support:/)
   assert.match(accountSupportSource, /data-responsive-dialog-focus-return="account-support"/)
   assert.match(accountSupportSource, /restoreFocus: focusReturnRef\.current/)
   assert.match(accountSupportSource, /closeModalIfTop\(document, dialogRef\.current, closeDrawer\)/)
   assert.equal(accountSupportSource.match(/onClick=\{requestCloseDrawer\}/g)?.length, 2)
+  assert.match(accountSupportSource, /required \? \(\s*<div aria-hidden="true"/)
+  assert.doesNotMatch(accountSupportSource, /onClick=\{required \? undefined : requestCloseDrawer\}/)
 })
 
 test('mobile header fixed geometry fits the 320px and 200-percent-zoom contract', async () => {
@@ -182,23 +192,24 @@ test('mobile header fixed geometry fits the 320px and 200-percent-zoom contract'
   assert.ok(mobileHeaderStart >= 0 && sidebarMount > mobileHeaderStart)
   const mobileHeader = appSource.slice(mobileHeaderStart, sidebarMount)
 
-  assert.match(mobileHeader, /className="h-12 shrink-0 border-b border-border bg-bg-secondary px-4 flex items-center justify-between"/)
-  assert.match(mobileHeader, /className="mx-1 flex min-w-0 items-center gap-2"/)
+  assert.match(mobileHeader, /className="grid h-12 shrink-0 grid-cols-\[2\.75rem_minmax\(0,1fr\)_5\.5rem\] items-center border-b border-border bg-bg-secondary px-1 sm:px-2"/)
+  assert.match(mobileHeader, /className="flex min-w-0 items-center gap-2 px-2"/)
   assert.match(mobileHeader, /className="min-w-0"/)
   assert.match(mobileHeader, /className="block truncate/)
-  assert.equal(mobileHeader.match(/<WhatsNewButton compact \/>/g)?.length, 1)
   assert.equal(mobileHeader.match(/<AccountSupportButton compact \/>/g)?.length, 1)
-  assert.equal(mobileHeader.match(/<span className="h-11 w-11 shrink-0" aria-hidden="true" \/>/g)?.length, 2)
+  assert.equal(mobileHeader.match(/<WhatsNewButton compact \/>/g)?.length, 1)
+  assert.match(mobileHeader, /<\/button> : <WhatsNewButton compact \/>}/)
+  assert.doesNotMatch(mobileHeader, /Open machine settings/)
   assert.match(appSource, /<WhatsNewDialogHost \/>/)
 
   const viewport = 320
-  const horizontalPadding = 32
-  const menuWidth = 44
-  const centerMargins = 8
-  const centerFixedWidth = 28 + 44 + 16
-  const rightActionsWidth = 44 + 4 + 44
-  const brandWidth = viewport - horizontalPadding - menuWidth - centerMargins - centerFixedWidth - rightActionsWidth
-  assert.ok(brandWidth >= 0, 'fixed 44px actions leave a non-negative truncation budget at 320 CSS pixels')
+  const horizontalPadding = 8
+  const menuOrReleaseNotesWidth = 44
+  const rightActionsWidth = 44 + 44
+  const brandColumnWidth = viewport - horizontalPadding - menuOrReleaseNotesWidth - rightActionsWidth
+  const brandTextWidth = brandColumnWidth - 16 - 24 - 8
+  assert.ok(brandColumnWidth >= 160, 'the compact brand keeps a meaningful center column at 320 CSS pixels')
+  assert.ok(brandTextWidth >= 120, 'the visual product name keeps a readable text budget beside its icon')
   assert.equal(viewport, 640 / 2, '320 CSS pixels represents a 640px viewport at 200% zoom')
 
   const compiler = await compile('@theme { --spacing: 0.25rem; } @tailwind utilities;')

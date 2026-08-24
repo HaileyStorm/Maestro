@@ -25,9 +25,10 @@ CLIENT_PATH = ROOT / "ui" / "src" / "api" / "client.ts"
 
 
 class _Response:
-    def __init__(self, content, status_code=200):
+    def __init__(self, content=None, status_code=200, headers=None):
         self.content = content
         self.status_code = status_code
+        self.headers = dict(headers or {})
 
 
 class _Request:
@@ -61,12 +62,18 @@ def _security_namespace():
         "_is_quick_tunnel_origin",
         "_is_workers_dev_origin",
         "_runtime_share_registration",
+        "_verified_runtime_cloudflare_origin",
+        "_cors_origin_allowed",
+        "_exact_runtime_cors_middleware",
         "_request_is_cloudflare_remote",
         "_first_forwarded_value",
         "_canonical_http_origin",
         "_approved_local_origin",
         "_request_external_origins",
         "_matches_verified_stable_redirect_origin",
+        "_account_exact_origin_allowed",
+        "_registration_request_is_remote",
+        "_public_registration_origin_allowed",
         "_request_is_https",
         "_reject_cross_origin_mutation",
         "_remote_local_only_denial",
@@ -84,6 +91,7 @@ def _security_namespace():
                 isinstance(target, ast.Name)
                 and target.id in {
                     "_STATE_CHANGING_METHODS", "_TRUE_ENV_VALUES",
+                    "_CORS_ALLOWED_METHODS",
                     "_REMOTE_LOCAL_ONLY_PREFIXES", "_REMOTE_LOCAL_ONLY_EXACT",
                 }
                 for target in (
@@ -110,11 +118,13 @@ def _security_namespace():
 
     namespace = {
         "os": os,
+        "re": __import__("re"),
         "ipaddress": ipaddress,
         "threading": threading,
         "urlsplit": urlsplit,
         "Request": object,
         "JSONResponse": _Response,
+        "Response": _Response,
         "HTTPException": FakeHTTPException,
         "_runtime_share_url_lock": threading.Lock(),
         "_runtime_share_url": "",
@@ -224,12 +234,14 @@ class OriginPolicyTests(unittest.TestCase):
 
     def test_forwarded_cloudflare_same_origin_is_allowed(self):
         reject = self.security["_reject_cross_origin_mutation"]
+        quick = "https://random.trycloudflare.com"
         request = _Request(
-            origin="https://random.trycloudflare.com",
+            origin=quick,
             x_forwarded_proto="https",
             x_forwarded_host="random.trycloudflare.com",
         )
         with patch.dict(os.environ, {"PINOKIO_SHARE_CLOUDFLARE": "true"}, clear=False):
+            self._register_runtime_share(stable=quick, quick=quick)
             self.assertIsNone(reject(request))
 
     def test_verified_stable_origin_is_accepted_on_its_registered_quick_target(self):
@@ -249,6 +261,120 @@ class OriginPolicyTests(unittest.TestCase):
             self.assertEqual(result, {"status": "ok", "share_url": stable})
             self.assertTrue(classify(request))
             self.assertIsNone(reject(request))
+
+    def test_credentialed_cors_tracks_only_the_registered_cloudflare_origins(self):
+        allowed = self.security["_cors_origin_allowed"]
+        stable = "https://maestro.account.workers.dev"
+        quick = "https://current-tunnel.trycloudflare.com"
+        self.assertFalse(allowed(stable))
+        self.assertFalse(allowed(quick))
+        self._register_runtime_share(stable=stable, quick=quick)
+        self.assertTrue(allowed(stable))
+        self.assertTrue(allowed(quick))
+        self.assertFalse(allowed("https://other.account.workers.dev"))
+        self.assertFalse(allowed("https://other-tunnel.trycloudflare.com"))
+
+    def test_verified_stable_browser_preflight_and_post_receive_exact_cors_headers(self):
+        middleware = self.security["_exact_runtime_cors_middleware"]
+        stable = "https://maestro.account.workers.dev"
+        quick = "https://current-tunnel.trycloudflare.com"
+
+        preflight = _Request(
+            method="OPTIONS",
+            origin=stable,
+            access_control_request_method="POST",
+            access_control_request_headers="content-type",
+        )
+
+        async def unexpected_call_next(_request):
+            raise AssertionError("preflight reached the application")
+
+        rejected = asyncio.run(middleware(preflight, unexpected_call_next))
+        self.assertEqual(rejected.status_code, 400)
+
+        self._register_runtime_share(stable=stable, quick=quick)
+        accepted = asyncio.run(middleware(preflight, unexpected_call_next))
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(accepted.headers["Access-Control-Allow-Origin"], stable)
+        self.assertEqual(accepted.headers["Access-Control-Allow-Credentials"], "true")
+        self.assertEqual(accepted.headers["Access-Control-Allow-Methods"], "POST")
+
+        post = _Request(method="POST", origin=stable)
+
+        async def application_response(_request):
+            return _Response({"status": "ok"}, headers={"Vary": "Accept-Encoding"})
+
+        response = asyncio.run(middleware(post, application_response))
+        self.assertEqual(response.headers["Access-Control-Allow-Origin"], stable)
+        self.assertEqual(response.headers["Access-Control-Allow-Credentials"], "true")
+        self.assertEqual(response.headers["Vary"], "Accept-Encoding, Origin")
+
+    def test_public_registration_accepts_only_the_exact_registered_browser_origin(self):
+        allowed = self.security["_public_registration_origin_allowed"]
+        reject = self.security["_reject_cross_origin_mutation"]
+        stable = "https://maestro.account.workers.dev"
+        quick = "https://current-tunnel.trycloudflare.com"
+        self._register_runtime_share(stable=stable, quick=quick)
+
+        for origin in (stable, quick):
+            request = _Request(
+                method="POST",
+                path="/api/v1/account/register",
+                base_url=quick + "/",
+                origin=origin,
+                x_forwarded_proto="https",
+                x_forwarded_host="current-tunnel.trycloudflare.com",
+            )
+            request.state = types.SimpleNamespace(maestro_remote=True)
+            self.assertTrue(allowed(request, mutation=True))
+            self.assertIsNone(reject(request))
+
+        for origin in (
+            "https://other.account.workers.dev",
+            "https://other.trycloudflare.com",
+            "*",
+        ):
+            request = _Request(
+                method="POST",
+                path="/api/v1/account/register",
+                base_url=quick + "/",
+                origin=origin,
+                x_forwarded_proto="https",
+                x_forwarded_host="current-tunnel.trycloudflare.com",
+            )
+            request.state = types.SimpleNamespace(maestro_remote=True)
+            self.assertFalse(allowed(request, mutation=True))
+            self.assertEqual(reject(request).status_code, 403)
+
+        loopback = _Request(
+            method="POST",
+            path="/api/v1/account/register",
+            base_url="http://127.0.0.1:7860/",
+            origin="http://127.0.0.1:7860",
+        )
+        loopback.state = types.SimpleNamespace(maestro_remote=False)
+        self.assertTrue(allowed(loopback, mutation=False))
+        self.assertTrue(allowed(loopback, mutation=True))
+
+        loopback_no_origin = _Request(
+            method="POST",
+            path="/api/v1/account/register",
+            base_url="http://127.0.0.1:7860/",
+        )
+        loopback_no_origin.state = types.SimpleNamespace(maestro_remote=False)
+        self.assertTrue(allowed(loopback_no_origin, mutation=False))
+        self.assertFalse(allowed(loopback_no_origin, mutation=True))
+
+        lan = _Request(
+            method="POST",
+            path="/api/v1/account/register",
+            base_url="http://192.168.1.20:7860/",
+            origin="http://192.168.1.20:7860",
+            client_host="192.168.1.20",
+        )
+        lan.state = types.SimpleNamespace(maestro_remote=False)
+        self.assertFalse(allowed(lan, mutation=False))
+        self.assertFalse(allowed(lan, mutation=True))
 
     def test_verified_stable_proxy_is_remote_without_machine_controls_and_keeps_csrf_pair(self):
         reject = self.security["_reject_cross_origin_mutation"]
@@ -349,6 +475,7 @@ class OriginPolicyTests(unittest.TestCase):
             x_forwarded_host="current-tunnel.trycloudflare.com",
         )
         with patch.dict(os.environ, {"PINOKIO_SHARE_CLOUDFLARE": "true"}, clear=False):
+            self._register_runtime_share(stable=quick, quick=quick)
             self.assertIsNone(reject(request))
 
     def test_unverified_stable_registration_is_rejected(self):
@@ -440,6 +567,21 @@ class OriginPolicyTests(unittest.TestCase):
             cf_connecting_ip="203.0.113.7",
         )
         with patch.dict(os.environ, {"PINOKIO_SHARE_CLOUDFLARE": "true"}, clear=False):
+            self.assertTrue(classify(rewritten))
+
+    def test_registered_cloudflare_fails_closed_when_process_flag_is_missing(self):
+        classify = self.security["_request_is_cloudflare_remote"]
+        rewritten = _Request(
+            base_url="http://127.0.0.1:7860/",
+            x_forwarded_proto="http",
+            x_forwarded_host="127.0.0.1:7860",
+            cf_ray="abc123-DEN",
+            cf_connecting_ip="203.0.113.7",
+        )
+        with patch.dict(os.environ, {"PINOKIO_SHARE_CLOUDFLARE": "false"}, clear=False):
+            self._register_runtime_share(
+                quick="https://registered.trycloudflare.com",
+            )
             self.assertTrue(classify(rewritten))
 
     def test_lan_peer_is_remote_and_cannot_gain_local_admin_bypass(self):
@@ -895,9 +1037,11 @@ class LaunchSecurityContractTests(unittest.TestCase):
         self.assertNotIn("shutil.move", move)
 
     def test_cors_is_credentialed_without_wildcard_origin(self):
-        self.assertIn("allow_credentials=True", self.source)
-        self.assertIn("allow_origin_regex=_cors_origin_regex", self.source)
+        self.assertIn("_exact_runtime_cors_middleware", self.source)
+        self.assertIn('"Access-Control-Allow-Credentials": "true"', self.source)
+        self.assertIn("_cors_origin_allowed(origin)", self.source)
         self.assertNotIn('allow_origins=["*"]', self.source)
+        self.assertNotIn("allow_origin_regex", self.source)
 
     def test_public_health_is_minimal_and_cookie_free(self):
         health = self._function_source("public_health")
@@ -1013,7 +1157,7 @@ class LaunchSecurityContractTests(unittest.TestCase):
             require.index("_project_access.authorize"),
         )
 
-    def test_active_membership_bypasses_project_password_checks(self):
+    def test_active_membership_removes_project_password_routes(self):
         class FakeHTTPException(Exception):
             def __init__(self, *, status_code, detail):
                 super().__init__(detail)
@@ -1090,6 +1234,9 @@ class LaunchSecurityContractTests(unittest.TestCase):
             {
                 "Request": object,
                 "HTTPException": FakeHTTPException,
+                "_account_project_access_state": lambda: {
+                    "state": "active", "enforced": True,
+                },
                 "_existing_workspace_dir": lambda _name: "/outputs/project-a",
                 "_require_account_project_permission": (
                     lambda *_args, **_kwargs: member
@@ -1097,10 +1244,9 @@ class LaunchSecurityContractTests(unittest.TestCase):
                 "_project_access": project_access,
             },
         )["unlock_workspace"]
-        self.assertEqual(
-            asyncio.run(unlock("project-a", NoBodyRequest()))["unlocked"],
-            True,
-        )
+        with self.assertRaises(FakeHTTPException) as unlock_removed:
+            asyncio.run(unlock("project-a", NoBodyRequest()))
+        self.assertEqual(unlock_removed.exception.status_code, 404)
         self.assertTrue(all(count == 0 for count in calls.values()))
 
         active_namespace = self._function_namespace(
@@ -1127,20 +1273,46 @@ class LaunchSecurityContractTests(unittest.TestCase):
                 "_remote_active_projects_lock": threading.RLock(),
             },
         )
-        password_result = asyncio.run(active_namespace[
-            "set_workspace_password"
-        ]("project-a", NoBodyRequest()))
-        self.assertFalse(password_result["password_protected"])
-        self.assertTrue(password_result["unlocked"])
-        self.assertEqual(
-            active_namespace["lock_workspace"]("project-a", NoBodyRequest()),
-            {"unlocked": True, "locked_count": 0},
-        )
-        self.assertEqual(
-            active_namespace["lock_all_workspaces"](NoBodyRequest()),
-            {"unlocked": True, "locked_count": 0},
-        )
+        for action in (
+            lambda: asyncio.run(active_namespace["set_workspace_password"](
+                "project-a", NoBodyRequest(),
+            )),
+            lambda: active_namespace["lock_workspace"](
+                "project-a", NoBodyRequest(),
+            ),
+            lambda: active_namespace["lock_all_workspaces"](NoBodyRequest()),
+        ):
+            with self.assertRaises(FakeHTTPException) as removed:
+                action()
+            self.assertEqual(removed.exception.status_code, 404)
         self.assertTrue(all(count == 0 for count in calls.values()))
+
+        class StaleCreateRequest:
+            state = types.SimpleNamespace(
+                maestro_remote=True,
+                maestro_session_id="account-browser",
+            )
+
+            async def json(self):
+                return {
+                    "name": "stale-client-project",
+                    "password": "legacy-password",
+                    "remember": "device",
+                }
+
+        create = self._function_namespace(
+            ("create_workspace",),
+            {
+                "Request": object,
+                "HTTPException": FakeHTTPException,
+                "_account_project_access_state": lambda: {
+                    "state": "active", "enforced": True,
+                },
+            },
+        )["create_workspace"]
+        with self.assertRaises(FakeHTTPException) as stale_create:
+            asyncio.run(create(StaleCreateRequest()))
+        self.assertEqual(stale_create.exception.status_code, 400)
 
         legacy_calls = {"lock": 0, "lock_all": 0}
         legacy_access = types.SimpleNamespace(

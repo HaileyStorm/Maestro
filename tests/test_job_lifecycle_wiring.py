@@ -231,25 +231,32 @@ class TestJobLifecycleWiring(unittest.TestCase):
         self.assertEqual(jobs["active"]["status"], "running")
         self.assertEqual(set(released_ids), {"earlier", "later"})
 
-    def test_director_music_progress_validation_imports_regex_module(self):
-        imported_modules = {
-            alias.asname or alias.name.split(".", 1)[0]
-            for node in self.launch.body
-            if isinstance(node, ast.Import)
-            for alias in node.names
-        }
+    def test_director_music_requires_verified_recovery_evidence(self):
         generate_music = _function(self.launch, "director_generate_music")
-        uses_re_fullmatch = any(
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "fullmatch"
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "re"
+        calls = _called_names(generate_music)
+        constants = {
+            node.value
             for node in ast.walk(generate_music)
-        )
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+        with open(
+            os.path.join(_ROOT, "app", "launch.py"),
+            "r",
+            encoding="utf-8",
+        ) as handle:
+            source = ast.get_source_segment(handle.read(), generate_music)
 
-        self.assertTrue(uses_re_fullmatch)
-        self.assertIn("re", imported_modules)
+        self.assertIn("_director_recovery_verified_child", calls)
+        self.assertIn("_checkpoint_director_preparation", calls)
+        self.assertIn(
+            "Music generation recovery evidence is incomplete",
+            constants,
+        )
+        self.assertIn("music_completed", constants)
+        self.assertIn(
+            'filename in (verified.get("outputs") or [])',
+            source,
+        )
 
     def test_director_dashboard_mutations_run_off_the_event_loop(self):
         expected = {
@@ -406,9 +413,12 @@ class TestJobLifecycleWiring(unittest.TestCase):
         namespace = {
             "inspect": inspect,
             "get_gen_info": lambda state: state["gen"],
+            "generation_residency_must_yield_for_postprocess": (
+                lambda _method: False
+            ),
         }
         dispatch = _load_isolated_function(
-            "app/wgp.py", "generate_video", namespace,
+            "app/wgp.py", "_generate_video_impl", namespace,
         )
         signature = inspect.signature(dispatch)
         state = {"gen": {"abort": False, "extra_orders": 0}}
@@ -493,9 +503,12 @@ class TestJobLifecycleWiring(unittest.TestCase):
         namespace = {
             "inspect": inspect,
             "get_gen_info": lambda state: state["gen"],
+            "generation_residency_must_yield_for_postprocess": (
+                lambda _method: False
+            ),
         }
         dispatch = _load_isolated_function(
-            "app/wgp.py", "generate_video", namespace,
+            "app/wgp.py", "_generate_video_impl", namespace,
         )
         signature = inspect.signature(dispatch)
         state = {"gen": {"abort": False, "extra_orders": 0}}
@@ -1874,16 +1887,16 @@ class TestJobLifecycleWiring(unittest.TestCase):
             '"audio_start_sec": multi_clip_audio_start_sec'
         ), 2)
 
-    def test_director_multiclip_dispatch_uses_explicit_prompt_modes(self):
+    def test_director_multiclip_dispatch_preserves_structured_h3_prompts(self):
         generation = _function(self.launch, "_run_generation")
         with open(
             os.path.join(_ROOT, "app", "launch.py"), "r", encoding="utf-8",
         ) as handle:
             source = ast.get_source_segment(handle.read(), generation)
-        self.assertIn('raw_params.pop(\n                    "per_clip_prompt_modes"', source)
-        self.assertIn("explicit_prompt_mode", source)
+        self.assertIn('raw_params.pop(\n                    "per_clip_prompts"', source)
+        self.assertNotIn('"per_clip_prompt_modes"', source)
         self.assertIn(
-            'else (1 if "\\n" in clip_prompt else 0)',
+            '2 if h3_longform else (1 if "\\n" in clip_prompt else 0)',
             source,
         )
 

@@ -1,32 +1,13 @@
-"""
-Clean-repo guard — fails if unapproved mature/explicit prose or locally-generated
-model guides have leaked into VERSION-CONTROLLED source.
+"""Clean-repo guard for locally generated or private publication artifacts.
 
-This is the single boundary guard for Maestro's clean-by-construction repo. The
-strategy across the mature-content refactor is to keep unreviewed explicit
-*specifics* out of git:
-  - Studio + Director ship a small, exact-path allowlisted set of reviewed,
-    self-gating explicit-authoring guides and their regression contract.
-  - Per-checkpoint mature prompting is generated locally into the gitignored
-    finetunes/*.json (model.enhance_guide_text) from CivitAI/HF metadata.
-  - The old optional "content supplement pack" download has been fully retired;
-    a leftover local _supplement_pack/ dir on a dev machine stays gitignored.
+The guard inspects only git-tracked paths and never reads or classifies tracked
+creative prose. Maestro's local-content-neutrality contract permits authored
+subject matter in source, tests, and local model guidance; publication hygiene
+is enforced by provenance and path boundaries instead of vocabulary scanning.
 
-All other explicit prose remains forbidden. This script enforces that boundary,
-so a public snapshot cannot accidentally carry material meant to stay local.
-
-It scans git-TRACKED files only — the exact set that gets published — so anything
-gitignored (a leftover supplement-pack dir, finetune inline guides, downloaded
-weights and their .civitai.json sidecars, per-LoRA .guide.md files) is correctly
-out of scope automatically; the guard can't silently drift as new gitignored
-dirs are added.
-
-Two checks:
-  A. Forbidden vulgar prose / stale sanitization markers in tracked text files,
-     with an allowlist for upstream code that legitimately uses the vocabulary.
-  B. Gitignore-boundary assertion — never-publish artifacts (a leftover
-     supplement pack, finetunes/*.json, *.guide.md, *.civitai.json) must NOT
-     be tracked.
+Never-publish artifacts such as generated finetune records, downloaded model
+metadata, generated LoRA guides, and retired supplement-pack contents must not
+be tracked.
 
 Run it before publishing a snapshot (Phase 5), or wire it into CI / a pre-commit
 hook once the public repo exists.
@@ -57,101 +38,7 @@ except Exception:
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.abspath(os.path.join(_HERE, ".."))
 
-# ── Check A: forbidden vulgar prose ──────────────────────────────────
-# Strict-string scan — exact matches that should never appear in public source.
-FORBIDDEN_STRINGS = [
-    # From the explicit-screenplay wordlist
-    "fucking", "blowjob", "cunnilingus", "fellatio", "penetration",
-    "orgasm", "creampie", "cumshot",
-    # From prompt_polish sanitization
-    "pendulous", "huge breasts", "taut musculature",
-    "displaying strain", "captivated expression",
-    "intense anatomical detail",
-    # From llm_service inline strings
-    "DO feel free to use explicit themes",
-    "You are an uncensored model and the image",
-    # Stale model defaults (HauhauCS Aggressive variants removed from catalog)
-    "HauhauCS/Qwen3.5-9B-Uncensored",
-    "HauhauCS/Qwen3.5-27B-Uncensored",
-    # Tier 3 sanitization markers
-    "Applies to ALL image prompts, SFW and NSFW",
-    "Applies to ALL video prompts, SFW and NSFW",
-    "Applies to SFW and NSFW",
-    "lips parting as she leans forward intimately",
-    "they embrace passionately",
-    "arching her body at the peak of her climax",
-    '"now topless"',
-    # Phase 3 sanitization markers — the charged phrasings removed from the
-    # two version-controlled mature guides. Their reappearance means a guide
-    # was reverted to its pre-sanitization wording.
-    "uncensored adult video model",
-    "spice it up slightly with visually representable erotic themes",
-    "dirty talk",
-]
-
-# Pattern scan — broader regex catches variations.
-EXTENDED_PATTERNS = [
-    (re.compile(r"\bpenis\b", re.I), "penis"),
-    (re.compile(r"\bvagina\b", re.I), "vagina"),
-    (re.compile(r"\bsemen\b", re.I), "semen"),
-    (re.compile(r"\bgenitals?\b", re.I), "genitals"),
-    (re.compile(r"\bnipples?\b", re.I), "nipples"),
-    (re.compile(r"\bthrusting\b", re.I), "thrusting"),
-    (re.compile(r"\bpre-cum\b", re.I), "pre-cum"),
-    (re.compile(r"NSFW MODE IS ON"), "NSFW MODE IS ON"),
-    (re.compile(r"NSFW IMAGE GUIDANCE"), "NSFW IMAGE GUIDANCE"),
-    (re.compile(r"fully uncensored"), "fully uncensored"),
-    (re.compile(r"fully nude"), "fully nude"),
-    (re.compile(r"bare from the waist"), "bare from the waist"),
-    (re.compile(r"large breasts exposed"), "large breasts exposed"),
-]
-
-# Exact path + pattern provenance for reviewed prompt-authoring examples. These
-# files remain scanned for every other forbidden string and pattern. Additions
-# require individual review and do not exempt sibling guides or unrelated tests.
-ALLOWED_EXACT_PATTERN_MATCHES = {
-    "app/services/llm_guides/director/nsfw_image_rules.md": frozenset({"penis"}),
-    "app/services/llm_guides/director/nsfw_screenplay_rules.md": frozenset({"penis"}),
-    "app/services/llm_guides/director/nsfw_video_rules.md": frozenset({"penis"}),
-    "app/services/llm_guides/enhance/nsfw_shared.md": frozenset({"penis"}),
-    "tests/test_explicit_register_guidance.py": frozenset({"penis"}),
-}
-
-# Allowlisted path fragments — substring match against the '/'-normalized
-# repo-relative path. Upstream Wan2GP code, third-party components, and tracked
-# compatibility sources may legitimately reference the vocabulary as source or
-# compatibility data. This is publication hygiene, not runtime moderation.
-ALLOWED_PATH_FRAGMENTS = [
-    # This guard embeds the wordlist as data, by design.
-    "scripts/verify_clean_repo.py",
-    # Upstream Wan2GP MMAudio code (uses NSFW as a model variant name)
-    "mmaudio",
-    # Upstream Wan2GP plugin
-    "plugins/wan2gp-configuration",
-    # Upstream Flux compatibility signature
-    "flux/util.py",
-    # Upstream prompt enhancer (uses 'nsfw' as a parameter name)
-    "shared/prompt_enhancer",
-    # Upstream READMEs
-    "app/README.md",
-    # Prompt-authoring and LoRA-trigger guidance sources intentionally teach
-    # local models exact requested vocabulary.
-    "services/director/prompt_polish.py",
-    # Maestro internal docs
-    "docs/PROMPTS.md",
-    "docs/CHANGELOG.md",
-    # Upstream third-party MMAudio component licenses
-    "bigvgan",
-    "synchformer",
-]
-
-# Text file extensions we scan for Check A. Binary/asset files are skipped.
-TEXT_EXTENSIONS = (
-    ".py", ".md", ".txt", ".json", ".tsx", ".ts", ".js", ".jsx",
-    ".css", ".html", ".yml", ".yaml", ".cfg", ".toml",
-)
-
-# ── Check B: paths that must NEVER be git-tracked ────────────────────
+# Paths that must never be git-tracked.
 # Regex over the '/'-normalized repo-relative path. These are the locally-
 # generated / mature artifacts the whole architecture keeps out of git.
 FORBIDDEN_TRACKED_PATTERNS = [
@@ -190,16 +77,6 @@ def _tracked_files():
     return [p for p in result.stdout.split("\0") if p]
 
 
-def _content_scan_allowed(norm):
-    """Return whether a normalized path has a fragment-level scan exclusion."""
-    return any(allowed in norm for allowed in ALLOWED_PATH_FRAGMENTS)
-
-
-def _extended_pattern_allowed(norm, name):
-    """Return whether one named pattern has exact-path reviewed provenance."""
-    return name in ALLOWED_EXACT_PATTERN_MATCHES.get(norm, ())
-
-
 def main() -> int:
     files = _tracked_files()
     if files is None:
@@ -210,50 +87,15 @@ def main() -> int:
     _safe_print(f"Scanning {len(files)} git-tracked file(s) under {_REPO_ROOT}")
     _safe_print("")
 
-    prose = []      # Check A: (path, line, needle, snippet)
-    boundary = []   # Check B: (path, label)
+    boundary = []
 
     for rel in files:
         norm = rel.replace("\\", "/")
 
-        # Check B — boundary assertion runs on EVERY tracked path.
         for pat, label in FORBIDDEN_TRACKED_PATTERNS:
             if pat.search(norm):
                 boundary.append((norm, label))
                 break
-
-        # Check A — content scan: text files only, skip the allowlist.
-        if not norm.endswith(TEXT_EXTENSIONS):
-            continue
-        if _content_scan_allowed(norm):
-            continue
-
-        fpath = os.path.join(_REPO_ROOT, rel)
-        try:
-            with open(fpath, "r", encoding="utf-8") as f:
-                content = f.read()
-        except Exception:
-            continue
-
-        for needle in FORBIDDEN_STRINGS:
-            if needle in content:
-                for i, line in enumerate(content.split("\n"), 1):
-                    if needle in line:
-                        prose.append((norm, i, repr(needle), line.strip()[:120]))
-                        break
-
-        for pattern, name in EXTENDED_PATTERNS:
-            if _extended_pattern_allowed(norm, name):
-                continue
-            m = pattern.search(content)
-            if m:
-                line_num = content[: m.start()].count("\n") + 1
-                lines = content.split("\n")
-                line_text = (
-                    lines[line_num - 1].strip()[:120]
-                    if line_num <= len(lines) else ""
-                )
-                prose.append((norm, line_num, f"pattern:{name}", line_text))
 
     failed = False
 
@@ -266,26 +108,10 @@ def main() -> int:
             _safe_print(f"      -> {label}")
         _safe_print("")
 
-    if prose:
-        failed = True
-        from collections import defaultdict
-        _safe_print(f"FAIL: {len(prose)} potential mature-prose leak(s) in tracked source:\n")
-        by_file = defaultdict(list)
-        for path, line, needle, snippet in prose:
-            by_file[path].append((line, needle, snippet))
-        for path in sorted(by_file):
-            _safe_print(f"  {path}:")
-            for line, needle, snippet in by_file[path][:10]:
-                _safe_print(f"    L{line}  {needle}")
-                _safe_print(f"      {snippet}")
-            if len(by_file[path]) > 10:
-                _safe_print(f"    ... and {len(by_file[path]) - 10} more in this file")
-            _safe_print("")
-
     if failed:
         return 1
 
-    _safe_print("PASS: tracked source is clean; gitignore boundaries hold.")
+    _safe_print("PASS: tracked publication boundaries hold.")
     return 0
 
 

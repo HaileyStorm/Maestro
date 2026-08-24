@@ -62,6 +62,68 @@ sys.argv = _wgp_argv
 # download progress for the UI's downloads-in-progress banner.
 print("[Maestro] Installing download stall protection...")
 from services import safe_download  # noqa: F401 (side-effect import)
+from services.checkpoint_compatibility import (
+    CheckpointCompatibilityError,
+    checkpoint_targets_for_base,
+    checkpoint_template_model_type,
+    ensure_allowed_checkpoint_target,
+    quarantine_incompatible_checkpoint_definitions,
+    suggested_checkpoint_architecture,
+    unsupported_checkpoint_reason,
+    validate_checkpoint_file,
+)
+
+
+def _audit_checkpoint_definitions(
+    *,
+    checkpoint_root: str | None = None,
+    resolve_checkpoint=None,
+) -> list[dict]:
+    """Apply the reversible CivitAI compatibility audit or fail closed."""
+
+    try:
+        changes = quarantine_incompatible_checkpoint_definitions(
+            _app_dir,
+            checkpoint_root=checkpoint_root,
+            resolve_checkpoint=resolve_checkpoint,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "CivitAI checkpoint compatibility audit failed; model loading "
+            f"was stopped ({type(exc).__name__})."
+        ) from exc
+    for change in changes:
+        if not change.get("applied"):
+            raise RuntimeError(
+                "CivitAI checkpoint compatibility audit could not safely "
+                "update a model definition; model loading was stopped."
+            )
+        action = "Restored" if change.get("compatible") else "Disabled"
+        print(
+            f"[CivitAI] {action} checkpoint definition "
+            f"'{change['model_type']}'."
+        )
+    return changes
+
+
+def _reload_after_checkpoint_audit(changes: list[dict]) -> None:
+    """Rebuild changed entries instead of merging stale visibility fields."""
+
+    for change in changes:
+        wgp.models_def.pop(change.get("model_type"), None)
+    wgp.load_model_definitions()
+
+
+def _audit_configured_checkpoint_definitions(*, reload_always: bool = False) -> list[dict]:
+    """Audit through WanGP's exact configured locator and refresh if needed."""
+
+    changes = _audit_checkpoint_definitions(
+        resolve_checkpoint=wgp.get_local_model_filename,
+    )
+    if changes or reload_always:
+        _reload_after_checkpoint_audit(changes)
+    return changes
+
 
 # HuggingFace token-path robustness (fixes the "Permission denied:
 # .../HF_AUTH/token" crash on machines that never logged into HF).
@@ -100,6 +162,12 @@ if _hf_token_path:
 # Now safe to import wgp - all module-level code will run with patched argv
 print("[Maestro] Importing WanGP engine...")
 import wgp
+from shared.model_dropdowns import required_runtime_assets_ready
+
+# WanGP has now loaded the configured checkpoint search roots. Audit through
+# the exact same primary-first locator before the server exposes the registry;
+# linked weights remain read-only and are never copied or moved.
+_audit_configured_checkpoint_definitions()
 print(f"[Maestro] WanGP loaded: {len(wgp.displayed_model_types)} models available")
 # Base save path always comes from server_config["save_path"] (never from wgp.save_path which gets workspace-modified)
 
@@ -135,14 +203,22 @@ except Exception as _sweep_err:
 # This is a one-shot migration: after the first boot post-update, the
 # key is persisted, so subsequent boots are no-ops.
 _services = wgp.server_config.setdefault("services", {})
+_services_migration_changed = False
+if not isinstance(_services.get("llm_selection_revision"), str) or not (
+    _services.get("llm_selection_revision") or ""
+).strip():
+    _services["llm_selection_revision"] = uuid.uuid4().hex
+    _services_migration_changed = True
 if "auto_performance" not in _services:
     _services["auto_performance"] = False
+    _services_migration_changed = True
+if _services_migration_changed:
     try:
         with open(wgp.server_config_filename, "w", encoding="utf-8") as _f:
             _f.write(json.dumps(wgp.server_config, indent=4))
-        print("[Maestro] Migration: existing config detected, auto_performance set to False (manual mode preserved)")
+        print("[Maestro] Migration: services defaults initialized")
     except Exception as _e:
-        print(f"[Maestro] Migration: failed to persist auto_performance default: {_e}")
+        print(f"[Maestro] Migration: failed to persist services defaults: {_e}")
 
 # First-boot auto-tune: a fresh install has auto_performance=True but the
 # recommended profile was only ever WRITTEN when the user opened Settings and
@@ -1713,9 +1789,12 @@ from services.krea_owner_policy import (
     KREA_LICENSE_DATE,
     KREA_LICENSE_URL,
     KREA_LICENSE_VERSION,
+    KREA_ROLE_USE_SCOPES,
     KreaOwnerPolicyError,
+    is_registered_krea2_model,
     krea_owner_policy_status,
     record_krea_owner_policy,
+    resolve_krea_actor_scope,
 )
 from services.h3_duration_plan import (
     GeneratedFrameCount,
@@ -11311,8 +11390,8 @@ def _init_pipeline():
 # API Routes: /api/v1/*
 # ============================================================================
 
-def _variant_group_filenames(urls) -> list:
-    """Flatten one weight group (list of variant URLs / dict entries) to file names."""
+def _variant_group_filenames(urls, model_type: str | None = None) -> list:
+    """Flatten one weight group to canonical and load-compatible filenames."""
     names = []
     for url_entry in urls:
         url_str = url_entry
@@ -11322,18 +11401,58 @@ def _variant_group_filenames(urls) -> list:
         if not isinstance(url_str, str) or not url_str:
             continue
         names.append(url_str.rstrip("/").split("/")[-1])
-    return names
+
+    compatibility = {}
+    if model_type:
+        model_def = wgp.get_model_def(model_type) or {}
+        compatibility = model_def.get("compatible_model_paths", {}) or {}
+
+    pending = list(names)
+    unique = []
+    seen = set()
+    while pending:
+        filename = pending.pop(0)
+        key = os.path.normcase(filename)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(filename)
+        aliases = compatibility.get(os.path.basename(str(filename)), [])
+        if isinstance(aliases, str):
+            aliases = [aliases]
+        pending.extend(
+            os.path.basename(str(alias))
+            for alias in aliases
+            if str(alias)
+        )
+    return unique
 
 
-def _variant_group_downloaded(urls, *, extra_paths=None) -> bool:
+def _variant_group_downloaded(
+    urls,
+    model_type: str | None = None,
+    *,
+    file_type=0,
+    extra_paths=None,
+) -> bool:
     """True when ANY variant (full bf16 vs quantized int8...) of one weight
     group exists locally. Resolves through the files locator so checkpoints
     in linked model folders (Settings -> System -> Linked Model Folders)
     light up too — a hardcoded ckpts_dir check misses every secondary root."""
-    for filename in _variant_group_filenames(urls):
-        if wgp.get_local_model_filename(
-            filename, extra_paths=extra_paths,
-        ) is not None:
+    for filename in _variant_group_filenames(urls, model_type=model_type):
+        if model_type is None:
+            located = wgp.get_local_model_filename(
+                filename,
+                extra_paths=extra_paths,
+            )
+        else:
+            located = wgp.get_compatible_local_model_filename(
+                filename,
+                model_type,
+                file_type=file_type,
+                extra_paths=extra_paths,
+            )
+        if located is not None:
             return True
     return False
 
@@ -11403,14 +11522,25 @@ def _check_model_downloaded(model_type: str) -> bool:
         groups = _model_weight_groups(model_type)
         if not groups:
             return False
-        if not all(_variant_group_downloaded(g) for g in groups):
+        if not all(
+            _variant_group_downloaded(g, model_type=model_type)
+            for g in groups
+        ):
             return False
         text_encoder_urls = wgp.get_model_recursive_prop(
             model_type, "text_encoder_URLs", return_list=True,
         )
         if text_encoder_urls and not _variant_group_downloaded(
             text_encoder_urls,
+            model_type=model_type,
+            file_type=2,
             extra_paths=model_def.get("text_encoder_folder"),
+        ):
+            return False
+        if not required_runtime_assets_ready(
+            model_def,
+            lambda path: wgp.fl.locate_file(path, error_if_none=False),
+            locate_folder=wgp.fl.locate_folder,
         ):
             return False
         # Some edit pipelines split required conditioning weights out of the
@@ -12224,7 +12354,9 @@ def delete_model(model_type: str):
     # shared base transformer for the base model's own delete button.
     filenames = []
     for group in _model_weight_groups(model_type, owned_only=True):
-        filenames.extend(_variant_group_filenames(group))
+        filenames.extend(
+            _variant_group_filenames(group, model_type=model_type)
+        )
     deleted = []
     skipped_linked = []
     errors = []
@@ -12367,7 +12499,12 @@ def _download_model_files(model_type: str):
         if text_encoder_filename is not None and len(text_encoder_filename):
             text_encoder_folder = model_def.get("text_encoder_folder", None)
             wgp.download_models(text_encoder_filename, model_type, 2, -1, force_path=text_encoder_folder)
-            if wgp.get_local_model_filename(text_encoder_filename, extra_paths=text_encoder_folder) is None:
+            if wgp.get_compatible_local_model_filename(
+                text_encoder_filename,
+                model_type,
+                file_type=2,
+                extra_paths=text_encoder_folder,
+            ) is None:
                 raise Exception(f"Text encoder '{os.path.basename(text_encoder_filename)}' could not be located after download.")
 
     if not _check_model_downloaded(model_type):
@@ -14157,6 +14294,82 @@ def _director_recovery_runtime_admission(
     _resolve_director_image_role_request(request, params)
 
 
+_KREA_JOB_ROLE_KEY = "_krea_principal_role"
+_KREA_CLIENT_AUTHORITY_KEYS = frozenset({
+    _KREA_JOB_ROLE_KEY,
+    "krea_principal_role",
+    "krea_use_scope",
+    "krea_role_use_scopes",
+})
+
+
+def _reject_client_krea_authority(body: dict) -> None:
+    """Keep account role and Krea license scope server-owned."""
+    if type(body) is not dict:
+        raise HTTPException(
+            status_code=400, detail="Generation request must be an object",
+        )
+    supplied = sorted(_KREA_CLIENT_AUTHORITY_KEYS.intersection(body))
+    if supplied:
+        raise HTTPException(
+            status_code=400,
+            detail="Krea account role and use scope are server-owned",
+        )
+
+
+def _is_registered_krea2_model(model_type: object) -> bool:
+    """Match an exact registered model definition, never a name substring."""
+    if type(model_type) is not str or not model_type:
+        return False
+    definition = wgp.get_model_def(model_type)
+    return is_registered_krea2_model(
+        model_type,
+        {model_type: definition} if type(definition) is dict else {},
+    )
+
+
+def _request_krea_principal_role(request: Request, model_type: object) -> str | None:
+    """Admit one Krea request from its current authenticated server role."""
+    if not _is_registered_krea2_model(model_type):
+        return None
+    principal = getattr(request.state, "maestro_account_principal", None)
+    role = principal.get("role") if isinstance(principal, dict) else None
+    if type(role) is not str or role not in KREA_ROLE_USE_SCOPES:
+        raise HTTPException(
+            status_code=403,
+            detail="Sign in with a Maestro owner or user account to use Krea 2",
+        )
+    try:
+        with _services_config_lock:
+            resolve_krea_actor_scope(
+                wgp.server_config.get("services", {}), role,
+            )
+    except KreaOwnerPolicyError as error:
+        raise HTTPException(status_code=451, detail=str(error)) from error
+    return role
+
+
+def _require_job_krea_actor_admission(job: dict) -> None:
+    """Reapply the sealed Krea role mapping on an ordinary retry/recovery."""
+    model_type = str(job.get("model_type") or "")
+    if not _is_registered_krea2_model(model_type):
+        return
+    role = job.get(_KREA_JOB_ROLE_KEY)
+    if type(role) is not str or role not in KREA_ROLE_USE_SCOPES:
+        raise HTTPException(
+            status_code=403,
+            detail="Krea 2 job account role is unavailable",
+        )
+    try:
+        with _services_config_lock:
+            resolve_krea_actor_scope(
+                wgp.server_config.get("services", {}), role,
+            )
+    except KreaOwnerPolicyError as error:
+        # Runtime 451 is already reserved for the H3 legal-location hold path.
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
 def _require_job_runtime_model_admission(job: dict) -> None:
     """Revalidate generic role snapshots and legacy terms before execution."""
     requested_models = _h3_job_model_types(job)
@@ -14177,6 +14390,7 @@ def _require_job_runtime_model_admission(job: dict) -> None:
         job["model_type"] = str(params.get("model_type") or "")
     else:
         _require_job_model_recipe_terms(job)
+    _require_job_krea_actor_admission(job)
 
 
 def _authorize_director_media_inputs(
@@ -15982,9 +16196,27 @@ def _h3_checkpoint_downloaded(model_type: str) -> bool:
     model_def = wgp.get_model_def(model_type) or {}
     text_encoder_urls = model_def.get("text_encoder_URLs")
     if isinstance(text_encoder_urls, list) and text_encoder_urls:
-        return _variant_group_downloaded(
+        text_encoder_folder = model_def.get("text_encoder_folder")
+        if _variant_group_downloaded(
             text_encoder_urls,
-            extra_paths=model_def.get("text_encoder_folder"),
+            extra_paths=text_encoder_folder,
+        ):
+            return True
+        compatible_resolver = getattr(
+            wgp,
+            "get_compatible_local_model_filename",
+            None,
+        )
+        if not callable(compatible_resolver):
+            return False
+        return any(
+            compatible_resolver(
+                filename,
+                model_type,
+                file_type=2,
+                extra_paths=text_encoder_folder,
+            ) is not None
+            for filename in _variant_group_filenames(text_encoder_urls)
         )
     return True
 
@@ -17199,52 +17431,6 @@ _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 _DEFAULTS_DIR = os.path.join(_APP_DIR, "defaults")
 _FINETUNES_DIR = os.path.join(_APP_DIR, "finetunes")
 
-# Best-guess default for the architecture picker, keyed by CivitAI baseModel.
-# Only needed where CIVIT_TO_LOCAL_ARCH's lora-DIR value isn't itself a real
-# model architecture (e.g. "LTXV 2.3" → lora dir "ltx2", but the model arch
-# is "ltx2_22B"). The UI picker lets the user override this guess.
-_CIVIT_BASE_TO_ARCH_HINT = {
-    "LTXV 2.3": "ltx2_22B",
-    "LTXV2": "ltx2_22B",
-    "Flux.2 Klein 9B": "flux2_klein_9b",
-    "Flux.2 Klein 9B-base": "flux2_klein_9b",
-    "Flux.2 Klein 4B": "flux2_klein_4b",
-    "Flux.2 Klein 4B-base": "flux2_klein_4b",
-    "Flux.2 D": "flux2_dev",
-    "Flux.1 D": "flux",
-    "Flux.1 Krea": "flux",
-    "Qwen": "qwen_image_20B",
-}
-
-# Architecture families we never offer for checkpoint import (the picker is
-# for video/image generators; audio/LLM checkpoints aren't Civitai "Checkpoint"
-# uploads and their pipelines don't take a swapped transformer this way).
-_CKPT_EXCLUDED_FAMILY_HINTS = ("audio", "llm", "language", "speech", "music")
-
-
-def _scan_defaults_by_arch() -> dict:
-    """Build {architecture: defaults_json_path} from the shipped defaults.
-
-    The path is the *settings template* we clone when registering a checkpoint
-    for that architecture (so inference defaults, handler-critical companion
-    weights, etc. come along). Prefer the def whose filename == architecture
-    (the canonical base) when several defaults share one arch."""
-    index: dict = {}
-    for path in glob.glob(os.path.join(_DEFAULTS_DIR, "*.json")):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                jd = json.load(f)
-        except Exception:
-            continue
-        arch = (jd.get("model") or {}).get("architecture")
-        if not arch:
-            continue
-        model_type = os.path.basename(path)[:-5]
-        if arch not in index or model_type == arch:
-            index[arch] = path
-    return index
-
-
 def _ckpt_family_for_arch(arch: str, model_type: str) -> str:
     """Best-effort UI family label for an architecture (for grouping/filtering
     in the picker). Falls back to empty string when WGP can't resolve it."""
@@ -17258,44 +17444,29 @@ def _ckpt_family_for_arch(arch: str, model_type: str) -> str:
     return ""
 
 
-def _list_checkpoint_architectures() -> list:
-    """Supported architectures for checkpoint import, with display name +
-    family, excluding audio/LLM families. Powers the UI architecture picker."""
+def _list_checkpoint_architectures(base_model: str) -> list:
+    """Return only shipped pipeline targets verified for this CivitAI base."""
+
     out = []
-    for arch, path in _scan_defaults_by_arch().items():
-        model_type = os.path.basename(path)[:-5]
+    for target in checkpoint_targets_for_base(base_model):
+        path = os.path.join(_DEFAULTS_DIR, f"{target.template_model_type}.json")
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                jd = json.load(f)
-            name = (jd.get("model") or {}).get("name", arch)
-        except Exception:
-            name = arch
-        family = _ckpt_family_for_arch(arch, model_type)
-        fam_l = family.lower()
-        if any(h in fam_l for h in _CKPT_EXCLUDED_FAMILY_HINTS):
+            with open(path, "r", encoding="utf-8") as handle:
+                definition = json.load(handle)
+        except (OSError, ValueError):
             continue
-        out.append({
-            "architecture": arch,
-            "name": name,
-            "family": family,
-            "template_model_type": model_type,
-        })
-    out.sort(key=lambda e: (e["family"], e["name"]))
+        if (definition.get("model") or {}).get("architecture") != target.architecture:
+            continue
+        out.append(
+            target.as_dict(
+                _ckpt_family_for_arch(
+                    target.architecture,
+                    target.template_model_type,
+                )
+            )
+        )
+    out.sort(key=lambda entry: (entry["family"], entry["name"]))
     return out
-
-
-def _guess_arch_for_base(base_model: str, arch_index: dict) -> str | None:
-    """Best-guess local architecture for a CivitAI baseModel string."""
-    if not base_model:
-        return None
-    hint = _CIVIT_BASE_TO_ARCH_HINT.get(base_model)
-    if hint and hint in arch_index:
-        return hint
-    # Fall back to the lora-dir mapping when it happens to equal a real arch.
-    d = CIVIT_TO_LOCAL_ARCH.get(base_model)
-    if d and d in arch_index:
-        return d
-    return None
 
 
 def _ckpt_slugify(text: str) -> str:
@@ -17327,17 +17498,33 @@ def _register_checkpoint_finetune(save_path: str, sidecar_data: dict,
     main transformer `URLs` at the LOCAL downloaded file. Because the URL is a
     bare filename (not http), WGP's get_local_model_filename() resolves it from
     ckpts/ and never tries to download it — the Civitai updater owns the file."""
-    arch_index = _scan_defaults_by_arch()
-    template_path = arch_index.get(target_architecture)
-    if template_path is None:
-        raise RuntimeError(f"Unsupported target architecture '{target_architecture}'")
+    base_model = str(sidecar_data.get("baseModel") or "")
+    filename = os.path.basename(save_path)
+    compatibility = validate_checkpoint_file(
+        save_path,
+        base_model,
+        target_architecture,
+        filename=filename,
+    )
+    template_model_type = checkpoint_template_model_type(
+        base_model,
+        target_architecture,
+    )
+    if not template_model_type:
+        raise CheckpointCompatibilityError(
+            "No verified Maestro template exists for this CivitAI checkpoint."
+        )
+    template_path = os.path.join(_DEFAULTS_DIR, f"{template_model_type}.json")
+    if not os.path.isfile(template_path):
+        raise RuntimeError("Required checkpoint template is unavailable")
     with open(template_path, "r", encoding="utf-8") as f:
         template = json.load(f)
+    if (template.get("model") or {}).get("architecture") != target_architecture:
+        raise RuntimeError("Checkpoint template architecture does not match")
 
     tmpl_model = dict(template.get("model") or {})
     settings = {k: v for k, v in template.items() if k != "model"}
 
-    filename = os.path.basename(save_path)
     name = sidecar_data.get("name") or os.path.splitext(filename)[0]
     model_id = sidecar_data.get("modelId")
     version_id = sidecar_data.get("versionId")
@@ -17359,8 +17546,9 @@ def _register_checkpoint_finetune(save_path: str, sidecar_data: dict,
         "modelId": model_id,
         "versionId": version_id,
         "modelType": "Checkpoint",
-        "baseModel": sidecar_data.get("baseModel", ""),
+        "baseModel": base_model,
         "filename": filename,
+        "compatibility": compatibility,
     }
     if auto_quantize:
         # Load-time int8 quantization via mmgp. Lets one large bf16/fp16
@@ -17378,8 +17566,17 @@ def _register_checkpoint_finetune(save_path: str, sidecar_data: dict,
     base_slug = _ckpt_slugify(f"civitai_{model_id}_{name}") if model_id else _ckpt_slugify(name)
     slug = base_slug[:80].strip("_") or "checkpoint"
     out_path = os.path.join(_FINETUNES_DIR, f"{slug}.json")
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(finetune_def, f, indent=4)
+    temporary_path = f"{out_path}.maestro-{os.getpid()}-{uuid.uuid4().hex}.tmp"
+    try:
+        with open(temporary_path, "w", encoding="utf-8") as f:
+            json.dump(finetune_def, f, indent=4)
+        os.replace(temporary_path, out_path)
+    finally:
+        if os.path.isfile(temporary_path):
+            try:
+                os.remove(temporary_path)
+            except OSError:
+                pass
     print(f"[CivitAI] Registered checkpoint finetune '{slug}' "
           f"(arch={target_architecture}) -> {out_path}")
     return slug, out_path
@@ -17445,6 +17642,7 @@ def _checkpoint_preview_url(filename: str):
 def _scan_installed_checkpoints() -> list:
     """Scan app/finetunes/*.json for CivitAI-imported checkpoints (those with a
     `model.civitai` provenance block)."""
+    _audit_configured_checkpoint_definitions()
     out = []
     for path in glob.glob(os.path.join(_FINETUNES_DIR, "*.json")):
         try:
@@ -17453,6 +17651,8 @@ def _scan_installed_checkpoints() -> list:
         except Exception:
             continue
         model = jd.get("model") or {}
+        if model.get("maestro_checkpoint_quarantine"):
+            continue
         civ = model.get("civitai")
         if not isinstance(civ, dict) or not civ.get("modelId"):
             continue
@@ -17917,7 +18117,9 @@ def _redact_civitai_headers(headers) -> dict[str, str]:
 #       }
 #     }
 #   }
-LORA_MANIFEST_VERSION = 1
+# v2 invalidates cached comparisons that followed a different CivitAI
+# baseModel/baseModelType branch from the locally installed version.
+LORA_MANIFEST_VERSION = 2
 LORA_MANIFEST_FILENAME = ".lora_update_manifest.json"
 LORA_MANIFEST_STALE_HOURS = 24
 LORA_CHANGELOG_MAX_LEN = 800
@@ -17996,6 +18198,47 @@ def _civitai_fetch_model(model_id: int, timeout: float = 15.0) -> tuple[dict | N
         return None, None
 
 
+def _select_latest_compatible_civitai_version(
+    versions: list,
+    current_version_id: int | None,
+) -> dict | None:
+    """Select the provider-newest release on the installed variant branch."""
+
+    valid = [version for version in versions if isinstance(version, dict)]
+    if not valid:
+        return None
+    try:
+        current_id = int(current_version_id)
+    except (TypeError, ValueError):
+        return valid[0]
+
+    current = None
+    for version in valid:
+        try:
+            if int(version.get("id")) == current_id:
+                current = version
+                break
+        except (TypeError, ValueError):
+            continue
+    if current is None:
+        return valid[0]
+
+    compatible = valid
+    for field in ("baseModel", "baseModelType"):
+        current_value = str(current.get(field) or "").strip().casefold()
+        if not current_value:
+            continue
+        matches = [
+            version
+            for version in compatible
+            if str(version.get(field) or "").strip().casefold()
+            == current_value
+        ]
+        if matches:
+            compatible = matches
+    return compatible[0] if compatible else current
+
+
 def _build_manifest_entry(
     model_id: int,
     current_version_id: int | None,
@@ -18033,7 +18276,10 @@ def _build_manifest_entry(
     if not isinstance(versions, list) or not versions:
         entry["status"] = "unknown"
         return entry
-    latest = versions[0] if isinstance(versions[0], dict) else None
+    latest = _select_latest_compatible_civitai_version(
+        versions,
+        current_version_id,
+    )
     if not latest:
         entry["status"] = "unknown"
         return entry
@@ -18066,12 +18312,29 @@ def civitai_base_models():
 
 @api.get("/api/v1/civitai/checkpoint-architectures")
 def civitai_checkpoint_architectures(base_model: str = ""):
-    """List architectures a checkpoint can be imported as (video/image models
-    we already support), plus a best-guess default for the given CivitAI
-    baseModel so the UI picker can pre-select it."""
-    architectures = _list_checkpoint_architectures()
-    guess = _guess_arch_for_base(base_model, {a["architecture"]: True for a in architectures})
-    return {"architectures": architectures, "suggested_architecture": guess}
+    """List only checkpoint pipelines verified for this CivitAI base label."""
+
+    architectures = _list_checkpoint_architectures(base_model)
+    guess = suggested_checkpoint_architecture(base_model)
+    available = {entry["architecture"] for entry in architectures}
+    if guess not in available:
+        guess = None
+    supported = bool(architectures)
+    if supported:
+        reason = None
+    elif checkpoint_targets_for_base(base_model):
+        reason = (
+            "Maestro recognizes this checkpoint family, but its required "
+            "pipeline definition is unavailable. Update Maestro and try again."
+        )
+    else:
+        reason = unsupported_checkpoint_reason(base_model)
+    return {
+        "architectures": architectures,
+        "suggested_architecture": guess,
+        "supported": supported,
+        "unsupported_reason": reason,
+    }
 
 
 @api.post("/api/v1/models/reload")
@@ -18081,7 +18344,7 @@ def reload_model_definitions():
     server. Returns the new model count and any model_types that appeared."""
     try:
         before = set(wgp.displayed_model_types)
-        wgp.load_model_definitions()
+        _audit_configured_checkpoint_definitions(reload_always=True)
         after = set(wgp.displayed_model_types)
         added = sorted(after - before)
         print(f"[Models] Reloaded model definitions: {len(after)} models"
@@ -18377,14 +18640,32 @@ async def civitai_download(request: Request):
 
     # Resolve target directory.
     if kind == "checkpoint":
-        # Checkpoints are full transformer weights — validate the requested
-        # architecture against the supported set and route into ckpts/ (where
-        # WGP loads model weights from), NOT the loras tree.
-        arch_index = _scan_defaults_by_arch()
-        if not target_architecture or target_architecture not in arch_index:
+        try:
+            ensure_allowed_checkpoint_target(base_model, target_architecture)
+        except CheckpointCompatibilityError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        available_targets = {
+            entry["architecture"]
+            for entry in _list_checkpoint_architectures(base_model)
+        }
+        if target_architecture not in available_targets:
             raise HTTPException(
                 status_code=400,
-                detail="A supported target_architecture is required for checkpoint imports",
+                detail=(
+                    "The verified pipeline definition for this checkpoint is "
+                    "not available. Update Maestro and try again."
+                ),
+            )
+        if os.path.splitext(filename)[1].casefold() not in {
+            ".safetensors",
+            ".sft",
+        }:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Checkpoint import supports individual SafeTensor files "
+                    "only; archives and other formats cannot be registered."
+                ),
             )
         target_dir = _checkpoint_download_dir()
     else:
@@ -18561,17 +18842,42 @@ def _run_civitai_download(download_id: str):
         # `.safetensors` file and later crashes mmgp's loader with
         # `OverflowError: cannot fit 'int' into an index-sized integer`
         # — much harder to diagnose than failing here at download time.
-        if filename.lower().endswith((".safetensors", ".sft")):
+        is_checkpoint = dl.get("_kind") == "checkpoint"
+        file_extension = os.path.splitext(filename)[1].casefold()
+        if is_checkpoint and file_extension not in {".safetensors", ".sft"}:
+            raise RuntimeError(
+                "CivitAI returned an archive or non-SafeTensor checkpoint. "
+                "Maestro can import only an individual SafeTensor file."
+            )
+        import zipfile
+        if is_checkpoint and zipfile.is_zipfile(partial_path):
+            raise RuntimeError(
+                "CivitAI returned an archive checkpoint. Maestro can import "
+                "only an individual SafeTensor file."
+            )
+        if file_extension in {".safetensors", ".sft"}:
             try:
                 _validate_safetensors_payload(partial_path)
             except Exception as _validate_exc:
+                asset_name = "checkpoint" if is_checkpoint else "LoRA"
                 raise RuntimeError(
-                    "CivitAI returned an invalid LoRA payload: "
+                    f"CivitAI returned an invalid {asset_name} payload: "
                     f"{_redact_civitai_diagnostic(_validate_exc)}. "
                     f"This is usually a missing/expired CivitAI API key, a rate-limit, "
                     f"or a model that requires special access. Check Settings → Services → "
                     f"CivitAI API Key."
                 )
+
+        checkpoint_compatibility = None
+        if is_checkpoint:
+            dl["message"] = "Verifying checkpoint architecture..."
+            checkpoint_compatibility = validate_checkpoint_file(
+                partial_path,
+                dl.get("_base_model", ""),
+                dl.get("_target_architecture", ""),
+                filename=filename,
+            )
+            dl["_checkpoint_compatibility"] = checkpoint_compatibility
 
         # Publish only a fully-received (and, for safetensors, validated)
         # payload. A failed stream leaves no truncated model at save_path.
@@ -18580,7 +18886,6 @@ def _run_civitai_download(download_id: str):
 
         # Check if downloaded file is a ZIP archive (some CivitAI LoRAs are zipped)
         extracted_files = []
-        import zipfile
         if zipfile.is_zipfile(save_path):
             print(f"[CivitAI] Downloaded file is a ZIP archive — extracting...")
             extracted_files = _extract_civitai_archive(
@@ -18598,14 +18903,9 @@ def _run_civitai_download(download_id: str):
             _update_download_record(download_id, filename=filename)
             print(f"[CivitAI] Extracted {len(extracted_files)} file(s)")
 
-        # NOTE: A previous version did dim-based architecture verification
-        # here (peeking the safetensors header and warning if the file's
-        # attention tensors didn't match the target directory's expected
-        # hidden dim). It was removed because the dim assumptions were
-        # wrong — Klein 9B uses the same 4096 hidden / 12288 QKV dims as
-        # Flux 2 Pro/Dev, so the check false-positived on legitimate
-        # Klein-trained LoRAs. The file-integrity gate above (size > 100KB
-        # AND parseable safetensors header) is the actual safety net.
+        # LoRAs remain metadata-routed because adapter formats vary. Full
+        # checkpoints are stricter: the header-only verifier checks multiple
+        # architecture-specific tensor anchors before publish or registration.
 
         sidecar_data = {
             "modelId": dl["_model_id"],
@@ -18625,6 +18925,7 @@ def _run_civitai_download(download_id: str):
             sidecar_data["publishedAt"] = dl["_published_at"]
         if dl.get("_kind") == "checkpoint":
             sidecar_data["modelType"] = "Checkpoint"
+            sidecar_data["compatibility"] = checkpoint_compatibility
 
         # Write sidecar and generate guide for each extracted file (or the single download)
         files_to_process = extracted_files if extracted_files else [save_path]
@@ -20599,6 +20900,7 @@ def _apply_linked_model_folders(folders):
     new_paths = [primary] + normalized + ["."]
     wgp.server_config["checkpoints_paths"] = new_paths
     wgp.fl.set_checkpoints_paths(new_paths)
+    _audit_configured_checkpoint_definitions()
     return normalized
 
 
@@ -21246,6 +21548,9 @@ def get_services_config(request: Request):
         "llm_device": services.get("llm_device", _llm_default_device()),
         "llm_provider": provider,
         "llm_remote_url": services.get("llm_remote_url", ""),
+        "llm_selection_revision": services.get("llm_selection_revision", ""),
+        "llm_remote_api_key": _mask_key(services.get("llm_remote_api_key", "")),
+        "llm_remote_api_key_set": bool(services.get("llm_remote_api_key", "")),
         "enhance_llm_model_id": (
             services.get("enhance_llm_model_id")
             or _DEFAULT_ENHANCE_LLM_REPO
@@ -21675,12 +21980,20 @@ def get_krea_owner_policy(request: Request):
 
 @api.put("/api/v1/krea/owner-policy")
 async def update_krea_owner_policy(request: Request):
-    """Record server-wide manual-review responsibility for local Krea use."""
+    """Record actor-aware manual-review responsibility for local Krea use."""
     _require_owner_policy_control(request)
     body = await _account_request_body(request)
+    if "use_scope" in body:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Krea owner policy schema v1 is no longer accepted; send the "
+                "exact role_use_scopes mapping"
+            ),
+        )
     expected_keys = {
         "owner_attested", "manual_review_accepted", "local_content_stays_local",
-        "attribution_accepted", "use_scope", "license_version", "license_date",
+        "attribution_accepted", "role_use_scopes", "license_version", "license_date",
     }
     if set(body) != expected_keys:
         raise HTTPException(status_code=400, detail="Krea owner policy request is invalid")
@@ -21695,7 +22008,7 @@ async def update_krea_owner_policy(request: Request):
                 manual_review_accepted=body.get("manual_review_accepted"),
                 local_content_stays_local=body.get("local_content_stays_local"),
                 attribution_accepted=body.get("attribution_accepted"),
-                use_scope=body.get("use_scope"),
+                role_use_scopes=body.get("role_use_scopes"),
                 license_version=body.get("license_version"),
                 license_date=body.get("license_date"),
             )
@@ -21830,6 +22143,260 @@ def migrate_account_projects(request: Request):
     ) as error:
         _raise_project_setup_unavailable(error)
     return _account_project_access_state()
+
+
+def _project_membership_route_context(
+    request: Request,
+    workspace: str,
+    *,
+    mutation: bool,
+) -> tuple[AccountAuthStore, AccountProjectMembershipStore, dict]:
+    """Resolve one owner-managed project without exposing inaccessible names."""
+    state = _account_project_access_state()
+    if not state["enforced"]:
+        raise HTTPException(status_code=404, detail="Project not found")
+    auth_store = _require_account_store(request)
+    try:
+        workspace_dir = _existing_workspace_dir(workspace)
+    except HTTPException as error:
+        if error.status_code in {400, 404}:
+            raise HTTPException(status_code=404, detail="Project not found") from error
+        raise
+    record = _require_account_project_permission(
+        request,
+        workspace_dir,
+        "project.membership.manage",
+        state=state,
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if mutation and not _request_has_recent_account_reauth(request):
+        raise HTTPException(
+            status_code=403,
+            detail="Confirm your password before changing project members",
+        )
+    membership_store = _account_project_membership_store()
+    if membership_store is None:
+        _raise_project_setup_unavailable(
+            ProjectMembershipStoreUnavailableError(
+                "project membership is unavailable",
+            ),
+        )
+    return auth_store, membership_store, record
+
+
+def _project_membership_projection(
+    auth_store: AccountAuthStore,
+    workspace: str,
+    record: dict,
+) -> dict:
+    """Return only account identities already bound to this project."""
+    members = []
+    try:
+        for binding in record["bindings"]:
+            account = auth_store.resolve_account(binding["account_id"])
+            if account is None:
+                raise AccountStoreCorruptError()
+            members.append({
+                "account_id": account["id"],
+                "username": account["username"],
+                "role": binding["role"],
+            })
+    except (AccountAuthError, KeyError, TypeError) as error:
+        _raise_project_setup_unavailable(error)
+    return {
+        "workspace": workspace,
+        "revision": record["revision"],
+        "members": members,
+    }
+
+
+def _project_membership_expected_revision(value) -> int:
+    if type(value) is not int or value < 1:
+        raise HTTPException(
+            status_code=400,
+            detail="expected_revision must be a positive integer",
+        )
+    return value
+
+
+def _project_membership_authorized_revision(record: dict, value) -> int:
+    """Bind a mutation to the exact membership record that authorized it."""
+    expected_revision = _project_membership_expected_revision(value)
+    if expected_revision != record["revision"]:
+        raise HTTPException(
+            status_code=409,
+            detail="Project members changed; refresh and try again",
+        )
+    return expected_revision
+
+
+def _project_membership_role(value) -> str:
+    if type(value) is not str or value not in {"owner", "editor", "viewer"}:
+        raise HTTPException(status_code=400, detail="Project role is invalid")
+    return value
+
+
+async def _bind_project_member(
+    auth_store: AccountAuthStore,
+    membership_store: AccountProjectMembershipStore,
+    workspace: str,
+    record: dict,
+    target: dict | None,
+    role: str,
+    expected_revision: int,
+) -> dict:
+    if target is None or target.get("disabled") is True:
+        raise HTTPException(status_code=404, detail="Account not found")
+    try:
+        updated = await asyncio.to_thread(
+            membership_store.bind,
+            target["id"],
+            role,
+            project_instance=record["project_instance"],
+            expected_revision=expected_revision,
+        )
+    except ProjectMembershipNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Project not found") from error
+    except ProjectMembershipConflictError as error:
+        raise HTTPException(
+            status_code=409,
+            detail="Project members changed; refresh and try again",
+        ) from error
+    except ProjectMembershipError as error:
+        _raise_project_setup_unavailable(error)
+    return _project_membership_projection(auth_store, workspace, updated)
+
+
+@api.get("/api/v1/workspaces/{workspace}/members")
+def list_project_members(workspace: str, request: Request):
+    auth_store, _membership_store, record = _project_membership_route_context(
+        request,
+        workspace,
+        mutation=False,
+    )
+    return _project_membership_projection(auth_store, workspace, record)
+
+
+@api.post("/api/v1/workspaces/{workspace}/members")
+async def add_project_member(
+    workspace: str,
+    request: Request,
+):
+    auth_store, membership_store, record = _project_membership_route_context(
+        request,
+        workspace,
+        mutation=True,
+    )
+    body = await _account_request_body(request)
+    if set(body) != {"username", "role", "expected_revision"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Expected username, role, and expected_revision only",
+        )
+    role = _project_membership_role(body["role"])
+    expected_revision = _project_membership_authorized_revision(
+        record,
+        body["expected_revision"],
+    )
+    try:
+        target = auth_store.resolve_account_username(body["username"])
+    except AccountStoreCorruptError as error:
+        _raise_project_setup_unavailable(error)
+    except AccountAuthError:
+        target = None
+    return await _bind_project_member(
+        auth_store,
+        membership_store,
+        workspace,
+        record,
+        target,
+        role,
+        expected_revision,
+    )
+
+
+@api.put("/api/v1/workspaces/{workspace}/members/{account_id}")
+async def set_project_member(
+    workspace: str,
+    account_id: str,
+    request: Request,
+):
+    auth_store, membership_store, record = _project_membership_route_context(
+        request,
+        workspace,
+        mutation=True,
+    )
+    body = await _account_request_body(request)
+    if set(body) != {"role", "expected_revision"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Expected role and expected_revision only",
+        )
+    role = _project_membership_role(body["role"])
+    expected_revision = _project_membership_authorized_revision(
+        record,
+        body["expected_revision"],
+    )
+    try:
+        target = auth_store.resolve_account(account_id)
+    except AccountAuthError as error:
+        _raise_account_http_error(error)
+    return await _bind_project_member(
+        auth_store,
+        membership_store,
+        workspace,
+        record,
+        target,
+        role,
+        expected_revision,
+    )
+
+
+@api.delete("/api/v1/workspaces/{workspace}/members/{account_id}")
+async def remove_project_member(
+    workspace: str,
+    account_id: str,
+    request: Request,
+):
+    auth_store, membership_store, record = _project_membership_route_context(
+        request,
+        workspace,
+        mutation=True,
+    )
+    body = await _account_request_body(request)
+    if set(body) != {"expected_revision"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Expected expected_revision only",
+        )
+    expected_revision = _project_membership_authorized_revision(
+        record,
+        body["expected_revision"],
+    )
+    try:
+        target = auth_store.resolve_account(account_id)
+    except AccountAuthError as error:
+        _raise_account_http_error(error)
+    if target is None:
+        raise HTTPException(status_code=404, detail="Account not found")
+    try:
+        updated = await asyncio.to_thread(
+            membership_store.unbind,
+            target["id"],
+            project_instance=record["project_instance"],
+            expected_revision=expected_revision,
+        )
+    except ProjectMembershipNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Project not found") from error
+    except ProjectMembershipConflictError as error:
+        raise HTTPException(
+            status_code=409,
+            detail="Project members changed or the last owner would be removed",
+        ) from error
+    except ProjectMembershipError as error:
+        _raise_project_setup_unavailable(error)
+    return _project_membership_projection(auth_store, workspace, updated)
 
 
 @api.post("/api/v1/account/nonce")
@@ -22599,10 +23166,27 @@ async def update_services_config(request: Request):
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Expected a JSON object")
 
+    def is_masked_key(value) -> bool:
+        return isinstance(value, str) and (
+            value == "***"
+            or (len(value) == 11 and value[4:7] == "...")
+        )
+
+    selection_fields = frozenset({
+        "llm_provider",
+        "llm_model_id",
+        "llm_device",
+        "llm_remote_url",
+        "llm_remote_api_key",
+        "openai_api_key",
+        "anthropic_api_key",
+    })
+
     ALLOWED_KEYS = {
         "llm_model_id", "llm_device", "llm_provider", "llm_remote_url",
         "enhance_llm_model_id", "enhance_llm_device",
-        "google_api_key", "openai_api_key", "anthropic_api_key",
+        "google_api_key", "llm_remote_api_key", "openai_api_key",
+        "anthropic_api_key",
         "use_director_v2", "nsfw_mode", "director_prompt_polish",
         "civitai_api_key", "voice_reference_enabled", "ltx_progressive_pipeline",
         "show_experimental", "auto_performance", "storage_allow_linked_removal",
@@ -22616,13 +23200,14 @@ async def update_services_config(request: Request):
         services = copy.deepcopy(wgp.server_config.get("services", {}))
         if not isinstance(services, dict):
             services = {}
+        previous_services = copy.deepcopy(services)
         updated = {}
 
         for key, value in body.items():
             if key not in ALLOWED_KEYS:
                 continue
             # Don't overwrite a real key with its masked version
-            if key.endswith("_api_key") and value and "..." in value:
+            if key.endswith("_api_key") and is_masked_key(value):
                 continue
             if key == "llm_provider":
                 value = str(value or "local").strip().lower()
@@ -22630,6 +23215,24 @@ async def update_services_config(request: Request):
                     raise HTTPException(status_code=400, detail="Unknown LLM provider")
             services[key] = value
             updated[key] = _mask_key(value) if key.endswith("_api_key") else value
+
+        revision = services.get("llm_selection_revision")
+        revision_changed = not (
+            isinstance(revision, str) and revision.strip()
+        )
+        if any(
+            previous_services.get(key) != services.get(key)
+            for key in selection_fields
+        ):
+            revision_changed = True
+        if revision_changed:
+            services["llm_selection_revision"] = (
+                __import__("uuid").uuid4().hex
+            )
+        if revision_changed:
+            updated["llm_selection_revision"] = services[
+                "llm_selection_revision"
+            ]
 
         # Provider compatibility is separate from host notice acceptance.
         provider = services.get("llm_provider", "local")
@@ -29739,7 +30342,7 @@ def storage_usage():
         seen_paths = set()
         try:
             for group in _model_weight_groups(mt):
-                for fname in _variant_group_filenames(group):
+                for fname in _variant_group_filenames(group, model_type=mt):
                     p = wgp.fl.locate_file(fname, error_if_none=False)
                     if not p:
                         continue
@@ -29759,7 +30362,7 @@ def storage_usage():
             # removes owned files only (a finetune's alias never deletes
             # the shared base) — mirror that here or the button lies.
             for group in _model_weight_groups(mt, owned_only=True):
-                for fname in _variant_group_filenames(group):
+                for fname in _variant_group_filenames(group, model_type=mt):
                     p = wgp.fl.locate_file(fname, error_if_none=False)
                     if p and not wgp.fl.is_protected_path(p):
                         try:
@@ -29937,7 +30540,10 @@ async def llm_load(request: Request):
     _require_local_llm_control(request)
 
     services = wgp.server_config.get("services", {})
-    provider = body.get("provider", services.get("llm_provider", "local"))
+    provider = str(
+        body.get("provider", services.get("llm_provider", "local"))
+        or "local"
+    ).strip().lower()
     selection = {
         "model_id": body.get(
             "model_id", services.get("llm_model_id", _DEFAULT_LLM_REPO),
@@ -29985,6 +30591,9 @@ def llm_unload(request: Request):
 
 
 def _llm_provider_api_key(provider: str, services: dict) -> str:
+    provider = str(provider or "").strip().lower()
+    if provider == "remote":
+        return services.get("llm_remote_api_key", "")
     if provider == "openai":
         return services.get("openai_api_key", "")
     if provider == "anthropic":
@@ -32957,6 +33566,14 @@ def _parse_song_output(raw, instrumental):
     return style, lyrics
 
 
+def _normalize_written_song_for_model(model_type, style, lyrics):
+    """Apply only the selected model's published structural lyric contract."""
+    if str(model_type or "") != "minimax_music3":
+        return style, lyrics
+    from models.TTS.minimax_music3.prompting import normalize_generated_music3_song
+    return normalize_generated_music3_song(style, lyrics)
+
+
 @api.post("/api/v1/llm/write-song")
 async def llm_write_song(request: Request):
     """Music-mode Simple writer: from a free-text description, produce a Music
@@ -33021,6 +33638,9 @@ async def llm_write_song(request: Request):
             detail="Song writing failed; check the local Maestro logs",
         ) from error
     style, lyrics = _parse_song_output(raw, instrumental)
+    style, lyrics = _normalize_written_song_for_model(
+        body.get("model_type"), style, lyrics,
+    )
     return {"style": style, "lyrics": lyrics, "raw": raw}
 
 
@@ -33211,6 +33831,9 @@ async def director_generate_music(request: Request):
                 detail="Song writing failed; check the local Maestro logs",
             ) from error
         w_style, w_lyrics = _parse_song_output(raw, instrumental)
+        w_style, w_lyrics = _normalize_written_song_for_model(
+            model_type, w_style, w_lyrics,
+        )
         style = style or w_style
         lyrics = lyrics or w_lyrics
 
@@ -36436,7 +37059,8 @@ def _require_saved_pipeline(
 def _public_pipeline_state(state: dict) -> dict:
     import copy
     from services.director.nsfw_guidance import EXPLICIT_GUIDANCE_SNAPSHOT_KEY
-    public = copy.deepcopy(state)
+    from services.director_pipeline import scrub_director_public_credentials
+    public = scrub_director_public_credentials(copy.deepcopy(state))
     # Historical raw planner logs predate request-scoped streaming. Keep the
     # file untouched for provenance, but never publish its prompt, thinking,
     # or response content. New Director checkpoints write this field as null.
@@ -41998,6 +42622,7 @@ async def release_sample_campaign_arm(request: Request):
 async def generate(request: Request):
     """Submit a generation job. Returns immediately with a job_id."""
     body = await request.json()
+    _reject_client_krea_authority(body)
     if _ENHANCED_PROMPT_CARDINALITY_KEY in body:
         raise HTTPException(
             status_code=400,
@@ -42052,6 +42677,9 @@ async def generate(request: Request):
     if director_role_mode:
         _resolve_director_image_role_request(request, body)
         _apply_director_image_role_generation(body)
+    _krea_principal_role = _request_krea_principal_role(
+        request, body.get("model_type"),
+    )
     _h3_turbo_validation_reference_bytes = (
         _authorize_h3_turbo_benchmark_request(request, body)
     )
@@ -42349,6 +42977,10 @@ async def generate(request: Request):
         ),
         "_h3_turbo_validation_reference_bytes": (
             _h3_turbo_validation_reference_bytes
+        ),
+        **(
+            {_KREA_JOB_ROLE_KEY: _krea_principal_role}
+            if _krea_principal_role is not None else {}
         ),
     }
     # Registration, owner/project identity, and the request manifest are
@@ -66242,7 +66874,7 @@ async def create_output_share(request: Request):
     """
     import mimetypes
 
-    body = await request.json()
+    body = await _account_request_body(request)
     workspace = _request_project_workspace(request, body.get("workspace"))
     name = str(body.get("name") or "")
     if os.path.splitext(name)[1].lower() not in _GALLERY_MEDIA_EXTENSIONS:
@@ -66283,7 +66915,7 @@ async def create_output_share(request: Request):
 async def revoke_output_share(request: Request):
     from services.win_safe_files import is_safe_direct_basename
 
-    body = await request.json()
+    body = await _account_request_body(request)
     workspace = _request_project_workspace(request, body.get("workspace"))
     name = str(body.get("name") or "")
     if (

@@ -1,6 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Check, ExternalLink, HeartHandshake, Loader2, ShieldCheck } from 'lucide-react'
-import { AccountApiError, isAccountProjectAccessActive } from '../../api/client'
+import {
+  AccountApiError,
+  fetchKreaOwnerPolicy,
+  isAccountProjectAccessActive,
+  setKreaOwnerPolicy,
+} from '../../api/client'
 import { useStore } from '../../stores/useStore'
 import type {
   AccountActivationState,
@@ -12,10 +17,18 @@ import type {
   SupportManualContributionInput,
   SupportManualContributionKind,
   SupportContributionSource,
+  SupportH3LegalAccessAvailabilityStatus,
+  SupportKreaOwnerPolicyProjection,
+  SupportKreaRoleUseScopes,
+  SupporterBenefitPolicy,
 } from '../../types'
 import {
+  allowedManualSupportKinds,
+  allowedManualSupportSources,
   affectedPriorityNotice,
   responsibleUseIsAccepted,
+  supporterBenefitLabels,
+  supporterTierLabels,
   verifiedDevelopmentCostRecovery,
   visibleSupportProviders,
 } from './supportPresentation'
@@ -145,11 +158,38 @@ const OPAQUE_SUPPORT_REFERENCE = /^key_[0-9a-f]{64}$/
 const FULFILLMENT_ITEM = /^[a-z][a-z0-9_]{1,63}$/
 const SUPPORT_CURRENCY = /^[A-Z]{3}$/
 const MAX_SUPPORT_AMOUNT_MINOR = 10_000_000_000
+const KREA_ROLE_USE_SCOPES: SupportKreaRoleUseScopes = Object.freeze({
+  owner: 'noncommercial',
+  user: 'commercial_under_1m',
+})
+const H3_LEGAL_ACCESS_TERRITORY_OPTIONS = ['US', 'CA', 'MX', 'GB', 'DE', 'FR', 'JP', 'AU', 'NZ', 'BR']
+const H3_LEGAL_ACCESS_STATUS_TEXT: Record<SupportH3LegalAccessAvailabilityStatus, string> = {
+  available: 'Allowed',
+  legal_blocked: 'Blocked by the current license',
+  location_declaration_required: 'Choose a country',
+}
+const H3_LEGAL_ACCESS_STATUS_CLASS: Record<SupportH3LegalAccessAvailabilityStatus, string> = {
+  available: 'border-indicator-success/40 bg-indicator-success/10 text-indicator-success',
+  legal_blocked: 'border-chip-red/40 bg-chip-red/10 text-chip-red',
+  location_declaration_required: 'border-indicator-warning/40 bg-indicator-warning/10 text-indicator-warning',
+}
 
-const contributionSourceLabels: Record<SupportContributionSource, string> = {
+function h3LegalAccessStatusLabel(value: SupportH3LegalAccessAvailabilityStatus | null): string {
+  if (!value) return H3_LEGAL_ACCESS_STATUS_TEXT.location_declaration_required
+  return H3_LEGAL_ACCESS_STATUS_TEXT[value]
+}
+
+function h3LegalAccessStatusClass(value: SupportH3LegalAccessAvailabilityStatus | null): string {
+  if (!value) return H3_LEGAL_ACCESS_STATUS_CLASS.location_declaration_required
+  return H3_LEGAL_ACCESS_STATUS_CLASS[value]
+}
+
+type ManualSupportContributionSource = SupportContributionSource
+
+const contributionSourceLabels: Record<ManualSupportContributionSource, string> = {
   buy_me_a_coffee: 'Buy Me a Coffee',
   patreon: 'Patreon',
-  direct_compute_sponsorship: 'Direct compute sponsorship',
+  direct_compute_sponsorship: 'Vast.ai compute sponsorship',
 }
 
 const manualContributionKindLabels: Record<SupportManualContributionKind, string> = {
@@ -160,11 +200,6 @@ const manualContributionKindLabels: Record<SupportManualContributionKind, string
   refund: 'Refund',
   chargeback: 'Chargeback',
 }
-
-const manualContributionSources = Object.keys(contributionSourceLabels) as SupportContributionSource[]
-// Manual audit provenance is independent of passive public-link marketing modes:
-// every source can record every lifecycle kind, subject to target/state rules.
-const manualContributionKinds = Object.keys(manualContributionKindLabels) as SupportManualContributionKind[]
 
 const fulfillmentStatusLabels: Record<SupportFulfillmentStatus, string> = {
   pending: 'Pending',
@@ -243,6 +278,79 @@ function minorUnits(value: number, currency: string): string {
     return `${value.toLocaleString('en-US')} cents (${dollars})`
   }
   return `${value.toLocaleString()} in the smallest ${currency} unit`
+}
+
+function supporterMoney(value: number, currency: string): string {
+  try {
+    return (value / 100).toLocaleString(undefined, {
+      style: 'currency',
+      currency,
+      minimumFractionDigits: value % 100 === 0 ? 0 : 2,
+    })
+  } catch {
+    return `${value.toLocaleString()} ${currency} minor units`
+  }
+}
+
+function supporterDuration(value: number): string {
+  const days = value / (24 * 60 * 60)
+  return Number.isInteger(days) ? `${days.toLocaleString()} days` : `${value.toLocaleString()} seconds`
+}
+
+function supporterTierName(value: string): string {
+  return value.replaceAll('_', ' ').replace(/\b\w/g, letter => letter.toUpperCase())
+}
+
+function SupporterBenefits({ policy }: { policy: SupporterBenefitPolicy }) {
+  const groups = [
+    { label: 'One-time support', tiers: policy.one_time_tiers, validity: policy.one_time_validity_seconds },
+    { label: 'Recurring support', tiers: policy.recurring_tiers, validity: policy.recurring_validity_seconds },
+  ]
+  return (
+    <section aria-labelledby="supporter-perks-heading" className="rounded-xl border border-border bg-bg-tertiary/20 p-3">
+      <div className="flex items-center gap-2">
+        <HeartHandshake size={14} className="shrink-0 text-accent-blue" aria-hidden="true" />
+        <h3 id="supporter-perks-heading" className="text-xs font-semibold text-text-primary">Supporter tiers and perks</h3>
+      </div>
+      <p className="mt-2 text-[10px] leading-relaxed text-text-secondary">
+        These are the exact thank-you tiers published by this Maestro host. Jobs remain schedulable without credits.
+      </p>
+      <p className="mt-1 text-[9px] leading-relaxed text-text-muted">
+        Supporter recognition appears as an account badge. Bounded queue priority activates only when the host and allowance say it is active. Early-access and convenience items remain recorded eligibility until Maestro explicitly delivers them.
+      </p>
+      <div className="mt-3 grid gap-3 sm:grid-cols-2">
+        {groups.map(group => (
+          <section key={group.label} className="min-w-0 rounded-lg border border-border bg-bg-primary/35 p-3">
+            <h4 className="text-[11px] font-semibold text-text-primary">{group.label}</h4>
+            <p className="mt-1 text-[9px] leading-relaxed text-text-muted">
+              Promotional credits, when enabled, are valid for {supporterDuration(group.validity)}.
+            </p>
+            <ul className="mt-2 space-y-2" aria-label={`${group.label} supporter tiers`}>
+              {group.tiers.map(tier => (
+                <li key={tier.tier} className="rounded-md border border-border/70 bg-bg-tertiary/25 p-2">
+                  <div className="flex flex-wrap items-baseline justify-between gap-1">
+                    <span className="text-[10px] font-semibold text-text-primary">{supporterTierName(tier.tier)}</span>
+                    <span className="text-[9px] font-medium text-accent-blue">{supporterMoney(tier.minimum_minor, policy.currency)}+</span>
+                  </div>
+                  <p className="mt-1 text-[9px] leading-relaxed text-text-muted">
+                    {policy.promotional_credits_enabled
+                      ? `${tier.promotional_maestro_credits.toLocaleString()} promotional Maestro credits`
+                      : 'Promotional credits are currently disabled'}
+                  </p>
+                  <p className="mt-1 text-[9px] leading-relaxed text-text-muted">
+                    Published eligibility: {tier.benefits.map(benefit => supporterBenefitLabels[benefit]).join(' · ')}
+                  </p>
+                </li>
+              ))}
+            </ul>
+          </section>
+        ))}
+      </div>
+      <p className="mt-3 text-[9px] leading-relaxed text-text-muted">
+        One-time promotional credits are capped at {policy.one_time_bonus_cap.toLocaleString()} {policy.credit_unit.replaceAll('_', ' ')}. Credits have no cash value, are nontransferable and nonrefundable, do not guarantee compute or service, and unused bonuses may expire or be revoked.
+      </p>
+    </section>
+  )
 }
 
 // Exported for deterministic linear-work regression coverage.
@@ -338,7 +446,7 @@ function AdminSupportAudit({
   const [busyKey, setBusyKey] = useState<string | null>(null)
   const [transitionNotice, setTransitionNotice] = useState<{ kind: 'success' | 'error'; text: string } | null>(null)
   const retryRef = useRef<{ fingerprint: string; idempotencyKey: string } | null>(null)
-  const [manualSource, setManualSource] = useState<SupportContributionSource>('buy_me_a_coffee')
+  const [manualSource, setManualSource] = useState<ManualSupportContributionSource>('buy_me_a_coffee')
   const [manualKind, setManualKind] = useState<SupportManualContributionKind>('one_time_contribution')
   const [manualAmount, setManualAmount] = useState('1')
   const [manualCurrency, setManualCurrency] = useState('USD')
@@ -347,6 +455,11 @@ function AdminSupportAudit({
   const [manualNotice, setManualNotice] = useState<{ kind: 'success' | 'error'; text: string } | null>(null)
   const manualRetryRef = useRef(new Map<string, string>())
   const manualInFlightRef = useRef(false)
+  const manualContributionSources = allowedManualSupportSources(directComputeUnlocked)
+  const manualContributionKinds = allowedManualSupportKinds(
+    manualSource,
+    directComputeUnlocked,
+  )
   const totals = Object.entries(audit.currency_totals_minor)
   const visibleEvents = audit.events.slice(-40).reverse()
   const hiddenEventCount = audit.events.length - visibleEvents.length
@@ -367,8 +480,6 @@ function AdminSupportAudit({
   const visibleFundingEvents = fundingEvents.slice(0, fundingEventLimit)
   const manualTargetRequired = manualKind !== 'one_time_contribution'
     && manualKind !== 'recurring_started'
-  const manualDirectComputeLocked = manualSource === 'direct_compute_sponsorship'
-    && !directComputeUnlocked
   const { matchingFundingEvents, remainingByTarget, activeRecurringTargets } = manualContributionTargetState(
     audit.events,
     manualSource,
@@ -388,13 +499,6 @@ function AdminSupportAudit({
 
   const recordManualContribution = async () => {
     if (manualBusy || manualInFlightRef.current) return
-    if (manualDirectComputeLocked) {
-      setManualNotice({
-        kind: 'error',
-        text: 'Direct compute sponsorship unlocks after the $1,000 development-cost target is reached.',
-      })
-      return
-    }
     const currency = manualCurrency.trim().toUpperCase()
     const amount = Number(manualAmount)
     const target = manualTargetEvents.some(event => event.event_id === manualTarget)
@@ -458,7 +562,9 @@ function AdminSupportAudit({
       setManualTarget('')
       setManualNotice({
         kind: 'success',
-        text: 'Contribution record saved. No payment was processed. Any resulting compute allowance is shown below and is used only when hosted credit priority is enabled.',
+        text: manualSource === 'direct_compute_sponsorship'
+          ? 'Vast.ai compute sponsorship record saved. It is excluded from the $1,000 target and supporter perks. Maestro processed no payment, granted no credits, and guarantees no compute or service. Maestro sent no refund.'
+          : 'Contribution record saved. No payment was processed. Any Maestro queue credits are shown below and affect only optional hosted queue priority.',
       })
     } catch (error) {
       if (error instanceof AccountApiError && [400, 401, 403, 404, 409].includes(error.status)) {
@@ -530,7 +636,7 @@ function AdminSupportAudit({
         Private support history and follow-up
       </h4>
       <p className="mt-1 text-[9px] leading-relaxed text-text-muted">
-        Available only after the owner recently confirmed their password. Maestro never processes a payment here. Contribution records can update the compute allowance used by optional hosted queue priority; follow-up records do not change benefits.
+        Available only after the owner recently confirmed their password. Maestro never processes a payment here. Contribution records can grant Maestro queue credits for optional hosted queue priority; Vast.ai compute sponsorship and follow-up records do not grant credits.
       </p>
       {transitionNotice && (
         <p
@@ -556,7 +662,7 @@ function AdminSupportAudit({
         </summary>
         <div className="space-y-2 pb-3">
           <p className="leading-relaxed">
-            This does not process a payment. It records an owner-verified contribution and may update the account's compute allowance for optional hosted queue priority.
+            This does not process a payment. Owner-verified support may grant Maestro queue credits. Vast.ai compute sponsorship can be recorded before or after the $1,000 target, but is excluded from that target and all supporter perks. Maestro does not detect, collect, or automatically refund Vast.ai sponsorships.
           </p>
           {manualNotice && (
             <p
@@ -576,7 +682,16 @@ function AdminSupportAudit({
               <select
                 value={manualSource}
                 onChange={event => changeManualSemantic(() => {
-                  setManualSource(event.target.value as SupportContributionSource)
+                  const source = event.target.value as ManualSupportContributionSource
+                  setManualSource(source)
+                  const allowedKinds = allowedManualSupportKinds(
+                    source,
+                    directComputeUnlocked,
+                  )
+                  if (!allowedKinds.includes(manualKind)) {
+                    setManualKind(allowedKinds[0])
+                    setManualAmount('1')
+                  }
                   setManualTarget('')
                 })}
                 className="mt-1 min-h-11 w-full rounded-md border border-border bg-bg-primary px-3 text-[10px] text-text-primary outline-none focus:border-accent-blue focus:ring-1 focus:ring-accent-blue"
@@ -585,11 +700,10 @@ function AdminSupportAudit({
                   <option
                     key={source}
                     value={source}
-                    disabled={source === 'direct_compute_sponsorship' && !directComputeUnlocked}
                   >
                     {contributionSourceLabels[source]}
                     {source === 'direct_compute_sponsorship' && !directComputeUnlocked
-                      ? ' — locked until $1,000 is recovered'
+                      ? ' — record only; excluded from target and perks'
                       : ''}
                   </option>
                 ))}
@@ -671,7 +785,7 @@ function AdminSupportAudit({
           )}
           <button
             type="button"
-            disabled={manualBusy || manualDirectComputeLocked || (manualTargetRequired && manualTargetEvents.length === 0)}
+            disabled={manualBusy || (manualTargetRequired && manualTargetEvents.length === 0)}
             onClick={() => void recordManualContribution()}
             className="min-h-11 w-full rounded-md bg-accent-blue px-3 py-2 text-[10px] font-semibold text-white hover:opacity-90 disabled:opacity-50"
           >
@@ -933,6 +1047,18 @@ function RecordedSupport({ summary }: { summary: SupportAccountSummary }) {
   const allowanceActive = allowance?.enforcement_enabled === true
   const visibleAllowanceSources = allowance?.sources.slice(0, 20) || []
   const hiddenAllowanceSourceCount = (allowance?.sources.length || 0) - visibleAllowanceSources.length
+  const ownerTest = summary.owner_test_credits
+  const tiers = supporterTierLabels(summary)
+  const recognitionActive = recorded
+    && summary.benefits.recorded_eligibility.includes('supporter_recognition')
+  const activeBenefits = [
+    ...(recognitionActive ? [supporterBenefitLabels.supporter_recognition] : []),
+    ...summary.benefits.effective_benefits.map(benefit => supporterBenefitLabels[benefit]),
+  ]
+  const recordedOnlyBenefits = summary.benefits.recorded_eligibility
+    .filter(benefit => benefit !== 'supporter_recognition'
+      && !summary.benefits.effective_benefits.includes(benefit))
+    .map(benefit => supporterBenefitLabels[benefit])
   return (
     <section className="rounded-xl border border-border bg-bg-tertiary/20 p-3">
       <div className="flex items-center gap-2">
@@ -948,7 +1074,7 @@ function RecordedSupport({ summary }: { summary: SupportAccountSummary }) {
       )}
       {summary.benefits.state === 'hosted_priority_available' && (
         <p className="mt-2 text-[10px] leading-relaxed text-text-muted">
-          Hosted credit priority is enabled, but this account has no current allowance. Jobs still remain eligible in the ordinary queue.
+          Hosted queue priority is available, but this account has no current allowance. Jobs still remain eligible in the ordinary queue.
         </p>
       )}
       {summary.benefits.state === 'owner_exempt' && (
@@ -956,16 +1082,78 @@ function RecordedSupport({ summary }: { summary: SupportAccountSummary }) {
           Owner jobs stay outside hosted credit accounting and use the ordinary owner scheduling path.
         </p>
       )}
-      {summary.benefits.state === 'active' && (
+      {summary.benefits.state === 'unmetered_realm' && (
         <p className="mt-2 text-[10px] leading-relaxed text-text-muted">
-          This account has active hosted compute allowance. Eligible jobs can receive bounded queue priority; jobs without enough allowance still remain eligible.
+          This local or authenticated-LAN session is unmetered. Recorded supporter status remains attached to the account, while credits are not used for this session.
         </p>
       )}
+      {summary.benefits.state === 'active' && (
+        <p className="mt-2 text-[10px] leading-relaxed text-text-muted">
+          This account has an active hosted queue allowance. Eligible jobs can receive bounded priority; jobs without enough allowance still remain eligible.
+        </p>
+      )}
+      {(tiers.length > 0 || recordedOnlyBenefits.length > 0 || activeBenefits.length > 0) && (
+        <div className="mt-3 grid gap-2 sm:grid-cols-2" aria-label="Supporter status and benefits">
+          <section className="rounded-lg border border-border bg-bg-primary/40 p-3">
+            <h4 className="text-[10px] font-semibold uppercase tracking-wide text-text-muted">Supporter status</h4>
+            {tiers.length > 0 ? (
+              <ul className="mt-2 flex flex-wrap gap-1.5" aria-label="Recorded supporter tiers">
+                {tiers.map(tier => (
+                  <li key={tier} className="rounded-full border border-accent-blue/35 bg-accent-blue/10 px-2 py-1 text-[9px] font-semibold text-accent-blue">
+                    {tier}
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="mt-2 text-[9px] leading-relaxed text-text-muted">No supporter tier is currently recorded.</p>
+            )}
+          </section>
+          <section className="rounded-lg border border-border bg-bg-primary/40 p-3">
+            <h4 className="text-[10px] font-semibold uppercase tracking-wide text-text-muted">Perks</h4>
+            <p className="mt-2 text-[9px] leading-relaxed text-text-secondary">
+              {activeBenefits.length > 0
+                ? `Delivered or active now: ${activeBenefits.join(' · ')}.`
+                : 'Delivered or active now: none.'}
+            </p>
+            <p className="mt-1 text-[9px] leading-relaxed text-text-muted">
+              {recordedOnlyBenefits.length > 0
+                ? `Recorded eligibility, not active yet: ${recordedOnlyBenefits.join(' · ')}.`
+                : 'No additional planned eligibility is recorded.'}
+            </p>
+          </section>
+        </div>
+      )}
+      {ownerTest && (
+        <details aria-label="Owner credit test details" className="mt-3 rounded-lg border border-border bg-bg-primary/40 p-3 text-[10px] text-text-muted">
+          <summary className="flex min-h-11 cursor-pointer items-center font-semibold text-text-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue md:min-h-0">
+            Technical details · owner credit test
+          </summary>
+          {ownerTest.state === 'active' ? (
+            <>
+              <p className="mt-2 text-sm font-semibold text-accent-blue">
+                {ownerTest.available_units.toLocaleString()} available · {ownerTest.used_units.toLocaleString()} used
+              </p>
+              <p className="mt-1 text-[9px] leading-relaxed text-text-muted">
+                Auto-refills to {ownerTest.target_balance.toLocaleString()} when needed. It exercises debit and refund behavior without changing real credits, access, or queue priority.
+              </p>
+              {ownerTest.last_activity_at && (
+                <p className="mt-1 text-[9px] text-text-muted">
+                  Last activity <time dateTime={ownerTest.last_activity_at}>{allowanceDate(ownerTest.last_activity_at)} UTC</time>
+                </p>
+              )}
+            </>
+          ) : (
+            <p className="mt-2 text-[10px] leading-relaxed text-indicator-warning">
+              Test accounting is temporarily unavailable. Owner generation remains available.
+            </p>
+          )}
+        </details>
+      )}
       {allowance && (
-        <section aria-label={allowanceActive ? 'Active hosted compute allowance' : 'Recorded informational compute allowance'} className="mt-3 min-w-0 rounded-lg border border-border bg-bg-primary/40 p-3">
+        <section aria-label={allowanceActive ? 'Active hosted queue allowance' : 'Recorded hosted queue allowance'} className="mt-3 min-w-0 rounded-lg border border-border bg-bg-primary/40 p-3">
           <div className="min-w-0">
             <h4 className="text-[11px] font-semibold text-text-primary">
-              {allowanceActive ? 'Active hosted compute allowance' : 'Recorded informational compute allowance'}
+              {allowanceActive ? 'Hosted queue allowance' : 'Hosted queue allowance · inactive'}
             </h4>
             <p className="mt-1 break-words text-sm font-semibold text-accent-blue">
               {allowanceActive ? 'Available amount' : 'Recorded amount'}: {allowanceUnits(allowance.effective_allowance, allowance.unit)}
@@ -986,7 +1174,7 @@ function RecordedSupport({ summary }: { summary: SupportAccountSummary }) {
                   <span className="text-[9px] font-medium text-text-secondary">{allowanceStateText[source.status]}</span>
                 </div>
                 <p className="mt-1 break-words text-[9px] leading-relaxed text-text-muted">
-                  Recorded informational amount: {allowanceUnits(source.effective_allowance, allowance.unit)}
+                  Recorded amount: {allowanceUnits(source.effective_allowance, allowance.unit)}
                   {' '}from an original recorded allowance of {allowanceUnits(source.granted_allowance, allowance.unit)}.
                 </p>
                 {source.expires_at && (
@@ -1026,9 +1214,14 @@ export function SupportPanel() {
   const admin = useStore(state => state.supportAdmin)
   const adminAccountId = useStore(state => state.supportAdminAccountId)
   const detailsLoading = useStore(state => state.supportDetailsLoading)
+  const h3LegalAccess = useStore(state => state.supportH3LegalAccess)
+  const h3LegalAccessLoading = useStore(state => state.supportH3LegalAccessLoading)
+  const h3LegalAccessError = useStore(state => state.supportH3LegalAccessError)
   const loadCatalog = useStore(state => state.loadSupportCatalog)
   const loadSelf = useStore(state => state.loadSupportSelf)
   const loadResponsibleUse = useStore(state => state.loadResponsibleUse)
+  const loadH3LegalAccessState = useStore(state => state.loadH3LegalAccessState)
+  const setH3LegalAccessLocation = useStore(state => state.setH3LegalAccessLocation)
   const acceptNotice = useStore(state => state.acceptResponsibleUse)
   const loadAdmin = useStore(state => state.loadSupportAdmin)
   const transitionFulfillment = useStore(state => state.transitionSupportFulfillment)
@@ -1036,6 +1229,18 @@ export function SupportPanel() {
   const clearAdmin = useStore(state => state.clearSupportAdmin)
   const [selectedUserIndex, setSelectedUserIndex] = useState('')
   const adminSelectionEpochRef = useRef(0)
+  const [h3LegalAccessTerritoryCode, setH3LegalAccessTerritoryCode] = useState('')
+  const [h3LegalAccessAttested, setH3LegalAccessAttested] = useState(false)
+  const [isSavingH3LegalAccess, setIsSavingH3LegalAccess] = useState(false)
+  const [kreaOwnerPolicy, setKreaOwnerPolicyState] = useState<SupportKreaOwnerPolicyProjection | null>(null)
+  const [kreaOwnerPolicyLoading, setKreaOwnerPolicyLoading] = useState(false)
+  const [kreaOwnerPolicySaving, setKreaOwnerPolicySaving] = useState(false)
+  const [kreaOwnerPolicyError, setKreaOwnerPolicyError] = useState<string | undefined>(undefined)
+  const [kreaOwnerAttested, setKreaOwnerAttested] = useState(false)
+  const [kreaManualReviewAccepted, setKreaManualReviewAccepted] = useState(false)
+  const [kreaLocalContentAccepted, setKreaLocalContentAccepted] = useState(false)
+  const [kreaAttributionAccepted, setKreaAttributionAccepted] = useState(false)
+  const kreaOwnerPolicyEpochRef = useRef(0)
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<{ kind: 'success' | 'error'; text: string } | null>(null)
   const accountProjectAccessActive = isAccountProjectAccessActive(
@@ -1064,17 +1269,16 @@ export function SupportPanel() {
     && adminAccountId === selectedAdminAccountId
     ? admin
     : null
+  const publicRecovery = verifiedDevelopmentCostRecovery(supportProjection)
   const recovery = selectedAdminProjection !== null
     ? verifiedDevelopmentCostRecovery(selectedAdminProjection)
-    : verifiedDevelopmentCostRecovery(supportProjection)
+    : publicRecovery
   const directComputeUnlocked = recovery?.state === 'recovered'
   const effectiveSupportProjection = supportProjection && selectedAdminProjection !== null
     ? { ...supportProjection, development_cost_recovery: recovery }
     : supportProjection
-  const visibleProviders = useMemo(
-    () => visibleSupportProviders(effectiveSupportProjection),
-    [effectiveSupportProjection],
-  )
+  const visibleProviders = visibleSupportProviders(effectiveSupportProjection)
+  const supporterPolicy = effectiveSupportProjection?.supporter_benefits || null
   const currentResponsibleUse = responsibleUse || self?.responsible_use || null
   const responsibleUseAccepted = responsibleUseIsAccepted(currentResponsibleUse)
   const selfPriorityNotice = affectedPriorityNotice(
@@ -1096,6 +1300,59 @@ export function SupportPanel() {
     }
     return () => { active = false }
   }, [accountId, loadCatalog, loadResponsibleUse, loadSelf])
+
+  useEffect(() => {
+    if (!ownerSupport) return
+    void loadH3LegalAccessState().catch(error => {
+      if (error instanceof AccountApiError) {
+        setNotice({ kind: 'error', text: error.message })
+      } else {
+        setNotice({ kind: 'error', text: 'Could not refresh H3 legal-access state.' })
+      }
+    })
+  }, [loadH3LegalAccessState, ownerSupport])
+
+  useEffect(() => {
+    setH3LegalAccessTerritoryCode(h3LegalAccess?.territory_code || '')
+    setH3LegalAccessAttested(false)
+  }, [h3LegalAccess?.territory_code, ownerSupport])
+
+  useEffect(() => {
+    const epoch = ++kreaOwnerPolicyEpochRef.current
+    if (!ownerSupport) {
+      setKreaOwnerPolicyState(null)
+      setKreaOwnerPolicyLoading(false)
+      setKreaOwnerPolicySaving(false)
+      setKreaOwnerPolicyError(undefined)
+      setKreaOwnerAttested(false)
+      setKreaManualReviewAccepted(false)
+      setKreaLocalContentAccepted(false)
+      setKreaAttributionAccepted(false)
+      return
+    }
+    setKreaOwnerPolicyLoading(true)
+    setKreaOwnerPolicyError(undefined)
+    void fetchKreaOwnerPolicy().then(policy => {
+      if (epoch !== kreaOwnerPolicyEpochRef.current) return
+      setKreaOwnerPolicyState(policy)
+    }).catch(error => {
+      if (epoch !== kreaOwnerPolicyEpochRef.current) return
+      setKreaOwnerPolicyError(
+        error instanceof AccountApiError
+          ? error.message
+          : 'Krea 2 license settings could not be refreshed.',
+      )
+    }).finally(() => {
+      if (epoch === kreaOwnerPolicyEpochRef.current) {
+        setKreaOwnerPolicyLoading(false)
+      }
+    })
+    return () => {
+      // Always invalidate GET, PUT, and post-PUT refetch work. A save may have
+      // advanced beyond this effect's initial epoch before identity/unmount.
+      kreaOwnerPolicyEpochRef.current += 1
+    }
+  }, [accountId, ownerSupport])
 
   useEffect(() => {
     if (!ownerSupport) {
@@ -1191,6 +1448,117 @@ export function SupportPanel() {
     await recordContribution(adminAccountId, input)
   }
 
+  const saveH3LegalAccessTerritory = async () => {
+    if (!ownerSupport) {
+      setNotice({ kind: 'error', text: 'Owner support controls are not active in this session.' })
+      return
+    }
+    const territoryCode = h3LegalAccessTerritoryCode.trim()
+    const licenseRevision = h3LegalAccess?.license_revision
+    const licenseSha256 = h3LegalAccess?.license_sha256
+    if (!territoryCode || !h3LegalAccessAttested || !licenseRevision || !licenseSha256) {
+      setNotice({
+        kind: 'error',
+        text: 'Choose the country where this computer will run MiniMax H3, review the current license, and confirm the declaration.',
+      })
+      return
+    }
+    setIsSavingH3LegalAccess(true)
+    setNotice(null)
+    try {
+      const updated = await setH3LegalAccessLocation({
+        territory_code: territoryCode,
+        owner_attested: true,
+        license_revision: licenseRevision,
+        license_sha256: licenseSha256,
+      })
+      setH3LegalAccessAttested(false)
+      setNotice({
+        kind: 'success',
+        text: updated?.availability_status === 'available'
+          ? `${territoryCode} saved. MiniMax H3 is allowed in this country under the current license.`
+          : `${territoryCode} saved. Review the MiniMax H3 availability status below.`,
+      })
+    } catch (error) {
+      if (error instanceof AccountApiError) {
+        setNotice({ kind: 'error', text: error.message })
+      } else {
+        setNotice({ kind: 'error', text: 'H3 legal-access location could not be saved.' })
+      }
+    } finally {
+      setIsSavingH3LegalAccess(false)
+    }
+  }
+
+  const saveKreaLicensePolicy = async () => {
+    if (!ownerSupport || kreaOwnerPolicySaving) return
+    if (
+      !kreaOwnerPolicy
+      || !kreaOwnerAttested
+      || !kreaManualReviewAccepted
+      || !kreaLocalContentAccepted
+      || !kreaAttributionAccepted
+    ) {
+      setKreaOwnerPolicyError('Review and confirm all four Krea 2 license conditions.')
+      return
+    }
+    const epoch = ++kreaOwnerPolicyEpochRef.current
+    setKreaOwnerPolicySaving(true)
+    setKreaOwnerPolicyError(undefined)
+    try {
+      await setKreaOwnerPolicy({
+        owner_attested: true,
+        manual_review_accepted: true,
+        local_content_stays_local: true,
+        attribution_accepted: true,
+        role_use_scopes: KREA_ROLE_USE_SCOPES,
+        license_version: kreaOwnerPolicy.license_version,
+        license_date: kreaOwnerPolicy.license_date,
+      })
+      if (epoch !== kreaOwnerPolicyEpochRef.current) return
+      const refreshed = await fetchKreaOwnerPolicy()
+      if (epoch !== kreaOwnerPolicyEpochRef.current) return
+      setKreaOwnerPolicyState(refreshed)
+      setKreaOwnerAttested(false)
+      setKreaManualReviewAccepted(false)
+      setKreaLocalContentAccepted(false)
+      setKreaAttributionAccepted(false)
+      setNotice({
+        kind: 'success',
+        text: 'Krea 2 license conditions recorded. Model files, creator terms, project access, and runtime readiness remain separate.',
+      })
+    } catch (error) {
+      if (epoch !== kreaOwnerPolicyEpochRef.current) return
+      setKreaOwnerPolicyError(
+        error instanceof AccountApiError
+          ? error.message
+          : 'Krea 2 license conditions could not be recorded.',
+      )
+    } finally {
+      if (epoch === kreaOwnerPolicyEpochRef.current) {
+        setKreaOwnerPolicySaving(false)
+      }
+    }
+  }
+
+  const h3TerritoryCode = h3LegalAccessTerritoryCode || h3LegalAccess?.territory_code || ''
+  const h3AvailabilityStatus = h3LegalAccess?.availability_status || 'location_declaration_required'
+  const h3CanSave = Boolean(
+    h3TerritoryCode
+    && h3LegalAccessAttested
+    && h3LegalAccess?.license_revision
+    && h3LegalAccess?.license_sha256,
+  )
+  const kreaPolicyRecorded = kreaOwnerPolicy?.availability_status === 'license_conditions_recorded'
+  const kreaCanSave = Boolean(
+    kreaOwnerPolicy
+    && kreaOwnerAttested
+    && kreaManualReviewAccepted
+    && kreaLocalContentAccepted
+    && kreaAttributionAccepted
+    && !kreaOwnerPolicySaving,
+  )
+
   return (
     <div className="space-y-4">
       {notice && (
@@ -1224,12 +1592,15 @@ export function SupportPanel() {
         <div className="flex items-start gap-3">
           <HeartHandshake size={18} className="mt-0.5 shrink-0 text-accent-blue" aria-hidden="true" />
           <div>
-            <h3 className="text-sm font-semibold text-text-primary">Support Maestro</h3>
+            <h3 className="text-sm font-semibold text-text-primary">Support Maestro Continuum</h3>
             <p className="mt-1 text-[10px] leading-relaxed text-text-secondary">
               Support first helps cover $1,000 in development costs. After that, it can help fund hosting Maestro Continuum with more compute.
             </p>
             <p className="mt-2 text-[10px] leading-relaxed text-text-muted">
-              Support is optional and offers no guarantees or perks. It does not change access or anyone&apos;s responsibilities.
+              Support is optional. Recognition and Maestro queue credits are thank-you benefits, not purchased compute, guaranteed service, or expanded access.
+            </p>
+            <p className="mt-1 text-[10px] leading-relaxed text-text-muted">
+              Zero-credit work remains schedulable, and local or authenticated-LAN use stays available.
             </p>
           </div>
         </div>
@@ -1244,15 +1615,208 @@ export function SupportPanel() {
         </div>
         <p className="mt-2 text-[10px] leading-relaxed text-text-secondary" role="status">
           {directComputeUnlocked
-            ? 'The $1,000 target has been reached. Direct compute sponsorship can be offered when it is configured.'
+            ? 'The initial $1,000 development-cost target has been reached. Vast.ai compute sponsorship may now use the operator-configured destination when one is available.'
             : recovery
-              ? 'Support is still going toward the first $1,000 in development costs. Direct compute sponsorship stays locked until that target is reached.'
-              : 'Recovery status is unavailable, so direct compute sponsorship stays locked.'}
+              ? 'Support is still going toward the first $1,000 in development costs. Vast.ai compute sponsorship stays locked.'
+              : 'Recovery status is unavailable, so Vast.ai compute sponsorship stays locked.'}
         </p>
         <p className="mt-1 text-[9px] leading-relaxed text-text-muted">
-          Maestro checks net recorded USD support after refunds. The running total and contribution history stay private.
+          Maestro checks net recorded USD support after refunds and chargebacks. The running total and contribution history stay private.
         </p>
       </section>
+
+      {supporterPolicy && <SupporterBenefits policy={supporterPolicy} />}
+
+      {ownerSupport && (
+        <section aria-label="H3 legal-access location" className="rounded-xl border border-border bg-bg-tertiary/20 p-3">
+          <div className="flex items-center gap-2">
+            <h3 className="text-xs font-semibold text-text-primary">H3 legal-access location</h3>
+            {h3LegalAccessLoading && <Loader2 size={13} className="animate-spin text-text-muted" aria-label="Refreshing H3 legal-access" />}
+          </div>
+          <div className="mt-2 grid gap-2 sm:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
+            <label className="block text-[10px] font-medium text-text-secondary">
+              <span>Country / region</span>
+              <select
+                value={h3TerritoryCode}
+                onChange={event => {
+                  setH3LegalAccessTerritoryCode(event.target.value)
+                  setH3LegalAccessAttested(false)
+                }}
+                className="mt-1 w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-xs text-text-primary outline-none focus:border-accent-blue focus:ring-1 focus:ring-accent-blue"
+              >
+                <option value="" disabled>Choose the country where this computer runs</option>
+                {H3_LEGAL_ACCESS_TERRITORY_OPTIONS.map(code => (
+                  <option key={code} value={code}>{code}</option>
+                ))}
+              </select>
+            </label>
+            <button
+              type="button"
+              onClick={() => void saveH3LegalAccessTerritory()}
+              disabled={isSavingH3LegalAccess || !h3CanSave}
+              className="mt-5 inline-flex min-h-11 items-center justify-center rounded-lg bg-accent-blue px-3 py-2 text-xs font-semibold text-white hover:opacity-90 disabled:opacity-50"
+            >
+              {isSavingH3LegalAccess
+                ? <Loader2 size={14} className="animate-spin" aria-hidden="true" />
+                : 'Confirm and save'}
+            </button>
+          </div>
+          <label className="mt-3 flex items-start gap-2 rounded-lg border border-border bg-bg-primary/30 p-2 text-[10px] leading-relaxed text-text-secondary">
+            <input
+              type="checkbox"
+              checked={h3LegalAccessAttested}
+              onChange={event => setH3LegalAccessAttested(event.target.checked)}
+              className="mt-0.5 h-4 w-4 shrink-0 accent-accent-blue"
+            />
+            <span>
+              I confirm that the selected country is where this computer will physically run MiniMax H3, and I have reviewed the current MiniMax H3 license.
+            </span>
+          </label>
+          <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[9px] leading-relaxed text-text-muted">
+            <span>Maestro does not infer this declaration from an IP address, VPN, or network location.</span>
+            {h3LegalAccess?.license_url && (
+              <a
+                href={h3LegalAccess.license_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1 text-accent-blue hover:underline"
+              >
+                Review current license <ExternalLink size={10} aria-hidden="true" />
+              </a>
+            )}
+          </div>
+          <p className={`mt-2 inline-flex rounded-md border px-2 py-1 text-[9px] font-medium ${h3LegalAccessStatusClass(h3AvailabilityStatus)}`}>
+            Availability: {h3LegalAccessStatusLabel(h3AvailabilityStatus)}
+          </p>
+          {h3LegalAccess ? (
+            <div className="mt-2 space-y-1 text-[9px] leading-relaxed text-text-muted">
+              <p>MiniMax H3 execution: {h3LegalAccess.execution_allowed ? 'allowed' : 'not allowed'}</p>
+              <p>This setting uses only the owner's country declaration.</p>
+            </div>
+          ) : (
+            <p className="mt-2 text-[9px] leading-relaxed text-text-muted">
+              {h3LegalAccessLoading
+                ? 'Loading H3 legal-access settings.'
+                : h3LegalAccessError
+                  ? h3LegalAccessError
+                  : 'H3 legal-access settings are unavailable in this session.'}
+            </p>
+          )}
+        </section>
+      )}
+
+      {ownerSupport && (
+        <section aria-label="Krea 2 license roles" className="rounded-xl border border-border bg-bg-tertiary/20 p-3">
+          <div className="flex items-center gap-2">
+            <ShieldCheck size={14} className="shrink-0 text-accent-blue" aria-hidden="true" />
+            <h3 className="text-xs font-semibold text-text-primary">Krea 2 license roles</h3>
+            {(kreaOwnerPolicyLoading || kreaOwnerPolicySaving) && (
+              <Loader2 size={13} className="animate-spin text-text-muted" aria-label="Refreshing Krea 2 license settings" />
+            )}
+          </div>
+          <p className="mt-2 text-[10px] leading-relaxed text-text-secondary">
+            Maestro applies these fixed scopes from the signed-in account role. A browser request cannot choose or change its own scope.
+          </p>
+          <dl className="mt-2 grid gap-2 sm:grid-cols-2">
+            <div className="rounded-lg border border-border bg-bg-primary/30 p-2">
+              <dt className="text-[9px] font-semibold uppercase tracking-wide text-text-muted">Owner account</dt>
+              <dd className="mt-1 text-[10px] font-medium text-text-primary">Noncommercial use</dd>
+            </div>
+            <div className="rounded-lg border border-border bg-bg-primary/30 p-2">
+              <dt className="text-[9px] font-semibold uppercase tracking-wide text-text-muted">User account</dt>
+              <dd className="mt-1 text-[10px] font-medium text-text-primary">Commercial use under $1M</dd>
+            </div>
+          </dl>
+          {kreaOwnerPolicy ? (
+            <>
+              <p
+                role="status"
+                className={`mt-2 inline-flex rounded-md border px-2 py-1 text-[9px] font-medium ${
+                  kreaPolicyRecorded
+                    ? 'border-indicator-success/40 bg-indicator-success/10 text-indicator-success'
+                    : 'border-indicator-warning/40 bg-indicator-warning/10 text-indicator-warning'
+                }`}
+              >
+                {kreaPolicyRecorded
+                  ? 'License conditions recorded'
+                  : kreaOwnerPolicy.migration_required
+                    ? 'Previous settings need confirmation'
+                    : 'Owner confirmation required'}
+              </p>
+              <p className="mt-2 text-[9px] leading-relaxed text-text-muted">
+                Recording these conditions does not prove that model files, creator terms, project access, or runtime requirements are ready.
+              </p>
+              <div className="mt-3 space-y-2">
+                <label className="flex items-start gap-2 rounded-lg border border-border bg-bg-primary/30 p-2 text-[10px] leading-relaxed text-text-secondary">
+                  <input
+                    type="checkbox"
+                    checked={kreaOwnerAttested}
+                    onChange={event => setKreaOwnerAttested(event.target.checked)}
+                    className="mt-0.5 h-4 w-4 shrink-0 accent-accent-blue"
+                  />
+                  <span>I reviewed and accept the current Krea 2 Community License and Acceptable Use Policy.</span>
+                </label>
+                <label className="flex items-start gap-2 rounded-lg border border-border bg-bg-primary/30 p-2 text-[10px] leading-relaxed text-text-secondary">
+                  <input
+                    type="checkbox"
+                    checked={kreaManualReviewAccepted}
+                    onChange={event => setKreaManualReviewAccepted(event.target.checked)}
+                    className="mt-0.5 h-4 w-4 shrink-0 accent-accent-blue"
+                  />
+                  <span>I accept responsibility for manually reviewing Krea 2 use and outputs.</span>
+                </label>
+                <label className="flex items-start gap-2 rounded-lg border border-border bg-bg-primary/30 p-2 text-[10px] leading-relaxed text-text-secondary">
+                  <input
+                    type="checkbox"
+                    checked={kreaLocalContentAccepted}
+                    onChange={event => setKreaLocalContentAccepted(event.target.checked)}
+                    className="mt-0.5 h-4 w-4 shrink-0 accent-accent-blue"
+                  />
+                  <span>I attest that locally processed content remains on this host. This policy records license choices without inspecting prompts or outputs.</span>
+                </label>
+                <label className="flex items-start gap-2 rounded-lg border border-border bg-bg-primary/30 p-2 text-[10px] leading-relaxed text-text-secondary">
+                  <input
+                    type="checkbox"
+                    checked={kreaAttributionAccepted}
+                    onChange={event => setKreaAttributionAccepted(event.target.checked)}
+                    className="mt-0.5 h-4 w-4 shrink-0 accent-accent-blue"
+                  />
+                  <span>I accept the current Krea 2 attribution requirements.</span>
+                </label>
+              </div>
+              <div className="mt-3 flex flex-wrap items-center gap-3 text-[9px]">
+                <a href={kreaOwnerPolicy.license_url} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-accent-blue hover:underline">
+                  Review license <ExternalLink size={10} aria-hidden="true" />
+                </a>
+                <a href={kreaOwnerPolicy.acceptable_use_url} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-accent-blue hover:underline">
+                  Review acceptable use policy <ExternalLink size={10} aria-hidden="true" />
+                </a>
+              </div>
+              <button
+                type="button"
+                onClick={() => void saveKreaLicensePolicy()}
+                disabled={!kreaCanSave}
+                className="mt-3 inline-flex min-h-11 w-full items-center justify-center rounded-lg bg-accent-blue px-3 py-2 text-xs font-semibold text-white hover:opacity-90 disabled:opacity-50"
+              >
+                {kreaOwnerPolicySaving
+                  ? <Loader2 size={14} className="animate-spin" aria-hidden="true" />
+                  : 'Record Krea 2 license conditions'}
+              </button>
+            </>
+          ) : (
+            <p className="mt-2 text-[9px] leading-relaxed text-text-muted">
+              {kreaOwnerPolicyLoading
+                ? 'Loading Krea 2 license settings.'
+                : kreaOwnerPolicyError || 'Krea 2 license settings are unavailable in this session.'}
+            </p>
+          )}
+          {kreaOwnerPolicy && kreaOwnerPolicyError && (
+            <p role="alert" className="mt-2 text-[9px] leading-relaxed text-chip-red">
+              {kreaOwnerPolicyError}
+            </p>
+          )}
+        </section>
+      )}
 
       <section aria-labelledby="support-options-heading" className="rounded-xl border border-border bg-bg-tertiary/20 p-3">
         <div className="flex items-center gap-2">
@@ -1271,8 +1835,8 @@ export function SupportPanel() {
                   <span className="mt-1 block text-[9px] leading-relaxed text-text-muted">{provider.description}</span>
                   {!provider.support_url && (
                     <span className="mt-1 block text-[9px] font-medium text-text-muted">
-                      {provider.provider_id === 'direct_compute_sponsorship' && !directComputeUnlocked
-                        ? 'Locked until the $1,000 development-cost target is reached'
+                      {provider.provider_id === 'direct_compute_sponsorship' && provider.state === 'locked'
+                        ? 'Locked until net other support reaches $1,000'
                         : 'Not available in this session'}
                     </span>
                   )}

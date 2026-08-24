@@ -208,6 +208,7 @@ class SupportPortalRouteTests(unittest.TestCase):
             "_support_request_context",
             "get_support_catalog",
             "get_account_support",
+            "receive_buy_me_a_coffee_webhook",
             "get_account_responsible_use",
             "accept_account_responsible_use",
             "get_admin_account_support",
@@ -238,6 +239,7 @@ class SupportPortalRouteTests(unittest.TestCase):
         names = (
             "get_support_catalog",
             "get_account_support",
+            "receive_buy_me_a_coffee_webhook",
             "get_account_responsible_use",
             "accept_account_responsible_use",
             "get_admin_account_support",
@@ -269,6 +271,10 @@ class SupportPortalRouteTests(unittest.TestCase):
             ("GET", "/api/v1/support/catalog", "get_support_catalog"),
             ("GET", "/api/v1/support/self", "get_account_support"),
             (
+                "POST", "/api/v1/support/webhooks/buy-me-a-coffee",
+                "receive_buy_me_a_coffee_webhook",
+            ),
+            (
                 "GET", "/api/v1/support/responsible-use",
                 "get_account_responsible_use",
             ),
@@ -291,6 +297,19 @@ class SupportPortalRouteTests(unittest.TestCase):
                 "record_admin_account_contribution",
             ),
         })
+
+    def test_native_bmac_route_keeps_raw_signed_delivery_private(self):
+        source = LAUNCH_PATH.read_text(encoding="utf-8")
+        start = source.index("async def receive_buy_me_a_coffee_webhook")
+        end = source.index("\n\n@api.", start)
+        route = source[start:end]
+        self.assertIn("raw_body = await request.body()", route)
+        self.assertIn("process_signed_webhook", route)
+        self.assertIn("dict(request.headers.items())", route)
+        self.assertIn('return {"status": "accepted", "duplicate": False}', route)
+        self.assertNotIn("email", route.lower())
+        self.assertNotIn("supporter", route.lower())
+        self.assertNotIn("event_id", route.lower())
 
     def test_route_envelopes_use_only_live_account_session_and_preserve_browser(self):
         portal = _Portal()
@@ -515,6 +534,7 @@ class SupportPortalRouteTests(unittest.TestCase):
             "_reject_cross_origin_mutation": lambda _request: None,
             "_remote_local_only_denial": lambda _request: None,
             "_REMOTE_OWNER_REAUTH_ALLOWED_EXACT": frozenset(),
+            "_note_listener_request": lambda: None,
             "_call_next_with_recovery_no_store": (
                 lambda request, call_next: _call_next_and_stamp(
                     request, call_next,
@@ -669,6 +689,9 @@ class SupportPortalRouteTests(unittest.TestCase):
             def __init__(self, **kwargs):
                 captured["portal"] = kwargs
 
+        def owner_test_credit_projection(_account_id):
+            return {"available": True}
+
         namespace = {
             "os": os,
             "hmac": hmac,
@@ -682,6 +705,7 @@ class SupportPortalRouteTests(unittest.TestCase):
             "ContributionLedger": _Ledger,
             "ResponsibleUseAcceptanceStore": _Acceptance,
             "SupportPortal": _Support,
+            "_owner_test_credit_projection": owner_test_credit_projection,
         }
         with mock.patch.dict(os.environ, {}, clear=True):
             exec(compile(module, str(path), "exec"), namespace)
@@ -695,6 +719,10 @@ class SupportPortalRouteTests(unittest.TestCase):
         )
         self.assertEqual(captured["portal"]["catalog_loader"](), "catalog")
         self.assertEqual(captured["catalog_kwargs"], {})
+        self.assertIs(
+            captured["portal"]["owner_test_credit_resolver"],
+            owner_test_credit_projection,
+        )
         keys = {
             captured["ledger_key"],
             captured["acceptance_key"],
@@ -802,21 +830,15 @@ class SupportPortalRouteTests(unittest.TestCase):
             })
             available = project_with_env({
                 **base_env,
-                "MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_ENABLED": (
-                    "true"
-                ),
+                "MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_ENABLED": "true",
                 "MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_URL": (
-                    "https://support.operator.com/maestro"
+                    "https://vast.ai/support"
                 ),
             })
             malformed_env = {
                 **base_env,
-                "MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_ENABLED": (
-                    "true"
-                ),
-                "MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_URL": (
-                    "https://[bad"
-                ),
+                "MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_ENABLED": "true",
+                "MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_URL": "https://[bad",
             }
             with self.assertRaises(HTTPException) as malformed:
                 project_with_env(malformed_env)
@@ -826,11 +848,9 @@ class SupportPortalRouteTests(unittest.TestCase):
                 env={
                     key: value for key, value in {
                         **base_env,
-                        "MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_ENABLED": (
-                            "true"
-                        ),
+                        "MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_ENABLED": "true",
                         "MAESTRO_SUPPORT_DIRECT_COMPUTE_SPONSORSHIP_URL": (
-                            "https://support.operator.com/maestro"
+                            "https://vast.ai/support"
                         ),
                     }.items()
                     if key != "MAESTRO_ACCOUNTS_ENABLED"
@@ -867,19 +887,18 @@ class SupportPortalRouteTests(unittest.TestCase):
                 for item in disabled["provider_catalog"]["providers"]
             ],
             [
+                "threadspan",
                 "buy_me_a_coffee",
-                "patreon",
                 "direct_compute_sponsorship",
+                "patreon",
             ],
         )
         self.assertEqual(
             provider(unconfigured, "patreon")["state"], "unconfigured",
         )
         direct = provider(available, "direct_compute_sponsorship")
-        self.assertEqual(direct["state"], "available")
-        self.assertEqual(
-            direct["support_url"], "https://support.operator.com/maestro",
-        )
+        self.assertEqual(direct["state"], "locked")
+        self.assertIsNone(direct["support_url"])
         self.assertFalse(available["benefit_availability"][
             "scheduler_enforcement_enabled"
         ])

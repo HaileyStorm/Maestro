@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { Check, ChevronDown, EyeOff, FileUp, ImagePlus, Library, Loader2, MapPin, Package, Pencil, RotateCcw, Trash2, UserRound, X } from 'lucide-react'
-import { useStore } from '../../stores/useStore'
+import { Check, ChevronDown, EyeOff, FileUp, ImagePlus, Library, Loader2, MapPin, Package, Pencil, Plus, RotateCcw, Trash2, UserRound, X } from 'lucide-react'
+import { currentAccountIdentityEpoch, useStore } from '../../stores/useStore'
 import {
   fetchProjectAssets,
   fetchProjectReferenceAuthoring,
@@ -54,6 +54,7 @@ import {
   serializeProjectReferenceCharacterProfile,
   setProjectAssetVariantStatus,
   uploadImage,
+  uploadAudio,
   validateLoraParameterValues,
   verifyManualCheckpoint,
   type ApiModel,
@@ -87,6 +88,21 @@ import { POLL_INTERVAL_MS, useVisibilityPolling } from '../../lib/useVisibilityP
 import { confirmReconnectedJob } from '../../lib/referenceQueue'
 import { formatManualInstallationBytes, manualInstallationDestination } from '../../lib/manualInstallation'
 import { requestQueueView } from '../../lib/mainViewNavigation'
+import {
+  groupSceneKitChoices,
+  sceneKitChoiceKey,
+  sceneKitOutputCount,
+  toggleSceneKitChoice,
+  type SceneKitChoice,
+} from '../../lib/sceneKit'
+import {
+  classifyStudioReferenceMedia,
+  nextSemanticSlotPaths,
+  semanticAudioPromptType,
+  semanticVideoPromptType,
+  STUDIO_SEMANTIC_AUDIO_KEYS,
+  STUDIO_SEMANTIC_VIDEO_KEYS,
+} from '../../lib/studioSemanticReferences'
 
 const ASSET_TYPES = [
   { value: 'character', label: 'Character', icon: UserRound },
@@ -939,8 +955,26 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
   const setGuideVideoFps = useStore(s => s.setGuideVideoFps)
   const setGuideVideoFrameCount = useStore(s => s.setGuideVideoFrameCount)
   const addImageRef = useStore(s => s.addImageRef)
-  const addCharacterRef = useStore(s => s.directorAddCharacterRef)
-  const addLocationRef = useStore(s => s.directorAddLocationRef)
+  const applyReferenceKit = useStore(s => s.directorApplyReferenceKit)
+  const directorReferenceCount = useStore(s => (
+    Number(Boolean(s.directorReferenceImage || s.directorReferenceImagePath))
+    + Math.max(s.directorCharacterRefs.length, s.directorCharacterRefPaths.length)
+    + Math.max(s.directorLocationRefs.length, s.directorLocationRefPaths.length)
+  ))
+  const selectedDirectorVideoModel = useStore(s => s.selectedModelPerMode.video || '')
+  const directorReferenceLimit = useStore(s => (
+    s.models.find(model => model.model_type === s.selectedModelPerMode.video)?.director?.max_image_refs ?? null
+  ))
+  const sceneKitHasPathOnlyRows = useStore(s => (
+    s.directorCharacterRefPaths.length > s.directorCharacterRefs.length
+    || s.directorLocationRefPaths.length > s.directorLocationRefs.length
+  ))
+  const sceneKitAccountFingerprint = useStore(s => {
+    const context = s.accountContext ?? s.accessContext?.accounts
+    return context?.authenticated === true && context.account
+      ? `${context.account.id}\u001f${context.account.role}`
+      : 'local-owner'
+  })
   const reconnectJobs = useStore(s => s.reconnectJobs)
   const hostTerms = useStore(s => s.hostTerms)
   const hostTermsLoading = useStore(s => s.hostTermsLoading)
@@ -953,6 +987,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
   const openModelVisibility = useStore(s => s.openModelVisibility)
   const open = active
   const [assets, setAssets] = useState<ProjectAsset[]>([])
+  const assetsRef = useRef<ProjectAsset[]>([])
   const [loading, setLoading] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [loadError, setLoadError] = useState('')
@@ -1031,11 +1066,14 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
   }>>({})
   const [authoringAvailability, setAuthoringAvailability] = useState<Record<string, ReferenceAuthoringAvailability>>({})
   const [privateReplayRetry, setPrivateReplayRetry] = useState(0)
+  const [sceneKitChoices, setSceneKitChoices] = useState<SceneKitChoice[]>([])
+  const [sceneKitApplying, setSceneKitApplying] = useState(false)
   const requestSequence = useRef(0)
   const catalogRequestSequence = useRef(0)
   const reviewerAutoRefreshSequence = useRef(0)
   const projectEpoch = useRef(0)
   const previousProject = useRef(project)
+  const previousSceneKitAccount = useRef(sceneKitAccountFingerprint)
   const currentProject = useRef(project)
   const enabledModelsSignature = useMemo(
     () => [...enabledModels].sort().join('\u001f'),
@@ -1359,6 +1397,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
   const visibleQueueBlockers = queueBlockers.filter(blocker => blocker.id !== 'submitting')
   const creationPanelStates = getProjectReferenceCreationPanelStates(candidateKind)
   currentProject.current = project
+  assetsRef.current = assets
 
   useEffect(() => {
     if (!authoritativeTypeCapabilities) return
@@ -1394,12 +1433,16 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
   }, [authoritativeTypeCapabilities, customSheetCount, depth, preset, sectionDefinitions])
 
   useEffect(() => {
-    if (previousProject.current === project) return
+    if (previousProject.current === project
+      && previousSceneKitAccount.current === sceneKitAccountFingerprint) return
     previousProject.current = project
+    previousSceneKitAccount.current = sceneKitAccountFingerprint
     projectEpoch.current += 1
     requestSequence.current += 1
     const resetSections = createSectionState('character', 'standard', 3)
     setAssets([])
+    setSceneKitChoices([])
+    setSceneKitApplying(false)
     setCatalogModels([])
     setReferenceCapabilities(null)
     setCapabilitiesLoadError('')
@@ -1461,7 +1504,26 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
     setReviewerAction(null)
     setReviewerActionError('')
     setActionError('')
-  }, [project])
+  }, [project, sceneKitAccountFingerprint])
+
+  useEffect(() => {
+    setSceneKitChoices(current => {
+      const next = current.filter(choice => {
+        const asset = assets.find(candidate => candidate.id === choice.assetId)
+        return Boolean(
+          asset
+          && getDirectorProjectReferenceKind(asset.asset_type) === choice.kind
+          && asset.variants.some(variant => (
+            variant.id === choice.variantId
+            && variant.status === 'kept'
+            && getProjectAssetApplyOutputs(variant).length === choice.outputCount
+            && getProjectAssetApplyOutputs(variant).every((output, index) => output.id === choice.outputIds[index])
+          )),
+        )
+      })
+      return next.length === current.length ? current : next
+    })
+  }, [assets])
 
   useLayoutEffect(() => {
     if (!projectExplicitlyLocked) return
@@ -1474,6 +1536,8 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
     authoringAvailabilityRef.current.clear()
     setAuthoringAvailability({})
     setAssets([])
+    setSceneKitChoices([])
+    setSceneKitApplying(false)
     setCatalogModels([])
     setReferenceCapabilities(null)
     setCapabilitiesLoadError('')
@@ -2811,6 +2875,15 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
       const directorReferenceKind = getDirectorProjectReferenceKind(asset.asset_type)
       const outputs = getProjectAssetApplyOutputs(variant)
       if (outputs.length === 0) throw new Error('This reference candidate has no usable media')
+      if (referenceReturnMode === 'director' && directorReferenceKind) {
+        if (sceneKitHasPathOnlyRows) {
+          throw new Error('A recovered Director reference is available by saved path only. Remove it or finish that Director plan before adding another reference.')
+        }
+        if (directorReferenceLimit != null
+          && directorReferenceCount + outputs.length > directorReferenceLimit) {
+          throw new Error(`This reference needs ${outputs.length} slots, but only ${Math.max(0, directorReferenceLimit - directorReferenceCount)} remain for the selected Director model.`)
+        }
+      }
       if (referenceReturnMode === 'director'
         && !directorReferenceKind
         && !outputs[0].media_type?.startsWith('video/')) {
@@ -2826,12 +2899,16 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
         files.push({ output, file: new File([blob], output.filename, { type: blob.type || output.media_type }) })
       }
       const [{ output, file }] = files
-      if (output.media_type?.startsWith('video/')) {
+      const metadata = variant.metadata || {}
+      const isBlenderControlVideo = Boolean(
+        output.media_type?.startsWith('video/')
+        && (metadata.recommended_video_prompt_type || metadata.semantic_mapping || metadata.recommended_model_type),
+      )
+      if (isBlenderControlVideo) {
         // A Director-approved Blender animation is a full-rate Studio control
         // reference with a paired semantic prompt, even when the library was
         // opened from Director mode.
         const setStudioParam = setParam as (key: string, value: unknown) => void
-        const metadata = variant.metadata || {}
         const semanticMapping = metadata.semantic_mapping
         const semanticPrompt = typeof metadata.conditioned_prompt === 'string'
           ? metadata.conditioned_prompt
@@ -2858,9 +2935,14 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
         }
       } else if (referenceReturnMode === 'director') {
         if (!isProjectAssetOperationCurrent(submittedProject, epoch, currentProject.current, projectEpoch.current)) return
-        for (const item of files) {
-          if (directorReferenceKind === 'character') addCharacterRef(item.file)
-          else addLocationRef(item.file)
+        if (!directorReferenceKind || !applyReferenceKit(files.map((item, index) => ({
+          kind: directorReferenceKind || 'location',
+          file: item.file,
+          label: files.length > 1
+            ? `${asset.name} · ${variant.label} · Sheet ${index + 1}`
+            : `${asset.name} · ${variant.label}`,
+        })), directorReferenceCount, selectedDirectorVideoModel)) {
+          throw new Error('Director references changed while this reference was loading. Review the current slots and try again; nothing was added.')
         }
       } else {
         // Project asset cards are semantic identity/setting/item references in
@@ -2870,7 +2952,32 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
         if (generationMode === 'video') {
           selectModel('minimax_h3_ref2va')
         }
-        for (const item of files) addImageRef(item.file)
+        const setStudioParam = setParam as (key: string, value: unknown) => void
+        const current = useStore.getState().params
+        let videoPaths = STUDIO_SEMANTIC_VIDEO_KEYS
+          .map(key => current[key])
+          .filter((path): path is string => typeof path === 'string' && path.length > 0)
+        let audioPaths = STUDIO_SEMANTIC_AUDIO_KEYS
+          .map(key => current[key])
+          .filter((path): path is string => typeof path === 'string' && path.length > 0)
+        for (const item of files) {
+          const kind = classifyStudioReferenceMedia(item.output.media_type, item.file.name)
+          if (kind === 'video') {
+            const uploaded = await uploadImage(item.file)
+            if (!isProjectAssetOperationCurrent(submittedProject, epoch, currentProject.current, projectEpoch.current)) return
+            videoPaths = nextSemanticSlotPaths(videoPaths, uploaded.path, 3)
+          } else if (kind === 'audio') {
+            const uploaded = await uploadAudio(item.file)
+            if (!isProjectAssetOperationCurrent(submittedProject, epoch, currentProject.current, projectEpoch.current)) return
+            audioPaths = nextSemanticSlotPaths(audioPaths, uploaded.path, 3)
+          } else {
+            addImageRef(item.file)
+          }
+        }
+        STUDIO_SEMANTIC_VIDEO_KEYS.forEach((key, index) => setStudioParam(key, videoPaths[index]))
+        setStudioParam('video_prompt_type', semanticVideoPromptType(videoPaths.length))
+        STUDIO_SEMANTIC_AUDIO_KEYS.forEach((key, index) => setStudioParam(key, audioPaths[index]))
+        setStudioParam('audio_prompt_type', semanticAudioPromptType(audioPaths.length))
       }
       setSidebarMode(destination)
     } catch (reason) {
@@ -2878,6 +2985,98 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
       setActionError(projectReferenceSafeErrorMessage(reason, 'Could not use this reference.'))
     }
   }
+
+  const applySceneKit = async () => {
+    if (sceneKitChoices.length === 0 || sceneKitApplying) return
+    const epoch = projectEpoch.current
+    const submittedProject = project
+    const accountEpoch = currentAccountIdentityEpoch()
+    const operationCurrent = () => (
+      currentAccountIdentityEpoch() === accountEpoch
+      && isProjectAssetOperationCurrent(submittedProject, epoch, currentProject.current, projectEpoch.current)
+    )
+    const selectionStillCurrent = () => sceneKitChoices.every(choice => {
+      const asset = assetsRef.current.find(candidate => candidate.id === choice.assetId)
+      const variant = asset?.variants.find(candidate => candidate.id === choice.variantId)
+      const outputs = variant ? getProjectAssetApplyOutputs(variant) : []
+      return Boolean(
+        asset
+        && variant?.status === 'kept'
+        && getDirectorProjectReferenceKind(asset.asset_type) === choice.kind
+        && outputs.length === choice.outputCount
+        && outputs.every((output, index) => output.id === choice.outputIds[index]),
+      )
+    })
+    const selectedOutputs = sceneKitChoices.flatMap(choice => {
+      const asset = assets.find(candidate => candidate.id === choice.assetId)
+      const variant = asset?.variants.find(candidate => candidate.id === choice.variantId)
+      if (!asset || !variant || variant.status !== 'kept') return []
+      const kind = getDirectorProjectReferenceKind(asset.asset_type)
+      if (!kind) return []
+      const outputs = getProjectAssetApplyOutputs(variant)
+      if (outputs.length !== choice.outputCount
+        || outputs.some((output, index) => output.id !== choice.outputIds[index])) return []
+      return outputs.map((output, outputIndex) => ({
+        asset,
+        variant,
+        kind,
+        output,
+        label: outputs.length > 1
+          ? `${asset.name} · ${variant.label} · Sheet ${outputIndex + 1}`
+          : `${asset.name} · ${variant.label}`,
+      }))
+    })
+    if (selectedOutputs.length !== sceneKitOutputCount(sceneKitChoices)) {
+      setActionError('One of the selected references changed. Review the Scene Kit and try again.')
+      return
+    }
+    if (directorReferenceLimit != null
+      && directorReferenceCount + selectedOutputs.length > directorReferenceLimit) {
+      setActionError(`This kit needs ${selectedOutputs.length} reference slots, but ${Math.max(0, directorReferenceLimit - directorReferenceCount)} remain for ${selectedDirectorVideoModel || 'the selected Director model'}.`)
+      return
+    }
+    setSceneKitApplying(true)
+    setActionError('')
+    try {
+      const entries: Array<{ kind: 'character' | 'location'; file: File; label: string }> = []
+      for (const item of selectedOutputs) {
+        const response = await fetch(getProjectAssetMediaUrl(submittedProject, item.output.relative_path))
+        if (!response.ok) throw projectAssetRequestError(response.status, 'Could not load Scene Kit media')
+        const blob = await response.blob()
+        if (!operationCurrent()) return
+        entries.push({
+          kind: item.kind,
+          file: new File([blob], item.output.filename, { type: blob.type || item.output.media_type }),
+          label: item.label,
+        })
+      }
+      if (!operationCurrent()) return
+      if (!selectionStillCurrent()) {
+        setActionError('One of the selected references changed while this kit was loading. Review the Scene Kit and try again; nothing was added.')
+        return
+      }
+      const applied = applyReferenceKit(entries, directorReferenceCount, selectedDirectorVideoModel)
+      if (!applied) {
+        setActionError('Director references changed while this kit was loading. Review the current slots and try again; nothing was added.')
+        return
+      }
+      setSceneKitChoices([])
+      setSidebarMode('director')
+    } catch (reason) {
+      if (!operationCurrent()) return
+      setActionError(projectReferenceSafeErrorMessage(reason, 'Could not apply the Scene Kit. Nothing was added.'))
+    } finally {
+      if (operationCurrent()) setSceneKitApplying(false)
+    }
+  }
+
+  const groupedSceneKit = groupSceneKitChoices(sceneKitChoices)
+  const sceneKitSlots = sceneKitOutputCount(sceneKitChoices)
+  const sceneKitRemainingSlots = directorReferenceLimit == null
+    ? null
+    : Math.max(0, directorReferenceLimit - directorReferenceCount)
+  const sceneKitOverCapacity = sceneKitRemainingSlots != null && sceneKitSlots > sceneKitRemainingSlots
+  const sceneKitUnavailable = sceneKitHasPathOnlyRows
 
   return (
     <section
@@ -3627,6 +3826,53 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                   <div className="flex h-48 items-center justify-center text-xs text-text-muted">No reference cards in this project yet.</div>
                 ) : (
                   <div className="space-y-4">
+                    {referenceReturnMode === 'director' && (
+                      <section aria-labelledby="scene-kit-title" className="rounded-xl border border-accent-blue/30 bg-accent-blue/[0.05] p-3">
+                        <div className="flex flex-wrap items-start justify-between gap-2">
+                          <div>
+                            <h3 id="scene-kit-title" className="text-xs font-semibold text-text-primary">Scene Kit · Cast Board</h3>
+                            <p className="text-[9px] text-text-muted">Pick kept Character and Location packs below, then attach the whole cast and set in one move.</p>
+                          </div>
+                          <span className="rounded-full bg-bg-primary/60 px-2 py-1 text-[9px] text-text-secondary">
+                            {sceneKitChoices.length} picks · {sceneKitSlots} sheets
+                            {sceneKitRemainingSlots != null ? ` · ${sceneKitRemainingSlots} slots left` : ''}
+                          </span>
+                        </div>
+                        {sceneKitChoices.length > 0 ? (
+                          <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                            {([
+                              ['Cast', groupedSceneKit.characters],
+                              ['Locations', groupedSceneKit.locations],
+                            ] as const).map(([label, choices]) => (
+                              <div key={label} className="min-w-0 rounded-lg border border-border bg-bg-secondary/70 p-2">
+                                <p className="text-[9px] font-semibold uppercase tracking-wide text-text-muted">{label}</p>
+                                {choices.length > 0 ? (
+                                  <ol className="mt-1 space-y-1">
+                                    {choices.map((choice, index) => (
+                                      <li key={choice.key} className="flex min-w-0 items-center gap-1.5 text-[9px] text-text-secondary">
+                                        <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-bg-primary text-[8px] font-bold">{index + 1}</span>
+                                        <span className="min-w-0 flex-1 truncate">{choice.assetName} · {choice.variantLabel}</span>
+                                        <span className="shrink-0 text-text-muted">{choice.outputCount}</span>
+                                      </li>
+                                    ))}
+                                  </ol>
+                                ) : <p className="mt-1 text-[9px] text-text-muted">Nothing selected</p>}
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="mt-2 rounded-lg border border-dashed border-border px-3 py-2 text-[9px] text-text-muted">Use “Add to Scene Kit” on any kept Character or Location candidate.</p>
+                        )}
+                        {sceneKitOverCapacity && <p role="status" className="mt-2 text-[9px] text-amber-200">This selection needs {sceneKitSlots} slots; only {sceneKitRemainingSlots} remain.</p>}
+                        {sceneKitUnavailable && <p role="status" className="mt-2 text-[9px] text-amber-200">A recovered Director reference is available by saved path only. Remove it or finish that Director plan before attaching a new kit.</p>}
+                        <div className="mt-2 grid grid-cols-[auto_1fr] gap-1.5">
+                          <button type="button" onClick={() => setSceneKitChoices([])} disabled={sceneKitChoices.length === 0 || sceneKitApplying} className="mobile-control-target rounded-lg border border-border px-3 text-[10px] text-text-secondary disabled:opacity-40">Clear</button>
+                          <button type="button" onClick={() => void applySceneKit()} disabled={sceneKitChoices.length === 0 || sceneKitApplying || sceneKitOverCapacity || sceneKitUnavailable} className="mobile-control-target flex items-center justify-center gap-1.5 rounded-lg bg-accent-blue px-3 text-[10px] font-semibold text-white disabled:opacity-40">
+                            {sceneKitApplying ? <Loader2 size={11} className="animate-spin" /> : <Check size={11} />} {sceneKitApplying ? 'Attaching kit…' : 'Attach kit to Director'}
+                          </button>
+                        </div>
+                      </section>
+                    )}
                     {assets.map(asset => (
                       <section key={asset.id} className="rounded-lg border border-border bg-bg-tertiary/60 p-3">
                         <div className="flex items-start justify-between gap-2">
@@ -3743,6 +3989,8 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                             const directorApplyUnsupported = referenceReturnMode === 'director'
                               && directorReferenceKind === null
                               && !applyOutput?.media_type?.startsWith('video/')
+                            const sceneKitKey = sceneKitChoiceKey(asset.id, variant.id)
+                            const sceneKitSelected = sceneKitChoices.some(choice => choice.key === sceneKitKey)
                             const applyLabel = applyOutput?.media_type?.startsWith('video/')
                               ? 'Use in Generate as an LTX-2.3 control and prompt'
                               : variant.variant_type === 'reference_pack'
@@ -3857,18 +4105,18 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                                     </details>
                                   )}
                                   <div className="mt-1.5 flex gap-1">
-                                    <button type="button" disabled={Boolean(pendingAction)} onClick={() => void updateStatus(asset.id, variant.id, 'kept')} className="flex flex-1 items-center justify-center gap-1 rounded bg-accent-green/15 px-1 py-1 text-[9px] text-accent-green disabled:opacity-40"><Check size={9} /> Keep</button>
-                                    <button type="button" disabled={Boolean(pendingAction)} onClick={() => void updateStatus(asset.id, variant.id, 'rejected')} className="rounded border border-border px-2 py-1 text-[9px] text-text-muted disabled:opacity-40">Reject</button>
-                                    <button type="button" disabled={Boolean(pendingAction)} onClick={() => void deleteVariant(asset.id, variant.id, variant.label)} className="rounded border border-red-500/30 px-2 py-1 text-red-400 disabled:opacity-40" title="Delete candidate and copied media" aria-label={`Delete ${variant.label}`}><Trash2 size={9} /></button>
+                                    <button type="button" disabled={sceneKitApplying || Boolean(pendingAction)} onClick={() => void updateStatus(asset.id, variant.id, 'kept')} className="flex flex-1 items-center justify-center gap-1 rounded bg-accent-green/15 px-1 py-1 text-[9px] text-accent-green disabled:opacity-40"><Check size={9} /> Keep</button>
+                                    <button type="button" disabled={sceneKitApplying || Boolean(pendingAction)} onClick={() => void updateStatus(asset.id, variant.id, 'rejected')} className="rounded border border-border px-2 py-1 text-[9px] text-text-muted disabled:opacity-40">Reject</button>
+                                    <button type="button" disabled={sceneKitApplying || Boolean(pendingAction)} onClick={() => void deleteVariant(asset.id, variant.id, variant.label)} className="rounded border border-red-500/30 px-2 py-1 text-red-400 disabled:opacity-40" title="Delete candidate and copied media" aria-label={`Delete ${variant.label}`}><Trash2 size={9} /></button>
                                   </div>
                                   {(variant.variant_type === 'reference_sheet' || variant.variant_type === 'reference_pack') && (
                                     <div className="mt-1.5 grid grid-cols-2 gap-1">
-                                      <button type="button" disabled={Boolean(pendingAction) || !exactRetryReady} onClick={() => void generateFromVariant(asset, variant)} className="flex items-center justify-center gap-1 rounded border border-border px-1 py-1 text-[9px] text-text-secondary disabled:opacity-40">
+                                      <button type="button" disabled={sceneKitApplying || Boolean(pendingAction) || !exactRetryReady} onClick={() => void generateFromVariant(asset, variant)} className="flex items-center justify-center gap-1 rounded border border-border px-1 py-1 text-[9px] text-text-secondary disabled:opacity-40">
                                         {pendingAction ? <Loader2 size={9} className="animate-spin" /> : <RotateCcw size={9} />} Retry
                                       </button>
                                       <button
                                         type="button"
-                                        disabled={Boolean(pendingAction) || !exactRetryReady}
+                                        disabled={sceneKitApplying || Boolean(pendingAction) || !exactRetryReady}
                                         aria-expanded={editing}
                                         aria-controls={`reference-sheet-edit-${variant.id}`}
                                         onClick={() => {
@@ -3919,7 +4167,28 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                                   )}
                                   {variant.status === 'kept' && applyOutput && (
                                     <>
-                                      <button type="button" disabled={directorApplyUnsupported} onClick={() => void applyReference(asset, variant)} className="mt-1.5 w-full rounded border border-accent-blue/40 px-1 py-1 text-[9px] text-accent-blue disabled:cursor-not-allowed disabled:border-border disabled:text-text-muted">{directorApplyUnsupported ? 'Use from Generate' : applyLabel}</button>
+                                      {referenceReturnMode === 'director' && directorReferenceKind && (
+                                        <button
+                                          type="button"
+                                          aria-label={`${sceneKitSelected ? 'Remove' : 'Add'} ${asset.name} · ${variant.label} ${sceneKitSelected ? 'from' : 'to'} Scene Kit`}
+                                          aria-pressed={sceneKitSelected}
+                                          disabled={sceneKitApplying}
+                                          onClick={() => setSceneKitChoices(current => toggleSceneKitChoice(current, {
+                                            key: sceneKitKey,
+                                            assetId: asset.id,
+                                            variantId: variant.id,
+                                            assetName: asset.name,
+                                            variantLabel: variant.label,
+                                            kind: directorReferenceKind,
+                                            outputCount: applyOutputs.length,
+                                            outputIds: applyOutputs.map(output => output.id),
+                                          }))}
+                                          className={`mobile-control-target mt-1.5 flex w-full items-center justify-center gap-1 rounded border px-2 text-[9px] ${sceneKitSelected ? 'border-accent-green/60 bg-accent-green/10 text-accent-green' : 'border-border text-text-secondary hover:border-accent-blue/50 hover:text-accent-blue'}`}
+                                        >
+                                          {sceneKitSelected ? <Check size={9} /> : <Plus size={9} />} {sceneKitSelected ? 'Selected for Scene Kit' : 'Add to Scene Kit'}
+                                        </button>
+                                      )}
+                                      <button type="button" disabled={directorApplyUnsupported || sceneKitApplying} onClick={() => void applyReference(asset, variant)} className="mt-1.5 w-full rounded border border-accent-blue/40 px-1 py-1 text-[9px] text-accent-blue disabled:cursor-not-allowed disabled:border-border disabled:text-text-muted">{directorApplyUnsupported ? 'Use from Generate' : applyLabel}</button>
                                       {directorApplyUnsupported && <p className="mt-1 text-[8px] leading-relaxed text-amber-200">Director currently accepts only Character and Location references. Use this candidate from Generate instead.</p>}
                                     </>
                                   )}

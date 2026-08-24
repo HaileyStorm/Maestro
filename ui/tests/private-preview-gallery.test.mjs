@@ -503,12 +503,16 @@ async function loadProjectAssetPreviewHarness() {
       export const MapPin = icon
       export const Package = icon
       export const Pencil = icon
+      export const Plus = icon
       export const RotateCcw = icon
       export const Trash2 = icon
       export const UserRound = icon
       export const X = icon
     `],
-    ['../../stores/useStore', 'export function useStore() { return {} }'],
+    ['../../stores/useStore', `
+      export function currentAccountIdentityEpoch() { return 0 }
+      export function useStore() { return {} }
+    `],
     ['./BlenderSceneTool', 'export function BlenderSceneTool() { return null }'],
     ['../../lib/hostTerms', 'export const HOST_TERM_NOTICES = {}'],
     ['../../lib/privatePreview', `

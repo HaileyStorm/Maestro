@@ -80,6 +80,7 @@ def _launch_subset(*names: str, include_remote_constants: bool = False) -> dict:
         "FileResponse": FileResponse,
         "HTTPException": HTTPException,
         "quote": quote,
+        "_note_listener_request": lambda: None,
         "_request_is_cloudflare_remote": lambda _request: True,
         "_STATE_CHANGING_METHODS": frozenset({"POST", "PUT", "PATCH", "DELETE"}),
     }
@@ -354,7 +355,7 @@ class RecipeUiSourceHarnessTests(unittest.TestCase):
         self.assertIn("aria-pressed={sidebarMode === 'studio'}", sidebar)
         self.assertIn("aria-pressed={isDirector}", sidebar)
         self.assertIn("aria-pressed={isReference}", sidebar)
-        self.assertIn('aria-label="Generate, Director, and Reference menu"', sidebar)
+        self.assertIn('aria-label="Generate, Director, and References menu"', sidebar)
         self.assertIn("<ProjectReferenceLibrary active={isReference} />", sidebar)
         self.assertIn('h-[100dvh]', sidebar)
         self.assertIn('role="dialog"', sidebar)

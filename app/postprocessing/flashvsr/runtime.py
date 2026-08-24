@@ -797,6 +797,12 @@ class FlashVSRRuntime:
                     raise RuntimeError("FlashVSR full variant requires the Wan VAE.")
                 vae_tile_size = int(vae_tile_size or 0)
                 print(f"[FlashVSR] Wan VAE tiling policy: tile_size={vae_tile_size}px")
+                # Denoise occupancy is finished. Unload the transformer tenant
+                # so VAE decode can use the GPU; MMGP reloads VAE layers.
+                print("[FlashVSR] Yielding denoise occupancy before VAE decode")
+                self.dit.clear_cross_kv()
+                self.lq_proj.clear_cache()
+                self._unload_mmgp()
                 save_still_debug_video = still_image and FLASHVSR_SAVE_STILL_IMAGE_DEBUG_VIDEO
                 decode_latents = latents[0, :, :first_chunk_latent_frames].contiguous() if still_image else latents[0]
                 frames = self.vae.decode_to_cpu_uint8([decode_latents], vae_tile_size, target_frames=None if save_still_debug_video else 1 if still_image else input_frames, target_height=output_height, target_width=output_width, frame_start=0 if save_still_debug_video or not still_image else still_output_frame)[0]

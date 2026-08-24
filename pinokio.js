@@ -71,7 +71,16 @@ module.exports = {
     // before its hardware inventory has populated that property, which would
     // hide Start from supported systems. install.js retains the documented
     // execution-time NVIDIA check for fresh installations.
-    let installed = info.exists("app/env")
+    // A complete install may live in the preserved compatibility environment,
+    // the preferred H3 Sol environment, or RTX 50's dedicated CUDA 13
+    // environment. Keep all three visible so a clean profile-specific install
+    // reaches the normal Start/Update menu instead of being offered Install
+    // again.
+    let installed = (
+      info.exists("app/env") ||
+      info.exists("app/env-sol") ||
+      info.exists("app/env-rtx50")
+    )
     let running = {
       install: info.running("install.js"),
       restart: info.running("restart.js"),

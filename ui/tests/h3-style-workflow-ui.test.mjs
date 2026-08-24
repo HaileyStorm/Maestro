@@ -16,6 +16,8 @@ import {
   captureH3StyleWorkflowRequest,
   h3StyleWorkflowCatalogStateLabel,
   h3StyleWorkflowSupportsModel,
+  h3StyleWorkflowSwatch,
+  nextH3StyleWorkflowSurprise,
   resolveH3StyleWorkflowRequest,
   stripLegacyH3StylePrefix,
 } from '../src/lib/h3StyleWorkflows.ts'
@@ -35,7 +37,7 @@ const workflow = {
   supported_h3_modes: ['t2va', 'fl2va', 'ref2va'],
 }
 
-function catalog(updateStatus = 'cached') {
+function catalog(updateStatus = 'cached', styles = [workflow]) {
   return {
     source: 'https://github.com/MiniMax-AI/MiniMax-H3/tree/main/skills',
     revision: 'official-revision',
@@ -52,7 +54,7 @@ function catalog(updateStatus = 'cached') {
       supported_h3_modes: ['t2va', 'fl2va', 'ref2va'],
       supported_model_types: ['minimax_h3', 'minimax_h3_ref2va'],
     },
-    styles: [workflow],
+    styles,
   }
 }
 
@@ -200,39 +202,100 @@ test('pipeline request captures the effective model and workflow together after 
   })
 })
 
-test('mounted Generate and Director controls use server catalog provenance and effective model gating', async () => {
+test('mounted Generate and Director jukeboxes use exact server cards without mutating prompt text', async () => {
   const { H3StyleWorkflowField } = await loadControlModule()
   const selections = []
+  let retries = 0
   let prompt = 'authored prompt bytes\n\nremain exact'
+  const duplicateLabelWorkflow = {
+    ...workflow,
+    id: 'paper-collage-explainer-generator',
+    description: 'A second exact server description.',
+  }
   globalThis.__maestroH3WorkflowStore = {
-    h3StyleWorkflowCatalog: catalog('offline_fallback'),
+    h3StyleWorkflowCatalog: catalog('offline_fallback', [workflow, duplicateLabelWorkflow]),
     h3StyleWorkflowCatalogLoading: false,
     h3StyleWorkflowCatalogError: null,
     h3StyleWorkflow: workflow.id,
     setH3StyleWorkflow(id) { selections.push(id) },
-    loadH3StyleWorkflowCatalog() {},
+    loadH3StyleWorkflowCatalog(force) { if (force) retries += 1 },
     params: { prompt },
   }
 
   for (const surface of ['Generate', 'Director']) {
     const tree = H3StyleWorkflowField({ effectiveVideoModel: 'minimax_h3', surface })
     const elements = flattenElements(tree)
-    const select = elements.find(element => element.type === 'select')
-    assert.ok(select)
-    assert.equal(select.props['aria-label'], `${surface} creative guide`)
-    assert.deepEqual(
-      flattenElements(select.props.children).filter(element => element.type === 'option').map(element => element.props.value),
-      ['', workflow.id],
-    )
+    const cards = elements.filter(element => element.props?.['data-workflow-id'])
+    assert.deepEqual(cards.map(card => card.props['data-workflow-id']), [workflow.id, duplicateLabelWorkflow.id])
+    assert.deepEqual(cards.map(card => card.key), [workflow.id, duplicateLabelWorkflow.id])
+    assert.equal(cards[0].props['aria-pressed'], true)
+    assert.equal(cards[1].props['aria-pressed'], false)
+    assert.match(elementText(cards[0]), /Papercraft stop-motion explainer.*Tactile handmade paper explainer metadata\..*Selected/)
+    assert.match(elementText(cards[1]), /Papercraft stop-motion explainer.*A second exact server description\./)
     assert.match(elementText(tree), /Choose an optional guide for pacing, framing, and finish/)
     assert.match(elementText(tree), /original recipe may include details this guide does not apply/)
     assert.match(elementText(tree), /Source detailsMiniMax H3 recipe library · Offline fallback catalog · revision official-revision · Maestro interpretation/)
     assert.equal(elements.find(element => element.type === 'a')?.props.href, catalog().source)
-    select.props.onChange({ target: { value: '' } })
+    const surprise = elements.find(element => element.type === 'button' && /Surprise me/.test(elementText(element)))
+    surprise.props.onClick()
+    cards[1].props.onClick()
+    const clear = elements.find(element => element.type === 'button' && elementText(element) === 'Clear')
+    clear.props.onClick()
     assert.equal(prompt, 'authored prompt bytes\n\nremain exact')
   }
-  assert.deepEqual(selections, ['', ''])
+  assert.deepEqual(selections, [
+    duplicateLabelWorkflow.id, duplicateLabelWorkflow.id, '',
+    duplicateLabelWorkflow.id, duplicateLabelWorkflow.id, '',
+  ])
   assert.equal(H3StyleWorkflowField({ effectiveVideoModel: 'minimax_h3_spoof', surface: 'Generate' }), null)
+
+  globalThis.__maestroH3WorkflowStore.h3StyleWorkflowCatalog = catalog('cached', [])
+  globalThis.__maestroH3WorkflowStore.h3StyleWorkflow = ''
+  const emptyTree = H3StyleWorkflowField({ effectiveVideoModel: 'minimax_h3', surface: 'Generate' })
+  const emptyElements = flattenElements(emptyTree)
+  assert.match(elementText(emptyTree), /No creative guides are available right now/)
+  assert.match(elementText(emptyTree), /No guide selected · prompt only/)
+  assert.equal(emptyElements.find(element => element.type === 'button' && /Surprise me/.test(elementText(element)))?.props.disabled, true)
+  assert.equal(emptyElements.find(element => elementText(element) === 'Clear')?.props.disabled, true)
+
+  globalThis.__maestroH3WorkflowStore.h3StyleWorkflowCatalog = null
+  globalThis.__maestroH3WorkflowStore.h3StyleWorkflowCatalogLoading = true
+  const loadingTree = H3StyleWorkflowField({ effectiveVideoModel: 'minimax_h3', surface: 'Generate' })
+  assert.equal(loadingTree.type, 'fieldset')
+  assert.match(elementText(loadingTree), /Creative guide jukeboxLoading creative guides…/)
+  assert.equal(flattenElements(loadingTree).find(element => element.props?.role === 'status')?.props.children, 'Loading creative guides…')
+
+  globalThis.__maestroH3WorkflowStore.h3StyleWorkflowCatalogLoading = false
+  globalThis.__maestroH3WorkflowStore.h3StyleWorkflowCatalogError = 'Creative guide catalog unavailable.'
+  const errorTree = H3StyleWorkflowField({ effectiveVideoModel: 'minimax_h3', surface: 'Generate' })
+  assert.equal(errorTree.type, 'fieldset')
+  assert.match(elementText(errorTree), /Creative guide catalog unavailable\.Retry creative guides/)
+  flattenElements(errorTree).find(element => element.type === 'button')?.props.onClick()
+  assert.equal(retries, 1)
+})
+
+test('Surprise is deterministic per revision, follows server order, and avoids the current card', () => {
+  const styles = Array.from({ length: 32 }, (_, index) => ({ id: `server-style-${index}` }))
+  const first = nextH3StyleWorkflowSurprise(styles, '', 'revision-a')
+  assert.equal(first, nextH3StyleWorkflowSurprise(styles, '', 'revision-a'))
+  assert.ok(styles.some(style => style.id === first))
+
+  const second = nextH3StyleWorkflowSurprise(styles, first, 'revision-a')
+  assert.notEqual(second, first)
+  assert.ok(styles.some(style => style.id === second))
+  assert.notEqual(nextH3StyleWorkflowSurprise(styles, '', 'revision-b'), '')
+  const cycle = new Set()
+  let current = ''
+  for (let index = 0; index < styles.length; index += 1) {
+    current = nextH3StyleWorkflowSurprise(styles, current, 'revision-a')
+    cycle.add(current)
+  }
+  assert.equal(cycle.size, styles.length)
+  assert.equal(nextH3StyleWorkflowSurprise([], 'current', 'revision-a'), '')
+  assert.equal(nextH3StyleWorkflowSurprise([{ id: 'only' }], 'only', 'revision-a'), 'only')
+  assert.equal(h3StyleWorkflowSwatch('papercraft-stop-motion-explainer'), 'paper')
+  assert.equal(h3StyleWorkflowSwatch('music-video-subtitle-generator'), 'rhythmic')
+  assert.equal(h3StyleWorkflowSwatch('unknown-upstream-style'), h3StyleWorkflowSwatch('unknown-upstream-style'))
 })
 
 test('catalog transport preserves fallback and provenance fields without a client catalog', async t => {
@@ -385,6 +448,8 @@ test('source removes client prefix authoring and wires catalog-gated requests on
     readFile(new URL('../src/api/client.ts', import.meta.url), 'utf8'),
   ])
   assert.doesNotMatch(promptInput, /H3_PREPARED_STYLES|H3 prepared style \[|applyPreparedStyle|startsWith\(['"]minimax_h3/)
+  assert.doesNotMatch(promptInput, /Math\.random/)
+  assert.match(promptInput, /nextH3StyleWorkflowSurprise\(styles, selection, sourceRevision\)/)
   assert.match(promptInput, /H3StyleWorkflowField effectiveVideoModel=\{effectiveVideoModel\} surface="Generate"/)
   assert.match(director, /H3StyleWorkflowField effectiveVideoModel=\{effectiveVideoModel\} surface="Director"/)
   assert.match(client, /supported_model_types: string\[\]/)

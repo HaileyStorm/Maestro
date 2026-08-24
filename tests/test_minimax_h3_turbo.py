@@ -834,7 +834,10 @@ class TestH3TurboContinuumHonesty(unittest.TestCase):
     def test_continuum_start_is_not_replaced_by_sol_or_turbo(self):
         start = (_ROOT / "start.js").read_text(encoding="utf-8")
         self.assertIn("python launch.py", start)
-        self.assertIn('venv: "env"', start)
+        self.assertIn("runtimeProfile(kernel)", start)
+        self.assertIn("legacyRuntimeProfile(kernel)", start)
+        self.assertIn("venv: selectedEnv", start)
+        self.assertIn("venv_python: selectedPython", start)
         self.assertNotIn("require(\"./start_sol\")", start)
         self.assertNotIn("MAESTRO_SOL_RUNTIME", start)
         self.assertNotIn("allow_unvalidated_ref2va", start)

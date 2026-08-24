@@ -35,11 +35,13 @@ from services.host_terms import (
 
 
 LEDGER_SCHEMA_VERSION = 1
+ENTITLEMENT_PROJECTION_SCHEMA_VERSION = 2
+SUPPORTER_BENEFIT_SCHEMA_VERSION = 1
+DEVELOPMENT_COST_RECOVERY_TARGET_MINOR = 100_000
+DEVELOPMENT_COST_RECOVERY_CURRENCY = "USD"
 MAX_LEDGER_BYTES = 8 * 1024 * 1024
 MAX_EVENTS = 50_000
 GENESIS_HMAC = "0" * 64
-DEVELOPMENT_COST_RECOVERY_TARGET_MINOR = 100_000
-DEVELOPMENT_COST_RECOVERY_CURRENCY = "USD"
 EVENT_KINDS = frozenset({
     "one_time_contribution",
     "recurring_started",
@@ -62,7 +64,8 @@ FULFILLMENT_STATES = frozenset({
     "pending", "in_progress", "fulfilled", "declined", "reversed",
 })
 MANUAL_CONTRIBUTION_SOURCES = frozenset({
-    "buy_me_a_coffee", "patreon", "direct_compute_sponsorship",
+    "threadspan", "buy_me_a_coffee", "patreon",
+    "direct_compute_sponsorship",
 })
 MANUAL_CONTRIBUTION_KINDS = frozenset({
     "one_time_contribution", "recurring_started", "recurring_renewed",
@@ -71,10 +74,15 @@ MANUAL_CONTRIBUTION_KINDS = frozenset({
 _MANUAL_PROVIDER_BY_SOURCE = MappingProxyType({
     source: f"manual_{source}" for source in MANUAL_CONTRIBUTION_SOURCES
 })
+_DIRECT_COMPUTE_SPONSORSHIP_PROVIDER = "manual_direct_compute_sponsorship"
 _MANUAL_PROVIDERS = frozenset(_MANUAL_PROVIDER_BY_SOURCE.values())
-_DIRECT_COMPUTE_SPONSORSHIP_PROVIDER = _MANUAL_PROVIDER_BY_SOURCE[
-    "direct_compute_sponsorship"
-]
+# Preserve readable provenance from the stale generic Vast source without
+# accepting new writes through that retired identifier.
+_LEGACY_MANUAL_PROVIDERS = frozenset({"manual_vast"})
+_DIRECT_COMPUTE_SPONSORSHIP_PROVIDERS = frozenset({
+    _DIRECT_COMPUTE_SPONSORSHIP_PROVIDER,
+    *_LEGACY_MANUAL_PROVIDERS,
+})
 LEGACY_FULFILLMENT_STATES = frozenset({"complete"})
 _FULFILLMENT_TRANSITIONS = MappingProxyType({
     None: frozenset({"pending"}),
@@ -91,6 +99,15 @@ ACCOUNT_LINK_KINDS = frozenset({
 _OPAQUE_KEY_RE = re.compile(r"key_[0-9a-f]{64}\Z")
 _PROVIDER_RE = re.compile(r"[a-z][a-z0-9_]{1,47}\Z")
 _ITEM_RE = re.compile(r"[a-z][a-z0-9_]{1,63}\Z")
+SUPPORTER_BENEFITS = frozenset({
+    "supporter_recognition",
+    "bounded_queue_priority",
+    "early_access_updates",
+    "supporter_convenience",
+})
+MAX_PROMOTIONAL_MAESTRO_CREDITS = 1_000_000
+MAX_PROMOTIONAL_VALIDITY_SECONDS = 10 * 365 * 24 * 60 * 60
+MAX_CONTRIBUTION_MINOR = 10_000_000_000
 
 
 class EntitlementError(ValueError):
@@ -98,10 +115,6 @@ class EntitlementError(ValueError):
 
 
 class LedgerIntegrityError(EntitlementError):
-    pass
-
-
-class DevelopmentCostRecoveryLockedError(EntitlementError):
     pass
 
 
@@ -289,41 +302,8 @@ def _canonical(value: Any) -> bytes:
 class TierRule:
     tier: str
     minimum_minor: int
+    promotional_maestro_credits: int
     benefits: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class AllowanceRule:
-    minimum_minor: int
-    allowance_units: int
-
-
-@dataclass(frozen=True, slots=True)
-class RecordedAllowancePolicy:
-    unit: str
-    free_allowance_units: int
-    one_time_rules: tuple[AllowanceRule, ...]
-    recurring_rules: tuple[AllowanceRule, ...]
-    one_time_cap_units: int
-    one_time_validity_seconds: int
-    recurring_validity_seconds: int
-
-
-DEFAULT_RECORDED_ALLOWANCE_POLICY = RecordedAllowancePolicy(
-    unit="compute_seconds",
-    free_allowance_units=0,
-    one_time_rules=(
-        AllowanceRule(500, 100),
-        AllowanceRule(2_500, 300),
-    ),
-    recurring_rules=(
-        AllowanceRule(300, 50),
-        AllowanceRule(1_000, 200),
-    ),
-    one_time_cap_units=400,
-    one_time_validity_seconds=90 * 24 * 60 * 60,
-    recurring_validity_seconds=35 * 24 * 60 * 60,
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -331,39 +311,41 @@ class BenefitPolicy:
     currency: str
     one_time_rules: tuple[TierRule, ...]
     recurring_rules: tuple[TierRule, ...]
-    allowance_policy: RecordedAllowancePolicy = DEFAULT_RECORDED_ALLOWANCE_POLICY
+    credit_unit: str = "maestro_credits"
+    one_time_bonus_cap: int = 1_000
+    one_time_validity_seconds: int = 90 * 24 * 60 * 60
+    recurring_validity_seconds: int = 35 * 24 * 60 * 60
+    promotional_credits_enabled: bool = True
 
 
 DEFAULT_BENEFIT_POLICY = BenefitPolicy(
     currency="USD",
     one_time_rules=(
-        TierRule("supporter", 500, ("supporter_record",)),
         TierRule(
-            "backer", 2_500,
-            ("supporter_record", "one_time_credit_eligibility"),
+            "supporter", 500, 25,
+            ("supporter_recognition", "bounded_queue_priority"),
         ),
         TierRule(
-            "sponsor", 10_000,
-            (
-                "supporter_record",
-                "one_time_credit_eligibility",
-                "retention_eligibility",
-            ),
+            "backer", 2_500, 150,
+            ("supporter_recognition", "bounded_queue_priority"),
+        ),
+        TierRule(
+            "sponsor", 10_000, 500,
+            ("supporter_recognition", "bounded_queue_priority"),
         ),
     ),
     recurring_rules=(
-        TierRule("member", 300, ("recurring_supporter_record",)),
         TierRule(
-            "sustainer", 1_000,
-            ("recurring_supporter_record", "periodic_credit_eligibility"),
+            "member", 300, 25,
+            ("supporter_recognition", "bounded_queue_priority"),
         ),
         TierRule(
-            "patron", 2_500,
-            (
-                "recurring_supporter_record",
-                "periodic_credit_eligibility",
-                "retention_eligibility",
-            ),
+            "sustainer", 1_000, 100,
+            ("supporter_recognition", "bounded_queue_priority"),
+        ),
+        TierRule(
+            "patron", 2_500, 250,
+            ("supporter_recognition", "bounded_queue_priority"),
         ),
     ),
 )
@@ -470,6 +452,7 @@ def _normalize_draft(
     draft: ContributionEventDraft,
     *,
     allow_legacy_fulfillment: bool = False,
+    allow_legacy_manual_provider: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(draft, ContributionEventDraft):
         raise EntitlementError("contribution event must use the frozen draft schema")
@@ -539,7 +522,13 @@ def _normalize_draft(
         or (
             draft.actor_key is not None
             and not (
-                draft.provider in _MANUAL_PROVIDERS
+                (
+                    draft.provider in _MANUAL_PROVIDERS
+                    or (
+                        allow_legacy_manual_provider
+                        and draft.provider in _LEGACY_MANUAL_PROVIDERS
+                    )
+                )
                 and draft.kind in MANUAL_CONTRIBUTION_KINDS
             )
         )
@@ -569,14 +558,106 @@ def _tier(rules: Sequence[TierRule], amount_minor: int) -> TierRule | None:
     return selected
 
 
-def _allowance_units(
-    rules: Sequence[AllowanceRule], amount_minor: int,
-) -> int:
-    selected = 0
-    for rule in rules:
-        if amount_minor >= rule.minimum_minor:
-            selected = rule.allowance_units
-    return selected
+def _validate_benefit_policy(policy: BenefitPolicy) -> BenefitPolicy:
+    if not isinstance(policy, BenefitPolicy):
+        raise EntitlementError("supporter benefit policy is invalid")
+    if (
+        not isinstance(policy.currency, str)
+        or re.fullmatch(r"[A-Z]{3}", policy.currency) is None
+        or policy.credit_unit != "maestro_credits"
+        or not isinstance(policy.one_time_bonus_cap, int)
+        or isinstance(policy.one_time_bonus_cap, bool)
+        or policy.one_time_bonus_cap < 0
+        or policy.one_time_bonus_cap > MAX_PROMOTIONAL_MAESTRO_CREDITS
+        or not isinstance(policy.one_time_validity_seconds, int)
+        or isinstance(policy.one_time_validity_seconds, bool)
+        or policy.one_time_validity_seconds <= 0
+        or policy.one_time_validity_seconds > MAX_PROMOTIONAL_VALIDITY_SECONDS
+        or not isinstance(policy.recurring_validity_seconds, int)
+        or isinstance(policy.recurring_validity_seconds, bool)
+        or policy.recurring_validity_seconds <= 0
+        or policy.recurring_validity_seconds > MAX_PROMOTIONAL_VALIDITY_SECONDS
+        or type(policy.promotional_credits_enabled) is not bool
+    ):
+        raise EntitlementError("supporter benefit policy is invalid")
+    for rules in (policy.one_time_rules, policy.recurring_rules):
+        previous_minimum = 0
+        previous_credits = 0
+        tiers: set[str] = set()
+        for rule in rules:
+            if (
+                not isinstance(rule, TierRule)
+                or not isinstance(rule.tier, str)
+                or _ITEM_RE.fullmatch(rule.tier) is None
+                or rule.tier in tiers
+                or not isinstance(rule.minimum_minor, int)
+                or isinstance(rule.minimum_minor, bool)
+                or rule.minimum_minor <= previous_minimum
+                or rule.minimum_minor > MAX_CONTRIBUTION_MINOR
+                or not isinstance(rule.promotional_maestro_credits, int)
+                or isinstance(rule.promotional_maestro_credits, bool)
+                or rule.promotional_maestro_credits <= previous_credits
+                or rule.promotional_maestro_credits
+                > MAX_PROMOTIONAL_MAESTRO_CREDITS
+                or not isinstance(rule.benefits, tuple)
+                or not rule.benefits
+                or len(set(rule.benefits)) != len(rule.benefits)
+                or not set(rule.benefits).issubset(SUPPORTER_BENEFITS)
+                or "bounded_queue_priority" not in rule.benefits
+            ):
+                raise EntitlementError("supporter tier rule is invalid")
+            tiers.add(rule.tier)
+            previous_minimum = rule.minimum_minor
+            previous_credits = rule.promotional_maestro_credits
+    return policy
+
+
+def benefit_policy_public_projection(
+    policy: BenefitPolicy = DEFAULT_BENEFIT_POLICY,
+) -> dict[str, Any]:
+    """Project portable tier terms without contribution or account data."""
+
+    validated = _validate_benefit_policy(policy)
+
+    def project(rule: TierRule) -> dict[str, Any]:
+        return {
+            "tier": rule.tier,
+            "minimum_minor": rule.minimum_minor,
+            "promotional_maestro_credits": (
+                rule.promotional_maestro_credits
+                if validated.promotional_credits_enabled else 0
+            ),
+            "benefits": list(rule.benefits),
+        }
+
+    return {
+        "schema_version": SUPPORTER_BENEFIT_SCHEMA_VERSION,
+        "currency": validated.currency,
+        "credit_unit": validated.credit_unit,
+        "promotional_credits_enabled": validated.promotional_credits_enabled,
+        "one_time_bonus_cap": validated.one_time_bonus_cap,
+        "one_time_validity_seconds": validated.one_time_validity_seconds,
+        "recurring_validity_seconds": validated.recurring_validity_seconds,
+        "one_time_tiers": [project(rule) for rule in validated.one_time_rules],
+        "recurring_tiers": [project(rule) for rule in validated.recurring_rules],
+        "terms": {
+            "cash_value": False,
+            "transferable": False,
+            "refundable": False,
+            "guaranteed_compute": False,
+            "guaranteed_service": False,
+            "unused_bonus_may_expire_or_be_revoked": True,
+        },
+        "notice": (
+            "Support is optional. Promotional Maestro credits are one tier "
+            "benefit alongside supporter recognition and bounded queue "
+            "priority. Credits have no cash value, are "
+            "nontransferable and nonrefundable, do not guarantee compute or "
+            "service, and are subject to the published cap and validity "
+            "periods. Unused bonuses may expire or be revoked under server "
+            "policy. Jobs remain schedulable without credits."
+        ),
+    }
 
 
 def _events_for_subject(
@@ -657,44 +738,26 @@ def _validate_link_transitions(events: Sequence[ContributionEvent]) -> None:
 def _recorded_allowance_projection(
     events: Sequence[ContributionEvent],
     *,
-    policy: RecordedAllowancePolicy,
-    currency: str,
+    policy: BenefitPolicy,
     as_of: datetime,
 ) -> dict[str, Any]:
-    numeric_values = (
-        policy.free_allowance_units,
-        policy.one_time_cap_units,
-        policy.one_time_validity_seconds,
-        policy.recurring_validity_seconds,
-    )
-    rules = (*policy.one_time_rules, *policy.recurring_rules)
-    if (
-        not isinstance(policy.unit, str)
-        or _ITEM_RE.fullmatch(policy.unit) is None
-        or any(
-            not isinstance(value, int)
-            or isinstance(value, bool)
-            or value < 0
-            for value in numeric_values
-        )
-        or any(
-            not isinstance(rule, AllowanceRule)
-            or not isinstance(rule.minimum_minor, int)
-            or isinstance(rule.minimum_minor, bool)
-            or rule.minimum_minor <= 0
-            or not isinstance(rule.allowance_units, int)
-            or isinstance(rule.allowance_units, bool)
-            or rule.allowance_units < 0
-            for rule in rules
-        )
-    ):
-        raise EntitlementError("recorded allowance policy is invalid")
+    validated = _validate_benefit_policy(policy)
+
+    def adjustment_state(amount_minor: int, adjusted_minor: int) -> str:
+        if adjusted_minor <= 0:
+            return "none"
+        if adjusted_minor < amount_minor:
+            return "partial"
+        if adjusted_minor == amount_minor:
+            return "full"
+        return "excess"
 
     funding = {
         (event.provider, event.source_event_key): event
         for event in events
         if event.kind in FUNDING_KINDS
-        and event.currency == currency
+        and event.currency == validated.currency
+        and event.provider not in _DIRECT_COMPUTE_SPONSORSHIP_PROVIDERS
         and _as_utc(event.occurred_at) <= as_of
     }
     adjustments: dict[tuple[str, str], int] = defaultdict(int)
@@ -713,15 +776,13 @@ def _recorded_allowance_projection(
     sources: list[dict[str, Any]] = [{
         "source": "free",
         "source_event_id": None,
-        "granted_allowance": policy.free_allowance_units,
-        "effective_allowance": policy.free_allowance_units,
+        "granted_allowance": 0,
+        "effective_allowance": 0,
         "expires_at": None,
-        "status": (
-            "active" if policy.free_allowance_units > 0 else "inactive"
-        ),
+        "status": "inactive",
         "refund_state": "not_applicable",
     }]
-    one_time_remaining = policy.one_time_cap_units
+    one_time_remaining = validated.one_time_bonus_cap
     one_time_events = sorted(
         (
             event for event in funding.values()
@@ -733,40 +794,43 @@ def _recorded_allowance_projection(
         key = (event.provider, event.source_event_key)
         adjusted = adjustments.get(key, 0)
         net_minor = max(0, event.amount_minor - adjusted)
-        granted = _allowance_units(policy.one_time_rules, event.amount_minor)
-        refundable = _allowance_units(policy.one_time_rules, net_minor)
-        expires = (
-            _as_utc(event.occurred_at)
-            + timedelta(seconds=policy.one_time_validity_seconds)
-            if policy.one_time_validity_seconds > 0
-            else None
+        granted_rule = _tier(validated.one_time_rules, event.amount_minor)
+        effective_rule = _tier(validated.one_time_rules, net_minor)
+        granted = (
+            0 if granted_rule is None
+            else granted_rule.promotional_maestro_credits
         )
-        before_cap = refundable if expires is None or as_of < expires else 0
+        eligible = (
+            0 if effective_rule is None
+            else effective_rule.promotional_maestro_credits
+        )
+        expires = _as_utc(event.occurred_at) + timedelta(
+            seconds=validated.one_time_validity_seconds,
+        )
+        before_cap = (
+            eligible
+            if validated.promotional_credits_enabled and as_of < expires else 0
+        )
         effective = min(before_cap, one_time_remaining)
         one_time_remaining -= effective
         if granted == 0:
             status = "inactive"
-        elif adjusted >= event.amount_minor:
-            status = "refunded"
-        elif expires is not None and as_of >= expires:
+        elif not validated.promotional_credits_enabled or effective_rule is None:
+            status = "canceled"
+        elif as_of >= expires:
             status = "expired"
         elif effective < before_cap:
             status = "capped"
         else:
             status = "active"
         sources.append({
-            "source": "one_time_support",
+            "source": "supporter_tier_bonus",
             "source_event_id": event.event_id,
             "granted_allowance": granted,
             "effective_allowance": effective,
-            "expires_at": None if expires is None else _iso_utc(expires),
+            "expires_at": _iso_utc(expires),
             "status": status,
-            "refund_state": (
-                "none" if adjusted == 0
-                else "partial" if adjusted < event.amount_minor
-                else "full" if adjusted == event.amount_minor
-                else "excess"
-            ),
+            "refund_state": adjustment_state(event.amount_minor, adjusted),
         })
 
     contract_events: dict[tuple[str, str], list[ContributionEvent]] = defaultdict(list)
@@ -776,8 +840,9 @@ def _recorded_allowance_projection(
             and event.contract_key
             and (
                 event.kind == "recurring_canceled"
-                or event.currency == currency
+                or event.currency == validated.currency
             )
+            and event.provider not in _DIRECT_COMPUTE_SPONSORSHIP_PROVIDERS
             and _as_utc(event.occurred_at) <= as_of
         ):
             contract_events[(event.provider, event.contract_key)].append(event)
@@ -795,49 +860,56 @@ def _recorded_allowance_projection(
         key = (source.provider, source.source_event_key)
         adjusted = adjustments.get(key, 0)
         net_minor = max(0, source.amount_minor - adjusted)
-        granted = _allowance_units(policy.recurring_rules, source.amount_minor)
-        refundable = _allowance_units(policy.recurring_rules, net_minor)
-        expires = (
-            _as_utc(source.occurred_at)
-            + timedelta(seconds=policy.recurring_validity_seconds)
-            if policy.recurring_validity_seconds > 0
-            else None
+        granted_rule = _tier(validated.recurring_rules, source.amount_minor)
+        effective_rule = _tier(validated.recurring_rules, net_minor)
+        granted = (
+            0 if granted_rule is None
+            else granted_rule.promotional_maestro_credits
+        )
+        eligible = (
+            0 if effective_rule is None
+            else effective_rule.promotional_maestro_credits
+        )
+        expires = _as_utc(source.occurred_at) + timedelta(
+            seconds=validated.recurring_validity_seconds,
         )
         canceled = latest.kind == "recurring_canceled"
         effective = (
             0
-            if canceled or (expires is not None and as_of >= expires)
-            else refundable
+            if (
+                canceled
+                or not validated.promotional_credits_enabled
+                or effective_rule is None
+                or as_of >= expires
+            )
+            else eligible
         )
         if granted == 0:
             status = "inactive"
-        elif adjusted >= source.amount_minor:
-            status = "refunded"
-        elif canceled:
+        elif (
+            canceled
+            or not validated.promotional_credits_enabled
+            or effective_rule is None
+        ):
             status = "canceled"
-        elif expires is not None and as_of >= expires:
+        elif as_of >= expires:
             status = "expired"
         else:
             status = "active"
         sources.append({
-            "source": "recurring_support",
+            "source": "supporter_tier_bonus",
             "source_event_id": source.event_id,
             "granted_allowance": granted,
             "effective_allowance": effective,
-            "expires_at": None if expires is None else _iso_utc(expires),
+            "expires_at": _iso_utc(expires),
             "status": status,
-            "refund_state": (
-                "none" if adjusted == 0
-                else "partial" if adjusted < source.amount_minor
-                else "full" if adjusted == source.amount_minor
-                else "excess"
-            ),
+            "refund_state": adjustment_state(source.amount_minor, adjusted),
         })
 
     return {
         "state": "recorded_not_enforced",
         "enforcement_enabled": False,
-        "unit": policy.unit,
+        "unit": validated.credit_unit,
         "as_of": _iso_utc(as_of),
         "effective_allowance": sum(
             source["effective_allowance"] for source in sources
@@ -851,14 +923,14 @@ def _development_cost_recovery_projection(
     *,
     as_of: datetime,
 ) -> dict[str, Any]:
-    """Project the global USD recovery gate without exposing ledger identities."""
+    """Project the private global USD gate without exposing support details."""
 
     funding = {
         (event.provider, event.source_event_key): event
         for event in events
         if event.kind in FUNDING_KINDS
         and event.currency == DEVELOPMENT_COST_RECOVERY_CURRENCY
-        and event.provider != _DIRECT_COMPUTE_SPONSORSHIP_PROVIDER
+        and event.provider not in _DIRECT_COMPUTE_SPONSORSHIP_PROVIDERS
         and _as_utc(event.occurred_at) <= as_of
     }
     adjusted: dict[tuple[str, str], int] = defaultdict(int)
@@ -1006,20 +1078,24 @@ class ContributionLedger:
             ):
                 raise LedgerIntegrityError("contribution event chain is invalid")
             try:
-                normalized = _normalize_draft(ContributionEventDraft(
-                    provider=event.provider,
-                    source_event_key=event.source_event_key,
-                    subject_key=event.subject_key,
-                    kind=event.kind,
-                    occurred_at=event.occurred_at,
-                    amount_minor=event.amount_minor,
-                    currency=event.currency,
-                    contract_key=event.contract_key,
-                    related_event_key=event.related_event_key,
-                    fulfillment_item=event.fulfillment_item,
-                    fulfillment_status=event.fulfillment_status,
-                    actor_key=event.actor_key,
-                ), allow_legacy_fulfillment=True)
+                normalized = _normalize_draft(
+                    ContributionEventDraft(
+                        provider=event.provider,
+                        source_event_key=event.source_event_key,
+                        subject_key=event.subject_key,
+                        kind=event.kind,
+                        occurred_at=event.occurred_at,
+                        amount_minor=event.amount_minor,
+                        currency=event.currency,
+                        contract_key=event.contract_key,
+                        related_event_key=event.related_event_key,
+                        fulfillment_item=event.fulfillment_item,
+                        fulfillment_status=event.fulfillment_status,
+                        actor_key=event.actor_key,
+                    ),
+                    allow_legacy_fulfillment=True,
+                    allow_legacy_manual_provider=True,
+                )
             except EntitlementError as error:
                 raise LedgerIntegrityError("stored contribution event is malformed") from error
             expected_id = "evt_" + hashlib.sha256(
@@ -1094,11 +1170,7 @@ class ContributionLedger:
         *,
         as_of: datetime | str | None = None,
     ) -> dict[str, Any]:
-        """Return the server-owned, privacy-bounded global recovery state.
-
-        The exact recovered amount remains private. An unreadable or tampered
-        ledger fails closed without turning integrity failure into an unlock.
-        """
+        """Return only the fixed target, currency, and server-owned gate state."""
 
         projected_at = _as_utc(as_of or datetime.now(timezone.utc))
         with self._locked():
@@ -1223,6 +1295,7 @@ class ContributionLedger:
                 event for event in effective_events
                 if event.event_id == target_event_id
                 and event.kind in FUNDING_KINDS
+                and event.provider not in _DIRECT_COMPUTE_SPONSORSHIP_PROVIDERS
             ), None)
             if target is None:
                 raise FulfillmentTransitionConflict(
@@ -1307,6 +1380,12 @@ class ContributionLedger:
             raise EntitlementError("manual contribution source is invalid")
         if kind not in MANUAL_CONTRIBUTION_KINDS:
             raise EntitlementError("manual contribution kind is invalid")
+        if source == "patreon" and kind == "one_time_contribution":
+            raise EntitlementError("Patreon is a membership source")
+        if source in {"threadspan", "direct_compute_sponsorship"} and kind in {
+            "recurring_started", "recurring_renewed", "recurring_canceled",
+        }:
+            raise EntitlementError(f"{source} is a one-time support source")
         if (
             not isinstance(amount_minor, int)
             or isinstance(amount_minor, bool)
@@ -1365,32 +1444,6 @@ class ContributionLedger:
                 raise ManualContributionConflict(
                     "manual contribution idempotency key conflicts"
                 )
-
-            if source == "direct_compute_sponsorship":
-                try:
-                    recovery = _development_cost_recovery_projection(
-                        events,
-                        as_of=datetime.now(timezone.utc),
-                    )
-                except Exception as error:
-                    raise DevelopmentCostRecoveryLockedError(
-                        "development cost recovery is not confirmed"
-                    ) from error
-                if (
-                    type(recovery) is not dict
-                    or set(recovery) != {"target_minor", "currency", "state"}
-                    or type(recovery.get("target_minor")) is not int
-                    or recovery["target_minor"]
-                    != DEVELOPMENT_COST_RECOVERY_TARGET_MINOR
-                    or type(recovery.get("currency")) is not str
-                    or recovery["currency"]
-                    != DEVELOPMENT_COST_RECOVERY_CURRENCY
-                    or type(recovery.get("state")) is not str
-                    or recovery["state"] != "recovered"
-                ):
-                    raise DevelopmentCostRecoveryLockedError(
-                        "development cost recovery is not confirmed"
-                    )
 
             initial = kind in {"one_time_contribution", "recurring_started"}
             if initial:
@@ -1519,6 +1572,7 @@ def _project_events(
     as_of: datetime,
     projection_subject_key: str,
 ) -> dict[str, Any]:
+    policy = _validate_benefit_policy(policy)
     funding = {
         (event.provider, event.source_event_key): event
         for event in events if event.kind in FUNDING_KINDS
@@ -1542,7 +1596,7 @@ def _project_events(
             continue
         adjustments[target_key] += event.amount_minor
     totals: dict[str, int] = defaultdict(int)
-    one_time_total = 0
+    one_time_rule: TierRule | None = None
     net_by_source: dict[tuple[str, str], int] = {}
     for source_key, event in funding.items():
         adjusted = adjustments.get(source_key, 0)
@@ -1554,12 +1608,28 @@ def _project_events(
             })
         net_by_source[source_key] = net
         totals[event.currency] += net
-        if event.kind == "one_time_contribution" and event.currency == policy.currency:
-            one_time_total += net
+        if (
+            event.kind == "one_time_contribution"
+            and event.currency == policy.currency
+            and event.provider not in _DIRECT_COMPUTE_SPONSORSHIP_PROVIDERS
+        ):
+            candidate = _tier(policy.one_time_rules, net)
+            if (
+                candidate is not None
+                and (
+                    one_time_rule is None
+                    or candidate.minimum_minor > one_time_rule.minimum_minor
+                )
+            ):
+                one_time_rule = candidate
 
     contract_events: dict[tuple[str, str], list[ContributionEvent]] = defaultdict(list)
     for event in events:
-        if event.kind in RECURRING_KINDS and event.contract_key:
+        if (
+            event.kind in RECURRING_KINDS
+            and event.contract_key
+            and event.provider not in _DIRECT_COMPUTE_SPONSORSHIP_PROVIDERS
+        ):
             contract_events[(event.provider, event.contract_key)].append(event)
     active_contracts: list[ContributionEvent] = []
     for items in contract_events.values():
@@ -1576,7 +1646,6 @@ def _project_events(
         ),
         default=0,
     )
-    one_time_rule = _tier(policy.one_time_rules, one_time_total)
     recurring_rule = _tier(policy.recurring_rules, recurring_amount)
     benefits = tuple(dict.fromkeys(
         (*(() if one_time_rule is None else one_time_rule.benefits),
@@ -1588,7 +1657,11 @@ def _project_events(
     }
     fulfillment_latest: dict[tuple[str, str, str], ContributionEvent] = {}
     for event in events:
-        if event.kind == "fulfillment_set" and event.related_event_key:
+        if (
+            event.kind == "fulfillment_set"
+            and event.related_event_key
+            and event.provider not in _DIRECT_COMPUTE_SPONSORSHIP_PROVIDERS
+        ):
             key = (
                 event.provider,
                 event.related_event_key,
@@ -1625,7 +1698,7 @@ def _project_events(
         fulfillment.append(projected)
 
     result: dict[str, Any] = {
-        "schema_version": LEDGER_SCHEMA_VERSION,
+        "schema_version": ENTITLEMENT_PROJECTION_SCHEMA_VERSION,
         "currency_totals_minor": dict(sorted(totals.items())),
         "one_time_tier": None if one_time_rule is None else one_time_rule.tier,
         "recurring_tier": None if recurring_rule is None else recurring_rule.tier,
@@ -1633,8 +1706,7 @@ def _project_events(
         "benefit_eligibility": list(benefits),
         "recorded_allowance": _recorded_allowance_projection(
             events,
-            policy=policy.allowance_policy,
-            currency=policy.currency,
+            policy=policy,
             as_of=as_of,
         ),
         "fulfillment": fulfillment,

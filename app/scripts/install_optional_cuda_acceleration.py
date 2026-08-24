@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
+from pathlib import Path
 
 
 # This is the same multi-architecture Linux wheel shipped by Pinokio's WanGP
@@ -33,6 +34,48 @@ FLASHATTENTION_WHEEL = (
 
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
+
+
+def _resolve_marker(marker: str, *, app_root: Path) -> Path:
+    """Resolve one app-relative readiness marker without escaping app_root."""
+    relative = Path(marker)
+    if not marker or relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("marker must be a safe app-relative path")
+    root = app_root.resolve()
+    resolved = (root / relative).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("marker must stay inside the Maestro app directory") from exc
+    return resolved
+
+
+def _publish_marker(marker: Path, *, ready: bool) -> None:
+    """Publish readiness only after every requested optional install succeeds."""
+    if not ready:
+        try:
+            marker.unlink(missing_ok=True)
+        except OSError as exc:
+            print(
+                "[Optional acceleration] The stale readiness marker could not be "
+                f"removed ({type(exc).__name__}); normal Update will retry."
+            )
+        return
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            "Maestro optional CUDA acceleration wheels installed successfully.\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        print(
+            "[Optional acceleration] Packages installed, but readiness could not be "
+            f"recorded ({type(exc).__name__}); normal Update will retry."
+        )
+        try:
+            marker.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _installer_prefix() -> list[str]:
@@ -70,7 +113,7 @@ def install_optional_wheel(
         print(
             f"[Optional acceleration] {label} was not installed (installer exit "
             f"{returncode}). Maestro will continue with Sol/SDPA; use "
-            "Advanced > Repair H3 Performance Runtime to retry later."
+            "the normal Update action in Pinokio to retry later."
         )
         return False
 
@@ -78,18 +121,33 @@ def install_optional_wheel(
     return True
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    app_root: Path | None = None,
+) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--flash-only",
         action="store_true",
         help="Repair only the optional FlashAttention wheel.",
     )
+    parser.add_argument(
+        "--marker",
+        required=True,
+        help="App-relative readiness marker owned by this optional installer.",
+    )
     args = parser.parse_args(argv)
+    try:
+        marker = _resolve_marker(args.marker, app_root=app_root or Path.cwd())
+    except ValueError as exc:
+        parser.error(str(exc))
 
+    results: list[bool] = []
     if not args.flash_only:
-        install_optional_wheel("SageAttention", SAGEATTENTION_WHEEL)
-    install_optional_wheel("FlashAttention", FLASHATTENTION_WHEEL)
+        results.append(install_optional_wheel("SageAttention", SAGEATTENTION_WHEEL))
+    results.append(install_optional_wheel("FlashAttention", FLASHATTENTION_WHEEL))
+    _publish_marker(marker, ready=all(results))
     return 0
 
 

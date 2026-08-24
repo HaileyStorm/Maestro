@@ -136,6 +136,12 @@ export function H3PerformanceProfiles() {
   const activeProfile = visibleSelection === 'custom'
     ? undefined
     : profiles.find(profile => profile.id === visibleSelection)
+  const hostLimit = currentEstimate as (H3PerformanceEstimate & {
+    host_setup_runnable?: boolean
+    host_setup_reason?: string | null
+    host_max_steps?: number | null
+  }) | null
+  const hostBlocked = hostLimit?.host_setup_runnable === false
   const unavailableReasons = Array.from(
     profiles.filter(profile => !profile.available && profile.fallback_reason)
       .reduce((grouped, profile) => {
@@ -182,6 +188,12 @@ export function H3PerformanceProfiles() {
       {activeProfile?.download_required && (
         <p className="text-[9px] text-amber-400">
           {(activeProfile.download_components || ['Model/adapter']).join(' + ')} download needed in the shared host cache · download time is separate from model loading and the run/upscale estimate.
+        </p>
+      )}
+      {hostBlocked && (
+        <p className="text-[9px] text-amber-400">
+          {hostLimit?.host_setup_reason
+            || 'This computer cannot finish the current MiniMax H3 quality. Choose a lower step count or a smaller canvas. It will be offered again if a compatible attention mode or a memory-saving update comes online.'}
         </p>
       )}
       {unavailableReasons.length > 0 && (

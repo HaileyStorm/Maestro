@@ -42,11 +42,9 @@ _PAREN_INSTRUMENTAL_RE = re.compile(
     re.IGNORECASE,
 )
 _PAREN_ONLY_RE = re.compile(r"^\s*\(([^()]+)\)\s*$")
-_PRODUCTION_CUE_RE = re.compile(
-    r"\b(?:whisper(?:ed|ing)?|spoken|softly|loudly|breathy|raspy|falsetto|"
-    r"belt(?:ed|ing)?|guitar|piano|drums?|bass|synth(?:esizer)?|strings?|"
-    r"brass|choir|vocals?|harmon(?:y|ies)|solo|instrumental|fade|build|drop|"
-    r"breakdown|tempo|bpm|key|reverb|delay|distortion|enters?|exits?)\b",
+_HIGH_CONFIDENCE_PRODUCTION_CUE_RE = re.compile(
+    r"^(?:guitar|piano|drums?|bass|synth(?:esizer)?|strings?|brass|choir|vocals?)\s+"
+    r"(?:enters?|exits?|fades?|builds?|drops?|breaks?|solos?)\b.*$",
     re.IGNORECASE,
 )
 
@@ -100,13 +98,13 @@ def _canonical_tag_and_direction(value: str) -> tuple[str | None, str]:
 
 
 def _parenthetical_production_cue(value: str) -> str | None:
-    """Return an obvious stage direction, but preserve sung parentheticals."""
+    """Return only an unambiguous production action, preserving sung asides."""
 
     match = _PAREN_ONLY_RE.fullmatch(str(value or ""))
     if not match:
         return None
     cue = match.group(1).strip()
-    return cue if _PRODUCTION_CUE_RE.search(cue) else None
+    return cue if _HIGH_CONFIDENCE_PRODUCTION_CUE_RE.fullmatch(cue) else None
 
 
 def normalize_generated_music3_song(

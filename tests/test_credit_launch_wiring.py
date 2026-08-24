@@ -53,6 +53,7 @@ from services.job_lifecycle import (
     finish_job,
     update_job,
 )
+from services.owner_test_credits import OwnerTestCreditError
 from services.queue_recovery_adapter import (
     owner_principal_digest,
     project_instance_digest,
@@ -146,6 +147,7 @@ class CreditLaunchWiringTests(unittest.TestCase):
 
     @staticmethod
     def _namespace(quote):
+        owner_test_receipt = types.SimpleNamespace(private_mapping=lambda: {})
         return {
             "CreditRuntimePolicy": CreditRuntimePolicy,
             "_CREDIT_ACCOUNT_PARAM": ACCOUNT_PARAM,
@@ -181,6 +183,13 @@ class CreditLaunchWiringTests(unittest.TestCase):
                 },
             ),
             "AccountAuthError": AccountAuthError,
+            "OwnerTestCreditError": OwnerTestCreditError,
+            "_owner_test_credit_ledger": lambda: types.SimpleNamespace(
+                record_dispatch=lambda **_kwargs: owner_test_receipt,
+            ),
+            "_owner_test_credit_account_key": lambda account_id: account_id,
+            "_owner_test_credit_source_key": lambda account_id: account_id,
+            "_credit_requested_units": lambda _job: 1,
             "CreditAccountingError": CreditAccountingError,
             "CreditRuntimeError": CreditRuntimeError,
             "EntitlementError": EntitlementError,
@@ -484,6 +493,7 @@ class CreditLaunchWiringTests(unittest.TestCase):
             def __init__(self, detail):
                 super().__init__(detail)
                 self.detail = detail
+                self.status_code = 400
 
         @contextlib.contextmanager
         def acquired_slot(*_args, **_kwargs):
@@ -517,6 +527,8 @@ class CreditLaunchWiringTests(unittest.TestCase):
                     lambda *_args, **_kwargs: None
                 ),
                 "generation_slot": acquired_slot,
+                "_WgpNativeGpuExecutionSlot": acquired_slot,
+                "_SAMPLE_CAMPAIGN_JOB_KIND": "sample_campaign_generation",
                 "_gen_lock": object(),
                 "try_start": lambda *_args, **_kwargs: (
                     label != "start-refused"
@@ -524,8 +536,12 @@ class CreditLaunchWiringTests(unittest.TestCase):
                 "_credit_admission_evaluations": evaluations,
                 "_require_h3_offload_plan_parity": require_parity,
                 "QueueRecoveryRuntimeError": RuntimeAdmissionError,
-                "finish_job": lambda *_args, **_kwargs: finished.append(label),
+                "_lifecycle_finish_job": (
+                    lambda *_args, **_kwargs: finished.append(label) or True
+                ),
                 "_queue_recovery_delivery_pending": lambda _job: None,
+                "_h3_job_model_types": lambda _job: (),
+                "_require_h3_legal_execution": lambda _models: None,
                 "_require_job_runtime_model_admission": require_model_admission,
                 "HTTPException": ModelAdmissionError,
                 "_director_image_role_wire_mode": lambda _params: "none",
@@ -602,6 +618,27 @@ class CreditLaunchWiringTests(unittest.TestCase):
         self.assertIsNone(namespace["_credit_accounting_journal"]())
         self.assertEqual(callbacks, [None])
         self.assertEqual(list(Path(self.temporary.name).iterdir()), [])
+
+    def test_hard_off_preserves_callbacks_for_existing_credit_lineage(self):
+        lifecycle_callbacks = []
+        settlement_callbacks = []
+
+        def callback(_event):
+            return {}
+
+        namespace = {
+            "_credit_accounting_enabled": lambda: False,
+            "_credit_accounting_value": object(),
+            "_credit_accounting_lock": threading.RLock(),
+            "_credit_accounting_existing_journal": lambda: object(),
+            "_credit_accounting_lifecycle_callback": callback,
+            "configure_credit_lifecycle_callback": lifecycle_callbacks.append,
+            "configure_credit_settlement_callback": settlement_callbacks.append,
+        }
+        _functions({"_credit_accounting_journal"}, namespace)
+        self.assertIsNone(namespace["_credit_accounting_journal"]())
+        self.assertEqual(lifecycle_callbacks, [callback])
+        self.assertEqual(settlement_callbacks, [callback])
 
     def test_hosted_accounting_fails_closed_on_corrupt_startup_state(self):
         app_dir = Path(self.temporary.name)
@@ -1505,6 +1542,62 @@ class CreditLaunchWiringTests(unittest.TestCase):
         self.assertNotIn(CLEANUP_PARAM, job["params"])
         self.assertEqual(
             journal.public_projection(ACCOUNTING_ACCOUNT)["reserved_units"], 0
+        )
+
+    def test_promoted_owner_consumed_lineage_still_hydrates_and_settles(self):
+        namespace, journal, jobs = self._real_accounting(units=20)
+        state = {"role": "user"}
+        namespace["_account_auth_store"] = lambda: types.SimpleNamespace(
+            resolve_account=lambda account_id: {
+                "id": account_id,
+                "role": state["role"],
+                "disabled": False,
+            },
+        )
+        job = {
+            "id": "promoted-owner-consumed",
+            "kind": "studio_generation",
+            "status": "queued",
+            "workspace": "default",
+            "created_at": 24.0,
+            "params": {"model_type": "standard"},
+        }
+        jobs[job["id"]] = job
+        configure_credit_lifecycle_callback(
+            namespace["_credit_accounting_lifecycle_callback"],
+        )
+        self.assertTrue(namespace["_credit_prepare_submission"](job))
+        self.assertTrue(namespace["_credit_prepare_admission"](job))
+        job["status"] = "running"
+        self.assertTrue(namespace["_credit_prepare_dispatch"](job))
+        self.assertEqual(job["credit_queue"]["reservation_state"], "consumed")
+
+        state["role"] = "owner"
+        namespace["_credit_accounting_reservation_accounts"].clear()
+        _functions({"_credit_accounting_hydrate_job"}, namespace)
+        self.assertTrue(namespace["_credit_accounting_hydrate_job"](job))
+        reservation_id = job["credit_queue"]["accounting_reservation_id"]
+        self.assertEqual(
+            namespace["_credit_accounting_reservation_accounts"][reservation_id],
+            ACCOUNTING_ACCOUNT,
+        )
+        receipt = namespace["_credit_accounting_lifecycle_callback"]({
+            "action": "settle",
+            "job_id": job["id"],
+            "accounting_reservation_id": reservation_id,
+            "operation_id": namespace["_credit_accounting_operation_id"](
+                "settle", job["id"], "completed",
+            ),
+            "expected_revision": job["credit_queue"][
+                "accounting_reservation_revision"
+            ],
+            "as_of": job["credit_queue"]["allowance_observed_at"],
+            "terminal_status": "completed",
+            "server_billable_units": None,
+        })
+        self.assertEqual(receipt["reservation_status"], "settled")
+        self.assertEqual(
+            journal.public_projection(ACCOUNTING_ACCOUNT)["consumed_units"], 10,
         )
 
     def test_owner_terminalization_defers_unavailable_release_to_recovery(self):

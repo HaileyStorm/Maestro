@@ -89,12 +89,28 @@ test('every production token-gradient call site uses its semantic foreground cla
       const cta = /\bbg-cta\b|\b(?:from|to)-gradient-cta-(?:from|to)\b/.test(classes)
       const toggle = /\bbg-toggle-active\b|\b(?:from|to)-gradient-toggle-(?:from|to)\b/.test(classes)
       assert.notEqual(cta, toggle, `${relativePath} token gradient resolves to exactly one semantic surface`)
-      callSites.push({ relativePath, classes, surface: cta ? 'cta' : 'toggle-active' })
+      const followingSource = source.slice((match.index || 0) + match[0].length, (match.index || 0) + match[0].length + 250)
+      callSites.push({
+        relativePath,
+        classes,
+        surface: cta ? 'cta' : 'toggle-active',
+        decorativeImage: /^\s*>\s*<img\s+aria-hidden="true"/.test(followingSource),
+      })
     }
   }
 
-  assert.equal(callSites.length, 8, 'expected all eight production token-gradient call sites')
-  for (const { relativePath, classes, surface } of callSites) {
+  assert.equal(callSites.length, 9, 'expected all nine production token-gradient call sites')
+  const decorativeImageSites = callSites.filter(site => site.decorativeImage)
+  assert.deepEqual(
+    decorativeImageSites.map(site => site.relativePath),
+    ['components/WelcomeModal.tsx'],
+    'the only token-gradient surface without text is the decorative welcome brand image',
+  )
+  for (const { relativePath, classes, surface, decorativeImage } of callSites) {
+    if (decorativeImage) {
+      assert.doesNotMatch(classes, /\btext-white\b/, `${relativePath} decorative gradient has no hardcoded text foreground`)
+      continue
+    }
     const foreground = surface === 'cta' ? 'text-cta-foreground' : 'text-toggle-active-foreground'
     assert.match(classes, new RegExp(`\\b${foreground}\\b`), `${relativePath} ${surface} uses ${foreground}`)
     assert.doesNotMatch(classes, /\btext-white\b/, `${relativePath} ${surface} has no hardcoded white foreground`)

@@ -1,10 +1,21 @@
 const { runtimeSecretEnv } = require("./launcher_secret_env")
+const {
+  isRtx50,
+  isSolCapable,
+  needsCuda13DriverUpdate,
+  runtimeProfile,
+} = require("./launcher_profile")
 
-module.exports = {
-  requires: {
-    bundle: "ai"
-  },
-  run: [
+module.exports = async (kernel) => {
+  const runtime = runtimeProfile(kernel)
+  const cuda13DriverUpdateRequired = (
+    isSolCapable(kernel) && needsCuda13DriverUpdate(kernel)
+  )
+  return {
+    requires: {
+      bundle: "ai"
+    },
+    run: [
     {
       when: "{{gpu !== 'nvidia'}}",
       method: "notify",
@@ -12,6 +23,21 @@ module.exports = {
         html: "This app requires an NVIDIA GPU on Windows or Linux."
       },
       next: null
+    },
+    {
+      when: cuda13DriverUpdateRequired && isRtx50(kernel),
+      method: "notify",
+      params: {
+        html: `Your NVIDIA driver (${kernel.gpu_driver}) is too old for Maestro's required RTX 50 CUDA 13 runtime. Update to NVIDIA driver 580 or newer, then run Install again.`
+      },
+      next: null
+    },
+    {
+      when: cuda13DriverUpdateRequired && !isRtx50(kernel),
+      method: "notify",
+      params: {
+        html: `Your NVIDIA driver (${kernel.gpu_driver}) is too old for Maestro's preferred CUDA 13 H3 runtime. Installing the preserved CUDA 12.8 compatibility runtime instead; update to driver 580 or newer and run Update later to migrate.`
+      }
     },
     {
       method: "shell.run",
@@ -34,7 +60,8 @@ module.exports = {
       method: "shell.run",
       params: {
         env: runtimeSecretEnv,
-        venv: "env",
+        venv: runtime.env,
+        venv_python: runtime.python,
         path: "app",
         message: [
           "uv pip install -r requirements.txt --index-strategy unsafe-best-match",
@@ -47,7 +74,8 @@ module.exports = {
       params: {
         uri: "torch.js",
         params: {
-          venv: "env",
+          venv: runtime.env,
+          venv_python: runtime.python,
           path: "app",
           xformers: true
         }
@@ -65,7 +93,8 @@ module.exports = {
       method: "shell.run",
       params: {
         env: runtimeSecretEnv,
-        venv: "env",
+        venv: runtime.env,
+        venv_python: runtime.python,
         path: "app",
         message: "python scripts/install_gguf_kernels.py"
       }
@@ -86,19 +115,31 @@ module.exports = {
     },
     {
       method: "script.start",
-      params: { uri: "blender_mcp_install.js" }
+      params: {
+        uri: "blender_mcp_install.js",
+        params: { venv: runtime.env, venv_python: runtime.python }
+      }
     },
     {
       method: "script.start",
-      params: { uri: "blender_runtime_install.js" }
+      params: {
+        uri: "blender_runtime_install.js",
+        params: { venv: runtime.env, venv_python: runtime.python }
+      }
     },
     {
       method: "script.start",
-      params: { uri: "h3_acceleration_install.js" }
+      params: {
+        uri: "h3_acceleration_install.js",
+        params: { venv: runtime.env, venv_python: runtime.python }
+      }
     },
     {
       method: "script.start",
-      params: { uri: "h3_w4a8_runtime_install.js" }
+      params: {
+        uri: "h3_w4a8_runtime_install.js",
+        params: { venv: runtime.env, venv_python: runtime.python }
+      }
     },
     {
       when: "{{exists('ui/package.json')}}",
@@ -127,5 +168,6 @@ module.exports = {
         description: 'Click "Start" to get started'
       }
     }
-  ]
+    ]
+  }
 }

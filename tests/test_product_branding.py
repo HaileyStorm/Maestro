@@ -15,6 +15,7 @@ WHATS_NEW = (ROOT / "ui/src/components/WhatsNewDialog.tsx").read_text(encoding="
 TYPES = (ROOT / "ui/src/types/index.ts").read_text(encoding="utf-8")
 INDEX = (ROOT / "ui/index.html").read_text(encoding="utf-8")
 PINOKIO = (ROOT / "pinokio.js").read_text(encoding="utf-8")
+MARK = (ROOT / "ui/public/maestro.svg").read_text(encoding="utf-8")
 
 
 class ProductBrandingTests(unittest.TestCase):
@@ -40,6 +41,15 @@ class ProductBrandingTests(unittest.TestCase):
             self.assertIn("PRODUCT_NAME_VISUAL", source)
             self.assertIn("PRODUCT_PROVENANCE", source)
         self.assertIn("<title>Maestro Continuum</title>", INDEX)
+
+    def test_anchored_reference_mark_is_shared_by_the_shell(self):
+        self.assertIn("Maestro Continuum anchored reference mark", MARK)
+        self.assertIn('stroke="#e9674f"', MARK)
+        self.assertIn('fill="#0d2a46"', MARK)
+        self.assertNotIn(">M<", MARK)
+        for source in (APP, SIDEBAR):
+            self.assertIn('src="/maestro.svg"', source)
+            self.assertNotIn("bg-accent-blue flex items-center justify-center text-white font-bold", source)
 
     def test_remote_shell_uses_embedded_provenance_not_system_config(self):
         self.assertNotIn("systemConfig?.app_version", APP)

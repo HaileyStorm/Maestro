@@ -82,13 +82,17 @@ def _load_model_download_check(*, vision_exists: bool):
         node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name == "_check_model_downloaded"
     )
-    model_def = {"vision_encoder_filename": "vision.safetensors"}
+    model_def = {
+        "vision_encoder_filename": "vision.safetensors",
+        "required_runtime_assets": {},
+    }
     fake_wgp = types.SimpleNamespace(
         get_model_def=lambda _model_type: model_def,
         get_model_recursive_prop=lambda *_args, **_kwargs: [],
         resolve_lora_path=lambda *_args, **_kwargs: "",
         fl=types.SimpleNamespace(
             locate_file=lambda *_args, **_kwargs: "vision.safetensors" if vision_exists else None,
+            locate_folder=lambda *_args, **_kwargs: None,
         ),
     )
     namespace = {
@@ -96,6 +100,11 @@ def _load_model_download_check(*, vision_exists: bool):
         "wgp": fake_wgp,
         "_model_weight_groups": lambda _model_type: [["transformer.safetensors"]],
         "_variant_group_downloaded": lambda _group, model_type=None: True,
+        "required_runtime_assets_ready": (
+            lambda current_def, *_args, **_kwargs: not current_def.get(
+                "required_runtime_assets"
+            )
+        ),
     }
     module = ast.Module(body=[function], type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), str(_LAUNCH_PATH), "exec"), namespace)

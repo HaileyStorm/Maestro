@@ -1,8 +1,11 @@
 import type {
   SupportAccountSummary,
+  SupportContributionSource,
+  SupportManualContributionKind,
   SupportPriorityPolicy,
   SupportProvider,
   SupportPublicProjection,
+  SupporterBenefit,
   ResponsibleUseProjection,
 } from '../../types'
 import {
@@ -11,6 +14,26 @@ import {
 } from '../../types/index.ts'
 
 export type AccountSupportTab = 'support' | 'account'
+
+export const supporterBenefitLabels: Record<SupporterBenefit, string> = {
+  supporter_recognition: 'Supporter recognition',
+  bounded_queue_priority: 'Bounded hosted queue priority',
+  early_access_updates: 'Early access updates',
+  supporter_convenience: 'Supporter convenience features',
+}
+
+function humanizeSupporterTier(value: string): string {
+  const words = value.replace(/[_-]+/g, ' ').trim().replace(/\s+/g, ' ')
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : value
+}
+
+export function supporterTierLabels(account: SupportAccountSummary | null): string[] {
+  if (!account) return []
+  const labels = []
+  if (account.one_time_tier) labels.push(`One-time ${humanizeSupporterTier(account.one_time_tier)}`)
+  if (account.recurring_tier) labels.push(`Recurring ${humanizeSupporterTier(account.recurring_tier)}`)
+  return labels
+}
 
 function safeSupportUrl(value: string | null): string | null {
   if (typeof value !== 'string') return null
@@ -72,13 +95,49 @@ export function visibleSupportProviders(
   })
 }
 
+const ORDINARY_MANUAL_SUPPORT_SOURCES: SupportContributionSource[] = [
+  'buy_me_a_coffee',
+  'patreon',
+]
+const ALL_MANUAL_SUPPORT_KINDS: SupportManualContributionKind[] = [
+  'one_time_contribution',
+  'recurring_started',
+  'recurring_renewed',
+  'recurring_canceled',
+  'refund',
+  'chargeback',
+]
+const DIRECT_COMPUTE_SUPPORT_KINDS: SupportManualContributionKind[] = [
+  'one_time_contribution',
+  'refund',
+  'chargeback',
+]
+
+export function allowedManualSupportSources(
+  _directComputeUnlocked: boolean,
+): SupportContributionSource[] {
+  // Sponsorship stays visible before activation; the caller separately gates
+  // which lifecycle mutations are available.
+  void _directComputeUnlocked
+  return [...ORDINARY_MANUAL_SUPPORT_SOURCES, 'direct_compute_sponsorship']
+}
+
+export function allowedManualSupportKinds(
+  source: SupportContributionSource,
+  _directComputeUnlocked = true,
+): SupportManualContributionKind[] {
+  void _directComputeUnlocked
+  return source === 'direct_compute_sponsorship'
+    ? [...DIRECT_COMPUTE_SUPPORT_KINDS]
+    : [...ALL_MANUAL_SUPPORT_KINDS]
+}
+
 export function affectedPriorityNotice(
   account: SupportAccountSummary | null,
   policy: SupportPriorityPolicy | null,
 ): string | null {
   const hasRecordedSchedulingBenefit = account?.benefits.recorded_eligibility.some(
-    benefit => benefit === 'one_time_credit_eligibility'
-      || benefit === 'periodic_credit_eligibility',
+    benefit => benefit === 'bounded_queue_priority',
   ) === true
   const hasExactExclusion = policy?.exclusions.some(
     exclusion => exclusion.support_priority_eligible === false

@@ -18,6 +18,8 @@ from services.krea_owner_policy import (
     KREA_LICENSE_URL,
     KREA_LICENSE_VERSION,
     KREA_OWNER_DECLARATION,
+    KREA_POLICY_SCHEMA_VERSION,
+    KREA_ROLE_USE_SCOPES,
     KreaOwnerPolicyError,
     krea_owner_policy_status,
     record_krea_owner_policy,
@@ -25,7 +27,7 @@ from services.krea_owner_policy import (
 
 
 class KreaOwnerPolicyTests(unittest.TestCase):
-    def _services(self, *, use_scope="noncommercial"):
+    def _services(self, *, role_use_scopes=None):
         services = {}
         record_krea_owner_policy(
             services,
@@ -33,7 +35,10 @@ class KreaOwnerPolicyTests(unittest.TestCase):
             manual_review_accepted=True,
             local_content_stays_local=True,
             attribution_accepted=True,
-            use_scope=use_scope,
+            role_use_scopes=(
+                dict(KREA_ROLE_USE_SCOPES)
+                if role_use_scopes is None else role_use_scopes
+            ),
             license_version=KREA_LICENSE_VERSION,
             license_date=KREA_LICENSE_DATE,
             declared_at_unix=1_700_000_000,
@@ -52,6 +57,7 @@ class KreaOwnerPolicyTests(unittest.TestCase):
             {
                 "attested": False,
                 "availability_status": "owner_attestation_required",
+                "migration_required": False,
                 "local_execution_allowed": False,
                 "hosted_execution_allowed": False,
                 "maestro_content_filtering": False,
@@ -65,15 +71,24 @@ class KreaOwnerPolicyTests(unittest.TestCase):
         self.assertFalse(status["hosted_execution_allowed"])
         self.assertTrue(status["manual_owner_review"])
         self.assertFalse(status["maestro_content_filtering"])
+        self.assertEqual(status["role_use_scopes"], KREA_ROLE_USE_SCOPES)
         self.assertNotIn("prompt", repr(status).casefold())
 
-    def test_noncommercial_and_under_1m_commercial_scopes_are_exact(self):
-        for scope in ("noncommercial", "commercial_under_1m"):
-            with self.subTest(scope=scope):
-                status = krea_owner_policy_status(self._services(use_scope=scope))
-                self.assertEqual(status["use_scope"], scope)
-        with self.assertRaises(KreaOwnerPolicyError):
-            self._services(use_scope="commercial")
+    def test_owner_and_user_scope_map_is_exact(self):
+        self.assertEqual(KREA_POLICY_SCHEMA_VERSION, 2)
+        status = krea_owner_policy_status(self._services())
+        self.assertEqual(
+            status["role_use_scopes"],
+            {"owner": "noncommercial", "user": "commercial_under_1m"},
+        )
+        for invalid in (
+            {"owner": "commercial_under_1m", "user": "commercial_under_1m"},
+            {"owner": "noncommercial"},
+            {**KREA_ROLE_USE_SCOPES, "admin": "noncommercial"},
+            "noncommercial",
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(KreaOwnerPolicyError):
+                self._services(role_use_scopes=invalid)
 
     def test_every_acknowledgement_and_current_license_are_required(self):
         base = {
@@ -81,7 +96,7 @@ class KreaOwnerPolicyTests(unittest.TestCase):
             "manual_review_accepted": True,
             "local_content_stays_local": True,
             "attribution_accepted": True,
-            "use_scope": "noncommercial",
+            "role_use_scopes": dict(KREA_ROLE_USE_SCOPES),
             "license_version": KREA_LICENSE_VERSION,
             "license_date": KREA_LICENSE_DATE,
             "declared_at_unix": 1,
@@ -118,6 +133,31 @@ class KreaOwnerPolicyTests(unittest.TestCase):
         extra["krea_owner_policy"]["prompt_scanner"] = True
         self.assertFalse(krea_owner_policy_status(extra)["attested"])
 
+    def test_schema_v1_is_preserved_as_migration_required_not_execution(self):
+        services = {
+            "krea_owner_policy": {
+                "schema_version": 1,
+                "owner_attested": True,
+                "manual_review_accepted": True,
+                "local_content_stays_local": True,
+                "attribution_accepted": True,
+                "maestro_content_filtering": False,
+                "use_scope": "noncommercial",
+                "declaration": KREA_OWNER_DECLARATION,
+                "license_version": KREA_LICENSE_VERSION,
+                "license_date": KREA_LICENSE_DATE,
+                "declared_at_unix": 1,
+            },
+        }
+        status = krea_owner_policy_status(services)
+        self.assertFalse(status["attested"])
+        self.assertTrue(status["migration_required"])
+        self.assertEqual(
+            status["availability_status"], "owner_policy_migration_required",
+        )
+        self.assertFalse(status["local_execution_allowed"])
+        self.assertFalse(status["hosted_execution_allowed"])
+
 
 class KreaOwnerPolicyWiringTests(unittest.TestCase):
     @classmethod
@@ -134,6 +174,10 @@ class KreaOwnerPolicyWiringTests(unittest.TestCase):
 
     def test_route_records_manual_review_and_never_client_content_rules(self):
         self.assertIn("record_krea_owner_policy(", self.launch)
+        self.assertIn('if "use_scope" in body:', self.launch)
+        self.assertIn("schema v1 is no longer accepted", self.launch)
+        self.assertIn('"attribution_accepted", "role_use_scopes"', self.launch)
+        self.assertIn('role_use_scopes=body.get("role_use_scopes")', self.launch)
         self.assertIn('"content_handling": "manual_owner_review"', self.launch)
         self.assertNotIn("prompt_filter", self.launch)
         self.assertNotIn("content_classifier", self.launch)

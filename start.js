@@ -1,5 +1,11 @@
 const fs = require("fs")
 const path = require("path")
+const {
+  isRtx50,
+  needsCuda13DriverUpdate,
+  legacyRuntimeProfile,
+  runtimeProfile,
+} = require("./launcher_profile")
 const { runtimeSecretEnv } = require("./launcher_secret_env")
 
 const parseEnvironmentValue = (rawValue) => {
@@ -65,6 +71,42 @@ const readAppEnvironment = () => {
 
 module.exports = async (kernel) => {
   let port = await kernel.port()
+  const runtime = runtimeProfile(kernel)
+  const legacyRuntime = legacyRuntimeProfile(kernel)
+  const hasRecoveryRuntime = runtime.env !== legacyRuntime.env
+  const selectedEnv = hasRecoveryRuntime
+    ? `{{exists('${runtime.marker}') ? '${runtime.env}' : '${legacyRuntime.env}'}}`
+    : runtime.env
+  const selectedPython = hasRecoveryRuntime
+    ? `{{exists('${runtime.marker}') ? '${runtime.python}' : '${legacyRuntime.python}'}}`
+    : runtime.python
+  const runtimeGuard = isRtx50(kernel)
+    ? (needsCuda13DriverUpdate(kernel) ? [{
+      method: "input",
+      params: {
+        title: "NVIDIA driver update required",
+        description: `RTX 50 requires NVIDIA driver 580 or newer for Maestro's CUDA 13 runtime (found ${kernel.gpu_driver}). Update the driver, then run Update before starting Maestro.`
+      },
+      next: null
+    }] : [{
+      when: `{{!exists('${runtime.marker}')}}`,
+      method: "input",
+      params: {
+        title: "RTX 50 runtime upgrade required",
+        description: "Run Update once to install Maestro's Python 3.11 / CUDA 13 acceleration environment, then start Maestro again. Your existing environment is preserved."
+      },
+      next: null
+    }])
+    : []
+  const recoveryGuard = hasRecoveryRuntime ? [{
+    when: `{{!exists('${runtime.marker}') && !exists('${legacyRuntime.marker}')}}`,
+    method: "input",
+    params: {
+      title: "Maestro runtime update required",
+      description: "Neither the preferred H3 runtime nor the preserved compatibility runtime is ready. Run Update, then start Maestro again."
+    },
+    next: null
+  }] : []
   const appEnvironment = readAppEnvironment()
   const effectiveEnvironmentValue = (key) => (
     Object.prototype.hasOwnProperty.call(appEnvironment, key)
@@ -101,6 +143,15 @@ module.exports = async (kernel) => {
     },
     daemon: true,
     run: [
+      ...runtimeGuard,
+      ...recoveryGuard,
+      ...(hasRecoveryRuntime ? [{
+        when: `{{!exists('${runtime.marker}') && exists('${legacyRuntime.marker}')}}`,
+        method: "log",
+        params: {
+          raw: "The preferred H3 acceleration runtime is not ready; starting the preserved compatibility runtime. Run Update to finish the automatic migration.",
+        },
+      }] : []),
       // SAM service starts on demand (launched by the backend when inpaint is used)
       // — not started here to avoid holding a CUDA context that wastes VRAM
       {
@@ -108,7 +159,8 @@ module.exports = async (kernel) => {
         method: "shell.run",
         params: {
           env: runtimeSecretEnv,
-          venv: "env",
+          venv: selectedEnv,
+          venv_python: selectedPython,
           path: "app",
           message: [
             "python -m services.blender_mcp_service attest-runtime --marker tools/blender/runtime.json",
@@ -123,7 +175,8 @@ module.exports = async (kernel) => {
       {
         method: "shell.run",
         params: {
-          venv: "env",
+          venv: selectedEnv,
+          venv_python: selectedPython,
           env: {
             ...backendEnvironment,
             ...runtimeSecretEnv,
@@ -162,7 +215,8 @@ module.exports = async (kernel) => {
         method: "shell.run",
         params: {
           env: runtimeSecretEnv,
-          venv: "env",
+          venv: selectedEnv,
+          venv_python: selectedPython,
           path: "app",
           message: [
             "python scripts/share_registration_watch.py --origin {{local.url}} --wait-backend-only"
@@ -190,7 +244,8 @@ module.exports = async (kernel) => {
         method: "shell.run",
         params: {
           env: runtimeSecretEnv,
-          venv: "env",
+          venv: selectedEnv,
+          venv_python: selectedPython,
           path: "app",
           message: [
             "python -c \"import time; time.sleep(1)\""
@@ -231,7 +286,8 @@ module.exports = async (kernel) => {
           : false,
         method: "shell.run",
         params: {
-          venv: "env",
+          venv: selectedEnv,
+          venv_python: selectedPython,
           path: "app",
           env: runtimeSecretEnv,
           message: [
@@ -267,7 +323,8 @@ module.exports = async (kernel) => {
           : false,
         method: "shell.run",
         params: {
-          venv: "env",
+          venv: selectedEnv,
+          venv_python: selectedPython,
           path: "app",
           env: {
             ...runtimeSecretEnv,
@@ -328,7 +385,8 @@ module.exports = async (kernel) => {
         when: "{{typeof args.restart_generation === 'string' && /^[A-Za-z0-9_-]{16,64}$/.test(args.restart_generation) && local.share_kind === 'stable'}}",
         method: "shell.run",
         params: {
-          venv: "env",
+          venv: selectedEnv,
+          venv_python: selectedPython,
           path: "app",
           env: {
             ...runtimeSecretEnv,
@@ -389,7 +447,8 @@ module.exports = async (kernel) => {
         method: "shell.run",
         params: {
           env: runtimeSecretEnv,
-          venv: "env",
+          venv: selectedEnv,
+          venv_python: selectedPython,
           path: "app",
           message: [
             "python scripts/quick_tunnel_supervisor.py --origin {{local.url}} --clear-url"
@@ -423,7 +482,8 @@ module.exports = async (kernel) => {
         method: "shell.run",
         params: {
           env: runtimeSecretEnv,
-          venv: "env",
+          venv: selectedEnv,
+          venv_python: selectedPython,
           path: "app",
           message: [
             "python scripts/quick_tunnel_supervisor.py --origin {{local.url}} --publish-url {{local.observed_quick_share_url}}"
@@ -452,7 +512,8 @@ module.exports = async (kernel) => {
           : false,
         method: "shell.run",
         params: {
-          venv: "env",
+          venv: selectedEnv,
+          venv_python: selectedPython,
           path: "app",
           env: {
             ...runtimeSecretEnv,
@@ -481,7 +542,8 @@ module.exports = async (kernel) => {
           : false,
         method: "shell.run",
         params: {
-          venv: "env",
+          venv: selectedEnv,
+          venv_python: selectedPython,
           path: "app",
           env: {
             ...runtimeSecretEnv,

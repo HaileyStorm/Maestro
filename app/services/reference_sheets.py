@@ -137,7 +137,10 @@ PACK_TYPE_FIELD_GROUPS: Mapping[
     }),
 })
 PACK_TYPE_PRESETS: Mapping[str, tuple[str, ...]] = MappingProxyType({
-    "character": ("identity", "wardrobe", "underlayers", "anatomy", "performance"),
+    "character": (
+        "identity", "identity_focus", "wardrobe", "underlayers", "anatomy",
+        "performance",
+    ),
     "location": ("spatial", "lighting", "materials"),
     "prop": ("product", "functional", "construction"),
     "vehicle": ("exterior", "interior", "mechanical"),
@@ -354,8 +357,9 @@ class PackSheetRecipe:
     objective: str
 
 
-# The first recipe is always the immutable canonical anchor for an anchored
-# pack. Presets may reprioritize derivatives but can never move that anchor.
+# The first recipe is the immutable default anchor for an anchored pack.
+# Explicit competing layout probes may nominate another server-owned recipe as
+# their anchor; ordinary presets only reprioritize derivatives.
 PACK_ROLE_RECIPES: Mapping[str, tuple[PackSheetRecipe, ...]] = MappingProxyType({
     "character": (
         PackSheetRecipe("canonical_identity", "CANONICAL IDENTITY", "least-obscured canonical identity and proportions"),
@@ -363,6 +367,9 @@ PACK_ROLE_RECIPES: Mapping[str, tuple[PackSheetRecipe, ...]] = MappingProxyType(
         PackSheetRecipe("expressions", "EXPRESSIONS", "expression range with invariant identity"),
         PackSheetRecipe("wardrobe", "WARDROBE", "requested clothing and accessory continuity"),
         PackSheetRecipe("identity_details", "IDENTITY DETAILS", "face, hair, hands, materials, and identifying details"),
+        PackSheetRecipe("frontal_face", "FRONTAL FACE", "one straight-on face view with neutral expression and unobstructed identity"),
+        PackSheetRecipe("body_front", "BODY FRONT", "one head-to-toe front view with neutral pose and consistent scale"),
+        PackSheetRecipe("body_back", "BODY BACK", "one head-to-toe rear view with neutral pose and matching scale"),
     ),
     "location": (
         PackSheetRecipe("canonical_establishing", "CANONICAL ESTABLISHING", "least-occluded spatial and geographic anchor"),
@@ -411,6 +418,7 @@ PACK_ROLE_RECIPES: Mapping[str, tuple[PackSheetRecipe, ...]] = MappingProxyType(
 
 _PACK_PRESET_ROLE_ORDERS: Mapping[tuple[str, str], tuple[str, ...]] = MappingProxyType({
     ("character", "identity"): ("turnaround", "expressions", "wardrobe", "identity_details"),
+    ("character", "identity_focus"): ("body_front", "body_back", "identity_details", "expressions"),
     ("character", "wardrobe"): ("wardrobe", "turnaround", "identity_details", "expressions"),
     ("character", "underlayers"): ("wardrobe", "identity_details", "turnaround", "expressions"),
     ("character", "anatomy"): ("turnaround", "wardrobe", "identity_details", "expressions"),
@@ -433,6 +441,14 @@ _PACK_PRESET_ROLE_ORDERS: Mapping[tuple[str, str], tuple[str, ...]] = MappingPro
     ("world", "visual_language"): ("composition_language", "lighting_language", "material_language", "motion_language"),
     ("world", "environment"): ("material_language", "lighting_language", "composition_language", "motion_language"),
     ("world", "cinematography"): ("motion_language", "composition_language", "lighting_language", "material_language"),
+})
+
+# Most presets retain the reference type's canonical first recipe. This one is
+# deliberately a competing, opt-in layout probe: it concentrates the standard
+# three-sheet pack on one face anchor and matched front/back body views without
+# changing the established multi-angle identity default.
+_PACK_PRESET_ANCHOR_ROLES: Mapping[tuple[str, str], str] = MappingProxyType({
+    ("character", "identity_focus"): "frontal_face",
 })
 
 
@@ -1375,7 +1391,11 @@ class ReferencePackPlan:
 
     @property
     def anchor_strategy(self) -> str:
-        return "draft_one_shot" if self.mode == "draft" else "canonical_anchor"
+        if self.mode == "draft":
+            return "draft_one_shot"
+        if self.preset == "identity_focus":
+            return "layout_probe_anchor"
+        return "canonical_anchor"
 
     @property
     def output_roles(self) -> tuple[str, ...]:
@@ -3896,7 +3916,10 @@ def _pack_recipes(reference_type: str, preset: str, count: int) -> tuple[PackShe
     recipes = PACK_ROLE_RECIPES[reference_type]
     by_role = {recipe.role: recipe for recipe in recipes}
     derivative_roles = _PACK_PRESET_ROLE_ORDERS[(reference_type, preset)]
-    ordered = (recipes[0], *(by_role[role] for role in derivative_roles))
+    anchor_role = _PACK_PRESET_ANCHOR_ROLES.get(
+        (reference_type, preset), recipes[0].role,
+    )
+    ordered = (by_role[anchor_role], *(by_role[role] for role in derivative_roles))
     return tuple(ordered[:count])
 
 
@@ -5209,7 +5232,9 @@ def _pack_generation_request(
     if routing_operation is None:
         routing_operation = (
             "generation"
-            if strategy in {"canonical_anchor", "draft_one_shot"}
+            if strategy in {
+                "canonical_anchor", "layout_probe_anchor", "draft_one_shot",
+            }
             else "edit"
         )
     route = plan.operation_route(routing_operation)
@@ -5760,15 +5785,19 @@ def create_reference_pack(
                 anchor_role = None
                 detail = None
             elif index == 0:
+                anchor_strategy = plan.anchor_strategy
                 request = _pack_generation_request(
-                    plan, recipe, index, strategy="canonical_anchor",
+                    plan,
+                    recipe,
+                    index,
+                    strategy=anchor_strategy,
                 )
                 path = _new_distinct_path(
                     generate_sheet(request), recipe.role, paths,
                 )
                 anchor_path = path
                 anchor_fingerprint = _fingerprint(path)
-                strategy = "canonical_anchor"
+                strategy = anchor_strategy
                 model = request.model
                 anchor_role = recipe.role
                 detail = None
@@ -5849,7 +5878,7 @@ def create_reference_pack(
                 if role is None:
                     break
                 if role == plan.sheet_roles[0]:
-                    # A rejected canonical anchor invalidates every derivative.
+                    # A rejected anchor invalidates every derivative.
                     # Regenerate the whole candidate into new files in one
                     # bounded attempt; prior artifacts remain immutable cleanup
                     # inputs and retain their original provenance.
@@ -5858,11 +5887,14 @@ def create_reference_pack(
                         for artifact in artifacts
                     )
                     anchor_recipe = plan.sheets[0]
+                    anchor_regeneration_strategy = (
+                        f"{plan.anchor_strategy}_regeneration"
+                    )
                     anchor_request = _pack_generation_request(
                         plan,
                         anchor_recipe,
                         0,
-                        strategy="canonical_anchor_regeneration",
+                        strategy=anchor_regeneration_strategy,
                         routing_operation="generation",
                         correction_assessment=assessment,
                         correction_brief=correction_brief,
@@ -5876,7 +5908,7 @@ def create_reference_pack(
                             role=role,
                             index=0,
                             model=anchor_request.model,
-                            strategy="canonical_anchor_regeneration",
+                            strategy=anchor_regeneration_strategy,
                             anchor_role=role,
                             reason_codes=assessment.reason_codes,
                         )

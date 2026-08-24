@@ -650,6 +650,23 @@ class QueueRecoveryRuntimeTests(unittest.TestCase):
 
 
 class QueueLaunchWiringTests(unittest.TestCase):
+    def test_prompt_enhancement_logical_kind_is_closed_public_projection(self):
+        public_kind = _isolated_functions(
+            self.launch,
+            ("_public_parent_job_id", "_public_logical_job_kind"),
+            {},
+        )["_public_logical_job_kind"]
+        self.assertEqual(public_kind({
+            "kind": "prompt_enhancement",
+            "logical_job_kind": "prompt_enhancement",
+            "resource_intent": "text",
+        }), "prompt_enhancement")
+        self.assertIsNone(public_kind({
+            "kind": "generation",
+            "logical_job_kind": "prompt_enhancement",
+            "resource_intent": "generation",
+        }))
+
     @classmethod
     def setUpClass(cls):
         cls.launch = _tree("app/launch.py")
@@ -878,7 +895,12 @@ class QueueLaunchWiringTests(unittest.TestCase):
         self.assertNotIn("generation_slot(", preparation)
         self.assertNotIn("with _gen_lock", preparation)
         self.assertIn("maestro_cpu_text_operation", llm_authority)
-        self.assertIn("_coordinate_generation=True", llm_authority)
+        self.assertIn(
+            "_coordinate_generation=not generation_slot_owned", llm_authority,
+        )
+        self.assertIn(
+            "_precoordinated_generation=generation_slot_owned", llm_authority,
+        )
 
     def test_plan_approval_uses_sealed_source_without_repeating_llm(self):
         approval = ast.get_source_segment(
@@ -1944,6 +1966,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
         for path in (
             "/api/v1/queue/job-a/recovery-retry",
             "/api/v1/sample-campaign/queue",
+            "/api/v1/outputs",
         ):
             for status_code in (200, 404, 409, 503):
                 with self.subTest(path=path, status_code=status_code):
@@ -1952,7 +1975,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                         response.headers["Cache-Control"], "private, no-store",
                     )
                     self.assertEqual(response.headers["Pragma"], "no-cache")
-        unrelated = asyncio.run(exercise("/api/v1/outputs", 404))
+        unrelated = asyncio.run(exercise("/health", 404))
         self.assertEqual(unrelated.headers, {})
 
     def test_startup_recovery_is_registered_before_other_worker_startup(self):
@@ -2732,6 +2755,9 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "/api/v1/director/preparation/request-a",
                 "/api/v1/director/generate-music",
                 "/api/v1/director/classify-sections",
+                "/api/v1/llm/enhance-prompt",
+                "/api/v1/llm/operations/enhance/request-a",
+                "/api/v1/llm/operations/enhance/request-a/result",
                 "/api/v1/director/pipeline/start",
                 "/api/v1/director/pipelines/pipeline-a/repair",
                 "/api/v1/audio/analyze",
@@ -2859,6 +2885,9 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "_jobs": jobs,
                 "_plan_review_timer_lock": __import__("threading").Lock(),
                 "_plan_review_timers": {},
+                "HTTPException": Exception,
+                "_h3_job_model_types": lambda _job: (),
+                "_require_h3_legal_execution": lambda _models: None,
                 "_approve_waiting_generation_plan": approve,
                 "fail_preparation": lambda *_args, **_kwargs: self.fail(
                     "valid timer unexpectedly failed preparation"
@@ -2964,6 +2993,9 @@ class QueueLaunchWiringTests(unittest.TestCase):
             self.launch,
             ("_arm_ref2va_waiting_plan_review",),
             {
+                "HTTPException": Exception,
+                "_h3_job_model_types": lambda _job: (),
+                "_require_h3_legal_execution": lambda _models: None,
                 "_waiting_plan_project_is_current": lambda _job: True,
                 "arm_prepared_job_plan_review": arm,
                 "_schedule_plan_review_auto_approval": schedule,
@@ -3053,8 +3085,10 @@ class QueueLaunchWiringTests(unittest.TestCase):
             {
                 "HTTPException": FakeHTTPException,
                 "_h3_generation_requirements": lambda _body, _plan: {
+                    "models": [],
                     "ref2va_terms_required": True,
                 },
+                "_require_h3_legal_execution": lambda _models: None,
                 "_ref2va_host_terms_accepted": lambda: False,
             },
         )
@@ -3926,10 +3960,15 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "generation_slot": (
                     lambda *_args, **_kwargs: contextlib.nullcontext(True)
                 ),
+                "_WgpNativeGpuExecutionSlot": (
+                    lambda acquired, **_kwargs: contextlib.nullcontext(acquired)
+                ),
                 "_stamp_requested_generation_residency": lambda *_args, **_kwargs: None,
                 "try_start": lambda *_args, **_kwargs: True,
                 "_apply_per_job_coefficient": lambda *_args: None,
                 "_queue_recovery_delivery_pending": lambda *_args: None,
+                "_h3_job_model_types": lambda _job: (),
+                "_require_h3_legal_execution": lambda _models: None,
                 "_require_job_runtime_model_admission": lambda _job: None,
                 "_trusted_h3_prepared_plan": (
                     lambda body, *_args, **_kwargs: body.get("_h3_longform")
@@ -4366,6 +4405,8 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "_register_discovered_local_h3_recovery": register,
                 "_queue_recovery_reconcile_cursor": reconcile,
                 "_rollback_discovered_local_h3_recovery": rollback,
+                "_h3_job_model_types": lambda _job: (),
+                "_require_h3_legal_execution": lambda _models: None,
                 "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
                 "hmac": hmac,
             },
@@ -4399,6 +4440,8 @@ class QueueLaunchWiringTests(unittest.TestCase):
                     )
                 ),
                 "_rollback_discovered_local_h3_recovery": rollback,
+                "_h3_job_model_types": lambda _job: (),
+                "_require_h3_legal_execution": lambda _models: None,
                 "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
                 "hmac": hmac,
             },
@@ -4832,6 +4875,9 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "_jobs": jobs,
                 "_plan_review_timer_lock": __import__("threading").Lock(),
                 "_plan_review_timers": {},
+                "HTTPException": Exception,
+                "_h3_job_model_types": lambda _job: (),
+                "_require_h3_legal_execution": lambda _models: None,
                 "_approve_waiting_generation_plan": (
                     lambda *_args, **_kwargs: approved.set()
                 ),
@@ -4877,6 +4923,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "_queue_recovery_manifest_validator": lambda *_args, **_kwargs: False,
                 "_require_h3_offload_plan_parity": lambda *_args, **_kwargs: None,
                 "_queue_recovery_reconcile_cursor": lambda *_args: None,
+                "_job_uses_registered_h3": lambda _job: False,
                 "next_recovery_attempt": lambda _job: (1, True),
             },
         )
@@ -4909,6 +4956,147 @@ class QueueLaunchWiringTests(unittest.TestCase):
         )[0]
         self.assertEqual(corrupt_waiting["status"], "failed")
         self.assertEqual(corrupt_waiting["recovery_state"], "terminal")
+
+    def test_prompt_enhancement_restart_terminalizes_without_auto_generation(self):
+        worker_calls = []
+        namespace = _isolated_functions(
+            self.launch,
+            ("_queue_recovery_materialize_job",),
+            {
+                "hmac": hmac,
+                "math": __import__("math"),
+                "time": types.SimpleNamespace(time=lambda: 1234.5),
+                "_PLAN_REVIEW_TIMEOUT_SECONDS": 16.0,
+                "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+                "_queue_recovery_worker": (
+                    lambda _job: worker_calls.append(True)
+                ),
+                "load_request_manifest": lambda *_args, **_kwargs: {
+                    "params": {
+                        "_prompt_enhancement_operation": {
+                            "account_key": "opaque-account",
+                            "project_instance_key": "opaque-project",
+                            "request_digest": "a" * 64,
+                            "body": {"prompt": "private prompt"},
+                        },
+                    },
+                    "inputs": [],
+                },
+                "validate_manifest_inputs": lambda *_args: None,
+                "_queue_recovery_manifest_validator": lambda *_args, **_kwargs: True,
+                "_require_h3_offload_plan_parity": lambda *_args, **_kwargs: None,
+                "_queue_recovery_reconcile_cursor": lambda *_args: None,
+            },
+        )
+        project_digest = "project:v1:" + "b" * 64
+        restored, auto_resume = namespace[
+            "_queue_recovery_materialize_job"
+        ]({
+            "id": "0f6f216342f741d0a26079b697081d96",
+            "kind": "prompt_enhancement",
+            "status": "running",
+            "workspace": "project-a",
+            "owner_principal": "owner:v1:" + "a" * 64,
+            "project_instance": project_digest,
+            "request_manifest": {
+                "path": ".maestro-recovery/prompt.request.json",
+            },
+            "resource_intent": "text",
+            "resource_execution": "standard",
+            "resource_state": "running",
+            "preemption_mode": "none",
+            "execution_attempt": 1,
+        }, {"project-a": ("/project", project_digest)})
+        self.assertFalse(auto_resume)
+        self.assertEqual(restored["status"], "failed")
+        self.assertEqual(restored["finished_at"], 1234.5)
+        self.assertEqual(restored["recovery_state"], "terminal")
+        self.assertEqual(restored["resource_state"], "released")
+        self.assertEqual(worker_calls, [])
+
+    def test_prompt_enhancement_startup_checkpoints_terminal_conversion_once(self):
+        class Registry(dict):
+            def prepare(self, job):
+                return job
+
+            def publish_prepared(self, job_id, job):
+                self[job_id] = job
+
+        job_id = "0f6f216342f741d0a26079b697081d96"
+        snapshots = {
+            job_id: {
+                "id": job_id,
+                "kind": "prompt_enhancement",
+                "status": "running",
+                "workspace": "default",
+                "message": "Enhancing prompt",
+            },
+        }
+        checkpoints = []
+        worker_calls = []
+        registry = Registry()
+
+        def materialize(snapshot, _projects):
+            job = dict(snapshot)
+            if snapshot["status"] in {"queued", "running"}:
+                job.update({
+                    "status": "failed",
+                    "finished_at": 1234.5,
+                    "queue_held": False,
+                    "recovery_attempt": 0,
+                    "recovery_state": "terminal",
+                    "reruns_denoise": False,
+                    "message": "Prompt enhancement was interrupted",
+                    "resource_state": "released",
+                })
+            return job, False
+
+        def checkpoint(job, **updates):
+            job.update(updates)
+            snapshots[job["id"]] = dict(job)
+            checkpoints.append(dict(job))
+            return True
+
+        namespace = _isolated_functions(
+            self.launch,
+            ("_restore_queue_recovery_on_startup",),
+            {
+                "_queue_recovery_workers_started": False,
+                "_queue_recovery_existing_projects": lambda: {},
+                "_queue_recovery_restored": types.SimpleNamespace(
+                    jobs=snapshots,
+                    global_state={},
+                ),
+                "_queue_recovery_materialize_job": materialize,
+                "_queue_recovery_checkpoint": checkpoint,
+                "_jobs": registry,
+                "_CREDIT_CLEANUP_PARAM": "credit_cleanup",
+                "restore_scheduler_state": lambda *_args: None,
+                "cleanup_orphan_request_manifests": lambda *_args: 0,
+                "cleanup_orphan_staged_outputs": lambda *_args: 0,
+                "_queue_recovery_coordinator": types.SimpleNamespace(
+                    compact=lambda: None,
+                ),
+                "_queue_recovery_worker": (
+                    lambda _job: worker_calls.append(True)
+                ),
+                "_queue_recovery_delivery_pending": lambda _job: None,
+                "_require_job_runtime_model_admission": lambda _job: None,
+            },
+        )
+
+        self.assertTrue(namespace["_restore_queue_recovery_on_startup"]())
+        self.assertEqual(len(checkpoints), 1)
+        self.assertEqual(snapshots[job_id]["status"], "failed")
+        self.assertEqual(snapshots[job_id]["finished_at"], 1234.5)
+        self.assertEqual(worker_calls, [])
+
+        namespace["_queue_recovery_workers_started"] = False
+        registry.clear()
+        self.assertTrue(namespace["_restore_queue_recovery_on_startup"]())
+        self.assertEqual(len(checkpoints), 1)
+        self.assertEqual(registry[job_id]["status"], "failed")
+        self.assertEqual(worker_calls, [])
 
     def test_completed_h3_requires_exact_adopted_finals_before_terminal_state(self):
         finality = {
@@ -5074,6 +5262,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "_queue_recovery_manifest_validator": lambda *_args, **_kwargs: True,
                 "_require_h3_offload_plan_parity": lambda *_args, **_kwargs: None,
                 "_queue_recovery_reconcile_cursor": lambda *_args: None,
+                "_job_uses_registered_h3": lambda _job: False,
                 "next_recovery_attempt": lambda _job: (_ for _ in ()).throw(
                     AssertionError("waiting state incremented recovery attempt")
                 ),
@@ -5127,6 +5316,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "_require_h3_offload_plan_parity": lambda *_args, **_kwargs: None,
                 "_queue_recovery_reconcile_cursor": lambda *_args: None,
                 "_h3_incomplete_recovery_prefix": lambda _job: None,
+                "_job_uses_registered_h3": lambda _job: False,
                 "next_recovery_attempt": next_recovery_attempt,
             },
         )
@@ -5189,6 +5379,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "_h3_incomplete_recovery_prefix": (
                     lambda _job: 4 if prefix_valid["value"] else None
                 ),
+                "_job_uses_registered_h3": lambda _job: False,
                 "next_recovery_attempt": lambda _job: (
                     next_attempt_calls.append(True) or (3, True)
                 ),
@@ -5199,6 +5390,8 @@ class QueueLaunchWiringTests(unittest.TestCase):
                     lambda job: str(job.get("_recovery_reason_code") or "")
                 ),
                 "_queue_recovery_revalidate_job": lambda _job: True,
+                "_h3_job_model_types": lambda _job: (),
+                "_require_h3_legal_execution": lambda _models: None,
                 "_prepare_h3_peak_recovery": lambda job: job.update({
                     "_recovery_reason_code": "h3_generation_oom_replanned",
                 }) or True,
@@ -5326,6 +5519,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "_queue_recovery_reconcile_cursor": lambda *_args: None,
                 "_h3_incomplete_recovery_prefix": lambda _job: 4,
                 "_h3_dependency_closed_recovery_prefix": lambda _job: 4,
+                "_job_uses_registered_h3": lambda _job: False,
                 "next_recovery_attempt": lambda _job: (
                     next_attempt_calls.append(True) or (99, False)
                 ),

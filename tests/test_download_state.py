@@ -1,11 +1,4 @@
-"""Continuum CivitAI/HuggingFace download-state wiring.
-
-Locks leftover 1.9.0 `ensure_allowed_checkpoint_target` /
-`_list_checkpoint_architectures(base_model)` / `unsupported_checkpoint_reason`
-/ `validate_checkpoint_file` probes onto Continuum `_scan_defaults_by_arch`
-membership, `_guess_arch_for_base`, and `_validate_safetensors_payload`.
-Do not invent leftover base-model checkpoint gates.
-"""
+"""CivitAI/HuggingFace download-state and checkpoint safety wiring."""
 from __future__ import annotations
 
 import ast
@@ -28,6 +21,7 @@ _UI_STORE_PATH = os.path.join(_ROOT, "ui", "src", "stores", "useStore.ts")
 _MODEL_DETAIL_PATH = os.path.join(
     _ROOT, "ui", "src", "components", "LoraBrowser", "ModelDetail.tsx",
 )
+_CLIENT_PATH = os.path.join(_ROOT, "ui", "src", "api", "client.ts")
 
 
 def _parse_launch() -> tuple[ast.Module, str]:
@@ -263,7 +257,6 @@ class TestDownloadState(unittest.TestCase):
             store_source = handle.read()
         with open(_MODEL_DETAIL_PATH, "r", encoding="utf-8") as handle:
             detail_source = handle.read()
-
         self.assertIn("download.status === 'completed'", store_source)
         self.assertIn("!!download.model_type", store_source)
         self.assertIn("await api.reloadModels()", store_source)
@@ -399,30 +392,143 @@ class TestDownloadState(unittest.TestCase):
         )
         with open(_MODEL_DETAIL_PATH, "r", encoding="utf-8") as handle:
             detail_source = handle.read()
+        with open(_CLIENT_PATH, "r", encoding="utf-8") as handle:
+            client_source = handle.read()
 
-        # Leftover 1.9.0 gated imports with ensure_allowed_checkpoint_target
-        # and listed architectures by leftover base_model. Continuum fail-closes
-        # on the shipped defaults index and only suggests an architecture.
-        self.assertNotIn("ensure_allowed_checkpoint_target", endpoint)
-        self.assertNotIn("unsupported_checkpoint_reason", architecture_endpoint)
-        self.assertNotIn("_list_checkpoint_architectures(base_model)", endpoint)
-        self.assertIn("arch_index = _scan_defaults_by_arch()", endpoint)
-        self.assertIn("target_architecture not in arch_index", endpoint)
-        self.assertIn("_list_checkpoint_architectures()", architecture_endpoint)
-        self.assertIn("_guess_arch_for_base(base_model", architecture_endpoint)
-        self.assertIn("suggested_architecture", architecture_endpoint)
-        # Leftover 1.9.0 used validate_checkpoint_file before publish.
-        # Continuum validates the safetensors payload, then atomically replaces.
-        self.assertNotIn("validate_checkpoint_file(", worker)
-        validate_at = worker.index("_validate_safetensors_payload(")
+        self.assertIn(
+            "ensure_allowed_checkpoint_target(base_model, target_architecture)",
+            endpoint,
+        )
+        self.assertIn("_list_checkpoint_architectures(base_model)", endpoint)
+        self.assertIn(
+            "unsupported_checkpoint_reason(base_model)",
+            architecture_endpoint,
+        )
+        self.assertIn('"supported": supported', architecture_endpoint)
+        self.assertIn('"unsupported_reason": reason', architecture_endpoint)
+        self.assertIn("Checkpoint import supports individual SafeTensor", endpoint)
+        checkpoint_validate_at = worker.index("validate_checkpoint_file(")
+        generic_validate_at = worker.index("_validate_safetensors_payload(")
+        archive_reject_at = worker.index(
+            "is_checkpoint and zipfile.is_zipfile(partial_path)"
+        )
         publish_at = worker.index("os.replace(partial_path, save_path)")
-        self.assertLess(validate_at, publish_at)
+        self.assertLess(generic_validate_at, publish_at)
+        self.assertLess(checkpoint_validate_at, publish_at)
+        self.assertLess(archive_reject_at, publish_at)
+        self.assertIn(
+            'file_extension not in {".safetensors", ".sft"}',
+            worker,
+        )
         self.assertNotIn(
             "r.suggested_architecture || prev ||",
             detail_source,
         )
         self.assertIn("setTargetArchitecture('')", detail_source)
         self.assertIn("checkpointSupportReason", detail_source)
+        self.assertIn("supported: boolean", client_source)
+        self.assertIn("unsupported_reason: string | null", client_source)
+        self.assertIn("encodeURIComponent(baseModel)", client_source)
+
+        reload_source = _source_segment(
+            self.tree,
+            self.source,
+            "reload_model_definitions",
+        )
+        self.assertIn(
+            "_audit_configured_checkpoint_definitions(reload_always=True)",
+            reload_source,
+        )
+        scan_source = _source_segment(
+            self.tree,
+            self.source,
+            "_scan_installed_checkpoints",
+        )
+        self.assertIn("_audit_configured_checkpoint_definitions()", scan_source)
+
+        import_at = self.source.index("\nimport wgp\n")
+        startup_audit_at = self.source.index(
+            "\n_audit_configured_checkpoint_definitions()\n",
+            import_at,
+        )
+        self.assertLess(import_at, startup_audit_at)
+
+        linked_update_source = _source_segment(
+            self.tree,
+            self.source,
+            "_apply_linked_model_folders",
+        )
+        self.assertIn("wgp.fl.set_checkpoints_paths(new_paths)", linked_update_source)
+        self.assertLess(
+            linked_update_source.index("wgp.fl.set_checkpoints_paths(new_paths)"),
+            linked_update_source.index("_audit_configured_checkpoint_definitions("),
+        )
+
+        configured_audit_source = _source_segment(
+            self.tree,
+            self.source,
+            "_audit_configured_checkpoint_definitions",
+        )
+        self.assertIn(
+            "resolve_checkpoint=wgp.get_local_model_filename",
+            configured_audit_source,
+        )
+
+    def test_configured_audit_passes_exact_wgp_resolver_and_reloads_changes(self):
+        configured_audit = _load_helpers(
+            self.tree,
+            ("_audit_configured_checkpoint_definitions",),
+        )["_audit_configured_checkpoint_definitions"]
+        calls = []
+
+        class FakeWGP:
+            def get_local_model_filename(self, filename):
+                return f"resolved:{filename}"
+
+        fake_wgp = FakeWGP()
+
+        def fake_audit(**kwargs):
+            resolver = kwargs["resolve_checkpoint"]
+            calls.append(("audit", resolver("weight.safetensors")))
+            return [{"model_type": "restored"}]
+
+        def fake_reload(changes):
+            calls.append(("reload", [item["model_type"] for item in changes]))
+
+        configured_audit.__globals__.update({
+            "wgp": fake_wgp,
+            "_audit_checkpoint_definitions": fake_audit,
+            "_reload_after_checkpoint_audit": fake_reload,
+        })
+        changes = configured_audit()
+        self.assertEqual(changes, [{"model_type": "restored"}])
+        self.assertEqual(calls, [
+            ("audit", "resolved:weight.safetensors"),
+            ("reload", ["restored"]),
+        ])
+
+    def test_checkpoint_audit_rebuild_drops_stale_merged_visibility(self):
+        reload_after_audit = _load_helpers(
+            self.tree,
+            ("_reload_after_checkpoint_audit",),
+        )["_reload_after_checkpoint_audit"]
+
+        class FakeWGP:
+            def __init__(self):
+                self.models_def = {
+                    "restored": {"visible": False},
+                    "untouched": {"visible": True},
+                }
+                self.loaded_after_pop = False
+
+            def load_model_definitions(self):
+                self.loaded_after_pop = "restored" not in self.models_def
+
+        fake = FakeWGP()
+        reload_after_audit.__globals__["wgp"] = fake
+        reload_after_audit([{"model_type": "restored"}])
+        self.assertTrue(fake.loaded_after_pop)
+        self.assertIn("untouched", fake.models_def)
 
     def test_target_reservation_is_normalized_and_single_flight(self):
         helpers = _load_helpers(

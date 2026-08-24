@@ -17,6 +17,7 @@ import {
 import {
   AccountApiError,
   isAccountProjectAccessActive,
+  registerAccount,
   type AccessContext,
 } from '../../api/client'
 import { closeModalIfTop, installModalFocus } from '../../lib/modalFocus'
@@ -77,7 +78,7 @@ export function safeAccountHttpErrorMessage(
   context: 'account' | 'project-migration' = 'account',
 ): string {
   if (context === 'project-migration' && code === 'project_migration_needs_attention') {
-    const message = 'Some existing project folders need attention. Fix or remove them on this computer, then retry. Account-based project filtering remains off, and existing project access stays unchanged.'
+    const message = 'Some existing project folders need attention. Resolve each listed project on this computer, then retry. Removing a project is a separate action that Maestro will ask you to confirm. Account-based project filtering remains off, and existing project access stays unchanged.'
     return retryAfter > 0 ? `${message} Try again in about ${retryAfter} seconds.` : message
   }
   if (code !== 'account_request_failed') return safeAccountErrorMessage(code, retryAfter)
@@ -85,7 +86,7 @@ export function safeAccountHttpErrorMessage(
   const message = status === 404
     ? 'Project setup is not available on this Maestro host.'
     : status === 423
-      ? 'Unlock the project in this browser, then try again.'
+      ? 'Project access changed while setup was running. Refresh project access, then try again.'
       : status === 503
         ? 'Project access is temporarily unavailable. Try again after Maestro is ready.'
         : status === 409
@@ -154,21 +155,38 @@ function Field({
   minLength?: number
   placeholder?: string
 }) {
+  const inputId = useId()
+  const [passwordVisible, setPasswordVisible] = useState(false)
+  const passwordField = type === 'password'
   return (
-    <label className="block text-[10px] font-medium text-text-secondary">
-      <span>{label}</span>
-      <input
-        type={type}
-        value={value}
-        onChange={event => onChange(event.target.value)}
-        autoComplete={autoComplete}
-        required={required}
-        minLength={minLength}
-        placeholder={placeholder}
-        tabIndex={0}
-        className="mt-1 w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-xs text-text-primary outline-none transition-colors placeholder:text-text-muted focus:border-accent-blue focus:ring-1 focus:ring-accent-blue"
-      />
-    </label>
+    <div className="block text-[10px] font-medium text-text-secondary">
+      <label htmlFor={inputId}>{label}</label>
+      <span className="relative mt-1 block">
+        <input
+          id={inputId}
+          type={passwordField && passwordVisible ? 'text' : type}
+          value={value}
+          onChange={event => onChange(event.target.value)}
+          autoComplete={autoComplete}
+          required={required}
+          minLength={minLength}
+          placeholder={placeholder}
+          tabIndex={0}
+          className={`min-h-11 w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-xs text-text-primary outline-none transition-colors placeholder:text-text-muted focus:border-accent-blue focus:ring-1 focus:ring-accent-blue ${passwordField ? 'pr-12' : ''}`}
+        />
+        {passwordField && (
+          <button
+            type="button"
+            onClick={() => setPasswordVisible(visible => !visible)}
+            className="absolute inset-y-0 right-0 flex min-h-11 min-w-11 items-center justify-center rounded-r-lg text-text-muted hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-blue"
+            aria-label={passwordVisible ? `Hide ${label.toLowerCase()}` : `Show ${label.toLowerCase()}`}
+            aria-pressed={passwordVisible}
+          >
+            <span className="text-[9px] font-semibold">{passwordVisible ? 'Hide' : 'Show'}</span>
+          </button>
+        )}
+      </span>
+    </div>
   )
 }
 
@@ -181,6 +199,40 @@ function OneTimeCodes({
   codes: string[]
   onDismiss: () => void
 }) {
+  const [savedAcknowledged, setSavedAcknowledged] = useState(false)
+  const [saveNotice, setSaveNotice] = useState('')
+  const codesText = codes.join('\n')
+
+  useEffect(() => {
+    setSavedAcknowledged(false)
+    setSaveNotice('')
+  }, [codes])
+
+  const copyCodes = async () => {
+    try {
+      await navigator.clipboard.writeText(codesText)
+      setSaveNotice('Copied. Store the codes somewhere private, then confirm below.')
+    } catch {
+      setSaveNotice('Copy was unavailable in this browser. Select the codes or download the file instead.')
+    }
+  }
+
+  const downloadCodes = () => {
+    let url = ''
+    try {
+      url = URL.createObjectURL(new Blob([`${codesText}\n`], { type: 'text/plain;charset=utf-8' }))
+      const link = document.createElement('a')
+      link.href = url
+      link.download = 'maestro-recovery-codes.txt'
+      link.click()
+      setSaveNotice('Downloaded. Move the file to a private place, then confirm below.')
+    } catch {
+      setSaveNotice('Download was unavailable in this browser. Copy or select the codes instead.')
+    } finally {
+      if (url) URL.revokeObjectURL(url)
+    }
+  }
+
   return (
     <section className="rounded-xl border border-indicator-warning/60 bg-indicator-warning/10 p-3" aria-live="polite">
       <div className="flex items-start gap-2">
@@ -193,12 +245,39 @@ function OneTimeCodes({
           <ol className="mt-2 grid gap-1 rounded-lg bg-bg-primary/70 p-2 font-mono text-[10px] text-text-primary sm:grid-cols-2">
             {codes.map(code => <li key={code}>{code}</li>)}
           </ol>
+          <div className="mt-2 grid gap-2 sm:grid-cols-2">
+            <button
+              type="button"
+              onClick={() => void copyCodes()}
+              className="flex min-h-11 items-center justify-center gap-2 rounded-lg border border-border px-3 py-2 text-[10px] font-semibold text-text-secondary hover:bg-bg-hover hover:text-text-primary"
+            >
+              Copy all
+            </button>
+            <button
+              type="button"
+              onClick={downloadCodes}
+              className="flex min-h-11 items-center justify-center gap-2 rounded-lg border border-border px-3 py-2 text-[10px] font-semibold text-text-secondary hover:bg-bg-hover hover:text-text-primary"
+            >
+              Download
+            </button>
+          </div>
+          {saveNotice && <p className="mt-2 text-[9px] leading-relaxed text-text-muted" role="status">{saveNotice}</p>}
+          <label className="mt-2 flex min-h-11 items-center gap-2 rounded-lg border border-border bg-bg-primary/40 px-3 py-2 text-[10px] leading-relaxed text-text-secondary">
+            <input
+              type="checkbox"
+              checked={savedAcknowledged}
+              onChange={event => setSavedAcknowledged(event.target.checked)}
+              className="h-5 w-5 shrink-0 accent-accent-blue"
+            />
+            <span>I stored these recovery codes somewhere private.</span>
+          </label>
           <button
             type="button"
             onClick={onDismiss}
-            className="mt-2 rounded-lg border border-border px-2.5 py-1.5 text-[10px] font-semibold text-text-secondary hover:bg-bg-hover hover:text-text-primary"
+            disabled={!savedAcknowledged}
+            className="mt-2 min-h-11 w-full rounded-lg bg-accent-blue px-3 py-2 text-[10px] font-semibold text-cta-foreground hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
           >
-            I saved them
+            Continue with saved codes
           </button>
         </div>
       </div>
@@ -211,7 +290,23 @@ export function AccountSupportButton({ compact = false }: { compact?: boolean })
   const open = useStore(state => state.accountDrawerOpen)
   const setOpen = useStore(state => state.setAccountDrawerOpen)
 
-  const accountLabel = context?.authenticated ? context.account?.username || 'Account' : null
+  const accountsEnabled = context?.enabled === true
+  const authenticated = accountsEnabled && context?.authenticated === true
+  const visibleLabel = !accountsEnabled
+    ? 'Support'
+    : authenticated
+      ? 'Account & support'
+      : 'Sign in'
+  const accessibleLabel = !accountsEnabled
+    ? 'Open support'
+    : authenticated
+      ? 'Open account and support'
+      : 'Open sign in and account help'
+  const TriggerIcon = !accountsEnabled
+    ? HeartHandshake
+    : authenticated
+      ? UserRound
+      : LogIn
   return (
     <button
       type="button"
@@ -220,18 +315,24 @@ export function AccountSupportButton({ compact = false }: { compact?: boolean })
       aria-haspopup="dialog"
       aria-controls="account-support-drawer"
       aria-expanded={open}
-      aria-label={accountLabel ? `Open Support and account for ${accountLabel}` : 'Open Support'}
+      aria-label={accessibleLabel}
       className={`flex shrink-0 items-center justify-center gap-1.5 rounded-lg border border-border bg-bg-secondary text-text-secondary shadow-lg transition-colors hover:border-border-light hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue ${
         compact ? 'h-11 w-11 p-0' : 'px-3 py-2 text-[11px] font-semibold'
       }`}
     >
-      <HeartHandshake size={compact ? 18 : 14} aria-hidden="true" />
-      {!compact && <span className="max-w-32 truncate">Support</span>}
+      <TriggerIcon size={compact ? 18 : 14} aria-hidden="true" />
+      {!compact && <span className="max-w-32 truncate">{visibleLabel}</span>}
     </button>
   )
 }
 
-export function AccountSupportDrawer() {
+export function AccountSupportDrawer({
+  required = false,
+  onAuthenticated,
+}: {
+  required?: boolean
+  onAuthenticated?: () => void
+} = {}) {
   const titleId = useId()
   const descriptionId = useId()
   const supportTabId = useId()
@@ -244,6 +345,7 @@ export function AccountSupportDrawer() {
   const focusReturnRef = useRef<HTMLSpanElement>(null)
   const lifecycleRef = useRef(createAccountDrawerLifecycle())
   const accountIdentityRef = useRef<string | null>(null)
+  const oneTimeCodesIdentityRef = useRef<string | null>(null)
   const open = useStore(state => state.accountDrawerOpen)
   const setOpen = useStore(state => state.setAccountDrawerOpen)
   const context = useStore(state => state.accountContext)
@@ -275,19 +377,27 @@ export function AccountSupportDrawer() {
   const [notice, setNotice] = useState<{ kind: 'success' | 'error'; text: string } | null>(null)
   const [oneTimeCodes, setOneTimeCodes] = useState<string[]>([])
   const [codesLabel, setCodesLabel] = useState('Recovery codes')
+  const [resumeAfterCodes, setResumeAfterCodes] = useState(false)
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [passwordConfirmation, setPasswordConfirmation] = useState('')
   const [email, setEmail] = useState('')
   const [deviceLabel, setDeviceLabel] = useState('Browser')
   const [recoveryCode, setRecoveryCode] = useState('')
   const [newPassword, setNewPassword] = useState('')
+  const [newPasswordConfirmation, setNewPasswordConfirmation] = useState('')
   const [reauthPassword, setReauthPassword] = useState('')
   const [managedUsername, setManagedUsername] = useState('')
   const [managedPassword, setManagedPassword] = useState('')
   const [managedEmail, setManagedEmail] = useState('')
-  const [activeTab, setActiveTab] = useState<AccountSupportTab>('support')
+  const [entryMode, setEntryMode] = useState<'login' | 'register' | 'recover'>('login')
+  const [activeTab, setActiveTab] = useState<AccountSupportTab>(required ? 'account' : 'support')
   const accountsEnabled = context?.enabled === true
   const authenticated = accountsEnabled && context.authenticated && context.account !== null
+  const publicRegistrationAvailable = context?.public_registration_available === true
+  const accountEntryModes: Array<['login' | 'register' | 'recover', string]> = publicRegistrationAvailable
+    ? [['login', 'Sign in'], ['register', 'Create account'], ['recover', 'Recover']]
+    : [['login', 'Sign in'], ['recover', 'Recover']]
   const accountIdentity = context?.authenticated === true && context.account
     ? context.account.id
     : ''
@@ -308,29 +418,44 @@ export function AccountSupportDrawer() {
 
   const clearSensitive = useCallback(() => {
     setPassword('')
+    setPasswordConfirmation('')
     setEmail('')
     setRecoveryCode('')
     setNewPassword('')
+    setNewPasswordConfirmation('')
     setReauthPassword('')
     setManagedPassword('')
     setManagedEmail('')
     setOneTimeCodes([])
+    setResumeAfterCodes(false)
+    oneTimeCodesIdentityRef.current = null
   }, [])
 
+  const dismissOneTimeCodes = useCallback(() => {
+    setOneTimeCodes([])
+    oneTimeCodesIdentityRef.current = null
+    if (!resumeAfterCodes) return
+    setResumeAfterCodes(false)
+    onAuthenticated?.()
+  }, [onAuthenticated, resumeAfterCodes])
+
   const closeDrawer = useCallback(() => {
+    if (required) return
     lifecycleRef.current.closed()
     clearSensitive()
     setBusy('')
     setNotice(null)
     setActiveTab('support')
+    setEntryMode('login')
     setOpen(false)
-  }, [clearSensitive, setOpen])
+  }, [clearSensitive, required, setOpen])
 
   const requestCloseDrawer = useCallback(() => {
     closeModalIfTop(document, dialogRef.current, closeDrawer)
   }, [closeDrawer])
 
   const selectTab = useCallback((tab: AccountSupportTab) => {
+    if (required && tab !== 'account') return
     if (tab === activeTab) return
     if (tab === 'support') {
       lifecycleRef.current.closed()
@@ -341,7 +466,17 @@ export function AccountSupportDrawer() {
       lifecycleRef.current.opened()
     }
     setActiveTab(tab)
-  }, [activeTab, clearSensitive])
+  }, [activeTab, clearSensitive, required])
+
+  useEffect(() => {
+    if (required && open && activeTab !== 'account') setActiveTab('account')
+  }, [activeTab, open, required])
+
+  useEffect(() => {
+    if (!publicRegistrationAvailable && entryMode === 'register') {
+      setEntryMode('login')
+    }
+  }, [entryMode, publicRegistrationAvailable])
 
   const handleTabKeyDown = useCallback((
     event: KeyboardEvent<HTMLButtonElement>,
@@ -421,6 +556,11 @@ export function AccountSupportDrawer() {
     const previousIdentity = accountIdentityRef.current
     accountIdentityRef.current = accountIdentity
     if (previousIdentity === null || previousIdentity === accountIdentity) return
+    if (oneTimeCodesIdentityRef.current === accountIdentity) {
+      oneTimeCodesIdentityRef.current = null
+      setBusy('')
+      return
+    }
     clearSensitive()
     setBusy('')
     setNotice(null)
@@ -435,7 +575,9 @@ export function AccountSupportDrawer() {
   }, [accountProjectAccessActive, activeTab, loadProjectMigration, migrationAvailable, open])
 
   useEffect(() => {
-    if (!open || !dialogRef.current || !closeRef.current) return
+    if (!open || !dialogRef.current) return
+    const initialFocus = required ? accountTabRef.current : closeRef.current
+    if (!initialFocus) return
     const nativeControls = Array.from(dialogRef.current.querySelectorAll<HTMLElement>(
       'input:not([disabled]), select:not([disabled]), textarea:not([disabled])',
     ))
@@ -444,16 +586,16 @@ export function AccountSupportDrawer() {
     const uninstall = installModalFocus({
       document,
       dialog: dialogRef.current,
-      initialFocus: closeRef.current,
+      initialFocus,
       restoreFocus: focusReturnRef.current,
       appRoot: document.getElementById('root'),
-      onClose: closeDrawer,
+      onClose: required ? () => {} : closeDrawer,
     })
     return () => {
       for (const control of annotatedControls) control.removeAttribute('tabindex')
       uninstall()
     }
-  }, [closeDrawer, open])
+  }, [closeDrawer, open, required])
 
   const focusReturnTarget = (
     <span
@@ -474,13 +616,17 @@ export function AccountSupportDrawer() {
       className="fixed inset-0 z-[170] flex items-stretch justify-end"
       style={{ paddingTop: 'env(safe-area-inset-top)', paddingBottom: 'env(safe-area-inset-bottom)' }}
     >
-      <button
-        type="button"
-        tabIndex={-1}
-        aria-label="Close Support panel"
-        className="absolute inset-0 appearance-none border-0 bg-black/70 p-0"
-        onClick={requestCloseDrawer}
-      />
+      {required ? (
+        <div aria-hidden="true" className="absolute inset-0 bg-black/70" />
+      ) : (
+        <button
+          type="button"
+          tabIndex={-1}
+          aria-label="Close Support panel"
+          className="absolute inset-0 appearance-none border-0 bg-black/70 p-0"
+          onClick={requestCloseDrawer}
+        />
+      )}
       <div
         id="account-support-drawer"
         ref={dialogRef}
@@ -496,17 +642,19 @@ export function AccountSupportDrawer() {
           </div>
           <div className="min-w-0 flex-1">
             <h2 id={titleId} className="text-sm font-semibold text-text-primary">
-              {accountsEnabled ? 'Support & account' : 'Support'}
+              {required ? 'Sign in to Maestro' : accountsEnabled ? 'Account & support' : 'Support'}
             </h2>
             <p id={descriptionId} className="mt-0.5 text-[10px] leading-relaxed text-text-muted">
-              {accountsEnabled
+              {required
+                ? 'Sign in before project names, uploads, or creative tools become available.'
+                : accountsEnabled
                 ? accountProjectAccessActive
-                  ? 'Support Maestro or manage your account. Project access follows your account membership.'
-                  : 'Support Maestro or manage your account. Existing project access may also depend on this browser or a project password.'
+                  ? 'Support Maestro Continuum or manage your account. Project access follows your account membership.'
+                  : 'Support Maestro Continuum or manage your account. Existing project access may also depend on this browser or a project password.'
                 : 'View optional ways to support Maestro. Support does not change access or available controls.'}
             </p>
           </div>
-          <button
+          {!required && <button
             ref={closeRef}
             type="button"
             onClick={requestCloseDrawer}
@@ -514,12 +662,12 @@ export function AccountSupportDrawer() {
             className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg p-0 text-text-muted hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue md:h-auto md:w-auto md:p-1.5"
           >
             <X size={17} aria-hidden="true" />
-          </button>
+          </button>}
         </header>
 
         {accountsEnabled && (
-          <div className="grid shrink-0 grid-cols-2 border-b border-border p-1" role="tablist" aria-label="Support and account sections">
-            <button
+          <div className={`grid shrink-0 ${required ? 'grid-cols-1' : 'grid-cols-2'} border-b border-border p-1`} role="tablist" aria-label="Support and account sections">
+            {!required && <button
               id={supportTabId}
               ref={supportTabRef}
               type="button"
@@ -532,7 +680,7 @@ export function AccountSupportDrawer() {
               className={`rounded-lg px-3 py-2 text-[11px] font-semibold ${activeTab === 'support' ? 'bg-bg-hover text-text-primary' : 'text-text-muted hover:text-text-primary'}`}
             >
               Support
-            </button>
+            </button>}
             <button
               id={accountTabId}
               ref={accountTabRef}
@@ -587,7 +735,7 @@ export function AccountSupportDrawer() {
           )}
           {oneTimeCodes.length > 0 && (
             <div className="mb-4">
-              <OneTimeCodes label={codesLabel} codes={oneTimeCodes} onDismiss={() => setOneTimeCodes([])} />
+              <OneTimeCodes label={codesLabel} codes={oneTimeCodes} onDismiss={dismissOneTimeCodes} />
             </div>
           )}
 
@@ -598,14 +746,23 @@ export function AccountSupportDrawer() {
                   className="rounded-xl border border-accent-blue/50 bg-accent-blue/5 p-3"
                   onSubmit={event => {
                     event.preventDefault()
+                    if (password !== passwordConfirmation) {
+                      setNotice({ kind: 'error', text: 'The password confirmation does not match.' })
+                      return
+                    }
                     void run('bootstrap', async isCurrent => {
                       const result = await bootstrap({ username, password, email, deviceLabel })
                       if (!isCurrent() || !result) return
                       setPassword('')
+                      setPasswordConfirmation('')
                       setEmail('')
-                      setOneTimeCodes(result.recovery_codes || [])
+                      const codes = result.recovery_codes || []
+                      oneTimeCodesIdentityRef.current = codes.length > 0 ? result.account.id : null
+                      setOneTimeCodes(codes)
+                      setResumeAfterCodes(codes.length > 0 && Boolean(onAuthenticated))
                       setCodesLabel('Owner recovery codes')
                       setNotice({ kind: 'success', text: 'Owner account created and signed in.' })
+                      if (codes.length === 0) onAuthenticated?.()
                     })
                   }}
                 >
@@ -620,12 +777,13 @@ export function AccountSupportDrawer() {
                     <Field label="Username" value={username} onChange={setUsername} autoComplete="username" required />
                     <Field label="Device label" value={deviceLabel} onChange={setDeviceLabel} autoComplete="off" required />
                     <Field label="Password" value={password} onChange={setPassword} type="password" autoComplete="new-password" required minLength={8} />
+                    <Field label="Confirm password" value={passwordConfirmation} onChange={setPasswordConfirmation} type="password" autoComplete="new-password" required minLength={8} />
                     <Field label="Email (optional)" value={email} onChange={setEmail} type="email" autoComplete="email" />
                   </div>
                   <button
                     type="submit"
                     disabled={Boolean(busy)}
-                    className="mt-3 flex w-full items-center justify-center gap-2 rounded-lg bg-bg-active px-3 py-2 text-xs font-semibold text-text-primary hover:bg-bg-hover disabled:opacity-100"
+                    className="mt-3 flex min-h-11 w-full items-center justify-center gap-2 rounded-lg bg-bg-active px-3 py-2 text-xs font-semibold text-text-primary hover:bg-bg-hover disabled:opacity-100"
                   >
                     {busy === 'bootstrap' ? <Loader2 size={14} className="animate-spin" /> : <ShieldCheck size={14} />}
                     Create owner account
@@ -633,15 +791,40 @@ export function AccountSupportDrawer() {
                 </form>
               )}
 
-              <form
+              <div
+                className={`grid ${publicRegistrationAvailable ? 'grid-cols-3' : 'grid-cols-2'} rounded-xl border border-border bg-bg-primary p-1`}
+                role="group"
+                aria-label="Account access"
+              >
+                {accountEntryModes.map(([mode, label]) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    aria-pressed={entryMode === mode}
+                    onClick={() => {
+                      clearSensitive()
+                      setNotice(null)
+                      setEntryMode(mode)
+                    }}
+                    className={`min-h-11 rounded-lg px-2 py-2 text-[10px] font-semibold ${entryMode === mode ? 'bg-bg-hover text-text-primary' : 'text-text-muted hover:text-text-primary'}`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+
+              {entryMode === 'login' && <form
                 className="rounded-xl border border-border bg-bg-tertiary/30 p-3"
                 onSubmit={event => {
                   event.preventDefault()
                   void run('login', async isCurrent => {
                     await login({ username, password, deviceLabel })
                     if (!isCurrent()) return
+                    await loadSessions().catch(() => {})
+                    if (!isCurrent()) return
                     setPassword('')
                     setNotice({ kind: 'success', text: 'Signed in.' })
+                    onAuthenticated?.()
                   })
                 }}
               >
@@ -659,29 +842,90 @@ export function AccountSupportDrawer() {
                 <button
                   type="submit"
                   disabled={Boolean(busy)}
-                  className="mt-3 flex w-full items-center justify-center gap-2 rounded-lg bg-bg-active px-3 py-2 text-xs font-semibold text-text-primary hover:bg-bg-hover disabled:opacity-100"
+                  className="mt-3 flex min-h-11 w-full items-center justify-center gap-2 rounded-lg bg-bg-active px-3 py-2 text-xs font-semibold text-text-primary hover:bg-bg-hover disabled:opacity-100"
                 >
                   {busy === 'login' ? <Loader2 size={14} className="animate-spin" /> : <LogIn size={14} />}
                   Sign in
                 </button>
-              </form>
+              </form>}
 
-              <details className="rounded-xl border border-border bg-bg-tertiary/20">
-                <summary className="cursor-pointer px-3 py-3 text-xs font-semibold text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-blue">
-                  Recover an account
-                </summary>
+              {entryMode === 'register' && publicRegistrationAvailable && (
                 <form
-                  className="border-t border-border p-3"
+                  className="rounded-xl border border-accent-blue/50 bg-accent-blue/5 p-3"
                   onSubmit={event => {
                     event.preventDefault()
+                    if (password !== passwordConfirmation) {
+                      setNotice({ kind: 'error', text: 'The password confirmation does not match.' })
+                      return
+                    }
+                    void run('register', async isCurrent => {
+                      const result = await registerAccount({ username, password, email, deviceLabel })
+                      if (!isCurrent()) return
+                      const codes = result.recovery_codes || []
+                      oneTimeCodesIdentityRef.current = codes.length > 0 ? result.account.id : null
+                      setOneTimeCodes(codes)
+                      setResumeAfterCodes(codes.length > 0 && Boolean(onAuthenticated))
+                      setCodesLabel('Your recovery codes')
+                      await loadContext()
+                      if (!isCurrent()) return
+                      await loadSessions().catch(() => {})
+                      if (!isCurrent()) return
+                      setPassword('')
+                      setPasswordConfirmation('')
+                      setEmail('')
+                      setNotice({ kind: 'success', text: 'Account created and signed in.' })
+                      if (codes.length === 0) onAuthenticated?.()
+                    })
+                  }}
+                >
+                  <div className="flex items-center gap-2">
+                    <UserPlus size={15} className="text-accent-blue" aria-hidden="true" />
+                    <h3 className="text-xs font-semibold text-text-primary">Create account</h3>
+                  </div>
+                  <p className="mt-1 text-[10px] leading-relaxed text-text-muted">
+                    Your account starts with no projects. Projects you create are owned by this account.
+                  </p>
+                  <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                    <Field label="Username" value={username} onChange={setUsername} autoComplete="username" required />
+                    <Field label="Device label" value={deviceLabel} onChange={setDeviceLabel} autoComplete="off" required />
+                    <Field label="Password" value={password} onChange={setPassword} type="password" autoComplete="new-password" required minLength={8} />
+                    <Field label="Confirm password" value={passwordConfirmation} onChange={setPasswordConfirmation} type="password" autoComplete="new-password" required minLength={8} />
+                    <Field label="Email (optional)" value={email} onChange={setEmail} type="email" autoComplete="email" />
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={Boolean(busy)}
+                    className="mt-3 flex min-h-11 w-full items-center justify-center gap-2 rounded-lg bg-bg-active px-3 py-2 text-xs font-semibold text-text-primary hover:bg-bg-hover disabled:opacity-50"
+                  >
+                    {busy === 'register' ? <Loader2 size={14} className="animate-spin" /> : <UserPlus size={14} />}
+                    Create account
+                  </button>
+                </form>
+              )}
+
+              {entryMode === 'recover' && <form
+                  className="rounded-xl border border-border bg-bg-tertiary/20 p-3"
+                  onSubmit={event => {
+                    event.preventDefault()
+                    if (newPassword !== newPasswordConfirmation) {
+                      setNotice({ kind: 'error', text: 'The new password confirmation does not match.' })
+                      return
+                    }
                     void run('recover', async isCurrent => {
                       const result = await recover({ username, recoveryCode, newPassword, deviceLabel })
                       if (!isCurrent() || !result) return
                       setRecoveryCode('')
                       setNewPassword('')
-                      setOneTimeCodes(result.recovery_codes || [])
+                      setNewPasswordConfirmation('')
+                      await loadSessions().catch(() => {})
+                      if (!isCurrent()) return
+                      const codes = result.recovery_codes || []
+                      oneTimeCodesIdentityRef.current = codes.length > 0 ? result.account.id : null
+                      setOneTimeCodes(codes)
+                      setResumeAfterCodes(codes.length > 0 && Boolean(onAuthenticated))
                       setCodesLabel('Replacement recovery codes')
                       setNotice({ kind: 'success', text: 'Account recovered and signed in.' })
+                      if (codes.length === 0) onAuthenticated?.()
                     })
                   }}
                 >
@@ -690,16 +934,16 @@ export function AccountSupportDrawer() {
                     <Field label="Device label" value={deviceLabel} onChange={setDeviceLabel} autoComplete="off" required />
                     <Field label="Recovery code" value={recoveryCode} onChange={setRecoveryCode} autoComplete="one-time-code" required />
                     <Field label="New password" value={newPassword} onChange={setNewPassword} type="password" autoComplete="new-password" required minLength={8} />
+                    <Field label="Confirm new password" value={newPasswordConfirmation} onChange={setNewPasswordConfirmation} type="password" autoComplete="new-password" required minLength={8} />
                   </div>
                   <button
                     type="submit"
                     disabled={Boolean(busy)}
-                    className="mt-3 w-full rounded-lg border border-border-light px-3 py-2 text-xs font-semibold text-text-primary hover:bg-bg-hover disabled:opacity-50"
+                    className="mt-3 min-h-11 w-full rounded-lg border border-border-light px-3 py-2 text-xs font-semibold text-text-primary hover:bg-bg-hover disabled:opacity-50"
                   >
                     Recover and sign in
                   </button>
-                </form>
-              </details>
+                </form>}
             </div>
           ) : (
             <div className="space-y-4">
@@ -782,7 +1026,7 @@ export function AccountSupportDrawer() {
                     </>
                   ) : projectMigration?.state === 'needs_attention' ? (
                     <p className="mt-2 text-[10px] leading-relaxed text-indicator-warning">
-                      Account-based project filtering is not enabled yet. {projectMigration.needs_attention} existing project folder{projectMigration.needs_attention === 1 ? '' : 's'} need attention. Fix or remove {projectMigration.needs_attention === 1 ? 'it' : 'them'} on this computer, then retry. Existing browser and project-password access stays unchanged.
+                      Account-based project filtering is not enabled yet. {projectMigration.needs_attention} existing project folder{projectMigration.needs_attention === 1 ? '' : 's'} need attention. Resolve each listed project on this computer, then retry. Removing a project is a separate action that Maestro will ask you to confirm. Existing browser and project-password access stays unchanged.
                     </p>
                   ) : (
                     <p className="mt-2 text-[10px] leading-relaxed text-text-muted">
@@ -900,15 +1144,23 @@ export function AccountSupportDrawer() {
                     className="mt-3"
                     onSubmit={event => {
                       event.preventDefault()
+                      if (newPassword !== newPasswordConfirmation) {
+                        setNotice({ kind: 'error', text: 'The new password confirmation does not match.' })
+                        return
+                      }
                       void run('password', async isCurrent => {
                         await changePassword(newPassword)
                         if (!isCurrent()) return
                         setNewPassword('')
+                        setNewPasswordConfirmation('')
                         setNotice({ kind: 'success', text: 'Password changed. Other sessions were revoked.' })
                       })
                     }}
                   >
                     <Field label="New password" value={newPassword} onChange={setNewPassword} type="password" autoComplete="new-password" required minLength={8} />
+                    <div className="mt-2">
+                      <Field label="Confirm new password" value={newPasswordConfirmation} onChange={setNewPasswordConfirmation} type="password" autoComplete="new-password" required minLength={8} />
+                    </div>
                     <button type="submit" disabled={Boolean(busy) || !context.reauthenticated} className="mt-2 w-full rounded-lg border border-border px-3 py-2 text-[10px] font-semibold text-text-primary hover:bg-bg-hover disabled:opacity-40">
                       Change password
                     </button>

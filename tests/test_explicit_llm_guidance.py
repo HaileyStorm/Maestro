@@ -10,6 +10,7 @@ import sys
 import tempfile
 import types
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -85,6 +86,45 @@ def _launch_functions(*names: str, **namespace):
     )
     exec(compile(module, str(path), "exec"), namespace)
     return namespace
+
+
+@contextmanager
+def _live_planning_pipeline(pid: str):
+    """Provide the process-local owner required by pipeline LLM calls."""
+    selection = {
+        "model_id": "synthetic-test-model",
+        "device": "cpu",
+        "provider": "local",
+        "remote_url": "",
+        "api_key": "",
+        "local_gguf_path": "",
+        "gguf_file_override": "",
+    }
+
+    @contextmanager
+    def model_lease(**_selection):
+        yield
+
+    with (
+        mock.patch.object(
+            director_pipeline,
+            "_pipelines",
+            {pid: {"id": pid, "status": "planning"}},
+        ),
+        mock.patch.object(
+            director_pipeline,
+            "_pipeline_llm_contexts",
+            {pid: {"selection": selection, "response_assist": None}},
+        ),
+        mock.patch.object(director_pipeline, "_pipeline_llm_tokens", {}),
+        mock.patch.object(
+            director_pipeline,
+            "_pipeline_llm_cancel_handles",
+            {},
+        ),
+        mock.patch.object(llm_service, "loaded_model_lease", model_lease),
+    ):
+        yield
 
 
 class ExplicitGuideTextTests(unittest.TestCase):
@@ -561,9 +601,8 @@ class LegacyPlannerTests(unittest.TestCase):
             observed.update(kwargs)
             return []
 
-        with mock.patch.object(
-            llm_service, "plan_clip_prompts_and_images",
-            side_effect=fake_plan,
+        with _live_planning_pipeline("synthetic-pipeline"), mock.patch.object(
+            llm_service, "plan_clip_prompts_and_images", side_effect=fake_plan,
         ):
             director_pipeline._run_planning_legacy(
                 "synthetic-pipeline",

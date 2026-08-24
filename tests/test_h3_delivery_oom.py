@@ -345,6 +345,8 @@ class H3DeliveryTransactionTests(unittest.TestCase):
             "wgp": SimpleNamespace(server_config={"vram_safety_coefficient": 0.8}),
             "is_cancel_requested": cancel,
             "update_job": update,
+            "_sample_campaign_transition_lock": threading.RLock(),
+            "_SAMPLE_CAMPAIGN_JOB_KIND": "sample_campaign_generation",
             "_release_h3_delivery_vram": release,
             "_apply_spatial_upsampling_to_file": upscale,
             "_apply_delivery_fit_to_file": fit,
@@ -369,7 +371,9 @@ class H3DeliveryTransactionTests(unittest.TestCase):
     def test_first_delivery_oom_releases_and_retries_same_native_files_once(self):
         calls = []
 
-        def upscale(path, method, job=None):
+        def upscale(
+            path, method, job=None, *, abort_check=None, update_job_fn=None,
+        ):
             calls.append((Path(path).name, method))
             if len(calls) == 1:
                 raise RuntimeError("CUDA out of memory at /secret/model/path")
@@ -398,7 +402,9 @@ class H3DeliveryTransactionTests(unittest.TestCase):
         self.assertFalse(any(name.startswith(".maestro-delivery-") for name in os.listdir(self.out_dir)))
 
     def test_second_oom_is_path_redacted_and_retains_private_owned_native(self):
-        def upscale(path, method, job=None):
+        def upscale(
+            path, method, job=None, *, abort_check=None, update_job_fn=None,
+        ):
             raise RuntimeError(f"CUDA out of memory while reading {path}")
 
         symbols, release = self._symbols(upscale, Mock())
@@ -440,7 +446,9 @@ class H3DeliveryTransactionTests(unittest.TestCase):
         self.assertEqual(self.job["output_files"], [])
 
     def test_cancellation_wins_over_an_oom_and_never_publishes_final(self):
-        def upscale(path, method, job=None):
+        def upscale(
+            path, method, job=None, *, abort_check=None, update_job_fn=None,
+        ):
             job["cancel_requested"] = True
             raise RuntimeError("CUDA out of memory")
 
@@ -595,7 +603,9 @@ class H3DeliveryTransactionTests(unittest.TestCase):
         self.assertEqual(retained["artifact_class"], "temporary")
 
     def test_cancel_after_lifecycle_update_retracts_and_rolls_back_final(self):
-        def upscale(path, method, job=None):
+        def upscale(
+            path, method, job=None, *, abort_check=None, update_job_fn=None,
+        ):
             with open(path, "ab") as handle:
                 handle.write(b"-upscaled")
 
@@ -1104,7 +1114,10 @@ class H3DeliverySelectionAndPrivacyTests(unittest.TestCase):
         self.assertNotIn("generate_video(", contract)
         self.assertNotIn("server_config_filename", contract)
         self.assertNotIn("services-config", contract)
-        self.assertIn("generation_slot(_gen_lock, job)", contract)
+        self.assertRegex(
+            contract,
+            r"with generation_slot\(\s*_gen_lock,\s*job,\s*\)",
+        )
         self.assertIn("_retry_h3_delivery_postprocess_only", contract)
 
     def test_retry_capability_schedules_one_bounded_postprocess_job(self):

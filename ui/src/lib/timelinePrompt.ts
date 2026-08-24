@@ -51,6 +51,110 @@ function timelineSeconds(raw: string): number | null {
   return parts.reduce((seconds, part) => seconds * 60 + part, 0)
 }
 
+export interface TimelineMarkerSummary {
+  markerCount: number
+  rangeCount: number
+  pointCount: number
+  malformedReversedCount: number
+  coverageStartSeconds: number | null
+  coverageEndSeconds: number | null
+  gapCount: number
+  overlapCount: number
+  endDeltaSeconds: number | null
+  truncated: boolean
+}
+
+const TIMELINE_REVIEW_MAX_CHARS = 65_536
+const TIMELINE_REVIEW_MAX_LINES = 256
+const TIMELINE_REVIEW_MAX_MARKERS = 128
+
+/** Bounded structural scan for browser-side prompt review. */
+export function timelineMarkerSummary(prompt: string, selectedDurationSeconds?: number): TimelineMarkerSummary {
+  const raw = String(prompt || '')
+  const clipped = raw.slice(0, TIMELINE_REVIEW_MAX_CHARS).replace(/\r\n?/g, '\n')
+  const allLines = clipped.split('\n')
+  const lines = allLines.slice(0, TIMELINE_REVIEW_MAX_LINES)
+  let rangeCount = 0
+  let pointCount = 0
+  let markerCount = 0
+  let inspectedMarkerCount = 0
+  let malformedReversedCount = 0
+  const ranges: Array<{ start: number; end: number }> = []
+
+  for (const rawLine of lines) {
+    if (inspectedMarkerCount >= TIMELINE_REVIEW_MAX_MARKERS) break
+    const line = rawLine.trim()
+    if (!line) continue
+    const parts = timelineLineParts(line)
+    if (parts.shotTime != null) {
+      pointCount += 1
+      markerCount += 1
+      inspectedMarkerCount += 1
+      continue
+    }
+    const range = RANGE_LINE.exec(parts.content)
+    if (range) {
+      const markerLine = parts.content.replace(/^\s*[-*]\s*/, '')
+      const hasTimeMarker = markerLine.startsWith('[') || markerLine.startsWith('(')
+        || range[1].includes(':') || range[2].includes(':')
+        || /(?:sec(?:ond)?s?|s)\s*$/i.test(range[1])
+        || /(?:sec(?:ond)?s?|s)\s*$/i.test(range[2])
+      const start = timelineSeconds(range[1])
+      const end = timelineSeconds(range[2])
+      if (hasTimeMarker && start != null && end != null) {
+        inspectedMarkerCount += 1
+        if (end > start) {
+          rangeCount += 1
+          markerCount += 1
+          ranges.push({ start, end })
+        } else {
+          malformedReversedCount += 1
+        }
+        continue
+      }
+    }
+    const point = POINT_LINE.exec(parts.content)
+    const at = point ? timelineSeconds(point[1]) : null
+    const bareAt = barePointSeconds(parts.content, parts.shotLabel)
+    if (at != null || bareAt != null) {
+      pointCount += 1
+      markerCount += 1
+      inspectedMarkerCount += 1
+    }
+  }
+
+  ranges.sort((left, right) => left.start - right.start || left.end - right.end)
+  let gapCount = 0
+  let overlapCount = 0
+  let coverageEndSeconds: number | null = null
+  for (const range of ranges) {
+    if (coverageEndSeconds != null) {
+      if (range.start > coverageEndSeconds) gapCount += 1
+      else if (range.start < coverageEndSeconds) overlapCount += 1
+    }
+    coverageEndSeconds = Math.max(coverageEndSeconds ?? range.end, range.end)
+  }
+  const duration = Number(selectedDurationSeconds)
+  const endDeltaSeconds = coverageEndSeconds != null && Number.isFinite(duration) && duration >= 0
+    ? coverageEndSeconds - duration
+    : null
+
+  return {
+    markerCount,
+    rangeCount,
+    pointCount,
+    malformedReversedCount,
+    coverageStartSeconds: ranges.length ? ranges[0].start : null,
+    coverageEndSeconds,
+    gapCount,
+    overlapCount,
+    endDeltaSeconds,
+    truncated: raw.length > TIMELINE_REVIEW_MAX_CHARS
+      || allLines.length > TIMELINE_REVIEW_MAX_LINES
+      || inspectedMarkerCount >= TIMELINE_REVIEW_MAX_MARKERS,
+  }
+}
+
 /** True when Studio should preserve a multi-line prompt as one global timeline. */
 export function hasGlobalTimeline(prompt: string): boolean {
   for (const rawLine of (prompt || '').replace(/\r\n?/g, '\n').split('\n')) {

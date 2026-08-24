@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import json
+import subprocess
 import sys
 import types
 import unittest
@@ -89,6 +91,46 @@ class TestFlashAttentionKernelProbe(unittest.TestCase):
         ):
             self.assertFalse(self.attention.flash_attn_kernels_available())
         implementation.assert_not_called()
+
+
+class TestCPUHiddenAttentionImport(unittest.TestCase):
+    def test_hidden_cuda_import_reports_only_cpu_safe_attention(self):
+        script = """
+import json
+import torch
+from shared import attention
+
+print(json.dumps({
+    "cuda_available": torch.cuda.is_available(),
+    "bfloat16_supported": attention.bfloat16_supported,
+    "supported_modes": attention.get_supported_attention_modes(),
+    "default_mode": attention.get_default_attention_mode(),
+    "sol_status": attention.get_sol_attention_status(),
+}))
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=_ROOT,
+            env={
+                **os.environ,
+                "CUDA_VISIBLE_DEVICES": "",
+                "PYTHONPATH": _APP,
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        payload = json.loads(completed.stdout.strip().splitlines()[-1])
+
+        self.assertFalse(payload["cuda_available"])
+        self.assertFalse(payload["bfloat16_supported"])
+        self.assertEqual(payload["supported_modes"], ["sdpa", "auto"])
+        self.assertEqual(payload["default_mode"], "sdpa")
+        self.assertFalse(payload["sol_status"]["supported"])
+        self.assertIsNone(payload["sol_status"]["capability"])
+        self.assertIn("visible CUDA GPU", payload["sol_status"]["reason"])
 
 
 if __name__ == "__main__":

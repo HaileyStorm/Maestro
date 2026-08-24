@@ -27,6 +27,7 @@ _SERVICES_UI_PATH = os.path.join(
     "SettingsDrawer",
     "ServicesSettingsPanel.tsx",
 )
+_SERVICES_TYPES_PATH = os.path.join(_ROOT, "ui", "src", "types", "index.ts")
 _INDEX_HTML_PATH = os.path.join(_ROOT, "ui", "index.html")
 
 
@@ -69,46 +70,88 @@ class TestRemoteOpenAICompatibleCredentials(unittest.TestCase):
             "openai_api_key": "openai-secret",
             "anthropic_api_key": "anthropic-secret",
         }
-        # Continuum's helper is (provider, services). Remote does not read
-        # llm_remote_api_key; that leftover 1.9.0 mapping was never restored.
-        self.assertEqual(self.pick_key("remote", services), "")
+        self.assertEqual(self.pick_key("remote", services), "lan-secret")
         self.assertEqual(self.pick_key("openai", services), "openai-secret")
         self.assertEqual(self.pick_key("anthropic", services), "anthropic-secret")
         self.assertEqual(self.pick_key("local", services), "")
 
-    def test_remote_key_ui_exists_but_launch_helper_does_not_read_it(self):
+    def test_remote_key_is_masked_persistable_and_typed(self):
         launch = _read(_LAUNCH_PATH)
         panel = _read(_SERVICES_UI_PATH)
+        types = _read(_SERVICES_TYPES_PATH)
         tree = ast.parse(launch, filename="launch.py")
         helper = next(
             node for node in tree.body
             if isinstance(node, ast.FunctionDef) and node.name == "_llm_provider_api_key"
         )
+        update = next(
+            node for node in tree.body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "update_services_config"
+        )
         helper_source = ast.get_source_segment(launch, helper) or ""
-        self.assertNotIn("llm_remote_api_key", helper_source)
+        update_source = ast.get_source_segment(launch, update) or ""
+        self.assertIn("llm_remote_api_key", helper_source)
+        self.assertIn('"llm_remote_api_key"', update_source)
         self.assertNotIn("_llm_api_key_for_provider", launch)
+        self.assertIn(
+            '"llm_remote_api_key": _mask_key(services.get("llm_remote_api_key", ""))',
+            launch,
+        )
+        self.assertIn(
+            '"llm_remote_api_key_set": bool(services.get("llm_remote_api_key", ""))',
+            launch,
+        )
         self.assertIn('label="Server API Key"', panel)
         self.assertIn("llm_remote_api_key", panel)
+        self.assertIn("llm_remote_api_key: string", types)
+        self.assertIn("llm_remote_api_key_set: boolean", types)
+        self.assertIn("llm_selection_revision: string", types)
+        self.assertIn('"llm_selection_revision": services.get(', launch)
 
     def test_remote_connection_reloads_when_url_or_key_changes(self):
         source = _read(_LLM_SERVICE_PATH)
-        self.assertIn("remote_url.rstrip(\"/\")", source)
+        self.assertIn(
+            'remote_url = str(remote_url or "").strip().rstrip("/")',
+            source,
+        )
         self.assertIn("credential_key", source)
         self.assertIn("hashlib.sha256(api_key.encode", source)
 
 
 class TestCivitAIVariantUpdates(unittest.TestCase):
-    def test_continuum_has_no_leftover_compatible_version_selector(self):
-        launch = _read(_LAUNCH_PATH)
-        tree = ast.parse(launch, filename="launch.py")
-        names = {
-            node.name
-            for node in tree.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
-        self.assertNotIn("_select_latest_compatible_civitai_version", names)
-        self.assertIn("LORA_MANIFEST_VERSION = 1", launch)
-        self.assertNotIn("LORA_MANIFEST_VERSION = 2", launch)
+    @classmethod
+    def setUpClass(cls):
+        cls.select = staticmethod(
+            _load_functions(
+                _LAUNCH_PATH,
+                ("_select_latest_compatible_civitai_version",),
+            )["_select_latest_compatible_civitai_version"]
+        )
+
+    def test_turbo_install_tracks_newest_turbo_not_newer_base_release(self):
+        versions = [
+            {"id": 400, "baseModel": "Z-Image Base", "baseModelType": "Standard"},
+            {"id": 350, "baseModel": "Z-Image Turbo", "baseModelType": "Standard"},
+            {"id": 300, "baseModel": "Z-Image Turbo", "baseModelType": "Standard"},
+        ]
+        self.assertEqual(self.select(versions, 300)["id"], 350)
+
+    def test_base_model_type_stays_on_the_installed_branch(self):
+        versions = [
+            {"id": 500, "baseModel": "Flux.2 D", "baseModelType": "Distilled"},
+            {"id": 450, "baseModel": "Flux.2 D", "baseModelType": "Standard"},
+            {"id": 300, "baseModel": "Flux.2 D", "baseModelType": "Standard"},
+        ]
+        self.assertEqual(self.select(versions, 300)["id"], 450)
+
+    def test_unknown_local_version_retains_provider_newest_fallback(self):
+        versions = [{"id": 2}, {"id": 1}]
+        self.assertEqual(self.select(versions, 999)["id"], 2)
+        self.assertEqual(self.select(versions, "malformed")["id"], 2)
+
+    def test_old_false_positive_manifest_is_invalidated(self):
+        self.assertIn("LORA_MANIFEST_VERSION = 2", _read(_LAUNCH_PATH))
 
 
 class TestStudioInterfaceQuickWins(unittest.TestCase):

@@ -188,6 +188,32 @@ class H3DurationSnapTests(unittest.TestCase):
         self.assertEqual(result.confidence, "unavailable")
         self.assertIn("no legal candidate", result.reason)
 
+    def test_planner_value_error_is_unavailable_not_fatal(self):
+        def oracle(total: PublishedFrameCount):
+            value = int(total)
+            if value < 360:
+                raise ValueError(
+                    "H3 authored event falls outside the published physical geometry"
+                )
+            published = _split_published(value, max(1, math.ceil(value / 345)))
+            return H3DurationOraclePlan(
+                requested_published_frames=PublishedFrameCount(value),
+                generated_frames=_generated_for(published),
+                published_frames=published,
+                confidence="high",
+                reason="Synthetic deterministic planning evidence.",
+            )
+
+        result = snap_published_duration(
+            481,
+            mode="nearest",
+            grid=self.grid,
+            oracle=oracle,
+        )
+        self.assertIsNone(result.candidate_published_frames)
+        self.assertEqual(result.confidence, "unavailable")
+        self.assertIn("no legal candidate", result.reason)
+
     def test_hostile_frame_and_grid_inputs_are_rejected(self):
         with self.assertRaises(H3DurationPlanError):
             snap_published_duration(

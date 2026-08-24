@@ -4,10 +4,21 @@ from importlib.metadata import version
 from mmgp import offload
 import torch.nn.functional as F
 import warnings
-from importlib.metadata import version
 
-major, minor = torch.cuda.get_device_capability(None)
-bfloat16_supported =  major >= 8 
+
+def _cuda_device_capability():
+    """Return the visible CUDA device capability, or ``None`` on CPU hosts."""
+
+    if not torch.cuda.is_available():
+        return None
+    return tuple(torch.cuda.get_device_capability())
+
+
+_import_device_capability = _cuda_device_capability()
+bfloat16_supported = bool(
+    _import_device_capability is not None
+    and _import_device_capability[0] >= 8
+)
 
 try:
     import triton
@@ -63,7 +74,10 @@ except ImportError:
 
 try:
     from .sage2_core import sageattn as sageattn2, is_sage2_supported
-    sage2_supported =  is_sage2_supported()
+    sage2_supported = (
+        _import_device_capability is not None
+        and is_sage2_supported()
+    )
 except ImportError:
     sageattn2 = None
     sage2_supported = False
@@ -267,7 +281,11 @@ def get_attention_modes():
 
 def get_supported_attention_modes():
     ret = get_attention_modes()
-    major, minor = torch.cuda.get_device_capability()
+    capability = _cuda_device_capability()
+    if capability is None:
+        return [mode for mode in ret if mode in ("sdpa", "auto")]
+
+    major, minor = capability
     if  major < 10 or not triton_installed:
         if "sage3" in ret:
             ret.remove("sage3")
@@ -306,9 +324,12 @@ def _triton_version_tuple():
 def get_sol_attention_status():
     """Describe whether the bundled H3-only Sol backend can run here."""
 
-    capability = tuple(torch.cuda.get_device_capability())
+    capability = _cuda_device_capability()
     triton_version = str(getattr(triton, "__version__", "")) if triton_installed else None
-    if not triton_installed:
+    if capability is None:
+        reason = "Sol Engine requires a visible CUDA GPU."
+        installed, supported = triton_installed, False
+    elif not triton_installed:
         reason = "Sol Engine requires Triton 3.6 or newer."
         installed = supported = False
     elif _triton_version_tuple() < SOL_ATTENTION_MIN_TRITON:
@@ -333,7 +354,11 @@ def get_sol_attention_status():
         "installed": installed,
         "supported": supported,
         "reason": reason,
-        "capability": f"SM{capability[0]}{capability[1]}",
+        "capability": (
+            f"SM{capability[0]}{capability[1]}"
+            if capability is not None
+            else None
+        ),
         "triton_version": triton_version,
         "minimum_triton": "3.6",
         "first_run_compiles_kernels": True,

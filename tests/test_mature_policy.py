@@ -231,18 +231,15 @@ class LocalContentNeutralityTests(unittest.TestCase):
             keyword.value for keyword in access_call.keywords
             if keyword.arg == "permission"
         )
-        requested_images = next(
+        image_resolution_call = next(
             item for item in ast.walk(enhance)
-            if isinstance(item, ast.Assign)
-            and any(
-                isinstance(target, ast.Name)
-                and target.id == "requested_image_paths"
-                for target in item.targets
-            )
+            if isinstance(item, ast.Call)
+            and isinstance(item.func, ast.Name)
+            and item.func.id == "image_resolver"
         )
         self.assertIsInstance(permission, ast.Constant)
         self.assertEqual(permission.value, "project.generate")
-        self.assertLess(access_call.lineno, requested_images.lineno)
+        self.assertLess(access_call.lineno, image_resolution_call.lineno)
 
 
 if __name__ == "__main__":

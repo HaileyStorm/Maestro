@@ -15,7 +15,16 @@ PROMPT_INPUT = (
 MUSIC = (
     ROOT / "ui/src/components/Sidebar/MusicControls.tsx"
 ).read_text(encoding="utf-8")
+MAIN_CONTENT = (
+    ROOT / "ui/src/components/MainContent/MainContent.tsx"
+).read_text(encoding="utf-8")
 LAUNCH = (ROOT / "app/launch.py").read_text(encoding="utf-8")
+LLM_OPERATIONS = (
+    ROOT / "app/services/llm_operations.py"
+).read_text(encoding="utf-8")
+QUEUE_RECOVERY_ADAPTER = (
+    ROOT / "app/services/queue_recovery_adapter.py"
+).read_text(encoding="utf-8")
 UI_QUEUE_TEST = (
     ROOT / "ui/tests/enhance-queue-flow.test.mjs"
 ).read_text(encoding="utf-8")
@@ -147,7 +156,8 @@ class LlmPrepareClientContracts(unittest.TestCase):
                 self.assertIn("lifecycle.signal", block)
                 self.assertIn("lifecycle.ownsWorkspace()", block)
         self.assertIn("workspace: requestWorkspace", MUSIC)
-        self.assertIn("useStore.getState().activeWorkspace !== requestWorkspace", MUSIC)
+        self.assertIn("const requestIsCurrent = () =>", MUSIC)
+        self.assertIn("current.activeWorkspace === requestWorkspace", MUSIC)
         self.assertIn("ownsWorkspace: () =>", STORE)
 
     def test_request_owned_loading_state_survives_project_switches(self):
@@ -341,9 +351,9 @@ class LlmPrepareClientContracts(unittest.TestCase):
 
         self.assertIn("request_id: scope.requestId", enhance)
         self.assertIn("project_instance: scope.projectInstance", enhance)
-        self.assertIn("requestId: api.createLlmRequestId()", enhance)
+        self.assertIn("const requestId = api.createLlmRequestId()", enhance)
         self.assertLess(
-            enhance.index("requestId: api.createLlmRequestId()"),
+            enhance.index("const requestId = api.createLlmRequestId()"),
             enhance.index("api.llmEnhancePrompt({"),
         )
         self.assertIn("onSubmissionAttempted", enhance)
@@ -428,6 +438,54 @@ class LlmPrepareClientContracts(unittest.TestCase):
         self.assertLess(
             CLIENT.index("await options.onSubmissionAttempted?.()"),
             CLIENT.index("throwIfAborted(options.signal)", CLIENT.index("await options.onSubmissionAttempted?.()")),
+        )
+
+    def test_prompt_enhance_service_substrate_is_durable_and_no_auto_generate(self):
+        store = source_block(
+            QUEUE_RECOVERY_ADAPTER,
+            "class PromptEnhancementRecoveryStore",
+            "    def result(\n",
+        )
+        manager = source_block(
+            LLM_OPERATIONS,
+            "class PromptEnhancementOperationManager",
+            "async def run_blocking_shielded",
+        )
+        constructor = source_block(
+            manager,
+            "    def __init__",
+            "    @staticmethod\n    def _scope",
+        )
+        for state in ("queued", "running", "completed", "failed", "cancelled"):
+            self.assertIn(f'"{state}"', QUEUE_RECOVERY_ADAPTER)
+        self.assertNotIn("reconcile_interrupted", constructor)
+        self.assertNotIn("create_task", constructor)
+        self.assertIn('"operation_kind": "prompt_enhancement"', store)
+        self.assertIn('self.results_root = self.root / "results"', store)
+        self.assertIn('self.metadata_path = self.root / "operations.json"', store)
+        self.assertNotIn("QueueRecoveryJournal(", store)
+        self.assertIn("consume_result", manager)
+        self.assertIn("class _CanonicalPromptEnhancementStore", LAUNCH)
+        self.assertIn("read_only=True", LAUNCH)
+        self.assertIn("_queue_recovery_register_and_publish(", LAUNCH)
+        self.assertIn('recovery_kind="prompt_enhancement"', LAUNCH)
+        self.assertIn("defer_worker=True", LAUNCH)
+        self.assertIn("acquire_and_start_generation_slot(", LAUNCH)
+        self.assertIn('if kind == "prompt_enhancement":', LAUNCH)
+        self.assertIn("PromptEnhancementResultStore", QUEUE_RECOVERY_ADAPTER)
+        self.assertIn('job.get("kind") == "prompt_enhancement"', LAUNCH)
+        self.assertIn(
+            "_CanonicalPromptEnhancementStore._same_scope", LAUNCH,
+        )
+
+        route = source_block(
+            LAUNCH,
+            '@api.post("/api/v1/llm/enhance-prompt")',
+            '@api.post("/api/v1/llm/describe-image")',
+        )
+        self.assertLess(
+            route.index("raw_request_id is None"),
+            route.index("if raw_request_id is not None:"),
         )
 
     def test_prompt_enhance_disconnect_and_cancel_are_distinct(self):
@@ -571,15 +629,19 @@ class LlmPrepareClientContracts(unittest.TestCase):
         self.assertIn("erroredLocksClaim", queue_flow)
         self.assertNotIn("getEntriesByType", queue_flow)
 
-    def test_prompt_input_uses_scoped_status_without_legacy_polling(self):
+    def test_prompt_enhance_queue_card_uses_scoped_status_without_legacy_polling(self):
         self.assertNotIn("/api/v1/llm/status", PROMPT_INPUT)
         self.assertNotIn("/api/v1/llm/stream-status", PROMPT_INPUT)
         self.assertNotIn("fetchLlmStatus", PROMPT_INPUT)
-        self.assertIn("routeEnhanceStatus?.partial_text", PROMPT_INPUT)
-        self.assertIn("routeEnhanceStatus?.live_tps", PROMPT_INPUT)
-        self.assertIn("routeEnhanceStatus.stage", PROMPT_INPUT)
-        self.assertIn("cancelEnhancePrompt", PROMPT_INPUT)
-        self.assertIn('aria-label="Cancel prompt enhancement"', PROMPT_INPUT)
+        self.assertIn(
+            "const operation = card.status && 'request_id' in card.status",
+            MAIN_CONTENT,
+        )
+        self.assertIn("operation?.partial_text", MAIN_CONTENT)
+        self.assertIn("operation?.stage", MAIN_CONTENT)
+        self.assertIn("cancelEnhancePrompt", MAIN_CONTENT)
+        self.assertIn("data-prompt-enhance-queue-card", MAIN_CONTENT)
+        self.assertIn("No generation was started.", MAIN_CONTENT)
         self.assertIn("mobile-control-target", PROMPT_INPUT)
 
 

@@ -3,8 +3,15 @@ import re
 
 
 _TIMELINE_TIME = (
-    r"(?:(?:\d{1,2}:){1,2}\d{1,2}(?:\.\d+)?|\d+(?:\.\d+)?)"
+    r"(?:(?:\d{1,2}:){1,2}\d{1,3}(?:\.\d+)?|\d+(?:\.\d+)?)"
     r"\s*(?:sec(?:ond)?s?|s)?"
+)
+# Aspect-ratio tokens such as 16:9 otherwise match MM:SS clocks
+# (16 minutes 9 seconds) and push later H3 events outside geometry.
+_ASPECT_RATIO_CLOCK_RE = re.compile(
+    r"^(?:16:9|9:16|4:3|3:4|3:2|2:3|1:1|21:9|4:5|5:4|2:1|1:2|"
+    r"5:3|3:5|8:7|7:8|32:9|9:32)$",
+    re.IGNORECASE,
 )
 GLOBAL_TIMELINE_RANGE_RE = re.compile(
     rf"^\s*(?:[-*]\s*)?[\[(]?\s*({_TIMELINE_TIME})\s*"
@@ -12,7 +19,8 @@ GLOBAL_TIMELINE_RANGE_RE = re.compile(
     re.IGNORECASE,
 )
 GLOBAL_TIMELINE_POINT_RE = re.compile(
-    rf"^\s*(?:[-*]\s*)?\(?\s*at\s+({_TIMELINE_TIME})\s*"
+    rf"^\s*(?:[-*]\s*)?\(?\s*at\s+(?:approximately|about|roughly|around)?\s*"
+    rf"({_TIMELINE_TIME})\s*"
     rf"(?:[:,]|[-–—])?[ \t]*(.+?)\)?\s*$",
     re.IGNORECASE,
 )
@@ -120,6 +128,8 @@ def _timeline_seconds(value):
         r"\s*(?:sec(?:ond)?s?|s)\s*$", "", str(value or "").strip(),
         flags=re.IGNORECASE,
     )
+    if _ASPECT_RATIO_CLOCK_RE.fullmatch(token):
+        return None
     try:
         parts = [float(part) for part in token.split(":")]
     except (TypeError, ValueError):

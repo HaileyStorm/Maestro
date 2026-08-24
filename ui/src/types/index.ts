@@ -126,7 +126,7 @@ export type ProjectReferenceAnchorPrivacy =
   | 'private_blurred' | 'private_visible' | 'project_blurred' | 'project_visible'
 export type ProjectReferenceLegacyAnchorPrivacy = ProjectReferenceAnchorPrivacy | 'standard'
 export type ProjectReferencePreset =
-  | 'identity' | 'performance' | 'wardrobe' | 'underlayers'
+  | 'identity' | 'identity_focus' | 'performance' | 'wardrobe' | 'underlayers'
   | 'spatial' | 'lighting'
   | 'materials' | 'product' | 'functional'
   | 'construction' | 'exterior' | 'interior' | 'mechanical'
@@ -367,7 +367,7 @@ export interface ProjectReferencePackPlan {
   ordered_output_roles: string[]
   mode: 'production' | 'hybrid' | 'draft'
   candidate_count: number
-  anchor_strategy: 'canonical_anchor' | 'draft_one_shot'
+  anchor_strategy: 'canonical_anchor' | 'layout_probe_anchor' | 'draft_one_shot'
   generation_model?: string
   editor_model?: string | null
   user_loras?: { count: number; preserved: boolean }
@@ -684,6 +684,20 @@ export interface AccountSummary {
   passkey_authentication_available: boolean
 }
 
+export type ProjectAccessRole = 'owner' | 'editor' | 'viewer'
+
+export interface ProjectAccessMember {
+  account_id: string
+  username: string
+  role: ProjectAccessRole
+}
+
+export interface ProjectAccessProjection {
+  workspace: string
+  revision: number
+  members: ProjectAccessMember[]
+}
+
 export interface AccountContext {
   enabled: boolean
   authenticated: boolean
@@ -774,6 +788,40 @@ export interface DevelopmentCostRecoveryProjection {
   state: 'locked' | 'recovered'
 }
 
+export type SupporterBenefit =
+  | 'supporter_recognition'
+  | 'bounded_queue_priority'
+  | 'early_access_updates'
+  | 'supporter_convenience'
+
+export interface SupporterBenefitTier {
+  tier: string
+  minimum_minor: number
+  promotional_maestro_credits: number
+  benefits: SupporterBenefit[]
+}
+
+export interface SupporterBenefitPolicy {
+  schema_version: 1
+  currency: string
+  credit_unit: string
+  promotional_credits_enabled: boolean
+  one_time_bonus_cap: number
+  one_time_validity_seconds: number
+  recurring_validity_seconds: number
+  one_time_tiers: SupporterBenefitTier[]
+  recurring_tiers: SupporterBenefitTier[]
+  terms: {
+    cash_value: false
+    transferable: false
+    refundable: false
+    guaranteed_compute: false
+    guaranteed_service: false
+    unused_bonus_may_expire_or_be_revoked: true
+  }
+  notice: string
+}
+
 export function developmentCostRecoveryProjection(
   value: unknown,
 ): DevelopmentCostRecoveryProjection | null {
@@ -802,6 +850,7 @@ export interface SupportPublicProjection {
     provider_neutral: boolean
     providers: SupportProvider[]
   }
+  supporter_benefits: SupporterBenefitPolicy | null
   benefit_availability: {
     scheduler_enforcement_enabled: boolean
     effective_benefits: string[]
@@ -878,10 +927,10 @@ export interface SupportAccountSummary {
   recorded_allowance?: SupportRecordedAllowance
   owner_test_credits?: OwnerTestCreditProjection
   benefits: {
-    state: string
+    state: 'active' | 'hosted_priority_available' | 'owner_exempt' | 'unmetered_realm' | 'recorded_not_enforced'
     scheduler_enforcement_enabled: boolean
-    effective_benefits: string[]
-    recorded_eligibility: string[]
+    effective_benefits: SupporterBenefit[]
+    recorded_eligibility: SupporterBenefit[]
   }
 }
 
@@ -1011,6 +1060,57 @@ export interface SupportH3LegalAccessLocationInput {
   owner_attested: true
   license_revision: string
   license_sha256: string
+}
+
+export type SupportKreaOwnerPolicyAvailabilityStatus =
+  | 'owner_attestation_required'
+  | 'owner_policy_migration_required'
+  | 'license_conditions_recorded'
+
+export interface SupportKreaRoleUseScopes {
+  owner: 'noncommercial'
+  user: 'commercial_under_1m'
+}
+
+export interface SupportKreaOwnerPolicyProjection {
+  attested: boolean
+  availability_status: SupportKreaOwnerPolicyAvailabilityStatus
+  migration_required: boolean
+  local_execution_allowed: boolean
+  hosted_execution_allowed: false
+  maestro_content_filtering: false
+  manual_owner_review?: boolean
+  role_use_scopes?: SupportKreaRoleUseScopes
+  declared_at_unix?: number
+  license_version: string
+  license_date: string
+  license_url: string
+  acceptable_use_url: string
+  content_handling: 'manual_owner_review'
+}
+
+export interface SupportKreaOwnerPolicyInput {
+  owner_attested: true
+  manual_review_accepted: true
+  local_content_stays_local: true
+  attribution_accepted: true
+  role_use_scopes: SupportKreaRoleUseScopes
+  license_version: string
+  license_date: string
+}
+
+export interface SupportKreaOwnerPolicyMutationResult {
+  status: 'ok'
+  attested: boolean
+  availability_status: SupportKreaOwnerPolicyAvailabilityStatus
+  migration_required: boolean
+  local_execution_allowed: boolean
+  hosted_execution_allowed: false
+  maestro_content_filtering: false
+  manual_owner_review?: boolean
+  role_use_scopes?: SupportKreaRoleUseScopes
+  declared_at_unix?: number
+  content_handling: 'manual_owner_review'
 }
 
 export interface GenerationJob {
@@ -1475,6 +1575,9 @@ export interface ServicesConfig {
   llm_device: string
   llm_provider: string
   llm_remote_url: string
+  llm_selection_revision: string
+  llm_remote_api_key: string
+  llm_remote_api_key_set: boolean
   enhance_llm_model_id: string
   enhance_llm_device: string
   google_api_key: string

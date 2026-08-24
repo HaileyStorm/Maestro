@@ -1,14 +1,20 @@
 // Official Blender Lab MCP support. The checkout is pinned and attested again
 // by Maestro before every connection; caller-provided Python is never exposed.
 const { runtimeSecretEnv } = require("./launcher_secret_env")
+const { runtimeProfile } = require("./launcher_profile")
 
-module.exports = {
-  run: [
+module.exports = async (kernel) => {
+  const runtime = runtimeProfile(kernel)
+  const selectedVenv = `{{args && args.venv ? args.venv : '${runtime.env}'}}`
+  const selectedPython = `{{args && args.venv_python ? args.venv_python : '${runtime.python}'}}`
+  return {
+    run: [
     {
       method: "shell.run",
       params: {
         env: runtimeSecretEnv,
-        venv: "env",
+        venv: selectedVenv,
+        venv_python: selectedPython,
         path: "app",
         message: "python -m services.blender_mcp_service provision-mcp --destination services/blender_mcp"
       }
@@ -18,6 +24,8 @@ module.exports = {
       method: "shell.run",
       params: {
         env: runtimeSecretEnv,
+        venv: selectedVenv,
+        venv_python: selectedPython,
         path: "app",
         message: "git clone --depth 1 --branch v1.0.0 https://projects.blender.org/lab/blender_mcp.git services/blender_mcp"
       }
@@ -27,6 +35,8 @@ module.exports = {
       method: "shell.run",
       params: {
         env: runtimeSecretEnv,
+        venv: selectedVenv,
+        venv_python: selectedPython,
         path: "app",
         message: [
           "git -C services/blender_mcp remote set-url origin https://projects.blender.org/lab/blender_mcp.git",
@@ -39,7 +49,8 @@ module.exports = {
       method: "shell.run",
       params: {
         env: runtimeSecretEnv,
-        venv: "env",
+        venv: selectedVenv,
+        venv_python: selectedPython,
         path: "app",
         message: [
           "python -m services.blender_mcp_service attest-mcp --checkout services/blender_mcp",
@@ -47,5 +58,6 @@ module.exports = {
         ]
       }
     }
-  ]
+    ]
+  }
 }

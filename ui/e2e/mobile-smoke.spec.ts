@@ -56,6 +56,11 @@ const TOOLBAR_VIEWPORTS = [
   { name: '4K desktop', width: 3840, height: 2160 },
 ] as const
 
+const PRODUCT_ACCEPTANCE_VIEWPORTS = [
+  { name: 'mobile', width: 390, height: 844 },
+  { name: 'desktop', width: 1440, height: 900 },
+] as const
+
 async function skipWelcome(page: Page) {
   await page.addInitScript(() => localStorage.setItem('maestro_welcome_seen_v1', '1'))
 }
@@ -66,6 +71,97 @@ async function gotoSyntheticApp(page: Page) {
   ))
   await page.goto('/')
   await hostTermsSettled
+}
+
+type RootFaultTarget = 'sidebar' | 'main' | 'account' | 'portal'
+
+async function routeOneShotRootFault(page: Page, target: RootFaultTarget) {
+  const once = `
+    function failOnce() {
+      const counts = globalThis.__maestroRootFaultCounts ||= {};
+      counts.${target} = (counts.${target} || 0) + 1;
+      if (counts.${target} === 1) throw new Error('Synthetic synchronous render fault');
+    }
+  `
+  const modules: Record<RootFaultTarget, { path: string; source: string }> = {
+    sidebar: {
+      path: '**/src/components/Sidebar/Sidebar.tsx',
+      source: `${once} export function Sidebar() { failOnce(); return null }`,
+    },
+    main: {
+      path: '**/src/components/MainContent/MainContent.tsx',
+      source: `${once} export function MainContent() { failOnce(); return null }`,
+    },
+    account: {
+      path: '**/src/components/AccountSupport/AccountSupportDrawer.tsx',
+      source: `${once}
+        export function AccountSupportButton() { return null }
+        export function AccountSupportDrawer() { failOnce(); return null }
+      `,
+    },
+    portal: {
+      path: '**/src/components/WhatsNewDialog.tsx',
+      source: `
+        import { createElement } from '/node_modules/.vite/deps/react.js';
+        import { createPortal } from '/node_modules/.vite/deps/react-dom.js';
+        ${once}
+        function PortalFault() { failOnce(); return null }
+        export function WhatsNewButton() { return null }
+        export function WhatsNewDialogHost() {
+          return createPortal(createElement(PortalFault), document.body)
+        }
+      `,
+    },
+  }
+  const selected = modules[target]
+  await page.route(selected.path, route => route.fulfill({
+    status: 200,
+    contentType: 'application/javascript',
+    body: selected.source,
+  }))
+}
+
+async function routeMigratedUserAccess(page: Page, username: string) {
+  await page.route('**/api/v1/access-context', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      remote: true,
+      project_password_required: false,
+      project_names_visible: true,
+      machine_controls: false,
+      custom_model_sources: false,
+      catalog_model_downloads: false,
+      classic_ui: false,
+      cloudflare_enabled: true,
+      share_url: 'https://stable.example.test',
+      share_flow: 'account',
+      account_project_access_active: true,
+      account_project_creation_requires_account: true,
+      accounts: {
+        enabled: true,
+        authenticated: true,
+        account: {
+          id: 'synthetic-user-account',
+          username,
+          role: 'user',
+          disabled: false,
+          created_at: 1_725_000_100,
+          has_email: false,
+          passkey_credentials: 0,
+          passkey_authentication_available: false,
+        },
+        capabilities: ['account.self'],
+        reauthenticated: true,
+        passkey_authentication_available: false,
+      },
+    }),
+  }))
+  await page.route('**/api/v1/sample-campaign/queue', route => route.fulfill({
+    status: 404,
+    contentType: 'application/json',
+    body: JSON.stringify({ detail: 'No sample campaign queue in this fixture' }),
+  }))
 }
 
 async function openAccountSupport(page: Page) {
@@ -279,12 +375,12 @@ async function collectPrimaryTargetStates(page: Page) {
   findings.queueHelp = await collectRenderedActionTargetViolations(root)
   await queueHelp.click()
 
-  const menuButton = page.getByRole('button', { name: 'Open Generate, Director, and Reference menu' })
+  const menuButton = page.getByRole('button', { name: 'Open Generate, Director, and References menu' })
   await menuButton.click()
   const menu = page.locator('#maestro-mobile-sidebar[role="dialog"]')
   await expect(menu).toBeVisible()
 
-  for (const mode of ['Generate', 'Director', 'Reference'] as const) {
+  for (const mode of ['Generate', 'Director', 'References'] as const) {
     const modeButton = menu.getByRole('button', { name: `Open ${mode}`, exact: true })
     if (await modeButton.isEnabled()) {
       await modeButton.click()
@@ -428,6 +524,27 @@ test.afterEach(async () => {
     throw new AggregateError(failures, 'Synthetic UI cleanup checks failed')
   }
 })
+
+for (const target of ['sidebar', 'main', 'account', 'portal'] as const) {
+  test(`root recovery boundary retries one synchronous ${target} render fault without a loop`, async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 })
+    await skipWelcome(page)
+    await routeOneShotRootFault(page, target)
+    await page.goto('/')
+
+    const recovery = page.getByRole('heading', { name: 'Maestro needs to recover this screen' })
+    await expect(recovery).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Reload Maestro' })).toBeVisible()
+    await page.getByRole('button', { name: 'Try again' }).click()
+    await expect(recovery).toHaveCount(0)
+    await expect(page.locator('#root')).not.toBeEmpty()
+    await page.waitForTimeout(100)
+    expect(await page.evaluate(fault => (
+      (globalThis as typeof globalThis & { __maestroRootFaultCounts?: Record<string, number> })
+        .__maestroRootFaultCounts?.[fault]
+    ), target)).toBe(2)
+  })
+}
 
 for (const viewport of VIEWPORTS) {
   test(`content-free responsive shell: ${viewport.name}`, async ({ page }) => {
@@ -666,12 +783,12 @@ test('mobile nested modal stack keeps only the top dialog interactive', async ({
   await skipWelcome(page)
   await gotoSyntheticApp(page)
 
-  const menuButton = page.getByRole('button', { name: 'Open Generate, Director, and Reference menu' })
+  const menuButton = page.getByRole('button', { name: 'Open Generate, Director, and References menu' })
   await expectMinimumTarget(menuButton)
   await menuButton.click()
-  await expect(page.getByRole('dialog', { name: 'Generate, Director, and Reference menu' })).toBeVisible()
+  await expect(page.getByRole('dialog', { name: 'Generate, Director, and References menu' })).toBeVisible()
   const menu = page.locator('#maestro-mobile-sidebar[role="dialog"]')
-  await expect(menu).toHaveAccessibleName('Generate, Director, and Reference menu')
+  await expect(menu).toHaveAccessibleName('Generate, Director, and References menu')
   await expect(menu).toBeVisible()
   await expect(page.locator('#root')).toHaveAttribute('inert', '')
   await expectBodyModalLock(page, true)
@@ -767,7 +884,7 @@ test('mobile nested modal stack keeps only the top dialog interactive', async ({
   await page.keyboard.press('Escape')
   await expect(menu).toHaveAttribute('aria-hidden', 'true')
   await expect(menu).toHaveAttribute('inert', '')
-  await expect(page.getByRole('dialog', { name: 'Generate, Director, and Reference menu' })).toHaveCount(0)
+  await expect(page.getByRole('dialog', { name: 'Generate, Director, and References menu' })).toHaveCount(0)
   await expect(menuButton).toBeFocused()
   await expect(page.locator('#root')).not.toHaveAttribute('inert', '')
   await expectBodyModalLock(page, false)
@@ -810,7 +927,7 @@ for (const viewport of [
       .toEqual(resizedViewport)
     await expectNoHorizontalOverflow(page)
 
-    const resizedMenuButton = page.getByRole('button', { name: 'Open Generate, Director, and Reference menu' })
+    const resizedMenuButton = page.getByRole('button', { name: 'Open Generate, Director, and References menu' })
     await expectRenderedActionsReachable(resizedMenuButton)
     if (testInfo.project.name === 'android-like-chromium') {
       const box = await resizedMenuButton.boundingBox()
@@ -852,7 +969,7 @@ for (const viewport of [
     await expectNoBlockingAxeFindings(page)
     await filters.getByRole('button', { name: 'Close Gallery filters' }).click()
 
-    const menuButton = page.getByRole('button', { name: 'Open Generate, Director, and Reference menu' })
+    const menuButton = page.getByRole('button', { name: 'Open Generate, Director, and References menu' })
     await menuButton.click()
     const menu = page.locator('#maestro-mobile-sidebar[role="dialog"]')
     await menu.getByRole('button', { name: 'Open Generate', exact: true }).click()
@@ -872,7 +989,7 @@ for (const viewport of [
     await recipes.getByRole('button', { name: 'Close recipes' }).last().click()
 
     if (await menu.getAttribute('aria-hidden') === 'true') {
-      await page.getByRole('button', { name: 'Open Generate, Director, and Reference menu' }).click()
+      await page.getByRole('button', { name: 'Open Generate, Director, and References menu' }).click()
     }
     await menu.getByRole('button', { name: 'Open Director', exact: true }).click()
     await menu.getByRole('button', { name: 'Open Director production dashboard' }).click()
@@ -914,7 +1031,7 @@ for (const viewport of [
     await skipWelcome(page)
     await gotoSyntheticApp(page)
 
-    await page.getByRole('button', { name: 'Open Generate, Director, and Reference menu' }).click()
+    await page.getByRole('button', { name: 'Open Generate, Director, and References menu' }).click()
     const menu = page.locator('#maestro-mobile-sidebar[role="dialog"]')
     await menu.getByRole('button', { name: 'Open Generate', exact: true }).click()
     const generationModes = menu.getByRole('group', { name: 'Generation mode' })
@@ -1004,6 +1121,59 @@ test('chat geometry and queue last-good retention remain usable on mobile', asyn
   await page.evaluate(() => window.dispatchEvent(new Event('maestro:queue-refresh')))
   await expect(page.getByText(/1 waiting/).first()).toBeVisible()
   await expect(page.getByRole('status')).toHaveCount(0)
+})
+
+test('stale remote sessions and locked boot calls recover without a blank root or early queue polling', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  await skipWelcome(page)
+  api!.setAccountScenario('remote-user')
+  await gotoSyntheticApp(page)
+
+  await expect(page.getByRole('button', { name: /Current project: Synthetic project/ })).toBeVisible()
+  await page.getByRole('tab', { name: /^Queue/ }).click()
+  await expect(page.getByText(/1 waiting/).first()).toBeVisible()
+  await expect.poll(() => api!.requestCount('/api/v1/queue')).toBeGreaterThan(0)
+  await expect.poll(() => api!.requestCount('/api/v1/jobs')).toBeGreaterThan(0)
+  await expect.poll(() => api!.requestCount('/api/v1/h3/estimate')).toBeGreaterThan(0)
+  await expect.poll(() => api!.requestCount('/api/v1/loras/check-updates')).toBeGreaterThan(0)
+
+  api!.setBootFailures({ queue: 423 })
+  await page.evaluate(() => window.dispatchEvent(new Event('maestro:queue-refresh')))
+  await expect(page.getByRole('heading', { name: 'Choose a project to continue' })).toBeVisible()
+  await expect(page.locator('#root')).not.toBeEmpty()
+  await expect(page.getByText(/1 waiting/)).toHaveCount(0)
+  const protectedRequestsAfterLock = {
+    queue: api!.requestCount('/api/v1/queue'),
+    jobs: api!.requestCount('/api/v1/jobs'),
+    estimate: api!.requestCount('/api/v1/h3/estimate'),
+    loras: api!.requestCount('/api/v1/loras/check-updates'),
+  }
+
+  api!.setBootFailures({ account: 403 })
+  await page.reload()
+  await expect(page.getByRole('heading', { name: 'Sign in to continue' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Try again' })).toBeVisible()
+  await expect(page.locator('#root')).not.toBeEmpty()
+  await expect.poll(() => ({
+    queue: api!.requestCount('/api/v1/queue'),
+    jobs: api!.requestCount('/api/v1/jobs'),
+    estimate: api!.requestCount('/api/v1/h3/estimate'),
+    loras: api!.requestCount('/api/v1/loras/check-updates'),
+  })).toEqual(protectedRequestsAfterLock)
+
+  api!.setBootFailures({ project: 403 })
+  await page.reload()
+  await expect(page.getByRole('heading', { name: 'Choose a project to continue' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Open sign-in' })).toBeVisible()
+  await expect(page.locator('#root')).not.toBeEmpty()
+  expect(api!.requestCount('/api/v1/account/context')).toBeGreaterThan(0)
+  expect(api!.requestCount('/api/v1/workspaces')).toBeGreaterThan(0)
+  await expect.poll(() => ({
+    queue: api!.requestCount('/api/v1/queue'),
+    jobs: api!.requestCount('/api/v1/jobs'),
+    estimate: api!.requestCount('/api/v1/h3/estimate'),
+    loras: api!.requestCount('/api/v1/loras/check-updates'),
+  })).toEqual(protectedRequestsAfterLock)
 })
 
 test('representative shell has no serious or critical axe findings', async ({ page }) => {
@@ -1149,6 +1319,7 @@ test('active account project access opens and creates member projects without pr
   await page.setViewportSize({ width: 768, height: 900 })
   await skipWelcome(page)
   api!.setAccountScenario('user')
+  await routeMigratedUserAccess(page, 'Synthetic User')
   const projectPermissions = [
     'project.open', 'project.read', 'project.mutate', 'project.generate', 'project.lifecycle', 'project.delete',
   ]
@@ -1218,11 +1389,296 @@ test('active account project access opens and creates member projects without pr
   const reopenedSelector = page.getByRole('dialog', { name: 'Projects' })
   await reopenedSelector.getByRole('button', { name: 'New project' }).click()
   await expect(reopenedSelector.locator('input[type="password"]')).toHaveCount(0)
-  await reopenedSelector.getByPlaceholder('workspace-name').fill('Created member project')
-  await reopenedSelector.getByRole('button', { name: 'Create project' }).click()
-  await expect(page.getByRole('button', { name: /Current project: Created-member-project/ })).toBeVisible()
-  expect(createdBodies).toEqual([{ name: 'Created-member-project', remember: 'device' }])
+  const nameInput = reopenedSelector.getByPlaceholder('workspace-name')
+  const createButton = reopenedSelector.getByRole('button', { name: 'Create project' })
+  await expect(createButton).toBeDisabled()
+  await nameInput.fill('threadspan-acceptance')
+  await expect(nameInput).toHaveValue('threadspan-acceptance')
+  await expect(createButton).toBeEnabled()
+  await createButton.click()
+  await expect(page.getByRole('button', { name: /Current project: threadspan-acceptance/ })).toBeVisible()
+  await expect.poll(() => createdBodies.length).toBe(1)
+  expect(createdBodies).toEqual([{ name: 'threadspan-acceptance' }])
 })
+
+test('a newly signed-up migrated user can create their first passwordless project exactly once', async ({ page }) => {
+  await page.setViewportSize({ width: 768, height: 900 })
+  await skipWelcome(page)
+  api!.setAccountScenario('user')
+  await routeMigratedUserAccess(page, 'threadspan-test')
+
+  const projectPermissions = [
+    'project.open', 'project.read', 'project.mutate', 'project.generate', 'project.lifecycle', 'project.delete',
+  ]
+  let activeProject = ''
+  const workspaces: Array<Record<string, unknown>> = []
+  const createdBodies: Array<Record<string, unknown>> = []
+  await page.route('**/api/v1/workspaces', async route => {
+    const request = route.request()
+    if (request.method() === 'GET') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ workspaces, active: activeProject }),
+      })
+      return
+    }
+    if (request.method() === 'POST') {
+      const body = request.postDataJSON() as Record<string, unknown>
+      createdBodies.push(body)
+      const name = String(body.name || '')
+      workspaces.push({
+        name,
+        password_protected: false,
+        unlocked: false,
+        project_role: 'owner',
+        project_permissions: projectPermissions,
+      })
+      await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' })
+      return
+    }
+    await route.abort('blockedbyclient')
+  })
+  await page.route('**/api/v1/workspaces/active', async route => {
+    const body = route.request().postDataJSON() as { name?: unknown }
+    activeProject = String(body.name || '')
+    await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' })
+  })
+
+  await page.goto('/')
+  const chooser = page.getByRole('dialog', { name: 'Choose a project to enter Maestro' })
+  await expect(chooser).toBeVisible()
+  await expect(chooser.locator('input[type="password"]')).toHaveCount(0)
+  const nameInput = chooser.getByPlaceholder('workspace-name')
+  const createButton = chooser.getByRole('button', { name: 'Create project' })
+  await expect(createButton).toBeDisabled()
+  await nameInput.fill('threadspan-acceptance')
+  await expect(nameInput).toHaveValue('threadspan-acceptance')
+  await expect(createButton).toBeEnabled()
+  await createButton.click()
+  await expect(page.getByRole('button', { name: /Current project: threadspan-acceptance/ })).toBeVisible()
+  await expect.poll(() => createdBodies.length).toBe(1)
+  expect(createdBodies).toEqual([{ name: 'threadspan-acceptance' }])
+})
+
+test('public signup requires saving one-time recovery codes and recovery replaces them', async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  await skipWelcome(page)
+  api!.setAccountScenario('public-anonymous')
+  await gotoSyntheticApp(page)
+
+  const trigger = page.locator('[data-responsive-dialog-trigger^="account-support:"]').first()
+  await expectMinimumTarget(trigger)
+  await trigger.click()
+  const drawer = page.locator('#account-support-drawer[role="dialog"]')
+  await expect(drawer).toBeVisible()
+  await drawer.getByRole('tab', { name: 'Account' }).click()
+  await drawer.getByRole('button', { name: 'Create account', exact: true }).first().click()
+
+  const registration = drawer.getByRole('heading', { name: 'Create account' }).locator('xpath=../..')
+  await registration.getByLabel('Username', { exact: true }).fill('Synthetic New User')
+  await registration.getByLabel('Device label', { exact: true }).fill('Synthetic phone')
+  await registration.getByLabel('Password', { exact: true }).fill('synthetic-new-password')
+  await registration.getByLabel('Confirm password', { exact: true }).fill('synthetic-new-password')
+  const registrationSubmit = registration.getByRole('button', { name: 'Create account', exact: true })
+  await expect(registrationSubmit).toBeEnabled()
+  expect(await registration.evaluate(form => (form as HTMLFormElement).checkValidity())).toBe(true)
+  const nonceResponse = page.waitForResponse(response => (
+    new URL(response.url()).pathname === '/api/v1/account/nonce'
+  ))
+  await registrationSubmit.click()
+  const issuedNonce = await nonceResponse
+  expect(issuedNonce.status()).toBe(200)
+  await expect(issuedNonce.json()).resolves.toMatchObject({ purpose: 'register' })
+  await expect.poll(() => ({
+    nonce: api!.requestCount('/api/v1/account/nonce'),
+    register: api!.requestCount('/api/v1/account/register'),
+  })).toEqual({ nonce: 1, register: 1 })
+
+  const codes = drawer.getByRole('heading', { name: 'Your recovery codes' }).locator('xpath=../..')
+  await expect(codes).toBeVisible()
+  await expect(codes.getByText('synthetic-recovery-code-one', { exact: true })).toBeVisible()
+  const continueWithCodes = codes.getByRole('button', { name: 'Continue with saved codes' })
+  await expect(continueWithCodes).toBeDisabled()
+  await expectMinimumTarget(codes.getByText('I stored these recovery codes somewhere private.').locator('xpath=..'))
+  await codes.getByLabel('I stored these recovery codes somewhere private.').check()
+  await expect(continueWithCodes).toBeEnabled()
+  await expectNoHorizontalOverflow(page)
+  await expectNoBlockingAxeFindings(page)
+  await page.screenshot({ path: testInfo.outputPath('mobile-public-signup-recovery-codes.png'), fullPage: true })
+  await continueWithCodes.click()
+  await expect(drawer.getByText('Synthetic New User', { exact: true }).first()).toBeVisible()
+
+  api!.setAccountScenario('public-anonymous')
+  await page.reload()
+  const reopenedTrigger = page.locator('[data-responsive-dialog-trigger^="account-support:"]').first()
+  await reopenedTrigger.click()
+  const reopened = page.locator('#account-support-drawer[role="dialog"]')
+  await reopened.getByRole('tab', { name: 'Account' }).click()
+  await reopened.getByRole('button', { name: 'Recover', exact: true }).click()
+  const recovery = reopened.getByRole('button', { name: 'Recover and sign in' }).locator('xpath=..')
+  await recovery.getByLabel('Username', { exact: true }).fill('Synthetic New User')
+  await recovery.getByLabel('Device label', { exact: true }).fill('Synthetic replacement phone')
+  await recovery.getByLabel('Recovery code', { exact: true }).fill('synthetic-recovery-code-one')
+  await recovery.getByLabel('New password', { exact: true }).fill('synthetic-recovered-password')
+  await recovery.getByLabel('Confirm new password', { exact: true }).fill('synthetic-recovered-password')
+  await recovery.getByRole('button', { name: 'Recover and sign in' }).click()
+
+  const replacementCodes = reopened.getByRole('heading', { name: 'Replacement recovery codes' }).locator('xpath=../..')
+  await expect(replacementCodes.getByText('synthetic-replacement-code-one', { exact: true })).toBeVisible()
+  const replacementContinue = replacementCodes.getByRole('button', { name: 'Continue with saved codes' })
+  await expect(replacementContinue).toBeDisabled()
+  await replacementCodes.getByLabel('I stored these recovery codes somewhere private.').check()
+  await replacementContinue.click()
+  await expect(reopened.getByText('Synthetic New User', { exact: true }).first()).toBeVisible()
+})
+
+for (const viewport of PRODUCT_ACCEPTANCE_VIEWPORTS) {
+  test(`supporter membership, perks, and live hosted allowance are visible on ${viewport.name}`, async ({ page }, testInfo) => {
+    await page.setViewportSize({ width: viewport.width, height: viewport.height })
+    api!.setAccountScenario('user')
+    api!.setSupportScenario('donor')
+    await gotoSyntheticApp(page)
+
+    const welcome = page.getByRole('dialog', { name: /Welcome to Maestro Continuum/ })
+    await expect(welcome).toBeVisible()
+    const membership = welcome.getByRole('region', { name: 'Account membership and supporter status' })
+    await expect(membership).toContainText('Member account')
+    await expect(membership).toContainText(/studio supporter/i)
+    await expect(membership).toContainText(/continuum supporter/i)
+    await expect(membership).toContainText('Supporter recognition')
+    await expect(membership).toContainText('Bounded hosted queue priority')
+    await expectNoHorizontalOverflow(page)
+    await expectNoBlockingAxeFindings(page)
+    if (viewport.width <= 767) await expectEveryRenderedActionMinimumTarget(welcome)
+    await page.screenshot({ path: testInfo.outputPath(`${viewport.name}-supporter-welcome.png`), fullPage: true })
+
+    await welcome.getByRole('button', { name: /Enter the studio/ }).click()
+    const trigger = page.locator('[data-responsive-dialog-trigger^="account-support:"]').first()
+    if (viewport.width <= 767) await expectMinimumTarget(trigger)
+    await trigger.click()
+    const drawer = page.locator('#account-support-drawer[role="dialog"]')
+    await drawer.getByRole('tab', { name: 'Support' }).click()
+    await expect(drawer.getByRole('heading', { name: 'Supporter tiers and perks' })).toBeVisible()
+    const recordedSupport = drawer.getByRole('heading', { name: 'Support is recorded for this account' })
+    await expect(recordedSupport).toBeVisible()
+    await expect(drawer.getByLabel('Supporter status and benefits')).toContainText(/studio supporter/i)
+    await expect(drawer.getByLabel('Supporter status and benefits')).toContainText('Early access updates')
+    const activeAllowance = drawer.getByLabel('Active hosted queue allowance')
+    await expect(activeAllowance).toContainText('Available amount: 2,400 maestro credits')
+    await expect(drawer).toContainText('Maestro neither detects nor automatically refunds it.')
+    await expectNoHorizontalOverflow(page)
+    await expectNoBlockingAxeFindings(page)
+    await activeAllowance.scrollIntoViewIfNeeded()
+    await page.screenshot({ path: testInfo.outputPath(`${viewport.name}-supporter-account.png`), fullPage: true })
+  })
+}
+
+for (const viewport of PRODUCT_ACCEPTANCE_VIEWPORTS) {
+test(`${viewport.name} output share creates, copies, opens anonymously, and revokes one read-only link`, async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: viewport.width, height: viewport.height })
+  await skipWelcome(page)
+  api!.setAccountScenario('remote-user')
+  api!.setOutputScenario('shareable')
+  await page.addInitScript(() => {
+    const target = globalThis as typeof globalThis & { __maestroCopiedShare?: string }
+    Object.defineProperty(navigator, 'share', { configurable: true, value: undefined })
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: async (value: string) => { target.__maestroCopiedShare = value } },
+    })
+  })
+  await gotoSyntheticApp(page)
+
+  await page.getByRole('tab', { name: 'Gallery' }).click()
+  const output = page.getByRole('group', { name: /synthetic-share\.png\. Press Enter or Space to select/ })
+  await expect(output).toBeVisible()
+  const share = output.getByRole('button', { name: /Share synthetic-share\.png — create an output-only link/ })
+  const revoke = output.getByRole('button', { name: /Revoke any active output-only link for synthetic-share\.png/ })
+  if (viewport.width <= 767) {
+    await expectMinimumTarget(share)
+    await expectMinimumTarget(revoke)
+  }
+  await share.click()
+  await expect(output.getByRole('status')).toContainText('Local-network output link copied.')
+  const copied = await page.evaluate(() => (
+    globalThis as typeof globalThis & { __maestroCopiedShare?: string }
+  ).__maestroCopiedShare || '')
+  expect(copied).toBe(`${E2E_ORIGIN}/share/synthetic-output-share-token`)
+  expect(api!.requestCount('/api/v1/output-shares')).toBe(1)
+  await expectNoHorizontalOverflow(page)
+  await expectNoBlockingAxeFindings(page)
+  await page.screenshot({ path: testInfo.outputPath(`${viewport.name}-output-share-active.png`), fullPage: true })
+
+  const sharedPage = await page.context().newPage()
+  const activeResponse = await sharedPage.goto(copied)
+  expect(activeResponse?.status()).toBe(200)
+  await expect(sharedPage.getByRole('heading', { name: 'Shared Maestro output' })).toBeVisible()
+  await expect(sharedPage.getByRole('img', { name: 'Shared Maestro output' })).toBeVisible()
+  await expect(sharedPage.getByText('synthetic-share.png', { exact: true })).toBeVisible()
+  await sharedPage.close()
+
+  page.once('dialog', dialog => dialog.accept())
+  await revoke.click()
+  await expect(output.getByRole('status')).toContainText('Output link revoked.')
+  expect(api!.requestCount('/api/v1/output-shares')).toBe(2)
+  const revokedPage = await page.context().newPage()
+  const revokedResponse = await revokedPage.goto(copied)
+  expect(revokedResponse?.status()).toBe(404)
+  await revokedPage.close()
+})
+}
+
+for (const viewport of PRODUCT_ACCEPTANCE_VIEWPORTS) {
+  test(`${viewport.name} project sharing manages exact account membership without creating a bearer project link`, async ({ page }, testInfo) => {
+    await page.setViewportSize({ width: viewport.width, height: viewport.height })
+    await skipWelcome(page)
+    api!.setAccountScenario('remote-user')
+    await page.addInitScript(() => {
+      const target = globalThis as typeof globalThis & { __maestroCopiedStudio?: string }
+      Object.defineProperty(navigator, 'clipboard', {
+        configurable: true,
+        value: { writeText: async (value: string) => { target.__maestroCopiedStudio = value } },
+      })
+    })
+    await gotoSyntheticApp(page)
+
+    const trigger = page.locator('[data-project-share-trigger]')
+    await expect(trigger).toBeVisible()
+    if (viewport.width <= 767) await expectMinimumTarget(trigger)
+    await trigger.click()
+    const panel = page.locator('[data-project-access-panel]')
+    await expect(panel).toBeVisible()
+    await expect(panel).toContainText('No email invite or public project link is created.')
+    await expect(panel.getByText('Synthetic User', { exact: true })).toBeVisible()
+
+    const copyStudio = panel.locator('[data-copy-studio-link]')
+    await copyStudio.click()
+    await expect(copyStudio).toContainText('Copied')
+    expect(await page.evaluate(() => (
+      globalThis as typeof globalThis & { __maestroCopiedStudio?: string }
+    ).__maestroCopiedStudio || '')).toBe(`${E2E_ORIGIN}/`)
+
+    const memberForm = panel.locator('[data-project-member-form]')
+    await memberForm.locator('[data-project-member-username]').fill('Synthetic Collaborator')
+    await memberForm.locator('[data-project-member-role]').selectOption('editor')
+    await memberForm.getByRole('button', { name: 'Save access' }).click()
+    await expect(panel.getByText('Synthetic Collaborator', { exact: true })).toBeVisible()
+    const collaboratorRole = panel.getByLabel('Role for Synthetic Collaborator')
+    await expect(collaboratorRole).toHaveValue('editor')
+    await collaboratorRole.selectOption('viewer')
+    await expect(collaboratorRole).toHaveValue('viewer')
+
+    const remove = panel.getByRole('button', { name: 'Remove Synthetic Collaborator' })
+    await remove.click()
+    await panel.getByRole('button', { name: 'Confirm removing Synthetic Collaborator' }).click()
+    await expect(panel.getByText('Synthetic Collaborator', { exact: true })).toHaveCount(0)
+    await expectNoHorizontalOverflow(page)
+    await expectNoBlockingAxeFindings(page)
+    if (viewport.width <= 767) await expectEveryRenderedActionMinimumTarget(panel)
+    await page.screenshot({ path: testInfo.outputPath(`${viewport.name}-project-sharing.png`), fullPage: true })
+  })
+}
 
 test('unknown and external requests are blocked before leaving the fixture', async ({ page }) => {
   await skipWelcome(page)

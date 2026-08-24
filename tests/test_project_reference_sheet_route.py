@@ -29,6 +29,7 @@ from services.output_access import (
     public_output_policy,
     stamp_sidecar_policy,
 )
+from services.h3_legal_access import h3_public_availability
 from services.project_assets import (
     ProjectAssetNotFoundError,
     ProjectAssetPersistenceError,
@@ -36,6 +37,7 @@ from services.project_assets import (
 )
 from services.queue_recovery_adapter import owner_principal_digest
 from services.queue_recovery_runtime import sha256_file
+from services.sample_campaign_coordinator import SAMPLE_JOB_KIND
 from services.reference_admission import (
     ReferenceAdmissionCapacityError,
     ReferenceAdmissionCorruptionError,
@@ -133,6 +135,7 @@ def _load_route_symbols(namespace):
         "_public_failed_child_metadata",
         "_public_job_prompt_fields",
         "_public_job_created_at",
+        "_generic_job_visible",
         "get_status",
         "list_jobs",
     }
@@ -211,6 +214,7 @@ class _ModelRegistry:
     }
     displayed_model_types = tuple(definitions)
     models_def = definitions
+    server_config = {"services": {}}
     lora_dir = ""
     families_infos = {
         "flux": (1, "Flux"),
@@ -345,6 +349,8 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             "hmac": hmac,
             "json": json,
             "math": math,
+            "Mapping": __import__("collections.abc").abc.Mapping,
+            "Any": __import__("typing").Any,
             "os": os,
             "re": re,
             "stat": stat,
@@ -364,6 +370,8 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             "ReferenceAdmissionPersistenceError": ReferenceAdmissionPersistenceError,
             "ReferenceAdmissionValidationError": ReferenceAdmissionValidationError,
             "wgp": _ModelRegistry,
+            "h3_public_availability": h3_public_availability,
+            "_SAMPLE_CAMPAIGN_JOB_KIND": SAMPLE_JOB_KIND,
             "public_output_policy": public_output_policy,
             "stamp_sidecar_policy": stamp_sidecar_policy,
             "ArtifactScope": ArtifactScope,

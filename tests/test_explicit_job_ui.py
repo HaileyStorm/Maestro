@@ -119,6 +119,10 @@ class ExplicitJobUiSourceTests(unittest.TestCase):
         self.assertIn("Private controls preview blur only", CONTROLS)
         self.assertIn("Project access rules always apply separately", CONTROLS)
         self.assertNotIn("visible to other authorized project users", CONTROLS)
+        self.assertIn("modelSelectionCustomized", CONTROLS)
+        self.assertIn("sidebarMode === 'studio'", CONTROLS)
+        self.assertIn("currentModelType === 'minimax_h3'", CONTROLS)
+        self.assertIn("selectModel('minimax_h3_pinkcherry_fl2va')", CONTROLS)
 
         self.assertGreaterEqual(SIDEBAR.count("<GenerationPrivacyControls />"), 2)
         self.assertEqual(
@@ -386,7 +390,7 @@ class ExplicitJobUiSourceTests(unittest.TestCase):
         self.assertIn("pinkReconciliationLabel", director_picker)
         self.assertIn("await get().selectModel(modelType)", STORE)
 
-    def test_explicit_base_is_warning_only_and_restores_normalize_editable_state(self):
+    def test_explicit_base_is_warning_only_and_presets_keep_exact_authored_state(self):
         self.assertIn("Base may be less reliable for explicit intent.", CONTROLS)
         self.assertNotIn("setParam", CONTROLS)
         self.assertNotIn("prompt", CONTROLS.lower())
@@ -399,7 +403,8 @@ class ExplicitJobUiSourceTests(unittest.TestCase):
             STORE.index("loadSettingsFromOutput: async"):
             STORE.index("// Restore image refs as File objects")
         ]
-        self.assertIn("normalizeH3EditableProfile", preset)
+        self.assertNotIn("normalizeH3EditableProfile", preset)
+        self.assertIn("must not silently replace its exact", preset)
         self.assertIn("normalizeH3EditableProfile", output_restore)
         self.assertIn("h3ProfileMatches(profile, state.params", STORE)
 
@@ -438,7 +443,7 @@ class ExplicitJobUiSourceTests(unittest.TestCase):
             self.assertIn("detailsRequest !== loraDetailsRequest.current", source)
         self.assertIn("<DirectorPresetPicker", DIRECTOR_LORAS)
 
-    def test_fresh_studio_video_defaults_to_h3_high(self):
+    def test_fresh_studio_video_uses_server_authored_role_profile(self):
         defaults = STORE[
             STORE.index("const modeDefaultModel"):
             STORE.index("export function getFamilyMode")
@@ -446,8 +451,9 @@ class ExplicitJobUiSourceTests(unittest.TestCase):
         self.assertIn("video: 'minimax_h3'", defaults)
         self.assertIn("model_type: 'minimax_h3'", STORE)
         self.assertIn("resolution: '1344x768'", STORE)
-        self.assertIn("num_inference_steps: 20", STORE)
-        self.assertIn("h3SelectedProfile: 'high' as const", STORE)
+        self.assertIn("num_inference_steps: 28", STORE)
+        self.assertIn("const roleProfile = defaults.h3_default_profile_id", STORE)
+        self.assertIn("h3SelectedProfile: selectedProfile", STORE)
 
     def test_private_preview_requires_deliberate_session_scoped_reveal(self):
         self.assertIn("const privateBlurred = file.private && !privateRevealed", MEDIA_ITEM)

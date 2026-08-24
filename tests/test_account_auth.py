@@ -197,12 +197,26 @@ class AccountAuthStoreTests(unittest.TestCase):
         self.assertEqual(self.store.resolve_account(account_id)["role"], "owner")
         self.assertIsNone(self.store.resolve_account("f" * 32))
         self.assertIsNone(self.store.resolve_account("not-an-account-id"))
+        self.assertEqual(
+            self.store.resolve_account_username("OWNER")["id"],
+            account_id,
+        )
+        self.assertEqual(
+            self.store.resolve_account_username("Ｏｗｎｅｒ")["id"],
+            account_id,
+        )
+        self.assertIsNone(self.store.resolve_account_username("other-user"))
+        with self.assertRaises(AccountAuthError) as invalid_username:
+            self.store.resolve_account_username(" Owner ")
+        self.assertEqual(invalid_username.exception.code, "invalid_username")
 
         payload = json.loads(self.path.read_text(encoding="utf-8"))
         payload["accounts"][0]["role"] = "user"
         self.path.write_text(json.dumps(payload), encoding="utf-8")
         with self.assertRaises(AccountStoreCorruptError):
             self.store.resolve_account(account_id)
+        with self.assertRaises(AccountStoreCorruptError):
+            self.store.resolve_account_username("owner")
 
     def test_legacy_nonempty_store_creates_missing_completion_marker(self):
         result = self._bootstrap()
@@ -542,6 +556,103 @@ class AccountAuthStoreTests(unittest.TestCase):
         with self.assertRaises(AccountAuthError) as denied:
             self.store.list_accounts(user)
         self.assertEqual(denied.exception.code, "owner_required")
+
+    def test_public_registration_creates_only_a_signed_in_user_and_is_rate_limited(self):
+        owner_session = self._bootstrap()["account_session_id"]
+        public_browser = "9" * 32
+        registered = self.store.register_account(
+            username="PublicUser",
+            password=PASSWORD,
+            email="public@example.test",
+            device_label="Public browser",
+            nonce_session_id=public_browser,
+            nonce=self.store.issue_nonce(public_browser, "register")["nonce"],
+            remote=True,
+            source_id="cf:203.0.113.8",
+        )
+        self.assertEqual(registered["account"]["role"], "user")
+        self.assertTrue(registered["recovery_codes"])
+        principal = self.store.resolve_session(registered["account_session_id"])
+        self.assertEqual(principal["id"], registered["account"]["id"])
+        self.assertEqual(principal["role"], "user")
+        self.assertNotIn(
+            "owner.admin",
+            resolve_account_capabilities(principal, remote=True),
+        )
+        self.assertTrue(
+            next(
+                session for session in self.store.list_sessions(
+                    registered["account_session_id"]
+                )
+                if session["current"]
+            )["remote_created"]
+        )
+        self.assertEqual(
+            [account["role"] for account in self.store.list_accounts(owner_session)],
+            ["owner", "user"],
+        )
+
+        with self.assertRaises(AccountAuthError) as duplicate:
+            self.store.register_account(
+                username="publicuser",
+                password=SECOND_PASSWORD,
+                email="",
+                device_label="Second browser",
+                nonce_session_id=public_browser,
+                nonce=self.store.issue_nonce(public_browser, "register")["nonce"],
+                remote=True,
+                source_id="cf:203.0.113.8",
+            )
+        self.assertEqual(duplicate.exception.code, "username_unavailable")
+
+        limited_browser = "8" * 32
+        with patch.object(account_auth, "_PUBLIC_REGISTRATION_BROWSER_FREE", 0):
+            self.store.register_account(
+                username="FirstLimited",
+                password=PASSWORD,
+                email="",
+                device_label="Limited browser",
+                nonce_session_id=limited_browser,
+                nonce=self.store.issue_nonce(limited_browser, "register")["nonce"],
+                remote=True,
+                source_id="cf:203.0.113.9",
+            )
+            with self.assertRaises(AccountAuthError) as limited:
+                self.store.register_account(
+                    username="SecondLimited",
+                    password=PASSWORD,
+                    email="",
+                    device_label="Limited browser",
+                    nonce_session_id=limited_browser,
+                    nonce=self.store.issue_nonce(limited_browser, "register")["nonce"],
+                    remote=True,
+                    source_id="cf:203.0.113.9",
+                )
+        self.assertEqual(limited.exception.code, "rate_limited")
+
+        local_browser = "7" * 32
+        local_registered = self.store.register_account(
+            username="LocalStudio",
+            password=PASSWORD,
+            email="",
+            device_label="Local browser",
+            nonce_session_id=local_browser,
+            nonce=self.store.issue_nonce(local_browser, "register")["nonce"],
+            remote=False,
+        )
+        self.assertEqual(local_registered["account"]["role"], "user")
+        self.assertEqual(local_registered["account"]["username"], "LocalStudio")
+        local_principal = self.store.resolve_session(
+            local_registered["account_session_id"],
+        )
+        self.assertEqual(local_principal["id"], local_registered["account"]["id"])
+        self.assertFalse(local_registered["account"]["has_email"])
+        local_sessions = self.store.list_sessions(
+            local_registered["account_session_id"],
+        )
+        self.assertEqual(len(local_sessions), 1)
+        self.assertFalse(local_sessions[0]["remote_created"])
+        self.assertTrue(local_sessions[0]["current"])
 
     def test_disabled_account_revokes_sessions_and_refuses_login(self):
         owner = self._bootstrap()["account_session_id"]
@@ -1625,6 +1736,7 @@ class AccountCapabilityTests(unittest.TestCase):
         source = (APP / "launch.py").read_text(encoding="utf-8")
         self.assertIn('MAESTRO_ACCOUNTS_ENABLED', source)
         self.assertIn('MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED', source)
+        self.assertIn('MAESTRO_PUBLIC_REGISTRATION_ENABLED', source)
         self.assertIn('request.state.maestro_account_principal', source)
         self.assertIn('request.state.maestro_account_capabilities', source)
         self.assertIn('request.state.maestro_account_session_cookie_id', source)
@@ -1634,6 +1746,24 @@ class AccountCapabilityTests(unittest.TestCase):
         self.assertIn('secure=_request_is_https(request)', source)
         self.assertIn('@api.post("/api/v1/account/login")', source)
         self.assertIn('@api.post("/api/v1/account/recover")', source)
+        self.assertIn('@api.post("/api/v1/account/register")', source)
+        self.assertIn('elif purpose == "register":', source)
+        self.assertIn('_registration_request_ready(request)', source)
+        self.assertIn('_loopback_registration_ready', source)
+        self.assertIn('_public_registration_origin_allowed(request, mutation=True)', source)
+        register_route = source[
+            source.index('async def register_public_account'):
+            source.index('@api.post("/api/v1/account/logout")')
+        ]
+        self.assertIn("store.register_account", register_route)
+        self.assertIn("remote=bool(request.state.maestro_remote)", register_route)
+        self.assertNotIn("remote=True", register_route)
+        self.assertNotIn('role=', register_route)
+        self.assertNotIn("membership", register_route)
+        audit = source[source.index("def _audit_public_registration"):source.index("def _request_external_origins")]
+        self.assertNotIn('body.get("username")', audit)
+        self.assertNotIn("email", audit)
+        self.assertNotIn("source_id", audit)
         self.assertIn('@api.post("/api/v1/account/reauth")', source)
         self.assertIn('@api.get("/api/v1/account/sessions")', source)
         self.assertIn('@api.post("/api/v1/account/sessions/revoke-all")', source)
@@ -1642,6 +1772,7 @@ class AccountCapabilityTests(unittest.TestCase):
     def test_opt_in_defaults_are_behaviorally_disabled(self):
         module, path = self._launch_subset(
             "_env_flag_enabled", "_accounts_enabled", "_account_bootstrap_enabled",
+            "_public_registration_enabled",
             constants=("_TRUE_ENV_VALUES",),
         )
         namespace = {"os": os}
@@ -1649,14 +1780,22 @@ class AccountCapabilityTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             self.assertFalse(namespace["_accounts_enabled"]())
             self.assertFalse(namespace["_account_bootstrap_enabled"]())
+            self.assertFalse(namespace["_public_registration_enabled"]())
         with patch.dict(os.environ, {"MAESTRO_ACCOUNTS_ENABLED": "true"}, clear=True):
             self.assertTrue(namespace["_accounts_enabled"]())
             self.assertFalse(namespace["_account_bootstrap_enabled"]())
+            self.assertFalse(namespace["_public_registration_enabled"]())
         with patch.dict(os.environ, {
             "MAESTRO_ACCOUNTS_ENABLED": "true",
             "MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED": "true",
         }, clear=True):
             self.assertTrue(namespace["_account_bootstrap_enabled"]())
+            self.assertFalse(namespace["_public_registration_enabled"]())
+        with patch.dict(os.environ, {
+            "MAESTRO_ACCOUNTS_ENABLED": "true",
+            "MAESTRO_PUBLIC_REGISTRATION_ENABLED": "true",
+        }, clear=True):
+            self.assertTrue(namespace["_public_registration_enabled"]())
 
     def test_project_account_stores_are_lazy_and_disabled_paths_do_no_io(self):
         module, path = self._launch_subset(
@@ -2201,6 +2340,7 @@ class AccountCapabilityTests(unittest.TestCase):
             "_require_account_store": lambda _request: store,
             "_raise_account_http_error": lambda error: (_ for _ in ()).throw(error),
             "_request_has_recent_account_reauth": lambda _request: False,
+            "_public_registration_available": lambda _request: False,
         }
         exec(compile(module, str(path), "exec"), namespace)
         request = types.SimpleNamespace(
@@ -2279,6 +2419,7 @@ class AccountCapabilityTests(unittest.TestCase):
             "_is_workers_dev_origin", "_canonical_http_origin",
             "_first_forwarded_value", "_request_external_origins",
             "_configured_app_origins", "_matches_verified_stable_redirect_origin",
+            "_verified_runtime_cloudflare_origin", "_cors_origin_allowed",
             "_account_exact_origin_allowed", "_account_local_bootstrap_allowed",
             "_account_activation_read_allowed", "_account_activation_context",
             "_require_account_project_migration_owner",
@@ -3104,6 +3245,10 @@ class AccountCapabilityTests(unittest.TestCase):
 
     def test_remote_owner_route_matrix_denies_before_body_or_side_effects(self):
         route_matrix = (
+            ("GET", "/api/v1/h3/legal-access"),
+            ("PUT", "/api/v1/h3/legal-access"),
+            ("GET", "/api/v1/krea/owner-policy"),
+            ("PUT", "/api/v1/krea/owner-policy"),
             ("PUT", "/api/v1/model-visibility"),
             ("POST", "/api/v1/models/reload"),
             ("POST", "/api/v1/llm/unload"),
@@ -3111,6 +3256,10 @@ class AccountCapabilityTests(unittest.TestCase):
             ("POST", "/api/v1/queue/resume"),
         )
         expected_handlers = {
+            ("GET", "/api/v1/h3/legal-access"): "get_h3_legal_access",
+            ("PUT", "/api/v1/h3/legal-access"): "update_h3_legal_access",
+            ("GET", "/api/v1/krea/owner-policy"): "get_krea_owner_policy",
+            ("PUT", "/api/v1/krea/owner-policy"): "update_krea_owner_policy",
             ("PUT", "/api/v1/model-visibility"): "update_model_visibility",
             ("POST", "/api/v1/models/reload"): "reload_model_definitions",
             ("POST", "/api/v1/llm/unload"): "llm_unload",
@@ -3225,7 +3374,7 @@ class AccountCapabilityTests(unittest.TestCase):
                     and isinstance(decorator.func, ast.Attribute)
                     and isinstance(decorator.func.value, ast.Name)
                     and decorator.func.value.id == "api"
-                    and decorator.func.attr in {"put", "post"}
+                    and decorator.func.attr in {"get", "put", "post"}
                     and decorator.args
                     and isinstance(decorator.args[0], ast.Constant)
                     and isinstance(decorator.args[0].value, str)
@@ -3351,6 +3500,34 @@ class AccountCapabilityTests(unittest.TestCase):
             namespace["_REMOTE_OWNER_REAUTH_ALLOWED_EXACT"],
         )
         self.assertTrue(all(item["reason"] for item in controls["unavailable"]))
+
+    def test_access_context_reports_registered_cloudflare_without_process_flag(self):
+        module, path = self._launch_subset(
+            "get_access_context",
+            constants=("_REMOTE_OWNER_REAUTH_ALLOWED_EXACT",),
+        )
+        namespace = {
+            "Request": object,
+            "_public_account_context": lambda _request: {
+                "activation_state": "ready", "bootstrap_available": False,
+            },
+            "_account_project_access_state": lambda: {
+                "state": "not_started", "enforced": False,
+            },
+            "_request_has_account_capability": lambda *_args: False,
+            "_request_has_recent_account_reauth": lambda _request: False,
+            "_env_flag_enabled": lambda _name: False,
+            "_public_share_url": lambda: "https://registered.trycloudflare.com",
+        }
+        exec(compile(module, str(path), "exec"), namespace)
+        request = types.SimpleNamespace(
+            state=types.SimpleNamespace(maestro_remote=False),
+        )
+        context = namespace["get_access_context"](request)
+        self.assertTrue(context["cloudflare_enabled"])
+        self.assertEqual(
+            context["share_url"], "https://registered.trycloudflare.com",
+        )
 
     def test_access_context_fallback_has_disabled_account_activation_state(self):
         module, path = self._launch_subset(

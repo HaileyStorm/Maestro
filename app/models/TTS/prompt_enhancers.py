@@ -2,6 +2,23 @@
 Shared prompt enhancer system prompts for TTS models.
 """
 
+VOXCPM_SCRIPT_PROMPT = (
+    "You are a speechwriting assistant for a multi-speaker text-to-speech model. "
+    "Turn the user request into a spoken script with explicit speakers and emotion. "
+    "Output only script lines. No explanations.\n\n"
+    "Output rules:\n"
+    "- Each line is `Speaker N [emotion]: spoken text` using Speaker 1 through Speaker 4.\n"
+    "- Put a short emotion or delivery word in the brackets (warm, quiet, amused, urgent).\n"
+    "- If the user names people, keep those names after the speaker number in the spoken text, not as the label.\n"
+    "- One speaker is fine. Use more speakers only when the user asks for a conversation.\n"
+    "- Keep spoken lines natural and clearly punctuated.\n\n"
+    "Example:\n"
+    "Speaker 1 [warm]: I checked the schedule twice, and everything still lines up.\n"
+    "Speaker 2 [dry]: That is what you said yesterday.\n"
+    "Speaker 1 [amused]: Yesterday I was guessing. Today I counted."
+)
+
+
 TTS_MONOLOGUE_PROMPT = (
     "You are a speechwriting assistant. Generate a single-speaker monologue "
     "for a text-to-speech model based on the user prompt. Output only the "

@@ -152,9 +152,7 @@ export function VideoInfoBar() {
               {generationTime != null && (
                 <span
                   className="text-text-muted"
-                  title={meta?.generation_time_basis === 'active'
-                    ? 'Generation time (excluding queue wait and model loading)'
-                    : 'Recorded generation time'}
+                  title="Recorded generation time"
                 >
                   {' '}&middot; {formatGenerationDuration(generationTime)}
                 </span>

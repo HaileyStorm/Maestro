@@ -9,6 +9,7 @@ and testable.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -19,8 +20,10 @@ import math
 import os
 from pathlib import Path, PurePath, PurePosixPath
 import re
+import secrets
 import stat
 import threading
+import time
 from typing import Any
 import uuid
 
@@ -78,7 +81,7 @@ _JOB_FIELDS = frozenset({
     "residency_base_key", "residency_affinity_key", "_queue_manual_order",
     "recovery_attempt", "recovery_state", "reruns_denoise",
     "recovery_unit", "recovery_cursor", "_recovery_reason_code",
-    "credit_queue",
+    "credit_queue", "prompt_result_reference", "prompt_result_consumed",
 })
 _GLOBAL_FIELDS = frozenset({
     "paused", "pause_after_current", "manual_order_sequence", "queue_order",
@@ -105,7 +108,7 @@ _RESOURCE_STATES = frozenset({
 })
 _FAILED_CHILD_STATUSES = frozenset({"failed", "cancelled", "blocked"})
 _LOGICAL_JOB_KINDS = frozenset({
-    "reference_pack_parent", "reference_pack_child",
+    "prompt_enhancement", "reference_pack_parent", "reference_pack_child",
 })
 _MAX_EXECUTION_ATTEMPT = 1_000_000
 _MAX_RESOURCE_RETRY_ATTEMPT = 8
@@ -124,8 +127,12 @@ _CREDIT_QUEUE_DECISIONS = frozenset({
     "capability_excluded",
     "owner_exempt_release",
 })
-_CREDIT_RESERVATION_STATES = frozenset({"reserved", "released", "consumed"})
-_CREDIT_REVALIDATION_STATES = frozenset({"valid", "downgraded", "released"})
+_CREDIT_RESERVATION_STATES = frozenset({
+    "reserved", "released", "consumed", "settled",
+})
+_CREDIT_REVALIDATION_STATES = frozenset({
+    "valid", "downgraded", "released", "settled",
+})
 _CREDIT_ACCOUNTING_RESERVATION_RE = re.compile(
     r"reservation_[0-9a-f]{32,64}\Z",
 )
@@ -133,6 +140,24 @@ _CREDIT_ACCOUNTING_RESERVATION_RE = re.compile(
 
 class QueueRecoveryAdapterError(RuntimeError):
     """Raised when runtime state cannot safely cross the durable boundary."""
+
+
+class PromptEnhancementRecoveryError(QueueRecoveryAdapterError):
+    """Base error for the dedicated Prompt Enhance recovery substrate."""
+
+
+class PromptEnhancementRecoveryConflictError(
+    PromptEnhancementRecoveryError, ValueError,
+):
+    """A request UUID was rebound to different exact effective input."""
+
+
+class PromptEnhancementRecoveryCapacityError(PromptEnhancementRecoveryError):
+    """The bounded durable Prompt Enhance operation table is full."""
+
+
+class PromptEnhancementRecoveryCorruptionError(PromptEnhancementRecoveryError):
+    """Dedicated Prompt Enhance recovery state failed validation."""
 
 
 def _valid_job_id(value: Any) -> bool:
@@ -907,7 +932,13 @@ def _safe_credit_queue(value: Any) -> dict[str, Any]:
             reservation_state in {"reserved", "consumed"}
             and revalidation_state == "downgraded"
         )
-        valid = requested_units_positive and (active or released or downgraded)
+        settled = (
+            reservation_state == "settled"
+            and revalidation_state == "settled"
+        )
+        valid = requested_units_positive and (
+            active or released or downgraded or settled
+        )
         if valid:
             valid = queue_band == (1 if active else -1)
     if not valid:
@@ -1044,6 +1075,10 @@ def serialize_job(
                 ) from error
         elif key == "credit_queue":
             result[key] = _safe_credit_queue(value)
+        elif key == "prompt_result_reference":
+            result[key] = PromptEnhancementRecoveryStore._result_reference(
+                value,
+            )
         elif key == "queue_class":
             if value not in _QUEUE_CLASSES:
                 raise QueueRecoveryAdapterError("job.queue_class is invalid.")
@@ -1203,6 +1238,12 @@ def serialize_job(
             )
     logical_kind = result.get("logical_job_kind")
     if (
+        logical_kind == "prompt_enhancement"
+        and (
+            result.get("kind") != "prompt_enhancement"
+            or result.get("resource_intent") != "text"
+        )
+    ) or (
         logical_kind == "reference_pack_parent"
         and "parent_job_id" in result
     ) or (
@@ -1213,7 +1254,7 @@ def serialize_job(
         )
     ):
         raise QueueRecoveryAdapterError(
-            "job logical Reference relation is invalid."
+            "job logical relation is invalid."
         )
     if present_child_fields and (
         present_child_fields != child_fields or result.get("status") != "failed"
@@ -1762,3 +1803,1058 @@ class QueueRecoveryCoordinator:
                 event_count=compacted.event_count,
                 discarded_torn_tail=compacted.discarded_torn_tail,
             )
+
+
+PROMPT_ENHANCEMENT_OPERATION_SCHEMA = 1
+PROMPT_ENHANCEMENT_RESULT_SCHEMA = 1
+PROMPT_ENHANCEMENT_RETENTION_SECONDS = 2 * 60 * 60
+PROMPT_ENHANCEMENT_MAX_RECORDS = 128
+PROMPT_ENHANCEMENT_MAX_RESULT_BYTES = 2 * 1024 * 1024
+_PROMPT_ENHANCEMENT_LEDGER_MAX_BYTES = 2 * 1024 * 1024
+_PROMPT_ENHANCEMENT_STATUSES = frozenset({
+    "queued", "running", "completed", "failed", "cancelled",
+})
+_PROMPT_ENHANCEMENT_TERMINAL = frozenset({
+    "completed", "failed", "cancelled",
+})
+_PROMPT_ENHANCEMENT_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_PROMPT_ENHANCEMENT_FAILURE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+class PromptEnhancementRecoveryStore:
+    """Legacy Prompt Enhance sidecar codec retained for compatibility.
+
+    Canonical operations live in the ordinary queue journal. Production opens
+    this older integrity-sealed metadata/result format read-only so completed
+    results and bounded historical state remain reachable without scheduling,
+    reconciling, cancelling, or rewriting legacy work.
+    """
+
+    _RECORD_KEYS = frozenset({
+        "request_id", "operation_kind", "account_scope", "project_scope",
+        "session_scope", "request_digest", "claim_digest", "status",
+        "created_at", "updated_at", "expires_at", "result_reference",
+        "consumed_at", "failure_code",
+    })
+
+    def __init__(
+        self,
+        root: str | os.PathLike[str],
+        secret: bytes,
+        *,
+        retention_seconds: float = PROMPT_ENHANCEMENT_RETENTION_SECONDS,
+        max_records: int = PROMPT_ENHANCEMENT_MAX_RECORDS,
+        clock=time.time,
+        read_only: bool = False,
+    ) -> None:
+        if not isinstance(secret, bytes) or len(secret) < 16:
+            raise ValueError("Prompt Enhance recovery requires a server secret.")
+        if retention_seconds <= 0:
+            raise ValueError("Prompt Enhance retention must be positive.")
+        if not 1 <= int(max_records) <= 100_000:
+            raise ValueError("Prompt Enhance record bound is invalid.")
+        self.root = Path(root)
+        self.results_root = self.root / "results"
+        self.metadata_path = self.root / "operations.json"
+        self._secret = secret
+        self.retention_seconds = float(retention_seconds)
+        self.max_records = int(max_records)
+        self._clock = clock
+        self.read_only = bool(read_only)
+        self._lock = threading.RLock()
+        if not self.read_only:
+            self._ensure_directory(self.root)
+            self._ensure_directory(self.results_root)
+
+    def _require_writable(self) -> None:
+        if self.read_only:
+            raise PromptEnhancementRecoveryError(
+                "Legacy Prompt Enhance recovery is read-only."
+            )
+
+    @staticmethod
+    def _ensure_directory(path: Path) -> None:
+        try:
+            path.mkdir(mode=0o700, parents=True, exist_ok=True)
+            info = path.lstat()
+            if path.is_symlink() or not stat.S_ISDIR(info.st_mode):
+                raise OSError("unsafe Prompt Enhance recovery directory")
+            if os.name != "nt":
+                os.chmod(path, 0o700)
+        except OSError as error:
+            raise PromptEnhancementRecoveryError(
+                "Prompt Enhance recovery storage is unavailable."
+            ) from error
+
+    def _digest(self, domain: bytes, value: str) -> str:
+        if not isinstance(value, str) or not value:
+            raise ValueError("Prompt Enhance ownership scope is incomplete.")
+        encoded = value.encode("utf-8")
+        if len(encoded) > 4096:
+            raise ValueError("Prompt Enhance ownership scope is oversized.")
+        return hmac.new(
+            self._secret, domain + b"\0" + encoded, hashlib.sha256,
+        ).hexdigest()
+
+    def _scope(
+        self,
+        account_key: str,
+        project_instance_key: str,
+        session_key: str,
+    ) -> tuple[str, str, str]:
+        return (
+            self._digest(b"prompt-enhance-account-v1", account_key),
+            self._digest(b"prompt-enhance-project-v1", project_instance_key),
+            self._digest(b"prompt-enhance-session-v1", session_key),
+        )
+
+    @staticmethod
+    def _request_id(value: str) -> str:
+        try:
+            return uuid.UUID(value).hex
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ValueError("Prompt Enhance request_id must be a UUID.") from error
+
+    @staticmethod
+    def _request_digest(value: str) -> str:
+        if (
+            not isinstance(value, str)
+            or _PROMPT_ENHANCEMENT_DIGEST_RE.fullmatch(value) is None
+        ):
+            raise ValueError("Prompt Enhance request digest is invalid.")
+        return value
+
+    def _integrity(self, ledger: Mapping[str, Any]) -> str:
+        unsigned = dict(ledger)
+        unsigned.pop("integrity", None)
+        encoded = json.dumps(
+            unsigned,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+        return hmac.new(
+            self._secret,
+            b"prompt-enhance-ledger-integrity-v1\0" + encoded,
+            hashlib.sha256,
+        ).hexdigest()
+
+    @staticmethod
+    def _empty_ledger() -> dict[str, Any]:
+        return {
+            "schema": PROMPT_ENHANCEMENT_OPERATION_SCHEMA,
+            "records": {},
+        }
+
+    @staticmethod
+    def _result_reference(value: Any) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        if not isinstance(value, Mapping) or set(value) != {
+            "path", "schema", "sha256", "size",
+        }:
+            raise PromptEnhancementRecoveryCorruptionError(
+                "Prompt Enhance result reference is corrupt."
+            )
+        relative = value.get("path")
+        if (
+            not isinstance(relative, str)
+            or PurePosixPath(relative).parent != PurePosixPath("results")
+            or PurePosixPath(relative).name != os.path.basename(relative)
+            or not PurePosixPath(relative).name.endswith(".result.json")
+            or value.get("schema") != PROMPT_ENHANCEMENT_RESULT_SCHEMA
+            or not isinstance(value.get("sha256"), str)
+            or _PROMPT_ENHANCEMENT_DIGEST_RE.fullmatch(value["sha256"]) is None
+            or type(value.get("size")) is not int
+            or not 1 <= value["size"] <= PROMPT_ENHANCEMENT_MAX_RESULT_BYTES
+        ):
+            raise PromptEnhancementRecoveryCorruptionError(
+                "Prompt Enhance result reference is corrupt."
+            )
+        return dict(value)
+
+    def _validate_record(self, value: Any) -> dict[str, Any]:
+        if type(value) is not dict or set(value) != self._RECORD_KEYS:
+            raise PromptEnhancementRecoveryCorruptionError(
+                "Prompt Enhance operation metadata is corrupt."
+            )
+        try:
+            request_id = self._request_id(value.get("request_id"))
+        except ValueError:
+            raise PromptEnhancementRecoveryCorruptionError(
+                "Prompt Enhance operation metadata is corrupt."
+            ) from None
+        if request_id != value.get("request_id"):
+            raise PromptEnhancementRecoveryCorruptionError(
+                "Prompt Enhance operation metadata is corrupt."
+            )
+        for field in (
+            "account_scope", "project_scope", "session_scope",
+            "request_digest", "claim_digest",
+        ):
+            if (
+                not isinstance(value.get(field), str)
+                or _PROMPT_ENHANCEMENT_DIGEST_RE.fullmatch(value[field]) is None
+            ):
+                raise PromptEnhancementRecoveryCorruptionError(
+                    "Prompt Enhance operation metadata is corrupt."
+                )
+        status = value.get("status")
+        result_reference = self._result_reference(value.get("result_reference"))
+        consumed_at = value.get("consumed_at")
+        failure_code = value.get("failure_code")
+        if (
+            value.get("operation_kind") != "prompt_enhancement"
+            or status not in _PROMPT_ENHANCEMENT_STATUSES
+            or (
+                failure_code is not None
+                and (
+                    not isinstance(failure_code, str)
+                    or _PROMPT_ENHANCEMENT_FAILURE_RE.fullmatch(failure_code)
+                        is None
+                )
+            )
+            or (status == "failed") != (failure_code is not None)
+            or (status != "completed" and result_reference is not None)
+            or (status != "completed" and consumed_at is not None)
+            or (
+                status == "completed"
+                and (result_reference is None) == (consumed_at is None)
+            )
+        ):
+            raise PromptEnhancementRecoveryCorruptionError(
+                "Prompt Enhance operation metadata is corrupt."
+            )
+        for field in ("created_at", "updated_at", "expires_at"):
+            number = value.get(field)
+            if type(number) not in {int, float} or not math.isfinite(float(number)):
+                raise PromptEnhancementRecoveryCorruptionError(
+                    "Prompt Enhance operation metadata is corrupt."
+                )
+        if consumed_at is not None and (
+            type(consumed_at) not in {int, float}
+            or not math.isfinite(float(consumed_at))
+        ):
+            raise PromptEnhancementRecoveryCorruptionError(
+                "Prompt Enhance operation metadata is corrupt."
+            )
+        if not value["created_at"] <= value["updated_at"] <= value["expires_at"]:
+            raise PromptEnhancementRecoveryCorruptionError(
+                "Prompt Enhance operation metadata is corrupt."
+            )
+        if consumed_at is not None and not value["updated_at"] <= consumed_at:
+            raise PromptEnhancementRecoveryCorruptionError(
+                "Prompt Enhance operation metadata is corrupt."
+            )
+        clean = dict(value)
+        clean["result_reference"] = result_reference
+        return clean
+
+    def _read_ledger(self) -> dict[str, Any]:
+        try:
+            descriptor = os.open(
+                self.metadata_path,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
+        except FileNotFoundError:
+            return self._empty_ledger()
+        except OSError as error:
+            raise PromptEnhancementRecoveryError(
+                "Prompt Enhance operation metadata is unavailable."
+            ) from error
+        try:
+            info = os.fstat(descriptor)
+            named = self.metadata_path.lstat()
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or (info.st_dev, info.st_ino) != (named.st_dev, named.st_ino)
+                or (os.name != "nt" and stat.S_IMODE(info.st_mode) != 0o600)
+            ):
+                raise PromptEnhancementRecoveryCorruptionError(
+                    "Prompt Enhance operation metadata is unsafe."
+                )
+            raw = os.read(descriptor, _PROMPT_ENHANCEMENT_LEDGER_MAX_BYTES + 1)
+        finally:
+            os.close(descriptor)
+        if len(raw) > _PROMPT_ENHANCEMENT_LEDGER_MAX_BYTES:
+            raise PromptEnhancementRecoveryCorruptionError(
+                "Prompt Enhance operation metadata is oversized."
+            )
+        try:
+            ledger = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            raise PromptEnhancementRecoveryCorruptionError(
+                "Prompt Enhance operation metadata is malformed."
+            ) from None
+        if (
+            type(ledger) is not dict
+            or set(ledger) != {"schema", "records", "integrity"}
+            or ledger.get("schema") != PROMPT_ENHANCEMENT_OPERATION_SCHEMA
+            or type(ledger.get("records")) is not dict
+            or len(ledger["records"]) > self.max_records
+            or not isinstance(ledger.get("integrity"), str)
+            or _PROMPT_ENHANCEMENT_DIGEST_RE.fullmatch(ledger["integrity"])
+                is None
+            or not hmac.compare_digest(ledger["integrity"], self._integrity(ledger))
+        ):
+            raise PromptEnhancementRecoveryCorruptionError(
+                "Prompt Enhance operation metadata is corrupt."
+            )
+        records: dict[str, dict[str, Any]] = {}
+        for request_id, raw_record in ledger["records"].items():
+            record = self._validate_record(raw_record)
+            if request_id != record["request_id"]:
+                raise PromptEnhancementRecoveryCorruptionError(
+                    "Prompt Enhance operation metadata is corrupt."
+                )
+            records[request_id] = record
+        return {
+            "schema": PROMPT_ENHANCEMENT_OPERATION_SCHEMA,
+            "records": records,
+        }
+
+    def _fsync_directory(self, path: Path) -> None:
+        if os.name == "nt":
+            return
+        try:
+            descriptor = os.open(
+                path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        except OSError as error:
+            raise PromptEnhancementRecoveryError(
+                "Prompt Enhance recovery directory could not be synchronized."
+            ) from error
+
+    def _write_ledger(self, ledger: Mapping[str, Any]) -> None:
+        document = {
+            "schema": PROMPT_ENHANCEMENT_OPERATION_SCHEMA,
+            "records": dict(ledger.get("records") or {}),
+        }
+        document["integrity"] = self._integrity(document)
+        encoded = json.dumps(
+            document,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+        if len(encoded) > _PROMPT_ENHANCEMENT_LEDGER_MAX_BYTES:
+            raise PromptEnhancementRecoveryCapacityError(
+                "Prompt Enhance operation metadata is full."
+            )
+        temporary = self.root / f".operations.{uuid.uuid4().hex}.tmp"
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+            )
+            if os.name != "nt":
+                os.fchmod(descriptor, 0o600)
+            view = memoryview(encoded)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("short Prompt Enhance metadata write")
+                view = view[written:]
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+            os.replace(temporary, self.metadata_path)
+            self._fsync_directory(self.root)
+        except OSError as error:
+            raise PromptEnhancementRecoveryError(
+                "Prompt Enhance operation metadata could not be committed."
+            ) from error
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+    @contextmanager
+    def _serialized(self):
+        if self.read_only:
+            with self._lock:
+                yield
+            return
+        lock_path = self.root / ".operations.lock"
+        deadline = time.monotonic() + 3.0
+        descriptor = None
+        with self._lock:
+            while descriptor is None:
+                try:
+                    descriptor = os.open(
+                        lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+                    )
+                except FileExistsError:
+                    try:
+                        if float(self._clock()) - lock_path.stat().st_mtime > 30.0:
+                            lock_path.unlink()
+                            continue
+                    except FileNotFoundError:
+                        continue
+                    except OSError as error:
+                        raise PromptEnhancementRecoveryError(
+                            "Prompt Enhance recovery lock is unavailable."
+                        ) from error
+                    if time.monotonic() >= deadline:
+                        raise PromptEnhancementRecoveryError(
+                            "Prompt Enhance recovery is temporarily busy."
+                        )
+                    time.sleep(0.01)
+                except OSError as error:
+                    raise PromptEnhancementRecoveryError(
+                        "Prompt Enhance recovery lock is unavailable."
+                    ) from error
+            try:
+                if os.name != "nt":
+                    os.fchmod(descriptor, 0o600)
+                yield
+            finally:
+                os.close(descriptor)
+                try:
+                    lock_path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _public(record: Mapping[str, Any]) -> dict[str, Any]:
+        status = str(record.get("status") or "failed")
+        public: dict[str, Any] = {
+            "request_id": record["request_id"],
+            "operation_kind": "enhance",
+            "status": status,
+            "phase": status,
+            "stage": status,
+            "partial_text": "",
+            "generated_tokens_approx": 0,
+            "elapsed_seconds": 0.0,
+            "live_tps": None,
+            "average_tps": None,
+            "result_available": bool(record.get("result_reference")),
+            "result_consumed": record.get("consumed_at") is not None,
+            "retryable": status == "failed",
+        }
+        if status == "failed":
+            public["error"] = {
+                "code": "prompt_enhancement_failed",
+                "message": "Prompt enhancement failed",
+                "retryable": True,
+            }
+        return public
+
+    @staticmethod
+    def _same_scope(
+        record: Mapping[str, Any], scope: tuple[str, str, str],
+    ) -> bool:
+        return all(hmac.compare_digest(record[field], expected) for field, expected in zip(
+            ("account_scope", "project_scope", "session_scope"), scope,
+            strict=True,
+        ))
+
+    def _prune(
+        self, ledger: dict[str, Any], now: float,
+    ) -> tuple[bool, list[dict[str, Any]]]:
+        changed = False
+        retired: list[dict[str, Any]] = []
+        records = ledger["records"]
+        for request_id, record in list(records.items()):
+            if (
+                record["status"] in _PROMPT_ENHANCEMENT_TERMINAL
+                and record["expires_at"] <= now
+            ):
+                reference = record.get("result_reference")
+                if reference is not None:
+                    retired.append(reference)
+                records.pop(request_id, None)
+                changed = True
+        return changed, retired
+
+    def _unlink_results(self, references: Sequence[Mapping[str, Any]]) -> None:
+        for reference in references:
+            try:
+                relative = self._result_reference(reference)
+                if relative is not None:
+                    (self.root / PurePosixPath(relative["path"])).unlink()
+            except (OSError, PromptEnhancementRecoveryCorruptionError):
+                pass
+
+    def _evict_for_admission(
+        self, ledger: dict[str, Any], now: float,
+    ) -> list[dict[str, Any]]:
+        _changed, retired = self._prune(ledger, now)
+        records = ledger["records"]
+        if len(records) < self.max_records:
+            return retired
+        terminal = [
+            record for record in records.values()
+            if record["status"] in _PROMPT_ENHANCEMENT_TERMINAL
+        ]
+        if terminal:
+            oldest = min(terminal, key=lambda item: item["updated_at"])
+            reference = oldest.get("result_reference")
+            if reference is not None:
+                retired.append(reference)
+            records.pop(oldest["request_id"], None)
+        if len(records) >= self.max_records:
+            raise PromptEnhancementRecoveryCapacityError(
+                "Prompt Enhance recovery is busy."
+            )
+        return retired
+
+    def reconcile_interrupted(self) -> int:
+        """Fail prior-process active records and remove unreferenced results."""
+        self._require_writable()
+        now = float(self._clock())
+        retired: list[dict[str, Any]] = []
+        with self._serialized():
+            ledger = self._read_ledger()
+            changed, retired = (
+                (False, []) if self.read_only else self._prune(ledger, now)
+            )
+            reconciled = 0
+            for record in ledger["records"].values():
+                if record["status"] in {"queued", "running"}:
+                    record.update({
+                        "status": "failed",
+                        "updated_at": now,
+                        "expires_at": now + self.retention_seconds,
+                        "failure_code": "interrupted",
+                    })
+                    reconciled += 1
+                    changed = True
+            if changed:
+                self._write_ledger(ledger)
+            referenced = {
+                str(record["result_reference"]["path"])
+                for record in ledger["records"].values()
+                if record.get("result_reference") is not None
+            }
+            try:
+                candidates = tuple(self.results_root.iterdir())
+            except OSError as error:
+                raise PromptEnhancementRecoveryError(
+                    "Prompt Enhance result storage is unavailable."
+                ) from error
+            if len(candidates) > self.max_records + 256:
+                raise PromptEnhancementRecoveryCapacityError(
+                    "Prompt Enhance result storage is full."
+                )
+            for candidate in candidates:
+                relative = f"results/{candidate.name}"
+                if relative not in referenced:
+                    try:
+                        candidate.unlink()
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        pass
+        self._unlink_results(retired)
+        return reconciled
+
+    def bind(
+        self,
+        *,
+        request_id: str,
+        account_key: str,
+        project_instance_key: str,
+        session_key: str,
+        request_digest: str,
+    ) -> tuple[dict[str, Any] | None, bool, str | None]:
+        """Create or replay one exact request binding without private input."""
+        self._require_writable()
+        request_id = self._request_id(request_id)
+        request_digest = self._request_digest(request_digest)
+        scope = self._scope(account_key, project_instance_key, session_key)
+        now = float(self._clock())
+        retired: list[dict[str, Any]] = []
+        with self._serialized():
+            ledger = self._read_ledger()
+            changed, retired = (
+                (False, []) if self.read_only else self._prune(ledger, now)
+            )
+            existing = ledger["records"].get(request_id)
+            if existing is not None:
+                if not self._same_scope(existing, scope):
+                    if changed:
+                        self._write_ledger(ledger)
+                    self._unlink_results(retired)
+                    return None, False, None
+                if not hmac.compare_digest(
+                    existing["request_digest"], request_digest,
+                ):
+                    raise PromptEnhancementRecoveryConflictError(
+                        "Prompt Enhance request_id is already bound."
+                    )
+                if changed:
+                    self._write_ledger(ledger)
+                self._unlink_results(retired)
+                return self._public(existing), False, None
+            retired.extend(self._evict_for_admission(ledger, now))
+            claim_token = secrets.token_urlsafe(32)
+            record = {
+                "request_id": request_id,
+                "operation_kind": "prompt_enhancement",
+                "account_scope": scope[0],
+                "project_scope": scope[1],
+                "session_scope": scope[2],
+                "request_digest": request_digest,
+                "claim_digest": self._digest(
+                    b"prompt-enhance-claim-v1", claim_token,
+                ),
+                "status": "queued",
+                "created_at": now,
+                "updated_at": now,
+                "expires_at": now + self.retention_seconds,
+                "result_reference": None,
+                "consumed_at": None,
+                "failure_code": None,
+            }
+            ledger["records"][request_id] = record
+            self._write_ledger(ledger)
+        self._unlink_results(retired)
+        return self._public(record), True, claim_token
+
+    def replay(
+        self,
+        *,
+        request_id: str,
+        account_key: str,
+        project_instance_key: str,
+        session_key: str,
+        request_digest: str,
+    ) -> dict[str, Any] | None:
+        """Read one exact legacy binding without scheduling or mutation."""
+        request_id = self._request_id(request_id)
+        request_digest = self._request_digest(request_digest)
+        scope = self._scope(account_key, project_instance_key, session_key)
+        with self._serialized():
+            ledger = self._read_ledger()
+            record = ledger["records"].get(request_id)
+            if record is None or not self._same_scope(record, scope):
+                return None
+            if not hmac.compare_digest(
+                record["request_digest"], request_digest,
+            ):
+                raise PromptEnhancementRecoveryConflictError(
+                    "Prompt Enhance request_id is already bound."
+                )
+            return self._public(record)
+
+    def status(
+        self,
+        request_id: str,
+        *,
+        account_key: str,
+        project_instance_key: str,
+        session_key: str,
+    ) -> dict[str, Any] | None:
+        try:
+            request_id = self._request_id(request_id)
+            scope = self._scope(account_key, project_instance_key, session_key)
+        except ValueError:
+            return None
+        now = float(self._clock())
+        retired: list[dict[str, Any]] = []
+        with self._serialized():
+            ledger = self._read_ledger()
+            changed, retired = (
+                (False, []) if self.read_only else self._prune(ledger, now)
+            )
+            record = ledger["records"].get(request_id)
+            if changed:
+                self._write_ledger(ledger)
+            public = (
+                self._public(record)
+                if record is not None and self._same_scope(record, scope)
+                else None
+            )
+        self._unlink_results(retired)
+        return public
+
+    def _claim_transition(
+        self,
+        request_id: str,
+        *,
+        account_key: str,
+        project_instance_key: str,
+        session_key: str,
+        request_digest: str,
+        claim_token: str,
+        status: str,
+        failure_code: str | None = None,
+        result_reference: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        self._require_writable()
+        request_id = self._request_id(request_id)
+        request_digest = self._request_digest(request_digest)
+        scope = self._scope(account_key, project_instance_key, session_key)
+        claim_digest = self._digest(b"prompt-enhance-claim-v1", claim_token)
+        now = float(self._clock())
+        with self._serialized():
+            ledger = self._read_ledger()
+            record = ledger["records"].get(request_id)
+            if record is None or not self._same_scope(record, scope):
+                return None
+            if not hmac.compare_digest(record["request_digest"], request_digest):
+                raise PromptEnhancementRecoveryConflictError(
+                    "Prompt Enhance request_id is already bound."
+                )
+            if (
+                record["status"] not in {"queued", "running"}
+                or not hmac.compare_digest(record["claim_digest"], claim_digest)
+            ):
+                return self._public(record)
+            record.update({
+                "status": status,
+                "updated_at": now,
+                "expires_at": now + self.retention_seconds,
+                "result_reference": (
+                    None if result_reference is None else dict(result_reference)
+                ),
+                "failure_code": failure_code,
+            })
+            self._validate_record(record)
+            self._write_ledger(ledger)
+            return self._public(record)
+
+    def mark_running(self, request_id: str, **scope: Any) -> dict[str, Any] | None:
+        """Durably mark the exact claimed operation running."""
+        return self._claim_transition(request_id, status="running", **scope)
+
+    def fail(
+        self, request_id: str, *, failure_code: str = "execution_failed", **scope: Any,
+    ) -> dict[str, Any] | None:
+        """Durably fail one exact claimed operation with a bounded code."""
+        if _PROMPT_ENHANCEMENT_FAILURE_RE.fullmatch(failure_code) is None:
+            raise ValueError("Prompt Enhance failure code is invalid.")
+        return self._claim_transition(
+            request_id, status="failed", failure_code=failure_code, **scope,
+        )
+
+    @staticmethod
+    def _canonical_result(request_id: str, result: Any) -> bytes:
+        payload = {
+            "schema": PROMPT_ENHANCEMENT_RESULT_SCHEMA,
+            "request_id": request_id,
+            "result": result,
+        }
+        try:
+            encoded = json.dumps(
+                payload,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        except (RecursionError, TypeError, ValueError, OverflowError):
+            raise PromptEnhancementRecoveryError(
+                "Prompt Enhance result is not durable JSON."
+            ) from None
+        if not 1 <= len(encoded) <= PROMPT_ENHANCEMENT_MAX_RESULT_BYTES:
+            raise PromptEnhancementRecoveryCapacityError(
+                "Prompt Enhance result exceeds its durable bound."
+            )
+        return encoded
+
+    def _write_result(self, request_id: str, result: Any) -> dict[str, Any]:
+        encoded = self._canonical_result(request_id, result)
+        filename = f"{request_id}.{uuid.uuid4().hex}.result.json"
+        path = self.results_root / filename
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+            )
+            if os.name != "nt":
+                os.fchmod(descriptor, 0o600)
+            view = memoryview(encoded)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("short Prompt Enhance result write")
+                view = view[written:]
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+            self._fsync_directory(self.results_root)
+        except OSError as error:
+            raise PromptEnhancementRecoveryError(
+                "Prompt Enhance result could not be committed."
+            ) from error
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        return {
+            "path": f"results/{filename}",
+            "schema": PROMPT_ENHANCEMENT_RESULT_SCHEMA,
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+            "size": len(encoded),
+        }
+
+    def complete(
+        self, request_id: str, *, result: Any, **scope: Any,
+    ) -> dict[str, Any] | None:
+        """Publish a private result file, then its bounded durable reference."""
+        request_id = self._request_id(request_id)
+        reference = self._write_result(request_id, result)
+        try:
+            public = self._claim_transition(
+                request_id,
+                status="completed",
+                result_reference=reference,
+                **scope,
+            )
+        except Exception:
+            self._unlink_results((reference,))
+            raise
+        if public is None or public.get("status") != "completed":
+            self._unlink_results((reference,))
+        return public
+
+    def cancel(
+        self,
+        request_id: str,
+        *,
+        account_key: str,
+        project_instance_key: str,
+        session_key: str,
+    ) -> dict[str, Any] | None:
+        """Cancel one exact active binding; terminal records are idempotent."""
+        self._require_writable()
+        try:
+            request_id = self._request_id(request_id)
+            scope = self._scope(account_key, project_instance_key, session_key)
+        except ValueError:
+            return None
+        now = float(self._clock())
+        retired: list[dict[str, Any]] = []
+        with self._serialized():
+            ledger = self._read_ledger()
+            changed, retired = self._prune(ledger, now)
+            record = ledger["records"].get(request_id)
+            if record is None or not self._same_scope(record, scope):
+                if changed:
+                    self._write_ledger(ledger)
+                public = None
+            elif record["status"] in {"queued", "running"}:
+                record.update({
+                    "status": "cancelled",
+                    "updated_at": now,
+                    "expires_at": now + self.retention_seconds,
+                    "failure_code": None,
+                })
+                self._write_ledger(ledger)
+                public = self._public(record)
+            else:
+                if changed:
+                    self._write_ledger(ledger)
+                public = self._public(record)
+        self._unlink_results(retired)
+        return public
+
+    def _load_result_reference(
+        self, request_id: str, reference: Mapping[str, Any],
+    ) -> Any:
+        clean = self._result_reference(reference)
+        if clean is None:
+            return None
+        path = self.root / PurePosixPath(clean["path"])
+        try:
+            descriptor = os.open(
+                path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
+        except OSError as error:
+            raise PromptEnhancementRecoveryCorruptionError(
+                "Prompt Enhance result is unavailable."
+            ) from error
+        try:
+            info = os.fstat(descriptor)
+            named = path.lstat()
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or (info.st_dev, info.st_ino) != (named.st_dev, named.st_ino)
+                or (os.name != "nt" and stat.S_IMODE(info.st_mode) != 0o600)
+            ):
+                raise PromptEnhancementRecoveryCorruptionError(
+                    "Prompt Enhance result is unsafe."
+                )
+            raw = os.read(descriptor, PROMPT_ENHANCEMENT_MAX_RESULT_BYTES + 1)
+        finally:
+            os.close(descriptor)
+        if (
+            len(raw) != clean["size"]
+            or hashlib.sha256(raw).hexdigest() != clean["sha256"]
+        ):
+            raise PromptEnhancementRecoveryCorruptionError(
+                "Prompt Enhance result failed its integrity check."
+            )
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            raise PromptEnhancementRecoveryCorruptionError(
+                "Prompt Enhance result is malformed."
+            ) from None
+        if (
+            type(payload) is not dict
+            or set(payload) != {"schema", "request_id", "result"}
+            or payload.get("schema") != PROMPT_ENHANCEMENT_RESULT_SCHEMA
+            or payload.get("request_id") != request_id
+            or self._canonical_result(request_id, payload.get("result")) != raw
+        ):
+            raise PromptEnhancementRecoveryCorruptionError(
+                "Prompt Enhance result is corrupt."
+            )
+        return deepcopy(payload["result"])
+
+    def result(
+        self,
+        request_id: str,
+        *,
+        account_key: str,
+        project_instance_key: str,
+        session_key: str,
+        consume: bool = False,
+    ) -> Any:
+        """Read, and optionally consume, one exact private terminal result."""
+        if consume:
+            self._require_writable()
+        try:
+            request_id = self._request_id(request_id)
+            scope = self._scope(account_key, project_instance_key, session_key)
+        except ValueError:
+            return None
+        reference = None
+        result = None
+        retired: list[dict[str, Any]] = []
+        now = float(self._clock())
+        with self._serialized():
+            ledger = self._read_ledger()
+            changed, retired = (
+                (False, []) if self.read_only else self._prune(ledger, now)
+            )
+            record = ledger["records"].get(request_id)
+            if (
+                record is None
+                or not self._same_scope(record, scope)
+                or record["status"] != "completed"
+                or record.get("result_reference") is None
+            ):
+                pass
+            else:
+                reference = dict(record["result_reference"])
+                result = self._load_result_reference(request_id, reference)
+            if consume and reference is not None:
+                record.update({
+                    "result_reference": None,
+                    "consumed_at": now,
+                    "expires_at": max(record["expires_at"], now),
+                })
+                self._validate_record(record)
+                self._write_ledger(ledger)
+            elif changed:
+                self._write_ledger(ledger)
+        self._unlink_results(retired)
+        if consume and reference is not None:
+            self._unlink_results((reference,))
+        return result
+
+
+class PromptEnhancementResultStore:
+    """Private result files for canonical queue-owned Prompt Enhance jobs.
+
+    This store has no operation ledger and therefore cannot schedule, restore,
+    or terminalize work.  The ordinary queue journal owns lifecycle state; the
+    only durable value crossing that boundary is an integrity-checked relative
+    result reference.
+    """
+
+    def __init__(
+        self,
+        root: str | os.PathLike[str],
+        *,
+        max_records: int = PROMPT_ENHANCEMENT_MAX_RECORDS,
+        retention_seconds: float = PROMPT_ENHANCEMENT_RETENTION_SECONDS,
+    ) -> None:
+        # Reuse the hardened result-file implementation without ever invoking
+        # its legacy operation-ledger mutation methods.
+        self._files = PromptEnhancementRecoveryStore(
+            root,
+            b"canonical-prompt-result-files-v1",
+            max_records=max_records,
+            retention_seconds=retention_seconds,
+        )
+        self.retention_seconds = float(retention_seconds)
+
+    def write(self, request_id: str, result: Any) -> dict[str, Any]:
+        with self._files._serialized():
+            try:
+                candidates = tuple(self._files.results_root.iterdir())
+            except OSError as error:
+                raise PromptEnhancementRecoveryError(
+                    "Prompt Enhance result storage is unavailable."
+                ) from error
+            if len(candidates) >= self._files.max_records:
+                raise PromptEnhancementRecoveryCapacityError(
+                    "Prompt Enhance result storage is full."
+                )
+            return self._files._write_result(
+                self._files._request_id(request_id), result,
+            )
+
+    def read(self, request_id: str, reference: Mapping[str, Any]) -> Any:
+        return self._files._load_result_reference(
+            self._files._request_id(request_id), reference,
+        )
+
+    def remove(self, reference: Mapping[str, Any] | None) -> None:
+        if reference is not None:
+            self._files._unlink_results((reference,))
+
+    def cleanup_unreferenced(
+        self,
+        references: Sequence[Mapping[str, Any]],
+    ) -> int:
+        """Remove only bounded result files absent from canonical snapshots."""
+        live = {
+            str(clean["path"])
+            for value in references
+            if (clean := self._files._result_reference(value)) is not None
+        }
+        removed = 0
+        with self._files._serialized():
+            try:
+                candidates = tuple(self._files.results_root.iterdir())
+            except OSError as error:
+                raise PromptEnhancementRecoveryError(
+                    "Prompt Enhance result storage is unavailable."
+                ) from error
+            if len(candidates) > self._files.max_records + 256:
+                raise PromptEnhancementRecoveryCapacityError(
+                    "Prompt Enhance result storage is full."
+                )
+            for candidate in candidates:
+                relative = f"results/{candidate.name}"
+                if relative in live:
+                    continue
+                try:
+                    candidate.unlink()
+                    removed += 1
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
+        return removed

@@ -264,48 +264,24 @@ class ExplicitRegisterGuideTests(unittest.TestCase):
             ten_eros_composed.index(REGISTER_HEADING),
         )
 
-    def test_clean_repo_guard_uses_exact_explicit_guidance_provenance(self):
+    def test_clean_repo_guard_never_classifies_tracked_creative_prose(self):
         from scripts import verify_clean_repo
 
-        expected = {
-            "app/services/llm_guides/director/nsfw_image_rules.md",
-            "app/services/llm_guides/director/nsfw_screenplay_rules.md",
-            "app/services/llm_guides/director/nsfw_video_rules.md",
-            "app/services/llm_guides/enhance/nsfw_shared.md",
-            "tests/test_explicit_register_guidance.py",
-        }
-        self.assertEqual(
-            set(verify_clean_repo.ALLOWED_EXACT_PATTERN_MATCHES), expected,
-        )
-        for path in expected:
-            with self.subTest(path=path):
-                self.assertEqual(
-                    verify_clean_repo.ALLOWED_EXACT_PATTERN_MATCHES[path],
-                    frozenset({"penis"}),
-                )
-                self.assertFalse(verify_clean_repo._content_scan_allowed(path))
-                self.assertTrue(
-                    verify_clean_repo._extended_pattern_allowed(path, "penis"),
-                )
-                self.assertFalse(
-                    verify_clean_repo._extended_pattern_allowed(
-                        path, "vag" + "ina",
-                    ),
-                )
-        for unreviewed in (
-            "app/services/llm_guides/director/nsfw_unreviewed_rules.md",
-            "app/services/llm_guides/enhance/unreviewed.md",
-            "tests/test_unreviewed_explicit_prose.py",
+        for obsolete in (
+            "FORBIDDEN_STRINGS",
+            "EXTENDED_PATTERNS",
+            "ALLOWED_EXACT_PATTERN_MATCHES",
+            "ALLOWED_PATH_FRAGMENTS",
+            "_content_scan_allowed",
+            "_extended_pattern_allowed",
         ):
-            with self.subTest(unreviewed=unreviewed):
-                self.assertFalse(
-                    verify_clean_repo._content_scan_allowed(unreviewed),
-                )
-                self.assertFalse(
-                    verify_clean_repo._extended_pattern_allowed(
-                        unreviewed, "penis",
-                    ),
-                )
+            with self.subTest(obsolete=obsolete):
+                self.assertFalse(hasattr(verify_clean_repo, obsolete))
+        self.assertTrue(verify_clean_repo.FORBIDDEN_TRACKED_PATTERNS)
+        self.assertTrue(all(
+            hasattr(pattern, "search") and isinstance(label, str)
+            for pattern, label in verify_clean_repo.FORBIDDEN_TRACKED_PATTERNS
+        ))
 
 
 if __name__ == "__main__":

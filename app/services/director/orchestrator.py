@@ -27,6 +27,7 @@ from .policies import (
     anchor_reference_edit_visual_style,
     anchor_visual_prompt,
 )
+from .workflow_templates import build_h3_shot_table_template
 
 
 # ── Feature Flags ────────────────────────────────────────────────────
@@ -150,6 +151,10 @@ class DirectorOrchestrator:
         if not planner_cls:
             raise ValueError(f"Unknown skill type: {skill_type}. Available: {list(_PLANNER_MAP.keys())}")
 
+        include_h3_shot_table_template = (
+            kwargs.pop("include_h3_shot_table_template", False) is True
+        )
+        has_h3_style_workflow = kwargs.get("h3_style_workflow_present") is True
         self._video_model = str(kwargs.get("video_model") or "")
         planner = planner_cls(
             llm_generate=self._generate,
@@ -170,6 +175,14 @@ class DirectorOrchestrator:
                         print(f"[Director] Shot {shot.shot_id} warnings: {result.warnings}")
                     if result.auto_fixes:
                         print(f"[Director] Shot {shot.shot_id} auto-fixes: {result.auto_fixes}")
+
+        if (
+            (include_h3_shot_table_template or has_h3_style_workflow)
+            and self._video_model.startswith("minimax_h3")
+        ):
+            production_plan.workflow_template = build_h3_shot_table_template(
+                production_plan
+            )
 
         print(f"[Director] Plan complete: {len(production_plan.shots)} shots, "
               f"{production_plan.total_duration_sec:.1f}s total")

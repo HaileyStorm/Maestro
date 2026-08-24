@@ -45,6 +45,186 @@ def _load_handler():
     return namespace["family_handler"]
 
 
+class TestMiniMaxH3NativeContinuation(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from services import h3_native_continuation
+
+        cls.native = h3_native_continuation
+
+    def test_exact_22_plus_119_geometry_and_reconciliation(self):
+        step = self.native.plan_h3_native_continuation_step(22, 119)
+
+        self.assertEqual(step.mode, "cumulative_append")
+        self.assertEqual(
+            (step.context_frames, step.extension_frames, step.target_frames),
+            (22, 119, 141),
+        )
+        self.assertEqual(
+            (
+                step.context_latent_frames,
+                step.extension_latent_frames,
+                step.target_latent_frames,
+            ),
+            (7, 35, 42),
+        )
+        self.assertEqual(step.target_audio_ticks, 235)
+        self.assertEqual(
+            step.context_audio_ticks + step.extension_audio_ticks,
+            step.target_audio_ticks,
+        )
+        self.assertEqual(
+            (
+                step.discard_video_latent_frames,
+                step.append_video_latent_frames,
+                step.discard_audio_ticks,
+                step.append_audio_ticks,
+            ),
+            (7, 35, step.context_audio_ticks, step.extension_audio_ticks),
+        )
+        self.assertEqual(
+            (
+                step.absolute_publish_start_frame,
+                step.absolute_publish_end_frame,
+                step.published_frames,
+                step.publication_trim_frames,
+            ),
+            (22, 141, 119, 0),
+        )
+        minimum = self.native.plan_h3_native_continuation_step(5, 17)
+        self.assertEqual(
+            (
+                minimum.target_frames,
+                minimum.context_latent_frames,
+                minimum.extension_latent_frames,
+                minimum.target_latent_frames,
+            ),
+            (22, 2, 5, 7),
+        )
+
+    def test_audio_uses_absolute_boundaries_without_local_rounding_drift(self):
+        tick = self.native.audio_tick_at_frame
+        span = self.native.audio_ticks_between_frames
+
+        self.assertEqual([tick(frame) for frame in (5, 56, 124)], [8, 93, 207])
+        self.assertEqual(
+            [span(5, 56), span(56, 124), span(5, 124)],
+            [85, 114, 199],
+        )
+        self.assertEqual(span(5, 56) + span(56, 124), span(5, 124))
+        self.assertEqual(span(243, 243 + 119), 198)
+        self.assertEqual(span(362, 362 + 119), 199)
+        after_243 = self.native.plan_h3_native_continuation_step(
+            22, 119, absolute_context_start_frame=221
+        )
+        after_362 = self.native.plan_h3_native_continuation_step(
+            22, 119, absolute_context_start_frame=340
+        )
+        self.assertEqual(after_243.extension_audio_ticks, 198)
+        self.assertEqual(after_362.extension_audio_ticks, 199)
+
+    def test_off_grid_960_and_720_tails_keep_legal_sampling_geometry(self):
+        cases = (
+            (960, [119] * 8 + [17], 969, 9, 8),
+            (720, [119] * 6 + [17], 731, 11, 6),
+        )
+        for requested, extensions, generated, trim, final_published in cases:
+            with self.subTest(requested=requested):
+                plan = self.native.plan_h3_native_continuation_tail(requested)
+                self.assertEqual(plan.mode, "cumulative_append")
+                self.assertEqual(
+                    [step.extension_frames for step in plan.steps], extensions
+                )
+                self.assertEqual(plan.generated_extension_frames, generated)
+                self.assertEqual(plan.publication_trim_frames, trim)
+                self.assertEqual(
+                    sum(step.published_frames for step in plan.steps), requested
+                )
+                self.assertEqual(plan.steps[0].absolute_publish_start_frame, 22)
+                self.assertEqual(
+                    plan.steps[-1].absolute_publish_end_frame, 22 + requested
+                )
+                self.assertEqual(
+                    sum(step.published_audio_ticks for step in plan.steps),
+                    self.native.audio_ticks_between_frames(22, 22 + requested),
+                )
+                self.assertEqual(plan.steps[-1].published_frames, final_published)
+                self.assertEqual(plan.steps[-1].publication_trim_frames, trim)
+                self.assertTrue(
+                    all(
+                        self.native.is_legal_h3_video_frame_count(step.target_frames)
+                        for step in plan.steps
+                    )
+                )
+                self.assertTrue(
+                    all(
+                        step.context_latent_frames + step.extension_latent_frames
+                        == step.target_latent_frames
+                        for step in plan.steps
+                    )
+                )
+        narrow_window = self.native.plan_h3_native_continuation_tail(
+            18, context_frames=328
+        )
+        self.assertEqual(
+            [step.extension_frames for step in narrow_window.steps], [17, 17]
+        )
+        self.assertEqual(narrow_window.max_extension_frames, 17)
+        self.assertEqual(
+            sum(step.published_frames for step in narrow_window.steps), 18
+        )
+        oversized_hint = self.native.plan_h3_native_continuation_tail(
+            340, max_extension_frames=340
+        )
+        self.assertEqual(
+            [step.extension_frames for step in oversized_hint.steps], [323, 17]
+        )
+        self.assertTrue(
+            all(step.target_frames <= 345 for step in oversized_hint.steps)
+        )
+
+    def test_invalid_context_and_extension_grids_fail_closed(self):
+        error = self.native.H3NativeContinuationError
+        for context in (True, 21, 327):
+            with self.subTest(context=context):
+                with self.assertRaisesRegex(error, r"context_frames.*17\*n\+5"):
+                    self.native.plan_h3_native_continuation_step(context, 17)
+        with self.assertRaisesRegex(error, r"extension_frames.*multiple of 17"):
+            self.native.plan_h3_native_continuation_step(22, 48)
+        with self.assertRaisesRegex(error, r"max_extension_frames.*multiple of 17"):
+            self.native.plan_h3_native_continuation_tail(
+                327, max_extension_frames=48
+            )
+        with self.assertRaisesRegex(
+            error, r"absolute_context_start_frame.*17-frame"
+        ):
+            self.native.plan_h3_native_continuation_step(
+                22, 119, absolute_context_start_frame=1
+            )
+        with self.assertRaisesRegex(error, r"target_frames.*max_window_frames"):
+            self.native.plan_h3_native_continuation_step(22, 340)
+        with self.assertRaisesRegex(error, r"max_window_frames.*17\*n\+5"):
+            self.native.plan_h3_native_continuation_step(
+                22, 119, max_window_frames=344
+            )
+        with self.assertRaisesRegex(error, r"leaves no legal extension"):
+            self.native.plan_h3_native_continuation_tail(
+                1, context_frames=345
+            )
+
+    def test_opening_guide_cannot_compete_with_continuation_context(self):
+        error = self.native.H3NativeContinuationError
+        message = "opening guide contradicts native continuation context"
+        with self.assertRaisesRegex(error, message):
+            self.native.plan_h3_native_continuation_step(
+                22, 119, opening_guide_present=True
+            )
+        with self.assertRaisesRegex(error, message):
+            self.native.plan_h3_native_continuation_tail(
+                720, opening_guide_present=True
+            )
+
+
 class TestMiniMaxH3Ref2VADefinition(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -93,6 +273,11 @@ class TestMiniMaxH3Ref2VADefinition(unittest.TestCase):
         self.assertEqual(fl2va["minimax_h3_conditioning_mode"], "first_last_frames")
         self.assertTrue(fl2va["end_frames_always_enabled"])
         self.assertNotIn("semantic_reference_limits", fl2va)
+
+    def test_wgp_keeps_ref2va_image_refs_without_legacy_i_letter(self):
+        source = _WGP.read_text(encoding="utf-8")
+        self.assertIn('minimax_h3_reference_mode", False) and image_refs', source)
+        self.assertIn("H3 Ref2VA semantic stills do not use the legacy", source)
 
     def test_reference_count_validation_enforces_official_limits(self):
         valid = {

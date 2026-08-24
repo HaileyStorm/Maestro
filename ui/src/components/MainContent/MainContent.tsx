@@ -1,8 +1,9 @@
 import { useRef, useCallback, useState, useEffect, useId, useLayoutEffect, useMemo, type JSX, type ReactNode } from 'react'
-import { Film, Play, Square, FolderOpen, Plus, Check, Loader2, X, BookMarked, Upload, Trash2, ListChecks, Eye, EyeOff, FolderInput, Lock, LockOpen, KeyRound, Pause, ArrowUp, ArrowDown, Sparkles } from 'lucide-react'
+import { Film, Play, Square, FolderOpen, Plus, Check, Loader2, X, BookMarked, Upload, Trash2, ListChecks, Eye, EyeOff, FolderInput, Lock, LockOpen, KeyRound, Pause, ArrowUp, ArrowDown, Sparkles, Share2 } from 'lucide-react'
 import { TabFilter } from './TabFilter'
 import { ThumbnailGallery } from './ThumbnailGallery'
 import { MediaFeedItem } from './MediaFeedItem'
+import { ProjectAccessPanel } from './ProjectAccessPanel'
 import { LlmChat } from '../LlmChat'
 import { H3DeliveryRecoveryStatus, OPEN_GALLERY_EVENT } from '../H3DeliveryRecoveryStatus'
 import { useStore } from '../../stores/useStore'
@@ -32,6 +33,7 @@ type ProjectPermission =
   | 'project.mutate'
   | 'project.generate'
   | 'project.lifecycle'
+  | 'project.membership.manage'
   | 'project.delete'
 
 // A missing projection is the pre-cutover compatibility shape. Once the
@@ -1363,6 +1365,11 @@ function JobPlaceholder({
   const failedChildCode = job.failureDetails?.code || null
   const jobModelLabel = visibleModelName(job.modelType, models)
   const resourcePresentation = describeResourceExecution(job.resourceDescriptor)
+  const recoveryAttemptLabel = Number.isInteger(job.recoveryAttempt)
+    && Number.isInteger(job.recoveryAttemptLimit)
+    && (job.recoveryAttemptLimit ?? 0) > 0
+    ? `Recovery attempt ${job.recoveryAttempt} of ${job.recoveryAttemptLimit}.`
+    : null
   const resourceWaitTitle = job.queueWaitReason === 'resource_wait' ? RESOURCE_WAIT_TITLE : undefined
   const queueWaitLabel = job.status !== 'running' && !isFailed && !recoveryBlocked ? ({
     held: 'Held — use Start next or Resume when ready',
@@ -1511,9 +1518,7 @@ function JobPlaceholder({
                 <p className="font-medium text-amber-200">
                   {job.recoveryReasonText || 'This generation needs your choice before it can continue.'}
                 </p>
-                <p className="mt-1">
-                  Recovery attempt {job.recoveryAttempt ?? 0} of {job.recoveryAttemptLimit ?? 0}.
-                </p>
+                {recoveryAttemptLabel && <p className="mt-1">{recoveryAttemptLabel}</p>}
                 {job.recoveryRerunsDenoise && (
                   <p className="mt-1">
                     The current part will restart from the beginning; completed parts will stay saved.
@@ -1747,7 +1752,7 @@ function JobPlaceholder({
 }
 
 function queueSummaryLabel(summary: api.QueueState['summary']): string {
-  return `${summary.running} running · ${summary.preparing ?? 0} preparing · ${summary.approval_waiting ?? 0} awaiting review · ${summary.waiting} waiting · ${summary.held} held · ${summary.registering} registering`
+  return `${summary.running} running · ${summary.preparing ?? 0} preparing · ${summary.approval_waiting ?? 0} awaiting review · ${summary.waiting} waiting · ${summary.held} held · ${summary.registering} being added`
 }
 
 function queuePositionLabel(position: number | null, waiting: number): string {
@@ -2103,6 +2108,7 @@ function QueuePanel({
                 <p>Ready jobs start by priority. When priorities match, Maestro usually keeps their queue order.</p>
                 <p>A job may start sooner when it can reuse a model that is already loaded.</p>
                 <p>Jobs that have waited a long time keep their place so they are not repeatedly delayed.</p>
+                <p>Queue order and time estimates can change as work starts, finishes, or becomes ready.</p>
                 <p>Queued generations do not interrupt work already running. Only a restartable CPU text task may start over with GPU acceleration, and only when that is expected to finish sooner.</p>
               </div>
             </details>
@@ -2541,6 +2547,7 @@ export function MainContent() {
   const activeWorkspace = useStore(s => s.activeWorkspace)
   const activeProject = useStore(s => (s.workspaces ?? []).find(workspace => workspace.name === s.activeWorkspace))
   const canMutateActiveProject = projectActionVisibility(activeProject).mutate
+  const canManageActiveProjectMembers = activeProject?.project_permissions?.includes('project.membership.manage') === true
   const browsingUploads = useStore(s => s.browsingUploads)
   const mediaFilter = useStore(s => s.mediaFilter)
   const outputArtifactScope = useStore(s => s.outputArtifactScope)
@@ -2557,6 +2564,9 @@ export function MainContent() {
   const sampleCampaignPairs = useStore(s => s.sampleCampaignPairs)
   const refreshSampleCampaignQueue = useStore(s => s.refreshSampleCampaignQueue)
   const [shareCopied, setShareCopied] = useState(false)
+  const [projectAccessOpen, setProjectAccessOpen] = useState(false)
+  const projectShareTriggerRef = useRef<HTMLButtonElement>(null)
+  const closeProjectAccess = useCallback(() => setProjectAccessOpen(false), [])
   const [mainView, setMainView] = useState<MainView>('gallery')
   const [queueTabSnapshot, setQueueTabSnapshot] = useState<QueueTabSnapshot>({
     state: null,
@@ -2578,6 +2588,9 @@ export function MainContent() {
     activeWorkspace,
     accountProjectMigration,
   )
+  const browserStudioUrl = typeof window === 'undefined'
+    ? ''
+    : `${window.location.origin}${window.location.pathname || '/'}`
   const hasActiveGalleryFilters = mediaFilter !== 'all'
     || outputArtifactScope !== 'final'
     || outputSearchQuery.trim().length > 0
@@ -3237,6 +3250,18 @@ export function MainContent() {
                 {accessContext.share_url ? (shareCopied ? '✓ Cloudflare link copied' : 'Cloudflare · Copy link') : 'Cloudflare · starting…'}
               </button>
             )}
+            {activeWorkspace && canManageActiveProjectMembers && (
+              <button
+                ref={projectShareTriggerRef}
+                type="button"
+                data-project-share-trigger
+                onClick={() => setProjectAccessOpen(true)}
+                className="flex min-h-11 shrink-0 items-center gap-1.5 rounded-md border border-accent-blue/40 bg-accent-blue/10 px-3 text-[10px] font-medium text-accent-blue transition-colors hover:bg-accent-blue/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue md:min-h-0 md:px-2 md:py-1"
+              >
+                <Share2 size={12} aria-hidden="true" />
+                Share project
+              </button>
+            )}
           </div>
           <div className="shrink-0 md:mr-28"><WorkspaceSelector /></div>
         </div>
@@ -3418,6 +3443,15 @@ export function MainContent() {
         </div>
         )}
       </MainViewPanels>
+      <ProjectAccessPanel
+        open={projectAccessOpen && activeWorkspace !== '' && canManageActiveProjectMembers}
+        workspace={activeWorkspace}
+        recentlyReauthenticated={accountContext?.reauthenticated === true}
+        configuredStudioUrl={accessContext?.share_url || ''}
+        browserStudioUrl={browserStudioUrl}
+        restoreFocus={projectShareTriggerRef.current}
+        onClose={closeProjectAccess}
+      />
     </main>
   )
 }

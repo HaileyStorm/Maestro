@@ -584,13 +584,17 @@ class H3ReferenceSequencePlannerTests(unittest.TestCase):
         helpers = (APP / "services" / "h3_planner_helpers.py").read_text(
             encoding="utf-8"
         )
-        controls = (
-            ROOT
-            / "ui"
-            / "src"
-            / "components"
-            / "Sidebar"
-            / "H3MultiWindowControls.tsx"
+        retired_controls = (
+            ROOT / "ui/src/components/Sidebar/H3MultiWindowControls.tsx"
+        )
+        sidebar = (
+            ROOT / "ui/src/components/Sidebar/Sidebar.tsx"
+        ).read_text(encoding="utf-8")
+        profiles = (
+            ROOT / "ui/src/components/Sidebar/H3PerformanceProfiles.tsx"
+        ).read_text(encoding="utf-8")
+        plan_review = (
+            ROOT / "ui/src/components/H3GenerationPlanDialog.tsx"
         ).read_text(encoding="utf-8")
         duration = (
             ROOT / "ui" / "src" / "components" / "Sidebar" / "DurationSlider.tsx"
@@ -604,8 +608,12 @@ class H3ReferenceSequencePlannerTests(unittest.TestCase):
         self.assertIn("_plan_generation_submission(", launch)
         self.assertIn("plan_h3_native_shots", launch)
         self.assertIn("plan_h3_clip_frames", launch)
-        self.assertIn("minimax_h3_reference_sequence", controls)
-        self.assertIn("minimax_h3_sequence_prompt_mode", controls)
+        self.assertFalse(retired_controls.exists())
+        self.assertIn("<H3PerformanceProfiles />", sidebar)
+        self.assertIn("state.h3PerformanceProfiles", profiles)
+        self.assertIn("state.applyH3PerformanceProfile", profiles)
+        self.assertIn("s.pendingH3Plan", plan_review)
+        self.assertIn("?.checkpoint_options", plan_review)
         self.assertIn("Maximum shot length", duration)
         self.assertIn("Maximum section length", duration)
         self.assertNotIn("omniReferenceSequence", duration)

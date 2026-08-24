@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+import hashlib
 import http.cookiejar
 import ipaddress
 import json
@@ -1081,10 +1082,35 @@ def probe_video(
     expected_resolution: str,
     expected_frames: int = 124,
     expected_fps: float = 24.0,
+    sample_video_signal: bool = False,
+    require_audible_audio: bool = False,
 ) -> dict[str, Any]:
+    """Return path-free structural and optional sampled signal evidence."""
+
+    try:
+        artifact_size = path.stat().st_size
+        digest = hashlib.sha256()
+        with path.open("rb") as artifact:
+            for chunk in iter(lambda: artifact.read(1024 * 1024), b""):
+                digest.update(chunk)
+        artifact_sha256 = f"sha256:{digest.hexdigest()}"
+    except OSError:
+        artifact_size = 0
+        artifact_sha256 = ""
+    artifact_valid = artifact_size > 0 and bool(artifact_sha256)
+    artifact_evidence = {
+        "artifact_size_bytes": artifact_size,
+        "artifact_sha256": artifact_sha256,
+    }
+
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
-        return {"validation": "unverified", "probe_available": False}
+        return {
+            "validation": "unverified" if artifact_valid else "invalid",
+            "probe_available": False,
+            **artifact_evidence,
+            "checks": {"artifact_nonempty": artifact_valid},
+        }
     command = [
         ffprobe, "-v", "error", "-count_frames", "-show_streams", "-show_format",
         "-of", "json", str(path),
@@ -1095,27 +1121,56 @@ def probe_video(
         )
         payload = json.loads(completed.stdout)
     except (OSError, subprocess.SubprocessError, ValueError):
-        return {"validation": "invalid", "probe_available": True}
+        return {
+            "validation": "invalid", "probe_available": True,
+            **artifact_evidence,
+        }
     streams = payload.get("streams") if isinstance(payload, dict) else []
     streams = streams if isinstance(streams, list) else []
-    video = next((item for item in streams if item.get("codec_type") == "video"), {})
-    audio_stream = next(
-        (item for item in streams if item.get("codec_type") == "audio"), {}
-    )
-    audio = bool(audio_stream)
+    video_streams = [
+        item for item in streams
+        if isinstance(item, Mapping) and item.get("codec_type") == "video"
+    ]
+    audio_streams = [
+        item for item in streams
+        if isinstance(item, Mapping) and item.get("codec_type") == "audio"
+    ]
+    video = video_streams[0] if video_streams else {}
+    audio_stream = audio_streams[0] if audio_streams else {}
+    audio = len(audio_streams) == 1
+
+    def media_rate(value: Any) -> float:
+        try:
+            text = str(value or "").strip()
+            if "/" in text:
+                numerator, denominator = text.split("/", 1)
+                rate = float(numerator) / float(denominator)
+            else:
+                rate = float(text)
+        except (TypeError, ValueError, ZeroDivisionError):
+            return 0.0
+        return rate if math.isfinite(rate) and rate > 0 else 0.0
+
+    actual_fps = media_rate(video.get("avg_frame_rate"))
+    if actual_fps <= 0:
+        actual_fps = media_rate(video.get("r_frame_rate"))
+    container = payload.get("format") if isinstance(payload, Mapping) else {}
+    container = container if isinstance(container, Mapping) else {}
     try:
         duration = float(
             video.get("duration")
-            or (payload.get("format") or {}).get("duration")
+            or container.get("duration")
             or 0
         )
         width, height = int(video.get("width") or 0), int(video.get("height") or 0)
         audio_sample_rate = int(audio_stream.get("sample_rate") or 0)
         audio_channels = int(audio_stream.get("channels") or 0)
+        audio_duration = float(audio_stream.get("duration") or 0)
     except (TypeError, ValueError):
         duration = 0.0
         width = height = 0
         audio_sample_rate = audio_channels = 0
+        audio_duration = 0.0
     frame_count: int | None
     try:
         frame_count = int(video.get("nb_read_frames") or video.get("nb_frames"))
@@ -1126,30 +1181,172 @@ def probe_video(
             int(value) for value in expected_resolution.split("x", 1)
         )
     except (TypeError, ValueError):
-        return {"validation": "invalid", "probe_available": True}
-    expected_duration = float(expected_frames) / float(expected_fps)
-    duration_tolerance = max(0.25, 2.0 / float(expected_fps))
+        return {
+            "validation": "invalid", "probe_available": True,
+            **artifact_evidence,
+        }
+    try:
+        expected_fps = float(expected_fps)
+        if (
+            isinstance(expected_frames, bool)
+            or int(expected_frames) != expected_frames
+            or expected_frames <= 0
+            or not math.isfinite(expected_fps)
+            or expected_fps <= 0
+        ):
+            raise ValueError
+        expected_frames = int(expected_frames)
+    except (TypeError, ValueError, OverflowError):
+        return {
+            "validation": "invalid",
+            "probe_available": True,
+            **artifact_evidence,
+        }
+    expected_duration = float(expected_frames) / expected_fps
+    duration_tolerance = max(0.01, 1.0 / expected_fps)
+    audio_duration_tolerance = max(
+        duration_tolerance,
+        1024.0 / float(audio_sample_rate or 32_000),
+    )
+    fps_tolerance = max(0.001, expected_fps * 0.0001)
     checks = {
+        "artifact_nonempty": artifact_valid,
+        "one_video_stream": len(video_streams) == 1,
+        "one_audio_stream": len(audio_streams) == 1,
         "dimensions": (width, height) == (expected_width, expected_height),
+        "fps": abs(actual_fps - expected_fps) <= fps_tolerance,
         "duration": abs(duration - expected_duration) <= duration_tolerance,
+        "duration_frame_grid": (
+            frame_count is not None
+            and actual_fps > 0
+            and abs(duration * actual_fps - frame_count) <= 1.0
+        ),
         "frame_count": frame_count == expected_frames,
         "audio_preserved": audio,
+        "audio_duration": (
+            audio_duration > 0
+            and abs(audio_duration - duration) <= audio_duration_tolerance
+        ),
         "audio_32khz_stereo": (
             audio_sample_rate == 32_000 and audio_channels == 2
         ),
     }
-    valid = bool(video) and all(checks.values())
+    signal_evidence: dict[str, Any] = {}
+    if sample_video_signal or require_audible_audio:
+        ffmpeg = shutil.which("ffmpeg")
+        signal_evidence["signal_probe_available"] = bool(ffmpeg)
+        if sample_video_signal:
+            checks["sampled_non_black"] = False
+            checks["sampled_motion"] = False
+        checks["decoded_audio_coverage"] = False
+        if require_audible_audio:
+            checks["audible_audio"] = False
+        if ffmpeg and sample_video_signal:
+            sample_indices = (0, expected_frames // 2, expected_frames - 1)
+            selector = "+".join(f"eq(n\\,{index})" for index in sample_indices)
+            frame_command = [
+                ffmpeg, "-v", "error", "-i", str(path),
+                "-vf", f"select='{selector}',scale=32:32,format=gray",
+                "-vsync", "0", "-an", "-f", "rawvideo", "-",
+            ]
+            try:
+                frame_result = subprocess.run(
+                    frame_command, check=True, capture_output=True, timeout=60,
+                )
+                frame_size = 32 * 32
+                if len(frame_result.stdout) != frame_size * len(sample_indices):
+                    raise ValueError
+                sampled_frames = [
+                    frame_result.stdout[offset:offset + frame_size]
+                    for offset in range(
+                        0, len(frame_result.stdout), frame_size,
+                    )
+                ]
+                mean_luma = max(
+                    sum(frame) / (len(frame) * 255.0)
+                    for frame in sampled_frames
+                )
+                motion_delta = max(
+                    sum(abs(left - right) for left, right in zip(first, second))
+                    / (frame_size * 255.0)
+                    for first, second in zip(sampled_frames, sampled_frames[1:])
+                )
+                checks["sampled_non_black"] = mean_luma > (1.0 / 255.0)
+                checks["sampled_motion"] = motion_delta > (1.0 / 255.0)
+                signal_evidence.update({
+                    "sampled_video_frames": len(sampled_frames),
+                    "sampled_max_mean_luma": round(mean_luma, 6),
+                    "sampled_max_motion_delta": round(motion_delta, 6),
+                })
+            except (OSError, subprocess.SubprocessError, ValueError):
+                pass
+        if ffmpeg:
+            audio_decode_seconds = min(
+                max(duration + audio_duration_tolerance, 0.0), 16.0,
+            )
+            audio_command = [
+                ffmpeg, "-v", "error", "-i", str(path), "-map", "0:a:0",
+                "-vn", "-t", f"{audio_decode_seconds:.6f}", "-ac", "2",
+                "-ar", "8000", "-f", "f32le", "-",
+            ]
+            try:
+                audio_result = subprocess.run(
+                    audio_command, check=True, capture_output=True, timeout=60,
+                )
+                samples = [
+                    value[0]
+                    for value in struct.iter_unpack("<f", audio_result.stdout)
+                ]
+                if not samples or len(samples) % 2:
+                    raise ValueError
+                channel_samples = (samples[0::2], samples[1::2])
+                channel_ac_rms: list[float] = []
+                for channel in channel_samples:
+                    trim = min(400, len(channel) // 4)
+                    analyzed = channel[trim:len(channel) - trim] or channel
+                    dc = sum(analyzed) / len(analyzed)
+                    channel_ac_rms.append(math.sqrt(
+                        sum((value - dc) ** 2 for value in analyzed)
+                        / len(analyzed)
+                    ))
+                decoded_audio_seconds = len(channel_samples[0]) / 8000.0
+                checks["decoded_audio_coverage"] = (
+                    abs(decoded_audio_seconds - duration)
+                    <= audio_duration_tolerance
+                )
+                if require_audible_audio:
+                    checks["audible_audio"] = (
+                        all(math.isfinite(value) for value in channel_ac_rms)
+                        and max(channel_ac_rms) > 0.001
+                    )
+                signal_evidence.update({
+                    "sampled_audio_values": len(samples),
+                    "decoded_audio_seconds": round(decoded_audio_seconds, 6),
+                    "sampled_audio_left_ac_rms": round(channel_ac_rms[0], 8),
+                    "sampled_audio_right_ac_rms": round(channel_ac_rms[1], 8),
+                })
+            except (
+                OSError, subprocess.SubprocessError, struct.error, ValueError,
+            ):
+                pass
+    valid = len(video_streams) == 1 and all(checks.values())
     return {
         "validation": "valid" if valid else "invalid",
         "probe_available": True,
+        **artifact_evidence,
         "duration_seconds": round(duration, 3),
+        "fps": round(actual_fps, 6),
         "width": width,
         "height": height,
         "frame_count": frame_count,
+        "video_stream_count": len(video_streams),
+        "audio_stream_count": len(audio_streams),
         "has_audio": audio,
         "audio_sample_rate": audio_sample_rate,
         "audio_channels": audio_channels,
+        "audio_duration_seconds": round(audio_duration, 3),
         "checks": checks,
+        **signal_evidence,
     }
 
 
@@ -1434,6 +1631,8 @@ def run_case(
                 expected_resolution=(case.delivery_resolution or case.resolution),
                 expected_frames=case.expected_frames,
                 expected_fps=24.0,
+                sample_video_signal=True,
+                require_audible_audio=not case.semantic_reference,
             )
             if case.boundary_mode:
                 expected_width, expected_height = (
@@ -1582,9 +1781,15 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    if args.live_4k_acceptance and not shutil.which("ffprobe"):
+    missing_media_tools = [
+        command for command in ("ffmpeg", "ffprobe")
+        if not shutil.which(command)
+    ]
+    if missing_media_tools:
         print(
-            "Benchmark setup failed: ffprobe_required_for_live_4k_acceptance",
+            "Benchmark setup failed: media_tools_required:" + ",".join(
+                missing_media_tools
+            ),
             file=sys.stderr,
         )
         return 1

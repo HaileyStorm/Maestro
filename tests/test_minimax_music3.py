@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
+import sys
 import types
 import unittest
 
@@ -26,6 +28,7 @@ _ACCELERATED_QWEN = (
     _APP / "models" / "TTS" / "minimax_music3" / "qwen3_accelerated.py"
 )
 _PACKAGE_INIT = _APP / "models" / "TTS" / "minimax_music3" / "__init__.py"
+_TTS_PACKAGE_INIT = _APP / "models" / "TTS" / "__init__.py"
 _PROMPTING = _APP / "models" / "TTS" / "minimax_music3" / "prompting.py"
 _CUDA_GRAPH = _APP / "shared" / "llm_engines" / "cudagraph_kit.py"
 _NANOVLLM_ATTENTION = (
@@ -169,6 +172,30 @@ def _load_engine_resolver(*, vllm_supported: bool):
 
 
 class MiniMaxMusic3Tests(unittest.TestCase):
+    def test_prompt_helpers_import_without_neural_runtime_modules(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                "-c",
+                (
+                    "import sys; "
+                    "from models.TTS.minimax_music3.prompting import normalize_generated_music3_song; "
+                    "assert 'shared.attention' not in sys.modules; "
+                    "assert normalize_generated_music3_song('pop', '[Verse]\\nhello')[1] == '[Verse]\\nhello'"
+                ),
+            ],
+            cwd=_ROOT,
+            env={**os.environ, "PYTHONPATH": str(_APP), "CUDA_VISIBLE_DEVICES": ""},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tts_package = _read(_TTS_PACKAGE_INIT)
+        self.assertNotIn("from . import (", tts_package)
+        self.assertIn("def __getattr__(name):", tts_package)
+
     def test_default_definition_is_visible_and_license_aware(self):
         default = json.loads(_read(_DEFAULT))
         model = default["model"]
@@ -285,13 +312,21 @@ class MiniMaxMusic3Tests(unittest.TestCase):
                 "[Verse] Hello",
             ),
         )
+        self.assertIsNone(
+            handler.validate_generative_prompt(
+                "minimax_music3",
+                model_def,
+                valid,
+                "[Verse]\n(whispered)\nHello",
+            )
+        )
         self.assertIn(
             "Move it to the Music Caption",
             handler.validate_generative_prompt(
                 "minimax_music3",
                 model_def,
                 valid,
-                "[Verse]\n(whispered)\nHello",
+                "[Verse]\n(guitar enters softly)\nHello",
             ),
         )
 
@@ -406,10 +441,8 @@ class MiniMaxMusic3Tests(unittest.TestCase):
         self.assertIn("FlashAttention2 + Triton", semantic)
         self.assertIn("CUDA graphs +", semantic)
         self.assertIn("Qwen3DecoderLayer", qwen)
-        self.assertIn(
-            "optimized_pipeline import MiniMaxMusic3Pipeline",
-            package_init,
-        )
+        self.assertIn('"MiniMaxMusic3Pipeline": (".optimized_pipeline", "MiniMaxMusic3Pipeline")', package_init)
+        self.assertIn("def __getattr__(name):", package_init)
         self.assertIn('capture_error_mode="thread_local"', cuda_graph)
         self.assertIn("torch.inference_mode()", cuda_graph)
         self.assertIn("scaled_dot_product_attention", attention)
@@ -426,10 +459,12 @@ class MiniMaxMusic3Tests(unittest.TestCase):
         client = _read(_CLIENT)
         launch = _read(_LAUNCH)
         self.assertIn("const DEFAULTS_VERSION = 9", store)
-        self.assertNotIn("directorMusicModel", store)
-        self.assertNotIn("'minimax_music3'", store)
+        self.assertIn("directorMusicModel", store)
+        self.assertIn("sendMusicToDirector", store)
         self.assertIn("api.writeSong({", ui)
-        self.assertIn("description: description.trim()", ui)
+        self.assertIn("description: requestDescription", ui)
+        self.assertIn("model_type: requestModelType || undefined", ui)
+        self.assertIn("MusicLyricPlayground", ui)
         self.assertNotIn("music3_structured_caption", ui)
         self.assertIn("duration_seconds?: number", client)
         self.assertIn("model_type?: string", client)
@@ -458,9 +493,11 @@ class MiniMaxMusic3Tests(unittest.TestCase):
         self.assertIn("'minimax_music3'", setup)
         self.assertIn("Music model", setup)
         self.assertIn("maximumDuration = isMusic3 ? 300 : 360", setup)
+        self.assertIn("selectedModel?.model_type === 'minimax_music3'", setup)
+        self.assertIn("execution_allowed === false", setup)
         self.assertIn("directorSongDuration", store)
         self.assertIn("duration_seconds: s.directorSongDuration", store)
-        self.assertNotIn("directorMusicModel", store)
+        self.assertIn("model_type: s.directorMusicModel || undefined", store)
         self.assertIn("_music3_virtual_catalog_model", launch)
         self.assertNotIn("1536 if is_minimax_music3 else 1024", launch)
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 import hashlib
 import hmac
 import json
@@ -38,13 +39,14 @@ MAX_WEBHOOK_BYTES = 256 * 1024
 MAX_REPLAY_STATE_BYTES = 16 * 1024 * 1024
 MAX_REPLAY_ENTRIES = 100_000
 MAX_STRIPE_RUNTIME_CONFIG_BYTES = 256 * 1024
-MAX_STRIPE_ASSOCIATION_STATE_BYTES = 4 * 1024 * 1024
-MAX_STRIPE_ASSOCIATION_ENTRIES = 50_000
+MAX_SUPPORT_ASSOCIATION_STATE_BYTES = 4 * 1024 * 1024
+MAX_SUPPORT_ASSOCIATION_ENTRIES = 50_000
 DEFAULT_TIMESTAMP_TOLERANCE_SECONDS = 300
 DEFAULT_REPLAY_RETENTION_SECONDS = 24 * 60 * 60
 REPLAY_SCHEMA_VERSION = 1
-STRIPE_RUNTIME_CONFIG_SCHEMA_VERSION = 2
-STRIPE_ASSOCIATION_SCHEMA_VERSION = 1
+BMAC_RUNTIME_CONFIG_SCHEMA_VERSION = 1
+DIRECT_STRIPE_RUNTIME_CONFIG_SCHEMA_VERSION = 1
+SUPPORT_ASSOCIATION_SCHEMA_VERSION = 2
 STRIPE_BMAC_CREATOR_SURFACE = (
     "reuse_verified_shared_buy_me_a_coffee_creator_account_and_page"
 )
@@ -86,7 +88,7 @@ class WebhookReplayIntegrityError(SupportWebhookError):
     pass
 
 
-class StripeAssociationIntegrityError(SupportWebhookError):
+class SupportAssociationIntegrityError(SupportWebhookError):
     pass
 
 
@@ -99,24 +101,53 @@ class SupportEvidenceContract:
     positive_event_types: tuple[str, ...]
     reversal_event_types: tuple[str, ...]
     server_mapping_keys: tuple[str, ...]
+    transport: str
+    signature_header: str
+    fraud_screening_role: str | None = None
 
     def public_projection(self) -> dict[str, Any]:
-        return {
+        projection = {
             "provider_id": self.provider_id,
             "enabled": self.enabled_by_default,
             "verification": "signed_webhook_required",
             "positive_event_types": list(self.positive_event_types),
             "reversal_event_types": list(self.reversal_event_types),
             "server_mapping_keys": list(self.server_mapping_keys),
-            "radar_role": "fraud_screening_only",
+            "transport": self.transport,
+            "signature_header": self.signature_header,
             "grants_app_or_account_authorization": False,
             "projects_personal_address_or_phone": False,
             "projects_api_keys_or_provider_subjects": False,
         }
+        if self.fraud_screening_role is not None:
+            projection["fraud_screening_role"] = self.fraud_screening_role
+        return projection
 
 
-STRIPE_BMAC_SUPPORT_EVIDENCE_CONTRACT = SupportEvidenceContract(
-    provider_id="buy_me_a_coffee_stripe",
+BMAC_SUPPORT_EVIDENCE_CONTRACT = SupportEvidenceContract(
+    provider_id="buy_me_a_coffee",
+    enabled_by_default=False,
+    positive_event_types=(
+        "donation.created",
+        "membership.started",
+        "membership.updated",
+        "recurring_donation.started",
+        "recurring_donation.updated",
+    ),
+    reversal_event_types=(
+        "donation.refunded",
+        "membership.cancelled",
+        "membership.paused",
+        "recurring_donation.cancelled",
+    ),
+    server_mapping_keys=("opaque_supporter_account_link",),
+    transport="native_buy_me_a_coffee_webhook",
+    signature_header="x-signature-sha256",
+)
+
+
+DIRECT_STRIPE_SUPPORT_EVIDENCE_CONTRACT = SupportEvidenceContract(
+    provider_id="direct_stripe_support",
     enabled_by_default=False,
     positive_event_types=("checkout.session.completed", "invoice.paid"),
     reversal_event_types=(
@@ -125,7 +156,15 @@ STRIPE_BMAC_SUPPORT_EVIDENCE_CONTRACT = SupportEvidenceContract(
         "customer.subscription.deleted",
     ),
     server_mapping_keys=("payment_link", "price"),
+    transport="optional_direct_stripe_webhook",
+    signature_header="Stripe-Signature",
+    fraud_screening_role="radar_fraud_screening_only_never_authorization",
 )
+
+
+# Compatibility import for support_catalog.py. The value is the native BMaC
+# contract; direct Stripe has its own explicitly separate contract above.
+STRIPE_BMAC_SUPPORT_EVIDENCE_CONTRACT = BMAC_SUPPORT_EVIDENCE_CONTRACT
 
 
 def _secret_bytes(value: bytes | str, *, name: str) -> bytes:
@@ -181,8 +220,15 @@ def _json_without_duplicate_keys(raw_body: bytes) -> dict[str, Any]:
             result[key] = value
         return result
 
+    def reject_constant(_value: str) -> None:
+        raise WebhookPayloadError("webhook JSON contains a non-finite number")
+
     try:
-        payload = json.loads(raw_body.decode("utf-8"), object_pairs_hook=pairs)
+        payload = json.loads(
+            raw_body.decode("utf-8"),
+            object_pairs_hook=pairs,
+            parse_constant=reject_constant,
+        )
     except WebhookPayloadError:
         raise
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -275,11 +321,9 @@ def _stripe_identifier(value: Any, *prefixes: str) -> str:
 
 
 @dataclass(frozen=True, slots=True)
-class StripeBmacWebhookConfig:
-    """Runtime-only adapter config for the shared BMaC private checkpoint."""
+class DirectStripeWebhookConfig:
+    """Optional generic direct-Stripe config; disabled and unrelated to BMaC."""
 
-    creator_surface: str = field(repr=False)
-    deployment_scope: str = field(repr=False)
     livemode: bool
     payment_links: Mapping[str, str] = field(repr=False)
     prices: Mapping[str, str] = field(repr=False)
@@ -290,14 +334,6 @@ class StripeBmacWebhookConfig:
     timestamp_tolerance_seconds: int = DEFAULT_TIMESTAMP_TOLERANCE_SECONDS
 
     def __post_init__(self) -> None:
-        if self.creator_surface != STRIPE_BMAC_CREATOR_SURFACE:
-            raise SupportWebhookError(
-                "Stripe support must reuse the verified shared BMaC creator surface"
-            )
-        if self.deployment_scope != STRIPE_BMAC_DEPLOYMENT_SCOPE:
-            raise SupportWebhookError(
-                "Stripe support is limited to the private usable checkpoint"
-            )
         if not isinstance(self.livemode, bool):
             raise SupportWebhookError("Stripe livemode setting is invalid")
         object.__setattr__(
@@ -376,13 +412,13 @@ class StripeBmacWebhookConfig:
         signing_secret: bytes | str,
         identity_secret: bytes | str,
         association_integrity_key: bytes | str,
-    ) -> "StripeBmacWebhookConfig":
+    ) -> "DirectStripeWebhookConfig":
         encoded = raw.encode("utf-8") if isinstance(raw, str) else raw
         payload = _runtime_json(encoded, label="Stripe support config")
         if set(payload) != {
-            "schema_version", "creator_surface", "deployment_scope",
-            "livemode", "payment_links", "prices", "account_links",
-        } or payload.get("schema_version") != STRIPE_RUNTIME_CONFIG_SCHEMA_VERSION:
+            "schema_version", "livemode", "payment_links", "prices",
+            "account_links",
+        } or payload.get("schema_version") != DIRECT_STRIPE_RUNTIME_CONFIG_SCHEMA_VERSION:
             raise SupportWebhookError("Stripe support config shape is invalid")
 
         def mappings(name: str) -> dict[str, str]:
@@ -399,8 +435,6 @@ class StripeBmacWebhookConfig:
             return result
 
         return cls(
-            creator_surface=payload.get("creator_surface"),
-            deployment_scope=payload.get("deployment_scope"),
             livemode=payload.get("livemode"),
             payment_links=mappings("payment_links"),
             prices=mappings("prices"),
@@ -415,7 +449,7 @@ class StripeBmacWebhookConfig:
         cls,
         path: str | os.PathLike[str],
         **secrets: bytes | str,
-    ) -> "StripeBmacWebhookConfig":
+    ) -> "DirectStripeWebhookConfig":
         raw = _private_runtime_file(
             path,
             maximum_bytes=MAX_STRIPE_RUNTIME_CONFIG_BYTES,
@@ -427,23 +461,23 @@ class StripeBmacWebhookConfig:
     def from_environment(
         cls,
         env: Mapping[str, str] | None = None,
-    ) -> "StripeBmacWebhookConfig":
+    ) -> "DirectStripeWebhookConfig":
         selected = os.environ if env is None else env
-        inline = selected.get("MAESTRO_SUPPORT_STRIPE_BMAC_CONFIG_JSON")
-        reference = selected.get("MAESTRO_SUPPORT_STRIPE_BMAC_CONFIG_FILE")
+        inline = selected.get("MAESTRO_SUPPORT_DIRECT_STRIPE_CONFIG_JSON")
+        reference = selected.get("MAESTRO_SUPPORT_DIRECT_STRIPE_CONFIG_FILE")
         if (inline is None) == (reference is None):
             raise SupportWebhookError(
                 "configure exactly one Stripe support JSON source"
             )
         secrets = {
             "signing_secret": _runtime_secret(
-                selected, "MAESTRO_SUPPORT_STRIPE_WEBHOOK_SECRET",
+                selected, "MAESTRO_SUPPORT_DIRECT_STRIPE_WEBHOOK_SECRET",
             ),
             "identity_secret": _runtime_secret(
-                selected, "MAESTRO_SUPPORT_STRIPE_IDENTITY_HMAC_KEY",
+                selected, "MAESTRO_SUPPORT_DIRECT_STRIPE_IDENTITY_HMAC_KEY",
             ),
             "association_integrity_key": _runtime_secret(
-                selected, "MAESTRO_SUPPORT_STRIPE_ASSOCIATION_HMAC_KEY",
+                selected, "MAESTRO_SUPPORT_DIRECT_STRIPE_ASSOCIATION_HMAC_KEY",
             ),
         }
         if reference is not None:
@@ -452,11 +486,200 @@ class StripeBmacWebhookConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class BmacWebhookConfig:
+    """Native BMaC runtime config for one shared-creator private checkpoint."""
+
+    creator_surface: str = field(repr=False)
+    deployment_scope: str = field(repr=False)
+    live_mode: bool
+    account_links: Mapping[str, str] = field(repr=False)
+    signing_secret: bytes = field(repr=False)
+    identity_secret: bytes = field(repr=False)
+    association_integrity_key: bytes = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if self.creator_surface != STRIPE_BMAC_CREATOR_SURFACE:
+            raise SupportWebhookError(
+                "BMaC must reuse the verified shared creator account and page"
+            )
+        if self.deployment_scope != STRIPE_BMAC_DEPLOYMENT_SCOPE:
+            raise SupportWebhookError(
+                "BMaC support is limited to the private usable checkpoint"
+            )
+        if not isinstance(self.live_mode, bool):
+            raise SupportWebhookError("BMaC live_mode setting is invalid")
+        object.__setattr__(
+            self, "signing_secret",
+            _secret_bytes(self.signing_secret, name="BMaC webhook secret"),
+        )
+        object.__setattr__(
+            self, "identity_secret",
+            _secret_bytes(self.identity_secret, name="BMaC identity key"),
+        )
+        object.__setattr__(
+            self, "association_integrity_key",
+            _secret_bytes(
+                self.association_integrity_key,
+                name="BMaC association integrity key",
+            ),
+        )
+        if not isinstance(self.account_links, Mapping) or len(
+            self.account_links,
+        ) > 10_000:
+            raise SupportWebhookError("BMaC account links are invalid")
+        links: dict[str, str] = {}
+        for supporter_key, account_key in self.account_links.items():
+            if (
+                not isinstance(supporter_key, str)
+                or _OPAQUE_KEY_RE.fullmatch(supporter_key) is None
+                or not isinstance(account_key, str)
+                or _OPAQUE_KEY_RE.fullmatch(account_key) is None
+            ):
+                raise SupportWebhookError(
+                    "BMaC account links must be explicit opaque associations"
+                )
+            links[supporter_key] = account_key
+        object.__setattr__(self, "account_links", MappingProxyType(links))
+
+    @classmethod
+    def from_runtime_json(
+        cls,
+        raw: bytes | str,
+        *,
+        signing_secret: bytes | str,
+        identity_secret: bytes | str,
+        association_integrity_key: bytes | str,
+    ) -> "BmacWebhookConfig":
+        encoded = raw.encode("utf-8") if isinstance(raw, str) else raw
+        payload = _runtime_json(encoded, label="BMaC support config")
+        if set(payload) != {
+            "schema_version", "creator_surface", "deployment_scope",
+            "live_mode", "account_links",
+        } or payload.get("schema_version") != BMAC_RUNTIME_CONFIG_SCHEMA_VERSION:
+            raise SupportWebhookError("BMaC support config shape is invalid")
+        return cls(
+            creator_surface=payload.get("creator_surface"),
+            deployment_scope=payload.get("deployment_scope"),
+            live_mode=payload.get("live_mode"),
+            account_links=payload.get("account_links"),
+            signing_secret=signing_secret,
+            identity_secret=identity_secret,
+            association_integrity_key=association_integrity_key,
+        )
+
+    @classmethod
+    def from_runtime_file(
+        cls,
+        path: str | os.PathLike[str],
+        **secrets: bytes | str,
+    ) -> "BmacWebhookConfig":
+        raw = _private_runtime_file(
+            path,
+            maximum_bytes=MAX_STRIPE_RUNTIME_CONFIG_BYTES,
+            label="BMaC support config file",
+        )
+        return cls.from_runtime_json(raw, **secrets)
+
+    @classmethod
+    def from_environment(
+        cls,
+        env: Mapping[str, str] | None = None,
+    ) -> "BmacWebhookConfig":
+        selected = os.environ if env is None else env
+        inline = selected.get("MAESTRO_SUPPORT_BMAC_CONFIG_JSON")
+        reference = selected.get("MAESTRO_SUPPORT_BMAC_CONFIG_FILE")
+        if (inline is None) == (reference is None):
+            raise SupportWebhookError(
+                "configure exactly one native BMaC support JSON source"
+            )
+        secrets = {
+            "signing_secret": _runtime_secret(
+                selected, "MAESTRO_SUPPORT_BMAC_WEBHOOK_SECRET",
+            ),
+            "identity_secret": _runtime_secret(
+                selected, "MAESTRO_SUPPORT_BMAC_IDENTITY_HMAC_KEY",
+            ),
+            "association_integrity_key": _runtime_secret(
+                selected, "MAESTRO_SUPPORT_BMAC_ASSOCIATION_HMAC_KEY",
+            ),
+        }
+        if reference is not None:
+            return cls.from_runtime_file(reference, **secrets)
+        return cls.from_runtime_json(inline or "", **secrets)
+
+
+@dataclass(frozen=True, slots=True)
+class BmacWebhookVerifier:
+    """Verify native BMaC HMAC evidence over the exact raw request body."""
+
+    signing_secret: bytes = field(repr=False)
+    contract: SupportEvidenceContract = BMAC_SUPPORT_EVIDENCE_CONTRACT
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "signing_secret",
+            _secret_bytes(self.signing_secret, name="BMaC webhook secret"),
+        )
+
+    def verify_event(
+        self,
+        raw_body: bytes,
+        headers: Mapping[str, str],
+        *,
+        received_at: datetime | str,
+    ) -> dict[str, Any]:
+        if (
+            not isinstance(raw_body, bytes)
+            or not raw_body
+            or len(raw_body) > MAX_WEBHOOK_BYTES
+        ):
+            raise WebhookPayloadError("BMaC webhook body size is invalid")
+        signature = _header(headers, "x-signature-sha256")
+        if re.fullmatch(r"[0-9a-fA-F]{64}", signature) is None:
+            raise WebhookSignatureError("BMaC webhook signature is invalid")
+        expected = hmac.new(
+            self.signing_secret, raw_body, hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(expected, signature.lower()):
+            raise WebhookSignatureError("BMaC webhook signature is invalid")
+        payload = _json_without_duplicate_keys(raw_body)
+        if set(payload) != {
+            "event_id", "type", "live_mode", "created", "attempt", "data",
+        }:
+            raise WebhookPayloadError("BMaC webhook envelope is invalid")
+        event_id = payload.get("event_id")
+        created = payload.get("created")
+        attempt = payload.get("attempt")
+        event_type = payload.get("type")
+        if (
+            type(event_id) is not int
+            or not 1 <= event_id <= 9_223_372_036_854_775_807
+            or event_type not in {
+                *self.contract.positive_event_types,
+                *self.contract.reversal_event_types,
+            }
+            or not isinstance(payload.get("live_mode"), bool)
+            or type(created) is not int
+            or type(attempt) is not int
+            or not 1 <= attempt <= 5
+            or not isinstance(payload.get("data"), dict)
+        ):
+            raise WebhookPayloadError("BMaC webhook envelope is invalid")
+        try:
+            created_at = datetime.fromtimestamp(created, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError) as error:
+            raise WebhookPayloadError("BMaC event time is invalid") from error
+        if created_at > _utc(received_at) + timedelta(minutes=5):
+            raise WebhookTimestampError("BMaC event time is in the future")
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
 class StripeWebhookVerifier:
     """Verify a Stripe event without treating payment or Radar state as auth."""
 
     signing_secret: bytes = field(repr=False)
-    contract: SupportEvidenceContract = STRIPE_BMAC_SUPPORT_EVIDENCE_CONTRACT
+    contract: SupportEvidenceContract = DIRECT_STRIPE_SUPPORT_EVIDENCE_CONTRACT
     timestamp_tolerance_seconds: int = DEFAULT_TIMESTAMP_TOLERANCE_SECONDS
 
     def __post_init__(self) -> None:
@@ -539,9 +762,10 @@ _DRAFT_RECORD_KEYS = frozenset({
     "fulfillment_item", "fulfillment_status", "actor_key",
 })
 _TARGET_RECORD_KEYS = frozenset({
-    "subject_key", "kind", "amount_minor", "currency", "contract_key",
+    "provider", "subject_key", "kind", "amount_minor", "currency",
+    "contract_key",
 })
-_ASSOCIATION_KINDS = ("charge", "payment_intent", "subscription")
+_ASSOCIATION_KINDS = ("payment", "transaction", "subscription")
 
 
 def _draft_record(draft: ContributionEventDraft) -> dict[str, Any]:
@@ -563,29 +787,29 @@ def _draft_record(draft: ContributionEventDraft) -> dict[str, Any]:
 
 def _draft_from_record(record: Mapping[str, Any]) -> ContributionEventDraft:
     if not isinstance(record, Mapping) or set(record) != _DRAFT_RECORD_KEYS:
-        raise StripeAssociationIntegrityError(
-            "Stripe association draft shape is invalid"
+        raise SupportAssociationIntegrityError(
+            "support association draft shape is invalid"
         )
     try:
         draft = ContributionEventDraft(**record)
         normalized = _draft_record(draft)
     except (TypeError, SupportWebhookError) as error:
-        raise StripeAssociationIntegrityError(
-            "Stripe association draft is invalid"
+        raise SupportAssociationIntegrityError(
+            "support association draft is invalid"
         ) from error
     if dict(record) != normalized:
-        raise StripeAssociationIntegrityError(
-            "Stripe association draft is not canonical"
+        raise SupportAssociationIntegrityError(
+            "support association draft is not canonical"
         )
     return draft
 
 
-class FileStripeAssociationStore:
-    """Integrity-sealed opaque Stripe-to-contribution associations."""
+class FileSupportAssociationStore:
+    """Integrity-sealed opaque provider-to-contribution associations."""
 
     CANONICAL_PATH = (
         Path(__file__).resolve().parents[1]
-        / "storage" / "support" / "stripe_bmac_associations.json"
+        / "storage" / "support" / "webhook_associations.json"
     )
 
     def __init__(
@@ -603,20 +827,20 @@ class FileStripeAssociationStore:
                 )
             except ValueError as error:
                 raise SupportWebhookError(
-                    "custom Stripe association paths must be temporary"
+                    "custom support association paths must be temporary"
                 ) from error
             if not allow_test_path:
                 raise SupportWebhookError(
-                    "custom Stripe association paths require explicit test approval"
+                    "custom support association paths require explicit test approval"
                 )
         if candidate.resolve(strict=False) != candidate:
             raise SupportWebhookError(
-                "Stripe association path must not use symlinks"
+                "support association path must not use symlinks"
             )
         self.path = candidate
         self.lock_path = candidate.with_suffix(candidate.suffix + ".lock")
         self._key = _secret_bytes(
-            integrity_key, name="Stripe association integrity key",
+            integrity_key, name="support association integrity key",
         )
         self._lock = threading.RLock()
 
@@ -637,7 +861,7 @@ class FileStripeAssociationStore:
             metadata = self.lock_path.lstat()
         except OSError as error:
             raise SupportWebhookError(
-                "Stripe association lock is unreadable"
+                "support association lock is unreadable"
             ) from error
         if (
             not stat.S_ISREG(metadata.st_mode)
@@ -647,36 +871,36 @@ class FileStripeAssociationStore:
                 and stat.S_IMODE(metadata.st_mode) != 0o600
             )
         ):
-            raise SupportWebhookError("Stripe association lock is unsafe")
+            raise SupportWebhookError("support association lock is unsafe")
 
     def _read(self) -> dict[str, Any]:
         if not self.path.exists():
             if self.path.is_symlink():
-                raise StripeAssociationIntegrityError(
-                    "Stripe association path is unsafe"
+                raise SupportAssociationIntegrityError(
+                    "support association path is unsafe"
                 )
             return self._empty_state()
         try:
             raw = _private_runtime_file(
                 self.path,
-                maximum_bytes=MAX_STRIPE_ASSOCIATION_STATE_BYTES,
-                label="Stripe association state",
+                maximum_bytes=MAX_SUPPORT_ASSOCIATION_STATE_BYTES,
+                label="support association state",
             )
             payload = json.loads(raw.decode("utf-8"))
         except SupportWebhookError as error:
-            raise StripeAssociationIntegrityError(
-                "Stripe association state is unsafe"
+            raise SupportAssociationIntegrityError(
+                "support association state is unsafe"
             ) from error
         except (UnicodeError, json.JSONDecodeError) as error:
-            raise StripeAssociationIntegrityError(
-                "Stripe association state is unreadable"
+            raise SupportAssociationIntegrityError(
+                "support association state is unreadable"
             ) from error
         if not isinstance(payload, dict) or set(payload) != {
             "schema_version", "targets", "associations", "adjustments",
             "event_drafts", "state_hmac",
         }:
-            raise StripeAssociationIntegrityError(
-                "Stripe association state shape is invalid"
+            raise SupportAssociationIntegrityError(
+                "support association state shape is invalid"
             )
         state = {
             "targets": payload.get("targets"),
@@ -685,12 +909,12 @@ class FileStripeAssociationStore:
             "event_drafts": payload.get("event_drafts"),
         }
         if (
-            payload.get("schema_version") != STRIPE_ASSOCIATION_SCHEMA_VERSION
+            payload.get("schema_version") != SUPPORT_ASSOCIATION_SCHEMA_VERSION
             or not isinstance(payload.get("state_hmac"), str)
             or not hmac.compare_digest(payload["state_hmac"], self._seal(state))
         ):
-            raise StripeAssociationIntegrityError(
-                "Stripe association state integrity failed"
+            raise SupportAssociationIntegrityError(
+                "support association state integrity failed"
             )
         targets = state["targets"]
         associations = state["associations"]
@@ -704,31 +928,33 @@ class FileStripeAssociationStore:
             or not isinstance(adjustments, dict)
             or not isinstance(event_drafts, dict)
         ):
-            raise StripeAssociationIntegrityError(
-                "Stripe association state collections are invalid"
+            raise SupportAssociationIntegrityError(
+                "support association state collections are invalid"
             )
         entry_count = len(targets) + len(adjustments) + len(event_drafts) + sum(
             len(values) for values in associations.values()
         )
-        if entry_count > MAX_STRIPE_ASSOCIATION_ENTRIES:
-            raise StripeAssociationIntegrityError(
-                "Stripe association state exceeds its entry bound"
+        if entry_count > MAX_SUPPORT_ASSOCIATION_ENTRIES:
+            raise SupportAssociationIntegrityError(
+                "support association state exceeds its entry bound"
             )
         for source_key, record in event_drafts.items():
             if _OPAQUE_KEY_RE.fullmatch(source_key or "") is None:
-                raise StripeAssociationIntegrityError(
-                    "Stripe association event key is invalid"
+                raise SupportAssociationIntegrityError(
+                    "support association event key is invalid"
                 )
             draft = _draft_from_record(record)
             if draft.source_event_key != source_key:
-                raise StripeAssociationIntegrityError(
-                    "Stripe association event identity is invalid"
+                raise SupportAssociationIntegrityError(
+                    "support association event identity is invalid"
                 )
         for source_key, target in targets.items():
             if (
                 _OPAQUE_KEY_RE.fullmatch(source_key or "") is None
                 or not isinstance(target, dict)
                 or set(target) != _TARGET_RECORD_KEYS
+                or not isinstance(target.get("provider"), str)
+                or re.fullmatch(r"[a-z][a-z0-9_]{1,47}", target["provider"]) is None
                 or _OPAQUE_KEY_RE.fullmatch(target.get("subject_key") or "") is None
                 or target.get("kind") not in {
                     "one_time_contribution", "recurring_started",
@@ -743,8 +969,8 @@ class FileStripeAssociationStore:
                     and _OPAQUE_KEY_RE.fullmatch(target["contract_key"]) is None
                 )
             ):
-                raise StripeAssociationIntegrityError(
-                    "Stripe association target is invalid"
+                raise SupportAssociationIntegrityError(
+                    "support association target is invalid"
                 )
         for values in associations.values():
             if not all(
@@ -752,8 +978,8 @@ class FileStripeAssociationStore:
                 and source_key in targets
                 for key, source_key in values.items()
             ):
-                raise StripeAssociationIntegrityError(
-                    "Stripe provider association is invalid"
+                raise SupportAssociationIntegrityError(
+                    "support provider association is invalid"
                 )
         for source_key, values in adjustments.items():
             if (
@@ -763,8 +989,8 @@ class FileStripeAssociationStore:
                 or not all(type(value) is int and value >= 0 for value in values.values())
                 or sum(values.values()) > targets[source_key]["amount_minor"]
             ):
-                raise StripeAssociationIntegrityError(
-                    "Stripe adjustment association is invalid"
+                raise SupportAssociationIntegrityError(
+                    "support adjustment association is invalid"
                 )
         return state
 
@@ -775,24 +1001,24 @@ class FileStripeAssociationStore:
             + len(state["event_drafts"])
             + sum(len(values) for values in state["associations"].values())
         )
-        if entry_count > MAX_STRIPE_ASSOCIATION_ENTRIES:
+        if entry_count > MAX_SUPPORT_ASSOCIATION_ENTRIES:
             raise SupportWebhookError(
-                "Stripe association entry bound reached"
+                "support association entry bound reached"
             )
         payload = {
-            "schema_version": STRIPE_ASSOCIATION_SCHEMA_VERSION,
+            "schema_version": SUPPORT_ASSOCIATION_SCHEMA_VERSION,
             **state,
             "state_hmac": self._seal(state),
         }
         encoded = _canonical(payload)
-        if len(encoded) > MAX_STRIPE_ASSOCIATION_STATE_BYTES:
+        if len(encoded) > MAX_SUPPORT_ASSOCIATION_STATE_BYTES:
             raise SupportWebhookError(
-                "Stripe association state would exceed its byte bound"
+                "support association state would exceed its byte bound"
             )
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if self.path.parent.resolve(strict=False) != self.path.parent:
             raise SupportWebhookError(
-                "Stripe association directory must not use symlinks"
+                "support association directory must not use symlinks"
             )
         descriptor, temp_name = tempfile.mkstemp(
             prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent,
@@ -810,7 +1036,7 @@ class FileStripeAssociationStore:
             os.replace(temp_name, self.path)
             if os.name != "nt" and stat.S_IMODE(self.path.stat().st_mode) != 0o600:
                 raise SupportWebhookError(
-                    "Stripe association permissions are unsafe"
+                    "support association permissions are unsafe"
                 )
             try:
                 directory = os.open(self.path.parent, os.O_RDONLY)
@@ -829,6 +1055,7 @@ class FileStripeAssociationStore:
     @staticmethod
     def _target_record(draft: ContributionEventDraft) -> dict[str, Any]:
         return {
+            "provider": draft.provider,
             "subject_key": draft.subject_key,
             "kind": draft.kind,
             "amount_minor": draft.amount_minor,
@@ -923,8 +1150,8 @@ class FileStripeAssociationStore:
                     )
                 target = self._target_record(selected)
                 if selected.source_event_key in state["targets"]:
-                    raise StripeAssociationIntegrityError(
-                        "Stripe association target is incomplete"
+                    raise SupportAssociationIntegrityError(
+                        "support association target is incomplete"
                     )
                 for kind, key in associations.items():
                     current = state["associations"][kind].get(key)
@@ -1005,7 +1232,7 @@ class FileStripeAssociationStore:
                     )
                 totals[bucket] += delta
                 draft = ContributionEventDraft(
-                    provider=STRIPE_BMAC_SUPPORT_EVIDENCE_CONTRACT.provider_id,
+                    provider=target["provider"],
                     source_event_key=source_event_key,
                     subject_key=target["subject_key"],
                     kind=kind,
@@ -1059,7 +1286,7 @@ class FileStripeAssociationStore:
                         "Stripe cancellation origin is invalid"
                     )
                 draft = ContributionEventDraft(
-                    provider=STRIPE_BMAC_SUPPORT_EVIDENCE_CONTRACT.provider_id,
+                    provider=target["provider"],
                     source_event_key=source_event_key,
                     subject_key=target["subject_key"],
                     kind="recurring_canceled",
@@ -1071,6 +1298,20 @@ class FileStripeAssociationStore:
                 state["event_drafts"][source_event_key] = _draft_record(draft)
                 self._write(state)
                 return draft
+
+
+class FileBmacAssociationStore(FileSupportAssociationStore):
+    CANONICAL_PATH = (
+        Path(__file__).resolve().parents[1]
+        / "storage" / "support" / "bmac_associations.json"
+    )
+
+
+class FileDirectStripeAssociationStore(FileSupportAssociationStore):
+    CANONICAL_PATH = (
+        Path(__file__).resolve().parents[1]
+        / "storage" / "support" / "direct_stripe_associations.json"
+    )
 
 
 def _stripe_currency(value: Any) -> str:
@@ -1099,28 +1340,28 @@ def _stripe_occurred_at(payload: Mapping[str, Any]) -> str:
         raise WebhookPayloadError("Stripe event creation time is invalid") from error
 
 
-class StripeBmacSupportWebhookAdapter:
-    """Shared-creator private Stripe/BMaC translation; never provider setup."""
+class DirectStripeSupportWebhookAdapter:
+    """Optional generic direct-Stripe support infrastructure; disabled."""
 
-    provider_id = STRIPE_BMAC_SUPPORT_EVIDENCE_CONTRACT.provider_id
-    production_ready = True
+    provider_id = DIRECT_STRIPE_SUPPORT_EVIDENCE_CONTRACT.provider_id
+    production_ready = False
     verification_method = "signed_webhook"
 
     def __init__(
         self,
-        config: StripeBmacWebhookConfig,
+        config: DirectStripeWebhookConfig,
         *,
         association_path: str | os.PathLike[str] | None = None,
         allow_test_path: bool = False,
     ):
-        if not isinstance(config, StripeBmacWebhookConfig):
+        if not isinstance(config, DirectStripeWebhookConfig):
             raise SupportWebhookError("Stripe support config is required")
         self.config = config
         self._verifier = StripeWebhookVerifier(
             config.signing_secret,
             timestamp_tolerance_seconds=config.timestamp_tolerance_seconds,
         )
-        self._associations = FileStripeAssociationStore(
+        self._associations = FileDirectStripeAssociationStore(
             association_path,
             integrity_key=config.association_integrity_key,
             allow_test_path=allow_test_path,
@@ -1130,8 +1371,8 @@ class StripeBmacSupportWebhookAdapter:
     def from_environment(
         cls,
         env: Mapping[str, str] | None = None,
-    ) -> "StripeBmacSupportWebhookAdapter":
-        return cls(StripeBmacWebhookConfig.from_environment(env))
+    ) -> "DirectStripeSupportWebhookAdapter":
+        return cls(DirectStripeWebhookConfig.from_environment(env))
 
     def __repr__(self) -> str:
         return (
@@ -1257,10 +1498,15 @@ class StripeBmacSupportWebhookAdapter:
                         )
         if any(len(values) > 1 for values in identifiers.values()):
             raise WebhookPayloadError("Stripe invoice payment is ambiguous")
-        result = {
-            kind: self._association(kind, next(iter(values)))
-            for kind, values in identifiers.items() if values
-        }
+        result: dict[str, str] = {}
+        if identifiers["charge"]:
+            result["payment"] = self._association(
+                "charge", next(iter(identifiers["charge"])),
+            )
+        if identifiers["payment_intent"]:
+            result["transaction"] = self._association(
+                "payment_intent", next(iter(identifiers["payment_intent"])),
+            )
         if not result:
             raise WebhookPayloadError(
                 "Stripe invoice has no immutable payment association"
@@ -1329,7 +1575,7 @@ class StripeBmacSupportWebhookAdapter:
             )
             return self._associations.record_funding(
                 draft,
-                {"payment_intent": self._association(
+                {"transaction": self._association(
                     "payment_intent", payment_intent,
                 )},
             )
@@ -1375,13 +1621,13 @@ class StripeBmacSupportWebhookAdapter:
             charge = self._object(payload, "charge")
             charge_id = _stripe_identifier(charge.get("id"), "ch")
             associations = {
-                "charge": self._association("charge", charge_id),
+                "payment": self._association("charge", charge_id),
             }
             if charge.get("payment_intent") is not None:
                 payment_intent = _stripe_identifier(
                     charge.get("payment_intent"), "pi",
                 )
-                associations["payment_intent"] = self._association(
+                associations["transaction"] = self._association(
                     "payment_intent", payment_intent,
                 )
             return self._associations.record_adjustment(
@@ -1398,7 +1644,7 @@ class StripeBmacSupportWebhookAdapter:
             dispute = self._object(payload, "dispute")
             _stripe_identifier(dispute.get("id"), "du")
             associations = {
-                "charge": self._association(
+                "payment": self._association(
                     "charge", _stripe_identifier(dispute.get("charge"), "ch"),
                 ),
             }
@@ -1406,7 +1652,7 @@ class StripeBmacSupportWebhookAdapter:
                 payment_intent = _stripe_identifier(
                     dispute.get("payment_intent"), "pi",
                 )
-                associations["payment_intent"] = self._association(
+                associations["transaction"] = self._association(
                     "payment_intent", payment_intent,
                 )
             return self._associations.record_adjustment(
@@ -1434,6 +1680,267 @@ class StripeBmacSupportWebhookAdapter:
             )
 
         raise WebhookPayloadError("Stripe support event type is unsupported")
+
+
+def _bmac_integer_reference(value: Any, *, label: str) -> int:
+    if (
+        type(value) is not int
+        or not 1 <= value <= 9_223_372_036_854_775_807
+    ):
+        raise WebhookPayloadError(f"BMaC {label} is invalid")
+    return value
+
+
+def _bmac_string_reference(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or not 1 <= len(value) <= 1_024:
+        raise WebhookPayloadError(f"BMaC {label} is invalid")
+    return value
+
+
+def _bmac_currency(value: Any) -> str:
+    if not isinstance(value, str) or _CURRENCY_RE.fullmatch(value) is None:
+        raise WebhookPayloadError("BMaC currency is invalid")
+    return value
+
+
+def _bmac_minor_amount(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+        raise WebhookPayloadError("BMaC amount is invalid")
+    try:
+        amount = Decimal(str(value))
+        minor = amount * 100
+    except (InvalidOperation, ValueError) as error:
+        raise WebhookPayloadError("BMaC amount is invalid") from error
+    if (
+        not amount.is_finite()
+        or amount <= 0
+        or minor != minor.to_integral_value()
+        or minor > 10_000_000_000
+    ):
+        raise WebhookPayloadError("BMaC amount is invalid")
+    return int(minor)
+
+
+def _bmac_flag(value: Any, *, label: str) -> bool:
+    if value is True or value == "true":
+        return True
+    if value is False or value == "false":
+        return False
+    raise WebhookPayloadError(f"BMaC {label} is invalid")
+
+
+class BmacSupportWebhookAdapter:
+    """Native signed BMaC lifecycle adapter for the shared creator surface."""
+
+    provider_id = BMAC_SUPPORT_EVIDENCE_CONTRACT.provider_id
+    production_ready = True
+    verification_method = "signed_webhook"
+
+    def __init__(
+        self,
+        config: BmacWebhookConfig,
+        *,
+        association_path: str | os.PathLike[str] | None = None,
+        allow_test_path: bool = False,
+    ):
+        if not isinstance(config, BmacWebhookConfig):
+            raise SupportWebhookError("native BMaC support config is required")
+        self.config = config
+        self._verifier = BmacWebhookVerifier(config.signing_secret)
+        self._associations = FileBmacAssociationStore(
+            association_path,
+            integrity_key=config.association_integrity_key,
+            allow_test_path=allow_test_path,
+        )
+
+    @classmethod
+    def from_environment(
+        cls,
+        env: Mapping[str, str] | None = None,
+    ) -> "BmacSupportWebhookAdapter":
+        return cls(BmacWebhookConfig.from_environment(env))
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(provider_id={self.provider_id!r}, "
+            f"live_mode={self.config.live_mode!r})"
+        )
+
+    def _verified_payload(
+        self,
+        raw_body: bytes,
+        headers: Mapping[str, str],
+        *,
+        received_at: datetime | str,
+    ) -> dict[str, Any]:
+        payload = self._verifier.verify_event(
+            raw_body, headers, received_at=received_at,
+        )
+        if payload["live_mode"] is not self.config.live_mode:
+            raise WebhookPayloadError("BMaC live_mode does not match config")
+        return payload
+
+    def _opaque(self, namespace: str, value: Any) -> str:
+        return opaque_key(namespace, str(value), self.config.identity_secret)
+
+    def _source_event_key(self, payload: Mapping[str, Any]) -> str:
+        event_id = _bmac_integer_reference(
+            payload.get("event_id"), label="event_id",
+        )
+        return self._opaque("bmac_event", event_id)
+
+    def _supporter_key(self, data: Mapping[str, Any]) -> str:
+        supporter_id = _bmac_integer_reference(
+            data.get("supporter_id"), label="supporter_id",
+        )
+        return self._opaque("bmac_supporter", supporter_id)
+
+    def _subject_key(self, supporter_key: str) -> str:
+        # No email/name matching. An absent explicit opaque association keeps
+        # the event on its provider subject, pending a later owner link.
+        return self.config.account_links.get(supporter_key, supporter_key)
+
+    def _subscription_key(self, data: Mapping[str, Any]) -> str:
+        subscription_id = _bmac_integer_reference(
+            data.get("id"), label="subscription id",
+        )
+        psp_id = _bmac_string_reference(
+            data.get("psp_id"), label="subscription PSP reference",
+        )
+        return self._opaque(
+            "bmac_subscription", f"{subscription_id}\0{psp_id}",
+        )
+
+    def verified_event_identity(
+        self,
+        raw_body: bytes,
+        headers: Mapping[str, str],
+        *,
+        received_at: datetime | str,
+    ) -> tuple[str, str]:
+        payload = self._verified_payload(
+            raw_body, headers, received_at=received_at,
+        )
+        return self.provider_id, self._source_event_key(payload)
+
+    def verify_and_translate(
+        self,
+        raw_body: bytes,
+        headers: Mapping[str, str],
+        *,
+        received_at: datetime | str,
+        recorded_event: ContributionEvent | None = None,
+    ) -> ContributionEventDraft:
+        del recorded_event
+        payload = self._verified_payload(
+            raw_body, headers, received_at=received_at,
+        )
+        event_type = payload["type"]
+        data = payload["data"]
+        occurred_at = _iso(
+            datetime.fromtimestamp(payload["created"], tz=timezone.utc)
+        )
+        source_event_key = self._source_event_key(payload)
+        supporter_key = self._supporter_key(data)
+        subject_key = self._subject_key(supporter_key)
+
+        if event_type in {"donation.created", "donation.refunded"}:
+            if data.get("object") != "payment":
+                raise WebhookPayloadError("BMaC donation object is invalid")
+            payment_id = _bmac_integer_reference(
+                data.get("id"), label="payment id",
+            )
+            transaction_id = _bmac_string_reference(
+                data.get("transaction_id"), label="transaction reference",
+            )
+            associations = {
+                "payment": self._opaque("bmac_payment", payment_id),
+                "transaction": self._opaque(
+                    "bmac_transaction", transaction_id,
+                ),
+            }
+            amount_minor = _bmac_minor_amount(data.get("amount"))
+            currency = _bmac_currency(data.get("currency"))
+            if event_type == "donation.created":
+                if (
+                    data.get("status") != "succeeded"
+                    or _bmac_flag(data.get("refunded"), label="refunded")
+                ):
+                    raise WebhookPayloadError("BMaC donation is not settled")
+                return self._associations.record_funding(
+                    ContributionEventDraft(
+                        provider=self.provider_id,
+                        source_event_key=source_event_key,
+                        subject_key=subject_key,
+                        kind="one_time_contribution",
+                        occurred_at=occurred_at,
+                        amount_minor=amount_minor,
+                        currency=currency,
+                    ),
+                    associations,
+                )
+            if (
+                data.get("status") != "refunded"
+                or not _bmac_flag(data.get("refunded"), label="refunded")
+            ):
+                raise WebhookPayloadError("BMaC refund is not settled")
+            return self._associations.record_adjustment(
+                source_event_key=source_event_key,
+                kind="refund",
+                occurred_at=occurred_at,
+                amount_minor=amount_minor,
+                currency=currency,
+                associations=associations,
+                cumulative_refund=True,
+            )
+
+        family = (
+            "membership" if event_type.startswith("membership.")
+            else "recurring_donation"
+        )
+        if data.get("object") != family:
+            raise WebhookPayloadError("BMaC subscription object is invalid")
+        subscription_key = self._subscription_key(data)
+        status = data.get("status")
+        canceled = _bmac_flag(data.get("canceled"), label="canceled")
+        paused = _bmac_flag(data.get("paused"), label="paused")
+        is_started = event_type.endswith(".started")
+        is_updated = event_type.endswith(".updated")
+        is_cancelled = event_type.endswith(".cancelled")
+        is_paused = event_type == "membership.paused"
+        if is_cancelled or is_paused or (
+            is_updated and (status in {"canceled", "paused"} or canceled or paused)
+        ):
+            if is_cancelled and (status != "canceled" or not canceled):
+                raise WebhookPayloadError("BMaC subscription is not canceled")
+            if is_paused and (status != "paused" or not paused):
+                raise WebhookPayloadError("BMaC membership is not paused")
+            return self._associations.record_cancellation(
+                source_event_key=source_event_key,
+                occurred_at=occurred_at,
+                subscription_key=subscription_key,
+            )
+        if (
+            not (is_started or is_updated)
+            or status != "active"
+            or canceled
+            or paused
+        ):
+            raise WebhookPayloadError("BMaC subscription lifecycle is invalid")
+        kind = "recurring_started" if is_started else "recurring_renewed"
+        draft = ContributionEventDraft(
+            provider=self.provider_id,
+            source_event_key=source_event_key,
+            subject_key=subject_key,
+            kind=kind,
+            occurred_at=occurred_at,
+            amount_minor=_bmac_minor_amount(data.get("amount")),
+            currency=_bmac_currency(data.get("currency")),
+            contract_key=subscription_key,
+        )
+        return self._associations.record_funding(
+            draft, {"subscription": subscription_key},
+        )
 
 class SupportWebhookAdapter(Protocol):
     provider_id: str

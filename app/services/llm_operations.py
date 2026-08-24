@@ -1,12 +1,12 @@
-"""Bounded, in-memory lifecycle tracking for LLM operations.
+"""Bounded lifecycle tracking for LLM operations.
 
 Preparation state is content-free. Public Chat and route lifecycle state retains
 only bounded generated partial/final output needed for exact owner/project
 recovery; effective input, prompt text, messages, media references, provider
 selection, rejected-attempt output, and exception text are never projected.
-Private terminal route results are exact-scope snapshots, never persisted, and
-are copied again on read. All records disappear on eviction, TTL expiry, or
-process restart.
+Private terminal route results are exact-scope snapshots copied again on read.
+Generic Chat and route records remain in memory; Prompt Enhance delegates its
+durable ordinary-queue state and private result references to its bound store.
 """
 
 from __future__ import annotations
@@ -18,9 +18,9 @@ import math
 import threading
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 from services.llm_cancellation import (
     LlmCancellationHandle,
@@ -65,6 +65,24 @@ class LlmRouteOperationConflictError(ValueError):
 
 class LlmRouteAdmissionError(RuntimeError):
     """The bounded route executor has no free admission slot."""
+
+
+class PromptEnhancementOperationStore(Protocol):
+    """Persistence boundary required by the durable Prompt Enhance manager."""
+
+    def bind(self, **scope: Any) -> tuple[dict[str, Any] | None, bool, str | None]: ...
+
+    def status(self, request_id: str, **scope: Any) -> dict[str, Any] | None: ...
+
+    def mark_running(self, request_id: str, **scope: Any) -> dict[str, Any] | None: ...
+
+    def complete(self, request_id: str, *, result: Any, **scope: Any) -> dict[str, Any] | None: ...
+
+    def fail(self, request_id: str, **scope: Any) -> dict[str, Any] | None: ...
+
+    def cancel(self, request_id: str, **scope: Any) -> dict[str, Any] | None: ...
+
+    def result(self, request_id: str, **scope: Any) -> Any: ...
 
 
 def _request_operation_evictable(operation: Any) -> bool:
@@ -1276,6 +1294,448 @@ class LlmRouteOperationManager:
         if cancellation is not None:
             cancellation.cancel()
         return public
+
+
+@dataclass
+class _PromptEnhancementRuntimeOperation:
+    request_id: str
+    account_key: str
+    project_instance_key: str
+    session_key: str
+    request_digest: str
+    claim_token: str
+    cancellation: LlmCancellationHandle
+    phase: str = "queued"
+    stage: str = "queued"
+    partial_text: str = ""
+    token_count: int = 0
+    elapsed_seconds: float = 0.0
+    live_tps: float | None = None
+    average_tps: float | None = None
+    worker_task: asyncio.Task[Any] | None = None
+    task: asyncio.Task[None] | None = None
+
+
+class PromptEnhancementOperationManager:
+    """Run Prompt Enhance through an injected canonical job store.
+
+    The store owns ordinary durable admission, lifecycle transitions, restart
+    reconciliation, and private result references.  This manager owns only
+    current-process execution, cancellation, and bounded private progress.
+    Constructing the manager is read-only and can never auto-execute or mutate
+    legacy sidecar records.
+    """
+
+    def __init__(self, store: PromptEnhancementOperationStore) -> None:
+        self._store = store
+        self._lock = threading.RLock()
+        self._active: dict[str, _PromptEnhancementRuntimeOperation] = {}
+
+    @staticmethod
+    def _scope(
+        operation: _PromptEnhancementRuntimeOperation,
+    ) -> dict[str, str]:
+        return {
+            "account_key": operation.account_key,
+            "project_instance_key": operation.project_instance_key,
+            "session_key": operation.session_key,
+        }
+
+    @staticmethod
+    def _claim_scope(
+        operation: _PromptEnhancementRuntimeOperation,
+    ) -> dict[str, str]:
+        return {
+            **PromptEnhancementOperationManager._scope(operation),
+            "request_digest": operation.request_digest,
+            "claim_token": operation.claim_token,
+        }
+
+    @staticmethod
+    def _same_runtime_scope(
+        operation: _PromptEnhancementRuntimeOperation,
+        *,
+        account_key: str,
+        project_instance_key: str,
+        session_key: str,
+    ) -> bool:
+        return (
+            isinstance(account_key, str)
+            and isinstance(project_instance_key, str)
+            and isinstance(session_key, str)
+            and hmac.compare_digest(operation.account_key, account_key)
+            and hmac.compare_digest(
+                operation.project_instance_key, project_instance_key,
+            )
+            and hmac.compare_digest(operation.session_key, session_key)
+        )
+
+    @staticmethod
+    def _clear_progress(operation: _PromptEnhancementRuntimeOperation) -> None:
+        operation.partial_text = ""
+        operation.token_count = 0
+        operation.elapsed_seconds = 0.0
+        operation.live_tps = None
+        operation.average_tps = None
+
+    def _progress(
+        self,
+        operation: _PromptEnhancementRuntimeOperation,
+        event: Mapping[str, Any],
+    ) -> None:
+        if not isinstance(event, Mapping):
+            return
+        durable_event: dict[str, Any] | None = None
+        with self._lock:
+            if self._active.get(operation.request_id) is not operation:
+                return
+            phase = event.get("phase")
+            if isinstance(phase, str) and phase in _ROUTE_PROGRESS_PHASES:
+                operation.phase = phase
+            stage = event.get("stage")
+            if (
+                isinstance(stage, str)
+                and 1 <= len(stage) <= 64
+                and all(
+                    character.isalnum() or character in "_-"
+                    for character in stage
+                )
+            ):
+                operation.stage = stage
+            text = event.get("text")
+            if isinstance(text, str):
+                operation.partial_text = text[-ROUTE_PROGRESS_MAX_CHARS:]
+            tokens = event.get("generated_tokens_approx")
+            if (
+                isinstance(tokens, int)
+                and not isinstance(tokens, bool)
+                and tokens >= 0
+            ):
+                operation.token_count = min(tokens, 10_000_000)
+            elapsed = event.get("elapsed_seconds")
+            if (
+                isinstance(elapsed, (int, float))
+                and not isinstance(elapsed, bool)
+                and math.isfinite(float(elapsed))
+                and elapsed >= 0
+            ):
+                operation.elapsed_seconds = min(float(elapsed), 31_536_000.0)
+            for field_name in ("live_tps", "average_tps"):
+                value = event.get(field_name)
+                if value is None and event.get("done") is True:
+                    setattr(operation, field_name, None)
+                elif (
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(float(value))
+                    and value >= 0
+                ):
+                    setattr(operation, field_name, float(value))
+            durable_event = {
+                "phase": operation.phase,
+                "stage": operation.stage,
+                "generated_tokens_approx": operation.token_count,
+                "elapsed_seconds": operation.elapsed_seconds,
+            }
+        publish = getattr(self._store, "progress", None)
+        if callable(publish) and durable_event is not None:
+            publish(
+                operation.request_id,
+                event=durable_event,
+                **self._claim_scope(operation),
+            )
+
+    def _with_runtime_progress(
+        self,
+        public: dict[str, Any],
+        operation: _PromptEnhancementRuntimeOperation | None,
+    ) -> dict[str, Any]:
+        result = dict(public)
+        if operation is None or result.get("status") not in {"queued", "running"}:
+            return result
+        result.update({
+            "phase": operation.phase,
+            "stage": operation.stage,
+            "partial_text": operation.partial_text,
+            "generated_tokens_approx": operation.token_count,
+            "elapsed_seconds": operation.elapsed_seconds,
+            "live_tps": operation.live_tps,
+            "average_tps": operation.average_tps,
+        })
+        return result
+
+    def submit(
+        self,
+        *,
+        request_id: str,
+        account_key: str,
+        project_instance_key: str,
+        session_key: str,
+        request_digest: str,
+        execute: Callable[
+            [Callable[[dict[str, Any]], None], LlmCancellationHandle],
+            Awaitable[Any],
+        ],
+        job_context: Mapping[str, Any] | None = None,
+        admit: Callable[[], bool] = lambda: True,
+        release: Callable[[], None] = lambda: None,
+    ) -> dict[str, Any] | None:
+        """Bind once and start only a newly admitted explicit request."""
+        if not callable(execute) or not callable(admit) or not callable(release):
+            raise TypeError("execute, admit, and release must be callable")
+        bind_scope = {
+            "request_id": request_id,
+            "account_key": account_key,
+            "project_instance_key": project_instance_key,
+            "session_key": session_key,
+            "request_digest": request_digest,
+        }
+        if job_context is not None:
+            bind_scope["job_context"] = dict(job_context)
+        public, created, claim_token = self._store.bind(
+            **bind_scope,
+        )
+        if public is None or not created:
+            if public is None:
+                return None
+            normalized = str(public.get("request_id") or "")
+            with self._lock:
+                operation = self._active.get(normalized)
+                if operation is not None and not self._same_runtime_scope(
+                    operation,
+                    account_key=account_key,
+                    project_instance_key=project_instance_key,
+                    session_key=session_key,
+                ):
+                    operation = None
+            return self._with_runtime_progress(public, operation)
+        if not isinstance(claim_token, str) or not claim_token:
+            raise RuntimeError("Prompt Enhance recovery claim is missing")
+        if not admit():
+            self._store.fail(
+                str(public["request_id"]),
+                failure_code="admission_failed",
+                account_key=account_key,
+                project_instance_key=project_instance_key,
+                session_key=session_key,
+                request_digest=request_digest,
+                claim_token=claim_token,
+            )
+            raise LlmRouteAdmissionError
+        normalized = str(public["request_id"])
+        operation = _PromptEnhancementRuntimeOperation(
+            request_id=normalized,
+            account_key=account_key,
+            project_instance_key=project_instance_key,
+            session_key=session_key,
+            request_digest=request_digest,
+            claim_token=claim_token,
+            cancellation=LlmCancellationHandle(),
+        )
+        release_once = _ReleaseOnce(release)
+        with self._lock:
+            self._active[normalized] = operation
+            try:
+                operation.task = asyncio.create_task(
+                    self._run(operation, execute, release_once),
+                )
+            except Exception:
+                self._active.pop(normalized, None)
+                self._store.fail(
+                    normalized,
+                    failure_code="execution_start_failed",
+                    **self._claim_scope(operation),
+                )
+                release_once()
+                raise
+
+            def finish(done: asyncio.Task[None]) -> None:
+                if done.cancelled():
+                    try:
+                        self._store.fail(
+                            normalized,
+                            failure_code="execution_interrupted",
+                            **self._claim_scope(operation),
+                        )
+                    except Exception:  # noqa: BLE001 - callback cannot recover
+                        pass
+                with self._lock:
+                    if self._active.get(normalized) is operation:
+                        self._active.pop(normalized, None)
+                release_once()
+                try:
+                    done.exception()
+                except asyncio.CancelledError:
+                    pass
+
+            operation.task.add_done_callback(finish)
+        return self._with_runtime_progress(public, operation)
+
+    async def _run(
+        self,
+        operation: _PromptEnhancementRuntimeOperation,
+        execute: Callable[
+            [Callable[[dict[str, Any]], None], LlmCancellationHandle],
+            Awaitable[Any],
+        ],
+        release_once: _ReleaseOnce,
+    ) -> None:
+        worker_task: asyncio.Task[Any] | None = None
+        try:
+            running = await asyncio.to_thread(
+                self._store.mark_running,
+                operation.request_id,
+                **self._claim_scope(operation),
+            )
+            if running is None or running.get("status") != "running":
+                return
+            with self._lock:
+                if self._active.get(operation.request_id) is not operation:
+                    return
+                operation.cancellation.checkpoint()
+                operation.phase = "inference"
+                operation.stage = "inference"
+                runtime_context_provider = getattr(
+                    self._store, "runtime_context", None,
+                )
+                runtime_context = (
+                    runtime_context_provider(
+                        operation.request_id, **self._scope(operation),
+                    )
+                    if callable(runtime_context_provider) else None
+                )
+                execution = (
+                    execute(
+                        lambda event: self._progress(operation, event),
+                        operation.cancellation,
+                        runtime_context,
+                    )
+                    if runtime_context is not None else execute(
+                        lambda event: self._progress(operation, event),
+                        operation.cancellation,
+                    )
+                )
+                worker_task = asyncio.create_task(execution)
+                operation.worker_task = worker_task
+            result = await asyncio.shield(worker_task)
+            operation.cancellation.checkpoint()
+            completed = self._store.complete(
+                operation.request_id,
+                result=copy.deepcopy(result),
+                **self._claim_scope(operation),
+            )
+            if completed is not None and completed.get("status") == "completed":
+                with self._lock:
+                    operation.phase = "completed"
+                    operation.stage = "completed"
+                    operation.live_tps = None
+                    operation.average_tps = None
+        except LlmRequestCancelled:
+            self._store.cancel(
+                operation.request_id, **self._scope(operation),
+            )
+            with self._lock:
+                self._clear_progress(operation)
+        except asyncio.CancelledError:
+            operation.cancellation.cancel()
+            self._store.fail(
+                operation.request_id,
+                failure_code="execution_interrupted",
+                **self._claim_scope(operation),
+            )
+            if worker_task is not None:
+                while not worker_task.done():
+                    try:
+                        await asyncio.shield(worker_task)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:  # noqa: BLE001 - cleanup only
+                        break
+            raise
+        except Exception:  # noqa: BLE001 - durable failure stays redacted
+            self._store.fail(
+                operation.request_id,
+                failure_code="execution_failed",
+                **self._claim_scope(operation),
+            )
+            with self._lock:
+                self._clear_progress(operation)
+        finally:
+            with self._lock:
+                if operation.worker_task is worker_task:
+                    operation.worker_task = None
+            release_slot = getattr(self._store, "release", None)
+            if callable(release_slot):
+                release_slot(
+                    operation.request_id, **self._scope(operation),
+                )
+            release_once()
+
+    def status(
+        self,
+        request_id: str,
+        *,
+        account_key: str,
+        project_instance_key: str,
+        session_key: str,
+    ) -> dict[str, Any] | None:
+        scope = {
+            "account_key": account_key,
+            "project_instance_key": project_instance_key,
+            "session_key": session_key,
+        }
+        public = self._store.status(request_id, **scope)
+        if public is None:
+            return None
+        normalized = str(public.get("request_id") or "")
+        with self._lock:
+            operation = self._active.get(normalized)
+            if operation is not None and not self._same_runtime_scope(
+                operation, **scope,
+            ):
+                operation = None
+        return self._with_runtime_progress(public, operation)
+
+    async def wait(self, request_id: str, **scope: Any) -> dict[str, Any] | None:
+        """Await this process's task while shielding it from waiter loss."""
+        public = self.status(request_id, **scope)
+        if public is None:
+            return None
+        normalized = str(public.get("request_id") or "")
+        with self._lock:
+            operation = self._active.get(normalized)
+            task = operation.task if operation is not None else None
+        if task is not None:
+            await asyncio.shield(task)
+        return self.status(normalized, **scope)
+
+    def cancel(self, request_id: str, **scope: Any) -> dict[str, Any] | None:
+        """Cancel exact durable state before closing current-process work."""
+        public = self._store.cancel(request_id, **scope)
+        if public is None:
+            return None
+        normalized = str(public.get("request_id") or "")
+        cancellation = None
+        with self._lock:
+            operation = self._active.get(normalized)
+            if operation is not None and self._same_runtime_scope(
+                operation, **scope,
+            ):
+                self._clear_progress(operation)
+                cancellation = operation.cancellation
+        if cancellation is not None:
+            cancellation.cancel()
+        return public
+
+    def result(
+        self, request_id: str, *, consume: bool = False, **scope: Any,
+    ) -> Any:
+        """Read or atomically consume one exact private durable result."""
+        return self._store.result(request_id, consume=consume, **scope)
+
+    def consume_result(self, request_id: str, **scope: Any) -> Any:
+        """Consume one result while retaining bounded completed metadata."""
+        return self.result(request_id, consume=True, **scope)
 
 
 async def run_blocking_shielded(

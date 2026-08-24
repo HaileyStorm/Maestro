@@ -7,12 +7,28 @@ pipeline uses the ConvRot checkpoints and semantic decoder adapted from
 WanGP; the original Diffusers-style pipeline remains available as a fallback.
 """
 
-from .condition_encoder import MiniMaxMusic3ConditionEncoder
-from .optimized_pipeline import MiniMaxMusic3Pipeline
-from .pipeline import MiniMaxMusic3Pipeline as LegacyMiniMaxMusic3Pipeline
-from .rvq_depth_decoder import MiniMaxMusic3RVQDepthDecoder
-from .transformer import MiniMaxMusic3Transformer1DModel
-from .vocoder import MiniMaxMusic3Vocoder
+from importlib import import_module
+
+_LAZY_EXPORTS = {
+    "MiniMaxMusic3ConditionEncoder": (".condition_encoder", "MiniMaxMusic3ConditionEncoder"),
+    "LegacyMiniMaxMusic3Pipeline": (".pipeline", "MiniMaxMusic3Pipeline"),
+    "MiniMaxMusic3Pipeline": (".optimized_pipeline", "MiniMaxMusic3Pipeline"),
+    "MiniMaxMusic3RVQDepthDecoder": (".rvq_depth_decoder", "MiniMaxMusic3RVQDepthDecoder"),
+    "MiniMaxMusic3Transformer1DModel": (".transformer", "MiniMaxMusic3Transformer1DModel"),
+    "MiniMaxMusic3Vocoder": (".vocoder", "MiniMaxMusic3Vocoder"),
+}
+
+
+def __getattr__(name):
+    """Load neural-network components only when a caller actually requests one."""
+
+    target = _LAZY_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(name)
+    module_name, attribute_name = target
+    value = getattr(import_module(module_name, __name__), attribute_name)
+    globals()[name] = value
+    return value
 
 __all__ = [
     "MiniMaxMusic3ConditionEncoder",

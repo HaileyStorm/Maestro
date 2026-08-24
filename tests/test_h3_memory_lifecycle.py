@@ -1646,6 +1646,16 @@ class H3LlmExclusionTests(unittest.TestCase):
     def test_local_llm_load_releases_resident_h3_before_model_lease(self):
         events = []
 
+        class NativeGpuLock:
+            def acquire(self, blocking=True):
+                events.append("native-acquire")
+                return True
+
+            def release(self):
+                events.append("native-release")
+
+        native_gpu_lock = NativeGpuLock()
+
         class Lease:
             def __enter__(self):
                 events.append("llm-lease")
@@ -1663,11 +1673,22 @@ class H3LlmExclusionTests(unittest.TestCase):
                 wan_model=object(),
                 offloadobj=object(),
                 release_model=lambda: events.append("h3-release"),
+                acquire_native_gpu_execution_lock=(
+                    lambda: native_gpu_lock.acquire()
+                ),
+                native_gpu_execution_lock=native_gpu_lock,
             ),
+            "_wgp_native_gpu_slot_state": threading.local(),
         }
         _load(
             "app/launch.py",
-            ("_run_llm_with_selection",),
+            (
+                "_WgpNativeGpuWaitCancelled",
+                "_WgpNativeGpuExecutionSlot",
+                "_release_wgp_model_with_native_gpu_exclusion",
+                "_local_llm_uses_native_gpu",
+                "_run_llm_with_selection",
+            ),
             namespace,
         )
 
@@ -1679,8 +1700,69 @@ class H3LlmExclusionTests(unittest.TestCase):
         self.assertEqual(result, "done")
         self.assertEqual(
             events,
-            ["h3-release", "llm-lease", "operation", "llm-release"],
+            [
+                "native-acquire",
+                "h3-release",
+                "llm-lease",
+                "operation",
+                "llm-release",
+                "native-release",
+            ],
         )
+
+    def test_generation_yields_residency_before_flashvsr_postprocess(self):
+        events = []
+        namespace = {
+            "wan_model": object(),
+            "offloadobj": object(),
+            "torch": SimpleNamespace(
+                cuda=SimpleNamespace(
+                    is_available=lambda: False,
+                    empty_cache=lambda: events.append("empty"),
+                    ipc_collect=lambda: events.append("ipc"),
+                ),
+            ),
+            "gc": SimpleNamespace(collect=lambda: events.append("gc")),
+            "flashvsr": SimpleNamespace(
+                is_upsampling=lambda value: str(value or "").startswith("flashvsr"),
+            ),
+            "release_model": lambda: events.append("release_model"),
+            "print": lambda *_args, **_kwargs: None,
+        }
+        _load(
+            "app/wgp.py",
+            (
+                "generation_residency_must_yield_for_postprocess",
+                "release_generation_residency_for_postprocess",
+            ),
+            namespace,
+        )
+        self.assertTrue(
+            namespace["generation_residency_must_yield_for_postprocess"](
+                "flashvsr2pass2",
+            )
+        )
+        self.assertFalse(
+            namespace["generation_residency_must_yield_for_postprocess"]("")
+        )
+        self.assertTrue(namespace["release_generation_residency_for_postprocess"]())
+        self.assertEqual(events, ["release_model"])
+        wgp_source = _source("app/wgp.py")
+        self.assertIn(
+            "release_generation_residency_for_postprocess()",
+            wgp_source,
+        )
+        self.assertIn(
+            "not single_repeat_dispatch",
+            wgp_source,
+        )
+        bridge = _source("app/postprocessing/flashvsr/wgp_bridge.py")
+        self.assertIn(
+            "release_generation_residency_for_postprocess",
+            bridge,
+        )
+        self.assertIn("decode_frame_budget", bridge)
+        self.assertIn("finalization windows", bridge)
 
 
 if __name__ == "__main__":

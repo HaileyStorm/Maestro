@@ -36,6 +36,26 @@ class DropdownDeps:
     get_model_family: callable
     get_model_name: callable
     get_transformer_dtype: callable
+    get_compatible_local_model_filename: callable = None
+    locate_model_folder: callable = None
+
+
+def _get_compatible_local_file_for_status(
+    deps,
+    filename,
+    model_type,
+    file_type=0,
+    extra_paths=None,
+):
+    resolver = getattr(deps, "get_compatible_local_model_filename", None)
+    if resolver is not None:
+        return resolver(
+            filename,
+            model_type,
+            file_type=file_type,
+            extra_paths=extra_paths,
+        )
+    return deps.get_local_model_filename(filename, extra_paths=extra_paths)
 
 
 def compact_name(family_name, model_name):
@@ -103,7 +123,9 @@ def _get_status_quantization_and_dtype(deps):
     return quantization, dtype_policy
 
 
-def _append_expected_file_entry(entries, seen, filename, extra_paths=None):
+def _append_expected_file_entry(
+    entries, seen, filename, extra_paths=None, file_type=None
+):
     if not isinstance(filename, str) or len(filename) == 0:
         return
     if extra_paths is None:
@@ -112,11 +134,21 @@ def _append_expected_file_entry(entries, seen, filename, extra_paths=None):
         extra_list = [path for path in extra_paths if isinstance(path, str) and len(path) > 0]
     else:
         extra_list = [extra_paths] if isinstance(extra_paths, str) and len(extra_paths) > 0 else []
-    key = (filename.casefold(), tuple(path.casefold() for path in extra_list))
+    key = (
+        filename.casefold(),
+        tuple(path.casefold() for path in extra_list),
+        file_type,
+    )
     if key in seen:
         return
     seen.add(key)
-    entries.append({"filename": filename, "extra_paths": extra_list if len(extra_list) > 0 else None})
+    entry = {
+        "filename": filename,
+        "extra_paths": extra_list if len(extra_list) > 0 else None,
+    }
+    if file_type is not None:
+        entry["file_type"] = file_type
+    entries.append(entry)
 
 
 def _append_expected_local_path_entry(entries, seen, local_path):
@@ -129,6 +161,69 @@ def _append_expected_local_path_entry(entries, seen, local_path):
     entries.append({"path": local_path})
 
 
+def _required_runtime_asset_paths(model_def):
+    manifest = model_def.get("required_runtime_assets", {})
+    if not isinstance(manifest, dict):
+        return None
+    paths = []
+    for value in manifest.values():
+        values = value if isinstance(value, (list, tuple)) else [value]
+        for path in values:
+            if not isinstance(path, str) or not path:
+                return None
+            paths.append(path)
+    return paths
+
+
+def required_runtime_assets_ready(
+    model_def,
+    locate_file,
+    *,
+    locate_folder=None,
+):
+    """Check exact auxiliary assets, keeping processor files in one root."""
+
+    required_paths = _required_runtime_asset_paths(model_def)
+    if required_paths is None:
+        return False
+    if not required_paths:
+        return True
+
+    processor = model_def.get("required_runtime_assets", {}).get("processor", [])
+    if not isinstance(processor, (list, tuple)):
+        return False
+    processor = list(processor)
+    processor_set = set(processor)
+    if processor:
+        processor_folder = os.path.dirname(processor[0])
+        if any(os.path.dirname(path) != processor_folder for path in processor):
+            return False
+        processor_files = [os.path.basename(path) for path in processor]
+        if callable(locate_folder):
+            located_folder = locate_folder(
+                processor_folder,
+                error_if_none=False,
+                required_files=processor_files,
+            )
+            if located_folder is None or not all(
+                os.path.isfile(os.path.join(located_folder, filename))
+                for filename in processor_files
+            ):
+                return False
+        else:
+            located_processor = [locate_file(path) for path in processor]
+            if any(path is None for path in located_processor):
+                return False
+            if len({os.path.dirname(os.path.abspath(path)) for path in located_processor}) != 1:
+                return False
+
+    return all(
+        locate_file(path) is not None
+        for path in required_paths
+        if path not in processor_set
+    )
+
+
 def get_expected_core_file_entries_for_status(deps, model_type):
     model_def = deps.get_model_def(model_type)
     if model_def is None:
@@ -138,21 +233,27 @@ def get_expected_core_file_entries_for_status(deps, model_type):
     seen = set()
 
     expected_filename = deps.get_model_filename(model_type, quantization=quantization, dtype_policy=dtype_policy)
-    _append_expected_file_entry(entries, seen, expected_filename)
+    _append_expected_file_entry(entries, seen, expected_filename, file_type=0)
     if isinstance(model_def, dict) and "URLs2" in model_def:
         expected_filename2 = deps.get_model_filename(model_type, quantization=quantization, dtype_policy=dtype_policy, submodel_no=2)
-        _append_expected_file_entry(entries, seen, expected_filename2)
+        _append_expected_file_entry(entries, seen, expected_filename2, file_type=0)
 
     module_files = _get_module_files_for_status(deps, model_type, quantization, dtype_policy)
     if isinstance(module_files, list):
         for filename in module_files:
-            _append_expected_file_entry(entries, seen, filename)
+            _append_expected_file_entry(entries, seen, filename, file_type=1)
 
     text_encoder_URLs = deps.get_model_recursive_prop(model_type, "text_encoder_URLs", return_list=True)
     if text_encoder_URLs is not None:
         text_encoder_filename = deps.get_model_filename(model_type=model_type, quantization=deps.text_encoder_quantization, dtype_policy=dtype_policy, URLs=text_encoder_URLs)
         text_encoder_folder = model_def.get("text_encoder_folder", None)
-        _append_expected_file_entry(entries, seen, text_encoder_filename, extra_paths=text_encoder_folder)
+        _append_expected_file_entry(
+            entries,
+            seen,
+            text_encoder_filename,
+            extra_paths=text_encoder_folder,
+            file_type=2,
+        )
     return entries
 
 
@@ -161,7 +262,14 @@ def get_missing_core_file_entries_for_status(deps, model_type):
     for entry in get_expected_core_file_entries_for_status(deps, model_type):
         filename = entry.get("filename", "")
         extra_paths = entry.get("extra_paths", None)
-        if deps.get_local_model_filename(filename, extra_paths=extra_paths) is None:
+        file_type = entry.get("file_type", 0)
+        if _get_compatible_local_file_for_status(
+            deps,
+            filename,
+            model_type,
+            file_type=file_type,
+            extra_paths=extra_paths,
+        ) is None:
             missing_entries.append(entry)
     return missing_entries
 
@@ -172,6 +280,11 @@ def get_expected_secondary_file_entries_for_status(deps, model_type):
         return []
     entries = []
     seen = set()
+
+    required_paths = _required_runtime_asset_paths(model_def)
+    if required_paths is not None:
+        for path in required_paths:
+            _append_expected_file_entry(entries, seen, path)
 
     preload_urls = deps.get_model_recursive_prop(model_type, "preload_URLs", return_list=True)
     if preload_urls is None:
@@ -213,12 +326,33 @@ def has_secondary_model_files_for_status(deps, model_type, quantization, dtype_p
     if model_def is None:
         return True
 
+    locate_folder = getattr(deps, "locate_model_folder", None)
+    try:
+        if locate_folder is None:
+            from shared.utils import files_locator
+
+            locate_folder = files_locator.locate_folder
+    except (ImportError, AttributeError):
+        pass
+    if not required_runtime_assets_ready(
+        model_def,
+        lambda path: deps.get_local_model_filename(path),
+        locate_folder=locate_folder,
+    ):
+        return False
+
     text_encoder_URLs = deps.get_model_recursive_prop(model_type, "text_encoder_URLs", return_list=True)
     if text_encoder_URLs is not None:
         text_encoder_filename = deps.get_model_filename(model_type=model_type, quantization=deps.text_encoder_quantization, dtype_policy=dtype_policy, URLs=text_encoder_URLs)
         if isinstance(text_encoder_filename, str) and len(text_encoder_filename) > 0:
             text_encoder_folder = model_def.get("text_encoder_folder", None)
-            if deps.get_local_model_filename(text_encoder_filename, extra_paths=text_encoder_folder) is None:
+            if _get_compatible_local_file_for_status(
+                deps,
+                text_encoder_filename,
+                model_type,
+                file_type=2,
+                extra_paths=text_encoder_folder,
+            ) is None:
                 return False
 
     for prop, recursive in (("preload_URLs", True), ("VAE_URLs", False)):
@@ -254,7 +388,9 @@ def has_secondary_model_files_for_status(deps, model_type, quantization, dtype_p
     for filename in module_files:
         if not isinstance(filename, str) or len(filename) == 0:
             continue
-        if deps.get_local_model_filename(filename) is None:
+        if _get_compatible_local_file_for_status(
+            deps, filename, model_type, file_type=1
+        ) is None:
             return False
     return True
 
@@ -273,7 +409,12 @@ def get_model_download_status(deps, model_type):
 
     expected_exists = []
     for filename in expected_filenames:
-        expected_exists.append(deps.get_local_model_filename(filename) is not None)
+        expected_exists.append(
+            _get_compatible_local_file_for_status(
+                deps, filename, model_type, file_type=0
+            )
+            is not None
+        )
 
     if len(expected_exists) > 0 and all(expected_exists):
         if not has_secondary_model_files_for_status(deps, model_type, quantization, dtype_policy):
@@ -301,7 +442,9 @@ def get_model_download_status(deps, model_type):
         checked_candidates.add(candidate_key)
         if candidate_key in expected_set:
             continue
-        if deps.get_local_model_filename(candidate) is not None:
+        if _get_compatible_local_file_for_status(
+            deps, candidate, model_type, file_type=0
+        ) is not None:
             return MODEL_FILE_STATUS_PARTIAL
     return MODEL_FILE_STATUS_MISSING
 

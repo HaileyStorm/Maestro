@@ -1,24 +1,28 @@
 # Things I need from you
 
-Last updated: 2026-08-16. I will keep this list short and remove items when they
+Last updated: 2026-08-23. I will keep this list short and remove items when they
 are settled.
 
 ## Questions
 
-- What country is this computer physically in when H3 runs? Please answer with
-  the two-letter country code. Maestro will use your answer, not IP/VPN data.
-- Will Krea use be noncommercial, or commercial with annual revenue under $1M?
+- None right now.
 
 ## Needed now
 
-- Just the two answers above.
+- Nothing. The H3 operating-country declaration is already stored as Japan
+  (`JP`), remains current and available, and was not rewritten in this wave.
+- Krea use scope is settled by account role: owner-account generations are
+  noncommercial; other user-account generations are commercial under $1M. The
+  v2 backend policy and Character Sheet readiness are CPU-verified. Live Krea
+  attestation is not recorded and profile runtime remains separately gated;
+  there is no additional scope decision to make now.
 
 ## I will ask later, if needed
 
-- If H3 runs from a license-excluded country, actual written MiniMax permission
-  will still be needed. I can draft the request, but MiniMax must approve it.
 - Music and Character Sheet quality checks can wait until there are real outputs
   to review.
+- Record the live Krea v2 attestation only when its separate profile/runtime
+  gate is ready for an owner-facing acceptance step.
 
 ## Already decided
 
@@ -34,8 +38,9 @@ are settled.
 - The only owner account cannot be disabled.
 - The new shared-harness task may take over the unfinished scanner repair
   without pretending the old work was complete.
-- Use Krea where its terms allow, with one server-wide owner attestation and no
-  Maestro prompt scanning.
+- Use Krea where its terms allow, with one server-recorded v2 attestation and
+  no Maestro prompt scanning. The fixed role map is owner → noncommercial and
+  user → commercial under $1M; never accept client-selected scope.
 
 ## Nothing for you to do
 

@@ -704,6 +704,42 @@ body {
   padding-bottom: env(safe-area-inset-bottom);
 }
 
+/* The existing mobile workspace drawer carries secondary shell actions so
+ * the 320px header can reserve full-size targets for menu, queue, and account.
+ * WhatsNewButton keeps its shared compact trigger/focus contract; this wrapper
+ * expands that same button across the labelled drawer row. */
+.mobile-sidebar-whats-new {
+  position: relative;
+}
+
+.mobile-sidebar-whats-new > button {
+  width: 100%;
+  justify-content: flex-start;
+  padding-inline: 0.75rem;
+}
+
+.mobile-sidebar-whats-new > span {
+  position: absolute;
+  inset-block: 0;
+  left: 2.25rem;
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  overflow: hidden;
+  color: var(--color-text-muted);
+  font-size: 0.625rem;
+  font-weight: 500;
+  line-height: 1;
+  pointer-events: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mobile-sidebar-whats-new:hover > span,
+.mobile-sidebar-whats-new:focus-within > span {
+  color: var(--color-text-primary);
+}
+
 @media (prefers-reduced-motion: reduce) {
   html:focus-within {
     scroll-behavior: auto;

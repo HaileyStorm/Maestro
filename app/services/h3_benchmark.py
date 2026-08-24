@@ -927,6 +927,27 @@ def estimate_h3_output(
         "matched_factors": matched_factors,
         "uncertainty_reasons": uncertainty,
     }
+    try:
+        from services.h3_host_limits import evaluate_setup
+        custom = context.get("custom_settings")
+        if not isinstance(custom, Mapping):
+            custom = {}
+        decision = evaluate_setup(
+            model_type=target.get("model_type") or context.get("model_type"),
+            resolution=f"{target['width']}x{target['height']}",
+            num_inference_steps=target["sampling_steps"],
+            video_length=target.get("processed_frame_count") or context.get("video_length"),
+            duration_seconds=target.get("duration_seconds") or context.get("duration_seconds"),
+            attention_engine=custom.get("h3_attention_engine") or target.get("engine_id"),
+        )
+        estimate["host_setup_runnable"] = decision.runnable
+        estimate["host_setup_reason"] = decision.reason
+        estimate["host_max_steps"] = decision.max_steps
+        if decision.reason:
+            uncertainty.append(decision.reason)
+            estimate["uncertainty_reasons"] = list(uncertainty)
+    except Exception:
+        pass
     return add_h3_postprocess_estimate(estimate, context)
 
 

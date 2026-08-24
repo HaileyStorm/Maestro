@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, ClassVar
 
+from services.credit_runtime import terminal_credit_settlement
 from services.entitlements import exclusive_file_lease
 
 SCHEMA_VERSION = 3
@@ -36,16 +37,19 @@ _UNIT_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _UTC_TIMESTAMP_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z\Z",
 )
-_STATUSES = frozenset({"pending", "consumed", "released", "invalidated"})
+_STATUSES = frozenset({
+    "pending", "consumed", "settled", "released", "invalidated",
+})
 _RECEIPT_STATES = frozenset({
     "reconciled", "reserved", "revalidated",
-    "consumed", "released", "terminal_satisfied",
+    "consumed", "settled", "released", "terminal_satisfied",
 })
 _RECEIPT_STATE_STATUSES = {
     "reconciled": frozenset({None}),
     "reserved": frozenset({"pending", "invalidated"}),
     "revalidated": _STATUSES,
     "consumed": frozenset({"consumed"}),
+    "settled": frozenset({"settled"}),
     "released": frozenset({"released"}),
     "terminal_satisfied": frozenset({"released", "invalidated"}),
 }
@@ -79,7 +83,12 @@ DEFAULT_CREDIT_ACCOUNTING_POLICY = CreditAccountingPolicy()
 
 @dataclass(frozen=True, slots=True)
 class CreditSourceBalance:
-    """Authoritative current allowance for one opaque source lot."""
+    """Authoritative units for one opaque, non-monetary source grant.
+
+    Supporter tier bonuses reach accounting only after server policy converts
+    the promotional grant to bounded units. Currency, purchase price, cash
+    value, transfer rights, and service guarantees are intentionally absent.
+    """
 
     source_key: str
     effective_units: int
@@ -461,7 +470,7 @@ class CreditAccountingJournal:
                         allocated = _units(
                             allocation["units"], "allocated units", positive=True,
                         )
-                        if reservation["status"] == "consumed":
+                        if reservation["status"] in {"consumed", "settled"}:
                             consumed_by_source[source_key] += allocated
                         elif reservation["status"] == "pending":
                             pending_by_source[source_key] += allocated
@@ -542,7 +551,8 @@ class CreditAccountingJournal:
                 is not (status == "pending" and affected_units == requested_units)
                 or allocation_satisfied
                 is not (status == "consumed" and affected_units == requested_units)
-                or terminal_satisfied is not (status in {"released", "invalidated"})
+                or terminal_satisfied
+                is not (status in {"settled", "released", "invalidated"})
             ):
                 raise CreditAccountingError(
                     "reservation receipt signals are inconsistent",
@@ -704,7 +714,7 @@ class CreditAccountingJournal:
             reservation["revision"],
             reservation["status"] == "pending" and affected == requested,
             reservation["status"] == "consumed" and affected == requested,
-            reservation["status"] in {"released", "invalidated"},
+            reservation["status"] in {"settled", "released", "invalidated"},
             high_water,
         )
 
@@ -976,9 +986,9 @@ class CreditAccountingJournal:
                         raise CreditAccountingConflict(
                             "reservation revision is ahead of durable state",
                         )
-                    if reservation["status"] == "consumed":
+                    if reservation["status"] in {"consumed", "settled"}:
                         raise CreditAccountingConflict(
-                            "consumed reservation cannot be released",
+                            "consumed or settled reservation cannot be released",
                         )
                     if reservation["status"] in {"released", "invalidated"}:
                         self._require_operation_capacity(state)
@@ -1068,6 +1078,111 @@ class CreditAccountingJournal:
             as_of=as_of,
             expected_revision=expected_revision,
         )
+
+    def settle(
+        self,
+        *,
+        account_key: str,
+        reservation_id: str,
+        operation_id: str,
+        terminal_status: str,
+        server_billable_units: int | None,
+        as_of: datetime | str,
+        expected_revision: int,
+    ) -> CreditAccountingReceipt:
+        """Atomically finalize a consumed reservation and refund its remainder.
+
+        The first accepted terminal observation is immutable. A retry of its
+        stable operation ID returns that receipt even if a later wall-clock
+        sample changed after callback success but before job persistence.
+        """
+
+        account_key = _opaque(account_key, _KEY_RE, "account key")
+        reservation_id = _opaque(
+            reservation_id, _RESERVATION_RE, "reservation id",
+        )
+        operation_id = _opaque(operation_id, _OPERATION_RE, "operation id")
+        expected_revision = _units(
+            expected_revision, "expected reservation revision", positive=True,
+        )
+        normalized_as_of = _iso(as_of)
+        if not self.policy.enforcement_enabled:
+            return CreditAccountingReceipt(
+                "disabled", None, 0, 0, None, None, None, None,
+                normalized_as_of,
+            )
+        # Measurement and observation time are deliberately absent from the
+        # replay fingerprint so one terminal outcome can survive a changed
+        # wall-clock sample. Terminal status remains immutable.
+        payload = {
+            "kind": "settle",
+            "account_key": account_key,
+            "reservation_id": reservation_id,
+            "expected_revision": expected_revision,
+            "terminal_status": terminal_status,
+        }
+        fingerprint = _fingerprint(payload)
+        with self._thread_lock:
+            lease, state = self._locked_state()
+            write = False
+            try:
+                replay = self._replay_or_conflict(
+                    state, operation_id, fingerprint,
+                )
+                if replay is not None:
+                    return replay
+                high_water = self._advance_clock(state, as_of)
+                write = True
+                account = state["accounts"].get(account_key)
+                reservation = (
+                    None if account is None
+                    else account["reservations"].get(reservation_id)
+                )
+                if reservation is None:
+                    raise CreditAccountingError("reservation does not exist")
+                if reservation["status"] != "consumed":
+                    raise CreditAccountingConflict(
+                        "settlement requires a consumed reservation",
+                    )
+                if reservation["revision"] != expected_revision:
+                    raise CreditAccountingConflict(
+                        "reservation revision is stale",
+                    )
+                reserved = sum(
+                    allocation["units"]
+                    for allocation in reservation["allocations"]
+                )
+                settlement = terminal_credit_settlement(
+                    terminal_status=terminal_status,
+                    reserved_units=reserved,
+                    server_billable_units=server_billable_units,
+                )
+                self._require_operation_capacity(state)
+                remaining = settlement.settled_units
+                kept: list[dict[str, Any]] = []
+                for allocation in reservation["allocations"]:
+                    retained = min(allocation["units"], remaining)
+                    refunded = allocation["units"] - retained
+                    source = account["sources"][allocation["source_key"]]
+                    source["consumed_units"] -= refunded
+                    if retained:
+                        kept.append({
+                            "source_key": allocation["source_key"],
+                            "units": retained,
+                        })
+                        remaining -= retained
+                reservation["allocations"] = kept
+                reservation["status"] = "settled"
+                reservation["revision"] += 1
+                receipt = self._reservation_receipt(
+                    "settled", reservation, high_water,
+                )
+                self._record_operation(
+                    state, operation_id, fingerprint, receipt,
+                )
+                return receipt
+            finally:
+                self._close_locked_state(lease, state, write=write)
 
     def public_projection(self, account_key: str) -> dict[str, Any]:
         """Return aggregate content-free accounting state without opaque IDs."""

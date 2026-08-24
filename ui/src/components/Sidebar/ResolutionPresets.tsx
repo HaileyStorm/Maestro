@@ -5,6 +5,7 @@ export function ResolutionPresets() {
   const resolutionPreset = useStore(s => s.resolutionPreset)
   const setResolutionPreset = useStore(s => s.setResolutionPreset)
   const resolution = useStore(s => s.params.resolution)
+  const normalizedResolution = typeof resolution === 'string' ? resolution : ''
   const deliveryResolution = useStore(s => s.params.delivery_resolution)
   const deliveryFit = useStore(s => s.params.delivery_fit)
   const modelType = useStore(s => s.params.model_type)
@@ -14,7 +15,7 @@ export function ResolutionPresets() {
   const spatialUpsampling = useStore(s => s.spatialUpsampling)
   const isEdit = generationMode === 'avatar'
   const isH3 = generationMode === 'video' && (
-    modelType.startsWith('minimax_h3')
+    String(modelType || '').startsWith('minimax_h3')
     || String(modelOptions?.architecture || '').startsWith('minimax_h3')
     || String(modelOptions?.model_type || '').startsWith('minimax_h3')
   )
@@ -33,8 +34,8 @@ export function ResolutionPresets() {
   }
 
   if (isH3 && nativeResolutions.length > 0) {
-    const selectedIsNative = nativeResolutions.some(option => option.value === resolution)
-    const [width, height] = resolution.split('x').map(Number)
+    const selectedIsNative = nativeResolutions.some(option => option.value === normalizedResolution)
+    const [width, height] = normalizedResolution.split('x').map(Number)
     const aspect = width > 0 && height > 0 ? width / height : 0
     const orientation = aspect > 1.05 ? 'landscape' : aspect < 0.95 ? 'portrait' : 'square'
     const flashMatch = /^flashvsr(2pass)?(1(?:\.5)?|2(?:\.5)?|3(?:\.5)?|4)$/.exec(spatialUpsampling)
@@ -52,12 +53,14 @@ export function ResolutionPresets() {
         <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">Resolution</label>
         <select
           aria-label="Resolution"
-          value={resolution}
+          value={normalizedResolution}
           onChange={event => setH3NativeResolution(event.target.value)}
           className="mobile-control-target w-full rounded-lg border border-border bg-bg-tertiary px-2.5 py-2 text-xs text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
         >
           {!selectedIsNative && (
-            <option value={resolution} disabled>{resolution} · choose a supported size</option>
+            <option value={normalizedResolution} disabled>
+              {normalizedResolution ? `${normalizedResolution} · choose a supported size` : 'Choose a supported size'}
+            </option>
           )}
           {nativeResolutions.map(option => (
             <option key={option.value} value={option.value}>

@@ -123,24 +123,22 @@ test('queue badge uses Continuum held flag instead of status held', () => {
 })
 
 test('GlobalQueuePopover keeps Continuum held jobs without requiring status held', () => {
-  const active = slice(
-    globalQueuePopover,
-    'const ACTIVE_JOB_STATUSES = new Set([',
-    '])',
-  )
-  assert.match(active, /'queued'/)
-  assert.match(active, /'running'/)
+  assert.match(globalQueuePopover, /projectLogicalQueue\(jobs\)/)
+  assert.match(globalQueuePopover, /isActiveLogicalQueueJob\(job\) \|\| job\.held/)
   assert.match(
     globalQueuePopover,
-    /jobs\.filter\(job => ACTIVE_JOB_STATUSES\.has\(job\.status\) \|\| job\.held\)/,
+    /studioProjection\.visibleJobs\.filter/,
   )
   assert.match(
     globalQueuePopover,
-    /studioJobs\.filter\(job => job\.held \|\| job\.status === 'held'\)/,
+    /studioJobs\.filter\(job => job\.held\)/,
   )
   assert.match(globalQueuePopover, /if \(studioHeldCount > 0\) await startStudioQueue\(\)/)
   assert.match(globalQueuePopover, /const label = job\.held/)
-  assert.match(globalQueuePopover, /job\.message \|\| 'Ready - waiting for Start Queue'/)
+  assert.match(globalQueuePopover, /job\.message !== 'Ready - waiting for Start Queue'/)
+  assert.match(globalQueuePopover, /'Held — starts when you choose the queue action'/)
+  assert.match(globalQueuePopover, /runningDirectorCount/)
+  assert.match(globalQueuePopover, /waitingDirectorCount/)
   assert.doesNotMatch(
     globalQueuePopover,
     /release_held|_start_held_studio_queue|_run_held_studio_jobs/,
@@ -153,16 +151,28 @@ test('Start queue releases Studio holds before Director dispatch', () => {
   assert.match(startAll, /if \(studioHeldCount > 0\) await startStudioQueue\(\)/)
   assert.match(startAll, /if \(\s*startableDirectorCount > 0/)
   assert.match(startAll, /await startDirectorQueue\(\)/)
-  const startButton = slice(
-    globalQueuePopover,
-    '{studioHeldCount > 0 ? (',
-    ') : (',
-  )
-  assert.match(startButton, /Start queue/)
-  assert.match(
-    startButton,
-    /Start all held Studio jobs, then any held Director projects/,
-  )
+  assert.match(globalQueuePopover, /Start held Studio work and resume Director queue/)
+  assert.match(globalQueuePopover, /const canStartHeldWork = studioHeldCount > 0 \|\| canStartDirector/)
+  assert.match(globalQueuePopover, /const canStartDirector = \([\s\S]*startableDirectorCount > 0[\s\S]*!directorQueue\?\.running \|\| directorQueue\.paused/)
+  assert.match(globalQueuePopover, /\{canStartHeldWork && \(/)
+  assert.equal((globalQueuePopover.match(/aria-label=\{startActionLabel\}/g) || []).length, 1)
+  assert.doesNotMatch(globalQueuePopover, />Start queue</)
+})
+
+test('GlobalQueuePopover follows dialog focus and mobile target contracts', () => {
+  assert.match(globalQueuePopover, /installModalFocus\(\{/)
+  assert.match(globalQueuePopover, /restoreFocus: triggerRef\.current/)
+  assert.match(globalQueuePopover, /closeModalIfTop\(document, dialogRef\.current/)
+  assert.match(globalQueuePopover, /iconSize >= 20 \? 'h-11 w-11 p-0'/)
+  for (const label of [
+    'Stop Director generation',
+    'Open Director project',
+    'Move Director project up',
+    'Move Director project down',
+    'Remove Director project from queue',
+  ]) {
+    assert.match(globalQueuePopover, new RegExp(`aria-label="${label}"`))
+  }
 })
 
 test('App mounts GlobalQueuePopover on header and compact chrome', () => {

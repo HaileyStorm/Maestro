@@ -239,7 +239,7 @@ test('Gallery and queue empty states add hierarchy without inventing actions or 
   )
   const queue = sourceRegion(
     source,
-    "{emptyState === 'pending' ? (",
+    "{panelEmptyState === 'pending' ? (",
     ') : visibleJobs.map((job, index) => {',
   )
 

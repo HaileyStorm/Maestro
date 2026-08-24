@@ -73,6 +73,7 @@ async function loadAccountDrawerRuntime() {
           if (args.path === 'api') return { contents: `
             export class AccountApiError extends Error {}
             export const isAccountProjectAccessActive = (context, migration = null) => context?.accounts?.enabled === true && (migration !== null ? migration.state === 'active' && migration.enforced === true : context.account_project_access_active === true)
+            export const registerAccount = async () => undefined
           ` }
           if (args.path === 'focus') return { contents: 'export const closeModalIfTop = () => true; export const installModalFocus = () => () => {}' }
           if (args.path === 'store') return { contents: 'export const useStore = selector => selector(globalThis.__drawerStore)' }
@@ -130,19 +131,19 @@ test('server-authored account cutover decides whether project passwords apply', 
   assert.equal(isAccountProjectAccessActive({ accounts, project_password_required: false }), false)
   assert.equal(isAccountProjectAccessActive(context, {
     state: 'disabled', enforced: false, project_count: 0, needs_attention: 0,
-  }), false)
+  }), true)
   assert.equal(isAccountProjectAccessActive(context, {
     state: 'not_started', enforced: false, project_count: 1, needs_attention: 0,
-  }), false)
+  }), true)
   assert.equal(isAccountProjectAccessActive(context, {
     state: 'needs_attention', enforced: false, project_count: 1, needs_attention: 1,
-  }), false)
+  }), true)
   assert.equal(isAccountProjectAccessActive({ ...context, account_project_access_active: false }, {
     state: 'active', enforced: true, project_count: 1, needs_attention: 0,
   }), true)
   assert.equal(isAccountProjectAccessActive(context, {
     state: 'active', enforced: false, project_count: 1, needs_attention: 0,
-  }), false)
+  }), true)
 })
 
 test('account drawer keeps sealed active access authoritative over stale migration detail', async () => {
@@ -497,6 +498,41 @@ test('account identity is established before the store-fenced startup project lo
   assert.match(store, /logoutAccount: async[\s\S]*_scrubAccountBoundProjectUi\(get\(\)\)[\s\S]*loadWorkspaces\(\)/)
 })
 
+test('active account cutover presents a non-dismissible sign-in gate before project UI', async () => {
+  const [app, drawer] = await Promise.all([
+    readFile(appUrl, 'utf8'),
+    readFile(accountDrawerUrl, 'utf8'),
+  ])
+
+  assert.match(app, /accountAuthenticationRequired = accessContext\?\.accounts\?\.enabled === true[\s\S]*accessContext\.account_project_access_active === true[\s\S]*accountContext\?\.authenticated !== true/)
+  assert.match(app, /bootstrapState === 'ready' && accountAuthenticationRequired[\s\S]*setAccountDrawerOpen\(true\)/)
+  assert.match(app, /<AccountSupportDrawer required=\{accountAuthenticationRequired\} \/>/)
+  assert.match(drawer, /required \? 'account' : 'support'/)
+  assert.match(drawer, /if \(required\) return/)
+  assert.match(drawer, /required \? 'Sign in to Maestro'/)
+  assert.match(drawer, /Sign in before project names, uploads, or creative tools become available/)
+  assert.match(drawer, /onClose: required \? \(\) => \{\} : closeDrawer/)
+})
+
+test('public account entry offers sign in, exact-gated signup, and recovery without owner claims', async () => {
+  const [drawer, client, store, types] = await Promise.all([
+    readFile(accountDrawerUrl, 'utf8'),
+    readFile(clientUrl, 'utf8'),
+    readFile(storeUrl, 'utf8'),
+    readFile(new URL('../src/types/index.ts', import.meta.url), 'utf8'),
+  ])
+
+  assert.match(drawer, /publicRegistrationAvailable = context\?\.public_registration_available === true/)
+  assert.match(drawer, /\['login', 'Sign in'\], \['register', 'Create account'\], \['recover', 'Recover'\]/)
+  assert.match(drawer, /Your account starts with no projects/)
+  assert.match(drawer, /const result = await registerAccount\(\{ username, password, email, deviceLabel \}\)/)
+  assert.doesNotMatch(drawer, /registerAccount\(\{[^}]*role/)
+  assert.match(client, /'register', '\/api\/v1\/account\/register'/)
+  assert.doesNotMatch(store, /registerAccount: async/)
+  assert.match(types, /public_registration_available\?: boolean/)
+  assert.match(types, /\| 'register'/)
+})
+
 test('signed-out account access hides the virtual Uploads content scope', async () => {
   const main = await readFile(mainContentUrl, 'utf8')
   const selector = main.slice(main.indexOf('function WorkspaceSelector()'), main.indexOf('function stripTimeSuffix'))
@@ -619,7 +655,9 @@ test('logout scrub clears account-bound UI without revoking independent project 
 
   for (const expected of [
     'workspaces: []', 'activeWorkspace: \'\'', 'outputs: []', 'jobs: []',
-    'params: { ...state.params, ...BLANK_VIDEO_INPUT_PARAMS }',
+    '...BLANK_VIDEO_INPUT_PARAMS,', 'presets: []', 'loraWeights: {}',
+    'spatialUpsampling: \'\'', "h3SelectedProfile: 'custom'",
+    'savedParamsPerMode: {}', 'savedLoraPerMode: {}', 'savedPromptPerMode: {}',
     'startImage: null', 'endImage: null', 'continueVideo: null',
     'continueVideoPath: \'\'', 'continueVideoUrl: \'\'', 'audioGuideFilename: null',
     'imageRefs: []', 'clips: []', 'videoSubModeStash: {}',
@@ -633,8 +671,14 @@ test('logout scrub clears account-bound UI without revoking independent project 
     'directorVoiceRef: null', 'directorVoiceRefPath: null', 'directorClipImages: []',
     'shortFilmCharacters: []', 'shortFilmPath: null',
   ]) assert.match(scrub, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+  assert.match(scrub, /localStorage\.removeItem\(STORAGE_KEY\)/)
   assert.ok(logout.indexOf('_scrubAccountBoundProjectUi(get())') < logout.indexOf('await api.logoutAccount()'))
   assert.doesNotMatch(logout, /lockAllWorkspaces|lockWorkspace|revoke_workspace|project-password/)
+  const deleteFlow = store.slice(
+    store.indexOf('deleteWorkspace: async'),
+    store.indexOf('storageDashboardOpen:', store.indexOf('deleteWorkspace: async')),
+  )
+  assert.match(deleteFlow, /switched_to_default[^]*presets: \[\][^]*void get\(\)\.loadPresets\(\)/)
 })
 
 test('Tools uploads use store-owned identity fences and Director preview uploads keep their request lease', async () => {

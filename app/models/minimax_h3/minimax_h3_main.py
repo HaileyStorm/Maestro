@@ -559,7 +559,40 @@ def _probe_transformer_checkpoint(filename: str) -> dict:
     }
 
 
-def _load_transformer(filename: str, dtype: torch.dtype) -> MiniMaxH3Transformer:
+def _restore_interleaved_transformer_qkv(
+    state_dict,
+    *,
+    qkv_layout="interleaved",
+):
+    """Convert WanGP's head-interleaved fused QKV rows for this runtime."""
+
+    if qkv_layout != "interleaved":
+        return state_dict
+    heads = 56
+    head_dim = 128
+    expected_rows = heads * 3 * head_dim
+    for key, tensor in list(state_dict.items()):
+        if not key.endswith((".qkv_proj.weight", ".qkv_proj.weight_scale")):
+            continue
+        if tensor.ndim == 0 or int(tensor.shape[0]) != expected_rows:
+            continue
+        trailing_shape = tuple(tensor.shape[1:])
+        grouped = tensor.reshape(heads, 3, head_dim, *trailing_shape)
+        permutation = (1, 0, 2, *range(3, grouped.ndim))
+        state_dict[key] = (
+            grouped.permute(permutation)
+            .reshape(expected_rows, *trailing_shape)
+            .contiguous()
+        )
+    return state_dict
+
+
+def _load_transformer(
+    filename: str,
+    dtype: torch.dtype,
+    *,
+    qkv_layout: str = "contiguous",
+) -> MiniMaxH3Transformer:
     from .convrot import adapt_int8_convrot_state_dict
 
     checkpoint = _probe_transformer_checkpoint(filename)
@@ -571,6 +604,10 @@ def _load_transformer(filename: str, dtype: torch.dtype) -> MiniMaxH3Transformer
         )
 
     def preprocess_transformer_state_dict(state_dict):
+        state_dict = _restore_interleaved_transformer_qkv(
+            state_dict,
+            qkv_layout=qkv_layout,
+        )
         return adapt_int8_convrot_state_dict(
             transformer, state_dict, output_dtype=dtype,
         )
@@ -584,12 +621,33 @@ def _load_transformer(filename: str, dtype: torch.dtype) -> MiniMaxH3Transformer
     )
     transformer._model_dtype = dtype
     transformer.h3_checkpoint_info = checkpoint
+    transformer.h3_qkv_layout = qkv_layout
     return transformer.eval().requires_grad_(False)
 
 
-def _load_conditioner(filename: str, assets_root: str, dtype: torch.dtype) -> MiniMaxH3Conditioner:
-    config_path = fl.locate_file(os.path.join(assets_root, "text_encoder", "config.json"))
-    processor_path = fl.locate_folder(os.path.join(assets_root, "processor"))
+def _load_conditioner(
+    filename: str,
+    config_relative_path: str,
+    processor_relative_paths: list[str],
+    dtype: torch.dtype,
+) -> MiniMaxH3Conditioner:
+    config_path = fl.locate_file(config_relative_path)
+    processor_folder = os.path.dirname(processor_relative_paths[0])
+    processor_files = [os.path.basename(path) for path in processor_relative_paths]
+    processor_path = fl.locate_folder(
+        processor_folder,
+        required_files=processor_files,
+    )
+    missing_processor_files = [
+        filename
+        for filename in processor_files
+        if not os.path.isfile(os.path.join(processor_path, filename))
+    ]
+    if missing_processor_files:
+        raise FileNotFoundError(
+            "MiniMax H3 processor folder is incomplete: "
+            + ", ".join(missing_processor_files)
+        )
     config = load_h3_qwen_config(config_path)
     tokenizer, processor = build_h3_processor(processor_path)
     # Qwen keeps rotary-frequency tables as computed, non-persistent buffers,
@@ -690,11 +748,36 @@ class MiniMaxH3Model:
         if not text_encoder_filename:
             raise FileNotFoundError("MiniMax H3 Qwen3-VL conditioner checkpoint is missing.")
 
-        video_vae_path = fl.locate_file(
-            os.path.join(self.assets_root, "vae", "minimax_h3_video_vae_fp16.safetensors")
-        )
-        audio_vae_path = fl.locate_file(
-            os.path.join(self.assets_root, "vae", "minimax_h3_audio_vae_fp32.safetensors")
+        required_assets = model_def.get("required_runtime_assets", {})
+        if not isinstance(required_assets, dict):
+            raise ValueError("MiniMax H3 required-runtime asset manifest is missing.")
+        video_vae_relative = required_assets.get("video_vae")
+        audio_vae_relative = required_assets.get("audio_vae")
+        text_config_relative = required_assets.get("text_encoder_config")
+        processor_relative = required_assets.get("processor")
+        if not all(
+            isinstance(path, str) and path
+            for path in (
+                video_vae_relative,
+                audio_vae_relative,
+                text_config_relative,
+            )
+        ) or not (
+            isinstance(processor_relative, (list, tuple))
+            and len(processor_relative) == 7
+            and all(isinstance(path, str) and path for path in processor_relative)
+            and len({os.path.dirname(path) for path in processor_relative}) == 1
+        ):
+            raise ValueError("MiniMax H3 required-runtime asset manifest is invalid.")
+
+        video_vae_path = fl.locate_file(video_vae_relative)
+        audio_vae_path = fl.locate_file(audio_vae_relative)
+        qkv_layout = str(model_def.get("minimax_h3_qkv_layout") or "contiguous")
+        qkv_layout = str(
+            model_def.get("compatible_model_qkv_layouts", {}).get(
+                os.path.basename(transformer_path),
+                qkv_layout,
+            )
         )
 
         def report_load_stage(label: str) -> None:
@@ -703,9 +786,18 @@ class MiniMaxH3Model:
 
         try:
             report_load_stage("Loading H3 transformer checkpoint")
-            self.transformer = _load_transformer(transformer_path, dtype)
+            self.transformer = _load_transformer(
+                transformer_path,
+                dtype,
+                qkv_layout=qkv_layout,
+            )
             report_load_stage("Loading H3 conditioner checkpoint")
-            self.conditioner = _load_conditioner(text_encoder_filename, self.assets_root, dtype)
+            self.conditioner = _load_conditioner(
+                text_encoder_filename,
+                text_config_relative,
+                list(processor_relative),
+                dtype,
+            )
             report_load_stage("Loading H3 video VAE checkpoint")
             self.vae = _load_video_vae(video_vae_path)
             report_load_stage("Loading H3 audio VAE checkpoint")
