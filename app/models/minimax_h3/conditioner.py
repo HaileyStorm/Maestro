@@ -20,6 +20,81 @@ IMAGE_TOKEN_ID = 151655
 VIDEO_TOKEN_ID = 151656
 TEXT_PAD_TOKEN_ID = 151643
 TEXT_ENCODER_LAYERS = 50
+H3_TEXT_EMBEDDING_VOCAB_SIZE = 151936
+H3_MARKER_TOKEN_IDS = {
+    "<d>": 151669,
+    "</d>": 151670,
+    "<|cutoff|>": 151671,
+    "<|lyrics_start|>": 151672,
+    "<|lyrics_end|>": 151673,
+    "<|caption_start|>": 151674,
+    "<|caption_end|>": 151675,
+}
+
+
+def _ensure_h3_marker_tokens(tokenizer):
+    """Register and validate the released H3 marker-token contract.
+
+    The conditioner embedding has a fixed 151936-row vocabulary, so silently
+    appending markers at different IDs would make prompts incompatible with the
+    checkpoint.  Preserve every tokenizer-provided additional special token,
+    register only absent H3 markers, then verify literal tokenizer round trips.
+    """
+
+    existing_specials = tuple(tokenizer.additional_special_tokens or ())
+    missing_markers = [
+        marker for marker in H3_MARKER_TOKEN_IDS if marker not in existing_specials
+    ]
+    if missing_markers:
+        tokenizer.add_special_tokens(
+            {"additional_special_tokens": missing_markers},
+            replace_additional_special_tokens=False,
+        )
+
+    registered_specials = set(tokenizer.additional_special_tokens or ())
+    lost_specials = [
+        token for token in existing_specials if token not in registered_specials
+    ]
+    if lost_specials:
+        raise ValueError(
+            "MiniMax H3 tokenizer registration replaced existing additional "
+            f"special tokens: {lost_specials!r}."
+        )
+    if len(tokenizer) > H3_TEXT_EMBEDDING_VOCAB_SIZE:
+        raise ValueError(
+            "MiniMax H3 tokenizer vocabulary exceeds the checkpoint embedding "
+            f"bound ({len(tokenizer)} > {H3_TEXT_EMBEDDING_VOCAB_SIZE})."
+        )
+
+    for marker, expected_id in H3_MARKER_TOKEN_IDS.items():
+        if expected_id >= H3_TEXT_EMBEDDING_VOCAB_SIZE:
+            raise ValueError(
+                f"MiniMax H3 marker {marker!r} ID {expected_id} exceeds the "
+                f"embedding bound {H3_TEXT_EMBEDDING_VOCAB_SIZE}."
+            )
+        actual_id = tokenizer.convert_tokens_to_ids(marker)
+        if actual_id != expected_id:
+            raise ValueError(
+                f"MiniMax H3 marker {marker!r} has tokenizer ID {actual_id!r}; "
+                f"checkpoint requires {expected_id}."
+            )
+        encoded = tokenizer.encode(marker, add_special_tokens=False)
+        if encoded != [expected_id]:
+            raise ValueError(
+                f"MiniMax H3 marker {marker!r} must encode literally as the "
+                f"single ID {expected_id}, got {encoded!r}."
+            )
+        decoded = tokenizer.decode(
+            [expected_id],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        if decoded != marker:
+            raise ValueError(
+                f"MiniMax H3 marker ID {expected_id} must decode literally as "
+                f"{marker!r}, got {decoded!r}."
+            )
+    return tokenizer
 
 
 def _visual_patches(
@@ -224,6 +299,7 @@ def load_h3_qwen_config(config_path: str) -> Qwen3VLConfig:
 
 def build_h3_processor(config_dir: str):
     tokenizer = AutoTokenizer.from_pretrained(config_dir, trust_remote_code=False)
+    _ensure_h3_marker_tokens(tokenizer)
     image_processor = Qwen2VLImageProcessorFast.from_pretrained(config_dir)
     return tokenizer, Krea2Qwen3VLProcessor(image_processor, tokenizer)
 

@@ -1,8 +1,8 @@
 # H3 ecosystem intake — 2026-08-25
 
-Status: intake and product planning completed from public sources on 2026-08-25.
-This is a capability decision and merge plan, not an install, download, model
-load, GPU result, quality claim, or default change.
+Status: intake, CPU-only scaffolding, and initial artifact acquisition completed
+on 2026-08-25. No Maestro model was loaded and no GPU inference or quality
+acceptance was performed. Experimental profiles remain explicit and non-default.
 
 Source thread: Maestro Continuum. Owner emphasis: H3 remains the primary focus;
 move quickly, adapt ComfyUI ideas into native Maestro rather than importing
@@ -50,9 +50,45 @@ Do not reimplement or silently displace these native surfaces:
   compatibility, quality, and runtime evaluation as any other tune; no prompt
   scanning or creative-content gate is added.
 
-No SSD is present yet. This intake does not download assets. Candidate storage
-sizes inform the later Crucial M500 placement plan, but do not block source and
-product planning now.
+No SSD is present yet. Owner-authorized artifacts were downloaded to the
+current ignored TVBox-backed Maestro model/LoRA roots and may move to the future
+Crucial M500 warm tier later. The storage-tier plan remains dormant: it did not
+guess a mount or migrate existing files.
+
+## Initial implementation checkpoint
+
+The owner explicitly extended the intake into a CPU-only implementation and
+download wave. The current checkout now contains:
+
+- exact H3 marker-token registration and fail-closed ID/round-trip checks;
+- a sealed native Bridge plan with legal frame/audio geometry, seam ownership,
+  trim, reroll, and recovery identities;
+- a sealed inert H3 ControlNet Union plan for Canny, depth, HED, MLSD, pose,
+  and inpaint inputs;
+- explicit, no-fallback Dasiwa exact-base, Dasiwa suspected-base, and Better
+  Motion Ref2VA profiles using the existing ordinary-LoRA request shape;
+- disabled benchmark descriptors for exact and suspected Dasiwa plus Better
+  Motion strengths 0.5, 0.7, 0.9, and 1.0;
+- an owner-review prompt/rubric pack for motion-LoRA coherence, created with a
+  sanitized public Grok consultation and kept separate from Maestro moderation.
+
+The exact Dasiwa LoRA (794,888,664 bytes, SHA-256
+`d2a9a723d97520232f17b6fec33335f9e94b03b2c67b56f91f16780355479274`)
+and Better Motion V1 (298,261,888 bytes, SHA-256
+`15615bf5aef77b974dba6cd109c547fb8a9a5d36a68fd38b3bd3578e59d3545a`)
+pass bounded CPU header/hash validation. Dasiwa's required base SHA-256
+`71c61492faf65b410d0726840ac3b27b017fcfeb76b16ae11589223d81b7121c`
+was not found publicly. The installed Ref2VA checkpoint instead matches the
+explicit suspected-compatible SHA-256
+`f86f2f79ebd2d76eb8eeb46091e83982e6ff51d255747e7b16e92834b392b8e9`.
+Accordingly, the exact profile stays unavailable while the suspected profile is
+visibly unverified and reserved for a later coherent-output probe.
+
+Additional owner-authorized, ignored artifacts were acquired and header-checked
+without loading them: Turbo-SLA, Prompt Rewriter, ControlNet Union,
+Single-Frame VAE, Music3 FP8/Turbo, and the 10Eros Ref2VA INT8 ConvRot
+skip-edge checkpoint. These are inventory for later one-variable-at-a-time
+acceptance, not evidence of runtime compatibility or quality.
 
 ## Decision style for this wave
 
@@ -302,8 +338,9 @@ H3 or Music3 runtime dependency in this wave.
 ## CPU-now merge train
 
 These are the highest-value implementation slices that require no model load or
-GPU. They are planned here; per the intake protocol, implementation starts in a
-separately owned wave.
+GPU. Rows 1, 2, 5 (initial Dasiwa/Better Motion descriptors), and 6 are now
+implemented as CPU-only foundations; the remaining rows retain their owners
+below.
 
 Use one lightweight **experiment descriptor** across the runtime candidates so
 future work adds cases, not bespoke integration machinery. It extends the
@@ -479,12 +516,15 @@ Direct X pages were intermittently inaccessible to unauthenticated tooling.
 Where needed, X's public oEmbed or a read-only mirror established the post text,
 then linked official repositories/model pages controlled technical decisions.
 
-## What this note did not do
+## Remaining evidence boundary
 
-No model, LoRA, VAE, graph, node pack, media corpus, or dependency was
-downloaded. No install, model load, GPU probe, inference, benchmark, output
-review, storage migration, runtime binding, profile/default change, prompt
-moderation, Beads mutation, restart, Git commit, or publication occurred.
+This wave downloaded selected model assets and implemented CPU-only plans,
+validation, profiles, and benchmark scaffolding. It did **not** load a Maestro
+model, create a Maestro CUDA context, run inference, judge an output, activate
+an experimental benchmark case, change a default, migrate storage, import a
+Comfy graph/node pack, add prompt moderation, mutate Beads, or restart Maestro.
 
-The intake stops here by design. The CPU merge train and later RTX 5090 matrix
-are separately owned implementation waves.
+GPU/runtime acceptance remains a separately scheduled wave after the current
+external GPU owner releases capacity. Exact Dasiwa-base acquisition remains
+open; the suspected-base case must remain visibly provisional even if its later
+neutral coherence output looks useful.

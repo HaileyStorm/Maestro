@@ -6,7 +6,10 @@ import { build } from 'esbuild'
 
 const source = relative => readFile(new URL(relative, import.meta.url), 'utf8')
 
-const [duration, profiles, resolution, prompt, music, models, inputs, css] = await Promise.all([
+const [
+  duration, profiles, resolution, prompt, music, models, inputs, css,
+  typesSource, storeSource,
+] = await Promise.all([
   source('../src/components/Sidebar/DurationSlider.tsx'),
   source('../src/components/Sidebar/H3PerformanceProfiles.tsx'),
   source('../src/components/Sidebar/ResolutionPresets.tsx'),
@@ -15,6 +18,8 @@ const [duration, profiles, resolution, prompt, music, models, inputs, css] = awa
   source('../src/components/Sidebar/ModelSelector.tsx'),
   source('../src/components/Sidebar/InputsPanel.tsx'),
   source('../src/index.css'),
+  source('../src/types/index.ts'),
+  source('../src/stores/useStore.ts'),
 ])
 
 function openingTag(contents, element, marker) {
@@ -147,6 +152,15 @@ test('performance profile and resolution selection remain exact at compact and n
 
   const narrowUsableWidth = 320 - 32
   assert.ok(5 * 44 <= narrowUsableWidth, 'five preset controls retain a 44px floor at 320px')
+})
+
+test('external H3 experiment profile IDs remain typed and restorable', () => {
+  assert.match(typesSource, /dasiwa_ref2va_experimental/)
+  assert.match(typesSource, /dasiwa_ref2va_suspected_experimental/)
+  assert.match(typesSource, /better_motion_ref2va_experimental/)
+  assert.match(storeSource, /dasiwa_ref2va_experimental/)
+  assert.match(storeSource, /dasiwa_ref2va_suspected_experimental/)
+  assert.match(storeSource, /better_motion_ref2va_experimental/)
 })
 
 test('creative-guide provenance and prompt-writing actions are reachable without changing request semantics', () => {

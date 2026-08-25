@@ -47,6 +47,69 @@ class TestH3BenchmarkMatrix(unittest.TestCase):
         self.assertEqual(ref_steps, {4, 8})
         self.assertTrue(all(case.export_frames for case in matrix if case.semantic_reference))
 
+    def test_ref2va_lora_experiments_are_explicit_scaffolds_with_exact_payloads(self):
+        case_ids = [
+            "ref2va_dasiwa_hybrid_4step",
+            "ref2va_dasiwa_hybrid_4step_suspected_base",
+            "ref2va_better_motion_0_5",
+            "ref2va_better_motion_0_7",
+            "ref2va_better_motion_0_9",
+            "ref2va_better_motion_1_0",
+        ]
+        defaults = [case.case_id for case in runner.build_matrix()]
+        self.assertTrue(all(case_id not in defaults for case_id in case_ids))
+        cases = runner.build_matrix(case_ids)
+        self.assertEqual([case.lora_strength for case in cases[2:]], [0.5, 0.7, 0.9, 1.0])
+        self.assertTrue(all(not case.artifact_execution_enabled for case in cases))
+        self.assertEqual(
+            cases[0].required_base_sha256,
+            "71c61492faf65b410d0726840ac3b27b017fcfeb76b16ae11589223d81b7121c",
+        )
+        self.assertEqual(
+            cases[1].required_base_sha256,
+            "f86f2f79ebd2d76eb8eeb46091e83982e6ff51d255747e7b16e92834b392b8e9",
+        )
+        for case in cases:
+            with self.subTest(case=case.case_id):
+                config = case.public_config()
+                self.assertEqual(config["artifact_id"], case.artifact_id)
+                self.assertEqual(config["lora_insertion_mode"], "ordinary_lora_model_only")
+                payload = runner.build_generation_payload(
+                    case,
+                    project="synthetic-project",
+                    seed=7,
+                    reference_path="private-procedural-reference.png",
+                )
+                self.assertEqual(payload["activated_loras"], [case.lora_filename])
+                self.assertEqual(payload["loras_multipliers"], str(case.lora_strength))
+                self.assertFalse(any(
+                    key.startswith("h3_experiment_")
+                    for key in payload["custom_settings"]
+                ))
+                self.assertNotIn("h3_turbo_profile", payload["custom_settings"])
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(runner.main([
+                "--base-url", "http://127.0.0.1:7860",
+                "--project", "synthetic-project",
+                "--case", case_ids[0],
+                "--dry-run",
+            ]), 0)
+        self.assertEqual(
+            json.loads(stdout.getvalue())["cases"][0]["artifact_id"],
+            "dasiwa_ref2va_hybrid_v1_4step",
+        )
+        stderr = io.StringIO()
+        with mock.patch.object(runner, "MaestroClient") as client, contextlib.redirect_stderr(stderr):
+            self.assertEqual(runner.main([
+                "--base-url", "http://127.0.0.1:7860",
+                "--project", "synthetic-project",
+                "--case", case_ids[0],
+            ]), 2)
+        client.assert_not_called()
+        self.assertIn("scaffold-only", stderr.getvalue())
+
     def test_safe_overrides_and_selection_are_ordered(self):
         matrix = runner.build_matrix(
             ["base_turbo_8_sdpa", "base_native_sdpa"],

@@ -1985,6 +1985,8 @@ const H3_PROFILE_PARAM_KEYS = new Set<keyof GenerateParams>([
 const H3_PERFORMANCE_PROFILE_IDS = new Set<H3PerformanceProfileId>([
   'draft', 'fast', 'quality', 'high', '1080p_delivery', 'ultra',
   '4k_delivery', 'spectrum_experimental', 'lightx2v_experimental',
+  'dasiwa_ref2va_experimental', 'dasiwa_ref2va_suspected_experimental',
+  'better_motion_ref2va_experimental',
 ])
 
 interface ModelDefaultsApplyOptions {

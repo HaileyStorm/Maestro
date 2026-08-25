@@ -56,7 +56,9 @@ class H3ProfileTests(unittest.TestCase):
             [item["id"] for item in definitions],
             [
                 "draft", "fast", "quality", "high", "spectrum_experimental",
-                "lightx2v_experimental", "1080p_delivery",
+                "lightx2v_experimental", "dasiwa_ref2va_experimental",
+                "dasiwa_ref2va_suspected_experimental",
+                "better_motion_ref2va_experimental", "1080p_delivery",
                 "ultra", "4k_delivery",
             ],
         )
@@ -121,6 +123,92 @@ class H3ProfileTests(unittest.TestCase):
             ("1344x768", "flashvsr3", "3840x2160", "center_crop"),
         )
         self.assertIn("not native 4K", profiles["4k_delivery"]["description"])
+        self.assertEqual(
+            profiles["dasiwa_ref2va_experimental"]["lora_filename"],
+            "dasiwa_ref2va_hybrid_v1_4step.safetensors",
+        )
+        self.assertEqual(
+            profiles["better_motion_ref2va_experimental"]["lora_strength"],
+            0.9,
+        )
+
+    def test_ref2va_lora_experiments_are_exact_explicit_and_never_fallbacks(self):
+        options = build_profile_options(
+            {
+                "model_type": "minimax_h3_ref2va",
+                "checkpoint_sha256": (
+                    "71c61492faf65b410d0726840ac3b27b017fcfeb76b16ae11589223d81b7121c"
+                ),
+                "reference_shape": {},
+            },
+            model_exists=lambda _model: True,
+            model_downloaded=lambda _model: True,
+            dasiwa_status={
+                "available": True, "downloaded": True,
+                "download_required": False,
+            },
+            dasiwa_suspected_status={
+                "available": True, "downloaded": True,
+                "download_required": False,
+            },
+            better_motion_status={
+                "available": False, "downloaded": False,
+                "download_required": True,
+                "reason": "Civitai Early Access",
+            },
+        )
+        by_id = {item["id"]: item for item in options}
+        dasiwa = by_id["dasiwa_ref2va_experimental"]
+        self.assertTrue(dasiwa["available"])
+        self.assertFalse(dasiwa["download_required"])
+        self.assertIsNone(dasiwa["fallback_profile_id"])
+        self.assertEqual(
+            dasiwa["settings"]["activated_loras"],
+            ["dasiwa_ref2va_hybrid_v1_4step.safetensors"],
+        )
+        self.assertEqual(dasiwa["settings"]["loras_multipliers"], "1.0")
+        self.assertEqual(
+            dasiwa["settings"]["lora_weights"],
+            {"dasiwa_ref2va_hybrid_v1_4step.safetensors": [1.0]},
+        )
+        self.assertNotIn("h3_turbo_profile", dasiwa["settings"]["custom_settings"])
+        self.assertFalse(any(
+            key.startswith("h3_experiment_")
+            for key in dasiwa["settings"]["custom_settings"]
+        ))
+        motion = by_id["better_motion_ref2va_experimental"]
+        self.assertFalse(motion["available"])
+        self.assertTrue(motion["download_required"])
+        self.assertEqual(
+            motion["download_components"],
+            ["Better Motion Ref2VA Experimental artifact"],
+        )
+        self.assertIsNone(motion["fallback_profile_id"])
+        suspected = by_id["dasiwa_ref2va_suspected_experimental"]
+        self.assertTrue(suspected["available"])
+        self.assertIsNone(suspected["fallback_profile_id"])
+        self.assertEqual(
+            suspected["settings"]["lora_weights"],
+            {"dasiwa_ref2va_hybrid_v1_4step.safetensors": [1.0]},
+        )
+
+        base = build_profile_options(
+            {"model_type": "minimax_h3", "reference_shape": {}},
+            model_exists=lambda _model: True,
+            model_downloaded=lambda _model: True,
+            dasiwa_status={"available": True, "downloaded": True},
+            dasiwa_suspected_status={"available": True, "downloaded": True},
+            better_motion_status={"available": True, "downloaded": True},
+        )
+        for profile_id in (
+            "dasiwa_ref2va_experimental",
+            "dasiwa_ref2va_suspected_experimental",
+            "better_motion_ref2va_experimental",
+        ):
+            candidate = next(item for item in base if item["id"] == profile_id)
+            self.assertFalse(candidate["available"])
+            self.assertIn("Ref2VA", candidate["fallback_reason"])
+            self.assertIsNone(candidate["fallback_profile_id"])
 
     def test_turbo_profiles_are_visibly_unavailable_until_registered(self):
         options = build_profile_options(

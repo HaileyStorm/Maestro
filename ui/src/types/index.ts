@@ -419,7 +419,19 @@ export interface Resolution {
   value: string
 }
 
-export type H3PerformanceProfileId = 'draft' | 'fast' | 'quality' | 'high' | '1080p_delivery' | 'ultra' | '4k_delivery' | 'spectrum_experimental' | 'lightx2v_experimental'
+export type H3PerformanceProfileId =
+  | 'draft'
+  | 'fast'
+  | 'quality'
+  | 'high'
+  | '1080p_delivery'
+  | 'ultra'
+  | '4k_delivery'
+  | 'spectrum_experimental'
+  | 'lightx2v_experimental'
+  | 'dasiwa_ref2va_experimental'
+  | 'dasiwa_ref2va_suspected_experimental'
+  | 'better_motion_ref2va_experimental'
 export type H3EstimateConfidence = 'calibrating' | 'low' | 'medium' | 'high'
 
 export interface H3SegmentCountEstimate {

@@ -5,6 +5,25 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Callable, Mapping
 
+from services.h3_dasiwa import (
+    BETTER_MOTION_ARTIFACT_ID,
+    BETTER_MOTION_DEFAULT_STRENGTH,
+    BETTER_MOTION_FILENAME,
+    BETTER_MOTION_PROFILE_ID,
+    BETTER_MOTION_SCHEDULER,
+    DASIWA_ARTIFACT_ID,
+    DASIWA_COMPATIBLE_BASE_SHA256,
+    DASIWA_FILENAME,
+    DASIWA_PROFILE_ID,
+    DASIWA_SCHEDULER,
+    DASIWA_STRENGTH,
+    DASIWA_SUSPECTED_BASE_FILENAME,
+    DASIWA_SUSPECTED_BASE_SHA256,
+    INCOMPATIBLE_ACCELERATORS,
+    LORA_INSERTION_MODE,
+    experiment_status,
+)
+
 
 H3_NATIVE_RESOLUTIONS = (
     "1344x768", "768x1344", "1024x768", "768x1024", "768x768",
@@ -85,6 +104,74 @@ _PROFILES = (
         "num_inference_steps": 4,
         "resolution": "608x352",
         "attention_engine": "sdpa",
+    },
+    {
+        "id": "dasiwa_ref2va_experimental",
+        "label": "Dasiwa Ref2VA Experimental",
+        "description": (
+            "Owner-enabled four-step Ref2VA hybrid LoRA. It requires its pinned "
+            "artifact and the exact compatible Ref2VA checkpoint; perceptual GPU "
+            "validation remains pending. It never stacks with another accelerator."
+        ),
+        "accelerator": "dasiwa",
+        "artifact_id": DASIWA_ARTIFACT_ID,
+        "runtime_profile_id": DASIWA_PROFILE_ID,
+        "num_inference_steps": 4,
+        "resolution": "608x352",
+        "attention_engine": "sdpa",
+        "lora_filename": DASIWA_FILENAME,
+        "lora_strength": DASIWA_STRENGTH,
+        "scheduler": DASIWA_SCHEDULER,
+        "insertion_mode": LORA_INSERTION_MODE,
+        "incompatible_accelerators": INCOMPATIBLE_ACCELERATORS,
+        "fallback_eligible": False,
+        "allow_fallback": False,
+    },
+    {
+        "id": "dasiwa_ref2va_suspected_experimental",
+        "label": "Dasiwa on Installed Ref2VA (Unverified)",
+        "description": (
+            "Owner-enabled compatibility probe using the installed scaled-FP8 "
+            "Ref2VA checkpoint. Static tensor conversion passes, but this is not "
+            "the author's exact base and needs a coherent-output GPU check."
+        ),
+        "accelerator": "dasiwa_suspected",
+        "artifact_id": DASIWA_ARTIFACT_ID,
+        "runtime_profile_id": DASIWA_PROFILE_ID + "_suspected_base",
+        "num_inference_steps": 4,
+        "resolution": "608x352",
+        "attention_engine": "sdpa",
+        "lora_filename": DASIWA_FILENAME,
+        "lora_strength": DASIWA_STRENGTH,
+        "scheduler": DASIWA_SCHEDULER,
+        "insertion_mode": LORA_INSERTION_MODE,
+        "suspected_base_filename": DASIWA_SUSPECTED_BASE_FILENAME,
+        "suspected_base_sha256": DASIWA_SUSPECTED_BASE_SHA256,
+        "incompatible_accelerators": INCOMPATIBLE_ACCELERATORS,
+        "fallback_eligible": False,
+        "allow_fallback": False,
+    },
+    {
+        "id": "better_motion_ref2va_experimental",
+        "label": "Better Motion Ref2VA Experimental",
+        "description": (
+            "Optional Ref2VA motion LoRA at strength 0.9. Its pinned Civitai "
+            "version must be downloaded explicitly; it never silently "
+            "substitutes another asset or accelerator."
+        ),
+        "accelerator": "better_motion",
+        "artifact_id": BETTER_MOTION_ARTIFACT_ID,
+        "runtime_profile_id": BETTER_MOTION_PROFILE_ID,
+        "num_inference_steps": 28,
+        "resolution": "1344x768",
+        "attention_engine": "sol_attn",
+        "lora_filename": BETTER_MOTION_FILENAME,
+        "lora_strength": BETTER_MOTION_DEFAULT_STRENGTH,
+        "scheduler": BETTER_MOTION_SCHEDULER,
+        "insertion_mode": LORA_INSERTION_MODE,
+        "incompatible_accelerators": INCOMPATIBLE_ACCELERATORS,
+        "fallback_eligible": False,
+        "allow_fallback": False,
     },
     {
         "id": "1080p_delivery",
@@ -186,6 +273,14 @@ def profile_settings(
         settings["custom_settings"]["h3_spectrum_profile"] = "spectrum_h3_v1"
     elif definition["accelerator"] == "lightx2v":
         settings["custom_settings"]["h3_lightx2v_profile"] = "h3_lightx2v_fl2v_4_v1"
+    elif definition["accelerator"] in {
+        "dasiwa", "dasiwa_suspected", "better_motion",
+    }:
+        filename = str(definition["lora_filename"])
+        strength = float(definition["lora_strength"])
+        settings["activated_loras"] = [filename]
+        settings["loras_multipliers"] = str(strength)
+        settings["lora_weights"] = {filename: [strength]}
     return settings
 
 
@@ -266,6 +361,9 @@ def build_profile_options(
     lightx2v_compatibility: Callable[[Mapping[str, Any]], tuple[bool, str | None]] | None = None,
     sage2_status: Mapping[str, Any] | None = None,
     upscale_status: Mapping[str, Any] | None = None,
+    dasiwa_status: Mapping[str, Any] | None = None,
+    dasiwa_suspected_status: Mapping[str, Any] | None = None,
+    better_motion_status: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Return editable bundles without mutating policy or reference controls."""
     selected = str(context.get("model_type") or "minimax_h3")
@@ -276,12 +374,41 @@ def build_profile_options(
     sage2_status = dict(sage2_status or {})
     upscale_status = dict(upscale_status or {})
     lightx2v_status = dict(lightx2v_status or {})
+    if dasiwa_status is None:
+        dasiwa_status = experiment_status(
+            DASIWA_ARTIFACT_ID,
+            selected_model_type=selected,
+            selected_base_sha256=str(context.get("checkpoint_sha256") or "") or None,
+        )
+    if dasiwa_suspected_status is None:
+        dasiwa_suspected_status = experiment_status(
+            DASIWA_ARTIFACT_ID,
+            selected_model_type=selected,
+            selected_base_sha256=DASIWA_SUSPECTED_BASE_SHA256,
+            allow_suspected_base=True,
+        )
+    if better_motion_status is None:
+        better_motion_status = experiment_status(
+            BETTER_MOTION_ARTIFACT_ID,
+            selected_model_type=selected,
+        )
+    experiment_statuses = {
+        "dasiwa": dict(dasiwa_status),
+        "dasiwa_suspected": dict(dasiwa_suspected_status),
+        "better_motion": {
+            "downloaded": False,
+            "download_required": True,
+            "reason": "The pinned Better Motion artifact must be downloaded explicitly.",
+            **dict(better_motion_status),
+        },
+    }
     turbo_registered = bool(turbo_status.get("registered"))
     result: list[dict[str, Any]] = []
     for definition in profile_definitions():
         turbo = definition["accelerator"] == "turbo"
         spectrum = definition["accelerator"] == "spectrum"
         lightx2v = definition["accelerator"] == "lightx2v"
+        experiment = definition["accelerator"] in experiment_statuses
         available = True
         reason = None
         # Profiles tune the selected checkpoint. Checkpoint/conditioning
@@ -306,6 +433,26 @@ def build_profile_options(
                 reason = "LightX2V Experimental supports only MiniMax H3 Base FL2VA."
             elif lightx2v_compatibility is not None:
                 available, reason = lightx2v_compatibility(settings)
+        if experiment:
+            status = experiment_statuses[definition["accelerator"]]
+            if selected != "minimax_h3_ref2va":
+                available = False
+                reason = f"{definition['label']} supports only MiniMax H3 Ref2VA."
+            elif (
+                definition["accelerator"] == "dasiwa"
+                and str(context.get("checkpoint_sha256") or "").strip().casefold()
+                != DASIWA_COMPATIBLE_BASE_SHA256
+            ):
+                available = False
+                reason = (
+                    "Dasiwa requires the exact compatible Ref2VA checkpoint identity."
+                )
+            elif status.get("available") is not True:
+                available = False
+                reason = str(
+                    status.get("reason")
+                    or f"{definition['label']} has not passed its exact artifact compatibility gate."
+                )
         sage2_context_reason = (
             _sage2_base_context_reason(context, reference_shape)
             if settings["custom_settings"].get("h3_attention_engine") == "sage2"
@@ -381,7 +528,13 @@ def build_profile_options(
             "fallback_reason": reason,
             "fallback_profile_id": None,
             "download_required": bool(
-                available and (
+                (
+                    experiment
+                    and experiment_statuses[definition["accelerator"]].get(
+                        "download_required"
+                    ) is True
+                )
+                or available and (
                     (turbo and not bool(turbo_status.get("downloaded")))
                     or (lightx2v and not bool(lightx2v_status.get("downloaded")))
                     or (model_exists(model_type) and not model_downloaded(model_type))
@@ -395,6 +548,13 @@ def build_profile_options(
                     ("Turbo adapter", turbo and not bool(turbo_status.get("downloaded"))),
                     ("LightX2V adapter", lightx2v and not bool(lightx2v_status.get("downloaded"))),
                     ("FlashVSR", bool(upscale) and not bool(upscale_status.get("downloaded"))),
+                    (
+                        definition.get("label", "H3 experiment") + " artifact",
+                        experiment
+                        and experiment_statuses[definition["accelerator"]].get(
+                            "download_required"
+                        ) is True,
+                    ),
                 )
                 if required
             ],
@@ -405,13 +565,13 @@ def build_profile_options(
     # select the first higher-quality compatible bundle in canonical order.
     # Never jump backward to a faster profile or guess a hard-coded default.
     for index, profile in enumerate(result):
-        if profile["available"]:
+        if profile["available"] or profile.get("allow_fallback") is False:
             continue
         profile["fallback_profile_id"] = next(
             (
                 candidate["id"]
                 for candidate in result[index + 1:]
-                if candidate["available"]
+                if candidate["available"] and candidate.get("fallback_eligible") is not False
             ),
             None,
         )

@@ -157,6 +157,14 @@ class BenchmarkCase:
     benchmark_dry_run_only: bool = False
     allocation_probe: bool = False
     offload_profile: int = -1
+    artifact_id: str = ""
+    lora_filename: str = ""
+    lora_strength: float = 0.0
+    experiment_scheduler: str = ""
+    lora_insertion_mode: str = ""
+    compatibility_contract: str = ""
+    required_base_sha256: str = ""
+    artifact_execution_enabled: bool = False
     enabled: bool = True
 
     def public_config(self) -> dict[str, Any]:
@@ -207,6 +215,17 @@ class BenchmarkCase:
                 "allocation_probe": True,
                 "expected_frames": self.expected_frames,
                 "offload_profile": self.offload_profile,
+            })
+        if self.artifact_id:
+            result.update({
+                "artifact_id": self.artifact_id,
+                "lora_filename": self.lora_filename,
+                "lora_strength": self.lora_strength,
+                "experiment_scheduler": self.experiment_scheduler,
+                "lora_insertion_mode": self.lora_insertion_mode,
+                "compatibility_contract": self.compatibility_contract,
+                "required_base_sha256": self.required_base_sha256,
+                "artifact_execution_enabled": self.artifact_execution_enabled,
             })
         return result
 
@@ -324,6 +343,52 @@ DEFAULT_CASES = (
         audio_evaluations=8,
         benchmark_dry_run_only=True,
         enabled=False,
+    ),
+    # Owner-priority Ref2VA LoRA experiments. These remain explicit and
+    # execution-disabled until their exact artifact/runtime gates are wired.
+    BenchmarkCase(
+        "ref2va_dasiwa_hybrid_4step", "minimax_h3_ref2va", 4,
+        semantic_reference=True, export_frames=True,
+        artifact_id="dasiwa_ref2va_hybrid_v1_4step",
+        lora_filename="dasiwa_ref2va_hybrid_v1_4step.safetensors",
+        lora_strength=1.0,
+        experiment_scheduler="dasiwa_ref2va_native_4step_v1",
+        lora_insertion_mode="ordinary_lora_model_only",
+        compatibility_contract="exact_ref2va_checkpoint_sha256_only",
+        required_base_sha256=(
+            "71c61492faf65b410d0726840ac3b27b017fcfeb76b16ae11589223d81b7121c"
+        ),
+        enabled=False,
+    ),
+    BenchmarkCase(
+        "ref2va_dasiwa_hybrid_4step_suspected_base",
+        "minimax_h3_ref2va", 4,
+        semantic_reference=True, export_frames=True,
+        artifact_id="dasiwa_ref2va_hybrid_v1_4step",
+        lora_filename="dasiwa_ref2va_hybrid_v1_4step.safetensors",
+        lora_strength=1.0,
+        experiment_scheduler="dasiwa_ref2va_native_4step_v1",
+        lora_insertion_mode="ordinary_lora_model_only",
+        compatibility_contract="suspected_ref2va_checkpoint_coherence_probe_only",
+        required_base_sha256=(
+            "f86f2f79ebd2d76eb8eeb46091e83982e6ff51d255747e7b16e92834b392b8e9"
+        ),
+        enabled=False,
+    ),
+    *tuple(
+        BenchmarkCase(
+            f"ref2va_better_motion_{str(strength).replace('.', '_')}",
+            "minimax_h3_ref2va", 20,
+            semantic_reference=True, export_frames=True,
+            artifact_id="h3_better_nsfw_motion_v1",
+            lora_filename="h3_Better_NSFW_Motion_V1.safetensors",
+            lora_strength=strength,
+            experiment_scheduler="minimax_h3_ref2va_native_v1",
+            lora_insertion_mode="ordinary_lora_model_only",
+            compatibility_contract="ref2va_only_no_accelerator_stacking",
+            enabled=False,
+        )
+        for strength in (0.5, 0.7, 0.9, 1.0)
     ),
     # Wan2GP 12.44 native-boundary evidence lane. These fixed-seed cases are
     # deliberately disabled unless named with --case: two exact 175-frame
@@ -498,9 +563,68 @@ def _validate_case(case: BenchmarkCase) -> BenchmarkCase:
         or case.benchmark_dry_run_only
     ):
         raise ValueError(f"multirate-only settings leaked into {case.case_id}")
+    if case.artifact_id:
+        if not (
+            case.model_type == "minimax_h3_ref2va"
+            and case.semantic_reference
+            and not case.turbo
+            and case.attention_engine == "sdpa"
+            and case.lora_insertion_mode == "ordinary_lora_model_only"
+            and not case.enabled
+            and not case.artifact_execution_enabled
+        ):
+            raise ValueError(
+                f"artifact experiment {case.case_id} changed its disabled Ref2VA contract"
+            )
+        if case.artifact_id == "dasiwa_ref2va_hybrid_v1_4step":
+            suspected = case.case_id.endswith("_suspected_base")
+            if (
+                case.case_id != (
+                    "ref2va_dasiwa_hybrid_4step_suspected_base"
+                    if suspected else "ref2va_dasiwa_hybrid_4step"
+                )
+                or case.steps != 4
+                or case.resolution != "608x352"
+                or case.lora_filename != "dasiwa_ref2va_hybrid_v1_4step.safetensors"
+                or case.lora_strength != 1.0
+                or case.experiment_scheduler != "dasiwa_ref2va_native_4step_v1"
+                or case.compatibility_contract != (
+                    "suspected_ref2va_checkpoint_coherence_probe_only"
+                    if suspected else "exact_ref2va_checkpoint_sha256_only"
+                )
+                or case.required_base_sha256 != (
+                    "f86f2f79ebd2d76eb8eeb46091e83982e6ff51d255747e7b16e92834b392b8e9"
+                    if suspected else
+                    "71c61492faf65b410d0726840ac3b27b017fcfeb76b16ae11589223d81b7121c"
+                )
+            ):
+                raise ValueError("Dasiwa benchmark identity changed")
+        elif case.artifact_id == "h3_better_nsfw_motion_v1":
+            if (
+                case.steps != 20
+                or case.resolution != "608x352"
+                or case.lora_filename != "h3_Better_NSFW_Motion_V1.safetensors"
+                or case.lora_strength not in {0.5, 0.7, 0.9, 1.0}
+                or case.experiment_scheduler != "minimax_h3_ref2va_native_v1"
+                or case.compatibility_contract != "ref2va_only_no_accelerator_stacking"
+                or case.required_base_sha256
+            ):
+                raise ValueError("Better Motion benchmark identity changed")
+        else:
+            raise ValueError(f"unknown artifact identity for {case.case_id}")
+    elif any((
+        case.lora_filename,
+        case.lora_strength,
+        case.experiment_scheduler,
+        case.lora_insertion_mode,
+        case.compatibility_contract,
+        case.required_base_sha256,
+        case.artifact_execution_enabled,
+    )):
+        raise ValueError(f"artifact-only settings leaked into {case.case_id}")
     for field in (
         "enabled", "export_frames", "procedural_edge", "benchmark_dry_run_only",
-        "allocation_probe",
+        "allocation_probe", "artifact_execution_enabled",
     ):
         if not isinstance(getattr(case, field), bool):
             raise ValueError(f"{field} for {case.case_id} must be boolean")
@@ -1003,8 +1127,8 @@ def build_generation_payload(
         "image_prompt_type": "",
         "video_prompt_type": "I" if case.semantic_reference else "",
         "audio_prompt_type": "",
-        "activated_loras": [],
-        "loras_multipliers": "",
+        "activated_loras": [case.lora_filename] if case.artifact_id else [],
+        "loras_multipliers": str(case.lora_strength) if case.artifact_id else "",
         "tea_cache": 0,
         "private_output": True,
         "explicit_output": case.explicit_output,
@@ -1778,6 +1902,15 @@ def main(argv: list[str] | None = None) -> int:
     if any(case.benchmark_dry_run_only for case in matrix):
         print(
             "Benchmark matrix error: selected multirate evidence is dry-run only",
+            file=sys.stderr,
+        )
+        return 2
+    if any(
+        case.artifact_id and not case.artifact_execution_enabled
+        for case in matrix
+    ):
+        print(
+            "Benchmark matrix error: selected artifact experiment is scaffold-only",
             file=sys.stderr,
         )
         return 2

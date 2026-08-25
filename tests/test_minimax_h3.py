@@ -254,7 +254,12 @@ def _load_handler_class():
             names = [target.id for target in node.targets if isinstance(target, ast.Name)]
             if any(name.startswith("_") for name in names):
                 selected.append(node)
-        elif isinstance(node, ast.FunctionDef) and node.name in ("_hf_url", "_is_reference_mode"):
+        elif isinstance(node, ast.FunctionDef) and node.name in (
+            "_hf_url",
+            "_is_reference_mode",
+            "_required_runtime_asset_manifest",
+            "_required_asset_filenames",
+        ):
             selected.append(node)
         elif isinstance(node, ast.ClassDef) and node.name == "family_handler":
             selected.append(node)
@@ -278,6 +283,120 @@ def _load_frame_aligner():
     module = ast.Module(body=[function], type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), str(_WGP_PATH), "exec"), namespace)
     return namespace["align_model_frame_count"]
+
+
+def _load_conditioner_marker_contract():
+    tree = ast.parse(_read(_CONDITIONER_PATH), filename=str(_CONDITIONER_PATH))
+    selected = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            names = [target.id for target in node.targets if isinstance(target, ast.Name)]
+            if any(name.startswith("H3_") for name in names):
+                selected.append(node)
+        elif isinstance(node, ast.FunctionDef) and node.name == "_ensure_h3_marker_tokens":
+            selected.append(node)
+    namespace = {}
+    module = ast.Module(body=selected, type_ignores=[])
+    exec(
+        compile(ast.fix_missing_locations(module), str(_CONDITIONER_PATH), "exec"),
+        namespace,
+    )
+    return namespace
+
+
+class _MarkerTokenizer:
+    def __init__(
+        self,
+        *,
+        id_overrides=None,
+        encoded_overrides=None,
+        decoded_overrides=None,
+    ):
+        self.additional_special_tokens = ["<legacy_special>"]
+        self.ids = {
+            "<d>": 151669,
+            "</d>": 151670,
+            "<|cutoff|>": 151671,
+            "<|lyrics_start|>": 151672,
+            "<|lyrics_end|>": 151673,
+            "<|caption_start|>": 151674,
+            "<|caption_end|>": 151675,
+        }
+        self.ids.update(id_overrides or {})
+        self.encoded_overrides = encoded_overrides or {}
+        self.decoded_overrides = decoded_overrides or {}
+        self.calls = []
+        self.length = 151936
+
+    def __len__(self):
+        return self.length
+
+    def add_special_tokens(self, value, *, replace_additional_special_tokens):
+        self.calls.append((copy.deepcopy(value), replace_additional_special_tokens))
+        for token in value["additional_special_tokens"]:
+            if token not in self.additional_special_tokens:
+                self.additional_special_tokens.append(token)
+        return 0
+
+    def convert_tokens_to_ids(self, token):
+        return self.ids[token]
+
+    def encode(self, token, *, add_special_tokens):
+        if add_special_tokens:
+            raise AssertionError("H3 marker validation must use literal encoding")
+        return self.encoded_overrides.get(token, [self.ids[token]])
+
+    def decode(self, token_ids, *, skip_special_tokens, clean_up_tokenization_spaces):
+        if skip_special_tokens or clean_up_tokenization_spaces:
+            raise AssertionError("H3 marker validation must preserve literal markers")
+        token_id = token_ids[0]
+        expected = next(token for token, value in self.ids.items() if value == token_id)
+        return self.decoded_overrides.get(token_id, expected)
+
+
+class TestMiniMaxH3MarkerTokens(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        contract = _load_conditioner_marker_contract()
+        cls.ensure_markers = staticmethod(contract["_ensure_h3_marker_tokens"])
+        cls.marker_ids = contract["H3_MARKER_TOKEN_IDS"]
+
+    def test_registers_only_missing_markers_without_replacing_existing_specials(self):
+        tokenizer = _MarkerTokenizer()
+        tokenizer.additional_special_tokens.append("<d>")
+        self.assertIs(self.ensure_markers(tokenizer), tokenizer)
+        self.assertEqual(tokenizer.additional_special_tokens[0], "<legacy_special>")
+        self.assertEqual(
+            tokenizer.calls,
+            [
+                (
+                    {"additional_special_tokens": list(self.marker_ids)[1:]},
+                    False,
+                )
+            ],
+        )
+        self.ensure_markers(tokenizer)
+        self.assertEqual(len(tokenizer.calls), 1)
+
+    def test_rejects_marker_id_drift(self):
+        tokenizer = _MarkerTokenizer(id_overrides={"<d>": 151668})
+        with self.assertRaisesRegex(ValueError, "checkpoint requires 151669"):
+            self.ensure_markers(tokenizer)
+
+    def test_rejects_non_literal_marker_encoding_or_decoding(self):
+        tokenizer = _MarkerTokenizer(encoded_overrides={"<d>": [1, 2]})
+        with self.assertRaisesRegex(ValueError, "single ID 151669"):
+            self.ensure_markers(tokenizer)
+
+        tokenizer = _MarkerTokenizer(decoded_overrides={151669: "different"})
+        with self.assertRaisesRegex(ValueError, "decode literally"):
+            self.ensure_markers(tokenizer)
+
+    def test_rejects_tokenizer_larger_than_checkpoint_embedding(self):
+        tokenizer = _MarkerTokenizer()
+        tokenizer.length = 151937
+        with self.assertRaisesRegex(ValueError, "embedding bound"):
+            self.ensure_markers(tokenizer)
 
 
 class TestMiniMaxH3Definition(unittest.TestCase):
@@ -879,6 +998,9 @@ class TestMiniMaxH3Definition(unittest.TestCase):
             "_validate_h3_turbo_estimate_context": lambda *_args, **_kwargs: None,
             "_validate_h3_spectrum_estimate_context": lambda _context: None,
             "_validate_h3_lightx2v_estimate_context": lambda _context: None,
+            "_local_owner_may_run_unvalidated_h3_turbo_ref2va": (
+                lambda _request: False
+            ),
             "_require_remote_visible_models": lambda _request, _models: None,
             "_h3_effective_model_types": lambda _body, _plan: [],
             "_require_h3_generation_terms": lambda _body, _plan: None,
