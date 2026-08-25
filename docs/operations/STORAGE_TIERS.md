@@ -1,22 +1,51 @@
 # Future storage tiers
 
-Maestro has a dormant, inspection-only storage plan for the two anticipated
-drives. Nothing here mounts a drive, creates a directory, copies data, changes
-an environment variable, edits `wgp_config.json`, or moves existing TVBox
-content.
+Maestro has a dormant, inspection-only storage plan for the incoming Crucial
+M500 SSD and a possible later fast HDD. Nothing here mounts a drive, creates a
+directory, copies data, changes an environment variable, edits
+`wgp_config.json`, or moves existing TVBox content.
 
 ## Intended roles
 
 | Role | Intended medium | Purpose |
 | --- | --- | --- |
 | `hot` | Existing NVMe | Active temporary files and latency-sensitive scratch space |
-| `warm_models` | New SSD | Primary model/checkpoint and reusable model-cache storage |
-| `warm_bulk` | Future fast HDD | Generated outputs and other large, write-active bulk data |
-| `cold` | Fast HDD after verified migration; TVBox initially/for overflow | Existing models kept as read-only linked checkpoints and other cold data |
+| `warm_models` | Lightly used Crucial M500 SSD, after health and identity acceptance | Primary model/checkpoint and reusable model-cache storage |
+| `warm_bulk` | Unbound; possible future fast HDD | Generated outputs and other large, write-active bulk data |
+| `cold` | TVBox initially and for overflow | Existing models kept as read-only linked checkpoints and other cold data |
 
-The future fast HDD can later take over some cold data after a verified copy;
-there is no requirement to migrate all existing TVBox content. Roles are
-logical and do not guess a mount point, device name, filesystem, or capacity.
+A future fast HDD can later take over write-active bulk data and selected cold
+data after a verified copy; it is not part of the current hardware wave and
+there is no requirement to migrate all existing TVBox content. Until then,
+`warm_bulk` stays unbound and Maestro's existing output location stays in
+effect. Roles are logical and do not guess a mount point, device name,
+filesystem, or capacity.
+
+## Crucial M500 acceptance
+
+The M500 is an older SATA SSD. Its light use makes it a promising read-heavy
+model tier, but age and prior use are not themselves acceptance evidence.
+Before assigning `warm_models`:
+
+1. Identify the exact device, capacity, serial, firmware, filesystem, and
+   stable filesystem or partition UUID without recording those machine-local
+   identifiers in the repository.
+2. Read its full SMART data and run the drive's extended self-test. Review
+   reallocated, pending, and uncorrectable sectors; remaining-life / wear
+   indicators; interface CRC errors; power-on hours; unsafe shutdowns; and
+   temperature. Interpret vendor-specific attributes using the drive model's
+   own reporting rather than a generic raw-value threshold.
+3. Confirm the expected SATA link, stable cabling, sufficient free-space
+   headroom, filesystem health, ownership, and TRIM/discard support before any
+   write workload.
+4. Bind the plan to the verified mounted root and UUID, then use the inspector
+   before creating directories or changing Maestro configuration.
+5. Copy and verify one bounded model/cache class at a time. Keep the original
+   copy until catalog visibility and rollback have been accepted.
+
+The intended workload is checkpoints and reusable caches: mostly large reads
+with bounded downloads. High-churn temporary files remain on NVMe, while
+write-active bulk outputs wait for the later HDD plan.
 
 ## Owner-supplied plan
 
