@@ -86,9 +86,14 @@ visibly unverified and reserved for a later coherent-output probe.
 
 Additional owner-authorized, ignored artifacts were acquired and header-checked
 without loading them: Turbo-SLA, Prompt Rewriter, ControlNet Union,
-Single-Frame VAE, Music3 FP8/Turbo, and the 10Eros Ref2VA INT8 ConvRot
-skip-edge checkpoint. These are inventory for later one-variable-at-a-time
-acceptance, not evidence of runtime compatibility or quality.
+Single-Frame VAE, Music3 FP8/Turbo, and the earlier 10Eros Ref2VA Beta2 INT8
+ConvRot skip-edge checkpoint. These are inventory for later
+one-variable-at-a-time acceptance, not evidence of runtime compatibility or
+quality. Beta3 acquisition was a separate owner-authorized transfer. The
+skip-edge artifact now has its exact final size, SHA-256, bounded 184-marker
+header contract, and owner-private final-path receipt verified; the fully
+quantized artifact remains undownloaded. This is storage/integrity evidence,
+not runtime or quality acceptance.
 
 ## Decision style for this wave
 
@@ -243,7 +248,7 @@ Keep these as distinct cases in one comparison matrix:
 | FastVideo FastH3 Preview v0.2 (`11dd7d6...`) | **Experiment / benchmark lead** | Does its explicit `[999,749,500,250]` DMD2 ladder preserve usable AV quality on 5090? |
 | LightX2V Turbo-SLA (`10ade67...`) | **Experiment** | Does four-step FL2V + 85% SLA outperform current Fast/Turbo on this host after compile cost? |
 | Dasiwa Ref2VA Hybrid V1 4-step (`da516a7...`, ~0.795 GB) | **Adopt as owner-prioritized experiment** | What family/keys/strength/schedule actually work, and how does it change explicit motion/identity? |
-| 10Eros-Max INT8 ConvRot (`a563c82...`) | **Experiment** | Do conservative skip-edge FL2VA/Ref2VA variants give useful VRAM/quality tradeoffs in Maestro's ConvRot path? |
+| 10Eros-Max Beta3 TURBO Hybrid INT8 ConvRot (`dbdd879...`) | **Experiment** | Does the six-step skip-edge checkpoint preserve useful AV quality before testing the fully quantized checkpoint? |
 | Existing managed Turbo / LightX2V / Sage | **Baseline duties** | Keep as controls; do not remove while evaluating newer paths. |
 
 FastH3 v0.2 is still a training preview (step 2900/4000), text-to-AV only,
@@ -251,6 +256,31 @@ about 148 GB self-contained, and below base quality on high-motion/audio detail.
 It is not a drop-in replacement for Ref2VA or managed Turbo. Turbo-SLA is a
 LoRA/runtime pair; sparse attention and four-step distillation must be measured
 separately where possible.
+
+10Eros Beta3 supersedes the earlier FL2VA/Ref2VA assumption for this intake.
+Both new artifacts are complete **TURBO Hybrid** transformers and must not be
+registered or described as FL2VA or Ref2VA. The conservative first candidate is
+`10Eros_Max_h3_TURBO-hybrid_beta3_int8_convrot_skip_edges.safetensors`
+(revision `09beb98782a6feb2f44c39c46179743ca8607c6c`, 22,513,576,472 bytes,
+SHA-256 `a5ae4559cf19b0830adc1de6e8355d10eaf10524f78e9851a189a80990e6963a`):
+184 ConvRot layers cover blocks 2–47 while blocks 0, 1, 48, and 49 remain
+BF16. The second candidate is
+`10Eros_Max_h3_TURBO-hybrid_beta3_int8_convrot.safetensors` (revision
+`84ea7a6ec06e0cb5f2f35615e25e3529c5ec6c02`, 20,973,147,816 bytes, SHA-256
+`ebd0cb25273253213028bea0289da4c5c94929027ed9191fbb24fc924d4a8f0d`):
+200 ConvRot layers cover blocks 0–49. Both use native `int8_tensorwise`,
+per-channel absmax scales, ConvRot group size 256, and a BF16 source.
+
+The **provisional Maestro experiment policy** starts at six steps with
+`er_sde/simple` and `multires/simple` as separate candidates and does not stack
+Maestro's built-in Turbo, Spectrum, LightX2V, SageAttention, or step cache.
+Those choices are not represented as immutable Hugging Face artifact facts.
+CPU descriptors and disabled benchmark/evaluation scaffolds are useful now;
+runtime registration, GPU use, quality acceptance, defaults, and automatic
+fallback remain absent.
+A Grok review contributed provisional public breadth only. The pinned
+Hugging Face repository revisions and artifact identities above remain the
+primary technical authority.
 
 ### 7. Owner-prioritized mature-motion paths
 
@@ -422,7 +452,8 @@ cannot be attributed.
    first, then its 64-token/90%-sparse VSA contract.
 8. **Sol Hybrid Draft/Refine/Sol** — dense hybrid first; tiny autoencoders and
    Sol-Attn after topology parity.
-9. **10Eros ConvRot** — begin with conservative skip-edge FL2VA and Ref2VA.
+9. **10Eros Beta3 TURBO Hybrid ConvRot** — six-step skip-edge first, then full;
+   do not claim FL2VA/Ref2VA compatibility or stack built-in accelerators.
 10. **ControlNet Union** — one control type at a time, then inpaint; verify audio
    remains truthful when control does not apply to audio.
 11. **Prompt Rewriter** — compare deterministic composer, base Qwen, and the
@@ -463,7 +494,7 @@ comparison matrix, not a release bureaucracy.
 | 22 | [Kōda storyboard guidance](https://x.com/aimikoda/status/2090556776156742071) | **Adopt** a storyboard-as-sequential-shot recipe. |
 | 23 | [Renataro noir/foley film](https://x.com/renataro9/status/2090573248752934994) | **Benchmark lead** for palette, cadence, and AV transient mapping. |
 | 24 | [H3 Prompt Composer](https://github.com/BMB12d3/minimax-h3-prompt-composer) | **Adapt / extract** camera/input/project/checker ideas into the native composer. |
-| 25 | [10Eros H3 INT8 ConvRot](https://huggingface.co/cicalooo/10Eros-Max-h3-int8-convrot) | **Experiment** explicit FL2VA/Ref2VA skip-edge cases. |
+| 25 | [10Eros H3 INT8 ConvRot](https://huggingface.co/cicalooo/10Eros-Max-h3-int8-convrot) | **Experiment** Beta3 TURBO Hybrid only: six-step skip-edge first, fully quantized second; no FL2VA/Ref2VA or default/runtime claim. |
 | 26 | [Naoneko action/graphics](https://x.com/Naonekozamurai/status/2091072883040600420) | **Benchmark lead** for action/contact/audio/graphic sync. |
 | 27 | [TechHalla Origami Cities](https://x.com/techhalla/status/2091149136737546441) | **Adopt** a material-transition recipe. |
 | 28 | [TechHalla Dusk to Words](https://x.com/techhalla/status/2091102688645644384) | **Adopt** a kinetic-material typography recipe. |
@@ -523,6 +554,9 @@ validation, profiles, and benchmark scaffolding. It did **not** load a Maestro
 model, create a Maestro CUDA context, run inference, judge an output, activate
 an experimental benchmark case, change a default, migrate storage, import a
 Comfy graph/node pack, add prompt moderation, mutate Beads, or restart Maestro.
+The Beta3 skip-edge artifact completed its pinned transfer and CPU-only
+integrity/header/receipt checks. The fully quantized artifact remains a later
+download, and neither artifact has runtime or GPU acceptance.
 
 GPU/runtime acceptance remains a separately scheduled wave after the current
 external GPU owner releases capacity. Exact Dasiwa-base acquisition remains

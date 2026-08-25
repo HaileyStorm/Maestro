@@ -45,6 +45,8 @@ MANAGED_H3_MODELS = frozenset({
     "minimax_h3_w4a8_fl2va",
     "minimax_h3_pinkcherry_fl2va",
     "minimax_h3_ref2va",
+    "minimax_h3_10eros_beta3_turbo_hybrid_skip_edges",
+    "minimax_h3_10eros_beta3_turbo_hybrid_full",
 })
 NATIVE_RESOLUTIONS = frozenset({
     "1344x768", "768x1344", "1024x768", "768x1024", "768x768",
@@ -165,6 +167,24 @@ class BenchmarkCase:
     compatibility_contract: str = ""
     required_base_sha256: str = ""
     artifact_execution_enabled: bool = False
+    checkpoint_filename: str = ""
+    artifact_revision: str = ""
+    artifact_size_bytes: int = 0
+    artifact_sha256: str = ""
+    artifact_mode: str = ""
+    quantization_format: str = ""
+    scale_method: str = ""
+    convrot: bool = False
+    convrot_groupsize: int = 0
+    source_dtype: str = ""
+    quantized_layer_count: int = 0
+    quantized_blocks: tuple[int, ...] = ()
+    bf16_edge_blocks: tuple[int, ...] = ()
+    sampler_candidates: tuple[str, ...] = ()
+    incompatible_stacking: tuple[str, ...] = ()
+    experiment_priority: int = 0
+    experiment_policy_evidence: str = ""
+    scaffold_only: bool = False
     enabled: bool = True
 
     def public_config(self) -> dict[str, Any]:
@@ -226,6 +246,34 @@ class BenchmarkCase:
                 "compatibility_contract": self.compatibility_contract,
                 "required_base_sha256": self.required_base_sha256,
                 "artifact_execution_enabled": self.artifact_execution_enabled,
+            })
+        if self.checkpoint_filename:
+            result.update({
+                "checkpoint_filename": self.checkpoint_filename,
+                "artifact_revision": self.artifact_revision,
+                "artifact_size_bytes": self.artifact_size_bytes,
+                "artifact_sha256": self.artifact_sha256,
+                "artifact_mode": self.artifact_mode,
+                "quantization": {
+                    "format": self.quantization_format,
+                    "scale_method": self.scale_method,
+                    "convrot": self.convrot,
+                    "convrot_groupsize": self.convrot_groupsize,
+                    "source_dtype": self.source_dtype,
+                },
+                "quantized_layer_count": self.quantized_layer_count,
+                "quantized_blocks": list(self.quantized_blocks),
+                "bf16_edge_blocks": list(self.bf16_edge_blocks),
+                "maestro_experiment_policy": {
+                    "evidence_class": self.experiment_policy_evidence,
+                    "schedule": {
+                        "steps": self.steps,
+                        "sampler_candidates": list(self.sampler_candidates),
+                    },
+                    "incompatible_stacking": list(self.incompatible_stacking),
+                    "priority": self.experiment_priority,
+                },
+                "scaffold_only": self.scaffold_only,
             })
         return result
 
@@ -342,6 +390,72 @@ DEFAULT_CASES = (
         video_evaluations=4,
         audio_evaluations=8,
         benchmark_dry_run_only=True,
+        enabled=False,
+    ),
+    # Complete TURBO Hybrid checkpoint experiments. They have their own
+    # scaffold-only identities because neither artifact is FL2VA or Ref2VA.
+    # Skip edges is the conservative first probe; both remain impossible to
+    # submit until a separate runtime/model-registration acceptance wave.
+    BenchmarkCase(
+        "minimax_h3_10eros_beta3_turbo_hybrid_skip_edges",
+        "minimax_h3_10eros_beta3_turbo_hybrid_skip_edges", 6,
+        artifact_id="10eros_beta3_turbo_hybrid_skip_edges",
+        checkpoint_filename=(
+            "10Eros_Max_h3_TURBO-hybrid_beta3_int8_convrot_"
+            "skip_edges.safetensors"
+        ),
+        artifact_revision="09beb98782a6feb2f44c39c46179743ca8607c6c",
+        artifact_size_bytes=22_513_576_472,
+        artifact_sha256=(
+            "a5ae4559cf19b0830adc1de6e8355d10eaf10524f78e9851a189a80990e6963a"
+        ),
+        artifact_mode="turbo_hybrid",
+        quantization_format="int8_tensorwise",
+        scale_method="per_channel_absmax",
+        convrot=True,
+        convrot_groupsize=256,
+        source_dtype="bfloat16",
+        quantized_layer_count=184,
+        quantized_blocks=tuple(range(2, 48)),
+        bf16_edge_blocks=(0, 1, 48, 49),
+        sampler_candidates=("er_sde/simple", "multires/simple"),
+        incompatible_stacking=(
+            "maestro_turbo", "spectrum", "lightx2v", "sage_attention",
+            "step_cache",
+        ),
+        experiment_priority=1,
+        experiment_policy_evidence="provisional_maestro_experiment_policy",
+        scaffold_only=True,
+        enabled=False,
+    ),
+    BenchmarkCase(
+        "minimax_h3_10eros_beta3_turbo_hybrid_full",
+        "minimax_h3_10eros_beta3_turbo_hybrid_full", 6,
+        artifact_id="10eros_beta3_turbo_hybrid_full",
+        checkpoint_filename=(
+            "10Eros_Max_h3_TURBO-hybrid_beta3_int8_convrot.safetensors"
+        ),
+        artifact_revision="84ea7a6ec06e0cb5f2f35615e25e3529c5ec6c02",
+        artifact_size_bytes=20_973_147_816,
+        artifact_sha256=(
+            "ebd0cb25273253213028bea0289da4c5c94929027ed9191fbb24fc924d4a8f0d"
+        ),
+        artifact_mode="turbo_hybrid",
+        quantization_format="int8_tensorwise",
+        scale_method="per_channel_absmax",
+        convrot=True,
+        convrot_groupsize=256,
+        source_dtype="bfloat16",
+        quantized_layer_count=200,
+        quantized_blocks=tuple(range(50)),
+        sampler_candidates=("er_sde/simple", "multires/simple"),
+        incompatible_stacking=(
+            "maestro_turbo", "spectrum", "lightx2v", "sage_attention",
+            "step_cache",
+        ),
+        experiment_priority=2,
+        experiment_policy_evidence="provisional_maestro_experiment_policy",
+        scaffold_only=True,
         enabled=False,
     ),
     # Owner-priority Ref2VA LoRA experiments. These remain explicit and
@@ -563,7 +677,76 @@ def _validate_case(case: BenchmarkCase) -> BenchmarkCase:
         or case.benchmark_dry_run_only
     ):
         raise ValueError(f"multirate-only settings leaked into {case.case_id}")
-    if case.artifact_id:
+    if case.artifact_id and case.scaffold_only:
+        expected = {
+            "10eros_beta3_turbo_hybrid_skip_edges": {
+                "model_type": "minimax_h3_10eros_beta3_turbo_hybrid_skip_edges",
+                "filename": (
+                    "10Eros_Max_h3_TURBO-hybrid_beta3_int8_convrot_"
+                    "skip_edges.safetensors"
+                ),
+                "revision": "09beb98782a6feb2f44c39c46179743ca8607c6c",
+                "size": 22_513_576_472,
+                "sha256": "a5ae4559cf19b0830adc1de6e8355d10eaf10524f78e9851a189a80990e6963a",
+                "layers": 184,
+                "blocks": tuple(range(2, 48)),
+                "edges": (0, 1, 48, 49),
+            },
+            "10eros_beta3_turbo_hybrid_full": {
+                "model_type": "minimax_h3_10eros_beta3_turbo_hybrid_full",
+                "filename": "10Eros_Max_h3_TURBO-hybrid_beta3_int8_convrot.safetensors",
+                "revision": "84ea7a6ec06e0cb5f2f35615e25e3529c5ec6c02",
+                "size": 20_973_147_816,
+                "sha256": "ebd0cb25273253213028bea0289da4c5c94929027ed9191fbb24fc924d4a8f0d",
+                "layers": 200,
+                "blocks": tuple(range(50)),
+                "edges": (),
+            },
+        }.get(case.artifact_id)
+        if expected is None or not (
+            case.case_id == expected["model_type"]
+            and case.model_type == expected["model_type"]
+            and case.steps == 6
+            and case.resolution == "608x352"
+            and case.attention_engine == "sdpa"
+            and not case.turbo
+            and not case.semantic_reference
+            and not case.enabled
+            and not case.artifact_execution_enabled
+            and case.checkpoint_filename == expected["filename"]
+            and case.artifact_revision == expected["revision"]
+            and case.artifact_size_bytes == expected["size"]
+            and case.artifact_sha256 == expected["sha256"]
+            and case.artifact_mode == "turbo_hybrid"
+            and case.quantization_format == "int8_tensorwise"
+            and case.scale_method == "per_channel_absmax"
+            and case.convrot
+            and case.convrot_groupsize == 256
+            and case.source_dtype == "bfloat16"
+            and case.quantized_layer_count == expected["layers"]
+            and case.quantized_blocks == expected["blocks"]
+            and case.bf16_edge_blocks == expected["edges"]
+            and case.sampler_candidates == ("er_sde/simple", "multires/simple")
+            and case.incompatible_stacking == (
+                "maestro_turbo", "spectrum", "lightx2v", "sage_attention",
+                "step_cache",
+            )
+            and case.experiment_priority == (
+                1 if case.artifact_id.endswith("skip_edges") else 2
+            )
+            and case.experiment_policy_evidence
+            == "provisional_maestro_experiment_policy"
+            and not any((
+                case.lora_filename,
+                case.lora_strength,
+                case.experiment_scheduler,
+                case.lora_insertion_mode,
+                case.compatibility_contract,
+                case.required_base_sha256,
+            ))
+        ):
+            raise ValueError(f"10Eros Beta3 scaffold identity changed for {case.case_id}")
+    elif case.artifact_id:
         if not (
             case.model_type == "minimax_h3_ref2va"
             and case.semantic_reference
@@ -620,11 +803,30 @@ def _validate_case(case: BenchmarkCase) -> BenchmarkCase:
         case.compatibility_contract,
         case.required_base_sha256,
         case.artifact_execution_enabled,
+        case.checkpoint_filename,
+        case.artifact_revision,
+        case.artifact_size_bytes,
+        case.artifact_sha256,
+        case.artifact_mode,
+        case.quantization_format,
+        case.scale_method,
+        case.convrot,
+        case.convrot_groupsize,
+        case.source_dtype,
+        case.quantized_layer_count,
+        case.quantized_blocks,
+        case.bf16_edge_blocks,
+        case.sampler_candidates,
+        case.incompatible_stacking,
+        case.experiment_priority,
+        case.experiment_policy_evidence,
+        case.scaffold_only,
     )):
         raise ValueError(f"artifact-only settings leaked into {case.case_id}")
     for field in (
         "enabled", "export_frames", "procedural_edge", "benchmark_dry_run_only",
         "allocation_probe", "artifact_execution_enabled",
+        "convrot", "scaffold_only",
     ):
         if not isinstance(getattr(case, field), bool):
             raise ValueError(f"{field} for {case.case_id} must be boolean")
@@ -1086,6 +1288,8 @@ def build_generation_payload(
     seed: int,
     reference_path: str | None,
 ) -> dict[str, Any]:
+    if case.scaffold_only:
+        raise ValueError("10Eros Beta3 benchmark cases are scaffold-only")
     custom: dict[str, Any] = {
         "h3_attention_engine": case.attention_engine,
         "h3_benchmark_capture": True,
@@ -1127,8 +1331,8 @@ def build_generation_payload(
         "image_prompt_type": "",
         "video_prompt_type": "I" if case.semantic_reference else "",
         "audio_prompt_type": "",
-        "activated_loras": [case.lora_filename] if case.artifact_id else [],
-        "loras_multipliers": str(case.lora_strength) if case.artifact_id else "",
+        "activated_loras": [case.lora_filename] if case.lora_filename else [],
+        "loras_multipliers": str(case.lora_strength) if case.lora_filename else "",
         "tea_cache": 0,
         "private_output": True,
         "explicit_output": case.explicit_output,
@@ -1906,7 +2110,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     if any(
-        case.artifact_id and not case.artifact_execution_enabled
+        case.scaffold_only
+        or (case.artifact_id and not case.artifact_execution_enabled)
         for case in matrix
     ):
         print(

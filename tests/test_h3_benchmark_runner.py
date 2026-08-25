@@ -110,6 +110,103 @@ class TestH3BenchmarkMatrix(unittest.TestCase):
         client.assert_not_called()
         self.assertIn("scaffold-only", stderr.getvalue())
 
+    def test_beta3_turbo_hybrid_cases_are_distinct_disabled_scaffolds(self):
+        case_ids = [
+            "minimax_h3_10eros_beta3_turbo_hybrid_skip_edges",
+            "minimax_h3_10eros_beta3_turbo_hybrid_full",
+        ]
+        defaults = [case.case_id for case in runner.build_matrix()]
+        self.assertTrue(all(case_id not in defaults for case_id in case_ids))
+        skip, full = runner.build_matrix(case_ids)
+        self.assertEqual([skip.steps, full.steps], [6, 6])
+        self.assertFalse(skip.turbo)
+        self.assertFalse(full.turbo)
+        self.assertFalse(skip.semantic_reference)
+        self.assertFalse(full.semantic_reference)
+        self.assertTrue(skip.scaffold_only)
+        self.assertTrue(full.scaffold_only)
+        self.assertFalse(skip.artifact_execution_enabled)
+        self.assertFalse(full.artifact_execution_enabled)
+        self.assertEqual(skip.artifact_id, "10eros_beta3_turbo_hybrid_skip_edges")
+        self.assertEqual(full.artifact_id, "10eros_beta3_turbo_hybrid_full")
+        self.assertEqual(skip.artifact_revision, "09beb98782a6feb2f44c39c46179743ca8607c6c")
+        self.assertEqual(full.artifact_revision, "84ea7a6ec06e0cb5f2f35615e25e3529c5ec6c02")
+        self.assertEqual(skip.artifact_size_bytes, 22_513_576_472)
+        self.assertEqual(full.artifact_size_bytes, 20_973_147_816)
+        self.assertEqual(
+            skip.artifact_sha256,
+            "a5ae4559cf19b0830adc1de6e8355d10eaf10524f78e9851a189a80990e6963a",
+        )
+        self.assertEqual(
+            full.artifact_sha256,
+            "ebd0cb25273253213028bea0289da4c5c94929027ed9191fbb24fc924d4a8f0d",
+        )
+        self.assertEqual(skip.artifact_mode, "turbo_hybrid")
+        self.assertEqual(full.artifact_mode, "turbo_hybrid")
+        self.assertEqual(skip.quantized_layer_count, 184)
+        self.assertEqual(full.quantized_layer_count, 200)
+        self.assertEqual(skip.quantized_blocks, tuple(range(2, 48)))
+        self.assertEqual(full.quantized_blocks, tuple(range(50)))
+        self.assertEqual(skip.bf16_edge_blocks, (0, 1, 48, 49))
+        self.assertEqual(full.bf16_edge_blocks, ())
+        for case in (skip, full):
+            with self.subTest(case=case.case_id):
+                config = case.public_config()
+                self.assertEqual(config["artifact_mode"], "turbo_hybrid")
+                self.assertEqual(config["quantization"]["format"], "int8_tensorwise")
+                self.assertEqual(config["quantization"]["scale_method"], "per_channel_absmax")
+                self.assertTrue(config["quantization"]["convrot"])
+                self.assertEqual(config["quantization"]["convrot_groupsize"], 256)
+                policy = config["maestro_experiment_policy"]
+                self.assertEqual(
+                    policy["schedule"]["sampler_candidates"],
+                    ["er_sde/simple", "multires/simple"],
+                )
+                self.assertEqual(
+                    policy["evidence_class"],
+                    "provisional_maestro_experiment_policy",
+                )
+                self.assertNotIn("fl2va", case.model_type)
+                self.assertNotIn("ref2va", case.model_type)
+                with self.assertRaisesRegex(ValueError, "scaffold-only"):
+                    runner.build_generation_payload(
+                        case,
+                        project="synthetic-project",
+                        seed=7,
+                        reference_path=None,
+                    )
+
+    def test_beta3_dry_run_has_no_client_and_live_submission_is_refused(self):
+        case_id = "minimax_h3_10eros_beta3_turbo_hybrid_skip_edges"
+        stdout = io.StringIO()
+        with mock.patch.object(
+            runner, "MaestroClient",
+        ) as client, contextlib.redirect_stdout(stdout):
+            result = runner.main([
+                "--base-url", "http://127.0.0.1:42016",
+                "--project", "synthetic-project",
+                "--case", case_id,
+                "--dry-run",
+            ])
+        self.assertEqual(result, 0)
+        client.assert_not_called()
+        projection = json.loads(stdout.getvalue())
+        self.assertEqual(projection["cases"][0]["case_id"], case_id)
+        self.assertTrue(projection["cases"][0]["scaffold_only"])
+
+        stderr = io.StringIO()
+        with mock.patch.object(
+            runner, "MaestroClient",
+        ) as client, contextlib.redirect_stderr(stderr):
+            refused = runner.main([
+                "--base-url", "http://127.0.0.1:42016",
+                "--project", "synthetic-project",
+                "--case", case_id,
+            ])
+        self.assertEqual(refused, 2)
+        client.assert_not_called()
+        self.assertIn("scaffold-only", stderr.getvalue())
+
     def test_safe_overrides_and_selection_are_ordered(self):
         matrix = runner.build_matrix(
             ["base_turbo_8_sdpa", "base_native_sdpa"],

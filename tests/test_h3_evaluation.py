@@ -16,6 +16,8 @@ if str(APP_ROOT) not in sys.path:
 from services.h3_evaluation import (  # noqa: E402
     CONDITIONING_ENCODE_SEED,
     H3EvaluationError,
+    MINIMAX_H3_10EROS_BETA3_FULL_ID,
+    MINIMAX_H3_10EROS_BETA3_SKIP_ID,
     MINIMAX_H3_FL2VA_ID,
     MINIMAX_H3_REF2VA_ID,
     build_h3_evaluation_manifest,
@@ -46,6 +48,7 @@ class H3CatalogTests(unittest.TestCase):
     def test_catalog_preserves_official_ids_revisions_and_component_roles(self):
         catalog = get_h3_profile_catalog()
         self.assertEqual(catalog["pinned_as_of"], "2026-08-06")
+        self.assertEqual(catalog["experimental_updated_as_of"], "2026-08-25")
         profiles = catalog["profiles"]
         self.assertIn("minimax_h3", profiles)
         self.assertIn("minimax_h3_ref2va", profiles)
@@ -91,6 +94,27 @@ class H3CatalogTests(unittest.TestCase):
         self.assertFalse(encoder["video_model"])
         self.assertEqual(encoder["license"], "Apache-2.0")
         self.assertFalse(encoder["enabled_by_default"])
+
+        skip = profiles[MINIMAX_H3_10EROS_BETA3_SKIP_ID]
+        full = profiles[MINIMAX_H3_10EROS_BETA3_FULL_ID]
+        self.assertEqual(skip["maestro_experiment_policy"]["priority"], 1)
+        self.assertEqual(full["maestro_experiment_policy"]["priority"], 2)
+        self.assertEqual(skip["pinned_as_of"], "2026-08-25")
+        self.assertEqual(full["pinned_as_of"], "2026-08-25")
+        self.assertEqual(skip["mode"], "turbo_hybrid")
+        self.assertEqual(full["mode"], "turbo_hybrid")
+        self.assertEqual(skip["revision"], "09beb98782a6feb2f44c39c46179743ca8607c6c")
+        self.assertEqual(full["revision"], "84ea7a6ec06e0cb5f2f35615e25e3529c5ec6c02")
+        self.assertEqual(skip["artifact_size_bytes"], 22_513_576_472)
+        self.assertEqual(full["artifact_size_bytes"], 20_973_147_816)
+        self.assertEqual(skip["layer_policy"]["marker_count"], 184)
+        self.assertEqual(full["layer_policy"]["marker_count"], 200)
+        self.assertFalse(skip["execution_available"])
+        self.assertFalse(full["execution_available"])
+        self.assertFalse(skip["enabled_by_default"])
+        self.assertFalse(full["enabled_by_default"])
+        self.assertNotEqual(skip["model_type"], MINIMAX_H3_FL2VA_ID)
+        self.assertNotEqual(skip["model_type"], MINIMAX_H3_REF2VA_ID)
 
     def test_catalog_is_returned_as_an_isolated_copy(self):
         first = get_h3_profile_catalog()
@@ -207,6 +231,92 @@ class H3ManifestTests(unittest.TestCase):
             manifest["profile"]["encoder_option"]["component_role"],
             "conditioning_encoder_only",
         )
+
+    def test_beta3_scaffold_manifests_are_portable_distinct_and_non_executable(self):
+        manifests = []
+        for profile_id in (
+            MINIMAX_H3_10EROS_BETA3_SKIP_ID,
+            MINIMAX_H3_10EROS_BETA3_FULL_ID,
+        ):
+            with self.subTest(profile_id=profile_id):
+                values = {
+                    "project_id": "project-beta3",
+                    "job_id": f"job-{profile_id.rsplit('_', 1)[-1]}",
+                    "model_type": profile_id,
+                    "resolved_seed": 77,
+                    "prompt": "A content-free scaffold fixture.",
+                    "frame_count": 124,
+                    "resolution": "608x352",
+                    "sampling_steps": 6,
+                    "conditioning": {},
+                    "profile_id": profile_id,
+                    "allow_experimental": True,
+                    "sampler_candidate": (
+                        "er_sde/simple"
+                        if profile_id == MINIMAX_H3_10EROS_BETA3_SKIP_ID
+                        else "multires/simple"
+                    ),
+                }
+                first = build_h3_evaluation_manifest(**values)
+                second = build_h3_evaluation_manifest(**values)
+                self.assertEqual(first, second)
+                validate_h3_evaluation_manifest(first)
+                self.assertTrue(first["profile"]["scaffold_only"])
+                self.assertFalse(first["profile"]["execution_available"])
+                self.assertEqual(first["conditioning"]["mode"], "scaffold_only")
+                self.assertEqual(
+                    first["request"]["sampler_candidate"],
+                    values["sampler_candidate"],
+                )
+                self.assertNotIn(str(Path(__file__).resolve().parent), json.dumps(first))
+                report = build_h3_evaluation_report(first)
+                self.assertEqual(report["execution"]["status"], "skipped")
+                self.assertEqual(
+                    report["configuration_facts"]["sampler_candidate"],
+                    values["sampler_candidate"],
+                )
+                with self.assertRaisesRegex(H3EvaluationError, "cannot be passed"):
+                    build_h3_evaluation_report(first, lambda _value: {})
+                manifests.append(first)
+        self.assertNotEqual(manifests[0]["manifest_id"], manifests[1]["manifest_id"])
+        with self.assertRaisesRegex(H3EvaluationError, "do not claim"):
+            build_h3_evaluation_manifest(
+                project_id="project-beta3",
+                job_id="job-bad-conditioning",
+                model_type=MINIMAX_H3_10EROS_BETA3_SKIP_ID,
+                resolved_seed=77,
+                prompt="A content-free scaffold fixture.",
+                frame_count=124,
+                resolution="608x352",
+                sampling_steps=6,
+                conditioning={"first_frame": "inputs/first.png"},
+                profile_id=MINIMAX_H3_10EROS_BETA3_SKIP_ID,
+                allow_experimental=True,
+                sampler_candidate="er_sde/simple",
+            )
+
+        base_values = {
+            "project_id": "project-beta3",
+            "job_id": "job-invalid-schedule",
+            "model_type": MINIMAX_H3_10EROS_BETA3_SKIP_ID,
+            "resolved_seed": 77,
+            "prompt": "A content-free scaffold fixture.",
+            "frame_count": 124,
+            "resolution": "608x352",
+            "conditioning": {},
+            "profile_id": MINIMAX_H3_10EROS_BETA3_SKIP_ID,
+            "allow_experimental": True,
+        }
+        for changes, message in (
+            ({"sampling_steps": 5, "sampler_candidate": "er_sde/simple"}, "six"),
+            ({"sampling_steps": 7, "sampler_candidate": "er_sde/simple"}, "six"),
+            ({"sampling_steps": 6}, "sampler_candidate"),
+            ({"sampling_steps": 6, "sampler_candidate": "euler/simple"}, "sampler_candidate"),
+        ):
+            with self.subTest(changes=changes), self.assertRaisesRegex(
+                H3EvaluationError, message,
+            ):
+                build_h3_evaluation_manifest(**base_values, **changes)
 
     def test_explicit_defaults_private_but_caller_may_deliberately_override(self):
         self.assertTrue(_manifest(explicit=True)["artifact_policy"]["private"])

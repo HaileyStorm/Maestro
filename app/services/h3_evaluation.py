@@ -21,9 +21,16 @@ from typing import Any
 
 SCHEMA_VERSION = 1
 CATALOG_PINNED_AS_OF = "2026-08-06"
+EXPERIMENTAL_CATALOG_UPDATED_AS_OF = "2026-08-25"
 
 MINIMAX_H3_FL2VA_ID = "minimax_h3"
 MINIMAX_H3_REF2VA_ID = "minimax_h3_ref2va"
+MINIMAX_H3_10EROS_BETA3_SKIP_ID = (
+    "minimax_h3_10eros_beta3_turbo_hybrid_skip_edges"
+)
+MINIMAX_H3_10EROS_BETA3_FULL_ID = (
+    "minimax_h3_10eros_beta3_turbo_hybrid_full"
+)
 
 MINIMAX_H3_COMFY_FL2VA_REVISION = "0543966fbdce5ba05709a8f2031c94bdba629b4a"
 MINIMAX_H3_COMFY_REF2VA_REVISION = "eb8a16107c595128b3a578f82d2ce2f75920c355"
@@ -89,6 +96,20 @@ _MODE_LIMITS = {
                 "total_maximum": 15.0,
             },
         },
+    },
+    MINIMAX_H3_10EROS_BETA3_SKIP_ID: {
+        "minimum_frames": 124,
+        "maximum_frames": 345,
+        "minimum_duration_seconds": 5.0,
+        "maximum_duration_seconds": 15.0,
+        "conditioning_mode": "scaffold_only",
+    },
+    MINIMAX_H3_10EROS_BETA3_FULL_ID: {
+        "minimum_frames": 124,
+        "maximum_frames": 345,
+        "minimum_duration_seconds": 5.0,
+        "maximum_duration_seconds": 15.0,
+        "conditioning_mode": "scaffold_only",
     },
 }
 
@@ -220,6 +241,99 @@ _PROFILE_CATALOG = {
         ],
         "upstream_pr_notes": [],
     },
+    MINIMAX_H3_10EROS_BETA3_SKIP_ID: {
+        "id": MINIMAX_H3_10EROS_BETA3_SKIP_ID,
+        "label": "10Eros H3 Beta3 TURBO Hybrid INT8 ConvRot (skip edges)",
+        "component_role": "video_model_bundle",
+        "model_type": MINIMAX_H3_10EROS_BETA3_SKIP_ID,
+        "experimental": True,
+        "enabled_by_default": False,
+        "execution_available": False,
+        "automatic_fallback": False,
+        "scaffold_only": True,
+        "repository": "cicalooo/10Eros-Max-h3-int8-convrot",
+        "pinned_as_of": EXPERIMENTAL_CATALOG_UPDATED_AS_OF,
+        "repository_head": "dbdd87944063bc01d8062bae1dba12212ca4061f",
+        "revision": "09beb98782a6feb2f44c39c46179743ca8607c6c",
+        "artifact": (
+            "10Eros_Max_h3_TURBO-hybrid_beta3_int8_convrot_"
+            "skip_edges.safetensors"
+        ),
+        "artifact_size_bytes": 22_513_576_472,
+        "artifact_sha256": (
+            "a5ae4559cf19b0830adc1de6e8355d10eaf10524f78e9851a189a80990e6963a"
+        ),
+        "mode": "turbo_hybrid",
+        "quantization": {
+            "format": "int8_tensorwise",
+            "scale_method": "per_channel_absmax",
+            "convrot": True,
+            "convrot_groupsize": 256,
+            "source_dtype": "bfloat16",
+        },
+        "layer_policy": {
+            "marker_count": 184,
+            "quantized_blocks": list(range(2, 48)),
+            "bf16_edge_blocks": [0, 1, 48, 49],
+        },
+        "maestro_experiment_policy": {
+            "evidence_class": "provisional_maestro_experiment_policy",
+            "schedule": {
+                "steps": 6,
+                "sampler_candidates": ["er_sde/simple", "multires/simple"],
+            },
+            "incompatible_stacking": [
+                "maestro_turbo", "spectrum", "lightx2v", "sage_attention",
+                "step_cache",
+            ],
+            "priority": 1,
+        },
+    },
+    MINIMAX_H3_10EROS_BETA3_FULL_ID: {
+        "id": MINIMAX_H3_10EROS_BETA3_FULL_ID,
+        "label": "10Eros H3 Beta3 TURBO Hybrid INT8 ConvRot (full)",
+        "component_role": "video_model_bundle",
+        "model_type": MINIMAX_H3_10EROS_BETA3_FULL_ID,
+        "experimental": True,
+        "enabled_by_default": False,
+        "execution_available": False,
+        "automatic_fallback": False,
+        "scaffold_only": True,
+        "repository": "cicalooo/10Eros-Max-h3-int8-convrot",
+        "pinned_as_of": EXPERIMENTAL_CATALOG_UPDATED_AS_OF,
+        "repository_head": "dbdd87944063bc01d8062bae1dba12212ca4061f",
+        "revision": "84ea7a6ec06e0cb5f2f35615e25e3529c5ec6c02",
+        "artifact": "10Eros_Max_h3_TURBO-hybrid_beta3_int8_convrot.safetensors",
+        "artifact_size_bytes": 20_973_147_816,
+        "artifact_sha256": (
+            "ebd0cb25273253213028bea0289da4c5c94929027ed9191fbb24fc924d4a8f0d"
+        ),
+        "mode": "turbo_hybrid",
+        "quantization": {
+            "format": "int8_tensorwise",
+            "scale_method": "per_channel_absmax",
+            "convrot": True,
+            "convrot_groupsize": 256,
+            "source_dtype": "bfloat16",
+        },
+        "layer_policy": {
+            "marker_count": 200,
+            "quantized_blocks": list(range(50)),
+            "bf16_edge_blocks": [],
+        },
+        "maestro_experiment_policy": {
+            "evidence_class": "provisional_maestro_experiment_policy",
+            "schedule": {
+                "steps": 6,
+                "sampler_candidates": ["er_sde/simple", "multires/simple"],
+            },
+            "incompatible_stacking": [
+                "maestro_turbo", "spectrum", "lightx2v", "sage_attention",
+                "step_cache",
+            ],
+            "priority": 2,
+        },
+    },
 }
 
 _METRIC_TYPES = {
@@ -243,9 +357,10 @@ class H3EvaluationError(ValueError):
 
 
 def get_h3_profile_catalog() -> dict[str, Any]:
-    """Return an isolated copy of the catalog pinned on 2026-08-06."""
+    """Return the base pin plus isolated, dated experimental additions."""
     return {
         "pinned_as_of": CATALOG_PINNED_AS_OF,
+        "experimental_updated_as_of": EXPERIMENTAL_CATALOG_UPDATED_AS_OF,
         "profiles": copy.deepcopy(_PROFILE_CATALOG),
     }
 
@@ -326,6 +441,12 @@ def _normalize_conditioning(model_type: str, conditioning: Any) -> dict[str, Any
     if not isinstance(raw, Mapping):
         raise H3EvaluationError("conditioning must be an object")
     mode = _MODE_LIMITS[model_type]["conditioning_mode"]
+    if mode == "scaffold_only":
+        if raw:
+            raise H3EvaluationError(
+                "10Eros Beta3 scaffold manifests do not claim a conditioning contract"
+            )
+        return {"mode": mode, "encode_seed": CONDITIONING_ENCODE_SEED}
     if model_type == MINIMAX_H3_FL2VA_ID:
         allowed = {"first_frame", "last_frame"}
         unknown = set(raw) - allowed
@@ -422,6 +543,7 @@ def build_h3_evaluation_manifest(
     profile_id: str | None = None,
     encoder_profile_id: str | None = None,
     allow_experimental: bool = False,
+    sampler_candidate: str | None = None,
 ) -> dict[str, Any]:
     """Build a deterministic and JSON-serializable H3 evaluation manifest."""
     project_id = _validate_lineage_id(project_id, "project_id")
@@ -469,6 +591,23 @@ def build_h3_evaluation_manifest(
         raise H3EvaluationError("profile_id is incompatible with model_type")
     if profile.get("experimental") and not allow_experimental:
         raise H3EvaluationError("experimental profiles require allow_experimental=True")
+    scaffold_only = bool(profile.get("scaffold_only", False))
+    if scaffold_only:
+        if sampling_steps != 6:
+            raise H3EvaluationError(
+                "10Eros Beta3 scaffold manifests require exactly six sampling steps"
+            )
+        sampler_candidates = profile["maestro_experiment_policy"]["schedule"][
+            "sampler_candidates"
+        ]
+        if sampler_candidate not in sampler_candidates:
+            raise H3EvaluationError(
+                "10Eros Beta3 sampler_candidate must be er_sde/simple or multires/simple"
+            )
+    elif sampler_candidate is not None:
+        raise H3EvaluationError(
+            "sampler_candidate is reserved for scaffold-only experimental profiles"
+        )
 
     encoder_profile = None
     if encoder_profile_id is not None:
@@ -479,6 +618,14 @@ def build_h3_evaluation_manifest(
             raise H3EvaluationError("experimental encoder profiles require allow_experimental=True")
 
     width, height = (int(part) for part in resolution.split("x"))
+    request = {
+        "prompt": prompt,
+        "resolved_seed": resolved_seed,
+        "conditioning_encode_seed": CONDITIONING_ENCODE_SEED,
+        "sampling_steps": sampling_steps,
+    }
+    if scaffold_only:
+        request["sampler_candidate"] = sampler_candidate
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "kind": "minimax_h3_evaluation_manifest",
@@ -488,15 +635,12 @@ def build_h3_evaluation_manifest(
             "id": selected_profile_id,
             "model_type": model_type,
             "experimental": bool(profile["experimental"]),
+            "scaffold_only": bool(profile.get("scaffold_only", False)),
+            "execution_available": bool(profile.get("execution_available", True)),
             "revision_provenance": copy.deepcopy(profile),
             "encoder_option": copy.deepcopy(encoder_profile),
         },
-        "request": {
-            "prompt": prompt,
-            "resolved_seed": resolved_seed,
-            "conditioning_encode_seed": CONDITIONING_ENCODE_SEED,
-            "sampling_steps": sampling_steps,
-        },
+        "request": request,
         "geometry": {
             "fps": NATIVE_FPS,
             "frame_count": frame_count,
@@ -559,6 +703,7 @@ def validate_h3_evaluation_manifest(manifest: Mapping[str, Any]) -> None:
             profile_id=profile["id"],
             encoder_profile_id=encoder["id"] if encoder else None,
             allow_experimental=bool(profile["experimental"] or encoder),
+            sampler_candidate=request.get("sampler_candidate"),
         )
     except (KeyError, TypeError) as error:
         raise H3EvaluationError("manifest is missing required canonical fields") from error
@@ -605,6 +750,10 @@ def build_h3_evaluation_report(
     estimates or zero-valued placeholders.
     """
     validate_h3_evaluation_manifest(manifest)
+    if manifest["profile"].get("scaffold_only") and executor is not None:
+        raise H3EvaluationError(
+            "10Eros Beta3 scaffold manifests cannot be passed to an executor"
+        )
     metrics = _unavailable_metrics(
         "executor_not_provided" if executor is None else "not_reported_by_executor"
     )
@@ -678,6 +827,10 @@ def build_h3_evaluation_report(
         "artifact_policy": copy.deepcopy(manifest["artifact_policy"]),
         "ranking": {"status": "not_performed"},
     }
+    if manifest["profile"].get("scaffold_only"):
+        report["configuration_facts"]["sampler_candidate"] = manifest[
+            "request"
+        ]["sampler_candidate"]
     report["report_id"] = _fingerprint("h3r", report)
     return report
 
@@ -692,8 +845,11 @@ __all__ = [
     "AUDIO_SCHEDULER_SHIFT",
     "CATALOG_PINNED_AS_OF",
     "CONDITIONING_ENCODE_SEED",
+    "EXPERIMENTAL_CATALOG_UPDATED_AS_OF",
     "H3EvaluationError",
     "LEGAL_CANVASES",
+    "MINIMAX_H3_10EROS_BETA3_FULL_ID",
+    "MINIMAX_H3_10EROS_BETA3_SKIP_ID",
     "MINIMAX_H3_FL2VA_ID",
     "MINIMAX_H3_REF2VA_ID",
     "NATIVE_FPS",
