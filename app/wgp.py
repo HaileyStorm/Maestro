@@ -153,6 +153,7 @@ reload_needed = True
 _loaded_model_configuration = None
 _loaded_residency_base_key = None
 _loaded_residency_affinity_key = None
+_loaded_h3_dasiwa_checkpoint_admission = None
 _model_residency_store = None
 _model_residency_singleflight = ResidencySingleflight()
 _model_residency_offload_setup_lock = threading.Lock()
@@ -746,12 +747,14 @@ def _invalidate_loaded_model_state():
     """Invalidate WGP and scheduler identity before fallible load/release work."""
     global reload_needed, _loaded_model_configuration
     global _loaded_residency_base_key, _loaded_residency_affinity_key
+    global _loaded_h3_dasiwa_checkpoint_admission
     global _loaded_model_residency_evidence_template
     global _loaded_model_residency_evidence_context_id
     reload_needed = True
     _loaded_model_configuration = None
     _loaded_residency_base_key = None
     _loaded_residency_affinity_key = None
+    _loaded_h3_dasiwa_checkpoint_admission = None
     evidence_lock = globals().get("_model_residency_evidence_context_lock")
     if evidence_lock is None:
         _loaded_model_residency_evidence_template = None
@@ -4343,6 +4346,20 @@ def get_compatible_local_model_filename(
     return None
 
 
+def get_resolved_transformer_checkpoint_path(model_type):
+    """Resolve the exact primary transformer path the ordinary loader selects."""
+    model_def = get_model_def(model_type)
+    save_quantized = args.save_quantized and model_def is not None
+    filename = get_model_filename(
+        model_type=model_type,
+        quantization="" if save_quantized else transformer_quantization,
+        dtype_policy=transformer_dtype_policy,
+    )
+    return get_compatible_local_model_filename(
+        filename, model_type, file_type=0,
+    )
+
+
 _MANUAL_CHECKPOINT_INTEGRITY_CONTRACTS = {
     PORNMASTER_V4_PONPOKE_RECIPE: {
         "filename": "pornmasterFlux2Klein_v4TurboFp8.safetensors",
@@ -6270,11 +6287,13 @@ def load_models(
     load_cancel_callback=None,
     residency_context=None,
     force_residency_reprofile=False,
+    h3_dasiwa_admission=None,
     **model_kwargs,
 ):
     global transformer_type, loaded_profile, reload_needed
     global _loaded_model_configuration, _loaded_residency_base_key
     global _loaded_residency_affinity_key
+    global _loaded_h3_dasiwa_checkpoint_admission
     # Shared fail-closed boundary for Studio, Classic, CLI, internal callers,
     # recovery, already-downloaded checkpoints, and first-use auto-downloads.
     # This check is recipe metadata only; it never inspects generation data.
@@ -6343,6 +6362,7 @@ def load_models(
             model_submodel_no_list.append(0) 
 
     local_model_file_list= []
+    resolved_primary_model_path = None
     for filename, file_model_type, file_source_type, submodel_no in zip(model_file_list, model_type_list, source_type_list, model_submodel_no_list):
         if len(filename) == 0: continue 
         download_models(filename, file_model_type, file_source_type, submodel_no)
@@ -6358,7 +6378,22 @@ def load_models(
             and submodel_no == 1
         ):
             local_file_name = verified_manual_checkpoint
+        if (
+            file_model_type == model_type
+            and file_source_type == 0
+            and submodel_no == 1
+        ):
+            resolved_primary_model_path = local_file_name
         local_model_file_list.append( os.path.basename(filename) if local_file_name is None else local_file_name )
+    if h3_dasiwa_admission is not None:
+        from services.h3_dasiwa import recheck_dasiwa_checkpoint_admission
+
+        # Recheck against the loader's own resolved primary path after any
+        # download/alias resolution and before model construction begins.
+        recheck_dasiwa_checkpoint_admission(
+            h3_dasiwa_admission,
+            resolved_primary_model_path,
+        )
     if len(local_model_file_list) == 0:
         download_models("", model_type, 0, -1)
 
@@ -6528,9 +6563,19 @@ def load_models(
             "Preparing H3 checkpoint loaders"
             if is_h3_load else "Loading model checkpoint"
         )
+        if h3_dasiwa_admission is not None:
+            recheck_dasiwa_checkpoint_admission(
+                h3_dasiwa_admission,
+                resolved_primary_model_path,
+            )
         wan_model, pipe = model_type_handler.load_model(
                     local_model_file_list, model_type, base_model_type, model_def, quantizeTransformer = quantizeTransformer, text_encoder_quantization = text_encoder_quantization,
                     dtype = transformer_dtype, VAE_dtype = VAE_dtype, mixed_precision_transformer = mixed_precision_transformer, save_quantized = save_quantized, submodel_no_list   = model_submodel_no_list, text_encoder_filename = text_encoder_filename, profile=profile, lm_decoder_engine=lm_decoder_engine_obtained, **handler_model_kwargs )
+        if h3_dasiwa_admission is not None:
+            recheck_dasiwa_checkpoint_admission(
+                h3_dasiwa_admission,
+                resolved_primary_model_path,
+            )
         status_reporter.check_cancelled()
         status_reporter.transition("Preparing model pipeline")
         kwargs = {}
@@ -6662,6 +6707,10 @@ def load_models(
             output_type,
             loaded_vae_setting,
         )
+    )
+    _loaded_h3_dasiwa_checkpoint_admission = (
+        dict(h3_dasiwa_admission)
+        if isinstance(h3_dasiwa_admission, dict) else None
     )
     reload_needed = False
     _register_model_residency_evidence_context(
@@ -10831,6 +10880,62 @@ def _generate_video_impl(
     if str(model_type or "").startswith("minimax_h3"):
         from services.h3_oom_relief import apply_h3_baseline_offload_profile
         profile = apply_h3_baseline_offload_profile(profile, model_type)
+    dasiwa_checkpoint_admission = None
+    dasiwa_lora_path = None
+    dasiwa_lora_candidates = (
+        [activated_loras]
+        if isinstance(activated_loras, str)
+        else (activated_loras or [])
+    )
+    if any(
+        os.path.basename(str(item))
+        == "dasiwa_ref2va_hybrid_v1_4step.safetensors"
+        for item in dasiwa_lora_candidates
+    ):
+        from services.h3_dasiwa import (
+            DASIWA_FILENAME,
+            enforce_dasiwa_runtime,
+        )
+
+        # This is the load/reuse boundary: resolve through the same canonical
+        # filename + compatible-local alias path used by load_models, then
+        # require the private receipt before releasing or reusing a model.
+        selected_checkpoint_path = get_resolved_transformer_checkpoint_path(
+            model_type,
+        )
+        selected_lora_path = resolve_lora_path(model_type, DASIWA_FILENAME)
+        dasiwa_lora_path = selected_lora_path
+        dasiwa_checkpoint_admission = enforce_dasiwa_runtime(
+            model_type=model_type,
+            activated_loras=activated_loras,
+            loras_multipliers=loras_multipliers,
+            num_inference_steps=num_inference_steps,
+            custom_settings=(
+                custom_settings if isinstance(custom_settings, dict) else {}
+            ),
+            skip_steps_cache_type=skip_steps_cache_type,
+            selected_checkpoint_path=selected_checkpoint_path,
+            selected_lora_path=selected_lora_path,
+        )
+        admission_keys = (
+            "sha256", "size", "compatibility", "family", "role",
+            "contract_revision",
+        )
+        if (
+            wan_model is not None
+            and model_type == transformer_type
+            and (
+                not isinstance(_loaded_h3_dasiwa_checkpoint_admission, dict)
+                or any(
+                    _loaded_h3_dasiwa_checkpoint_admission.get(key)
+                    != dasiwa_checkpoint_admission.get(key)
+                    for key in admission_keys
+                )
+            )
+        ):
+            # A same-model resident load without this checkpoint binding is
+            # not proof that its in-memory weights came from the verified file.
+            reload_needed = True
     requested_model_configuration = _model_load_configuration(
         args.vram_safety_coefficient,
         profile,
@@ -10908,6 +11013,7 @@ def _generate_video_impl(
             load_status_callback=lambda stage: send_cmd("status", stage),
             load_cancel_callback=lambda: bool(gen.get("abort", False)),
             residency_context=requested_residency_evidence_context,
+            h3_dasiwa_admission=dasiwa_checkpoint_admission,
             **model_kwargs,
         )
         send_cmd("status", "Model loaded")
@@ -11130,7 +11236,22 @@ def _generate_video_impl(
         if len(errors) > 0: raise Exception(f"Error parsing Loras: {errors}")
         errors = check_loras_exist(model_type, activated_loras, True, send_cmd)
         if len(errors) > 0 : raise gr.Error(errors)
-        loras_selected += [ resolve_lora_path(model_type, lora) for lora in activated_loras]
+        resolved_activated_loras = []
+        for lora in activated_loras:
+            if (
+                dasiwa_checkpoint_admission is not None
+                and os.path.basename(str(lora))
+                == "dasiwa_ref2va_hybrid_v1_4step.safetensors"
+            ):
+                from services.h3_dasiwa import admitted_dasiwa_lora_path
+                resolved_activated_loras.append(admitted_dasiwa_lora_path(
+                    dasiwa_checkpoint_admission,
+                    lora,
+                    dasiwa_lora_path,
+                ))
+            else:
+                resolved_activated_loras.append(resolve_lora_path(model_type, lora))
+        loras_selected += resolved_activated_loras
     else:
         print(f"[LoRA] No LoRAs activated for this generation (model_type={model_type})")
 
@@ -11259,6 +11380,11 @@ def _generate_video_impl(
 
         def prepare():
             if len(loras_selected) > 0:
+                if dasiwa_checkpoint_admission is not None:
+                    from services.h3_dasiwa import recheck_dasiwa_lora_admission
+                    recheck_dasiwa_lora_admission(
+                        dasiwa_checkpoint_admission, dasiwa_lora_path,
+                    )
                 pinnedLora = loaded_profile !=5  # and transformer_loras_filenames == None False # # #
                 preprocess_target = trans_lora if trans_lora is not None else trans
                 split_linear_modules_map = getattr(preprocess_target, "split_linear_modules_map", None)
@@ -11272,6 +11398,10 @@ def _generate_video_impl(
                     maxReservedLoras=server_config.get("max_reserved_loras", -1),
                     split_linear_modules_map=split_linear_modules_map,
                 )
+                if dasiwa_checkpoint_admission is not None:
+                    recheck_dasiwa_lora_admission(
+                        dasiwa_checkpoint_admission, dasiwa_lora_path,
+                    )
                 errors = trans_lora._loras_errors
                 if len(errors) > 0:
                     error_files = [msg for _, msg in errors]

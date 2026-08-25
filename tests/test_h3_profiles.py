@@ -22,6 +22,18 @@ from services.h3_profiles import (  # noqa: E402
 )
 
 class H3ProfileTests(unittest.TestCase):
+    def test_profile_estimate_uses_actual_path_free_checkpoint_receipt_status(self):
+        source = (APP / "launch.py").read_text(encoding="utf-8")
+        start = source.index("def _h3_profile_estimate_payload")
+        end = source.index("\ndef _local_owner_may_run_unvalidated", start)
+        section = source[start:end]
+        self.assertIn("get_resolved_transformer_checkpoint_path(", section)
+        self.assertIn("checkpoint_status(selected_checkpoint_path)", section)
+        self.assertIn(
+            "dasiwa_checkpoint_status=dasiwa_checkpoint_status", section,
+        )
+        self.assertNotIn('context.get("checkpoint_sha256")', section)
+
     def test_high_is_the_single_fresh_default_bundle(self):
         self.assertEqual(DEFAULT_H3_PROFILE_ID, "high")
         self.assertEqual(OWNER_DEFAULT_H3_PROFILE_ID, "high")
@@ -136,18 +148,20 @@ class H3ProfileTests(unittest.TestCase):
         options = build_profile_options(
             {
                 "model_type": "minimax_h3_ref2va",
-                "checkpoint_sha256": (
-                    "71c61492faf65b410d0726840ac3b27b017fcfeb76b16ae11589223d81b7121c"
-                ),
+                # Request/catalog fields are deliberately not integrity authority.
+                "checkpoint_sha256": "0" * 64,
                 "reference_shape": {},
             },
             model_exists=lambda _model: True,
             model_downloaded=lambda _model: True,
-            dasiwa_status={
-                "available": True, "downloaded": True,
-                "download_required": False,
+            dasiwa_checkpoint_status={
+                "verified": True,
+                "compatibility": "exact_base",
+                "sha256": (
+                    "71c61492faf65b410d0726840ac3b27b017fcfeb76b16ae11589223d81b7121c"
+                ),
             },
-            dasiwa_suspected_status={
+            dasiwa_status={
                 "available": True, "downloaded": True,
                 "download_required": False,
             },
@@ -185,19 +199,47 @@ class H3ProfileTests(unittest.TestCase):
         )
         self.assertIsNone(motion["fallback_profile_id"])
         suspected = by_id["dasiwa_ref2va_suspected_experimental"]
-        self.assertTrue(suspected["available"])
+        self.assertFalse(suspected["available"])
         self.assertIsNone(suspected["fallback_profile_id"])
         self.assertEqual(
             suspected["settings"]["lora_weights"],
             {"dasiwa_ref2va_hybrid_v1_4step.safetensors": [1.0]},
         )
 
+        suspected_options = build_profile_options(
+            {"model_type": "minimax_h3_ref2va", "reference_shape": {}},
+            model_exists=lambda _model: True,
+            model_downloaded=lambda _model: True,
+            dasiwa_checkpoint_status={
+                "verified": True,
+                "compatibility": "suspected_compatible_base",
+                "sha256": (
+                    "f86f2f79ebd2d76eb8eeb46091e83982e6ff51d255747e7b16e92834b392b8e9"
+                ),
+            },
+            dasiwa_status={"available": True, "downloaded": True},
+            better_motion_status={"available": False, "downloaded": False},
+        )
+        suspected_by_id = {item["id"]: item for item in suspected_options}
+        self.assertFalse(
+            suspected_by_id["dasiwa_ref2va_experimental"]["available"]
+        )
+        self.assertTrue(
+            suspected_by_id["dasiwa_ref2va_suspected_experimental"]["available"]
+        )
+
         base = build_profile_options(
             {"model_type": "minimax_h3", "reference_shape": {}},
             model_exists=lambda _model: True,
             model_downloaded=lambda _model: True,
+            dasiwa_checkpoint_status={
+                "verified": True,
+                "compatibility": "suspected_compatible_base",
+                "sha256": (
+                    "f86f2f79ebd2d76eb8eeb46091e83982e6ff51d255747e7b16e92834b392b8e9"
+                ),
+            },
             dasiwa_status={"available": True, "downloaded": True},
-            dasiwa_suspected_status={"available": True, "downloaded": True},
             better_motion_status={"available": True, "downloaded": True},
         )
         for profile_id in (
@@ -209,6 +251,35 @@ class H3ProfileTests(unittest.TestCase):
             self.assertFalse(candidate["available"])
             self.assertIn("Ref2VA", candidate["fallback_reason"])
             self.assertIsNone(candidate["fallback_profile_id"])
+
+    def test_suspected_candidate_is_selectable_with_runtime_preparation(self):
+        options = build_profile_options(
+            {"model_type": "minimax_h3_ref2va", "reference_shape": {}},
+            model_exists=lambda _model: True,
+            model_downloaded=lambda _model: True,
+            dasiwa_checkpoint_status={
+                "verified": False,
+                "candidate": True,
+                "preparation_required": True,
+                "compatibility": "suspected_compatible_base",
+                "reason": "Checkpoint verification will run once at runtime.",
+            },
+            dasiwa_status={
+                "available": False,
+                "candidate": True,
+                "preparation_required": True,
+                "downloaded": True,
+                "download_required": False,
+                "reason": "LoRA verification will run once at runtime.",
+            },
+            better_motion_status={"available": False, "downloaded": False},
+        )
+        by_id = {item["id"]: item for item in options}
+        self.assertFalse(by_id["dasiwa_ref2va_experimental"]["available"])
+        suspected = by_id["dasiwa_ref2va_suspected_experimental"]
+        self.assertTrue(suspected["available"])
+        self.assertTrue(suspected["preparation_required"])
+        self.assertIn("runtime", suspected["preparation_reason"])
 
     def test_turbo_profiles_are_visibly_unavailable_until_registered(self):
         options = build_profile_options(

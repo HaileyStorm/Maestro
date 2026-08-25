@@ -40028,6 +40028,13 @@ def _h3_profile_estimate_payload(
     lightx2v_status = {"registered": True, "downloaded": False}
     sage2_status = {"available": False, "validated": False}
     upscale_status = {"enabled": False, "downloaded": False}
+    dasiwa_checkpoint_status = {
+        "verified": False,
+        "available": False,
+        "compatibility": "unavailable",
+        "receipt_reused": False,
+        "reason": "The selected transformer has not passed its local integrity receipt.",
+    }
     try:
         from services.h3_turbo import turbo_assets_status
         runtime_status = dict(turbo_assets_status() or {})
@@ -40077,6 +40084,20 @@ def _h3_profile_estimate_payload(
             "downloaded": False,
             "reason": "FlashVSR assets are not available yet.",
         }
+    try:
+        from services.h3_dasiwa import (
+            dasiwa_checkpoint_status as checkpoint_status,
+            dasiwa_lora_candidate_status,
+        )
+
+        selected_model_type = str(context.get("model_type") or "minimax_h3")
+        selected_checkpoint_path = wgp.get_resolved_transformer_checkpoint_path(
+            selected_model_type,
+        )
+        dasiwa_checkpoint_status = checkpoint_status(selected_checkpoint_path)
+        dasiwa_status = dasiwa_lora_candidate_status()
+    except (AttributeError, ImportError, OSError, RuntimeError, TypeError, ValueError):
+        dasiwa_status = None
     def candidate_for_settings(settings: dict) -> dict:
         candidate = dict(context)
         candidate.update({
@@ -40148,6 +40169,8 @@ def _h3_profile_estimate_payload(
         lightx2v_compatibility=lightx2v_compatibility,
         sage2_status=sage2_status,
         upscale_status=upscale_status,
+        dasiwa_checkpoint_status=dasiwa_checkpoint_status,
+        dasiwa_status=dasiwa_status,
     )
     for profile in profiles:
         settings = profile["settings"]

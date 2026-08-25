@@ -21,6 +21,7 @@ from services.h3_dasiwa import (
     DASIWA_SUSPECTED_BASE_SHA256,
     INCOMPATIBLE_ACCELERATORS,
     LORA_INSERTION_MODE,
+    dasiwa_lora_candidate_status,
     experiment_status,
 )
 
@@ -361,8 +362,8 @@ def build_profile_options(
     lightx2v_compatibility: Callable[[Mapping[str, Any]], tuple[bool, str | None]] | None = None,
     sage2_status: Mapping[str, Any] | None = None,
     upscale_status: Mapping[str, Any] | None = None,
+    dasiwa_checkpoint_status: Mapping[str, Any] | None = None,
     dasiwa_status: Mapping[str, Any] | None = None,
-    dasiwa_suspected_status: Mapping[str, Any] | None = None,
     better_motion_status: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Return editable bundles without mutating policy or reference controls."""
@@ -374,19 +375,9 @@ def build_profile_options(
     sage2_status = dict(sage2_status or {})
     upscale_status = dict(upscale_status or {})
     lightx2v_status = dict(lightx2v_status or {})
+    dasiwa_checkpoint_status = dict(dasiwa_checkpoint_status or {})
     if dasiwa_status is None:
-        dasiwa_status = experiment_status(
-            DASIWA_ARTIFACT_ID,
-            selected_model_type=selected,
-            selected_base_sha256=str(context.get("checkpoint_sha256") or "") or None,
-        )
-    if dasiwa_suspected_status is None:
-        dasiwa_suspected_status = experiment_status(
-            DASIWA_ARTIFACT_ID,
-            selected_model_type=selected,
-            selected_base_sha256=DASIWA_SUSPECTED_BASE_SHA256,
-            allow_suspected_base=True,
-        )
+        dasiwa_status = dasiwa_lora_candidate_status()
     if better_motion_status is None:
         better_motion_status = experiment_status(
             BETTER_MOTION_ARTIFACT_ID,
@@ -394,7 +385,7 @@ def build_profile_options(
         )
     experiment_statuses = {
         "dasiwa": dict(dasiwa_status),
-        "dasiwa_suspected": dict(dasiwa_suspected_status),
+        "dasiwa_suspected": dict(dasiwa_status),
         "better_motion": {
             "downloaded": False,
             "download_required": True,
@@ -435,19 +426,56 @@ def build_profile_options(
                 available, reason = lightx2v_compatibility(settings)
         if experiment:
             status = experiment_statuses[definition["accelerator"]]
+            checkpoint_compatibility = str(
+                dasiwa_checkpoint_status.get("compatibility") or ""
+            )
+            checkpoint_sha256 = str(
+                dasiwa_checkpoint_status.get("sha256") or ""
+            ).strip().casefold()
             if selected != "minimax_h3_ref2va":
                 available = False
                 reason = f"{definition['label']} supports only MiniMax H3 Ref2VA."
             elif (
                 definition["accelerator"] == "dasiwa"
-                and str(context.get("checkpoint_sha256") or "").strip().casefold()
-                != DASIWA_COMPATIBLE_BASE_SHA256
+                and not (
+                    dasiwa_checkpoint_status.get("verified") is True
+                    and checkpoint_compatibility == "exact_base"
+                    and checkpoint_sha256 == DASIWA_COMPATIBLE_BASE_SHA256
+                )
             ):
                 available = False
                 reason = (
-                    "Dasiwa requires the exact compatible Ref2VA checkpoint identity."
+                    "Dasiwa exact-base mode is unavailable until the selected "
+                    "transformer matches its verified exact checkpoint contract."
                 )
-            elif status.get("available") is not True:
+            elif (
+                definition["accelerator"] == "dasiwa_suspected"
+                and not (
+                    (
+                        dasiwa_checkpoint_status.get("verified") is True
+                        and checkpoint_compatibility == "suspected_compatible_base"
+                        and checkpoint_sha256 == DASIWA_SUSPECTED_BASE_SHA256
+                    )
+                    or (
+                        dasiwa_checkpoint_status.get("candidate") is True
+                        and dasiwa_checkpoint_status.get("preparation_required") is True
+                        and checkpoint_compatibility == "suspected_compatible_base"
+                    )
+                )
+            ):
+                available = False
+                reason = (
+                    "The installed Ref2VA compatibility probe is unavailable "
+                    "until its actual transformer passes the local integrity receipt."
+                )
+            elif (
+                status.get("available") is not True
+                and not (
+                    definition["accelerator"] == "dasiwa_suspected"
+                    and status.get("candidate") is True
+                    and status.get("preparation_required") is True
+                )
+            ):
                 available = False
                 reason = str(
                     status.get("reason")
@@ -525,6 +553,29 @@ def build_profile_options(
             "attention_engine": settings["custom_settings"]["h3_attention_engine"],
             "description": description,
             "available": available,
+            "preparation_required": bool(
+                definition["accelerator"] == "dasiwa_suspected"
+                and (
+                    dasiwa_checkpoint_status.get("preparation_required") is True
+                    or experiment_statuses["dasiwa_suspected"].get(
+                        "preparation_required"
+                    ) is True
+                )
+            ),
+            "preparation_reason": (
+                str(
+                    dasiwa_checkpoint_status.get("reason")
+                    or experiment_statuses["dasiwa_suspected"].get("reason")
+                    or "Runtime verification is required."
+                )
+                if definition["accelerator"] == "dasiwa_suspected"
+                and (
+                    dasiwa_checkpoint_status.get("preparation_required") is True
+                    or experiment_statuses["dasiwa_suspected"].get(
+                        "preparation_required"
+                    ) is True
+                ) else None
+            ),
             "fallback_reason": reason,
             "fallback_profile_id": None,
             "download_required": bool(
