@@ -4,7 +4,7 @@
         "architecture": "minimax_h3",
         "description": "Explicit-mode MiniMax H3 FL2VA checkpoint for text, first-frame, and first/last-frame video with synchronized stereo audio. FL2VA only; semantic image/video/audio references continue to use MiniMax H3 Ref2VA.",
         "URLs": [
-            "https://huggingface.co/SexGod1979/PinkCherry_MiniMax-H3/resolve/fcd03fbaed78c268c1dc36c21b2ad6f0202fc50a/alpha-0.2-testing/PinkCherry_h3_fl2va_int8_convrot_v0.2-alpha.safetensors"
+            "https://huggingface.co/SexGod1979/PinkCherry_MiniMax-H3/resolve/8642ce26b8ff3d671fb8370de70d8fd1b36b070c/beta-0.6-fl2va/PinkCherry_fl2va_MiniMax_H3_pruned_int8_convrot-beta-0.6.safetensors"
         ],
         "text_encoder_URLs": [
             "https://huggingface.co/ethanfel/Qwen3-VL-32B-Ultra-Heretic-H3-ComfyUI-INT8-ConvRot/resolve/e8967f6a39ea5b4939a1aff81be3e8706490c0e8/qwen3vl_32b_h3_ultra_uncensored_heretic_int8_convrot.safetensors"
@@ -17,7 +17,7 @@
             "enabled": true,
             "provider": "huggingface",
             "repo_id": "SexGod1979/PinkCherry_MiniMax-H3",
-            "file_pattern": "alpha-[0-9.]+-testing/PinkCherry_h3_fl2va_int8_convrot_v(?P<version>[0-9.]+)-alpha\\.safetensors",
+            "file_pattern": "beta-(?P<version>[0-9.]+)-fl2va/PinkCherry_fl2va_MiniMax_H3_pruned_int8_convrot-beta-(?P=version)\\.safetensors",
             "check_interval_hours": 24,
             "auto_replace": true,
             "compatibility": {

@@ -49,7 +49,9 @@ H3_TURBO_STRENGTH = 1.0
 H3_TURBO_SCHEDULE_ALGORITHM_VERSION = "maestro_h3_turbo_dual_clock_v1"
 H3_TURBO_BASE_CHECKPOINT = "minimax_h3_fl2va_pruned_fp8_scaled.safetensors"
 H3_TURBO_W4A8_CHECKPOINT = "minimax_h3_fl2va_pruned_w4a8_mixed.safetensors"
-H3_TURBO_PINKCHERRY_CHECKPOINT = "PinkCherry_h3_fl2va_int8_convrot_v0.2-alpha.safetensors"
+H3_TURBO_PINKCHERRY_CHECKPOINT = (
+    "PinkCherry_fl2va_MiniMax_H3_pruned_int8_convrot-beta-0.6.safetensors"
+)
 H3_TURBO_REF2VA_CHECKPOINT = "minimax_h3_ref2va_pruned_fp8_scaled.safetensors"
 
 _MODEL_VARIANTS = {
