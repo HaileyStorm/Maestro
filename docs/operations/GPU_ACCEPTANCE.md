@@ -82,6 +82,28 @@ store, not in Git. A model-free test, downloaded asset, runtime marker, printed
 URL, completed queue plan, or screenshot of controls is not generated-output or
 human acceptance.
 
+### 2026-08-27 PinkCherry beta-0.6 runtime receipt
+
+- Source revision: `5a30ce7`; Linux `7.0.0-30-generic`; RTX 5090; NVIDIA
+  `595.84`; CUDA compiler `12.8.93`.
+- Producer: `minimax_h3_pinkcherry_fl2va`; checkpoint
+  `PinkCherry_fl2va_MiniMax_H3_pruned_int8_convrot-beta-0.6.safetensors`
+  at pinned revision `8642ce26b8ff3d671fb8370de70d8fd1b36b070c`, SHA-256
+  `0cb2812f061003d9f345186d58f1bafbf902c6ad2b4c064590b4fc4811634ad1`;
+  Heretic INT8 conditioner; no LoRA, managed Turbo, TeaCache, or model fallback.
+- One private member-project job completed 28 Sol-Attn steps and produced a
+  7,661,687-byte HEVC MP4 with 124 frames at 1344x768/24 fps plus 32 kHz stereo
+  AAC. Output SHA-256:
+  `d36103f99d9579637ef9bf35e17f7548a5368cba27c490e36a1782dd471054fd`.
+- Observed peak VRAM was 27,333 MiB. Sampled frames retained one coherent adult
+  performer, dress, stage, lighting, and plausible anatomy/motion; the audio
+  stream was finite and non-silent (peak -19.34 dBFS, RMS -32.80 dBFS).
+- Evidence class: live local GPU generation plus agent visual and technical A/V
+  review. The runtime/output portion passes. The strict matrix row remains open
+  only for the separately worded signed-in-owner UI action and direct human
+  keep/reject confirmation; do not rerun merely to replace the authorized
+  generic account unless that remaining distinction is decision-changing.
+
 When all applicable rows pass, update this matrix rather than deleting it. Keep
 failed or intentionally unsupported variants as provenance, and remove only a
 superseded command after its replacement is both documented and accepted.

@@ -549,18 +549,22 @@ then linked official repositories/model pages controlled technical decisions.
 
 ## Remaining evidence boundary
 
-This wave downloaded selected model assets and implemented CPU-only plans,
-validation, profiles, and benchmark scaffolding. It did **not** load a Maestro
-model, create a Maestro CUDA context, run inference, judge an output, activate
-an experimental benchmark case, change a default, migrate storage, import a
-Comfy graph/node pack, add prompt moderation, mutate Beads, or restart Maestro.
+The intake implementation portion downloaded selected model assets and
+implemented CPU-only plans, validation, profiles, and benchmark scaffolding. It
+did not activate an experimental benchmark case, change a default, migrate
+storage, import a Comfy graph/node pack, add prompt moderation, or mutate Beads.
 Both Beta3 artifacts completed pinned transfers and CPU-only
 integrity/header/receipt checks. Commit `3855a94` also adds a model-free,
 fail-closed runtime-admission seam with exact request and receipt binding plus a
 held-descriptor consumption contract. It deliberately remains unwired from WGP
 and the MiniMax H3 handler, so neither artifact has runtime or GPU acceptance.
 
-GPU/runtime acceptance remains a separately scheduled wave after the current
-external GPU owner releases capacity. Exact Dasiwa-base acquisition remains
-open; the suspected-base case must remain visibly provisional even if its later
-neutral coherence output looks useful.
+The separately coordinated 2026-08-27 GPU wave loaded exact PinkCherry
+beta-0.6 and its Heretic INT8 conditioner without a LoRA, managed Turbo,
+TeaCache, or model fallback. One 28-step Sol-Attn private job completed at
+1344x768 with 124 video frames and 32 kHz stereo audio; sampled-frame review
+found coherent performer identity, wardrobe, staging, and plausible motion.
+This is PinkCherry live runtime/output evidence only and does not promote
+PinkCherry to a default or prove Beta3, Dasiwa, Better Motion, Ref2VA, or Base.
+Exact Dasiwa-base acquisition remains open; the suspected-base case must remain
+visibly provisional even if its later neutral coherence output looks useful.
