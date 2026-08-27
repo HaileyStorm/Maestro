@@ -35,7 +35,12 @@ def _load_handler():
             names = [target.id for target in node.targets if isinstance(target, ast.Name)]
             if any(name.startswith("_") for name in names):
                 selected.append(node)
-        elif isinstance(node, ast.FunctionDef) and node.name in ("_hf_url", "_is_reference_mode"):
+        elif isinstance(node, ast.FunctionDef) and node.name in (
+            "_hf_url",
+            "_is_reference_mode",
+            "_required_asset_filenames",
+            "_required_runtime_asset_manifest",
+        ):
             selected.append(node)
         elif isinstance(node, ast.ClassDef) and node.name == "family_handler":
             selected.append(node)
@@ -382,7 +387,8 @@ class TestMiniMaxH3Ref2VADefinition(unittest.TestCase):
         self.assertIn("h3StudioWorkflow && (h3AdaptiveConditioning || h3HasSemanticInputs)", inputs_panel)
         self.assertIn("const canAttachFrameAnchors = !dedicatedRef2VAMode || h3AdaptiveConditioning", inputs_panel)
         self.assertIn("const showFrameAnchorControls = canAttachFrameAnchors || h3HasFrameInputs", inputs_panel)
-        self.assertIn("canAttachSemanticReferences && h3TermsAccepted", inputs_panel)
+        self.assertIn("const canAttachSemanticReferences = dedicatedRef2VAMode || (", inputs_panel)
+        self.assertIn("const needsTerms = semanticReferenceMode && !h3TermsAccepted", inputs_panel)
 
         # Switching between the managed H3 checkpoints must not erase either
         # side of the hybrid request before the planner can inspect it.

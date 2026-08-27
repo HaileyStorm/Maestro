@@ -1,9 +1,9 @@
-"""Read-only inspection for an owner-supplied future storage-tier plan.
+"""Read-only inspection for an owner-supplied storage-tier plan.
 
 This module deliberately does not create directories, mount filesystems, copy
 data, or change Maestro/WGP configuration.  It validates an external JSON plan
-and describes the bindings that a later, separately authorized cutover could
-apply.
+and describes bindings that an operator may activate through a separate,
+identity-bound cutover.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import subprocess
@@ -23,9 +23,20 @@ STORAGE_TIER_PLAN_SCHEMA = 1
 STORAGE_TIER_ROLES = ("hot", "warm_models", "warm_bulk", "cold")
 MAX_PLAN_BYTES = 256 * 1024
 
-_PLAN_KEYS = frozenset({"schema_version", "tiers"})
+_PLAN_KEYS = frozenset({"schema_version", "tiers", "layout"})
 _TIER_KEYS = frozenset({"root", "write_intent", "identity"})
 _IDENTITY_KEYS = frozenset({"filesystem_uuid", "partition_uuid"})
+_LAYOUT_KEYS = frozenset({
+    "HF_HOME",
+    "TORCH_HOME",
+    "MAESTRO_LLM_CACHE",
+    "GRADIO_TEMP_DIR",
+    "checkpoint_primary",
+    "checkpoint_linked",
+    "save_path",
+    "image_save_path",
+    "audio_save_path",
+})
 _STABLE_ID = re.compile(r"^[A-Za-z0-9._:+-]{1,128}$")
 _WRITE_INTENTS = frozenset({"read_write", "read_only"})
 _REQUIRED_WRITE_INTENTS = {
@@ -36,7 +47,7 @@ _REQUIRED_WRITE_INTENTS = {
 }
 
 # Relative layout only.  The owner supplies every absolute root in the ignored
-# external plan.  These values are reported, never created or applied.
+# external plan.  These values are reported, never created or applied here.
 _ENVIRONMENT_LAYOUT = {
     "HF_HOME": ("warm_models", "caches/huggingface"),
     "TORCH_HOME": ("warm_models", "caches/torch"),
@@ -47,6 +58,8 @@ _WGP_LAYOUT = {
     "checkpoint_primary": ("warm_models", "models/maestro/ckpts"),
     "checkpoint_linked": ("cold", "models/maestro/ckpts"),
     "save_path": ("warm_bulk", "outputs/maestro"),
+    "image_save_path": ("warm_bulk", "outputs/maestro/images"),
+    "audio_save_path": ("warm_bulk", "outputs/maestro/audio"),
 }
 
 IdentityProbe = Callable[[Path], Mapping[str, str]]
@@ -147,6 +160,11 @@ def _findmnt_identity(root: Path) -> Mapping[str, str]:
 
 def _paths_overlap(left: Path, right: Path) -> bool:
     try:
+        if os.path.samefile(left, right):
+            return True
+    except (OSError, ValueError):
+        pass
+    try:
         common = os.path.commonpath([os.fspath(left), os.fspath(right)])
     except ValueError:
         return False
@@ -210,6 +228,19 @@ def _binding(role: str, relative: str, tiers: Mapping[str, Mapping[str, Any]], *
             "apply": False,
         }
     exists = candidate.is_dir()
+    if write_intent == "read_write":
+        access_target = candidate
+        while not access_target.exists() and access_target != access_target.parent:
+            access_target = access_target.parent
+        if not access_target.is_dir() or not os.access(access_target, os.W_OK | os.X_OK):
+            return {
+                "tier": role,
+                "relative_path": relative,
+                "path": os.fspath(candidate),
+                "state": "unwritable",
+                "write_intent": write_intent,
+                "apply": False,
+            }
     return {
         "tier": role,
         "relative_path": relative,
@@ -220,21 +251,88 @@ def _binding(role: str, relative: str, tiers: Mapping[str, Mapping[str, Any]], *
     }
 
 
-def _proposed_bindings(tiers: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+def _normalize_layout(
+    value: Any, *, issues: list[dict[str, str]],
+) -> tuple[dict[str, tuple[str, str]], dict[str, tuple[str, str]]]:
+    environment = dict(_ENVIRONMENT_LAYOUT)
+    wgp = dict(_WGP_LAYOUT)
+    if value in (None, {}):
+        return environment, wgp
+    if not isinstance(value, Mapping):
+        issues.append(_issue("invalid_layout", "layout must be an object."))
+        return environment, wgp
+    unknown = sorted(set(value) - _LAYOUT_KEYS)
+    if unknown:
+        issues.append(_issue(
+            "invalid_layout",
+            f"layout has unsupported fields: {', '.join(unknown)}.",
+        ))
+    for key in _LAYOUT_KEYS:
+        if key not in value:
+            continue
+        raw = value.get(key)
+        valid = bool(
+            isinstance(raw, str)
+            and 0 < len(raw) <= 512
+            and raw == raw.strip()
+            and "\\" not in raw
+            and "\0" not in raw
+            and ":" not in raw
+        )
+        candidate = PurePosixPath(raw) if valid else PurePosixPath(".")
+        valid = bool(
+            valid
+            and not candidate.is_absolute()
+            and candidate.parts
+            and all(part not in {"", ".", ".."} for part in candidate.parts)
+            and candidate.as_posix() == raw
+        )
+        if not valid:
+            issues.append(_issue(
+                "invalid_layout",
+                f"layout.{key} must be a contained POSIX-style relative path.",
+            ))
+            continue
+        target = environment if key in environment else wgp
+        role, _default = target[key]
+        target[key] = (role, candidate.as_posix())
+    return environment, wgp
+
+
+def _proposed_bindings(
+    tiers: Mapping[str, Mapping[str, Any]],
+    *,
+    environment_layout: Mapping[str, tuple[str, str]] | None = None,
+    wgp_layout: Mapping[str, tuple[str, str]] | None = None,
+) -> dict[str, Any]:
+    environment_spec = _ENVIRONMENT_LAYOUT if environment_layout is None else environment_layout
+    wgp_spec = _WGP_LAYOUT if wgp_layout is None else wgp_layout
     environment = {
         name: _binding(role, relative, tiers, write_intent="read_write")
-        for name, (role, relative) in _ENVIRONMENT_LAYOUT.items()
+        for name, (role, relative) in environment_spec.items()
     }
-    primary = _binding(*_WGP_LAYOUT["checkpoint_primary"], tiers, write_intent="read_write")
-    linked = _binding(*_WGP_LAYOUT["checkpoint_linked"], tiers, write_intent="read_only")
-    save_path = _binding(*_WGP_LAYOUT["save_path"], tiers, write_intent="read_write")
+    primary = _binding(*wgp_spec["checkpoint_primary"], tiers, write_intent="read_write")
+    linked = _binding(*wgp_spec["checkpoint_linked"], tiers, write_intent="read_only")
+    save_path = _binding(*wgp_spec["save_path"], tiers, write_intent="read_write")
+    image_save_path = _binding(*wgp_spec["image_save_path"], tiers, write_intent="read_write")
+    audio_save_path = _binding(*wgp_spec["audio_save_path"], tiers, write_intent="read_write")
+    internal_fallback = {
+        "tier": "internal",
+        "relative_path": ".",
+        "path": ".",
+        "state": "ready",
+        "write_intent": "read_only",
+        "apply": False,
+    }
     return {
         "environment": environment,
         "wgp": {
             "checkpoint_primary": primary,
             "checkpoint_linked": [linked],
-            "checkpoints_paths": [primary, linked],
+            "checkpoints_paths": [primary, linked, internal_fallback],
             "save_path": save_path,
+            "image_save_path": image_save_path,
+            "audio_save_path": audio_save_path,
         },
     }
 
@@ -279,7 +377,7 @@ def inspect_storage_tier_plan(
     except FileNotFoundError:
         issues.append(_issue("missing_plan", "The configured storage-tier plan file does not exist."))
         return report
-    except (OSError, UnicodeError) as exc:
+    except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
         issues.append(_issue("unreadable_plan", f"The storage-tier plan cannot be read: {exc}."))
         return report
     except json.JSONDecodeError as exc:
@@ -294,6 +392,9 @@ def inspect_storage_tier_plan(
         issues.append(_issue("invalid_plan", f"Plan has unsupported fields: {', '.join(unknown_plan_keys)}."))
     if payload.get("schema_version") != STORAGE_TIER_PLAN_SCHEMA:
         issues.append(_issue("invalid_schema", f"schema_version must be {STORAGE_TIER_PLAN_SCHEMA}."))
+    environment_layout, wgp_layout = _normalize_layout(
+        payload.get("layout"), issues=issues,
+    )
     raw_tiers = payload.get("tiers")
     if not isinstance(raw_tiers, Mapping):
         issues.append(_issue("invalid_tiers", "tiers must be an object with all four storage roles."))
@@ -360,7 +461,7 @@ def inspect_storage_tier_plan(
             continue
         try:
             resolved = Path(root_value).resolve(strict=True)
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             issues.append(_issue("missing_root", "The bound root does not exist.", role=role))
             tier_report["state"] = "missing"
             continue
@@ -413,7 +514,11 @@ def inspect_storage_tier_plan(
                 ))
 
     report["tiers"] = normalized_tiers
-    report["proposed_bindings"] = _proposed_bindings(normalized_tiers)
+    report["proposed_bindings"] = _proposed_bindings(
+        normalized_tiers,
+        environment_layout=environment_layout,
+        wgp_layout=wgp_layout,
+    )
     bindings = report["proposed_bindings"]
     checked_bindings = [
         *bindings["environment"].items(),
@@ -423,6 +528,8 @@ def inspect_storage_tier_plan(
             for index, item in enumerate(bindings["wgp"]["checkpoint_linked"])
         ),
         ("wgp.save_path", bindings["wgp"]["save_path"]),
+        ("wgp.image_save_path", bindings["wgp"]["image_save_path"]),
+        ("wgp.audio_save_path", bindings["wgp"]["audio_save_path"]),
     ]
     for name, binding in checked_bindings:
         if binding.get("state") in {"unsafe_symlink", "unsafe_escape"}:
@@ -434,6 +541,12 @@ def inspect_storage_tier_plan(
             issues.append(_issue(
                 "symlink_binding" if binding["state"] == "unsafe_symlink" else "escaping_binding",
                 f"Proposed binding {name} {reason}.",
+                role=str(binding["tier"]),
+            ))
+        elif binding.get("state") == "unwritable":
+            issues.append(_issue(
+                "write_access_unavailable",
+                f"Proposed binding {name} is not writable by the current account.",
                 role=str(binding["tier"]),
             ))
     if issues:

@@ -1,16 +1,24 @@
-# Future storage tiers
+# Storage tier planning and activation
 
-Maestro has a dormant, inspection-only storage plan for the incoming Crucial
-M500 SSD and a possible later fast HDD. Nothing here mounts a drive, creates a
-directory, copies data, changes an environment variable, edits
-`wgp_config.json`, or moves existing TVBox content.
+Maestro has an inspection-only storage plan for operator-managed hot, model,
+bulk, and cold tiers. A host may already have activated some of those roles in
+ignored configuration; the tracked inspector still only validates and reports
+the supplied layout. Nothing here mounts a drive, creates a directory, copies
+data, changes an environment variable, edits `wgp_config.json`, or moves
+existing content.
+
+Host activation evidence is deliberately separate from this document. Record
+the stable mount path, boot-mount configuration, filesystem identity, SMART
+results, performance measurements, copy receipts, and current free space in
+owner-private machine state. Do not put serial numbers, filesystem UUIDs, or
+other machine-local identifiers in the repository.
 
 ## Intended roles
 
 | Role | Intended medium | Purpose |
 | --- | --- | --- |
 | `hot` | Existing NVMe | Active temporary files and latency-sensitive scratch space |
-| `warm_models` | Lightly used Crucial M500 SSD, after health and identity acceptance | Primary model/checkpoint and reusable model-cache storage |
+| `warm_models` | Accepted read-heavy SSD, including the Crucial M500 on the current class of host | Primary model/checkpoint and reusable model-cache storage |
 | `warm_bulk` | Unbound; possible future fast HDD | Generated outputs and other large, write-active bulk data |
 | `cold` | TVBox initially and for overflow | Existing models kept as read-only linked checkpoints and other cold data |
 
@@ -105,14 +113,35 @@ The report proposes this fixed layout beneath the owner-bound role roots:
   `checkpoints_paths` entry.
 - The `cold` checkpoint location as a later read-only linked entry. This keeps
   useful TVBox models searchable without making linked content a write target.
-- WGP `save_path` under `warm_bulk`.
+- Maestro's internal `.` checkpoint fallback remains the final search entry.
+- WGP `save_path`, `image_save_path`, and `audio_save_path` under `warm_bulk`.
 
 Every proposal includes `apply: false` and reports its directory as `ready`,
-`missing`, `unbound`, `unsafe_symlink`, or `unsafe_escape`. A missing proposed
-child is not created. Binding and directory creation belong to the later
-cutover, after the final drive layout is known.
+`missing`, `unbound`, `unwritable`, `unsafe_symlink`, or `unsafe_escape`. A
+missing proposed child is not created. Binding and directory creation belong
+to the later cutover, after the final drive layout is known.
 
-## Future cutover checklist
+The defaults above are only relative layout conventions. When an accepted
+existing tree uses another relative location, the ignored plan may override
+one or more paths without changing their assigned tier or write intent:
+
+```json
+"layout": {
+  "checkpoint_linked": "existing/application/checkpoints"
+}
+```
+
+Supported keys are `HF_HOME`, `TORCH_HOME`, `MAESTRO_LLM_CACHE`,
+`GRADIO_TEMP_DIR`, `checkpoint_primary`, `checkpoint_linked`, and `save_path`.
+The independent output bindings `image_save_path` and `audio_save_path` are
+also supported.
+Values must be canonical POSIX-style relative paths: no absolute paths, drive
+prefixes, backslashes, empty/dot components, or `..`. The inspector still
+rejects symlink components and any resolved escape from the assigned tier
+root. This keeps machine-specific subpaths in the ignored plan rather than
+hardcoding one host's installation layout in tracked source.
+
+## Cutover and migration checklist
 
 1. **Identify** — record the exact mounted roots and stable filesystem or
    partition identities; confirm the plan is `ready` and contains no aliases or
@@ -131,3 +160,9 @@ cutover, after the final drive layout is known.
    On any mismatch, stop writes and restore the preserved bindings.
 8. **Retire selectively** — remove an old copy only after explicit target
    review and approval. Existing TVBox content may remain as cold/overflow.
+
+After activation, keep using the same sequence for each additional bounded
+model class. Re-inspect the external plan after a mount, UUID, path, or role
+change. Re-run performance measurements only under the host resource
+coordinator's current CPU and storage-I/O envelope; a mounted filesystem and a
+green static plan are not throughput, endurance, or runtime acceptance.

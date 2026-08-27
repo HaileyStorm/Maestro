@@ -1,4 +1,4 @@
-"""Print the dormant storage-tier plan inspection as JSON."""
+"""Print the owner-supplied storage-tier plan inspection as JSON."""
 
 from __future__ import annotations
 
