@@ -89,11 +89,11 @@ without loading them: Turbo-SLA, Prompt Rewriter, ControlNet Union,
 Single-Frame VAE, Music3 FP8/Turbo, and the earlier 10Eros Ref2VA Beta2 INT8
 ConvRot skip-edge checkpoint. These are inventory for later
 one-variable-at-a-time acceptance, not evidence of runtime compatibility or
-quality. Beta3 acquisition was a separate owner-authorized transfer. The
-skip-edge artifact now has its exact final size, SHA-256, bounded 184-marker
-header contract, and owner-private final-path receipt verified; the fully
-quantized artifact remains undownloaded. This is storage/integrity evidence,
-not runtime or quality acceptance.
+quality. Beta3 acquisition was a separate owner-authorized transfer. Both the
+skip-edge and fully quantized artifacts now have exact final sizes, SHA-256
+identities, bounded header contracts, and reusable owner-private final-path
+receipts. This is storage/integrity evidence, not runtime or quality
+acceptance.
 
 ## Decision style for this wave
 
@@ -554,9 +554,11 @@ validation, profiles, and benchmark scaffolding. It did **not** load a Maestro
 model, create a Maestro CUDA context, run inference, judge an output, activate
 an experimental benchmark case, change a default, migrate storage, import a
 Comfy graph/node pack, add prompt moderation, mutate Beads, or restart Maestro.
-The Beta3 skip-edge artifact completed its pinned transfer and CPU-only
-integrity/header/receipt checks. The fully quantized artifact remains a later
-download, and neither artifact has runtime or GPU acceptance.
+Both Beta3 artifacts completed pinned transfers and CPU-only
+integrity/header/receipt checks. Commit `3855a94` also adds a model-free,
+fail-closed runtime-admission seam with exact request and receipt binding plus a
+held-descriptor consumption contract. It deliberately remains unwired from WGP
+and the MiniMax H3 handler, so neither artifact has runtime or GPU acceptance.
 
 GPU/runtime acceptance remains a separately scheduled wave after the current
 external GPU owner releases capacity. Exact Dasiwa-base acquisition remains
