@@ -267,7 +267,14 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
                 self.uv, self.python, **kwargs
             )
 
-    def execute(self, fake, *, plan=None, monotonic=lambda: 0.0):
+    def execute(
+        self,
+        fake,
+        *,
+        plan=None,
+        monotonic=lambda: 0.0,
+        rss_sampler=lambda _process_group: 0,
+    ):
         plan = plan or self.plan()
         with (
             mock.patch.object(producer, "_inspect_uv", return_value=self.uv_receipt),
@@ -289,6 +296,7 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
                 state_root=self.state,
                 process_factory=fake,
                 monotonic=monotonic,
+                rss_sampler=rss_sampler,
             )
 
     def make_uv_cache_link(
@@ -320,6 +328,29 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
         source = source_parent / version_tag
         source.symlink_to(target_parent)
         return source, target_parent
+
+    def make_proc_process(
+        self,
+        proc_root: Path,
+        *,
+        pid: int,
+        process_group: int,
+        rss_kib: int,
+        start_time: int = 123,
+        state: str = "S",
+        include_status: bool = True,
+    ) -> None:
+        process_root = proc_root / str(pid)
+        process_root.mkdir()
+        fields = [state, "1", str(process_group), *("0" for _ in range(16))]
+        fields.append(str(start_time))
+        (process_root / "stat").write_text(
+            f"{pid} (fake uv worker) " + " ".join(fields) + "\n"
+        )
+        if include_status:
+            (process_root / "status").write_text(
+                f"Name:\tfake-uv\nVmRSS:\t{rss_kib} kB\n"
+            )
 
     def test_plan_is_path_free_network_free_and_exactly_bound(self):
         with (
@@ -356,6 +387,22 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
         self.assertEqual(first.document["target"]["python_abi"], "cp312")
         self.assertEqual(first.document["resources"]["cpu_cores"], 2)
         self.assertEqual(first.document["resources"]["nice"], 15)
+        self.assertEqual(
+            first.document["resources"]["address_space_bytes"],
+            4 * 1024**3,
+        )
+        self.assertEqual(
+            first.document["resources"]["address_space_enforcement"],
+            "linux_rlimit_as_hard",
+        )
+        self.assertEqual(
+            first.document["resources"]["rss_bytes"],
+            1536 * 1024**2,
+        )
+        self.assertEqual(
+            first.document["resources"]["rss_enforcement"],
+            "sampled_process_group_hard_stop_best_effort",
+        )
         self.assertEqual(first.document["resources"]["metadata_byte_cap"], 1024**3)
         self.assertEqual(
             first.document["resources"]["child_file_size_bytes"], 16 * 1024**2
@@ -402,11 +449,57 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
         self.assertFalse(first.document["resolver"]["builds_permitted"])
         self.assertNotIn(str(self.root), json.dumps(first.document, sort_keys=True))
 
+        legacy = json.loads(json.dumps(first.document))
+        legacy["schema"] = "maestro.h3-prompt-rewriter.uv-resolution-plan.v1"
+        for field in (
+            "address_space_bytes",
+            "address_space_enforcement",
+            "rss_enforcement",
+            "rss_proc_pid_entry_cap",
+            "rss_proc_stat_byte_cap",
+            "rss_proc_status_byte_cap",
+        ):
+            legacy["resources"].pop(field)
+        legacy_sha = hashlib.sha256(producer._canonical_json(legacy)).hexdigest()
+        self.assertNotEqual(first.sha256, legacy_sha)
+
     def test_documented_uv_0926_golden_variant_is_accepted(self):
         report = producer.parse_uv_pylock_to_wheel_report(
             UV_0926_DOCUMENTED_GOLDEN_PYLOCK
         )
         self.assertEqual(len(report["packages"]), len(PACKAGE_ROWS))
+
+    def test_execution_rejects_legacy_resource_plan_even_with_matching_sha(self):
+        current = self.plan()
+        legacy = current.document
+        legacy["schema"] = "maestro.h3-prompt-rewriter.uv-resolution-plan.v1"
+        for field in (
+            "address_space_bytes",
+            "address_space_enforcement",
+            "rss_enforcement",
+            "rss_proc_pid_entry_cap",
+            "rss_proc_stat_byte_cap",
+            "rss_proc_status_byte_cap",
+        ):
+            legacy["resources"].pop(field)
+        plan = producer.H3PromptRewriterUvResolutionPlan._from_document(legacy)
+        process_factory = mock.Mock(side_effect=AssertionError("process spawned"))
+        with self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError):
+            producer.execute_h3_prompt_rewriter_uv_resolution(
+                plan,
+                expected_plan_sha256=plan.sha256,
+                expected_input_sha256=hashlib.sha256(
+                    producer.reviewed_requirements_input_bytes()
+                ).hexdigest(),
+                expected_uv_sha256=producer.PINNED_UV_SHA256,
+                expected_python_sha256=self.python_receipt.sha256,
+                uv_executable=self.uv,
+                python_executable=self.python,
+                private_feature_root=self.feature,
+                state_root=self.state,
+                process_factory=process_factory,
+            )
+        process_factory.assert_not_called()
 
     def test_bootstrap_python_rejects_symlink_and_identity_drift(self):
         symlink = self.root / "python-link"
@@ -784,6 +877,282 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
             ),
             limits,
         )
+        self.assertIn(
+            (
+                producer.resource.RLIMIT_AS,
+                (
+                    producer.MAX_ADDRESS_SPACE_BYTES,
+                    producer.MAX_ADDRESS_SPACE_BYTES,
+                ),
+            ),
+            limits,
+        )
+        if hasattr(producer.resource, "RLIMIT_RSS"):
+            self.assertFalse(
+                any(kind == producer.resource.RLIMIT_RSS for kind, _value in limits)
+            )
+
+    def test_process_group_rss_census_sums_only_stable_group_members(self):
+        proc_root = self.root / "proc"
+        proc_root.mkdir()
+        self.make_proc_process(
+            proc_root,
+            pid=101,
+            process_group=9876,
+            rss_kib=100,
+        )
+        self.make_proc_process(
+            proc_root,
+            pid=102,
+            process_group=9876,
+            rss_kib=250,
+        )
+        self.make_proc_process(
+            proc_root,
+            pid=103,
+            process_group=0,
+            rss_kib=999,
+            include_status=False,
+        )
+        self.make_proc_process(
+            proc_root,
+            pid=104,
+            process_group=7777,
+            rss_kib=999,
+            include_status=False,
+        )
+        self.assertEqual(
+            producer._sample_process_group_rss(9876, proc_root=proc_root),
+            350 * 1024,
+        )
+
+    def test_process_group_rss_census_fails_closed_on_unreadable_live_member(self):
+        proc_root = self.root / "proc-unreadable"
+        proc_root.mkdir()
+        self.make_proc_process(
+            proc_root,
+            pid=101,
+            process_group=9876,
+            rss_kib=100,
+        )
+        real_read = producer._read_bounded_proc_file
+
+        def unreadable_status(directory_fd, name, byte_cap):
+            if name == "status":
+                raise OSError("private proc detail")
+            return real_read(directory_fd, name, byte_cap)
+
+        with (
+            mock.patch.object(
+                producer,
+                "_read_bounded_proc_file",
+                side_effect=unreadable_status,
+            ),
+            self.assertRaises(
+                producer.H3PromptRewriterUvResolutionExecutionError
+            ) as raised,
+        ):
+            producer._sample_process_group_rss(9876, proc_root=proc_root)
+        self.assertNotIn("private proc detail", str(raised.exception))
+
+    def test_quick_zombie_without_vmrss_completes_and_counts_zero(self):
+        proc_root = self.root / "proc-zombie"
+        proc_root.mkdir()
+        self.make_proc_process(
+            proc_root,
+            pid=_FakeProcess.pid,
+            process_group=_FakeProcess.pid,
+            rss_kib=0,
+            state="Z",
+            include_status=False,
+        )
+        result = self.execute(
+            _FakeUv(_pylock()),
+            rss_sampler=lambda process_group: producer._sample_process_group_rss(
+                process_group,
+                proc_root=proc_root,
+            ),
+        )
+        self.assertEqual(result["peak_rss_bytes"], 0)
+
+    def test_live_member_missing_vmrss_remains_fatal(self):
+        proc_root = self.root / "proc-live-missing-rss"
+        proc_root.mkdir()
+        self.make_proc_process(
+            proc_root,
+            pid=101,
+            process_group=9876,
+            rss_kib=100,
+        )
+        (proc_root / "101" / "status").write_text("Name:\tfake-uv\n")
+        with self.assertRaises(producer.H3PromptRewriterUvResolutionExecutionError):
+            producer._sample_process_group_rss(9876, proc_root=proc_root)
+
+    def test_process_group_census_retries_pid_disappearance(self):
+        proc_root = self.root / "proc-disappearance"
+        proc_root.mkdir()
+        self.make_proc_process(
+            proc_root,
+            pid=101,
+            process_group=9876,
+            rss_kib=100,
+        )
+        real_open = producer.os.open
+        disappeared = False
+
+        def disappear_once(path, flags, *args, **kwargs):
+            nonlocal disappeared
+            if path == "101" and not disappeared:
+                disappeared = True
+                raise FileNotFoundError
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(producer.os, "open", side_effect=disappear_once):
+            observed = producer._sample_process_group_rss(9876, proc_root=proc_root)
+        self.assertTrue(disappeared)
+        self.assertEqual(observed, 100 * 1024)
+
+    def test_process_group_census_retries_pid_starttime_reuse(self):
+        proc_root = self.root / "proc-reuse"
+        proc_root.mkdir()
+        self.make_proc_process(
+            proc_root,
+            pid=101,
+            process_group=9876,
+            rss_kib=100,
+        )
+        real_read = producer._read_bounded_proc_file
+        stat_reads = 0
+        replaced = False
+
+        def replace_starttime(directory_fd, name, byte_cap):
+            nonlocal stat_reads, replaced
+            if name == "stat":
+                stat_reads += 1
+                if stat_reads == 2:
+                    stat_path = proc_root / "101" / "stat"
+                    fields = ["S", "1", "9876", *("0" for _ in range(16)), "456"]
+                    stat_path.write_text("101 (fake uv worker) " + " ".join(fields))
+                    replaced = True
+            return real_read(directory_fd, name, byte_cap)
+
+        with mock.patch.object(
+            producer,
+            "_read_bounded_proc_file",
+            side_effect=replace_starttime,
+        ):
+            observed = producer._sample_process_group_rss(9876, proc_root=proc_root)
+        self.assertTrue(replaced)
+        self.assertEqual(observed, 100 * 1024)
+
+    def test_process_group_census_accepts_live_state_churn_with_stable_identity(self):
+        proc_root = self.root / "proc-live-state-churn"
+        proc_root.mkdir()
+        self.make_proc_process(
+            proc_root,
+            pid=101,
+            process_group=9876,
+            rss_kib=100,
+            state="R",
+        )
+        real_read = producer._read_bounded_proc_file
+        stat_reads = 0
+
+        def change_live_state(directory_fd, name, byte_cap):
+            nonlocal stat_reads
+            if name == "stat":
+                stat_reads += 1
+                if stat_reads == 2:
+                    stat_path = proc_root / "101" / "stat"
+                    fields = ["S", "1", "9876", *("0" for _ in range(16)), "123"]
+                    stat_path.write_text("101 (fake uv worker) " + " ".join(fields))
+            return real_read(directory_fd, name, byte_cap)
+
+        with mock.patch.object(
+            producer,
+            "_read_bounded_proc_file",
+            side_effect=change_live_state,
+        ):
+            observed = producer._sample_process_group_rss(9876, proc_root=proc_root)
+        self.assertEqual(stat_reads, 2)
+        self.assertEqual(observed, 100 * 1024)
+
+    def test_process_group_census_rejects_oversized_and_malformed_metadata(self):
+        cases = (
+            ("malformed_stat", "stat", b"not proc stat"),
+            ("oversized_stat", "stat", b"x" * (producer.MAX_PROC_STAT_BYTES + 1)),
+            ("malformed_status", "status", b"Name:\tfake-uv\n"),
+            (
+                "oversized_status",
+                "status",
+                b"x" * (producer.MAX_PROC_STATUS_BYTES + 1),
+            ),
+        )
+        for ordinal, (label, filename, payload) in enumerate(cases):
+            proc_root = self.root / f"proc-invalid-{ordinal}"
+            proc_root.mkdir()
+            self.make_proc_process(
+                proc_root,
+                pid=101,
+                process_group=9876,
+                rss_kib=100,
+            )
+            (proc_root / "101" / filename).write_bytes(payload)
+            with (
+                self.subTest(label=label),
+                self.assertRaises(producer.H3PromptRewriterUvResolutionExecutionError),
+            ):
+                producer._sample_process_group_rss(9876, proc_root=proc_root)
+
+    def test_process_group_rss_cap_kills_and_records_peak(self):
+        observed = producer.MAX_RSS_BYTES + 1
+        fake = _FakeUv(_pylock())
+        with self.assertRaises(producer.H3PromptRewriterUvResolutionExecutionError):
+            self.execute(fake, rss_sampler=lambda _process_group: observed)
+        failure = json.loads((self.state / producer.FAILURE_NAME).read_text())
+        self.assertEqual(failure["phase"], "process_monitor")
+        self.assertEqual(failure["peak_rss_bytes"], observed)
+        self.assertFalse((self.state / producer.REPORT_NAME).exists())
+
+    def test_success_provenance_and_result_record_path_free_peak_rss(self):
+        observed = 123_456_789
+        result = self.execute(
+            _FakeUv(_pylock()),
+            rss_sampler=lambda _process_group: observed,
+        )
+        provenance = json.loads((self.state / producer.PROVENANCE_NAME).read_text())
+        self.assertEqual(result["peak_rss_bytes"], observed)
+        self.assertEqual(provenance["peak_rss_bytes"], observed)
+        self.assertNotIn(str(self.root), json.dumps({"peak": observed}))
+
+    def test_sparse_anonymous_mapping_above_rss_cap_and_below_address_cap(self):
+        mapping_bytes = producer.MAX_RSS_BYTES + 64 * 1024**2
+        self.assertLess(mapping_bytes, producer.MAX_ADDRESS_SPACE_BYTES)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import mmap; "
+                    f"mapping=mmap.mmap(-1,{mapping_bytes}); "
+                    "mapping[0]=1; assert mapping[0] == 1; mapping.close()"
+                ),
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            shell=False,
+            close_fds=True,
+            env={
+                "PYTHONNOUSERSITE": "1",
+                "PYTHONPATH": "",
+                "CUDA_VISIBLE_DEVICES": "",
+                "NVIDIA_VISIBLE_DEVICES": "void",
+            },
+            preexec_fn=producer._apply_child_limits,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr[:1024])
 
     def test_growing_private_file_is_accepted_accounted_and_capped(self):
         producer._layout(self.feature, self.state)
@@ -1597,6 +1966,56 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
             json.loads(buffer.getvalue()),
             {"error": "H3PromptRewriterUvResolutionError"},
         )
+
+    def test_cli_execute_success_reports_path_free_peak_rss(self):
+        plan = self.plan()
+        buffer = io.StringIO()
+        result = {
+            "package_count": len(PACKAGE_ROWS),
+            "peak_rss_bytes": 654_321,
+            "provenance_sha256": "1" * 64,
+            "pylock_sha256": "2" * 64,
+            "report_sha256": "3" * 64,
+            "total_candidate_bytes": 1234,
+        }
+        with (
+            mock.patch.object(
+                report_cli,
+                "build_h3_prompt_rewriter_uv_resolution_plan",
+                return_value=plan,
+            ),
+            mock.patch.object(
+                report_cli,
+                "execute_h3_prompt_rewriter_uv_resolution",
+                return_value=result,
+            ),
+            redirect_stdout(buffer),
+        ):
+            returncode = report_cli.main(
+                [
+                    "--uv-executable",
+                    str(self.uv),
+                    "--python-executable",
+                    str(self.python),
+                    "--execute",
+                    "--expected-plan-sha256",
+                    plan.sha256,
+                    "--expected-input-sha256",
+                    "0" * 64,
+                    "--expected-uv-sha256",
+                    producer.PINNED_UV_SHA256,
+                    "--expected-python-sha256",
+                    self.python_receipt.sha256,
+                    "--private-feature-root",
+                    str(self.feature),
+                    "--state-root",
+                    str(self.state),
+                ]
+            )
+        output = json.loads(buffer.getvalue())
+        self.assertEqual(returncode, 0)
+        self.assertEqual(output["peak_rss_bytes"], 654_321)
+        self.assertNotIn(str(self.root), buffer.getvalue())
 
     def test_pinned_uv_offline_command_reaches_resolution_not_cli_validation(self):
         executable = os.environ.get("MAESTRO_H3_PINNED_UV_PROBE")

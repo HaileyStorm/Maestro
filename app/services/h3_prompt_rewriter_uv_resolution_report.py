@@ -38,7 +38,7 @@ from packaging.version import InvalidVersion, Version
 from services import h3_prompt_rewriter_dependency_closure as closure
 from services import h3_prompt_rewriter_wheel_resolver as wheel_resolver
 
-UV_RESOLUTION_PLAN_SCHEMA = "maestro.h3-prompt-rewriter.uv-resolution-plan.v1"
+UV_RESOLUTION_PLAN_SCHEMA = "maestro.h3-prompt-rewriter.uv-resolution-plan.v2"
 UV_RESOLUTION_PROVENANCE_SCHEMA = (
     "maestro.h3-prompt-rewriter.uv-resolution-provenance.v1"
 )
@@ -64,7 +64,11 @@ MAX_UV_INTERNAL_LOCK_BYTES = 4 * 1024
 POLL_SECONDS = 0.25
 MAX_STATE_DEPTH = 32
 MAX_SCAN_RETRIES = 3
-MAX_RSS_BYTES = wheel_resolver.MAX_RSS_BYTES
+MAX_ADDRESS_SPACE_BYTES = 4 * 1024**3
+MAX_RSS_BYTES = 1536 * 1024**2
+MAX_PROC_PID_ENTRIES = 1_000_000
+MAX_PROC_STAT_BYTES = 4096
+MAX_PROC_STATUS_BYTES = 64 * 1024
 MAX_CPU_CORES = wheel_resolver.MAX_CPU_CORES
 PROCESS_NICE = wheel_resolver.PROCESS_NICE
 
@@ -467,7 +471,13 @@ def build_h3_prompt_rewriter_uv_resolution_plan(
             "nice": PROCESS_NICE,
             "ionice": "idle",
             "cpu_cores": MAX_CPU_CORES,
+            "address_space_bytes": MAX_ADDRESS_SPACE_BYTES,
+            "address_space_enforcement": "linux_rlimit_as_hard",
             "rss_bytes": MAX_RSS_BYTES,
+            "rss_enforcement": "sampled_process_group_hard_stop_best_effort",
+            "rss_proc_pid_entry_cap": MAX_PROC_PID_ENTRIES,
+            "rss_proc_stat_byte_cap": MAX_PROC_STAT_BYTES,
+            "rss_proc_status_byte_cap": MAX_PROC_STATUS_BYTES,
             "deadline_seconds": deadline_seconds,
             "metadata_byte_cap": metadata_byte_cap,
             "metadata_entry_cap": metadata_entry_cap,
@@ -509,6 +519,31 @@ def build_h3_prompt_rewriter_uv_resolution_plan(
     if str(uv.path) in encoded or "/home/" in encoded or "/mnt/" in encoded:
         raise AssertionError("public uv plan contains a private path")
     return H3PromptRewriterUvResolutionPlan._from_document(document)
+
+
+def _validate_plan_resource_contract(
+    plan: H3PromptRewriterUvResolutionPlan,
+) -> None:
+    document = plan.document
+    resources = document.get("resources")
+    expected = {
+        "address_space_bytes": MAX_ADDRESS_SPACE_BYTES,
+        "address_space_enforcement": "linux_rlimit_as_hard",
+        "rss_bytes": MAX_RSS_BYTES,
+        "rss_enforcement": "sampled_process_group_hard_stop_best_effort",
+        "rss_proc_pid_entry_cap": MAX_PROC_PID_ENTRIES,
+        "rss_proc_stat_byte_cap": MAX_PROC_STAT_BYTES,
+        "rss_proc_status_byte_cap": MAX_PROC_STATUS_BYTES,
+        "poll_seconds": POLL_SECONDS,
+    }
+    if (
+        document.get("schema") != UV_RESOLUTION_PLAN_SCHEMA
+        or not isinstance(resources, dict)
+        or any(resources.get(key) != value for key, value in expected.items())
+    ):
+        raise H3PromptRewriterUvResolutionSecurityError(
+            "resolution resource contract changed"
+        )
 
 
 def _private_directory(path: Path) -> None:
@@ -1107,6 +1142,7 @@ def _write_failure_receipt(
         "validated_pylock_candidate_observed": (
             diagnostic.get("validated_pylock_candidate") is True
         ),
+        "peak_rss_bytes": diagnostic.get("peak_rss_bytes", 0),
         "plan_sha256": plan.sha256,
         "requirements_input_sha256": input_sha256,
         "uv_sha256": uv_sha256,
@@ -1591,12 +1627,13 @@ def _apply_child_limits() -> None:
     available = sorted(os.sched_getaffinity(0))
     if len(available) > MAX_CPU_CORES:
         os.sched_setaffinity(0, set(available[:MAX_CPU_CORES]))
-    resource.setrlimit(resource.RLIMIT_AS, (MAX_RSS_BYTES, MAX_RSS_BYTES))
+    resource.setrlimit(
+        resource.RLIMIT_AS,
+        (MAX_ADDRESS_SPACE_BYTES, MAX_ADDRESS_SPACE_BYTES),
+    )
     resource.setrlimit(
         resource.RLIMIT_FSIZE, (MAX_CHILD_FILE_BYTES, MAX_CHILD_FILE_BYTES)
     )
-    if hasattr(resource, "RLIMIT_RSS"):
-        resource.setrlimit(resource.RLIMIT_RSS, (MAX_RSS_BYTES, MAX_RSS_BYTES))
     try:
         syscall = ctypes.CDLL(None, use_errno=True).syscall
         # Linux ioprio_set(IOPRIO_WHO_PROCESS=1, self=0, class idle=3).
@@ -1604,6 +1641,223 @@ def _apply_child_limits() -> None:
             raise OSError(ctypes.get_errno(), "ioprio_set failed")
     except Exception as error:
         raise OSError("ionice idle could not be applied") from error
+
+
+def _read_bounded_proc_file(
+    directory_fd: int,
+    name: str,
+    byte_cap: int,
+) -> bytes:
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=directory_fd,
+    )
+    try:
+        payload = os.read(descriptor, byte_cap + 1)
+    finally:
+        os.close(descriptor)
+    if len(payload) > byte_cap:
+        raise H3PromptRewriterUvResolutionExecutionError(
+            "resolver process metadata exceeded its bound"
+        )
+    return payload
+
+
+def _parse_proc_stat(payload: bytes, expected_pid: int) -> tuple[bytes, int, int]:
+    prefix = f"{expected_pid} (".encode("ascii")
+    closing = payload.rfind(b")")
+    if (
+        not payload.startswith(prefix)
+        or closing < len(prefix)
+        or closing + 2 > len(payload)
+    ):
+        raise H3PromptRewriterUvResolutionExecutionError(
+            "resolver process metadata is malformed"
+        )
+    fields = payload[closing + 2 :].split()
+    if len(fields) < 20:
+        raise H3PromptRewriterUvResolutionExecutionError(
+            "resolver process metadata is malformed"
+        )
+    try:
+        process_state = fields[0]
+        process_group = int(fields[2])
+        start_time = int(fields[19])
+    except (TypeError, ValueError) as error:
+        raise H3PromptRewriterUvResolutionExecutionError(
+            "resolver process metadata is malformed"
+        ) from error
+    if (
+        len(process_state) != 1
+        or process_state not in b"RSDZTtWXxKPI"
+        or process_group < 0
+        or start_time < 0
+    ):
+        raise H3PromptRewriterUvResolutionExecutionError(
+            "resolver process metadata is malformed"
+        )
+    return process_state, process_group, start_time
+
+
+def _parse_proc_status_rss(payload: bytes) -> int:
+    values: list[int] = []
+    for line in payload.splitlines():
+        match = re.fullmatch(rb"VmRSS:[ \t]+([0-9]+)[ \t]+kB", line)
+        if match is not None:
+            values.append(int(match.group(1)))
+    if len(values) != 1:
+        raise H3PromptRewriterUvResolutionExecutionError(
+            "resolver process RSS metadata is malformed"
+        )
+    rss_bytes = values[0] * 1024
+    if rss_bytes < 0 or rss_bytes > MAX_ADDRESS_SPACE_BYTES:
+        raise H3PromptRewriterUvResolutionExecutionError(
+            "resolver process RSS metadata is outside its bound"
+        )
+    return rss_bytes
+
+
+def _sample_process_group_rss(
+    process_group: int,
+    *,
+    proc_root: Path = Path("/proc"),
+) -> int:
+    """Sum stable VmRSS observations for every visible member of one group."""
+
+    if type(process_group) is not int or process_group <= 1:
+        raise H3PromptRewriterUvResolutionExecutionError(
+            "resolver process group identity is invalid"
+        )
+    for _attempt in range(MAX_SCAN_RETRIES):
+        transient = False
+        total = 0
+        root_fd = -1
+        try:
+            root_fd = os.open(
+                proc_root,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            names = os.listdir(root_fd)
+            numeric_names = sorted(
+                name for name in names if name.isascii() and name.isdigit()
+            )
+            if len(numeric_names) > MAX_PROC_PID_ENTRIES:
+                raise H3PromptRewriterUvResolutionExecutionError(
+                    "resolver process census exceeded its entry bound"
+                )
+            for name in numeric_names:
+                pid = int(name)
+                pid_fd = -1
+                try:
+                    pid_fd = os.open(
+                        name,
+                        os.O_RDONLY
+                        | os.O_DIRECTORY
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=root_fd,
+                    )
+                    before = _parse_proc_stat(
+                        _read_bounded_proc_file(
+                            pid_fd,
+                            "stat",
+                            MAX_PROC_STAT_BYTES,
+                        ),
+                        pid,
+                    )
+                    if before[1] != process_group:
+                        continue
+                    if before[0] in {b"Z", b"X", b"x"}:
+                        after = _parse_proc_stat(
+                            _read_bounded_proc_file(
+                                pid_fd,
+                                "stat",
+                                MAX_PROC_STAT_BYTES,
+                            ),
+                            pid,
+                        )
+                        if after[1:] != before[1:] or after[0] not in {
+                            b"Z",
+                            b"X",
+                            b"x",
+                        }:
+                            transient = True
+                            break
+                        continue
+                    try:
+                        rss_bytes = _parse_proc_status_rss(
+                            _read_bounded_proc_file(
+                                pid_fd,
+                                "status",
+                                MAX_PROC_STATUS_BYTES,
+                            )
+                        )
+                    except H3PromptRewriterUvResolutionExecutionError:
+                        after = _parse_proc_stat(
+                            _read_bounded_proc_file(
+                                pid_fd,
+                                "stat",
+                                MAX_PROC_STAT_BYTES,
+                            ),
+                            pid,
+                        )
+                        if after[1:] != before[1:]:
+                            transient = True
+                            break
+                        if after[0] not in {b"Z", b"X", b"x"}:
+                            raise
+                        final = _parse_proc_stat(
+                            _read_bounded_proc_file(
+                                pid_fd,
+                                "stat",
+                                MAX_PROC_STAT_BYTES,
+                            ),
+                            pid,
+                        )
+                        if final[1:] != before[1:] or final[0] not in {
+                            b"Z",
+                            b"X",
+                            b"x",
+                        }:
+                            transient = True
+                            break
+                        continue
+                    after = _parse_proc_stat(
+                        _read_bounded_proc_file(
+                            pid_fd,
+                            "stat",
+                            MAX_PROC_STAT_BYTES,
+                        ),
+                        pid,
+                    )
+                    if after[1:] != before[1:]:
+                        transient = True
+                        break
+                    total += rss_bytes
+                except FileNotFoundError:
+                    transient = True
+                    break
+                finally:
+                    if pid_fd >= 0:
+                        os.close(pid_fd)
+            if not transient:
+                return total
+        except H3PromptRewriterUvResolutionError:
+            raise
+        except (OSError, ValueError) as error:
+            raise H3PromptRewriterUvResolutionExecutionError(
+                "resolver process census could not be read"
+            ) from error
+        finally:
+            if root_fd >= 0:
+                os.close(root_fd)
+    raise H3PromptRewriterUvResolutionExecutionError(
+        "resolver process census changed too often"
+    )
 
 
 def _child_environment(state_root: Path) -> dict[str, str]:
@@ -1759,17 +2013,43 @@ def _wait_for_resolution(
     *,
     started: float,
     monotonic: Callable[[], float],
+    diagnostic: dict[str, object],
+    rss_sampler: Callable[[int], int] | None,
 ) -> int:
     resources = plan.document["resources"]
     deadline = float(resources["deadline_seconds"])
     byte_cap = int(resources["metadata_byte_cap"])
     entry_cap = int(resources["metadata_entry_cap"])
+    rss_cap = int(resources["rss_bytes"])
+    sampler = rss_sampler or _sample_process_group_rss
     while True:
         _scan_private_state(
             state_root,
             byte_cap=byte_cap,
             entry_cap=entry_cap,
         )
+        try:
+            observed_rss = sampler(process.pid)
+        except H3PromptRewriterUvResolutionError:
+            raise
+        except (OSError, ValueError) as error:
+            raise H3PromptRewriterUvResolutionExecutionError(
+                "resolver process RSS could not be sampled"
+            ) from error
+        if type(observed_rss) is not int or observed_rss < 0:
+            raise H3PromptRewriterUvResolutionExecutionError(
+                "resolver process RSS sample is invalid"
+            )
+        previous_peak = diagnostic.get("peak_rss_bytes", 0)
+        if type(previous_peak) is not int or previous_peak < 0:
+            raise H3PromptRewriterUvResolutionExecutionError(
+                "resolver process RSS peak is invalid"
+            )
+        diagnostic["peak_rss_bytes"] = max(previous_peak, observed_rss)
+        if observed_rss > rss_cap:
+            raise H3PromptRewriterUvResolutionExecutionError(
+                "resolver process group exceeded its resident-memory cap"
+            )
         remaining = deadline - (monotonic() - started)
         if remaining <= 0:
             raise H3PromptRewriterUvResolutionExecutionError(
@@ -1808,6 +2088,7 @@ def _execute_h3_prompt_rewriter_uv_resolution_unlocked(
     state_root: object,
     process_factory: Callable[..., object] = subprocess.Popen,
     monotonic: Callable[[], float] = time.monotonic,
+    rss_sampler: Callable[[int], int] | None = None,
     diagnostic: dict[str, object],
 ) -> dict[str, object]:
     """Run one hash-bound uv resolution and emit private candidate evidence."""
@@ -1818,6 +2099,7 @@ def _execute_h3_prompt_rewriter_uv_resolution_unlocked(
             "process_spawned": False,
             "returncode": None,
             "validated_pylock_candidate": False,
+            "peak_rss_bytes": 0,
         }
     )
 
@@ -1889,6 +2171,8 @@ def _execute_h3_prompt_rewriter_uv_resolution_unlocked(
             plan,
             started=started,
             monotonic=monotonic,
+            diagnostic=diagnostic,
+            rss_sampler=rss_sampler,
         )
         diagnostic["returncode"] = returncode
         if returncode != 0:
@@ -1962,6 +2246,7 @@ def _execute_h3_prompt_rewriter_uv_resolution_unlocked(
                 "total_candidate_bytes": total_bytes,
             },
             "resource_contract": plan.document["resources"],
+            "peak_rss_bytes": diagnostic["peak_rss_bytes"],
         }
         provenance_payload = _canonical_json(provenance) + b"\n"
         _atomic_write(state / PROVENANCE_NAME, provenance_payload)
@@ -1973,6 +2258,7 @@ def _execute_h3_prompt_rewriter_uv_resolution_unlocked(
             "provenance_sha256": _sha256_bytes(provenance_payload),
             "package_count": len(report["packages"]),
             "total_candidate_bytes": total_bytes,
+            "peak_rss_bytes": diagnostic["peak_rss_bytes"],
         }
     finally:
         if process is not None:
@@ -1992,6 +2278,7 @@ def _execute_h3_prompt_rewriter_uv_resolution_bound(
     state_root: object,
     process_factory: Callable[..., object] = subprocess.Popen,
     monotonic: Callable[[], float] = time.monotonic,
+    rss_sampler: Callable[[int], int] | None = None,
 ) -> dict[str, object]:
     """Serialize a fully bound resolution against its private state root."""
 
@@ -2010,6 +2297,7 @@ def _execute_h3_prompt_rewriter_uv_resolution_bound(
             raise H3PromptRewriterUvResolutionSecurityError(
                 "terminal resolution failure requires a fresh private state root"
             )
+        _validate_plan_resource_contract(plan)
         uv = _inspect_uv(uv_executable)
         python = _inspect_python(python_executable)
         if (
@@ -2035,6 +2323,7 @@ def _execute_h3_prompt_rewriter_uv_resolution_bound(
             "process_spawned": False,
             "returncode": None,
             "validated_pylock_candidate": False,
+            "peak_rss_bytes": 0,
         }
         try:
             _reconcile_pylock_pair(state)
@@ -2050,6 +2339,7 @@ def _execute_h3_prompt_rewriter_uv_resolution_bound(
                 state_root=state_root,
                 process_factory=process_factory,
                 monotonic=monotonic,
+                rss_sampler=rss_sampler,
                 diagnostic=diagnostic,
             )
         except Exception as error:
@@ -2087,6 +2377,7 @@ def execute_h3_prompt_rewriter_uv_resolution(
     state_root: object,
     process_factory: Callable[..., object] = subprocess.Popen,
     monotonic: Callable[[], float] = time.monotonic,
+    rss_sampler: Callable[[int], int] | None = None,
 ) -> dict[str, object]:
     """Translate all external failures into the content-free local contract."""
 
@@ -2103,6 +2394,7 @@ def execute_h3_prompt_rewriter_uv_resolution(
             state_root=state_root,
             process_factory=process_factory,
             monotonic=monotonic,
+            rss_sampler=rss_sampler,
         )
     except H3PromptRewriterUvResolutionError:
         raise

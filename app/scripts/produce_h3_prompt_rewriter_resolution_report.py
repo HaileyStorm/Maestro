@@ -92,6 +92,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         _print(
             {
                 "package_count": result["package_count"],
+                "peak_rss_bytes": result["peak_rss_bytes"],
                 "plan_sha256": plan.sha256,
                 "provenance_sha256": result["provenance_sha256"],
                 "pylock_sha256": result["pylock_sha256"],
