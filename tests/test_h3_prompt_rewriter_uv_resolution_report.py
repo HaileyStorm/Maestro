@@ -1,0 +1,762 @@
+"""Source-only tests for the pinned-uv H3 resolution-report producer."""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import socket
+import subprocess
+import sys
+import tempfile
+import types
+import unittest
+import urllib.parse
+from contextlib import redirect_stdout
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[1]
+APP = ROOT / "app"
+if str(APP) not in sys.path:
+    sys.path.insert(0, str(APP))
+
+from services import h3_prompt_rewriter_dependency_closure as closure
+from services import h3_prompt_rewriter_uv_resolution_report as producer
+from services import h3_prompt_rewriter_wheel_resolver as resolver
+
+from scripts import produce_h3_prompt_rewriter_resolution_report as report_cli
+
+PACKAGE_ROWS = (
+    ("accelerate", "1.12.0", "py3-none-any", ()),
+    ("nvidia-cublas-cu12", "12.8.4.1", "py3-none-manylinux_2_28_x86_64", ()),
+    ("peft", "0.20.0", "py3-none-any", ()),
+    ("pillow", "12.2.0", "cp312-cp312-manylinux_2_28_x86_64", ()),
+    ("safetensors", "0.8.0", "cp312-cp312-manylinux_2_28_x86_64", ()),
+    ("tokenizers", "0.22.1", "cp312-cp312-manylinux_2_28_x86_64", ()),
+    (
+        "torch",
+        "2.10.0+cu128",
+        "cp312-cp312-manylinux_2_28_x86_64",
+        ("nvidia-cublas-cu12",),
+    ),
+    (
+        "torchvision",
+        "0.25.0+cu128",
+        "cp312-cp312-manylinux_2_28_x86_64",
+        ("torch",),
+    ),
+    ("transformers", "4.57.1", "py3-none-any", ()),
+)
+
+
+def _wheel_filename(name: str, version: str, tag: str) -> str:
+    return f"{name.replace('-', '_')}-{version}-{tag}.whl"
+
+
+def _pylock(
+    *,
+    mutate_package=None,
+    extra_packages: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (),
+    optional_empty_header: bool = False,
+) -> bytes:
+    lines = [
+        'lock-version = "1.0"',
+        'created-by = "uv"',
+        'requires-python = ">=3.12.14,<3.13"',
+        "",
+    ]
+    if optional_empty_header:
+        lines[3:3] = [
+            "environments = []",
+            "extras = []",
+            "dependency-groups = []",
+            "default-groups = []",
+        ]
+    for ordinal, row in enumerate(PACKAGE_ROWS + extra_packages, start=1):
+        name, version, tag, dependencies = row
+        filename = _wheel_filename(name, version, tag)
+        index = (
+            resolver.PYTORCH_INDEX
+            if name in {"torch", "torchvision"} or name.startswith("nvidia-")
+            else resolver.PYPI_INDEX
+        )
+        url = (
+            "https://download.pytorch.org/whl/cu128/"
+            + urllib.parse.quote(filename, safe="-._~")
+            if index == resolver.PYTORCH_INDEX
+            else f"https://files.pythonhosted.org/packages/aa/{ordinal:02d}/{filename}"
+        )
+        package = {
+            "name": name,
+            "version": version,
+            "index": index,
+            "dependencies": list(dependencies),
+            "wheels": [
+                {
+                    "name": filename,
+                    "url": url,
+                    "size": ordinal * 100,
+                    "hash": hashlib.sha256(filename.encode()).hexdigest(),
+                }
+            ],
+        }
+        if mutate_package is not None:
+            package = mutate_package(dict(package))
+        lines.extend(
+            [
+                "[[packages]]",
+                f"name = {json.dumps(package['name'])}",
+                f"version = {json.dumps(package['version'])}",
+                f"index = {json.dumps(package['index'])}",
+            ]
+        )
+        if package.get("marker") is not None:
+            lines.append(f"marker = {json.dumps(package['marker'])}")
+        if package.get("sdist") is not None:
+            lines.append(
+                'sdist = {name = "bad.tar.gz", '
+                'url = "https://files.pythonhosted.org/packages/bad.tar.gz"}'
+            )
+        dependency_values = []
+        for dependency in package["dependencies"]:
+            if isinstance(dependency, dict):
+                values = ", ".join(
+                    f"{key} = {json.dumps(value)}" for key, value in dependency.items()
+                )
+                dependency_values.append("{" + values + "}")
+            else:
+                dependency_values.append(f"{{name = {json.dumps(dependency)}}}")
+        lines.append("dependencies = [" + ", ".join(dependency_values) + "]")
+        wheels = []
+        for wheel in package["wheels"]:
+            wheels.append(
+                "{name = "
+                + json.dumps(wheel["name"])
+                + ", url = "
+                + json.dumps(wheel["url"])
+                + f", size = {wheel['size']}, hashes = {{sha256 = "
+                + json.dumps(wheel["hash"])
+                + "}}"
+            )
+        lines.append("wheels = [" + ", ".join(wheels) + "]")
+        lines.append("")
+    return "\n".join(lines).encode("utf-8")
+
+
+# Bounded PEP 751 shape documented by uv 0.9.26; this is deliberately not
+# represented as captured live resolution output.
+UV_0926_DOCUMENTED_GOLDEN_PYLOCK = _pylock(optional_empty_header=True)
+
+
+class _FakeProcess:
+    pid = 9876
+
+    def __init__(self, returncode: int = 0):
+        self.returncode = returncode
+
+    def wait(self, timeout):
+        return self.returncode
+
+
+class _SequencedProcess(_FakeProcess):
+    def __init__(self, outcomes):
+        super().__init__()
+        self.outcomes = list(outcomes)
+        self.wait_calls = 0
+
+    def wait(self, timeout):
+        self.wait_calls += 1
+        outcome = self.outcomes.pop(0) if self.outcomes else self.returncode
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+class _ProcessFactory:
+    def __init__(self, process, payload: bytes | None = None, grow_bytes: int = 0):
+        self.process = process
+        self.payload = payload
+        self.grow_bytes = grow_bytes
+
+    def __call__(self, command, **kwargs):
+        destination = Path(command[command.index("--output-file") + 1])
+        if self.payload is not None:
+            destination.write_bytes(self.payload)
+            destination.chmod(0o600)
+        if self.grow_bytes:
+            cache_file = Path(kwargs["cwd"]) / "cache" / "growth.bin"
+            cache_file.write_bytes(b"x" * self.grow_bytes)
+            cache_file.chmod(0o600)
+        return self.process
+
+
+class _GroupSignals:
+    def __init__(self, *, survive_term: bool = True):
+        self.alive = True
+        self.survive_term = survive_term
+        self.calls: list[int] = []
+
+    def __call__(self, pid, signal_number):
+        self.calls.append(signal_number)
+        if signal_number == 0:
+            if not self.alive:
+                raise ProcessLookupError
+            return
+        if signal_number == producer.signal.SIGTERM and not self.survive_term:
+            self.alive = False
+        if signal_number == producer.signal.SIGKILL:
+            self.alive = False
+
+
+class _FakeUv:
+    def __init__(self, payload: bytes, *, returncode: int = 0):
+        self.payload = payload
+        self.returncode = returncode
+        self.commands: list[list[str]] = []
+        self.kwargs = None
+
+    def __call__(self, command, **kwargs):
+        self.commands.append(list(command))
+        self.kwargs = kwargs
+        destination = Path(command[command.index("--output-file") + 1])
+        destination.write_bytes(self.payload)
+        destination.chmod(0o600)
+        return _FakeProcess(self.returncode)
+
+
+class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.feature = self.root / "feature"
+        self.feature.mkdir(mode=0o700)
+        self.state = self.feature / "resolution"
+        self.uv = self.root / "uv"
+        self.uv.write_bytes(b"fake uv")
+        self.uv.chmod(0o700)
+        info = self.uv.stat()
+        self.uv_receipt = producer._UvReceipt(
+            path=self.uv,
+            sha256=producer.PINNED_UV_SHA256,
+            size_bytes=producer.PINNED_UV_SIZE_BYTES,
+            stat_identity=producer._stat_identity(info),
+        )
+
+    def plan(self, **kwargs):
+        with mock.patch.object(producer, "_inspect_uv", return_value=self.uv_receipt):
+            return producer.build_h3_prompt_rewriter_uv_resolution_plan(
+                self.uv, **kwargs
+            )
+
+    def execute(self, fake, *, plan=None, monotonic=lambda: 0.0):
+        plan = plan or self.plan()
+        with mock.patch.object(producer, "_inspect_uv", return_value=self.uv_receipt):
+            return producer.execute_h3_prompt_rewriter_uv_resolution(
+                plan,
+                expected_plan_sha256=plan.sha256,
+                expected_input_sha256=hashlib.sha256(
+                    producer.reviewed_requirements_input_bytes()
+                ).hexdigest(),
+                expected_uv_sha256=producer.PINNED_UV_SHA256,
+                uv_executable=self.uv,
+                private_feature_root=self.feature,
+                state_root=self.state,
+                process_factory=fake,
+                monotonic=monotonic,
+            )
+
+    def test_plan_is_path_free_network_free_and_exactly_bound(self):
+        with (
+            mock.patch.object(producer, "_inspect_uv", return_value=self.uv_receipt),
+            mock.patch.object(socket, "socket", side_effect=AssertionError("network")),
+            mock.patch.object(
+                subprocess, "Popen", side_effect=AssertionError("process")
+            ),
+        ):
+            first = producer.build_h3_prompt_rewriter_uv_resolution_plan(self.uv)
+            second = producer.build_h3_prompt_rewriter_uv_resolution_plan(self.uv)
+        self.assertEqual(first.sha256, second.sha256)
+        self.assertFalse(first.document["planning_mutation"])
+        self.assertFalse(first.document["planning_network"])
+        self.assertTrue(first.document["execution_requires_network"])
+        self.assertTrue(first.document["execution_writes_private_state"])
+        self.assertNotIn("mutation", first.document)
+        self.assertNotIn("network", first.document)
+        self.assertEqual(first.document["uv"]["version"], "0.9.26")
+        self.assertEqual(first.document["target"]["python_abi"], "cp312")
+        self.assertEqual(first.document["resources"]["cpu_cores"], 2)
+        self.assertEqual(first.document["resources"]["nice"], 15)
+        self.assertEqual(first.document["resources"]["metadata_byte_cap"], 1024**3)
+        self.assertEqual(
+            first.document["resources"]["child_file_size_bytes"], 16 * 1024**2
+        )
+        self.assertEqual(
+            first.document["resources"]["state_depth_cap"],
+            producer.MAX_STATE_DEPTH,
+        )
+        self.assertNotIn(str(self.root), json.dumps(first.document, sort_keys=True))
+
+    def test_documented_uv_0926_golden_variant_is_accepted(self):
+        report = producer.parse_uv_pylock_to_wheel_report(
+            UV_0926_DOCUMENTED_GOLDEN_PYLOCK
+        )
+        self.assertEqual(len(report["packages"]), len(PACKAGE_ROWS))
+
+    def test_parse_emits_exact_downstream_report_schema(self):
+        report = producer.parse_uv_pylock_to_wheel_report(_pylock())
+        self.assertEqual(report["schema"], resolver.WHEEL_RESOLUTION_REPORT_SCHEMA)
+        self.assertEqual(report["root_requirements"], list(closure.ROOT_REQUIREMENTS))
+        self.assertEqual(
+            [item["name"] for item in report["packages"]],
+            sorted(item[0] for item in PACKAGE_ROWS),
+        )
+        torch = next(item for item in report["packages"] if item["name"] == "torch")
+        self.assertEqual(torch["wheel"]["index"], resolver.PYTORCH_INDEX)
+        self.assertEqual(torch["dependencies"], ["nvidia-cublas-cu12==12.8.4.1"])
+
+    def test_execution_uses_one_scrubbed_bounded_fake_uv_and_private_outputs(self):
+        fake = _FakeUv(_pylock())
+        result = self.execute(fake)
+        self.assertEqual(len(fake.commands), 1)
+        command = fake.commands[0]
+        for option in (
+            "--no-config",
+            "--no-python-downloads",
+            "--no-managed-python",
+            "--no-build",
+            "--only-binary",
+            "--no-sources",
+        ):
+            self.assertIn(option, command)
+        self.assertEqual(command[command.index("--index-strategy") + 1], "first-index")
+        self.assertEqual(command[command.index("--python-version") + 1], "3.12.14")
+        self.assertEqual(
+            command[command.index("--python-platform") + 1],
+            "x86_64-manylinux_2_28",
+        )
+        self.assertFalse(fake.kwargs["shell"])
+        self.assertTrue(fake.kwargs["start_new_session"])
+        self.assertEqual(fake.kwargs["preexec_fn"].__name__, "_apply_child_limits")
+        environment = fake.kwargs["env"]
+        self.assertNotIn("PATH", environment)
+        self.assertFalse(any(key.startswith("PIP_") for key in environment))
+        self.assertFalse(any("PROXY" in key for key in environment))
+        self.assertNotIn("PYTHONPATH", environment)
+        self.assertEqual(environment["NVIDIA_VISIBLE_DEVICES"], "void")
+        self.assertEqual(result["package_count"], len(PACKAGE_ROWS))
+        for name in (
+            producer.INPUT_NAME,
+            producer.PYLOCK_NAME,
+            producer.REPORT_NAME,
+            producer.PROVENANCE_NAME,
+        ):
+            path = self.state / name
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(path.stat().st_nlink, 1)
+        provenance = json.loads((self.state / producer.PROVENANCE_NAME).read_text())
+        self.assertEqual(provenance["status"], "unreviewed_candidate")
+        self.assertFalse(provenance["installation_authorized"])
+
+    def test_execution_requires_all_three_expected_hashes(self):
+        plan = self.plan()
+        for field in ("plan", "input", "uv"):
+            values = {
+                "expected_plan_sha256": plan.sha256,
+                "expected_input_sha256": hashlib.sha256(
+                    producer.reviewed_requirements_input_bytes()
+                ).hexdigest(),
+                "expected_uv_sha256": producer.PINNED_UV_SHA256,
+            }
+            values[f"expected_{field}_sha256"] = "0" * 64
+            with (
+                self.subTest(field=field),
+                mock.patch.object(
+                    producer, "_inspect_uv", return_value=self.uv_receipt
+                ),
+                self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError),
+            ):
+                producer.execute_h3_prompt_rewriter_uv_resolution(
+                    plan,
+                    **values,
+                    uv_executable=self.uv,
+                    private_feature_root=self.feature,
+                    state_root=self.state,
+                    process_factory=_FakeUv(_pylock()),
+                )
+
+    def test_rejects_sdist_direct_marker_prerelease_and_wrong_registry(self):
+        mutations = {
+            "sdist": lambda item: {**item, "sdist": True},
+            "marker": lambda item: {**item, "marker": "sys_platform == 'linux'"},
+            "dependency_marker": lambda item: {
+                **item,
+                "dependencies": (
+                    [{"name": "torch", "marker": "python_version == '3.12'"}]
+                    if item["name"] == "torchvision"
+                    else item["dependencies"]
+                ),
+            },
+            "prerelease": lambda item: (
+                {**item, "version": "1.12.0rc1"}
+                if item["name"] == "accelerate"
+                else item
+            ),
+            "wrong_registry": lambda item: (
+                {**item, "index": resolver.PYPI_INDEX}
+                if item["name"] == "torch"
+                else item
+            ),
+        }
+        for name, mutation in mutations.items():
+            with (
+                self.subTest(name=name),
+                self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError),
+            ):
+                producer.parse_uv_pylock_to_wheel_report(
+                    _pylock(mutate_package=mutation)
+                )
+
+    def test_rejects_ambiguous_and_too_new_wheels(self):
+        def ambiguous(item):
+            if item["name"] == "accelerate":
+                item["wheels"] = item["wheels"] * 2
+            return item
+
+        def too_new(item):
+            if item["name"] == "pillow":
+                wheel = item["wheels"][0]
+                wheel["name"] = wheel["name"].replace(
+                    "manylinux_2_28", "manylinux_2_35"
+                )
+                wheel["url"] = wheel["url"].replace("manylinux_2_28", "manylinux_2_35")
+            return item
+
+        for name, mutation in (("ambiguous", ambiguous), ("too_new", too_new)):
+            with (
+                self.subTest(name=name),
+                self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError),
+            ):
+                producer.parse_uv_pylock_to_wheel_report(
+                    _pylock(mutate_package=mutation)
+                )
+
+    def test_rejects_duplicate_cycle_unreachable_and_unresolved(self):
+        with self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError):
+            producer.parse_uv_pylock_to_wheel_report(
+                _pylock(extra_packages=(PACKAGE_ROWS[0],))
+            )
+
+        def cycle(item):
+            if item["name"] == "nvidia-cublas-cu12":
+                item["dependencies"] = ["torch"]
+            return item
+
+        def unresolved(item):
+            if item["name"] == "accelerate":
+                item["dependencies"] = ["not-present"]
+            return item
+
+        for name, payload in (
+            ("cycle", _pylock(mutate_package=cycle)),
+            ("unresolved", _pylock(mutate_package=unresolved)),
+            (
+                "unreachable",
+                _pylock(extra_packages=(("orphan", "1.0", "py3-none-any", ()),)),
+            ),
+        ):
+            with (
+                self.subTest(name=name),
+                self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError),
+            ):
+                producer.parse_uv_pylock_to_wheel_report(payload)
+
+    def test_failed_fake_uv_preserves_temporary_state_and_emits_no_report(self):
+        fake = _FakeUv(_pylock(), returncode=9)
+        with self.assertRaises(producer.H3PromptRewriterUvResolutionExecutionError):
+            self.execute(fake)
+        self.assertTrue((self.state / f".{producer.PYLOCK_NAME}.tmp").exists())
+        self.assertFalse((self.state / producer.REPORT_NAME).exists())
+
+    def test_metadata_cap_kills_process_group_before_evidence(self):
+        plan = self.plan(metadata_byte_cap=512)
+        process = _SequencedProcess([0, 0, 0])
+        factory = _ProcessFactory(process, grow_bytes=1024)
+        signals = _GroupSignals(survive_term=True)
+        with (
+            mock.patch.object(producer.os, "killpg", side_effect=signals),
+            self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError),
+        ):
+            self.execute(factory, plan=plan)
+        self.assertIn(producer.signal.SIGTERM, signals.calls)
+        self.assertIn(producer.signal.SIGKILL, signals.calls)
+        self.assertFalse(signals.alive)
+        self.assertFalse((self.state / producer.REPORT_NAME).exists())
+
+    def test_state_monitor_rejects_symlink_and_child_limit_binds_file_size(self):
+        process = _SequencedProcess([0, 0, 0])
+
+        def symlink_factory(_command, **kwargs):
+            (Path(kwargs["cwd"]) / "cache" / "escape").symlink_to(self.uv)
+            return process
+
+        signals = _GroupSignals(survive_term=True)
+        with (
+            mock.patch.object(producer.os, "killpg", side_effect=signals),
+            self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError),
+        ):
+            self.execute(symlink_factory)
+        self.assertIn(producer.signal.SIGKILL, signals.calls)
+
+        limits = []
+        library = types.SimpleNamespace(syscall=lambda *_args: 0)
+        with (
+            mock.patch.object(producer.os, "umask"),
+            mock.patch.object(producer.os, "nice"),
+            mock.patch.object(producer.os, "sched_getaffinity", return_value={0, 1}),
+            mock.patch.object(
+                producer.resource,
+                "setrlimit",
+                side_effect=lambda kind, value: limits.append((kind, value)),
+            ),
+            mock.patch.object(producer.ctypes, "CDLL", return_value=library),
+        ):
+            producer._apply_child_limits()
+        self.assertIn(
+            (
+                producer.resource.RLIMIT_FSIZE,
+                (producer.MAX_CHILD_FILE_BYTES, producer.MAX_CHILD_FILE_BYTES),
+            ),
+            limits,
+        )
+
+    def test_growing_private_file_is_accepted_accounted_and_capped(self):
+        producer._layout(self.feature, self.state)
+        growing = self.state / "cache" / "growing.bin"
+        growing.write_bytes(b"a" * 100)
+        growing.chmod(0o600)
+        real_open = producer.os.open
+        appended = False
+
+        def append_before_open(path, flags, *args, **kwargs):
+            nonlocal appended
+            if path == "growing.bin" and not appended:
+                appended = True
+                with growing.open("ab") as stream:
+                    stream.write(b"b" * 200)
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(producer.os, "open", side_effect=append_before_open):
+            usage = producer._scan_private_state(
+                self.state,
+                byte_cap=400,
+                entry_cap=100,
+            )
+        self.assertTrue(appended)
+        self.assertGreaterEqual(usage.bytes, 300)
+        with self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError):
+            producer._scan_private_state(
+                self.state,
+                byte_cap=299,
+                entry_cap=100,
+            )
+
+    def test_atomic_rename_disappearance_retries_within_bound(self):
+        producer._layout(self.feature, self.state)
+        candidate = self.state / "cache" / "atomic.tmp"
+        candidate.write_bytes(b"candidate")
+        candidate.chmod(0o600)
+        real_open = producer.os.open
+        disappeared = False
+
+        def disappear_once(path, flags, *args, **kwargs):
+            nonlocal disappeared
+            if path == "atomic.tmp" and not disappeared:
+                disappeared = True
+                raise FileNotFoundError
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(producer.os, "open", side_effect=disappear_once):
+            usage = producer._scan_private_state(
+                self.state,
+                byte_cap=1024,
+                entry_cap=100,
+            )
+        self.assertTrue(disappeared)
+        self.assertGreaterEqual(usage.bytes, len(b"candidate"))
+
+    def test_deep_private_tree_is_rejected_content_free(self):
+        producer._layout(self.feature, self.state)
+        directory = self.state / "cache"
+        for ordinal in range(producer.MAX_STATE_DEPTH + 2):
+            directory = directory / f"d{ordinal}"
+            directory.mkdir(mode=0o700)
+        with self.assertRaises(
+            producer.H3PromptRewriterUvResolutionSecurityError
+        ) as raised:
+            producer._scan_private_state(
+                self.state,
+                byte_cap=1024,
+                entry_cap=100,
+            )
+        self.assertEqual(
+            str(raised.exception),
+            "private resolution state exceeds its depth cap",
+        )
+
+    def test_nonzero_with_descendant_forces_term_kill_and_final_reap(self):
+        process = _SequencedProcess([9, 9, 9, 9])
+        factory = _ProcessFactory(process, payload=_pylock())
+        signals = _GroupSignals(survive_term=True)
+        with (
+            mock.patch.object(producer.os, "killpg", side_effect=signals),
+            self.assertRaises(producer.H3PromptRewriterUvResolutionExecutionError),
+        ):
+            self.execute(factory)
+        self.assertIn(producer.signal.SIGTERM, signals.calls)
+        self.assertIn(producer.signal.SIGKILL, signals.calls)
+        self.assertGreaterEqual(process.wait_calls, 4)
+        self.assertFalse(signals.alive)
+
+    def test_late_success_is_rejected_and_group_is_cleaned(self):
+        values = iter((0.0, 0.0, 2.0))
+        process = _SequencedProcess([0, 0, 0, 0])
+        factory = _ProcessFactory(process, payload=_pylock())
+        signals = _GroupSignals(survive_term=True)
+        plan = self.plan(deadline_seconds=1)
+        with (
+            mock.patch.object(producer.os, "killpg", side_effect=signals),
+            self.assertRaises(producer.H3PromptRewriterUvResolutionExecutionError),
+        ):
+            self.execute(factory, plan=plan, monotonic=lambda: next(values))
+        self.assertIn(producer.signal.SIGKILL, signals.calls)
+        self.assertFalse((self.state / producer.REPORT_NAME).exists())
+
+    def test_running_process_is_polled_until_deadline_then_killed(self):
+        values = iter((0.0, 0.0, 2.0))
+        process = _SequencedProcess([subprocess.TimeoutExpired("uv", 0.25), 0, 0, 0])
+        factory = _ProcessFactory(process, payload=_pylock())
+        signals = _GroupSignals(survive_term=True)
+        plan = self.plan(deadline_seconds=1)
+        with (
+            mock.patch.object(producer.os, "killpg", side_effect=signals),
+            self.assertRaises(producer.H3PromptRewriterUvResolutionExecutionError),
+        ):
+            self.execute(factory, plan=plan, monotonic=lambda: next(values))
+        self.assertGreaterEqual(process.wait_calls, 4)
+        self.assertIn(producer.signal.SIGTERM, signals.calls)
+        self.assertIn(producer.signal.SIGKILL, signals.calls)
+        self.assertFalse(signals.alive)
+
+    def test_popen_and_wait_errors_are_content_free_and_cleanup_wait_descendants(self):
+        def broken_factory(*_args, **_kwargs):
+            raise OSError("private popen detail")
+
+        with self.assertRaises(
+            producer.H3PromptRewriterUvResolutionExecutionError
+        ) as raised:
+            self.execute(broken_factory)
+        self.assertNotIn("private popen detail", str(raised.exception))
+
+        self.state = self.feature / "wait-resolution"
+        process = _SequencedProcess([OSError("private wait detail"), 0, 0, 0])
+        factory = _ProcessFactory(process, payload=_pylock())
+        signals = _GroupSignals(survive_term=True)
+        with (
+            mock.patch.object(producer.os, "killpg", side_effect=signals),
+            self.assertRaises(
+                producer.H3PromptRewriterUvResolutionExecutionError
+            ) as raised,
+        ):
+            self.execute(factory)
+        self.assertNotIn("private wait detail", str(raised.exception))
+        self.assertIn(producer.signal.SIGKILL, signals.calls)
+        self.assertFalse(signals.alive)
+
+    def test_postprocess_error_still_cleans_descendants(self):
+        process = _SequencedProcess([0, 0, 0, 0, 0, 0])
+        factory = _ProcessFactory(process, payload=_pylock())
+        signals = _GroupSignals(survive_term=True)
+        with (
+            mock.patch.object(producer.os, "killpg", side_effect=signals),
+            mock.patch.object(
+                producer,
+                "parse_uv_pylock_to_wheel_report",
+                side_effect=OSError("private parse detail"),
+            ),
+            self.assertRaises(producer.H3PromptRewriterUvResolutionExecutionError),
+        ):
+            self.execute(factory)
+        self.assertIn(producer.signal.SIGKILL, signals.calls)
+        self.assertFalse(signals.alive)
+        self.assertFalse((self.state / producer.REPORT_NAME).exists())
+
+    def test_downstream_invalid_url_error_is_translated(self):
+        with (
+            mock.patch.object(
+                resolver,
+                "_load_report",
+                side_effect=resolver.H3PromptRewriterWheelResolverSecurityError(
+                    "private invalid URL detail"
+                ),
+            ),
+            self.assertRaises(
+                producer.H3PromptRewriterUvResolutionSecurityError
+            ) as raised,
+        ):
+            producer.parse_uv_pylock_to_wheel_report(_pylock())
+        self.assertNotIn("private invalid URL detail", str(raised.exception))
+
+    def test_cli_defaults_to_plan_and_rejects_execute_arguments_without_flag(self):
+        buffer = io.StringIO()
+        with (
+            mock.patch.object(producer, "_inspect_uv", return_value=self.uv_receipt),
+            mock.patch.object(
+                report_cli,
+                "build_h3_prompt_rewriter_uv_resolution_plan",
+                side_effect=lambda *args, **kwargs: (
+                    producer.build_h3_prompt_rewriter_uv_resolution_plan(
+                        *args, **kwargs
+                    )
+                ),
+            ),
+            redirect_stdout(buffer),
+        ):
+            result = report_cli.main(["--uv-executable", str(self.uv)])
+        self.assertEqual(result, 0)
+        output = json.loads(buffer.getvalue())
+        self.assertFalse(output["plan"]["planning_mutation"])
+        self.assertTrue(output["plan"]["execution_writes_private_state"])
+
+        buffer = io.StringIO()
+        with (
+            mock.patch.object(producer, "_inspect_uv", return_value=self.uv_receipt),
+            mock.patch.object(
+                report_cli,
+                "build_h3_prompt_rewriter_uv_resolution_plan",
+                side_effect=lambda *args, **kwargs: (
+                    producer.build_h3_prompt_rewriter_uv_resolution_plan(
+                        *args, **kwargs
+                    )
+                ),
+            ),
+            redirect_stdout(buffer),
+        ):
+            result = report_cli.main(
+                [
+                    "--uv-executable",
+                    str(self.uv),
+                    "--expected-plan-sha256",
+                    "0" * 64,
+                ]
+            )
+        self.assertEqual(result, 2)
+        self.assertEqual(
+            json.loads(buffer.getvalue()),
+            {"error": "H3PromptRewriterUvResolutionError"},
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
