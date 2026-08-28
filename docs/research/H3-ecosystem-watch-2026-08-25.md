@@ -565,7 +565,11 @@ TeaCache, or model fallback. One 28-step Sol-Attn private job completed at
 1344x768 with 124 video frames and 32 kHz stereo audio; sampled-frame review
 found coherent performer identity, wardrobe, staging, and plausible motion.
 This is PinkCherry live runtime/output evidence only and does not promote
-PinkCherry to a default or prove Beta3, Ref2VA generally, or Base.
+PinkCherry to a default or prove Beta3, Ref2VA generally, or Base. Direct human
+review subsequently accepted the clip as a generally acceptable result, with
+an explicit reservation that it was not a high-quality exemplar. This closes
+the bounded beta-0.6 usability gate without making PinkCherry the preferred
+mature model.
 
 A second coordinated 2026-08-27 GPU wave then exercised the installed Ref2VA
 checkpoint with two isolated adapters and the same procedural reference/seed.
@@ -580,7 +584,9 @@ occurred. The exact output receipts live in `docs/operations/GPU_ACCEPTANCE.md`.
 
 This promotes both adapters from static scaffold to **live neutral coherence
 evidence**, not to defaults. Exact Dasiwa-base acquisition remains open, so its
-installed-base profile must remain visibly provisional. Better Motion's neutral
-robot result proves runtime compatibility and useful motion tendency, not
-mature-content quality across prompts or direct human acceptance. Beta3 remains
-unwired and has no GPU/runtime acceptance.
+installed-base profile must remain visibly provisional. Direct human comparison
+judged Better Motion materially better than Dasiwa in this sample, making it the
+leading observed Ref2VA motion experiment for the next private/mature test.
+Better Motion's neutral robot result still proves runtime compatibility and a
+useful motion tendency rather than mature-content quality across prompts. Beta3
+remains unwired and has no GPU/runtime acceptance.

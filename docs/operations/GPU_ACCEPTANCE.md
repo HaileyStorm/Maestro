@@ -101,10 +101,12 @@ human acceptance.
   performer, dress, stage, lighting, and plausible anatomy/motion; the audio
   stream was finite and non-silent (peak -19.34 dBFS, RMS -32.80 dBFS).
 - Evidence class: live local GPU generation plus agent visual and technical A/V
-  review. The runtime/output portion passes. The strict matrix row remains open
-  only for the separately worded signed-in-owner UI action and direct human
-  keep/reject confirmation; do not rerun merely to replace the authorized
-  generic account unless that remaining distinction is decision-changing.
+  review, followed by direct human review. The owner accepted the clip as a
+  generally acceptable output while explicitly noting that it is not a
+  high-quality exemplar. The authorized generic account satisfies this bounded
+  acceptance; do not rerun merely to reproduce it under a differently named
+  owner account. PinkCherry beta-0.6 therefore passes this matrix row with a
+  quality reservation, without becoming a default or preferred mature model.
 
 ### 2026-08-27 Ref2VA adapter runtime receipts
 
@@ -135,8 +137,11 @@ human acceptance.
   output, or finality errors. Maestro fetched two pinned, sub-megabyte Ref2VA
   LoRA compatibility maps during the first preparation; no model artifact was
   downloaded. Evidence class is live local GPU generation plus agent visual
-  and technical A/V review. Direct human keep/reject remains open, and the
-  neutral Better Motion sample does not establish mature-content quality.
+  and technical A/V review, followed by direct human comparison. The owner
+  judged Better Motion materially better than Dasiwa in this sample. That
+  promotes Better Motion to the leading observed Ref2VA motion experiment for
+  the next private/mature evaluation, while leaving it opt-in; this neutral
+  robot sample still does not establish mature-content quality across prompts.
 
 When all applicable rows pass, update this matrix rather than deleting it. Keep
 failed or intentionally unsupported variants as provenance, and remove only a
