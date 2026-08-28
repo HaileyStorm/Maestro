@@ -69,6 +69,10 @@ MAX_CPU_CORES = wheel_resolver.MAX_CPU_CORES
 PROCESS_NICE = wheel_resolver.PROCESS_NICE
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_UV_INDEX_ID = re.compile(r"[0-9a-f]{16}")
+_UV_PACKAGE_COMPONENT = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}")
+_UV_VERSION_TAG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,254}")
+_UV_ARCHIVE_ID = re.compile(r"[A-Za-z0-9_-]{21}")
 _ALLOWED_STATE_FILES = {
     INPUT_NAME,
     PYLOCK_NAME,
@@ -171,6 +175,16 @@ class _PythonReceipt:
 class _StateUsage:
     bytes: int
     entries: int
+
+
+@dataclass(frozen=True, slots=True)
+class _UvCacheSymlinkReceipt:
+    relative: tuple[str, ...]
+    identity: tuple[int, int, int, int, int]
+    size_bytes: int
+    target_text: str
+    target_relative: tuple[str, ...]
+    target_identity: tuple[int, int, int, int, int]
 
 
 def _canonical_json(value: object) -> bytes:
@@ -472,6 +486,17 @@ def build_h3_prompt_rewriter_uv_resolution_plan(
                 "regular_single_link_owner_only": True,
                 "owner_private_ancestors": True,
             },
+            "uv_cache_symlink_contract": {
+                "schema": "wheels-v5-to-archive-v0.v1",
+                "source": "cache/wheels-v5/index/<hex16>/<package>/<version-tag>",
+                "source_mode": "0777",
+                "target": "cache/archive-v0/<base64url21>",
+                "target_text": "exact_absolute_same_state_root",
+                "target_type": "owner_private_directory",
+                "follow_during_traversal": False,
+                "opened_target_identity_reconciled": True,
+                "link_text_bytes_accounted": True,
+            },
         },
         "outputs": {
             "pylock": "private_candidate",
@@ -579,6 +604,37 @@ def _layout(feature_value: object, state_value: object) -> tuple[Path, Path]:
     return feature, state_root
 
 
+def _uv_cache_symlink_source(relative: tuple[str, ...]) -> bool:
+    return (
+        len(relative) == 6
+        and relative[:3] == ("cache", "wheels-v5", "index")
+        and _UV_INDEX_ID.fullmatch(relative[3]) is not None
+        and _UV_PACKAGE_COMPONENT.fullmatch(relative[4]) is not None
+        and _UV_VERSION_TAG.fullmatch(relative[5]) is not None
+    )
+
+
+def _uv_cache_symlink_target(state_root: Path, target_text: str) -> tuple[str, ...]:
+    archive_root = state_root / "cache" / "archive-v0"
+    target = Path(target_text)
+    try:
+        relative = target.relative_to(archive_root)
+    except ValueError as error:
+        raise H3PromptRewriterUvResolutionSecurityError(
+            "uv cache link target leaves its private archive"
+        ) from error
+    if (
+        not target.is_absolute()
+        or len(relative.parts) != 1
+        or _UV_ARCHIVE_ID.fullmatch(relative.parts[0]) is None
+        or target_text != str(archive_root / relative.parts[0])
+    ):
+        raise H3PromptRewriterUvResolutionSecurityError(
+            "uv cache link target shape is invalid"
+        )
+    return ("cache", "archive-v0", relative.parts[0])
+
+
 def _scan_private_state_once(
     state_root: Path, *, byte_cap: int, entry_cap: int
 ) -> _StateUsage:
@@ -586,18 +642,90 @@ def _scan_private_state_once(
 
     _private_directory(state_root)
     totals = [0, 0]
+    visited_directories: dict[tuple[str, ...], tuple[int, int, int, int, int]] = {}
+    symlink_receipts: list[_UvCacheSymlinkReceipt] = []
 
-    def account(info: os.stat_result) -> None:
+    def account(info: os.stat_result, *, charge_link_text: bool = False) -> None:
         totals[1] += 1
         if totals[1] > entry_cap:
             raise H3PromptRewriterUvResolutionSecurityError(
                 "private resolution state exceeds its entry cap"
             )
-        if stat.S_ISREG(info.st_mode):
+        if stat.S_ISREG(info.st_mode) or charge_link_text:
             totals[0] += info.st_size
             if totals[0] > byte_cap:
                 raise H3PromptRewriterUvResolutionSecurityError(
                     "private resolution state exceeds its byte cap"
+                )
+
+    def open_private_target(
+        relative: tuple[str, ...], root_descriptor: int
+    ) -> tuple[
+        int,
+        os.stat_result,
+        tuple[
+            tuple[tuple[str, ...], tuple[int, int, int, int, int]],
+            ...,
+        ],
+    ]:
+        current = os.dup(root_descriptor)
+        try:
+            prefix: tuple[str, ...] = ()
+            chain = [(prefix, _stable_identity(os.fstat(current)))]
+            for component in relative:
+                try:
+                    child = os.open(
+                        component,
+                        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=current,
+                    )
+                except FileNotFoundError:
+                    raise
+                except OSError as error:
+                    raise H3PromptRewriterUvResolutionSecurityError(
+                        "uv cache link target cannot be opened safely"
+                    ) from error
+                os.close(current)
+                current = child
+                info = os.fstat(current)
+                if (
+                    not stat.S_ISDIR(info.st_mode)
+                    or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) & 0o077
+                ):
+                    raise H3PromptRewriterUvResolutionSecurityError(
+                        "uv cache link target directory is not private"
+                    )
+                prefix = (*prefix, component)
+                chain.append((prefix, _stable_identity(info)))
+            return current, os.fstat(current), tuple(chain)
+        except Exception:
+            os.close(current)
+            raise
+
+    def read_link(name: str, *, descriptor: int) -> str:
+        try:
+            return os.readlink(name, dir_fd=descriptor)
+        except FileNotFoundError:
+            raise
+        except OSError as error:
+            raise H3PromptRewriterUvResolutionSecurityError(
+                "uv cache link text cannot be read safely"
+            ) from error
+
+    def reconcile_opened_chain(
+        chain: tuple[
+            tuple[tuple[str, ...], tuple[int, int, int, int, int]],
+            ...,
+        ],
+        *,
+        root_identity: tuple[int, int, int, int, int],
+    ) -> None:
+        for prefix, identity in chain:
+            expected = root_identity if not prefix else visited_directories.get(prefix)
+            if identity != expected:
+                raise _TransientStateChange(
+                    "uv cache directory chain changed during reconciliation"
                 )
 
     def walk(
@@ -615,6 +743,54 @@ def _scan_private_state_once(
                         "resolution state contains a foreign entry"
                     )
                 info = entry.stat(follow_symlinks=False)
+                if stat.S_ISLNK(info.st_mode):
+                    if (
+                        not _uv_cache_symlink_source(entry_relative)
+                        or info.st_uid != os.getuid()
+                        or info.st_nlink != 1
+                        or stat.S_IMODE(info.st_mode) != 0o777
+                    ):
+                        raise H3PromptRewriterUvResolutionSecurityError(
+                            "resolution state contains an unapproved link"
+                        )
+                    target_text = read_link(entry.name, descriptor=descriptor)
+                    after_link = os.stat(
+                        entry.name,
+                        dir_fd=descriptor,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        _stable_identity(after_link) != _stable_identity(info)
+                        or after_link.st_size != info.st_size
+                        or info.st_size != len(os.fsencode(target_text))
+                    ):
+                        raise _TransientStateChange("uv cache link changed")
+                    target_relative = _uv_cache_symlink_target(state_root, target_text)
+                    target_descriptor, target_info, _target_chain = open_private_target(
+                        target_relative, root_descriptor
+                    )
+                    try:
+                        followed = os.stat(
+                            entry.name,
+                            dir_fd=descriptor,
+                            follow_symlinks=True,
+                        )
+                        if _stable_identity(followed) != _stable_identity(target_info):
+                            raise _TransientStateChange("uv cache link target changed")
+                    finally:
+                        os.close(target_descriptor)
+                    account(info, charge_link_text=True)
+                    symlink_receipts.append(
+                        _UvCacheSymlinkReceipt(
+                            relative=entry_relative,
+                            identity=_stable_identity(info),
+                            size_bytes=info.st_size,
+                            target_text=target_text,
+                            target_relative=target_relative,
+                            target_identity=_stable_identity(target_info),
+                        )
+                    )
+                    continue
                 mode = stat.S_IMODE(info.st_mode)
                 uv_internal_lock = entry_relative in _UV_INTERNAL_LOCK_PATHS
                 compatible_uv_internal_lock = (
@@ -624,10 +800,8 @@ def _scan_private_state_once(
                     and mode == 0o666
                     and info.st_size <= MAX_UV_INTERNAL_LOCK_BYTES
                 )
-                if (
-                    stat.S_ISLNK(info.st_mode)
-                    or info.st_uid != os.getuid()
-                    or (mode & 0o077 and not compatible_uv_internal_lock)
+                if info.st_uid != os.getuid() or (
+                    mode & 0o077 and not compatible_uv_internal_lock
                 ):
                     raise H3PromptRewriterUvResolutionSecurityError(
                         "resolution state contains a linked or non-private entry"
@@ -644,6 +818,7 @@ def _scan_private_state_once(
                             raise _TransientStateChange(
                                 "resolution directory identity changed"
                             )
+                        visited_directories[entry_relative] = _stable_identity(opened)
                         account(opened)
                         walk(
                             child,
@@ -697,9 +872,117 @@ def _scan_private_state_once(
     try:
         opened_root = os.fstat(root_descriptor)
         current_root = state_root.lstat()
-        if _stable_identity(opened_root) != _stable_identity(current_root):
+        root_identity = _stable_identity(opened_root)
+        if root_identity != _stable_identity(current_root):
             raise _TransientStateChange("resolution state root identity changed")
         walk(root_descriptor, top=True, depth=0, relative=())
+        for receipt in symlink_receipts:
+            if (
+                visited_directories.get(receipt.target_relative)
+                != receipt.target_identity
+            ):
+                raise _TransientStateChange(
+                    "uv cache link target was not traversed canonically"
+                )
+            source_parent = receipt.relative[:-1]
+            expected_parent_identity = visited_directories.get(source_parent)
+            if expected_parent_identity is None:
+                raise _TransientStateChange(
+                    "uv cache link parent was not traversed canonically"
+                )
+            parent_descriptor, parent_info, parent_chain = open_private_target(
+                source_parent, root_descriptor
+            )
+            try:
+                reconcile_opened_chain(parent_chain, root_identity=root_identity)
+                if _stable_identity(parent_info) != expected_parent_identity:
+                    raise _TransientStateChange(
+                        "uv cache link parent changed after traversal"
+                    )
+                source_name = receipt.relative[-1]
+                final_link = os.stat(
+                    source_name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    _stable_identity(final_link) != receipt.identity
+                    or final_link.st_size != receipt.size_bytes
+                ):
+                    raise _TransientStateChange("uv cache link changed after traversal")
+                final_target_text = read_link(source_name, descriptor=parent_descriptor)
+                if (
+                    final_target_text != receipt.target_text
+                    or _uv_cache_symlink_target(state_root, final_target_text)
+                    != receipt.target_relative
+                ):
+                    raise _TransientStateChange(
+                        "uv cache link target text changed after traversal"
+                    )
+                target_descriptor, target_info, target_chain = open_private_target(
+                    receipt.target_relative, root_descriptor
+                )
+                try:
+                    reconcile_opened_chain(
+                        target_chain,
+                        root_identity=root_identity,
+                    )
+                    followed = os.stat(
+                        source_name,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=True,
+                    )
+                    if (
+                        _stable_identity(target_info) != receipt.target_identity
+                        or _stable_identity(followed) != receipt.target_identity
+                    ):
+                        raise _TransientStateChange(
+                            "uv cache link target changed after traversal"
+                        )
+                finally:
+                    os.close(target_descriptor)
+                after_link = os.stat(
+                    source_name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    _stable_identity(after_link) != receipt.identity
+                    or after_link.st_size != receipt.size_bytes
+                ):
+                    raise _TransientStateChange(
+                        "uv cache link changed during final reconciliation"
+                    )
+            finally:
+                os.close(parent_descriptor)
+            reopened_parent, reopened_parent_info, reopened_parent_chain = (
+                open_private_target(source_parent, root_descriptor)
+            )
+            try:
+                reconcile_opened_chain(
+                    reopened_parent_chain,
+                    root_identity=root_identity,
+                )
+                if _stable_identity(reopened_parent_info) != expected_parent_identity:
+                    raise _TransientStateChange(
+                        "uv cache link ancestor changed during reconciliation"
+                    )
+            finally:
+                os.close(reopened_parent)
+            reopened_target, reopened_target_info, reopened_target_chain = (
+                open_private_target(receipt.target_relative, root_descriptor)
+            )
+            try:
+                reconcile_opened_chain(
+                    reopened_target_chain,
+                    root_identity=root_identity,
+                )
+                if _stable_identity(reopened_target_info) != receipt.target_identity:
+                    raise _TransientStateChange(
+                        "uv cache target ancestor changed during reconciliation"
+                    )
+            finally:
+                os.close(reopened_target)
         final_root = state_root.lstat()
         if _stable_identity(final_root) != _stable_identity(opened_root):
             raise _TransientStateChange("resolution state root changed during scan")

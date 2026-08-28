@@ -291,6 +291,36 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
                 monotonic=monotonic,
             )
 
+    def make_uv_cache_link(
+        self,
+        state: Path,
+        *,
+        package: str,
+        version_tag: str,
+        archive_id: str,
+        payload: bytes = b"",
+    ) -> tuple[Path, Path]:
+        target_parent = state / "cache"
+        for component in ("archive-v0", archive_id):
+            target_parent = target_parent / component
+            target_parent.mkdir(mode=0o700, exist_ok=True)
+        if payload:
+            target_file = target_parent / "artifact"
+            target_file.write_bytes(payload)
+            target_file.chmod(0o600)
+        source_parent = state / "cache"
+        for component in (
+            "wheels-v5",
+            "index",
+            "d2bd0b84f216183d",
+            package,
+        ):
+            source_parent = source_parent / component
+            source_parent.mkdir(mode=0o700, exist_ok=True)
+        source = source_parent / version_tag
+        source.symlink_to(target_parent)
+        return source, target_parent
+
     def test_plan_is_path_free_network_free_and_exactly_bound(self):
         with (
             mock.patch.object(producer, "_inspect_uv", return_value=self.uv_receipt),
@@ -350,6 +380,14 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
             producer.MAX_UV_INTERNAL_LOCK_BYTES,
         )
         self.assertTrue(cache_lock_contract["owner_private_ancestors"])
+        cache_link_contract = first.document["resources"]["uv_cache_symlink_contract"]
+        self.assertEqual(cache_link_contract["schema"], "wheels-v5-to-archive-v0.v1")
+        self.assertEqual(cache_link_contract["source_mode"], "0777")
+        self.assertEqual(
+            cache_link_contract["target_text"], "exact_absolute_same_state_root"
+        )
+        self.assertFalse(cache_link_contract["follow_during_traversal"])
+        self.assertTrue(cache_link_contract["link_text_bytes_accounted"])
         self.assertEqual(first.document["resolver"]["only_binary"], ":all:")
         self.assertEqual(
             first.document["resolver"]["candidate_output_name"],
@@ -926,6 +964,382 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
                 producer._scan_private_state(
                     state,
                     byte_cap=1024,
+                    entry_cap=100,
+                )
+
+    def test_confined_uv_cache_links_are_not_followed_and_are_accounted(self):
+        producer._layout(self.feature, self.state)
+        first, _first_target = self.make_uv_cache_link(
+            self.state,
+            package="jinja2",
+            version_tag="3.1.6-py3-none-any",
+            archive_id="KkNamxay3FSOLcC_mpMAy",
+            payload=b"first-target",
+        )
+        second, _second_target = self.make_uv_cache_link(
+            self.state,
+            package="setuptools",
+            version_tag="78.1.0-py3-none-any",
+            archive_id="G7w12C-QfFaZGVYxKm3gd",
+            payload=b"second-target",
+        )
+        shared, _shared_target = self.make_uv_cache_link(
+            self.state,
+            package="markupsafe",
+            version_tag="3.0.2-cp312-cp312-manylinux_2_28_x86_64",
+            archive_id="KkNamxay3FSOLcC_mpMAy",
+        )
+        expected_bytes = (
+            len(b"first-target")
+            + len(b"second-target")
+            + first.lstat().st_size
+            + second.lstat().st_size
+            + shared.lstat().st_size
+        )
+        usage = producer._scan_private_state(
+            self.state,
+            byte_cap=expected_bytes,
+            entry_cap=100,
+        )
+        self.assertEqual(usage.bytes, expected_bytes)
+        with self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError):
+            producer._scan_private_state(
+                self.state,
+                byte_cap=expected_bytes - 1,
+                entry_cap=100,
+            )
+        with self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError):
+            producer._scan_private_state(
+                self.state,
+                byte_cap=expected_bytes,
+                entry_cap=usage.entries - 1,
+            )
+
+    def test_uv_cache_link_source_and_target_variants_are_rejected(self):
+        source_variants = (
+            Path("cache/wheels-v4/index/d2bd0b84f216183d/jinja2/3.1.6-py3-none-any"),
+            Path("cache/wheels-v5/index/D2BD0B84F216183D/jinja2/3.1.6-py3-none-any"),
+            Path("cache/wheels-v5/index/d2bd0b84f216183/jinja2/3.1.6-py3-none-any"),
+            Path("cache/wheels-v5/index/d2bd0b84f216183d/Jinja2/3.1.6-py3-none-any"),
+            Path("cache/wheels-v5/index/d2bd0b84f216183d/jinja2/3.1.6@py3"),
+            Path("cache/wheels-v5/index/d2bd0b84f216183d/jinja2"),
+        )
+        for ordinal, relative in enumerate(source_variants):
+            state = self.feature / f"cache-link-source-{ordinal}"
+            producer._layout(self.feature, state)
+            target = state / "cache"
+            for component in ("archive-v0", "KkNamxay3FSOLcC_mpMAy"):
+                target = target / component
+                target.mkdir(mode=0o700)
+            source = state
+            for component in relative.parts[:-1]:
+                source = source / component
+                source.mkdir(mode=0o700, exist_ok=True)
+            (source / relative.name).symlink_to(target)
+            with (
+                self.subTest(source=str(relative)),
+                self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError),
+            ):
+                producer._scan_private_state(
+                    state,
+                    byte_cap=4096,
+                    entry_cap=100,
+                )
+
+        target_variants = (
+            "relative/archive-v0/KkNamxay3FSOLcC_mpMAy",
+            "/tmp/KkNamxay3FSOLcC_mpMAy",
+            "{root}/cache/archive-v0",
+            "{root}/cache/archive-v0/too-short",
+            "{root}/cache/archive-v0/KkNamxay3FSOLcC_mpMAy/nested",
+            "{root}/cache/archive-v0/../archive-v0/KkNamxay3FSOLcC_mpMAy",
+            "{root}/cache//archive-v0/KkNamxay3FSOLcC_mpMAy",
+        )
+        for ordinal, template in enumerate(target_variants):
+            state = self.feature / f"cache-link-target-{ordinal}"
+            producer._layout(self.feature, state)
+            source, target = self.make_uv_cache_link(
+                state,
+                package="jinja2",
+                version_tag="3.1.6-py3-none-any",
+                archive_id="KkNamxay3FSOLcC_mpMAy",
+            )
+            source.unlink()
+            source.symlink_to(template.format(root=state))
+            with (
+                self.subTest(target=template),
+                self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError),
+            ):
+                producer._scan_private_state(
+                    state,
+                    byte_cap=4096,
+                    entry_cap=100,
+                )
+            self.assertTrue(target.is_dir())
+
+    def test_uv_cache_link_target_confinement_and_races_fail_closed(self):
+        producer._layout(self.feature, self.state)
+        source, target = self.make_uv_cache_link(
+            self.state,
+            package="jinja2",
+            version_tag="3.1.6-py3-none-any",
+            archive_id="KkNamxay3FSOLcC_mpMAy",
+        )
+        original_target = os.readlink(source)
+        real_readlink = producer.os.readlink
+        read_calls = 0
+
+        def changed_final_link(path, *args, **kwargs):
+            nonlocal read_calls
+            result = real_readlink(path, *args, **kwargs)
+            if path == source.name:
+                read_calls += 1
+                if read_calls % 2 == 0:
+                    return original_target + "-changed"
+            return result
+
+        with (
+            mock.patch.object(
+                producer.os,
+                "readlink",
+                side_effect=changed_final_link,
+            ),
+            self.assertRaises(
+                producer.H3PromptRewriterUvResolutionSecurityError
+            ) as raised,
+        ):
+            producer._scan_private_state(
+                self.state,
+                byte_cap=4096,
+                entry_cap=100,
+            )
+        self.assertEqual(
+            str(raised.exception),
+            "private resolution state changed too often during scan",
+        )
+
+        real_stat = producer.os.stat
+        replaced = False
+
+        def replace_target_after_follow(path, *args, **kwargs):
+            nonlocal replaced
+            result = real_stat(path, *args, **kwargs)
+            if path == source.name and kwargs.get("follow_symlinks") and not replaced:
+                replaced = True
+                target.rename(target.with_name(target.name + "-old"))
+                target.mkdir(mode=0o700)
+            return result
+
+        with (
+            mock.patch.object(
+                producer.os,
+                "stat",
+                side_effect=replace_target_after_follow,
+            ),
+            self.assertRaises(producer._TransientStateChange),
+        ):
+            producer._scan_private_state_once(
+                self.state,
+                byte_cap=4096,
+                entry_cap=100,
+            )
+        self.assertTrue(replaced)
+
+    def test_uv_cache_link_final_source_and_ancestor_replacements_are_detected(self):
+        for label in ("source", "ancestor"):
+            state = self.feature / f"cache-link-final-race-{label}"
+            producer._layout(self.feature, state)
+            source, target = self.make_uv_cache_link(
+                state,
+                package="jinja2",
+                version_tag="3.1.6-py3-none-any",
+                archive_id="KkNamxay3FSOLcC_mpMAy",
+            )
+            real_readlink = producer.os.readlink
+            calls = 0
+            replaced = False
+
+            def replace_at_final_readlink(
+                path,
+                *args,
+                _real_readlink=real_readlink,
+                _source=source,
+                _target=target,
+                _label=label,
+                **kwargs,
+            ):
+                nonlocal calls, replaced
+                result = _real_readlink(path, *args, **kwargs)
+                if path == _source.name:
+                    calls += 1
+                    if calls == 2:
+                        if _label == "source":
+                            replacement_name = path + ".replacement"
+                            os.symlink(
+                                result,
+                                replacement_name,
+                                dir_fd=kwargs["dir_fd"],
+                            )
+                            os.rename(
+                                replacement_name,
+                                path,
+                                src_dir_fd=kwargs["dir_fd"],
+                                dst_dir_fd=kwargs["dir_fd"],
+                            )
+                        else:
+                            old_parent = _source.parent.with_name("jinja2-old")
+                            _source.parent.rename(old_parent)
+                            _source.parent.mkdir(mode=0o700)
+                            (_source.parent / _source.name).symlink_to(_target)
+                        replaced = True
+                return result
+
+            with (
+                self.subTest(label=label),
+                mock.patch.object(
+                    producer.os,
+                    "readlink",
+                    side_effect=replace_at_final_readlink,
+                ),
+                self.assertRaises(producer._TransientStateChange),
+            ):
+                producer._scan_private_state_once(
+                    state,
+                    byte_cap=4096,
+                    entry_cap=100,
+                )
+            self.assertTrue(replaced)
+
+    def test_uv_cache_link_preserved_leaf_higher_ancestor_swaps_are_detected(self):
+        source_state = self.feature / "cache-link-source-high-ancestor"
+        producer._layout(self.feature, source_state)
+        source, _target = self.make_uv_cache_link(
+            source_state,
+            package="jinja2",
+            version_tag="3.1.6-py3-none-any",
+            archive_id="KkNamxay3FSOLcC_mpMAy",
+        )
+        source_parent_identity = producer._stable_identity(source.parent.stat())
+        real_readlink = producer.os.readlink
+        read_calls = 0
+        source_ancestor_replaced = False
+
+        def replace_source_ancestor(path, *args, **kwargs):
+            nonlocal read_calls, source_ancestor_replaced
+            result = real_readlink(path, *args, **kwargs)
+            if path == source.name:
+                read_calls += 1
+                if read_calls == 2:
+                    wheels = source_state / "cache" / "wheels-v5"
+                    old_wheels = wheels.with_name("wheels-v5-old")
+                    wheels.rename(old_wheels)
+                    new_parent = source_state / "cache"
+                    for component in (
+                        "wheels-v5",
+                        "index",
+                        "d2bd0b84f216183d",
+                    ):
+                        new_parent = new_parent / component
+                        new_parent.mkdir(mode=0o700)
+                    old_source_parent = (
+                        old_wheels / "index" / "d2bd0b84f216183d" / "jinja2"
+                    )
+                    old_source_parent.rename(new_parent / "jinja2")
+                    source_ancestor_replaced = True
+            return result
+
+        with (
+            mock.patch.object(
+                producer.os,
+                "readlink",
+                side_effect=replace_source_ancestor,
+            ),
+            self.assertRaises(producer._TransientStateChange),
+        ):
+            producer._scan_private_state_once(
+                source_state,
+                byte_cap=4096,
+                entry_cap=100,
+            )
+        self.assertTrue(source_ancestor_replaced)
+        self.assertEqual(
+            producer._stable_identity(source.parent.stat()),
+            source_parent_identity,
+        )
+
+        target_state = self.feature / "cache-link-target-high-ancestor"
+        producer._layout(self.feature, target_state)
+        target_source, target = self.make_uv_cache_link(
+            target_state,
+            package="jinja2",
+            version_tag="3.1.6-py3-none-any",
+            archive_id="KkNamxay3FSOLcC_mpMAy",
+        )
+        target_identity = producer._stable_identity(target.stat())
+        real_stat = producer.os.stat
+        follow_calls = 0
+        target_ancestor_replaced = False
+
+        def replace_target_ancestor(path, *args, **kwargs):
+            nonlocal follow_calls, target_ancestor_replaced
+            result = real_stat(path, *args, **kwargs)
+            if path == target_source.name and kwargs.get("follow_symlinks"):
+                follow_calls += 1
+                if follow_calls == 2:
+                    archive = target_state / "cache" / "archive-v0"
+                    old_archive = archive.with_name("archive-v0-old")
+                    archive.rename(old_archive)
+                    archive.mkdir(mode=0o700)
+                    (old_archive / target.name).rename(archive / target.name)
+                    target_ancestor_replaced = True
+            return result
+
+        with (
+            mock.patch.object(
+                producer.os,
+                "stat",
+                side_effect=replace_target_ancestor,
+            ),
+            self.assertRaises(producer._TransientStateChange),
+        ):
+            producer._scan_private_state_once(
+                target_state,
+                byte_cap=4096,
+                entry_cap=100,
+            )
+        self.assertTrue(target_ancestor_replaced)
+        self.assertEqual(producer._stable_identity(target.stat()), target_identity)
+
+    def test_uv_cache_link_rejects_symlink_target_unsafe_ancestor_and_hardlink(self):
+        for label in ("target_symlink", "unsafe_ancestor", "hardlink"):
+            state = self.feature / f"cache-link-confinement-{label}"
+            producer._layout(self.feature, state)
+            source, target = self.make_uv_cache_link(
+                state,
+                package="jinja2",
+                version_tag="3.1.6-py3-none-any",
+                archive_id="KkNamxay3FSOLcC_mpMAy",
+            )
+            if label == "target_symlink":
+                target.rmdir()
+                replacement = state / "cache" / "archive-v0" / "replacement"
+                replacement.mkdir(mode=0o700)
+                target.symlink_to(replacement)
+            elif label == "unsafe_ancestor":
+                (state / "cache" / "archive-v0").chmod(0o755)
+            else:
+                source.unlink()
+                regular = source.with_name("regular")
+                regular.write_bytes(b"")
+                regular.chmod(0o600)
+                os.link(regular, source)
+            with (
+                self.subTest(label=label),
+                self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError),
+            ):
+                producer._scan_private_state(
+                    state,
+                    byte_cap=4096,
                     entry_cap=100,
                 )
 
