@@ -334,6 +334,14 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
             first.document["resources"]["state_depth_cap"],
             producer.MAX_STATE_DEPTH,
         )
+        cache_lock_contract = first.document["resources"]["uv_cache_lock_compatibility"]
+        self.assertEqual(cache_lock_contract["relative_path"], "cache/.lock")
+        self.assertEqual(cache_lock_contract["mode"], "0666")
+        self.assertEqual(
+            cache_lock_contract["maximum_bytes"],
+            producer.MAX_UV_CACHE_LOCK_BYTES,
+        )
+        self.assertTrue(cache_lock_contract["owner_private_ancestors"])
         self.assertEqual(first.document["resolver"]["only_binary"], ":all:")
         self.assertEqual(
             first.document["resolver"]["candidate_output_name"],
@@ -759,6 +767,107 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
             producer._scan_private_state(
                 self.state,
                 byte_cap=299,
+                entry_cap=100,
+            )
+
+    def test_exact_bounded_uv_cache_lock_is_accepted_and_accounted(self):
+        producer._layout(self.feature, self.state)
+        lock = self.state / "cache" / ".lock"
+        payload = b"uv-lock"
+        lock.write_bytes(b"")
+        lock.chmod(0o666)
+        real_open = producer.os.open
+        appended = False
+
+        def append_before_open(path, flags, *args, **kwargs):
+            nonlocal appended
+            if path == ".lock" and not appended:
+                appended = True
+                with lock.open("ab") as stream:
+                    stream.write(payload)
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(producer.os, "open", side_effect=append_before_open):
+            usage = producer._scan_private_state(
+                self.state,
+                byte_cap=len(payload),
+                entry_cap=100,
+            )
+        self.assertTrue(appended)
+        self.assertGreaterEqual(usage.bytes, len(payload))
+        with self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError):
+            producer._scan_private_state(
+                self.state,
+                byte_cap=len(payload) - 1,
+                entry_cap=100,
+            )
+        lock.write_bytes(b"x" * (producer.MAX_UV_CACHE_LOCK_BYTES + 1))
+        lock.chmod(0o666)
+        with self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError):
+            producer._scan_private_state(
+                self.state,
+                byte_cap=producer.MAX_UV_CACHE_LOCK_BYTES + 1,
+                entry_cap=100,
+            )
+
+    def test_uv_cache_lock_exception_does_not_expand_writable_surface(self):
+        cases = (
+            ("same_name_elsewhere", Path("home/.lock"), 0o666),
+            ("nested_same_name", Path("cache/nested/.lock"), 0o666),
+            ("different_cache_name", Path("cache/other.lock"), 0o666),
+            ("allowed_top_level_name", Path(producer.INPUT_NAME), 0o666),
+            ("wrong_exact_lock_mode", Path("cache/.lock"), 0o664),
+        )
+        for ordinal, (label, relative, mode) in enumerate(cases):
+            state = self.feature / f"lock-case-{ordinal}"
+            producer._layout(self.feature, state)
+            candidate = state / relative
+            candidate.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            candidate.write_bytes(b"")
+            candidate.chmod(mode)
+            with (
+                self.subTest(label=label),
+                self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError),
+            ):
+                producer._scan_private_state(
+                    state,
+                    byte_cap=1024,
+                    entry_cap=100,
+                )
+
+        symlink_state = self.feature / "lock-case-symlink"
+        producer._layout(self.feature, symlink_state)
+        (symlink_state / "cache" / ".lock").symlink_to(self.uv)
+        with self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError):
+            producer._scan_private_state(
+                symlink_state,
+                byte_cap=1024,
+                entry_cap=100,
+            )
+
+        ancestor_state = self.feature / "lock-case-ancestor"
+        producer._layout(self.feature, ancestor_state)
+        ancestor_lock = ancestor_state / "cache" / ".lock"
+        ancestor_lock.write_bytes(b"")
+        ancestor_lock.chmod(0o666)
+        (ancestor_state / "cache").chmod(0o755)
+        with self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError):
+            producer._scan_private_state(
+                ancestor_state,
+                byte_cap=1024,
+                entry_cap=100,
+            )
+
+        linked_state = self.feature / "lock-case-hardlink"
+        producer._layout(self.feature, linked_state)
+        linked_lock = linked_state / "cache" / ".lock"
+        linked_lock.write_bytes(b"")
+        linked_lock.chmod(0o666)
+        os.link(linked_lock, linked_state / "cache" / "alias")
+        with self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError):
+            producer._scan_private_state(
+                linked_state,
+                byte_cap=1024,
                 entry_cap=100,
             )
 
