@@ -56,6 +56,8 @@ the signed-in owner UI; do not weaken account enforcement or substitute a static
 | --- | --- | --- |
 | H3 Base FL2VA and managed assets | Run `base_native_sdpa`, `base_turbo_4_sdpa`, and `base_turbo_8_sdpa`. Then run `base_high_native_sol` explicitly. | Each exact managed checkpoint, conditioner, VAE, audio asset, and Turbo asset resolves from its declared revision; the selected case completes without fallback; video and synchronized audio are finite, playable, correctly timed, and visibly match the synthetic brief. High must use the requested Sol settings rather than a hidden dense fallback. |
 | H3 Ref2VA | Run `ref2va_native_sdpa`, `ref2va_turbo_4_sdpa`, and `ref2va_turbo_8_sdpa` with the runner's procedural reference. | The Ref2VA checkpoint—not the FL2VA alias—is loaded; ordered reference identity is visible in the result; video/audio complete; exported frames show the red-circle/yellow-triangle identity; no request is silently rerouted to Base FL2VA. |
+| Dasiwa Ref2VA Hybrid V1 | Select the visibly provisional installed-base profile, use the fixed procedural reference, and run one 4-step 608x352 SDPA clip with only the Dasiwa LoRA at strength 1.0. | Runtime admission binds the installed Ref2VA checkpoint and exact LoRA bytes; no managed Turbo, Spectrum, LightX2V, SLA, MATLOW, or other LoRA is stacked; the 124-frame A/V output is playable and visibly preserves reference identity. A coherent result on the suspected-compatible base does not certify the author's exact-base contract. |
+| H3 Better Motion Ref2VA V1 | With the same fixed reference and seed, run one 28-step 1344x768 Sol-Attn clip with only Better Motion V1 at strength 0.9. | Exact Ref2VA and LoRA identity is retained with no fallback or stacking; video/audio complete; motion and reference adherence are reviewed against the Dasiwa probe. A neutral coherence sample proves runtime compatibility, not mature-content quality across prompts. |
 | H3 W4A8 | First run the runtime's `python scripts/validate_h3_w4a8.py` from its installed environment, then run `w4a8_turbo_8_sdpa`. | The finite-output marker is bound to the current GPU, Torch, Triton, runtime revision, and checkpoint; the full generated sample is playable and visually acceptable; no dequantization or different checkpoint fallback is reported. |
 | H3 PinkCherry FL2VA | Select **PinkCherry H3 FL2VA (Explicit)** in the signed-in owner UI and generate one minimum-duration private sample. An allocation-only scout may use `pinkcherry_high_allocation_p4`, but it cannot close this row. | The exact PinkCherry checkpoint and required assets load, the explicit model remains the selected producer, audio/video complete, and the owner accepts the output. A two-step allocation probe or a Base fallback is insufficient. |
 | H3 aliases and linked assets | For each Base, Ref2VA, W4A8, and PinkCherry row, capture the canonical model ID plus the resolved asset revision/name from the live model/download projection before and after generation. | Both supported linked-install aliases resolve to the same intended canonical bytes where declared, stale partial assets are not accepted, every variant keeps its own checkpoint identity, and deleting/rechecking one alias cannot make an unrelated or incomplete file appear ready. |
@@ -103,6 +105,38 @@ human acceptance.
   only for the separately worded signed-in-owner UI action and direct human
   keep/reject confirmation; do not rerun merely to replace the authorized
   generic account unless that remaining distinction is decision-changing.
+
+### 2026-08-27 Ref2VA adapter runtime receipts
+
+- Source revision: `d4685e6`; Linux `7.0.0-30-generic`; RTX 5090; NVIDIA
+  `595.84`; CUDA compiler `12.8.93`. Both jobs used the installed Ref2VA
+  checkpoint `minimax_h3_ref2va_pruned_fp8_scaled.safetensors`, SHA-256
+  `f86f2f79ebd2d76eb8eeb46091e83982e6ff51d255747e7b16e92834b392b8e9`,
+  with the same private procedural red-circle/yellow-triangle reference and
+  seed `314159265`.
+- Dasiwa job `40d504963e6646259a6888acd725ed44` used only
+  `dasiwa_ref2va_hybrid_v1_4step.safetensors` at strength 1.0, four SDPA
+  steps, and 608x352. It produced a 669,844-byte HEVC MP4 with 124 frames at
+  24 fps and finite 32 kHz stereo AAC; output SHA-256
+  `c372eb35f12c98fe4c57952e1ad03d0c45280b6ab2e1f6bea955ce0690f67b54`.
+  Observed peak VRAM was 25,168 MiB. Sampled frames preserved the reference
+  geometry, colors, emblem, and a stable simplified walk. This is useful
+  coherence evidence on the installed suspected-compatible base, not proof of
+  the unavailable exact Dasiwa base.
+- Better Motion job `5f80f28b180d4b969d41225ee93afde0` used only
+  `h3_Better_NSFW_Motion_V1.safetensors` at strength 0.9, 28 Sol-Attn steps,
+  and 1344x768. It produced a 3,611,105-byte HEVC MP4 with 124 frames at 24
+  fps and finite 32 kHz stereo AAC; output SHA-256
+  `202efe5b0d56c3667a49be6675b04a4ba462a9e61ba70d3b897c96c1afe93726`.
+  Aggregate observed peak VRAM was 28,003 MiB. Sampled frames preserved the
+  reference identity while adding materially stronger 3D form, foot planting,
+  and weight transfer than the Dasiwa probe.
+- Both jobs completed without checkpoint, LoRA, stack, fallback, CUDA, OOM,
+  output, or finality errors. Maestro fetched two pinned, sub-megabyte Ref2VA
+  LoRA compatibility maps during the first preparation; no model artifact was
+  downloaded. Evidence class is live local GPU generation plus agent visual
+  and technical A/V review. Direct human keep/reject remains open, and the
+  neutral Better Motion sample does not establish mature-content quality.
 
 When all applicable rows pass, update this matrix rather than deleting it. Keep
 failed or intentionally unsupported variants as provenance, and remove only a
