@@ -38,7 +38,7 @@ from packaging.version import InvalidVersion, Version
 from services import h3_prompt_rewriter_dependency_closure as closure
 from services import h3_prompt_rewriter_wheel_resolver as wheel_resolver
 
-UV_RESOLUTION_PLAN_SCHEMA = "maestro.h3-prompt-rewriter.uv-resolution-plan.v3"
+UV_RESOLUTION_PLAN_SCHEMA = "maestro.h3-prompt-rewriter.uv-resolution-plan.v4"
 UV_RESOLUTION_PROVENANCE_SCHEMA = (
     "maestro.h3-prompt-rewriter.uv-resolution-provenance.v1"
 )
@@ -507,6 +507,13 @@ def build_h3_prompt_rewriter_uv_resolution_plan(
                 "opened_target_identity_reconciled": True,
                 "link_text_bytes_accounted": True,
             },
+            "uv_archive_executable_compatibility": {
+                "relative_root": "cache/archive-v0/<base64url21>/**",
+                "mode": "0711",
+                "regular_single_link_owner_only": True,
+                "owner_private_ancestors": True,
+                "bytes_accounted": True,
+            },
         },
         "outputs": {
             "pylock": "private_candidate",
@@ -535,6 +542,13 @@ def _validate_plan_resource_contract(
         "rss_proc_stat_byte_cap": MAX_PROC_STAT_BYTES,
         "rss_proc_status_byte_cap": MAX_PROC_STATUS_BYTES,
         "poll_seconds": POLL_SECONDS,
+        "uv_archive_executable_compatibility": {
+            "relative_root": "cache/archive-v0/<base64url21>/**",
+            "mode": "0711",
+            "regular_single_link_owner_only": True,
+            "owner_private_ancestors": True,
+            "bytes_accounted": True,
+        },
     }
     if (
         document.get("schema") != UV_RESOLUTION_PLAN_SCHEMA
@@ -668,6 +682,14 @@ def _uv_cache_symlink_target(state_root: Path, target_text: str) -> tuple[str, .
             "uv cache link target shape is invalid"
         )
     return ("cache", "archive-v0", relative.parts[0])
+
+
+def _uv_archive_executable(relative: tuple[str, ...]) -> bool:
+    return (
+        len(relative) >= 4
+        and relative[:2] == ("cache", "archive-v0")
+        and _UV_ARCHIVE_ID.fullmatch(relative[2]) is not None
+    )
 
 
 def _scan_private_state_once(
@@ -835,8 +857,16 @@ def _scan_private_state_once(
                     and mode == 0o666
                     and info.st_size <= MAX_UV_INTERNAL_LOCK_BYTES
                 )
+                compatible_uv_archive_executable = (
+                    _uv_archive_executable(entry_relative)
+                    and stat.S_ISREG(info.st_mode)
+                    and info.st_nlink == 1
+                    and mode == 0o711
+                )
                 if info.st_uid != os.getuid() or (
-                    mode & 0o077 and not compatible_uv_internal_lock
+                    mode & 0o077
+                    and not compatible_uv_internal_lock
+                    and not compatible_uv_archive_executable
                 ):
                     raise H3PromptRewriterUvResolutionSecurityError(
                         "resolution state contains a linked or non-private entry"

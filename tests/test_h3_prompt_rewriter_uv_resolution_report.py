@@ -435,6 +435,17 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
         )
         self.assertFalse(cache_link_contract["follow_during_traversal"])
         self.assertTrue(cache_link_contract["link_text_bytes_accounted"])
+        archive_executable_contract = first.document["resources"][
+            "uv_archive_executable_compatibility"
+        ]
+        self.assertEqual(
+            archive_executable_contract["relative_root"],
+            "cache/archive-v0/<base64url21>/**",
+        )
+        self.assertEqual(archive_executable_contract["mode"], "0711")
+        self.assertTrue(archive_executable_contract["regular_single_link_owner_only"])
+        self.assertTrue(archive_executable_contract["owner_private_ancestors"])
+        self.assertTrue(archive_executable_contract["bytes_accounted"])
         self.assertEqual(first.document["resolver"]["only_binary"], ":all:")
         self.assertEqual(
             first.document["resolver"]["candidate_output_name"],
@@ -505,6 +516,29 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
         legacy = self.plan().document
         legacy["schema"] = "maestro.h3-prompt-rewriter.uv-resolution-plan.v2"
         legacy["resources"]["address_space_bytes"] = 4 * 1024**3
+        plan = producer.H3PromptRewriterUvResolutionPlan._from_document(legacy)
+        process_factory = mock.Mock(side_effect=AssertionError("process spawned"))
+        with self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError):
+            producer.execute_h3_prompt_rewriter_uv_resolution(
+                plan,
+                expected_plan_sha256=plan.sha256,
+                expected_input_sha256=hashlib.sha256(
+                    producer.reviewed_requirements_input_bytes()
+                ).hexdigest(),
+                expected_uv_sha256=producer.PINNED_UV_SHA256,
+                expected_python_sha256=self.python_receipt.sha256,
+                uv_executable=self.uv,
+                python_executable=self.python,
+                private_feature_root=self.feature,
+                state_root=self.state,
+                process_factory=process_factory,
+            )
+        process_factory.assert_not_called()
+
+    def test_execution_rejects_v3_without_archive_executable_contract(self):
+        legacy = self.plan().document
+        legacy["schema"] = "maestro.h3-prompt-rewriter.uv-resolution-plan.v3"
+        legacy["resources"].pop("uv_archive_executable_compatibility")
         plan = producer.H3PromptRewriterUvResolutionPlan._from_document(legacy)
         process_factory = mock.Mock(side_effect=AssertionError("process spawned"))
         with self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError):
@@ -1406,6 +1440,54 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
                 self.state,
                 byte_cap=expected_bytes,
                 entry_cap=usage.entries - 1,
+            )
+
+    def test_private_uv_archive_executable_is_exactly_bounded_and_accounted(self):
+        producer._layout(self.feature, self.state)
+        archive = self.state / "cache"
+        for component in (
+            "archive-v0",
+            "KkNamxay3FSOLcC_mpMAy",
+            "markupsafe",
+        ):
+            archive = archive / component
+            archive.mkdir(mode=0o700)
+        extension = archive / "_speedups.cpython-312-x86_64-linux-gnu.so"
+        extension.write_bytes(b"extension")
+        extension.chmod(0o711)
+        usage = producer._scan_private_state(
+            self.state,
+            byte_cap=len(b"extension"),
+            entry_cap=100,
+        )
+        self.assertEqual(usage.bytes, len(b"extension"))
+
+        for label, path, mode in (
+            ("outside_archive", self.state / "cache" / "outside", 0o711),
+            ("group_readable", archive / "group-readable", 0o751),
+            ("other_readable", archive / "other-readable", 0o715),
+            ("wrong_execute_shape", archive / "wrong-execute", 0o710),
+        ):
+            path.write_bytes(b"x")
+            path.chmod(mode)
+            with (
+                self.subTest(label=label),
+                self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError),
+            ):
+                producer._scan_private_state(
+                    self.state,
+                    byte_cap=1024,
+                    entry_cap=100,
+                )
+            path.unlink()
+
+        hardlink = archive / "hardlink"
+        os.link(extension, hardlink)
+        with self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError):
+            producer._scan_private_state(
+                self.state,
+                byte_cap=1024,
+                entry_cap=100,
             )
 
     def test_uv_cache_link_source_and_target_variants_are_rejected(self):
