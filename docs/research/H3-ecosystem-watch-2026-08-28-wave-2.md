@@ -157,10 +157,12 @@ be silently folded into the ordinary Turbo or delivery-upscale path.
 ## Cluster B — programmatic composition and motion boards
 
 **Decision: Adopt a Maestro-owned programmatic composition capability.** The
-first implementation plan should define a neutral composition document and a
-sandboxed render/player adapter under Director. This decision adopts the native
-capability, not any external editor or engine. Remotion is the preferred first
-backend benchmark candidate, not yet an adopted dependency.
+first implementation plan should define a neutral composition document and
+sandboxed render/player adapters under Director. This decision adopts the
+native capability, not any external editor or engine. Remotion is the preferred
+first **2D/code-driven** backend benchmark candidate, not yet an adopted
+dependency. The existing Blender + Blender-MCP path is the corresponding first
+**3D scene** backend candidate under the same contract.
 
 The useful capability extends far beyond the supplied parkour example:
 motion-reference boards, animated storyboards, title and lower-third systems,
@@ -184,6 +186,33 @@ require a company license, and a proposed v5 license-key change remains under
 discussion in [issue #9539](https://github.com/remotion-dev/remotion/issues/9539).
 No dependency or distribution decision is made until the owner/legal gate
 accepts the applicable terms and the exact package versions.
+
+### Blender + Blender-MCP
+
+Maestro is already partway to the second backend. `blender_mcp_service.py`
+exposes a closed, structured facade for scene creation, keyframe animation,
+preview and full-rate animation rendering. `app/launch.py` already wraps that
+facade with project authorization, readiness-before-LLM, shared GPU admission,
+LLM planning/review and a candidate-not-final output transaction. That makes
+Blender the natural first backend for 3D scene composition. Its current closed
+surface covers typed primitives, materials, keyframes and renders; camera,
+lighting, physics and broader spatial controls are prospective typed extensions,
+not capabilities inferred from Blender's unrestricted scripting surface.
+
+The transferable design is **LLM -> typed composition/scene actions -> bounded
+Blender-MCP adapter**, never LLM -> arbitrary Python, unrestricted MCP or direct
+filesystem access. The selected local or explicitly authorized remote LLM may
+compile Director intent into closed scene actions; Maestro validates and invokes
+them, and only Maestro can publish the resulting asset. Blender must not acquire
+its own project store, queue, planner, output root or finality state.
+
+Remotion and Blender therefore share the neutral core contract—ordered assets,
+timing/FPS/duration, audio commitments, logical source versus clip-instance
+identity, backend/version identity, cancellation and result provenance—while
+declaring backend-specific capabilities in extension blocks. Remotion is the
+first 2D/player/export candidate; Blender-MCP is the existing 3D/render-worker
+candidate. Revideo, Motion Canvas and the other references remain possible
+later adapters rather than competing composition authorities.
 
 ### Diffusion Studio
 
@@ -303,6 +332,55 @@ Negative prompt wording in these recipes remains creative direction, not
 moderation. Exact dialogue, lyrics, visible text, timing, reference roles and
 audio ownership remain protected by the existing H3 compiler contracts.
 
+## Cluster E — future Qwen3.8-Flash-Next LLM endpoint
+
+**Decision: Defer the model switch; prepare the endpoint contract.** The owner
+expects a future accepted, uncensored Qwen3.8-Flash-Next derivative to replace
+most default LLM work, but explicitly states that this artifact does not exist
+yet. The active work is tracked in Codex task
+[`01a04020-e0af-7382-b016-961a2d2ee5b1`](codex://threads/01a04020-e0af-7382-b016-961a2d2ee5b1)
+and its canonical `docs/FLASH_NEXT_TRANSITION_PLAN.md`; Maestro must not infer
+availability, quality or authorization from that task's runtime progress.
+
+The durable upstream plan separates an untouched source-locked `F0`, an
+independently qualified uncensoring candidate `F_U`, a reasoning-efficiency
+derivative `F_E`, and the accepted compact/runtime representation `F_Q`.
+Maestro readiness is blocked on a reloadable, accepted `F_U` and its eventual
+endpoint receipt. Until then, current LLM defaults and comparison models remain
+unchanged and no public catalog row may imply that Flash-Next is usable.
+
+The future endpoint descriptor should bind, independently:
+
+- provider/locality and transport versus engine/runtime identity;
+- exact model/source revision, artifact representation and digest;
+- tokenizer, processor and chat-template identity;
+- text, image and video capability, with audio false until separately proven;
+- the accepted context window and structured/tool-output contract;
+- Qwen4Exp GDN/QSA behavior, PLE packing/address/gating/projection fidelity,
+  native MTP and QSA-index reuse;
+- quantization, device/residency, prefix-cache/prefetch and unload state; and
+- cancellation, resource ceilings, request serialization and output finality.
+
+An OpenAI-compatible URL proves only a transport shape. It must not erase the
+engine, artifact, modality, template, QSA/PLE/MTP or residency identity, and it
+must never silently fall back to another model, provider, quant, context,
+modality or CPU/GPU path. Director, Blender composition planning and ordinary
+chat should all consume the same exact selection/lease receipt rather than
+special-case Flash-Next.
+
+For planning provenance, the current transition document source-locks
+`Qwen/Qwen3.8-Flash-Next` at
+`f5d08274bafd880402bd16f5e3e6c514136ec06c`, with a native 262,144-token
+context and first-class QSA, PLE, gated residual, vision and MTP semantics.
+The same source lock binds the Qwen release repository at
+`513aa6e18a335296fc13e538232a8735b230877d` and the merged Transformers
+Qwen4Exp implementation at
+`fc5c5bde8e656dad91cbf34e61940d984b1c7b91`.
+Those are endpoint compatibility requirements, not evidence that an accepted
+uncensored artifact or Maestro runtime now exists. The preferred endpoint is a
+compact representation that preserves those semantics; a nominally related
+GGUF, quant or provider alias is not an acceptable substitute.
+
 ## Next-wave order / merge train
 
 1. **Finish the active Prompt Rewriter checkpoint first.** Preserve the prior
@@ -323,17 +401,24 @@ audio ownership remain protected by the existing H3 compiler contracts.
 4. **Programmatic Composition contract.** One Director schema/orchestrator/
    pipeline owner defines a neutral, versioned composition package from shot
    plans and a sandboxed worker result; UI and renderer adapters remain later
-   disjoint owners. Evaluate Remotion first, Revideo as the permissive fallback,
-   and Motion Canvas for specialized vector work. Do not start until license,
-   telemetry, sandbox, path and finality gates are explicit.
-5. **H3 AV inpaint descriptor.** One `h3_control_plan.py` plus focused-tests
+   disjoint owners. Evaluate Remotion first for 2D/code-driven composition and
+   bring the existing Blender-MCP facade under the same contract for 3D scene
+   work; Revideo remains the permissive fallback and Motion Canvas the
+   specialized vector candidate. Do not start until license, telemetry,
+   sandbox, path and finality gates are explicit.
+5. **Flash-Next endpoint readiness.** Add only a disabled, source-bound engine
+   descriptor and exact selection/capability tests after the composition schema
+   boundary settles. Keep current defaults and controls; activation, catalog
+   promotion and migration wait for an independently accepted `F_U`/endpoint
+   receipt and their own runtime and human-acceptance wave.
+6. **H3 AV inpaint descriptor.** One `h3_control_plan.py` plus focused-tests
    owner extends the inert control plan with source-only mask/audio geometry and
    parity fixtures; keep execution false.
-6. **Craft fixtures.** One `h3_upstream_skills.py` plus focused-tests owner adds
+7. **Craft fixtures.** One `h3_upstream_skills.py` plus focused-tests owner adds
    motion-board, causal-storybook, construction/drawing process and synthetic-
    speedpaint recipes only where existing craft IDs do not already express the
    invariant.
-7. **Live work remains separately coordinated.** GPU/runtime rows require fresh
+8. **Live work remains separately coordinated.** GPU/runtime rows require fresh
    grants after CPU descriptors, exact artifacts, dependency closure and static
    review settle.
 
@@ -367,6 +452,9 @@ A later candidate may advance only with:
   public.
 - **Remotion:** recheck licensing and the proposed v5 key requirement before a
   dependency decision.
+- **Blender-MCP composition backend:** recheck the neutral composition schema,
+  closed action mapping, renderer identity and shared cancellation/finality
+  contract before expanding beyond the existing Blender scene tool.
 - **Diffusion Studio:** recheck Windows/export/shader issues and its document
   API stability after the v0.200.0 breaking change.
 - **Revideo:** recheck exact package/repository provenance, telemetry-off mode,
@@ -383,6 +471,10 @@ A later candidate may advance only with:
 - **Social prompts:** recheck when canonical prompt, seed, checkpoint, LoRAs,
   strength, steps/scheduler, attention/cache, edit chain and failure evidence
   are recoverable.
+- **Flash-Next endpoint:** recheck only when a reloadable, independently
+  qualified uncensored `F_U` exists with exact artifact/runtime/capability
+  receipts. Endpoint-shape compatibility alone does not authorize a default
+  change.
 
 ## Public evidence index
 
@@ -420,6 +512,9 @@ Additional canonical/comment evidence used during triage:
 - [ComfyUI H3 inpainting PR #15375](https://github.com/Comfy-Org/ComfyUI/pull/15375)
 - [H3 inpainting Space discussion #1](https://huggingface.co/spaces/linoyts/minimax-h3-inpainting/discussions/1)
 - [Official MiniMax H3 license](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)
+- [Qwen3.8-Flash-Next pinned model source](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/tree/f5d08274bafd880402bd16f5e3e6c514136ec06c)
+- [Qwen3.8-Flash-Next pinned release repository](https://github.com/QwenLM/Qwen3.8-Flash-Next/tree/513aa6e18a335296fc13e538232a8735b230877d)
+- [Transformers Qwen4Exp implementation commit](https://github.com/huggingface/transformers/commit/fc5c5bde8e656dad91cbf34e61940d984b1c7b91)
 - [Public mirror — @PhotogenicWeekE thread](https://api.fxtwitter.com/2/conversation/2093198730958897335)
 - [Public mirror — @ihteshamali thread](https://api.fxtwitter.com/2/conversation/2092998752332341410)
 - [Public mirror — @ailker thread](https://api.fxtwitter.com/2/conversation/2093165511920046289)
