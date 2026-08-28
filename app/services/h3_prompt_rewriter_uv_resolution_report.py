@@ -39,7 +39,7 @@ from packaging.version import InvalidVersion, Version
 from services import h3_prompt_rewriter_dependency_closure as closure
 from services import h3_prompt_rewriter_wheel_resolver as wheel_resolver
 
-UV_RESOLUTION_PLAN_SCHEMA = "maestro.h3-prompt-rewriter.uv-resolution-plan.v5"
+UV_RESOLUTION_PLAN_SCHEMA = "maestro.h3-prompt-rewriter.uv-resolution-plan.v6"
 UV_RESOLUTION_PROVENANCE_SCHEMA = (
     "maestro.h3-prompt-rewriter.uv-resolution-provenance.v1"
 )
@@ -68,6 +68,7 @@ MAX_UV_INTERNAL_LOCK_BYTES = 4 * 1024
 POLL_SECONDS = 0.25
 MAX_STATE_DEPTH = 32
 MAX_SCAN_RETRIES = 3
+MAX_UNATTESTED_STATE_SECONDS = 2
 MAX_ADDRESS_SPACE_BYTES = 16 * 1024**3
 MAX_RSS_BYTES = 1536 * 1024**2
 MAX_PROC_PID_ENTRIES = 1_000_000
@@ -152,6 +153,10 @@ class H3PromptRewriterUvResolutionExecutionError(H3PromptRewriterUvResolutionErr
 
 class _TransientStateChange(RuntimeError):
     """A bounded atomic rename or replacement requires a fresh tree scan."""
+
+
+class _PrivateStateNotSettled(H3PromptRewriterUvResolutionSecurityError):
+    """The private tree remained transient across the strict retry budget."""
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -511,6 +516,8 @@ def build_h3_prompt_rewriter_uv_resolution_plan(
             "poll_seconds": POLL_SECONDS,
             "state_depth_cap": MAX_STATE_DEPTH,
             "scan_retry_cap": MAX_SCAN_RETRIES,
+            "state_scan_max_unattested_seconds": MAX_UNATTESTED_STATE_SECONDS,
+            "state_scan_quiescent_after_child": True,
             "process_group_cleanup": True,
             "recursive_private_state_monitor": True,
             "uv_internal_lock_compatibility": {
@@ -569,6 +576,8 @@ def _validate_plan_resource_contract(
         "rss_proc_stat_byte_cap": MAX_PROC_STAT_BYTES,
         "rss_proc_status_byte_cap": MAX_PROC_STATUS_BYTES,
         "poll_seconds": POLL_SECONDS,
+        "state_scan_max_unattested_seconds": MAX_UNATTESTED_STATE_SECONDS,
+        "state_scan_quiescent_after_child": True,
         "uv_archive_executable_compatibility": {
             "relative_root": "cache/archive-v0/<base64url21>/**",
             "mode": "0711",
@@ -1095,7 +1104,7 @@ def _scan_private_state(
             )
         except (FileNotFoundError, _TransientStateChange):
             if attempt + 1 == MAX_SCAN_RETRIES:
-                raise H3PromptRewriterUvResolutionSecurityError(
+                raise _PrivateStateNotSettled(
                     "private resolution state changed too often during scan"
                 ) from None
         except RecursionError:
@@ -2332,12 +2341,23 @@ def _wait_for_resolution(
     entry_cap = int(resources["metadata_entry_cap"])
     rss_cap = int(resources["rss_bytes"])
     sampler = rss_sampler or _sample_process_group_rss
+    last_state_attestation = started
     while True:
-        _scan_private_state(
-            state_root,
-            byte_cap=byte_cap,
-            entry_cap=entry_cap,
-        )
+        try:
+            _scan_private_state(
+                state_root,
+                byte_cap=byte_cap,
+                entry_cap=entry_cap,
+            )
+        except _PrivateStateNotSettled:
+            scan_finished_at = monotonic()
+            if scan_finished_at - last_state_attestation > MAX_UNATTESTED_STATE_SECONDS:
+                raise H3PromptRewriterUvResolutionExecutionError(
+                    "private resolution state did not settle within its monitor bound"
+                ) from None
+        else:
+            scan_finished_at = monotonic()
+            last_state_attestation = scan_finished_at
         try:
             observed_rss = sampler(process.pid)
         except H3PromptRewriterUvResolutionError:
@@ -2360,7 +2380,7 @@ def _wait_for_resolution(
             raise H3PromptRewriterUvResolutionExecutionError(
                 "resolver process group exceeded its resident-memory cap"
             )
-        remaining = deadline - (monotonic() - started)
+        remaining = deadline - (scan_finished_at - started)
         if remaining <= 0:
             raise H3PromptRewriterUvResolutionExecutionError(
                 "uv resolution exceeded its plan-bound deadline"
@@ -2373,11 +2393,6 @@ def _wait_for_resolution(
             raise H3PromptRewriterUvResolutionExecutionError(
                 "uv resolution wait failed"
             ) from error
-        _scan_private_state(
-            state_root,
-            byte_cap=byte_cap,
-            entry_cap=entry_cap,
-        )
         if monotonic() - started > deadline:
             raise H3PromptRewriterUvResolutionExecutionError(
                 "uv resolution crossed its plan-bound deadline"
@@ -2463,6 +2478,7 @@ def _execute_h3_prompt_rewriter_uv_resolution_unlocked(
             )
             suffix = "" if ordinal == 1 else f"_{ordinal}"
             diagnostic["phase"] = f"spawn{suffix}"
+            diagnostic["returncode"] = None
             try:
                 process = process_factory(
                     command,
@@ -2500,6 +2516,13 @@ def _execute_h3_prompt_rewriter_uv_resolution_unlocked(
             diagnostic["phase"] = f"process_cleanup{suffix}"
             _cleanup_process_group(process)
             process = None
+            diagnostic["phase"] = f"state_attestation{suffix}"
+            resources = plan.document["resources"]
+            _scan_private_state(
+                state,
+                byte_cap=int(resources["metadata_byte_cap"]),
+                entry_cap=int(resources["metadata_entry_cap"]),
+            )
         resources = plan.document["resources"]
         _scan_private_state(
             state,

@@ -453,6 +453,11 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
             first.document["resources"]["state_depth_cap"],
             producer.MAX_STATE_DEPTH,
         )
+        self.assertEqual(
+            first.document["resources"]["state_scan_max_unattested_seconds"],
+            producer.MAX_UNATTESTED_STATE_SECONDS,
+        )
+        self.assertTrue(first.document["resources"]["state_scan_quiescent_after_child"])
         cache_lock_contract = first.document["resources"][
             "uv_internal_lock_compatibility"
         ]
@@ -1001,6 +1006,23 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
         self.assertFalse(failure["validated_pylock_candidate_observed"])
         self.assertEqual(failure["failure_category"], "execution_boundary")
 
+    def test_second_spawn_failure_does_not_reuse_first_returncode(self):
+        first = _FakeUv(_pylock())
+        calls = 0
+
+        def second_spawn_fails(command, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("private second-spawn detail")
+            return first(command, **kwargs)
+
+        with self.assertRaises(producer.H3PromptRewriterUvResolutionExecutionError):
+            self.execute(second_spawn_fails)
+        failure = json.loads((self.state / producer.FAILURE_NAME).read_text())
+        self.assertEqual(failure["phase"], "spawn_2")
+        self.assertIsNone(failure["returncode"])
+
     def test_invalid_pylock_emits_schema_phase_private_terminal_receipt(self):
         fake = _FakeUv(b"not valid toml")
         with self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError):
@@ -1310,6 +1332,83 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
         self.assertEqual(result["peak_rss_bytes"], observed)
         self.assertEqual(provenance["peak_rss_bytes"], observed)
         self.assertNotIn(str(self.root), json.dumps({"peak": observed}))
+
+    def test_process_monitor_2_tolerates_bounded_cache_churn_until_cleanup(self):
+        fake = _FakeUv(_pylock())
+        usage = producer._StateUsage(bytes=0, entries=4)
+        scans = (
+            usage,
+            usage,
+            producer._PrivateStateNotSettled(
+                "private resolution state changed too often during scan"
+            ),
+            usage,
+            usage,
+        )
+        with mock.patch.object(
+            producer,
+            "_scan_private_state",
+            side_effect=scans,
+        ) as scanner:
+            result = self.execute(fake)
+        self.assertEqual(result["package_count"], len(PACKAGE_ROWS))
+        self.assertEqual(scanner.call_count, 5)
+        self.assertFalse((self.state / producer.FAILURE_NAME).exists())
+
+    def test_each_child_is_cleaned_before_strict_state_attestation(self):
+        events = []
+        usage = producer._StateUsage(bytes=0, entries=4)
+
+        def scan(*_args, **_kwargs):
+            events.append("scan")
+            return usage
+
+        def cleanup(_process):
+            events.append("cleanup")
+
+        with (
+            mock.patch.object(producer, "_scan_private_state", side_effect=scan),
+            mock.patch.object(
+                producer,
+                "_cleanup_process_group",
+                side_effect=cleanup,
+            ),
+        ):
+            result = self.execute(_FakeUv(_pylock()))
+        self.assertEqual(result["package_count"], len(PACKAGE_ROWS))
+        self.assertEqual(
+            events,
+            ["scan", "cleanup", "scan", "scan", "cleanup", "scan", "scan"],
+        )
+
+    def test_live_state_churn_exceeding_monitor_bound_fails_closed(self):
+        process = _SequencedProcess(
+            [subprocess.TimeoutExpired("uv", producer.POLL_SECONDS)]
+        )
+        values = iter((producer.MAX_UNATTESTED_STATE_SECONDS + 1,))
+        with (
+            mock.patch.object(
+                producer,
+                "_scan_private_state",
+                side_effect=producer._PrivateStateNotSettled(
+                    "private resolution state changed too often during scan"
+                ),
+            ),
+            self.assertRaises(
+                producer.H3PromptRewriterUvResolutionExecutionError
+            ) as raised,
+        ):
+            producer._wait_for_resolution(
+                process,
+                self.state,
+                self.plan(),
+                started=0.0,
+                monotonic=lambda: next(values),
+                diagnostic={"peak_rss_bytes": 0},
+                rss_sampler=lambda _process_group: 0,
+            )
+        self.assertIn("did not settle", str(raised.exception))
+        self.assertEqual(process.wait_calls, 0)
 
     def test_sparse_anonymous_mapping_above_rss_cap_and_below_address_cap(self):
         mapping_bytes = 4 * 1024**3 + 64 * 1024**2
