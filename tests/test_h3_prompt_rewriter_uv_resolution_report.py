@@ -389,7 +389,7 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
         self.assertEqual(first.document["resources"]["nice"], 15)
         self.assertEqual(
             first.document["resources"]["address_space_bytes"],
-            4 * 1024**3,
+            16 * 1024**3,
         )
         self.assertEqual(
             first.document["resources"]["address_space_enforcement"],
@@ -482,6 +482,29 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
             "rss_proc_status_byte_cap",
         ):
             legacy["resources"].pop(field)
+        plan = producer.H3PromptRewriterUvResolutionPlan._from_document(legacy)
+        process_factory = mock.Mock(side_effect=AssertionError("process spawned"))
+        with self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError):
+            producer.execute_h3_prompt_rewriter_uv_resolution(
+                plan,
+                expected_plan_sha256=plan.sha256,
+                expected_input_sha256=hashlib.sha256(
+                    producer.reviewed_requirements_input_bytes()
+                ).hexdigest(),
+                expected_uv_sha256=producer.PINNED_UV_SHA256,
+                expected_python_sha256=self.python_receipt.sha256,
+                uv_executable=self.uv,
+                python_executable=self.python,
+                private_feature_root=self.feature,
+                state_root=self.state,
+                process_factory=process_factory,
+            )
+        process_factory.assert_not_called()
+
+    def test_execution_rejects_v2_address_space_plan_even_with_matching_sha(self):
+        legacy = self.plan().document
+        legacy["schema"] = "maestro.h3-prompt-rewriter.uv-resolution-plan.v2"
+        legacy["resources"]["address_space_bytes"] = 4 * 1024**3
         plan = producer.H3PromptRewriterUvResolutionPlan._from_document(legacy)
         process_factory = mock.Mock(side_effect=AssertionError("process spawned"))
         with self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError):
@@ -1126,7 +1149,8 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
         self.assertNotIn(str(self.root), json.dumps({"peak": observed}))
 
     def test_sparse_anonymous_mapping_above_rss_cap_and_below_address_cap(self):
-        mapping_bytes = producer.MAX_RSS_BYTES + 64 * 1024**2
+        mapping_bytes = 4 * 1024**3 + 64 * 1024**2
+        self.assertGreater(mapping_bytes, producer.MAX_RSS_BYTES)
         self.assertLess(mapping_bytes, producer.MAX_ADDRESS_SPACE_BYTES)
         completed = subprocess.run(
             [

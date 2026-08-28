@@ -38,7 +38,7 @@ from packaging.version import InvalidVersion, Version
 from services import h3_prompt_rewriter_dependency_closure as closure
 from services import h3_prompt_rewriter_wheel_resolver as wheel_resolver
 
-UV_RESOLUTION_PLAN_SCHEMA = "maestro.h3-prompt-rewriter.uv-resolution-plan.v2"
+UV_RESOLUTION_PLAN_SCHEMA = "maestro.h3-prompt-rewriter.uv-resolution-plan.v3"
 UV_RESOLUTION_PROVENANCE_SCHEMA = (
     "maestro.h3-prompt-rewriter.uv-resolution-provenance.v1"
 )
@@ -64,7 +64,7 @@ MAX_UV_INTERNAL_LOCK_BYTES = 4 * 1024
 POLL_SECONDS = 0.25
 MAX_STATE_DEPTH = 32
 MAX_SCAN_RETRIES = 3
-MAX_ADDRESS_SPACE_BYTES = 4 * 1024**3
+MAX_ADDRESS_SPACE_BYTES = 16 * 1024**3
 MAX_RSS_BYTES = 1536 * 1024**2
 MAX_PROC_PID_ENTRIES = 1_000_000
 MAX_PROC_STAT_BYTES = 4096
