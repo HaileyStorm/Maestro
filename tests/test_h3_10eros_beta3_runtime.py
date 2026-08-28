@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import ast
 from copy import deepcopy
 from dataclasses import asdict, replace
 import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import sys
 import tempfile
 import unittest
@@ -116,6 +118,83 @@ class _DictSubclass(dict):
 
 
 class _StringSubclass(str):
+    pass
+
+
+def _run_mmgp_safetensors_source_probe(path: str) -> int:
+    """Execute MMGP's installed suffix predicate and safetensors call shape."""
+
+    version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    source_path = (
+        Path(sys.prefix) / "lib" / version / "site-packages" / "mmgp" / "offload.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(source_path))
+    function = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "load_model_data"
+    )
+    branch = next(
+        node for node in ast.walk(function)
+        if isinstance(node, ast.If)
+        and ".safetensors" in (ast.get_source_segment(source, node.test) or "")
+        and ".sft" in (ast.get_source_segment(source, node.test) or "")
+        and "not" in (ast.get_source_segment(source, node.test) or "")
+    )
+    safe_call = next(
+        node for node in ast.walk(ast.Module(body=branch.orelse, type_ignores=[]))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_safetensors_load_file"
+    )
+    probe = ast.Module(
+        body=[
+            ast.If(
+                test=deepcopy(branch.test),
+                body=[
+                    ast.Raise(
+                        exc=ast.Call(
+                            func=ast.Name(id="AssertionError", ctx=ast.Load()),
+                            args=[ast.Constant("MMGP selected torch.load")],
+                            keywords=[],
+                        ),
+                        cause=None,
+                    )
+                ],
+                orelse=[ast.Expr(value=deepcopy(safe_call))],
+            )
+        ],
+        type_ignores=[],
+    )
+    ast.fix_missing_locations(probe)
+    observed: dict[str, int] = {}
+
+    def fake_safetensors_load_file(
+        candidate: str, *, writable_tensors: bool,
+    ) -> tuple[dict, None]:
+        self_fd = os.open(candidate, os.O_RDONLY)
+        try:
+            observed["inode"] = int(os.fstat(self_fd).st_ino)
+            observed["writable"] = int(writable_tensors)
+        finally:
+            os.close(self_fd)
+        return {}, None
+
+    exec(
+        compile(probe, str(source_path), "exec"),
+        {
+            "AssertionError": AssertionError,
+            "file": path,
+            "writable_tensors": False,
+            "_safetensors_load_file": fake_safetensors_load_file,
+        },
+    )
+    if observed.get("writable") != 0:
+        raise AssertionError("MMGP probe changed writable_tensors")
+    return observed["inode"]
+
+
+class _ConsumerFailure(RuntimeError):
     pass
 
 
@@ -384,18 +463,132 @@ class H310ErosBeta3RuntimeTests(unittest.TestCase):
         return artifact, path, admission
 
     @unittest.skipUnless(os.name == "posix", "same-descriptor path is POSIX-only")
-    def test_held_descriptor_survives_path_replacement_and_closes_after_exit(self):
+    def test_suffix_bridge_survives_path_replacement_and_cleans_after_exit(self):
         for source in self.artifacts:
             with self.subTest(artifact_id=source["artifact_id"]), tempfile.TemporaryDirectory() as directory:
-                _, path, admission = self._admit_tiny_file(directory, source, b"old")
+                artifact, path, admission = self._admit_tiny_file(directory, source, b"old")
+                admitted_inode = path.stat().st_ino
                 with runtime.hold_beta3_checkpoint(path, admission) as held:
-                    self.assertRegex(held, r"^/proc/self/fd/[0-9]+$")
+                    bridge = Path(held)
+                    proc_directory = bridge.parent
+                    self.assertEqual(bridge.name, artifact["filename"])
+                    self.assertEqual(bridge.suffix, ".safetensors")
+                    self.assertTrue(".safetensors" in held or ".sft" in held)
+                    self.assertTrue(stat.S_ISLNK(bridge.lstat().st_mode))
+                    self.assertEqual(
+                        stat.S_IMODE(proc_directory.stat().st_mode), 0o500,
+                    )
+                    self.assertEqual(bridge.lstat().st_uid, os.geteuid())
+                    self.assertRegex(os.readlink(bridge), r"^/proc/self/fd/[0-9]+$")
+                    self.assertEqual(bridge.stat().st_ino, admitted_inode)
                     self.assertEqual(Path(held).read_bytes(), b"old")
                     replacement = path.with_name("replacement.tmp")
                     replacement.write_bytes(b"new")
                     os.replace(replacement, path)
-                    self.assertEqual(Path(held).read_bytes(), b"old")
-                self.assertFalse(os.path.exists(held))
+                    self.assertEqual(bridge.stat().st_ino, admitted_inode)
+                    self.assertEqual(bridge.read_bytes(), b"old")
+                    competitor = path.with_name("bridge-competitor.tmp")
+                    competitor.write_bytes(b"wrong")
+                    with self.assertRaises(PermissionError):
+                        os.replace(competitor, bridge)
+                    self.assertEqual(bridge.read_bytes(), b"old")
+                    self.assertEqual(
+                        _run_mmgp_safetensors_source_probe(held), admitted_inode,
+                    )
+                    self.assertNotIn(str(proc_directory), repr(admission))
+                    self.assertNotIn(
+                        str(proc_directory), json.dumps(admission.public_projection()),
+                    )
+                self.assertFalse(proc_directory.exists())
+
+    @unittest.skipUnless(os.name == "posix", "same-descriptor path is POSIX-only")
+    def test_suffix_bridge_cleans_after_consumer_error(self):
+        source = self.artifacts[0]
+        with tempfile.TemporaryDirectory() as directory:
+            _, path, admission = self._admit_tiny_file(directory, source, b"old")
+            bridge_directory = None
+            with self.assertRaisesRegex(RuntimeError, "consumer failed"):
+                with runtime.hold_beta3_checkpoint(path, admission) as held:
+                    bridge_directory = Path(held).parent
+                    raise RuntimeError("consumer failed")
+            self.assertIsNotNone(bridge_directory)
+            self.assertFalse(bridge_directory.exists())
+
+    @unittest.skipUnless(os.name == "posix", "same-descriptor path is POSIX-only")
+    def test_proc_dirfd_bridge_survives_directory_path_substitution(self):
+        source = self.artifacts[0]
+        with tempfile.TemporaryDirectory() as directory:
+            _, path, admission = self._admit_tiny_file(directory, source, b"old")
+            admitted_inode = path.stat().st_ino
+            original_directory = None
+            moved_directory = None
+            with self.assertRaisesRegex(
+                runtime.H310ErosBeta3RuntimeAdmissionError, "could not be cleaned",
+            ):
+                with runtime.hold_beta3_checkpoint(path, admission) as held:
+                    bridge = Path(held)
+                    original_directory = Path(os.readlink(bridge.parent))
+                    moved_directory = original_directory.with_name(
+                        original_directory.name + "-moved"
+                    )
+                    os.rename(original_directory, moved_directory)
+                    original_directory.mkdir(mode=0o700)
+                    replacement = path.with_name("replacement.tmp")
+                    replacement.write_bytes(b"new")
+                    os.replace(replacement, path)
+                    self.assertEqual(bridge.stat().st_ino, admitted_inode)
+                    self.assertEqual(bridge.read_bytes(), b"old")
+                    self.assertEqual(
+                        _run_mmgp_safetensors_source_probe(held), admitted_inode,
+                    )
+            self.assertIsNotNone(original_directory)
+            self.assertIsNotNone(moved_directory)
+            self.assertTrue(original_directory.is_dir())
+            self.assertTrue(moved_directory.is_dir())
+            original_directory.rmdir()
+            moved_directory.rmdir()
+
+    @unittest.skipUnless(os.name == "posix", "same-descriptor path is POSIX-only")
+    def test_consumer_error_remains_primary_when_cleanup_also_fails(self):
+        source = self.artifacts[0]
+        with tempfile.TemporaryDirectory() as directory:
+            _, path, admission = self._admit_tiny_file(directory, source, b"old")
+            original_directory = None
+            moved_directory = None
+            with self.assertRaisesRegex(_ConsumerFailure, "consumer-primary") as caught:
+                with runtime.hold_beta3_checkpoint(path, admission) as held:
+                    original_directory = Path(os.readlink(Path(held).parent))
+                    moved_directory = original_directory.with_name(
+                        original_directory.name + "-moved"
+                    )
+                    os.rename(original_directory, moved_directory)
+                    original_directory.mkdir(mode=0o700)
+                    raise _ConsumerFailure("consumer-primary")
+            self.assertIs(type(caught.exception), _ConsumerFailure)
+            self.assertIsInstance(
+                caught.exception.__context__,
+                runtime.H310ErosBeta3RuntimeAdmissionError,
+            )
+            self.assertTrue(original_directory.is_dir())
+            self.assertTrue(moved_directory.is_dir())
+            original_directory.rmdir()
+            moved_directory.rmdir()
+
+    @unittest.skipUnless(os.name == "posix", "same-descriptor path is POSIX-only")
+    def test_preexisting_suffix_bridge_is_never_replaced_or_yielded(self):
+        source = self.artifacts[0]
+        with tempfile.TemporaryDirectory() as directory:
+            artifact, path, admission = self._admit_tiny_file(directory, source, b"old")
+            preexisting_directory = Path(directory) / "preexisting-bridge"
+            preexisting_directory.mkdir(mode=0o700)
+            preexisting = preexisting_directory / artifact["filename"]
+            preexisting.write_bytes(b"do-not-replace")
+            with mock.patch.object(
+                runtime.tempfile, "mkdtemp", return_value=str(preexisting_directory),
+            ), self.assertRaises(runtime.H310ErosBeta3RuntimeAdmissionError):
+                with runtime.hold_beta3_checkpoint(path, admission):
+                    self.fail("a preexisting bridge must never be yielded")
+            self.assertEqual(preexisting.read_bytes(), b"do-not-replace")
 
     @unittest.skipUnless(os.name == "posix", "same-descriptor path is POSIX-only")
     def test_replacement_and_symlink_paths_fail_before_descriptor_yield(self):

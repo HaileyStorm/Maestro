@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import os
 import stat
+import tempfile
 from types import MappingProxyType
 from typing import Any
 
@@ -442,11 +443,56 @@ def _binding_matches_stat(binding: Mapping[str, Any], value: os.stat_result) -> 
     )
 
 
+def _same_owner(value: os.stat_result) -> bool:
+    return os.name != "posix" or int(getattr(value, "st_uid", -1)) == os.geteuid()
+
+
+def _stat_identity(value: os.stat_result) -> tuple[int, int, int]:
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        int(getattr(value, "st_uid", -1)),
+    )
+
+
+def _bridge_link_matches(
+    directory_descriptor: int,
+    filename: str,
+    *,
+    link_identity: tuple[int, int, int],
+    target: str,
+) -> bool:
+    try:
+        current = os.lstat(filename, dir_fd=directory_descriptor)
+        return (
+            stat.S_ISLNK(current.st_mode)
+            and _same_owner(current)
+            and _stat_identity(current) == link_identity
+            and os.readlink(filename, dir_fd=directory_descriptor) == target
+        )
+    except OSError:
+        return False
+
+
+def _attach_cleanup_failure(
+    primary_error: BaseException,
+    cleanup_error: BaseException,
+) -> None:
+    message = f"Beta3 descriptor bridge cleanup also failed: {cleanup_error}"
+    add_note = getattr(primary_error, "add_note", None)
+    if callable(add_note):  # pragma: no cover - Python 3.11+
+        add_note(message)
+    try:
+        primary_error.__context__ = cleanup_error
+    except (AttributeError, TypeError):  # pragma: no cover - exotic exceptions
+        pass
+
+
 @contextmanager
 def hold_beta3_checkpoint(
     path: str | os.PathLike[str], admission: object,
 ) -> Iterator[str]:
-    """Hold and yield a same-descriptor path for a future in-process loader."""
+    """Hold and yield a suffix-preserving path for a future in-process loader."""
 
     normalized_path = _normalize_pathlike(path, field="checkpoint")
     data = _admission_data(admission)
@@ -454,7 +500,7 @@ def hold_beta3_checkpoint(
         raise H310ErosBeta3RuntimeAdmissionError(
             "The Beta3 checkpoint binding changed after admission"
         )
-    _, binding = data
+    public, binding = data
     if os.name != "posix":  # pragma: no cover - Linux runtime is the admitted host
         raise H310ErosBeta3RuntimeAdmissionError(
             "This host has no admitted same-descriptor Beta3 path contract"
@@ -471,19 +517,143 @@ def hold_beta3_checkpoint(
         raise H310ErosBeta3RuntimeAdmissionError(
             "The admitted Beta3 checkpoint could not be held"
         ) from error
+    bridge_directory: str | None = None
+    directory_descriptor: int | None = None
+    bridge_filename = public["filename"]
+    link_identity: tuple[int, int, int] | None = None
+    directory_identity: tuple[int, int, int] | None = None
+    descriptor_target = f"/proc/self/fd/{descriptor}"
+    primary_error: BaseException | None = None
     try:
-        if not _binding_matches_stat(binding, os.fstat(descriptor)):
-            raise H310ErosBeta3RuntimeAdmissionError(
-                "The Beta3 checkpoint changed while acquiring its descriptor"
+        try:
+            if not _binding_matches_stat(binding, os.fstat(descriptor)):
+                raise H310ErosBeta3RuntimeAdmissionError(
+                    "The Beta3 checkpoint changed while acquiring its descriptor"
+                )
+            if not os.path.exists(descriptor_target):
+                raise H310ErosBeta3RuntimeAdmissionError(
+                    "This host cannot expose a stable Beta3 descriptor path"
+                )
+            bridge_directory = tempfile.mkdtemp(prefix=".maestro-beta3-held-")
+            directory_flags = (
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_DIRECTORY", 0)
+                | nofollow
             )
-        descriptor_path = f"/proc/self/fd/{descriptor}"
-        if not os.path.exists(descriptor_path):
-            raise H310ErosBeta3RuntimeAdmissionError(
-                "This host cannot expose a stable Beta3 descriptor path"
-            )
-        yield descriptor_path
+            directory_descriptor = os.open(bridge_directory, directory_flags)
+            directory_lstat = os.lstat(bridge_directory)
+            directory_fstat = os.fstat(directory_descriptor)
+            directory_identity = _stat_identity(directory_fstat)
+            if (
+                not stat.S_ISDIR(directory_fstat.st_mode)
+                or not _same_owner(directory_fstat)
+                or stat.S_IMODE(directory_fstat.st_mode) != 0o700
+                or _stat_identity(directory_lstat) != directory_identity
+            ):
+                raise H310ErosBeta3RuntimeAdmissionError(
+                    "The Beta3 descriptor bridge directory is not private"
+                )
+            try:
+                os.symlink(
+                    descriptor_target,
+                    bridge_filename,
+                    dir_fd=directory_descriptor,
+                )
+            except OSError as error:
+                raise H310ErosBeta3RuntimeAdmissionError(
+                    "The Beta3 descriptor bridge path was not exclusively created"
+                ) from error
+            link_stat = os.lstat(bridge_filename, dir_fd=directory_descriptor)
+            link_identity = _stat_identity(link_stat)
+            proc_directory = f"/proc/self/fd/{directory_descriptor}"
+            bridge_path = f"{proc_directory}/{bridge_filename}"
+            if (
+                not _bridge_link_matches(
+                    directory_descriptor,
+                    bridge_filename,
+                    link_identity=link_identity,
+                    target=descriptor_target,
+                )
+                or _stat_identity(os.stat(proc_directory)) != directory_identity
+                or not _binding_matches_stat(binding, os.stat(bridge_path))
+            ):
+                raise H310ErosBeta3RuntimeAdmissionError(
+                    "The Beta3 descriptor bridge does not resolve to the admitted file"
+                )
+            os.fchmod(directory_descriptor, 0o500)
+            if stat.S_IMODE(os.fstat(directory_descriptor).st_mode) != 0o500:
+                raise H310ErosBeta3RuntimeAdmissionError(
+                    "The Beta3 descriptor bridge could not be sealed"
+                )
+            yield bridge_path
+            followed = os.stat(bridge_path)
+            if (
+                not _bridge_link_matches(
+                    directory_descriptor,
+                    bridge_filename,
+                    link_identity=link_identity,
+                    target=descriptor_target,
+                )
+                or not stat.S_ISREG(followed.st_mode)
+                or int(followed.st_dev) != binding["dev"]
+                or int(followed.st_ino) != binding["ino"]
+            ):
+                raise H310ErosBeta3RuntimeAdmissionError(
+                    "The Beta3 descriptor bridge changed during consumption"
+                )
+        except BaseException as error:
+            primary_error = error
+            raise
     finally:
-        os.close(descriptor)
+        cleanup_error: BaseException | None = None
+        if directory_descriptor is not None:
+            try:
+                os.fchmod(directory_descriptor, 0o700)
+                if link_identity is not None and _bridge_link_matches(
+                    directory_descriptor,
+                    bridge_filename,
+                    link_identity=link_identity,
+                    target=descriptor_target,
+                ):
+                    os.unlink(bridge_filename, dir_fd=directory_descriptor)
+            except OSError as error:
+                cleanup_error = error
+            finally:
+                try:
+                    os.close(directory_descriptor)
+                except OSError as error:
+                    cleanup_error = cleanup_error or error
+        if bridge_directory is not None:
+            try:
+                current_directory = os.lstat(bridge_directory)
+                if (
+                    directory_identity is None
+                    or not stat.S_ISDIR(current_directory.st_mode)
+                    or not _same_owner(current_directory)
+                    or _stat_identity(current_directory) != directory_identity
+                ):
+                    raise H310ErosBeta3RuntimeAdmissionError(
+                        "The Beta3 bridge directory path was substituted; foreign state was left intact"
+                    )
+                os.rmdir(bridge_directory)
+            except OSError as error:
+                cleanup_error = cleanup_error or error
+            except H310ErosBeta3RuntimeAdmissionError as error:
+                cleanup_error = cleanup_error or error
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            cleanup_error = cleanup_error or error
+        if cleanup_error is not None:
+            wrapped_cleanup = H310ErosBeta3RuntimeAdmissionError(
+                "The Beta3 descriptor bridge could not be cleaned"
+            )
+            wrapped_cleanup.__cause__ = cleanup_error
+            if primary_error is not None:
+                _attach_cleanup_failure(primary_error, wrapped_cleanup)
+            else:
+                raise wrapped_cleanup
 
 
 __all__ = [
