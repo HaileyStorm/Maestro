@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -243,16 +244,37 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
             size_bytes=producer.PINNED_UV_SIZE_BYTES,
             stat_identity=producer._stat_identity(info),
         )
+        self.python = self.root / "python3.12"
+        self.python.write_bytes(b"fake Python")
+        self.python.chmod(0o700)
+        python_info = self.python.stat()
+        self.python_receipt = producer._PythonReceipt(
+            path=self.python,
+            sha256=hashlib.sha256(b"fake Python").hexdigest(),
+            size_bytes=len(b"fake Python"),
+            version="3.12.3",
+            stat_identity=producer._stat_identity(python_info),
+        )
 
     def plan(self, **kwargs):
-        with mock.patch.object(producer, "_inspect_uv", return_value=self.uv_receipt):
+        with (
+            mock.patch.object(producer, "_inspect_uv", return_value=self.uv_receipt),
+            mock.patch.object(
+                producer, "_inspect_python", return_value=self.python_receipt
+            ),
+        ):
             return producer.build_h3_prompt_rewriter_uv_resolution_plan(
-                self.uv, **kwargs
+                self.uv, self.python, **kwargs
             )
 
     def execute(self, fake, *, plan=None, monotonic=lambda: 0.0):
         plan = plan or self.plan()
-        with mock.patch.object(producer, "_inspect_uv", return_value=self.uv_receipt):
+        with (
+            mock.patch.object(producer, "_inspect_uv", return_value=self.uv_receipt),
+            mock.patch.object(
+                producer, "_inspect_python", return_value=self.python_receipt
+            ),
+        ):
             return producer.execute_h3_prompt_rewriter_uv_resolution(
                 plan,
                 expected_plan_sha256=plan.sha256,
@@ -260,7 +282,9 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
                     producer.reviewed_requirements_input_bytes()
                 ).hexdigest(),
                 expected_uv_sha256=producer.PINNED_UV_SHA256,
+                expected_python_sha256=self.python_receipt.sha256,
                 uv_executable=self.uv,
+                python_executable=self.python,
                 private_feature_root=self.feature,
                 state_root=self.state,
                 process_factory=fake,
@@ -270,21 +294,35 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
     def test_plan_is_path_free_network_free_and_exactly_bound(self):
         with (
             mock.patch.object(producer, "_inspect_uv", return_value=self.uv_receipt),
+            mock.patch.object(
+                producer, "_inspect_python", return_value=self.python_receipt
+            ),
             mock.patch.object(socket, "socket", side_effect=AssertionError("network")),
             mock.patch.object(
                 subprocess, "Popen", side_effect=AssertionError("process")
             ),
         ):
-            first = producer.build_h3_prompt_rewriter_uv_resolution_plan(self.uv)
-            second = producer.build_h3_prompt_rewriter_uv_resolution_plan(self.uv)
+            first = producer.build_h3_prompt_rewriter_uv_resolution_plan(
+                self.uv, self.python
+            )
+            second = producer.build_h3_prompt_rewriter_uv_resolution_plan(
+                self.uv, self.python
+            )
         self.assertEqual(first.sha256, second.sha256)
         self.assertFalse(first.document["planning_mutation"])
         self.assertFalse(first.document["planning_network"])
         self.assertTrue(first.document["execution_requires_network"])
         self.assertTrue(first.document["execution_writes_private_state"])
+        self.assertTrue(first.document["execution_requires_expected_python_sha256"])
         self.assertNotIn("mutation", first.document)
         self.assertNotIn("network", first.document)
         self.assertEqual(first.document["uv"]["version"], "0.9.26")
+        self.assertEqual(first.document["bootstrap_python"]["version"], "3.12.3")
+        self.assertEqual(
+            first.document["bootstrap_python"]["canonical_path_sha256"],
+            hashlib.sha256(str(self.python).encode()).hexdigest(),
+        )
+        self.assertEqual(first.document["target"]["python_full_version"], "3.12.14")
         self.assertEqual(first.document["target"]["python_abi"], "cp312")
         self.assertEqual(first.document["resources"]["cpu_cores"], 2)
         self.assertEqual(first.document["resources"]["nice"], 15)
@@ -296,6 +334,18 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
             first.document["resources"]["state_depth_cap"],
             producer.MAX_STATE_DEPTH,
         )
+        self.assertEqual(first.document["resolver"]["only_binary"], ":all:")
+        self.assertEqual(
+            first.document["resolver"]["candidate_output_name"],
+            producer.PYLOCK_CANDIDATE_NAME,
+        )
+        self.assertEqual(
+            first.document["resolver"]["canonical_output_name"],
+            producer.PYLOCK_NAME,
+        )
+        self.assertFalse(first.document["resolver"]["no_build_flag_used"])
+        self.assertFalse(first.document["resolver"]["source_distributions_permitted"])
+        self.assertFalse(first.document["resolver"]["builds_permitted"])
         self.assertNotIn(str(self.root), json.dumps(first.document, sort_keys=True))
 
     def test_documented_uv_0926_golden_variant_is_accepted(self):
@@ -303,6 +353,61 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
             UV_0926_DOCUMENTED_GOLDEN_PYLOCK
         )
         self.assertEqual(len(report["packages"]), len(PACKAGE_ROWS))
+
+    def test_bootstrap_python_rejects_symlink_and_identity_drift(self):
+        symlink = self.root / "python-link"
+        symlink.symlink_to(self.python)
+        with self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError):
+            producer._inspect_python(symlink)
+
+        def mutate_during_version_check(*_args, **_kwargs):
+            self.python.write_bytes(b"changed Python")
+            self.python.chmod(0o700)
+            return subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=b"Python 3.12.3\n", stderr=b""
+            )
+
+        with (
+            mock.patch.object(
+                producer.subprocess,
+                "run",
+                side_effect=mutate_during_version_check,
+            ),
+            self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError),
+        ):
+            producer._inspect_python(self.python)
+
+    def test_bootstrap_python_same_bytes_at_another_path_cannot_retarget(self):
+        plan = self.plan()
+        moved = self.root / "other-python3.12"
+        moved.write_bytes(b"fake Python")
+        moved.chmod(0o700)
+        moved_receipt = producer._PythonReceipt(
+            path=moved,
+            sha256=self.python_receipt.sha256,
+            size_bytes=self.python_receipt.size_bytes,
+            version=self.python_receipt.version,
+            stat_identity=producer._stat_identity(moved.stat()),
+        )
+        with (
+            mock.patch.object(producer, "_inspect_uv", return_value=self.uv_receipt),
+            mock.patch.object(producer, "_inspect_python", return_value=moved_receipt),
+            self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError),
+        ):
+            producer.execute_h3_prompt_rewriter_uv_resolution(
+                plan,
+                expected_plan_sha256=plan.sha256,
+                expected_input_sha256=hashlib.sha256(
+                    producer.reviewed_requirements_input_bytes()
+                ).hexdigest(),
+                expected_uv_sha256=producer.PINNED_UV_SHA256,
+                expected_python_sha256=self.python_receipt.sha256,
+                uv_executable=self.uv,
+                python_executable=moved,
+                private_feature_root=self.feature,
+                state_root=self.state,
+                process_factory=_FakeUv(_pylock()),
+            )
 
     def test_parse_emits_exact_downstream_report_schema(self):
         report = producer.parse_uv_pylock_to_wheel_report(_pylock())
@@ -325,11 +430,17 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
             "--no-config",
             "--no-python-downloads",
             "--no-managed-python",
-            "--no-build",
             "--only-binary",
             "--no-sources",
         ):
             self.assertIn(option, command)
+        self.assertNotIn("--no-build", command)
+        self.assertEqual(command[command.index("--only-binary") + 1], ":all:")
+        self.assertEqual(command[command.index("--python") + 1], str(self.python))
+        self.assertEqual(
+            Path(command[command.index("--output-file") + 1]).name,
+            producer.PYLOCK_CANDIDATE_NAME,
+        )
         self.assertEqual(command[command.index("--index-strategy") + 1], "first-index")
         self.assertEqual(command[command.index("--python-version") + 1], "3.12.14")
         self.assertEqual(
@@ -359,15 +470,16 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
         self.assertEqual(provenance["status"], "unreviewed_candidate")
         self.assertFalse(provenance["installation_authorized"])
 
-    def test_execution_requires_all_three_expected_hashes(self):
+    def test_execution_requires_all_four_expected_hashes(self):
         plan = self.plan()
-        for field in ("plan", "input", "uv"):
+        for field in ("plan", "input", "uv", "python"):
             values = {
                 "expected_plan_sha256": plan.sha256,
                 "expected_input_sha256": hashlib.sha256(
                     producer.reviewed_requirements_input_bytes()
                 ).hexdigest(),
                 "expected_uv_sha256": producer.PINNED_UV_SHA256,
+                "expected_python_sha256": self.python_receipt.sha256,
             }
             values[f"expected_{field}_sha256"] = "0" * 64
             with (
@@ -375,12 +487,16 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
                 mock.patch.object(
                     producer, "_inspect_uv", return_value=self.uv_receipt
                 ),
+                mock.patch.object(
+                    producer, "_inspect_python", return_value=self.python_receipt
+                ),
                 self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError),
             ):
                 producer.execute_h3_prompt_rewriter_uv_resolution(
                     plan,
                     **values,
                     uv_executable=self.uv,
+                    python_executable=self.python,
                     private_feature_root=self.feature,
                     state_root=self.state,
                     process_factory=_FakeUv(_pylock()),
@@ -476,8 +592,92 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
         fake = _FakeUv(_pylock(), returncode=9)
         with self.assertRaises(producer.H3PromptRewriterUvResolutionExecutionError):
             self.execute(fake)
-        self.assertTrue((self.state / f".{producer.PYLOCK_NAME}.tmp").exists())
+        self.assertTrue((self.state / producer.PYLOCK_CANDIDATE_NAME).exists())
         self.assertFalse((self.state / producer.REPORT_NAME).exists())
+        failure = json.loads((self.state / producer.FAILURE_NAME).read_text())
+        self.assertEqual(failure["phase"], "process_nonzero")
+        self.assertTrue(failure["process_spawned"])
+        self.assertEqual(failure["returncode"], 9)
+        self.assertFalse(failure["validated_pylock_candidate_observed"])
+        self.assertEqual(failure["failure_category"], "execution_boundary")
+        self.assertFalse(failure["retry_authorized"])
+        failure_path = self.state / producer.FAILURE_NAME
+        self.assertEqual(failure_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(failure_path.stat().st_nlink, 1)
+
+    def test_terminal_failure_receipt_requires_fresh_state_for_every_retry(self):
+        plan = self.plan()
+        with self.assertRaises(producer.H3PromptRewriterUvResolutionExecutionError):
+            self.execute(_FakeUv(_pylock(), returncode=9), plan=plan)
+        failure_path = self.state / producer.FAILURE_NAME
+        preserved_receipt = failure_path.read_bytes()
+
+        for label, returncode in (("success", 0), ("different_failure", 17)):
+            uv_inspection = mock.Mock(side_effect=AssertionError("uv inspection"))
+            python_inspection = mock.Mock(
+                side_effect=AssertionError("Python inspection")
+            )
+            version_probe = mock.Mock(side_effect=AssertionError("version probe"))
+            process_factory = mock.Mock(wraps=_FakeUv(_pylock(), returncode=returncode))
+            with (
+                self.subTest(label=label),
+                mock.patch.object(producer, "_inspect_uv", uv_inspection),
+                mock.patch.object(producer, "_inspect_python", python_inspection),
+                mock.patch.object(producer.subprocess, "run", version_probe),
+                self.assertRaises(
+                    producer.H3PromptRewriterUvResolutionSecurityError
+                ) as raised,
+            ):
+                producer.execute_h3_prompt_rewriter_uv_resolution(
+                    plan,
+                    expected_plan_sha256=plan.sha256,
+                    expected_input_sha256=hashlib.sha256(
+                        producer.reviewed_requirements_input_bytes()
+                    ).hexdigest(),
+                    expected_uv_sha256=producer.PINNED_UV_SHA256,
+                    expected_python_sha256=self.python_receipt.sha256,
+                    uv_executable=self.uv,
+                    python_executable=self.python,
+                    private_feature_root=self.feature,
+                    state_root=self.state,
+                    process_factory=process_factory,
+                )
+            self.assertIn("fresh private state root", str(raised.exception))
+            uv_inspection.assert_not_called()
+            python_inspection.assert_not_called()
+            version_probe.assert_not_called()
+            process_factory.assert_not_called()
+            self.assertEqual(failure_path.read_bytes(), preserved_receipt)
+
+    def test_popen_failure_emits_content_free_private_terminal_receipt(self):
+        def broken_factory(*_args, **_kwargs):
+            raise OSError("private popen detail")
+
+        with self.assertRaises(
+            producer.H3PromptRewriterUvResolutionExecutionError
+        ) as raised:
+            self.execute(broken_factory)
+        self.assertNotIn("private popen detail", str(raised.exception))
+        failure_path = self.state / producer.FAILURE_NAME
+        failure_text = failure_path.read_text()
+        failure = json.loads(failure_text)
+        self.assertNotIn("private popen detail", failure_text)
+        self.assertEqual(failure["phase"], "spawn")
+        self.assertFalse(failure["process_spawned"])
+        self.assertIsNone(failure["returncode"])
+        self.assertFalse(failure["validated_pylock_candidate_observed"])
+        self.assertEqual(failure["failure_category"], "execution_boundary")
+
+    def test_invalid_pylock_emits_schema_phase_private_terminal_receipt(self):
+        fake = _FakeUv(b"not valid toml")
+        with self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError):
+            self.execute(fake)
+        failure = json.loads((self.state / producer.FAILURE_NAME).read_text())
+        self.assertEqual(failure["phase"], "pylock_schema")
+        self.assertTrue(failure["process_spawned"])
+        self.assertEqual(failure["returncode"], 0)
+        self.assertTrue(failure["validated_pylock_candidate_observed"])
+        self.assertEqual(failure["failure_category"], "security_boundary")
 
     def test_metadata_cap_kills_process_group_before_evidence(self):
         plan = self.plan(metadata_byte_cap=512)
@@ -713,25 +913,8 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
         with (
             mock.patch.object(producer, "_inspect_uv", return_value=self.uv_receipt),
             mock.patch.object(
-                report_cli,
-                "build_h3_prompt_rewriter_uv_resolution_plan",
-                side_effect=lambda *args, **kwargs: (
-                    producer.build_h3_prompt_rewriter_uv_resolution_plan(
-                        *args, **kwargs
-                    )
-                ),
+                producer, "_inspect_python", return_value=self.python_receipt
             ),
-            redirect_stdout(buffer),
-        ):
-            result = report_cli.main(["--uv-executable", str(self.uv)])
-        self.assertEqual(result, 0)
-        output = json.loads(buffer.getvalue())
-        self.assertFalse(output["plan"]["planning_mutation"])
-        self.assertTrue(output["plan"]["execution_writes_private_state"])
-
-        buffer = io.StringIO()
-        with (
-            mock.patch.object(producer, "_inspect_uv", return_value=self.uv_receipt),
             mock.patch.object(
                 report_cli,
                 "build_h3_prompt_rewriter_uv_resolution_plan",
@@ -747,6 +930,38 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
                 [
                     "--uv-executable",
                     str(self.uv),
+                    "--python-executable",
+                    str(self.python),
+                ]
+            )
+        self.assertEqual(result, 0)
+        output = json.loads(buffer.getvalue())
+        self.assertFalse(output["plan"]["planning_mutation"])
+        self.assertTrue(output["plan"]["execution_writes_private_state"])
+
+        buffer = io.StringIO()
+        with (
+            mock.patch.object(producer, "_inspect_uv", return_value=self.uv_receipt),
+            mock.patch.object(
+                producer, "_inspect_python", return_value=self.python_receipt
+            ),
+            mock.patch.object(
+                report_cli,
+                "build_h3_prompt_rewriter_uv_resolution_plan",
+                side_effect=lambda *args, **kwargs: (
+                    producer.build_h3_prompt_rewriter_uv_resolution_plan(
+                        *args, **kwargs
+                    )
+                ),
+            ),
+            redirect_stdout(buffer),
+        ):
+            result = report_cli.main(
+                [
+                    "--uv-executable",
+                    str(self.uv),
+                    "--python-executable",
+                    str(self.python),
                     "--expected-plan-sha256",
                     "0" * 64,
                 ]
@@ -756,6 +971,87 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
             json.loads(buffer.getvalue()),
             {"error": "H3PromptRewriterUvResolutionError"},
         )
+
+    def test_cli_execute_failure_remains_content_free(self):
+        plan = self.plan()
+        buffer = io.StringIO()
+        with (
+            mock.patch.object(
+                report_cli,
+                "build_h3_prompt_rewriter_uv_resolution_plan",
+                return_value=plan,
+            ),
+            mock.patch.object(
+                report_cli,
+                "execute_h3_prompt_rewriter_uv_resolution",
+                side_effect=producer.H3PromptRewriterUvResolutionExecutionError(
+                    "private uv parser detail"
+                ),
+            ),
+            redirect_stdout(buffer),
+        ):
+            result = report_cli.main(
+                [
+                    "--uv-executable",
+                    str(self.uv),
+                    "--python-executable",
+                    str(self.python),
+                    "--execute",
+                    "--expected-plan-sha256",
+                    plan.sha256,
+                    "--expected-input-sha256",
+                    "0" * 64,
+                    "--expected-uv-sha256",
+                    producer.PINNED_UV_SHA256,
+                    "--expected-python-sha256",
+                    self.python_receipt.sha256,
+                    "--private-feature-root",
+                    str(self.feature),
+                    "--state-root",
+                    str(self.state),
+                ]
+            )
+        self.assertEqual(result, 2)
+        self.assertEqual(
+            json.loads(buffer.getvalue()),
+            {"error": "H3PromptRewriterUvResolutionError"},
+        )
+
+    def test_pinned_uv_offline_command_reaches_resolution_not_cli_validation(self):
+        executable = os.environ.get("MAESTRO_H3_PINNED_UV_PROBE")
+        python_executable = os.environ.get("MAESTRO_H3_PINNED_PYTHON_PROBE")
+        if executable is None or python_executable is None:
+            self.skipTest("exact pinned uv/Python offline probe was not requested")
+        receipt = producer._inspect_uv(Path(executable))
+        python_receipt = producer._inspect_python(Path(python_executable))
+        producer._layout(self.feature, self.state)
+        producer._atomic_write(
+            self.state / producer.INPUT_NAME,
+            producer.reviewed_requirements_input_bytes(),
+        )
+        environment = producer._child_environment(self.state)
+        environment["UV_OFFLINE"] = "1"
+        completed = subprocess.run(
+            producer._command(receipt.path, python_receipt.path, self.state),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            shell=False,
+            close_fds=True,
+            cwd=self.state,
+            env=environment,
+            timeout=15,
+            check=False,
+        )
+        terminal = (completed.stdout + completed.stderr)[: 64 * 1024].lower()
+        self.assertEqual(completed.returncode, 1, terminal.decode(errors="replace"))
+        self.assertIn(b"cache", terminal)
+        for cli_validation_error in (
+            b"cannot be used with",
+            b"must start with `pylock.`",
+            b"must end with `.toml`",
+            b"unexpected argument",
+        ):
+            self.assertNotIn(cli_validation_error, terminal)
 
 
 if __name__ == "__main__":

@@ -31,6 +31,7 @@ def _parser() -> argparse.ArgumentParser:
         description="Plan or explicitly produce the pinned-uv H3 wheel report"
     )
     parser.add_argument("--uv-executable", required=True)
+    parser.add_argument("--python-executable", required=True)
     parser.add_argument("--deadline-seconds", type=int, default=MAX_DEADLINE_SECONDS)
     parser.add_argument(
         "--metadata-byte-cap", type=int, default=DEFAULT_METADATA_BYTE_CAP
@@ -42,6 +43,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-plan-sha256")
     parser.add_argument("--expected-input-sha256")
     parser.add_argument("--expected-uv-sha256")
+    parser.add_argument("--expected-python-sha256")
     parser.add_argument("--private-feature-root")
     parser.add_argument("--state-root")
     return parser
@@ -52,6 +54,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     try:
         plan = build_h3_prompt_rewriter_uv_resolution_plan(
             options.uv_executable,
+            options.python_executable,
             deadline_seconds=options.deadline_seconds,
             metadata_byte_cap=options.metadata_byte_cap,
             metadata_entry_cap=options.metadata_entry_cap,
@@ -60,6 +63,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
             options.expected_plan_sha256,
             options.expected_input_sha256,
             options.expected_uv_sha256,
+            options.expected_python_sha256,
             options.private_feature_root,
             options.state_root,
         )
@@ -72,14 +76,16 @@ def main(arguments: Sequence[str] | None = None) -> int:
             return 0
         if any(value is None for value in execution_values):
             raise H3PromptRewriterUvResolutionError(
-                "--execute requires exact plan/input/uv bindings and private roots"
+                "--execute requires exact plan/input/uv/Python bindings and private roots"
             )
         result = execute_h3_prompt_rewriter_uv_resolution(
             plan,
             expected_plan_sha256=options.expected_plan_sha256,
             expected_input_sha256=options.expected_input_sha256,
             expected_uv_sha256=options.expected_uv_sha256,
+            expected_python_sha256=options.expected_python_sha256,
             uv_executable=options.uv_executable,
+            python_executable=options.python_executable,
             private_feature_root=options.private_feature_root,
             state_root=options.state_root,
         )

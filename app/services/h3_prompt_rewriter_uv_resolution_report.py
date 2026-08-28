@@ -42,13 +42,16 @@ UV_RESOLUTION_PLAN_SCHEMA = "maestro.h3-prompt-rewriter.uv-resolution-plan.v1"
 UV_RESOLUTION_PROVENANCE_SCHEMA = (
     "maestro.h3-prompt-rewriter.uv-resolution-provenance.v1"
 )
+UV_RESOLUTION_FAILURE_SCHEMA = "maestro.h3-prompt-rewriter.uv-resolution-failure.v1"
 PINNED_UV_VERSION = "0.9.26"
 PINNED_UV_SHA256 = "0650696de7f403348e9dd617e1f65dc32147c106c40129138017efd8f0f01cc8"
 PINNED_UV_SIZE_BYTES = 56_224_064
 PYLOCK_NAME = "pylock.toml"
+PYLOCK_CANDIDATE_NAME = "pylock.candidate.toml"
 REPORT_NAME = "wheel-report.json"
 PROVENANCE_NAME = "resolution-provenance.json"
 INPUT_NAME = "requirements.in"
+FAILURE_NAME = "resolution-failure.json"
 MAX_PYLOCK_BYTES = 8 * 1024 * 1024
 MAX_TOTAL_WHEEL_BYTES = wheel_resolver.MAX_BYTE_CAP
 MAX_DEADLINE_SECONDS = wheel_resolver.MAX_DEADLINE_SECONDS
@@ -70,10 +73,12 @@ _ALLOWED_STATE_FILES = {
     PYLOCK_NAME,
     REPORT_NAME,
     PROVENANCE_NAME,
+    FAILURE_NAME,
     f".{INPUT_NAME}.tmp",
-    f".{PYLOCK_NAME}.tmp",
+    PYLOCK_CANDIDATE_NAME,
     f".{REPORT_NAME}.tmp",
     f".{PROVENANCE_NAME}.tmp",
+    f".{FAILURE_NAME}.tmp",
     "cache",
     "home",
     "tmp",
@@ -140,6 +145,15 @@ class _UvReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class _PythonReceipt:
+    path: Path
+    sha256: str
+    size_bytes: int
+    version: str
+    stat_identity: tuple[int, int, int, int, int, int, int]
+
+
+@dataclass(frozen=True, slots=True)
 class _StateUsage:
     bytes: int
     entries: int
@@ -157,6 +171,14 @@ def _canonical_json(value: object) -> bytes:
 
 def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _python_path_sha256(receipt: _PythonReceipt) -> str:
+    return _sha256_bytes(str(receipt.path).encode("utf-8"))
+
+
+def _python_stat_sha256(receipt: _PythonReceipt) -> str:
+    return _sha256_bytes(_canonical_json(list(receipt.stat_identity)))
 
 
 def reviewed_requirements_input_bytes() -> bytes:
@@ -249,8 +271,88 @@ def _inspect_uv(value: object) -> _UvReceipt:
     return receipt
 
 
+def _inspect_python(value: object) -> _PythonReceipt:
+    if not isinstance(value, (str, os.PathLike)) or not Path(value).is_absolute():
+        raise H3PromptRewriterUvResolutionSecurityError(
+            "bootstrap Python executable must be an absolute path"
+        )
+    path = Path(value)
+    try:
+        if path.resolve(strict=True) != path:
+            raise H3PromptRewriterUvResolutionSecurityError(
+                "bootstrap Python executable must not traverse links"
+            )
+        before = path.lstat()
+    except OSError as error:
+        raise H3PromptRewriterUvResolutionSecurityError(
+            "bootstrap Python executable is unavailable"
+        ) from error
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_uid not in {0, os.getuid()}
+        or before.st_nlink != 1
+        or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or not os.access(path, os.X_OK)
+    ):
+        raise H3PromptRewriterUvResolutionSecurityError(
+            "bootstrap Python executable identity or mode is invalid"
+        )
+    digest = hashlib.sha256()
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(descriptor)
+        if _stat_identity(opened) != _stat_identity(before):
+            raise H3PromptRewriterUvResolutionSecurityError(
+                "bootstrap Python executable identity changed"
+            )
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+    finally:
+        os.close(descriptor)
+    try:
+        completed = subprocess.run(
+            [str(path), "--version"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            shell=False,
+            close_fds=True,
+            env={"PYTHONNOUSERSITE": "1", "PYTHONPATH": ""},
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise H3PromptRewriterUvResolutionSecurityError(
+            "bootstrap Python version could not be verified"
+        ) from error
+    output = completed.stdout + completed.stderr
+    match = re.fullmatch(rb"Python (3\.12\.[0-9]+)\r?\n?", output)
+    if completed.returncode != 0 or len(output) > 64 or match is None:
+        raise H3PromptRewriterUvResolutionSecurityError(
+            "bootstrap Python version is outside the reviewed contract"
+        )
+    try:
+        after = path.lstat()
+    except OSError as error:
+        raise H3PromptRewriterUvResolutionSecurityError(
+            "bootstrap Python executable changed during inspection"
+        ) from error
+    if _stat_identity(after) != _stat_identity(before):
+        raise H3PromptRewriterUvResolutionSecurityError(
+            "bootstrap Python executable changed during inspection"
+        )
+    return _PythonReceipt(
+        path=path,
+        sha256=digest.hexdigest(),
+        size_bytes=before.st_size,
+        version=match.group(1).decode("ascii"),
+        stat_identity=_stat_identity(before),
+    )
+
+
 def build_h3_prompt_rewriter_uv_resolution_plan(
     uv_executable: object,
+    python_executable: object,
     *,
     deadline_seconds: object = MAX_DEADLINE_SECONDS,
     metadata_byte_cap: object = DEFAULT_METADATA_BYTE_CAP,
@@ -280,6 +382,7 @@ def build_h3_prompt_rewriter_uv_resolution_plan(
             "metadata entry cap is outside the reviewed bound"
         )
     uv = _inspect_uv(uv_executable)
+    python = _inspect_python(python_executable)
     input_sha = _sha256_bytes(reviewed_requirements_input_bytes())
     document = {
         "schema": UV_RESOLUTION_PLAN_SCHEMA,
@@ -291,9 +394,10 @@ def build_h3_prompt_rewriter_uv_resolution_plan(
         "execution_requires_expected_plan_sha256": True,
         "execution_requires_expected_input_sha256": True,
         "execution_requires_expected_uv_sha256": True,
+        "execution_requires_expected_python_sha256": True,
         "installation_authorized": False,
         "runtime_execution_authorized": False,
-        "target": dict(_TARGET),
+        "target": {**_TARGET, "python_full_version": "3.12.14"},
         "root_requirements": list(closure.ROOT_REQUIREMENTS),
         "requirements_input_sha256": input_sha,
         "uv": {
@@ -303,14 +407,28 @@ def build_h3_prompt_rewriter_uv_resolution_plan(
             "executable_path_disclosed": False,
             "stat_identity_rechecked_at_execution": True,
         },
+        "bootstrap_python": {
+            "implementation": "cpython",
+            "version": python.version,
+            "sha256": python.sha256,
+            "size_bytes": python.size_bytes,
+            "canonical_path_sha256": _python_path_sha256(python),
+            "stat_identity_sha256": _python_stat_sha256(python),
+            "executable_path_disclosed": False,
+            "stat_identity_rechecked_at_execution": True,
+        },
         "resolver": {
             "command": "uv pip compile",
             "format": "pylock.toml",
+            "candidate_output_name": PYLOCK_CANDIDATE_NAME,
+            "canonical_output_name": PYLOCK_NAME,
             "no_config": True,
             "no_python_downloads": True,
             "no_managed_python": True,
-            "no_build": True,
             "only_binary": ":all:",
+            "no_build_flag_used": False,
+            "source_distributions_permitted": False,
+            "builds_permitted": False,
             "prerelease": "disallow",
             "index_strategy": "first-index",
             "pytorch_index": wheel_resolver.PYTORCH_INDEX,
@@ -625,6 +743,47 @@ def _atomic_write(path: Path, payload: bytes) -> None:
         os.close(directory)
 
 
+def _write_failure_receipt(
+    state_root: Path,
+    plan: H3PromptRewriterUvResolutionPlan,
+    diagnostic: dict[str, object],
+    error: Exception,
+    *,
+    input_sha256: str,
+    uv_sha256: str,
+    python_sha256: str,
+) -> None:
+    if isinstance(error, H3PromptRewriterUvResolutionSecurityError):
+        category = "security_boundary"
+    elif isinstance(error, H3PromptRewriterUvResolutionExecutionError):
+        category = "execution_boundary"
+    else:
+        category = "external_boundary"
+    returncode = diagnostic.get("returncode")
+    if returncode is not None and type(returncode) is not int:
+        returncode = None
+    document = {
+        "schema": UV_RESOLUTION_FAILURE_SCHEMA,
+        "status": "failed",
+        "terminal": True,
+        "installation_authorized": False,
+        "runtime_execution_authorized": False,
+        "retry_authorized": False,
+        "phase": diagnostic.get("phase", "pre_spawn"),
+        "failure_category": category,
+        "process_spawned": diagnostic.get("process_spawned") is True,
+        "returncode": returncode,
+        "validated_pylock_candidate_observed": (
+            diagnostic.get("validated_pylock_candidate") is True
+        ),
+        "plan_sha256": plan.sha256,
+        "requirements_input_sha256": input_sha256,
+        "uv_sha256": uv_sha256,
+        "bootstrap_python_sha256": python_sha256,
+    }
+    _atomic_write(state_root / FAILURE_NAME, _canonical_json(document) + b"\n")
+
+
 @contextmanager
 def _execution_lock(state_root: Path):
     path = state_root / "execution.lock"
@@ -657,7 +816,7 @@ def _execution_lock(state_root: Path):
 
 def _reconcile_pylock_pair(state_root: Path) -> None:
     final = state_root / PYLOCK_NAME
-    temporary = state_root / f".{PYLOCK_NAME}.tmp"
+    temporary = state_root / PYLOCK_CANDIDATE_NAME
     if not temporary.exists():
         return
     _private_file(temporary, MAX_PYLOCK_BYTES)
@@ -1132,14 +1291,16 @@ def _child_environment(state_root: Path) -> dict[str, str]:
     }
 
 
-def _command(uv: Path, state_root: Path) -> list[str]:
+def _command(uv: Path, python: Path, state_root: Path) -> list[str]:
     return [
         str(uv),
         "pip",
         "compile",
         str(state_root / INPUT_NAME),
+        "--python",
+        str(python),
         "--output-file",
-        str(state_root / f".{PYLOCK_NAME}.tmp"),
+        str(state_root / PYLOCK_CANDIDATE_NAME),
         "--format",
         "pylock.toml",
         "--python-version",
@@ -1149,7 +1310,6 @@ def _command(uv: Path, state_root: Path) -> list[str]:
         "--no-config",
         "--no-python-downloads",
         "--no-managed-python",
-        "--no-build",
         "--only-binary",
         ":all:",
         "--prerelease",
@@ -1310,19 +1470,32 @@ def _execute_h3_prompt_rewriter_uv_resolution_unlocked(
     expected_plan_sha256: object,
     expected_input_sha256: object,
     expected_uv_sha256: object,
+    expected_python_sha256: object,
     uv_executable: object,
+    python_executable: object,
     private_feature_root: object,
     state_root: object,
     process_factory: Callable[..., object] = subprocess.Popen,
     monotonic: Callable[[], float] = time.monotonic,
+    diagnostic: dict[str, object],
 ) -> dict[str, object]:
     """Run one hash-bound uv resolution and emit private candidate evidence."""
+
+    diagnostic.update(
+        {
+            "phase": "pre_spawn",
+            "process_spawned": False,
+            "returncode": None,
+            "validated_pylock_candidate": False,
+        }
+    )
 
     if not isinstance(plan, H3PromptRewriterUvResolutionPlan):
         raise H3PromptRewriterUvResolutionSecurityError("resolution plan is invalid")
     expected_plan = _digest(expected_plan_sha256, "expected plan digest")
     expected_input = _digest(expected_input_sha256, "expected input digest")
     expected_uv = _digest(expected_uv_sha256, "expected uv digest")
+    expected_python = _digest(expected_python_sha256, "expected Python digest")
     if not hmac.compare_digest(plan.sha256, expected_plan):
         raise H3PromptRewriterUvResolutionSecurityError(
             "resolution plan digest changed"
@@ -1337,17 +1510,29 @@ def _execute_h3_prompt_rewriter_uv_resolution_unlocked(
             "requirements input digest changed"
         )
     uv = _inspect_uv(uv_executable)
+    python = _inspect_python(python_executable)
     if (
         not hmac.compare_digest(uv.sha256, expected_uv)
         or plan.document["uv"]["sha256"] != uv.sha256
+        or not hmac.compare_digest(python.sha256, expected_python)
+        or plan.document["bootstrap_python"]["sha256"] != python.sha256
+        or plan.document["bootstrap_python"]["size_bytes"] != python.size_bytes
+        or plan.document["bootstrap_python"]["version"] != python.version
+        or plan.document["bootstrap_python"]["canonical_path_sha256"]
+        != _python_path_sha256(python)
+        or plan.document["bootstrap_python"]["stat_identity_sha256"]
+        != _python_stat_sha256(python)
     ):
-        raise H3PromptRewriterUvResolutionSecurityError("uv executable digest changed")
+        raise H3PromptRewriterUvResolutionSecurityError(
+            "resolver executable binding changed"
+        )
     _feature, state = _layout(private_feature_root, state_root)
     _atomic_write(state / INPUT_NAME, input_payload)
-    command = _command(uv.path, state)
+    command = _command(uv.path, python.path, state)
     started = monotonic()
     process = None
     try:
+        diagnostic["phase"] = "spawn"
         try:
             process = process_factory(
                 command,
@@ -1365,6 +1550,8 @@ def _execute_h3_prompt_rewriter_uv_resolution_unlocked(
             raise H3PromptRewriterUvResolutionExecutionError(
                 "uv resolution process could not be started"
             ) from error
+        diagnostic["process_spawned"] = True
+        diagnostic["phase"] = "process_monitor"
         returncode = _wait_for_resolution(
             process,
             state,
@@ -1372,10 +1559,13 @@ def _execute_h3_prompt_rewriter_uv_resolution_unlocked(
             started=started,
             monotonic=monotonic,
         )
+        diagnostic["returncode"] = returncode
         if returncode != 0:
+            diagnostic["phase"] = "process_nonzero"
             raise H3PromptRewriterUvResolutionExecutionError(
                 "uv resolution failed; private temporary state was preserved"
             )
+        diagnostic["phase"] = "process_cleanup"
         _cleanup_process_group(process)
         resources = plan.document["resources"]
         _scan_private_state(
@@ -1383,8 +1573,10 @@ def _execute_h3_prompt_rewriter_uv_resolution_unlocked(
             byte_cap=int(resources["metadata_byte_cap"]),
             entry_cap=int(resources["metadata_entry_cap"]),
         )
-        temporary_pylock = state / f".{PYLOCK_NAME}.tmp"
+        diagnostic["phase"] = "pylock_schema"
+        temporary_pylock = state / PYLOCK_CANDIDATE_NAME
         _private_file(temporary_pylock, MAX_PYLOCK_BYTES)
+        diagnostic["validated_pylock_candidate"] = True
         final_pylock = state / PYLOCK_NAME
         if final_pylock.exists():
             _private_file(final_pylock, MAX_PYLOCK_BYTES)
@@ -1399,6 +1591,7 @@ def _execute_h3_prompt_rewriter_uv_resolution_unlocked(
             final_pylock, MAX_PYLOCK_BYTES
         )
         report = parse_uv_pylock_to_wheel_report(pylock_payload)
+        diagnostic["phase"] = "evidence_write"
         report_payload = _canonical_json(report) + b"\n"
         _atomic_write(state / REPORT_NAME, report_payload)
         report_sha = _sha256_bytes(report_payload)
@@ -1419,6 +1612,13 @@ def _execute_h3_prompt_rewriter_uv_resolution_unlocked(
                 "path": str(uv.path),
                 "stat_identity": list(uv.stat_identity),
             },
+            "bootstrap_python": {
+                "version": python.version,
+                "sha256": python.sha256,
+                "size_bytes": python.size_bytes,
+                "path": str(python.path),
+                "stat_identity": list(python.stat_identity),
+            },
             "pylock": {
                 "path": str(final_pylock),
                 "sha256": pylock_sha,
@@ -1434,6 +1634,7 @@ def _execute_h3_prompt_rewriter_uv_resolution_unlocked(
         }
         provenance_payload = _canonical_json(provenance) + b"\n"
         _atomic_write(state / PROVENANCE_NAME, provenance_payload)
+        diagnostic["phase"] = "complete"
         return {
             "report": report,
             "report_sha256": report_sha,
@@ -1453,7 +1654,9 @@ def _execute_h3_prompt_rewriter_uv_resolution_bound(
     expected_plan_sha256: object,
     expected_input_sha256: object,
     expected_uv_sha256: object,
+    expected_python_sha256: object,
     uv_executable: object,
+    python_executable: object,
     private_feature_root: object,
     state_root: object,
     process_factory: Callable[..., object] = subprocess.Popen,
@@ -1466,32 +1669,78 @@ def _execute_h3_prompt_rewriter_uv_resolution_bound(
     expected_plan = _digest(expected_plan_sha256, "expected plan digest")
     expected_input = _digest(expected_input_sha256, "expected input digest")
     expected_uv = _digest(expected_uv_sha256, "expected uv digest")
+    expected_python = _digest(expected_python_sha256, "expected Python digest")
     input_sha = _sha256_bytes(reviewed_requirements_input_bytes())
-    uv = _inspect_uv(uv_executable)
-    if (
-        not hmac.compare_digest(plan.sha256, expected_plan)
-        or not hmac.compare_digest(input_sha, expected_input)
-        or not hmac.compare_digest(uv.sha256, expected_uv)
-        or plan.document["requirements_input_sha256"] != input_sha
-        or plan.document["uv"]["sha256"] != uv.sha256
-    ):
-        raise H3PromptRewriterUvResolutionSecurityError(
-            "resolution execution bindings changed"
-        )
     _feature, state = _layout(private_feature_root, state_root)
     with _execution_lock(state):
-        _reconcile_pylock_pair(state)
-        return _execute_h3_prompt_rewriter_uv_resolution_unlocked(
-            plan,
-            expected_plan_sha256=expected_plan_sha256,
-            expected_input_sha256=expected_input_sha256,
-            expected_uv_sha256=expected_uv_sha256,
-            uv_executable=uv_executable,
-            private_feature_root=private_feature_root,
-            state_root=state_root,
-            process_factory=process_factory,
-            monotonic=monotonic,
-        )
+        failure_receipt = state / FAILURE_NAME
+        if failure_receipt.exists():
+            _private_file(failure_receipt, 16 * 1024)
+            raise H3PromptRewriterUvResolutionSecurityError(
+                "terminal resolution failure requires a fresh private state root"
+            )
+        uv = _inspect_uv(uv_executable)
+        python = _inspect_python(python_executable)
+        if (
+            not hmac.compare_digest(plan.sha256, expected_plan)
+            or not hmac.compare_digest(input_sha, expected_input)
+            or not hmac.compare_digest(uv.sha256, expected_uv)
+            or not hmac.compare_digest(python.sha256, expected_python)
+            or plan.document["requirements_input_sha256"] != input_sha
+            or plan.document["uv"]["sha256"] != uv.sha256
+            or plan.document["bootstrap_python"]["sha256"] != python.sha256
+            or plan.document["bootstrap_python"]["size_bytes"] != python.size_bytes
+            or plan.document["bootstrap_python"]["version"] != python.version
+            or plan.document["bootstrap_python"]["canonical_path_sha256"]
+            != _python_path_sha256(python)
+            or plan.document["bootstrap_python"]["stat_identity_sha256"]
+            != _python_stat_sha256(python)
+        ):
+            raise H3PromptRewriterUvResolutionSecurityError(
+                "resolution execution bindings changed"
+            )
+        diagnostic: dict[str, object] = {
+            "phase": "state_reconcile",
+            "process_spawned": False,
+            "returncode": None,
+            "validated_pylock_candidate": False,
+        }
+        try:
+            _reconcile_pylock_pair(state)
+            return _execute_h3_prompt_rewriter_uv_resolution_unlocked(
+                plan,
+                expected_plan_sha256=expected_plan_sha256,
+                expected_input_sha256=expected_input_sha256,
+                expected_uv_sha256=expected_uv_sha256,
+                expected_python_sha256=expected_python_sha256,
+                uv_executable=uv_executable,
+                python_executable=python_executable,
+                private_feature_root=private_feature_root,
+                state_root=state_root,
+                process_factory=process_factory,
+                monotonic=monotonic,
+                diagnostic=diagnostic,
+            )
+        except Exception as error:
+            try:
+                _write_failure_receipt(
+                    state,
+                    plan,
+                    diagnostic,
+                    error,
+                    input_sha256=input_sha,
+                    uv_sha256=uv.sha256,
+                    python_sha256=python.sha256,
+                )
+            except (
+                H3PromptRewriterUvResolutionError,
+                OSError,
+                subprocess.SubprocessError,
+            ) as receipt_error:
+                raise H3PromptRewriterUvResolutionExecutionError(
+                    "private resolution failure receipt could not be written"
+                ) from receipt_error
+            raise
 
 
 def execute_h3_prompt_rewriter_uv_resolution(
@@ -1500,7 +1749,9 @@ def execute_h3_prompt_rewriter_uv_resolution(
     expected_plan_sha256: object,
     expected_input_sha256: object,
     expected_uv_sha256: object,
+    expected_python_sha256: object,
     uv_executable: object,
+    python_executable: object,
     private_feature_root: object,
     state_root: object,
     process_factory: Callable[..., object] = subprocess.Popen,
@@ -1514,7 +1765,9 @@ def execute_h3_prompt_rewriter_uv_resolution(
             expected_plan_sha256=expected_plan_sha256,
             expected_input_sha256=expected_input_sha256,
             expected_uv_sha256=expected_uv_sha256,
+            expected_python_sha256=expected_python_sha256,
             uv_executable=uv_executable,
+            python_executable=python_executable,
             private_feature_root=private_feature_root,
             state_root=state_root,
             process_factory=process_factory,
