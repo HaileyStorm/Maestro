@@ -30,7 +30,7 @@ from pathlib import Path
 
 from services import h3_prompt_rewriter_dependency_closure as closure
 
-WHEEL_RESOLUTION_PLAN_SCHEMA = "maestro.h3-prompt-rewriter.wheel-plan.v2"
+WHEEL_RESOLUTION_PLAN_SCHEMA = "maestro.h3-prompt-rewriter.wheel-plan.v3"
 WHEEL_RESOLUTION_REPORT_SCHEMA = "maestro.h3-prompt-rewriter.wheel-report.v1"
 WHEEL_MANIFEST_SCHEMA = "maestro.h3-prompt-rewriter.wheel-manifest.v2"
 WHEEL_STATE_SCHEMA = "maestro.h3-prompt-rewriter.wheel-state.v2"
@@ -201,17 +201,24 @@ def build_h3_prompt_rewriter_wheel_resolution_plan(
             "exact_expected_sha256_required": True,
             "complete_graph_required_before_download": True,
             "exact_source_url_and_size_required": True,
-            "producer_included": False,
-            "live_execution_gate": "no_go_until_separate_pinned_uv_report_wave",
+            "producer_included": True,
+            "live_execution_gate": "source_bound_v5_report_and_review_required",
         },
         "sources": [
             {
                 "index": PYTORCH_INDEX,
-                "package_scope": "torch_torchvision_and_nvidia_dependencies",
+                "package_scope": "first_index_selected_packages",
+                "artifact_hosts": [
+                    "download.pytorch.org",
+                    "download-r2.pytorch.org",
+                    "files.pythonhosted.org",
+                    "pypi.nvidia.com_for_nvidia_packages_only",
+                ],
             },
             {
                 "index": PYPI_INDEX,
-                "package_scope": "remaining_roots_and_non_nvidia_dependencies",
+                "package_scope": "default_index_selected_packages",
+                "artifact_hosts": ["files.pythonhosted.org"],
             },
         ],
         "pip": {
@@ -279,7 +286,7 @@ def _bounded_plain_json(value: object) -> None:
         )
 
 
-def _source_url(filename: str, index: str, value: object) -> str:
+def _source_url(filename: str, package: str, index: str, value: object) -> str:
     if type(value) is not str or len(value) > 2048:
         raise H3PromptRewriterWheelResolverSecurityError("wheel source URL is invalid")
     if (
@@ -317,13 +324,25 @@ def _source_url(filename: str, index: str, value: object) -> str:
     ):
         raise H3PromptRewriterWheelResolverSecurityError("wheel source URL is invalid")
     if index == PYTORCH_INDEX:
-        expected_host = "download.pytorch.org"
-        valid = parsed.netloc == expected_host and decoded_path.startswith(
-            "/whl/cu128/"
+        valid = (
+            (
+                parsed.netloc in {"download.pytorch.org", "download-r2.pytorch.org"}
+                and decoded_path.startswith("/whl/")
+            )
+            or (
+                parsed.netloc == "files.pythonhosted.org"
+                and decoded_path.startswith("/packages/")
+            )
+            or (
+                package.startswith("nvidia-")
+                and parsed.netloc == "pypi.nvidia.com"
+                and decoded_path.startswith(f"/{package}/")
+            )
         )
     else:
-        expected_host = "files.pythonhosted.org"
-        valid = parsed.netloc == expected_host and decoded_path.startswith("/packages/")
+        valid = parsed.netloc == "files.pythonhosted.org" and decoded_path.startswith(
+            "/packages/"
+        )
     if not valid:
         raise H3PromptRewriterWheelResolverSecurityError(
             "wheel source provenance contradicts its assigned index"
@@ -418,10 +437,10 @@ def _load_report(payload: object, expected_sha256: object) -> _Report:
         size = wheel["size_bytes"]
         digest = wheel["sha256"]
         index = wheel["index"]
-        expected_index = (
-            PYTORCH_INDEX
+        expected_indexes = (
+            {PYTORCH_INDEX}
             if name in {"torch", "torchvision"} or name.startswith("nvidia-")
-            else PYPI_INDEX
+            else {PYPI_INDEX, PYTORCH_INDEX}
         )
         if (
             type(filename) is not str
@@ -429,12 +448,12 @@ def _load_report(payload: object, expected_sha256: object) -> _Report:
             or not 1 <= size <= MAX_BYTE_CAP
             or type(digest) is not str
             or _SHA256.fullmatch(digest) is None
-            or index != expected_index
+            or index not in expected_indexes
         ):
             raise H3PromptRewriterWheelResolverSecurityError(
                 "resolution wheel evidence is invalid"
             )
-        _source_url(filename, index, wheel["source_url"])
+        _source_url(filename, name, index, wheel["source_url"])
         total += size
         names.append(name)
         packages.append(dict(item))

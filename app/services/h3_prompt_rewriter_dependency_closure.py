@@ -17,7 +17,6 @@ from typing import Any
 
 from services import h3_prompt_rewriter as rewriter
 
-
 DEPENDENCY_INPUT_SCHEMA = "maestro.h3-prompt-rewriter.dependency-input.v1"
 DEPENDENCY_PLAN_SCHEMA = "maestro.h3-prompt-rewriter.dependency-plan.v1"
 
@@ -285,7 +284,7 @@ def _model_receipts() -> dict[str, object]:
 
 def _validate_manylinux_x86_64(platform_tag: str) -> None:
     for platform in platform_tag.split("."):
-        if platform == "manylinux2014_x86_64":
+        if platform in {"manylinux2010_x86_64", "manylinux2014_x86_64"}:
             continue
         match = re.fullmatch(r"manylinux_2_([0-9]+)_x86_64", platform)
         if match is None or int(match.group(1)) > 35:
@@ -303,9 +302,7 @@ def _validate_wheel_filename(filename: str, *, name: str, version: str) -> None:
         )
     components = filename[:-4].split("-")
     if len(components) not in {5, 6}:
-        raise H3PromptRewriterDependencyClosureError(
-            "wheel filename is not canonical"
-        )
+        raise H3PromptRewriterDependencyClosureError("wheel filename is not canonical")
     distribution, wheel_version = components[:2]
     if (
         _WHEEL_COMPONENT.fullmatch(distribution) is None
@@ -319,29 +316,24 @@ def _validate_wheel_filename(filename: str, *, name: str, version: str) -> None:
         )
     python_tag, abi_tag, platform_tag = components[-3:]
     if any(
-        _WHEEL_TAG.fullmatch(tag) is None
-        for tag in (python_tag, abi_tag, platform_tag)
+        _WHEEL_TAG.fullmatch(tag) is None for tag in (python_tag, abi_tag, platform_tag)
     ):
-        raise H3PromptRewriterDependencyClosureError(
-            "wheel tags are not canonical"
-        )
+        raise H3PromptRewriterDependencyClosureError("wheel tags are not canonical")
     python_tags = set(python_tag.split("."))
     abi_tags = set(abi_tag.split("."))
     normalized_name = _normalize_package(name)
-    py3_none = python_tags == {"py3"} and abi_tags == {"none"}
-    if py3_none and platform_tag == "any":
-        if (
-            normalized_name in _PURE_WHEEL_FORBIDDEN
-            or normalized_name.startswith("nvidia-")
+    pure_python = python_tags in ({"py3"}, {"py2", "py3"}) and abi_tags == {"none"}
+    if pure_python and platform_tag == "any":
+        if normalized_name in _PURE_WHEEL_FORBIDDEN or normalized_name.startswith(
+            "nvidia-"
         ):
             raise H3PromptRewriterDependencyClosureError(
                 "binary dependency may not use a pure-Python wheel"
             )
         return
-    if py3_none:
-        if (
-            normalized_name in _ROOT_PACKAGE_NAMES
-            or not normalized_name.startswith("nvidia-")
+    if pure_python:
+        if normalized_name in _ROOT_PACKAGE_NAMES or not normalized_name.startswith(
+            "nvidia-"
         ):
             raise H3PromptRewriterDependencyClosureError(
                 "platform-specific py3-none wheel is restricted to NVIDIA transitive packages"
@@ -377,7 +369,10 @@ def _validate_wheel_candidates(
         )
     _validate_wheel_filename(item["wheel_name"], name=package, version=version)
     _digest(item["sha256"], field=f"{package} unreviewed wheel digest")
-    if type(item["size_bytes"]) is not int or not 1 <= item["size_bytes"] <= 2 * 1024**4:
+    if (
+        type(item["size_bytes"]) is not int
+        or not 1 <= item["size_bytes"] <= 2 * 1024**4
+    ):
         raise H3PromptRewriterDependencyClosureError(
             f"{package} wheel size is outside its bound"
         )
@@ -442,9 +437,7 @@ def _validate_graph(packages: list[dict[str, object]]) -> list[dict[str, str]]:
         raise H3PromptRewriterDependencyClosureError(
             "dependency closure contains duplicate normalized packages"
         )
-    roots = {
-        _normalize_package(name): version for name, version in ROOT_PACKAGE_PINS
-    }
+    roots = {_normalize_package(name): version for name, version in ROOT_PACKAGE_PINS}
     if any(
         by_name.get(name, {}).get("version") != version
         for name, version in roots.items()
@@ -501,7 +494,9 @@ def _validate_graph(packages: list[dict[str, object]]) -> list[dict[str, str]]:
         raise H3PromptRewriterDependencyClosureError(
             "dependency graph contains unreachable packages"
         )
-    return sorted(edges, key=lambda item: (item["from"], item["to"], item["requirement"]))
+    return sorted(
+        edges, key=lambda item: (item["from"], item["to"], item["requirement"])
+    )
 
 
 def _inventory_sha256(
@@ -542,12 +537,11 @@ def _validate_resolution_claim(
         raise H3PromptRewriterDependencyClosureError(
             "complete resolution claim must name the reviewed resolver"
         )
-    if type(item["resolver_version"]) is not str or _VERSION.fullmatch(
-        item["resolver_version"]
-    ) is None:
-        raise H3PromptRewriterDependencyClosureError(
-            "resolver version is not exact"
-        )
+    if (
+        type(item["resolver_version"]) is not str
+        or _VERSION.fullmatch(item["resolver_version"]) is None
+    ):
+        raise H3PromptRewriterDependencyClosureError("resolver version is not exact")
     _digest(item["resolver_report_sha256"], field="resolver report digest")
     _digest(item["offline_replay_sha256"], field="offline replay digest")
     for field in (
@@ -744,11 +738,11 @@ def build_h3_prompt_rewriter_dependency_closure_plan(
 __all__ = [
     "DEPENDENCY_INPUT_SCHEMA",
     "DEPENDENCY_PLAN_SCHEMA",
+    "ROOT_REQUIREMENTS",
+    "RUNTIME_TARGET",
     "H3PromptRewriterDependencyClosureError",
     "H3PromptRewriterDependencyClosurePlan",
     "H3PromptRewriterDependencyClosureSecurityError",
-    "ROOT_REQUIREMENTS",
-    "RUNTIME_TARGET",
     "build_h3_prompt_rewriter_dependency_closure_plan",
     "reviewed_h3_prompt_rewriter_dependency_seed_bytes",
 ]

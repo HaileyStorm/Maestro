@@ -10,7 +10,6 @@ import sys
 import unittest
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "app"
 if str(APP) not in sys.path:
@@ -53,9 +52,7 @@ def _inventory_sha(value: dict[str, object]) -> str:
 class H3PromptRewriterDependencyClosureTests(unittest.TestCase):
     def seed(self) -> dict[str, object]:
         return json.loads(
-            closure.reviewed_h3_prompt_rewriter_dependency_seed_bytes().decode(
-                "ascii"
-            )
+            closure.reviewed_h3_prompt_rewriter_dependency_seed_bytes().decode("ascii")
         )
 
     def candidate(self, name: str, version: str) -> dict[str, object]:
@@ -67,11 +64,7 @@ class H3PromptRewriterDependencyClosureTests(unittest.TestCase):
             "torch",
             "torchvision",
         }
-        tags = (
-            "cp312-cp312-manylinux_2_28_x86_64"
-            if binary
-            else "py3-none-any"
-        )
+        tags = "cp312-cp312-manylinux_2_28_x86_64" if binary else "py3-none-any"
         return {
             "wheel_name": f"{normalized}-{version}-{tags}.whl",
             "sha256": _sha(f"unreviewed:{name}:{version}"),
@@ -155,9 +148,7 @@ class H3PromptRewriterDependencyClosureTests(unittest.TestCase):
                 "transformers==4.57.1",
             ],
         )
-        package_requirements = {
-            item["requirement"] for item in environment["packages"]
-        }
+        package_requirements = {item["requirement"] for item in environment["packages"]}
         self.assertEqual(package_requirements, set(environment["root_requirements"]))
         receipts = document["model_receipt_dependencies"]
         self.assertEqual(receipts["adapter"], rewriter.adapter_descriptor())
@@ -196,7 +187,9 @@ class H3PromptRewriterDependencyClosureTests(unittest.TestCase):
         self.assertFalse(bound.document["installation_authorized"])
         self.assertFalse(bound.document["execution_authorized"])
 
-    def test_wheel_candidates_reject_pure_binary_wrong_tags_and_multiple_selection(self):
+    def test_wheel_candidates_reject_pure_binary_wrong_tags_and_multiple_selection(
+        self,
+    ):
         cases = [
             (
                 "torch-2.10.0+cu128-py3-none-any.whl",
@@ -256,8 +249,7 @@ class H3PromptRewriterDependencyClosureTests(unittest.TestCase):
             "wheel_candidates": [
                 {
                     "wheel_name": (
-                        "nvidia_cublas_cu12-12.8.4.1-py3-none-"
-                        "manylinux_2_27_x86_64.whl"
+                        "nvidia_cublas_cu12-12.8.4.1-py3-none-manylinux_2_27_x86_64.whl"
                     ),
                     "sha256": _sha("unreviewed:nvidia-cublas-cu12:12.8.4.1"),
                     "size_bytes": 1000,
@@ -271,9 +263,7 @@ class H3PromptRewriterDependencyClosureTests(unittest.TestCase):
         )
         torch = next(item for item in value["packages"] if item["name"] == "torch")
         torch["dependencies"] = ["nvidia-cublas-cu12==12.8.4.1"]
-        plan = closure.build_h3_prompt_rewriter_dependency_closure_plan(
-            _encode(value)
-        )
+        plan = closure.build_h3_prompt_rewriter_dependency_closure_plan(_encode(value))
         self.assertEqual(plan.document["status"], "blocked")
         self.assertIn(
             "durable_reviewed_artifact_receipts_missing", plan.document["blockers"]
@@ -300,6 +290,25 @@ class H3PromptRewriterDependencyClosureTests(unittest.TestCase):
         )
         transformers["wheel_candidates"] = [candidate]
         self.assert_rejected(arbitrary, "restricted to NVIDIA transitive packages")
+
+        legacy = copy.deepcopy(value)
+        nvidia = next(
+            item for item in legacy["packages"] if item["name"] == "nvidia-cublas-cu12"
+        )
+        nvidia["wheel_candidates"][0]["wheel_name"] = (
+            "nvidia_cublas_cu12-12.8.4.1-py3-none-"
+            "manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
+        )
+        closure.build_h3_prompt_rewriter_dependency_closure_plan(_encode(legacy))
+
+        pure = self.seed()
+        urllib3 = next(
+            item for item in pure["packages"] if item["name"] == "transformers"
+        )
+        candidate = self.candidate("transformers", "4.57.1")
+        candidate["wheel_name"] = "transformers-4.57.1-py2.py3-none-any.whl"
+        urllib3["wheel_candidates"] = [candidate]
+        closure.build_h3_prompt_rewriter_dependency_closure_plan(_encode(pure))
 
         fabricated = self.fabricated_completion_claim()
         vision = next(
@@ -329,7 +338,9 @@ class H3PromptRewriterDependencyClosureTests(unittest.TestCase):
         for name in ("pillow", "torchvision"):
             value = self.seed()
             requirement = next(
-                item for item in value["root_requirements"] if item.startswith(name + "==")
+                item
+                for item in value["root_requirements"]
+                if item.startswith(name + "==")
             )
             value["root_requirements"].remove(requirement)
             value["packages"] = [
@@ -361,8 +372,9 @@ class H3PromptRewriterDependencyClosureTests(unittest.TestCase):
             b"{",
         ]
         for payload in hostile_payloads:
-            with self.subTest(payload=payload[:24]), self.assertRaises(
-                closure.H3PromptRewriterDependencyClosureError
+            with (
+                self.subTest(payload=payload[:24]),
+                self.assertRaises(closure.H3PromptRewriterDependencyClosureError),
             ):
                 closure.build_h3_prompt_rewriter_dependency_closure_plan(payload)
 

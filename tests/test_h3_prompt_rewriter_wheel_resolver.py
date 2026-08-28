@@ -350,6 +350,21 @@ class H3PromptRewriterWheelResolverTests(unittest.TestCase):
                 apply_parent_limits=lambda: None,
             )
         self.assertFalse(self.stage.exists())
+        with self.assertRaisesRegex(
+            resolver.H3PromptRewriterWheelResolverSecurityError, "report"
+        ):
+            resolver.execute_h3_prompt_rewriter_wheel_resolution(
+                plan,
+                expected_plan_sha256=plan.sha256,
+                resolution_report_payload=self.report_payload,
+                expected_resolution_report_sha256="0" * 64,
+                private_feature_root=self.feature,
+                staging_root=self.stage,
+                python_executable=self.python_executable,
+                process_factory=_FakePip(self.sources),
+                apply_parent_limits=lambda: None,
+            )
+        self.assertFalse(self.stage.exists())
 
     def test_report_hash_precedes_bounded_deep_json_validation(self):
         payload = b"[" * 2000 + b"0" + b"]" * 2000 + b"\n"
@@ -432,21 +447,56 @@ class H3PromptRewriterWheelResolverTests(unittest.TestCase):
                         apply_parent_limits=lambda: None,
                     )
                 self.assertFalse(self.stage.exists())
-        with self.assertRaisesRegex(
-            resolver.H3PromptRewriterWheelResolverSecurityError, "report"
-        ):
-            resolver.execute_h3_prompt_rewriter_wheel_resolution(
-                plan,
-                expected_plan_sha256=plan.sha256,
-                resolution_report_payload=self.report_payload,
-                expected_resolution_report_sha256="0" * 64,
-                private_feature_root=self.feature,
-                staging_root=self.stage,
-                python_executable=self.python_executable,
-                process_factory=_FakePip(self.sources),
-                apply_parent_limits=lambda: None,
+
+    def test_source_url_accepts_only_reviewed_uv_registry_artifact_hosts(self):
+        cases = (
+            (
+                "torch-2.10.0+cu128-cp312-cp312-manylinux_2_28_x86_64.whl",
+                "torch",
+                resolver.PYTORCH_INDEX,
+                (
+                    "https://download-r2.pytorch.org/whl/cu128/"
+                    "torch-2.10.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl"
+                ),
+            ),
+            (
+                "cuda_bindings-12.9.4-cp312-cp312-manylinux_2_28_x86_64.whl",
+                "cuda-bindings",
+                resolver.PYTORCH_INDEX,
+                (
+                    "https://files.pythonhosted.org/packages/aa/bb/"
+                    "cuda_bindings-12.9.4-cp312-cp312-manylinux_2_28_x86_64.whl"
+                ),
+            ),
+            (
+                "nvidia_cublas_cu12-12.8.4.1-py3-none-manylinux_2_27_x86_64.whl",
+                "nvidia-cublas-cu12",
+                resolver.PYTORCH_INDEX,
+                (
+                    "https://pypi.nvidia.com/nvidia-cublas-cu12/"
+                    "nvidia_cublas_cu12-12.8.4.1-py3-none-manylinux_2_27_x86_64.whl"
+                ),
+            ),
+        )
+        for filename, package, index, url in cases:
+            with self.subTest(package=package):
+                self.assertEqual(
+                    resolver._source_url(filename, package, index, url), url
+                )
+        with self.assertRaises(resolver.H3PromptRewriterWheelResolverSecurityError):
+            resolver._source_url(
+                "accelerate-1.12.0-py3-none-any.whl",
+                "accelerate",
+                resolver.PYPI_INDEX,
+                "https://download.pytorch.org/whl/accelerate-1.12.0-py3-none-any.whl",
             )
-        self.assertFalse(self.stage.exists())
+        with self.assertRaises(resolver.H3PromptRewriterWheelResolverSecurityError):
+            resolver._source_url(
+                "accelerate-1.12.0-py3-none-any.whl",
+                "accelerate",
+                resolver.PYTORCH_INDEX,
+                "https://pypi.nvidia.com/accelerate/accelerate-1.12.0-py3-none-any.whl",
+            )
 
     def test_deadline_stops_between_wheels_and_complete_attempt_resumes(self):
         plan = resolver.build_h3_prompt_rewriter_wheel_resolution_plan(

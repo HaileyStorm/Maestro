@@ -20,13 +20,14 @@ import stat
 import subprocess
 import time
 import urllib.parse
+import urllib.request
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 import tomllib
-from packaging.requirements import Requirement
+from packaging.markers import InvalidMarker, Marker
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import (
     InvalidWheelFilename,
@@ -38,7 +39,7 @@ from packaging.version import InvalidVersion, Version
 from services import h3_prompt_rewriter_dependency_closure as closure
 from services import h3_prompt_rewriter_wheel_resolver as wheel_resolver
 
-UV_RESOLUTION_PLAN_SCHEMA = "maestro.h3-prompt-rewriter.uv-resolution-plan.v4"
+UV_RESOLUTION_PLAN_SCHEMA = "maestro.h3-prompt-rewriter.uv-resolution-plan.v5"
 UV_RESOLUTION_PROVENANCE_SCHEMA = (
     "maestro.h3-prompt-rewriter.uv-resolution-provenance.v1"
 )
@@ -48,11 +49,14 @@ PINNED_UV_SHA256 = "0650696de7f403348e9dd617e1f65dc32147c106c40129138017efd8f0f0
 PINNED_UV_SIZE_BYTES = 56_224_064
 PYLOCK_NAME = "pylock.toml"
 PYLOCK_CANDIDATE_NAME = "pylock.candidate.toml"
+HASHED_REQUIREMENTS_NAME = "requirements.hashed.txt"
+HASHED_REQUIREMENTS_CANDIDATE_NAME = "requirements.hashed.candidate.txt"
 REPORT_NAME = "wheel-report.json"
 PROVENANCE_NAME = "resolution-provenance.json"
 INPUT_NAME = "requirements.in"
 FAILURE_NAME = "resolution-failure.json"
 MAX_PYLOCK_BYTES = 8 * 1024 * 1024
+MAX_HASHED_REQUIREMENTS_BYTES = 512 * 1024
 MAX_TOTAL_WHEEL_BYTES = wheel_resolver.MAX_BYTE_CAP
 MAX_DEADLINE_SECONDS = wheel_resolver.MAX_DEADLINE_SECONDS
 DEFAULT_METADATA_BYTE_CAP = 1024**3
@@ -85,6 +89,8 @@ _ALLOWED_STATE_FILES = {
     FAILURE_NAME,
     f".{INPUT_NAME}.tmp",
     PYLOCK_CANDIDATE_NAME,
+    HASHED_REQUIREMENTS_NAME,
+    HASHED_REQUIREMENTS_CANDIDATE_NAME,
     f".{REPORT_NAME}.tmp",
     f".{PROVENANCE_NAME}.tmp",
     f".{FAILURE_NAME}.tmp",
@@ -115,6 +121,20 @@ _TARGET = {
     "python_abi": "cp312",
     "platform": "manylinux_2_28_x86_64",
     "binary_wheels_only": True,
+}
+
+_MARKER_ENVIRONMENT = {
+    "implementation_name": "cpython",
+    "implementation_version": "3.12.14",
+    "os_name": "posix",
+    "platform_machine": "x86_64",
+    "platform_python_implementation": "CPython",
+    "platform_release": "",
+    "platform_system": "Linux",
+    "platform_version": "",
+    "python_full_version": "3.12.14",
+    "python_version": "3.12",
+    "sys_platform": "linux",
 }
 
 
@@ -451,9 +471,13 @@ def build_h3_prompt_rewriter_uv_resolution_plan(
         },
         "resolver": {
             "command": "uv pip compile",
-            "format": "pylock.toml",
-            "candidate_output_name": PYLOCK_CANDIDATE_NAME,
-            "canonical_output_name": PYLOCK_NAME,
+            "sequential_invocations": 2,
+            "formats": ["pylock.toml", "requirements.txt+hashes+annotations"],
+            "candidate_output_names": [
+                PYLOCK_CANDIDATE_NAME,
+                HASHED_REQUIREMENTS_CANDIDATE_NAME,
+            ],
+            "canonical_output_names": [PYLOCK_NAME, HASHED_REQUIREMENTS_NAME],
             "no_config": True,
             "no_python_downloads": True,
             "no_managed_python": True,
@@ -465,6 +489,8 @@ def build_h3_prompt_rewriter_uv_resolution_plan(
             "index_strategy": "first-index",
             "pytorch_index": wheel_resolver.PYTORCH_INDEX,
             "default_index": wheel_resolver.PYPI_INDEX,
+            "exact_size_evidence": "pylock_or_serial_https_head_content_length",
+            "head_redirects": "same_artifact_reviewed_hosts_only",
         },
         "resources": {
             "subprocess_concurrency": 1,
@@ -517,6 +543,7 @@ def build_h3_prompt_rewriter_uv_resolution_plan(
         },
         "outputs": {
             "pylock": "private_candidate",
+            "hashed_requirements": "private_candidate",
             "wheel_report_schema": wheel_resolver.WHEEL_RESOLUTION_REPORT_SCHEMA,
             "provenance": "private_unreviewed_candidate",
             "atomic_mode": "0600",
@@ -1250,7 +1277,7 @@ def _manylinux_floor(platform: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def _compatible_wheel(filename: str, package: str, version: str) -> bool:
+def _wheel_priority(filename: str, package: str, version: str) -> tuple[int, int, int]:
     try:
         distribution, wheel_version, _build, tags = parse_wheel_filename(filename)
     except InvalidWheelFilename as error:
@@ -1261,11 +1288,11 @@ def _compatible_wheel(filename: str, package: str, version: str) -> bool:
         raise H3PromptRewriterUvResolutionSecurityError(
             "wheel filename contradicts package identity"
         )
-    matches = False
+    priorities: list[tuple[int, int, int]] = []
     for tag in tags:
         if tag.interpreter == "py3" and tag.abi == "none" and tag.platform == "any":
             if package not in _BINARY_ROOTS and not package.startswith("nvidia-"):
-                matches = True
+                priorities.append((1, 0, 0))
             continue
         floor = _manylinux_floor(tag.platform)
         if floor is None:
@@ -1274,18 +1301,18 @@ def _compatible_wheel(filename: str, package: str, version: str) -> bool:
             continue
         if package.startswith("nvidia-"):
             if tag.interpreter == "py3" and tag.abi == "none":
-                matches = True
+                priorities.append((2, floor, 0))
             continue
         if tag.interpreter == "cp312" and tag.abi == "cp312":
-            matches = True
+            priorities.append((4, floor, 12))
             continue
         abi3 = re.fullmatch(r"cp3([0-9]+)", tag.interpreter)
         if tag.abi == "abi3" and abi3 and int(abi3.group(1)) <= 12:
-            matches = True
-    return matches
+            priorities.append((3, floor, int(abi3.group(1))))
+    return max(priorities, default=(0, 0, 0))
 
 
-def _source_url(value: object, filename: str, expected_index: str) -> str:
+def _source_url(value: object, filename: str, package: str, selected_index: str) -> str:
     if type(value) is not str or len(value) > 2048:
         raise H3PromptRewriterUvResolutionSecurityError("wheel URL is invalid")
     parsed = urllib.parse.urlsplit(value)
@@ -1306,14 +1333,32 @@ def _source_url(value: object, filename: str, expected_index: str) -> str:
         or decoded_path.split("/")[-1] != filename
     ):
         raise H3PromptRewriterUvResolutionSecurityError("wheel URL is invalid")
-    pytorch = expected_index == wheel_resolver.PYTORCH_INDEX
-    valid = (
-        parsed.hostname == "download.pytorch.org"
-        and parsed.path.startswith("/whl/cu128/")
-        if pytorch
-        else parsed.hostname == "files.pythonhosted.org"
-        and parsed.path.startswith("/packages/")
-    )
+    if parsed.port is not None or parsed.netloc != parsed.hostname:
+        raise H3PromptRewriterUvResolutionSecurityError("wheel URL is invalid")
+    if selected_index == wheel_resolver.PYPI_INDEX:
+        valid = parsed.hostname == "files.pythonhosted.org" and parsed.path.startswith(
+            "/packages/"
+        )
+    elif selected_index == wheel_resolver.PYTORCH_INDEX:
+        valid = (
+            (
+                parsed.hostname in {"download.pytorch.org", "download-r2.pytorch.org"}
+                and parsed.path.startswith("/whl/")
+            )
+            or (
+                parsed.hostname == "files.pythonhosted.org"
+                and parsed.path.startswith("/packages/")
+            )
+            or (
+                package.startswith("nvidia-")
+                and parsed.hostname == "pypi.nvidia.com"
+                and parsed.path.startswith(f"/{package}/")
+            )
+        )
+    else:
+        valid = False
+    if package in {"torch", "torchvision"} or package.startswith("nvidia-"):
+        valid = valid and selected_index == wheel_resolver.PYTORCH_INDEX
     if not valid:
         raise H3PromptRewriterUvResolutionSecurityError(
             "wheel URL violates its registry partition"
@@ -1321,70 +1366,82 @@ def _source_url(value: object, filename: str, expected_index: str) -> str:
     return value
 
 
-def _dependency_names(value: object) -> list[tuple[str, str | None]]:
-    if value is None:
-        return []
-    if type(value) is not list:
-        raise H3PromptRewriterUvResolutionSecurityError(
-            "pylock dependency list is invalid"
+def _head_content_length(
+    url: str,
+    package: str,
+    selected_index: str,
+    filename: str,
+    *,
+    timeout: float,
+) -> int:
+    if timeout <= 0:
+        raise H3PromptRewriterUvResolutionExecutionError(
+            "wheel size lookup crossed its deadline"
         )
-    dependencies: list[tuple[str, str | None]] = []
-    for raw in value:
-        if type(raw) is str:
-            try:
-                parsed = Requirement(raw)
-            except Exception as error:
+    _source_url(url, filename, package, selected_index)
+    request = urllib.request.Request(
+        url,
+        method="HEAD",
+        headers={"User-Agent": "Maestro-H3-metadata-canary/1"},
+    )
+
+    class ReviewedRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            _source_url(newurl, filename, package, selected_index)
+            prior_host = urllib.parse.urlsplit(req.full_url).hostname
+            new_host = urllib.parse.urlsplit(newurl).hostname
+            if not (
+                prior_host == "download.pytorch.org"
+                and new_host == "download-r2.pytorch.org"
+            ):
                 raise H3PromptRewriterUvResolutionSecurityError(
-                    "pylock dependency is invalid"
-                ) from error
-            if parsed.url or parsed.marker or parsed.extras:
-                raise H3PromptRewriterUvResolutionSecurityError(
-                    "direct, marked, or extra dependencies are forbidden"
+                    "wheel size lookup redirected outside its reviewed artifact host"
                 )
-            dependencies.append(
-                (canonicalize_name(parsed.name), str(parsed.specifier) or None)
-            )
-            continue
-        if (
-            type(raw) is not dict
-            or not set(raw) <= {"name", "specifier"}
-            or "name" not in raw
-        ):
-            raise H3PromptRewriterUvResolutionSecurityError(
-                "pylock dependency fields are invalid"
-            )
-        name = raw["name"]
-        if type(name) is not str:
-            raise H3PromptRewriterUvResolutionSecurityError(
-                "pylock dependency identity is invalid"
-            )
-        specifier = None
-        if "specifier" in raw:
-            if type(raw["specifier"]) is not str:
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), ReviewedRedirectHandler()
+    )
+    try:
+        with opener.open(request, timeout=min(timeout, 5.0)) as response:
+            final_url = response.geturl()
+            _source_url(final_url, filename, package, selected_index)
+            original_host = urllib.parse.urlsplit(url).hostname
+            final_host = urllib.parse.urlsplit(final_url).hostname
+            if final_url != url and not (
+                original_host == "download.pytorch.org"
+                and final_host == "download-r2.pytorch.org"
+            ):
                 raise H3PromptRewriterUvResolutionSecurityError(
-                    "pylock dependency specifier is invalid"
+                    "wheel size lookup redirected outside its reviewed artifact host"
                 )
-            try:
-                SpecifierSet(raw["specifier"])
-            except InvalidSpecifier as error:
-                raise H3PromptRewriterUvResolutionSecurityError(
-                    "pylock dependency specifier is invalid"
-                ) from error
-            specifier = raw["specifier"] or None
-        dependencies.append((canonicalize_name(name), specifier))
-    names = [name for name, _specifier in dependencies]
-    if names != sorted(set(names)):
-        raise H3PromptRewriterUvResolutionSecurityError(
-            "pylock dependencies are not unique canonical order"
+            value = response.headers.get("Content-Length")
+    except H3PromptRewriterUvResolutionError:
+        raise
+    except (OSError, ValueError) as error:
+        raise H3PromptRewriterUvResolutionExecutionError(
+            "wheel size metadata could not be read"
+        ) from error
+    if value is None or not value.isascii() or not value.isdigit():
+        raise H3PromptRewriterUvResolutionExecutionError(
+            "wheel size metadata is unavailable"
         )
-    return dependencies
+    size = int(value)
+    if not 1 <= size <= MAX_TOTAL_WHEEL_BYTES:
+        raise H3PromptRewriterUvResolutionSecurityError(
+            "wheel size metadata is outside its bound"
+        )
+    return size
 
 
 def _wheel_row(
-    raw: object, package: str, version: str, expected_index: str
-) -> dict[str, object] | None:
+    raw: object,
+    package: str,
+    version: str,
+    selected_index: str,
+    requirement_hashes: frozenset[str],
+) -> tuple[tuple[int, int, int], dict[str, object]] | None:
     if type(raw) is not dict or not set(raw) <= {
-        "name",
         "url",
         "size",
         "hashes",
@@ -1393,37 +1450,182 @@ def _wheel_row(
         raise H3PromptRewriterUvResolutionSecurityError(
             "pylock wheel fields are invalid"
         )
-    if not {"name", "url", "size", "hashes"} <= set(raw):
-        raise H3PromptRewriterUvResolutionSecurityError(
-            "pylock wheel lacks exact byte evidence"
-        )
-    filename, size, hashes = raw["name"], raw["size"], raw["hashes"]
+    if not {"url", "hashes"} <= set(raw):
+        raise H3PromptRewriterUvResolutionSecurityError("pylock wheel is incomplete")
+    if type(raw["url"]) is not str:
+        raise H3PromptRewriterUvResolutionSecurityError("wheel URL is invalid")
+    filename = urllib.parse.unquote(urllib.parse.urlsplit(raw["url"]).path).split("/")[
+        -1
+    ]
+    hashes = raw["hashes"]
+    size = raw.get("size")
     if (
         type(filename) is not str
-        or type(size) is not int
-        or not 1 <= size <= MAX_TOTAL_WHEEL_BYTES
+        or (
+            size is not None
+            and (type(size) is not int or not 1 <= size <= MAX_TOTAL_WHEEL_BYTES)
+        )
         or type(hashes) is not dict
-        or set(hashes) != {"sha256"}
+        or not set(hashes) <= {"sha256"}
     ):
         raise H3PromptRewriterUvResolutionSecurityError(
             "pylock wheel byte evidence is invalid"
         )
-    digest = _digest(hashes["sha256"], "wheel digest")
-    url = _source_url(raw["url"], filename, expected_index)
-    if not _compatible_wheel(filename, package, version):
+    if "sha256" in hashes:
+        digest = _digest(hashes["sha256"], "wheel digest")
+        if digest not in requirement_hashes:
+            raise H3PromptRewriterUvResolutionSecurityError(
+                "pylock wheel digest contradicts hashed requirements"
+            )
+    elif len(requirement_hashes) == 1:
+        digest = next(iter(requirement_hashes))
+    else:
+        raise H3PromptRewriterUvResolutionSecurityError(
+            "selected wheel digest is ambiguous"
+        )
+    url = _source_url(raw["url"], filename, package, selected_index)
+    priority = _wheel_priority(filename, package, version)
+    if priority == (0, 0, 0):
         return None
-    return {
+    return priority, {
         "filename": filename,
         "size_bytes": size,
         "sha256": digest,
-        "index": expected_index,
+        "index": selected_index,
         "source_url": url,
     }
 
 
-def parse_uv_pylock_to_wheel_report(payload: object) -> dict[str, object]:
-    """Parse a single-target PEP 751 candidate into resolver report v1."""
+def _parse_hashed_requirements(
+    payload: object, *, requirements_reference: str
+) -> dict[str, dict[str, object]]:
+    if (
+        type(payload) is not bytes
+        or not 1 <= len(payload) <= MAX_HASHED_REQUIREMENTS_BYTES
+        or type(requirements_reference) is not str
+        or not requirements_reference.startswith("/")
+    ):
+        raise H3PromptRewriterUvResolutionSecurityError(
+            "hashed requirements bytes are outside their bound"
+        )
+    try:
+        lines = payload.decode("utf-8").splitlines()
+    except UnicodeError as error:
+        raise H3PromptRewriterUvResolutionSecurityError(
+            "hashed requirements are invalid"
+        ) from error
+    if (
+        len(lines) < 3
+        or lines[0] != "# This file was autogenerated by uv via the following command:"
+    ):
+        raise H3PromptRewriterUvResolutionSecurityError(
+            "hashed requirements header is invalid"
+        )
+    lines = lines[2:]
+    rows: dict[str, dict[str, object]] = {}
+    position = 0
+    header = re.compile(r"([a-z0-9][a-z0-9._-]{0,127})==([^ \\]+) \\")
+    hash_line = re.compile(r"    --hash=sha256:([0-9a-f]{64})( \\)?")
+    while position < len(lines):
+        match = header.fullmatch(lines[position])
+        if match is None:
+            raise H3PromptRewriterUvResolutionSecurityError(
+                "hashed requirements package line is invalid"
+            )
+        name = canonicalize_name(match.group(1))
+        version = match.group(2)
+        if name != match.group(1) or name in rows:
+            raise H3PromptRewriterUvResolutionSecurityError(
+                "hashed requirements package identity is invalid"
+            )
+        try:
+            parsed_version = Version(version)
+        except InvalidVersion as error:
+            raise H3PromptRewriterUvResolutionSecurityError(
+                "hashed requirements version is invalid"
+            ) from error
+        if str(parsed_version) != version or parsed_version.is_prerelease:
+            raise H3PromptRewriterUvResolutionSecurityError(
+                "hashed requirements version is invalid"
+            )
+        position += 1
+        hashes: list[str] = []
+        while position < len(lines) and (
+            digest := hash_line.fullmatch(lines[position])
+        ):
+            hashes.append(digest.group(1))
+            position += 1
+        if not hashes or hashes != sorted(set(hashes)):
+            raise H3PromptRewriterUvResolutionSecurityError(
+                "hashed requirements digests are invalid"
+            )
+        parents: list[str] = []
+        if position >= len(lines) or not lines[position].startswith("    # via"):
+            raise H3PromptRewriterUvResolutionSecurityError(
+                "hashed requirements dependency provenance is missing"
+            )
+        via = lines[position][len("    # via") :].strip()
+        position += 1
+        if via:
+            parents.append(via)
+        else:
+            while position < len(lines) and lines[position].startswith("    #   "):
+                parents.append(lines[position][len("    #   ") :])
+                position += 1
+        if position >= len(lines) or not lines[position].startswith("    # from "):
+            raise H3PromptRewriterUvResolutionSecurityError(
+                "hashed requirements registry annotation is missing"
+            )
+        index = lines[position][len("    # from ") :]
+        position += 1
+        if index not in {wheel_resolver.PYPI_INDEX, wheel_resolver.PYTORCH_INDEX}:
+            raise H3PromptRewriterUvResolutionSecurityError(
+                "hashed requirements registry annotation is invalid"
+            )
+        canonical_parents: list[str] = []
+        root = False
+        for parent in parents:
+            if parent == f"-r {requirements_reference}":
+                root = True
+                continue
+            if parent.startswith("-r "):
+                raise H3PromptRewriterUvResolutionSecurityError(
+                    "hashed requirements references an unknown input"
+                )
+            canonical = canonicalize_name(parent)
+            if canonical != parent:
+                raise H3PromptRewriterUvResolutionSecurityError(
+                    "hashed requirements dependency parent is noncanonical"
+                )
+            canonical_parents.append(canonical)
+        if canonical_parents != sorted(set(canonical_parents)):
+            raise H3PromptRewriterUvResolutionSecurityError(
+                "hashed requirements dependency parents are invalid"
+            )
+        rows[name] = {
+            "version": version,
+            "hashes": frozenset(hashes),
+            "parents": tuple(canonical_parents),
+            "root": root,
+            "index": index,
+        }
+    if list(rows) != sorted(rows):
+        raise H3PromptRewriterUvResolutionSecurityError(
+            "hashed requirements packages are not canonical order"
+        )
+    return rows
 
+
+def parse_uv_resolution_evidence_to_wheel_report(
+    pylock_payload: object,
+    hashed_requirements_payload: object,
+    *,
+    requirements_reference: str,
+    size_resolver: Callable[[str, str, str, str], int],
+) -> dict[str, object]:
+    """Join pinned uv's selected-artifact and dependency-graph evidence."""
+
+    payload = pylock_payload
     if type(payload) is not bytes or not 1 <= len(payload) <= MAX_PYLOCK_BYTES:
         raise H3PromptRewriterUvResolutionSecurityError(
             "pylock bytes are outside their bound"
@@ -1476,21 +1678,23 @@ def parse_uv_pylock_to_wheel_report(payload: object) -> dict[str, object]:
         raise H3PromptRewriterUvResolutionSecurityError(
             "pylock package inventory is invalid"
         )
-    pending: list[tuple[str, str, list[tuple[str, str | None]], dict[str, object]]] = []
+    requirements = _parse_hashed_requirements(
+        hashed_requirements_payload, requirements_reference=requirements_reference
+    )
+    pending: list[tuple[str, str, dict[str, object]]] = []
     seen: set[str] = set()
     for raw in raw_packages:
         allowed_package = {
             "name",
             "version",
             "requires-python",
-            "dependencies",
             "wheels",
-            "index",
+            "marker",
         }
         if (
             type(raw) is not dict
             or not set(raw) <= allowed_package
-            or not {"name", "version", "wheels", "index"} <= set(raw)
+            or not {"name", "version", "wheels"} <= set(raw)
         ):
             raise H3PromptRewriterUvResolutionSecurityError(
                 "pylock package fields are invalid or contain a non-registry source"
@@ -1518,15 +1722,27 @@ def parse_uv_pylock_to_wheel_report(payload: object) -> dict[str, object]:
                 "pylock package identity is noncanonical, duplicate, or prerelease"
             )
         seen.add(name)
-        expected_index = (
-            wheel_resolver.PYTORCH_INDEX
-            if name in {"torch", "torchvision"} or name.startswith("nvidia-")
-            else wheel_resolver.PYPI_INDEX
-        )
-        if raw["index"] != expected_index:
+        requirement_row = requirements.get(name)
+        if requirement_row is None or requirement_row["version"] != version_value:
             raise H3PromptRewriterUvResolutionSecurityError(
-                "pylock package index violates the registry partition"
+                "pylock and hashed requirements inventories disagree"
             )
+        marker = raw.get("marker")
+        if marker is not None:
+            if type(marker) is not str:
+                raise H3PromptRewriterUvResolutionSecurityError(
+                    "pylock package marker is invalid"
+                )
+            try:
+                selected = Marker(marker).evaluate(_MARKER_ENVIRONMENT)
+            except InvalidMarker as error:
+                raise H3PromptRewriterUvResolutionSecurityError(
+                    "pylock package marker is invalid"
+                ) from error
+            if not selected:
+                raise H3PromptRewriterUvResolutionSecurityError(
+                    "pylock contains a package outside the reviewed target"
+                )
         if "requires-python" in raw:
             if type(raw["requires-python"]) is not str:
                 raise H3PromptRewriterUvResolutionSecurityError(
@@ -1552,16 +1768,35 @@ def parse_uv_pylock_to_wheel_report(payload: object) -> dict[str, object]:
         compatible = [
             row
             for item in raw_wheels
-            if (row := _wheel_row(item, name, version_value, expected_index))
+            if (
+                row := _wheel_row(
+                    item,
+                    name,
+                    version_value,
+                    str(requirement_row["index"]),
+                    requirement_row["hashes"],
+                )
+            )
             is not None
         ]
-        if len(compatible) != 1:
+        if not compatible:
             raise H3PromptRewriterUvResolutionSecurityError(
-                "pylock must select exactly one compatible target wheel"
+                "pylock has no compatible target wheel"
             )
-        dependencies = _dependency_names(raw.get("dependencies"))
-        pending.append((name, version_value, dependencies, compatible[0]))
-    versions = {name: version for name, version, _deps, _wheel in pending}
+        best_priority = max(priority for priority, _wheel in compatible)
+        selected_wheels = [
+            wheel for priority, wheel in compatible if priority == best_priority
+        ]
+        if len(selected_wheels) != 1:
+            raise H3PromptRewriterUvResolutionSecurityError(
+                "pylock target wheel selection is ambiguous"
+            )
+        pending.append((name, version_value, selected_wheels[0]))
+    if set(requirements) != seen:
+        raise H3PromptRewriterUvResolutionSecurityError(
+            "pylock and hashed requirements inventories disagree"
+        )
+    versions = {name: version for name, version, _wheel in pending}
     roots = {
         canonicalize_name(name): version for name, version in closure.ROOT_PACKAGE_PINS
     }
@@ -1569,39 +1804,33 @@ def parse_uv_pylock_to_wheel_report(payload: object) -> dict[str, object]:
         raise H3PromptRewriterUvResolutionSecurityError(
             "pylock misses an exact reviewed root"
         )
-    adjacency: dict[str, list[str]] = {}
-    rows: list[dict[str, object]] = []
-    total = 0
-    for name, version, dependency_rows, wheel in pending:
-        dependency_names = [dependency for dependency, _specifier in dependency_rows]
-        if any(dependency not in versions for dependency in dependency_names):
-            raise H3PromptRewriterUvResolutionSecurityError(
-                "pylock contains an unresolved dependency"
-            )
-        for dependency, specifier in dependency_rows:
-            if specifier is not None and Version(
-                versions[dependency]
-            ) not in SpecifierSet(specifier):
-                raise H3PromptRewriterUvResolutionSecurityError(
-                    "pylock dependency specifier contradicts the selected version"
-                )
-        dependencies = [
-            f"{dependency}=={versions[dependency]}" for dependency in dependency_names
-        ]
-        adjacency[name] = list(dependency_names)
-        total += int(wheel["size_bytes"])
-        if total > MAX_TOTAL_WHEEL_BYTES:
-            raise H3PromptRewriterUvResolutionSecurityError(
-                "resolved wheel inventory exceeds 8 GiB"
-            )
-        rows.append(
-            {
-                "name": name,
-                "version": version,
-                "requirement": f"{name}=={version}",
-                "dependencies": dependencies,
-                "wheel": wheel,
-            }
+    root_rows = {name for name, row in requirements.items() if row["root"]}
+    if root_rows != set(roots):
+        raise H3PromptRewriterUvResolutionSecurityError(
+            "hashed requirements roots disagree with the reviewed input"
+        )
+    adjacency = {
+        name: sorted(
+            dependency
+            for dependency, row in requirements.items()
+            if name in row["parents"]
+        )
+        for name in requirements
+    }
+    if any(
+        parent not in requirements
+        for row in requirements.values()
+        for parent in row["parents"]
+    ):
+        raise H3PromptRewriterUvResolutionSecurityError(
+            "hashed requirements contains an unresolved dependency parent"
+        )
+    if (
+        sum(len(dependencies) for dependencies in adjacency.values())
+        > closure.MAX_EDGES
+    ):
+        raise H3PromptRewriterUvResolutionSecurityError(
+            "hashed requirements dependency graph exceeds its edge bound"
         )
     state = {name: 0 for name in adjacency}
     for root in sorted(roots):
@@ -1630,6 +1859,37 @@ def parse_uv_pylock_to_wheel_report(payload: object) -> dict[str, object]:
         raise H3PromptRewriterUvResolutionSecurityError(
             "pylock contains unreachable packages"
         )
+    rows: list[dict[str, object]] = []
+    total = 0
+    for name, version, wheel in pending:
+        if wheel["size_bytes"] is None:
+            wheel["size_bytes"] = size_resolver(
+                str(wheel["source_url"]),
+                name,
+                str(wheel["index"]),
+                str(wheel["filename"]),
+            )
+        if type(wheel["size_bytes"]) is not int:
+            raise H3PromptRewriterUvResolutionSecurityError(
+                "wheel size evidence is invalid"
+            )
+        total += int(wheel["size_bytes"])
+        if total > MAX_TOTAL_WHEEL_BYTES:
+            raise H3PromptRewriterUvResolutionSecurityError(
+                "resolved wheel inventory exceeds 8 GiB"
+            )
+        rows.append(
+            {
+                "name": name,
+                "version": version,
+                "requirement": f"{name}=={version}",
+                "dependencies": [
+                    f"{dependency}=={versions[dependency]}"
+                    for dependency in adjacency[name]
+                ],
+                "wheel": wheel,
+            }
+        )
     rows.sort(key=lambda item: str(item["name"]))
     report = {
         "schema": wheel_resolver.WHEEL_RESOLUTION_REPORT_SCHEMA,
@@ -1649,6 +1909,14 @@ def parse_uv_pylock_to_wheel_report(payload: object) -> dict[str, object]:
             "wheel report failed the downstream compatibility gate"
         ) from error
     return report
+
+
+def parse_uv_pylock_to_wheel_report(payload: object) -> dict[str, object]:
+    """Reject the former single-document claim; uv 0.9.26 omits required evidence."""
+
+    raise H3PromptRewriterUvResolutionSecurityError(
+        "uv pylock requires separate hash, graph, and size evidence"
+    )
 
 
 def _apply_child_limits() -> None:
@@ -1906,8 +2174,10 @@ def _child_environment(state_root: Path) -> dict[str, str]:
     }
 
 
-def _command(uv: Path, python: Path, state_root: Path) -> list[str]:
-    return [
+def _command(
+    uv: Path, python: Path, state_root: Path, *, hashed_requirements: bool = False
+) -> list[str]:
+    command = [
         str(uv),
         "pip",
         "compile",
@@ -1915,9 +2185,14 @@ def _command(uv: Path, python: Path, state_root: Path) -> list[str]:
         "--python",
         str(python),
         "--output-file",
-        str(state_root / PYLOCK_CANDIDATE_NAME),
-        "--format",
-        "pylock.toml",
+        str(
+            state_root
+            / (
+                HASHED_REQUIREMENTS_CANDIDATE_NAME
+                if hashed_requirements
+                else PYLOCK_CANDIDATE_NAME
+            )
+        ),
         "--python-version",
         "3.12.14",
         "--python-platform",
@@ -1942,6 +2217,11 @@ def _command(uv: Path, python: Path, state_root: Path) -> list[str]:
         "--color",
         "never",
     ]
+    if hashed_requirements:
+        command.extend(["--generate-hashes", "--emit-index-annotation"])
+    else:
+        command.extend(["--format", "pylock.toml"])
+    return command
 
 
 def _process_group_exists(pid: int) -> bool:
@@ -2121,7 +2401,7 @@ def _execute_h3_prompt_rewriter_uv_resolution_unlocked(
     rss_sampler: Callable[[int], int] | None = None,
     diagnostic: dict[str, object],
 ) -> dict[str, object]:
-    """Run one hash-bound uv resolution and emit private candidate evidence."""
+    """Run two sequential hash-bound uv views and emit private candidate evidence."""
 
     diagnostic.update(
         {
@@ -2171,47 +2451,55 @@ def _execute_h3_prompt_rewriter_uv_resolution_unlocked(
         )
     _feature, state = _layout(private_feature_root, state_root)
     _atomic_write(state / INPUT_NAME, input_payload)
-    command = _command(uv.path, python.path, state)
     started = monotonic()
     process = None
     try:
-        diagnostic["phase"] = "spawn"
-        try:
-            process = process_factory(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                shell=False,
-                close_fds=True,
-                start_new_session=True,
-                cwd=state,
-                env=_child_environment(state),
-                preexec_fn=_apply_child_limits,
+        for ordinal, hashed_requirements in enumerate((False, True), start=1):
+            command = _command(
+                uv.path,
+                python.path,
+                state,
+                hashed_requirements=hashed_requirements,
             )
-        except (OSError, subprocess.SubprocessError) as error:
-            raise H3PromptRewriterUvResolutionExecutionError(
-                "uv resolution process could not be started"
-            ) from error
-        diagnostic["process_spawned"] = True
-        diagnostic["phase"] = "process_monitor"
-        returncode = _wait_for_resolution(
-            process,
-            state,
-            plan,
-            started=started,
-            monotonic=monotonic,
-            diagnostic=diagnostic,
-            rss_sampler=rss_sampler,
-        )
-        diagnostic["returncode"] = returncode
-        if returncode != 0:
-            diagnostic["phase"] = "process_nonzero"
-            raise H3PromptRewriterUvResolutionExecutionError(
-                "uv resolution failed; private temporary state was preserved"
+            suffix = "" if ordinal == 1 else f"_{ordinal}"
+            diagnostic["phase"] = f"spawn{suffix}"
+            try:
+                process = process_factory(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    shell=False,
+                    close_fds=True,
+                    start_new_session=True,
+                    cwd=state,
+                    env=_child_environment(state),
+                    preexec_fn=_apply_child_limits,
+                )
+            except (OSError, subprocess.SubprocessError) as error:
+                raise H3PromptRewriterUvResolutionExecutionError(
+                    "uv resolution process could not be started"
+                ) from error
+            diagnostic["process_spawned"] = True
+            diagnostic["phase"] = f"process_monitor{suffix}"
+            returncode = _wait_for_resolution(
+                process,
+                state,
+                plan,
+                started=started,
+                monotonic=monotonic,
+                diagnostic=diagnostic,
+                rss_sampler=rss_sampler,
             )
-        diagnostic["phase"] = "process_cleanup"
-        _cleanup_process_group(process)
+            diagnostic["returncode"] = returncode
+            if returncode != 0:
+                diagnostic["phase"] = f"process_nonzero{suffix}"
+                raise H3PromptRewriterUvResolutionExecutionError(
+                    "uv resolution failed; private temporary state was preserved"
+                )
+            diagnostic["phase"] = f"process_cleanup{suffix}"
+            _cleanup_process_group(process)
+            process = None
         resources = plan.document["resources"]
         _scan_private_state(
             state,
@@ -2235,7 +2523,39 @@ def _execute_h3_prompt_rewriter_uv_resolution_unlocked(
         pylock_size, pylock_sha, pylock_payload = _hash_private_file(
             final_pylock, MAX_PYLOCK_BYTES
         )
-        report = parse_uv_pylock_to_wheel_report(pylock_payload)
+        temporary_requirements = state / HASHED_REQUIREMENTS_CANDIDATE_NAME
+        _private_file(temporary_requirements, MAX_HASHED_REQUIREMENTS_BYTES)
+        final_requirements = state / HASHED_REQUIREMENTS_NAME
+        if final_requirements.exists():
+            _private_file(final_requirements, MAX_HASHED_REQUIREMENTS_BYTES)
+            if final_requirements.read_bytes() != temporary_requirements.read_bytes():
+                raise H3PromptRewriterUvResolutionSecurityError(
+                    "new hashed requirements conflict with preserved evidence"
+                )
+            temporary_requirements.unlink()
+        else:
+            os.replace(temporary_requirements, final_requirements)
+        requirements_size, requirements_sha, requirements_payload = _hash_private_file(
+            final_requirements, MAX_HASHED_REQUIREMENTS_BYTES
+        )
+        deadline = float(plan.document["resources"]["deadline_seconds"])
+
+        def size_resolver(url: str, package: str, index: str, filename: str) -> int:
+            remaining = deadline - (monotonic() - started)
+            return _head_content_length(
+                url,
+                package,
+                index,
+                filename,
+                timeout=remaining,
+            )
+
+        report = parse_uv_resolution_evidence_to_wheel_report(
+            pylock_payload,
+            requirements_payload,
+            requirements_reference=str(state / INPUT_NAME),
+            size_resolver=size_resolver,
+        )
         diagnostic["phase"] = "evidence_write"
         report_payload = _canonical_json(report) + b"\n"
         _atomic_write(state / REPORT_NAME, report_payload)
@@ -2268,6 +2588,11 @@ def _execute_h3_prompt_rewriter_uv_resolution_unlocked(
                 "path": str(final_pylock),
                 "sha256": pylock_sha,
                 "size_bytes": pylock_size,
+            },
+            "hashed_requirements": {
+                "path": str(final_requirements),
+                "sha256": requirements_sha,
+                "size_bytes": requirements_size,
             },
             "wheel_report": {
                 "path": str(state / REPORT_NAME),
@@ -2440,6 +2765,8 @@ def execute_h3_prompt_rewriter_uv_resolution(
 
 
 __all__ = [
+    "HASHED_REQUIREMENTS_CANDIDATE_NAME",
+    "HASHED_REQUIREMENTS_NAME",
     "PINNED_UV_SHA256",
     "PINNED_UV_SIZE_BYTES",
     "PINNED_UV_VERSION",
@@ -2452,5 +2779,6 @@ __all__ = [
     "build_h3_prompt_rewriter_uv_resolution_plan",
     "execute_h3_prompt_rewriter_uv_resolution",
     "parse_uv_pylock_to_wheel_report",
+    "parse_uv_resolution_evidence_to_wheel_report",
     "reviewed_requirements_input_bytes",
 ]
