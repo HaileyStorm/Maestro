@@ -8,6 +8,7 @@ import json
 import struct
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from types import MappingProxyType
@@ -30,6 +31,32 @@ assert _RUNNER_SPEC is not None and _RUNNER_SPEC.loader is not None
 benchmark = importlib.util.module_from_spec(_RUNNER_SPEC)
 sys.modules[_RUNNER_SPEC.name] = benchmark
 _RUNNER_SPEC.loader.exec_module(benchmark)
+
+_HANDLER_PATH = APP / "models" / "minimax_h3" / "minimax_h3_handler.py"
+_DEFINITION_PATHS = {
+    beta3.TEN_EROS_BETA3_SKIP_ID: (
+        APP / "defaults" / "minimax_h3_10eros_beta3_skip_edges.json"
+    ),
+    beta3.TEN_EROS_BETA3_FULL_ID: (
+        APP / "defaults" / "minimax_h3_10eros_beta3_full.json"
+    ),
+}
+
+
+def _load_handler_module():
+    spec = importlib.util.spec_from_file_location(
+        "models.minimax_h3._beta3_registration_handler", _HANDLER_PATH,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    torch_stub = types.ModuleType("torch")
+    torch_stub.bfloat16 = "bfloat16"
+    with mock.patch.dict(sys.modules, {"torch": torch_stub}):
+        spec.loader.exec_module(module)
+    return module
+
+
+_HANDLER = _load_handler_module()
 
 _MARKER = json.dumps({
     "format": "int8_tensorwise",
@@ -157,6 +184,193 @@ class H310ErosBeta3Tests(unittest.TestCase):
         )
         with self.assertRaises(TypeError):
             beta3._ARTIFACT_CATALOG[beta3.TEN_EROS_BETA3_SKIP_ID]["size"] = 1
+
+    def test_stage2a_definitions_match_catalog_and_remain_opt_in(self):
+        artifacts = {
+            item["artifact_id"]: item
+            for item in beta3.get_10eros_beta3_catalog()["artifacts"]
+        }
+        for artifact_id, path in _DEFINITION_PATHS.items():
+            with self.subTest(artifact_id=artifact_id):
+                defaults = json.loads(path.read_text(encoding="utf-8"))
+                model = defaults["model"]
+                artifact = artifacts[artifact_id]
+                self.assertEqual(model["architecture"], "minimax_h3_10eros_beta3")
+                self.assertEqual(model["URLs"], [
+                    "https://huggingface.co/"
+                    f"{artifact['repository']}/resolve/{artifact['revision']}/"
+                    f"{artifact['filename']}"
+                ])
+                self.assertEqual(
+                    model["h3_10eros_beta3_profile_id"], artifact["profile_id"]
+                )
+                self.assertEqual(
+                    model["h3_10eros_beta3_repository_head"],
+                    artifact["repository_head"],
+                )
+                self.assertEqual(
+                    model["h3_10eros_beta3_revision"], artifact["revision"]
+                )
+                self.assertEqual(
+                    model["h3_10eros_beta3_filename"], artifact["filename"]
+                )
+                self.assertEqual(model["h3_10eros_beta3_size"], artifact["size"])
+                self.assertEqual(
+                    model["h3_10eros_beta3_sha256"], artifact["sha256"]
+                )
+                self.assertEqual(model["h3_10eros_beta3_mode"], "turbo_hybrid")
+                self.assertTrue(model["experimental"])
+                self.assertTrue(model["opt_in_only"])
+                self.assertTrue(model["scaffold_only"])
+                self.assertTrue(model["h3_convrot"])
+                self.assertEqual(model["minimax_h3_qkv_layout"], "contiguous")
+                self.assertEqual(model["compatible_model_paths"], {})
+                self.assertEqual(model["compatible_model_qkv_layouts"], {})
+                self.assertFalse(model["execution_available"])
+                self.assertFalse(model["enabled_by_default"])
+                self.assertFalse(model["automatic_fallback"])
+                self.assertEqual(defaults["num_inference_steps"], 6)
+                self.assertEqual(
+                    defaults["h3_10eros_beta3_sampler"], "er_sde/simple"
+                )
+                self.assertEqual(
+                    defaults["custom_settings"], {"h3_attention_engine": "sdpa"}
+                )
+                self.assertEqual(defaults["tea_cache"], 0)
+                self.assertEqual(defaults["skip_steps_cache_type"], "")
+                self.assertEqual(defaults["activated_loras"], [])
+                self.assertEqual(defaults["loras_multipliers"], "")
+
+    def test_stage2a_handler_neutralizes_fl2va_and_rejects_execution(self):
+        handler = _HANDLER.family_handler
+        self.assertEqual(
+            handler.query_supported_types(),
+            ["minimax_h3", "minimax_h3_ref2va", "minimax_h3_10eros_beta3"],
+        )
+        self.assertNotIn(
+            "minimax_h3_10eros_beta3", handler.query_family_maps()[0]
+        )
+        artifacts = {
+            item["artifact_id"]: item
+            for item in beta3.get_10eros_beta3_catalog()["artifacts"]
+        }
+        for artifact_id, path in _DEFINITION_PATHS.items():
+            with self.subTest(artifact_id=artifact_id):
+                artifact = artifacts[artifact_id]
+                raw = json.loads(path.read_text(encoding="utf-8"))["model"]
+                inherited = handler.query_model_def(
+                    "minimax_h3_10eros_beta3", raw
+                )
+                merged = {**inherited, **raw}
+                self.assertTrue(merged["t2v_class"])
+                self.assertFalse(merged["i2v_class"])
+                self.assertEqual(merged["image_prompt_types_allowed"], "")
+                self.assertFalse(merged["end_frames_always_enabled"])
+                self.assertEqual(merged["minimax_h3_conditioning_mode"], "unwired")
+                self.assertEqual(merged["required_runtime_assets"], {})
+                self.assertEqual(merged["text_encoder_URLs"], [])
+                self.assertEqual(merged["compatible_model_paths"], {})
+                self.assertEqual(merged["compatible_model_qkv_layouts"], {})
+                self.assertEqual(merged["compatible_text_encoder_paths"], {})
+                self.assertEqual(
+                    merged["h3_10eros_beta3_contract"], artifacts[artifact_id]
+                )
+                self.assertEqual(
+                    handler.validate_generative_settings(
+                        path.stem, merged, {}
+                    ),
+                    _HANDLER._BETA3_UNWIRED_MESSAGE,
+                )
+                self.assertEqual(
+                    handler.query_model_files(
+                        [], "minimax_h3_10eros_beta3", merged
+                    ),
+                    [],
+                )
+                with self.assertRaisesRegex(
+                    _HANDLER.H310ErosBeta3UnwiredError,
+                    "runtime execution remains unavailable",
+                ):
+                    handler.load_model(
+                        artifact["filename"],
+                        model_type=path.stem,
+                        base_model_type="minimax_h3_10eros_beta3",
+                        model_def=merged,
+                    )
+                defaults = {}
+                handler.update_default_settings(
+                    "minimax_h3_10eros_beta3", merged, defaults
+                )
+                self.assertEqual(defaults["num_inference_steps"], 6)
+                self.assertEqual(
+                    defaults["custom_settings"], {"h3_attention_engine": "sdpa"}
+                )
+                self.assertEqual(defaults["image_prompt_type"], "")
+                self.assertEqual(defaults["video_prompt_type"], "")
+                self.assertEqual(defaults["audio_prompt_type"], "")
+
+    def test_stage2a_handler_rejects_identity_and_policy_drift(self):
+        handler = _HANDLER.family_handler
+        raw = json.loads(
+            _DEFINITION_PATHS[beta3.TEN_EROS_BETA3_SKIP_ID].read_text(
+                encoding="utf-8"
+            )
+        )["model"]
+        corruptions = {
+            "artifact": {"h3_10eros_beta3_artifact_id": "unknown"},
+            "architecture": {"architecture": "minimax_h3"},
+            "profile": {"h3_10eros_beta3_profile_id": "wrong"},
+            "revision": {"h3_10eros_beta3_revision": "0" * 40},
+            "size": {"h3_10eros_beta3_size": 1},
+            "sha": {"h3_10eros_beta3_sha256": "0" * 64},
+            "url": {"URLs": ["https://example.invalid/model.safetensors"]},
+            "convrot": {"h3_convrot": False},
+            "qkv": {"minimax_h3_qkv_layout": "interleaved"},
+            "alias": {"compatible_model_qkv_layouts": {"wrong": "interleaved"}},
+            "execution": {"execution_available": True},
+            "default": {"enabled_by_default": True},
+            "fallback": {"automatic_fallback": True},
+        }
+        for label, patch in corruptions.items():
+            with self.subTest(label=label), self.assertRaises(
+                _HANDLER.H310ErosBeta3UnwiredError
+            ):
+                handler.query_model_def(
+                    "minimax_h3_10eros_beta3", {**raw, **patch}
+                )
+
+        legacy_architecture = {**raw, "architecture": "minimax_h3"}
+        self.assertTrue(
+            handler._is_beta3_definition(
+                "minimax_h3_10eros_beta3_skip_edges", legacy_architecture
+            )
+        )
+        with self.assertRaises(_HANDLER.H310ErosBeta3UnwiredError):
+            handler.load_model(
+                raw["h3_10eros_beta3_filename"],
+                model_type="minimax_h3_10eros_beta3_skip_edges",
+                base_model_type="minimax_h3",
+                model_def=legacy_architecture,
+            )
+
+        stripped = {
+            key: value
+            for key, value in raw.items()
+            if key not in _HANDLER._BETA3_DEFINITION_MARKERS
+        }
+        stripped["architecture"] = "minimax_h3"
+        self.assertTrue(
+            handler._is_beta3_definition(
+                "minimax_h3_10eros_beta3_skip_edges", stripped
+            )
+        )
+        with self.assertRaises(_HANDLER.H310ErosBeta3UnwiredError):
+            handler.load_model(
+                raw["h3_10eros_beta3_filename"],
+                model_type="minimax_h3_10eros_beta3_skip_edges",
+                base_model_type="minimax_h3",
+                model_def=stripped,
+            )
 
     def test_service_evaluation_and_benchmark_descriptors_remain_in_parity(self):
         evaluation = h3_evaluation.get_h3_profile_catalog()["profiles"]

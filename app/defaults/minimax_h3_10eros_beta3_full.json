@@ -1,0 +1,58 @@
+{
+    "model": {
+        "name": "10Eros MiniMax H3 Beta3 Full ConvRot (Unwired)",
+        "architecture": "minimax_h3_10eros_beta3",
+        "description": "Opt-in 10Eros Beta3 TURBO Hybrid experiment with all transformer blocks in INT8 ConvRot form. This is a distinct complete checkpoint, not FL2VA or Ref2VA. Exact identity is registered, but generation remains fail-closed until the dedicated runtime is wired and accepted.",
+        "URLs": [
+            "https://huggingface.co/cicalooo/10Eros-Max-h3-int8-convrot/resolve/84ea7a6ec06e0cb5f2f35615e25e3529c5ec6c02/10Eros_Max_h3_TURBO-hybrid_beta3_int8_convrot.safetensors"
+        ],
+        "experimental": true,
+        "opt_in_only": true,
+        "scaffold_only": true,
+        "h3_convrot": true,
+        "minimax_h3_qkv_layout": "contiguous",
+        "compatible_model_paths": {},
+        "compatible_model_qkv_layouts": {},
+        "h3_10eros_beta3_artifact_id": "10eros_beta3_turbo_hybrid_full",
+        "h3_10eros_beta3_profile_id": "minimax_h3_10eros_beta3_turbo_hybrid_full",
+        "h3_10eros_beta3_repository": "cicalooo/10Eros-Max-h3-int8-convrot",
+        "h3_10eros_beta3_repository_head": "dbdd87944063bc01d8062bae1dba12212ca4061f",
+        "h3_10eros_beta3_revision": "84ea7a6ec06e0cb5f2f35615e25e3529c5ec6c02",
+        "h3_10eros_beta3_filename": "10Eros_Max_h3_TURBO-hybrid_beta3_int8_convrot.safetensors",
+        "h3_10eros_beta3_size": 20973147816,
+        "h3_10eros_beta3_sha256": "ebd0cb25273253213028bea0289da4c5c94929027ed9191fbb24fc924d4a8f0d",
+        "h3_10eros_beta3_mode": "turbo_hybrid",
+        "h3_10eros_beta3_authored_evaluations": 6,
+        "h3_10eros_beta3_sampler_candidates": [
+            "er_sde/simple",
+            "multires/simple"
+        ],
+        "h3_10eros_beta3_incompatible_stacking": [
+            "maestro_turbo",
+            "spectrum",
+            "lightx2v",
+            "sage_attention",
+            "step_cache"
+        ],
+        "execution_available": false,
+        "enabled_by_default": false,
+        "automatic_fallback": false
+    },
+    "prompt": "A cinematic scene with natural motion, synchronized dialogue, and detailed environmental sound.",
+    "num_inference_steps": 6,
+    "h3_10eros_beta3_sampler": "er_sde/simple",
+    "video_length": 124,
+    "resolution": "1344x768",
+    "guidance_scale": 1.0,
+    "custom_settings": {"h3_attention_engine": "sdpa"},
+    "tea_cache": 0,
+    "skip_steps_cache_type": "",
+    "activated_loras": [],
+    "loras_multipliers": "",
+    "spatial_upsampling": "",
+    "delivery_resolution": "",
+    "delivery_fit": "",
+    "image_prompt_type": "",
+    "video_prompt_type": "",
+    "audio_prompt_type": ""
+}

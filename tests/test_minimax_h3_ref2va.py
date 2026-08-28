@@ -248,7 +248,8 @@ class TestMiniMaxH3Ref2VADefinition(unittest.TestCase):
     def test_ref2va_contract_is_arbitrary_reference_not_keyframe_mode(self):
         model_def = self.handler.query_model_def("minimax_h3_ref2va", {})
         self.assertEqual(
-            self.handler.query_supported_types(), ["minimax_h3", "minimax_h3_ref2va"]
+            self.handler.query_supported_types(),
+            ["minimax_h3", "minimax_h3_ref2va", "minimax_h3_10eros_beta3"],
         )
         self.assertTrue(model_def["minimax_h3_reference_mode"])
         self.assertFalse(model_def["sliding_window"])

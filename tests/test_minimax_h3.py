@@ -493,7 +493,7 @@ class TestMiniMaxH3Definition(unittest.TestCase):
         model_def = self.handler.query_model_def("minimax_h3", {})
         self.assertEqual(
             self.handler.query_supported_types(),
-            ["minimax_h3", "minimax_h3_ref2va"],
+            ["minimax_h3", "minimax_h3_ref2va", "minimax_h3_10eros_beta3"],
         )
         self.assertEqual((model_def["fps"], model_def["frames_minimum"]), (24, 124))
         self.assertEqual((model_def["frames_steps"], model_def["frames_maximum"]), (17, 345))

@@ -1,4 +1,4 @@
-"""Maestro family handler for MiniMax H3 FL2VA and Ref2VA."""
+"""MiniMax H3 FL2VA/Ref2VA handler plus fail-closed Beta3 registration."""
 
 from __future__ import annotations
 
@@ -9,6 +9,26 @@ import torch
 
 _MODEL_TYPE = "minimax_h3"
 _REF2VA_MODEL_TYPE = "minimax_h3_ref2va"
+_BETA3_MODEL_TYPE = "minimax_h3_10eros_beta3"
+_BETA3_SELECTABLE_MODEL_TYPES = frozenset({
+    "minimax_h3_10eros_beta3_skip_edges",
+    "minimax_h3_10eros_beta3_full",
+})
+_BETA3_DEFINITION_MARKERS = frozenset({
+    "h3_10eros_beta3_artifact_id",
+    "h3_10eros_beta3_profile_id",
+    "h3_10eros_beta3_repository",
+    "h3_10eros_beta3_repository_head",
+    "h3_10eros_beta3_revision",
+    "h3_10eros_beta3_filename",
+    "h3_10eros_beta3_size",
+    "h3_10eros_beta3_sha256",
+    "h3_10eros_beta3_mode",
+})
+_BETA3_UNWIRED_MESSAGE = (
+    "10Eros MiniMax H3 Beta3 is registered for explicit selection and exact "
+    "checkpoint identity only; runtime execution remains unavailable"
+)
 _COMFY_REPO = "Comfy-Org/MiniMax-H3"
 _COMFY_REVISION = "0543966fbdce5ba05709a8f2031c94bdba629b4a"
 _COMFY_REF2VA_REVISION = "eb8a16107c595128b3a578f82d2ce2f75920c355"
@@ -76,6 +96,77 @@ _REF2VA_LIMITS = {
 
 def _is_reference_mode(base_model_type: str) -> bool:
     return base_model_type == _REF2VA_MODEL_TYPE
+
+
+def _is_beta3_mode(base_model_type: str) -> bool:
+    return base_model_type == _BETA3_MODEL_TYPE
+
+
+class H310ErosBeta3UnwiredError(RuntimeError):
+    """A Beta3 definition reached an execution path before runtime wiring."""
+
+
+def _beta3_artifact_for_model_def(base_model_type: str, model_def: object):
+    """Bind a selectable Beta3 definition to the immutable service catalog."""
+
+    if not _is_beta3_mode(base_model_type):
+        return None
+    if type(model_def) is not dict:
+        raise H310ErosBeta3UnwiredError(
+            "10Eros MiniMax H3 Beta3 requires an exact model definition"
+        )
+
+    from services.h3_10eros_beta3 import get_10eros_beta3_catalog
+
+    artifacts = {
+        artifact["artifact_id"]: artifact
+        for artifact in get_10eros_beta3_catalog()["artifacts"]
+    }
+    artifact = artifacts.get(model_def.get("h3_10eros_beta3_artifact_id"))
+    if artifact is None:
+        raise H310ErosBeta3UnwiredError(
+            "The selected 10Eros MiniMax H3 Beta3 artifact is not registered"
+        )
+
+    expected = {
+        "architecture": _BETA3_MODEL_TYPE,
+        "h3_10eros_beta3_profile_id": artifact["profile_id"],
+        "h3_10eros_beta3_repository": artifact["repository"],
+        "h3_10eros_beta3_repository_head": artifact["repository_head"],
+        "h3_10eros_beta3_revision": artifact["revision"],
+        "h3_10eros_beta3_filename": artifact["filename"],
+        "h3_10eros_beta3_size": artifact["size"],
+        "h3_10eros_beta3_sha256": artifact["sha256"],
+        "h3_10eros_beta3_mode": artifact["mode"],
+        "h3_10eros_beta3_authored_evaluations": 6,
+        "h3_10eros_beta3_sampler_candidates": artifact[
+            "maestro_experiment_policy"
+        ]["schedule"]["sampler_candidates"],
+        "h3_10eros_beta3_incompatible_stacking": artifact[
+            "maestro_experiment_policy"
+        ]["incompatible_stacking"],
+    }
+    if any(model_def.get(key) != value for key, value in expected.items()):
+        raise H310ErosBeta3UnwiredError(
+            "The selected 10Eros MiniMax H3 Beta3 definition does not match its catalog"
+        )
+    expected_url = _hf_url(
+        artifact["repository"], artifact["revision"], artifact["filename"]
+    )
+    if (
+        model_def.get("URLs") != [expected_url]
+        or model_def.get("h3_convrot") is not True
+        or model_def.get("minimax_h3_qkv_layout") != "contiguous"
+        or model_def.get("compatible_model_paths") != {}
+        or model_def.get("compatible_model_qkv_layouts") != {}
+        or model_def.get("execution_available") is not False
+        or model_def.get("enabled_by_default") is not False
+        or model_def.get("automatic_fallback") is not False
+    ):
+        raise H310ErosBeta3UnwiredError(
+            "The selected 10Eros MiniMax H3 Beta3 definition is not fail-closed"
+        )
+    return artifact
 
 
 def _hf_url(repo_id: str, revision: str, *parts: str) -> str:
@@ -235,6 +326,20 @@ def _normalize_resolution(value) -> str:
 
 class family_handler:
     @staticmethod
+    def _is_beta3_definition(model_type, model_def):
+        return (
+            model_type == _BETA3_MODEL_TYPE
+            or model_type in _BETA3_SELECTABLE_MODEL_TYPES
+            or (
+                type(model_def) is dict
+                and (
+                    model_def.get("architecture") == _BETA3_MODEL_TYPE
+                    or any(key in model_def for key in _BETA3_DEFINITION_MARKERS)
+                )
+            )
+        )
+
+    @staticmethod
     def _apply_fresh_profile_defaults(ui_defaults):
         """Hydrate omitted H3 controls from the curated High profile."""
         from services.h3_profiles import default_profile_settings
@@ -248,7 +353,7 @@ class family_handler:
 
     @staticmethod
     def query_supported_types():
-        return [_MODEL_TYPE, _REF2VA_MODEL_TYPE]
+        return [_MODEL_TYPE, _REF2VA_MODEL_TYPE, _BETA3_MODEL_TYPE]
 
     @staticmethod
     def query_family_maps():
@@ -265,6 +370,11 @@ class family_handler:
     @staticmethod
     def query_model_def(base_model_type, model_def):
         reference_mode = _is_reference_mode(base_model_type)
+        beta3_artifact = (
+            _beta3_artifact_for_model_def(_BETA3_MODEL_TYPE, model_def)
+            if family_handler._is_beta3_definition(base_model_type, model_def)
+            else None
+        )
         native_boundary_enabled = (
             os.environ.get("MAESTRO_H3_NATIVE_BOUNDARY_EXPERIMENTAL") == "1"
         )
@@ -302,7 +412,7 @@ class family_handler:
             "minimax_h3_assets_root": _ASSETS_ROOT,
             "required_runtime_assets": _required_runtime_asset_manifest(),
             "minimax_h3_reference_mode": reference_mode,
-            # The two H3 checkpoints accept different kinds of conditioning.
+            # The two executable H3 checkpoints accept different conditioning.
             # Keep this machine-readable so Studio can render semantic refs
             # without treating them as timeline/keyframe anchors.
             "minimax_h3_conditioning_mode": (
@@ -446,10 +556,32 @@ class family_handler:
                     ],
                 }
             )
+        elif beta3_artifact is not None:
+            result.update(
+                {
+                    "i2v_class": False,
+                    "image_prompt_types_allowed": "",
+                    "end_frames_always_enabled": False,
+                    "minimax_h3_conditioning_mode": "unwired",
+                    "required_runtime_assets": {},
+                    "text_encoder_URLs": [],
+                    "compatible_model_paths": {},
+                    "compatible_model_qkv_layouts": {},
+                    "compatible_text_encoder_paths": {},
+                    "runtime_custom_settings": ["h3_attention_engine"],
+                    "h3_10eros_beta3_contract": beta3_artifact,
+                    "execution_available": False,
+                    "enabled_by_default": False,
+                    "automatic_fallback": False,
+                }
+            )
         return result
 
     @staticmethod
     def validate_generative_settings(base_model_type, model_def, inputs):
+        if family_handler._is_beta3_definition(base_model_type, model_def):
+            _beta3_artifact_for_model_def(_BETA3_MODEL_TYPE, model_def)
+            return _BETA3_UNWIRED_MESSAGE
         custom_settings = inputs.get("custom_settings")
         from services.h3_audio import (
             H3AudioCompatibilityError,
@@ -689,6 +821,9 @@ class family_handler:
 
     @staticmethod
     def query_model_files(computeList, base_model_type, model_def=None):
+        if family_handler._is_beta3_definition(base_model_type, model_def):
+            _beta3_artifact_for_model_def(_BETA3_MODEL_TYPE, model_def)
+            return []
         return [
             {
                 "repoId": _COMFY_REPO,
@@ -719,6 +854,12 @@ class family_handler:
         text_encoder_filename=None,
         **kwargs,
     ):
+        if (
+            family_handler._is_beta3_definition(model_type, model_def)
+            or family_handler._is_beta3_definition(base_model_type, model_def)
+        ):
+            _beta3_artifact_for_model_def(_BETA3_MODEL_TYPE, model_def)
+            raise H310ErosBeta3UnwiredError(_BETA3_UNWIRED_MESSAGE)
         from .minimax_h3_main import MiniMaxH3Model
 
         model = MiniMaxH3Model(
@@ -746,6 +887,25 @@ class family_handler:
 
     @staticmethod
     def update_default_settings(base_model_type, model_def, ui_defaults):
+        if base_model_type == _BETA3_MODEL_TYPE:
+            _beta3_artifact_for_model_def(base_model_type, model_def)
+            ui_defaults.update(
+                {
+                    "num_inference_steps": 6,
+                    "video_length": 124,
+                    "resolution": "1344x768",
+                    "guidance_scale": 1.0,
+                    "custom_settings": {"h3_attention_engine": "sdpa"},
+                    "tea_cache": 0,
+                    "skip_steps_cache_type": "",
+                    "activated_loras": [],
+                    "loras_multipliers": "",
+                    "image_prompt_type": "",
+                    "video_prompt_type": "",
+                    "audio_prompt_type": "",
+                }
+            )
+            return
         reference_mode = _is_reference_mode(base_model_type)
         family_handler._apply_fresh_profile_defaults(ui_defaults)
         ui_defaults.update(
@@ -772,6 +932,11 @@ class family_handler:
 
     @staticmethod
     def fix_settings(base_model_type, settings_version, model_def, ui_defaults):
+        if base_model_type == _BETA3_MODEL_TYPE:
+            family_handler.update_default_settings(
+                base_model_type, model_def, ui_defaults
+            )
+            return
         # Saved settings created before this family existed cannot need a
         # migration, but imported presets still need valid H3 geometry.
         from .packing import align_num_frames
