@@ -1,10 +1,11 @@
-"""Data-only catalog and resolver for official MiniMax H3 style workflows.
+"""Data-only catalog and resolver for MiniMax H3 style workflows.
 
 Maestro does not install, execute, or follow upstream agent skills.  It reads
 only bounded text files from the official MiniMax-H3 GitHub repository,
 normalizes a bounded provenance/display schema, and atomically publishes a
-last-known-good catalog. Generate and Director accept only an exact workflow
-ID; the server resolves and revision-binds Maestro's adapted prompt brief.
+last-known-good catalog alongside Maestro-native craft families. Generate and
+Director accept only an exact workflow ID; the server resolves and
+revision-binds Maestro's adapted prompt brief.
 """
 from __future__ import annotations
 
@@ -38,7 +39,10 @@ MAX_TEMPLATE_BYTES = 96 * 1024
 MAX_TOTAL_LINKED_BYTES = 4 * 1024 * 1024
 MAX_TEMPLATES_PER_STYLE = 2
 WORKFLOW_SELECTION_SCHEMA_VERSION = 1
+COMPOSER_DOCUMENT_SCHEMA_VERSION = 1
 WORKFLOW_IDENTITY_SOURCE = "official_minimax_h3_skill"
+NATIVE_CRAFT_IDENTITY_SOURCE = "maestro_native_h3_craft"
+NATIVE_CRAFT_SOURCE = "maestro_native_h3_craft_catalog"
 WORKFLOW_SURFACE = "huggingface_hub_canvas"
 PROMPT_BRIEF_PROVENANCE = "maestro_adapted"
 SUPPORTED_PROMPT_SCHEMAS = (
@@ -51,8 +55,14 @@ SUPPORTED_MODEL_TYPES = (
     "minimax_h3_w4a8_fl2va",
     "minimax_h3_ref2va",
 )
+PHYSICAL_INPUT_KINDS = ("picture", "video", "audio")
+COMPOSER_ROLE_TYPES = (
+    "source_subject", "performance", "wardrobe", "camera", "timing", "audio",
+)
+CAMERA_OWNERS = ("manual", "path_planner")
 
 _STYLE_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_COMPOSER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$")
 _PATH_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$")
 _HEADING = re.compile(r"^###\s+([a-z0-9][a-z0-9-]{1,79})\s*$", re.MULTILINE)
 _SECTION_HEADING = re.compile(r"^#{2,4}\s+(.{1,120})\s*$", re.MULTILINE)
@@ -82,6 +92,14 @@ _CANONICAL_RECORD = re.compile(
     r"(?P<tail>\s*\|\s*dialogue_and_vocalizations\s*:[^\r\n]*)",
     re.IGNORECASE,
 )
+_COMPOSER_DOCUMENT_KEYS = frozenset({
+    "schema_version", "original_prompt", "compiled_prompt", "prompt_schema",
+    "workflow", "physical_inputs", "logical_assets", "role_bindings",
+    "camera_owner", "commitment",
+})
+_PHYSICAL_INPUT_KEYS = frozenset({"input_id", "kind", "ordinal"})
+_LOGICAL_ASSET_KEYS = frozenset({"asset_id"})
+_ROLE_BINDING_KEYS = frozenset({"role", "asset_id", "input_id"})
 
 
 _BUILTIN_STYLES = [
@@ -132,6 +150,83 @@ _BUILTIN_STYLES = [
         "label": "Hand-drawn + live-action fusion",
         "description": "Surreal shorts combining rough glowing hand-drawn animation with live-action spaces.",
         "prompt_brief": "Rough glowing hand-drawn animation interacting physically with live-action space, continuous morphing, and delayed handheld camera response.",
+    },
+    {
+        "id": "bridge-transition",
+        "workflow_identity_source": NATIVE_CRAFT_IDENTITY_SOURCE,
+        "label": "Bridge / transition",
+        "description": "Connect two clips or key states through one deliberate audiovisual transition.",
+        "prompt_brief": "Bridge the authored source and destination states with continuous subject, camera, light, motion, and sound cues; make the transition legible and preserve both boundary identities.",
+    },
+    {
+        "id": "character-reveal",
+        "workflow_identity_source": NATIVE_CRAFT_IDENTITY_SOURCE,
+        "label": "Character reveal",
+        "description": "Introduce a character through identity-locked references and precisely timed reveals.",
+        "prompt_brief": "Lock the character to the approved identity reference, stage a readable introduction, and time each reveal, cut, marking, and visible name exactly.",
+    },
+    {
+        "id": "storyboard-performance",
+        "workflow_identity_source": NATIVE_CRAFT_IDENTITY_SOURCE,
+        "label": "Storyboard performance",
+        "description": "Treat storyboard panels as sequential performance beats while identity remains independently anchored.",
+        "prompt_brief": "Treat storyboard panels as ordered shot and performance beats while a separate character reference owns identity; preserve panel timing, action, framing, and continuity.",
+    },
+    {
+        "id": "brand-logo-reel",
+        "workflow_identity_source": NATIVE_CRAFT_IDENTITY_SOURCE,
+        "label": "Brand / logo reel",
+        "description": "Build a premium reel around exact brand geometry and a causally constructed final mark.",
+        "prompt_brief": "Preserve exact logo geometry and visible text, construct the brand mark through causal premium motion, and finish on a stable readable final-mark lock.",
+    },
+    {
+        "id": "tapestry-causal-world-build",
+        "workflow_identity_source": NATIVE_CRAFT_IDENTITY_SOURCE,
+        "label": "Tapestry / causal world build",
+        "description": "Grow a coherent world whose final elements share one visible material lineage.",
+        "prompt_brief": "Grow every environment, object, and brand element from one visible material lineage, with causal transformations and a coherent final world rather than unrelated decoration.",
+    },
+    {
+        "id": "kinetic-typography",
+        "workflow_identity_source": NATIVE_CRAFT_IDENTITY_SOURCE,
+        "label": "Kinetic typography",
+        "description": "Animate exact text as physical or graphic material with explicit timing and legibility.",
+        "prompt_brief": "Render authored visible text exactly as smoke, dust, thread, ink, paper, or graphic material; specify entrance and hold timing while preserving legibility and wording.",
+    },
+    {
+        "id": "limited-palette-rhythm",
+        "workflow_identity_source": NATIVE_CRAFT_IDENTITY_SOURCE,
+        "label": "Limited-palette rhythm",
+        "description": "Lock a concise noir or neon palette to rhythmic visual and sound transients.",
+        "prompt_brief": "Lock a limited noir or neon palette, then map cuts, freezes, reversals, contacts, and graphic changes to the authored audiovisual rhythm and sound transients.",
+    },
+    {
+        "id": "origami-page-turn-worlds",
+        "workflow_identity_source": NATIVE_CRAFT_IDENTITY_SOURCE,
+        "label": "Origami / page-turn worlds",
+        "description": "Move between folded or printed worlds through crisp physical material changes.",
+        "prompt_brief": "Build folded-paper and page-turn worlds with crisp hinges, creases, occlusion, and hard material transitions; avoid soft morphs and keep each new world spatially coherent.",
+    },
+    {
+        "id": "sprite-animation",
+        "workflow_identity_source": NATIVE_CRAFT_IDENTITY_SOURCE,
+        "label": "Sprite animation",
+        "description": "Author short, extractable sprite moves with clean silhouettes and consistent identity.",
+        "prompt_brief": "Use a flat matte background, one readable move per short clip, consistent scale and identity, strong pose extremes, clean silhouettes, and frames suitable for background removal and spritesheet packing.",
+    },
+    {
+        "id": "action-beat-graphics",
+        "workflow_identity_source": NATIVE_CRAFT_IDENTITY_SOURCE,
+        "label": "Action / beat graphics",
+        "description": "Synchronize continuous action, contacts, graphic changes, and audio accents.",
+        "prompt_brief": "Keep the action path continuous and readable, with physical contacts, pose accents, graphic changes, cuts, and sound transients landing on the same authored beats.",
+    },
+    {
+        "id": "high-resolution-regeneration",
+        "workflow_identity_source": NATIVE_CRAFT_IDENTITY_SOURCE,
+        "label": "High-resolution regeneration",
+        "description": "Condition a new detailed render on a lower-resolution motion prototype while exposing drift risk.",
+        "prompt_brief": "Use the low-resolution motion prototype as conditioning for a new detailed H3 render, preserve timing and motion intent, and review identity, framing, text, and scene drift as regeneration rather than pixel-preserving upscale.",
     },
 ]
 _BUILTIN_BY_ID = {style["id"]: style for style in _BUILTIN_STYLES}
@@ -307,6 +402,10 @@ def _workflow_source(style_id: str) -> str:
     return f"{SOURCE_PAGE}/{style_id}"
 
 
+def _native_craft_source(style_id: str) -> str:
+    return f"{NATIVE_CRAFT_SOURCE}:{style_id}"
+
+
 def _normalize_style(style: dict[str, Any]) -> dict[str, Any]:
     style_id = str(style.get("id") or "")
     if not _STYLE_ID.fullmatch(style_id):
@@ -314,6 +413,15 @@ def _normalize_style(style: dict[str, Any]) -> dict[str, Any]:
     label = _safe_text(style.get("label", ""), limit=100)
     description = _safe_text(style.get("description", ""), limit=600)
     prompt_brief = _safe_text(style.get("prompt_brief", ""), limit=400)
+    identity_source = style.get(
+        "workflow_identity_source", WORKFLOW_IDENTITY_SOURCE,
+    )
+    if identity_source == WORKFLOW_IDENTITY_SOURCE:
+        workflow_source = _workflow_source(style_id)
+    elif identity_source == NATIVE_CRAFT_IDENTITY_SOURCE:
+        workflow_source = _native_craft_source(style_id)
+    else:
+        raise ValueError("Invalid H3 style provenance")
     if (
         not label
         or len(description) < 20
@@ -333,8 +441,8 @@ def _normalize_style(style: dict[str, Any]) -> dict[str, Any]:
         "label": label,
         "description": description,
         "prompt_brief": prompt_brief,
-        "workflow_identity_source": WORKFLOW_IDENTITY_SOURCE,
-        "workflow_source": _workflow_source(style_id),
+        "workflow_identity_source": identity_source,
+        "workflow_source": workflow_source,
         "prompt_brief_provenance": PROMPT_BRIEF_PROVENANCE,
         "surface": WORKFLOW_SURFACE,
         "supported_prompt_schemas": list(SUPPORTED_PROMPT_SCHEMAS),
@@ -345,7 +453,9 @@ def _normalize_style(style: dict[str, Any]) -> dict[str, Any]:
 def _catalog_provenance() -> dict[str, Any]:
     return {
         "workflow_identity_source": WORKFLOW_IDENTITY_SOURCE,
+        "native_craft_identity_source": NATIVE_CRAFT_IDENTITY_SOURCE,
         "workflow_source": SOURCE_PAGE,
+        "native_craft_source": NATIVE_CRAFT_SOURCE,
         "prompt_brief_provenance": PROMPT_BRIEF_PROVENANCE,
         "surface": WORKFLOW_SURFACE,
         "supported_prompt_schemas": list(SUPPORTED_PROMPT_SCHEMAS),
@@ -392,6 +502,16 @@ def parse_official_skills_readme(
             }))
         except ValueError:
             continue
+    existing_ids = {style["id"] for style in styles}
+    styles.extend(
+        _normalize_style(style)
+        for style in _BUILTIN_STYLES
+        if (
+            style.get("workflow_identity_source")
+            == NATIVE_CRAFT_IDENTITY_SOURCE
+            and style["id"] not in existing_ids
+        )
+    )
     if not 1 <= len(styles) <= MAX_STYLES:
         raise ValueError("Official H3 skill catalog did not match the bounded schema")
     return {
@@ -493,7 +613,7 @@ def validate_resolved_h3_style_workflow(value: object) -> dict[str, Any] | None:
     """Validate one server-resolved selection carried through replay/recovery."""
     if value is None:
         return None
-    if not isinstance(value, dict) or set(value) != {
+    if type(value) is not dict or set(value) != {
         "schema_version", "id", "catalog_revision", "prompt_brief",
         "brief_commitment",
     }:
@@ -503,17 +623,18 @@ def validate_resolved_h3_style_workflow(value: object) -> dict[str, Any] | None:
     brief = value.get("prompt_brief")
     commitment = value.get("brief_commitment")
     if (
-        value.get("schema_version") != WORKFLOW_SELECTION_SCHEMA_VERSION
-        or not isinstance(style_id, str)
+        type(value.get("schema_version")) is not int
+        or value.get("schema_version") != WORKFLOW_SELECTION_SCHEMA_VERSION
+        or type(style_id) is not str
         or _STYLE_ID.fullmatch(style_id) is None
-        or not isinstance(revision, str)
+        or type(revision) is not str
         or not revision
         or len(revision) > 80
         or revision != _safe_text(revision, limit=80)
-        or not isinstance(brief, str)
+        or type(brief) is not str
         or brief != _safe_text(brief, limit=400)
         or len(brief) < 20
-        or not isinstance(commitment, str)
+        or type(commitment) is not str
         or re.fullmatch(r"[0-9a-f]{64}", commitment) is None
         or commitment != _workflow_brief_commitment(style_id, revision, brief)
     ):
@@ -589,6 +710,235 @@ def compile_h3_style_workflow(
             return source, "freeform"
         raise ValueError("Freeform H3 workflow guidance drifted")
     return f"{guidance}\n\n{source}", "freeform"
+
+
+def _composer_id(value: object, *, field: str) -> str:
+    if type(value) is not str or _COMPOSER_ID.fullmatch(value) is None:
+        raise ValueError(f"H3 composer {field} is invalid")
+    return value
+
+
+def _validate_physical_inputs(value: object) -> list[dict[str, Any]]:
+    if type(value) is not list or not value:
+        raise ValueError("H3 composer physical_inputs must be a non-empty list")
+    result: list[dict[str, Any]] = []
+    input_ids: set[str] = set()
+    ordinals_by_kind: dict[str, set[int]] = {
+        kind: set() for kind in PHYSICAL_INPUT_KINDS
+    }
+    for item in value:
+        if type(item) is not dict or set(item) != _PHYSICAL_INPUT_KEYS:
+            raise ValueError("H3 composer physical input is invalid")
+        input_id = _composer_id(item.get("input_id"), field="input_id")
+        kind = item.get("kind")
+        ordinal = item.get("ordinal")
+        if type(kind) is not str or kind not in PHYSICAL_INPUT_KINDS:
+            raise ValueError("H3 composer physical input kind is invalid")
+        if type(ordinal) is not int or ordinal <= 0:
+            raise ValueError("H3 composer physical input ordinal is invalid")
+        if input_id in input_ids:
+            raise ValueError("H3 composer physical input_id is duplicated")
+        if ordinal in ordinals_by_kind[kind]:
+            raise ValueError(
+                "H3 composer physical input kind/ordinal is duplicated",
+            )
+        input_ids.add(input_id)
+        ordinals_by_kind[kind].add(ordinal)
+        result.append({"input_id": input_id, "kind": kind, "ordinal": ordinal})
+    for kind, ordinals in ordinals_by_kind.items():
+        if ordinals and ordinals != set(range(1, len(ordinals) + 1)):
+            raise ValueError(
+                f"H3 composer {kind} ordinals must be contiguous from 1",
+            )
+    kind_order = {kind: index for index, kind in enumerate(PHYSICAL_INPUT_KINDS)}
+    return sorted(result, key=lambda item: (
+        kind_order[item["kind"]], item["ordinal"], item["input_id"],
+    ))
+
+
+def _validate_logical_assets(value: object) -> list[dict[str, str]]:
+    if type(value) is not list or not value:
+        raise ValueError("H3 composer logical_assets must be a non-empty list")
+    result: list[dict[str, str]] = []
+    asset_ids: set[str] = set()
+    for item in value:
+        if type(item) is not dict or set(item) != _LOGICAL_ASSET_KEYS:
+            raise ValueError("H3 composer logical asset is invalid")
+        asset_id = _composer_id(item.get("asset_id"), field="asset_id")
+        if asset_id in asset_ids:
+            raise ValueError("H3 composer asset_id is duplicated")
+        asset_ids.add(asset_id)
+        result.append({"asset_id": asset_id})
+    return sorted(result, key=lambda item: item["asset_id"])
+
+
+def _validate_role_bindings(
+    value: object,
+    *,
+    input_ids: set[str],
+    asset_ids: set[str],
+) -> list[dict[str, str]]:
+    if type(value) is not list or not value:
+        raise ValueError("H3 composer role_bindings must be a non-empty list")
+    result: list[dict[str, str]] = []
+    triples: set[tuple[str, str, str]] = set()
+    camera_count = 0
+    for item in value:
+        if type(item) is not dict or set(item) != _ROLE_BINDING_KEYS:
+            raise ValueError("H3 composer role binding is invalid")
+        role = item.get("role")
+        if type(role) is not str or role not in COMPOSER_ROLE_TYPES:
+            raise ValueError("H3 composer role binding type is invalid")
+        asset_id = _composer_id(item.get("asset_id"), field="asset_id")
+        input_id = _composer_id(item.get("input_id"), field="input_id")
+        if asset_id not in asset_ids or input_id not in input_ids:
+            raise ValueError("H3 composer role binding references an unknown ID")
+        triple = (role, asset_id, input_id)
+        if triple in triples:
+            raise ValueError("H3 composer role binding is duplicated")
+        triples.add(triple)
+        if role == "camera":
+            camera_count += 1
+        result.append({
+            "role": role,
+            "asset_id": asset_id,
+            "input_id": input_id,
+        })
+    if camera_count == 0:
+        raise ValueError("H3 composer camera role binding is required")
+    if camera_count != 1:
+        raise ValueError("H3 composer camera role binding conflicts")
+    role_order = {role: index for index, role in enumerate(COMPOSER_ROLE_TYPES)}
+    return sorted(result, key=lambda item: (
+        role_order[item["role"]], item["asset_id"], item["input_id"],
+    ))
+
+
+def _composer_commitment(document: dict[str, Any]) -> str:
+    payload = json.dumps(
+        document, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _normalize_composer_fields(
+    *,
+    physical_inputs: object,
+    logical_assets: object,
+    role_bindings: object,
+    camera_owner: object,
+) -> tuple[
+    list[dict[str, Any]], list[dict[str, str]], list[dict[str, str]], str,
+]:
+    inputs = _validate_physical_inputs(physical_inputs)
+    assets = _validate_logical_assets(logical_assets)
+    bindings = _validate_role_bindings(
+        role_bindings,
+        input_ids={item["input_id"] for item in inputs},
+        asset_ids={item["asset_id"] for item in assets},
+    )
+    if type(camera_owner) is not str or camera_owner not in CAMERA_OWNERS:
+        raise ValueError(
+            "H3 composer camera_owner must be manual or path_planner",
+        )
+    return inputs, assets, bindings, camera_owner
+
+
+def compose_h3_prompt_document(
+    original_prompt: object,
+    workflow: object,
+    *,
+    physical_inputs: object,
+    logical_assets: object,
+    role_bindings: object,
+    camera_owner: object,
+) -> dict[str, Any]:
+    """Build one pure, versioned prompt document from a resolved workflow."""
+    if type(original_prompt) is not str:
+        raise ValueError("H3 composer original_prompt must be a string")
+    resolved = validate_resolved_h3_style_workflow(workflow)
+    if resolved is None:
+        raise ValueError("H3 composer requires an explicit resolved workflow")
+    inputs, assets, bindings, owner = _normalize_composer_fields(
+        physical_inputs=physical_inputs,
+        logical_assets=logical_assets,
+        role_bindings=role_bindings,
+        camera_owner=camera_owner,
+    )
+    compiled_prompt, prompt_schema = compile_h3_style_workflow(
+        original_prompt, resolved,
+    )
+    if prompt_schema not in SUPPORTED_PROMPT_SCHEMAS:
+        raise ValueError("H3 composer compiled prompt schema is invalid")
+    document: dict[str, Any] = {
+        "schema_version": COMPOSER_DOCUMENT_SCHEMA_VERSION,
+        "original_prompt": original_prompt,
+        "compiled_prompt": compiled_prompt,
+        "prompt_schema": prompt_schema,
+        "workflow": resolved,
+        "physical_inputs": inputs,
+        "logical_assets": assets,
+        "role_bindings": bindings,
+        "camera_owner": owner,
+    }
+    document["commitment"] = _composer_commitment(document)
+    return validate_h3_prompt_document(document)
+
+
+def validate_h3_prompt_document(value: object) -> dict[str, Any]:
+    """Validate an exact, path-free JSON H3 composer document and commitment."""
+    if type(value) is not dict or set(value) != _COMPOSER_DOCUMENT_KEYS:
+        raise ValueError("H3 composer document is invalid")
+    if (
+        type(value.get("schema_version")) is not int
+        or value.get("schema_version") != COMPOSER_DOCUMENT_SCHEMA_VERSION
+        or type(value.get("original_prompt")) is not str
+        or type(value.get("compiled_prompt")) is not str
+        or type(value.get("prompt_schema")) is not str
+        or value.get("prompt_schema") not in SUPPORTED_PROMPT_SCHEMAS
+        or type(value.get("workflow")) is not dict
+        or type(value.get("commitment")) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", value.get("commitment")) is None
+    ):
+        raise ValueError("H3 composer document fields are invalid")
+    resolved = validate_resolved_h3_style_workflow(value["workflow"])
+    if resolved is None:
+        raise ValueError("H3 composer requires an explicit resolved workflow")
+    inputs, assets, bindings, owner = _normalize_composer_fields(
+        physical_inputs=value["physical_inputs"],
+        logical_assets=value["logical_assets"],
+        role_bindings=value["role_bindings"],
+        camera_owner=value["camera_owner"],
+    )
+    if (
+        value["physical_inputs"] != inputs
+        or value["logical_assets"] != assets
+        or value["role_bindings"] != bindings
+    ):
+        raise ValueError("H3 composer document collections are not canonical")
+    compiled_prompt, prompt_schema = compile_h3_style_workflow(
+        value["original_prompt"], resolved,
+    )
+    if (
+        value["compiled_prompt"] != compiled_prompt
+        or value["prompt_schema"] != prompt_schema
+    ):
+        raise ValueError("H3 composer compiled prompt drifted")
+    clean: dict[str, Any] = {
+        "schema_version": COMPOSER_DOCUMENT_SCHEMA_VERSION,
+        "original_prompt": value["original_prompt"],
+        "compiled_prompt": value["compiled_prompt"],
+        "prompt_schema": value["prompt_schema"],
+        "workflow": resolved,
+        "physical_inputs": inputs,
+        "logical_assets": assets,
+        "role_bindings": bindings,
+        "camera_owner": owner,
+    }
+    if value["commitment"] != _composer_commitment(clean):
+        raise ValueError("H3 composer commitment drifted")
+    clean["commitment"] = value["commitment"]
+    return clean
 
 
 class H3SkillCatalogUpdater:

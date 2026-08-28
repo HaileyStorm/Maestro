@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 import urllib.parse
+from unittest import mock
 
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -20,8 +21,10 @@ from services.h3_upstream_skills import (  # noqa: E402
     H3SkillCatalogUpdater,
     builtin_catalog,
     compile_h3_style_workflow,
+    compose_h3_prompt_document,
     parse_official_skills_readme,
     resolve_h3_style_workflow,
+    validate_h3_prompt_document,
     validate_resolved_h3_style_workflow,
 )
 from services.director.h3_dialogue import (  # noqa: E402
@@ -65,6 +68,61 @@ description: |
 - Matte mineral surfaces with restrained color
 - Slow macro camera motion
 """
+
+CRAFT_STYLE_IDS = (
+    "bridge-transition",
+    "character-reveal",
+    "storyboard-performance",
+    "brand-logo-reel",
+    "tapestry-causal-world-build",
+    "kinetic-typography",
+    "limited-palette-rhythm",
+    "origami-page-turn-worlds",
+    "sprite-animation",
+    "action-beat-graphics",
+    "high-resolution-regeneration",
+)
+
+BASE_PROMPT = """subject_definitions: <Subject 1> is Ava: an adult in a blue coat.
+integrated_multimodal_description:
+[Shot 1] [0.00s-8.00s] shot_name: Ava presents | audiovisual_description: <Subject 1> presents a sign whose visible text reads KEEP EXACT. | dialogue_and_vocalizations: <d>[English] Lyrics: stay with the beat.</d>
+overall_soundscape: Exact room tone and a soft mechanical hum.
+non_diegetic_music: Exact authored music cue."""
+
+REF2VA_PROMPT = """subject_definitions: <Subject 1> is Ava from <Picture 1>.
+summary: Preserve the authored scene.
+retention_analysis: Preserve <Subject 1> from <Picture 1>.
+detailed_description:
+[Shot 1] [0.00s-8.00s] shot_name: Ava presents | audiovisual_description: <Subject 1> presents a sign whose visible text reads KEEP EXACT. | dialogue_and_vocalizations: <d>[English] Lyrics: stay with the beat.</d>
+overall_soundscape: Exact room tone and a soft mechanical hum.
+non_diegetic_music: Exact authored music cue."""
+
+
+def composer_fields() -> dict:
+    return {
+        "physical_inputs": [
+            {"input_id": "picture-primary", "kind": "picture", "ordinal": 1},
+            {"input_id": "picture-wardrobe", "kind": "picture", "ordinal": 2},
+            {"input_id": "video-performance", "kind": "video", "ordinal": 1},
+            {"input_id": "audio-guide", "kind": "audio", "ordinal": 1},
+        ],
+        "logical_assets": [
+            {"asset_id": "hero"},
+            {"asset_id": "costume"},
+            {"asset_id": "performance-guide"},
+            {"asset_id": "audio-guide"},
+        ],
+        "role_bindings": [
+            {"role": "source_subject", "asset_id": "hero", "input_id": "picture-primary"},
+            {"role": "source_subject", "asset_id": "costume", "input_id": "picture-wardrobe"},
+            {"role": "performance", "asset_id": "performance-guide", "input_id": "video-performance"},
+            {"role": "wardrobe", "asset_id": "costume", "input_id": "picture-wardrobe"},
+            {"role": "camera", "asset_id": "performance-guide", "input_id": "video-performance"},
+            {"role": "timing", "asset_id": "performance-guide", "input_id": "video-performance"},
+            {"role": "audio", "asset_id": "audio-guide", "input_id": "audio-guide"},
+        ],
+        "camera_owner": "manual",
+    }
 
 
 def envelope(text: str, sha: str) -> bytes:
@@ -127,10 +185,13 @@ class H3UpstreamSkillTests(unittest.TestCase):
         )
         self.assertEqual(
             [style["id"] for style in result["styles"]],
-            ["papercraft-stop-motion-explainer", "new-safe-style"],
+            [
+                "papercraft-stop-motion-explainer", "new-safe-style",
+                *CRAFT_STYLE_IDS,
+            ],
         )
         self.assertEqual(result["revision"], "abc123")
-        paper, new = result["styles"]
+        paper, new = result["styles"][:2]
         self.assertIn("richer official description", paper["description"])
         self.assertNotEqual(paper["description"], paper["prompt_brief"])
         self.assertIn("Matte mineral surfaces", new["prompt_brief"])
@@ -168,7 +229,9 @@ class H3UpstreamSkillTests(unittest.TestCase):
         self.assertEqual(catalog["update_status"], "bundled_fallback")
         self.assertEqual(catalog["provenance"], {
             "workflow_identity_source": "official_minimax_h3_skill",
+            "native_craft_identity_source": "maestro_native_h3_craft",
             "workflow_source": "https://github.com/MiniMax-AI/MiniMax-H3/tree/main/skills",
+            "native_craft_source": "maestro_native_h3_craft_catalog",
             "prompt_brief_provenance": "maestro_adapted",
             "surface": "huggingface_hub_canvas",
             "supported_prompt_schemas": [
@@ -185,6 +248,286 @@ class H3UpstreamSkillTests(unittest.TestCase):
         style = catalog["styles"][0]
         self.assertEqual(style["prompt_brief_provenance"], "maestro_adapted")
         self.assertTrue(style["workflow_source"].endswith("/" + style["id"]))
+
+    def test_all_optional_craft_families_are_server_resolved(self):
+        catalog = builtin_catalog()
+        by_id = {style["id"]: style for style in catalog["styles"]}
+        self.assertTrue(set(CRAFT_STYLE_IDS).issubset(by_id))
+        for style_id in CRAFT_STYLE_IDS:
+            with self.subTest(style_id=style_id):
+                style = by_id[style_id]
+                self.assertEqual(
+                    style["prompt_brief_provenance"], "maestro_adapted",
+                )
+                self.assertEqual(
+                    style["workflow_identity_source"],
+                    "maestro_native_h3_craft",
+                )
+                self.assertEqual(
+                    style["workflow_source"],
+                    f"maestro_native_h3_craft_catalog:{style_id}",
+                )
+                resolved = resolve_h3_style_workflow(style_id, catalog)
+                self.assertEqual(resolved["prompt_brief"], style["prompt_brief"])
+                self.assertEqual(
+                    validate_resolved_h3_style_workflow(resolved), resolved,
+                )
+
+    def test_craft_families_compile_in_all_prompt_shapes_and_are_idempotent(self):
+        catalog = builtin_catalog()
+        prompts = (BASE_PROMPT, REF2VA_PROMPT, "A cyclist crosses the rain.")
+        schemas = ("base_context_ir", "ref2va_context_ir", "freeform")
+        for style_id in CRAFT_STYLE_IDS:
+            for prompt, expected_schema in zip(prompts, schemas):
+                with self.subTest(
+                    style_id=style_id, prompt_schema=expected_schema,
+                ):
+                    workflow = resolve_h3_style_workflow(style_id, catalog)
+                    compiled, schema = compile_h3_style_workflow(prompt, workflow)
+                    marker = f"H3 workflow guidance [{style_id}]:"
+                    self.assertEqual(schema, expected_schema)
+                    self.assertEqual(compiled.count(marker), 1)
+                    if expected_schema == "freeform":
+                        self.assertTrue(compiled.startswith(marker))
+                    else:
+                        visual_field = (
+                            "integrated_multimodal_description:"
+                            if expected_schema == "base_context_ir"
+                            else "detailed_description:"
+                        )
+                        visual = compiled.split(visual_field, 1)[1].split(
+                            "overall_soundscape:", 1,
+                        )[0]
+                        self.assertIn(marker, visual)
+                    self.assertEqual(
+                        compile_h3_style_workflow(compiled, workflow),
+                        (compiled, schema),
+                    )
+
+    def test_composer_preserves_original_and_authored_text_fields(self):
+        workflow = resolve_h3_style_workflow(
+            "kinetic-typography", builtin_catalog(),
+        )
+        original = " \r\n" + BASE_PROMPT.replace("\n", "\r\n") + "\r\n "
+        document = compose_h3_prompt_document(
+            original, workflow, **composer_fields(),
+        )
+        self.assertEqual(document["original_prompt"], original)
+        self.assertEqual(document["prompt_schema"], "base_context_ir")
+        for literal in (
+            "[0.00s-8.00s]",
+            "visible text reads KEEP EXACT",
+            "<d>[English] Lyrics: stay with the beat.</d>",
+            "Exact room tone and a soft mechanical hum.",
+            "Exact authored music cue.",
+        ):
+            self.assertEqual(
+                document["compiled_prompt"].count(literal),
+                BASE_PROMPT.count(literal),
+            )
+
+    def test_composer_exact_json_round_trip_and_deterministic_commitment(self):
+        workflow = resolve_h3_style_workflow(
+            "storyboard-performance", builtin_catalog(),
+        )
+        first = compose_h3_prompt_document(
+            REF2VA_PROMPT, workflow, **composer_fields(),
+        )
+        second = compose_h3_prompt_document(
+            REF2VA_PROMPT, workflow, **composer_fields(),
+        )
+        round_tripped = json.loads(json.dumps(first, ensure_ascii=False))
+        self.assertEqual(first, second)
+        self.assertEqual(first["commitment"], second["commitment"])
+        self.assertEqual(validate_h3_prompt_document(round_tripped), first)
+        permuted_fields = composer_fields()
+        permuted_fields["physical_inputs"].reverse()
+        permuted_fields["logical_assets"].reverse()
+        permuted_fields["role_bindings"].reverse()
+        self.assertEqual(
+            compose_h3_prompt_document(
+                REF2VA_PROMPT, workflow, **permuted_fields,
+            ),
+            first,
+        )
+        self.assertNotIn("path", json.dumps(first).lower())
+        self.assertEqual(
+            [
+                (item["kind"], item["ordinal"])
+                for item in first["physical_inputs"]
+            ],
+            [("picture", 1), ("picture", 2), ("video", 1), ("audio", 1)],
+        )
+        self.assertEqual(
+            [
+                item for item in first["role_bindings"]
+                if item["role"] == "source_subject"
+            ],
+            [
+                {"role": "source_subject", "asset_id": "costume", "input_id": "picture-wardrobe"},
+                {"role": "source_subject", "asset_id": "hero", "input_id": "picture-primary"},
+            ],
+        )
+
+    def test_composer_rejects_tamper_extras_types_duplicates_and_bad_ids(self):
+        workflow = resolve_h3_style_workflow(
+            "bridge-transition", builtin_catalog(),
+        )
+        valid = compose_h3_prompt_document(
+            BASE_PROMPT, workflow, **composer_fields(),
+        )
+        mutations = []
+        for path, replacement in (
+            (("original_prompt",), BASE_PROMPT + " changed"),
+            (("compiled_prompt",), valid["compiled_prompt"] + " changed"),
+            (("prompt_schema",), "freeform"),
+            (("commitment",), "0" * 64),
+            (("schema_version",), True),
+            (("physical_inputs", 0, "ordinal"), True),
+        ):
+            changed = json.loads(json.dumps(valid))
+            target = changed
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = replacement
+            mutations.append(changed)
+        extra = json.loads(json.dumps(valid))
+        extra["filesystem_path"] = "/not/allowed"
+        mutations.append(extra)
+        nested_extra = json.loads(json.dumps(valid))
+        nested_extra["physical_inputs"][0]["path"] = "/not/allowed"
+        mutations.append(nested_extra)
+        for collection in (
+            "physical_inputs", "logical_assets", "role_bindings",
+        ):
+            noncanonical = json.loads(json.dumps(valid))
+            noncanonical[collection].reverse()
+            mutations.append(noncanonical)
+        for changed in mutations:
+            with self.subTest(changed=changed):
+                with self.assertRaises(ValueError):
+                    validate_h3_prompt_document(changed)
+
+        invalid_fields = []
+        duplicate_input = composer_fields()
+        duplicate_input["physical_inputs"].append({
+            "input_id": "picture-primary", "kind": "picture", "ordinal": 3,
+        })
+        invalid_fields.append(duplicate_input)
+        duplicate_kind_ordinal = composer_fields()
+        duplicate_kind_ordinal["physical_inputs"].append({
+            "input_id": "picture-extra", "kind": "picture", "ordinal": 2,
+        })
+        invalid_fields.append(duplicate_kind_ordinal)
+        noncontiguous = composer_fields()
+        noncontiguous["physical_inputs"][1]["ordinal"] = 3
+        invalid_fields.append(noncontiguous)
+        duplicate_asset = composer_fields()
+        duplicate_asset["logical_assets"].append({"asset_id": "hero"})
+        invalid_fields.append(duplicate_asset)
+        duplicate_binding = composer_fields()
+        duplicate_binding["role_bindings"].append(dict(
+            duplicate_binding["role_bindings"][0],
+        ))
+        invalid_fields.append(duplicate_binding)
+        unknown_reference = composer_fields()
+        unknown_reference["role_bindings"][0]["input_id"] = "missing"
+        invalid_fields.append(unknown_reference)
+        path_like_id = composer_fields()
+        path_like_id["physical_inputs"][0]["input_id"] = "folder/input"
+        invalid_fields.append(path_like_id)
+        for fields in invalid_fields:
+            with self.subTest(fields=fields):
+                with self.assertRaises(ValueError):
+                    compose_h3_prompt_document(
+                        BASE_PROMPT, workflow, **fields,
+                    )
+        with self.assertRaisesRegex(ValueError, "explicit resolved workflow"):
+            compose_h3_prompt_document(
+                BASE_PROMPT, None, **composer_fields(),
+            )
+
+    def test_composer_camera_authority_is_exactly_one(self):
+        workflow = resolve_h3_style_workflow(
+            "action-beat-graphics", builtin_catalog(),
+        )
+        missing = composer_fields()
+        missing["role_bindings"] = [
+            item for item in missing["role_bindings"]
+            if item["role"] != "camera"
+        ]
+        with self.assertRaisesRegex(ValueError, "camera role binding is required"):
+            compose_h3_prompt_document(BASE_PROMPT, workflow, **missing)
+
+        conflict = composer_fields()
+        conflict["role_bindings"].append({
+            "role": "camera",
+            "asset_id": "hero",
+            "input_id": "picture-primary",
+        })
+        with self.assertRaisesRegex(ValueError, "camera role binding conflicts"):
+            compose_h3_prompt_document(BASE_PROMPT, workflow, **conflict)
+
+        for invalid_owner in (None, "both", ["manual", "path_planner"]):
+            fields = composer_fields()
+            fields["camera_owner"] = invalid_owner
+            with self.subTest(camera_owner=invalid_owner):
+                with self.assertRaisesRegex(ValueError, "camera_owner"):
+                    compose_h3_prompt_document(
+                        BASE_PROMPT, workflow, **fields,
+                    )
+
+    def test_physical_reordering_does_not_rewrite_logical_bindings(self):
+        workflow = resolve_h3_style_workflow(
+            "character-reveal", builtin_catalog(),
+        )
+        first_fields = composer_fields()
+        first = compose_h3_prompt_document(
+            BASE_PROMPT, workflow, **first_fields,
+        )
+        reordered_fields = composer_fields()
+        reordered_fields["physical_inputs"] = [
+            {"input_id": "picture-wardrobe", "kind": "picture", "ordinal": 1},
+            {"input_id": "picture-primary", "kind": "picture", "ordinal": 2},
+            reordered_fields["physical_inputs"][2],
+            reordered_fields["physical_inputs"][3],
+        ]
+        reordered = compose_h3_prompt_document(
+            BASE_PROMPT, workflow, **reordered_fields,
+        )
+        self.assertEqual(first["logical_assets"], reordered["logical_assets"])
+        self.assertEqual(first["role_bindings"], reordered["role_bindings"])
+        self.assertEqual(first["compiled_prompt"], reordered["compiled_prompt"])
+        self.assertNotEqual(first["physical_inputs"], reordered["physical_inputs"])
+        self.assertNotEqual(first["commitment"], reordered["commitment"])
+
+    def test_composer_is_content_neutral_and_has_no_network_or_model_effects(self):
+        workflow = resolve_h3_style_workflow(
+            "limited-palette-rhythm", builtin_catalog(),
+        )
+        documents = []
+        with mock.patch(
+            "urllib.request.urlopen",
+            side_effect=AssertionError("network access is forbidden"),
+        ), mock.patch(
+            "importlib.import_module",
+            side_effect=AssertionError("dynamic model imports are forbidden"),
+        ):
+            for prompt in (
+                "Two dancers reconcile under blue light.",
+                "Two fighters trade violent blows under blue light.",
+            ):
+                documents.append(compose_h3_prompt_document(
+                    prompt, workflow, **composer_fields(),
+                ))
+        self.assertEqual(documents[0]["prompt_schema"], documents[1]["prompt_schema"])
+        self.assertEqual(set(documents[0]), set(documents[1]))
+        for document, prompt in zip(documents, (
+            "Two dancers reconcile under blue light.",
+            "Two fighters trade violent blows under blue light.",
+        )):
+            self.assertEqual(document["original_prompt"], prompt)
+            self.assertTrue(document["compiled_prompt"].endswith(prompt))
 
     def test_exact_id_resolution_rejects_client_briefs_and_commitment_drift(self):
         catalog = builtin_catalog()
