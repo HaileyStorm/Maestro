@@ -60,7 +60,7 @@ MAX_METADATA_BYTE_CAP = 1024**3
 DEFAULT_METADATA_ENTRY_CAP = 50_000
 MAX_METADATA_ENTRY_CAP = 50_000
 MAX_CHILD_FILE_BYTES = 16 * 1024**2
-MAX_UV_CACHE_LOCK_BYTES = 4 * 1024
+MAX_UV_INTERNAL_LOCK_BYTES = 4 * 1024
 POLL_SECONDS = 0.25
 MAX_STATE_DEPTH = 32
 MAX_SCAN_RETRIES = 3
@@ -85,6 +85,19 @@ _ALLOWED_STATE_FILES = {
     "tmp",
     "execution.lock",
 }
+_UV_INTERNAL_LOCK_PATHS = frozenset(
+    {
+        ("cache", ".lock"),
+        (
+            "home",
+            ".local",
+            "share",
+            "uv",
+            "credentials",
+            "credentials.toml.lock",
+        ),
+    }
+)
 _BINARY_ROOTS = frozenset(
     {"pillow", "safetensors", "tokenizers", "torch", "torchvision"}
 )
@@ -450,10 +463,12 @@ def build_h3_prompt_rewriter_uv_resolution_plan(
             "scan_retry_cap": MAX_SCAN_RETRIES,
             "process_group_cleanup": True,
             "recursive_private_state_monitor": True,
-            "uv_cache_lock_compatibility": {
-                "relative_path": "cache/.lock",
+            "uv_internal_lock_compatibility": {
+                "relative_paths": sorted(
+                    "/".join(path) for path in _UV_INTERNAL_LOCK_PATHS
+                ),
                 "mode": "0666",
-                "maximum_bytes": MAX_UV_CACHE_LOCK_BYTES,
+                "maximum_bytes": MAX_UV_INTERNAL_LOCK_BYTES,
                 "regular_single_link_owner_only": True,
                 "owner_private_ancestors": True,
             },
@@ -601,18 +616,18 @@ def _scan_private_state_once(
                     )
                 info = entry.stat(follow_symlinks=False)
                 mode = stat.S_IMODE(info.st_mode)
-                uv_cache_lock = entry_relative == ("cache", ".lock")
-                compatible_uv_cache_lock = (
-                    uv_cache_lock
+                uv_internal_lock = entry_relative in _UV_INTERNAL_LOCK_PATHS
+                compatible_uv_internal_lock = (
+                    uv_internal_lock
                     and stat.S_ISREG(info.st_mode)
                     and info.st_nlink == 1
                     and mode == 0o666
-                    and info.st_size <= MAX_UV_CACHE_LOCK_BYTES
+                    and info.st_size <= MAX_UV_INTERNAL_LOCK_BYTES
                 )
                 if (
                     stat.S_ISLNK(info.st_mode)
                     or info.st_uid != os.getuid()
-                    or (mode & 0o077 and not compatible_uv_cache_lock)
+                    or (mode & 0o077 and not compatible_uv_internal_lock)
                 ):
                     raise H3PromptRewriterUvResolutionSecurityError(
                         "resolution state contains a linked or non-private entry"
@@ -664,12 +679,12 @@ def _scan_private_state_once(
                     if _stable_identity(opened) != _stable_identity(info):
                         raise _TransientStateChange("resolution file identity changed")
                     if (
-                        compatible_uv_cache_lock
+                        compatible_uv_internal_lock
                         and stat.S_IMODE(opened.st_mode) == 0o666
-                        and opened.st_size > MAX_UV_CACHE_LOCK_BYTES
+                        and opened.st_size > MAX_UV_INTERNAL_LOCK_BYTES
                     ):
                         raise H3PromptRewriterUvResolutionSecurityError(
-                            "uv cache lock exceeds its compatibility bound"
+                            "uv internal lock exceeds its compatibility bound"
                         )
                     account(opened)
                 finally:

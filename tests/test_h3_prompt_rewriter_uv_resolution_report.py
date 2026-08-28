@@ -334,12 +334,20 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
             first.document["resources"]["state_depth_cap"],
             producer.MAX_STATE_DEPTH,
         )
-        cache_lock_contract = first.document["resources"]["uv_cache_lock_compatibility"]
-        self.assertEqual(cache_lock_contract["relative_path"], "cache/.lock")
+        cache_lock_contract = first.document["resources"][
+            "uv_internal_lock_compatibility"
+        ]
+        self.assertEqual(
+            cache_lock_contract["relative_paths"],
+            [
+                "cache/.lock",
+                "home/.local/share/uv/credentials/credentials.toml.lock",
+            ],
+        )
         self.assertEqual(cache_lock_contract["mode"], "0666")
         self.assertEqual(
             cache_lock_contract["maximum_bytes"],
-            producer.MAX_UV_CACHE_LOCK_BYTES,
+            producer.MAX_UV_INTERNAL_LOCK_BYTES,
         )
         self.assertTrue(cache_lock_contract["owner_private_ancestors"])
         self.assertEqual(first.document["resolver"]["only_binary"], ":all:")
@@ -801,12 +809,12 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
                 byte_cap=len(payload) - 1,
                 entry_cap=100,
             )
-        lock.write_bytes(b"x" * (producer.MAX_UV_CACHE_LOCK_BYTES + 1))
+        lock.write_bytes(b"x" * (producer.MAX_UV_INTERNAL_LOCK_BYTES + 1))
         lock.chmod(0o666)
         with self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError):
             producer._scan_private_state(
                 self.state,
-                byte_cap=producer.MAX_UV_CACHE_LOCK_BYTES + 1,
+                byte_cap=producer.MAX_UV_INTERNAL_LOCK_BYTES + 1,
                 entry_cap=100,
             )
 
@@ -870,6 +878,56 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
                 byte_cap=1024,
                 entry_cap=100,
             )
+
+    def test_exact_uv_credentials_lock_is_accepted_but_variants_are_rejected(self):
+        producer._layout(self.feature, self.state)
+        baseline = producer._scan_private_state(
+            self.state,
+            byte_cap=1024,
+            entry_cap=100,
+        )
+        credentials_parent = self.state / "home"
+        for component in (".local", "share", "uv", "credentials"):
+            credentials_parent = credentials_parent / component
+            credentials_parent.mkdir(mode=0o700)
+        credentials_lock = credentials_parent / "credentials.toml.lock"
+        payload = b"uv-credentials-lock"
+        credentials_lock.write_bytes(payload)
+        credentials_lock.chmod(0o666)
+        usage = producer._scan_private_state(
+            self.state,
+            byte_cap=len(payload),
+            entry_cap=100,
+        )
+        self.assertGreaterEqual(usage.bytes, len(payload))
+        self.assertGreater(usage.entries, baseline.entries)
+
+        variants = (
+            Path("home/.local/share/uv/credentials.toml.lock"),
+            Path("home/.local/share/uv/credentials/credentials.toml.lock.alias"),
+            Path("home/.local/share/uv/Credentials/credentials.toml.lock"),
+            Path("home/.local/share/uv/credentials/sub/credentials.toml.lock"),
+            Path("cache/credentials.toml.lock"),
+        )
+        for ordinal, relative in enumerate(variants):
+            state = self.feature / f"credentials-lock-variant-{ordinal}"
+            producer._layout(self.feature, state)
+            candidate = state / relative
+            parent = state
+            for component in relative.parts[:-1]:
+                parent = parent / component
+                parent.mkdir(mode=0o700, exist_ok=True)
+            candidate.write_bytes(b"")
+            candidate.chmod(0o666)
+            with (
+                self.subTest(relative=str(relative)),
+                self.assertRaises(producer.H3PromptRewriterUvResolutionSecurityError),
+            ):
+                producer._scan_private_state(
+                    state,
+                    byte_cap=1024,
+                    entry_cap=100,
+                )
 
     def test_atomic_rename_disappearance_retries_within_bound(self):
         producer._layout(self.feature, self.state)
