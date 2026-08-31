@@ -60,6 +60,22 @@ const configureTarget = async (env, value = target) => {
   await env.MAESTRO_TARGETS.put("quick-tunnel-origin", value)
 }
 
+const utf8ByteLength = (value) => new TextEncoder().encode(value).byteLength
+
+const paddedTargetJson = (nextTarget, byteLength, seed = "é你") => {
+  const json = (pad) => JSON.stringify({ target: nextTarget, pad })
+  return json(seed + "x".repeat(byteLength - utf8ByteLength(json(seed))))
+}
+
+const updateTargetRequest = (body, headers = {}) => new Request(
+  `https://maestro.example.workers.dev${paths.UPDATE_PATH}`,
+  {
+    method: "PUT",
+    headers: { ...auth, "Content-Type": "application/json", ...headers },
+    body,
+  },
+)
+
 const statusRequest = (method, body, headers = auth) => new Request(statusUrl, {
   method,
   headers: body === undefined ? headers : { ...headers, "Content-Type": "application/json" },
@@ -182,6 +198,111 @@ test("authenticated health confirms the exact stored target", async () => {
   ), env)
   assert.equal(health.status, 200)
   assert.deepEqual(await health.json(), { ok: true, configured: true, target })
+})
+
+test("update target rejects oversized chunked JSON without mutating KV", async () => {
+  const env = environment()
+  const updateUrl = `https://maestro.example.workers.dev${paths.UPDATE_PATH}`
+  const existing = "https://existing-tunnel.trycloudflare.com"
+  const next = "https://current-tunnel.trycloudflare.com"
+  await configureTarget(env, existing)
+
+  const oversized = JSON.stringify({ target: next, pad: "x".repeat(4096) })
+  assert.ok(new TextEncoder().encode(oversized).byteLength > 4096)
+  const request = new Request(updateUrl, {
+    method: "PUT",
+    headers: { ...auth, "Content-Type": "application/json" },
+    body: new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(oversized))
+        controller.close()
+      },
+    }),
+    duplex: "half",
+  })
+  assert.equal(request.headers.get("Content-Length"), null)
+  const response = await worker.fetch(request, env)
+
+  assert.equal(response.status, 413)
+  assert.deepEqual(await response.json(), { ok: false })
+  assert.equal(await env.MAESTRO_TARGETS.get("quick-tunnel-origin"), existing)
+})
+
+test("update target stores a canonical Quick Tunnel origin", async () => {
+  const env = environment()
+  const next = "https://current-tunnel.trycloudflare.com"
+  const response = await worker.fetch(new Request(
+    `https://maestro.example.workers.dev${paths.UPDATE_PATH}`,
+    {
+      method: "PUT",
+      headers: { ...auth, "Content-Type": "application/json" },
+      body: JSON.stringify({ target: next }),
+    },
+  ), env)
+
+  assert.equal(response.status, 200)
+  assert.deepEqual(await response.json(), { ok: true, configured: true, target: next })
+  assert.equal(await env.MAESTRO_TARGETS.get("quick-tunnel-origin"), next)
+})
+
+test("update target accepts a 4096-byte UTF-8 JSON body with multibyte padding", async () => {
+  const env = environment()
+  const existing = "https://existing-tunnel.trycloudflare.com"
+  const next = "https://current-tunnel.trycloudflare.com"
+  await configureTarget(env, existing)
+
+  const body = paddedTargetJson(next, 4096)
+  assert.equal(utf8ByteLength(body), 4096)
+  assert.ok(body.length < 4096)
+  assert.ok(body.includes("é你"))
+  const request = updateTargetRequest(body, { "Content-Length": "4096" })
+  assert.equal(request.headers.get("Content-Length"), "4096")
+  const response = await worker.fetch(request, env)
+
+  assert.equal(response.status, 200)
+  assert.deepEqual(await response.json(), { ok: true, configured: true, target: next })
+  assert.equal(await env.MAESTRO_TARGETS.get("quick-tunnel-origin"), next)
+})
+
+test("update target rejects a 4097-byte UTF-8 JSON body without mutating KV", async () => {
+  const env = environment()
+  const existing = "https://existing-tunnel.trycloudflare.com"
+  const next = "https://current-tunnel.trycloudflare.com"
+  await configureTarget(env, existing)
+
+  const body = paddedTargetJson(next, 4097)
+  assert.equal(utf8ByteLength(body), 4097)
+  assert.ok(body.length < 4097)
+  assert.ok(body.includes("é你"))
+  const request = updateTargetRequest(body, { "Content-Length": "4097" })
+  assert.equal(request.headers.get("Content-Length"), "4097")
+  const response = await worker.fetch(request, env)
+
+  assert.equal(response.status, 413)
+  assert.deepEqual(await response.json(), { ok: false })
+  assert.equal(await env.MAESTRO_TARGETS.get("quick-tunnel-origin"), existing)
+})
+
+test("update target rejects an oversized body with understated Content-Length", async () => {
+  const env = environment()
+  const existing = "https://existing-tunnel.trycloudflare.com"
+  const next = "https://current-tunnel.trycloudflare.com"
+  await configureTarget(env, existing)
+
+  const body = paddedTargetJson(next, 4097)
+  const declaredLength = String(body.length)
+  assert.equal(utf8ByteLength(body), 4097)
+  assert.ok(body.length < 4096)
+  assert.ok(Number(declaredLength) < utf8ByteLength(body))
+  // Node 22 Request keeps the understated Content-Length and still yields the
+  // full UTF-8 body from text()/arrayBuffer(); the Worker must use actual bytes.
+  const request = updateTargetRequest(body, { "Content-Length": declaredLength })
+  assert.equal(request.headers.get("Content-Length"), declaredLength)
+  const response = await worker.fetch(request, env)
+
+  assert.equal(response.status, 413)
+  assert.deepEqual(await response.json(), { ok: false })
+  assert.equal(await env.MAESTRO_TARGETS.get("quick-tunnel-origin"), existing)
 })
 
 test("restart status management is authenticated and method bounded", async () => {

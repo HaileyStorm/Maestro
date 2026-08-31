@@ -260,15 +260,10 @@ const updateTarget = async (request, env) => {
   if (!(await authorized(request, env.UPDATE_TOKEN))) {
     return jsonResponse({ ok: false }, 401)
   }
-  const contentLength = Number(request.headers.get("Content-Length") || "0")
-  if (contentLength > 4096) return jsonResponse({ ok: false }, 413)
-  let body
-  try {
-    body = await request.json()
-  } catch {
-    return jsonResponse({ ok: false }, 400)
-  }
-  const target = canonicalQuickTunnelOrigin(body?.target)
+  const body = await readBoundedJson(request)
+  if (body.kind === "large") return jsonResponse({ ok: false }, 413)
+  if (body.kind !== "valid") return jsonResponse({ ok: false }, 400)
+  const target = canonicalQuickTunnelOrigin(body.value?.target)
   if (!target) return jsonResponse({ ok: false }, 400)
   await env.MAESTRO_TARGETS.put(TARGET_KEY, target)
   return jsonResponse({ ok: true, configured: true, target })
