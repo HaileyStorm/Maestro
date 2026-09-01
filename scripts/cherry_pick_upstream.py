@@ -115,6 +115,8 @@ _PROVENANCE_NAME = re.compile(
     re.IGNORECASE,
 )
 _UNSAFE_GIT_MODES = frozenset({"120000", "160000"})
+# The full preflight series stays in memory, so bound practical binary patches.
+MAX_STAGED_PATCH_BYTES = 16 * 1024 * 1024
 
 
 class UpstreamSyncError(ValueError):
@@ -560,6 +562,7 @@ def main() -> int:
         return 1
 
     staged = []
+    staged_patch_bytes = 0
     for commit in args.commits:
         print(f"==> Cherry-picking {commit}", file=sys.stderr)
         try:
@@ -567,11 +570,19 @@ def main() -> int:
             patch = get_patch(full_commit)
             rewritten = rewrite_patch(patch)
             rewritten = add_provenance_trailers(rewritten, full_commit)
+            rewritten_bytes = len(_encode_patch(rewritten))
+            next_staged_patch_bytes = staged_patch_bytes + rewritten_bytes
+            if next_staged_patch_bytes > MAX_STAGED_PATCH_BYTES:
+                raise UpstreamSyncError(
+                    "staged patch batch exceeds the "
+                    f"{MAX_STAGED_PATCH_BYTES}-byte bound"
+                )
         except (subprocess.CalledProcessError, UpstreamSyncError) as error:
             print(f"!! Refusing {commit}: {error}", file=sys.stderr)
             return 1
 
         staged.append((full_commit, rewritten))
+        staged_patch_bytes = next_staged_patch_bytes
 
     for full_commit, rewritten in staged:
         if args.dry_run:

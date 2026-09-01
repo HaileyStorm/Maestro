@@ -202,10 +202,117 @@ class GitProvenanceTests(unittest.TestCase):
 
 
 class CherryPickCliTests(unittest.TestCase):
-    def test_later_unmapped_commit_is_refused_before_any_apply(self):
+    def test_later_preflight_failures_are_refused_before_any_output_or_apply(self):
         commits = ["1" * 7, "2" * 7]
         full_commits = ["1" * 40, "2" * 40]
-        patches = [_patch("models/first.py"), _patch("unknown/file.py")]
+        spoofed = _patch("models/spoofed.py").replace(
+            "---\n", "Upstream-Commit: " + "b" * 40 + "\n---\n", 1,
+        )
+        cases = (
+            (
+                "resolve",
+                [full_commits[0], SYNC.UpstreamSyncError("resolution failed")],
+                [_patch("models/first.py")],
+            ),
+            (
+                "format-patch",
+                full_commits,
+                [
+                    _patch("models/first.py"),
+                    subprocess.CalledProcessError(1, ["git", "format-patch"]),
+                ],
+            ),
+            (
+                "protected-path",
+                full_commits,
+                [
+                    _patch("models/first.py"),
+                    _patch("models/minimax_h3/transformer.py"),
+                ],
+            ),
+            (
+                "unmapped-path",
+                full_commits,
+                [_patch("models/first.py"), _patch("unknown/file.py")],
+            ),
+            (
+                "malformed-format",
+                full_commits,
+                [_patch("models/first.py"), "From: no-diff@example.invalid\n"],
+            ),
+            (
+                "reserved-provenance",
+                full_commits,
+                [_patch("models/first.py"), spoofed],
+            ),
+        )
+
+        for label, resolved, patches in cases:
+            for dry_run in (False, True):
+                argv = [str(SCRIPT)]
+                if dry_run:
+                    argv.append("--dry-run")
+                argv.extend(commits)
+                with self.subTest(label=label, dry_run=dry_run), mock.patch.object(
+                    SYNC, "verify_remote",
+                ), mock.patch.object(
+                    SYNC, "resolve_upstream_commit", side_effect=resolved,
+                ), mock.patch.object(
+                    SYNC, "get_patch", side_effect=patches,
+                ), mock.patch.object(
+                    SYNC, "apply_patch",
+                ) as apply, mock.patch.object(
+                    SYNC.sys, "argv", argv,
+                ), mock.patch.object(
+                    SYNC.sys, "stdout", io.StringIO(),
+                ) as stdout, mock.patch.object(
+                    SYNC.sys, "stderr", io.StringIO(),
+                ) as stderr:
+                    self.assertEqual(SYNC.main(), 1)
+
+                apply.assert_not_called()
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertIn(f"!! Refusing {commits[1]}:", stderr.getvalue())
+
+    def test_exact_staged_patch_byte_bound_is_accepted(self):
+        commits = ["1" * 7, "2" * 7]
+        full_commits = ["1" * 40, "2" * 40]
+        patches = [_patch("models/first.py"), _patch("models/second.py")]
+        rewritten = [
+            SYNC.add_provenance_trailers(SYNC.rewrite_patch(patch), full_commit)
+            for patch, full_commit in zip(patches, full_commits)
+        ]
+        exact_cap = sum(len(SYNC._encode_patch(patch)) for patch in rewritten)
+
+        with mock.patch.object(
+            SYNC, "MAX_STAGED_PATCH_BYTES", exact_cap,
+        ), mock.patch.object(
+            SYNC, "verify_remote",
+        ), mock.patch.object(
+            SYNC, "resolve_upstream_commit", side_effect=full_commits,
+        ), mock.patch.object(
+            SYNC, "get_patch", side_effect=patches,
+        ), mock.patch.object(
+            SYNC, "apply_patch",
+        ) as apply, mock.patch.object(
+            SYNC.sys, "argv", [str(SCRIPT), *commits],
+        ):
+            self.assertEqual(SYNC.main(), 0)
+
+        self.assertEqual(apply.call_count, len(commits))
+
+    def test_one_byte_over_staged_patch_bound_is_refused_atomically(self):
+        commits = ["1" * 7, "2" * 7]
+        full_commits = ["1" * 40, "2" * 40]
+        patches = [_patch("models/first.py"), _patch("models/second.py")]
+        rewritten = [
+            SYNC.add_provenance_trailers(SYNC.rewrite_patch(patch), full_commit)
+            for patch, full_commit in zip(patches, full_commits)
+        ]
+        encoded_sizes = [len(SYNC._encode_patch(patch)) for patch in rewritten]
+        one_byte_short = sum(encoded_sizes) - 1
+        self.assertLessEqual(encoded_sizes[0], one_byte_short)
+        self.assertEqual(sum(encoded_sizes), one_byte_short + 1)
 
         for dry_run in (False, True):
             argv = [str(SCRIPT)]
@@ -213,6 +320,8 @@ class CherryPickCliTests(unittest.TestCase):
                 argv.append("--dry-run")
             argv.extend(commits)
             with self.subTest(dry_run=dry_run), mock.patch.object(
+                SYNC, "MAX_STAGED_PATCH_BYTES", one_byte_short,
+            ), mock.patch.object(
                 SYNC, "verify_remote",
             ), mock.patch.object(
                 SYNC, "resolve_upstream_commit", side_effect=full_commits,
@@ -224,11 +333,16 @@ class CherryPickCliTests(unittest.TestCase):
                 SYNC.sys, "argv", argv,
             ), mock.patch.object(
                 SYNC.sys, "stdout", io.StringIO(),
-            ) as stdout:
+            ) as stdout, mock.patch.object(
+                SYNC.sys, "stderr", io.StringIO(),
+            ) as stderr:
                 self.assertEqual(SYNC.main(), 1)
 
             apply.assert_not_called()
             self.assertEqual(stdout.getvalue(), "")
+            self.assertIn(f"!! Refusing {commits[1]}:", stderr.getvalue())
+            self.assertIn("staged patch batch", stderr.getvalue())
+            self.assertIn("byte bound", stderr.getvalue())
 
     def test_valid_commits_apply_in_requested_order_after_preflight(self):
         commits = ["1" * 7, "2" * 7]
