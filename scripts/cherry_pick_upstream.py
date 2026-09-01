@@ -559,6 +559,7 @@ def main() -> int:
         print(f"!! {error}", file=sys.stderr)
         return 1
 
+    staged = []
     for commit in args.commits:
         print(f"==> Cherry-picking {commit}", file=sys.stderr)
         try:
@@ -570,6 +571,9 @@ def main() -> int:
             print(f"!! Refusing {commit}: {error}", file=sys.stderr)
             return 1
 
+        staged.append((full_commit, rewritten))
+
+    for full_commit, rewritten in staged:
         if args.dry_run:
             output = _encode_patch(rewritten) + b"\n"
             if hasattr(sys.stdout, "buffer"):

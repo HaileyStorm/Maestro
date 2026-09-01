@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import importlib.util
+import io
 import subprocess
 import types
 import unittest
@@ -198,6 +199,93 @@ class GitProvenanceTests(unittest.TestCase):
                 SYNC.resolve_upstream_commit("c" * 7)
         with self.assertRaisesRegex(SYNC.UpstreamSyncError, "hexadecimal"):
             SYNC.resolve_upstream_commit("--all")
+
+
+class CherryPickCliTests(unittest.TestCase):
+    def test_later_unmapped_commit_is_refused_before_any_apply(self):
+        commits = ["1" * 7, "2" * 7]
+        full_commits = ["1" * 40, "2" * 40]
+        patches = [_patch("models/first.py"), _patch("unknown/file.py")]
+
+        for dry_run in (False, True):
+            argv = [str(SCRIPT)]
+            if dry_run:
+                argv.append("--dry-run")
+            argv.extend(commits)
+            with self.subTest(dry_run=dry_run), mock.patch.object(
+                SYNC, "verify_remote",
+            ), mock.patch.object(
+                SYNC, "resolve_upstream_commit", side_effect=full_commits,
+            ), mock.patch.object(
+                SYNC, "get_patch", side_effect=patches,
+            ), mock.patch.object(
+                SYNC, "apply_patch",
+            ) as apply, mock.patch.object(
+                SYNC.sys, "argv", argv,
+            ), mock.patch.object(
+                SYNC.sys, "stdout", io.StringIO(),
+            ) as stdout:
+                self.assertEqual(SYNC.main(), 1)
+
+            apply.assert_not_called()
+            self.assertEqual(stdout.getvalue(), "")
+
+    def test_valid_commits_apply_in_requested_order_after_preflight(self):
+        commits = ["1" * 7, "2" * 7]
+        full_commits = ["1" * 40, "2" * 40]
+        patches = [_patch("models/first.py"), _patch("models/second.py")]
+
+        with mock.patch.object(
+            SYNC, "verify_remote",
+        ), mock.patch.object(
+            SYNC, "resolve_upstream_commit", side_effect=full_commits,
+        ), mock.patch.object(
+            SYNC, "get_patch", side_effect=patches,
+        ), mock.patch.object(
+            SYNC, "apply_patch",
+        ) as apply, mock.patch.object(
+            SYNC.sys, "argv", [str(SCRIPT), *commits],
+        ):
+            self.assertEqual(SYNC.main(), 0)
+
+        self.assertEqual(apply.call_count, len(commits))
+        applied = [call.args[0] for call in apply.call_args_list]
+        self.assertIn("a/app/models/first.py", applied[0])
+        self.assertIn("a/app/models/second.py", applied[1])
+        for rewritten, full_commit in zip(applied, full_commits):
+            self.assertIn(f"Upstream-Commit: {full_commit}", rewritten)
+
+    def test_dry_run_prints_valid_commits_in_requested_order(self):
+        commits = ["1" * 7, "2" * 7]
+        full_commits = ["1" * 40, "2" * 40]
+        patches = [_patch("models/first.py"), _patch("models/second.py")]
+        stdout = io.StringIO()
+
+        with mock.patch.object(
+            SYNC, "verify_remote",
+        ), mock.patch.object(
+            SYNC, "resolve_upstream_commit", side_effect=full_commits,
+        ), mock.patch.object(
+            SYNC, "get_patch", side_effect=patches,
+        ), mock.patch.object(
+            SYNC, "apply_patch",
+        ) as apply, mock.patch.object(
+            SYNC.sys, "argv", [str(SCRIPT), "--dry-run", *commits],
+        ), mock.patch.object(
+            SYNC.sys, "stdout", stdout,
+        ):
+            self.assertEqual(SYNC.main(), 0)
+
+        apply.assert_not_called()
+        output = stdout.getvalue()
+        self.assertLess(
+            output.index("a/app/models/first.py"),
+            output.index("a/app/models/second.py"),
+        )
+        self.assertLess(
+            output.index(f"Upstream-Commit: {full_commits[0]}"),
+            output.index(f"Upstream-Commit: {full_commits[1]}"),
+        )
 
 
 class SelectiveIntegrationLedgerTests(unittest.TestCase):
