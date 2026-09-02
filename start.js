@@ -70,7 +70,6 @@ const readAppEnvironment = () => {
 }
 
 module.exports = async (kernel) => {
-  let port = await kernel.port()
   const runtime = runtimeProfile(kernel)
   const legacyRuntime = legacyRuntimeProfile(kernel)
   const hasRecoveryRuntime = runtime.env !== legacyRuntime.env
@@ -80,24 +79,14 @@ module.exports = async (kernel) => {
   const selectedPython = hasRecoveryRuntime
     ? `{{exists('${runtime.marker}') ? '${runtime.python}' : '${legacyRuntime.python}'}}`
     : runtime.python
-  const runtimeGuard = isRtx50(kernel)
-    ? (needsCuda13DriverUpdate(kernel) ? [{
+  const runtimeGuard = isRtx50(kernel) && needsCuda13DriverUpdate(kernel) ? [{
       method: "input",
       params: {
         title: "NVIDIA driver update required",
         description: `RTX 50 requires NVIDIA driver 580 or newer for Maestro's CUDA 13 runtime (found ${kernel.gpu_driver}). Update the driver, then run Update before starting Maestro.`
       },
       next: null
-    }] : [{
-      when: `{{!exists('${runtime.marker}')}}`,
-      method: "input",
-      params: {
-        title: "RTX 50 runtime upgrade required",
-        description: "Run Update once to install Maestro's Python 3.11 / CUDA 13 acceleration environment, then start Maestro again. Your existing environment is preserved."
-      },
-      next: null
-    }])
-    : []
+    }] : []
   const recoveryGuard = hasRecoveryRuntime ? [{
     when: `{{!exists('${runtime.marker}') && !exists('${legacyRuntime.marker}')}}`,
     method: "input",
@@ -180,7 +169,7 @@ module.exports = async (kernel) => {
           env: {
             ...backendEnvironment,
             ...runtimeSecretEnv,
-            SERVER_PORT: port,
+            SERVER_PORT: "{{port}}",
           },
           path: "app",
           message: [

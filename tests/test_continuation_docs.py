@@ -35,6 +35,24 @@ class TestContinuationDocs(unittest.TestCase):
         self.assertIn("AGENTS.md", startup)
         self.assertIn("git status --short --branch", startup)
 
+        launch = self.guide_section("Start Maestro Continuum")
+        for required in (
+            "start.js",
+            "python wgp.py",
+            "pterm search",
+            "pterm run",
+            "app/env-rtx50",
+            "preserved `app/env`",
+            "SERVER_PORT",
+            "{{port}}",
+            "Caddy",
+            "MAESTRO_STRICT_SERVER_PORT=true",
+            "/health",
+            "/ready",
+        ):
+            with self.subTest(launch_contract=required):
+                self.assertIn(required, launch)
+
         accounts = self.guide_section("Accounts and existing projects")
         for required in (
             "MAESTRO_ACCOUNTS_ENABLED=true",

@@ -148,7 +148,11 @@ Promise.resolve(launcher.menu({}, info))
                 start = (_ROOT / filename).read_text(encoding="utf-8")
 
                 self.assertIn('bundle: "ai"', start)
-                self.assertIn('SERVER_PORT: port', start)
+                if filename == "start.js":
+                    self.assertIn('SERVER_PORT: "{{port}}"', start)
+                    self.assertNotIn("let port = await kernel.port()", start)
+                else:
+                    self.assertIn("SERVER_PORT: port", start)
                 self.assertIn('"event": "/(http:\\/\\/[0-9.:]+)/"', start)
                 self.assertIn('url: "{{input.event[1]}}"', start)
 
@@ -843,7 +847,7 @@ const explicitBackendEnvironment = (definition) => {
                 params_environment["PINOKIO_STABLE_SHARE_UPDATE_SECRET"],
                 "",
             )
-            self.assertEqual(params_environment["SERVER_PORT"], 49152)
+            self.assertEqual(params_environment["SERVER_PORT"], "{{port}}")
 
     def _load_start_with_environment(self, app_environment, global_environment):
         source = (_ROOT / "start.js").read_text(encoding="utf-8")

@@ -600,6 +600,8 @@ and closure procedure.
 ## Usage
 
 After clicking **Start**, the launcher shows an **Open Web UI** button once the server is up.
+The current Pinokio Start/Restart procedure, including RTX 50 compatibility
+fallback and dynamic ports, is in [docs/operations/CONTINUATION.md](docs/operations/CONTINUATION.md).
 
 - **Sidebar** — peer workspaces (Generate / Director / References), model picker, prompt, LoRAs, and advanced settings
 - **Recipes** — open the bundled preset library from the empty Gallery or Generate sidebar; applying a recipe deliberately returns to Generate with editable settings and prompt

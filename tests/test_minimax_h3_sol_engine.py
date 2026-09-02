@@ -304,8 +304,24 @@ const childNames = [
 
   const rtx50 = {...kernel, gpu_target: 'sm_120', gpu_model: 'RTX 5090'};
   const rtx50Plan = await classic(rtx50);
+  const rtx50Backend = rtx50Plan.run.find((step) =>
+    step.method === 'shell.run' &&
+    Array.isArray(step.params.message) &&
+    step.params.message.some((command) => command.includes('python wgp.py'))
+  );
+  assert.equal(
+    rtx50Backend.params.venv,
+    "{{exists('app/env-rtx50/.maestro_torch_rtx50_v2.installed') ? 'env-rtx50' : 'env'}}"
+  );
+  assert.equal(
+    rtx50Backend.params.venv_python,
+    "{{exists('app/env-rtx50/.maestro_torch_rtx50_v2.installed') ? '3.11' : '3.10'}}"
+  );
+  assert(!rtx50Plan.run.some((step) =>
+    step.next === null && step.params && step.params.title === 'RTX 50 runtime upgrade required'
+  ));
   assert(rtx50Plan.run.some((step) =>
-    step.next === null && String(step.when).includes('.maestro_torch_rtx50_v2.installed')
+    step.method === 'log' && /preserved compatibility runtime/.test(step.params.raw)
   ));
   const oldRtx50 = await classic({...rtx50, gpu_driver: '579.9'});
   assert(oldRtx50.run.some((step) =>
@@ -376,6 +392,36 @@ const evaluate = (when, existing) => new Function(
       assert.equal(evaluate(guard.when, existing), guardExpected);
       assert.equal(evaluate(fallback.when, existing), fallbackExpected);
     }
+  }
+
+  const rtx50 = {
+    ...kernel, gpu_target: 'sm_120', gpu_model: 'RTX 5090',
+  };
+  for (const build of builders) {
+    const plan = await build(rtx50);
+    assert(!plan.run.some((step) =>
+      step.params && step.params.title === 'RTX 50 runtime upgrade required'
+    ));
+    const backend = plan.run.find((step) =>
+      step.method === 'shell.run' &&
+      Array.isArray(step.params.message) &&
+      step.params.message.some((command) =>
+        command.includes('python launch.py') || command.includes('python wgp.py')
+      )
+    );
+    assert.equal(
+      backend.params.venv,
+      "{{exists('app/env-rtx50/.maestro_torch_rtx50_v2.installed') ? 'env-rtx50' : 'env'}}"
+    );
+    const guard = plan.run.find((step) =>
+      step.next === null && step.params.title === 'Maestro runtime update required'
+    );
+    const fallback = plan.run.find((step) =>
+      step.method === 'log' && /preserved compatibility runtime/.test(step.params.raw)
+    );
+    assert(guard && fallback);
+    assert.equal(evaluate(guard.when, new Set([legacy])), false);
+    assert.equal(evaluate(fallback.when, new Set([legacy])), true);
   }
   process.stdout.write('ok');
 })().catch((error) => { console.error(error); process.exit(1); });

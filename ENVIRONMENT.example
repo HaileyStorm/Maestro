@@ -27,6 +27,9 @@ TORCH_HOME=./cache/TORCH_HOME
 MAESTRO_STORAGE_TIER_PLAN_FILE=
 PINOKIO_SHARE_LOCAL=false
 PINOKIO_SHARE_LOCAL_PORT=
+# Keep the Pinokio-assigned SERVER_PORT. launch.py holds it before model
+# import. Set false only to allow a one-time hop if that port is already taken.
+MAESTRO_STRICT_SERVER_PORT=true
 
 # Optional public Support links. Each option is disabled unless explicitly
 # enabled; an enabled option also needs a valid URL before it is available.

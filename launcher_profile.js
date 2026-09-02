@@ -34,19 +34,18 @@ const needsCuda13DriverUpdate = (kernel = {}) => {
   return Number.isFinite(driver) && driver < 580
 }
 
+const rtx50RuntimeProfile = () => ({
+  env: "env-rtx50",
+  python: "3.11",
+  // v2 pins Triton 3.6 for the integrated H3 Sol Engine path. The marker
+  // bump makes v1.7.5 Update migrate existing RTX 50 environments once.
+  marker: "app/env-rtx50/.maestro_torch_rtx50_v2.installed",
+  flashMarker: "app/env-rtx50/.maestro_flash_2_8_3_v1.installed",
+  flashSupported: true,
+  label: "RTX 50 / CUDA 13",
+})
+
 const legacyRuntimeProfile = (kernel = {}) => {
-  if (isRtx50(kernel)) {
-    return {
-      env: "env-rtx50",
-      python: "3.11",
-      // v2 pins Triton 3.6 for the integrated H3 Sol Engine path. The marker
-      // bump makes v1.7.5 Update migrate existing RTX 50 environments once.
-      marker: "app/env-rtx50/.maestro_torch_rtx50_v2.installed",
-      flashMarker: "app/env-rtx50/.maestro_flash_2_8_3_v1.installed",
-      flashSupported: true,
-      label: "RTX 50 / CUDA 13",
-    }
-  }
   const target = String(kernel.gpu_target || "").toLowerCase()
   const legacyWindowsFlashSupported = (
     kernel.platform !== "win32"
@@ -68,7 +67,7 @@ const legacyRuntimeProfile = (kernel = {}) => {
 }
 
 const solRuntimeProfile = (kernel = {}) => {
-  if (isRtx50(kernel)) return legacyRuntimeProfile(kernel)
+  if (isRtx50(kernel)) return rtx50RuntimeProfile()
   return {
     env: "env-sol",
     python: "3.11",
@@ -80,9 +79,10 @@ const solRuntimeProfile = (kernel = {}) => {
 }
 
 // The tested CUDA 13 / Python 3.11 environment is now Maestro's preferred
-// runtime on GPUs supported by H3 Sol Engine. Existing RTX 40 installations
-// retain app/env as a recovery path; start.js falls back to it automatically
-// until the normal Update flow finishes this side-by-side migration.
+// runtime on GPUs supported by H3 Sol Engine. Existing RTX 40 and RTX 50
+// installations retain app/env as a recovery path; start.js falls back to it
+// automatically until the normal Update flow finishes this side-by-side
+// migration. RTX 50 still prefers env-rtx50 when that marker exists.
 const runtimeProfile = (kernel = {}) => (
   isSolCapable(kernel) && !needsCuda13DriverUpdate(kernel)
     ? solRuntimeProfile(kernel)
@@ -97,4 +97,5 @@ module.exports = {
   legacyRuntimeProfile,
   runtimeProfile,
   solRuntimeProfile,
+  rtx50RuntimeProfile,
 }

@@ -361,6 +361,38 @@ changes the separate, existing recent-password-reauthentication gate for the
 account/project migration action or permits a historical SQLite tracker
 mutation.
 
+## Start Maestro Continuum
+
+Start Continuum from Pinokio's **Start** action (`start.js`). Do not launch
+with `python wgp.py`. **Start (Classic UI)** is a separate local-only path.
+
+If Pinokio itself is not running, start the installed desktop/AppImage first.
+On Linux, an Electron SUID sandbox abort is fixed with `--no-sandbox` at
+launch time; do not rewrite Pinokio or Maestro files for that.
+
+Resolve the live app; do not hardcode a port:
+
+```bash
+pterm search "Maestro Continuum" --mode balanced --min-match 1 --limit 8
+pterm status "$MAESTRO_REF" --probe --timeout=5000
+pterm run "$MAESTRO_REF" --default start.js
+```
+
+RTX 50 with NVIDIA driver 580 or newer prefers `app/env-rtx50` when its
+install marker exists. Otherwise Start uses the preserved `app/env`
+compatibility runtime and logs that Update still needs to finish the CUDA 13
+migration. A driver older than 580 still stops until the operator updates it.
+
+`start.js` assigns `SERVER_PORT` with Pinokio's `{{port}}` on the `launch.py`
+step. `launch.py` binds that port before importing torch/WanGP so Pinokio
+Caddy cannot steal it while models load. Caddy is Pinokio's HTTPS reverse
+proxy, not Blender. Keep `MAESTRO_STRICT_SERVER_PORT=true` in the ignored
+operator ENVIRONMENT so a busy requested port fails instead of silently
+moving the stable-share backend; set it false only as a temporary recovery.
+
+After Start, use the current `ready_url` and probe `/health` then `/ready`.
+Never reuse a previous session's port.
+
 ## Coordinated restart and status
 
 Use Pinokio's **Restart Maestro** launcher action. It invokes `restart.js`,

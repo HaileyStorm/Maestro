@@ -13,6 +13,26 @@ Environment variables:
     SERVER_PORT  - Port to bind (default: 7860)
 """
 
+import os
+import sys
+import socket
+
+# --- Bootstrap: CWD must be app/ before holding SERVER_PORT or importing wgp ---
+_app_dir = os.path.dirname(os.path.abspath(__file__))
+os.chdir(_app_dir)
+
+_HELD_SERVER = None
+if __name__ == "__main__":
+    from services.server_port_hold import (
+        ServerPortHoldError,
+        acquire_configured_server_port,
+    )
+    try:
+        _HELD_SERVER = acquire_configured_server_port()
+    except ServerPortHoldError as exc:
+        print(exc.message, end="" if exc.message.endswith("\n") else "\n", flush=True)
+        raise SystemExit(1) from exc
+
 import gc
 import base64
 import atexit
@@ -20,9 +40,7 @@ import copy
 import hashlib
 import hmac
 import ipaddress
-import sys
 import torch
-import os
 import glob
 import json
 import math
@@ -34,15 +52,10 @@ import contextvars
 import threading
 import traceback
 import requests
-import socket
 from collections.abc import Mapping, Sequence
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable
 from urllib.parse import parse_qsl, quote, urlsplit
-
-# --- Bootstrap: CWD must be app/ and sys.argv must be patched before importing wgp ---
-_app_dir = os.path.dirname(os.path.abspath(__file__))
-os.chdir(_app_dir)
 
 # Preserve original argv, patch for wgp's argparse
 _original_argv = sys.argv[:]
@@ -68449,80 +68462,20 @@ else:
 # ============================================================================
 
 if __name__ == "__main__":
-    port = int(os.environ.get("SERVER_PORT", "7860"))
-
-    # Bind-host resolution priority:
-    #   1. PINOKIO_SHARE_LOCAL — start.js freshly reads the per-app
-    #      ENVIRONMENT and explicitly overlays this selected policy value
-    #      after the global fallback. "true" → 0.0.0.0 (LAN-accessible),
-    #      anything else → 127.0.0.1 (loopback only). This is the primary
-    #      Pinokio path; kernel.envs alone exposes only the global value.
-    #   2. SERVER_NAME — manual override for direct python launches
-    #      outside Pinokio. Lets devs force a bind without going through
-    #      the env-var dance.
-    #   3. Default 127.0.0.1 (safe loopback).
-    pinokio_share = (os.environ.get("PINOKIO_SHARE_LOCAL") or "").strip().lower()
-    if pinokio_share == "true":
-        host = "0.0.0.0"
-    elif pinokio_share == "false":
-        host = "127.0.0.1"
-    else:
-        host = os.environ.get("SERVER_NAME", "127.0.0.1")
-
-    # Port resolution: Pinokio hands us a free port via SERVER_PORT, but a
-    # stale prior instance or another app can still be holding it by the time
-    # we bind — and an uncaught bind failure makes the launcher report a
-    # blank "server failed to start" with no clue. Probe the requested port
-    # and fall forward to the next free one, printing what happened so the
-    # captured URL (below) matches the actual bind.
-    def _first_bindable_port(bind_host: str, preferred: int, span: int = 20):
-        import socket as _socket
-        probe_host = "127.0.0.1" if bind_host == "0.0.0.0" else bind_host
-        for candidate in [preferred] + [preferred + i for i in range(1, span + 1)]:
-            s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-            try:
-                # No SO_REUSEADDR — a plain bind fails iff the port is truly
-                # in use right now, which is exactly the check we want (and
-                # avoids the Windows REUSEADDR hijack-a-live-port behavior).
-                s.bind((probe_host, candidate))
-                return candidate
-            except OSError:
-                continue
-            finally:
-                s.close()
-        return None
-
-    resolved_port = _first_bindable_port(host, port)
-    if resolved_port is None:
-        print(
-            f"\n[Maestro] ERROR: could not find a free port in "
-            f"{port}-{port + 20}. Another app (or a stale Maestro instance) "
-            f"is holding them.\n"
-            f"  • Close the other program, or stop the existing Maestro from "
-            f"the Pinokio menu, then Start again.\n"
-            f"  • On Windows you can see what holds a port with: "
-            f"netstat -ano | findstr :{port}\n",
-            flush=True,
+    if _HELD_SERVER is None:
+        from services.server_port_hold import (
+            ServerPortHoldError,
+            acquire_configured_server_port,
         )
-        sys.exit(1)
-    strict_port = str(
-        os.environ.get("MAESTRO_STRICT_SERVER_PORT") or ""
-    ).strip().lower() in {"1", "true", "yes", "on"}
-    if resolved_port != port and strict_port:
-        print(
-            f"[Maestro] ERROR: required port {port} is busy; refusing to "
-            "move the stable-share backend to another port.",
-            flush=True,
-        )
-        sys.exit(1)
-    if resolved_port != port:
-        print(
-            f"[Maestro] Port {port} was busy — using {resolved_port} instead.",
-            flush=True,
-        )
-        port = resolved_port
-    # Origin authorization is evaluated per request from SERVER_PORT. Keep it
-    # aligned with the actual listener if startup had to fall forward.
+        try:
+            _HELD_SERVER = acquire_configured_server_port()
+        except ServerPortHoldError as exc:
+            print(exc.message, end="" if exc.message.endswith("\n") else "\n", flush=True)
+            raise SystemExit(1) from exc
+
+    host = _HELD_SERVER.host
+    port = _HELD_SERVER.port
+    display_host = _HELD_SERVER.display_host
     os.environ["SERVER_PORT"] = str(port)
 
     # Browsers can't navigate to 0.0.0.0 (it's a non-routable bind
@@ -68530,8 +68483,6 @@ if __name__ == "__main__":
     # URL — that's what Pinokio's regex captures from this output and
     # hands to its built-in browser. The actual bind stays 0.0.0.0 so
     # LAN access works; only the displayed URL is loopback.
-    display_host = "127.0.0.1" if host == "0.0.0.0" else host
-
     print(f"\n{'='*50}")
     print(f"  Maestro UI:    http://{display_host}:{port}/")
     # Trailing slash required: the Gradio submount 404s the bare path.
@@ -68542,11 +68493,9 @@ if __name__ == "__main__":
     print(f"{'='*50}\n")
 
     try:
-        uvicorn.run(api, host=host, port=port)
+        config = uvicorn.Config(api, host=host, port=port)
+        uvicorn.Server(config).run(sockets=[_HELD_SERVER.sock])
     except OSError as e:
-        # The probe above narrows this to a genuine race (port taken in the
-        # window between probe and uvicorn's own bind). Still fail loudly and
-        # actionably rather than dumping a bare traceback into the launcher.
         print(
             f"\n[Maestro] ERROR: failed to bind {host}:{port} ({e}). "
             f"The port was taken just after we checked it — Start again to "

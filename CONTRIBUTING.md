@@ -9,7 +9,9 @@ pipeline and distributed through [Pinokio](https://pinokio.computer).
 Maestro is a Pinokio app, so the easiest dev loop is:
 
 1. Install Maestro through Pinokio (see the [README](README.md)). This creates
-   the Python environment in `app/env/` and installs the app.
+   the Python environment in `app/env/` and installs the app. Launch with
+   Pinokio **Start** (`start.js`); see **Launch Maestro Continuum** in
+   `AGENTS.md` and `docs/operations/CONTINUATION.md`.
 2. Edit the source in place. The layout:
    - **Launcher scripts** (`install.js`, `start.js`, `update.js`, `reset.js`,
      `pinokio.js`) live at the repo root.
