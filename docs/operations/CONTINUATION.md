@@ -366,17 +366,25 @@ mutation.
 Start Continuum from Pinokio's **Start** action (`start.js`). Do not launch
 with `python wgp.py`. **Start (Classic UI)** is a separate local-only path.
 
-If Pinokio itself is not running, start the installed desktop/AppImage first.
-On Linux, an Electron SUID sandbox abort is fixed with `--no-sandbox` at
-launch time; do not rewrite Pinokio or Maestro files for that.
+If Pinokio itself is not running, start the installed desktop/AppImage first
+with the user systemd unit (`systemctl --user start pinokio`). Do not launch
+the AppImage from an agent-owned shell: those wrappers impose a runtime
+limit and kill Pinokio plus every Maestro child when the limit fires. On
+Linux, an Electron SUID sandbox abort is fixed with `--no-sandbox` at launch
+time; do not rewrite Pinokio or Maestro files for that.
 
-Resolve the live app; do not hardcode a port:
+Resolve the live app; do not hardcode a port. Prefer the user systemd
+units so neither Pinokio nor Continuum is an agent-owned timed shell:
 
 ```bash
+systemctl --user start pinokio maestro-continuum
 pterm search "Maestro Continuum" --mode balanced --min-match 1 --limit 8
 pterm status "$MAESTRO_REF" --probe --timeout=5000
-pterm run "$MAESTRO_REF" --default start.js
 ```
+
+If the units are unavailable, `pterm run "$MAESTRO_REF" --default start.js`
+still starts Continuum, but do not leave that client attached to an
+agent wrapper with a runtime limit.
 
 RTX 50 with NVIDIA driver 580 or newer prefers `app/env-rtx50` when its
 install marker exists. Otherwise Start uses the preserved `app/env`
