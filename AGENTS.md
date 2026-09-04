@@ -108,7 +108,7 @@ To guarantee every contribution follows this guide precisely, obey this checklis
   policy, security, or infrastructure work. For the next fresh thread, make the
   already-pushed accounts/project flow usable first; keep credit enforcement
   out of that critical path.
-- New unpinned Codex tasks use GPT-6 Astra at low (Light) as the primary
+- New unpinned Codex tasks use GPT-6 Astra at medium as the primary
   controller. An explicit user, picker, task, or project model and reasoning
   choice always wins. Astra owns synthesis and acceptance; use the global
   Astra-first Pareto envelope for specialists: Sol high for bounded
