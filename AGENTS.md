@@ -217,7 +217,7 @@ If the initial prompt is simply a URL and nothing else, check the website conten
 
 1. A Tutorial: the intent may be to implement a demo for the tutorial and build a launcher.
 2. A Demo: the intent may be a 1-click launcher for the demo
-3. Open source project: the intent may be a 1-click launcher for the project
+3. Open source project: the intent may be a 1-click launcher for the project 
 4. Regular website: the intent may be to clone the website and a launcher.
 5. There can be other cases, but try to guess.
 
@@ -413,7 +413,7 @@ module.exports = {
           // and the script will go onto the next step.
           // The regular expression match object will be passed on to the next step as `input.event`
           // Useful for capturing the URL at which the server is running (in case the server prints some message about where the server is running)
-          "event": "/(http:\/\/\\S+)/",
+          "event": "/(http:\/\/\\S+)/", 
 
           // Use "done": true to move to the next step while keeping the shell alive.
           // Use "kill": true to move to the next step after killing the shell.
@@ -439,14 +439,14 @@ module.exports = {
 ## 2. Launching serverless web apps
 
 - In case of purely static web apps WITHOUT servers or backends (for example an HTML based app that connects to 3rd party servers--either remote or localhost), we do NOT need the launcher scripts.
-- In these cases, simply include `index.html` in the project root folder and everything should automatically work. No need for any of the pinokio launcher scripts. (Do
+- In these cases, simply include `index.html` in the project root folder and everything should automatically work. No need for any of the pinokio launcher scripts. (Do 
 - You still need to include the metadata file so they show up properly on pinokio:
   - `pinokio.json`: For metadata
 
 ## 3. Launching quick scripts without web UI
 
 - In many cases, we may not even need a web UI, but instead just a simple way to run scripts.
-- This may include TUI (Terminal User Interface) apps, a simple launcher
+- This may include TUI (Terminal User Interface) apps, a simple launcher 
 - In these cases, all we need is the launcher file `pinokio.js`, which may link to multiple scripts. In this case, there are no web apps (no serverless apsp, no servers), but instead just the default pinokio launcher UI that calls a bunch of scripts.
 - Here are some examples:
   - A pinokio script to toggle the desktop theme between dark and light
@@ -510,8 +510,8 @@ The following variables are accessible inside template expressions (example `{{a
 - next: The next variable points to the index of the next instruction to be executed. (null if the current instruction is the final instruction in the run array)
 - envs: You can access the environment variables of the currently running process with envs object.
 - which: Check whether a command exists and return its absolute path (example: `{{which('winget')}}`). This is the correct way to resolve command paths inside reproducible Pinokio scripts, including custom shell selection such as `shell: "{{which('bash')}}"`. If you are outside a Pinokio-managed shell and only need to inspect Pinokio's environment manually, use `pterm which <command>`, but do NOT copy that user-specific absolute path into launcher scripts.
-- exists: Check whether a file or folder exists at the specified relative path (example: `"when": "{{!exists('app')}}"`). Can be used with the `when` attribute to determine a path's existence and trigger custom logic. Use relative paths and it will resolve automatically to the current execution folder.
-- running: Check whether a script file is running (example: `"when": "{{!running('start.js')}}"`). Can be used with the `when` attribute to determine a path's existence and trigger custom logic. Use relative paths and it will resolve automatically to the current execution folder.
+- exists: Check whether a file or folder exists at the specified relative path (example: `"when": "{{!exists('app')}}"`). Can be used with the `when` attribute to determine a path's existence and trigger custom logic. Use relative paths and it will resolve automatically to the current execution folder. 
+- running: Check whether a script file is running (example: `"when": "{{!running('start.js')}}"`). Can be used with the `when` attribute to determine a path's existence and trigger custom logic. Use relative paths and it will resolve automatically to the current execution folder. 
 - os: Pinokio exposes the node.js os module through the os variable.
 - path: Pinokio exposes the Node.js path module through the path variable (example: `{{path.resolve(...)}}`
 
@@ -519,7 +519,7 @@ The following variables are accessible inside template expressions (example `{{a
 ### Package Management (Use in Order of Preference)
 The following package managers come pre-installed with Pinokio, so whenever you need to install a 3rd party binary, remember that these are available. Also, you can assume these are available and include the following package manager commands in Pinokio scripts:
 1. **UV** - For Python packages (preferred over pip)
-2. **NPM** - For Node.js packages
+2. **NPM** - For Node.js packages  
 3. **Conda** - For cross-platform 3rd party binaries
 4. **Brew** - Mac-only fallback when other options unavailable
 5. **Git** - Full access to git is available.
@@ -711,7 +711,7 @@ The `torch.js` script also includes ways to install pytorch dependent libraries 
 ## Quick Reference
 ### Essential Documentation
 - **Pinokio Programming:** See `PINOKIO.md` at `/media/hailey/TVBox/pinokio/prototype/PINOKIO.md` → "Programming Pinokio" section
-- **Dynamic Menus:** See `PINOKIO.md` at `/media/hailey/TVBox/pinokio/prototype/PINOKIO.md` → "Dynamic menu rendering" section
+- **Dynamic Menus:** See `PINOKIO.md` at `/media/hailey/TVBox/pinokio/prototype/PINOKIO.md` → "Dynamic menu rendering" section  
 - **CLI Commands:** See `PTERM.md` at `/media/hailey/TVBox/pinokio/prototype/PTERM.md`
 ### Common Patterns
 - **Python Virtual Env:** `shell.run` with `venv` attribute
