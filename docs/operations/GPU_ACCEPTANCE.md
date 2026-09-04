@@ -143,6 +143,49 @@ human acceptance.
   the next private/mature evaluation, while leaving it opt-in; this neutral
   robot sample still does not establish mature-content quality across prompts.
 
+### 2026-09-04 FlashVSR delivery row (1080p, Ultra, 4K)
+
+- Host: Linux `7.0.0-30-generic`; RTX 5090; NVIDIA `595.84`; live Continuum
+  runtime `env-rtx50` with PyTorch `2.10.0+cu130` / CUDA 13.0. Cases used the
+  synthetic H3 benchmark payload, private output, and SDPA except 1080p
+  (High native Sol 20). Native canvas was 1344x768 except the 608 Turbo
+  probes used only while diagnosing delivery. Final publication selected the
+  explicit delivery output; protected natives were not exposed; 4K is
+  learned upscale, not a native-4K claim.
+- Probe-cache bug: `probe_video_stream_metadata` and `get_video_info` cached
+  on path only. FlashVSR wrote a 2688x1536 or 4032x2304 mux, then replaced
+  the work path in place; dest probes kept the native 1344x768 hit and
+  `upscale_exact` refused. The cache key now includes file identity
+  (dev/inode/mtime/size). Model-free unit tests cover same-path replace.
+- `base_1080p_delivery` (`flashvsr1.5`, `center_crop`, 1920x1080) completed
+  **before** the cache-identity fix: valid 1920x1080, 124 frames, 24 fps,
+  5.167s, 32 kHz stereo audio, sampled motion and non-black; 4,200,528
+  bytes; SHA-256
+  `4ab47d430ddb943de70b74bf0204c4fb310bde1811281c0ed4398a8362702218`;
+  wall 521s. Geometry passed via coded-size center-crop from a dest that
+  still probed native.
+- `base_ultra_delivery` (`flashvsr2pass2`, `upscale_exact`, 2688x1536)
+  completed **after** the cache-identity fix: dest after replace probed
+  2688x1536; valid 2688x1536, 124 frames, 24 fps, 5.167s, 32 kHz stereo
+  audio, sampled motion and non-black; 6,649,455 bytes; SHA-256
+  `621a049badc45fec13b7ebe3222a24099348f1f7e5c60a5dbbe5f3f9c92e645a`;
+  wall 1093s; public finality valid.
+- `base_4k_delivery` (`flashvsr3`, `center_crop`, 3840x2160) completed after
+  the same fix: FlashVSR encoded 4032x2304, then center-crop to 3840x2160;
+  valid 3840x2160, 124 frames, 24 fps, 5.167s, 32 kHz stereo audio, sampled
+  motion and non-black; 14,285,748 bytes; SHA-256
+  `03e78558823fed16ff9327056f2f165db69734bfd6a91c78e9d22fd954f014bb`;
+  wall 1480s; `native_4k` false; public finality valid.
+- Evidence class: live local GPU generation plus automated validity and
+  public-finality probes. This is not owner visual acceptance of
+  detail/identity. Media remains in the private output store, not Git.
+- Residual: SageAttention2++ is not importable in `env-rtx50`, so that row
+  was not run (an SDPA fallback would not count). The first Ref2VA Turbo-4
+  named case was rejected at generate with HTTP 404 after a successful
+  private upload; that is request admission, not GPU failure. Uncommitted
+  mixed `app/launch.py` still holds transactional H3 delivery breadcrumbs
+  alongside unrelated dirty work and was not part of this commit.
+
 When all applicable rows pass, update this matrix rather than deleting it. Keep
 failed or intentionally unsupported variants as provenance, and remove only a
 superseded command after its replacement is both documented and accepted.

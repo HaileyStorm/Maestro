@@ -19,7 +19,7 @@ import subprocess
 import json
 import time
 from functools import lru_cache
-from .video_decode import probe_video_stream_metadata, video_needs_corrected_decode, decode_video_frames_ffmpeg, get_video_summary_extras
+from .video_decode import probe_video_stream_metadata, video_needs_corrected_decode, decode_video_frames_ffmpeg, get_video_summary_extras, _media_file_identity
 os.environ["U2NET_HOME"] = os.path.join(os.getcwd(), "ckpts", "rembg")
 
 
@@ -158,8 +158,16 @@ def process_images_multithread(image_processor, items, process_type, wrap_in_lis
     # print(f"duration:{end_time-start_time:.1f}")
 
     return results
-@lru_cache(maxsize=100)
 def get_video_info(video_path):
+    video_path = os.fspath(video_path)
+    identity = _media_file_identity(video_path)
+    if identity is None:
+        return 0, 0, 0, 0
+    return _get_video_info_cached(video_path, identity)
+
+
+@lru_cache(maxsize=100)
+def _get_video_info_cached(video_path, _identity):
     # Prefer ffprobe metadata — returns DISPLAY dimensions (SAR-corrected) and
     # handles HDR/anamorphic videos that cv2 reports wrong. Falls back to cv2
     # if ffprobe is unavailable or the file isn't a standard video container.

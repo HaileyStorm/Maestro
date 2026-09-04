@@ -72,9 +72,25 @@ def _resolve_media_binary(binary_name: str):
     return shutil.which(binary_name + (".exe" if os.name == "nt" else "")) or shutil.which(binary_name)
 
 
-@lru_cache(maxsize=128)
+def _media_file_identity(video_path):
+    """Cache identity for a path whose bytes may be replaced in place."""
+    try:
+        stat = os.stat(video_path)
+    except OSError:
+        return None
+    return (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size)
+
+
 def probe_video_stream_metadata(video_path):
     video_path = os.fspath(video_path)
+    identity = _media_file_identity(video_path)
+    if identity is None:
+        return None
+    return _probe_video_stream_metadata_cached(video_path, identity)
+
+
+@lru_cache(maxsize=128)
+def _probe_video_stream_metadata_cached(video_path, _identity):
     ffprobe_path = _resolve_media_binary("ffprobe")
     if ffprobe_path is None:
         return None
