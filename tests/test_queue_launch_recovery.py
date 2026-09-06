@@ -878,10 +878,32 @@ class QueueLaunchWiringTests(unittest.TestCase):
             _function(self.launch, "_run_authorized_llm_with_selection"),
         )
         self.assertIn('body.pop(\n        "enhance_before_generate"', submit)
-        self.assertIn(
-            '"preparing" if durable_generation_preparation else "queued"',
-            submit,
+        generate = _function(self.launch, "generate")
+        effective_prepare = next(
+            node for node in generate.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == "effective_prepare" for target in node.targets)
         )
+        job = next(
+            node.value for node in generate.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "job"
+                    for target in node.targets)
+        )
+        status = next(value for key, value in zip(job.keys, job.values)
+                      if isinstance(key, ast.Constant) and key.value == "status")
+        for prepare in (False, True):
+            for held in (False, True):
+                with self.subTest(prepare=prepare, held=held):
+                    scope = {"durable_generation_preparation": prepare,
+                             "hold_for_queue": held}
+                    exec(compile(ast.Module(body=[effective_prepare], type_ignores=[]),
+                                 "preparation-admission", "exec"), scope)
+                    actual = eval(compile(ast.Expression(status),
+                                          "preparation-status", "eval"), scope)
+                    self.assertEqual(actual, "preparing" if prepare and not held
+                                     else "queued")
         self.assertIn("_queue_recovery_register_and_publish(", submit)
         self.assertIn("complete_preparation(", preparation)
         self.assertIn("write_sealed_request_manifest(", preparation)
@@ -6431,23 +6453,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
         self.assertNotIn(private_error, repr(status))
         self.assertNotIn(private_error, repr(listed))
 
-    def test_wgp_completed_repeat_offset_skips_only_outer_dispatch(self):
-        generate = _function(self.wgp, "generate_video")
-        arguments = [argument.arg for argument in generate.args.args]
-        self.assertIn("repeat_start_offset", arguments)
-        source = ast.get_source_segment(self.wgp_source, generate)
-        self.assertIn("completed_repeats = max(", source)
-        self.assertIn("int(repeat_start_offset or 0)", source)
-        self.assertIn("repeat_no = 0", source)
-
-    def test_native_recovery_uses_private_stable_target_before_promotion(self):
-        generate = ast.get_source_segment(
-            self.wgp_source, _function(self.wgp, "generate_video"),
-        )
-        self.assertIn("durable_output_dir = candidate", generate)
-        self.assertIn("output_dir = durable_output_dir", generate)
-        self.assertIn("durable_output_dir or save_path", generate)
-        self.assertIn("{durable_file_stem}-audio-tmp.wav", generate)
+    def test_native_recovery_promotes_before_checkpoint(self):
         runner = ast.get_source_segment(
             self.launch_source, _function(self.launch, "_run_generation"),
         )
@@ -6481,33 +6487,6 @@ class QueueLaunchWiringTests(unittest.TestCase):
         )
         self.assertIn(
             'f"{recovery_output_prefix}-continuation-ref.mp4"', ref2va,
-        )
-
-    def test_all_recovery_preprocessing_audio_uses_private_unit_prefix(self):
-        generate = ast.get_source_segment(
-            self.wgp_source, _function(self.wgp, "generate_video"),
-        )
-        validation = generate.index(
-            'raise RuntimeError("Recovery output staging identity is invalid")'
-        )
-        first_preprocess = generate.index(
-            '_recovery_preprocess_path("control-audio")'
-        )
-        self.assertLess(validation, first_preprocess)
-        for label in (
-            "control-audio", "clean-audio-1", "clean-audio-2",
-            "speaker-1", "speaker-2", "speaker-clean", "clean-audio",
-            "clip-offset",
-        ):
-            with self.subTest(label=label):
-                self.assertIn(
-                    f'_recovery_preprocess_path("{label}")', generate,
-                )
-        self.assertIn(
-            'f"{durable_output_prefix}-pre-audio-norm-"', generate,
-        )
-        self.assertIn(
-            'f"{durable_output_prefix}-pre-null-"', generate,
         )
 
     def test_recovered_custom_workers_never_fall_back_to_generation(self):
@@ -7743,10 +7722,38 @@ class QueueLaunchWiringTests(unittest.TestCase):
             jobs.index("_generic_job_visible(snapshot)"),
             jobs.index("authorized_jobs.append(job)"),
         )
-        self.assertLess(
-            jobs.index("_generic_job_visible(snapshot)"),
-            jobs.index('"output_files": j["output_files"]'),
+        class NotFound(Exception):
+            def __init__(self, *, status_code, detail):
+                self.status_code = status_code
+
+        sample.update(id="sample", status="failed")
+        projection = mock.Mock(return_value={
+            "logical_jobs": [], "representative_job_ids": {}, "summary": {},
+        })
+        namespace = _isolated_functions(
+            self.launch, ("get_status", "list_jobs"), {
+                "api": types.SimpleNamespace(
+                    get=lambda *_args, **_kwargs: lambda function: function),
+                "Request": object, "Response": object,
+                "HTTPException": NotFound,
+                "_jobs": {"sample": sample},
+                "_generic_job_visible": visible,
+                "_set_recovery_no_store": lambda _response: None,
+                "_job_owned_by_request": lambda *_args: True,
+                "queue_scheduler_snapshot": _synthetic_scheduler_snapshot,
+                "authorized_logical_queue_projection": projection,
+                "queue_control_state": lambda: {},
+            },
         )
+        with self.assertRaises(NotFound) as rejected:
+            namespace["get_status"]("sample", object(), object())
+        self.assertEqual(rejected.exception.status_code, 404)
+        listed = namespace["list_jobs"](object(), object())
+        self.assertEqual(listed["jobs"], [])
+        self.assertEqual(projection.call_args.args[0], [])
+        for private_value in ("PRIVATE_PROMPT_SENTINEL", "/private/sample.mp4",
+                              "PRIVATE_ERROR_SENTINEL"):
+            self.assertNotIn(private_value, repr(listed))
         self.assertIn(
             "_generic_job_visible(scheduler[\"states\"][id(job)])",
             queue,

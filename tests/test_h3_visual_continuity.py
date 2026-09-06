@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import ast
+import hashlib
+import json
+import re
 from pathlib import Path
 import sys
 import unittest
@@ -336,6 +339,73 @@ class H3VisualContinuityTests(unittest.TestCase):
         )
         validate_h3_shot_plan_seal(plan)
         apply_visual_carry_to_shot_plan(plan)
+        validate_h3_shot_plan_seal(plan)
+
+    def test_carried_clip_prompts_keep_matching_execution_digests(self):
+        prompt = (
+            "[Shot 1] [0s-9.5s] First beat.\n"
+            "[Shot 2] [9.5s-21.00s] Second beat.\n"
+            "[Shot 3] [21s-38.5s] Third beat.\n"
+            "[Shot 4] [38.5s-57.46s] Fourth beat."
+        )
+        frames = [243, 277, 226, 209, 243, 226]
+        published = [228, 276, 226, 194, 243, 212]
+        classified = classify_timeline_clip_boundaries(
+            prompt, clip_frame_counts=published, fps=24,
+        )
+        plan = plan_h3_native_shots(
+            global_prompt=prompt,
+            clip_frame_counts=frames,
+            clip_requested_frames=published,
+            fps=24,
+            clip_boundaries=classified,
+        )
+        self.assertGreater(len(plan["clip_prompts"]), 1)
+        self.assertTrue(
+            plan["clip_prompts"][1].startswith(SAME_SOURCE_VISUAL_CARRY_LINE),
+        )
+        for index, prompt_text in enumerate(plan["clip_prompts"]):
+            self.assertEqual(plan["shots"][index]["prompt"], prompt_text)
+        for key in ("source_contracts", "semantic_shots"):
+            for contract in plan[key]:
+                for local_index, segment_index in enumerate(contract["segment_indices"]):
+                    self.assertEqual(
+                        contract["executable_prompt_sha256"][local_index],
+                        hashlib.sha256(
+                            plan["clip_prompts"][segment_index].encode("utf-8")
+                        ).hexdigest(),
+                    )
+        validate_h3_shot_plan_seal(plan)
+
+    def test_director_carry_projection_preserves_seal_and_drop_restores_digests(self):
+        source = (MODULE.parent / "director_pipeline.py").read_text(encoding="utf-8")
+        names = {"_director_h3_keep_context_ir_with_carry",
+                 "_director_h3_executable_clip_prompts", "_director_h3_drop_planner_carry"}
+        functions = [node for node in ast.parse(source).body
+                     if isinstance(node, ast.FunctionDef) and node.name in names]
+        self.assertEqual({node.name for node in functions}, names)
+        namespace = {"re": re}
+        exec(compile(ast.Module(body=functions, type_ignores=[]),
+                     "director-carry", "exec"), namespace)
+        plan = plan_h3_native_shots(
+            global_prompt="[Shot 1] The pilot crosses the hangar without a cut.",
+            clip_frame_counts=[158, 345], clip_requested_frames=[144, 336],
+            fps=24, clip_boundaries=[{"type": "continuous", "source": "model_grid"}],
+        )
+        # A persisted plan has equal contract copies rather than Python aliases.
+        plan = json.loads(json.dumps(plan))
+        namespace["_director_h3_drop_planner_carry"](plan)
+        self.assertNotIn(SAME_SOURCE_VISUAL_CARRY_LINE, plan["clip_prompts"][1])
+        for key in ("source_contracts", "semantic_shots"):
+            for contract in plan[key]:
+                self.assertEqual(contract["executable_prompt_sha256"], [
+                    hashlib.sha256(plan["clip_prompts"][index].encode("utf-8")).hexdigest()
+                    for index in contract["segment_indices"]
+                ])
+        validate_h3_shot_plan_seal(plan)
+        before = json.dumps(plan, sort_keys=True)
+        namespace["_director_h3_executable_clip_prompts"](plan, list(plan["clip_prompts"]))
+        self.assertEqual(json.dumps(plan, sort_keys=True), before)
         validate_h3_shot_plan_seal(plan)
 
     def test_plan_h3_native_shots_leaves_implicit_splits_uncarried(self):

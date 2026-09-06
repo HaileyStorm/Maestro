@@ -2764,6 +2764,15 @@ def plan_h3_native_shots(
         from services.h3_visual_continuity import apply_visual_carry_to_shot_plan
 
         apply_visual_carry_to_shot_plan(result)
+        # Carry is part of the executable bytes sealed for recovery. Both
+        # contract keys share source_contracts during plan construction.
+        for shot, prompt in zip(native_shots, result["clip_prompts"]):
+            shot["prompt"] = prompt
+        for contract in source_contracts:
+            contract["executable_prompt_sha256"] = [
+                hashlib.sha256(result["clip_prompts"][index].encode("utf-8")).hexdigest()
+                for index in contract["segment_indices"]
+            ]
     seal_h3_shot_plan(result)
     return result
 

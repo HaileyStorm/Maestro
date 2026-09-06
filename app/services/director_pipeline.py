@@ -8515,6 +8515,15 @@ def _director_h3_drop_planner_carry(shot_plan: dict) -> None:
                 and shot.get("prompt") == prompts[index]
             ):
                 shot["prompt"] = cleaned[index]
+    if shot_plan.get("semantic_physical_contract_version") == 2:
+        import hashlib
+
+        for key in ("source_contracts", "semantic_shots"):
+            for contract in shot_plan.get(key) or []:
+                contract["executable_prompt_sha256"] = [
+                    hashlib.sha256(cleaned[index].encode("utf-8")).hexdigest()
+                    for index in contract["segment_indices"]
+                ]
     from services.h3_shot_planner import seal_h3_shot_plan
 
     seal_h3_shot_plan(shot_plan)
