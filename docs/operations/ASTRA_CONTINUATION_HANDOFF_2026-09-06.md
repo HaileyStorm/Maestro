@@ -1,5 +1,57 @@
 # Astra continuation handoff — 2026-09-06
 
+## Successor progress
+
+The successor's native Goal is active and continuous. The original handoff
+below remains provenance; these completed slices supersede its first failure
+list and part of its account UI work:
+
+- `945ab68`: all seven named recovery failures are resolved. Five were stale
+  source probes; two exposed continuity text whose execution digests were not
+  updated. Plan construction now seals the final bytes, and Director restores
+  matching digests when normalizing carry. Projection leaves sealed source
+  plans unchanged. Duplicate WGP probes were removed in favor of the existing
+  implementation tests. The isolated candidate passed 322 tests across the
+  complete recovery, planner, visual-continuity, WGP implementation, and
+  Director H3 suites, plus syntax/publication checks and independent review.
+- `55153e1`: required account sign-in precedes Welcome and has matching focus
+  and visual priority above optional dialogs. Optional account/support behavior
+  is preserved. The isolated candidate passed 472 UI tests, 68 remote-access
+  contracts, TypeScript, production build, and independent review.
+- `e3bcb62`: reference-pack quality checks are optional and default to Off in
+  the UI. Retry/Edit honor the current checker choice in both directions;
+  disabled review ignores stale reviewer fields. New Off results have an
+  explicit unreviewed public state without failure reasons or pending-grade
+  badges. Recovery binds that state to the exact Off metadata, retaining the
+  existing single-candidate selection marker and historical metadata reads.
+  The API's omitted-review default is preserved for compatibility. The final
+  isolated candidate passed 215 backend tests, 473 UI tests, application/E2E
+  TypeScript, production build, syntax/publication checks, and independent
+  review. Private evidence is in `.artifacts-temp/astra-optional-review-20260906/`.
+
+All three slices are pushed. Their staged bytes matched isolated candidates;
+unrelated changes remain unstaged. Private receipts and preimages are under
+`.artifacts-temp/astra-recovery-contracts-20260906/` and
+`.artifacts-temp/astra-required-signin-20260906/`. The generic visual-carry
+helper's pre-existing digest mutation was superseded by the construction and
+normalization fixes; its original preimage is retained privately.
+
+Browser acceptance is still deferred pending permission for task-specific
+external cache/result directories on a different filesystem. Existing browser
+binaries are available, so no download is needed for the prepared attempt.
+Keep the cross-filesystem and synthetic-network gates intact. This is not
+authorization to start Maestro or perform live account, LAN, GPU, model, or
+provider work. All original task boundaries and the historical tracker hold
+remain in force.
+
+Next, inspect the remaining account/support, project-access, H3/native
+conditioning, lifecycle, and LLM/runtime WIP against its paired tests. The
+historical full-backend failure inventory below is a triage reference, not a
+current failure count: the completed bounded suites above supersede their
+covered entries. Keep storage-janitor and other untracked source/test pairs
+intact. Do not stage mixed files wholesale or claim that the entire backend,
+live deployment, or broader Goal is complete.
+
 ## Authority and Goal
 
 The owner explicitly requested a new task using GPT-6 Astra at medium to

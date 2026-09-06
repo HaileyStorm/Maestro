@@ -670,9 +670,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.launch = _tree("app/launch.py")
-        cls.wgp = _tree("app/wgp.py")
         cls.launch_source = (ROOT / "app/launch.py").read_text(encoding="utf-8")
-        cls.wgp_source = (ROOT / "app/wgp.py").read_text(encoding="utf-8")
 
     def test_bootstrap_binds_hook_before_registry_and_http_submission(self):
         coordinator = self.launch_source.index("_queue_recovery_coordinator =")
