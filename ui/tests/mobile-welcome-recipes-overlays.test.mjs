@@ -333,6 +333,47 @@ test('Welcome remote access copy follows account project access and uses the can
   assert.equal(findNodes(signedIn, node => node.type === 'img' && node.props?.src === '/maestro.svg').length, 1)
 })
 
+test('required account sign-in at priority 200 covers Welcome at 120 so the form stays usable', () => {
+  const document = new FakeDocument()
+  const appRoot = new FakeElement(document, 'app root')
+  const welcome = modalFixture(document, 'Welcome')
+  const account = modalFixture(document, 'Account')
+  const outerOpener = new FakeElement(document, 'welcome opener')
+  let welcomeCloses = 0
+  let accountCloses = 0
+
+  outerOpener.focus()
+  const cleanupWelcome = installModalFocus({
+    document,
+    dialog: welcome.dialog,
+    initialFocus: welcome.first,
+    restoreFocus: outerOpener,
+    appRoot,
+    onClose: () => { welcomeCloses += 1 },
+    priority: 120,
+  })
+  const cleanupAccount = installModalFocus({
+    document,
+    dialog: account.dialog,
+    initialFocus: account.first,
+    restoreFocus: welcome.first,
+    appRoot,
+    onClose: () => { accountCloses += 1 },
+    priority: 200,
+  })
+
+  assert.equal(document.activeElement, account.first)
+  assert.equal(welcome.dialog.hasAttribute('inert'), true)
+  assert.equal(account.dialog.hasAttribute('inert'), false)
+  assert.equal(closeModalIfTop(document, welcome.dialog, () => { welcomeCloses += 1 }), false)
+  assert.equal(welcomeCloses, 0)
+  assert.equal(closeModalIfTop(document, account.dialog, () => { accountCloses += 1 }), true)
+  assert.equal(accountCloses, 1)
+
+  cleanupAccount()
+  cleanupWelcome()
+})
+
 test('Welcome at priority 120 covers Recipes at 100 without losing locks or exact focus restoration', () => {
   const document = new FakeDocument()
   const appRoot = new FakeElement(document, 'app root')

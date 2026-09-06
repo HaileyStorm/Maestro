@@ -417,8 +417,9 @@ function App() {
           rather than frozen. */}
       {machineControls && <DownloadStatusBanner />}
       {/* A remote browser must choose/unlock a project before optional
-          orientation can cover the required project dialog. */}
-      {!remoteProjectRequired && <WelcomeModal />}
+          orientation can cover the required project dialog. Required
+          local sign-in must also stay above first-run welcome. */}
+      {!remoteProjectRequired && !accountAuthenticationRequired && <WelcomeModal />}
     </div>
   )
 }

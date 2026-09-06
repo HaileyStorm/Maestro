@@ -184,7 +184,7 @@ test("what's-new visible controls keep mobile touch targets and compact desktop 
 })
 
 test('welcome onboarding uses the shared priority stack and bounded mobile geometry', () => {
-  assert.match(appSource, /\{!remoteProjectRequired && <WelcomeModal \/>\}/)
+  assert.match(appSource, /\{!remoteProjectRequired && !accountAuthenticationRequired && <WelcomeModal \/>\}/)
   assert.match(welcomeSource, /maestro_welcome_seen_v1/)
   assert.match(welcomeSource, /createPortal\(/)
   assert.match(welcomeSource, /document\.body/)

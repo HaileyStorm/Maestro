@@ -590,6 +590,7 @@ export function AccountSupportDrawer({
       restoreFocus: focusReturnRef.current,
       appRoot: document.getElementById('root'),
       onClose: required ? () => {} : closeDrawer,
+      priority: required ? 200 : 100,
     })
     return () => {
       for (const control of annotatedControls) control.removeAttribute('tabindex')
@@ -613,11 +614,11 @@ export function AccountSupportDrawer({
     {focusReturnTarget}
     {createPortal(
     <div
-      className="fixed inset-0 z-[170] flex items-stretch justify-end"
+      className={`fixed inset-0 ${required ? 'z-[200]' : 'z-[170]'} flex items-stretch justify-end`}
       style={{ paddingTop: 'env(safe-area-inset-top)', paddingBottom: 'env(safe-area-inset-bottom)' }}
     >
       {required ? (
-        <div aria-hidden="true" className="absolute inset-0 bg-black/70" />
+        <div aria-hidden="true" className="absolute inset-0 bg-black/70 pointer-events-none" />
       ) : (
         <button
           type="button"
@@ -634,7 +635,7 @@ export function AccountSupportDrawer({
         aria-modal="true"
         aria-labelledby={titleId}
         aria-describedby={descriptionId}
-        className="relative flex h-full min-h-0 w-full flex-col overflow-hidden border-l border-border bg-bg-secondary shadow-2xl sm:max-w-xl"
+        className="relative z-10 flex h-full min-h-0 w-full flex-col overflow-hidden border-l border-border bg-bg-secondary shadow-2xl sm:max-w-xl"
       >
         <header className="flex shrink-0 items-start gap-3 border-b border-border px-4 py-4 sm:px-5">
           <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-accent-blue/15 text-accent-blue">

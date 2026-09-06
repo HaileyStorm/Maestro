@@ -2127,7 +2127,10 @@ class LaunchSecurityContractTests(unittest.TestCase):
         self.assertIn("taking too long to load your projects", app)
         self.assertIn("Checking your connection and projects", app)
         self.assertIn("couldn't open", app)
-        self.assertIn("!remoteProjectRequired && <WelcomeModal />", app)
+        self.assertIn(
+            "!remoteProjectRequired && !accountAuthenticationRequired && <WelcomeModal />",
+            app,
+        )
 
         self.assertIn("if (requiredProject) return", selector)
         self.assertIn('role="dialog"', selector)
