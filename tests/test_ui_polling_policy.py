@@ -138,7 +138,7 @@ class UiPollingStateTests(unittest.TestCase):
         self.assertIn("queueActivity", MAIN)
         self.assertIn("POLL_INTERVAL_MS.queueActiveVisible", MAIN)
         self.assertIn("POLL_INTERVAL_MS.queueIdleVisible", MAIN)
-        self.assertIn("if (!document.hidden) void refreshQueue()", MAIN)
+        self.assertIn("if (queuePollingReady && !document.hidden) void refreshQueue()", MAIN)
         self.assertIn("QUEUE_REFRESH_EVENT", MAIN)
         self.assertIn("queueRefreshIsStale(sequence, queuePollSequence.current", MAIN)
         self.assertIn("role=\"status\"", MAIN)
