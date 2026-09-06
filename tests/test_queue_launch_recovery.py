@@ -6934,6 +6934,123 @@ class QueueLaunchWiringTests(unittest.TestCase):
             with Image.open(handoff["path"]) as image:
                 self.assertEqual(image.getpixel((0, 0)), (2, 2, 2))
 
+    def test_obsolete_sidecar_quarantine_preserves_adopted_media_and_races(self):
+        from services import queue_recovery_runtime as runtime
+
+        for case in ("unchanged", "changed", "wrong-job", "wrong-producer", "wrong-output",
+                     "protected", "malformed-name", "replacement-before-move", "symlink"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                media = root / "accepted.mp4"
+                media.write_bytes(b"accepted-media")
+                current = root / "accepted.meta.json"
+                current.write_bytes(b"accepted-metadata")
+                old = root / "old.meta.json"
+                unit_id = recovery_unit_id("job", "h3_segment")
+                meta = {"job_id": "job", "producer_unit_id": unit_id, "output_filename": media.name}
+                old.write_text(json.dumps(meta))
+                record = artifact_descriptor(root, basename=media.name,
+                    sidecar_basename=old.name, producer_unit_id=unit_id)
+                protected = {media.name, current.name}
+                if case in {"wrong-job", "wrong-producer", "wrong-output"}:
+                    key = {"wrong-job": "job_id", "wrong-producer": "producer_unit_id", "wrong-output": "output_filename"}[case]
+                    old.write_text(json.dumps(dict(meta, **{key: "another"})))
+                    record["sidecar_size"], record["sidecar_sha256"] = recovery_sha256_file(old)
+                if case == "changed":
+                    old.write_bytes(b"changed metadata")
+                if case == "protected":
+                    protected.add(old.name)
+                if case == "malformed-name":
+                    record["sidecar_basename"] = []
+                if case == "symlink":
+                    foreign = root / "foreign.meta.json"
+                    foreign.write_bytes(old.read_bytes())
+                    old.unlink()
+                    old.symlink_to(foreign)
+                primitive = runtime.quarantine_sidecar_if_unchanged
+                def swapped(project, filename, **kwargs):
+                    replacement = root / "replacement.meta.json"
+                    replacement.write_bytes(b"newer metadata")
+                    os.replace(replacement, old)
+                    return primitive(project, filename, **kwargs)
+                ns = _isolated_functions(self.launch, ("_queue_recovery_quarantine_obsolete_sidecar",), {
+                    "os": os, "json": json, "hashlib": hashlib,
+                    "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+                    "_recovery_sha256_file": recovery_sha256_file,
+                })
+                with mock.patch.object(runtime, "quarantine_sidecar_if_unchanged", side_effect=swapped if case == "replacement-before-move" else primitive):
+                    ns["_queue_recovery_quarantine_obsolete_sidecar"](
+                        {"id": "job"}, str(root), unit_id, record, protected)
+                self.assertEqual(media.read_bytes(), b"accepted-media")
+                self.assertEqual(current.read_bytes(), b"accepted-metadata")
+                supported = runtime._manifest_dir_fd_supported() and os.rename in os.supports_dir_fd
+                if case == "unchanged" and supported:
+                    self.assertFalse(old.exists())
+                    quarantined = list((root / ".maestro-recovery" / "quarantine").glob("*-old.meta.json"))
+                    self.assertEqual(len(quarantined), 1)
+                    self.assertEqual(json.loads(quarantined[0].read_text()), meta)
+                else:
+                    self.assertTrue(old.exists())
+                if case == "replacement-before-move":
+                    self.assertEqual(old.read_bytes(), b"newer metadata")
+                if case == "symlink":
+                    self.assertTrue(old.is_symlink())
+                    self.assertTrue(foreign.exists())
+
+    def test_reconcile_quarantines_only_obsolete_alternate_sidecar(self):
+        from services import queue_recovery_runtime as runtime
+        supported = runtime._manifest_dir_fd_supported() and os.rename in os.supports_dir_fd
+        for malformed in (False, True):
+            with self.subTest(malformed=malformed), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                media = root / "segment.mp4"
+                old_sidecar = root / "old.meta.json"
+                current_sidecar = root / "segment.meta.json"
+                media.write_bytes(b"old-video")
+                old_id = recovery_unit_id("job", "h3_segment", settings={"revision": 1})
+                old_sidecar.write_text(json.dumps({"job_id": "job", "output_filename": media.name,
+                    "producer_unit_id": old_id}))
+                old_artifact = artifact_descriptor(root, basename=media.name,
+                    sidecar_basename=old_sidecar.name, producer_unit_id=old_id)
+                if malformed:
+                    old_artifact["sidecar_basename"] = []
+                old_unit = {"kind": "h3_segment", "state": "completed", "index": 0, "variant": 0,
+                            "unit_id": old_id, "dependencies": [], "settings": {"revision": 1},
+                            "artifacts": [old_artifact]}
+                media.write_bytes(b"current-video")
+                settings = {"revision": 2}
+                current_id = recovery_unit_id("job", "h3_segment", settings=settings)
+                meta = {"job_id": "job", "output_filename": media.name,
+                        "producer_unit_id": current_id, "producer_unit_kind": "h3_segment",
+                        "producer_unit_index": 0, "producer_unit_variant": 0,
+                        "producer_unit_dependencies": [], "producer_unit_settings": settings,
+                        "producer_unit_artifact_names": [media.name],
+                        "producer_media_size": media.stat().st_size,
+                        "producer_media_sha256": recovery_sha256_file(media)[1],
+                        "producer_artifact_class": "component", "artifact_class": "component"}
+                current_sidecar.write_text(json.dumps(meta))
+                original_current = current_sidecar.read_bytes()
+                search = types.ModuleType("services.search_index")
+                search.load_media_sidecars = lambda _root: {media.name: meta}
+                ns = _isolated_functions(self.launch, (
+                    "_queue_recovery_units", "_queue_recovery_unit_matches",
+                    "_queue_recovery_reconcile_cursor", "_h3_dependency_closed_recovery_units",
+                    "_queue_recovery_quarantine_obsolete_sidecar",
+                ), {"os": os, "json": json, "hmac": hmac, "hashlib": hashlib,
+                    "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+                    "recovery_unit_id": recovery_unit_id, "_recovery_sha256_file": recovery_sha256_file,
+                    "_recovery_artifact_descriptor": artifact_descriptor,
+                    "validate_artifact_descriptor": validate_artifact_descriptor,
+                    "_quarantine_recovery_artifact": quarantine_artifact,
+                    "_queue_recovery_reconcile_orphan_delivery": lambda *_args: None})
+                job = {"id": "job", "recovery_cursor": {"completed_units": [old_unit]}}
+                with mock.patch.dict(sys.modules, {"services.search_index": search}):
+                    ns["_queue_recovery_reconcile_cursor"](job, str(root))
+                self.assertEqual(job["recovery_cursor"]["completed_units"][0]["unit_id"], current_id)
+                self.assertEqual(media.read_bytes(), b"current-video")
+                self.assertEqual(current_sidecar.read_bytes(), original_current)
+                self.assertEqual(old_sidecar.exists(), malformed or not supported)
+
     def test_h3_continuation_enrichment_binds_identity_and_survives_journal_gap(self):
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)

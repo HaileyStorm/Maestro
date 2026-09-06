@@ -9205,6 +9205,58 @@ def _h3_dependency_closed_recovery_units(verified: list[dict]) -> list[dict]:
     return dependency_closed
 
 
+def _queue_recovery_quarantine_obsolete_sidecar(
+    job: dict, project_dir: str, unit_id: str, artifact: dict,
+    protected_paths: set[str],
+) -> None:
+    """Retire only unchanged old metadata without touching adopted media."""
+    from services.queue_recovery_runtime import MAX_MANIFEST_BYTES, quarantine_sidecar_if_unchanged
+
+    name = artifact.get("sidecar_basename")
+    size = artifact.get("sidecar_size")
+    digest = artifact.get("sidecar_sha256")
+    if (
+        type(name) is not str or not name or name.startswith(".")
+        or os.path.basename(name) != name or name in protected_paths
+        or type(size) is not int or not 0 < size <= MAX_MANIFEST_BYTES
+        or type(digest) is not str or len(digest) != 64
+        or artifact.get("producer_unit_id") != unit_id
+    ):
+        return
+    path = os.path.join(project_dir, name)
+    try:
+        if _recovery_sha256_file(path) != (size, digest):
+            return
+        handle = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            opened = os.fstat(handle)
+            with os.fdopen(handle, "rb", closefd=False) as stream:
+                raw = stream.read(size + 1)
+            if len(raw) != size or hashlib.sha256(raw).hexdigest() != digest:
+                return
+            meta = json.loads(raw)
+            if (
+                not isinstance(meta, dict)
+                or meta.get("job_id") != job.get("id")
+                or meta.get("producer_unit_id") != unit_id
+                or meta.get("output_filename") != artifact.get("basename")
+            ):
+                return
+            current = os.stat(path, follow_symlinks=False)
+            if ((opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+                    != (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)):
+                return
+            quarantine_sidecar_if_unchanged(
+                project_dir, name,
+                expected_identity=(opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns),
+                expected_sha256=digest,
+            )
+        finally:
+            os.close(handle)
+    except (OSError, ValueError, TypeError, QueueRecoveryRuntimeError):
+        return
+
+
 def _queue_recovery_reconcile_cursor(job: dict, project_dir: str) -> None:
     """Keep verified units and recover the sidecar-before-journal crash gap."""
     verified: list[dict] = []
@@ -9410,12 +9462,26 @@ def _queue_recovery_reconcile_cursor(job: dict, project_dir: str) -> None:
         artifact.get("basename") for unit in verified
         for artifact in unit.get("artifacts") or [] if isinstance(artifact, dict)
     }
+    protected_paths = protected_names | {
+        artifact.get("sidecar_basename") for unit in verified
+        for artifact in unit.get("artifacts") or [] if isinstance(artifact, dict)
+    }
     for unit in unmatched_units:
         if unit.get("kind") == "h3_source_audio_premux":
             continue
         for artifact in unit.get("artifacts") or []:
             if (isinstance(artifact, dict)
-                    and artifact.get("basename") not in protected_names
+                    and type(artifact.get("basename")) is str
+                    and artifact["basename"] in protected_names
+                    and type(artifact.get("sidecar_basename")) is str
+                    and artifact["sidecar_basename"] not in protected_paths):
+                _queue_recovery_quarantine_obsolete_sidecar(
+                    job, project_dir, str(unit.get("unit_id") or ""), artifact,
+                    protected_paths,
+                )
+            if (isinstance(artifact, dict)
+                    and type(artifact.get("basename")) is str
+                    and artifact["basename"] not in protected_names
                     and not validate_artifact_descriptor(
                         project_dir, artifact, producer_unit_id=str(unit.get("unit_id") or ""),
                     )):

@@ -118,11 +118,17 @@ an old journal descriptor; replaced media cannot be adopted under that old
 identity, and all producer sidecars must agree on the continuation. Private
 handoffs are retained rather than treated as consumed-file exceptions.
 
-The review's non-blocking cleanup remainder is `H3-RECOVERY-ALTERNATE-SIDECAR`:
-this Goal owns a future exact-sidecar cleanup check. Reconciliation conservatively
-retains an unmatched alternate sidecar when its media basename was adopted.
-Before cleanup, prove that the alternate metadata is obsolete and is not another
-accepted artifact's sidecar; never quarantine the adopted media to remove it.
+`H3-RECOVERY-ALTERNATE-SIDECAR` is resolved for the supported Linux path.
+Reconciliation protects every accepted media and sidecar name, then retires only
+an alternate header matching the old size/hash and job/producer/output identity.
+The metadata-only primitive rechecks content and file identity through directory
+handles under a process-local guard before moving it into private quarantine.
+Changed, malformed, linked, protected, or unsupported-platform metadata remains
+in place. Its snapshot/move guarantee relies on the repository's existing
+writer-coordination contract. The isolated candidate passes 294 tests, with one
+Windows-only test skipped; syntax/publication checks and independent review pass.
+Evidence is in `.artifacts-temp/astra-alternate-sidecar-20260906/` and includes
+real temporary-filesystem moves plus replacement-at-primitive-entry tests.
 
 The isolated candidate passes all 464 applicable lifecycle, queue recovery,
 Studio, native-boundary, audio-safety, delivery, and LLM tests. Its six code/test
@@ -135,6 +141,17 @@ metadata-write failure preservation, replaced-media rejection, strict malformed
 continuation cases, and callback/replay ordering. This does not establish live
 GPU, encoded native-AV handoff, generation, or human acceptance. Native
 conditioning, offload/quality changes, and the remaining WIP are still open.
+
+For the remaining adaptive-conditioning/LoRA WIP, retain the selected FL2VA
+flavor across routing, enforce Ref2VA-only and exclusive accelerators before
+queueing, and keep estimate inputs aligned with submission inputs. The scout
+found three concrete parity requirements: estimates need the selected adaptive
+models and architecture-specific lists; partial split-list payloads need an
+explicit fallback/validation rule; Python and TypeScript must normalize
+path-qualified known filenames consistently. Integrate the pure
+`h3_lora_compat.py` contract and its planner tests without adopting unrelated
+prompt-adaptation, native-boundary, offload, or delivery changes. UI integration
+and rendered acceptance remain distinct follow-up evidence.
 
 Browser acceptance is still deferred pending permission for task-specific
 external cache/result directories on a different filesystem. Existing browser

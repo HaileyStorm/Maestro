@@ -17,6 +17,7 @@ from pathlib import Path, PurePosixPath
 import re
 import stat
 import tempfile
+import threading
 from typing import Any
 import uuid
 
@@ -1110,6 +1111,59 @@ def validate_protected_artifact_descriptor(
     return all(rebuilt.get(key) == descriptor.get(key) for key in rebuilt)
 
 
+_sidecar_quarantine_lock = threading.Lock()
+
+
+def quarantine_sidecar_if_unchanged(
+    project_directory: os.PathLike[str] | str,
+    filename: str,
+    *,
+    expected_identity: tuple[int, int, int, int],
+    expected_sha256: str,
+) -> bool:
+    """Recheck the recorded sidecar at the guarded, directory-relative move."""
+    if (
+        type(filename) is not str or not filename.endswith(".meta.json")
+        or filename.startswith(".") or os.path.basename(filename) != filename
+        or type(expected_identity) is not tuple or len(expected_identity) != 4
+        or any(type(value) is not int for value in expected_identity)
+        or not 0 < expected_identity[2] <= MAX_MANIFEST_BYTES
+        or type(expected_sha256) is not str or _SHA256_RE.fullmatch(expected_sha256) is None
+        or not _manifest_dir_fd_supported()
+        or os.rename not in getattr(os, "supports_dir_fd", set())
+    ):
+        return False
+    with _sidecar_quarantine_lock:
+        root_fd = quarantine_fd = None
+        try:
+            root = _validated_project_root(project_directory)
+            root_info = os.stat(root, follow_symlinks=False)
+            root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+            opened_root = os.fstat(root_fd)
+            if (root_info.st_dev, root_info.st_ino) != (opened_root.st_dev, opened_root.st_ino):
+                return False
+            recovery, _ = _ensure_private_directory(root / MANIFEST_DIRECTORY)
+            quarantine, _ = _ensure_private_directory(recovery / "quarantine")
+            quarantine_fd = _open_private_directory(quarantine)
+            raw = _read_exact_file_at(root_fd, filename, maximum_bytes=MAX_MANIFEST_BYTES)
+            if len(raw) != expected_identity[2] or hashlib.sha256(raw).hexdigest() != expected_sha256:
+                return False
+            current = os.stat(filename, dir_fd=root_fd, follow_symlinks=False)
+            if (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) != expected_identity:
+                return False
+            os.rename(filename, f"{uuid.uuid4().hex}-{filename}", src_dir_fd=root_fd, dst_dir_fd=quarantine_fd)
+            os.fsync(quarantine_fd)
+            os.fsync(root_fd)
+            return True
+        except (OSError, ValueError, TypeError, QueueRecoveryRuntimeError):
+            return False
+        finally:
+            if quarantine_fd is not None:
+                os.close(quarantine_fd)
+            if root_fd is not None:
+                os.close(root_fd)
+
+
 def quarantine_artifact(
     project_directory: os.PathLike[str] | str,
     descriptor: Mapping[str, Any],
@@ -1287,6 +1341,7 @@ __all__ = [
     "protected_artifact_descriptor",
     "promote_recovery_staged_artifact",
     "quarantine_artifact",
+    "quarantine_sidecar_if_unchanged",
     "remove_request_manifest",
     "replay_concat_to_stable_output",
     "replay_delivery_from_protected_native",
