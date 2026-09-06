@@ -1753,7 +1753,7 @@ process.stdout.write(JSON.stringify(effectiveSlidingWindowGeometry(10, 5, 5, opt
         self.assertIn("enhance_before_generate", generation)
         self.assertIn("enhanceBeforeGenerate", generation)
         self.assertNotIn("get().enhancePrompt()", generation)
-        self.assertLess(generation.index("jobs: [newJob, ...s.jobs]"), generation.index("api.submitGeneration(params)"))
+        self.assertLess(generation.index("jobs: [newJob, ...s.jobs]"), generation.index("api.submitGeneration(params, holdForQueue)"))
         self.assertIn("enhanceBeforeGenerate && s.activeWorkspace === submissionWorkspace", generation)
         self.assertIn("? { studioPromptEnhance: false }", generation)
         self.assertIn("get().activeWorkspace !== submissionWorkspace", generation)
@@ -2103,7 +2103,7 @@ process.stdout.write(JSON.stringify(effectiveSlidingWindowGeometry(10, 5, 5, opt
     def test_concat_failure_seals_final_segment_before_success_only_branch(self):
         launch = Path(APP, "launch.py").read_text(encoding="utf-8")
         callback_at = launch.index(
-            "def _seal_final_h3_segment_before_concat("
+            "def _seal_h3_segment_before_concat("
         )
         generate_at = launch.index(
             "async_run(make_error_handler", callback_at,

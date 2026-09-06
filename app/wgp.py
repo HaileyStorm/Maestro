@@ -9170,20 +9170,20 @@ def _trim_video_tail(clip_path, trim_frames, fps):
 def seal_multi_clip_segment_before_concat(
     clip_path, multi_clip_info, after_segment_output,
 ):
-    """Durably hand off the final rendered component before concat starts."""
+    """Durably hand off each rendered H3 component before the next clip starts."""
     if not isinstance(multi_clip_info, dict) or not callable(after_segment_output):
         return clip_path
-    try:
-        segment_index = max(0, int(multi_clip_info.get("index", 0) or 0))
-        segment_total = max(1, int(multi_clip_info.get("total", 1) or 1))
-    except (TypeError, ValueError):
+    segment_index = multi_clip_info.get("index")
+    segment_total = multi_clip_info.get("total")
+    if (
+        type(segment_index) is not int or segment_index < 0
+        or type(segment_total) is not int or segment_total <= segment_index
+    ):
         raise PostDecodeStageError(
             "The rendered segment identity is invalid",
             stage="segment_checkpoint",
             code="segment_identity_invalid",
-        ) from None
-    if segment_index + 1 != segment_total:
-        return clip_path
+        )
     try:
         replacement = after_segment_output(
             clip_path, dict(multi_clip_info),
@@ -13838,6 +13838,15 @@ def _generate_video_impl(
                 # Only register after the LAST sliding window (or if no sliding window)
                 is_last_window = not sliding_window or window_no >= gen.get("total_windows", 1)
                 if (
+                    isinstance(multi_clip_info, dict)
+                    and not is_image and not audio_only and is_last_window
+                    and callable(after_segment_output)
+                ):
+                    clip_path = video_path[0] if isinstance(video_path, list) else video_path
+                    video_path = seal_multi_clip_segment_before_concat(
+                        clip_path, multi_clip_info, after_segment_output,
+                    )
+                if (
                     multi_clip_info is not None
                     and not is_image
                     and not audio_only
@@ -13849,12 +13858,6 @@ def _generate_video_impl(
                     and not multi_clip_info.get("defer_concat", False)
                 ):
                     clip_path = video_path[0] if isinstance(video_path, list) else video_path
-                    clip_path = seal_multi_clip_segment_before_concat(
-                        clip_path,
-                        multi_clip_info,
-                        after_segment_output,
-                    )
-                    video_path = clip_path
                     clip_store = gen.setdefault("multi_clip_paths", {})
                     group_id = multi_clip_info["group_id"]
                     group = clip_store.setdefault(group_id, {})

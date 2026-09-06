@@ -100,19 +100,41 @@ delivery, and queue-recovery tests pass, as do syntax/publication checks.
 Independent review found no issues; private candidate/test evidence is in
 `.artifacts-temp/astra-checkpoint-errors-20260906/`.
 
-Before integrating the remaining checkpoint-ordering WIP, complete these
-CPU-verifiable contracts as one coherent slice:
+The checkpoint-ordering slice seals every completed video component before
+concat, including single-component/deferred-concat hooks, and binds the callback
+to its current segment/group. It removes the ambiguous reversed-file fallback.
+Missing producer evidence fails before another task can run. Normal completion
+and replay share the CPU handoff helper; replay reconstructs a handoff only when
+the descriptor is absent and the next same-group task explicitly requires one.
+Present null, malformed, missing-file, hash-changed, or invalid native-boundary
+descriptors remain rejected by both journal and orphan-sidecar reconciliation.
 
-- Align WGP and launch callbacks to seal each valid component, update the old
-  final-only regression, and reject invalid or mismatched segment identities.
-- Replace the broad reversed-`task_files` fallback with verified task/producer
-  evidence; ambiguous files must not become an arbitrary segment checkpoint.
-- Bind continuation enrichment to the current dependency/settings-derived unit
-  ID, segment, private staging path, size, and hash. Reject a matched old unit
-  whose identity differs from the new continuation dependency. Define consistent predecessor/concat behavior for a consumed
-  handoff; a missing file alone must not authorize skipping validation. Cover
-  malformed, changed, wrong-segment, and absent continuation evidence, then
-  retain the existing dependency-closure and recovery privacy gates.
+Continuation enrichment binds the current unit ID, dependencies, settings,
+private staging location, size, and hash. It fsyncs the file and (on Linux) its
+directory, then atomically updates only existing producer metadata before the
+journal. An update failure does not quarantine the sealed video. Reconciliation
+defers quarantine long enough to adopt a valid same-media sidecar update over
+an old journal descriptor; replaced media cannot be adopted under that old
+identity, and all producer sidecars must agree on the continuation. Private
+handoffs are retained rather than treated as consumed-file exceptions.
+
+The review's non-blocking cleanup remainder is `H3-RECOVERY-ALTERNATE-SIDECAR`:
+this Goal owns a future exact-sidecar cleanup check. Reconciliation conservatively
+retains an unmatched alternate sidecar when its media basename was adopted.
+Before cleanup, prove that the alternate metadata is obsolete and is not another
+accepted artifact's sidecar; never quarantine the adopted media to remove it.
+
+The isolated candidate passes all 464 applicable lifecycle, queue recovery,
+Studio, native-boundary, audio-safety, delivery, and LLM tests. Its six code/test
+files stayed byte-identical throughout the final run. Syntax and publication
+checks pass; independent-review blockers were addressed with regression coverage.
+Private preimages, isolated candidates, regression output, and closure receipts
+are in `.artifacts-temp/astra-segment-checkpoint-20260906/`. Tests include CPU
+handoff construction from synthetic frames, old-journal/updated-sidecar recovery,
+metadata-write failure preservation, replaced-media rejection, strict malformed
+continuation cases, and callback/replay ordering. This does not establish live
+GPU, encoded native-AV handoff, generation, or human acceptance. Native
+conditioning, offload/quality changes, and the remaining WIP are still open.
 
 Browser acceptance is still deferred pending permission for task-specific
 external cache/result directories on a different filesystem. Existing browser

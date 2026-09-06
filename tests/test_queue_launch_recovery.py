@@ -6472,13 +6472,11 @@ class QueueLaunchWiringTests(unittest.TestCase):
         runner = ast.get_source_segment(
             self.launch_source, _function(self.launch, "_run_generation"),
         )
-        continuation = runner.index(
-            'f"{recovery_output_prefix}-continuation.png"'
+        helper = ast.get_source_segment(
+            self.launch_source, _function(self.launch, "_prepare_task_continuation"),
         )
-        self.assertLess(
-            runner.rindex("if recovery_staging_dir:", 0, continuation),
-            continuation,
-        )
+        continuation = helper.index('f"{recovery_output_prefix}-continuation.png"')
+        self.assertLess(helper.rindex("if recovery_staging_dir:", 0, continuation), continuation)
         self.assertIn(
             "recovery_staging_dir=recovery_staging_dir", runner,
         )
@@ -6879,6 +6877,238 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 project_dir=str(project),
             ))
 
+            continuation.write_bytes(b"frame")
+            for malformed in (None, {}, {"dependency": "wrong", "mode": "prompt_only"},
+                              {"dependency": unit_id, "mode": []},
+                              {"dependency": unit_id, "mode": "last_frame"},
+                              {**unit["continuation"], "size": True},
+                              {**unit["continuation"], "mode": "native_av_overlap"}):
+                with self.subTest(continuation=malformed):
+                    job["recovery_cursor"]["completed_units"] = [dict(unit, continuation=malformed)]
+                    self.assertIsNone(matcher(job, kind="h3_segment", variant=0, index=0, project_dir=str(project)))
+            prompt_only = {"dependency": unit_id, "mode": "prompt_only"}
+            job["recovery_cursor"]["completed_units"] = [dict(unit, continuation=prompt_only)]
+            self.assertIsNotNone(matcher(job, kind="h3_segment", variant=0, index=0, project_dir=str(project)))
+            incomplete = dict(unit)
+            incomplete.pop("continuation")
+            job["recovery_cursor"]["completed_units"] = [incomplete]
+            self.assertIsNotNone(matcher(job, kind="h3_segment", variant=0, index=0, project_dir=str(project)))
+
+    def test_shared_cpu_handoff_uses_verified_video_and_private_staging(self):
+        import numpy as np
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            staging = ensure_recovery_staging_directory(project)
+            selected = []
+            class Reader:
+                def __len__(self):
+                    return 3
+                def __getitem__(self, index):
+                    selected.append(index)
+                    return types.SimpleNamespace(asnumpy=lambda: np.full((2, 2, 3), index, dtype=np.uint8))
+            decord = types.ModuleType("decord")
+            decord.VideoReader = mock.Mock(return_value=Reader())
+            ns = _isolated_functions(self.launch, ("_prepare_task_continuation",), {
+                "os": os, "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+                "ensure_recovery_staging_directory": ensure_recovery_staging_directory,
+            })
+            source = {"params": {"multi_clip_info": {"automatic_h3_longform": True}}}
+            next_task = {"params": {"_continuation": True}}
+            with mock.patch.dict(sys.modules, {"decord": decord}):
+                with self.assertRaises(QueueRecoveryRuntimeError):
+                    ns["_prepare_task_continuation"](
+                        source, next_task, "verified-component.mp4", out_dir=str(project),
+                        task_no=1, recovery_staging_dir=staging, recovery_output_prefix="../escape")
+                decord.VideoReader.assert_not_called()
+                handoff = ns["_prepare_task_continuation"](
+                    source, next_task, "verified-component.mp4", out_dir=str(project),
+                    task_no=1, recovery_staging_dir=staging, recovery_output_prefix="unit-job-t0")
+            decord.VideoReader.assert_called_once_with("verified-component.mp4")
+            self.assertEqual(selected, [2])
+            self.assertEqual(handoff["mode"], "last_frame")
+            self.assertEqual(Path(handoff["path"]).parent, Path(staging))
+            self.assertNotIn("_continuation", next_task["params"])
+            self.assertEqual(next_task["params"]["image_start"], handoff["path"])
+            with Image.open(handoff["path"]) as image:
+                self.assertEqual(image.getpixel((0, 0)), (2, 2, 2))
+
+    def test_h3_continuation_enrichment_binds_identity_and_survives_journal_gap(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            staging = Path(ensure_recovery_staging_directory(project))
+            frame = staging / "unit-job-t0-continuation.png"
+            frame.write_bytes(b"synthetic-frame")
+            media = project / "segment.mp4"
+            media.write_bytes(b"synthetic-video")
+            unit_id = recovery_unit_id("job", "h3_segment", variant=0, index=0)
+            meta = {
+                "job_id": "job", "output_filename": media.name,
+                "producer_unit_id": unit_id, "producer_unit_kind": "h3_segment",
+                "producer_unit_variant": 0, "producer_unit_index": 0,
+                "producer_unit_dependencies": [], "producer_unit_settings": {},
+                "producer_unit_artifact_names": [media.name],
+                "producer_artifact_class": "component", "artifact_class": "component",
+                "private": True, "workspace": "project",
+                "producer_media_size": media.stat().st_size,
+                "producer_media_sha256": recovery_sha256_file(media)[1],
+            }
+            sidecar = project / "segment.meta.json"
+            sidecar.write_text(json.dumps(meta), encoding="utf-8")
+            pristine = sidecar.read_bytes()
+            artifact = artifact_descriptor(project, basename=media.name,
+                sidecar_basename=sidecar.name, producer_unit_id=unit_id)
+            unit = {"kind": "h3_segment", "variant": 0, "index": 0, "state": "completed",
+                    "dependencies": [], "unit_id": unit_id, "artifacts": [artifact]}
+            job = {"id": "job", "recovery_cursor": {"completed_units": [unit]}}
+            events = []
+            accept = True
+            def checkpoint(target, **updates):
+                events.append("journal")
+                self.assertEqual(json.loads(sidecar.read_text())["producer_unit_continuation"],
+                                 updates["recovery_unit"]["continuation"])
+                if accept:
+                    target.update(updates)
+                return accept
+            def write(path, updated):
+                events.append("sidecar")
+                self.assertEqual(Path(path), sidecar)
+                sidecar.write_text(json.dumps(updated), encoding="utf-8")
+            quarantine = mock.Mock(wraps=quarantine_artifact)
+            ns = _isolated_functions(self.launch, (
+                "_queue_recovery_units", "_queue_recovery_unit_matches",
+                "_queue_recovery_continuation_path", "_queue_recovery_continuation_descriptor",
+                "_queue_recovery_checkpoint_unit", "_queue_recovery_enrich_h3_continuation",
+                "_queue_recovery_reconcile_cursor", "_h3_dependency_closed_recovery_units",
+            ), {"os": os, "json": json, "hmac": hmac, "hashlib": hashlib,
+                "_atomic_write_json": write,
+                "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+                "recovery_unit_id": recovery_unit_id,
+                "ensure_recovery_staging_directory": ensure_recovery_staging_directory,
+                "_recovery_sha256_file": recovery_sha256_file,
+                "_recovery_artifact_descriptor": artifact_descriptor,
+                "validate_artifact_descriptor": validate_artifact_descriptor,
+                "_queue_recovery_checkpoint": checkpoint,
+                "_quarantine_recovery_artifact": quarantine,
+                "_queue_recovery_reconcile_orphan_delivery": lambda *_args: None})
+            import stat
+            flushes = []
+            real_fsync = os.fsync
+            def record_fsync(fd):
+                flushes.append("directory" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file")
+                real_fsync(fd)
+            with mock.patch.object(os, "fsync", side_effect=record_fsync):
+                continuation = ns["_queue_recovery_continuation_descriptor"](
+                    str(project), str(frame), mode="last_frame", dependency=unit_id)
+            self.assertEqual(flushes[-2:] if os.name != "nt" else flushes[-1:],
+                             ["file", "directory"] if os.name != "nt" else ["file"])
+            enrich = ns["_queue_recovery_enrich_h3_continuation"]
+            for bad_unit, bad_continuation, settings in (
+                (unit, dict(continuation, dependency="wrong"), {}),
+                (unit, dict(continuation, sha256="0" * 64), {}),
+                (unit, dict(continuation, basename="../elsewhere.png"), {}),
+                (unit, continuation, {"published_frames": 123}),
+                (dict(unit, index=1), continuation, {}),
+                (dict(unit, settings=[]), continuation, {}),
+                (dict(unit, settings=None), continuation, {}),
+            ):
+                with self.subTest(settings=settings, continuation=bad_continuation), self.assertRaises(QueueRecoveryRuntimeError):
+                    enrich(job, str(project), bad_unit, variant=0, index=0,
+                           dependencies=[], settings=settings, continuation=bad_continuation)
+                self.assertEqual(events, [])
+                self.assertEqual(sidecar.read_bytes(), pristine)
+            with mock.patch.dict(ns, {"_atomic_write_json": mock.Mock(side_effect=OSError("synthetic write failure"))}):
+                with self.assertRaises(OSError):
+                    enrich(job, str(project), unit, variant=0, index=0,
+                           dependencies=[], settings={}, continuation=continuation)
+            self.assertEqual(sidecar.read_bytes(), pristine)
+            self.assertEqual(media.read_bytes(), b"synthetic-video")
+            self.assertIsNotNone(ns["_queue_recovery_unit_matches"](
+                job, kind="h3_segment", variant=0, index=0, project_dir=str(project)))
+            self.assertEqual(events, [])
+            result = enrich(job, str(project), unit, variant=0, index=0,
+                            dependencies=[], settings={}, continuation=continuation)
+            self.assertEqual(events, ["sidecar", "journal"])
+            self.assertEqual(result["unit_id"], unit_id)
+            self.assertEqual(result["continuation"], continuation)
+            self.assertEqual(media.read_bytes(), b"synthetic-video")
+
+            # Recreate the sidecar-written/journal-missing crash seam.
+            sidecar.write_bytes(pristine)
+            job["recovery_cursor"] = {"completed_units": [unit]}
+            accept = False
+            self.assertIsNone(enrich(job, str(project), unit, variant=0, index=0,
+                dependencies=[], settings={}, continuation=continuation))
+            restored = {"id": "job", "recovery_cursor": {"completed_units": [unit]}}
+            search = types.ModuleType("services.search_index")
+            search.load_media_sidecars = lambda _root: {media.name: json.loads(sidecar.read_text())}
+            with mock.patch.dict(sys.modules, {"services.search_index": search}):
+                ns["_queue_recovery_reconcile_cursor"](restored, str(project))
+            units = restored["recovery_cursor"]["completed_units"]
+            self.assertEqual(len(units), 1)
+            quarantine.assert_not_called()
+            self.assertEqual(media.read_bytes(), b"synthetic-video")
+            self.assertEqual(units[0]["continuation"], continuation)
+            self.assertEqual(units[0]["unit_id"], unit_id)
+            self.assertEqual(restored["output_files"], [])
+            enriched_meta = json.loads(sidecar.read_text())
+            for corrupt in (None, {}, dict(continuation, mode="unknown"),
+                            dict(continuation, mode="native_av_overlap", fps=1)):
+                with self.subTest(orphan_continuation=corrupt):
+                    sidecar.write_text(json.dumps(dict(enriched_meta, producer_unit_continuation=corrupt)))
+                    orphan = {"id": "job", "recovery_cursor": {"completed_units": []}}
+                    with mock.patch.dict(sys.modules, {"services.search_index": search}):
+                        ns["_queue_recovery_reconcile_cursor"](orphan, str(project))
+                    self.assertEqual(orphan["recovery_cursor"]["completed_units"], [])
+                    self.assertEqual(media.read_bytes(), b"synthetic-video")
+
+            media.write_bytes(b"replacement-video")
+            replaced_meta = dict(enriched_meta, producer_media_size=media.stat().st_size,
+                                 producer_media_sha256=recovery_sha256_file(media)[1])
+            sidecar.write_text(json.dumps(replaced_meta))
+            stale = {"id": "job", "recovery_cursor": {"completed_units": [unit]}}
+            with mock.patch.dict(sys.modules, {"services.search_index": search}):
+                ns["_queue_recovery_reconcile_cursor"](stale, str(project))
+            self.assertEqual(stale["recovery_cursor"]["completed_units"], [])
+            quarantine.assert_called_once()
+            self.assertFalse(media.exists())
+            quarantine.reset_mock()
+            media.write_bytes(b"synthetic-video")
+            sidecar.write_text(json.dumps(enriched_meta))
+
+            for artifacts in ([artifact, "corrupt-extra"],
+                              [dict(artifact, basename=None), artifact], [artifact, artifact]):
+                media.write_bytes(b"synthetic-video")
+                sidecar.write_text(json.dumps(enriched_meta))
+                malformed = dict(unit, artifacts=artifacts)
+                stale = {"id": "job", "recovery_cursor": {"completed_units": [malformed]}}
+                with mock.patch.dict(sys.modules, {"services.search_index": search}):
+                    ns["_queue_recovery_reconcile_cursor"](stale, str(project))
+                self.assertEqual(stale["recovery_cursor"]["completed_units"], [])
+            quarantine.reset_mock()
+            media.write_bytes(b"synthetic-video")
+            sidecar.write_text(json.dumps(enriched_meta))
+
+            second = project / "window.mp4"
+            second.write_bytes(b"synthetic-window")
+            multi = dict(enriched_meta, producer_unit_artifact_names=[media.name, second.name])
+            sidecar.write_text(json.dumps(multi))
+            other = dict(multi, output_filename=second.name,
+                         producer_media_size=second.stat().st_size,
+                         producer_media_sha256=recovery_sha256_file(second)[1],
+                         producer_unit_continuation={"dependency": unit_id, "mode": "prompt_only"})
+            other_sidecar = project / "window.meta.json"
+            other_sidecar.write_text(json.dumps(other))
+            search.load_media_sidecars = lambda _root: {
+                media.name: json.loads(sidecar.read_text()), second.name: json.loads(other_sidecar.read_text())}
+            orphan = {"id": "job", "recovery_cursor": {"completed_units": []}}
+            with mock.patch.dict(sys.modules, {"services.search_index": search}):
+                ns["_queue_recovery_reconcile_cursor"](orphan, str(project))
+            self.assertEqual(orphan["recovery_cursor"]["completed_units"], [])
+            quarantine.assert_not_called()
+
+
     def test_h3_continuation_accepts_only_attested_current_staging_path(self):
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
@@ -7054,6 +7284,11 @@ class QueueLaunchWiringTests(unittest.TestCase):
                         ).hexdigest()],
                         "clip_start_frames": [0],
                     }
+                if kind == "h3_concat":
+                    from services.h3_audio_safety import DEFAULT_TARGET_DBTP, POLICY_VERSION
+                    settings["h3_audio_true_peak_policy"] = {
+                        "policy_version": POLICY_VERSION, "target_dbtp": DEFAULT_TARGET_DBTP,
+                    }
                 unit_id = recovery_unit_id(
                     job_id, kind, variant=0, index=index,
                     dependencies=dependencies, settings=settings,
@@ -7097,6 +7332,11 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 })
                 if settings:
                     units[-1]["settings"] = settings
+                if kind == "h3_concat":
+                    units[-1]["attestation"] = {"h3_audio_true_peak": {
+                        "policy_version": POLICY_VERSION, "target_dbtp": DEFAULT_TARGET_DBTP,
+                        "verified": True,
+                    }}
 
             def atomic_write(path, value):
                 Path(path).write_text(json.dumps(value), encoding="utf-8")

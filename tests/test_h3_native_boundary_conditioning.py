@@ -131,7 +131,7 @@ def _native_admission_namespace():
         "torch": types.SimpleNamespace(
             cuda=types.SimpleNamespace(is_available=lambda: False),
         ),
-        "wgp": types.SimpleNamespace(get_model_def=lambda model_type: {}),
+        "wgp": types.SimpleNamespace(get_model_def=lambda model_type: {}, server_config={}),
         "_H3_LONG_STUDIO_MODELS": {
             "minimax_h3", "minimax_h3_ref2va",
         },
@@ -172,6 +172,7 @@ def _native_admission_namespace():
         "generation_slot": (
             lambda lock, job, **kwargs: contextlib.nullcontext(True)
         ),
+        "_wgp_native_gpu_slot_state": types.SimpleNamespace(current_slot=object()),
         "_WgpNativeGpuExecutionSlot": (
             lambda acquired, **kwargs: contextlib.nullcontext(bool(acquired))
         ),
@@ -187,6 +188,7 @@ def _native_admission_namespace():
         "_director_image_role_wire_mode": lambda body: "legacy",
         "_require_h3_offload_plan_parity": lambda job: None,
         "_require_job_model_recipe_terms": lambda job: None,
+        "_require_job_krea_actor_admission": lambda job: None,
         "_apply_per_job_coefficient": lambda job: None,
         "finish_job": (
             lambda *args, **kwargs: finished_jobs.append((args, kwargs))
@@ -197,6 +199,7 @@ def _native_admission_namespace():
             )
         ),
         "_restore_base_coefficient": lambda: None,
+        "_try_automatic_resource_retry": lambda *_args, **_kwargs: False,
     }
     for name in (
         "_validate_h3_sampling_steps",
@@ -219,6 +222,7 @@ def _native_admission_namespace():
             "_trusted_h3_prepared_plan",
             "_h3_job_model_types",
             "_require_job_runtime_model_admission",
+            "_job_failure_positions", "_failure_stage_from_job", "_safe_failure_updates",
             "_require_h3_native_boundary_experimental",
             "_plan_generation_submission",
             "preview_generation_plan",
@@ -253,7 +257,7 @@ def _load_handler():
         ):
             selected.append(node)
         elif isinstance(node, ast.FunctionDef) and node.name in {
-            "_hf_url", "_is_reference_mode",
+            "_hf_url", "_is_reference_mode", "_required_runtime_asset_manifest",
         }:
             selected.append(node)
         elif isinstance(node, ast.ClassDef) and node.name == "family_handler":

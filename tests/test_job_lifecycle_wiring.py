@@ -1863,7 +1863,116 @@ class TestJobLifecycleWiring(unittest.TestCase):
             run.assert_not_called()
             self.assertFalse(os.path.exists(output))
 
-    def test_final_segment_callback_runs_before_concat_and_is_stage_safe(self):
+    def test_segment_callback_binds_current_identity_before_sidecars(self):
+        import threading
+        from services.queue_recovery_runtime import QueueRecoveryRuntimeError, recovery_unit_id
+
+        callback = _function(self.launch, "_seal_h3_segment_before_concat")
+        expected = {"index": 0, "total": 2, "output_index": 0, "group_id": "group"}
+        events = []
+        ns = {"os": os, "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+              "recovery_h3_segment": True, "recovery_clip": expected,
+              "recovery_staging_dir": "staging", "out_dir": "project", "job_id": "job", "job": {},
+              "_queue_recovery_staged_media_paths": lambda *_args: {"native.mp4": "staging/native.mp4"},
+              "_queue_recovery_resolve_task_video_path": lambda *_args: "staging/native.mp4",
+              "_h3_verified_segment_dependency_evidence": lambda *_args: ([], {}),
+              "_h3_segment_recovery_settings": lambda _info: {}, "recovery_unit_id": recovery_unit_id,
+              "producer_artifact_roles": {}, "_sample_campaign_transition_lock": threading.RLock(),
+              "sample_safe_unit_current": lambda _state: True, "abort_state": None,
+              "update_job": lambda *_args, **_kwargs: True,
+              "_write_output_sidecars": lambda *_args, **_kwargs: events.append("sidecar"),
+              "_queue_recovery_promote_staged_outputs": lambda *_args: events.append("promote"),
+              "_queue_recovery_checkpoint_unit": lambda *_args, **_kwargs: events.append("checkpoint") or {"unit_id": "unit"},
+              "h3_delivery_request": False, "task_sidecar_params": {}, "gen": {}, "clip_output_files": {}}
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[callback], type_ignores=[])), "launch.py", "exec"), ns)
+        for wrong in (dict(expected, index=1), dict(expected, index=-1), dict(expected, index=True),
+                      dict(expected, total=3), dict(expected, output_index=1), dict(expected, group_id="other")):
+            with self.subTest(identity=wrong), self.assertRaises(QueueRecoveryRuntimeError):
+                ns[callback.name]("staging/native.mp4", wrong)
+        self.assertEqual(events, [])
+        self.assertEqual(ns[callback.name]("staging/native.mp4", expected), os.path.join("project", "native.mp4"))
+        self.assertEqual(events, ["sidecar", "promote", "checkpoint"])
+        self.assertEqual(ns["clip_output_files"], {0: "native.mp4"})
+
+    def test_segment_without_producer_evidence_fails_before_checkpoint(self):
+        generation = _function(self.launch, "_run_generation")
+        guard = next(node for node in ast.walk(generation) if isinstance(node, ast.If)
+                     and ast.unparse(node.test) == "not segment_names and sealed_segment_unit is None")
+        ns = {"segment_names": [], "sealed_segment_unit": None, "_h3_checkpoint_error": RuntimeError}
+        with self.assertRaisesRegex(RuntimeError, "no verified component"):
+            exec(compile(ast.fix_missing_locations(ast.Module(body=[guard], type_ignores=[])), "launch.py", "exec"), ns)
+
+    def test_replay_repairs_only_absent_required_handoff_before_skip(self):
+        import copy
+        from services.queue_recovery_runtime import QueueRecoveryRuntimeError
+
+        generation = _function(self.launch, "_run_generation")
+        branch = next(node for node in ast.walk(generation)
+                      if isinstance(node, ast.If)
+                      and ast.unparse(node.test) == "str(next_info.get('group_id') or '') == group_id")
+        for missing, required, commit in ((True, True, True), (False, True, True),
+                                           (True, False, True), (True, True, False)):
+            with self.subTest(missing=missing, required=required, commit=commit):
+                next_task = {"params": {"_continuation": required}}
+                unit = {"unit_id": "unit", "artifacts": []}
+                if not missing:
+                    unit["continuation"] = {"mode": "last_frame"}
+                events = []
+                def prepare(_source, target, path, **kwargs):
+                    events.append("prepare")
+                    self.assertIsNot(target["params"], next_task["params"])
+                    target["params"].pop("_continuation")
+                    self.assertEqual(path, "verified.mp4")
+                    return {"mode": "last_frame", "path": "unit-handoff.png"}
+                def enrich(*args, **kwargs):
+                    events.append("persist")
+                    return dict(unit, continuation={"mode": "last_frame"}) if commit else None
+                def apply(*args):
+                    events.append("apply")
+                    self.assertEqual(next_task["params"]["_continuation"], required)
+                ns = {"copy": copy, "next_info": {"group_id": "group"}, "group_id": "group",
+                      "queue": [{}, next_task], "task_idx": 0, "task": {}, "task_no": 1,
+                      "recovered_segment": unit, "recovery_variant": 0, "recovery_segment": 0,
+                      "recovery_clip_info": {}, "job_id": "job", "job": {}, "out_dir": "synthetic",
+                      "video_path": "verified.mp4", "abort_state": None,
+                      "_h3_verified_segment_dependency_evidence": lambda *_args: ([], {}),
+                      "_h3_segment_recovery_settings": lambda _info: {},
+                      "recovery_unit_id": lambda *_args, **_kwargs: "unit",
+                      "_h3_checkpoint_error": QueueRecoveryRuntimeError,
+                      "_prepare_task_continuation": prepare,
+                      "ensure_recovery_staging_directory": lambda _dir: "staging",
+                      "_queue_recovery_continuation_descriptor": lambda *_args, **_kwargs: {"dependency": "unit"},
+                      "_queue_recovery_enrich_h3_continuation": enrich,
+                      "_apply_h3_recovered_continuation": apply,
+                      "_sample_campaign_transition_lock": __import__("threading").RLock(),
+                      "sample_safe_unit_current": lambda _state: True}
+                wrapper = ast.parse("def replay():\n    global recovered_segment\n    pass\n    return True\n")
+                wrapper.body[0].body[1] = copy.deepcopy(branch)
+                exec(compile(ast.fix_missing_locations(wrapper), "launch.py", "exec"), ns)
+                self.assertEqual(ns["replay"](), commit if missing and required else True)
+                self.assertEqual(events, (["prepare", "persist", "apply"] if commit else ["prepare", "persist"])
+                                 if missing and required else ["apply"])
+
+    def test_segment_hook_covers_single_and_deferred_concat(self):
+        generation = _function(_parse("app/wgp.py"), "_generate_video_impl")
+        gate = next(node for node in ast.walk(generation) if isinstance(node, ast.If)
+                    and any(isinstance(item, ast.Assign) and isinstance(item.value, ast.Call)
+                            and isinstance(item.value.func, ast.Name)
+                            and item.value.func.id == "seal_multi_clip_segment_before_concat"
+                            for item in node.body))
+        for total, deferred, last_window in ((1, False, True), (2, True, True), (2, False, True), (2, True, False)):
+            with self.subTest(total=total, deferred=deferred, last=last_window):
+                seal = Mock(return_value="sealed.mp4")
+                ns = {"multi_clip_info": {"index": 0, "total": total, "defer_concat": deferred},
+                      "is_image": False, "audio_only": False, "is_last_window": last_window,
+                      "after_segment_output": Mock(), "video_path": ["component.mp4"],
+                      "seal_multi_clip_segment_before_concat": seal}
+                exec(compile(ast.fix_missing_locations(ast.Module(body=[gate], type_ignores=[])), "wgp.py", "exec"), ns)
+                self.assertEqual(seal.call_count, int(last_window))
+                if last_window:
+                    self.assertEqual(ns["video_path"], "sealed.mp4")
+
+    def test_each_segment_callback_runs_before_concat_and_is_stage_safe(self):
         seal = _load_isolated_function(
             "app/wgp.py",
             "seal_multi_clip_segment_before_concat",
@@ -1875,12 +1984,18 @@ class TestJobLifecycleWiring(unittest.TestCase):
         )
         self.assertEqual(seal(
             "segment-1.mp4", {"index": 0, "total": 2}, callback,
-        ), "segment-1.mp4")
-        self.assertEqual(calls, [])
+        ), "sealed.mp4")
+        self.assertEqual(calls, [("segment-1.mp4", 0)])
         self.assertEqual(seal(
             "segment-2.mp4", {"index": 1, "total": 2}, callback,
         ), "sealed.mp4")
-        self.assertEqual(calls, [("segment-2.mp4", 1)])
+        self.assertEqual(calls, [("segment-1.mp4", 0), ("segment-2.mp4", 1)])
+        for info in ({"index": -1, "total": 2}, {"index": 2, "total": 2},
+                     {"index": 0, "total": 0}, {"index": True, "total": 2},
+                     {"index": "0", "total": 2}, {"total": 2}):
+            with self.subTest(info=info), self.assertRaises(_PostDecodeStageError):
+                seal("segment.mp4", info, callback)
+        self.assertEqual(len(calls), 2)
 
         def fail(_path, _info):
             raise OSError("private checkpoint path")

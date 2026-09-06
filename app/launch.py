@@ -8463,6 +8463,7 @@ def _queue_recovery_unit_matches(
     variant: int,
     index: int,
     project_dir: str,
+    quarantine_invalid: bool = True,
 ) -> dict | None:
     """Return one fully verified completed unit; invalid evidence is ignored."""
     for unit in _queue_recovery_units(job):
@@ -8532,13 +8533,37 @@ def _queue_recovery_unit_matches(
             # sidecars and cannot use the public artifact quarantine path.
             # Leave invalid private bytes for the bounded staging-orphan
             # cleanup rather than interpreting them as gallery artifacts.
-            if kind != "h3_source_audio_premux":
+            if quarantine_invalid and kind != "h3_source_audio_premux":
                 for descriptor in artifacts:
                     if isinstance(descriptor, dict):
                         _quarantine_recovery_artifact(project_dir, descriptor)
             return None
         continuation = unit.get("continuation")
-        if isinstance(continuation, dict) and continuation.get("basename"):
+        if "continuation" in unit:
+            if not isinstance(continuation, dict) or continuation.get("dependency") != unit_id:
+                return None
+            mode = continuation.get("mode")
+            if mode == "prompt_only":
+                if set(continuation) != {"dependency", "mode"}:
+                    return None
+                return unit
+            if type(mode) is not str or mode not in {"last_frame", "semantic_still", "temporal_tail", "native_av_overlap"}:
+                return None
+            if not continuation.get("basename") or type(continuation.get("size")) is not int:
+                return None
+            if mode == "native_av_overlap":
+                from services.h3_boundary_policy import (
+                    H3_NATIVE_FPS, H3_NATIVE_AUDIO_SAMPLE_RATE,
+                    H3_NATIVE_OVERLAP_FRAMES, H3_NATIVE_HISTORY_FRAMES,
+                )
+                expected = {
+                    "fps": H3_NATIVE_FPS, "audio_sample_rate": H3_NATIVE_AUDIO_SAMPLE_RATE,
+                    "audio_channels": 2, "overlap_frames": H3_NATIVE_OVERLAP_FRAMES,
+                    "discard_frames": H3_NATIVE_HISTORY_FRAMES,
+                }
+                if any(type(continuation.get(key)) is not int or continuation[key] != value
+                       for key, value in expected.items()):
+                    return None
             try:
                 path = _queue_recovery_continuation_path(
                     project_dir, continuation,
@@ -8667,6 +8692,75 @@ def _queue_recovery_checkpoint_unit(
     return unit if committed is True else None
 
 
+def _queue_recovery_enrich_h3_continuation(
+    job: dict,
+    project_dir: str,
+    unit: dict,
+    *,
+    variant: int,
+    index: int,
+    dependencies: list[str],
+    settings: dict,
+    continuation: dict,
+) -> dict | None:
+    """Attach a verified handoff to the exact already-sealed component."""
+    expected_id = recovery_unit_id(
+        str(job.get("id") or ""), "h3_segment", variant=variant, index=index,
+        dependencies=dependencies, settings=settings,
+    )
+    if (
+        not isinstance(unit, dict)
+        or unit.get("unit_id") != expected_id
+        or unit.get("kind") != "h3_segment"
+        or unit.get("variant") != variant
+        or unit.get("index") != index
+        or unit.get("dependencies") != dependencies
+        or not isinstance(unit.get("settings", {}), dict)
+        or unit.get("settings", {}) != settings
+        or not isinstance(continuation, dict)
+        or continuation.get("dependency") != expected_id
+        or ("continuation" in unit and unit["continuation"] != continuation)
+    ):
+        raise QueueRecoveryRuntimeError("H3 continuation checkpoint identity changed.")
+    proposed = dict(unit, continuation=dict(continuation))
+    check_job = dict(job, recovery_cursor={"completed_units": [proposed]})
+    if _queue_recovery_unit_matches(
+        check_job, kind="h3_segment", variant=variant, index=index,
+        project_dir=project_dir,
+    ) is None:
+        raise QueueRecoveryRuntimeError("H3 continuation checkpoint is invalid.")
+    names = [artifact["basename"] for artifact in unit["artifacts"]]
+    for artifact in unit["artifacts"]:
+        sidecar_path = os.path.join(project_dir, artifact["sidecar_basename"])
+        with open(sidecar_path, "rb") as handle:
+            raw = handle.read(artifact["sidecar_size"] + 1)
+        if (len(raw) != artifact["sidecar_size"]
+                or hashlib.sha256(raw).hexdigest() != artifact["sidecar_sha256"]):
+            raise QueueRecoveryRuntimeError("H3 continuation sidecar changed.")
+        meta = json.loads(raw)
+        if (
+            not isinstance(meta, dict)
+            or meta.get("producer_unit_id") != expected_id
+            or meta.get("producer_unit_kind") != "h3_segment"
+            or meta.get("producer_unit_variant") != variant
+            or meta.get("producer_unit_index") != index
+            or meta.get("producer_unit_dependencies") != dependencies
+            or not isinstance(meta.get("producer_unit_settings", {}), dict)
+            or meta.get("producer_unit_settings", {}) != settings
+        ):
+            raise QueueRecoveryRuntimeError("H3 continuation producer changed.")
+        meta["producer_unit_continuation"] = dict(continuation)
+        # This is an update to already-sealed media. Never use the fresh-output
+        # writer's quarantine/delete path if an atomic sidecar update fails.
+        _atomic_write_json(sidecar_path, meta)
+    return _queue_recovery_checkpoint_unit(
+        job, kind="h3_segment", variant=variant, index=index,
+        project_dir=project_dir,
+        artifact_names=names,
+        dependencies=dependencies, settings=settings, continuation=continuation,
+    )
+
+
 def _queue_recovery_checkpoint_staged_premux(
     job: dict,
     *,
@@ -8762,6 +8856,17 @@ def _queue_recovery_continuation_descriptor(
         raise QueueRecoveryRuntimeError(
             "H3 continuation is not in private recovery staging."
         )
+    handle = os.open(candidate, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        os.fsync(handle)
+    finally:
+        os.close(handle)
+    if os.name != "nt":
+        directory = os.open(staging_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     size, digest = _recovery_sha256_file(candidate)
     descriptor = {
         "basename": os.path.basename(candidate),
@@ -9109,6 +9214,8 @@ def _queue_recovery_reconcile_cursor(job: dict, project_dir: str) -> None:
         str(unit.get("kind") or "").startswith("h3_")
         for unit in original_units
     )
+    unmatched_units = []
+    originals_by_id = {str(unit.get("unit_id") or ""): unit for unit in original_units}
     for unit in original_units:
         unit_id = str(unit.get("unit_id") or "")
         matched = _queue_recovery_unit_matches(
@@ -9117,6 +9224,7 @@ def _queue_recovery_reconcile_cursor(job: dict, project_dir: str) -> None:
             variant=max(0, int(unit.get("variant", 0) or 0)),
             index=max(0, int(unit.get("index", 0) or 0)),
             project_dir=project_dir,
+            quarantine_invalid=False,
         )
         repair_roles = globals().get("_queue_recovery_repair_unit_roles")
         if matched is not None and callable(repair_roles):
@@ -9124,6 +9232,8 @@ def _queue_recovery_reconcile_cursor(job: dict, project_dir: str) -> None:
         if matched is not None and unit_id not in seen:
             verified.append(matched)
             seen.add(unit_id)
+        elif matched is None:
+            unmatched_units.append(unit)
 
     # Sidecars are written and fsynced before the journal checkpoint. If the
     # process dies in that narrow gap, reconstruct the exact unit only from a
@@ -9153,7 +9263,7 @@ def _queue_recovery_reconcile_cursor(job: dict, project_dir: str) -> None:
                 dependencies = []
             if not isinstance(settings, dict):
                 settings = {}
-            if continuation is not None and not isinstance(continuation, dict):
+            if "producer_unit_continuation" in meta and not isinstance(continuation, dict):
                 continue
             if (
                 not isinstance(expected_artifacts, list)
@@ -9222,16 +9332,21 @@ def _queue_recovery_reconcile_cursor(job: dict, project_dir: str) -> None:
             "unit_id": unit_id,
             "variant": variant,
             "_expected_artifacts": tuple(sorted(expected_artifacts)),
+            "_continuation_signature": ("producer_unit_continuation" in meta, continuation),
         })
         if recovered.get("_expected_artifacts") != tuple(sorted(expected_artifacts)):
             invalid_recovered_units.add(unit_id)
             continue
+        if recovered.get("_continuation_signature") != ("producer_unit_continuation" in meta, continuation):
+            invalid_recovered_units.add(unit_id)
+            continue
         if settings:
             recovered["settings"] = dict(settings)
-        if continuation:
+        if "producer_unit_continuation" in meta:
             recovered["continuation"] = dict(continuation)
         recovered["artifacts"].append(artifact)
     for unit_id, unit in recovered_by_unit.items():
+        unit.pop("_continuation_signature", None)
         expected_artifacts = set(unit.pop("_expected_artifacts", ()))
         actual_artifacts = {
             str(artifact.get("basename") or "")
@@ -9243,6 +9358,39 @@ def _queue_recovery_reconcile_cursor(job: dict, project_dir: str) -> None:
             and actual_artifacts == expected_artifacts
             and unit_id not in seen
         ):
+            original = originals_by_id.get(unit_id)
+            if original is not None:
+                def media_identity(value):
+                    artifacts = value.get("artifacts")
+                    if not isinstance(artifacts, list) or not artifacts:
+                        return None
+                    identities = []
+                    names = set()
+                    for item in artifacts:
+                        if not isinstance(item, dict):
+                            return None
+                        name, size, digest = item.get("basename"), item.get("size"), item.get("sha256")
+                        if (
+                            type(name) is not str or not name or name.startswith(".")
+                            or os.path.basename(name) != name or name in names
+                            or type(size) is not int or size < 0
+                            or type(digest) is not str or len(digest) != 64
+                            or any(char not in "0123456789abcdef" for char in digest)
+                            or item.get("producer_unit_id") != value.get("unit_id")
+                        ):
+                            return None
+                        names.add(name)
+                        identities.append((name, size, digest))
+                    return sorted(identities)
+                old_media, new_media = media_identity(original), media_identity(unit)
+                if old_media is None or new_media is None or old_media != new_media:
+                    continue
+            check_job = dict(job, recovery_cursor={"completed_units": [unit]})
+            if _queue_recovery_unit_matches(
+                check_job, kind=unit["kind"], variant=unit["variant"],
+                index=unit["index"], project_dir=project_dir,
+            ) is None:
+                continue
             repair_roles = globals().get("_queue_recovery_repair_unit_roles")
             repaired = (
                 repair_roles(job, unit, project_dir)
@@ -9255,6 +9403,23 @@ def _queue_recovery_reconcile_cursor(job: dict, project_dir: str) -> None:
     # An independently valid downstream file must not survive after a
     # predecessor artifact or continuation is quarantined.
     verified = _h3_dependency_closed_recovery_units(verified)
+    # A sanctioned sidecar update can precede its journal replacement. Give
+    # verified same-media orphan evidence a chance before quarantining stale
+    # descriptors, and never remove a file adopted by the reconciled view.
+    protected_names = {
+        artifact.get("basename") for unit in verified
+        for artifact in unit.get("artifacts") or [] if isinstance(artifact, dict)
+    }
+    for unit in unmatched_units:
+        if unit.get("kind") == "h3_source_audio_premux":
+            continue
+        for artifact in unit.get("artifacts") or []:
+            if (isinstance(artifact, dict)
+                    and artifact.get("basename") not in protected_names
+                    and not validate_artifact_descriptor(
+                        project_dir, artifact, producer_unit_id=str(unit.get("unit_id") or ""),
+                    )):
+                _quarantine_recovery_artifact(project_dir, artifact)
 
     cursor = dict(job.get("recovery_cursor") or {})
     cursor["completed_units"] = verified[-2048:]
@@ -10556,6 +10721,118 @@ def _merge_h3_ref2va_keyframes(
             "MiniMax H3 Ref2VA accepts at most 9 combined semantic references and per-clip keyframes"
         )
     return combined
+
+
+def _prepare_task_continuation(
+    source_task: dict,
+    next_task: dict,
+    latest_video: str,
+    *,
+    out_dir: str,
+    task_no: int,
+    recovery_staging_dir: str | None = None,
+    recovery_output_prefix: str | None = None,
+) -> dict:
+    """Build only the CPU handoff; shared by fresh and recovered components."""
+    next_params = next_task.get("params")
+    if not isinstance(next_params, dict):
+        raise QueueRecoveryRuntimeError("H3 continuation target is invalid.")
+    native_boundary_request = next_params.get("_h3_native_boundary_request")
+    ref2va_boundary = next_params.get("_ref2va_continuation")
+    if recovery_staging_dir:
+        import re
+
+        expected_staging = os.path.realpath(ensure_recovery_staging_directory(out_dir))
+        if (
+            os.path.realpath(recovery_staging_dir) != expected_staging
+            or os.path.islink(recovery_staging_dir)
+            or type(recovery_output_prefix) is not str
+            or re.fullmatch(r"unit-[A-Za-z0-9._-]{1,180}", recovery_output_prefix) is None
+        ):
+            raise QueueRecoveryRuntimeError("H3 recovery continuation storage is invalid.")
+    if native_boundary_request:
+        native_prefix = str(recovery_output_prefix or "")
+        handoff = _attach_h3_native_boundary_handoff(
+            next_params,
+            latest_video=latest_video,
+            project_dir=out_dir,
+            output_prefix=native_prefix,
+        )
+        h3_continuation = dict(handoff)
+        print(
+            "  [H3 Native] 18-frame AV boundary "
+            f"prepared for segment {task_no + 1}"
+        )
+    else:
+        from PIL import Image as PILImage
+        import decord
+        vr = decord.VideoReader(latest_video)
+        current_clip_info = (
+            (source_task.get("params") or {}).get(
+                "multi_clip_info"
+            )
+            or {}
+        )
+        safe_idx = max(0, len(vr) - 1)
+        if not current_clip_info.get(
+            "automatic_h3_longform"
+        ):
+            safe_idx = max(0, len(vr) - 9)
+        frame_img = PILImage.fromarray(
+            vr[safe_idx].asnumpy()
+        )
+        del vr
+        if recovery_staging_dir:
+            if not recovery_output_prefix:
+                raise QueueRecoveryRuntimeError(
+                    "H3 recovery continuation identity is missing."
+                )
+            cont_path = os.path.join(
+                recovery_staging_dir,
+                f"{recovery_output_prefix}-continuation.png",
+            )
+        else:
+            cont_path = os.path.join(
+                out_dir,
+                f"_continuation_{task_no}.png",
+            )
+        frame_img.save(cont_path)
+        if ref2va_boundary:
+            handoff = _attach_h3_ref2va_handoff(
+                next_params,
+                latest_video=latest_video,
+                last_frame_path=cont_path,
+                out_dir=out_dir,
+                task_no=task_no,
+                boundary_type=str(ref2va_boundary),
+                recovery_staging_dir=recovery_staging_dir,
+                recovery_output_prefix=(
+                    recovery_output_prefix or None
+                ),
+            )
+            next_params.pop("_ref2va_continuation", None)
+            warning = handoff.get("warning")
+            h3_continuation = {
+                "mode": str(handoff.get("mode") or "prompt_only"),
+                "path": handoff.get("path"),
+            }
+            print(
+                "  [H3 Ref2VA] "
+                f"{handoff['mode']} handoff for segment "
+                f"{task_no + 1} ({ref2va_boundary})"
+                + (f"; fallback: {warning}" if warning else "")
+            )
+        else:
+            next_params["image_start"] = cont_path
+            next_params["image_prompt_type"] = "S" + (next_params.get("image_prompt_type", "") or "")
+            next_task["start_image_data"] = frame_img
+            next_params.pop("_continuation", None)
+            h3_continuation = {
+                "mode": "last_frame",
+                "path": cont_path,
+            }
+            print(f"  [Continuation] Extracted last frame for clip {task_no + 1}")
+    return h3_continuation
 
 
 def _apply_h3_recovered_continuation(
@@ -59653,6 +59930,51 @@ def _run_generation(
                                 ) or {}
                             )
                             if str(next_info.get("group_id") or "") == group_id:
+                                next_task = queue[task_idx + 1]
+                                next_params = next_task.get("params") or {}
+                                needs_handoff = bool(
+                                    next_params.get("_continuation")
+                                    or next_params.get("_ref2va_continuation")
+                                    or next_params.get("_h3_native_boundary_request")
+                                )
+                                if "continuation" not in recovered_segment and needs_handoff:
+                                    dependencies, predecessor_evidence = (
+                                        _h3_verified_segment_dependency_evidence(
+                                            recovery_variant, recovery_segment,
+                                        )
+                                    )
+                                    settings = _h3_segment_recovery_settings(recovery_clip_info)
+                                    settings.update(predecessor_evidence)
+                                    expected_id = recovery_unit_id(
+                                        job_id, "h3_segment", variant=recovery_variant,
+                                        index=recovery_segment, dependencies=dependencies,
+                                        settings=settings,
+                                    )
+                                    if recovered_segment.get("unit_id") != expected_id:
+                                        raise _h3_checkpoint_error("Recovered H3 segment identity changed.")
+                                    handoff_target = {"params": copy.deepcopy(next_params)}
+                                    handoff = _prepare_task_continuation(
+                                        task, handoff_target, video_path,
+                                        out_dir=out_dir, task_no=task_no,
+                                        recovery_staging_dir=ensure_recovery_staging_directory(out_dir),
+                                        recovery_output_prefix=f"unit-{job_id}-t{task_idx}",
+                                    )
+                                    continuation = _queue_recovery_continuation_descriptor(
+                                        out_dir, handoff.get("path"),
+                                        mode=str(handoff.get("mode") or "prompt_only"),
+                                        dependency=expected_id, metadata=handoff,
+                                    )
+                                    with _sample_campaign_transition_lock:
+                                        if not sample_safe_unit_current(abort_state):
+                                            return False
+                                        recovered_segment = _queue_recovery_enrich_h3_continuation(
+                                            job, out_dir, recovered_segment,
+                                            variant=recovery_variant, index=recovery_segment,
+                                            dependencies=dependencies, settings=settings,
+                                            continuation=continuation,
+                                        )
+                                        if recovered_segment is None:
+                                            return False
                                 _apply_h3_recovered_continuation(
                                     recovered_segment,
                                     queue[task_idx + 1],
@@ -59994,10 +60316,10 @@ def _run_generation(
                             return False
                     return resumed
 
-                def _seal_final_h3_segment_before_concat(
+                def _seal_h3_segment_before_concat(
                     rendered_path, callback_clip_info,
                 ):
-                    """Seal/promote the last component before WGP enters ffmpeg."""
+                    """Seal/promote each H3 component as soon as WGP writes it."""
                     if (
                         not recovery_h3_segment
                         or not isinstance(callback_clip_info, dict)
@@ -60006,24 +60328,21 @@ def _run_generation(
                         raise QueueRecoveryRuntimeError(
                             "H3 pre-concat segment callback is invalid."
                         )
-                    try:
-                        variant = max(
-                            0,
-                            int(callback_clip_info.get("output_index", 0) or 0),
-                        )
-                        segment_index = max(
-                            0, int(callback_clip_info.get("index", 0) or 0),
-                        )
-                        segment_total = max(
-                            1, int(callback_clip_info.get("total", 1) or 1),
-                        )
-                    except (TypeError, ValueError):
+                    variant = callback_clip_info.get("output_index", 0)
+                    segment_index = callback_clip_info.get("index")
+                    segment_total = callback_clip_info.get("total")
+                    if (
+                        type(variant) is not int or variant < 0
+                        or type(segment_index) is not int or segment_index < 0
+                        or type(segment_total) is not int or segment_total <= segment_index
+                        or not isinstance(recovery_clip, dict)
+                        or variant != recovery_clip.get("output_index", 0)
+                        or segment_index != recovery_clip.get("index")
+                        or segment_total != recovery_clip.get("total")
+                        or callback_clip_info.get("group_id") != recovery_clip.get("group_id")
+                    ):
                         raise QueueRecoveryRuntimeError(
                             "H3 pre-concat segment identity is invalid."
-                        ) from None
-                    if segment_index + 1 != segment_total:
-                        raise QueueRecoveryRuntimeError(
-                            "Only the final H3 segment may use pre-concat sealing."
                         )
                     name = os.path.basename(rendered_path)
                     if (
@@ -60064,7 +60383,7 @@ def _run_generation(
                             raise InterruptedError("H3 segment preempted")
                         if not update_job(
                             job,
-                            message="Sealing rendered segment before final join...",
+                            message="Sealing rendered segment...",
                             phase="Segment checkpoint",
                         ):
                             raise InterruptedError("H3 segment preempted")
@@ -60119,20 +60438,9 @@ def _run_generation(
                         except (TypeError, ValueError):
                             params["repeat_start_offset"] = 0
                 if recovery_h3_segment:
-                    try:
-                        callback_index = max(
-                            0, int((recovery_clip or {}).get("index", 0) or 0),
-                        )
-                        callback_total = max(
-                            1, int((recovery_clip or {}).get("total", 1) or 1),
-                        )
-                    except (TypeError, ValueError):
-                        callback_index = 0
-                        callback_total = 1
-                    if callback_index + 1 == callback_total:
-                        params["after_segment_output"] = (
-                            _seal_final_h3_segment_before_concat
-                        )
+                    params["after_segment_output"] = (
+                        _seal_h3_segment_before_concat
+                    )
 
                 premux_settings = _h3_source_audio_premux_settings(params)
                 if premux_settings is not None:
@@ -60890,94 +61198,14 @@ def _run_generation(
                                         break
                             if latest_video:
                                 try:
-                                    recovery_output_prefix = str(
-                                        params.get("_recovery_output_prefix") or ""
+                                    h3_continuation = _prepare_task_continuation(
+                                        task, next_task, latest_video,
+                                        out_dir=out_dir, task_no=task_no,
+                                        recovery_staging_dir=recovery_staging_dir,
+                                        recovery_output_prefix=str(
+                                            params.get("_recovery_output_prefix") or ""
+                                        ),
                                     )
-                                    if native_boundary_request:
-                                        native_prefix = str(
-                                            params.get("_recovery_output_prefix")
-                                            or f"unit-{job_id}-t{task_idx}"
-                                        )
-                                        handoff = _attach_h3_native_boundary_handoff(
-                                            next_params,
-                                            latest_video=latest_video,
-                                            project_dir=out_dir,
-                                            output_prefix=native_prefix,
-                                        )
-                                        h3_continuation = dict(handoff)
-                                        print(
-                                            "  [H3 Native] 18-frame AV boundary "
-                                            f"prepared for segment {task_no + 1}"
-                                        )
-                                    else:
-                                        from PIL import Image as PILImage
-                                        import decord
-                                        vr = decord.VideoReader(latest_video)
-                                        current_clip_info = (
-                                            (task.get("params") or {}).get(
-                                                "multi_clip_info"
-                                            )
-                                            or {}
-                                        )
-                                        safe_idx = max(0, len(vr) - 1)
-                                        if not current_clip_info.get(
-                                            "automatic_h3_longform"
-                                        ):
-                                            safe_idx = max(0, len(vr) - 9)
-                                        frame_img = PILImage.fromarray(
-                                            vr[safe_idx].asnumpy()
-                                        )
-                                        del vr
-                                        if recovery_staging_dir:
-                                            if not recovery_output_prefix:
-                                                raise QueueRecoveryRuntimeError(
-                                                    "H3 recovery continuation identity is missing."
-                                                )
-                                            cont_path = os.path.join(
-                                                recovery_staging_dir,
-                                                f"{recovery_output_prefix}-continuation.png",
-                                            )
-                                        else:
-                                            cont_path = os.path.join(
-                                                out_dir,
-                                                f"_continuation_{task_no}.png",
-                                            )
-                                        frame_img.save(cont_path)
-                                        if ref2va_boundary:
-                                            handoff = _attach_h3_ref2va_handoff(
-                                                next_params,
-                                                latest_video=latest_video,
-                                                last_frame_path=cont_path,
-                                                out_dir=out_dir,
-                                                task_no=task_no,
-                                                boundary_type=str(ref2va_boundary),
-                                                recovery_staging_dir=recovery_staging_dir,
-                                                recovery_output_prefix=(
-                                                    recovery_output_prefix or None
-                                                ),
-                                            )
-                                            next_params.pop("_ref2va_continuation", None)
-                                            warning = handoff.get("warning")
-                                            h3_continuation = {
-                                                "mode": str(handoff.get("mode") or "prompt_only"),
-                                                "path": handoff.get("path"),
-                                            }
-                                            print(
-                                                "  [H3 Ref2VA] "
-                                                f"{handoff['mode']} handoff for segment "
-                                                f"{task_no + 1} ({ref2va_boundary})"
-                                                + (f"; fallback: {warning}" if warning else "")
-                                            )
-                                        else:
-                                            next_params["image_start"] = cont_path
-                                            next_params["image_prompt_type"] = "S" + (next_params.get("image_prompt_type", "") or "")
-                                            next_task["start_image_data"] = frame_img
-                                            next_params.pop("_continuation", None)
-                                            h3_continuation = {
-                                                "mode": "last_frame",
-                                                "path": cont_path,
-                                            }
-                                            print(f"  [Continuation] Extracted last frame for clip {task_no + 1}")
                                 except Exception as e:
                                     message = (
                                         "Failed to prepare the required last-frame "
@@ -61059,6 +61287,8 @@ def _run_generation(
                             index=h3_segment,
                             project_dir=out_dir,
                         )
+                        if not segment_names and sealed_segment_unit is None:
+                            raise _h3_checkpoint_error("H3 segment produced no verified component.")
                         if segment_names and sealed_segment_unit is None:
                             segment_units = {
                                 name: {
@@ -61112,6 +61342,18 @@ def _run_generation(
                                     dependencies=h3_dependencies,
                                     continuation=continuation_descriptor,
                                     settings=h3_segment_settings,
+                                ):
+                                    return False
+                        elif continuation_descriptor and sealed_segment_unit is not None:
+                            with _sample_campaign_transition_lock:
+                                if not sample_safe_unit_current(abort_state):
+                                    return False
+                                if not _queue_recovery_enrich_h3_continuation(
+                                    job, out_dir, sealed_segment_unit,
+                                    variant=h3_variant, index=h3_segment,
+                                    dependencies=h3_dependencies,
+                                    settings=h3_segment_settings,
+                                    continuation=continuation_descriptor,
                                 ):
                                     return False
                         if concat_names and not task_error:
