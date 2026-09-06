@@ -841,9 +841,14 @@ class ReferencePackAttempt:
     repaired_role: str | None = None
     applied_correction_brief_commitment: str | None = None
 
-    def public_metadata(self, *, selected: bool = False) -> dict[str, Any]:
+    def public_metadata(
+        self, *, selected: bool = False, review_requested: bool = True,
+    ) -> dict[str, Any]:
         assessment = self.review.fidelity_assessment
+        if not review_requested and assessment is not None:
+            raise ValueError("unrequested review has an assessment")
         outcome = (
+            "not_requested" if not review_requested else
             "review_unavailable"
             if assessment is None
             else "target_met"
@@ -1693,9 +1698,17 @@ class ReferencePackResult:
     def public_metadata(self) -> dict[str, Any]:
         preview = self.plan.public_preview()
         preview.pop("candidate_count", None)
+        review_requested = self.plan.review_selection.requested_model != "off"
+        if not review_requested and (
+            self.plan.review_selection.resolved_model is not None
+            or self.plan.review_selection.resolved_provider != "off"
+            or self.review.fidelity_assessment is not None
+        ):
+            raise ValueError("Off reviewer selection is invalid")
+        public_review_status = self.review.status if review_requested else "not_requested"
         preview["review"] = {
             **self.plan.review_selection.public_metadata(),
-            "status": self.review.status,
+            "status": public_review_status,
             "publication_eligible": self.publication_eligible,
         }
         if self.review.fidelity_assessment is not None:
@@ -1739,6 +1752,7 @@ class ReferencePackResult:
             preview["review"]["attempt_history"] = [
                 attempt.public_metadata(
                     selected=index == self.selected_attempt_index,
+                    review_requested=review_requested,
                 )
                 for index, attempt in enumerate(self.attempt_history)
             ]
@@ -1751,8 +1765,8 @@ class ReferencePackResult:
                 "sheets": list(self.plan.sheet_roles),
                 "repaired": _public_pack_roles(self.repaired_roles),
             },
-            "reason_codes": list(self.review.reason_codes),
-            "review_status": self.review.status,
+            "reason_codes": list(self.review.reason_codes) if review_requested else [],
+            "review_status": public_review_status,
             "publication_status": "ready",
             "publication_eligible": self.publication_eligible,
             "max_repair_attempts": self.max_repair_attempts,
@@ -4719,13 +4733,6 @@ def build_reference_pack_plan(
     )
     if resolved_review_contract not in PACK_REVIEW_CONTRACTS:
         raise ValueError("review_contract is invalid")
-    if (
-        content_capability == "unrestricted_local"
-        and resolved_review_contract != "explicit_unrestricted_fidelity_v1"
-    ):
-        raise ValueError(
-            "unrestricted_local requires the explicit unrestricted fidelity review contract"
-        )
     if (
         not isinstance(additional_loras, Sequence)
         or isinstance(additional_loras, (str, bytes))

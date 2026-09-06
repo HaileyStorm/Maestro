@@ -2868,7 +2868,7 @@ export interface ProjectAssetOutput {
 }
 
 export type ProjectReferenceSheetMode = 'production' | 'hybrid' | 'draft'
-export type ProjectReferenceReviewStatus = 'pass' | 'fail' | 'review_unavailable'
+export type ProjectReferenceReviewStatus = 'pass' | 'fail' | 'review_unavailable' | 'not_requested'
 
 const PROJECT_REFERENCE_ASSET_TYPE_ALIASES: Record<string, ProjectReferenceAssetType> = {
   character: 'character',
@@ -2993,7 +2993,7 @@ export interface ProjectReferenceSheetVariantMetadata {
   anchor_privacy?: ProjectReferenceLegacyAnchorPrivacy
 }
 
-export type ProjectReferenceQualityStatus = 'pass' | 'residual' | 'review_unavailable'
+export type ProjectReferenceQualityStatus = 'pass' | 'residual' | 'review_unavailable' | 'not_requested'
 export type ProjectReferenceAssessmentClass = 'exact' | 'minor_residual' | 'material_residual'
 export type ProjectReferenceAssessmentSeverity = ProjectReferenceAssessmentClass | 'not_applicable'
 export type ProjectReferenceRecommendationBasis =
@@ -3079,6 +3079,24 @@ export function projectReferenceQualityPresentation(
 ): ProjectReferenceQualityPresentation | null {
   const quality = metadata?.quality
   if (!quality) return null
+  if (quality.status === 'not_requested' || (
+    quality.status === 'review_unavailable'
+    && metadata?.review?.requested_model === 'off'
+    && metadata.review.resolved_model == null
+    && metadata.review.resolved_provider === 'off'
+  )) {
+    return {
+      stateLabel: 'Visual quality check off',
+      gradeLabel: 'Ungraded',
+      scoreLabel: null,
+      residualSummary: null,
+      correctionAvailable: false,
+      recommended: false,
+      preliminary: false,
+      notice: 'No automatic visual quality check was requested.',
+      tone: 'deferred',
+    }
+  }
   if (quality.status === 'review_unavailable') {
     return {
       stateLabel: 'Fidelity review deferred',
@@ -3141,7 +3159,7 @@ export function projectReferenceJobQualitySummary(
   const presentation = projectReferenceQualityPresentation(
     recommended[0].metadata.reference_pack,
   )
-  return presentation ? {
+  return presentation?.recommended ? {
     candidateCount: candidates.length,
     variantLabel: recommended[0].label,
     presentation,
@@ -3379,10 +3397,10 @@ export interface ProjectReferenceCapabilities {
     }>
   }
   review_policy: {
-    mandatory_for_content_capabilities: Array<'unrestricted_local'>
-    mandatory_when_explicit_output: true
-    off_allowed_for_content_capabilities: Array<'standard'>
-    mandatory_contract: 'explicit_unrestricted_fidelity_v1'
+    mandatory_for_content_capabilities: Array<'standard' | 'unrestricted_local'>
+    mandatory_when_explicit_output: boolean
+    off_allowed_for_content_capabilities: Array<'standard' | 'unrestricted_local'>
+    mandatory_contract: 'explicit_unrestricted_fidelity_v1' | null
   }
   character_profile: {
     schema_version: 1
@@ -3758,7 +3776,7 @@ const PROJECT_REFERENCE_QUEUE_BLOCKER_COPY: Record<
   invalid_character_age: PROJECT_REFERENCE_CHARACTER_AGE_BLOCKER,
   explicit_convenience_age: PROJECT_REFERENCE_EXPLICIT_CONVENIENCE_AGE_BLOCKER,
   too_many_detail_callouts: 'Select at most eight combined authored and managed detail callouts.',
-  review_unavailable: 'Prepare the required local fidelity reviewer and MMProj shown above.',
+  review_unavailable: 'The selected visual quality check is not ready. Choose Off to continue without it, or prepare the local reviewer shown above.',
 }
 
 export function getProjectReferenceQueueBlockers(
@@ -3997,8 +4015,8 @@ export function isProjectReferenceReviewMandatory(
 ): boolean {
   return (policy
     ? policy.mandatory_for_content_capabilities.some(capability => capability === contentCapability)
-    : contentCapability === 'unrestricted_local')
-    || (explicitOutput && (policy?.mandatory_when_explicit_output ?? true))
+    : false)
+    || (explicitOutput && (policy?.mandatory_when_explicit_output ?? false))
 }
 
 export function isProjectReferenceReviewerEligible(
@@ -4024,36 +4042,14 @@ export function isProjectReferenceReviewerEligible(
   ))
 }
 
-export function getProjectReferenceReviewerSetupCopy(
-  contract: ProjectReferenceCapabilities['uncensored_auto_review'] | undefined,
-): string {
-  if (!contract) {
-    return 'The required local fidelity-review setup is unavailable. Refresh Reference and try again.'
-  }
-  switch (contract.setup_state) {
-    case 'ready_resident':
-      return 'Paperscarecrow is loaded with its MMProj and ready for local fidelity review.'
-    case 'ready_unloaded':
-      return 'Paperscarecrow and its MMProj are installed. They will load automatically when local fidelity review starts.'
-    case 'loading':
-      return `Paperscarecrow is loading${contract.loading_phase ? ` (${contract.loading_phase})` : ''}. Queueing will unlock when its MMProj setup is confirmed.`
-    case 'missing_model':
-      return 'The required Paperscarecrow reviewer checkpoint is not installed. Install and verify that exact local model before queueing.'
-    case 'missing_projector':
-      return 'Paperscarecrow is installed, but its required MMProj is missing. Install the listed MMProj before queueing.'
-    case 'loaded_without_vision':
-      return 'Paperscarecrow is loaded, but vision is unavailable because its MMProj did not initialize. Reload or repair the local reviewer before queueing.'
-  }
-}
-
 export function getProjectReferenceReviewerAction(
   setupState: ProjectReferenceCapabilities['uncensored_auto_review']['setup_state'] | undefined,
 ): { kind: 'load' | 'reload'; label: string } | null {
   if (setupState === 'missing_model' || setupState === 'missing_projector') {
-    return { kind: 'load', label: 'Install / load required reviewer' }
+    return { kind: 'load', label: 'Install / load selected reviewer' }
   }
   if (setupState === 'loaded_without_vision') {
-    return { kind: 'reload', label: 'Reload required reviewer' }
+    return { kind: 'reload', label: 'Reload selected reviewer' }
   }
   return null
 }
@@ -4061,6 +4057,7 @@ export function getProjectReferenceReviewerAction(
 export interface ProjectReferenceRetryReviewDecision {
   ready: boolean
   use_current_reviewer: boolean
+  disable_review?: boolean
   intelligence_policy: 'standard_auto' | 'uncensored_auto'
 }
 
@@ -4076,23 +4073,30 @@ export function resolveProjectReferenceRetryReview(
     source.content_capability, source.explicit_output, capabilities?.review_policy,
   )
   const intelligencePolicy = source.intelligence_policy
-    ?? (mandatory ? 'uncensored_auto' : 'standard_auto')
-  if (!mandatory) {
-    return { ready: true, use_current_reviewer: false, intelligence_policy: intelligencePolicy }
-  }
-  if (source.review && isProjectReferenceReviewerEligible(
-    intelligencePolicy, source.review_model, source.review_provider,
-    reviewModels, capabilities,
-  )) {
-    return { ready: true, use_current_reviewer: false, intelligence_policy: intelligencePolicy }
+    ?? (source.content_capability === 'unrestricted_local' || source.explicit_output
+      ? 'uncensored_auto' : 'standard_auto')
+  if (current.review_model === 'off') {
+    return {
+      ready: !mandatory,
+      use_current_reviewer: false,
+      disable_review: !mandatory,
+      intelligence_policy: intelligencePolicy,
+    }
   }
   const currentEligible = isProjectReferenceReviewerEligible(
     intelligencePolicy, current.review_model, current.review_provider,
     reviewModels, capabilities,
   )
+  if (currentEligible) {
+    return {
+      ready: true,
+      use_current_reviewer: true,
+      intelligence_policy: intelligencePolicy,
+    }
+  }
   return {
-    ready: currentEligible,
-    use_current_reviewer: currentEligible,
+    ready: false,
+    use_current_reviewer: false,
     intelligence_policy: intelligencePolicy,
   }
 }

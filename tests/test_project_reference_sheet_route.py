@@ -980,7 +980,9 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         self.assertEqual(metadata["reason_codes"], ["review_unavailable"])
         self.assertNotIn("offline secret", json.dumps(metadata))
 
-    def test_explicit_or_unrestricted_review_cannot_be_disabled_or_unresolved(self):
+    def test_explicit_or_unrestricted_review_can_be_turned_off(self):
+        review_requests = []
+        self.review = lambda request: review_requests.append(request)
         for body in (
             self._body(
                 content_capability="unrestricted_local",
@@ -993,11 +995,56 @@ class ProjectReferenceRouteTests(unittest.TestCase):
                 review_model="off",
             ),
         ):
-            with self.subTest(body=body), self.assertRaises(HTTPException) as raised:
-                self._run(body)
-            self.assertEqual(raised.exception.status_code, 409)
-        self.assertEqual(self.jobs, {})
-        self.assertEqual(self._assets(), [])
+            with self.subTest(body=body):
+                config = self.ns["_project_reference_request_config"](body, _Request({}))
+                self.assertFalse(config["mandatory_review"])
+                self.assertFalse(config["review"])
+                self.assertEqual(config["review_contract"], "standard_fidelity_v1")
+                response = self._run(body)
+                self.assertEqual(self.jobs[response["job_id"]]["status"], "completed")
+                self.assertEqual(review_requests, [])
+                asset = next(item for item in self._assets()
+                             if item["id"] == response["asset"]["id"])
+                variant = asset["variants"][0]
+                reference = variant["metadata"]["reference_pack"]
+                quality = reference["quality"]
+                self.assertEqual(quality["status"], "not_requested")
+                self.assertFalse(quality["review_deferred"])
+                self.assertIsNone(quality["warning"])
+                self.assertTrue(quality["recommended"])
+                self.assertEqual(quality["recommendation_basis"], "preliminary_ungraded")
+                self.assertEqual(reference["review_status"], "not_requested")
+                self.assertEqual(reference["review"]["status"], "not_requested")
+                self.assertEqual(reference["reason_codes"], [])
+                self.assertNotIn("review_unavailable", json.dumps(reference))
+                validate = self.ns["_project_reference_validate_committed_variant"]
+                arguments = dict(job_id=response["job_id"], candidate_index=1,
+                                 candidate_count=1, plan_seal=reference["plan_seal"],
+                                 mandatory_review=False, explicit_output=body["explicit_output"])
+                validate(self.store, "project", "main", variant, **arguments)
+                with self.assertRaises(ValueError):
+                    validate(self.store, "project", "main", variant,
+                             **{**arguments, "mandatory_review": True})
+                for path, value in (
+                    (("review", "resolved_provider"), "local"),
+                    (("review", "status"), "review_unavailable"),
+                    (("review", "assessment"), {}),
+                    (("review_status",), "review_unavailable"),
+                    (("reason_codes",), ["review_unavailable"]),
+                ):
+                    tampered = copy.deepcopy(variant)
+                    destination = tampered["metadata"]["reference_pack"]
+                    for key in path[:-1]:
+                        destination = destination[key]
+                    destination[path[-1]] = value
+                    with self.subTest(drift=path), self.assertRaises(ValueError):
+                        validate(self.store, "project", "main", tampered, **arguments)
+                calls_before_recovery = len(self.calls)
+                job = self.jobs[response["job_id"]]
+                job.update(status="queued", queue_held=False)
+                self.ns["_recover_project_reference_publication"](response["job_id"])
+                self.assertEqual(job["status"], "completed")
+                self.assertEqual(len(self.calls), calls_before_recovery)
 
         standard_off = self.ns["_project_reference_request_config"](
             self._body(
@@ -1026,12 +1073,18 @@ class ProjectReferenceRouteTests(unittest.TestCase):
                 }
             )
         )
-        with self.assertRaises(HTTPException) as raised:
-            self._run(self._body(content_capability="unrestricted_local"))
-        self.assertEqual(raised.exception.status_code, 409)
-        self.assertEqual(self.jobs, {})
+        unresolved = self.ns["_project_reference_request_config"](
+            self._body(
+                content_capability="unrestricted_local",
+                review=False,
+                review_model="off",
+            ),
+            _Request({}),
+        )
+        self.assertFalse(unresolved["mandatory_review"])
+        self.assertIsNone(unresolved["review_selection"]["resolved_model"])
 
-    def test_mandatory_review_unavailable_publishes_ungraded_artifacts(self):
+    def test_selected_review_unavailable_publishes_ungraded_artifacts(self):
         self.review = lambda _request: (_ for _ in ()).throw(
             RuntimeError("PRIVATE_PROVIDER_FAILURE"),
         )
@@ -1683,20 +1736,20 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             }
         )
         validate = self.ns["_project_reference_request_config"]
-        for review in (True, False):
-            with self.subTest(review=review), self.assertRaises(HTTPException) as raised:
-                validate(self._body(
-                    review=review,
-                    review_model="remote-vlm",
-                ), _Request({}))
-            self.assertEqual(raised.exception.status_code, 400)
+        with self.assertRaises(HTTPException) as raised:
+            validate(self._body(review=True, review_model="remote-vlm"), _Request({}))
+        self.assertEqual(raised.exception.status_code, 400)
+        disabled = validate(self._body(review=False, review_model="remote-vlm"), _Request({}))
+        self.assertEqual(disabled["review_selection"], {
+            "requested_model": "off", "resolved_model": None, "resolved_provider": "off",
+        })
         config = validate(self._body(
             review_model="remote-vlm",
             review_provider="openai",
         ), _Request({}))
         self.assertEqual(config["review_selection"]["resolved_provider"], "openai")
 
-    def test_mandatory_remote_review_requires_explicit_provider_disclosure(self):
+    def test_selected_remote_review_requires_explicit_provider_disclosure(self):
         def remote_review_selection(
             request, *, requested_model, requested_provider, purpose, intent,
         ):
@@ -1726,9 +1779,9 @@ class ProjectReferenceRouteTests(unittest.TestCase):
             review_provider="openai",
         ), _Request({}))
         self.assertEqual(config["review_selection"]["resolved_provider"], "openai")
-        self.assertTrue(config["mandatory_review"])
+        self.assertFalse(config["mandatory_review"])
 
-    def test_mandatory_review_repairs_then_publishes_residual_assessment(self):
+    def test_selected_review_repairs_then_publishes_residual_assessment(self):
         review_count = {"value": 0}
 
         def failing_review(request):
@@ -2877,10 +2930,12 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         ):
             self.assertNotIn(f'"{private_field}"', public_character_sheet)
         self.assertEqual(response["review_policy"], {
-            "mandatory_for_content_capabilities": ["unrestricted_local"],
-            "mandatory_when_explicit_output": True,
-            "off_allowed_for_content_capabilities": ["standard"],
-            "mandatory_contract": "explicit_unrestricted_fidelity_v1",
+            "mandatory_for_content_capabilities": [],
+            "mandatory_when_explicit_output": False,
+            "off_allowed_for_content_capabilities": [
+                "standard", "unrestricted_local",
+            ],
+            "mandatory_contract": None,
         })
         no_store = self.ns["_recovery_response_requires_no_store"]
         self.assertTrue(no_store(
@@ -3964,7 +4019,7 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         ), _Request({}))
         self.assertFalse(explicit_policy_only["explicit_convenience"])
         self.assertIsNone(explicit_policy_only["character_profile"])
-        self.assertTrue(explicit_policy_only["mandatory_review"])
+        self.assertFalse(explicit_policy_only["mandatory_review"])
 
         invalid_profiles = (
             self._body(

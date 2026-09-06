@@ -5373,7 +5373,7 @@ def _project_reference_validate_committed_variant(
     quality_status = quality.get("status")
     assessment = quality.get("assessment")
     if (
-        quality_status not in {"pass", "residual", "review_unavailable"}
+        quality_status not in {"pass", "residual", "review_unavailable", "not_requested"}
         or type(quality.get("recommended")) is not bool
         or type(quality.get("review_deferred")) is not bool
         or (
@@ -5389,7 +5389,52 @@ def _project_reference_validate_committed_variant(
         )
     ):
         raise ValueError("committed publication quality metadata changed")
-    if quality_status == "review_unavailable":
+    if quality_status == "not_requested":
+        review_selection = reference.get("review")
+        if (
+            mandatory_review is not False
+            or assessment is not None
+            or quality.get("review_deferred") is not False
+            or quality.get("warning") is not None
+            or quality.get("recommendation_basis") not in {None, "preliminary_ungraded"}
+            or not isinstance(review_selection, dict)
+            or not {"requested_model", "resolved_model", "resolved_provider",
+                    "status", "publication_eligible"}.issubset(review_selection)
+            or set(review_selection) - {
+                "requested_model", "resolved_model", "resolved_provider",
+                "status", "publication_eligible", "attempt_history", "selected_attempt_index",
+            }
+            or review_selection.get("requested_model") != "off"
+            or review_selection.get("resolved_model") is not None
+            or review_selection.get("resolved_provider") != "off"
+            or review_selection.get("status") != "not_requested"
+            or review_selection.get("publication_eligible") is not True
+            or reference.get("review_status") != "not_requested"
+            or reference.get("reason_codes") != []
+        ):
+            raise ValueError("committed publication quality metadata changed")
+        if "attempt_history" in review_selection or "selected_attempt_index" in review_selection:
+            history = review_selection.get("attempt_history")
+            selected = review_selection.get("selected_attempt_index")
+            if (
+                not isinstance(history, list) or not history
+                or type(selected) is not int or not 0 <= selected < len(history)
+                or any(
+                    not isinstance(attempt, dict)
+                    or set(attempt) != {"attempt_index", "repair_count", "repaired_role",
+                                       "review_outcome", "selected"}
+                    or type(attempt["attempt_index"]) is not int
+                    or attempt["attempt_index"] != index
+                    or type(attempt["repair_count"]) is not int
+                    or attempt["repair_count"] != 0
+                    or attempt["repaired_role"] is not None
+                    or attempt["review_outcome"] != "not_requested"
+                    or attempt["selected"] is not (index == selected)
+                    for index, attempt in enumerate(history)
+                )
+            ):
+                raise ValueError("committed publication quality metadata changed")
+    elif quality_status == "review_unavailable":
         if (
             assessment is not None
             or quality.get("review_deferred") is not True
@@ -25621,10 +25666,12 @@ def _project_reference_capabilities():
         "uncensored_auto_review": _project_reference_uncensored_review_setup(),
         "explicit_generation_model": _project_reference_explicit_generation_model(),
         "review_policy": {
-            "mandatory_for_content_capabilities": ["unrestricted_local"],
-            "mandatory_when_explicit_output": True,
-            "off_allowed_for_content_capabilities": ["standard"],
-            "mandatory_contract": _PROJECT_REFERENCE_UNRESTRICTED_REVIEW,
+            "mandatory_for_content_capabilities": [],
+            "mandatory_when_explicit_output": False,
+            "off_allowed_for_content_capabilities": [
+                "standard", "unrestricted_local",
+            ],
+            "mandatory_contract": None,
         },
         "max_candidate_count": 8,
         "max_repair_attempts": 5,
@@ -25929,14 +25976,14 @@ def _project_reference_request_config(
     if not isinstance(review, bool):
         raise HTTPException(status_code=400, detail="review must be a boolean")
 
-    mandatory_review = bool(
-        content_capability == "unrestricted_local"
-        or explicit_output
-        or explicit_convenience
-    )
     review_contract = (
         _PROJECT_REFERENCE_UNRESTRICTED_REVIEW
-        if mandatory_review else _PROJECT_REFERENCE_STANDARD_REVIEW
+        if review and (
+            content_capability == "unrestricted_local"
+            or explicit_output
+            or explicit_convenience
+        )
+        else _PROJECT_REFERENCE_STANDARD_REVIEW
     )
     initial_blur = body.get("initial_blur")
     if initial_blur is None:
@@ -25965,6 +26012,9 @@ def _project_reference_request_config(
     ):
         if value is not None and (not isinstance(value, str) or not value or len(value) > 256):
             raise HTTPException(status_code=400, detail=f"Invalid {field}")
+    if not review:
+        review_model = "off"
+        review_provider = None
     planning_selection = _project_reference_intelligence_selection(
         request,
         requested_model=planning_model,
@@ -25972,8 +26022,11 @@ def _project_reference_request_config(
         purpose="planning",
         intent=intent,
     )
-    review_selection = None
-    if intelligence_policy != "uncensored_auto" or not review:
+    review_selection = (
+        {"requested_model": "off", "resolved_model": None, "resolved_provider": "off"}
+        if not review else None
+    )
+    if review and intelligence_policy != "uncensored_auto":
         review_selection = _project_reference_intelligence_selection(
             request,
             requested_model=review_model,
@@ -26019,15 +26072,10 @@ def _project_reference_request_config(
             }
         intelligence_recipe["status"] = "queued"
     assert review_selection is not None
-    if mandatory_review:
+    if review and review_selection.get("resolved_model"):
         review_selection = _project_reference_seal_intelligence_selection(
             review_selection,
         )
-        if not review or review_selection["resolved_model"] is None:
-            raise HTTPException(
-                status_code=409,
-                detail="Explicit/unrestricted output requires a selected vision fidelity reviewer",
-            )
     if (
         review_selection["resolved_model"] is not None
         and review_selection["resolved_provider"] != "local"
@@ -26174,7 +26222,9 @@ def _project_reference_request_config(
         "initial_blur": initial_blur,
         "intelligence_policy": intelligence_policy,
         "review_contract": review_contract,
-        "mandatory_review": mandatory_review,
+        # Retain the persisted field for recovery compatibility; new requests
+        # never require a visual quality checker.
+        "mandatory_review": False,
         "intelligence_recipe": intelligence_recipe,
         "operation_routing": operation_routing,
         "operation_models": operation_models,
@@ -26962,11 +27012,18 @@ def _project_reference_public_quality(
     review = getattr(result, "review", None)
     assessment = getattr(review, "fidelity_assessment", None)
     if assessment is None:
+        selection = getattr(getattr(result, "plan", None), "review_selection", None)
+        not_requested = getattr(selection, "requested_model", None) == "off"
         return {
-            "status": "review_unavailable",
-            "warning": "Fidelity review was unavailable; this result is ungraded.",
-            "review_deferred": True,
+            "status": "not_requested" if not_requested else "review_unavailable",
+            "warning": (
+                None if not_requested else
+                "Fidelity review was unavailable; this result is ungraded."
+            ),
+            "review_deferred": not not_requested,
             "assessment": None,
+            # Recovery requires one selected candidate even without grading.
+            # The Off presentation does not show this as a quality recommendation.
             "recommended": bool(recommended),
             "recommendation_basis": recommendation_basis,
         }

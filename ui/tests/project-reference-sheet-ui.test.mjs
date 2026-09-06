@@ -1310,6 +1310,25 @@ test('public Reference fidelity presentation is compact, advisory, and legacy-sa
   assert.equal(deferred?.preliminary, true)
   assert.match(deferred?.notice ?? '', /remains usable/)
   assert.doesNotMatch(JSON.stringify(deferred), /PRIVATE_PROVIDER_FAILURE/)
+  const off = projectReferenceQualityPresentation({
+    ...deferredMetadata,
+    quality: { ...deferredMetadata.quality, status: 'not_requested',
+      warning: null, review_deferred: false },
+  })
+  assert.equal(off?.stateLabel, 'Visual quality check off')
+  assert.equal(off?.gradeLabel, 'Ungraded')
+  assert.equal(off?.correctionAvailable, false)
+  assert.equal(off?.preliminary, false)
+  assert.equal(off?.recommended, false)
+  assert.doesNotMatch(JSON.stringify([off?.stateLabel, off?.notice]), /deferred|unavailable|until fidelity review/i)
+  assert.equal(projectReferenceQualityPresentation({
+    ...deferredMetadata,
+    review: { requested_model: 'off', resolved_model: null, resolved_provider: 'off' },
+  })?.stateLabel, 'Visual quality check off')
+  assert.equal(projectReferenceQualityPresentation({
+    ...deferredMetadata,
+    review: { requested_model: 'off', resolved_model: null, resolved_provider: 'local' },
+  })?.stateLabel, 'Fidelity review deferred')
   assert.equal(projectReferenceQualityPresentation({
     schema_version: 2,
     planner_version: 'reference-pack-v2',
@@ -1336,6 +1355,15 @@ test('public Reference fidelity presentation is compact, advisory, and legacy-sa
     presentation: deferred,
   })
   assert.equal(projectReferenceJobQualitySummary(assets, 'missing-job'), null)
+  for (const metadata of [
+    { ...deferredMetadata, quality: { ...deferredMetadata.quality, status: 'not_requested',
+      warning: null, review_deferred: false } },
+    { ...deferredMetadata, review: { requested_model: 'off', resolved_model: null, resolved_provider: 'off' } },
+  ]) {
+    assert.equal(projectReferenceJobQualitySummary([{
+      ...assets[0], variants: [makeCandidate('off', 'Off', metadata)],
+    }], 'job-1'), null, 'Off must not surface a recommendation in the queue summary')
+  }
   const duplicateRecommendation = structuredClone(assets)
   duplicateRecommendation[0].variants[0].metadata.reference_pack.quality.recommended = true
   duplicateRecommendation[0].variants[0].metadata.reference_pack.quality.recommendation_basis = 'residual_assessment'
@@ -1519,10 +1547,10 @@ test('capabilities helper returns authoritative ordered roles for prequeue previ
         }],
       },
       review_policy: {
-        mandatory_for_content_capabilities: ['unrestricted_local'],
-        mandatory_when_explicit_output: true,
-        off_allowed_for_content_capabilities: ['standard'],
-        mandatory_contract: 'explicit_unrestricted_fidelity_v1',
+        mandatory_for_content_capabilities: [],
+        mandatory_when_explicit_output: false,
+        off_allowed_for_content_capabilities: ['standard', 'unrestricted_local'],
+        mandatory_contract: null,
       },
       character_sheet: characterSheetCapabilities(),
       reference_types: [{
@@ -1574,10 +1602,10 @@ test('capabilities helper returns authoritative ordered roles for prequeue previ
   assert.equal(capabilities.explicit_generation_model.resolved_model, 'krea2_moody_mix_v7_fp8')
   assert.equal(capabilities.explicit_generation_model.candidates[0].ready, true)
   assert.deepEqual(capabilities.review_policy, {
-    mandatory_for_content_capabilities: ['unrestricted_local'],
-    mandatory_when_explicit_output: true,
-    off_allowed_for_content_capabilities: ['standard'],
-    mandatory_contract: 'explicit_unrestricted_fidelity_v1',
+    mandatory_for_content_capabilities: [],
+    mandatory_when_explicit_output: false,
+    off_allowed_for_content_capabilities: ['standard', 'unrestricted_local'],
+    mandatory_contract: null,
   })
   assert.deepEqual(
     capabilities.character_sheet.profiles.map(profile => profile.id),
@@ -1632,7 +1660,7 @@ test('Character Sheet capability decoder rejects drift and private fields withou
   assert.deepEqual(missing.reference_types, [{ id: 'character' }])
 })
 
-test('mandatory retry review fails closed for recorded Off or unavailable reviewers', () => {
+test('optional retry review honors Off and requires an available selected reviewer', () => {
   const capabilities = {
     uncensored_auto_review: {
       requested_model: 'auto_local',
@@ -1642,16 +1670,16 @@ test('mandatory retry review fails closed for recorded Off or unavailable review
       queue_ready: true,
     },
     review_policy: {
-      mandatory_for_content_capabilities: ['unrestricted_local'],
-      mandatory_when_explicit_output: true,
-      off_allowed_for_content_capabilities: ['standard'],
-      mandatory_contract: 'explicit_unrestricted_fidelity_v1',
+      mandatory_for_content_capabilities: [],
+      mandatory_when_explicit_output: false,
+      off_allowed_for_content_capabilities: ['standard', 'unrestricted_local'],
+      mandatory_contract: null,
     },
   }
   const exactLocalModels = [{ id: 'local-abliterated-vision', provider: 'local' }]
   assert.equal(isProjectReferenceReviewMandatory('standard', false, capabilities.review_policy), false)
-  assert.equal(isProjectReferenceReviewMandatory('unrestricted_local', false, capabilities.review_policy), true)
-  assert.equal(isProjectReferenceReviewMandatory('standard', true, capabilities.review_policy), true)
+  assert.equal(isProjectReferenceReviewMandatory('unrestricted_local', false, capabilities.review_policy), false)
+  assert.equal(isProjectReferenceReviewMandatory('standard', true, capabilities.review_policy), false)
   assert.equal(isProjectReferenceReviewerEligible(
     'uncensored_auto', 'missing-recorded-reviewer', 'local', exactLocalModels, capabilities,
   ), false)
@@ -1664,10 +1692,20 @@ test('mandatory retry review fails closed for recorded Off or unavailable review
     review_model: 'off',
   }, { review_model: 'off' }, exactLocalModels, capabilities)
   assert.deepEqual(recordedOff, {
-    ready: false,
+    ready: true,
     use_current_reviewer: false,
+    disable_review: true,
     intelligence_policy: 'uncensored_auto',
   })
+  const savedOff = {
+    review: false, review_model: 'off', intelligence_policy: 'uncensored_auto',
+  }
+  assert.equal(resolveProjectReferenceRetryReview(
+    savedOff, { review_model: 'auto_local' }, exactLocalModels, capabilities,
+  ).use_current_reviewer, true)
+  assert.equal(resolveProjectReferenceRetryReview(
+    savedOff, { review_model: 'missing-checker' }, exactLocalModels, capabilities,
+  ).ready, false)
 
   const recordedUnavailable = resolveProjectReferenceRetryReview({
     content_capability: 'standard',
@@ -1677,8 +1715,31 @@ test('mandatory retry review fails closed for recorded Off or unavailable review
     review_model: 'missing-recorded-reviewer',
     review_provider: 'local',
   }, { review_model: 'off' }, exactLocalModels, capabilities)
-  assert.equal(recordedUnavailable.ready, false)
+  assert.equal(recordedUnavailable.ready, true)
   assert.equal(recordedUnavailable.use_current_reviewer, false)
+  assert.equal(recordedUnavailable.disable_review, true)
+  assert.equal(resolveProjectReferenceRetryReview({
+    review: false, review_model: 'off', content_capability: 'standard', explicit_output: true,
+  }, { review_model: 'off' }, [], capabilities).intelligence_policy, 'uncensored_auto')
+
+  const savedReview = {
+    content_capability: 'unrestricted_local',
+    explicit_output: true,
+    intelligence_policy: 'uncensored_auto',
+    review: true,
+    review_model: 'missing-recorded-reviewer',
+    review_provider: 'local',
+  }
+  assert.equal(resolveProjectReferenceRetryReview(
+    savedReview, { review_model: 'also-unavailable' }, [], capabilities,
+  ).ready, false)
+  const stillRequired = {
+    ...capabilities,
+    review_policy: { ...capabilities.review_policy, mandatory_when_explicit_output: true },
+  }
+  assert.equal(resolveProjectReferenceRetryReview(
+    savedReview, { review_model: 'off' }, [], stillRequired,
+  ).ready, false)
 
   const safelySubstituted = resolveProjectReferenceRetryReview({
     content_capability: 'unrestricted_local',
@@ -1692,7 +1753,32 @@ test('mandatory retry review fails closed for recorded Off or unavailable review
   assert.equal(safelySubstituted.use_current_reviewer, true)
 })
 
-test('required Paperscarecrow reviewer is queue-ready while installed but unloaded', () => {
+test('retry Off clears the saved reviewer in the submitted settings', async () => {
+  const source = await readFile(new URL('../src/components/Sidebar/ProjectReferenceLibrary.tsx', import.meta.url), 'utf8')
+  const branch = source.match(/if \(retryReview\.disable_review\) \{([^]*?)\} else if \(retryReview\.use_current_reviewer\)/)?.[1]
+  assert.ok(branch, 'Retry must apply its explicit Off decision before building the request')
+  const settings = {
+    review: true,
+    review_model: 'unavailable-saved-reviewer',
+    review_provider: 'local',
+    max_repair_attempts: 3,
+    model_type: 'unchanged-generator',
+    private_output: true,
+  }
+  const decision = resolveProjectReferenceRetryReview(settings, { review_model: 'off' }, [], null)
+  assert.equal(decision.disable_review, true)
+  new Function('sourceSettings', branch)(settings)
+  assert.deepEqual(settings, {
+    review: false,
+    review_model: 'off',
+    review_provider: undefined,
+    max_repair_attempts: 0,
+    model_type: 'unchanged-generator',
+    private_output: true,
+  })
+})
+
+test('selected Paperscarecrow reviewer is queue-ready while installed but unloaded', () => {
   const base = {
     requested_model: 'auto_local',
     resolved_model: 'paperscarecrow/Gemma-4-31B-it-abliterated-gguf',
@@ -2245,15 +2331,17 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /referenceModelCustomized\) return selectProjectReferenceModel\(referenceModels, current\)/)
   assert.match(source, /referenceCapabilities\?\.review_policy/)
   assert.match(source, /isProjectReferenceReviewMandatory\(/)
-  assert.match(source, /mandatoryReview && reviewModel === 'off'/)
-  assert.match(source, /value="off" disabled=\{mandatoryReview\}/)
-  assert.match(source, /A visual quality check is required for unrestricted or explicit output and cannot be turned off/)
+  assert.match(source, /<option value="off">Off<\/option>/)
+  assert.doesNotMatch(source, /A visual quality check is required for unrestricted or explicit output and cannot be turned off/)
+  assert.match(source, /a vision model is never required/)
   assert.match(source, /model\.id === uncensoredReviewContract\?\.resolved_model/)
   assert.match(source, /\(model\.provider \?\? 'local'\) === uncensoredReviewContract\?\.resolved_provider/)
   assert.match(source, /intelligencePolicy === 'uncensored_auto'[\s\S]*?uncensoredReviewCatalogModel \? \[uncensoredReviewCatalogModel\] : \[\]/)
   assert.match(source, /!uncensoredReviewContract\?\.queue_ready \|\| !uncensoredReviewSelectionValid/)
   assert.match(source, /reviewModel !== 'auto_local' && reviewModel !== 'off' && !exactLocalSelection/)
-  assert.match(source, /aria-label="Required visual reviewer setup"/)
+  assert.match(source, /aria-label="Visual quality checker setup"/)
+  assert.match(source, /reviewModel !== 'off' && intelligencePolicy === 'uncensored_auto' && uncensoredReviewContract &&/)
+  assert.match(source, /if \(retryReview\.disable_review\) \{\s*sourceSettings\.review = false\s*sourceSettings\.review_model = 'off'\s*sourceSettings\.review_provider = undefined\s*sourceSettings\.max_repair_attempts = 0/)
   assert.match(source, /Image understanding: \{uncensoredReviewContract\.projector_available/)
   assert.match(source, /projectReferenceReviewerLoadingLabel\(uncensoredReviewContract\.loading_phase\)/)
   assert.match(source, /Ready to load automatically/)
@@ -2270,7 +2358,7 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.doesNotMatch(source, /getProjectReferenceReviewerSetupCopy/)
   assert.match(source, /Refresh visual review status/)
   assert.match(source, /LAN sessions can refresh its status but cannot change models running on the host/)
-  assert.match(source, /Could not prepare the required visual review model/)
+  assert.match(source, /Could not prepare the selected visual review model/)
   assert.match(source, /intelligencePolicy === 'standard_auto' && selectedReviewModel/)
   assert.match(source, /const queueBlockers = getProjectReferenceQueueBlockers\(/)
   assert.match(source, /const visibleQueueBlockers = queueBlockers\.filter\(blocker => blocker\.id !== 'submitting'\)/)
@@ -2279,7 +2367,7 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, />Queue blocked by</)
   assert.match(source, /Automatic · unavailable/)
   assert.match(source, /content_capability: contentCapability/)
-  assert.match(source, /review: mandatoryReview \|\| reviewModel !== 'off'/)
+  assert.match(source, /review: reviewModel !== 'off'/)
   assert.match(source, /initial_blur: initialBlur/)
   assert.match(source, /intelligence_policy: intelligencePolicy/)
   assert.match(source, /additional_loras: additionalLoras/)
@@ -2333,7 +2421,7 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /disabled=\{sceneKitApplying \|\| Boolean\(pendingAction\) \|\| !exactRetryReady\}/)
   assert.match(source, /resolveProjectReferenceRetryReview\(/)
   assert.match(source, /if \(!retryReview\.ready\)/)
-  assert.match(source, /The original visual review model is unavailable\. Retry or Edit will use the current compatible model/)
+  assert.match(source, /Retry and Edit will use the selected visual quality checker/)
   assert.match(source, /none of your style, profile, custom fields, or details are lost/)
   assert.match(source, /const sourcePreset = sourceAssetType === assetType/)
   assert.match(source, /asset_type: sourceSettings\.asset_type/)
@@ -2357,7 +2445,7 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /aria-label="Dismiss project reference error"/)
   assert.match(source, /modelLoadError && <p role="status"/)
   assert.match(source, /source mode, model, privacy, and repair policy were preserved;/)
-  assert.match(source, /reuse the saved style, models, privacy, fixes, planning, and quality-check choices/)
+  assert.match(source, /reuse the saved style, models, privacy, fixes, and planning/)
   assert.doesNotMatch(source, /One bounded repair/)
   assert.equal(source.match(/setActionError\(''\)/g)?.length, 4)
   assert.doesNotMatch(source, /job\?\.error/)
@@ -2701,8 +2789,8 @@ test('Reference creation methods are reversible across every semantic type and s
   assert.match(source, /setCandidateKind\('image_pack'\)[\s\S]*?setAssetType\('character'\)/)
   assert.equal(source.match(/setCandidateKind\('image_pack'\)/g)?.length, 2, 'only project and lock resets canonicalize the method')
   assert.match(source, /setCandidateKind\(transition\.candidateKind\)\s+if \(!transition\.assetTypeChanged\) return/)
-  assert.match(source, /The visual quality check looks for consistent identity, anatomy, layout, and style\./)
-  assert.match(source, /It does not classify or censor content or decide whether a request is allowed\./)
+  assert.match(source, /If you turn on a visual quality check, it looks for consistent identity, anatomy, layout, and style\./)
+  assert.match(source, /does not classify or censor content, and does not decide whether a request is allowed\./)
 })
 
 test('Reference and Director expose style, skill, flow, and truthful Blender choices', async () => {

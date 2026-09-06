@@ -110,7 +110,7 @@ class ReferenceSheetTests(unittest.TestCase):
             "editor_model": "qwen_image_edit_2511_20B_fp8_lightning_8step",
             "sheet_size": (96, 80),
             "planning": PackIntelligenceSelection("auto", "deterministic", "local"),
-            "review_selection": PackIntelligenceSelection("off", None, "off"),
+            "review_selection": PackIntelligenceSelection("test-reviewer", "test-reviewer", "local"),
         }
         values.update(updates)
         return build_reference_pack_plan(**values)
@@ -2951,11 +2951,11 @@ class ReferenceSheetTests(unittest.TestCase):
             parse_semantic_review_result(invalid, allowed_roles=plan.panel_roles)
 
     def test_legacy_unrestricted_review_is_read_compatibility_only(self):
-        with self.assertRaises(ValueError):
-            self._pack_plan(
-                content_capability="unrestricted_local",
-                review_contract="standard_fidelity_v1",
-            )
+        off_plan = self._pack_plan(
+            content_capability="unrestricted_local",
+            review_contract="standard_fidelity_v1",
+        )
+        self.assertEqual(off_plan.review_contract, "standard_fidelity_v1")
         plan = self._pack_plan(
             depth="compact",
             content_capability="unrestricted_local",

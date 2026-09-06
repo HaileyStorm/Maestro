@@ -1202,9 +1202,9 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
           },
           review_policy: {
             mandatory_for_content_capabilities: [],
-            mandatory_when_explicit_output: true,
-            off_allowed_for_content_capabilities: ['standard'],
-            mandatory_contract: 'explicit_unrestricted_fidelity_v1',
+            mandatory_when_explicit_output: false,
+            off_allowed_for_content_capabilities: ['standard', 'unrestricted_local'],
+            mandatory_contract: null,
           },
           character_profile: {
             schema_version: 1,

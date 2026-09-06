@@ -1021,7 +1021,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
   const [authoringStatus, setAuthoringStatus] = useState('')
   const [detailSettings, setDetailSettings] = useState<Record<string, DetailCalloutSetting>>({})
   const [planningModel, setPlanningModel] = useState('auto')
-  const [reviewModel, setReviewModel] = useState('auto_local')
+  const [reviewModel, setReviewModel] = useState('off')
   const [referenceExplicitOutput, setReferenceExplicitOutput] = useState(explicitOutput)
   const [explicitConvenience, setExplicitConvenience] = useState(false)
   const [characterGender, setCharacterGender] = useState<ProjectReferenceCharacterGender>('unspecified')
@@ -1463,7 +1463,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
     setAuthoringStatus('')
     setDetailSettings({})
     setPlanningModel('auto')
-    setReviewModel('auto_local')
+    setReviewModel('off')
     setReferenceExplicitOutput(explicitOutputRef.current)
     setExplicitConvenience(false)
     setCharacterGender('unspecified')
@@ -1558,7 +1558,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
     setAuthoringStatus('')
     setDetailSettings({})
     setPlanningModel('auto')
-    setReviewModel('auto_local')
+    setReviewModel('off')
     setReferenceExplicitOutput(explicitOutputRef.current)
     setExplicitConvenience(false)
     setCharacterGender('unspecified')
@@ -1625,21 +1625,17 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
   }, [planningModel, planningModels])
 
   useEffect(() => {
-    if (mandatoryReview && reviewModel === 'off') {
-      setReviewModel('auto_local')
-      return
-    }
     if (intelligencePolicy === 'uncensored_auto') {
       const exactLocalSelection = reviewModel === uncensoredReviewContract?.resolved_model
         && (selectedReviewModel?.provider ?? 'local') === uncensoredReviewContract?.resolved_provider
       if (reviewModel !== 'auto_local' && reviewModel !== 'off' && !exactLocalSelection) {
-        setReviewModel('auto_local')
+        setReviewModel('off')
       }
       return
     }
     if (reviewModel !== 'auto_local' && reviewModel !== 'off'
-      && !reviewModels.some(model => model.id === reviewModel)) setReviewModel('auto_local')
-  }, [intelligencePolicy, mandatoryReview, reviewModel, reviewModels, selectedReviewModel?.provider, uncensoredReviewContract?.resolved_model, uncensoredReviewContract?.resolved_provider])
+      && !reviewModels.some(model => model.id === reviewModel)) setReviewModel('off')
+  }, [intelligencePolicy, reviewModel, reviewModels, selectedReviewModel?.provider, uncensoredReviewContract?.resolved_model, uncensoredReviewContract?.resolved_provider])
 
   useEffect(() => {
     let active = true
@@ -1847,7 +1843,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
         submittedProject, epoch, currentProject.current, projectEpoch.current,
       )) return
       setReviewerActionError(loadRequired
-        ? 'Could not prepare the required visual review model. Check the local model service, then refresh its status.'
+        ? 'Could not prepare the selected visual review model. Check the local model service, then refresh its status.'
         : 'Could not refresh the visual review model. Check the local model service and try again.')
     } finally {
       if (isProjectAssetOperationCurrent(
@@ -2444,7 +2440,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
         review_provider: reviewModel === 'auto_local' || reviewModel === 'off'
           ? undefined
           : selectedReviewModel?.provider,
-        review: mandatoryReview || reviewModel !== 'off',
+        review: reviewModel !== 'off',
         content_capability: contentCapability,
         initial_blur: initialBlur,
         intelligence_policy: intelligencePolicy,
@@ -2675,10 +2671,15 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
       referenceCapabilities,
     )
     if (!retryReview.ready) {
-      setActionError('Retry and Edit require a compatible vision reviewer for this unrestricted or explicit source pack. Load and select an eligible reviewer first.')
+      setActionError('Retry and Edit need a ready visual quality checker for this pack, or set Visual quality check to Off.')
       return
     }
-    if (retryReview.use_current_reviewer) {
+    if (retryReview.disable_review) {
+      sourceSettings.review = false
+      sourceSettings.review_model = 'off'
+      sourceSettings.review_provider = undefined
+      sourceSettings.max_repair_attempts = 0
+    } else if (retryReview.use_current_reviewer) {
       sourceSettings.review = true
       sourceSettings.review_model = reviewModel
       sourceSettings.review_provider = reviewModel === 'auto_local'
@@ -2790,7 +2791,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
       )
       if (!isProjectAssetOperationCurrent(submittedProject, epoch, currentProject.current, projectEpoch.current)) return
       setQueuedMessage(jobConfirmed
-        ? `${instruction?.trim() ? 'Edit' : 'Retry'} queued. Available source mode, model, privacy, and repair policy were preserved; ${retryReview.use_current_reviewer ? 'the current compatible reviewer replaced an unavailable recorded reviewer' : 'current layout and review intent were used'}. The original and any kept source stay unchanged.`
+        ? `${instruction?.trim() ? 'Edit' : 'Retry'} queued. Available source mode, model, privacy, and repair policy were preserved; ${retryReview.use_current_reviewer ? 'the selected visual quality checker will be used' : 'the visual quality check is off'}. The original and any kept source stay unchanged.`
         : `${instruction?.trim() ? 'Edit' : 'Retry'} accepted; Queue confirmation is still catching up. The original and any kept source stay unchanged.`)
       // Queue navigation and accepted-state updates happen before confirmation;
       // the Reference peer remains mounted with its existing asset identity.
@@ -3346,7 +3347,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                     Allow explicit output
                   </label>
                   <p className="mt-1 text-[8px] text-text-muted">This permission is separate from the Character profile. Anatomy detail views require it, so turning it off also turns that option off. You can choose the content mode, initial blur, and automatic model behavior below.</p>
-                  <p className="mt-1 text-[8px] text-text-muted">The visual quality check looks for consistent identity, anatomy, layout, and style. It does not classify or censor content or decide whether a request is allowed.</p>
+                  <p className="mt-1 text-[8px] text-text-muted">If you turn on a visual quality check, it looks for consistent identity, anatomy, layout, and style. It is optional, does not classify or censor content, and does not decide whether a request is allowed.</p>
                   <div className="mt-2 grid grid-cols-1 gap-1.5">
                     <label htmlFor="project-reference-content-capability" className="text-[9px] text-text-muted">Content mode
                       <select id="project-reference-content-capability" value={contentCapability} onChange={event => setContentCapability(event.target.value as 'standard' | 'unrestricted_local')} className="mt-0.5 min-h-11 w-full rounded border border-border bg-bg-primary px-2 py-1 text-[9px] text-text-secondary md:min-h-0">
@@ -3710,14 +3711,13 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                 <label htmlFor="project-reference-review-model" className="mt-2 block text-[10px] text-text-secondary">Visual quality check
                   <select id="project-reference-review-model" aria-label="Reference visual review model" value={reviewModel} onChange={event => setReviewModel(event.target.value)} className="mt-1 min-h-11 w-full rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px] text-text-primary md:min-h-0">
                     <option value="auto_local">{intelligencePolicy === 'uncensored_auto' && uncensoredReviewContract ? `Auto local · ${projectReferenceModelLabel(uncensoredReviewContract.resolved_model, llmCatalogModels)}` : 'Auto local'}</option>
-                    <option value="off" disabled={mandatoryReview}>{mandatoryReview ? 'Off · unavailable for unrestricted / explicit output' : 'Off'}</option>
+                    <option value="off">Off</option>
                     {selectableReviewModels.map(model => <option key={model.id} value={model.id}>{model.label} · {projectReferenceProviderLabel(model.provider)} · {intelligencePolicy !== 'uncensored_auto' || uncensoredReviewContract?.setup_state === 'ready_resident' ? 'Ready' : uncensoredReviewContract?.setup_state === 'ready_unloaded' ? 'Installed; loads when needed' : 'Setup required'}</option>)}
                   </select>
                 </label>
-                <p className="mt-1 text-[8px] text-text-muted">Automatic choices never send data remotely. Standard automatic uses an available local vision model. Unrestricted local automatic uses the required Paperscarecrow model and its vision projector; both may load when the quality check starts.</p>
-                {mandatoryReview && <p role="status" className="mt-1 text-[9px] text-amber-200">A visual quality check is required for unrestricted or explicit output and cannot be turned off.</p>}
-                {intelligencePolicy === 'uncensored_auto' && uncensoredReviewContract && (
-                  <div aria-label="Required visual reviewer setup" className="mt-1.5 rounded border border-border bg-bg-primary/50 p-1.5 text-[8px] leading-relaxed text-text-muted">
+                <p className="mt-1 text-[8px] text-text-muted">Leave this Off unless you want an optional local visual quality check. Automatic choices never send data remotely. Owner review is enough; a vision model is never required and does not decide what is allowed.</p>
+                {reviewModel !== 'off' && intelligencePolicy === 'uncensored_auto' && uncensoredReviewContract && (
+                  <div aria-label="Visual quality checker setup" className="mt-1.5 rounded border border-border bg-bg-primary/50 p-1.5 text-[8px] leading-relaxed text-text-muted">
                     <p>Model: {projectReferenceModelLabel(uncensoredReviewContract.resolved_model, llmCatalogModels)} · Local only · No remote fallback</p>
                     <p>Model file: {uncensoredReviewContract.installed ? 'Installed' : 'Missing'} · Image understanding: {uncensoredReviewContract.projector_available ? 'Installed' : 'Missing'}</p>
                     <p>Status: {uncensoredReviewContract.loading ? projectReferenceReviewerLoadingLabel(uncensoredReviewContract.loading_phase) : uncensoredReviewContract.resident ? 'Loaded' : uncensoredReviewContract.queue_ready ? 'Ready to load automatically' : 'Not loaded'} · Image understanding: {!uncensoredReviewContract.vision_capable ? 'Not configured' : uncensoredReviewContract.vision_available === true ? 'Ready' : uncensoredReviewContract.vision_available === false ? 'Unavailable' : 'Checked after loading'}</p>
@@ -3732,7 +3732,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                         {reviewerAction === 'refreshing' ? 'Refreshing visual review status…' : 'Refresh visual review status'}
                       </button>
                     </div>
-                    {reviewerSetupAction && !machineControls && <p className="mt-1 text-amber-200">Open Maestro at localhost on the host computer to install, load, or reload the required visual review model. LAN sessions can refresh its status but cannot change models running on the host.</p>}
+                    {reviewerSetupAction && !machineControls && <p className="mt-1 text-amber-200">Open Maestro at localhost on the host computer to install, load, or reload the selected visual review model. LAN sessions can refresh its status but cannot change models running on the host.</p>}
                     {reviewerActionError && <p role="status" className="mt-1 text-red-300">{reviewerActionError}</p>}
                     <details className="mt-1 rounded border border-border/70 px-1.5">
                       <summary className="flex min-h-11 cursor-pointer items-center md:min-h-0">Technical details</summary>
@@ -3743,7 +3743,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                     </details>
                   </div>
                 )}
-                {intelligencePolicy === 'uncensored_auto' && !uncensoredReviewContract && (
+                {reviewModel !== 'off' && intelligencePolicy === 'uncensored_auto' && !uncensoredReviewContract && (
                   <div className="mt-1 text-[9px]">
                     <p role="status" className="text-red-300">{reviewerSetupCopy}</p>
                     <button type="button" disabled={reviewerAction !== null} onClick={() => { void refreshReviewerSetup(false) }} className="mt-1 min-h-11 min-w-11 rounded border border-border px-3 py-0.5 text-text-secondary disabled:opacity-40 md:min-h-0 md:min-w-0 md:px-1.5">{reviewerAction === 'refreshing' ? 'Refreshing visual review status…' : 'Refresh visual review status'}</button>
@@ -4135,9 +4135,9 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                                     && ((requiresPrivateAuthoring && !exactAuthoringReady) || (requiresPrivateLoraInputs && !exactLoraInputsReady)) && (
                                     <button type="button" onClick={() => setPrivateReplayRetry(current => current + 1)} className="mt-1 rounded border border-amber-400/40 px-1.5 py-0.5 text-[8px] text-amber-100">Reload private settings</button>
                                   )}
-                                  {!retryReview.ready && <p role="status" className="mt-1 text-[8px] leading-relaxed text-amber-200">{retryReview.intelligence_policy === 'uncensored_auto' ? `Retry and Edit are waiting for the required local visual review model. ${reviewerSetupCopy}` : 'Retry and Edit need a loaded local visual review model for this pack. Load and select a compatible model first.'}</p>}
-                                  {retryReview.use_current_reviewer && <p role="status" className="mt-1 text-[8px] leading-relaxed text-text-muted">The original visual review model is unavailable. Retry or Edit will use the current compatible model.</p>}
-                                  {(variant.variant_type === 'reference_sheet' || variant.variant_type === 'reference_pack') && <p className="mt-1 text-[8px] leading-relaxed text-text-muted">Retry and Edit reuse the saved style, models, privacy, fixes, planning, and quality-check choices. The kept candidate does not change.</p>}
+                                  {!retryReview.ready && <p role="status" className="mt-1 text-[8px] leading-relaxed text-amber-200">{retryReview.intelligence_policy === 'uncensored_auto' ? `The selected visual quality check is not ready. Choose Off to continue without it. ${reviewerSetupCopy}` : 'The selected visual quality check is not ready. Choose Off to continue without it, or load a compatible local model.'}</p>}
+                                  {retryReview.use_current_reviewer && <p role="status" className="mt-1 text-[8px] leading-relaxed text-text-muted">Retry and Edit will use the selected visual quality checker.</p>}
+                                  {(variant.variant_type === 'reference_sheet' || variant.variant_type === 'reference_pack') && <p className="mt-1 text-[8px] leading-relaxed text-text-muted">Retry and Edit reuse the saved style, models, privacy, fixes, and planning. Choose Off above to skip the visual quality check. The kept candidate does not change.</p>}
                                   {editing && (variant.variant_type === 'reference_sheet' || variant.variant_type === 'reference_pack') && (
                                     <div id={`reference-sheet-edit-${variant.id}`} className="mt-1.5 rounded border border-border p-1.5">
                                       <label htmlFor={`reference-sheet-edit-instruction-${variant.id}`} className="text-[9px] text-text-muted">What should change in the next candidate?</label>
