@@ -32,6 +32,8 @@ class KreaActorPolicyTests(unittest.TestCase):
         services: dict[str, object] = {}
         record_krea_owner_policy(
             services,
+            schema_version=KREA_POLICY_SCHEMA_VERSION,
+            declaration=KREA_OWNER_DECLARATION,
             owner_attested=True,
             manual_review_accepted=True,
             local_content_stays_local=True,
@@ -43,10 +45,10 @@ class KreaActorPolicyTests(unittest.TestCase):
         )
         return services
 
-    def test_v2_records_the_exact_role_map_and_four_acknowledgements(self):
+    def test_current_policy_records_the_exact_role_map_and_four_acknowledgements(self):
         services = self._services()
         record = services["krea_owner_policy"]
-        self.assertEqual(KREA_POLICY_SCHEMA_VERSION, 2)
+        self.assertEqual(KREA_POLICY_SCHEMA_VERSION, 3)
         self.assertEqual(
             record["role_use_scopes"],
             {"owner": "noncommercial", "user": "commercial_under_1m"},
@@ -102,7 +104,7 @@ class KreaActorPolicyTests(unittest.TestCase):
                 "attribution_accepted": True,
                 "maestro_content_filtering": False,
                 "use_scope": "commercial_under_1m",
-                "declaration": KREA_OWNER_DECLARATION,
+                "declaration": 'I accept responsibility for manually reviewing Krea 2 use and outputs under the Krea 2 Community License and Acceptable Use Policy.',
                 "license_version": KREA_LICENSE_VERSION,
                 "license_date": KREA_LICENSE_DATE,
                 "declared_at_unix": 1,
@@ -114,7 +116,7 @@ class KreaActorPolicyTests(unittest.TestCase):
         )
         self.assertIs(status["migration_required"], True)
         self.assertIs(status["local_execution_allowed"], False)
-        with self.assertRaisesRegex(KreaOwnerPolicyError, "schema v1"):
+        with self.assertRaisesRegex(KreaOwnerPolicyError, "current manual-review confirmation"):
             resolve_krea_actor_scope(services, "user")
 
     def test_public_status_is_local_only_and_content_neutral(self):

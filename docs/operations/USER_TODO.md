@@ -21,7 +21,7 @@ are settled.
 
 - Music and Character Sheet quality checks can wait until there are real outputs
   to review.
-- Record the live Krea v2 attestation only when its separate profile/runtime
+- Record the current Krea 2 owner declaration only when its separate profile/runtime
   gate is ready for an owner-facing acceptance step.
 
 ## Already decided
@@ -29,8 +29,8 @@ are settled.
 - Music 3 is approved for a local-only install and benchmark. Show its required
   credit; keep LAN and Cloudflare access off for now.
 - Character Sheets start from a FLUX anchor. Quad FLUX is the safe default;
-  Krea choices are explicit, and Dynamic Krea stays experimental. A local VLM
-  and Qwen Image Edit handle review and repair.
+  Krea choices are explicit, and Dynamic Krea stays experimental. Visual quality checks are
+  optional and start Off; Qwen Image Edit remains available for repairs.
 - Maestro gets first call on the 5090 for development and benchmarks, but will
   coordinate with both Palimpsest tasks and will not hog it. Samples come last.
 - Direct compute stays locked until verified development-cost recovery reaches
@@ -38,7 +38,7 @@ are settled.
 - The only owner account cannot be disabled.
 - The new shared-harness task may take over the unfinished scanner repair
   without pretending the old work was complete.
-- Use Krea where its terms allow, with one server-recorded v2 attestation and
+- Use Krea where its terms allow, with one current server-recorded owner declaration and
   no Maestro prompt scanning. The fixed role map is owner → noncommercial and
   user → commercial under $1M; never accept client-selected scope.
 

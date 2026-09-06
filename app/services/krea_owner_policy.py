@@ -12,13 +12,18 @@ from __future__ import annotations
 import time
 from collections.abc import Mapping
 
-KREA_POLICY_SCHEMA_VERSION = 2
+KREA_POLICY_SCHEMA_VERSION = 3
 KREA_POLICY_SERVICE_KEY = "krea_owner_policy"
 KREA_LICENSE_VERSION = "v1"
 KREA_LICENSE_DATE = "2026-06-22"
 KREA_LICENSE_URL = "https://www.krea.ai/krea-2-licensing"
 KREA_AUP_URL = "https://www.krea.ai/krea-2-use-policy"
 KREA_OWNER_DECLARATION = (
+    "I accept responsibility for manually reviewing Krea 2 use and outputs "
+    "under the Krea 2 Community License and Acceptable Use Policy, and for "
+    "deleting any outputs that should not remain."
+)
+_LEGACY_OWNER_DECLARATION = (
     "I accept responsibility for manually reviewing Krea 2 use and outputs "
     "under the Krea 2 Community License and Acceptable Use Policy."
 )
@@ -34,7 +39,7 @@ KREA2_ARCHITECTURES = frozenset({
     "krea2_turbo_edit",
 })
 
-_V2_RECORD_KEYS = frozenset({
+_ROLE_RECORD_KEYS = frozenset({
     "schema_version",
     "owner_attested",
     "manual_review_accepted",
@@ -47,7 +52,7 @@ _V2_RECORD_KEYS = frozenset({
     "license_date",
     "declared_at_unix",
 })
-_V1_RECORD_KEYS = (_V2_RECORD_KEYS - {"role_use_scopes"}) | {"use_scope"}
+_V1_RECORD_KEYS = (_ROLE_RECORD_KEYS - {"role_use_scopes"}) | {"use_scope"}
 
 
 class KreaOwnerPolicyError(ValueError):
@@ -71,13 +76,25 @@ def record_krea_owner_policy(
     local_content_stays_local: object,
     attribution_accepted: object,
     role_use_scopes: object,
+    schema_version: object,
+    declaration: object,
     license_version: object,
     license_date: object,
     declared_at_unix: int | None = None,
 ) -> dict[str, object]:
-    """Store the exact v2 host attestation without creative-content access."""
+    """Store the exact displayed host attestation without creative-content access."""
     if type(services) is not dict:
         raise KreaOwnerPolicyError("Services configuration is invalid.")
+    if (
+        type(schema_version) is not int
+        or schema_version != KREA_POLICY_SCHEMA_VERSION
+        or type(declaration) is not str
+        or declaration != KREA_OWNER_DECLARATION
+    ):
+        raise KreaOwnerPolicyError(
+            "The Krea manual-review declaration changed. Refresh the settings "
+            "and review the current declaration before confirming."
+        )
     if not all(
         value is True
         for value in (
@@ -120,7 +137,9 @@ def record_krea_owner_policy(
     return {**record, "role_use_scopes": dict(KREA_ROLE_USE_SCOPES)}
 
 
-def _valid_common_record(record: object) -> bool:
+def _valid_common_record(
+    record: object, *, declaration: str = KREA_OWNER_DECLARATION,
+) -> bool:
     return (
         type(record) is dict
         and record.get("owner_attested") is True
@@ -128,7 +147,8 @@ def _valid_common_record(record: object) -> bool:
         and record.get("local_content_stays_local") is True
         and record.get("attribution_accepted") is True
         and record.get("maestro_content_filtering") is False
-        and record.get("declaration") == KREA_OWNER_DECLARATION
+        and type(record.get("declaration")) is str
+        and record.get("declaration") == declaration
         and record.get("license_version") == KREA_LICENSE_VERSION
         and record.get("license_date") == KREA_LICENSE_DATE
         and type(record.get("declared_at_unix")) is int
@@ -139,14 +159,20 @@ def _valid_common_record(record: object) -> bool:
 def krea_owner_policy_status(
     services: Mapping[str, object] | None,
 ) -> dict[str, object]:
-    """Project bounded v2 status; schema-v1 records require explicit migration."""
+    """Project current status without silently upgrading earlier declarations."""
     record = services.get(KREA_POLICY_SERVICE_KEY) if isinstance(services, Mapping) else None
     if (
         type(record) is dict
-        and set(record) == set(_V1_RECORD_KEYS)
-        and record.get("schema_version") == 1
-        and _valid_common_record(record)
-        and record.get("use_scope") in KREA_USE_SCOPES
+        and type(record.get("schema_version")) is int
+        and _valid_common_record(record, declaration=_LEGACY_OWNER_DECLARATION)
+        and (
+            (record.get("schema_version") == 1
+             and set(record) == set(_V1_RECORD_KEYS)
+             and record.get("use_scope") in KREA_USE_SCOPES)
+            or (record.get("schema_version") == 2
+                and set(record) == set(_ROLE_RECORD_KEYS)
+                and _exact_role_scope_map(record.get("role_use_scopes")))
+        )
     ):
         return {
             "attested": False,
@@ -158,7 +184,8 @@ def krea_owner_policy_status(
         }
     valid = (
         type(record) is dict
-        and set(record) == set(_V2_RECORD_KEYS)
+        and set(record) == set(_ROLE_RECORD_KEYS)
+        and type(record.get("schema_version")) is int
         and record.get("schema_version") == KREA_POLICY_SCHEMA_VERSION
         and _valid_common_record(record)
         and _exact_role_scope_map(record.get("role_use_scopes"))
@@ -195,7 +222,7 @@ def resolve_krea_actor_scope(
     status = krea_owner_policy_status(services)
     if status.get("migration_required") is True:
         raise KreaOwnerPolicyError(
-            "The saved Krea policy uses schema v1 and must be confirmed again."
+            "The saved Krea policy needs the current manual-review confirmation."
         )
     if (
         status.get("attested") is not True

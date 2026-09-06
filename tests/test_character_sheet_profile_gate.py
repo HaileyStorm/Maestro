@@ -17,6 +17,8 @@ from services.host_terms import CURRENT_HOST_TERM_VERSIONS, accept_host_term
 from services.krea_owner_policy import (
     KREA_LICENSE_DATE,
     KREA_LICENSE_VERSION,
+    KREA_OWNER_DECLARATION,
+    KREA_POLICY_SCHEMA_VERSION,
     KREA_ROLE_USE_SCOPES,
     record_krea_owner_policy,
 )
@@ -95,6 +97,8 @@ class CharacterSheetProfileGateTests(unittest.TestCase):
         services = {}
         record_krea_owner_policy(
             services,
+            schema_version=KREA_POLICY_SCHEMA_VERSION,
+            declaration=KREA_OWNER_DECLARATION,
             owner_attested=True,
             manual_review_accepted=True,
             local_content_stays_local=True,

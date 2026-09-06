@@ -2708,6 +2708,8 @@ export async function setKreaOwnerPolicy(
   return accountRequest('/api/v1/krea/owner-policy', {
     method: 'PUT',
     body: JSON.stringify({
+      schema_version: input.schema_version,
+      declaration: input.declaration,
       owner_attested: input.owner_attested,
       manual_review_accepted: input.manual_review_accepted,
       local_content_stays_local: input.local_content_stays_local,

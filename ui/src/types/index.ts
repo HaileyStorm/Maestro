@@ -1085,6 +1085,8 @@ export interface SupportKreaRoleUseScopes {
 }
 
 export interface SupportKreaOwnerPolicyProjection {
+  schema_version: number
+  declaration: string
   attested: boolean
   availability_status: SupportKreaOwnerPolicyAvailabilityStatus
   migration_required: boolean
@@ -1102,6 +1104,8 @@ export interface SupportKreaOwnerPolicyProjection {
 }
 
 export interface SupportKreaOwnerPolicyInput {
+  schema_version: number
+  declaration: string
   owner_attested: true
   manual_review_accepted: true
   local_content_stays_local: true

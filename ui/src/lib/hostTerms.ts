@@ -31,7 +31,7 @@ export const HOST_TERM_NOTICES: Record<HostTermId, {
   },
   krea2_self_review: {
     version: 2,
-    text: "Confirm the Krea 2 Community License and Acceptable Use Policy apply, and complete the required human review. Legitimate intended or potential broad-capability research, evaluation, and fine-tune development are not automatically circumvention; artifacts explicitly designed to defeat safety filters remain excluded from Maestro's curated routing. Optional local fidelity QA evaluates quality only; it is not moderation and does not decide permissibility.",
+    text: "Confirm the Krea 2 Community License and Acceptable Use Policy apply, and complete your own review. Legitimate intended or potential broad-capability research, evaluation, and fine-tune development are not automatically circumvention; artifacts explicitly designed to defeat safety filters remain excluded from Maestro's curated routing. Optional local visual quality checks are never required and do not decide permissibility.",
     href: 'https://huggingface.co/krea/Krea-2-Turbo/blob/98e0fe1/README.md',
     linkLabel: 'Review Krea 2 terms',
   },

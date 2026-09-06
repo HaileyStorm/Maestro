@@ -689,7 +689,9 @@ class ImageRecipeTermTests(unittest.TestCase):
         )
         self.assertIn("excluded from Maestro's curated routing", krea_notice)
         self.assertIn("Acceptable Use Policy", krea_notice)
-        self.assertIn("required human review", krea_notice)
+        self.assertIn("complete your own review", krea_notice)
+        self.assertNotIn("Delete any outputs", krea_notice)
+        self.assertIn("never required", krea_notice)
         for creator_term, source_url in (
             (
                 KREA2_MOODY_MIX_V7_CREATOR_TERM,

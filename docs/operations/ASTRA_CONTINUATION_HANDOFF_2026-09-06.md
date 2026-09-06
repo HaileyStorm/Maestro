@@ -29,12 +29,36 @@ list and part of its account UI work:
   TypeScript, production build, syntax/publication checks, and independent
   review. Private evidence is in `.artifacts-temp/astra-optional-review-20260906/`.
 
-All three slices are pushed. Their staged bytes matched isolated candidates;
+- `dd23be5`: the H3 resolution-report parser uses the existing declared
+  `tomli` fallback under Python 3.10. Its 60-test suite passes on Python 3.10
+  and 3.11, with the exact pinned-uv offline probe intentionally skipped once
+  on each runtime. No dependency installation or resolution run was performed.
+- `5173276`: model and projector download failures have bounded messages and
+  suppressed private causal tracebacks. A registered vision model cannot
+  silently become text-only; failed replacement preserves the incumbent
+  runtime, retry clears loading state, and unregistered text fallback remains
+  available without raw error logging. All 80 isolated LLM tests pass. The
+  hardware-identity test uses explicit visibility stubs under the CPU mask.
+
+The current Krea declaration update uses schema 3 and binds GET-displayed text
+and revision into PUT. Valid historical v1/v2 declarations require explicit
+owner reconfirmation; reads do not rewrite them. The separate host-term v2
+notice contains clarification only, so it does not silently gain the new
+deletion acknowledgment. UI consent resets on identity changes, and stale
+responses cannot announce success. The isolated candidate passes 165 backend
+tests, 474 UI tests, TypeScript, production build, and independent review.
+This prepares a future owner-facing confirmation; no live account or policy
+record was changed.
+
+The hash-named slices are pushed. Their staged bytes matched isolated candidates;
 unrelated changes remain unstaged. Private receipts and preimages are under
 `.artifacts-temp/astra-recovery-contracts-20260906/` and
 `.artifacts-temp/astra-required-signin-20260906/`. The generic visual-carry
 helper's pre-existing digest mutation was superseded by the construction and
 normalization fixes; its original preimage is retained privately.
+Additional private receipts are under `.artifacts-temp/astra-toml-compat-20260906/`,
+`.artifacts-temp/astra-llm-artifacts-20260906/`, and
+`.artifacts-temp/astra-krea-declaration-20260906/`.
 
 Browser acceptance is still deferred pending permission for task-specific
 external cache/result directories on a different filesystem. Existing browser

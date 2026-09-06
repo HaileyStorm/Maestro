@@ -1802,6 +1802,8 @@ from services.krea_owner_policy import (
     KREA_LICENSE_DATE,
     KREA_LICENSE_URL,
     KREA_LICENSE_VERSION,
+    KREA_OWNER_DECLARATION,
+    KREA_POLICY_SCHEMA_VERSION,
     KREA_ROLE_USE_SCOPES,
     KreaOwnerPolicyError,
     is_registered_krea2_model,
@@ -22028,6 +22030,8 @@ def get_krea_owner_policy(request: Request):
         )
     return {
         **status,
+        "schema_version": KREA_POLICY_SCHEMA_VERSION,
+        "declaration": KREA_OWNER_DECLARATION,
         "license_version": KREA_LICENSE_VERSION,
         "license_date": KREA_LICENSE_DATE,
         "license_url": KREA_LICENSE_URL,
@@ -22041,6 +22045,11 @@ async def update_krea_owner_policy(request: Request):
     """Record actor-aware manual-review responsibility for local Krea use."""
     _require_owner_policy_control(request)
     body = await _account_request_body(request)
+    if not {"schema_version", "declaration"}.issubset(body):
+        raise HTTPException(
+            status_code=400,
+            detail="Refresh Krea settings and review the current manual-review declaration.",
+        )
     if "use_scope" in body:
         raise HTTPException(
             status_code=400,
@@ -22052,6 +22061,7 @@ async def update_krea_owner_policy(request: Request):
     expected_keys = {
         "owner_attested", "manual_review_accepted", "local_content_stays_local",
         "attribution_accepted", "role_use_scopes", "license_version", "license_date",
+        "schema_version", "declaration",
     }
     if set(body) != expected_keys:
         raise HTTPException(status_code=400, detail="Krea owner policy request is invalid")
@@ -22062,6 +22072,8 @@ async def update_krea_owner_policy(request: Request):
                 services = {}
             record_krea_owner_policy(
                 services,
+                schema_version=body.get("schema_version"),
+                declaration=body.get("declaration"),
                 owner_attested=body.get("owner_attested"),
                 manual_review_accepted=body.get("manual_review_accepted"),
                 local_content_stays_local=body.get("local_content_stays_local"),

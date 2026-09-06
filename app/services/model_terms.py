@@ -85,13 +85,12 @@ MODEL_TERM_DOCUMENTS: dict[str, dict[str, Any]] = {
         "review_mode": "manual_self_review",
         "notice": (
             "Confirm the Krea 2 Community License and Acceptable Use Policy "
-            "apply, and complete the required human review. Legitimate "
-            "intended or potential broad-capability research, evaluation, "
-            "and fine-tune development are not automatically circumvention; "
-            "artifacts explicitly designed to defeat safety filters remain "
-            "excluded from Maestro's curated routing. Optional local fidelity "
-            "QA evaluates quality only; it is not moderation and does not "
-            "decide permissibility."
+            "apply, and complete your own review. Legitimate intended or potential "
+            "broad-capability research, evaluation, and fine-tune development "
+            "are not automatically circumvention; artifacts explicitly designed "
+            "to defeat safety filters remain excluded from Maestro's curated "
+            "routing. Optional local visual quality checks are never required "
+            "and do not decide permissibility."
         ),
     },
     PONPOKE_FLUX2_KLEIN4B_TERM: {

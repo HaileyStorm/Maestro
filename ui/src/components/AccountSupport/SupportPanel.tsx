@@ -1319,15 +1319,15 @@ export function SupportPanel() {
 
   useEffect(() => {
     const epoch = ++kreaOwnerPolicyEpochRef.current
+    setKreaOwnerPolicyState(null)
+    setKreaOwnerPolicySaving(false)
+    setKreaOwnerAttested(false)
+    setKreaManualReviewAccepted(false)
+    setKreaLocalContentAccepted(false)
+    setKreaAttributionAccepted(false)
     if (!ownerSupport) {
-      setKreaOwnerPolicyState(null)
       setKreaOwnerPolicyLoading(false)
-      setKreaOwnerPolicySaving(false)
       setKreaOwnerPolicyError(undefined)
-      setKreaOwnerAttested(false)
-      setKreaManualReviewAccepted(false)
-      setKreaLocalContentAccepted(false)
-      setKreaAttributionAccepted(false)
       return
     }
     setKreaOwnerPolicyLoading(true)
@@ -1494,6 +1494,7 @@ export function SupportPanel() {
     if (!ownerSupport || kreaOwnerPolicySaving) return
     if (
       !kreaOwnerPolicy
+      || !kreaDeclarationAvailable
       || !kreaOwnerAttested
       || !kreaManualReviewAccepted
       || !kreaLocalContentAccepted
@@ -1507,6 +1508,8 @@ export function SupportPanel() {
     setKreaOwnerPolicyError(undefined)
     try {
       await setKreaOwnerPolicy({
+        schema_version: kreaOwnerPolicy.schema_version,
+        declaration: kreaOwnerPolicy.declaration,
         owner_attested: true,
         manual_review_accepted: true,
         local_content_stays_local: true,
@@ -1550,8 +1553,12 @@ export function SupportPanel() {
     && h3LegalAccess?.license_sha256,
   )
   const kreaPolicyRecorded = kreaOwnerPolicy?.availability_status === 'license_conditions_recorded'
+  const kreaDeclarationAvailable = Number.isSafeInteger(kreaOwnerPolicy?.schema_version)
+    && typeof kreaOwnerPolicy?.declaration === 'string'
+    && kreaOwnerPolicy.declaration.trim().length > 0
   const kreaCanSave = Boolean(
     kreaOwnerPolicy
+    && kreaDeclarationAvailable
     && kreaOwnerAttested
     && kreaManualReviewAccepted
     && kreaLocalContentAccepted
@@ -1740,7 +1747,7 @@ export function SupportPanel() {
                 {kreaPolicyRecorded
                   ? 'License conditions recorded'
                   : kreaOwnerPolicy.migration_required
-                    ? 'Previous settings need confirmation'
+                    ? 'Review the updated manual-review declaration'
                     : 'Owner confirmation required'}
               </p>
               <p className="mt-2 text-[9px] leading-relaxed text-text-muted">
@@ -1763,7 +1770,7 @@ export function SupportPanel() {
                     onChange={event => setKreaManualReviewAccepted(event.target.checked)}
                     className="mt-0.5 h-4 w-4 shrink-0 accent-accent-blue"
                   />
-                  <span>I accept responsibility for manually reviewing Krea 2 use and outputs.</span>
+                  <span>{kreaDeclarationAvailable ? kreaOwnerPolicy.declaration : 'Refresh this page to load the current manual-review declaration.'} Maestro will not use a vision model to decide what to keep or delete.</span>
                 </label>
                 <label className="flex items-start gap-2 rounded-lg border border-border bg-bg-primary/30 p-2 text-[10px] leading-relaxed text-text-secondary">
                   <input

@@ -1118,6 +1118,8 @@ const h3LegalAccessProjection = {
 }
 
 const kreaOwnerPolicyProjection = {
+  schema_version: 3,
+  declaration: 'Synthetic current Krea manual-review declaration.',
   attested: true,
   availability_status: 'license_conditions_recorded',
   migration_required: false,
@@ -1397,7 +1399,7 @@ test('Support wrappers use exact no-store envelopes and discard private contribu
   assert.equal(calls[0].init.body, undefined)
 })
 
-test('Krea owner-policy wrappers use the exact v2 role map and no-store route', async () => {
+test('Krea owner-policy wrappers echo the displayed declaration and exact role map', async () => {
   const calls = []
   await withFetchMock(async (url, init = {}) => {
     calls.push({ url: String(url), init })
@@ -1423,6 +1425,8 @@ test('Krea owner-policy wrappers use the exact v2 role map and no-store route', 
       owner: 'noncommercial', user: 'commercial_under_1m',
     })
     const updated = await setKreaOwnerPolicy({
+      schema_version: current.schema_version,
+      declaration: current.declaration,
       owner_attested: true,
       manual_review_accepted: true,
       local_content_stays_local: true,
@@ -1446,6 +1450,8 @@ test('Krea owner-policy wrappers use the exact v2 role map and no-store route', 
     assert.equal(call.init.cache, 'no-store')
   }
   assert.deepEqual(JSON.parse(calls[1].init.body), {
+    schema_version: kreaOwnerPolicyProjection.schema_version,
+    declaration: kreaOwnerPolicyProjection.declaration,
     owner_attested: true,
     manual_review_accepted: true,
     local_content_stays_local: true,
@@ -1455,6 +1461,63 @@ test('Krea owner-policy wrappers use the exact v2 role map and no-store route', 
     license_date: '2026-06-22',
   })
   assert.equal('use_scope' in JSON.parse(calls[1].init.body), false)
+})
+
+test('Krea confirmation submits the displayed text and fences stale completions', async () => {
+  const source = await readFile(supportPanelUrl, 'utf8')
+  const start = source.indexOf('const saveKreaLicensePolicy = async () => {')
+  const end = source.indexOf('const h3TerritoryCode =', start)
+  assert.ok(start >= 0 && end > start)
+  const code = source.slice(start, end).replace('const saveKreaLicensePolicy =', 'return')
+  const calls = []
+  const epoch = { current: 0 }
+  const noOp = () => {}
+  const scope = {
+    ownerSupport: true, kreaOwnerPolicySaving: false,
+    kreaOwnerPolicy: kreaOwnerPolicyProjection, kreaDeclarationAvailable: true,
+    kreaOwnerAttested: true, kreaManualReviewAccepted: true,
+    kreaLocalContentAccepted: true, kreaAttributionAccepted: true,
+    kreaOwnerPolicyEpochRef: epoch,
+    KREA_ROLE_USE_SCOPES: { owner: 'noncommercial', user: 'commercial_under_1m' },
+    setKreaOwnerPolicyError: noOp, setKreaOwnerPolicySaving: noOp,
+    setKreaOwnerPolicyState: value => calls.push(['state', value]),
+    setKreaOwnerAttested: noOp, setKreaManualReviewAccepted: noOp,
+    setKreaLocalContentAccepted: noOp, setKreaAttributionAccepted: noOp,
+    setNotice: value => calls.push(['notice', value]), AccountApiError,
+    setKreaOwnerPolicy: async input => { calls.push(['put', input]) },
+    fetchKreaOwnerPolicy: async () => { calls.push(['get']); return kreaOwnerPolicyProjection },
+  }
+  const makeSave = values => new Function(...Object.keys(values), code)(...Object.values(values))
+  await makeSave(scope)()
+  assert.equal(calls[0][0], 'put')
+  assert.equal(calls[0][1].schema_version, kreaOwnerPolicyProjection.schema_version)
+  assert.equal(calls[0][1].declaration, kreaOwnerPolicyProjection.declaration)
+  assert.equal(calls[1][0], 'get')
+  calls.length = 0
+  await makeSave({ ...scope, kreaDeclarationAvailable: false })()
+  assert.deepEqual(calls, [])
+  let finishPut
+  const pending = makeSave({ ...scope,
+    setKreaOwnerPolicy: () => new Promise(resolve => { finishPut = resolve }),
+  })()
+  epoch.current += 1
+  finishPut()
+  await pending
+  assert.deepEqual(calls, [], 'superseded confirmation cannot refetch or announce success')
+
+  const resetStart = source.indexOf('const epoch = ++kreaOwnerPolicyEpochRef.current')
+  const resetEnd = source.indexOf('setKreaOwnerPolicyLoading(true)', resetStart)
+  const resetCalls = []
+  const resetScope = { ...scope,
+    setKreaOwnerPolicyState: value => resetCalls.push(['policy', value]),
+    setKreaOwnerAttested: value => resetCalls.push(['owner', value]),
+    setKreaManualReviewAccepted: value => resetCalls.push(['review', value]),
+    setKreaLocalContentAccepted: value => resetCalls.push(['local', value]),
+    setKreaAttributionAccepted: value => resetCalls.push(['attribution', value]),
+  }
+  new Function(...Object.keys(resetScope), source.slice(resetStart, resetEnd))(...Object.values(resetScope))
+  assert.deepEqual(resetCalls, [['policy', null], ['owner', false], ['review', false],
+    ['local', false], ['attribution', false]])
 })
 
 test('Support recovery projections reject malformed or privacy-bearing shapes without retaining them', async () => {
@@ -2365,7 +2428,7 @@ test('Support panel shows owner-only H3 legal-access controls and hides them for
   assert.equal(findElements(tree, node => node.props?.['aria-label'] === 'H3 legal-access location').length, 0)
 })
 
-test('Support panel shows an owner-only fixed Krea v2 role map with fenced direct API state', async t => {
+test('Support panel shows the owner declaration and fixed role map with fenced API state', async t => {
   const { SupportPanel } = await loadSupportPanel()
   t.after(() => {
     delete globalThis.__supportStore
@@ -2409,6 +2472,8 @@ test('Support panel shows an owner-only fixed Krea v2 role map with fenced direc
   assert.match(source, /if \(epoch !== kreaOwnerPolicyEpochRef\.current\) return/)
   assert.match(source, /kreaOwnerPolicyEpochRef\.current \+= 1[^]*\}, \[accountId, ownerSupport\]\)/)
   assert.match(source, /I attest that locally processed content remains on this host\./)
+  assert.match(source, /kreaDeclarationAvailable \? kreaOwnerPolicy\.declaration/)
+  assert.match(source, /Maestro will not use a vision model to decide what to keep or delete\./)
   assert.match(source, /Krea 2 license conditions recorded\. Model files, creator terms, project access, and runtime readiness remain separate\./)
   assert.equal([...source.matchAll(/checked=\{krea(?:OwnerAttested|ManualReviewAccepted|LocalContentAccepted|AttributionAccepted)\}/g)].length, 4)
   assert.doesNotMatch(source, /content_classifier|prompt_filter|execution ready/i)
