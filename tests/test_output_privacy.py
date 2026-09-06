@@ -1220,7 +1220,7 @@ class LaunchPrivacyContractTests(unittest.TestCase):
         source = (APP_ROOT / "launch.py").read_text(encoding="utf-8")
         tree = ast.parse(source)
         functions = {
-            node.name: ast.get_source_segment(source, node) or ""
+            node.name: node
             for node in tree.body
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
@@ -1232,7 +1232,10 @@ class LaunchPrivacyContractTests(unittest.TestCase):
             "delete_output_components", "delete_output",
         ):
             with self.subTest(route=name):
-                self.assertIn("_request_project_workspace", functions[name])
+                self.assertIn(
+                    "_request_project_workspace",
+                    ast.get_source_segment(source, functions[name]) or "",
+                )
 
     def test_routes_are_workspace_scoped_and_bulk_lineage_aware(self):
         source = (APP_ROOT / "launch.py").read_text(encoding="utf-8")

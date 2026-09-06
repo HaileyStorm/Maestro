@@ -38,6 +38,14 @@ checkout, not a passing backend release gate or proof that every failure
 predates migration. Resolve each affected source/test contract before claiming
 full CPU acceptance; keep those changes out of the terminal-recovery slice.
 
+The subsequent CPU-only test improvement limits output-privacy source
+extraction to the same 15 asserted routes, instead of extracting every
+launcher function. A nonblocking stack sample identified the original
+repeated extraction during the full suite. Independent review confirmed
+unchanged assertion and missing-route behavior; all 50 tests in
+`test_output_privacy.py` pass in 8.6 seconds after the change. The full run
+continued without interruption using its already-loaded test code.
+
 Remaining CPU-safe work includes reviewing the separate failed-card retry
 button and its server recovery contract before staging that pre-existing hunk.
 The unrelated H3, backend, account UI, and restored-test changes remain outside
