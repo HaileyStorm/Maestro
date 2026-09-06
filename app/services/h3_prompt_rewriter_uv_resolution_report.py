@@ -26,7 +26,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 application environment
+    import tomli as tomllib
 from packaging.markers import InvalidMarker, Marker
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import (
