@@ -206,6 +206,8 @@ class QueueRecoveryUiContracts(unittest.TestCase):
         placeholder = source_slice(MAIN, "function JobPlaceholder", "function queueSummaryLabel")
         queue_panel = source_slice(MAIN, "function QueuePanel", "function GalleryBulkToolbar")
         self.assertIn("job.recoveryActions.map(action =>", placeholder)
+        self.assertIn("Retry generation", placeholder)
+        self.assertIn("job.recoveryActions?.includes('retry')", placeholder)
         self.assertNotIn("recoveryActionable ?", placeholder)
         self.assertIn("The current part will restart from the beginning", placeholder)
         self.assertIn("completed parts will stay saved", placeholder)

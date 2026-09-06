@@ -1753,3 +1753,49 @@ test('Reference queue navigation uses one payload-free event with exact cleanup'
   assert.match(mainSource, /return subscribeQueueView\(openQueue\)/)
   assert.match(mainSource, /if \(newActiveJob && openQueueAfterSubmit\) setMainView\('queue'\)/)
 })
+
+test('failed-card retry follows current project permissions and the advertised action', async t => {
+  const previous = globalThis.__resourceWaitStore
+  const calls = []
+  globalThis.__resourceWaitStore = {
+    accessContext: { remote: true, machine_controls: false, accounts: { enabled: true }, account_project_access_active: true },
+    activeWorkspace: 'project-a',
+    workspaces: [{ name: 'project-a', project_permissions: ['project.read', 'project.generate'] }],
+    retryJobRecovery: async id => { calls.push(id) },
+    hostTerms: { minimax_h3_ref2va: { accepted: true } },
+  }
+  t.after(() => { globalThis.__resourceWaitStore = previous })
+  const { JobPlaceholder, QueuePanel } = await loadJobPlaceholder()
+  const job = {
+    id: 'abcd1234', workspace: 'project-a', status: 'failed', recoveryState: 'terminal',
+    recoveryActions: ['retry'], progress: 0, step: 0, totalSteps: 1,
+    phase: '', message: 'Generation failed.', outputFiles: [], error: null,
+  }
+  const renderCard = changes => {
+    const panel = QueuePanel({ jobs: [{ ...job, ...changes }], sampleCampaignPairs: [],
+      onStop() {}, onDismiss() {}, queue: null, queueError: null, queueLastSuccessAt: null,
+      refreshQueue: async () => {},
+    })
+    const card = flattenElements(panel).find(element => element.type === JobPlaceholder)
+    assert.ok(card)
+    return JobPlaceholder(card.props)
+  }
+  const retries = tree => flattenElements(tree).filter(element => (
+    element.type === 'button' && elementText(element) === 'Retry generation'
+  ))
+  const buttons = retries(renderCard({}))
+  assert.equal(buttons.length, 1)
+  buttons[0].props.onClick()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(calls, [job.id])
+  assert.equal(retries(renderCard({ recoveryActions: [] })).length, 0)
+  assert.equal(retries(renderCard({ status: 'cancelled' })).length, 0)
+  const blocked = renderCard({ recoveryState: 'blocked', recoveryBlocked: true })
+  assert.equal(retries(blocked).length, 0)
+  assert.equal(flattenElements(blocked).filter(element => (
+    element.type === 'button' && elementText(element) === 'Retry recovery'
+  )).length, 1)
+  globalThis.__resourceWaitStore.workspaces[0].project_permissions = ['project.read']
+  assert.equal(retries(renderCard({})).length, 0)
+  assert.deepEqual(calls, [job.id])
+})

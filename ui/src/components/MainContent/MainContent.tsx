@@ -1673,6 +1673,17 @@ function JobPlaceholder({
                     />
                   </div>
                 )}
+                {job.status === 'failed' && canManageGeneration && job.recoveryActions?.includes('retry') && (
+                  <div className="mt-2 flex justify-center">
+                    <button
+                      type="button"
+                      onClick={() => onRecoveryAction?.('retry')}
+                      className="rounded bg-accent-green/15 px-2.5 py-1 text-[10px] font-medium text-accent-green hover:bg-accent-green/25"
+                    >
+                      Retry generation
+                    </button>
+                  </div>
+                )}
                 {job.status !== 'cancelled' && (!job.oomInfo || machineControls) && (
                   <details className="mt-2 rounded border border-border bg-bg-secondary/70 px-2 py-1.5 text-[10px] text-text-muted">
                     <summary className="cursor-pointer text-text-secondary">Technical details</summary>

@@ -63110,6 +63110,10 @@ _QUEUE_RECOVERY_REASON_TEXT = {
     "h3_generation_oom_replanned": (
         "The calibrated H3 replacement plan is ready"
     ),
+    "generation_failed": (
+        "Generation failed. Retry will reuse any verified completed parts."
+    ),
+    "recovery_unavailable": "This job has no supported recovery action.",
 }
 
 
@@ -63223,7 +63227,8 @@ def _job_owned_by_request(job: dict | None, request: Request) -> bool:
 
 
 def _queue_recovery_reason_code(job: dict) -> str | None:
-    if not _queue_recovery_is_blocked(job):
+    failed = str(job.get("status") or "") == "failed"
+    if not _queue_recovery_is_blocked(job) and not failed:
         return None
     attempt = _queue_recovery_attempt(job)
     if attempt >= MAX_RECOVERY_ATTEMPTS:
@@ -63233,7 +63238,11 @@ def _queue_recovery_reason_code(job: dict) -> str | None:
     explicit = str(job.get("_recovery_reason_code") or "")
     if explicit in _QUEUE_RECOVERY_REASON_TEXT:
         return explicit
+    if explicit:
+        return "recovery_unavailable"
     state = str(job.get("recovery_state") or "")
+    if failed and state in {"", "terminal"}:
+        return "generation_failed"
     if state == "blocked_preparation":
         return "preparation_must_resubmit"
     if state == "blocked_remote_reauth":
@@ -63269,13 +63278,17 @@ def _public_queue_recovery_metadata(job: dict) -> dict:
             "owner_reauthentication_required"
         ):
             actions = ["resume"]
-        elif state == "blocked" and reason in {
+        elif (
+            state == "blocked"
+            or (state in {"", "terminal"} and str(job.get("status") or "") == "failed")
+        ) and reason in {
             "input_missing_or_changed", "worker_start_failed",
             "h3_generation_recovery_authorization_required",
             "h3_peak_calibration_required",
             "h3_generation_oom_replanned",
             "model_terms_required",
             "director_role_admission_required",
+            "generation_failed",
         }:
             actions = ["retry"]
     public = {
@@ -65142,6 +65155,11 @@ def _resume_recovered_job(
             "resume" if state == "blocked_remote_reauth"
             else "resume" if state == "blocked" and legal_resume
             else "retry" if state == "blocked"
+            else "retry" if (
+                state in {"", "terminal"}
+                and str(job.get("status") or "") == "failed"
+                and requested_action == "retry"
+            )
             else ""
         )
         if not expected_action:
@@ -65165,6 +65183,7 @@ def _resume_recovered_job(
                 "h3_legal_access_required",
                 "model_terms_required",
                 "director_role_admission_required",
+                "generation_failed",
             }
         )
         if reason not in allowed_reasons:

@@ -5974,6 +5974,19 @@ class QueueLaunchWiringTests(unittest.TestCase):
         })
         self.assertEqual(capped["recovery_reason"], "attempt_limit_reached")
         self.assertEqual(capped["recovery_actions"], [])
+        failed = public({
+            "status": "failed",
+            "recovery_state": "terminal",
+            "recovery_attempt": 0,
+        })
+        self.assertEqual(failed["recovery_actions"], ["retry"])
+        missing = public({
+            "status": "failed",
+            "recovery_state": "blocked",
+            "recovery_attempt": 1,
+            "_recovery_reason_code": "project_missing_or_recreated",
+        })
+        self.assertEqual(missing["recovery_actions"], [])
         preparation = public({
             "recovery_state": "blocked_preparation",
             "recovery_attempt": 1,
@@ -5983,6 +5996,101 @@ class QueueLaunchWiringTests(unittest.TestCase):
             preparation["recovery_reason"], "preparation_must_resubmit",
         )
         self.assertEqual(preparation["recovery_actions"], [])
+
+    def test_failed_retry_projection_and_execution_share_the_guarded_contract(self):
+        class Denied(Exception):
+            def __init__(self, *, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+
+        reasons = ast.literal_eval(next(
+            node.value for node in self.launch.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "_QUEUE_RECOVERY_REASON_TEXT"
+                    for target in node.targets)
+        ))
+        secret = b"synthetic-terminal-retry-secret"
+        owner = "synthetic-owner"
+        base = {"id": "abcd1234", "workspace": "project-a", "kind": "studio_generation",
+                "status": "failed", "recovery_state": "terminal", "recovery_attempt": 0,
+                "_recovery_owner_digest": owner_principal_digest(secret, owner)}
+        scenarios = [
+            ({}, {}, ["retry"], None),
+            ({"status": "cancelled"}, {}, [], 409),
+            ({"status": "completed"}, {}, [], 409),
+            ({"recovery_state": "retrying"}, {}, [], 409),
+            ({"_recovery_reason_code": "private/unknown-reason"}, {}, [], 409),
+            ({"_recovery_reason_code": "final_output_recovery_incomplete"}, {}, [], 409),
+            ({"_recovery_reason_code": "project_missing_or_recreated"}, {}, [], 409),
+            ({"recovery_attempt": 3}, {}, [], 409),
+            ({}, {"worker": False}, [], 409),
+            ({}, {"owned": False}, ["retry"], 404),
+            ({"_recovery_owner_digest": "wrong"}, {}, ["retry"], 404),
+            ({}, {"generate": False}, ["retry"], 403),
+            ({}, {"valid_inputs": False}, ["retry"], 409),
+            ({}, {"durable": False}, ["retry"], 409),
+        ]
+        for updates, gates, actions, error in scenarios:
+            with self.subTest(updates=updates, gates=gates):
+                job = {**base, **updates}
+                started = []
+                access_checks = []
+                class WorkerThread:
+                    def __init__(self, **kwargs):
+                        self.kwargs = kwargs
+                    def start(self):
+                        started.append(self.kwargs["args"])
+                def owned(_id, _request):
+                    if not gates.get("owned", True):
+                        raise Denied(status_code=404, detail="Job not found")
+                    return job
+                def authorize(_request, workspace, *, permission):
+                    access_checks.append((workspace, permission))
+                    if not gates.get("generate", True):
+                        raise Denied(status_code=403, detail="Permission denied")
+                def checkpoint(target, **updates):
+                    if not gates.get("durable", True):
+                        return False
+                    target.update(updates)
+                    return True
+                namespace = _isolated_functions(self.launch, (
+                    "_queue_recovery_is_blocked", "_queue_recovery_attempt",
+                    "_queue_recovery_reason_code", "_public_queue_recovery_metadata",
+                    "_resume_recovered_job",
+                ), {
+                    "HTTPException": Denied, "MAX_RECOVERY_ATTEMPTS": 3,
+                    "_BLOCKED_QUEUE_RECOVERY_STATES": frozenset({"blocked", "blocked_preparation", "blocked_remote_reauth"}),
+                    "_QUEUE_RECOVERY_REASON_TEXT": reasons,
+                    "_queue_recovery_worker": lambda _job: object() if gates.get("worker", True) else None,
+                    "_queue_recovery_checkpoint_lock": threading.RLock(),
+                    "_require_owned_job": owned, "_require_project_access": authorize,
+                    "_session_secret": lambda: secret, "owner_principal_digest": owner_principal_digest,
+                    "hmac": hmac, "_queue_recovery_revalidate_job": lambda _job: gates.get("valid_inputs", True),
+                    "_queue_recovery_delivery_pending": lambda _job: None,
+                    "_require_job_runtime_model_admission": lambda _job: None,
+                    "_queue_recovery_checkpoint": checkpoint, "next_recovery_attempt": next_recovery_attempt,
+                    "update_queue_job": lambda *_args, **_kwargs: True,
+                    "threading": types.SimpleNamespace(Thread=WorkerThread),
+                })
+                metadata = namespace["_public_queue_recovery_metadata"](job)
+                self.assertEqual(metadata["recovery_actions"], actions)
+                self.assertNotIn("private/unknown-reason", json.dumps(metadata))
+                retry = namespace["_resume_recovered_job"]
+                request = types.SimpleNamespace(state=types.SimpleNamespace(maestro_session_id=owner))
+                if error is not None:
+                    with self.assertRaises(Denied) as raised:
+                        retry(job["id"], request, requested_action="retry")
+                    self.assertEqual(raised.exception.status_code, error)
+                    self.assertEqual(started, [])
+                else:
+                    result = retry(job["id"], request, requested_action="retry")
+                    self.assertEqual((result["status"], result["recovery_attempt"]), ("queued", 1))
+                    self.assertEqual(started, [(job["id"],)])
+                    self.assertEqual(access_checks, [("project-a", "project.generate")])
+                    with self.assertRaises(Denied):
+                        retry(job["id"], request, requested_action="retry")
+                    self.assertEqual(len(started), 1)
+
 
     def test_generic_queue_controls_reject_all_blocked_recovery_states(self):
         class FakeHTTPException(Exception):

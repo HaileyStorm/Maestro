@@ -1,5 +1,46 @@
 # Migrated-checkout continuation — 2026-09-05
 
+## Failed-generation retry follow-up
+
+Ordinary failed generations now advertise a retry only when their terminal
+state, recovery reason, worker, and attempt limit permit it. Unknown reasons
+remain opaque and unavailable; cancelled terminal jobs, incomplete-final
+recovery, and known missing/recreated projects do not gain a retry. The endpoint retains current
+ownership, `project.generate`, browser-owner binding, input revalidation,
+runtime admission, and durable-checkpoint checks. The failed-card button uses
+the projected action and current project permission; blocked recovery keeps
+its existing controls.
+
+Independent review found no remaining issues in this slice. The new model-free
+lifecycle matrix exercises projection and endpoint behavior together, including
+denied ownership/permission, invalid inputs, exhausted attempts, unavailable
+workers, failed persistence, and duplicate requests. The executable queue/card
+test covers the retry callback, permission denial, cancelled cards, and no
+duplicate recovery controls.
+
+Verification: 475 working-checkout UI tests pass; the isolated candidate passes
+471 UI tests, application/config TypeScript, and a Vite production build. All
+21 queue UI contract tests pass. The complete isolated queue-recovery file
+runs 159 tests with three failures and four errors; all seven reproduce against
+HEAD without this patch. They remain separate source-contract/H3 baseline
+work, not passing acceptance. Every staged implementation/test file was
+compared byte-for-byte with the tested candidate. Private evidence lives under
+`.artifacts-temp/failed-retry-current/`.
+
+The stale polling assertion was corrected separately in `9fae1e6`; all 15
+polling-policy tests pass against both the working checkout and isolated source.
+The shared harness owner repaired the reservation scanner's bounded traversal
+and link-boundary handling. Installed Linux read-only scanning now completes
+with zero uncertain scopes; this task then performed supported reconciliation
+and acquired its own exact backend claim. No project-local scanner shim was
+introduced. Windows acceptance remains the shared owner's separate gate.
+
+Continue with bounded triage of the remaining recovery/source-contract failures
+and existing account/project usability priorities. Browser acceptance remains
+deferred by the cache-filesystem requirement below. GPU/model execution,
+generation, service restarts, credits, SSO, and new providers remain outside
+this CPU-only task's authority.
+
 ## Recovery slice follow-up
 
 The initial handoff below is historical provenance. Its three-file staged
@@ -46,8 +87,8 @@ unchanged assertion and missing-route behavior; all 50 tests in
 `test_output_privacy.py` pass in 8.6 seconds after the change. The full run
 continued without interruption using its already-loaded test code.
 
-Remaining CPU-safe work includes reviewing the separate failed-card retry
-button and its server recovery contract before staging that pre-existing hunk.
+The failed-card retry follow-up above resolves the separate UI/backend retry
+slice identified by this earlier checkpoint.
 The unrelated H3, backend, account UI, and restored-test changes remain outside
 the recovery commit. The broader account/project milestone remains open.
 
