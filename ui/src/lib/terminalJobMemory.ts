@@ -1,7 +1,16 @@
-import type { GenerationJob } from '../types'
+import type { AccountContext, GenerationJob } from '../types'
 
-const STORAGE_KEY = 'maestro.terminal-jobs.v1'
+const STORAGE_KEY = 'maestro.terminal-jobs.v2'
+const LEGACY_STORAGE_KEY = 'maestro.terminal-jobs.v1'
 const MAX_JOBS = 30
+
+export function terminalJobScope(context: AccountContext | null | undefined): string | null {
+  if (context?.enabled === false) return 'local'
+  if (context?.enabled === true && context.authenticated === true && context.account?.id) {
+    return `account:${context.account.id}`
+  }
+  return null
+}
 
 function canUseStorage(): boolean {
   try {
@@ -45,14 +54,14 @@ export function compactTerminalJob(job: GenerationJob): GenerationJob | null {
   }
 }
 
-export function loadTerminalJobs(): GenerationJob[] {
-  if (!canUseStorage()) return []
+export function loadTerminalJobs(scope: string | null = null): GenerationJob[] {
+  if (!scope || !canUseStorage()) return []
   try {
     const raw = sessionStorage.getItem(STORAGE_KEY)
     if (!raw) return []
     const parsed = JSON.parse(raw)
-    if (!Array.isArray(parsed)) return []
-    return parsed
+    if (parsed?.scope !== scope || !Array.isArray(parsed.jobs)) return []
+    return (parsed.jobs as unknown[])
       .map(item => compactTerminalJob(item as GenerationJob))
       .filter((item): item is GenerationJob => item != null)
       .slice(0, MAX_JOBS)
@@ -61,25 +70,28 @@ export function loadTerminalJobs(): GenerationJob[] {
   }
 }
 
-export function persistTerminalJobs(jobs: readonly GenerationJob[]): void {
+export function clearTerminalJobs(): void {
   if (!canUseStorage()) return
+  try {
+    sessionStorage.removeItem(STORAGE_KEY)
+    sessionStorage.removeItem(LEGACY_STORAGE_KEY)
+  } catch {
+    /* private mode */
+  }
+}
+
+export function persistTerminalJobs(jobs: readonly GenerationJob[], scope: string | null = null): void {
+  // Do not erase the previous page's record while account bootstrap is pending.
+  if (!scope || !canUseStorage()) return
   const terminal = jobs
     .map(compactTerminalJob)
     .filter((item): item is GenerationJob => item != null)
     .slice(0, MAX_JOBS)
   try {
+    sessionStorage.removeItem(LEGACY_STORAGE_KEY)
     if (terminal.length === 0) sessionStorage.removeItem(STORAGE_KEY)
-    else sessionStorage.setItem(STORAGE_KEY, JSON.stringify(terminal))
+    else sessionStorage.setItem(STORAGE_KEY, JSON.stringify({ scope, jobs: terminal }))
   } catch {
     /* private mode or quota */
   }
-}
-
-export function mergeTerminalJobs(
-  current: readonly GenerationJob[],
-  remembered: readonly GenerationJob[],
-): GenerationJob[] {
-  const have = new Set(current.map(job => job.id).filter(Boolean))
-  const extras = remembered.filter(job => job.id && !have.has(job.id))
-  return extras.length === 0 ? [...current] : [...current, ...extras]
 }

@@ -7,6 +7,12 @@ import { HOST_TERM_NOTICES } from '../lib/hostTerms'
 import { applyH3SegmentCeilingPolicy, hasManualH3SegmentCeiling } from '../lib/h3Submission'
 import { alignStudioTotalFrames, alignTotalFrames, controlFpsTotalFrames, effectiveSlidingWindowGeometry, hasGlobalTimeline, usesStudioSegments } from '../lib/timelinePrompt'
 import { hidePrivatePreviewsForWorkspace } from '../lib/privatePreview'
+import {
+  clearTerminalJobs,
+  loadTerminalJobs,
+  persistTerminalJobs,
+  terminalJobScope,
+} from '../lib/terminalJobMemory'
 import { resolveSidebarNavigation, type ReferenceReturnMode, type SidebarMode } from '../lib/sidebarNavigation'
 import {
   H3_STYLE_PREFIX_MIGRATION_KEY,
@@ -3957,6 +3963,31 @@ function _accountIdentity(context: AccountContext | null | undefined): string {
   return context?.authenticated === true && context.account ? context.account.id : ''
 }
 
+// Reload cards stay outside renderable state until a fresh workspace response
+// verifies project access. null means that verification has completed.
+let _pendingTerminalJobs: GenerationJob[] | null = []
+
+function _terminalJobsForAccount(
+  previous: AccountContext | null,
+  next: AccountContext | null | undefined,
+): Partial<AppState> {
+  const scope = terminalJobScope(next)
+  if (previous === null) {
+    if (!next) return {}
+    _pendingTerminalJobs = loadTerminalJobs(scope)
+    // Remove mismatched and legacy envelopes, too, without losing matching
+    // recovery while the first workspace request is pending.
+    if (_pendingTerminalJobs.length === 0) clearTerminalJobs()
+    return { jobs: [] }
+  }
+  if (terminalJobScope(previous) !== scope) {
+    clearTerminalJobs()
+    _pendingTerminalJobs = []
+    return { jobs: [], isGenerating: false }
+  }
+  return {}
+}
+
 function _enhanceAccountFingerprint(
   state: Pick<AppState, 'accountContext' | 'accessContext'>,
 ): string {
@@ -4782,6 +4813,8 @@ function _scrubAccountBoundProjectUi(state: AppState): Partial<AppState> {
   // same account. A real scrub/logout always has a previous context and must
   // remove every prior-account recovery fence.
   if (state.accountContext !== null) {
+    clearTerminalJobs()
+    _pendingTerminalJobs = []
     try { localStorage.removeItem(STORAGE_KEY) } catch { /* private mode */ }
     void _clearStoredEnhanceOperations()
     const priorAccountFingerprint = _enhanceAccountFingerprint(state)
@@ -9298,6 +9331,8 @@ export const useStore = create<AppState>((set, get) => ({
         ))) {
           void get().loadOutputs()
         }
+      } else {
+        set(s => ({ isGenerating: s.jobs.some(_isActiveGenerationJob) }))
       }
       if (!_accountIdentityIsCurrent(accountIdentityEpoch)) return
       await get().reconnectDirectorPreparation()
@@ -10153,6 +10188,7 @@ export const useStore = create<AppState>((set, get) => ({
         accountProjectMigration: null,
         accountProjectMigrationLoading: false,
       } : {}),
+      ..._terminalJobsForAccount(previous, next),
       ...(supportIdentityChanged ? {
         accountSessions: [],
         accountUsers: [],
@@ -10228,6 +10264,7 @@ export const useStore = create<AppState>((set, get) => ({
       const projectUiScrub = identityChanged ? _scrubAccountBoundProjectUi(get()) : {}
       set({
         ...projectUiScrub,
+        ..._terminalJobsForAccount(get().accountContext, accessAccounts),
         accountContext: get().accessContext?.accounts ?? null,
         accountContextLoading: false,
         accountProjectMigration: null,
@@ -10282,6 +10319,7 @@ export const useStore = create<AppState>((set, get) => ({
           || !context.capabilities.includes('account.self')
         return {
           ...projectUiScrub,
+          ..._terminalJobsForAccount(previous, context),
           accountContext: context,
           accountContextLoading: false,
           accessContext: state.accessContext
@@ -14486,20 +14524,26 @@ export const useStore = create<AppState>((set, get) => ({
   loadWorkspaces: async () => {
     const requestSequence = ++_workspaceLoadSequence
     const accountIdentityEpoch = _accountIdentityEpoch
+    const recoveryScope = terminalJobScope(get().accountContext)
+    const accessContext = get().accessContext
+    const accountProjectAccessActive = api.isAccountProjectAccessActive(
+      accessContext, get().accountProjectMigration,
+    )
     try {
       const data = await api.fetchWorkspaces()
       if (
         requestSequence !== _workspaceLoadSequence
         || accountIdentityEpoch !== _accountIdentityEpoch
+        || recoveryScope !== terminalJobScope(get().accountContext)
+        || accessContext?.remote !== get().accessContext?.remote
+        || accountProjectAccessActive !== api.isAccountProjectAccessActive(
+          get().accessContext, get().accountProjectMigration,
+        )
       ) return false
       const before = get()
       const previousActive = before.activeWorkspace
       const projectChanged = data.active !== previousActive
       const nextWorkspaces = new Map(data.workspaces.map(workspace => [workspace.name, workspace]))
-      const accountProjectAccessActive = api.isAccountProjectAccessActive(
-        before.accessContext,
-        before.accountProjectMigration,
-      )
       const revokedWorkspaces = accountProjectAccessActive ? [] : before.workspaces
         .filter(workspace => (
           workspace.password_protected
@@ -14523,10 +14567,29 @@ export const useStore = create<AppState>((set, get) => ({
         _dashboardPipelineListLoadToken += 1
       }
       if (clearPendingPlan) _h3PlanReviewSequence += 1
+      const pendingTerminalJobs = recoveryScope && accessContext ? _pendingTerminalJobs ?? [] : []
+      if (recoveryScope && accessContext) _pendingTerminalJobs = null
       set(state => {
-        const remainingJobs = previousAccessRevoked
-          ? state.jobs.filter(job => job.workspace && job.workspace !== previousActive)
-          : state.jobs
+        const currentJobIds = new Set(state.jobs.map(job => job.id))
+        const remainingJobs = [
+          ...state.jobs,
+          ...pendingTerminalJobs.filter(job => !currentJobIds.has(job.id)),
+        ].filter(job => {
+          // Live tool placeholders predate workspace tagging. They belong to
+          // the unchanged active project; cached unscoped cards have no such
+          // authority and must never use this fallback.
+          const workspace = job.workspace || (
+            currentJobIds.has(job.id) && !projectChanged && !previousAccessRevoked
+              ? previousActive : ''
+          )
+          const project = nextWorkspaces.get(workspace)
+          if (!project) return false
+          if (accountProjectAccessActive) {
+            return state.accountContext?.authenticated === true
+              && project.project_permissions?.includes('project.read') === true
+          }
+          return accessContext !== null && (!accessContext.remote || project.unlocked === true)
+        })
         return {
           workspaces: data.workspaces,
           activeWorkspace: data.active,
@@ -14559,10 +14622,8 @@ export const useStore = create<AppState>((set, get) => ({
             dashboardSelectedPipeline: null,
             dashboardLoading: false,
           } : {}),
-          ...(previousAccessRevoked ? {
-            jobs: remainingJobs,
-            isGenerating: remainingJobs.some(_isActiveGenerationJob),
-          } : {}),
+          jobs: remainingJobs,
+          isGenerating: remainingJobs.some(_isActiveGenerationJob),
           ...(clearPendingPlan ? {
             pendingH3Plan: null,
             pendingH3PlanEstimate: null,
@@ -16825,4 +16886,10 @@ useStore.subscribe(state => {
     card.workspace !== state.activeWorkspace
     || card.accountFingerprint !== _enhanceAccountFingerprint(state)
   ) useStore.setState({ enhanceQueueCard: null })
+})
+
+useStore.subscribe((state, previous) => {
+  if (state.jobs !== previous.jobs && _pendingTerminalJobs === null) {
+    persistTerminalJobs(state.jobs, terminalJobScope(state.accountContext))
+  }
 })

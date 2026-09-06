@@ -1,5 +1,57 @@
 # Migrated-checkout continuation — 2026-09-05
 
+## Recovery slice follow-up
+
+The initial handoff below is historical provenance. Its three-file staged
+patch has been corrected: remembered terminal cards remain private until the
+newest identity-fenced workspace response verifies each project. Account
+cutover requires explicit `project.read`, including locally; legacy remote
+access requires a fresh unlock. Rejected records are erased. An authenticated
+remote shell with no selected project retains verified recovery cards. Live
+tool placeholders without workspace tags retain their existing object identity
+only under fresh, unchanged active-project authorization; cached unscoped
+cards are rejected.
+
+The lifecycle tests now execute the real workspace loader and MainContent's
+queue-reset effect. They cover revoked membership, expired unlock, no-selection
+retention, reversed workspace responses, account switches, unchanged-account
+refresh races, and live tool placeholders. This is model-free synthetic
+evidence, not a mounted-browser or live-account acceptance claim. The old
+unscoped merge helper and two source-pattern assertions for the narrower
+filter were removed in favor of the lifecycle checks.
+
+The isolated staged UI snapshot passes 470 tests, TypeScript checking, and a
+Vite production build. The dirty checkout passes 474 UI tests and TypeScript;
+the standalone JSON grammar regression and publication guard pass. Builds are
+isolated from the installed UI. Private logs and patch preimages are under
+`.artifacts-temp/terminal-recovery-current/` and must remain untracked.
+
+The full GPU-masked backend run is **not green**: 4,583 tests ran with 35
+failures, 48 errors, and 14 skips. Python syntax compilation passed. Preserve
+`backend.log` for the next bounded CPU triage; do not rerun the entire suite
+merely to reproduce this unchanged baseline. The failures span Director H3
+prompt/schema contracts, native conditioning and lifecycle source extraction,
+LTX integration, launcher/runtime assumptions, UI source-pattern assertions,
+and the stable-share filesystem test. One import error is the compatibility
+runtime's Python 3.10 lacking `tomllib`. This run is evidence about the dirty
+checkout, not a passing backend release gate or proof that every failure
+predates migration. Resolve each affected source/test contract before claiming
+full CPU acceptance; keep those changes out of the terminal-recovery slice.
+
+Remaining CPU-safe work includes reviewing the separate failed-card retry
+button and its server recovery contract before staging that pre-existing hunk.
+The unrelated H3, backend, account UI, and restored-test changes remain outside
+the recovery commit. The broader account/project milestone remains open.
+
+Browser acceptance is deferred: the checked-in E2E runner rejects its default
+browser cache because it now shares the migrated checkout's filesystem.
+Harness TypeScript passes, but suite listing and execution stop at that host
+preflight. A separately scoped host setup must supply existing approved cache
+and result directories on a different filesystem, then rerun the synthetic
+account/project recovery journeys. Do not weaken the runner gate or treat the
+store/effect tests as browser acceptance. The tracker hold and the prohibition
+on GPU work, model loading, generation, and service restarts remain in force.
+
 ## Read first
 
 Continue in the saved Maestro Project selected by the owner for the migrated

@@ -451,7 +451,6 @@ test('selector keeps row selection separate from independent project locks', asy
 
   assert.match(store, /const result = await api\.lockWorkspace\(name\)[\s\S]*await get\(\)\.loadWorkspaces\(\)/)
   assert.match(store, /const result = await api\.lockAllWorkspaces\(\)[\s\S]*await get\(\)\.loadWorkspaces\(\)/)
-  assert.match(store, /api\.isAccountProjectAccessActive\([\s\S]*before\.accountProjectMigration/)
   assert.match(store, /nextActiveWorkspace === undefined[\s\S]*!accountProjectAccessActive && nextActiveWorkspace\.unlocked === false/)
   assert.match(store, /api\.createWorkspace\(name, accountProjectAccessActive \? undefined : password, 'device'\)/)
   assert.match(store, /outputs: \[\],[\s\S]*selectedOutputKeys: \[\]/)
@@ -460,7 +459,6 @@ test('selector keeps row selection separate from independent project locks', asy
   assert.match(store, /if \(!await get\(\)\.loadWorkspaces\(\)\) \{[\s\S]*current access state could not be refreshed/)
   assert.match(store, /const previousAccessRevoked = Boolean\(previousActive\)[\s\S]*nextActiveWorkspace === undefined[\s\S]*nextActiveWorkspace\.unlocked === false/)
   assert.match(store, /const requestSequence = \+\+_workspaceLoadSequence[\s\S]*requestSequence !== _workspaceLoadSequence/)
-  assert.match(store, /previousAccessRevoked[\s\S]*state\.jobs\.filter\(job => job\.workspace && job\.workspace !== previousActive\)/)
   assert.match(store, /job\.workspace \? job\.workspace !== name : !lockedActiveWorkspace/)
   assert.match(store, /job\.workspace[\s\S]*!lockedWorkspaces\.has\(job\.workspace\)[\s\S]*!lockedActiveWorkspace/)
 })

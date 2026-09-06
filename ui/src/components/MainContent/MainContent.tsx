@@ -2720,11 +2720,11 @@ export function MainContent() {
       error: null,
       lastSuccessAt: null,
     })
-    useStore.setState({
-      jobs: [],
+    useStore.setState(state => ({
+      jobs: state.jobs.filter(job => job.status === 'failed' || job.status === 'cancelled'),
       sampleCampaignPairs: [],
       isGenerating: false,
-    })
+    }))
   }, [queuePollingReady])
 
   useEffect(() => {
