@@ -3988,7 +3988,13 @@ def load_model(
             os.makedirs(cache_dir, exist_ok=True)
             with _runtime_status_lock:
                 _loading_model_id = repo_id
-            gguf_path = _download_gguf(repo_id, gguf_file, cache_dir)
+            try:
+                gguf_path = _download_gguf(repo_id, gguf_file, cache_dir)
+            except Exception:
+                raise RuntimeError(
+                    "The selected chat model could not be downloaded. "
+                    "Retry from this computer."
+                ) from None
             gguf_path = os.path.normpath(gguf_path)
 
         # Try to download mmproj for vision support (optional — not all models have it)
@@ -4015,8 +4021,14 @@ def load_model(
                 mmproj_path = _download_gguf(mmproj_repo, mmproj_file, cache_dir)
                 mmproj_path = os.path.normpath(mmproj_path)
                 print(f"[LLM] Vision support: mmproj loaded from {mmproj_repo}")
-            except Exception as e:
-                print(f"[LLM] No mmproj available (vision disabled): {e}")
+            except Exception:
+                if registered_model:
+                    raise RuntimeError(
+                        "This vision chat model needs its image projector "
+                        "before it can load. Retry the download from this "
+                        "computer."
+                    ) from None
+                print("[LLM] No mmproj available for this unregistered model (vision disabled)")
         else:
             print("[LLM] Model is registered without an mmproj (vision disabled)")
 

@@ -3070,6 +3070,8 @@ class LlmRuntimeTests(unittest.TestCase):
                 llm_service.unload_model()
 
     def test_download_failure_clears_loading_state_and_allows_retry(self):
+        import traceback
+
         calls = 0
 
         def download(_repo, filename, cache_dir):
@@ -3098,8 +3100,13 @@ class LlmRuntimeTests(unittest.TestCase):
         ), mock.patch.object(
             llm_service.threading, "Timer", _RecordingTimer,
         ):
-            with self.assertRaisesRegex(OSError, "download failure"):
+            with self.assertRaisesRegex(RuntimeError, "could not be downloaded") as raised:
                 llm_service.load_model(repo)
+            self.assertNotIn("synthetic download failure", str(raised.exception))
+            self.assertIsNone(raised.exception.__cause__)
+            self.assertNotIn("synthetic download failure", "".join(traceback.format_exception(
+                type(raised.exception), raised.exception, raised.exception.__traceback__,
+            )))
             status = llm_service.get_status()
             self.assertFalse(status["loaded"])
             self.assertFalse(status["loading"])
@@ -4123,12 +4130,16 @@ class LlmRuntimeTests(unittest.TestCase):
         with mock.patch.object(
             llm_service, "_hardware_profile", return_value=profile,
         ), mock.patch.object(
+            llm_service, "_cuda_device_is_visible", return_value=True,
+        ), mock.patch.object(
             llm_service.subprocess, "run", return_value=first_gpu,
         ):
             llm_service._speed_hardware_identity_cache.clear()
             first, _ = llm_service._speed_hardware_identity("cuda")
         with mock.patch.object(
             llm_service, "_hardware_profile", return_value=profile,
+        ), mock.patch.object(
+            llm_service, "_cuda_device_is_visible", return_value=True,
         ), mock.patch.object(
             llm_service.subprocess, "run", return_value=second_gpu,
         ):
@@ -4432,6 +4443,77 @@ class LlmRuntimeTests(unittest.TestCase):
             profile = llm_service._hardware_profile()
 
         self.assertEqual(profile["gpu_vram_gb"], 12.0)
+
+    def test_registered_vision_model_fails_closed_without_projector(self):
+        import traceback
+
+        vision_repo = (
+            "Youssofal/Qwen3.6-27B-Abliterated-Heretic-Uncensored-GGUF"
+        )
+        projector_ready = False
+
+        def fake_download(repo_id, filename, cache_dir):
+            projector_files = {entry.get("mmproj_file") for entry in llm_service.MODEL_REGISTRY.values()}
+            projector_files.add(llm_service.DEFAULT_MMPROJ_FILE)
+            if not projector_ready and filename in projector_files:
+                raise OSError("PRIVATE projector missing")
+            path = Path(cache_dir) / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"model")
+            return str(path)
+
+        self.addCleanup(llm_service.unload_model)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            llm_service, "get_model_dir", return_value=tmp
+        ), mock.patch.object(
+            llm_service, "_download_gguf", side_effect=fake_download
+        ), mock.patch.object(
+            llm_service, "_get_server_exe", return_value="synthetic-llama-server",
+        ) as server, mock.patch.object(
+            llm_service, "_find_free_port", return_value=54321,
+        ), mock.patch.object(
+            llm_service.subprocess, "Popen", side_effect=lambda *_args, **_kwargs: _FakeLlamaProcess(),
+        ), mock.patch.object(
+            llm_service.requests, "get", return_value=_HealthyResponse(),
+        ), mock.patch.object(
+            llm_service.threading, "Timer", _RecordingTimer,
+        ):
+            llm_service.unload_model()
+            with self.assertRaises(RuntimeError) as raised:
+                llm_service.load_model(vision_repo)
+            server.assert_not_called()
+            self.assertIn("image projector", str(raised.exception))
+            self.assertNotIn("PRIVATE", str(raised.exception))
+            self.assertNotIn("PRIVATE", "".join(traceback.format_exception(
+                type(raised.exception), raised.exception, raised.exception.__traceback__,
+            )))
+            self.assertFalse(llm_service.get_status()["loading"])
+            self.assertFalse(llm_service._vision_available)
+            self.assertEqual(llm_service._loaded_model_key, ())
+            projector_ready = True
+            llm_service.load_model(vision_repo)
+            self.assertTrue(llm_service.is_loaded())
+            self.assertTrue(llm_service._vision_available)
+            incumbent = (llm_service._process, llm_service._model_id,
+                         llm_service._loaded_model_key, llm_service._vision_available)
+            alternate = next(repo for repo, entry in llm_service.MODEL_REGISTRY.items()
+                             if repo != vision_repo and entry.get("mmproj_file"))
+            projector_ready = False
+            with self.assertRaises(RuntimeError):
+                llm_service.load_model(alternate)
+            self.assertEqual((llm_service._process, llm_service._model_id,
+                              llm_service._loaded_model_key, llm_service._vision_available), incumbent)
+            self.assertEqual(llm_service._loading_model_id, "")
+            self.assertTrue(llm_service.is_loaded())
+            llm_service.unload_model()
+            projector_ready = False
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+                llm_service.load_model("synthetic/unregistered-GGUF")
+            self.assertTrue(llm_service.is_loaded())
+            self.assertFalse(llm_service._vision_available)
+            self.assertNotIn("PRIVATE", output.getvalue())
+            llm_service.unload_model()
+
 
 
 if __name__ == "__main__":
