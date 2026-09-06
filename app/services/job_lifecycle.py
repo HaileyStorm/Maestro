@@ -4173,6 +4173,18 @@ def consume_prompt_enhancement_result(
         return reference
 
 
+def generation_slot_should_park_after_output(job: Mapping[str, Any]) -> bool:
+    """Park only for an explicit hold or pause, never to start another job.
+
+    Remaining samples and this job's deferred FlashVSR pass keep native GPU
+    occupancy so the generation model stays resident for the whole job.
+    """
+    with _queue_condition:
+        return bool(job.get("hold_after_output", False)) or bool(
+            _pause_after_current
+        )
+
+
 def yield_generation_slot_after_output(
     generation_lock: threading.Lock,
     job: MutableMapping[str, Any],

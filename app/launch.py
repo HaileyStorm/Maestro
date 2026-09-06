@@ -1767,6 +1767,7 @@ from services.job_lifecycle import (
     update_job,
     update_preparation_job,
     yield_generation_slot_after_output,
+    generation_slot_should_park_after_output,
 )
 from services.cpu_text_lane import (
     BreakEvenEstimate,
@@ -4095,6 +4096,10 @@ class _WgpNativeGpuExecutionSlot:
     def __init__(
         self, enabled=True, *, blocking=True, cancel_checkpoint=None,
     ):
+        from threading import RLock
+
+        self._guard = RLock()
+        self._closed = False
         self._enabled = bool(enabled)
         self._blocking = bool(blocking)
         self._cancel_checkpoint = cancel_checkpoint
@@ -4102,64 +4107,65 @@ class _WgpNativeGpuExecutionSlot:
         self._prior_slot = None
 
     def acquire(self):
-        if self._acquired:
-            return True
-        if not self._enabled:
-            return False
-        if self._blocking:
-            try:
-                if callable(self._cancel_checkpoint):
-                    wgp.acquire_native_gpu_execution_lock(
-                        self._cancel_checkpoint,
-                    )
-                else:
-                    wgp.acquire_native_gpu_execution_lock()
-            except _WgpNativeGpuWaitCancelled:
+        with self._guard:
+            if self._closed:
                 return False
-            self._acquired = True
-        else:
-            self._acquired = wgp.native_gpu_execution_lock.acquire(
-                blocking=False,
-            )
-        if self._acquired:
-            _wgp_native_gpu_slot_state.depth = (
-                int(getattr(_wgp_native_gpu_slot_state, "depth", 0)) + 1
-            )
-        return self._acquired
+            if self._acquired:
+                return True
+            if not self._enabled:
+                return False
+            if self._blocking:
+                try:
+                    if callable(self._cancel_checkpoint):
+                        wgp.acquire_native_gpu_execution_lock(
+                            self._cancel_checkpoint,
+                        )
+                    else:
+                        wgp.acquire_native_gpu_execution_lock()
+                except _WgpNativeGpuWaitCancelled:
+                    return False
+                self._acquired = True
+            else:
+                self._acquired = wgp.native_gpu_execution_lock.acquire(
+                    blocking=False,
+                )
+            return self._acquired
 
     def release(self):
-        if self._acquired:
-            self._acquired = False
-            depth = max(
-                0,
-                int(getattr(_wgp_native_gpu_slot_state, "depth", 0)) - 1,
-            )
-            _wgp_native_gpu_slot_state.depth = depth
-            wgp.native_gpu_execution_lock.release()
-            return True
-        return False
+        with self._guard:
+            if self._acquired:
+                self._acquired = False
+                wgp.native_gpu_execution_lock.release()
+                return True
+            return False
 
     def __enter__(self):
-        acquired = self.acquire()
-        if acquired:
-            self._prior_slot = getattr(
-                _wgp_native_gpu_slot_state, "current_slot", None,
-            )
-            _wgp_native_gpu_slot_state.current_slot = self
-        return acquired
+        with self._guard:
+            acquired = self.acquire()
+            if acquired:
+                self._prior_slot = getattr(
+                    _wgp_native_gpu_slot_state, "current_slot", None,
+                )
+                _wgp_native_gpu_slot_state.current_slot = self
+            return acquired
 
     def __exit__(self, _exc_type, _exc_value, _traceback):
-        self.release()
-        if getattr(
-            _wgp_native_gpu_slot_state, "current_slot", None,
-        ) is self:
-            _wgp_native_gpu_slot_state.current_slot = self._prior_slot
-        return False
+        with self._guard:
+            self._closed = True
+            self.release()
+            if getattr(
+                _wgp_native_gpu_slot_state, "current_slot", None,
+            ) is self:
+                _wgp_native_gpu_slot_state.current_slot = self._prior_slot
+            return False
 
 
-def _yield_current_native_gpu_slot() -> _WgpNativeGpuExecutionSlot:
+def _yield_current_native_gpu_slot(
+    slot: _WgpNativeGpuExecutionSlot,
+) -> _WgpNativeGpuExecutionSlot:
     """Release the paired native lane before scheduler releases ``_gen``."""
-    slot = getattr(_wgp_native_gpu_slot_state, "current_slot", None)
+    # Listener callbacks run on a different thread. The captured slot is the
+    # capability to yield this job; process-global lookup could select a peer.
     if not isinstance(slot, _WgpNativeGpuExecutionSlot) or not slot.release():
         raise RuntimeError("generation native GPU slot is not owned")
     return slot
@@ -4167,7 +4173,8 @@ def _yield_current_native_gpu_slot() -> _WgpNativeGpuExecutionSlot:
 
 def _release_wgp_model_with_native_gpu_exclusion():
     """Release WGP residency only while owning its native GPU/model lane."""
-    if int(getattr(_wgp_native_gpu_slot_state, "depth", 0)) > 0:
+    slot = getattr(_wgp_native_gpu_slot_state, "current_slot", None)
+    if isinstance(slot, _WgpNativeGpuExecutionSlot) and slot._acquired:
         return wgp.release_model()
     with _WgpNativeGpuExecutionSlot() as acquired:
         if not acquired:
@@ -57732,6 +57739,7 @@ def _run_generation(
             job
         ),
     ) as native_acquired:
+        native_slot = getattr(_wgp_native_gpu_slot_state, "current_slot", None)
         if not acquired or not native_acquired:
             _credit_admission_evaluations.pop(job_id, None)
             return False
@@ -59714,9 +59722,9 @@ def _run_generation(
                 # WGP splits API repeats into complete one-output model calls.
                 # At each returned boundary, publish its registered finals and
                 # full artifact lineage before a requested scheduler hold can
-                # block this worker. H3 segment groups retain their existing
-                # task-boundary yield below, and deferred Director/tool workers
-                # retain their all-at-once publication contract.
+                # block this worker. H3 segment groups check for holds at
+                # task boundaries below; deferred Director/tool workers retain
+                # their all-at-once publication contract.
                 repeat_file_cursor = len(gen.get("file_list") or [])
                 repeat_audio_cursor = len(gen.get("audio_file_list") or [])
                 repeat_published_artifacts = set(collect_job_outputs(
@@ -59898,10 +59906,16 @@ def _run_generation(
                         progress_indeterminate=True,
                     )
                     inactive_started = time.time()
-                    yielded_native_slot = _yield_current_native_gpu_slot()
-                    resumed = yield_generation_slot_after_output(_gen_lock, job)
-                    if resumed and not yielded_native_slot.acquire():
-                        return False
+                    # Keep native GPU occupancy across remaining samples of
+                    # this job. FlashVSR is a later same-job post-pass, not
+                    # another job's turn.
+                    if generation_slot_should_park_after_output(job):
+                        yielded_native_slot = _yield_current_native_gpu_slot(native_slot)
+                        resumed = yield_generation_slot_after_output(_gen_lock, job)
+                        if resumed and not yielded_native_slot.acquire():
+                            return False
+                    else:
+                        resumed = True
                     _record_eta_inactive_time(inactive_started)
                     if resumed:
                         if is_cancel_requested(job):
@@ -61239,16 +61253,19 @@ def _run_generation(
                             ):
                                 return False
                             inactive_started = time.time()
-                            yielded_native_slot = _yield_current_native_gpu_slot()
-                            if not yield_generation_slot_after_output(
-                                _gen_lock, job,
-                            ):
-                                _record_eta_inactive_time(inactive_started)
-                                cancelled = True
-                                break
-                            if not yielded_native_slot.acquire():
-                                cancelled = True
-                                break
+                            if generation_slot_should_park_after_output(job):
+                                yielded_native_slot = (
+                                    _yield_current_native_gpu_slot(native_slot)
+                                )
+                                if not yield_generation_slot_after_output(
+                                    _gen_lock, job,
+                                ):
+                                    _record_eta_inactive_time(inactive_started)
+                                    cancelled = True
+                                    break
+                                if not yielded_native_slot.acquire():
+                                    cancelled = True
+                                    break
                             _record_eta_inactive_time(inactive_started)
 
             elapsed = time.time() - start_time

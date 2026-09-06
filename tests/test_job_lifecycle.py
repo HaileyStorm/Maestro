@@ -76,6 +76,7 @@ from services.job_lifecycle import (  # noqa: E402
     update_job,
     update_preparation_job,
     yield_generation_slot_after_output,
+    generation_slot_should_park_after_output,
 )
 
 
@@ -1720,6 +1721,21 @@ class TestJobLifecycle(unittest.TestCase):
         self.assertEqual(result, [True])
         self.assertEqual(job.get("status"), "running")
         generation_lock.release()
+
+    def test_repeat_boundary_parks_only_for_hold_or_pause_not_next_job(self):
+        job = _job()
+        self.assertFalse(generation_slot_should_park_after_output(job))
+        job["hold_after_output"] = True
+        self.assertTrue(generation_slot_should_park_after_output(job))
+        job["hold_after_output"] = False
+        self.assertEqual(
+            set_queue_pause_after_current(True)["pause_after_current"], True,
+        )
+        try:
+            self.assertTrue(generation_slot_should_park_after_output(job))
+        finally:
+            set_queue_pause_after_current(False)
+        self.assertFalse(generation_slot_should_park_after_output(job))
 
     def test_hold_after_admission_relinquishes_and_requeues_before_start(self):
         generation_lock = threading.Lock()

@@ -60,6 +60,21 @@ Additional private receipts are under `.artifacts-temp/astra-toml-compat-2026090
 `.artifacts-temp/astra-llm-artifacts-20260906/`, and
 `.artifacts-temp/astra-krea-declaration-20260906/`.
 
+The native-slot slice retains thread-local model-release authority and passes
+an explicit captured slot to Listener output callbacks. Ordinary repeats keep
+that slot; an explicit hold or queue pause yields native exclusion before the
+generation lock, and a cancelled resume does not reacquire it. The proposed
+process-global ownership state is superseded because it could let an unrelated
+thread bypass model-release exclusion. Its private preimage is retained.
+The isolated candidate passes 166 LLM/lifecycle tests and all 52 lifecycle wiring
+tests, including synthetic cross-thread exclusion and execution of both parking
+branches. A per-slot guard fences duplicate release and post-context
+reacquisition; the worker-thread round trip and persistence-failure paths are
+covered. Independent review, syntax, and publication checks pass. This is CPU
+synchronization evidence, not live model residency or GPU acceptance. Receipts are in `.artifacts-temp/astra-native-slot-20260906/`.
+H3 delivery publication, segment checkpoint, and native-conditioning WIP remain
+separate and must be integrated with their own dependencies and acceptance.
+
 Browser acceptance is still deferred pending permission for task-specific
 external cache/result directories on a different filesystem. Existing browser
 binaries are available, so no download is needed for the prepared attempt.

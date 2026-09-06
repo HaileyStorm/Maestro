@@ -716,7 +716,7 @@ class LlmRuntimeTests(unittest.TestCase):
 
         thread = threading.Thread(target=follower)
         thread.start()
-        yielded = namespace["_yield_current_native_gpu_slot"]()
+        yielded = namespace["_yield_current_native_gpu_slot"](slot)
         self.assertIs(yielded, slot)
         self.assertFalse(native_gpu.locked())
         gen_lock.release()
@@ -741,7 +741,13 @@ class LlmRuntimeTests(unittest.TestCase):
             source, generation_node,
         ) or ""
         self.assertEqual(
-            generation_source.count("_yield_current_native_gpu_slot()"), 2,
+            generation_source.count("_yield_current_native_gpu_slot(native_slot)"), 2,
+        )
+        self.assertGreaterEqual(
+            generation_source.count(
+                "generation_slot_should_park_after_output(job)"
+            ),
+            2,
         )
         self.assertEqual(
             generation_source.count(
@@ -751,12 +757,11 @@ class LlmRuntimeTests(unittest.TestCase):
         )
         for marker in (
             "resumed = yield_generation_slot_after_output(_gen_lock, job)",
-            "if not yield_generation_slot_after_output(\n"
-            "                                _gen_lock, job,",
+            "if not yield_generation_slot_after_output(",
         ):
             yield_at = generation_source.index(marker)
             release_at = generation_source.rfind(
-                "_yield_current_native_gpu_slot()", 0, yield_at,
+                "_yield_current_native_gpu_slot(native_slot)", 0, yield_at,
             )
             resume_at = generation_source.index(
                 "yielded_native_slot.acquire()", yield_at,
@@ -764,6 +769,175 @@ class LlmRuntimeTests(unittest.TestCase):
             self.assertGreaterEqual(release_at, 0)
             self.assertLess(release_at, yield_at)
             self.assertLess(yield_at, resume_at)
+
+    def test_repeat_yield_owns_native_slot_from_wgp_worker_thread(self):
+        # WGP generate_video runs on Listener's worker thread, not the
+        # _run_generation thread that entered the native GPU slot.
+        launch_path = Path(__file__).resolve().parents[1] / "app" / "launch.py"
+        source = launch_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        nodes = []
+        for node in tree.body:
+            if (
+                isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name)
+                    and target.id == "_wgp_native_gpu_slot_state"
+                    for target in node.targets
+                )
+            ):
+                nodes.append(node)
+            elif (
+                isinstance(node, ast.ClassDef)
+                and node.name in {
+                    "_WgpNativeGpuExecutionSlot",
+                }
+            ):
+                nodes.append(node)
+            elif (
+                isinstance(node, ast.FunctionDef)
+                and node.name in {
+                    "_yield_current_native_gpu_slot",
+                    "_release_wgp_model_with_native_gpu_exclusion",
+                }
+            ):
+                nodes.append(node)
+        native_gpu = threading.Lock()
+        namespace = {
+            "threading": threading,
+            "wgp": types.SimpleNamespace(
+                native_gpu_execution_lock=native_gpu,
+                acquire_native_gpu_execution_lock=native_gpu.acquire,
+            ),
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=nodes, type_ignores=[],
+        )), str(launch_path), "exec"), namespace)
+        release_called = threading.Event()
+        namespace["wgp"].release_model = release_called.set
+        slot = namespace["_WgpNativeGpuExecutionSlot"]()
+        release_started = threading.Event()
+        yielded_ready = threading.Event()
+        resume_worker = threading.Event()
+        errors = []
+        yielded = {}
+        threads = []
+
+        def unrelated_release():
+            release_started.set()
+            namespace["_release_wgp_model_with_native_gpu_exclusion"]()
+
+        def worker():
+            try:
+                yielded["slot"] = namespace["_yield_current_native_gpu_slot"](slot)
+                with self.assertRaisesRegex(RuntimeError, "not owned"):
+                    namespace["_yield_current_native_gpu_slot"](slot)
+                yielded_ready.set()
+                if not resume_worker.wait(timeout=2):
+                    raise AssertionError("synthetic resume gate timed out")
+                yielded["reacquired"] = slot.acquire()
+            except BaseException as exc:
+                errors.append(exc)
+                yielded_ready.set()
+
+        try:
+            self.assertTrue(slot.__enter__())
+            self.assertTrue(native_gpu.locked())
+            outsider = threading.Thread(target=unrelated_release)
+            threads.append(outsider)
+            outsider.start()
+            self.assertTrue(release_started.wait(timeout=1))
+            self.assertFalse(release_called.wait(timeout=0.1))
+
+            thread = threading.Thread(target=worker)
+            threads.append(thread)
+            thread.start()
+            self.assertTrue(yielded_ready.wait(timeout=1))
+            self.assertEqual(errors, [])
+            self.assertIs(yielded["slot"], slot)
+            self.assertTrue(release_called.wait(timeout=1))
+            outsider.join(timeout=1)
+            self.assertFalse(outsider.is_alive())
+            self.assertFalse(native_gpu.locked())
+
+            # A parent TLS reference to the yielded slot cannot authorize
+            # unload while a peer holds native exclusion.
+            release_called.clear()
+            native_gpu.acquire()
+            observed = []
+            def finish_peer():
+                observed.append(release_called.wait(timeout=0.1))
+                native_gpu.release()
+            peer = threading.Thread(target=finish_peer)
+            threads.append(peer)
+            peer.start()
+            namespace["_release_wgp_model_with_native_gpu_exclusion"]()
+            peer.join(timeout=1)
+            self.assertFalse(peer.is_alive())
+            self.assertEqual(observed, [False])
+            self.assertTrue(release_called.is_set())
+
+            resume_worker.set()
+            thread.join(timeout=1)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertTrue(yielded["reacquired"])
+            self.assertTrue(native_gpu.locked())
+        finally:
+            resume_worker.set()
+            slot.__exit__(None, None, None)
+            for thread in threads:
+                thread.join(timeout=2)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertFalse(native_gpu.locked())
+        self.assertFalse(slot.acquire())
+        with self.assertRaisesRegex(RuntimeError, "not owned"):
+            namespace["_yield_current_native_gpu_slot"](slot)
+
+    def test_both_output_boundaries_retain_native_slot_unless_parked(self):
+        launch_path = Path(__file__).resolve().parents[1] / "app" / "launch.py"
+        tree = ast.parse(launch_path.read_text(encoding="utf-8"))
+        generation = next(node for node in tree.body
+                          if isinstance(node, ast.FunctionDef)
+                          and node.name == "_run_generation")
+        branches = [node for node in ast.walk(generation)
+                    if isinstance(node, ast.If)
+                    and isinstance(node.test, ast.Call)
+                    and isinstance(node.test.func, ast.Name)
+                    and node.test.func.id == "generation_slot_should_park_after_output"]
+        self.assertEqual(len(branches), 2)
+        for branch in branches:
+            for parked, resumed in ((False, True), (True, True), (True, False), (True, "persistence_error")):
+                with self.subTest(line=branch.lineno, parked=parked, resumed=resumed):
+                    template = ast.parse("def boundary():\n    for _ in (None,):\n        pass\n")
+                    template.body[0].body[0].body = [branch]
+                    slot = mock.Mock()
+                    slot.acquire.return_value = True
+                    release = mock.Mock(return_value=slot)
+                    park = mock.Mock(return_value=resumed)
+                    if resumed == "persistence_error":
+                        park.side_effect = RuntimeError("synthetic persistence failure")
+                    namespace = {
+                        "job": {}, "native_slot": slot, "_gen_lock": object(),
+                        "generation_slot_should_park_after_output": lambda _job: parked,
+                        "_yield_current_native_gpu_slot": release,
+                        "yield_generation_slot_after_output": park,
+                        "_record_eta_inactive_time": mock.Mock(), "inactive_started": 0,
+                    }
+                    exec(compile(ast.fix_missing_locations(template), str(launch_path), "exec"), namespace)
+                    if resumed == "persistence_error":
+                        with self.assertRaisesRegex(RuntimeError, "synthetic persistence failure"):
+                            namespace["boundary"]()
+                    else:
+                        namespace["boundary"]()
+                    if parked:
+                        release.assert_called_once_with(slot)
+                        park.assert_called_once_with(namespace["_gen_lock"], namespace["job"])
+                        self.assertEqual(slot.acquire.call_count, int(resumed is True))
+                    else:
+                        release.assert_not_called()
+                        park.assert_not_called()
+                        slot.acquire.assert_not_called()
 
     def test_cancelled_api_waiter_releases_generation_lock_before_native_lane(self):
         from concurrent.futures import ThreadPoolExecutor
