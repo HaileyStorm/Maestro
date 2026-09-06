@@ -639,19 +639,16 @@ def admitted_dasiwa_lora_path(
     return os.fspath(admitted_path)
 
 
-def enforce_dasiwa_runtime(
+def validate_dasiwa_request(
     *,
-    model_type: str,
+    model_types: Any,
     activated_loras: Any,
     loras_multipliers: Any,
     num_inference_steps: Any,
     custom_settings: Mapping[str, Any] | None,
-    skip_steps_cache_type: Any,
-    selected_checkpoint_path: str | os.PathLike[str] | None,
-    selected_lora_path: str | os.PathLike[str] | None,
-    receipt_root: str | os.PathLike[str] | None = None,
-) -> dict[str, Any] | None:
-    """Fail closed when the Dasiwa filename activates outside its contract."""
+    skip_steps_cache_type: Any = "",
+) -> bool:
+    """Return True when Dasiwa is selected. Raise if that selection is illegal."""
     if isinstance(activated_loras, str):
         loras = [activated_loras]
     elif isinstance(activated_loras, (list, tuple)):
@@ -660,13 +657,22 @@ def enforce_dasiwa_runtime(
         loras = []
     selected = [item for item in loras if Path(str(item)).name == DASIWA_FILENAME]
     if not selected:
-        return None
+        return False
     if len(selected) != 1 or len(loras) != 1:
         raise H3ExperimentCompatibilityError(
             "Dasiwa cannot be stacked with another LoRA or accelerator"
         )
-    if model_type != "minimax_h3_ref2va":
-        raise H3ExperimentCompatibilityError("Dasiwa requires MiniMax H3 Ref2VA")
+    if isinstance(model_types, str):
+        types = [model_types]
+    elif isinstance(model_types, (list, tuple)):
+        types = [str(item or "") for item in model_types] or [""]
+    else:
+        types = [""]
+    if any(item != "minimax_h3_ref2va" for item in types):
+        raise H3ExperimentCompatibilityError(
+            "Dasiwa requires MiniMax H3 Ref2VA"
+            + (" for every planned shot" if len(types) > 1 else "")
+        )
     if type(num_inference_steps) is not int or num_inference_steps != DASIWA_AUTHORED_STEPS:
         raise H3ExperimentCompatibilityError("Dasiwa requires exactly four sampling steps")
     if _dasiwa_multiplier(loras_multipliers) != DASIWA_STRENGTH:
@@ -683,6 +689,31 @@ def enforce_dasiwa_runtime(
         raise H3ExperimentCompatibilityError(
             "Dasiwa cannot be stacked with another accelerator"
         )
+    return True
+
+
+def enforce_dasiwa_runtime(
+    *,
+    model_type: str,
+    activated_loras: Any,
+    loras_multipliers: Any,
+    num_inference_steps: Any,
+    custom_settings: Mapping[str, Any] | None,
+    skip_steps_cache_type: Any,
+    selected_checkpoint_path: str | os.PathLike[str] | None,
+    selected_lora_path: str | os.PathLike[str] | None,
+    receipt_root: str | os.PathLike[str] | None = None,
+) -> dict[str, Any] | None:
+    """Fail closed when the Dasiwa filename activates outside its contract."""
+    if not validate_dasiwa_request(
+        model_types=[str(model_type or "")],
+        activated_loras=activated_loras,
+        loras_multipliers=loras_multipliers,
+        num_inference_steps=num_inference_steps,
+        custom_settings=custom_settings,
+        skip_steps_cache_type=skip_steps_cache_type,
+    ):
+        return None
     if (
         selected_checkpoint_path is None
         or Path(selected_checkpoint_path).name != DASIWA_SUSPECTED_BASE_FILENAME

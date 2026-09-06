@@ -992,6 +992,7 @@ class TestMiniMaxH3Definition(unittest.TestCase):
             "_apply_fresh_h3_role_defaults": lambda _body, _request: "high",
             "_validate_h3_sampling_steps": lambda _body: None,
             "_validate_h3_explicit_multiclip_request": lambda _body: None,
+            "_validate_h3_lora_request": lambda _body, _plan=None: None,
             "_prepare_h3_long_studio_request": prepare,
             "_require_h3_acceleration_available": lambda _body, _plan: None,
             "_h3_estimate_context": lambda _body, _plan: {},

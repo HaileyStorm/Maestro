@@ -3928,6 +3928,9 @@ class QueueLaunchWiringTests(unittest.TestCase):
             self.launch,
             (
                 "_h3_execution_shots_for_dispatch",
+                "_validate_h3_lora_request",
+                "_h3_lora_asset_selections",
+                "_apply_h3_loras_to_manifest",
                 "_apply_h3_offload_plan_to_manifest",
                 "_require_h3_offload_plan_parity",
                 "_snapshot_h3_recovery_task_params",

@@ -142,16 +142,43 @@ continuation cases, and callback/replay ordering. This does not establish live
 GPU, encoded native-AV handoff, generation, or human acceptance. Native
 conditioning, offload/quality changes, and the remaining WIP are still open.
 
-For the remaining adaptive-conditioning/LoRA WIP, retain the selected FL2VA
-flavor across routing, enforce Ref2VA-only and exclusive accelerators before
-queueing, and keep estimate inputs aligned with submission inputs. The scout
-found three concrete parity requirements: estimates need the selected adaptive
-models and architecture-specific lists; partial split-list payloads need an
-explicit fallback/validation rule; Python and TypeScript must normalize
-path-qualified known filenames consistently. Integrate the pure
-`h3_lora_compat.py` contract and its planner tests without adopting unrelated
-prompt-adaptation, native-boundary, offload, or delivery changes. UI integration
-and rendered acceptance remain distinct follow-up evidence.
+The CPU LoRA contract slice now uses one per-checkpoint resolver for admission,
+direct/restored workers, asset preparation, task manifests, and estimates.
+Missing/null architecture lists inherit shared choices; an explicit empty list
+clears that side. Paths and positional weights retain their selected identity;
+only compatibility classification normalizes basenames across path separators.
+Empty/duplicate assets, incompatible explicit lists, exclusive stacks, invalid
+Dasiwa step/strength settings, and surplus weights reject before model work.
+Ordinary missing weights retain the existing 1.00 default.
+
+Estimate routing uses the existing adaptive resolver on a private presence-only
+request. Segment Turbo validation and profile previews preserve architecture
+selection precedence. Single-task aliases resolve before mutation, and manifest
+projection runs before parsing and recovery-sidecar snapshots. The existing
+Dasiwa runtime artifact/receipt checks remain intact. Superseded clip-only
+projection and duplicate validation code have been removed. This slice does not
+adopt checkpoint-default, prompt-adaptation, native-boundary, or offload WIP.
+
+The final frozen candidate passes 359 of 368 tests; nine optional runtime tests
+are skipped. Its seven code/test files stayed byte-identical through the run.
+Python syntax and tracked publication checks pass. Private
+preimages, review fixes, CPU logs, and candidate digests are under
+`.artifacts-temp/astra-h3-lora-contract-20260906/`. Independent static review's
+four findings were resolved and have executable AST/spy regressions. This is
+CPU/synthetic evidence, not model, GPU, provider, rendered-UI, or human acceptance.
+
+The broader 877-test run exposed five pre-existing native-slot fixture errors
+across CPU-text/credit admission and three stale UI source assertions in
+`test_phase1_issue_fixes.py`. A separate residency test still extracts the
+`generate_video` wrapper instead of `_generate_video_impl`; the tested source
+and test bytes both match HEAD. These fixture corrections are the next bounded
+CPU maintenance slice, not evidence that the broader suite passes. Keep the
+remaining UI, model routing, prompt, native-boundary, and offload WIP separate.
+
+For the remaining adaptive-conditioning/UI work, retain the selected FL2VA
+flavor, send the selected adaptive models and split lists in estimates, and align
+TypeScript basename normalization with the Python contract. Rendered acceptance
+remains a distinct follow-up gate.
 
 Browser acceptance is still deferred pending permission for task-specific
 external cache/result directories on a different filesystem. Existing browser

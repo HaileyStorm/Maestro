@@ -16826,6 +16826,62 @@ def _expand_h3_longform_outputs(
     return expanded_manifest
 
 
+def _validate_h3_lora_request(body: dict, plan: dict | None = None) -> None:
+    """Reject H3 LoRA sets the split pickers should have made unselectable."""
+    from services.h3_lora_compat import validate_h3_lora_selection
+
+    if str(body.get("model_type") or "") not in _H3_LONG_STUDIO_MODELS:
+        return
+    validate_h3_lora_selection(
+        model_type=body.get("model_type"),
+        activated_loras=body.get("activated_loras"),
+        loras_multipliers=body.get("loras_multipliers"),
+        num_inference_steps=body.get("num_inference_steps"),
+        custom_settings=(
+            body.get("custom_settings")
+            if isinstance(body.get("custom_settings"), dict) else {}
+        ),
+        skip_steps_cache_type=body.get("skip_steps_cache_type"),
+        planned_model_types=_h3_effective_model_types(body, plan),
+        fl2va_loras=body.get("h3_fl2va_loras"),
+        fl2va_loras_multipliers=body.get("h3_fl2va_loras_multipliers"),
+        ref2va_loras=body.get("h3_ref2va_loras"),
+        ref2va_loras_multipliers=body.get("h3_ref2va_loras_multipliers"),
+    )
+
+def _h3_lora_asset_selections(body: dict, plan: dict | None = None) -> dict:
+    """Resolve each effective checkpoint without changing sealed request fields."""
+    from services.h3_lora_compat import h3_request_loras_for_model
+
+    models = _h3_effective_model_types(body, plan)
+    if not models:
+        return {str(body.get("model_type") or ""): (
+            body.get("activated_loras"), body.get("loras_multipliers"),
+        )}
+    return {model: h3_request_loras_for_model(body, model) for model in models}
+
+
+def _apply_h3_loras_to_manifest(manifest: list, body: dict) -> None:
+    """Project shared/split choices once, before native parsing or snapshots."""
+    from services.h3_lora_compat import (
+        architecture_for_h3_model, h3_request_loras_for_model,
+    )
+
+    # Single-task params may be body itself. Resolve every row before writes.
+    projections = []
+    for task in manifest:
+        params = task.get("params") if isinstance(task, dict) else None
+        if not isinstance(params, dict):
+            continue
+        model = params.get("model_type")
+        if architecture_for_h3_model(model):
+            names, weights = h3_request_loras_for_model(body, model)
+            projections.append((params, names, weights))
+    for params, names, weights in projections:
+        params["activated_loras"] = names
+        params["loras_multipliers"] = weights
+
+
 def _validate_h3_explicit_multiclip_request(body: dict) -> None:
     """Reject oversized explicit H3 scenes instead of silently clamping."""
     model_type = str(body.get("model_type") or "")
@@ -17374,6 +17430,9 @@ def list_loras_details(model_type: str):
                 info["downloaded_at"] = None
         # Stable identifier: civitai:{modelId} when available, else local:{filename}.
         info["lora_id"] = _compute_lora_id(basename, meta)
+        if str(model_type or "").startswith("minimax_h3"):
+            from services.h3_lora_compat import public_h3_lora_contract
+            info.update(public_h3_lora_contract(basename))
         # Per-file update status (see /api/v1/loras/installed for the
         # equivalent logic). Computes against this file's own sidecar
         # versionId rather than blindly inheriting the manifest's
@@ -39321,6 +39380,7 @@ def _plan_generation_submission(
     _validate_h3_sampling_steps(body)
     _validate_h3_explicit_multiclip_request(body)
     plan = _prepare_h3_long_studio_request(body)
+    _validate_h3_lora_request(body, plan)
     _require_h3_acceleration_available(body, plan)
     estimate_context = _h3_estimate_context(body, plan)
     _validate_h3_turbo_estimate_context(
@@ -40027,6 +40087,26 @@ def _h3_estimate_context(body: dict, plan: dict | None = None) -> dict:
     Prompt text is consumed only by the shared planner and is never copied
     into estimate/status responses or benchmark observations.
     """
+    # Estimates carry a shape rather than file inputs. Use the same routing
+    # function on a private presence-only request before selecting LoRAs.
+    body = dict(body)
+    body.setdefault("model_type", "minimax_h3")
+    estimate_reference = body.get("reference_shape")
+    estimate_reference = (
+        estimate_reference if isinstance(estimate_reference, dict) else {}
+    )
+    if not isinstance(plan, dict) and not isinstance(body.get("_h3_longform"), dict):
+        routing = dict(body)
+        if estimate_reference:
+            for field, shape in (("image_start", "has_start"), ("image_end", "has_end")):
+                routing[field] = bool(estimate_reference.get(shape))
+            routing["image_refs"] = [True] if estimate_reference.get("image_count") else []
+            routing["video_guide"] = bool(estimate_reference.get("video_count"))
+            routing["audio_guide"] = bool(estimate_reference.get("audio_count"))
+        _apply_h3_adaptive_checkpoint(routing)
+        body["model_type"] = routing["model_type"]
+        if "custom_settings" in routing:
+            body["custom_settings"] = routing["custom_settings"]
     model_type = str(body.get("model_type") or "minimax_h3")
     model_def = wgp.get_model_def(model_type) or {}
     fps = float(model_def.get("fps") or 24)
@@ -40082,6 +40162,9 @@ def _h3_estimate_context(body: dict, plan: dict | None = None) -> dict:
                 "duration_seconds": scene_duration,
                 "prompt": str(scene.get("prompt") or ""),
             })
+    from services.h3_lora_compat import h3_request_loras_for_model
+
+    selected_loras, selected_weights = h3_request_loras_for_model(body, model_type)
     context = {
         "model_type": model_type,
         "duration_seconds": duration,
@@ -40128,8 +40211,8 @@ def _h3_estimate_context(body: dict, plan: dict | None = None) -> dict:
         "num_inference_steps": body.get("num_inference_steps", 20),
         "resolution": body.get("resolution") or "1344x768",
         "custom_settings": dict(body.get("custom_settings") or {}),
-        "activated_loras": list(body.get("activated_loras") or []),
-        "loras_multipliers": body.get("loras_multipliers") or "",
+        "activated_loras": selected_loras,
+        "loras_multipliers": selected_weights,
         "tea_cache": body.get("tea_cache", 0),
         "spatial_upsampling": str(body.get("spatial_upsampling") or ""),
         "delivery_resolution": str(body.get("delivery_resolution") or ""),
@@ -40160,8 +40243,14 @@ def _h3_estimate_context(body: dict, plan: dict | None = None) -> dict:
         },
         "explicit_output": bool(body.get("explicit_output")),
     }
+    for key in (
+        "h3_fl2va_loras", "h3_fl2va_loras_multipliers",
+        "h3_ref2va_loras", "h3_ref2va_loras_multipliers",
+    ):
+        if key in body:
+            context[key] = body[key]
     segment_models = list(long_plan.get("segment_models") or []) if isinstance(long_plan, dict) else []
-    if len(clip_frames) > 1 and len(segment_models) == len(clip_frames):
+    if clip_frames and len(segment_models) == len(clip_frames):
         segment_contexts = []
         base_shape = dict(context["reference_shape"])
         for index, (frame_count, segment_model) in enumerate(zip(clip_frames, segment_models)):
@@ -40169,6 +40258,9 @@ def _h3_estimate_context(body: dict, plan: dict | None = None) -> dict:
                 continue
             effective_model = str(segment_model.get("model_type") or model_type)
             segment = dict(context)
+            names, weights = h3_request_loras_for_model(body, effective_model)
+            segment["activated_loras"] = names
+            segment["loras_multipliers"] = weights
             published_frame_count = int(
                 clip_published_frames[index]
                 if index < len(clip_published_frames) else frame_count
@@ -40530,6 +40622,8 @@ def _h3_profile_estimate_payload(
     except (AttributeError, ImportError, OSError, RuntimeError, TypeError, ValueError):
         dasiwa_status = None
     def candidate_for_settings(settings: dict) -> dict:
+        from services.h3_lora_compat import h3_request_loras_for_model
+
         candidate = dict(context)
         candidate.update({
             "model_type": settings["model_type"],
@@ -40545,6 +40639,9 @@ def _h3_profile_estimate_payload(
             # rather than merge with, the previously selected profile.
             "custom_settings": dict(settings["custom_settings"]),
         })
+        names, weights = h3_request_loras_for_model(candidate, candidate["model_type"])
+        candidate["activated_loras"] = names
+        candidate["loras_multipliers"] = weights
         source_segments = context.get("_segment_contexts")
         if isinstance(source_segments, list):
             candidate["_segment_contexts"] = [
@@ -40563,6 +40660,12 @@ def _h3_profile_estimate_payload(
                 for segment in source_segments
                 if isinstance(segment, dict)
             ]
+        for segment in candidate.get("_segment_contexts") or []:
+            names, weights = h3_request_loras_for_model(
+                {**context, **settings}, segment["model_type"],
+            )
+            segment["activated_loras"] = names
+            segment["loras_multipliers"] = weights
         return candidate
 
     def turbo_compatibility(settings: dict) -> tuple[bool, str | None]:
@@ -40664,8 +40767,6 @@ def _validate_h3_turbo_estimate_context(
                 **segment,
                 "custom_settings": dict(custom or {}),
                 "num_inference_steps": context.get("num_inference_steps"),
-                "activated_loras": context.get("activated_loras"),
-                "loras_multipliers": context.get("loras_multipliers"),
                 "tea_cache": context.get("tea_cache"),
             }
             candidate.pop("_segment_contexts", None)
@@ -40821,6 +40922,8 @@ async def h3_estimate(request: Request):
         "h3_adaptive_conditioning", "manual_segment_ceiling",
         "num_inference_steps", "resolution", "custom_settings",
         "activated_loras", "loras_multipliers", "reference_shape",
+        "h3_fl2va_loras", "h3_fl2va_loras_multipliers",
+        "h3_ref2va_loras", "h3_ref2va_loras_multipliers",
         "explicit_output", "tea_cache",
         "spatial_upsampling",
         "delivery_resolution", "delivery_fit",
@@ -40866,6 +40969,7 @@ async def h3_estimate(request: Request):
         raise HTTPException(status_code=400, detail="Unsupported H3 reference shape")
     try:
         context = _h3_estimate_context(body)
+        _validate_h3_lora_request({**body, "model_type": context["model_type"]})
         _validate_h3_turbo_estimate_context(context)
         _validate_h3_spectrum_estimate_context(context)
         _validate_h3_lightx2v_estimate_context(context)
@@ -58295,6 +58399,8 @@ def _run_generation(
                             "original_image_end"
                         ),
                     )
+                _validate_h3_lora_request(raw_params, trusted_h3_plan)
+                lora_asset_selections = _h3_lora_asset_selections(raw_params, trusted_h3_plan)
                 _validate_h3_lightx2v_recovery_identity(raw_params)
                 _require_h3_acceleration_available(
                     raw_params,
@@ -58439,12 +58545,11 @@ def _run_generation(
             # AdaLN widths.  Provision the small revision-pinned affine maps
             # for every effective checkpoint before MMGP preprocesses a LoRA.
             try:
-                if raw_params.get("activated_loras"):
+                if any(names for names, _ in lora_asset_selections.values()):
                     h3_lora_flavors = set()
-                    lora_model_types = set(effective_h3_models)
-                    if requested_model:
-                        lora_model_types.add(requested_model)
-                    for effective_model in lora_model_types:
+                    for effective_model, (names, _) in lora_asset_selections.items():
+                        if not names:
+                            continue
                         effective_def = wgp.get_model_def(effective_model) or {}
                         architecture = str(
                             effective_def.get("architecture") or effective_model
@@ -58479,11 +58584,11 @@ def _run_generation(
             # hasn't finished yet, so the user doesn't hit a "file not found"
             # error. No-op (one dict lookup) for jobs without a managed LoRA.
             try:
-                _ensure_managed_loras_present(
-                    raw_params.get("activated_loras"),
-                    raw_params.get("model_type"),
-                    progress=lambda msg: update_job(job, message=msg),
-                )
+                for effective_model, (names, _) in lora_asset_selections.items():
+                    _ensure_managed_loras_present(
+                        names, effective_model,
+                        progress=lambda msg: update_job(job, message=msg),
+                    )
             except Exception as e:
                 finish_job(job, "failed", error=str(e), message=str(e))
                 return False
@@ -59207,6 +59312,7 @@ def _run_generation(
                     "plugin_data": {},
                 }]
 
+            _apply_h3_loras_to_manifest(manifest, raw_params)
             _apply_h3_offload_plan_to_manifest(
                 manifest, sealed_h3_offload_plan,
             )

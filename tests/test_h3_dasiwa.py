@@ -78,6 +78,16 @@ class H3DasiwaTests(unittest.TestCase):
         self.assertLess(enforcement, load)
         self.assertEqual(generation.count("recheck_dasiwa_lora_admission("), 2)
         self.assertIn("admitted_dasiwa_lora_path(", generation)
+        launch = (APP / "launch.py").read_text(encoding="utf-8")
+        planner = launch[
+            launch.index("def _plan_generation_submission("):
+            launch.index("\n@api.post(\"/api/v1/generate/plan\")")
+        ]
+        self.assertIn("_validate_h3_lora_request(body, plan)", planner)
+        self.assertLess(
+            planner.index("_prepare_h3_long_studio_request(body)"),
+            planner.index("_validate_h3_lora_request(body, plan)"),
+        )
         lora_load = generation.index("offload.load_loras_into_model(")
         lora_rechecks = [
             index
@@ -442,6 +452,43 @@ class H3DasiwaTests(unittest.TestCase):
             h3_dasiwa.H3ExperimentCompatibilityError, "verified Dasiwa contract",
         ):
             h3_dasiwa.enforce_dasiwa_runtime(**common)
+
+    def test_plan_validation_rejects_stacked_loras_and_mixed_segments(self):
+        common = {
+            "activated_loras": [h3_dasiwa.DASIWA_FILENAME],
+            "loras_multipliers": "1.0",
+            "num_inference_steps": 4,
+            "custom_settings": {},
+        }
+        self.assertTrue(h3_dasiwa.validate_dasiwa_request(
+            model_types=["minimax_h3_ref2va"], **common,
+        ))
+        self.assertFalse(h3_dasiwa.validate_dasiwa_request(
+            model_types=["minimax_h3"],
+            activated_loras=[],
+            loras_multipliers="",
+            num_inference_steps=28,
+            custom_settings={},
+        ))
+        with self.assertRaisesRegex(
+            h3_dasiwa.H3ExperimentCompatibilityError, "stacked",
+        ):
+            h3_dasiwa.validate_dasiwa_request(
+                model_types=["minimax_h3_ref2va"],
+                **{
+                    **common,
+                    "activated_loras": [
+                        h3_dasiwa.DASIWA_FILENAME, "other.safetensors",
+                    ],
+                },
+            )
+        with self.assertRaisesRegex(
+            h3_dasiwa.H3ExperimentCompatibilityError, "every planned shot",
+        ):
+            h3_dasiwa.validate_dasiwa_request(
+                model_types=["minimax_h3", "minimax_h3_ref2va"],
+                **common,
+            )
 
     def test_dasiwa_status_rejects_final_symlink_and_wrong_owner(self):
         with tempfile.TemporaryDirectory() as temporary:
