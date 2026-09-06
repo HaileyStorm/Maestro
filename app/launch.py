@@ -10849,8 +10849,7 @@ def _queue_recovery_reseal_delivery_source(
         or meta.get("artifact_class") != "temporary"
         or meta.get("delivery_native_source") is not True
         or meta.get("private") is not True
-        or str(meta.get("owner_session_id") or "")
-            != str(job.get("session_id") or "")
+        # stamp_sidecar_policy no longer persists browser-session owners.
         or str(meta.get("workspace") or "")
             != str(job.get("workspace") or "default")
         or str(meta.get("job_id") or "") != str(job.get("id") or "")
@@ -10897,7 +10896,7 @@ def _queue_recovery_delivery_plan(
                     producer_unit_id=unit_id,
                 ):
                     # H3 delivery intentionally restamps the final native as an
-                    # owner-private temporary before this plan is built. That
+                    # project-private temporary before this plan is built. That
                     # sanctioned policy/role change invalidates only the safe
                     # unit's sidecar digest. Reseal only the exact recognized
                     # private-native policy evolution; never rewrite evidence or
@@ -59017,10 +59016,7 @@ def _run_generation(
                 }
                 sidecar_policy = dict(job.get("access_policy") or {})
                 if native_source:
-                    sidecar_policy.update({
-                        "private": True,
-                        "owner_session_id": job.get("session_id"),
-                    })
+                    sidecar_policy["private"] = True
                 stamp_sidecar_policy(
                     sidecar,
                     sidecar_policy,
@@ -59246,7 +59242,12 @@ def _run_generation(
                         producer_role = _queue_recovery_expected_artifact_role(
                             producer_kind, meta,
                         )
-                        if producer_role in _RECOVERY_ARTIFACT_ROLES:
+                        if meta.get("delivery_native_source") is True:
+                            # Exact delivery hides the native until the
+                            # protected post-pass. Do not reclassify it as a
+                            # gallery Final; that breaks producer-unit reseal.
+                            meta["artifact_class"] = "temporary"
+                        elif producer_role in _RECOVERY_ARTIFACT_ROLES:
                             meta["artifact_class"] = producer_role
                         elif producer_kind:
                             # Modern but incomplete evidence never becomes a
@@ -59866,7 +59867,23 @@ def _run_generation(
                                     [] if h3_delivery_request else final_files
                                 ),
                             )
-                            if not all(
+                            # Exact H3 delivery keeps native files off
+                            # output_files until the protected post-pass.
+                            # Requiring them in published finals aborts a
+                            # successful native save (Queue completed 0/1)
+                            # and never reaches FlashVSR.
+                            if h3_delivery_request:
+                                recorded = list(job.get("artifact_files") or [])
+                                if not all(
+                                    name in recorded for name in new_artifacts
+                                ):
+                                    print(
+                                        "[H3] delivery after-repeat did not "
+                                        "record native artifacts; aborting",
+                                        flush=True,
+                                    )
+                                    return False
+                            elif not all(
                                 name in published for name in new_artifacts
                             ):
                                 return False

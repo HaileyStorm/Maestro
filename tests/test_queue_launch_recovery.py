@@ -3980,6 +3980,9 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "generation_slot": (
                     lambda *_args, **_kwargs: contextlib.nullcontext(True)
                 ),
+                "_wgp_native_gpu_slot_state": types.SimpleNamespace(
+                    current_slot=object(),
+                ),
                 "_WgpNativeGpuExecutionSlot": (
                     lambda acquired, **_kwargs: contextlib.nullcontext(acquired)
                 ),

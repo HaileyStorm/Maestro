@@ -230,13 +230,14 @@ class H3DeliveryTransactionTests(unittest.TestCase):
 
         # This is the exact sanctioned refresh that invalidated the live safe-
         # unit descriptor: producer evidence/media stay fixed while delivery
-        # makes the native owner-private and temporary before protection.
+        # makes the native project-private and temporary before protection.
         sidecar.update({
-            "private": True,
-            "owner_session_id": "owner-session",
+            "owner_session_id": "obsolete-session",
             "artifact_class": "temporary",
             "delivery_native_source": True,
         })
+        stamp_sidecar_policy(sidecar, {"private": True}, workspace=self.job["workspace"])
+        self.assertNotIn("owner_session_id", sidecar)
         sidecar_path.write_text(json.dumps(sidecar, indent=2), encoding="utf-8")
         self.assertFalse(validate_artifact_descriptor(
             self.out_dir, stale, producer_unit_id=unit_id,
@@ -282,6 +283,18 @@ class H3DeliveryTransactionTests(unittest.TestCase):
         self.assertEqual(sidecar_path.read_bytes(), restamped_sidecar_bytes)
 
         current_sidecar_bytes = sidecar_path.read_bytes()
+        for key, value in (("workspace", "another-project"), ("job_id", "another-job"),
+                           ("private", False), ("artifact_class", "final"),
+                           ("delivery_native_source", False), ("producer_artifact_class", "unknown")):
+            with self.subTest(tampered_field=key):
+                tampered = dict(sidecar, **{key: value})
+                sidecar_path.write_text(json.dumps(tampered), encoding="utf-8")
+                before_reseal = sidecar_path.read_bytes()
+                self.assertIsNone(symbols["_queue_recovery_reseal_delivery_source"](
+                    self.job, self.out_dir, unit, stale, filename,
+                ))
+                self.assertEqual(sidecar_path.read_bytes(), before_reseal)
+        sidecar_path.write_bytes(current_sidecar_bytes)
         forged_unit_id = recovery_unit_id("job-1", "ordinary_repeat", index=1)
         forged_unit = dict(unit, index=1, unit_id=forged_unit_id)
         forged_sidecar = json.loads(current_sidecar_bytes.decode("utf-8"))

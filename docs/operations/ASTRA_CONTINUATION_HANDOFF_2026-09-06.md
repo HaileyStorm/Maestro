@@ -60,7 +60,7 @@ Additional private receipts are under `.artifacts-temp/astra-toml-compat-2026090
 `.artifacts-temp/astra-llm-artifacts-20260906/`, and
 `.artifacts-temp/astra-krea-declaration-20260906/`.
 
-The native-slot slice retains thread-local model-release authority and passes
+`0a9d6fc` retains thread-local model-release authority and passes
 an explicit captured slot to Listener output callbacks. Ordinary repeats keep
 that slot; an explicit hold or queue pause yields native exclusion before the
 generation lock, and a cancelled resume does not reacquire it. The proposed
@@ -72,8 +72,23 @@ branches. A per-slot guard fences duplicate release and post-context
 reacquisition; the worker-thread round trip and persistence-failure paths are
 covered. Independent review, syntax, and publication checks pass. This is CPU
 synchronization evidence, not live model residency or GPU acceptance. Receipts are in `.artifacts-temp/astra-native-slot-20260906/`.
-H3 delivery publication, segment checkpoint, and native-conditioning WIP remain
-separate and must be integrated with their own dependencies and acceptance.
+H3 segment checkpoint and native-conditioning WIP remain separate and must
+be integrated with their own dependencies and acceptance.
+
+The delivery-native slice keeps intermediate media in artifact lineage while
+excluding it from public finals until the protected delivery pass. Metadata
+refresh preserves its temporary role, and resealing follows the current
+project-scoped sidecar format without requiring an obsolete browser-session
+owner field. Nested orphan-recovery owner checks remain intact. Executable
+callback/metadata tests replace superseded source-string probes; the reseal
+fixture uses the real policy stamp and rejects invalid project/job/private/role
+state, forged producer units, and changed media. All three new regressions fail
+against the prior source. The broader recovery fixture now supplies the captured
+slot state used by the already-shipped native-slot fix. All 293 applicable
+delivery, wiring, output-privacy, and queue-recovery tests pass, along with
+syntax/publication checks and independent review. Private evidence is in
+`.artifacts-temp/astra-delivery-native-20260906/`. This remains synthetic CPU
+and temporary-filesystem evidence, not live delivery or generation acceptance.
 
 Browser acceptance is still deferred pending permission for task-specific
 external cache/result directories on a different filesystem. Existing browser

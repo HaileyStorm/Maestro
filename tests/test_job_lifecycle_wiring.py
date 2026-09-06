@@ -407,6 +407,91 @@ class TestJobLifecycleWiring(unittest.TestCase):
             source,
         )
 
+    def test_repeat_delivery_records_native_without_publishing_it(self):
+        import copy
+        import threading
+        from services import job_lifecycle
+        from services.queue_recovery_runtime import recovery_unit_id
+
+        callback = copy.deepcopy(_function(self.launch, "_publish_and_yield_after_repeat_output"))
+        # Execute the production closure with explicit synthetic surrounding
+        # state; disk checkpointing and model calls are outside this test.
+        for node in callback.body:
+            if isinstance(node, ast.Nonlocal):
+                callback.body[callback.body.index(node)] = ast.Global(names=node.names)
+        for delivery, record_success, checkpoint_success in (
+            (True, True, True), (False, True, True),
+            (True, False, True), (True, True, False),
+        ):
+            with self.subTest(delivery=delivery, record=record_success, checkpoint=checkpoint_success):
+                job = {"id": "synthetic", "status": "running", "output_files": []}
+                events = []
+                def sidecars(*args, **kwargs):
+                    events.append("sidecars")
+                    self.assertEqual(kwargs["native_source"], delivery)
+                def checkpoint(*args, **kwargs):
+                    events.append("checkpoint")
+                    self.assertEqual(kwargs["artifact_names"], ["native.mp4"])
+                    return checkpoint_success
+                def record(*args, **kwargs):
+                    events.append("record")
+                    if not record_success:
+                        return []
+                    return job_lifecycle.record_job_outputs(*args, **kwargs)
+                ns = {
+                    "os": os, "job": job, "job_id": "synthetic",
+                    "gen": {"file_list": ["native.mp4"], "repeat_no": 1, "total_generation": 1},
+                    "params": {}, "out_dir": "synthetic", "before": set(),
+                    "repeat_file_cursor": 0, "repeat_audio_cursor": 0,
+                    "repeat_published_artifacts": set(), "repeat_final_files": set(),
+                    "producer_artifact_roles": {}, "recovery_staging_dir": None,
+                    "h3_delivery_request": delivery, "sample_worker": False,
+                    "abort_state": None, "_active_gen_states": {},
+                    "_sample_campaign_transition_lock": threading.RLock(),
+                    "sample_safe_unit_current": lambda _state: True,
+                    "_queue_recovery_staged_media_paths": lambda *_args: {},
+                    "collect_job_outputs": lambda *_args, **_kwargs: ["native.mp4"],
+                    "_queue_recovery_units": lambda _job: [],
+                    "_write_output_sidecars": sidecars,
+                    "_queue_recovery_checkpoint_unit": checkpoint,
+                    "record_job_outputs": record, "recovery_unit_id": recovery_unit_id,
+                    "unregister_abort_state": Mock(),
+                }
+                exec(compile(ast.fix_missing_locations(ast.Module(body=[callback], type_ignores=[])), "launch.py", "exec"), ns)
+                with patch.object(job_lifecycle, "_persist_prospective_unlocked"):
+                    result = ns[callback.name]()
+                self.assertEqual(result, record_success and checkpoint_success)
+                self.assertEqual(events[:2], ["sidecars", "checkpoint"])
+                if checkpoint_success:
+                    self.assertEqual(events, ["sidecars", "checkpoint", "record"])
+                accepted = record_success and checkpoint_success
+                self.assertEqual(job.get("artifact_files", []), ["native.mp4"] if accepted else [])
+                self.assertEqual(job["output_files"], ["native.mp4"] if accepted and not delivery else [])
+                self.assertEqual(ns["repeat_published_artifacts"], {"native.mp4"} if accepted else set())
+
+    def test_sidecar_refresh_preserves_delivery_native_role(self):
+        import json
+        refresh = next(node for node in ast.walk(_function(self.launch, "_write_output_sidecars"))
+                       if isinstance(node, ast.For)
+                       and isinstance(node.iter, ast.Call)
+                       and isinstance(node.iter.func, ast.Attribute)
+                       and isinstance(node.iter.func.value, ast.Name)
+                       and node.iter.func.value.id == "job_sidecars")
+        for native in (True, False):
+            with self.subTest(native=native), tempfile.TemporaryDirectory() as directory:
+                meta = {"delivery_native_source": native, "private": True,
+                        "producer_unit_kind": "ordinary_repeat",
+                        "producer_artifact_class": "final", "artifact_class": "window"}
+                ns = {"job_sidecars": {"native.mp4": meta}, "out_dir": directory,
+                      "os": os, "json": json, "_RECOVERY_ARTIFACT_ROLES": {"final", "window"},
+                      "_queue_recovery_expected_artifact_role": lambda _kind, value: value["producer_artifact_class"]}
+                exec(compile(ast.fix_missing_locations(ast.Module(body=[refresh], type_ignores=[])), "launch.py", "exec"), ns)
+                with open(os.path.join(directory, "native.meta.json"), encoding="utf-8") as handle:
+                    restored = json.load(handle)
+                self.assertEqual(restored["artifact_class"], "temporary" if native else "final")
+                self.assertTrue(restored["private"])
+                self.assertEqual(restored["producer_artifact_class"], "final")
+
     def test_repeat_boundary_two_outputs_resume_cancel_and_extra_orders(self):
         import inspect
 
