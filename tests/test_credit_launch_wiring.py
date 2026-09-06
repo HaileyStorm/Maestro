@@ -528,6 +528,7 @@ class CreditLaunchWiringTests(unittest.TestCase):
                 ),
                 "generation_slot": acquired_slot,
                 "_WgpNativeGpuExecutionSlot": acquired_slot,
+                "_wgp_native_gpu_slot_state": types.SimpleNamespace(current_slot=None),
                 "_SAMPLE_CAMPAIGN_JOB_KIND": "sample_campaign_generation",
                 "_gen_lock": object(),
                 "try_start": lambda *_args, **_kwargs: (

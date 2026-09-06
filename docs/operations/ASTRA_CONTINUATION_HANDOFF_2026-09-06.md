@@ -167,13 +167,23 @@ preimages, review fixes, CPU logs, and candidate digests are under
 four findings were resolved and have executable AST/spy regressions. This is
 CPU/synthetic evidence, not model, GPU, provider, rendered-UI, or human acceptance.
 
-The broader 877-test run exposed five pre-existing native-slot fixture errors
-across CPU-text/credit admission and three stale UI source assertions in
-`test_phase1_issue_fixes.py`. A separate residency test still extracts the
-`generate_video` wrapper instead of `_generate_video_impl`; the tested source
-and test bytes both match HEAD. These fixture corrections are the next bounded
-CPU maintenance slice, not evidence that the broader suite passes. Keep the
-remaining UI, model routing, prompt, native-boundary, and offload WIP separate.
+The stale fixtures exposed by the broader run are corrected: CPU-text and
+credit admission fixtures now supply captured native-slot state; residency
+assertions inspect `_generate_video_impl` and verify that the retry wrapper
+delegates there; UI source assertions track held-job responses, normalized
+resolution, and the dynamic inference-step ceiling while retaining its 50-step
+cap. All 195 tests in the four affected suites pass on an isolated HEAD-based
+candidate. The four test files stayed byte-identical during verification;
+production source and unrelated WIP were not changed. Evidence is under
+`.artifacts-temp/astra-stale-fixtures-20260906/`. This closes those recorded
+fixture failures, not the entire historical backend inventory.
+
+Remaining H3 work includes the native-max offload candidate and public failure
+copy. Inspect exact sealed-plan dependencies and source evidence before adopting
+the offload default; CPU tests cannot establish a GPU memory or speed benefit.
+Failure-copy integration must preserve the public error boundary and never
+accept arbitrary persisted text merely because it begins with a familiar
+prefix. Keep UI, model routing, prompt, native-boundary, and offload WIP separate.
 
 For the remaining adaptive-conditioning/UI work, retain the selected FL2VA
 flavor, send the selected adaptive models and split lists in estimates, and align

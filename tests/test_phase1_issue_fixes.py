@@ -2749,8 +2749,9 @@ class TestStudioPrimaryInferenceSteps(unittest.TestCase):
         self.assertIn("const showInferenceSteps = !isAudioOnly", source)
         self.assertIn("'Stage 1 / Primary Steps (Fixed)'", source)
         self.assertIn("const minimumInferenceSteps = isH3 ? 2 : 1", source)
-        self.assertIn('type="range" min={minimumInferenceSteps} max={50}', source)
-        self.assertIn("Math.max(minimumInferenceSteps, Math.min(50", source)
+        self.assertIn('type="range" min={minimumInferenceSteps} max={inferenceStepCeiling}', source)
+        self.assertIn("Math.max(minimumInferenceSteps, Math.min(inferenceStepCeiling,", source)
+        self.assertIn("Math.min(50, Math.trunc(hostMaxSteps))", source)
         self.assertIn("Choose a non-distilled model", source)
         self.assertIn(
             "disabled={!!modelOptions?.lock_inference_steps && !isScailEdit}",
@@ -2828,7 +2829,7 @@ class TestH3PerformanceProfileUI(unittest.TestCase):
         self.assertIn("estimateLabel(profile.estimate)", component)
         self.assertIn("H3EstimateBadge", _read(_GENERATE_BUTTON_PATH))
         self.assertIn("h3_estimate?: import('../types').H3PerformanceEstimate", client)
-        self.assertIn("const { job_id, status, h3_estimate }", store)
+        self.assertIn("const { job_id, status, held, h3_estimate }", store)
         self.assertIn("h3Estimate: submittedEstimate", store)
         self.assertIn("_h3EstimateTotalSeconds(submittedEstimate)", store)
         self.assertIn("previous?.etaSeconds", store)
@@ -2875,7 +2876,7 @@ class TestH3PerformanceProfileUI(unittest.TestCase):
         self.assertIn("'Inference Steps'", advanced)
         self.assertIn("const nativeResolutions = h3OptionsReady ? (modelOptions?.resolutions || []) : []", resolution)
         self.assertIn(
-            "const selectedIsNative = nativeResolutions.some(option => option.value === resolution)",
+            "const selectedIsNative = nativeResolutions.some(option => option.value === normalizedResolution)",
             resolution,
         )
         self.assertIn(

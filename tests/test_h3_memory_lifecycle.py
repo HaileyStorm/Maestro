@@ -1321,10 +1321,17 @@ class ModelResidencyRuntimeIntegrationTests(unittest.TestCase):
             node.name: ast.get_source_segment(source, node)
             for node in ast.parse(source).body
             if isinstance(node, ast.FunctionDef)
-            and node.name in {"load_models", "generate_video"}
+            and node.name in {"load_models", "generate_video", "_generate_video_impl"}
         }
         load_source = functions["load_models"]
-        generate_source = functions["generate_video"]
+        generate_source = functions["_generate_video_impl"]
+        wrapper = ast.parse(functions["generate_video"])
+        self.assertEqual(sum(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_generate_video_impl"
+            for node in ast.walk(wrapper)
+        ), 1)
 
         self.assertIn("return_template=True", load_source)
         self.assertIn(

@@ -703,6 +703,7 @@ class TestCPUTextLane(unittest.TestCase):
                     ),
                     "generation_slot": generation_slot,
                     "_WgpNativeGpuExecutionSlot": native_gpu_slot,
+                    "_wgp_native_gpu_slot_state": types.SimpleNamespace(current_slot=None),
                     "_SAMPLE_CAMPAIGN_JOB_KIND": "sample_campaign_generation",
                     "try_start": try_start,
                     "_active_gen_states": {},
