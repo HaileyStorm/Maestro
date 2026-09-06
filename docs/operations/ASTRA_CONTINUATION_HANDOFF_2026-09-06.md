@@ -90,6 +90,30 @@ syntax/publication checks and independent review. Private evidence is in
 `.artifacts-temp/astra-delivery-native-20260906/`. This remains synthetic CPU
 and temporary-filesystem evidence, not live delivery or generation acceptance.
 
+Checkpoint error attribution now distinguishes H3 audio/video decode, audio
+mux checkpoints, and rendered-segment sealing. Model-checkpoint loading and
+sealed-reference planning remain generic generation phases. Missing predecessor
+units or artifact hashes carry an explicit segment-checkpoint stage/code through
+sanitization, independent of a stale decode message. This slice does not change
+completed-unit validation or callback timing. All 246 applicable wiring,
+delivery, and queue-recovery tests pass, as do syntax/publication checks.
+Independent review found no issues; private candidate/test evidence is in
+`.artifacts-temp/astra-checkpoint-errors-20260906/`.
+
+Before integrating the remaining checkpoint-ordering WIP, complete these
+CPU-verifiable contracts as one coherent slice:
+
+- Align WGP and launch callbacks to seal each valid component, update the old
+  final-only regression, and reject invalid or mismatched segment identities.
+- Replace the broad reversed-`task_files` fallback with verified task/producer
+  evidence; ambiguous files must not become an arbitrary segment checkpoint.
+- Bind continuation enrichment to the current dependency/settings-derived unit
+  ID, segment, private staging path, size, and hash. Reject a matched old unit
+  whose identity differs from the new continuation dependency. Define consistent predecessor/concat behavior for a consumed
+  handoff; a missing file alone must not authorize skipping validation. Cover
+  malformed, changed, wrong-segment, and absent continuation evidence, then
+  retain the existing dependency-closure and recovery privacy gates.
+
 Browser acceptance is still deferred pending permission for task-specific
 external cache/result directories on a different filesystem. Existing browser
 binaries are available, so no download is needed for the prepared attempt.

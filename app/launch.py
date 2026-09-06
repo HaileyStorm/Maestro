@@ -56496,9 +56496,13 @@ def _job_failure_positions(job: dict) -> tuple[dict | None, dict | None, dict | 
 
 def _failure_stage_from_job(job: dict) -> str:
     phase = str(job.get("phase") or job.get("message") or "").casefold()
-    if "vae decod" in phase:
+    if any(marker in phase for marker in (
+        "vae decod", "decoding h3 audio", "decoding h3 video",
+    )):
         return "vae_decode"
-    if "seal" in phase or "checkpoint" in phase:
+    if "audio checkpoint" in phase:
+        return "audio_mux"
+    if "segment checkpoint" in phase or "sealing rendered segment" in phase:
         return "segment_checkpoint"
     if "denois" in phase:
         return "denoise"
@@ -56506,7 +56510,7 @@ def _failure_stage_from_job(job: dict) -> str:
         return "flashvsr"
     if "delivery" in phase or "fitting exact" in phase:
         return "delivery"
-    if "audio" in phase or "mux" in phase:
+    if "mux" in phase or "combined with audio" in phase:
         return "audio_mux"
     if "post" in phase or "film grain" in phase or "voice clon" in phase:
         return "postprocess"
@@ -59449,6 +59453,13 @@ def _run_generation(
                         gen["file_list"].append(path)
                     return unit
 
+            def _h3_checkpoint_error(message: str) -> QueueRecoveryRuntimeError:
+                error = QueueRecoveryRuntimeError(message)
+                error.stage = "segment_checkpoint"
+                error.code = "segment_checkpoint_failed"
+                return error
+
+
             def _h3_verified_segment_dependency_evidence(
                 variant: int, segment_index: int,
             ) -> tuple[list[str], dict]:
@@ -59462,7 +59473,7 @@ def _run_generation(
                     project_dir=out_dir,
                 )
                 if predecessor is None or not predecessor.get("unit_id"):
-                    raise QueueRecoveryRuntimeError(
+                    raise _h3_checkpoint_error(
                         "H3 segment predecessor is not durably checkpointed."
                     )
                 artifact_hashes = sorted(
@@ -59471,7 +59482,7 @@ def _run_generation(
                     if isinstance(artifact, dict) and artifact.get("sha256")
                 )
                 if not artifact_hashes:
-                    raise QueueRecoveryRuntimeError(
+                    raise _h3_checkpoint_error(
                         "H3 segment predecessor has no attested artifact hash."
                     )
                 evidence = {"predecessor_artifact_hashes": artifact_hashes}

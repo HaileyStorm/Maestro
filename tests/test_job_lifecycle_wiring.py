@@ -1749,6 +1749,71 @@ class TestJobLifecycleWiring(unittest.TestCase):
         self.assertNotIn("ffmpeg stderr", str(details))
         self.assertNotIn("VRAM", details["detail"])
 
+    def test_stale_h3_audio_decode_phase_is_not_audio_mux(self):
+        tree = _parse("app/launch.py")
+        names = {
+            "_job_failure_positions",
+            "_failure_stage_from_job",
+            "_safe_failure_updates",
+        }
+        nodes = [
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in names
+        ]
+        namespace = {"wgp": SimpleNamespace(server_config={})}
+        module = ast.Module(body=nodes, type_ignores=[])
+        ast.fix_missing_locations(module)
+        exec(compile(module, "app/launch.py", "exec"), namespace)
+        for phase, expected in (
+            ("Prompt 2/6 - Decoding H3 audio", "vae_decode"),
+            ("Decoding H3 video", "vae_decode"),
+            ("VAE Decoding", "vae_decode"),
+            ("Sealing rendered segment", "segment_checkpoint"),
+            ("Segment checkpoint", "segment_checkpoint"),
+            ("Loading model checkpoint", "generation"),
+            ("Planning sealed reference packs", "generation"),
+            ("Audio checkpoint", "audio_mux"),
+            ("Muxing audio", "audio_mux"),
+            ("Denoising", "denoise"),
+            ("FlashVSR", "flashvsr"),
+            ("Publishing output", "publication"),
+        ):
+            with self.subTest(phase=phase):
+                self.assertEqual(namespace["_failure_stage_from_job"]({"phase": phase}), expected)
+        error = RuntimeError("H3 segment predecessor is not durably checkpointed.")
+        error.stage = "segment_checkpoint"
+        error.code = "segment_checkpoint_failed"
+        updates = namespace["_safe_failure_updates"](
+            error,
+            {"phase": "Prompt 2/6 - Decoding H3 audio"},
+        )
+        details = updates["failure_details"]
+        self.assertEqual(details["stage"], "segment_checkpoint")
+        self.assertEqual(details["code"], "segment_checkpoint_failed")
+        self.assertNotIn("combined with audio", details["detail"].casefold())
+
+    def test_h3_predecessor_verification_reports_checkpoint_failure(self):
+        from services.queue_recovery_runtime import QueueRecoveryRuntimeError
+
+        nodes = [_function(self.launch, name) for name in (
+            "_h3_checkpoint_error", "_h3_verified_segment_dependency_evidence",
+        )]
+        verify = Mock()
+        ns = {"QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+              "_queue_recovery_unit_matches": verify, "job": {}, "out_dir": "synthetic"}
+        exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), "launch.py", "exec"), ns)
+        evidence = ns["_h3_verified_segment_dependency_evidence"]
+        self.assertEqual(evidence(0, 0), ([], {}))
+        verify.assert_not_called()
+        for predecessor in (None, {"unit_id": "unit", "artifacts": []}):
+            verify.return_value = predecessor
+            with self.assertRaises(QueueRecoveryRuntimeError) as caught:
+                evidence(0, 1)
+            self.assertEqual(caught.exception.stage, "segment_checkpoint")
+            self.assertEqual(caught.exception.code, "segment_checkpoint_failed")
+        verify.return_value = {"unit_id": "unit", "artifacts": [{"sha256": "a" * 64}]}
+        self.assertEqual(evidence(0, 1), (["unit"], {"predecessor_artifact_hashes": ["a" * 64]}))
+
     def test_failed_multiclip_concat_removes_partial_output(self):
         concatenate = _load_isolated_function(
             "app/wgp.py",

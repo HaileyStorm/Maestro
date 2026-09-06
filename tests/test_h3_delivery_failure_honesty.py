@@ -71,6 +71,27 @@ class DeliveryStructuredFailureHonestyTests(unittest.TestCase):
                 self.assertNotIn("cuda_oom", json.dumps(details))
                 self.assertNotIn("hip_oom", json.dumps(details))
 
+    def test_segment_checkpoint_error_is_not_audio_mux(self):
+        from services.queue_recovery_runtime import QueueRecoveryRuntimeError
+
+        error = QueueRecoveryRuntimeError(
+            "H3 segment predecessor is not durably checkpointed."
+        )
+        error.stage = "segment_checkpoint"
+        error.code = "segment_checkpoint_failed"
+        details = build_failure_details(
+            error, stage="audio_mux", code="audio_mux_failed",
+        )
+        self.assertEqual(details["stage"], "segment_checkpoint")
+        self.assertEqual(details["code"], "segment_checkpoint_failed")
+        self.assertEqual(
+            details["detail"],
+            "The rendered segment could not be sealed for recovery.",
+        )
+        self.assertFalse(details["is_oom"])
+        self.assertNotIn("audio", details["detail"].casefold())
+
+
     def test_real_cuda_oom_still_publishes_confident_gpu_code(self):
         error = RuntimeError("CUDA out of memory while decoding delivery")
         details = build_failure_details(
