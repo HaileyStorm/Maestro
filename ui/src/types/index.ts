@@ -492,7 +492,17 @@ export interface H3PerformanceProfile {
   segment_count_estimate?: H3SegmentCountEstimate
 }
 
-export interface H3EstimateRequest {
+/** Explicit adaptive choices; omitted split lists retain legacy fallback. */
+export interface H3AdaptiveSelection {
+  h3_adaptive_fl2va_model?: string
+  h3_adaptive_ref2va_model?: string
+  h3_fl2va_loras?: string[]
+  h3_fl2va_loras_multipliers?: string
+  h3_ref2va_loras?: string[]
+  h3_ref2va_loras_multipliers?: string
+}
+
+export interface H3EstimateRequest extends H3AdaptiveSelection {
   model_type: string
   duration_seconds: number
   window_seconds: number
@@ -530,7 +540,7 @@ export interface H3EstimateResponse {
   profiles: H3PerformanceProfile[]
 }
 
-export interface GenerateParams {
+export interface GenerateParams extends H3AdaptiveSelection {
   prompt: string
   /** ACE-Step "Music Caption" — style/genre/instruments/mood (music mode). */
   alt_prompt?: string

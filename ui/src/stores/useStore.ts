@@ -1062,14 +1062,14 @@ type H3EstimateState = {
 
 function _buildH3EstimateRequest(
   state: H3EstimateState,
-  modelType = state.params.model_type,
+  modelType?: string,
 ): import('../types').H3EstimateRequest {
   const semanticImages = Math.max(
     state.imageRefs.length,
     Array.isArray(state.params.image_refs) ? state.params.image_refs.length : 0,
   )
   return {
-    model_type: modelType,
+    model_type: modelType ?? state.params.model_type,
     duration_seconds: state.durationSeconds,
     window_seconds: state.slidingWindowSeconds,
     window_overlap: state.slidingWindowOverlap,
@@ -1081,6 +1081,18 @@ function _buildH3EstimateRequest(
     custom_settings: { ...(state.params.custom_settings || {}) },
     activated_loras: [...(state.params.activated_loras || [])],
     loras_multipliers: state.params.loras_multipliers || '',
+    h3_adaptive_fl2va_model: modelType && [
+      'minimax_h3', 'minimax_h3_pinkcherry_fl2va', 'minimax_h3_w4a8_fl2va',
+    ].includes(modelType) ? modelType : state.params.h3_adaptive_fl2va_model,
+    h3_adaptive_ref2va_model: state.params.h3_adaptive_ref2va_model,
+    ...(Array.isArray(state.params.h3_fl2va_loras) ? {
+      h3_fl2va_loras: [...state.params.h3_fl2va_loras],
+      h3_fl2va_loras_multipliers: state.params.h3_fl2va_loras_multipliers,
+    } : {}),
+    ...(Array.isArray(state.params.h3_ref2va_loras) ? {
+      h3_ref2va_loras: [...state.params.h3_ref2va_loras],
+      h3_ref2va_loras_multipliers: state.params.h3_ref2va_loras_multipliers,
+    } : {}),
     tea_cache: state.params.tea_cache,
     spatial_upsampling: state.spatialUpsampling,
     delivery_resolution: state.params.delivery_resolution,

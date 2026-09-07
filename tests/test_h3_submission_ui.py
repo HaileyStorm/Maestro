@@ -63,11 +63,11 @@ process.stdout.write(JSON.stringify(cases.map(([name, payload, locked]) => [
         self.assertNotIn("api.previewGenerationPlan(params)", generation)
         self.assertLess(
             generation.index("applyH3SegmentCeilingPolicy("),
-            generation.index("api.submitGeneration(params)"),
+            generation.index("api.submitGeneration(params, holdForQueue)"),
         )
         self.assertLess(
             generation.index("jobs: [newJob, ...s.jobs]"),
-            generation.index("api.submitGeneration(params)"),
+            generation.index("api.submitGeneration(params, holdForQueue)"),
         )
         restore = source[source.index("const automaticH3Longform"):source.index("// Derive resolution preset")]
         self.assertIn("hasManualH3SegmentCeiling(", restore)

@@ -15321,6 +15321,10 @@ def _apply_h3_adaptive_checkpoint(body: dict) -> str:
     selected = str(body.get("model_type") or "")
     if selected not in _H3_LONG_STUDIO_MODELS:
         return selected
+    if body.get("h3_adaptive_conditioning", True) is not False:
+        _h3_preferred_fl2va_model(body)
+        if body.get("h3_adaptive_ref2va_model") not in (None, "", _H3_REF2VA_MODEL):
+            raise ValueError("MiniMax H3 Ref2VA model selection is unavailable.")
     has_semantic = bool(body.get("image_refs")) or any(
         body.get(key) for key in (
             "video_guide", "video_guide2", "video_guide3",
@@ -15374,12 +15378,15 @@ def _apply_h3_adaptive_checkpoint(body: dict) -> str:
 
 
 def _h3_preferred_fl2va_model(body: dict) -> str:
-    """Return the FL2VA checkpoint matching caller model-selection intent.
+    """Keep explicit adaptive choice, then the caller's selected FL2VA flavor.
 
-    Adaptive routing may temporarily use Ref2VA, but it must return to the
-    caller's exact Base, W4A8, or PinkCherry FL2VA flavor. ``explicit_output``
-    is output metadata and never participates in checkpoint selection.
+    Output metadata never participates in checkpoint selection.
     """
+    requested = body.get("h3_adaptive_fl2va_model")
+    if requested not in (None, ""):
+        if not isinstance(requested, str) or requested not in _H3_FL2VA_MODELS:
+            raise ValueError("MiniMax H3 FL2VA model selection is unavailable.")
+        return requested
     selected = str(
         body.get("_h3_requested_checkpoint")
         or body.get("model_type")
@@ -40244,6 +40251,7 @@ def _h3_estimate_context(body: dict, plan: dict | None = None) -> dict:
         "explicit_output": bool(body.get("explicit_output")),
     }
     for key in (
+        "h3_adaptive_fl2va_model", "h3_adaptive_ref2va_model",
         "h3_fl2va_loras", "h3_fl2va_loras_multipliers",
         "h3_ref2va_loras", "h3_ref2va_loras_multipliers",
     ):
@@ -40922,6 +40930,7 @@ async def h3_estimate(request: Request):
         "h3_adaptive_conditioning", "manual_segment_ceiling",
         "num_inference_steps", "resolution", "custom_settings",
         "activated_loras", "loras_multipliers", "reference_shape",
+        "h3_adaptive_fl2va_model", "h3_adaptive_ref2va_model",
         "h3_fl2va_loras", "h3_fl2va_loras_multipliers",
         "h3_ref2va_loras", "h3_ref2va_loras_multipliers",
         "explicit_output", "tea_cache",
@@ -40932,7 +40941,13 @@ async def h3_estimate(request: Request):
     if unknown:
         raise HTTPException(status_code=400, detail=f"Unsupported H3 estimate fields: {unknown}")
     selected_model = str(body.get("model_type") or "minimax_h3")
-    _require_remote_visible_models(request, [selected_model])
+    visibility_models = [selected_model]
+    if body.get("h3_adaptive_conditioning", True) is not False:
+        for key in ("h3_adaptive_fl2va_model", "h3_adaptive_ref2va_model"):
+            value = body.get(key)
+            if isinstance(value, (str, int, float, bool)) and value not in (None, ""):
+                visibility_models.append(str(value))
+    _require_remote_visible_models(request, visibility_models)
     if selected_model not in _H3_LONG_STUDIO_MODELS:
         raise HTTPException(status_code=400, detail="H3 estimates require a managed MiniMax H3 model")
     _require_h3_legal_execution([selected_model])
@@ -40969,6 +40984,15 @@ async def h3_estimate(request: Request):
         raise HTTPException(status_code=400, detail="Unsupported H3 reference shape")
     try:
         context = _h3_estimate_context(body)
+        estimate_models = {context["model_type"]}
+        if body.get("h3_adaptive_conditioning", True) is not False:
+            estimate_models.update(
+                body[key] for key in (
+                    "h3_adaptive_fl2va_model", "h3_adaptive_ref2va_model",
+                ) if body.get(key)
+            )
+        _require_remote_visible_models(request, sorted(estimate_models))
+        _require_h3_legal_execution(sorted(estimate_models))
         _validate_h3_lora_request({**body, "model_type": context["model_type"]})
         _validate_h3_turbo_estimate_context(context)
         _validate_h3_spectrum_estimate_context(context)

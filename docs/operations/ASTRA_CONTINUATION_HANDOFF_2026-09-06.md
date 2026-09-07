@@ -265,10 +265,29 @@ implementation, and retry. Verify supported canvas/model boundaries and retain
 source evidence separately from any GPU memory or performance claim. Keep UI,
 model routing, prompt, native-boundary, and offload WIP separate.
 
-For the remaining adaptive-conditioning/UI work, retain the selected FL2VA
-flavor, send the selected adaptive models and split lists in estimates, and align
-TypeScript basename normalization with the Python contract. Rendered acceptance
-remains a distinct follow-up gate.
+Adaptive estimate requests now carry explicit FL2VA/Ref2VA selections and
+independent LoRA lists/weights. Missing or null lists retain the shared-list
+fallback; an explicit empty list remains a clear selection. Compatibility
+queries for another FL2VA flavor use that queried model rather than a stale
+picker. The shared request type owns these fields for estimates and generation.
+The server honors explicit FL2VA selection, then preserves the selected flavor,
+then falls back to Base; output metadata never selects PinkCherry. Invalid
+adaptive IDs fail validation, and remote visibility runs before model/settings
+validation so hidden and unknown IDs share the same response. Effective-model
+access checks remain in place after routing.
+
+The final isolated candidate passes 136 backend tests and 478 UI tests, Python
+syntax, TypeScript, and the production build. Independent review is clean. One
+stale submission-source assertion now matches the held-job argument while
+preserving its ordering checks. Receipts and exact source hashes are under
+`.artifacts-temp/astra-adaptive-request-20260907/`. This is CPU, synthetic
+endpoint, and build evidence; no browser/server/GPU acceptance is claimed.
+
+Remaining adaptive UI work includes picker integration, persistence/seeding,
+TypeScript basename normalization against the Python contract, and rendered
+acceptance. Do not adopt the dirty helpers that make `explicit_output` choose
+PinkCherry: that behavior is superseded by the existing metadata-only contract.
+The broad picker/helper/default WIP remains uncommitted and separate.
 
 Browser acceptance is still deferred pending permission for task-specific
 external cache/result directories on a different filesystem. Existing browser
