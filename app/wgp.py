@@ -10306,6 +10306,19 @@ def _resolve_image_ref_fit(model_def, auto_aspect):
         return 1
     return ref_fit
 
+def _notify_h3_profile_observer(observer, event, model_type, profile=None, load_state=None):
+    """Keep advisory runtime observation outside generation error handling."""
+    if observer is None:
+        return
+    try:
+        if load_state is None:
+            observer(event, model_type, profile)
+        else:
+            observer(event, model_type, profile, load_state)
+    except Exception:
+        pass
+
+
 def generate_video(*args, **kwargs):
     """Outer wrapper so H3 denoise OOM can unwind before a safer retry."""
     from services.h3_oom_relief import (
@@ -10336,6 +10349,7 @@ def generate_video(*args, **kwargs):
         bound_kwargs[name] = value
 
     model_type = _bound_value("model_type")
+    profile_observer = _bound_value("_h3_profile_observer")
     if is_h3_model(model_type):
         current_profile = _bound_value("override_profile", -1)
         if current_profile in (None, -1):
@@ -10347,6 +10361,7 @@ def generate_video(*args, **kwargs):
             apply_h3_baseline_offload_profile(current_profile, model_type),
         )
     while True:
+        _notify_h3_profile_observer(profile_observer, "reset", model_type)
         try:
             result = _generate_video_impl(*bound_args, **bound_kwargs)
             if result:
@@ -10650,6 +10665,8 @@ def _generate_video_impl(
     # Director may supply a vocals-only derivative for conditioning while the
     # original audio_guide remains the soundtrack used for final delivery.
     audio_conditioning_guide=None,
+    # Ephemeral API-owned observation callback, never saved in task settings.
+    _h3_profile_observer=None,
 ):
 
     # API scheduling needs a model-safe boundary between independent outputs.
@@ -10730,6 +10747,8 @@ def _generate_video_impl(
             release_generation_residency_for_postprocess()
         return success
 
+    _notify_h3_profile_observer(_h3_profile_observer, "execution", model_type)
+    _h3_observation_request = (resolution, video_length, num_inference_steps)
     if str(model_type or "").startswith("minimax_h3"):
         try:
             from services.h3_host_limits import reason_if_blocked
@@ -11144,6 +11163,7 @@ def _generate_video_impl(
         cache_mode=skip_steps_cache_type,
         attention_backend=override_attention,
     )
+    _h3_profile_load_state = "cold"
     if model_type != transformer_type or reload_needed or profile != loaded_profile:
         if not configuration_reprofiled:
             release_model()
@@ -11189,6 +11209,8 @@ def _generate_video_impl(
         send_cmd("status", "Model loaded")
         send_cmd("refresh_models", get_unique_id())
         reload_needed=  False
+    else:
+        _h3_profile_load_state = "cold" if configuration_reprofiled else "resident"
     _clear_current_model_residency_evidence_context()
     # Remember the VAE setting we just asked for so the next generation's
     # comparison has a real value to check against (instead of falling back
@@ -11198,6 +11220,11 @@ def _generate_video_impl(
     if args.test:
         send_cmd("info", "Test mode: model loaded, skipping generation.")
         return True
+    _h3_observed_loaded_model = transformer_type
+    _h3_observed_loaded_profile = (
+        loaded_profile if wan_model is not None and offloadobj is not None
+        and not reload_needed else None
+    )
     overridden_attention = override_attention if len(override_attention) else get_overridden_attention(model_type)
     # if overridden_attention is not None and overridden_attention !=  attention_mode: print(f"Attention mode has been overriden to {overridden_attention} for model type '{model_type}'")
     attn = overridden_attention if overridden_attention is not None else attention_mode
@@ -12089,6 +12116,25 @@ def _generate_video_impl(
             )
 
     first_window_video_length = current_video_length
+    if (
+        initial_total_windows != 1 or batch_size != 1
+        or str(_h3_observation_request[0]).lower() != f"{width}x{height}"
+        or _h3_observation_request[1:] != (first_window_video_length, num_inference_steps)
+    ):
+        # Aggregate or internally reshaped work needs different benchmark
+        # accounting; do not label it with the original single-window request.
+        _notify_h3_profile_observer(_h3_profile_observer, "discard", model_type)
+    else:
+        _notify_h3_profile_observer(
+            _h3_profile_observer, "loaded", _h3_observed_loaded_model,
+            _h3_observed_loaded_profile if (
+                transformer_type == _h3_observed_loaded_model
+                and loaded_profile == _h3_observed_loaded_profile
+                and wan_model is not None and offloadobj is not None
+                and not reload_needed
+            ) else None,
+            load_state=_h3_profile_load_state,
+        )
     finalized_residency_evidence_context = _generation_residency_context(
         output_type=output_type,
         resolution=f"{width}x{height}",
@@ -12130,6 +12176,8 @@ def _generate_video_impl(
         gen["header_text"] = ""    
         if repeat_no >= total_generation: break
         repeat_no +=1
+        if repeat_no > 1:
+            _notify_h3_profile_observer(_h3_profile_observer, "discard", model_type)
         gen["repeat_no"] = (
             single_repeat_offset + repeat_no
             if single_repeat_dispatch else repeat_no
@@ -12312,6 +12360,8 @@ def _generate_video_impl(
             if window_no >= total_windows:
                 break
             window_no += 1
+            if window_no > 1:
+                _notify_h3_profile_observer(_h3_profile_observer, "discard", model_type)
             gen["window_no"] = window_no
             # The API runner publishes this state to Studio's job card. Keep
             # the exact per-window prompt here (after global-timeline mapping
@@ -13402,6 +13452,7 @@ def _generate_video_impl(
                     # of the duration users see or restore from metadata.
                     inputs["video_length"] = published_video_length
                 if overridden_inputs is not None: inputs.update(overridden_inputs)
+                inputs.pop("_h3_profile_observer", None)
                 durable_file_stem = None
                 if durable_output_dir is not None:
                     durable_repeat = (

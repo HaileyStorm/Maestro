@@ -543,14 +543,13 @@ class SpectrumCompatibilityTests(unittest.TestCase):
             "_H3_LONG_STUDIO_MODELS": {"minimax_h3"},
             "_H3_REF2VA_MODEL": "minimax_h3_ref2va",
             "_H3_W4A8_FL2VA_MODEL": "minimax_h3_w4a8_fl2va",
-            "_H3_PEAK_RECOVERY_POLICY_VERSION": 1,
-            "_h3_effective_offload_profile": (
-                lambda params: int(params.get("override_profile") or 4)
-            ),
+            "_H3_PEAK_RECOVERY_POLICY_VERSION": 2,
             "_h3_benchmark_input_signature": lambda _params, _case: {},
             "_get_h3_benchmark_cache": lambda: Cache(),
         }
-        exec(compile(ast.Module(body=[function], type_ignores=[]), "launch.py", "exec"), namespace)
+        observed_helper = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                               and node.name == "_h3_observed_offload_profile")
+        exec(compile(ast.Module(body=[observed_helper, function], type_ignores=[]), "launch.py", "exec"), namespace)
         return namespace["_record_h3_benchmark_observation"]
 
     def test_exact_base_native_matrix_is_accepted_for_sdpa_and_sol(self):
@@ -629,6 +628,7 @@ class SpectrumCompatibilityTests(unittest.TestCase):
 
     def test_observation_capture_skips_fallback_and_labels_only_completed_spectrum(self):
         params = {
+            "repeat_generation": 1, "batch_size": 1,
             "model_type": "minimax_h3",
             "video_length": 124,
             "num_inference_steps": 20,
@@ -643,7 +643,7 @@ class SpectrumCompatibilityTests(unittest.TestCase):
             {"reset_reason": "native_fallback"}, records,
         )
         fallback(
-            params, wall_time_seconds=10, output_files=["out.mp4"], out_dir=".",
+            params, wall_time_seconds=10, output_files=["out.mp4"], out_dir=".", observed_profile=4.5,
         )
         self.assertEqual(records, [])
 
@@ -663,7 +663,7 @@ class SpectrumCompatibilityTests(unittest.TestCase):
         ):
             completed(
                 params, wall_time_seconds=10,
-                output_files=["out.mp4"], out_dir=".",
+                output_files=["out.mp4"], out_dir=".", observed_profile=4.5,
             )
         self.assertEqual(len(records), 1)
         record = records[0]

@@ -22,8 +22,13 @@ class NativeOffloadEvidenceTests(unittest.TestCase):
                         if isinstance(node, ast.FunctionDef)
                         and node.name == "_h3_calibrated_peak_choice")
         cls.code = compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec")
+        cls.policy_version = next(ast.literal_eval(node.value) for node in tree.body
+                                  if isinstance(node, ast.Assign) and any(
+                                      isinstance(target, ast.Name)
+                                      and target.id == "_H3_PEAK_RECOVERY_POLICY_VERSION"
+                                      for target in node.targets))
 
-    def choose(self, profile):
+    def choose(self, profile, *, record_policy_version=None):
         gib = 1 << 30
         namespace = {
             "sys": types.SimpleNamespace(modules={}),
@@ -33,7 +38,7 @@ class NativeOffloadEvidenceTests(unittest.TestCase):
             ),
             "wgp": types.SimpleNamespace(_host_memory_snapshot=lambda: (48 * gib, 64 * gib)),
             "QueueRecoveryRuntimeError": ValueError,
-            "_H3_PEAK_RECOVERY_POLICY_VERSION": 1,
+            "_H3_PEAK_RECOVERY_POLICY_VERSION": self.policy_version,
             "_H3_PEAK_RECOVERY_HEADROOM_RATIO": 0.8,
             "_H3_PEAK_RECOVERY_HOST_HEADROOM_RATIO": 0.25,
             "_h3_effective_offload_profile": lambda params: 4,
@@ -52,7 +57,8 @@ class NativeOffloadEvidenceTests(unittest.TestCase):
             "spec": {
                 "task": {"offload_profile": profile, "frame_count": 128,
                          "width": 1344, "height": 768, "sampling_steps": 20,
-                         "recovery_policy_version": 1},
+                         "recovery_policy_version": (self.policy_version if record_policy_version is None
+                                                     else record_policy_version)},
                 "model": {"id": "minimax_h3"}, "engine": {"id": "sdpa"},
                 "hardware": {"gpu": "cpu"},
                 "runtime": {"torch": "synthetic", "cuda": "", "triton": "unknown"},
@@ -67,6 +73,11 @@ class NativeOffloadEvidenceTests(unittest.TestCase):
         for profile in (4.5, "4.5", 5.7, float("nan"), float("inf"), True, None):
             with self.subTest(profile=profile):
                 self.assertIsNone(self.choose(profile))
+
+    def test_requested_profile_era_records_are_not_loaded_profile_authority(self):
+        self.assertGreaterEqual(self.policy_version, 2)
+        self.assertIsNone(self.choose(5, record_policy_version=1))
+        self.assertIsNotNone(self.choose(5, record_policy_version=self.policy_version))
 
     def test_matching_integer_observations_retain_recovery_authority(self):
         for profile in (4, 5, "4"):
@@ -87,7 +98,10 @@ class OffloadWrapperBindingTests(unittest.TestCase):
         path = app / "wgp.py"
         node = next(node for node in ast.parse(path.read_text()).body
                     if isinstance(node, ast.FunctionDef) and node.name == "generate_video")
-        code = compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec")
+        observer_helper = next(item for item in ast.parse(path.read_text()).body
+                               if isinstance(item, ast.FunctionDef)
+                               and item.name == "_notify_h3_profile_observer")
+        code = compile(ast.Module(body=[observer_helper, node], type_ignores=[]), str(path), "exec")
         for style in ("positional", "keyword", "mixed"):
             with self.subTest(style=style):
                 calls = []

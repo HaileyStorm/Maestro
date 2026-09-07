@@ -547,6 +547,50 @@ service restart, or native Windows acceptance occurred. Unrelated H3/API/UI WIP
 remains unadopted. The continuous Goal and the remaining planned backlog stay
 active.
 
+## Task-bound offload observations — CPU integration, 2026-09-07
+
+H3 benchmark and allocation observations now require an ephemeral callback
+capture from the actual generation attempt. The callback is injected only into
+runtime arguments, survives nested one-output dispatch, and is removed from
+output settings after overrides. It never enters persisted task parameters.
+The existing wrapped function signature remains intact.
+
+The collector accepts one actual execution and one matching loaded-profile
+capture. Reset cannot erase cumulative attempts or ambiguity. Retries, repeated
+outputs, batches, multiple windows, dynamic extra repeats/windows, missing
+residency, and changed model/geometry/steps cannot become single-execution
+calibration authority. Capture occurs only at finalized geometry; a load or
+preprocessing failure before that boundary remains unobserved. Internally
+aligned or reshaped jobs still execute, but are skipped by this request-based
+benchmark accounting rather than labeled with guessed dimensions/frame counts.
+
+Cold/resident state now follows the actual load/reuse/reprofile decision,
+replacing the speculative pre-call resident check. Each worker owns its timing
+dictionary explicitly, so a delayed worker cannot label a later task. The first
+failed task's params and validated profile are snapshotted together after its
+stream exits; final OOM accounting cannot borrow the last loop task's values.
+Fractional 4.5 remains 4.5. Missing or mismatched captures skip observation.
+
+Calibrated-recovery policy revision 2 excludes requested-profile-era evidence;
+old ledger/cache files are not migrated or rewritten. Sealed v1 integer profile
+requests and completed-prefix provenance remain unchanged. Fractional records
+are retained accurately but still cannot alias an integer v1 recovery request.
+
+All 346 tests in the final assembled benchmark, capture, observed-offload,
+sealed-plan, WGP, audio, acceleration, and queue-recovery suites pass. Independent
+review is clean, including early OOM, actual load state, aggregate work, and
+timing isolation. This is CPU/static and synthetic execution evidence. No model
+load, GPU work, generation, service restart, browser, or Windows acceptance ran.
+Exact source hashes, preimages, prior failed fixtures, and final receipts are in
+`.artifacts-temp/astra-h3-observed-capture-20260907/`; collector lineage is in
+`.artifacts-temp/astra-h3-observation-collector-20260907/`.
+
+Next, complete native-max floor propagation and its requested-versus-effective
+profile query contract without changing v1 seals or observed retry history.
+The earlier parked candidate needs rebasing onto this capture boundary. Preserve
+unrelated FlashVSR, native-conditioning, prompt-adapter, and input-policy WIP.
+Browser acceptance still awaits its separately requested test-directory gate.
+
 ## Offload-profile precision prerequisite — 2026-09-07
 
 Benchmark construction, cache normalization, and allocation evidence now
@@ -568,13 +612,11 @@ and queue-recovery suites pass. Syntax and publication checks are separate
 final gates recorded in the private manifest.
 
 Native-max floor adoption remains open. Its source map distinguishes immutable
-v1 integer profile requests from the floating profile actually loaded. Current
-benchmark/allocation callers still derive their profile from a pre-floor
-request helper; serialization precision alone does not make that observed
-runtime evidence. Before changing the floor, add task-bound load/reuse evidence,
-clear it before each attempt, skip unknown/mismatched observations, and bind new
-calibration to an explicit policy revision. Preserve historical ledgers and
-completed-prefix requested-profile provenance rather than relabeling them.
+v1 integer profile requests from the floating profile actually loaded. At this
+precision checkpoint, benchmark/allocation callers still derived their profile
+from a pre-floor request helper. The subsequent task-bound observation change
+above closes that provenance gap. Historical ledgers and completed-prefix
+requested-profile provenance remain preserved rather than relabeled.
 
 Then finish resolution propagation through queue identity, wrapper, load,
 loaded identity/reprofile, and recovery. Observed 4.5 must remain 4.5 until a

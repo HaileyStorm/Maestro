@@ -17,6 +17,7 @@ from services.h3_benchmark import (  # noqa: E402
     H3BenchmarkCache,
     H3AllocationLedger,
     H3BenchmarkError,
+    H3OffloadObservation,
     aggregate_h3_estimates,
     build_benchmark_report,
     build_benchmark_spec,
@@ -38,6 +39,175 @@ def spec(case="text_only", engine="sdpa", signature=None):
         encoder={"id": "nvfp4", "revision": "enc", "sha256": "2" * 64},
         input_signature=signature,
     )
+
+
+class H3OffloadObservationTests(unittest.TestCase):
+    MODEL = "minimax_h3_ref2va"
+
+    def test_single_execution_preserves_exact_fractional_profile(self):
+        observation = H3OffloadObservation(self.MODEL)
+        observation("reset", self.MODEL)
+        observation("execution", self.MODEL)
+        observation("loaded", self.MODEL, 4.5)
+
+        self.assertEqual(observation.profile, 4.5)
+        self.assertIsInstance(observation.profile, float)
+        self.assertEqual(observation.load_state, "unknown")
+
+    def test_loaded_event_records_exact_load_state(self):
+        for load_state in ("cold", "resident"):
+            with self.subTest(load_state=load_state):
+                observation = H3OffloadObservation(self.MODEL)
+                observation("execution", self.MODEL)
+                observation("loaded", self.MODEL, 4.5, load_state)
+
+                self.assertEqual(observation.profile, 4.5)
+                self.assertEqual(observation.load_state, load_state)
+
+    def test_discard_permanently_invalidates_capture(self):
+        discard_events = (
+            ("discard", self.MODEL),
+            ("discard", self.MODEL, None),
+            ("discard", self.MODEL, None, "resident"),
+        )
+        for event in discard_events:
+            with self.subTest(event=event):
+                observation = H3OffloadObservation(self.MODEL)
+                observation("execution", self.MODEL)
+                observation("loaded", self.MODEL, 4.5, "cold")
+                self.assertEqual(observation.profile, 4.5)
+                self.assertEqual(observation.load_state, "cold")
+
+                observation(*event)
+                observation("reset", self.MODEL)
+                observation("execution", self.MODEL)
+                observation("loaded", self.MODEL, 5, "resident")
+
+                self.assertIsNone(observation.profile)
+                self.assertEqual(observation.load_state, "unknown")
+
+    def test_nested_resets_before_one_leaf_execution_do_not_add_work(self):
+        observation = H3OffloadObservation(self.MODEL)
+        observation("reset", self.MODEL)
+        observation("reset", self.MODEL, None)
+        observation("reset", self.MODEL)
+        observation("execution", self.MODEL)
+        observation("loaded", self.MODEL, 4)
+
+        self.assertEqual(observation.profile, 4)
+        self.assertIsInstance(observation.profile, int)
+
+    def test_reset_before_each_retry_preserves_total_execution_count(self):
+        observation = H3OffloadObservation(self.MODEL)
+        observation("reset", self.MODEL)
+        observation("execution", self.MODEL)
+        observation("reset", self.MODEL)
+        observation("execution", self.MODEL)
+        observation("loaded", self.MODEL, 5, "cold")
+
+        self.assertIsNone(observation.profile)
+        self.assertEqual(observation.load_state, "unknown")
+
+    def test_reset_clears_stale_capture_and_requires_a_new_execution(self):
+        observation = H3OffloadObservation(self.MODEL)
+        observation("execution", self.MODEL)
+        observation("loaded", self.MODEL, 4, "resident")
+        self.assertEqual(observation.profile, 4)
+        self.assertEqual(observation.load_state, "resident")
+
+        observation("reset", self.MODEL)
+        self.assertIsNone(observation.profile)
+        self.assertEqual(observation.load_state, "unknown")
+        observation("loaded", self.MODEL, 5)
+        observation("reset", self.MODEL)
+        observation("execution", self.MODEL)
+        observation("loaded", self.MODEL, 5)
+        self.assertIsNone(observation.profile)
+        self.assertEqual(observation.load_state, "unknown")
+
+    def test_model_mismatch_permanently_invalidates_capture(self):
+        observation = H3OffloadObservation(self.MODEL)
+        observation("execution", self.MODEL)
+        observation("loaded", "minimax_h3", 4.5)
+        observation("reset", self.MODEL)
+        observation("execution", self.MODEL)
+        observation("loaded", self.MODEL, 4.5)
+
+        self.assertIsNone(observation.profile)
+
+    def test_repeated_execution_cannot_collapse_into_one_observation(self):
+        observation = H3OffloadObservation(self.MODEL)
+        observation("execution", self.MODEL)
+        observation("execution", self.MODEL)
+        observation("loaded", self.MODEL, 4.5)
+
+        self.assertIsNone(observation.profile)
+
+    def test_duplicate_loaded_event_permanently_invalidates_capture(self):
+        observation = H3OffloadObservation(self.MODEL)
+        observation("execution", self.MODEL)
+        observation("loaded", self.MODEL, 4.5)
+        self.assertEqual(observation.profile, 4.5)
+
+        observation("loaded", self.MODEL, 4.5)
+        observation("reset", self.MODEL)
+        observation("execution", self.MODEL)
+        observation("loaded", self.MODEL, 4.5)
+        self.assertIsNone(observation.profile)
+
+    def test_invalid_profiles_fail_closed_and_never_recover(self):
+        invalid_profiles = (
+            True, False, "4.5", None, [], {}, 0, 3.25, 6,
+            float("nan"), float("inf"), float("-inf"),
+        )
+        for value in invalid_profiles:
+            with self.subTest(value=repr(value)):
+                observation = H3OffloadObservation(self.MODEL)
+                observation("execution", self.MODEL)
+                observation("loaded", self.MODEL, value)
+                observation("reset", self.MODEL)
+                observation("execution", self.MODEL)
+                observation("loaded", self.MODEL, 4.5)
+                self.assertIsNone(observation.profile)
+                self.assertEqual(observation.load_state, "unknown")
+
+    def test_invalid_load_state_fails_closed_and_never_recovers(self):
+        invalid_load_states = (
+            None, "", "unknown", "warm", True, 1, [], {},
+        )
+        for value in invalid_load_states:
+            with self.subTest(value=repr(value)):
+                observation = H3OffloadObservation(self.MODEL)
+                observation("execution", self.MODEL)
+                observation("loaded", self.MODEL, 4.5, value)
+                observation("reset", self.MODEL)
+                observation("execution", self.MODEL)
+                observation("loaded", self.MODEL, 4.5, "resident")
+
+                self.assertIsNone(observation.profile)
+                self.assertEqual(observation.load_state, "unknown")
+
+    def test_malformed_and_out_of_order_events_never_raise(self):
+        malformed_events = (
+            (),
+            ("loaded", self.MODEL, 4.5),
+            ("unknown", self.MODEL),
+            ("reset", self.MODEL, 4),
+            ("execution",),
+            ("execution", self.MODEL, {"attempt": 1}),
+            ("reset", self.MODEL, None, "cold"),
+            ("execution", self.MODEL, None, "resident"),
+        )
+        for event in malformed_events:
+            with self.subTest(event=event):
+                observation = H3OffloadObservation(self.MODEL)
+                observation(*event)
+                observation("loaded", self.MODEL, 4.5)
+                self.assertIsNone(observation.profile)
+
+        observation = H3OffloadObservation(self.MODEL)
+        observation(event="loaded", model=self.MODEL, profile=4.5)
+        self.assertIsNone(observation.profile)
 
 
 class H3BenchmarkTests(unittest.TestCase):

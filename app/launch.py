@@ -39514,7 +39514,7 @@ def h3_acceleration_status(probe: bool = False):
 
 _h3_benchmark_cache = None
 _h3_allocation_ledger = None
-_H3_PEAK_RECOVERY_POLICY_VERSION = 1
+_H3_PEAK_RECOVERY_POLICY_VERSION = 2
 _H3_PEAK_RECOVERY_HEADROOM_RATIO = 0.85
 _H3_PEAK_RECOVERY_HOST_HEADROOM_RATIO = 0.25
 
@@ -39588,6 +39588,47 @@ def _h3_allocation_scenario(
             0, int(getattr(wgp, "_h3_residency_epoch", 0) or 0),
         ),
     }
+
+
+def _h3_observed_offload_profile(value):
+    from services.h3_oom_relief import offload_rank
+    if type(value) not in (int, float) or offload_rank(value) < 0:
+        return None
+    return value
+
+
+def _h3_task_offload_profile(params, timing):
+    if not isinstance(params, dict) or not isinstance(timing, dict):
+        return None
+    context = timing.get("offload_context")
+    if not isinstance(context, dict):
+        return None
+    for key in ("model_type", "resolution", "video_length", "num_inference_steps", "repeat_generation", "batch_size"):
+        if params.get(key) is None or context.get(key) != params.get(key):
+            return None
+    if not params.get("model_type") or not isinstance(params.get("resolution"), str):
+        return None
+    try:
+        width, height = (int(value) for value in params["resolution"].lower().split("x"))
+    except (ValueError, TypeError):
+        return None
+    if width < 1 or height < 1 or any(
+        type(params[key]) is not int or params[key] < 1
+        for key in ("video_length", "num_inference_steps")
+    ):
+        return None
+    if any(type(params[key]) is not int or params[key] != 1 for key in ("repeat_generation", "batch_size")):
+        return None
+    return _h3_observed_offload_profile(timing.get("offload_profile"))
+
+
+def _h3_allocation_observation_scenario(params, *, frame_count, observed_profile):
+    profile = _h3_observed_offload_profile(observed_profile)
+    if profile is None:
+        raise QueueRecoveryRuntimeError("H3 loaded-profile evidence is unavailable.")
+    scenario = _h3_allocation_scenario(params, frame_count=frame_count)
+    scenario["offload_profile"] = profile
+    return scenario
 
 
 def _h3_allocation_success_outcome(params: dict) -> str:
@@ -39934,7 +39975,14 @@ def _record_h3_benchmark_observation(
     output_files: list[str],
     out_dir: str,
     model_load_state: str = "unknown",
+    observed_profile: int | float | None = None,
 ) -> None:
+    observed_profile = _h3_observed_offload_profile(observed_profile)
+    if observed_profile is None or any(
+        type(params.get(key)) is not int or params[key] != 1
+        for key in ("repeat_generation", "batch_size")
+    ):
+        return
     custom = params.get("custom_settings")
     if not isinstance(custom, dict):
         custom = {}
@@ -39983,13 +40031,17 @@ def _record_h3_benchmark_observation(
         else "first_frame" if has_start or has_end
         else "text_only"
     )
-    resolution = str(params.get("resolution") or "608x352").lower()
+    resolution = params.get("resolution")
+    if not isinstance(resolution, str):
+        return
     try:
-        width, height = [int(value) for value in resolution.split("x", 1)]
-    except (TypeError, ValueError):
-        width, height = 608, 352
-    frames = int(params.get("video_length") or 124)
-    steps = int(params.get("num_inference_steps") or 20)
+        width, height = [int(value) for value in resolution.lower().split("x", 1)]
+        frames = int(params.get("video_length"))
+        steps = int(params.get("num_inference_steps"))
+    except (TypeError, ValueError, OverflowError):
+        return
+    if min(width, height, frames, steps) < 1:
+        return
     profile = "quick" if (width, height, frames, steps) == (608, 352, 124, 4) else "observed_job"
     engine_id = str(custom.get("h3_attention_engine") or "sol_attn")
     # Explicit engines are fail-closed before an output can complete, so a
@@ -40059,7 +40111,7 @@ def _record_h3_benchmark_observation(
             "processed_frame_count": frames,
             "lora_count": len(params.get("activated_loras") or []),
             "cache_enabled": bool(params.get("tea_cache")),
-            "offload_profile": _h3_effective_offload_profile(params),
+            "offload_profile": observed_profile,
             "recovery_policy_version": _H3_PEAK_RECOVERY_POLICY_VERSION,
         },
     )
@@ -59433,6 +59485,7 @@ def _run_generation(
             cancelled = False
             first_task_error = None
             first_failure_details = None
+            first_failure_context = None
             first_resource_retryable = None
             last_residency_context = None
             allocation_success_observations: list[tuple[dict, str]] = []
@@ -60722,7 +60775,7 @@ def _run_generation(
                 worker_started = threading.Event()
                 worker_start_state = {"cancelled": False}
 
-                def make_error_handler(task, params, send_cmd):
+                def make_error_handler(task, params, send_cmd, call_timing):
                     def error_handler():
                         with worker_start_lock:
                             if worker_start_state["cancelled"]:
@@ -60730,6 +60783,7 @@ def _run_generation(
                                 return
                             worker_started.set()
                         call_started = time.perf_counter()
+                        profile_observation = None
                         try:
                             expected_args = set(inspect.signature(wgp.generate_video).parameters.keys())
                             filtered_params = {k: v for k, v in params.items() if k in expected_args}
@@ -60739,11 +60793,15 @@ def _run_generation(
                                 ] = True
                             plugin_data = task.get('plugin_data', {})
                             call_model = str(filtered_params.get("model_type") or "")
-                            _h3_call_timing["model_load_state"] = (
-                                "resident"
-                                if _h3_model_is_resident(call_model)
-                                else "cold"
-                            )
+                            filtered_params.pop("_h3_profile_observer", None)
+                            if call_model in _H3_LONG_STUDIO_MODELS:
+                                from services.h3_benchmark import H3OffloadObservation
+                                profile_observation = H3OffloadObservation(call_model)
+                                filtered_params["_h3_profile_observer"] = profile_observation
+                            call_timing["offload_context"] = {
+                                key: filtered_params.get(key)
+                                for key in ("model_type", "resolution", "video_length", "num_inference_steps", "repeat_generation", "batch_size")
+                            }
                             _run_generation_task_with_llm_exclusion(
                                 call_model,
                                 send_cmd,
@@ -60770,7 +60828,15 @@ def _run_generation(
                                 ],
                             )
                         finally:
-                            _h3_call_timing["seconds"] = max(
+                            call_timing["model_load_state"] = (
+                                profile_observation.load_state
+                                if profile_observation is not None else "unknown"
+                            )
+                            call_timing["offload_profile"] = (
+                                profile_observation.profile
+                                if profile_observation is not None else None
+                            )
+                            call_timing["seconds"] = max(
                                 0.001, time.perf_counter() - call_started,
                             )
                             send_cmd("exit", None)
@@ -60778,7 +60844,7 @@ def _run_generation(
 
                 wgp._recover_dead_async_listener(Listener)
                 try:
-                    async_run(make_error_handler(task, params, send_cmd))
+                    async_run(make_error_handler(task, params, send_cmd, _h3_call_timing))
                 except BaseException:
                     with worker_start_lock:
                         worker_start_state["cancelled"] = True
@@ -60892,6 +60958,7 @@ def _run_generation(
                 # Process stream — update job dict with live progress
                 task_error = False
                 task_failure_details = None
+                is_first_failure_task = False
                 last_msg_len = 0
                 in_status_line = False
                 while True:
@@ -60909,6 +60976,7 @@ def _run_generation(
                         failure_updates = _safe_failure_updates(data, job)
                         task_failure_details = failure_updates["failure_details"]
                         if first_task_error is None:
+                            is_first_failure_task = True
                             first_failure_details = task_failure_details
                             first_task_error = task_failure_details["detail"]
                             first_resource_retryable = (
@@ -61064,6 +61132,11 @@ def _run_generation(
                         print(f"\n  [INFO] {data}")
                         in_status_line = False
 
+                if is_first_failure_task:
+                    first_failure_context = (
+                        copy.deepcopy(task.get("params") or {}),
+                        _h3_task_offload_profile(task.get("params"), _h3_call_timing),
+                    )
                 task_residency_context = (
                     _current_model_residency_evidence_context()
                 )
@@ -61138,13 +61211,15 @@ def _run_generation(
                             model_load_state=str(
                                 _h3_call_timing.get("model_load_state") or "unknown"
                             ),
+                            observed_profile=_h3_task_offload_profile(task_params, _h3_call_timing),
                         )
                         allocation_success_observations.append((
-                            _h3_allocation_scenario(
+                            _h3_allocation_observation_scenario(
                                 task_params,
                                 frame_count=int(
                                     task_params.get("video_length") or 0
                                 ),
+                                observed_profile=_h3_task_offload_profile(task_params, _h3_call_timing),
                             ),
                             _h3_allocation_success_outcome(task_params),
                         ))
@@ -62511,12 +62586,14 @@ def _run_generation(
                         clean_episode, contamination = (
                             _h3_allocation_outcome_is_clean(job)
                         )
+                        failed_params, failed_profile = first_failure_context or ({}, None)
                         _get_h3_allocation_ledger().record(
-                            _h3_allocation_scenario(
-                                task_params,
+                            _h3_allocation_observation_scenario(
+                                failed_params,
                                 frame_count=int(
-                                    task_params.get("video_length") or 0
+                                    failed_params.get("video_length") or 0
                                 ),
+                                observed_profile=failed_profile,
                             ),
                             (
                                 "clean_oom"

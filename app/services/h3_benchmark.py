@@ -83,6 +83,128 @@ def _normalize_offload_profile(
     return int(numeric) if numeric.is_integer() else numeric
 
 
+class H3OffloadObservation:
+    """Capture one unambiguous loaded MMGP profile for one H3 execution."""
+
+    def __init__(self, expected_model_id: Any):
+        self._expected_model_id = (
+            expected_model_id
+            if isinstance(expected_model_id, str) and expected_model_id
+            else None
+        )
+        self._execution_count = 0
+        self._execution_pending = False
+        self._loaded_for_execution = False
+        self._profile: int | float | None = None
+        self._load_state = "unknown"
+        self._invalid = self._expected_model_id is None
+
+    def _clear_current(self) -> None:
+        self._execution_pending = False
+        self._loaded_for_execution = False
+        self._profile = None
+        self._load_state = "unknown"
+
+    def _invalidate(self) -> None:
+        self._invalid = True
+        self._clear_current()
+
+    def _matches_expected(self, model_id: Any) -> bool:
+        return (
+            isinstance(model_id, str)
+            and model_id == self._expected_model_id
+        )
+
+    def __call__(self, *event: Any, **event_kwargs: Any) -> None:
+        try:
+            if event_kwargs or len(event) not in {2, 3, 4}:
+                self._invalidate()
+                return
+            event_name, model_id = event[:2]
+            event_profile = event[2] if len(event) >= 3 else None
+            event_load_state = event[3] if len(event) == 4 else "unknown"
+            if not isinstance(event_name, str):
+                self._invalidate()
+                return
+
+            if event_name == "discard":
+                self._invalidate()
+                return
+
+            if event_name == "reset":
+                self._clear_current()
+                if (
+                    len(event) == 4
+                    or event_profile is not None
+                    or not self._matches_expected(model_id)
+                ):
+                    self._invalidate()
+                return
+
+            if event_name == "execution":
+                self._execution_count += 1
+                self._clear_current()
+                if (
+                    len(event) == 4
+                    or event_profile is not None
+                    or not self._matches_expected(model_id)
+                ):
+                    self._invalidate()
+                elif not self._invalid:
+                    self._execution_pending = True
+                return
+
+            if event_name != "loaded":
+                self._invalidate()
+                return
+            if (
+                self._invalid
+                or not self._matches_expected(model_id)
+                or not self._execution_pending
+                or self._loaded_for_execution
+                or isinstance(event_profile, bool)
+                or not isinstance(event_profile, (int, float))
+                or (
+                    len(event) == 4
+                    and (
+                        not isinstance(event_load_state, str)
+                        or event_load_state not in {"cold", "resident"}
+                    )
+                )
+            ):
+                self._invalidate()
+                return
+            try:
+                normalized = _normalize_offload_profile(
+                    event_profile,
+                    error_message="Invalid H3 offload observation",
+                )
+            except H3BenchmarkError:
+                self._invalidate()
+                return
+            self._execution_pending = False
+            self._loaded_for_execution = True
+            self._profile = normalized
+            self._load_state = event_load_state
+        except Exception:
+            # This callback is evidence collection, never generation authority.
+            self._invalidate()
+
+    @property
+    def profile(self) -> int | float | None:
+        if (
+            self._invalid
+            or self._execution_count != 1
+            or not self._loaded_for_execution
+        ):
+            return None
+        return self._profile
+
+    @property
+    def load_state(self) -> str:
+        return self._load_state if self.profile is not None else "unknown"
+
+
 def _safe_mapping(group: str, value: Mapping[str, Any] | None) -> dict[str, Any]:
     source = dict(value or {})
     return {
@@ -1460,7 +1582,7 @@ class H3BenchmarkCache:
 
 __all__ = [
     "CASE_IDS", "QUICK_TASK", "PUBLISHED_EXTERNAL", "H3BenchmarkCache",
-    "H3AllocationLedger", "ALLOCATION_HEURISTIC_REVISION",
+    "H3AllocationLedger", "H3OffloadObservation", "ALLOCATION_HEURISTIC_REVISION",
     "ALLOCATION_OOM_THRESHOLD", "ALLOCATION_SUCCESS_HYSTERESIS",
     "H3BenchmarkError", "build_benchmark_spec", "measure_benchmark",
     "record_observation", "build_benchmark_report", "estimate_h3_output",

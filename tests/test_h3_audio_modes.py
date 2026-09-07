@@ -539,7 +539,9 @@ class H3AudioBenchmarkIsolationTests(unittest.TestCase):
             if isinstance(item, ast.FunctionDef)
             and item.name == "_record_h3_benchmark_observation"
         )
-        module = ast.Module(body=[node], type_ignores=[])
+        observed_helper = next(item for item in tree.body if isinstance(item, ast.FunctionDef)
+                               and item.name == "_h3_observed_offload_profile")
+        module = ast.Module(body=[observed_helper, node], type_ignores=[])
         ast.fix_missing_locations(module)
         namespace = {"wgp": object(), "_H3_LONG_STUDIO_MODELS": set()}
         exec(compile(module, str(APP / "launch.py"), "exec"), namespace)
@@ -556,17 +558,17 @@ class H3AudioBenchmarkIsolationTests(unittest.TestCase):
 
         experimental = TrackingParams({
             "custom_settings": {"h3_source_audio_mode": "remix_source"},
-            "model_type": "minimax_h3",
+            "model_type": "minimax_h3", "repeat_generation": 1, "batch_size": 1,
         })
         capture(
-            experimental, wall_time_seconds=1, output_files=[], out_dir=".",
+            experimental, wall_time_seconds=1, output_files=[], out_dir=".", observed_profile=4.5,
         )
         self.assertNotIn("model_type", experimental.keys_read)
 
         ordinary = TrackingParams({
-            "custom_settings": {}, "model_type": "not-h3",
+            "custom_settings": {}, "model_type": "not-h3", "repeat_generation": 1, "batch_size": 1,
         })
-        capture(ordinary, wall_time_seconds=1, output_files=[], out_dir=".")
+        capture(ordinary, wall_time_seconds=1, output_files=[], out_dir=".", observed_profile=4.5)
         self.assertIn("model_type", ordinary.keys_read)
 
     def test_estimate_transport_allowlist_contains_only_path_free_audio_controls(self):
