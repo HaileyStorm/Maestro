@@ -232,10 +232,35 @@ the upstream quantizer requires. No package or numerical validation completed;
 the process exited and its lease is confirmed cancelled. `attempt1/` preserves
 the original runner, plan, grant, log, and result. Independent flag review
 confirmed that undefining the four injected suppression macros restores the
-upstream CMake contract without changing kernel source. The corrected runner
-has a refreshed source-bound plan and a separate queued request. Read the
-current coordinator response and validate it before starting; this checkpoint
-does not prove a second grant or build success.
+upstream CMake contract without changing kernel source.
+
+The corrected runner subsequently received and validated a fresh lease. All
+nine translation units built successfully, and the private complete package
+passed all nine default-cuBLAS synthetic cases: widths 32/64/96, logical rows
+1/50/129, and output width 128. Outputs were finite with relative MAE
+0.0069444–0.0555556 against the dequantized reference. The process recorded
+native quantization/GEMM dispatch and 42,283,520 peak allocated bytes. ELF
+dependencies and actual process maps confirmed CUDA-13 cuBLASLt/runtime;
+no CUDA-12 cuBLASLt/runtime was mapped. The selector was absent, so this
+acceptance used the default cuBLAS route, not the earlier CUTLASS override.
+Extension SHA-256:
+`b2fde2c3b1f4a0748457396c6d716d3c859568fe214fe707cb517fb1dfeeb0e7`.
+
+The process exited successfully and `withdrawal-r2.json` confirms the request
+no longer grants authority and its ledger lease is cancelled. Build, package
+hash, source, process-map, and numerical receipts remain in the artifact above.
+No installed package, launcher, default selector, or running service changed.
+`package_wheel.py` now packages the exact verified bytes with source/CUTLASS
+licenses and Python/runtime metadata. Repacking produces the identical wheel
+hash, and every RECORD entry passes an independent hash/size check. Wheel:
+`lightx2v_kernel-0.0.2+torch2.10.0.cu130.maestro1-cp311-cp311-linux_x86_64.whl`,
+SHA-256 `a7ebaf98817810394e24ea5e93e9b4774b615bbcb3c4db17d4574f201bac0be7`.
+This is deterministic packaging of the tested local build, not independently
+reproduced compilation or a cross-platform distribution release.
+Next: preserve installed-package rollback, make the source/build installation
+flow reproducible in the normal launcher, and validate the installed runtime
+under a separate fresh lease.
+Full-model generation, visual quality, performance, and Windows remain open.
 
 While waiting, a direct CPU audit of the uncommitted `h3_prompt_adapt.py` found
 two reproducible blockers to integration: an embedded `summary:` label inside
@@ -247,6 +272,25 @@ adapter unchanged or treat its eight simple tests as preservation evidence.
 Keep single-owner dialogue, literal authored text, and sealed execution digests
 as the acceptance conditions when replacing its field parser/summary behavior.
 The clip/model-count probe retained both clips and is not a failure finding.
+
+A subsequent unadopted candidate protects dialogue with the planner's exact
+placeholder mechanism and shared top-level parser. Fourteen CPU unit tests
+pass, including embedded field names, multiline dialogue, placeholder-like
+authored strings, and rejection of duplicate/mixed fields and unsupported
+Ref2VA-to-Base text. Review exposed additional execution requirements: a
+generated Ref2VA summary needs its reference-derived official task-type
+prefix; summary-only input must compile to actual shot records rather than
+`detailed_description: N/A`; any Base visual plus Ref-only field is mixed;
+and unsupported summary/reference text needs exact shot ownership before
+relocation. Noncanonical wrapper headers are not a valid preservation fix.
+
+Candidate source/tests, original preimages, hashes, and open requirements are
+in `.artifacts-temp/astra-prompt-preservation-20260907/`. The original untracked
+workspace files were restored byte-for-byte; the candidate is not dispatched
+or adopted. Continue through the canonical compiler and target-schema
+postconditions, then review the existing event-restoration/resealing helpers
+and callsites before integration. Passing parser unit tests alone is not
+executable-prompt acceptance.
 
 ## Successor progress
 

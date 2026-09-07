@@ -246,8 +246,9 @@ Process maps confirmed that library, but the first case then failed with
 Its lease is confirmed cancelled and the task-private link was removed.
 
 The instrumented CUDA-13 diagnostic below completes that bounded build check.
-The complete package still needs reproducible build, resolved-dependency,
-rollback, and installed-runtime verification before promotion. The passing CUTLASS comparison is not promoted to a permanent
+The complete private package build and resolved-dependency check subsequently
+passed as recorded below. Packaging, rollback, and installed-runtime
+verification remain required before promotion. The passing CUTLASS comparison is not promoted to a permanent
 default. Receipts: `.artifacts-temp/astra-lightx-route-20260907/` and
 `.artifacts-temp/astra-lightx-cublas128-20260907/`. This evidence does not
 establish full-model correctness, speed, or Windows acceptance.
@@ -266,8 +267,19 @@ output and relative MAE 0.0069444444961845875. The diagnostic binary hash is
 The process exited and the lease was withdrawn/confirmed cancelled. Receipts:
 `.artifacts-temp/astra-lightx-cu13-build-20260907/`.
 
-This supports the ABI diagnosis but does not close complete-package,
-installed-runtime, full-model, performance, or Windows acceptance. The next
-step is a reproducible complete package build with rollback and separate
-installed-runtime validation; diagnostic operators and temporary selectors
-remain unpromoted.
+This diagnostic supports the ABI diagnosis. Diagnostic operators and temporary
+selectors remain unpromoted.
+
+## Complete CUDA-13 package — 2026-09-07 UTC
+
+The source-bound complete private package built and passed all nine synthetic
+default-cuBLAS cases under a fresh validated lease. Actual process maps used
+CUDA-13 libraries with no CUDA-12 cuBLASLt/runtime mapped. The child exited
+successfully and the lease is confirmed cancelled. See the
+[complete build evidence and receipts](ASTRA_CONTINUATION_HANDOFF_2026-09-06.md#cuda-13-diagnostic-result--2026-09-07-utc)
+for exact shapes, numerical results, source/binary hashes, and the corrected
+compiler flags.
+
+Installed-runtime rollout, reproducible distribution packaging, rollback,
+full-model generation, visual quality, performance, and Windows acceptance
+remain open. The installed package and running services were not changed.
