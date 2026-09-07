@@ -1459,3 +1459,20 @@ audit the inherited _UNREQUESTED_SPECTACLE_PATTERNS prompt/plan keyword checks i
 h3_sequence_planner, h3_planner_helpers and h3_story_ledger against the project's
 local-content-neutrality rule; they were encountered during this source pass and
 are not covered by the role-formatting neutrality tests.
+
+### Reference metadata cache binding (2026-09-07)
+
+The sequence-plan signature now includes has_audio, so a changed video soundtrack
+flag cannot reuse the old reference plan. Its existing ordered field projection
+now lives in reference_manifest.reference_binding_projection; the caller uses
+that shared owner rather than maintaining another list. The projection snapshots
+metadata and preserves kind aliases while excluding unrelated UI keys. Admission
+validation remains separate, and a path is not proof of immutable file contents.
+
+All 155 applicable CPU tests pass with two skipped. Regressions prove soundtrack
+presence changes both reference context and cache signature; roles, asset paths,
+intents and order remain bound; irrelevant UI metadata is excluded; and JSON
+round trips are stable. Evidence: `.artifacts-temp/astra-reference-binding-20260907/`.
+Use this projection with validated active inputs for mapper integration, adding
+separately proven asset identity when available. No GPU/model/service/browser or
+Windows acceptance is claimed. The inherited keyword-check audit remains separate.

@@ -8,6 +8,7 @@ lightweight tools and CI.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 
@@ -22,6 +23,28 @@ _VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
 _AUDIO_EXTENSIONS = {".aac", ".flac", ".m4a", ".mp3", ".ogg", ".wav"}
 _AUDIO_INTENTS = {"voice", "drive", "style"}
 _IMAGE_INTENTS = {"identity", "scene", "style", "composition"}
+
+
+def reference_binding_projection(references) -> list[dict]:
+    """Snapshot ordered reference metadata used by prompt planning.
+
+    This projection does not validate inputs or inspect files. Callers retain
+    their admission checks; paths identify metadata, not immutable file content.
+    """
+    return [
+        copy.deepcopy({
+            "type": item.get("type") or item.get("kind"),
+            "path": item.get("path"),
+            "role": item.get("role"),
+            "image_intent": item.get("image_intent"),
+            "audio_intent": item.get("audio_intent"),
+            "include_audio": item.get("include_audio"),
+            "audio_path": item.get("audio_path"),
+            "has_audio": item.get("has_audio"),
+        })
+        for item in (references or [])
+        if isinstance(item, dict)
+    ]
 
 
 def reference_role_text(role: str) -> str:

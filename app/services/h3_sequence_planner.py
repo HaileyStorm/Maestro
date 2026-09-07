@@ -172,19 +172,9 @@ def h3_sequence_plan_signature(
     overlap_frames: int = 0,
     native_continuation: bool = False,
 ) -> str:
-    reference_contract = [
-        {
-            "type": item.get("type") or item.get("kind"),
-            "path": item.get("path"),
-            "role": item.get("role"),
-            "image_intent": item.get("image_intent"),
-            "audio_intent": item.get("audio_intent"),
-            "include_audio": item.get("include_audio"),
-            "audio_path": item.get("audio_path"),
-        }
-        for item in (references or [])
-        if isinstance(item, dict)
-    ]
+    from models.minimax_h3.reference_manifest import reference_binding_projection
+
+    reference_contract = reference_binding_projection(references)
     payload = {
         "planner_version": _H3_SEQUENCE_PLANNER_VERSION,
         "prompt": str(prompt or "").strip(),

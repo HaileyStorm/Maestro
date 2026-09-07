@@ -6,9 +6,9 @@ import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'app'))
-from models.minimax_h3.reference_manifest import reference_role_text
+from models.minimax_h3.reference_manifest import reference_role_text, reference_binding_projection
 from services.director.h3_dialogue import compile_h3_official_prompt, validate_h3_prompt_contract
-from services.h3_sequence_planner import _reference_context
+from services.h3_sequence_planner import _reference_context, h3_sequence_plan_signature
 from services.h3_audio import validate_prompt_media_ordinals
 
 
@@ -83,6 +83,43 @@ class ReferenceRoleTests(unittest.TestCase):
         self.assertIn('<Subject 1>', prompt)
         self.assertNotIn('<Subject 2>', prompt)
         self.assertEqual(validate_h3_prompt_contract(prompt, [], mode='ref2va', references=refs), [])
+
+
+class ReferenceBindingTests(unittest.TestCase):
+    def signature(self, references):
+        return h3_sequence_plan_signature(
+            'A person walks.', model_type='minimax_h3_ref2va', resolution='1280x720',
+            total_frames=240, min_clip_frames=124, max_clip_frames=345, frame_step=17,
+            fps=24, references=references)
+
+    def test_soundtrack_presence_invalidates_cached_reference_plan(self):
+        without = [{'type': 'video', 'path': 'video.mp4', 'has_audio': False}]
+        with_audio = [{'type': 'video', 'path': 'video.mp4', 'has_audio': True}]
+        self.assertNotEqual(_reference_context(without), _reference_context(with_audio))
+        self.assertNotEqual(self.signature(without), self.signature(with_audio))
+        self.assertEqual(self.signature(with_audio), self.signature(json.loads(json.dumps(with_audio))))
+
+    def test_reference_roles_assets_intents_and_order_remain_bound(self):
+        refs = [{'type': 'image', 'path': 'one.png', 'role': 'lead', 'image_intent': 'identity'},
+                {'type': 'image', 'path': 'two.png', 'role': 'scene', 'image_intent': 'scene'}]
+        original = self.signature(refs)
+        for key, value in (('path', 'other.png'), ('role', 'someone else'), ('image_intent', 'style')):
+            changed = copy.deepcopy(refs)
+            changed[0][key] = value
+            with self.subTest(key=key):
+                self.assertNotEqual(self.signature(changed), original)
+        self.assertNotEqual(self.signature(list(reversed(refs))), original)
+        changed = copy.deepcopy(refs)
+        changed[0]['irrelevant_ui_note'] = 'not a runtime input'
+        self.assertEqual(self.signature(changed), original)
+
+    def test_projection_is_a_snapshot_and_preserves_kind_alias(self):
+        refs = [{'kind': 'video', 'path': 'video.mp4', 'has_audio': True}]
+        result = reference_binding_projection(refs)
+        refs[0]['path'] = 'later.mp4'
+        self.assertEqual(result[0]['type'], 'video')
+        self.assertEqual(result[0]['path'], 'video.mp4')
+        self.assertTrue(result[0]['has_audio'])
 
 
 if __name__ == '__main__':
