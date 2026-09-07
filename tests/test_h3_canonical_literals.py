@@ -1,7 +1,7 @@
 """Model-free exact dialogue preservation through physical record mapping."""
 import ast
 from pathlib import Path
-import re
+import subprocess
 import sys
 import unittest
 
@@ -12,13 +12,10 @@ sys.path.insert(0, str(ROOT / 'app'))
 def compiler():
     path = ROOT / 'app/services/director_pipeline.py'
     tree = ast.parse(path.read_text())
-    functions = {'_director_h3_record_payload', '_director_h3_time_token', '_director_h3_canonical_prompt'}
-    constants = {'_DIRECTOR_H3_RECORD_PAYLOAD_RE', '_DIRECTOR_H3_DIALOGUE_RE'}
-    nodes = [node for node in tree.body if
-             isinstance(node, ast.FunctionDef) and node.name in functions or
-             isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id in constants
-                                                  for target in node.targets)]
-    namespace = {'re': re}
+    from services.h3_canonical_prompt import h3_record_payload
+    nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+             and node.name in {'_director_h3_canonical_prompt', '_director_h3_scene_prompt'}]
+    namespace = {'h3_record_payload': h3_record_payload}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), namespace)
     return namespace
 
@@ -28,6 +25,67 @@ class CanonicalLiteralTests(unittest.TestCase):
     def setUpClass(cls):
         cls.namespace = compiler()
 
+    def test_shared_compiler_import_and_execution_do_not_load_director_or_torch(self):
+        result = subprocess.run(
+            [sys.executable, '-c',
+             'import sys; from services.h3_canonical_prompt import canonicalize_h3_prompt; '
+             'result = canonicalize_h3_prompt("A person walks.", duration_seconds=5, mode="t2va"); '
+             'assert "[Shot 1]" in result; '
+             'assert "services.director_pipeline" not in sys.modules; '
+             'assert "torch" not in sys.modules'],
+            cwd=ROOT / 'app', capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_director_wrapper_preserves_shared_results_and_errors(self):
+        from services.h3_canonical_prompt import canonicalize_h3_prompt
+        wrapper = self.namespace['_director_h3_canonical_prompt']
+        for prompt in ('A person walks.', '<d>[English] Keep  this.</d>'):
+            with self.subTest(prompt=prompt):
+                self.assertEqual(wrapper(prompt, duration_seconds=5, mode='t2va'),
+                                 canonicalize_h3_prompt(prompt, duration_seconds=5, mode='t2va'))
+        with self.assertRaises(ValueError) as direct:
+            canonicalize_h3_prompt('summary: incomplete', duration_seconds=5, mode='ref2va')
+        with self.assertRaises(ValueError) as wrapped:
+            wrapper('summary: incomplete', duration_seconds=5, mode='ref2va')
+        self.assertEqual(str(wrapped.exception), str(direct.exception))
+
+    def test_explicit_timed_events_remain_a_source_when_prompt_is_empty(self):
+        from services.h3_canonical_prompt import canonicalize_h3_prompt
+        events = [{'kind': 'range', 'start': 0, 'end': 2.5, 'text': 'A person walks.', 'order': 0},
+                  {'kind': 'range', 'start': 2.5, 'end': 5, 'text': 'A person stops.', 'order': 1}]
+        direct = canonicalize_h3_prompt('', duration_seconds=5, events=events, mode='t2va')
+        scene = self.namespace['_director_h3_scene_prompt'](
+            {'window_prompts': ['A person walks.', 'A person stops.']},
+            frame_count=120, fps=24, mode='t2va')
+        self.assertEqual(scene, direct)
+        self.assertIn('[0.000s-2.500s]', direct)
+        self.assertIn('[2.500s-5.000s]', direct)
+        self.assertIn('A person walks.', direct)
+        self.assertIn('A person stops.', direct)
+
+    def test_explicit_events_cannot_fabricate_records_from_blank_payloads(self):
+        from services.h3_canonical_prompt import canonicalize_h3_prompt
+        valid = {'kind': 'range', 'start': 0, 'end': 2.5, 'text': 'A person walks.', 'order': 0}
+        for events in ([{}], [{'text': ''}], [{'text': '   '}], [{'text': None}],
+                       [valid, {'kind': 'range', 'start': 2.5, 'end': 5, 'text': '', 'order': 1}],
+                       {'text': 'A person walks.'}, ['A person walks.']):
+            for prompt in ('', 'A person walks.'):
+                with self.subTest(events=events, prompt=prompt), self.assertRaisesRegex(
+                        ValueError, 'nonblank text records'):
+                    canonicalize_h3_prompt(prompt, duration_seconds=5, events=events)
+
+    def test_empty_sources_and_invalid_durations_fail_before_record_generation(self):
+        from services.h3_canonical_prompt import canonicalize_h3_prompt
+        for prompt in ('', ' ', '\n\r\t', None, 7, False):
+            with self.subTest(prompt=prompt), self.assertRaisesRegex(ValueError, 'must contain text'):
+                canonicalize_h3_prompt(prompt, duration_seconds=5)
+        for duration in (True, False, 0, -1, float('nan'), float('inf'), -float('inf'),
+                         'nan', 'inf', None, {}, 10 ** 10000):
+            with self.subTest(duration_type=type(duration).__name__), self.assertRaisesRegex(
+                    ValueError, 'positive finite number'):
+                canonicalize_h3_prompt('A person walks.', duration_seconds=duration)
+
     def test_freeform_and_structured_records_keep_authored_dialogue_bytes(self):
         literal = '<d>[English] Keep  these\tspaces, summary: exactly.</d>'
         for prompt in (
@@ -35,7 +93,7 @@ class CanonicalLiteralTests(unittest.TestCase):
             f'shot_name: Speak | audiovisual_description: A person speaks | dialogue_and_vocalizations: {literal}',
         ):
             with self.subTest(prompt=prompt):
-                name, visual, vocals = self.namespace['_director_h3_record_payload'](prompt, 1)
+                name, visual, vocals = self.namespace['h3_record_payload'](prompt, 1)
                 self.assertEqual(vocals, literal)
                 self.assertNotIn(literal, visual)
                 self.assertNotIn(literal, name)
@@ -43,7 +101,7 @@ class CanonicalLiteralTests(unittest.TestCase):
     def test_repeated_literals_keep_occurrence_count_and_order(self):
         one = '<d>[English] Wait  here.</d>'
         two = '<d>[French] Reste\tici.</d>'
-        _, _, vocals = self.namespace['_director_h3_record_payload'](f'A person says {one} {two} {one}', 1)
+        _, _, vocals = self.namespace['h3_record_payload'](f'A person says {one} {two} {one}', 1)
         self.assertEqual(vocals, f'{one} {two} {one}')
 
     def test_canonical_compiler_preserves_literal_and_validates_target(self):

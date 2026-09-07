@@ -1366,3 +1366,29 @@ a workaround. Resolve the actual target-audio versus reference-audio contract in
 the caller integration. Mapper source preservation, manifest binding, Ref-only
 field ownership, and real geometry/reference wiring remain open. No GPU/model,
 restart, browser, mixed-K runtime or Windows acceptance is claimed.
+
+### Shared physical-record canonicalizer (2026-09-07)
+
+The existing Director compiler now lives in services.h3_canonical_prompt. Director
+keeps its canonical-prompt wrapper and forwards prompt, duration, events, and mode
+unchanged; unused local payload/time helpers and regex copies are removed. The
+initial extraction is AST-identical after identifier renaming. Input guards
+then reject text-free requests without events, malformed or blank event payloads,
+and invalid, Boolean, overflowing, nonpositive or nonfinite durations. Explicit timed events remain a
+valid source when prompt text is empty, including the Director window-prompts path.
+
+The clean ten-module gate passes all 525 tests. Independent review closed the
+empty-event-source and blank-event-payload findings. Final focused checks pass
+after removing an unused import and obsolete test alias. A fresh subprocess compiles an
+ordinary prompt without importing Director or torch. Wrapper output/error parity
+and exact dialogue preservation are covered, and four synthetic Base/Ref2VA
+mapper probes pass using the shared compiler. Evidence:
+`.artifacts-temp/astra-canonical-service-20260907/`. The rejected blanket blank
+guard and its reproduced multi-window regression are retained as provenance.
+
+Use canonicalize_h3_prompt directly when replacing the prototype's arbitrary
+canonicalizer callback. This extraction does not adopt the mapper or establish
+its source-conservation guarantee: stale reference binding, structural role
+encoding, Ref-only field ownership, source geometry and real reference/drive
+routing remain open. No GPU/model, service, browser or Windows acceptance is
+claimed. The historical tracker remains held and unrelated WIP is preserved.
