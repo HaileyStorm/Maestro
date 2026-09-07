@@ -1144,3 +1144,40 @@ that dirt. If incoming changes now exist, reconcile safely rather than force.
 The predecessor performs no further feature work after writing this handoff.
 The successor owns the new Goal and continuation, not the paused predecessor's
 native state. Retain the unfinished broad objective until genuinely satisfied.
+
+### FlashVSR delivery publication checkpoint (2026-09-07)
+
+Whole-file delivery now checks the segment writer's success result, coded pixel
+canvas and frame count before transfer; muxing must preserve the upscaled
+canvas. Private unique scratch files are registered for cleanup before encoding.
+In-place publication uses atomic replacement and preserves original bytes on
+encoding, muxing, cancellation, or replacement failure. Exact fit uses coded
+pixels and square sample aspect ratio; display metadata cannot authorize
+interpolation enlargement in place of learned upscaling. API deferral uses the
+bridge classifier, including supported mixed-case values and the empty-mode path.
+
+The uncommitted blanket WGP H3 deferral is removed: Classic, CLI and headless
+callers retain inline upscaling because they do not enter Continuum's whole-file
+delivery layer. The unlink-before-rename workaround, ineffective post-rename
+byte ratio, duplicate release, raw diagnostics, and associated draft assertions
+are superseded; exact preimages remain in the private evidence directory.
+A stale Studio predicted-residency assertion now follows the already-shipped
+observed-load-state contract.
+
+The clean candidate passes all 409 tests across delivery files, H3 memory
+lifecycle, job wiring, delivery OOM recovery, queue recovery, Studio and H3
+profiles. Evidence includes real CPU FFmpeg coded-canvas/SAR/audio-presence
+checks and owned-child cancellation/timeout reaping. Independent source review
+has no blocking publication findings. Syntax and patch checks pass. Evidence:
+`.artifacts-temp/astra-flashvsr-delivery-20260907/`.
+
+Next delivery action: extend the shared imageio segment writer and audio mux
+with optional abort/deadline controls, preserving codec and audio metadata
+behavior and generic callers. Those calls remain non-cooperative; cancellation
+acceptance here covers only concat and exact-fit encoder processes. Require
+real-child stop/reap and partial-output cleanup regressions before closing that
+gap. GPU/model, live service, browser and native Windows acceptance remain
+unproven. The owner has authorized GPU work only under fresh coordinator grants;
+this checkpoint requested no lease and performed no GPU or model work. Preserve
+the historical tracker hold and all unrelated WIP. The continuous Goal remains
+active with this and the existing planned backlog outstanding.

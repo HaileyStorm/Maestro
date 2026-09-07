@@ -1898,7 +1898,8 @@ process.stdout.write(JSON.stringify(effectiveSlidingWindowGeometry(10, 5, 5, opt
         ]
         self.assertIn("wgp.generate_video", timer)
         self.assertIn('time.perf_counter() - call_started', timer)
-        self.assertIn("_h3_model_is_resident(call_model)", timer)
+        self.assertIn("profile_observation.load_state", timer)
+        self.assertNotIn("_h3_model_is_resident(call_model)", timer)
         resident = launch[
             launch.index("def _h3_model_is_resident"):
             launch.index("def _h3_estimate_for_context")

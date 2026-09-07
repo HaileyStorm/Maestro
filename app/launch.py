@@ -54906,6 +54906,39 @@ def _run_sfx_generation(job: dict, raw_params: dict, start_time: float):
         return False
 
 
+def _run_delivery_encoder(command, *, timeout, abort_check=None):
+    """Reap this delivery encoder on cancellation, timeout, or caller failure."""
+    import subprocess
+    import time
+
+    if callable(abort_check) and abort_check():
+        raise InterruptedError("Delivery encoding cancelled")
+    with subprocess.Popen(
+        command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ) as process:
+        deadline = time.monotonic() + timeout
+        try:
+            while True:
+                if callable(abort_check) and abort_check():
+                    raise InterruptedError("Delivery encoding cancelled")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Delivery encoding timed out")
+                try:
+                    return process.wait(timeout=min(0.25, remaining))
+                except subprocess.TimeoutExpired:
+                    pass
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+
+
 def _chunked_flashvsr_upscale(
     video_path: str, method: str, *, job: dict = None, abort_check=None,
     progress_callback=None, update_job_fn=None,
@@ -54933,7 +54966,7 @@ def _chunked_flashvsr_upscale(
     """
     import gc
     import math
-    import subprocess
+    import tempfile
     import torch
 
     from shared.utils.utils import get_video_info
@@ -54964,7 +54997,10 @@ def _chunked_flashvsr_upscale(
     overlap = FLASHVSR_CONTINUE_CACHE_FRAMES
     n_chunks = max(1, math.ceil(max(1, int(total_frames)) / chunk_frames))
 
-    # Free generation-model cache before loading FlashVSR.
+    if callable(abort_check) and abort_check():
+        return None
+    # The direct chunked path must yield generation residency before cache work.
+    wgp.release_generation_residency_for_postprocess()
     if torch.cuda.is_available():
         gc.collect()
         torch.cuda.empty_cache()
@@ -54993,13 +55029,27 @@ def _chunked_flashvsr_upscale(
     container = wgp.server_config.get("video_container", "mp4")
     codec = wgp.server_config.get("video_output_codec", None)
 
+    def _scratch(suffix):
+        handle, path = tempfile.mkstemp(
+            prefix=".flashvsr-", suffix=suffix,
+            dir=os.path.dirname(os.path.abspath(video_path)),
+        )
+        os.close(handle)
+        return path
+
     def _save_segment(frames, path):
         # tiny/tiny-long yield float32 in [-1,1]; the full variant yields
         # uint8 (decode_to_cpu_uint8) which save_video takes un-normalized.
         if frames.dtype == torch.uint8:
-            wgp.save_video(tensor=frames[None], save_file=path, fps=output_fps, nrow=1, normalize=False, codec_type=codec, container=container)
+            saved = wgp.save_video(tensor=frames[None], save_file=path, fps=output_fps, nrow=1, normalize=False, codec_type=codec, container=container)
         else:
-            wgp.save_video(tensor=frames[None], save_file=path, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type=codec, container=container)
+            saved = wgp.save_video(tensor=frames[None], save_file=path, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type=codec, container=container)
+        if saved != path:
+            raise RuntimeError("Could not encode the upscaled video segment")
+        if _coded_video_size(path, expected_frames=int(frames.shape[1])) != (
+            int(frames.shape[3]), int(frames.shape[2]),
+        ):
+            raise RuntimeError("Upscaled video segment has an unexpected canvas")
 
     profile = wgp.loaded_profile if wgp.loaded_profile >= 0 else wgp.get_default_profile("video")
 
@@ -55050,9 +55100,9 @@ def _chunked_flashvsr_upscale(
                 # First `ov` output frames replicate the previous segment's
                 # tail (continue_cache contract) — already encoded there.
                 out = out[:, ov:]
-            seg_path = video_path + f".upseg{seg_idx:03d}.{container}"
-            _save_segment(out, seg_path)
+            seg_path = _scratch(f".{container}")
             segment_paths.append(seg_path)
+            _save_segment(out, seg_path)
             out = None
             written += take_new
             seg_idx += 1
@@ -55072,17 +55122,18 @@ def _chunked_flashvsr_upscale(
                     return None
             if callable(abort_check) and abort_check():
                 return None
-            concat_list = video_path + ".upconcat.txt"
+            concat_list = _scratch(".txt")
             with open(concat_list, "w", encoding="utf-8") as f:
                 for p in segment_paths:
                     f.write("file '" + os.path.abspath(p).replace("\\", "/").replace("'", "'\\''") + "'\n")
-            tmp_video = video_path + f".upscale_tmp.{container}"
-            result = subprocess.run(
-                ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list, "-c", "copy", tmp_video],
-                capture_output=True, text=True, timeout=600,
+            tmp_video = _scratch(f".{container}")
+            result = _run_delivery_encoder(
+                [os.environ.get("FFMPEG_BINARY", "ffmpeg"), "-nostdin", "-y",
+                 "-f", "concat", "-safe", "0", "-i", concat_list, "-c", "copy", tmp_video],
+                timeout=600, abort_check=abort_check,
             )
-            if result.returncode != 0 or not os.path.isfile(tmp_video):
-                raise RuntimeError(f"ffmpeg concat failed: {result.stderr[-400:]}")
+            if result != 0 or not os.path.isfile(tmp_video):
+                raise RuntimeError("Could not join the upscaled video segments")
 
         if callable(abort_check) and abort_check():
             return None
@@ -55124,6 +55175,8 @@ def _apply_spatial_upsampling_to_file(
     _apply_film_grain_to_file's in-place contract. Raises on failure; the
     caller treats it as a non-fatal warning and keeps the original.
     """
+    import tempfile
+
     audio_tracks, audio_metadata = wgp.extract_audio_tracks(video_path)
     tmp_video = None
     tmp_muxed = None
@@ -55137,20 +55190,27 @@ def _apply_spatial_upsampling_to_file(
             update_job_fn=update_job_fn,
         )
         if tmp_video is None:
-            raise RuntimeError("FlashVSR upscale was aborted")
+            raise InterruptedError("FlashVSR upscale was aborted")
         if callable(abort_check) and abort_check():
-            raise RuntimeError("FlashVSR upscale was aborted")
+            raise InterruptedError("FlashVSR upscale was aborted")
+        encoded_size = _coded_video_size(tmp_video)
         if audio_tracks:
             container = wgp.server_config.get("video_container", "mp4")
-            tmp_muxed = video_path + f".upscale_mux.{container}"
+            handle, tmp_muxed = tempfile.mkstemp(
+                prefix=".flashvsr-mux-", suffix=f".{container}",
+                dir=os.path.dirname(os.path.abspath(video_path)),
+            )
+            os.close(handle)
             wgp.combine_video_with_audio_tracks(tmp_video, audio_tracks, tmp_muxed, audio_metadata=audio_metadata)
+            if _coded_video_size(tmp_muxed) != encoded_size:
+                raise RuntimeError("Audio mux changed the upscaled canvas")
             if callable(abort_check) and abort_check():
-                raise RuntimeError("FlashVSR upscale was aborted")
+                raise InterruptedError("FlashVSR upscale was aborted")
             os.replace(tmp_muxed, video_path)
             tmp_muxed = None  # consumed by the replace
         else:
             if callable(abort_check) and abort_check():
-                raise RuntimeError("FlashVSR upscale was aborted")
+                raise InterruptedError("FlashVSR upscale was aborted")
             os.replace(tmp_video, video_path)
             tmp_video = None  # consumed by the replace
     finally:
@@ -55163,6 +55223,21 @@ def _apply_spatial_upsampling_to_file(
         wgp.cleanup_temp_audio_files(audio_tracks)
 
 
+def _coded_video_size(video_path: str, *, expected_frames: int | None = None) -> tuple[int, int]:
+    """Read encoded pixel dimensions; display metadata cannot prove an upscale."""
+    from shared.utils.video_decode import probe_video_stream_metadata
+
+    metadata = probe_video_stream_metadata(video_path)
+    if metadata is None:
+        raise RuntimeError("Could not verify the encoded video canvas")
+    width, height = int(metadata["width"]), int(metadata["height"])
+    if width <= 0 or height <= 0:
+        raise RuntimeError("Encoded video canvas is invalid")
+    if expected_frames is not None and int(metadata.get("frame_count") or 0) != expected_frames:
+        raise RuntimeError("Upscaled video segment has an unexpected frame count")
+    return width, height
+
+
 def _apply_delivery_fit_to_file(
     video_path: str,
     delivery_resolution: str,
@@ -55171,7 +55246,7 @@ def _apply_delivery_fit_to_file(
     job: dict | None = None,
 ) -> None:
     """Atomically enforce an exact, explicitly labeled delivery canvas."""
-    import subprocess
+    import tempfile
 
     try:
         target_width, target_height = [
@@ -55183,40 +55258,47 @@ def _apply_delivery_fit_to_file(
         raise ValueError("Unsupported H3 delivery resolution")
     if delivery_fit not in {"upscale_exact", "center_crop"}:
         raise ValueError("Unsupported H3 delivery fit")
-    _, source_width, source_height, _ = wgp.get_video_info(video_path)
-    source_width, source_height = int(source_width), int(source_height)
+    if job is not None and is_cancel_requested(job):
+        raise InterruptedError("Delivery fit cancelled")
+    source_width, source_height = _coded_video_size(video_path)
     if (source_width, source_height) == (target_width, target_height):
-        return
-    if delivery_fit == "upscale_exact":
-        raise RuntimeError(
-            f"Upscaler produced {source_width}x{source_height}; expected exact "
-            f"{target_width}x{target_height} delivery"
-        )
-    if target_width > source_width or target_height > source_height:
-        raise RuntimeError("Delivery fit cannot enlarge beyond the learned upscale canvas")
-    target_aspect = target_width / target_height
-    if source_width / source_height > target_aspect:
-        crop_height = source_height - (source_height % 2)
-        crop_width = min(source_width, int(crop_height * target_aspect))
-        crop_width -= crop_width % 2
+        vf = "setsar=1"
     else:
-        crop_width = source_width - (source_width % 2)
-        crop_height = min(source_height, int(crop_width / target_aspect))
-        crop_height -= crop_height % 2
-    crop_x = max(0, ((source_width - crop_width) // 2) // 2 * 2)
-    crop_y = max(0, ((source_height - crop_height) // 2) // 2 * 2)
+        if delivery_fit == "upscale_exact":
+            raise RuntimeError(
+                f"Upscaler produced {source_width}x{source_height}; expected exact "
+                f"{target_width}x{target_height} delivery"
+            )
+        if target_width > source_width or target_height > source_height:
+            raise RuntimeError("Delivery fit cannot enlarge beyond the learned upscale canvas")
+        target_aspect = target_width / target_height
+        if source_width / source_height > target_aspect:
+            crop_height = source_height - (source_height % 2)
+            crop_width = min(source_width, int(crop_height * target_aspect))
+            crop_width -= crop_width % 2
+        else:
+            crop_width = source_width - (source_width % 2)
+            crop_height = min(source_height, int(crop_width / target_aspect))
+            crop_height -= crop_height % 2
+        crop_x = max(0, ((source_width - crop_width) // 2) // 2 * 2)
+        crop_y = max(0, ((source_height - crop_height) // 2) // 2 * 2)
+        vf = (
+            f"crop={crop_width}:{crop_height}:{crop_x}:{crop_y},"
+            f"scale={target_width}:{target_height}:flags=lanczos,setsar=1"
+        )
     container = os.path.splitext(video_path)[1].lower()
     if container not in {".mp4", ".mkv", ".webm"}:
         raise ValueError("Unsupported exact-delivery video container")
-    temporary = video_path + ".delivery_fit.tmp" + container
+    handle, temporary = tempfile.mkstemp(
+        prefix=".delivery-fit-", suffix=container,
+        dir=os.path.dirname(os.path.abspath(video_path)),
+    )
+    os.close(handle)
     ffmpeg_bin = os.environ.get("FFMPEG_BINARY", "ffmpeg")
     command = [
         ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
         "-i", video_path,
-        "-vf", (
-            f"crop={crop_width}:{crop_height}:{crop_x}:{crop_y},"
-            f"scale={target_width}:{target_height}:flags=lanczos"
-        ),
+        "-vf", vf,
         "-map", "0:v:0", "-map", "0:a?",
     ]
     if container == ".webm":
@@ -55234,18 +55316,21 @@ def _apply_delivery_fit_to_file(
             command.extend(["-movflags", "+faststart"])
     command.append(temporary)
     try:
-        completed = subprocess.run(
-            command, capture_output=True, text=True, timeout=3600,
+        completed = _run_delivery_encoder(
+            command, timeout=3600,
+            abort_check=(lambda: is_cancel_requested(job)) if job is not None else None,
         )
-        if completed.returncode != 0 or not os.path.isfile(temporary):
+        if completed != 0 or not os.path.isfile(temporary):
             raise RuntimeError(
-                "Exact delivery fit failed: " + (completed.stderr or "unknown ffmpeg error")[-500:]
+                "Exact delivery fit failed while encoding the video"
             )
         if job is not None and is_cancel_requested(job):
             raise InterruptedError("Delivery fit cancelled")
-        _, fitted_width, fitted_height, _ = wgp.get_video_info(temporary)
+        fitted_width, fitted_height = _coded_video_size(temporary)
         if (int(fitted_width), int(fitted_height)) != (target_width, target_height):
             raise RuntimeError("Exact delivery fit produced an unexpected canvas")
+        if job is not None and is_cancel_requested(job):
+            raise InterruptedError("Delivery fit cancelled")
         os.replace(temporary, video_path)
     finally:
         if os.path.isfile(temporary):
@@ -58748,7 +58833,7 @@ def _run_generation(
             ).lower()
             if gen_mode != "image":
                 _su_val = str(raw_params.get("spatial_upsampling") or "")
-                if "flashvsr" in _su_val:
+                if _su_val and wgp.flashvsr.is_upsampling(_su_val):
                     pp_spatial_upsampling = _su_val
                     raw_params.pop("spatial_upsampling", None)
             if pp_delivery_resolution and not pp_spatial_upsampling:
