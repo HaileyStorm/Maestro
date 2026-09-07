@@ -212,7 +212,7 @@ def decide_h3_oom_relief(
     attempt: int = 0,
     step_now: int = 0,
     same_setup_retries: int = 0,
-    offload_profile: Any = H3_BASELINE_OFFLOAD_PROFILE,
+    offload_profile: Any = None,
     model_type: Any = "minimax_h3_ref2va",
 ) -> dict[str, Any] | None:
     """Choose the next relief action for one H3 denoise OOM.
@@ -242,9 +242,11 @@ def decide_h3_oom_relief(
     at_floor = _lower_steps(steps) is None
     max_same = SAME_SETUP_RETRIES_AT_FLOOR if at_floor else SAME_SETUP_RETRIES
     step0 = step_index <= 0
-    current_profile = apply_h3_baseline_offload_profile(
-        offload_profile, model_type,
-    )
+    # Recovery describes the setup that actually failed. Applying the current
+    # standing floor here could silently skip an offload rung never attempted.
+    current_profile = _as_profile(offload_profile)
+    if current_profile is None:
+        return None
 
     def _pack(payload: dict[str, Any], *, record_denial: bool = False) -> dict[str, Any]:
         packed = {

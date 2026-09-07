@@ -41,10 +41,27 @@ Receipts: `.artifacts-temp/astra-w4a8-installer-20260907/`,
 full checkpoint generation, visual quality, and human acceptance remain open
 in `GPU_ACCEPTANCE.md`. No app restart or full-model run occurred.
 
+### Observed offload recovery — 2026-09-07 UTC
+
+Denoise OOM recovery now uses WGP's successfully loaded MMGP profile instead
+of reconstructing task intent and applying the standing floor. Observed 4.5
+retains its same-setup retry and subsequent escalation to 5 on the same canvas;
+unknown or omitted profiles preserve the original failure without fabricating
+a retry. Persistent host-limit denial requires an observed profile 5 and the
+existing mid-denoise/exhaustion evidence. Existing host-limit history is retained.
+
+The isolated HEAD-based candidate passes all 89 tests across observed-profile,
+OOM policy, offload-plan, host-limit, memory-lifecycle, and WGP boundary suites.
+Syntax checks pass. Receipts and preserved preimages are in
+`.artifacts-temp/astra-observed-offload-20260907/`. Evidence is CPU/synthetic,
+not live OOM recovery or a GPU memory/performance claim.
+
 The native-max offload-floor WIP remains unadopted. Before changing its floor,
-reconcile sealed integer profile intent with effective fractional profiles and
-observed loaded-profile retry state; preserve completed-prefix provenance and
-calibration semantics. No offload source was changed in this slice.
+reconcile sealed integer profile intent with effective fractional profiles;
+preserve completed-prefix provenance and calibration semantics. Its unstaged
+test expecting observed 4.5 to act like 5 is superseded by the observed-profile
+contract and must be corrected when that WIP is integrated. Other native-max
+policy/default and resolution-plumbing changes remain separate.
 
 ## Successor progress
 

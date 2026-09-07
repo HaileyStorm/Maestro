@@ -12857,7 +12857,7 @@ def _generate_video_impl(
                 if h3_oom:
                     from services.h3_oom_relief import (
                         H3OomReliefRetry,
-                        apply_h3_baseline_offload_profile,
+                        offload_rank,
                         decide_h3_oom_relief,
                     )
                     params = task.get("params") if isinstance(task, dict) else {}
@@ -12884,10 +12884,9 @@ def _generate_video_impl(
                         step_now = int(step_info.get("current") or 0)
                     except (TypeError, ValueError):
                         step_now = 0
-                    current_offload = apply_h3_baseline_offload_profile(
-                        params.get("_h3_relief_offload_profile", override_profile),
-                        model_type,
-                    )
+                    # The loaded MMGP profile is evidence of the failed setup;
+                    # task overrides describe intent and may not have been loaded.
+                    current_offload = loaded_profile
                     relief = decide_h3_oom_relief(
                         resolution=str(resolution),
                         num_inference_steps=int(num_inference_steps),
@@ -12898,9 +12897,11 @@ def _generate_video_impl(
                         offload_profile=current_offload,
                         model_type=model_type,
                     )
-                    true_limit = bool(
-                        relief is None or relief.get("record_denial")
-                    ) and int(step_now) > 0
+                    true_limit = (
+                        offload_rank(current_offload) >= offload_rank(5)
+                        and bool(relief is None or relief.get("record_denial"))
+                        and int(step_now) > 0
+                    )
                     try:
                         from services.h3_host_limits import record_denoise_failure
                         _h3_attention = None
