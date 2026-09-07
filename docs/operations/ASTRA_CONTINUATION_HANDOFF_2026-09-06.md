@@ -1287,3 +1287,32 @@ copy/validate/reseal transaction remain unadopted: exact ownership for Ref-only
 fields, complete nested event/dialogue checks, and real per-clip geometry and
 runtime reference-role caller integration are still open. No GPU, model,
 service restart, browser or native Windows acceptance is claimed.
+
+### Shared execution-plan transaction (2026-09-07)
+
+Dispatch validation now lives in `services.h3_execution_contract`; launch keeps
+its existing wrapper, error type, legacy paths and returned-copy behavior.
+The extracted validator's AST matches the predecessor exactly after renaming.
+`rewrite_h3_execution_prompts` validates a copied sealed v2 plan before updating
+anything. It reconstructs events from the semantic prompt with the existing
+segment compiler, validates dialogue identity from the semantic source, preserves
+per-segment event multiplicity and exact dialogue bytes/order, and rejects
+mismatched nested metadata. Target callbacks must confirm success; the supplied
+prompt list is snapshotted before callbacks. Only the copy's prompt mirrors and
+executable digests change, then it is resealed and dispatch-validated again.
+
+All 422 applicable tests pass. Independent review closed callback-list mutation
+and forged/duplicated event findings through snapshotting and source reconstruction. Focused transaction
+coverage includes stale seals, failed target checks, malformed owners, coherent
+payload forgery, continuations, serialized multi-source plans, and intentional
+repeated dialogue. Legacy dispatch fixtures remain intact.
+
+Four CPU mapper/transaction probes pass with ordinary and spoken input across
+Base and Ref2VA. Canonicalize source records before constructing their reviewed
+shot plan; mapping freeform after sealing can break contiguous event-payload
+identity even when individual words survive. The prototype mapper remains
+unadopted, including unresolved Ref-only field ownership and real caller
+reference-role/geometry wiring. Use the shared transaction instead of the earlier
+unadopted ad hoc resealer. Evidence:
+`.artifacts-temp/astra-execution-contract-20260907/`. No GPU/model/service or
+browser acceptance is claimed, and the continuous Goal remains active.

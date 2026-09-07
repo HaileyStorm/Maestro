@@ -3688,8 +3688,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
             seal_h3_shot_plan,
         )
 
-        class RecoveryError(RuntimeError):
-            pass
+        RecoveryError = QueueRecoveryRuntimeError
 
         prompt = "[Shot 1] The pilot crosses the hangar without a cut."
         plan = plan_h3_native_shots(
