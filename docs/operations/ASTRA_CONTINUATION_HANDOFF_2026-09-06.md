@@ -1540,3 +1540,48 @@ Ref2VA dialogue, and raw quoted input before WGP enhancement is not canonical
 claiming enhancer-model or Ref-recovery byte fidelity. Age/style stripping,
 automatic classifiers, mapper/caller integration, and the broader backlog remain
 open. No model/GPU/service/browser/Windows acceptance is claimed.
+
+### Ownership correction: stop expanding the retired sequence path (2026-09-07)
+
+A fresh repository-wide call search establishes that h3_sequence_planner's
+sequence/manual builders, source resolver and compilers have no production
+caller; h3_story_ledger planning and the window compiler are reached only by
+that dormant chain or tests. The removed /api/v1/llm/plan-h3-sequence endpoint
+is explicitly kept absent by test_h3_sequence_planner. The reference helper is
+also used by the unadopted mapper artifact, which is not runtime adoption.
+Earlier changes to this chain establish library/CPU correctness only. In
+contrast, the shared canonicalizer, execution validator and WGP template calls
+have active owners. Do not conflate those evidence levels.
+
+A raw-source replay/hash candidate passed 154 CPU tests, but was not adopted
+after this ownership finding. The two root edits were restored exactly to their
+preimages; the patch, test result and status remain in
+`.artifacts-temp/astra-ref-source-replay-20260907/`. Do not spend the next phase
+finishing age/style or recovery patches in this orphaned chain. Retire/minimize
+its superseded machinery after moving any actually needed helper into the
+active adapter's owner; preserve historical inputs and replay fixtures.
+
+The active integration owners are launch._plan_generation_submission,
+launch._prepare_h3_long_studio_request and
+director_pipeline._prepare_director_h3_longform. Their current uncommitted WIP
+calls the flawed untracked h3_prompt_adapt; those calls are not in HEAD. Finish
+that coherent feature with per-segment geometry, active reference inputs and
+rewrite_h3_execution_prompts, replacing the append-only event restoration and
+resealing draft. Canonicalize before ownership is sealed while retaining the
+actual authored source; do not silently relabel canonicalized text as original
+authoring or mutate an existing sealed source contract.
+
+Generated Ref mappings with verified Base/freeform provenance can switch back
+to Base by regenerating from their retained original source; do not parse away
+their generated Ref fields. Extend the provenance recipe's target-switch path
+with that invariant. Authored/legacy Ref text lacks that proof and must never
+be treated as generated scaffolding. The active caller must preserve capability
+and authoring boundaries while the remaining Ref-only ownership is resolved.
+
+If a genuine future owner adopts Ref-to-story recovery, use a typed bundle that
+separates nonspoken summary context from authoritative detailed dialogue. Keep
+exact_block, language and occurrence D-IDs; None means derive plain quotes, while
+an explicit empty catalogue means canonical no-speech. Detailed offsets cannot
+be repurposed as summary event positions. This is a design finding, not deployed
+recovery. The broader active backlog and browser acceptance remain open, and the
+continuous Goal remains active.
