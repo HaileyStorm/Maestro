@@ -1253,3 +1253,17 @@ Do not use append-only event restoration to repair dispatch identity. Candidate
 integration, stronger nested ownership checks, mapper target-schema validation,
 and launch/Director geometry/reference-role wiring remain open. No GPU or model
 execution occurred; the continuous Goal remains active.
+
+The new pure mapper prototype is retained under
+`.artifacts-temp/astra-adapter-contract-20260907/candidate/`; its ten CPU tests
+pass independently in the parent. It requires explicit duration, a concrete
+no-file-read reference manifest and a Base canonicalizer callback, and calls
+both actual production validators. It is not adopted. An additional ordinary
+speech-free input fails: the physical compiler emits canonical
+`dialogue_and_vocalizations: none`, while the full vocal validator requires a
+separate explicit silence phrase. Resolve that shared contract mismatch with
+speech-free target tests before integration. Summary-only Ref input and
+Ref-to-Base also remain intentionally unsupported pending exact field ownership;
+those representability errors are open work, not the intended final product.
+Pair the mapper with the copy/validate/reseal transaction and real caller
+geometry/reference-role inputs only after those remaining gates pass.
