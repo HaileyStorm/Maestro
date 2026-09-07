@@ -124,19 +124,38 @@ def remap_primary_audio(
     return remapped, old_to_new
 
 
-def remap_prompt_audio_ordinals(prompt: str, old_to_new: Mapping[int, int]) -> str:
-    """Rewrite only exact Audio tags; all creative text remains byte-for-byte."""
+def _media_matches_outside_dialogue(prompt: str, pattern):
+    """Yield reference markup without interpreting canonical authored speech."""
+    from services.director.h3_dialogue import _dialogue_spans, _H3_STRICT_DIALOGUE_RE
 
+    spans, malformed = _dialogue_spans(prompt)
+    spans = [] if malformed else [
+        (start, end) for start, end in spans
+        if _H3_STRICT_DIALOGUE_RE.fullmatch(prompt[start:end])
+    ]
+    cursor = 0
+    for match in pattern.finditer(prompt):
+        while cursor < len(spans) and spans[cursor][1] <= match.start():
+            cursor += 1
+        if cursor < len(spans) and spans[cursor][0] <= match.start():
+            continue
+        yield match
+
+
+def remap_prompt_audio_ordinals(prompt: str, old_to_new: Mapping[int, int]) -> str:
+    """Remap reference Audio tags while preserving exact authored dialogue."""
     if not isinstance(prompt, str):
         raise H3MediaMapError("MiniMax H3 accepts one text prompt per generation")
-
-    def replace(match: re.Match[str]) -> str:
+    parts = []
+    cursor = 0
+    for match in _media_matches_outside_dialogue(prompt, _MEDIA_TAG):
         if match.group(1) != "Audio":
-            return match.group(0)
+            continue
         old = int(match.group(2))
-        return f"<Audio {int(old_to_new.get(old, old))}>"
-
-    return _MEDIA_TAG.sub(replace, prompt)
+        parts.extend((prompt[cursor:match.start()], f"<Audio {int(old_to_new.get(old, old))}>"))
+        cursor = match.end()
+    parts.append(prompt[cursor:])
+    return "".join(parts)
 
 
 def canonical_media_map(
@@ -190,13 +209,13 @@ def validate_prompt_media_ordinals(
         "Audio": int(audio_count),
     }
     used: dict[str, set[int]] = {kind: set() for kind in _MEDIA_KINDS}
-    for candidate in _MEDIA_LIKE_TAG.finditer(prompt):
+    for candidate in _media_matches_outside_dialogue(prompt, _MEDIA_LIKE_TAG):
         if _MEDIA_TAG.fullmatch(candidate.group(0)) is None:
             raise H3MediaMapError(
                 f"{candidate.group(0)} is not a canonical MiniMax H3 media tag; "
                 "use <Picture N>, <Video N>, or <Audio N>"
             )
-    for match in _MEDIA_TAG.finditer(prompt):
+    for match in _media_matches_outside_dialogue(prompt, _MEDIA_TAG):
         kind, ordinal = match.group(1), int(match.group(2))
         if ordinal < 1 or ordinal > available[kind]:
             raise H3MediaMapError(

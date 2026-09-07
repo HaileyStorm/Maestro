@@ -230,6 +230,41 @@ class H3MediaOrdinalTests(unittest.TestCase):
             media_map,
         )
 
+    def test_canonical_speech_media_literals_are_not_references_or_remapped(self):
+        literal = '<d>[English] Say <Picture 9>, <Video two>, and <Audio 2> exactly.</d>'
+        prompt = '<Audio 1> and <Audio 2> provide reference timbres. ' + literal
+        mapped = remap_prompt_audio_ordinals(prompt, {1: 2, 2: 1})
+        self.assertEqual(mapped, '<Audio 2> and <Audio 1> provide reference timbres. ' + literal)
+        self.assertEqual(len(validate_prompt_media_ordinals(mapped, audio_count=2)), 2)
+        self.assertEqual(validate_prompt_media_ordinals(literal), ())
+        with self.assertRaises(H3MediaMapError):
+            validate_prompt_media_ordinals(literal + ' <Picture 9>', picture_count=1)
+
+    def test_only_balanced_canonical_dialogue_exempts_literal_tags(self):
+        for prompt in ('<d>[English] <Picture 9>', '<d>No language <Picture 9></d>',
+                       '<d>[English] <d>[English] <Picture 9></d></d>'):
+            with self.subTest(prompt=prompt), self.assertRaises(H3MediaMapError):
+                validate_prompt_media_ordinals(prompt, picture_count=1)
+
+    def test_native_presentation_receives_original_speech_bytes(self):
+        from types import SimpleNamespace
+        source = (APP / 'models/minimax_h3/conditioner.py').read_text()
+        cls = next(node for node in ast.parse(source).body if isinstance(node, ast.ClassDef)
+                   and node.name == 'MiniMaxH3Conditioner')
+        method = next(node for node in cls.body if isinstance(node, ast.FunctionDef)
+                      and node.name == '_presentation_entries')
+        namespace = {'torch': torch, 'VISION_START_TOKEN_ID': 1, 'VISION_END_TOKEN_ID': 2, 'TEXT_PAD_TOKEN_ID': 0}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), 'native-presentation', 'exec'), namespace)
+        texts = []
+        def tokenizer(text, **kwargs):
+            texts.append(text)
+            return {'input_ids': list(text.encode())}
+        literal = '<d>[English] Read <Picture 9> and <Audio 2>.</d>'
+        validate_prompt_media_ordinals(literal, picture_count=1, audio_count=1)
+        namespace['_presentation_entries'](SimpleNamespace(tokenizer=tokenizer), literal,
+                                           [{'type':'image', 'frames': object()}, {'type':'audio'}])
+        self.assertEqual(texts, ['<Picture 1>: ', '<Audio 1>: ', literal])
+
     def test_unknown_zero_and_gapped_ordinals_fail_closed(self):
         for prompt, counts in (
             ("<Audio 0>", {"audio_count": 1}),

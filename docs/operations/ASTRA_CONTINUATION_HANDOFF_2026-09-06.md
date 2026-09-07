@@ -1316,3 +1316,28 @@ reference-role/geometry wiring. Use the shared transaction instead of the earlie
 unadopted ad hoc resealer. Evidence:
 `.artifacts-temp/astra-execution-contract-20260907/`. No GPU/model/service or
 browser acceptance is claimed, and the continuous Goal remains active.
+
+### Literal media tags in canonical dialogue (2026-09-07)
+
+The shared H3 media ordinal validator and audio remapper now distinguish actual
+reference tags from literal text inside balanced canonical dialogue. They preserve
+those dialogue bytes unchanged, including media-like wording; outside references
+still require canonical tags and valid ordinal namespaces. Nested, unbalanced or
+noncanonical dialogue does not exempt tags from validation. The native conditioner
+continues to receive the unchanged prompt after its separate media prefixes.
+
+The clean candidate ran 114 applicable CPU tests successfully with two skipped.
+Independent review found no consequential issues and independently passed 28 audio
+and 10 canonical-literal tests. The conditioner regression extracts its actual
+Python method with a fake tokenizer: this proves string preservation and ordering,
+not tokenizer semantics or GPU/model quality. Evidence:
+`.artifacts-temp/astra-adaptive-integration-20260907/`.
+
+The mapper prototype remains unadopted. Its remaining review findings include stale
+same-schema reference-role binding, structural role delimiter handling, incomplete
+callback source-conservation checks, and whitespace-only input. Runtime reference
+integration must preserve active-slot ordering and positional paired soundtracks;
+the prompt contract validator still needs paired-video audio accounting. Existing
+Ref-only field ownership and geometry/caller work remain open. No content scanner
+is authorized or needed for role prose. GPU work is owner-authorized only through
+a fresh validated coordinator grant; none was requested or used for this repair.
