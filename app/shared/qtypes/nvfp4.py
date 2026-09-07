@@ -57,6 +57,7 @@ _NVFP4_LAYOUT_TENSORCORE = "tensorcore"
 _NVFP4_BACKEND_AUTO = "auto"
 _NVFP4_BACKEND_COMFY = "comfy"
 _NVFP4_BACKEND_LIGHTX2V = "lightx2v"
+_NVFP4_LIGHTX2V_ROW_ALIGN = 128
 
 _NVFP4_KERNEL_LOGGED = False
 _NVFP4_FALLBACK_LOGGED = False
@@ -331,6 +332,13 @@ def _nvfp4_get_act_scale(device):
     return act_scale
 
 
+def _nvfp4_aligned_rows(rows, align):
+    if rows <= 0:
+        return rows
+    remainder = rows % align
+    return rows if remainder == 0 else rows + (align - remainder)
+
+
 def _nvfp4_swap_nibbles(tensor):
     return ((tensor & 0x0F) << 4) | ((tensor & 0xF0) >> 4)
 
@@ -406,7 +414,6 @@ def _nvfp4_linear_cuda_comfy(input, weight, bias=None):
 
 
 def _nvfp4_linear_cuda_lightx2v(input, weight, bias=None):
-    _nvfp4_note_kernel()
     x2d = input.reshape(-1, input.shape[-1])
     if not x2d.is_floating_point():
         x2d = x2d.to(torch.float16)
@@ -418,6 +425,13 @@ def _nvfp4_linear_cuda_lightx2v(input, weight, bias=None):
         out_dtype = orig_dtype
     if not x2d.is_contiguous():
         x2d = x2d.contiguous()
+    orig_rows = x2d.shape[0]
+    if orig_rows == 0:
+        return x2d.new_empty((*input.shape[:-1], weight.size(0)), dtype=orig_dtype)
+    _nvfp4_note_kernel()
+    pad_rows = _nvfp4_aligned_rows(orig_rows, _NVFP4_LIGHTX2V_ROW_ALIGN) - orig_rows
+    if pad_rows:
+        x2d = torch.nn.functional.pad(x2d, (0, 0, 0, pad_rows))
     weight_fp4 = weight._data
     weight_scale = weight._scale
     input_scale = weight._input_global_scale
@@ -465,6 +479,8 @@ def _nvfp4_linear_cuda_lightx2v(input, weight, bias=None):
         alpha=alpha,
         bias=bias,
     )
+    if pad_rows:
+        out = out[:orig_rows]
     if out.dtype != orig_dtype:
         out = out.to(orig_dtype)
     return out.reshape(*input.shape[:-1], weight.size(0))
@@ -992,6 +1008,9 @@ class QLinearNVFP4(QModuleMixin, torch.nn.Linear):
             quantize_input=quantize_input,
         )
         self._nvfp4_default_dtype = dtype
+        # MMGP copies instance attributes into its Quanto router. Its LoRA
+        # base must call our forward to retain pre_quant_scale.
+        self._mm_requires_native_linear_forward = True
 
     @classmethod
     def qcreate(

@@ -88,6 +88,41 @@ seal. This is CPU/synthetic and local codec evidence, not live model quality or
 GPU recovery acceptance. Receipts and source hashes are in
 `.artifacts-temp/astra-shot-packing-20260907/`.
 
+## NVFP4 native LoRA forwarding — 2026-09-07 UTC
+
+NVFP4 modules now keep the native-forward marker as an instance attribute,
+which the pinned MMGP router copies. Ordinary LoRA execution retains the
+module's input scaling and real dequantization. The numerical CPU regression
+uses the installed router load, hook, wrapper, and native forward; it checks
+scaled base output plus factor delta, floating output, and unchanged packed
+weight bytes across three ranks and both bias modes.
+
+LightX2V inputs now pad rows to 128 and trim the result back to the original
+shape. Empty inputs retain their dtype and do not report or dispatch a kernel.
+Kernel RuntimeError/OOM propagation remains intact. The uncommitted global
+LoRA monkeypatch and catch-all kernel fallback were removed instead of adopted;
+the raw-integer transformer activation casts remain unadopted pending their
+actual producer/dtype diagnosis.
+
+The isolated candidate passes 121 of 131 tests (10 explicit runtime skips),
+plus the five NVFP4 CPU tests in the CUDA-13 environment. Both local MMGP 3.7.12
+installations' source bytes match their installed RECORD entries. Independent
+review is clean. Receipts/preimages are in
+`.artifacts-temp/astra-nvfp4-native-20260907/`. These are CPU numerical and
+mock-kernel dispatch checks, not live GPU kernel, full-model, or Windows proof.
+
+Remaining task-owned compatibility work:
+
+- `NVFP4-K32`: logical input width 32 exposes the existing scale-deswizzle
+  assumption: scale columns are cropped before the padded 128-by-4 tile is
+  reshaped. Reproduce with the retained initial CPU receipt, then reconcile
+  logical versus physical scale geometry and test widths 32/64/96. Preserve
+  pinned checkpoint scale/nibble semantics; require a fresh lease for GPU proof.
+- `NVFP4-DORA`: MMGP's DoRA branch bypasses the native-forward marker and
+  needs separate scaled-base/dequantization analysis and numerical acceptance.
+  Ordinary low-rank LoRA evidence cannot close this item. Do not restore broad
+  monkeypatches or integer casts as a workaround.
+
 ## Successor progress
 
 The successor's native Goal is active and continuous. The original handoff
