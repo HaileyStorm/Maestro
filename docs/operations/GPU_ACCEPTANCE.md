@@ -245,9 +245,29 @@ Process maps confirmed that library, but the first case then failed with
 `Unable to find suitable cuBLAS GEMM algorithm`; zero numerical cases completed.
 Its lease is confirmed cancelled and the task-private link was removed.
 
-The next diagnostic requires an instrumented build bound to the selected
-CUDA-13 runtime, with ELF/dependency and rollback verification before another
-bounded lease. The passing CUTLASS comparison is not promoted to a permanent
+The instrumented CUDA-13 diagnostic below completes that bounded build check.
+The complete package still needs reproducible build, resolved-dependency,
+rollback, and installed-runtime verification before promotion. The passing CUTLASS comparison is not promoted to a permanent
 default. Receipts: `.artifacts-temp/astra-lightx-route-20260907/` and
 `.artifacts-temp/astra-lightx-cublas128-20260907/`. This evidence does not
 establish full-model correctness, speed, or Windows acceptance.
+
+## CUDA-13 cuBLAS diagnostic — 2026-09-07 UTC
+
+A fresh validated lease compiled the source-bound cuBLAS path with CUDA 13.0
+and the selected environment's libraries. The diagnostic ELF requires
+`libcublasLt.so.13` and `libcudart.so.13`, with neither CUDA-12 dependency;
+process maps confirmed the CUDA-13 library resolution. It used an independent
+Torch operator and did not replace the installed package.
+
+The exact previously failing physical M=128/N=128/K=64 case passed with finite
+output and relative MAE 0.0069444444961845875. The diagnostic binary hash is
+`dc0d700b1f712928414e4eef5d86bb2e1167f86a28fa17e2d9c332a08cf4e577`.
+The process exited and the lease was withdrawn/confirmed cancelled. Receipts:
+`.artifacts-temp/astra-lightx-cu13-build-20260907/`.
+
+This supports the ABI diagnosis but does not close complete-package,
+installed-runtime, full-model, performance, or Windows acceptance. The next
+step is a reproducible complete package build with rollback and separate
+installed-runtime validation; diagnostic operators and temporary selectors
+remain unpromoted.

@@ -152,9 +152,10 @@ Remaining task-owned compatibility work:
   was changed permanently.
 
   Therefore library resolution contributes to the original failure, but a
-  newer CUDA-12 library alone is not sufficient acceptance. Next: prepare a
-  provenance-bound, instrumented build against the selected CUDA-13 runtime;
-  verify actual ELF dependencies/resolution before one bounded leased case.
+  newer CUDA-12 library alone is not sufficient acceptance. The instrumented
+  CUDA-13 diagnostic below now passes the same case. Next: build the complete
+  pinned extension for the selected runtime, verify package/ELF dependencies,
+  and stage rollback before a separate installed-runtime acceptance lease.
   Preserve rollback and the working CUTLASS diagnostic, but do not promote a
   permanent route from these small tensors. Source and acceptance must be
   checked independently on Windows. Receipts are in
@@ -164,6 +165,51 @@ Remaining task-owned compatibility work:
   needs separate scaled-base/dequantization analysis and numerical acceptance.
   Ordinary low-rank LoRA evidence cannot close this item. Do not restore broad
   monkeypatches or integer casts as a workaround.
+
+## CUDA-13 diagnostic result — 2026-09-07 UTC
+
+The local CUDA 13.0 compiler, selected environment's cuBLASLt 13 headers/library,
+and Ninja/G++ are available. A task-private diagnostic extracts the unchanged
+cuBLAS math/descriptor path from the recorded upstream snapshot, removes only
+unused CUTLASS includes, adds failing-call/line diagnostics, and registers an
+independent Torch operator. Review confirmed parity; the runner supplies the
+upstream tensor dtype/device/contiguity/shape checks before calling it.
+
+Artifacts: `.artifacts-temp/astra-lightx-cu13-build-20260907/` contains
+`cu13_diagnostic.cu`, `build-manifest.json`, `gpu-plan.json`, and `run_once.py`.
+The coordinator granted the queued request after the other project released
+its reservation. The source-bound runner validated grant/status/epoch/raw
+ledger before compilation and again before GEMM. Compilation used CUDA 13.0,
+one Ninja worker, and the selected CUDA-13 Python environment. ELF inspection
+confirmed `libcublasLt.so.13` and `libcudart.so.13` dependencies, with no CUDA-12
+dependency in the diagnostic extension. Process maps confirmed the selected
+CUDA-13 libraries (the unchanged original quantizer also loaded its own older
+libraries).
+
+The single M=128/N=128/K=64 diagnostic GEMM passed with finite output and
+relative MAE 0.0069444444961845875. Binary SHA-256:
+`dc0d700b1f712928414e4eef5d86bb2e1167f86a28fa17e2d9c332a08cf4e577`.
+The process exited and the lease is confirmed cancelled. No installed package,
+launcher, default selector, or service was changed. This is native diagnostic
+GEMM evidence, not a complete extension rebuild, installed-runtime rollout,
+full-model generation, performance, or Windows acceptance.
+
+Next: produce a reproducible complete package build against the selected
+runtime, assert resolved ABI dependencies and source/package provenance,
+preserve the installed baseline for rollback, and perform installed-runtime
+acceptance under a new exact lease. Do not promote the task-private operator
+or process-only CUTLASS selector into the default path.
+
+While waiting, a direct CPU audit of the uncommitted `h3_prompt_adapt.py` found
+two reproducible blockers to integration: an embedded `summary:` label inside
+canonical dialogue causes the exact dialogue span to disappear during family
+mapping, and freeform dialogue appears twice after Ref2VA wrapping (summary
+plus detailed description). The recorded source hash and synthetic results are
+in `prompt-adapter-audit.json` under the diagnostic artifact. Do not adopt that
+adapter unchanged or treat its eight simple tests as preservation evidence.
+Keep single-owner dialogue, literal authored text, and sealed execution digests
+as the acceptance conditions when replacing its field parser/summary behavior.
+The clip/model-count probe retained both clips and is not a failure finding.
 
 ## Successor progress
 
