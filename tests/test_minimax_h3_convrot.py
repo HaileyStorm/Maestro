@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import copy
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -36,6 +37,89 @@ def _descriptor(**overrides) -> torch.Tensor:
 
 
 class ConvRotAdapterTests(unittest.TestCase):
+    def test_transformer_preserves_fractional_inputs_for_quantized_entry_projections(self):
+        from models.minimax_h3.transformer import MiniMaxH3Transformer
+
+        for kind in ("int8", "w4a8"):
+            with self.subTest(kind=kind), torch.inference_mode():
+                model = MiniMaxH3Transformer(
+                    hidden_size=8, num_layers=1, token_refiner_layers=1,
+                    num_attention_heads=1, attention_head_dim=8, ffn_dim=12,
+                    video_channels=32, audio_channels=32, patch_size=(1, 1, 1),
+                    text_dim=32, curve_grid=4, curve_dim=2, rope_freq_dim=1,
+                    dtype=torch.float32,
+                ).eval()
+                model.adaln_t_table.zero_()
+                names = ("video_patch_proj", "audio_patch_proj", "condition_proj")
+                for name in names:
+                    original = getattr(model, name)
+                    original.weight.fill_(0.25)
+                    original.bias.zero_()
+                reference = copy.deepcopy(model)
+                for name in names:
+                    original = getattr(model, name)
+                    if kind == "int8":
+                        replacement = ConvRotInt8Linear(
+                            32, 8, bias=True, output_dtype=torch.float32,
+                            convrot=False,
+                        )
+                        replacement.weight.fill_(1)
+                        replacement.weight_scale.fill_(0.25)
+                    else:
+                        replacement = W4A8ConvRotLinear(original, {
+                            "layer.weight": torch.zeros((8, 16), dtype=torch.int8),
+                            "layer.weight_s_rel": torch.ones((8, 2), dtype=torch.float8_e4m3fn),
+                            "layer.weight_s_channel": torch.ones(8),
+                            "layer.bias": torch.zeros(8),
+                        }, "layer", output_dtype=torch.float32)
+                    replacement.bias.zero_()
+                    setattr(model, name, replacement)
+
+                inputs = [torch.linspace(-0.75, 0.75, n * 32).reshape(1, n, 32)
+                          for n in (3, 4, 2)]
+                kwargs = dict(
+                    hidden_states=inputs[0], audio_hidden_states=inputs[1],
+                    encoder_hidden_states=inputs[2], timestep=torch.tensor([0.1, 0.4]),
+                    timestep_indices=torch.tensor([0, 0, 1, 1, 1, 1, 0, 0, 0]),
+                    token_tags=torch.tensor([1, 1, 2, 2, 2, 2, 0, 0, 0]),
+                    position_ids=torch.zeros(9, 3, dtype=torch.float64),
+                    video_indices=torch.tensor([6, 7, 8]),
+                    audio_indices=torch.tensor([2, 3, 4, 5]),
+                    text_indices=torch.tensor([0, 1]), return_dict=False,
+                )
+                expected = reference(**kwargs)
+                seen = []
+
+                def linear(value, weight, scale, *args, **options):
+                    seen.append(value.clone())
+                    # CPU oracle for this fixed fixture, not kernel acceptance.
+                    dense = (weight.float() * scale if kind == "int8" else
+                             torch.full((8, 32), 0.25))
+                    return torch.nn.functional.linear(value.float(), dense).to(options["out_dtype"])
+
+                with patch.dict(sys.modules, {"comfy_kitchen": SimpleNamespace(
+                    int8_linear=linear, w4a8_int8_linear=linear,
+                )}):
+                    actual = model(**kwargs)
+                self.assertEqual(len(seen), 3)
+                for original, projected in zip(inputs, seen):
+                    self.assertEqual(projected.dtype, torch.float32)
+                    torch.testing.assert_close(projected, original, rtol=0, atol=0)
+                for result, baseline in zip(actual, expected):
+                    torch.testing.assert_close(result, baseline, rtol=0, atol=0)
+
+    def test_projection_dtype_uses_declared_float_output_before_packed_storage(self):
+        from models.minimax_h3.transformer import _weight_dtype
+
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            layer = ConvRotInt8Linear(4, 3, bias=False, output_dtype=dtype)
+            self.assertEqual(_weight_dtype(layer, torch.float32), dtype)
+        for dtype in (torch.int8, torch.uint8, torch.int32):
+            layer = SimpleNamespace(weight=torch.ones(1, dtype=dtype))
+            self.assertEqual(_weight_dtype(layer, torch.float32), torch.float32)
+        dense = nn.Linear(4, 3, dtype=torch.float16)
+        self.assertEqual(_weight_dtype(dense, torch.float32), torch.float16)
+
     def test_replaces_marked_linear_and_consumes_descriptor(self):
         model = nn.Sequential(nn.Linear(4, 3, bias=True, device="meta"))
         state = {

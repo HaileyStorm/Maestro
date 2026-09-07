@@ -52,9 +52,14 @@ class MiniMaxH3TransformerOutput:
 
 
 def _weight_dtype(module: nn.Module, fallback: torch.dtype) -> torch.dtype:
+    # Quantized modules expose packed storage separately from their floating
+    # execution dtype. Casting inputs to storage dtype loses fractional values.
+    output_dtype = getattr(module, "output_dtype", None)
+    if output_dtype is not None and output_dtype.is_floating_point:
+        return output_dtype
     weight = getattr(module, "weight", None)
     dtype = getattr(weight, "dtype", None)
-    if dtype is None or dtype == torch.uint8:
+    if dtype is None or not dtype.is_floating_point:
         return fallback
     return dtype
 

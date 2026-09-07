@@ -101,8 +101,8 @@ LightX2V inputs now pad rows to 128 and trim the result back to the original
 shape. Empty inputs retain their dtype and do not report or dispatch a kernel.
 Kernel RuntimeError/OOM propagation remains intact. The uncommitted global
 LoRA monkeypatch and catch-all kernel fallback were removed instead of adopted;
-the raw-integer transformer activation casts remain unadopted pending their
-actual producer/dtype diagnosis.
+the raw-integer transformer activation casts were subsequently retired after
+the input-dtype diagnosis below; their original bytes remain in private evidence.
 
 The isolated candidate passes 121 of 131 tests (10 explicit runtime skips),
 plus the five NVFP4 CPU tests in the CUDA-13 environment. Both local MMGP 3.7.12
@@ -546,6 +546,39 @@ mock, and build evidence; no LTX model generation, live browser, GPU quality,
 service restart, or native Windows acceptance occurred. Unrelated H3/API/UI WIP
 remains unadopted. The continuous Goal and the remaining planned backlog stay
 active.
+
+## H3 quantized projection input dtype — 2026-09-07
+
+H3 entry projections now use a module's declared floating output dtype before
+considering its weight dtype, and packed integer storage uses the explicit
+floating fallback. Previously INT8 or W4A8 entry weights caused video, audio,
+and text inputs to be cast to integer codes before reaching the kernel,
+discarding fractional values. Ordinary floating-weight behavior is preserved.
+
+The regression executes a tiny joint transformer with the real INT8 and W4A8
+wrapper classes and synthetic CPU kernels. All three kernels receive the exact
+fractional inputs, and outputs match the corresponding dense reference exactly.
+The original source fails both wrapper cases and the declared-dtype check;
+the corrected focused suite passes all nine tests. This is CPU numerical and
+mock-kernel evidence, not actual INT8/W4A8 kernel or full-model acceptance.
+
+The broad clean H3 run executed 183 tests with 13 skips and found one stale
+adaptive Load Settings source assertion. It now checks restoration's explicit
+boolean handling; the existing UI state regression executes both adaptive and
+pinned restoration. The corrected Ref2VA module passes 17 tests with two skips
+using its explicit app import path. Independent review is clean; syntax and
+diff checks pass. The earlier
+broad run remains separately recorded rather than being relabeled a full pass
+on the corrected fixture.
+
+The uncommitted post-projection raw-integer cast/dequantize fallback and its two
+matching tests were removed, with exact preimages preserved. Casting raw codes
+without their scale cannot reconstruct activations. Historical Char failures
+occurred at different boundaries and do not establish that this source repair
+fixes a current full-checkpoint run. Receipts and the retained draft are under
+`.artifacts-temp/astra-h3-activation-20260907/`. No model load, GPU work, service
+restart, or Windows acceptance occurred. Other native/offload/input-policy and
+prompt-adapter WIP remains separate.
 
 ## Adaptive H3 controls — CPU integration checkpoint, 2026-09-07
 

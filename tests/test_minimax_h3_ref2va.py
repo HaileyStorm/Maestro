@@ -401,7 +401,11 @@ class TestMiniMaxH3Ref2VADefinition(unittest.TestCase):
         self.assertIn("(state.imageRefType || h3SemanticReferenceSubmission)", store)
         self.assertIn("params.h3_adaptive_conditioning !== false", store)
         self.assertIn("p._h3_requested_checkpoint", store)
-        self.assertIn("newParams.h3_adaptive_conditioning", store)
+        # Load Settings preserves an explicit boolean before applying the
+        # paired checkpoint choices; true/false behavior is exercised by the
+        # UI's cross-model Load Settings state regression.
+        self.assertIn("typeof p.h3_adaptive_conditioning === 'boolean'", store)
+        self.assertIn("h3_adaptive_conditioning: adaptive", store)
         self.assertIn("restoreSemanticH3Paths", store)
         self.assertIn("? [...(params.image_refs as string[])]", store)
         self.assertIn("state.imageRefs.length + (state.params.image_refs?.length ?? 0)", store)
