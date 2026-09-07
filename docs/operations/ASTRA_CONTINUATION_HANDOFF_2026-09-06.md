@@ -468,9 +468,42 @@ that a missing local checkpoint without a URL causes no network call.
 
 All 139 tests across the five full modules pass in a HEAD-based source copy
 containing neither the ignored environment nor private runtime configuration.
-Evidence: `.artifacts-temp/astra-baseline-repair-20260907/`. The stable-share
-destination identity race is a separate production defect under repair; the
-remaining LTX and UI/branding baseline cases are not closed by these tests.
+Three further shell assertions now follow the existing composed mobile UI:
+the shared sidebar identity supplies embedded provenance in both layouts, and
+the mobile sidebar owns the machine-settings action. Both full shell modules
+pass (16 tests); no UI behavior changed.
+
+Evidence: `.artifacts-temp/astra-baseline-repair-20260907/`. Eight recorded
+baseline cases are resolved by these test repairs. The seven LTX cases remain
+separate work.
+
+### Stable-share runtime-file identity — 2026-09-07 UTC
+
+The reproduced destination replacement failure was an inode-reuse race. The
+shared publisher now retains descriptors for both the existing destination and
+the temporary file through validation and atomic replacement. Clear uses the
+same retained destination identity. Both paths recheck owner, type, mode,
+single-link status, and pathname identity; cleanup removes only a temporary
+name still bound to the held single-link file. Substituted or hardlinked files
+are preserved. Temporary-name failure occurs before an anchor is acquired.
+The quick-tunnel supervisor delegates to these shared primitives; its duplicate
+publication and clear machinery is removed.
+
+All 50 stable-share tests pass in an isolated source copy under development
+mode with warnings treated as errors. This includes real Linux temporary-file
+replacement/link/cleanup checks and mocked Windows handle flags/ownership.
+Independent review is clean for that scope. Windows uses non-inherited,
+reparse-point-aware handles with delete sharing so anchors remain open through
+replacement; the API contract follows Microsoft's
+[CreateFileW](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew)
+and [MoveFileExW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw)
+documentation. Native Windows replacement/deletion with held handles remains
+unverified and requires the full stable-share suite on that host.
+
+No live share files or running service were changed or restarted. These checks
+close the recorded Linux inode-reuse defect, not every possible filesystem race
+or live service/Windows acceptance. Nine of the 16 recorded baseline cases are
+now covered by verified repairs; the seven LTX cases remain open.
 
 ### Prompt-adapter audit — not adopted
 

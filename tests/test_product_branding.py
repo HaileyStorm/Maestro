@@ -39,7 +39,9 @@ class ProductBrandingTests(unittest.TestCase):
         for source in (APP, SIDEBAR, WELCOME):
             self.assertIn("PRODUCT_NAME", source)
             self.assertIn("PRODUCT_NAME_VISUAL", source)
+        for source in (SIDEBAR, WELCOME):
             self.assertIn("PRODUCT_PROVENANCE", source)
+        self.assertIn("<Sidebar />", APP)
         self.assertIn("<title>Maestro Continuum</title>", INDEX)
 
     def test_anchored_reference_mark_is_shared_by_the_shell(self):
@@ -54,8 +56,12 @@ class ProductBrandingTests(unittest.TestCase):
     def test_remote_shell_uses_embedded_provenance_not_system_config(self):
         self.assertNotIn("systemConfig?.app_version", APP)
         self.assertNotIn("systemConfig?.app_version", SIDEBAR)
-        self.assertIn("{PRODUCT_PROVENANCE}", APP)
         self.assertIn("{PRODUCT_PROVENANCE}", SIDEBAR)
+        self.assertIn("{PRODUCT_NAME}. {PRODUCT_PROVENANCE}", SIDEBAR)
+        mobile, desktop = SIDEBAR.split("// Desktop: static sidebar", 1)
+        self.assertIn("{productIdentity}", mobile)
+        self.assertIn("{productIdentity}", desktop)
+        self.assertIn("<Sidebar />", APP)
 
     def test_launcher_preserves_schema_branding_and_provenance(self):
         self.assertIn('version: "8.0"', PINOKIO)

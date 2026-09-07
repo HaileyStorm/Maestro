@@ -347,7 +347,10 @@ class RecipeUiSourceHarnessTests(unittest.TestCase):
         self.assertIn("<RecipesOverlay />", app)
         self.assertNotIn("machineControls && <RecipesOverlay />", app)
         self.assertIn('aria-controls="maestro-mobile-sidebar"', app)
-        self.assertIn('aria-label="Open machine settings"', app)
+        self.assertIn("<Sidebar />", app)
+        mobile_sidebar = sidebar.split("// Desktop: static sidebar", 1)[0]
+        self.assertIn('aria-label="Open machine settings"', mobile_sidebar)
+        self.assertIn("onClick={openMobileMachineSettings}", mobile_sidebar)
 
         self.assertIn("setSidebarMode('director')", sidebar)
         self.assertIn("setSidebarMode('studio')", sidebar)
