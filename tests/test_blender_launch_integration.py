@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -333,8 +334,30 @@ class BlenderLaunchIntegrationTests(unittest.TestCase):
         video_apply, _director_apply = apply_reference.split(
             "} else if (referenceReturnMode === 'director')", 1,
         )
+        classification = apply_reference.split(
+            "const isBlenderControlVideo = Boolean(", 1,
+        )[1].split("\n      )", 1)[0]
+        subprocess.run([
+            "node", "-e", r"""
+const assert = require('node:assert/strict');
+const expression = JSON.parse(process.argv[1]);
+const isControl = new Function('output', 'metadata', 'return Boolean(' + expression + ');');
+for (const metadata of [
+  {recommended_video_prompt_type: 'TVG'},
+  {semantic_mapping: {conditioned_prompt: 'A performer crosses the room'}},
+  {recommended_model_type: 'ltx2_22B_1_1'},
+]) {
+  assert.equal(isControl({media_type: 'video/mp4'}, metadata), true);
+  assert.equal(isControl({media_type: 'image/png'}, metadata), false);
+  assert.equal(isControl({media_type: 'audio/wav'}, metadata), false);
+  assert.equal(isControl({}, metadata), false);
+}
+assert.equal(isControl({media_type: 'video/mp4'}, {}), false);
+assert.equal(isControl({media_type: 'video/mp4'}, {conditioned_prompt: 'ordinary reference'}), false);
+""", json.dumps(classification),
+        ], check=True, capture_output=True, text=True, cwd=ROOT)
         for value in (
-            "if (output.media_type?.startsWith('video/'))",
+            "if (isBlenderControlVideo)",
             "destination = 'studio'",
             "setGenerationMode('video')",
             "conditioned_prompt",

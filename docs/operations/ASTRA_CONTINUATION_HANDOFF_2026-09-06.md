@@ -449,6 +449,29 @@ GPU or service evidence. The 4,703-test suite was not repeated for this isolated
 test change; the 16 independently reproduced baseline failures/errors remain
 overall-goal work.
 
+### Baseline fixture and request-contract repairs — 2026-09-07 UTC
+
+Five of the 16 reproduced baseline cases are repaired without changing
+production behavior. The Director fresh-start test now verifies that the
+caller-owned request remains unchanged while the owned copy and durable state
+exclude the forged generated anchor. The Blender regression executes the
+current control-video classification against video, image, audio, and missing
+media metadata, retaining its semantic-prompt and Generate handoff assertions.
+
+The real research-child shutdown fixture now uses the selected test interpreter
+for both parent and descendant, and always stops its owned runtime if readiness
+fails. It no longer depends on an ignored `app/env` directory. The task/capability
+routing test keeps its in-memory routing/default checks and no longer reads or
+asserts the owner's private `wgp_config.json`. The manual-checkpoint regression
+loads the actual compatibility resolver with the downloader and still proves
+that a missing local checkpoint without a URL causes no network call.
+
+All 139 tests across the five full modules pass in a HEAD-based source copy
+containing neither the ignored environment nor private runtime configuration.
+Evidence: `.artifacts-temp/astra-baseline-repair-20260907/`. The stable-share
+destination identity race is a separate production defect under repair; the
+remaining LTX and UI/branding baseline cases are not closed by these tests.
+
 ### Prompt-adapter audit — not adopted
 
 While waiting, a direct CPU audit of the uncommitted `h3_prompt_adapt.py` found

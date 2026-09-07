@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -264,7 +265,7 @@ class ResearchRuntimeTests(unittest.TestCase):
         code = (
             "from pathlib import Path\n"
             "import subprocess, time\n"
-            f"subprocess.Popen([{str(ROOT / 'app/env/bin/python')!r}, '-c', {descendant_code!r}])\n"
+            f"subprocess.Popen([{sys.executable!r}, '-c', {descendant_code!r}])\n"
             f"Path({str(ready)!r}).write_text('ready')\n"
             "try:\n"
             "    time.sleep(60)\n"
@@ -276,7 +277,7 @@ class ResearchRuntimeTests(unittest.TestCase):
             store=FakeStore(self.root),
             repo_root=ROOT,
             popen_factory=lambda *_args, **_kwargs: subprocess.Popen(
-                [str(ROOT / "app/env/bin/python"), "-c", code],
+                [sys.executable, "-c", code],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -285,8 +286,10 @@ class ResearchRuntimeTests(unittest.TestCase):
             terminate_grace_seconds=1,
         )
         runtime.start_research(force=True)
-        self.assertTrue(wait_until(ready.exists))
-        runtime.stop()
+        try:
+            self.assertTrue(wait_until(ready.exists))
+        finally:
+            runtime.stop()
         self.assertTrue(cleaned.exists())
         time.sleep(1.2)
         self.assertFalse(descendant_survived.exists())

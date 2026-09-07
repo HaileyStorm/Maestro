@@ -445,7 +445,9 @@ class TestLayeredKlein9BRegistry(unittest.TestCase):
         for phrase in ("iamddtla", "credit", "derivatives", "RentCivit"):
             self.assertIn(phrase, self.model["selector_help"])
 
-        loader = _load_functions(_WGP, {"download_models"})
+        loader = _load_functions(
+            _WGP, {"download_models", "get_compatible_local_model_filename"},
+        )
         network_calls = []
 
         class MissingCheckpointLocator:

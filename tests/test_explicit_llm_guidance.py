@@ -570,9 +570,6 @@ class EnhancerPropagationTests(unittest.TestCase):
         )
         self.assertEqual(llm_service.DEFAULT_ENHANCE_HF_REPO, enhancer)
         self.assertEqual(llm_service.DEFAULT_HF_REPO, heavy)
-        config = json.loads((APP / "wgp_config.json").read_text(encoding="utf-8"))
-        self.assertEqual(config["services"]["enhance_llm_model_id"], enhancer)
-        self.assertEqual(config["services"]["llm_model_id"], heavy)
         self.assertTrue(llm_service.MODEL_REGISTRY[enhancer]["mmproj_file"])
         self.assertFalse(llm_service.MODEL_REGISTRY[text_only].get("mmproj_file"))
 

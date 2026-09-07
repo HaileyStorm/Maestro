@@ -3096,7 +3096,7 @@ class TestDirectorCancellation(unittest.TestCase):
         self.assertNotIn("provider prompt token", public_failure)
         self.assertNotIn("/private/director", public_failure)
 
-    def test_fresh_start_strips_internal_generated_anchor_metadata(self):
+    def test_fresh_start_strips_internal_anchor_from_owned_copy_and_saved_state(self):
         params = {
             "pipeline_type": "music_video",
             "generated_reference_image_filename": "unrelated.jpg",
@@ -3106,11 +3106,18 @@ class TestDirectorCancellation(unittest.TestCase):
             pid = pipeline.start_pipeline(params)
 
         start_worker.assert_called_once_with(pid)
-        self.assertNotIn("generated_reference_image_filename", params)
+        self.assertEqual(params, {
+            "pipeline_type": "music_video",
+            "generated_reference_image_filename": "unrelated.jpg",
+        })
+        self.assertIsNot(pipeline._pipelines[pid]["params"], params)
         self.assertNotIn(
             "generated_reference_image_filename",
             pipeline._pipelines[pid]["params"],
         )
+        saved = pipeline.load_pipeline_state(self.temp_dir.name, pid)
+        self.assertIsNone(saved["generated_reference_image_filename"])
+        self.assertNotIn("unrelated.jpg", json.dumps(saved))
 
 
 if __name__ == "__main__":
