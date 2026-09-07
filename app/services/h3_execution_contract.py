@@ -265,7 +265,7 @@ def rewrite_h3_execution_prompts(shot_plan: dict, prompts: list[str], *, validat
     from services.h3_shot_planner import (
         seal_h3_shot_plan, _semantic_dialogue_identity, _tag_dialogue_occurrences,
         _compile_segment_local_prompts, _strip_dialogue_occurrence_tokens,
-        _canonical_context_ir_parts,
+        _canonical_context_ir_parts, h3_effective_source, h3_source_compiler_inputs,
     )
 
     candidate = copy.deepcopy(shot_plan)
@@ -305,7 +305,11 @@ def rewrite_h3_execution_prompts(shot_plan: dict, prompts: list[str], *, validat
             for ordinal, block in enumerate(dialogue_blocks(contract["semantic_prompt"]))
         ]
         tagged, tokens = _tag_dialogue_occurrences(contract["semantic_prompt"], semantic_manifest)
-        canonical_source = _canonical_context_ir_parts(contract["authored_prompt"]) is not None
+        compiler_inputs = h3_source_compiler_inputs(contract)
+        effective_source = h3_effective_source(
+            contract["authored_prompt"], compiler_inputs.get("source_canonicalization"),
+        )
+        canonical_source = _canonical_context_ir_parts(effective_source) is not None
         _, expected_events = _compile_segment_local_prompts(
             tagged, segment_positions=contract["segment_indices"], published_frames=published,
             source_index=source_index, fps=candidate["fps"],

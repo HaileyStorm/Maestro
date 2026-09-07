@@ -13,12 +13,15 @@ if _APP not in sys.path:
     sys.path.insert(0, _APP)
 
 from services.h3_shot_planner import (  # noqa: E402
+    H3_COMPILER_INPUT_REPLAY_CANONICAL_VERSION,
     H3_COMPILER_INPUT_REPLAY_VERSION,
     H3_SEMANTIC_PHYSICAL_CONTRACT_VERSION,
     H3ShotPlanError,
     _fold_short_terminal_clip,
     build_h3_visual_context,
     estimate_h3_segment_count,
+    h3_effective_source,
+    h3_source_compiler_inputs,
     plan_h3_clip_frames,
     plan_h3_native_shots,
     validate_h3_shot_plan_seal,
@@ -1667,6 +1670,333 @@ class H3SharedShotPlannerTests(unittest.TestCase):
                 clip_frame_counts=[96],
                 fps=24,
             )
+
+    def test_source_canonicalization_freezes_authored_bytes_and_dialogue_owner(self):
+        dialogue = "<d>[Speaker 1]  Keep  this. </d>"
+        source = (
+            f"  [0s-5s] The archivist opens a book. {dialogue}\n"
+            "[5s-10s] The archivist closes the book.  "
+        )
+        plan = plan_h3_native_shots(
+            global_prompt=source,
+            clip_frame_counts=[240],
+            fps=24,
+            source_canonicalization="t2va",
+        )
+        contract = plan["source_contracts"][0]
+
+        self.assertEqual(plan["global_prompt"], source)
+        self.assertEqual(contract["authored_prompt"], source)
+        self.assertEqual(contract["source_canonicalization"], {
+            "mode": "t2va",
+            "recipe_version": 1,
+            "duration_seconds": 10.0,
+            "fps": 24.0,
+            "published_frames": 240,
+        })
+        effective_source = h3_effective_source(
+            source, contract["source_canonicalization"],
+        )
+        self.assertIn(
+            "integrated_multimodal_description:\n[Shot 1]",
+            effective_source,
+        )
+        self.assertIn(
+            "audiovisual_description: The archivist opens a book. | "
+            f"dialogue_and_vocalizations: {dialogue}",
+            contract["semantic_prompt"],
+        )
+        self.assertEqual(contract["semantic_prompt"].count(dialogue), 1)
+        self.assertEqual(sum(item.count(dialogue) for item in plan["clip_prompts"]), 1)
+        self.assertEqual(
+            contract["dialogue_manifest"][0]["exact_block"], dialogue,
+        )
+        validate_h3_shot_plan_seal(plan)
+
+    def test_canonical_source_replay_uses_frozen_duration_across_new_geometry(self):
+        source = "[0s-10s] An adult archivist crosses the reading room."
+        initial = plan_h3_native_shots(
+            global_prompt=source,
+            clip_frame_counts=[240],
+            fps=24,
+            source_canonicalization="t2va",
+        )
+        contract = initial["source_contracts"][0]
+        compiler_inputs = h3_source_compiler_inputs(contract)
+        self.assertEqual(
+            compiler_inputs["version"],
+            H3_COMPILER_INPUT_REPLAY_CANONICAL_VERSION,
+        )
+
+        replay = plan_h3_native_shots(
+            global_prompt=source,
+            source_prompts=[source],
+            source_compiler_inputs=[compiler_inputs],
+            clip_frame_counts=[120, 120],
+            fps=24,
+        )
+        replay_contract = replay["source_contracts"][0]
+        self.assertEqual(
+            replay_contract["source_canonicalization"],
+            contract["source_canonicalization"],
+        )
+        self.assertEqual(
+            replay_contract["semantic_prompt"], contract["semantic_prompt"],
+        )
+        self.assertEqual(replay_contract["authored_prompt"], source)
+        validate_h3_shot_plan_seal(replay)
+
+        from services.director_pipeline import (
+            _canonicalize_director_h3_v2_shot_plan,
+        )
+        director_prompts = _canonicalize_director_h3_v2_shot_plan(
+            replay,
+            prompts=list(replay["clip_prompts"]),
+            published=list(replay["clip_published_frames"]),
+            fps=24,
+            compile_workflow=lambda value: value,
+        )
+        self.assertEqual(len(director_prompts), 2)
+
+        compiler_inputs["structured_dialogue_blocks"].append(
+            "<d>[English] Mutated copy.</d>"
+        )
+        self.assertEqual(contract["structured_dialogue_blocks"], [])
+
+    def test_source_canonicalization_normalizes_sparse_and_point_timelines(self):
+        sparse = plan_h3_native_shots(
+            global_prompt="[5s-10s] The archivist opens the book.",
+            clip_frame_counts=[480],
+            fps=24,
+            source_canonicalization="t2va",
+        )
+        sparse_semantic = sparse["source_contracts"][0]["semantic_prompt"]
+        self.assertIn("[Shot 1] [0.000s-5.000s]", sparse_semantic)
+        self.assertIn("[Shot 2] [5.000s-10.000s]", sparse_semantic)
+        self.assertIn("[Shot 3] [10.000s-20.000s]", sparse_semantic)
+        self.assertEqual(sum(
+            "opens the book" in line for line in sparse_semantic.splitlines()
+        ), 1)
+
+        dialogue = "<d>[English]  Open now. </d>"
+        point_source = f"at 5 seconds: The archivist says {dialogue}"
+        point = plan_h3_native_shots(
+            global_prompt=point_source,
+            clip_frame_counts=[480],
+            fps=24,
+            source_canonicalization="t2va",
+        )
+        point_contract = point["source_contracts"][0]
+        self.assertEqual(point_contract["authored_prompt"], point_source)
+        self.assertIn(
+            "[Shot 2] [5.000s-5.042s]", point_contract["semantic_prompt"],
+        )
+        self.assertEqual(point_contract["semantic_prompt"].count(dialogue), 1)
+        self.assertEqual(point_contract["dialogue_manifest"][0]["exact_block"], dialogue)
+
+        canonical_source = point_contract["semantic_prompt"]
+        descriptor = point_contract["source_canonicalization"]
+        self.assertEqual(
+            h3_effective_source(canonical_source, descriptor), canonical_source,
+        )
+
+    def test_source_canonicalization_lowers_nested_points_without_payload_loss(self):
+        parent_dialogue = "<d>[English]  Hold steady. </d>"
+        point_dialogue = "<d>[English]  Turn now. </d>"
+        for point_seconds in (0, 5):
+            source = (
+                "[Shot 1] The reader holds a book and says "
+                f"{parent_dialogue}\n"
+                f"at {point_seconds} seconds: The page turns and the reader "
+                f"says {point_dialogue}"
+            )
+            with self.subTest(point_seconds=point_seconds):
+                plan = plan_h3_native_shots(
+                    global_prompt=source,
+                    clip_frame_counts=[480],
+                    fps=24,
+                    source_canonicalization="t2va",
+                )
+                contract = plan["source_contracts"][0]
+                semantic = contract["semantic_prompt"]
+                records = [
+                    line for line in semantic.splitlines()
+                    if line.startswith("[Shot ")
+                ]
+
+                self.assertEqual(contract["authored_prompt"], source)
+                self.assertFalse(any(
+                    "audiovisual_description: [Shot 1]" in line
+                    for line in records
+                ))
+                self.assertEqual(sum(
+                    "reader holds a book" in line for line in records
+                ), 1)
+                self.assertEqual(sum(
+                    "page turns" in line for line in records
+                ), 1)
+                self.assertEqual(semantic.count(parent_dialogue), 1)
+                self.assertEqual(semantic.count(point_dialogue), 1)
+                self.assertIn(
+                    f"dialogue_and_vocalizations: {parent_dialogue}",
+                    records[0],
+                )
+                self.assertEqual(
+                    [item["exact_block"] for item in contract["dialogue_manifest"]],
+                    [parent_dialogue, point_dialogue],
+                )
+
+                replay = plan_h3_native_shots(
+                    global_prompt=source,
+                    source_prompts=[source],
+                    source_compiler_inputs=[h3_source_compiler_inputs(contract)],
+                    clip_frame_counts=[240, 240],
+                    fps=24,
+                )
+                self.assertEqual(
+                    replay["source_contracts"][0]["semantic_prompt"], semantic,
+                )
+                self.assertEqual(
+                    replay["source_contracts"][0]["dialogue_manifest"],
+                    contract["dialogue_manifest"],
+                )
+
+        boundary_source = (
+            "[Shot 1] The reader holds a book and says "
+            f"{parent_dialogue}\n"
+            "at 10 seconds: The page turns and the reader says "
+            f"{point_dialogue}"
+        )
+        boundary = plan_h3_native_shots(
+            global_prompt=boundary_source,
+            clip_frame_counts=[240, 240],
+            fps=24,
+            source_canonicalization="t2va",
+        )
+        boundary_contract = boundary["source_contracts"][0]
+        self.assertEqual(
+            [item["segment_index"] for item in boundary_contract["dialogue_manifest"]],
+            [0, 1],
+        )
+        boundary_replay = plan_h3_native_shots(
+            global_prompt=boundary_source,
+            source_prompts=[boundary_source],
+            source_compiler_inputs=[h3_source_compiler_inputs(boundary_contract)],
+            clip_frame_counts=[240, 240],
+            fps=24,
+        )
+        self.assertEqual(boundary_replay["clip_prompts"], boundary["clip_prompts"])
+        self.assertEqual(
+            boundary_replay["source_contracts"], boundary["source_contracts"],
+        )
+
+    def test_source_canonicalization_rejects_bad_or_ambiguous_replay(self):
+        base_contract = {
+            "authored_shot_id": "shot-replay",
+            "visual_context": "",
+            "opening_blocking": "",
+            "final_blocking": "",
+            "structured_dialogue_blocks": [],
+        }
+        with self.assertRaisesRegex(
+            H3ShotPlanError, "descriptor is incomplete",
+        ):
+            h3_source_compiler_inputs({
+                **base_contract,
+                "source_canonicalization": None,
+            })
+
+        for descriptor in (
+            {
+                "mode": "ref2va", "recipe_version": 1,
+                "duration_seconds": 4.0, "fps": 24.0,
+                "published_frames": 96,
+            },
+            {
+                "mode": "t2va", "recipe_version": 2,
+                "duration_seconds": 4.0, "fps": 24.0,
+                "published_frames": 96,
+            },
+            {
+                "mode": "t2va", "recipe_version": 1,
+                "duration_seconds": 0, "fps": 24.0,
+                "published_frames": 96,
+            },
+            {
+                "mode": "t2va", "recipe_version": 1,
+                "duration_seconds": 4.0, "fps": 0,
+                "published_frames": 96,
+            },
+            {
+                "mode": "t2va", "recipe_version": 1,
+                "duration_seconds": float("nan"), "fps": 24.0,
+                "published_frames": 96,
+            },
+            {
+                "mode": "t2va", "recipe_version": 1,
+                "duration_seconds": 4.0, "fps": 24.0,
+                "published_frames": 95,
+            },
+            {
+                "mode": "t2va", "recipe_version": 1,
+                "duration_seconds": 4.0, "fps": 24.0,
+                "published_frames": 96, "extra": True,
+            },
+        ):
+            with self.subTest(descriptor=descriptor), self.assertRaises(
+                H3ShotPlanError,
+            ):
+                h3_effective_source("An adult host waits.", descriptor)
+
+        null_replay = {
+            "version": H3_COMPILER_INPUT_REPLAY_CANONICAL_VERSION,
+            **base_contract,
+            "source_canonicalization": None,
+        }
+        with self.assertRaisesRegex(
+            H3ShotPlanError, "descriptor is incomplete",
+        ):
+            plan_h3_native_shots(
+                global_prompt="An adult host waits.",
+                source_compiler_inputs=[null_replay],
+                clip_frame_counts=[96],
+                fps=24,
+            )
+        with self.assertRaisesRegex(
+            H3ShotPlanError, "cannot be combined with replay inputs",
+        ):
+            plan_h3_native_shots(
+                global_prompt="An adult host waits.",
+                source_compiler_inputs=[{
+                    "version": H3_COMPILER_INPUT_REPLAY_VERSION,
+                    **base_contract,
+                }],
+                source_canonicalization="t2va",
+                clip_frame_counts=[96],
+                fps=24,
+            )
+
+    def test_legacy_source_compiler_projection_keeps_v1_shape(self):
+        source = "[0-4s] An adult mechanic waits beside the workbench."
+        plan = plan_h3_native_shots(
+            global_prompt=source,
+            clip_frame_counts=[96],
+            fps=24,
+        )
+        contract = plan["source_contracts"][0]
+        compiler_inputs = h3_source_compiler_inputs(contract)
+
+        self.assertNotIn("source_canonicalization", contract)
+        self.assertEqual(compiler_inputs, {
+            "version": H3_COMPILER_INPUT_REPLAY_VERSION,
+            "authored_shot_id": contract["authored_shot_id"],
+            "visual_context": contract["visual_context"],
+            "opening_blocking": contract["opening_blocking"],
+            "final_blocking": contract["final_blocking"],
+            "structured_dialogue_blocks": contract[
+                "structured_dialogue_blocks"
+            ],
+        })
 
     def test_replay_compiler_inputs_reject_redundant_semantic_claims(self):
         dialogue = "<d>[English] Hello.</d>"

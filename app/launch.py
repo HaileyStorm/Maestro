@@ -9899,16 +9899,9 @@ def _replan_h3_final_segment_for_peak(
                 contract.get(source_prompt_field) or ""
             ))
             if contract_version == 2:
-                source_compiler_inputs.append({
-                    "version": 1,
-                    "authored_shot_id": contract.get("authored_shot_id"),
-                    "visual_context": contract.get("visual_context"),
-                    "opening_blocking": contract.get("opening_blocking"),
-                    "final_blocking": contract.get("final_blocking"),
-                    "structured_dialogue_blocks": copy.deepcopy(
-                        contract.get("structured_dialogue_blocks")
-                    ),
-                })
+                from services.h3_shot_planner import h3_source_compiler_inputs
+
+                source_compiler_inputs.append(h3_source_compiler_inputs(contract))
             else:
                 # Retain the committed v1 compiler input shape byte-for-byte;
                 # only v2 adopts the closed replay-input contract above.
@@ -64486,16 +64479,23 @@ def _replay_h3_duration_shot_plan(
         ):
             raise ValueError("sealed H3 prompt source is incomplete")
         source_prompts.append(contract["authored_prompt"])
-        compiler_inputs.append({
-            "version": 1,
-            "authored_shot_id": contract.get("authored_shot_id"),
-            "visual_context": contract.get("visual_context"),
-            "opening_blocking": contract.get("opening_blocking"),
-            "final_blocking": contract.get("final_blocking"),
-            "structured_dialogue_blocks": copy.deepcopy(
-                contract.get("structured_dialogue_blocks")
-            ),
-        })
+        from services.h3_shot_planner import h3_source_compiler_inputs
+
+        replay_input = h3_source_compiler_inputs(contract)
+        if "source_canonicalization" in replay_input:
+            # Duration approval creates a new plan from the authored source.
+            # Only generated source timing follows the approved geometry.
+            source_frames = sum(
+                frames for index, frames in enumerate(published)
+                if source_indices[index] == expected_index
+            )
+            source_fps = float(plan.get("fps") or 24)
+            replay_input["source_canonicalization"].update({
+                "published_frames": source_frames,
+                "fps": source_fps,
+                "duration_seconds": source_frames / source_fps,
+            })
+        compiler_inputs.append(replay_input)
     boundaries = list(plan.get("clip_boundaries") or [])
     if len(boundaries) < len(generated) - 1:
         raise ValueError("sealed H3 boundary mapping is incomplete")

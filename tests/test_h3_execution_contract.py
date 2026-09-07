@@ -25,6 +25,25 @@ class H3ExecutionContractTests(unittest.TestCase):
             rewrite_h3_execution_prompts(plan, prompts, validate_prompt=validator)
         self.assertEqual(plan, before)
 
+    def test_canonicalized_raw_source_keeps_ownership_during_schema_rewrite(self):
+        source = "  [0s-5s] The book opens. <d>[English]  Keep  this. </d>\n[5s-10s] The book closes.  "
+        plan = plan_h3_native_shots(
+            global_prompt=source, clip_frame_counts=[120, 120], fps=24,
+            source_canonicalization="t2va",
+            structured_shots=[{"spatial_setup": "The book starts closed.",
+                               "closing_blocking": "The book stays closed."}],
+        )
+        before = copy.deepcopy(plan)
+        result = rewrite_h3_execution_prompts(
+            plan, plan["clip_prompts"], validate_prompt=lambda *args: None,
+        )
+        self.assertEqual(plan, before)
+        self.assertEqual(result["source_contracts"][0]["authored_prompt"], source)
+        self.assertEqual(result["event_ownership"], plan["event_ownership"])
+        self.assertEqual(result["dialogue_manifest"], plan["dialogue_manifest"])
+        self.assertEqual(sum(p.count("<d>[English]  Keep  this. </d>") for p in result["clip_prompts"]), 1)
+        self.reject_unchanged(plan, [p.replace("The book opens.", "The book burns.") for p in plan["clip_prompts"]])
+
     def test_shared_dispatch_preserves_optional_legacy_paths_and_copy_isolation(self):
         self.assertIsNone(validate_h3_execution_shots(None, [], 0))
         self.assertIsNone(validate_h3_execution_shots({}, [], 0))

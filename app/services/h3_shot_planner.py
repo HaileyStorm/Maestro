@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 import hashlib
 import json
+import math
 import re
 from typing import Any
 
@@ -17,6 +18,8 @@ from typing import Any
 H3_SHOT_PLAN_VERSION = 1
 H3_SEMANTIC_PHYSICAL_CONTRACT_VERSION = 2
 H3_COMPILER_INPUT_REPLAY_VERSION = 1
+H3_COMPILER_INPUT_REPLAY_CANONICAL_VERSION = 2
+H3_SOURCE_CANONICALIZATION_RECIPE_VERSION = 1
 H3_CONTINUITY_MODES = frozenset({
     "independent", "continuous", "extend_previous",
 })
@@ -29,6 +32,174 @@ _H3_PROFILE_PREFERRED_FRAMES = {
 
 class H3ShotPlanError(ValueError):
     """Raised when authored shot semantics cannot be reconciled safely."""
+
+
+def _source_canonicalization_descriptor(value: Any) -> dict[str, Any]:
+    """Validate one sealed source-to-Context-IR compiler descriptor."""
+
+    required_fields = {
+        "mode", "recipe_version", "duration_seconds", "fps",
+        "published_frames",
+    }
+    if not isinstance(value, Mapping) or set(value) != required_fields:
+        raise H3ShotPlanError(
+            "H3 source canonicalization descriptor is incomplete"
+        )
+    if (
+        value.get("mode") != "t2va"
+        or type(value.get("recipe_version")) is not int
+        or value.get("recipe_version")
+            != H3_SOURCE_CANONICALIZATION_RECIPE_VERSION
+        or isinstance(value.get("duration_seconds"), bool)
+        or isinstance(value.get("fps"), bool)
+        or isinstance(value.get("published_frames"), bool)
+        or type(value.get("published_frames")) is not int
+        or value.get("published_frames", 0) <= 0
+    ):
+        raise H3ShotPlanError(
+            "H3 source canonicalization descriptor is unsupported"
+        )
+    try:
+        duration = float(value["duration_seconds"])
+        fps = float(value["fps"])
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise H3ShotPlanError(
+            "H3 source canonicalization duration must be positive and finite"
+        ) from exc
+    if (
+        not math.isfinite(duration)
+        or duration <= 0
+        or not math.isfinite(fps)
+        or fps <= 0
+    ):
+        raise H3ShotPlanError(
+            "H3 source canonicalization duration must be positive and finite"
+        )
+    try:
+        expected_duration = int(value["published_frames"]) / fps
+    except (OverflowError, ZeroDivisionError) as exc:
+        raise H3ShotPlanError(
+            "H3 source canonicalization geometry is invalid"
+        ) from exc
+    if not math.isclose(duration, expected_duration, rel_tol=0.0, abs_tol=1e-9):
+        raise H3ShotPlanError(
+            "H3 source canonicalization geometry disagrees"
+        )
+    return {
+        "mode": "t2va",
+        "recipe_version": H3_SOURCE_CANONICALIZATION_RECIPE_VERSION,
+        "duration_seconds": duration,
+        "fps": fps,
+        "published_frames": int(value["published_frames"]),
+    }
+
+
+def h3_effective_source(
+    authored_prompt: str,
+    source_canonicalization: Mapping[str, Any] | None = None,
+) -> str:
+    """Rebuild the deterministic semantic compiler source for one contract."""
+
+    source = str(authored_prompt or "")
+    if source_canonicalization is None:
+        return source
+    descriptor = _source_canonicalization_descriptor(source_canonicalization)
+    from services.h3_canonical_prompt import canonicalize_h3_prompt
+
+    try:
+        if _canonical_context_ir_parts(source) is not None:
+            return canonicalize_h3_prompt(
+                source,
+                duration_seconds=descriptor["duration_seconds"],
+                mode=descriptor["mode"],
+            )
+        normalized_prompts, _ownership = _compile_segment_local_prompts(
+            source,
+            segment_positions=[0],
+            published_frames=[descriptor["published_frames"]],
+            source_index=0,
+            fps=descriptor["fps"],
+        )
+        normalized_lines = normalized_prompts[0].splitlines()
+        for line_index, line in enumerate(normalized_lines):
+            first_shot = re.fullmatch(
+                r"\s*\[\s*(?:shot|scene)\s+1(?:\s*[^\]|]*)?\]\s*"
+                r"(?P<body>\S.*)",
+                line,
+                re.IGNORECASE,
+            )
+            if first_shot is not None:
+                # A first untimed shot preceding point cues is global direction
+                # in the shared parser. Fold its payload into the first disjoint
+                # range so its structural marker cannot become a nested record,
+                # and canonicalization can keep any exact dialogue in vocals.
+                first_range_index = next((
+                    index for index in range(line_index + 1, len(normalized_lines))
+                    if re.fullmatch(
+                        r"\s*\[[^\]\r\n]+-[^\]\r\n]+s\]\s+\S.*",
+                        normalized_lines[index],
+                    )
+                ), None)
+                if first_range_index is None:
+                    raise H3ShotPlanError(
+                        "H3 nested point timeline has no executable range"
+                    )
+                first_range = re.fullmatch(
+                    r"(?P<prefix>\s*\[[^\]\r\n]+-[^\]\r\n]+s\]\s+)"
+                    r"(?P<body>\S.*)",
+                    normalized_lines[first_range_index],
+                )
+                if first_range is None:
+                    raise H3ShotPlanError(
+                        "H3 nested point timeline range is malformed"
+                    )
+                normalized_lines[first_range_index] = (
+                    f"{first_range.group('prefix')}"
+                    f"{first_shot.group('body')} {first_range.group('body')}"
+                )
+                normalized_lines.pop(line_index)
+                break
+        normalized_prompt = "\n".join(normalized_lines)
+        return canonicalize_h3_prompt(
+            normalized_prompt,
+            duration_seconds=descriptor["duration_seconds"],
+            mode=descriptor["mode"],
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise H3ShotPlanError(
+            f"H3 source canonicalization failed: {exc}"
+        ) from exc
+
+
+def h3_source_compiler_inputs(contract: Mapping[str, Any]) -> dict[str, Any]:
+    """Project one sealed source contract into its exact replay input shape."""
+
+    if not isinstance(contract, Mapping):
+        raise H3ShotPlanError("H3 source compiler contract is incomplete")
+    base_fields = {
+        "authored_shot_id": contract.get("authored_shot_id"),
+        "visual_context": contract.get("visual_context"),
+        "opening_blocking": contract.get("opening_blocking"),
+        "final_blocking": contract.get("final_blocking"),
+        "structured_dialogue_blocks": (
+            list(contract["structured_dialogue_blocks"])
+            if isinstance(contract.get("structured_dialogue_blocks"), list)
+            else contract.get("structured_dialogue_blocks")
+        ),
+    }
+    if "source_canonicalization" not in contract:
+        return {
+            "version": H3_COMPILER_INPUT_REPLAY_VERSION,
+            **base_fields,
+        }
+    descriptor = _source_canonicalization_descriptor(
+        contract.get("source_canonicalization")
+    )
+    return {
+        "version": H3_COMPILER_INPUT_REPLAY_CANONICAL_VERSION,
+        **base_fields,
+        "source_canonicalization": descriptor,
+    }
 
 
 # Public planner-contract copy: two-colon clocks are H:M:S, not mm:ss.ss.
@@ -2297,6 +2468,7 @@ def plan_h3_native_shots(
     source_indices: Sequence[int] | None = None,
     structured_shots: Sequence[Any] | None = None,
     source_compiler_inputs: Sequence[Mapping[str, Any]] | None = None,
+    source_canonicalization: str | None = None,
     source_requested_frames: Sequence[int] | None = None,
     clip_requested_frames: Sequence[int] | None = None,
     segment_frames_maximum: int | None = None,
@@ -2335,6 +2507,15 @@ def plan_h3_native_shots(
         if source_compiler_inputs is not None
         else None
     )
+    if source_canonicalization is not None:
+        if source_canonicalization != "t2va":
+            raise H3ShotPlanError(
+                "H3 source canonicalization mode is unsupported"
+            )
+        if replay_inputs is not None:
+            raise H3ShotPlanError(
+                "H3 source canonicalization cannot be combined with replay inputs"
+            )
     if replay_inputs is not None:
         if shots:
             raise H3ShotPlanError(
@@ -2405,14 +2586,14 @@ def plan_h3_native_shots(
         ]
         if positions != list(range(positions[0], positions[-1] + 1)):
             raise H3ShotPlanError("H3 source segments must remain chronological")
-        source = str(prompts_by_source[source_index] or "").strip()
+        source_input = str(prompts_by_source[source_index] or "")
         local_published = [clip_published_frames[index] for index in positions]
         shot = shots[source_index] if source_index < len(shots) else None
         replay_input = (
             replay_inputs[source_index] if replay_inputs is not None else None
         )
         if replay_input is not None:
-            required_replay_fields = {
+            legacy_replay_fields = {
                 "version",
                 "authored_shot_id",
                 "visual_context",
@@ -2420,12 +2601,20 @@ def plan_h3_native_shots(
                 "final_blocking",
                 "structured_dialogue_blocks",
             }
+            replay_version = replay_input.get("version")
+            required_replay_fields = (
+                legacy_replay_fields
+                if replay_version == H3_COMPILER_INPUT_REPLAY_VERSION
+                else legacy_replay_fields | {"source_canonicalization"}
+            )
             if (
                 not isinstance(replay_input, Mapping)
                 or set(replay_input) != required_replay_fields
-                or type(replay_input.get("version")) is not int
-                or replay_input.get("version")
-                    != H3_COMPILER_INPUT_REPLAY_VERSION
+                or type(replay_version) is not int
+                or replay_version not in {
+                    H3_COMPILER_INPUT_REPLAY_VERSION,
+                    H3_COMPILER_INPUT_REPLAY_CANONICAL_VERSION,
+                }
                 or not isinstance(replay_input.get("authored_shot_id"), str)
                 or not replay_input.get("authored_shot_id", "").strip()
                 or not isinstance(replay_input.get("visual_context"), str)
@@ -2450,6 +2639,14 @@ def plan_h3_native_shots(
             raw_final_blocking = replay_input["final_blocking"]
             structured_dialogue_blocks = list(
                 replay_input["structured_dialogue_blocks"]
+            )
+            source_descriptor = (
+                _source_canonicalization_descriptor(
+                    replay_input.get("source_canonicalization")
+                )
+                if replay_version
+                    == H3_COMPILER_INPUT_REPLAY_CANONICAL_VERSION
+                else None
             )
             if (
                 authored_shot_id != authored_shot_id.strip()
@@ -2478,11 +2675,26 @@ def plan_h3_native_shots(
             structured_dialogue_blocks = [
                 item["exact_block"] for item in _source_dialogue_beats(shot)
             ]
+            source_descriptor = (
+                _source_canonicalization_descriptor({
+                    "mode": source_canonicalization,
+                    "recipe_version": H3_SOURCE_CANONICALIZATION_RECIPE_VERSION,
+                    "duration_seconds": sum(local_published) / fps_value,
+                    "fps": fps_value,
+                    "published_frames": sum(local_published),
+                })
+                if source_canonicalization is not None else None
+            )
         if authored_shot_id in seen_authored_shot_ids:
             raise H3ShotPlanError(
                 f"Duplicate authored H3 shot ID: {authored_shot_id}"
             )
         seen_authored_shot_ids.add(authored_shot_id)
+
+        authored_source = (
+            source_input if source_descriptor is not None else source_input.strip()
+        )
+        source = h3_effective_source(authored_source, source_descriptor)
 
         # All deterministic semantic compilation happens once, before native
         # geometry fans the shot out into physical execution segments.
@@ -2566,6 +2778,12 @@ def plan_h3_native_shots(
             or final_blocking != replay_input["final_blocking"]
             or structured_dialogue_blocks
                 != replay_input["structured_dialogue_blocks"]
+            or (
+                replay_input.get("version")
+                    == H3_COMPILER_INPUT_REPLAY_CANONICAL_VERSION
+                and source_descriptor
+                    != replay_input.get("source_canonicalization")
+            )
         ):
             raise H3ShotPlanError(
                 "H3 replay compiler inputs are not canonical"
@@ -2590,7 +2808,7 @@ def plan_h3_native_shots(
         localized_semantic_prompt, dialogue_tokens = _tag_dialogue_occurrences(
             semantic_prompt, source_dialogue,
         )
-        authored_final_blocking = _extract_final_blocking(source)[1]
+        authored_final_blocking = _extract_final_blocking(authored_source)[1]
         executable_prompts, source_events = _compile_segment_local_prompts(
             localized_semantic_prompt,
             segment_positions=positions,
@@ -2706,14 +2924,14 @@ def plan_h3_native_shots(
                 "end_seconds": end_cursor / fps_value,
             })
             local_cursor = end_cursor
-        source_contracts.append({
+        source_contract = {
             "source_index": source_index,
             "authored_shot_id": authored_shot_id,
             "semantic_shot_index": source_index,
             "segment_indices": positions,
             "semantic_prompt": semantic_prompt,
-            "authored_prompt": source,
-            "prompt_changed_before_split": semantic_prompt != source,
+            "authored_prompt": authored_source,
+            "prompt_changed_before_split": semantic_prompt != authored_source,
             "prompt_rewrite_for_physical_split": True,
             "physical_prompt_compiler_version": 2,
             "execution_slices": execution_slices,
@@ -2729,7 +2947,10 @@ def plan_h3_native_shots(
             "opening_blocking": opening_blocking,
             "final_blocking": final_blocking,
             "authored_final_blocking": authored_final_blocking,
-        })
+        }
+        if source_descriptor is not None:
+            source_contract["source_canonicalization"] = source_descriptor
+        source_contracts.append(source_contract)
 
     raw_boundaries = list(clip_boundaries or [])
     if len(raw_boundaries) > len(counts) - 1:
@@ -2860,13 +3081,18 @@ def plan_h3_native_shots(
 
 
 __all__ = [
+    "H3_COMPILER_INPUT_REPLAY_CANONICAL_VERSION",
+    "H3_COMPILER_INPUT_REPLAY_VERSION",
     "H3_CONTINUITY_MODES",
-    "H3_SHOT_PLAN_VERSION",
     "H3_SEGMENT_POLICY_VERSION",
     "H3_SEMANTIC_PHYSICAL_CONTRACT_VERSION",
+    "H3_SHOT_PLAN_VERSION",
+    "H3_SOURCE_CANONICALIZATION_RECIPE_VERSION",
     "H3ShotPlanError",
     "build_h3_visual_context",
     "floor_h3_frame_count",
+    "h3_effective_source",
+    "h3_source_compiler_inputs",
     "infer_h3_profile_id",
     "plan_h3_clip_frames",
     "plan_h3_native_shots",

@@ -675,6 +675,22 @@ class H3LongStudioPlanningTests(unittest.TestCase):
         self.assertTrue(all(124 <= frames <= 345 for frames in plan))
         self.assertTrue(all(frames % 17 == 5 for frames in plan))
 
+    def test_manual_base_keeps_freeform_source_without_strict_mapping(self):
+        prepare = self._load_launch_helpers()["_prepare_h3_long_studio_request"]
+        for source in (
+            "The title reads left | right.",
+            "A reader says <d>[English] Keep\n  this exact speech. </d>",
+            "subject_definitions:\n<Subject 1>: an adult pilot\nThe pilot reads.",
+        ):
+            with self.subTest(source=source):
+                body = {"model_type": "minimax_h3", "video_length": 480,
+                        "prompt": source, "h3_adaptive_conditioning": False}
+                plan = prepare(body)
+                contract = plan["shot_plan"]["source_contracts"][0]
+                self.assertEqual(contract["authored_prompt"], source)
+                self.assertNotIn("source_canonicalization", contract)
+                self.assertEqual(plan["global_prompt"], source)
+
     def test_studio_persists_per_segment_publication_geometry(self):
         prepare = self._load_launch_helpers()["_prepare_h3_long_studio_request"]
         body = {

@@ -1585,3 +1585,48 @@ an explicit empty catalogue means canonical no-speech. Detailed offsets cannot
 be repurposed as summary event positions. This is a design finding, not deployed
 recovery. The broader active backlog and browser acceptance remain open, and the
 continuous Goal remains active.
+
+
+### Active source compiler and replay prerequisite (2026-09-07)
+
+The active shared shot planner now supports an explicit
+source_canonicalization="t2va" recipe before ownership compilation. It retains
+exact authored input separately, including edge whitespace, and seals a closed
+recipe containing mode, version, duration, FPS and published frames. Sparse
+ranges and point cues use the existing timeline compiler before canonicalization;
+an untimed first-shot marker is lowered without losing its action or speech.
+The source helper does not load a model or call Director.
+
+Legacy replay input v1 and default planner output remain unchanged. New recipe
+plans use closed replay input v2. Active recovery, duration editing, Director
+provenance validation and transactional prompt rewriting use the same helpers.
+Recovery retains the frozen recipe. An explicitly approved duration edit creates
+a new recipe from approved geometry and the retained authored input; it does not
+mutate the old plan or silently retime authored timestamps outside the new range.
+The duplicated launch replay dictionaries were replaced by the shared projection.
+
+The final clean-candidate gate passes all 544 CPU tests across planner, execution,
+canonical literals, Director, Studio, queue recovery, generation planning,
+duration and native-boundary contracts. The final nested-point/zero-FPS closure
+passes two additional targeted checks; compileall and tracked-publication checks
+pass. Independent review closed blanket Studio activation, zero-FPS validation,
+and first-shot/point normalization findings. Four captured legacy plans and an
+independent five-source plan/replay probe remain byte-equivalent. Evidence and
+exact reviewed hashes: `.artifacts-temp/astra-active-source-20260907/`.
+
+This is a prerequisite, not adaptive mapper adoption. The attempted unconditional
+Base Studio switch was rejected and is preserved only in the evidence artifact.
+Manual Base retains its existing freeform behavior: multiline speech, literal
+separators and loose subject declarations must not acquire strict schema rules
+merely because they enter Studio. Some of these sources cannot yet be represented
+by the strict mapper without an explicit authoring policy; do not invent aliases,
+strip literal material or weaken the subject validator to hide that gap.
+
+Next integrate the recipe only at the actual adaptive schema-mapping owner,
+together with per-segment reference/geometry binding, original-source provenance
+and rewrite_h3_execution_prompts. Replace the unadopted append-and-reseal draft;
+do not re-enable the rejected broad Studio switch or expand the retired sequence
+chain. Generated Ref-to-Base target switching must rebuild from proven retained
+Base/freeform source. The broader backlog, rendered-browser checks and live
+acceptance remain open. No GPU/model/service/browser/Windows acceptance is added
+by this CPU milestone; the continuous Goal remains active.

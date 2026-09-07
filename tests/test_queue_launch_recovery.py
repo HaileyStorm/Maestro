@@ -1131,6 +1131,32 @@ class QueueLaunchWiringTests(unittest.TestCase):
             approval_source,
         )
 
+    def test_duration_replay_retains_canonical_source_recipe_and_authored_bytes(self):
+        from services.h3_shot_planner import plan_h3_native_shots
+        source = "  The book opens. <d>[English]  Keep  this. </d>  "
+        original = plan_h3_native_shots(
+            global_prompt=source, clip_frame_counts=[240, 240], fps=24,
+            source_canonicalization="t2va",
+        )
+        namespace = _isolated_functions(
+            self.launch, ("_replay_h3_duration_shot_plan",), {"copy": copy},
+        )
+        replay = namespace["_replay_h3_duration_shot_plan"](
+            {"global_prompt": source, "fps": 24, "shot_plan": original,
+             "clip_boundaries": original["clip_boundaries"],
+             "segment_frames_maximum": 345},
+            generated=[230, 230], published=[230, 230],
+        )
+        before = original["source_contracts"][0]
+        after = replay["source_contracts"][0]
+        for field in ("authored_prompt", "dialogue_manifest"):
+            self.assertEqual(after[field], before[field], field)
+        self.assertEqual(before["source_canonicalization"]["published_frames"], 480)
+        self.assertEqual(after["source_canonicalization"]["published_frames"], 460)
+        self.assertEqual(after["source_canonicalization"]["duration_seconds"], 460 / 24)
+        self.assertIn("The book opens.", after["semantic_prompt"])
+        self.assertIn("<d>[English]  Keep  this. </d>", after["semantic_prompt"])
+
     def test_one_segment_snap_replays_sealed_sources_and_rejects_hybrids(self):
         from services.director_pipeline import (
             _bind_director_h3_runtime_contract,
@@ -3118,6 +3144,12 @@ class QueueLaunchWiringTests(unittest.TestCase):
             )
 
     def test_calibrated_replan_preserves_prefix_and_exact_publication(self):
+        self._check_calibrated_replan_source_recipe(None)
+
+    def test_calibrated_replan_preserves_canonical_source_recipe(self):
+        self._check_calibrated_replan_source_recipe("t2va")
+
+    def _check_calibrated_replan_source_recipe(self, canonicalization):
         from services.h3_shot_planner import plan_h3_native_shots
 
         class RecoveryError(RuntimeError):
@@ -3171,8 +3203,11 @@ class QueueLaunchWiringTests(unittest.TestCase):
         semantic_source = (
             "<Subject 1> holds position while the hangar doors close."
         )
+        if canonicalization:
+            semantic_source = "  The pilot holds position while the hangar doors close.  "
         original_shot_plan = plan_h3_native_shots(
             global_prompt=semantic_source,
+            source_canonicalization=canonicalization,
             clip_frame_counts=prefix_frames + [294],
             clip_requested_frames=prefix_published + [292],
             fps=24,
@@ -3238,6 +3273,9 @@ class QueueLaunchWiringTests(unittest.TestCase):
             },
         )
         plan = replanned["_h3_longform"]
+        if canonicalization:
+            for field in ("authored_prompt", "source_canonicalization", "semantic_prompt", "dialogue_manifest"):
+                self.assertEqual(plan["shot_plan"]["source_contracts"][0][field], original_shot_plan["source_contracts"][0][field], field)
         self.assertEqual(plan["clip_frames"][:4], prefix_frames)
         self.assertEqual(plan["clip_published_frames"][:4], prefix_published)
         self.assertEqual(sum(plan["clip_published_frames"]),
@@ -3502,6 +3540,9 @@ class QueueLaunchWiringTests(unittest.TestCase):
             )
 
         committed_v1 = _committed_v1_h3_plan(original_shot_plan)
+        if canonicalization:
+            return  # New compiler recipes never belonged to legacy v1 plans.
+
         v1_params = {
             **params,
             "per_clip_prompts": list(committed_v1["clip_prompts"]),

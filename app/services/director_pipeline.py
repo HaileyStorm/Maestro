@@ -7528,6 +7528,7 @@ def _canonicalize_director_h3_v2_shot_plan(
         _authored_opening_payload,
         _canonical_context_ir_parts,
         _extract_final_blocking,
+        h3_effective_source,
         _semantic_dialogue_identity,
         _strip_dialogue_occurrence_tokens,
         _tag_dialogue_occurrences,
@@ -7604,6 +7605,22 @@ def _canonicalize_director_h3_v2_shot_plan(
         ):
             raise ValueError("Saved Director H3 semantic shot is incomplete")
         _validate_dialogue_spans(semantic_prompt)
+        if (
+            "source_canonicalization" in contract
+            and contract.get("source_canonicalization") is None
+        ):
+            raise ValueError(
+                "Saved Director H3 source canonicalization is incomplete"
+            )
+        try:
+            effective_source = h3_effective_source(
+                authored_prompt,
+                contract.get("source_canonicalization"),
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"Saved Director H3 source canonicalization is invalid: {exc}"
+            ) from exc
         visual_context = contract.get("visual_context")
         opening_blocking = contract.get("opening_blocking")
         final_blocking = contract.get("final_blocking")
@@ -7623,7 +7640,7 @@ def _canonicalize_director_h3_v2_shot_plan(
                 "Saved Director H3 semantic compiler inputs are incomplete"
             )
         rebuilt_semantic_prompt, _rebuilt_dialogue = _compile_semantic_prompt(
-            authored_prompt,
+            effective_source,
             visual_context=visual_context,
             opening_blocking=opening_blocking,
             final_blocking=final_blocking,
@@ -7635,7 +7652,7 @@ def _canonicalize_director_h3_v2_shot_plan(
             )
         if visual_context:
             without_visual, _ = _compile_semantic_prompt(
-                authored_prompt,
+                effective_source,
                 visual_context="",
                 opening_blocking=opening_blocking,
                 final_blocking=final_blocking,
@@ -7646,11 +7663,11 @@ def _canonicalize_director_h3_v2_shot_plan(
                     "Saved Director H3 semantic compiler inputs are not canonical"
                 )
         source_is_canonical = (
-            _canonical_context_ir_parts(authored_prompt) is not None
+            _canonical_context_ir_parts(effective_source) is not None
         )
         if final_blocking and not source_is_canonical:
             without_final, _ = _compile_semantic_prompt(
-                authored_prompt,
+                effective_source,
                 visual_context=visual_context,
                 opening_blocking=opening_blocking,
                 final_blocking="",
@@ -7662,17 +7679,17 @@ def _canonicalize_director_h3_v2_shot_plan(
                 )
         if opening_blocking:
             without_opening, _ = _compile_semantic_prompt(
-                authored_prompt,
+                effective_source,
                 visual_context=visual_context,
                 opening_blocking="",
                 final_blocking=final_blocking,
                 structured_dialogue_blocks=structured_dialogue_blocks,
             )
             if without_opening == semantic_prompt:
-                authored_opening = _authored_opening_payload(authored_prompt)
+                authored_opening = _authored_opening_payload(effective_source)
                 if (
                     not _authored_opening_contains(
-                        authored_prompt, opening_blocking,
+                        effective_source, opening_blocking,
                     )
                     or opening_blocking != authored_opening
                 ):
@@ -7686,7 +7703,7 @@ def _canonicalize_director_h3_v2_shot_plan(
                 if index != block_index
             ]
             without_block, _ = _compile_semantic_prompt(
-                authored_prompt,
+                effective_source,
                 visual_context=visual_context,
                 opening_blocking=opening_blocking,
                 final_blocking=final_blocking,
