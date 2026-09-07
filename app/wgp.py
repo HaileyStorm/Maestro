@@ -131,7 +131,7 @@ lm_decoder_engine = ""
 enable_int8_kernels = 0
 # All media attachment keys for queue save/load
 ATTACHMENT_KEYS = ["image_start", "image_end", "image_refs", "image_guide", "image_mask",
-                   "video_guide", "video_guide2", "video_guide3", "video_mask", "video_source", "video_end", "audio_guide", "audio_guide2", "audio_guide3", "audio_guide4", "audio_guide5", "audio_guide6", "audio_source", "custom_guide"]
+                   "video_guide", "video_guide2", "video_guide3", "video_mask", "video_source", "video_end", "audio_guide", "audio_guide2", "audio_guide3", "audio_guide4", "audio_guide5", "audio_guide6", "audio_conditioning_guide", "audio_source", "custom_guide"]
 
 from importlib.metadata import version
 mmgp_version = version("mmgp")
@@ -1431,6 +1431,33 @@ def clear_custom_setting_slots(inputs):
     for idx in range(CUSTOM_SETTINGS_MAX):
         inputs.pop(get_custom_setting_key(idx), None)
 
+
+def _normalize_audio_prompt_type_from_guide(
+    model_def,
+    image_mode,
+    audio_guide,
+    video_guide,
+    video_prompt_type,
+    audio_prompt_type,
+):
+    """Restore a missing audio source selector for unambiguous soundtracks."""
+
+    normalized_audio_prompt_type = (
+        audio_prompt_type if isinstance(audio_prompt_type, str) else ""
+    )
+    if (
+        image_mode == 0
+        and model_def.get("infer_audio_prompt_from_guide", False)
+        and audio_guide
+        and (not video_guide or "V" not in str(video_prompt_type or ""))
+        and not any(
+            letter in normalized_audio_prompt_type for letter in "AK2"
+        )
+    ):
+        return f"A{normalized_audio_prompt_type}"
+    return normalized_audio_prompt_type
+
+
 def validate_settings(state, model_type, single_prompt, inputs):
     def ret():
         return None, None, None, None
@@ -1570,6 +1597,16 @@ def validate_settings(state, model_type, single_prompt, inputs):
     self_refiner_plan = inputs["self_refiner_plan"]
     model_mode = inputs["model_mode"]
     medium = "Videos" if image_mode == 0 else "Images"
+
+    audio_prompt_type = _normalize_audio_prompt_type_from_guide(
+        model_def,
+        image_mode,
+        audio_guide,
+        video_guide,
+        video_prompt_type,
+        audio_prompt_type,
+    )
+    inputs["audio_prompt_type"] = audio_prompt_type
 
     if image_start is not None and not isinstance(image_start, list): image_start = [image_start]
     outpainting_modes = model_def.get("video_guide_outpainting", [])
@@ -9828,6 +9865,74 @@ def slice_audio_window(audio_path, start_frame, num_frames, fps, output_dir, suf
     return data, sample_rate
 
 
+def _audio_waveform_sample_count(waveform):
+    """Return samples for either channel-first or channel-last audio."""
+
+    if waveform is None:
+        return 0
+    shape = tuple(int(value) for value in getattr(waveform, "shape", ()))
+    if not shape or any(value == 0 for value in shape):
+        return 0
+    if len(shape) == 1:
+        return shape[0]
+    return max(shape[-2:])
+
+
+def _validate_audio_conditioning_guide(audio_conditioning_guide):
+    """Return one existing conditioning file without exposing its path on error."""
+
+    if audio_conditioning_guide is None:
+        return None
+    if isinstance(audio_conditioning_guide, str) and not audio_conditioning_guide:
+        return None
+    if not isinstance(audio_conditioning_guide, (str, os.PathLike)):
+        raise ValueError(
+            "Audio conditioning guide must be one existing audio file."
+        )
+    audio_conditioning_path = os.fspath(audio_conditioning_guide)
+    if not audio_conditioning_path or not os.path.isfile(audio_conditioning_path):
+        raise ValueError(
+            "Audio conditioning guide must be one existing audio file."
+        )
+    return audio_conditioning_path
+
+
+def _is_ltx25_runtime(model_def):
+    return (
+        model_def.get("external_runtime") == "ltx25"
+        or model_def.get("ltx25_native_runtime", False)
+    )
+
+
+def _validate_audio_conditioning_guide_for_model(
+    model_def,
+    audio_conditioning_guide,
+):
+    """Keep the optional conditioning channel isolated to LTX-2.5."""
+
+    if audio_conditioning_guide is None:
+        return None
+    if isinstance(audio_conditioning_guide, str) and not audio_conditioning_guide:
+        return None
+    if not _is_ltx25_runtime(model_def):
+        raise ValueError(
+            "Audio conditioning guide is supported only by LTX-2.5 models."
+        )
+    return _validate_audio_conditioning_guide(audio_conditioning_guide)
+
+
+def _resolve_audio_guide_roles(audio_guide, audio_conditioning_guide):
+    """Keep delivery provenance separate from optional model conditioning."""
+
+    conditioning_guide = _validate_audio_conditioning_guide(
+        audio_conditioning_guide
+    )
+    return (
+        audio_guide,
+        audio_guide if conditioning_guide is None else conditioning_guide,
+    )
+
+
 def get_audio_file_sample_rate(audio_path):
     import ffmpeg
 
@@ -10292,6 +10397,48 @@ def generate_video(*args, **kwargs):
                 torch.cuda.ipc_collect()
 
 
+def _resolve_ltx25_video_vae_request(
+    model_def,
+    requested_variant,
+    resident_model,
+):
+    """Return normalized LTX-2.5 decoder state and whether it changed."""
+
+    if not _is_ltx25_runtime(model_def):
+        return None, False
+    from models.ltx25.ltx25_handler import normalize_video_vae_variant
+
+    normalized_variant = normalize_video_vae_variant(
+        requested_variant
+        or model_def.get("ltx25_video_vae_default", "fast")
+    )
+    return (
+        normalized_variant,
+        resident_model is not None
+        and getattr(resident_model, "video_vae_variant", None)
+        != normalized_variant,
+    )
+
+
+def _apply_ltx25_video_vae_request(
+    model_def,
+    requested_variant,
+    resident_model,
+    model_kwargs,
+    reload_needed,
+):
+    """Apply decoder kwargs and preserve or raise the model reload decision."""
+
+    normalized_variant, variant_changed = _resolve_ltx25_video_vae_request(
+        model_def,
+        requested_variant,
+        resident_model,
+    )
+    if normalized_variant is not None:
+        model_kwargs["ltx25_video_vae"] = normalized_variant
+    return bool(reload_needed or variant_changed)
+
+
 def _generate_video_impl(
     task,
     send_cmd,
@@ -10495,6 +10642,13 @@ def _generate_video_impl(
     after_repeat_output=None,
     after_segment_output=None,
     _maestro_enhanced_prompt_cardinality=None,
+    # LTX-2.5's optional decoder is resident model state. Keep these public
+    # inputs at the tail so existing positional generation callers retain
+    # their established argument order.
+    ltx25_video_vae="fast",
+    # Director may supply a vocals-only derivative for conditioning while the
+    # original audio_guide remains the soundtrack used for final delivery.
+    audio_conditioning_guide=None,
 ):
 
     # API scheduling needs a model-safe boundary between independent outputs.
@@ -10695,7 +10849,12 @@ def _generate_video_impl(
         audio_file_settings_list = gen["audio_file_settings_list"]
 
 
-    model_def = get_model_def(model_type) 
+    model_def = get_model_def(model_type)
+    validated_audio_conditioning_guide = (
+        _validate_audio_conditioning_guide_for_model(
+            model_def, audio_conditioning_guide,
+        )
+    )
     semantic_reference_mode = bool(model_def.get("minimax_h3_reference_mode", False))
     is_image = image_mode > 0
     audio_only = model_def.get("audio_only", False)
@@ -10857,6 +11016,14 @@ def _generate_video_impl(
     vae_upsampling = model_def.get("vae_upsampler", None)
     new_vae_upsampling = None
     model_kwargs = {}
+    resident_ltx25_model = wan_model if model_type == transformer_type else None
+    reload_needed = _apply_ltx25_video_vae_request(
+        model_def,
+        ltx25_video_vae,
+        resident_ltx25_model,
+        model_kwargs,
+        reload_needed,
+    )
     if vae_upsampling is not None:
         new_vae_upsampling = None if image_mode not in vae_upsampling or "vae" not in spatial_upsampling else spatial_upsampling
         # Read back the currently-applied setting to decide whether a reload
@@ -10874,7 +11041,8 @@ def _generate_video_impl(
         else:
             old_vae_upsampling = _last_vae_upsampling
         reload_needed = reload_needed or old_vae_upsampling != new_vae_upsampling
-        if new_vae_upsampling: model_kwargs = {"VAE_upsampling": new_vae_upsampling}
+        if new_vae_upsampling:
+            model_kwargs["VAE_upsampling"] = new_vae_upsampling
     output_type = get_output_type_for_model(model_type, image_mode)
     profile = compute_profile(override_profile, output_type)
     if str(model_type or "").startswith("minimax_h3"):
@@ -10965,6 +11133,7 @@ def _generate_video_impl(
             video_guide3, custom_guide, voice_reference,
             audio_source, audio_guide, audio_guide2, audio_guide3,
             audio_guide4, audio_guide5, audio_guide6,
+            validated_audio_conditioning_guide,
         ],
         loras=activated_loras,
         stage_count=(
@@ -11642,6 +11811,10 @@ def _generate_video_impl(
     output_new_audio_filepath = None
     original_audio_guide = audio_guide
     original_audio_guide2 = audio_guide2
+    original_audio_guide, audio_guide = _resolve_audio_guide_roles(
+        original_audio_guide,
+        validated_audio_conditioning_guide,
+    )
     audio_proj_split = None
     audio_proj_full = None
     audio_scale = audio_scale if model_def.get("audio_scale_name") else None
@@ -11926,6 +12099,7 @@ def _generate_video_impl(
             video_guide3, custom_guide, voice_reference,
             audio_source, audio_guide, audio_guide2, audio_guide3,
             audio_guide4, audio_guide5, audio_guide6,
+            validated_audio_conditioning_guide,
         ],
         loras=loras_selected,
         stage_count=(
@@ -12239,11 +12413,44 @@ def _generate_video_impl(
                 # If the requested audio window fell past the source (empty slice),
                 # fall back to the previous window's trailing generated audio so we
                 # get a non-empty prefix — the model will continue the voice/tone.
-                if input_waveform is not None and input_waveform.shape[0] == 0 and pre_audio_guide is not None:
+                if _audio_waveform_sample_count(input_waveform) == 0 and pre_audio_guide is not None:
                     input_waveform, input_waveform_sample_rate = pre_audio_guide, pre_audio_guide_sample_rate
                 if audio_frame_offset > 0:
                     audio_energy = float(np.abs(input_waveform).mean()) if input_waveform is not None else 0
                     print(f"[Multi-Clip] clip audio_start_frame={audio_start_frame} (offset={audio_frame_offset}), frames={current_video_length}, audio_energy={audio_energy:.6f}")
+            elif model_def.get("audio_guide_window_slicing", False):
+                # Native-audio models continue from the exact audio tail they
+                # generated in the preceding window. If the first pass begins
+                # with source-video overlap, seed it from the source soundtrack.
+                if _audio_waveform_sample_count(pre_audio_guide) > 0:
+                    input_waveform, input_waveform_sample_rate = (
+                        pre_audio_guide,
+                        pre_audio_guide_sample_rate,
+                    )
+                elif (
+                    window_no == 1
+                    and source_video_overlap_frames_count > 0
+                    and len(source_audio_tracks) > 0
+                ):
+                    source_audio_start_frame = max(
+                        0,
+                        source_video_frames_count
+                        - source_video_overlap_frames_count,
+                    )
+                    input_waveform, input_waveform_sample_rate = (
+                        slice_audio_window(
+                            source_audio_tracks[0],
+                            source_audio_start_frame,
+                            source_video_overlap_frames_count,
+                            fps,
+                            save_path,
+                            suffix=f"_source_overlap_win{window_no}",
+                            pad_head=False,
+                            pad_tail=False,
+                        )
+                    )
+                    if _audio_waveform_sample_count(input_waveform) == 0:
+                        input_waveform, input_waveform_sample_rate = None, 0
             if fantasy and audio_guide is not None:
                 audio_proj_split , audio_context_lens = parse_audio(audio_guide, start_frame = aligned_window_start_frame, num_frames= current_video_length, fps= fps,  device= processing_device  )
             if multitalk:
@@ -12976,15 +13183,35 @@ def _generate_video_impl(
                     overlapped_latents = samples.get("latent_slice", None)
                     BGRA_frames = samples.get("BGRA_frames", None)
                     generated_audio = samples.get("audio", generated_audio)
+                    output_audio_sampling_rate = resolve_generated_audio_sampling_rate(
+                        samples,
+                        audio_sampling_rate,
+                    )
                     overridden_inputs = samples.get("overridden_inputs", None)
                     if generated_audio is not None:
-                        if model_def.get("output_audio_is_input_audio", False) and output_new_audio_filepath is not None:  
+                        input_fills_window = (
+                            input_waveform is not None
+                            and input_waveform_sample_rate > 0
+                            and _audio_waveform_sample_count(input_waveform)
+                            >= int(
+                                round(
+                                    current_video_length
+                                    * input_waveform_sample_rate
+                                    / fps
+                                )
+                            )
+                        )
+                        if (
+                            (
+                                model_def.get("output_audio_is_input_audio", False)
+                                or "D" in audio_prompt_type
+                            )
+                            and output_new_audio_filepath is not None
+                            and input_fills_window
+                        ):
                             generated_audio = None
-                        else:
+                        elif input_fills_window:
                             output_new_audio_filepath = None
-                            output_audio_sampling_rate =  samples.get("audio_sampling_rate", audio_sampling_rate)
-                    else:
-                        output_audio_sampling_rate =  samples.get("audio_sampling_rate", audio_sampling_rate)
                     post_decode_pre_trim = samples.get("post_decode_pre_trim", 0)
                     _retake_stitch_info = samples.get("retake_stitch_info", None)
                     samples = samples.get("x", None)

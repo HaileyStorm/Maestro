@@ -14041,6 +14041,7 @@ _GENERATION_MEDIA_INPUTS = (
     "video_guide", "video_guide2", "video_guide3", "video_mask",
     "video_source", "video_end", "audio_guide", "audio_guide2",
     "audio_guide3", "audio_guide4", "audio_guide5", "audio_guide6",
+    "audio_conditioning_guide",
     "audio_source", "custom_guide", "voice_reference",
 )
 
@@ -14054,6 +14055,8 @@ def _authorize_generation_media_inputs(
     def _resolve(value, field: str):
         if value is None or value == "":
             return value
+        if field == "audio_conditioning_guide" and isinstance(value, list):
+            raise HTTPException(status_code=400, detail="audio_conditioning_guide must be a single media path")
         if isinstance(value, list):
             return [_resolve(item, field) for item in value]
         if not isinstance(value, str):
@@ -15213,6 +15216,7 @@ def _authorize_h3_turbo_benchmark_request(
         "video_guide", "video_guide2", "video_guide3", "video_mask",
         "video_source", "video_end", "audio_guide", "audio_guide2",
         "audio_guide3", "audio_guide4", "audio_guide5", "audio_guide6",
+        "audio_conditioning_guide",
         "audio_source", "custom_guide", "voice_reference",
     )
     if valid:
@@ -21061,6 +21065,7 @@ def get_model_options(model_type: str, request: Request):
         "returns_audio": md.get("returns_audio", False),
         "any_audio_prompt": md.get("any_audio_prompt", False),
         "audio_scale_name": md.get("audio_scale_name", ""),
+        "infer_audio_prompt_from_guide": md.get("infer_audio_prompt_from_guide", False),
         "lock_inference_steps": md.get("lock_inference_steps", False),
         "lock_guidance_scale": md.get("lock_guidance_scale", False),
         "no_negative_prompt": md.get("no_negative_prompt", False),
@@ -21100,6 +21105,8 @@ def get_model_options(model_type: str, request: Request):
         "cfg_star": md.get("cfg_star", False),
         "adaptive_projected_guidance": md.get("adaptive_projected_guidance", False),
         "audio_guidance": md.get("audio_guidance", False),
+        "ltx25_video_vae_choices": md.get("ltx25_video_vae_choices"),
+        "ltx25_video_vae_default": md.get("ltx25_video_vae_default", "fast"),
         "prompt_enhancer_model": md.get("prompt_enhancer_model"),
 
         # Sliding window
@@ -43307,6 +43314,22 @@ async def generate(request: Request):
     # falling back to T2V as Maestro's UX promises.
     _normalize_image_prompt_type(body)
 
+    _generation_model_def = {} if is_sfx else (wgp.get_model_def(body["model_type"]) or {})
+    if (
+        _generation_model_def.get("infer_audio_prompt_from_guide", False)
+        and body.get("image_mode", 0) == 0
+        and body.get("audio_guide")
+        and (not body.get("video_guide") or "V" not in str(body.get("video_prompt_type") or ""))
+    ):
+        _audio_prompt_type = body.get("audio_prompt_type")
+        if _audio_prompt_type is not None and not isinstance(_audio_prompt_type, str):
+            raise HTTPException(status_code=400, detail="audio_prompt_type must be a string")
+        _audio_prompt_type = _audio_prompt_type or ""
+        if not any(letter in _audio_prompt_type for letter in "AK2"):
+            # Retain processing flags while restoring a standalone soundtrack's
+            # source selector. Control-video requests keep their explicit mode.
+            body["audio_prompt_type"] = f"A{_audio_prompt_type}"
+
     # MiniMax H3 checkpoints have a hard native 15-second ceiling and do not
     # implement latent sliding windows. A longer Studio duration is therefore
     # planned as consecutive legal H3 clips, using the existing multi-clip
@@ -59450,6 +59473,7 @@ def _run_generation(
                     "video_guide3", "audio_guide",
                     "audio_guide2", "audio_guide3", "audio_guide4",
                     "audio_guide5", "audio_guide6",
+                    "audio_conditioning_guide",
                 ]:
                     val = source_params.get(key)
                     if val and isinstance(val, str):
@@ -62750,6 +62774,7 @@ def _write_recast_shot_aware_sidecar(
         "video_guide3", "audio_guide",
         "audio_guide2", "audio_guide3", "audio_guide4",
         "audio_guide5", "audio_guide6",
+        "audio_conditioning_guide",
     ):
         value = params.get(key)
         if isinstance(value, str) and value:
@@ -63010,6 +63035,7 @@ def _write_repaint_shot_aware_sidecar(
         "video_guide3", "audio_guide",
         "audio_guide2", "audio_guide3", "audio_guide4",
         "audio_guide5", "audio_guide6",
+        "audio_conditioning_guide",
     ):
         value = params.get(key)
         if isinstance(value, str) and value:
@@ -63271,6 +63297,7 @@ def _write_outpaint_shot_aware_sidecar(
         "video_guide3", "audio_guide",
         "audio_guide2", "audio_guide3", "audio_guide4",
         "audio_guide5", "audio_guide6",
+        "audio_conditioning_guide",
     ):
         value = params.get(key)
         if isinstance(value, str) and value:

@@ -458,7 +458,6 @@ class MiniMaxMusic3Tests(unittest.TestCase):
         ui = _read(_MUSIC_UI)
         client = _read(_CLIENT)
         launch = _read(_LAUNCH)
-        self.assertIn("const DEFAULTS_VERSION = 9", store)
         self.assertIn("directorMusicModel", store)
         self.assertIn("sendMusicToDirector", store)
         self.assertIn("api.writeSong({", ui)

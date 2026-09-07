@@ -33,11 +33,11 @@ class ModelVisibilityDefaultsTests(unittest.TestCase):
         )
         self.assertIn("'minimax_h3'", defaults)
         self.assertIn("'ltx2_22B_distilled_1_1'", defaults)
+        self.assertIn("'ltx2_25'", defaults)
         self.assertIn("'mmaudio_v2'", defaults)
         self.assertIn("'mmaudio_nsfw'", defaults)
         self.assertIn("'animate'", defaults)
-        self.assertIn("const DEFAULTS_VERSION = 9", source)
-        self.assertNotIn("const DEFAULTS_VERSION = 10", source)
+        self.assertIn("const DEFAULTS_VERSION = 10", source)
 
     def test_mmaudio_nsfw_catalog_entry_has_no_mature_only_gate(self):
         source = _store_source()

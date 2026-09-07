@@ -10,7 +10,10 @@ import os
 from pathlib import Path
 import stat
 import tempfile
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Maestro also supports Python 3.10.
+    import tomli as tomllib
 import unittest
 from unittest import mock
 import warnings

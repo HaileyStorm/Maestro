@@ -733,10 +733,11 @@ class TestJobLifecycleWiring(unittest.TestCase):
             argument
             for argument in generate.args.args
             if not argument.arg.startswith("_")
-        ][-2:]
+        ][-4:]
         self.assertEqual(
             [argument.arg for argument in public_tail_arguments],
-            ["after_repeat_output", "after_segment_output"],
+            ["after_repeat_output", "after_segment_output",
+             "ltx25_video_vae", "audio_conditioning_guide"],
         )
         defaults_by_name = dict(zip(
             [argument.arg for argument in generate.args.args[-len(generate.args.defaults):]],

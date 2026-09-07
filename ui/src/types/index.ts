@@ -587,6 +587,8 @@ export interface GenerateParams extends H3AdaptiveSelection {
   audio_guide2?: string
   audio_guide3?: string
   audio_scale?: number
+  /** LTX-2.5 video decoder. Fast ConvVAE is recommended; NAD is experimental. */
+  ltx25_video_vae?: 'fast' | 'nad'
   video_guide?: string
   video_guide2?: string
   video_guide3?: string
@@ -1407,6 +1409,8 @@ export interface ModelOptions {
   returns_audio: boolean
   any_audio_prompt: boolean
   audio_scale_name: string
+  /** Repair a standalone uploaded soundtrack whose hidden source mode was lost. */
+  infer_audio_prompt_from_guide?: boolean
   lock_inference_steps: boolean
   lock_guidance_scale: boolean
   no_negative_prompt: boolean
@@ -1419,6 +1423,13 @@ export interface ModelOptions {
   image_ref_choices: ChoiceConfig | null
   audio_prompt_type_sources: ChoiceConfig | null
   background_removal_label: string | null
+  ltx25_video_vae_choices?: {
+    value: 'fast' | 'nad'
+    label: string
+    description: string
+    experimental?: boolean
+  }[] | null
+  ltx25_video_vae_default?: 'fast' | 'nad'
   max_image_refs?: number | null
   minimax_h3_reference_mode?: boolean
   minimax_h3_conditioning_mode?: 'semantic_references' | 'first_last_frames'

@@ -219,6 +219,12 @@ function useAdvancedActiveItems(): string[] {
   if (!isScailEdit && spatialUpsampling) items.push(`Upscaling (${spatialUpsampling})`)
   if (!isScailEdit && filmGrainIntensity > 0) items.push('Film grain')
   if (!isScailEdit && (params.self_refiner_setting ?? 0) > 0) items.push('Self refiner')
+  if (
+    modelOptions?.ltx25_video_vae_choices?.length
+    && params.ltx25_video_vae === 'nad'
+  ) {
+    items.push('LTX-2.5 NAD VAE')
+  }
   if ((params.custom_settings as H3CustomSettings | undefined)?.h3_attention_engine === 'sol_attn') {
     items.push('H3 Sol-Attn (approximate)')
   } else if ((params.custom_settings as H3CustomSettings | undefined)?.h3_attention_engine === 'sage2') {
@@ -605,6 +611,30 @@ export function AdvancedSettings() {
                   </div>
                 </div>
               )}
+
+              {modelOptions?.ltx25_video_vae_choices?.length ? (
+                <div>
+                  <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">
+                    LTX-2.5 Video Decoder
+                  </label>
+                  <select
+                    value={params.ltx25_video_vae || modelOptions.ltx25_video_vae_default || modelOptions.ltx25_video_vae_choices[0]?.value}
+                    onChange={e => setParam('ltx25_video_vae', e.target.value as 'fast' | 'nad')}
+                    className="w-full bg-bg-tertiary border border-border rounded px-2.5 py-1.5 text-xs text-text-primary focus:outline-none focus:border-accent-blue"
+                  >
+                    {modelOptions.ltx25_video_vae_choices.map(choice => (
+                      <option key={choice.value} value={choice.value}>
+                        {choice.label}{choice.experimental ? ' (Experimental)' : ''}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="text-[9px] text-text-muted mt-1">
+                    {modelOptions.ltx25_video_vae_choices.find(
+                      choice => choice.value === (params.ltx25_video_vae || modelOptions.ltx25_video_vae_default)
+                    )?.description || 'Changing this reloads the LTX-2.5 model.'}
+                  </p>
+                </div>
+              ) : null}
 
               {/* TTS Settings */}
               {isAudioOnly && (

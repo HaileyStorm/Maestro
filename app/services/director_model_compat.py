@@ -328,6 +328,13 @@ def assess_director_model(
     )
     if reference_mode not in {"none", "start_frame", "start_end"}:
         reference_mode = "start_frame"
+    configured_voice_mode = model_def.get("director_voice_reference_mode")
+    if configured_voice_mode is None:
+        voice_reference_mode = (
+            "id_lora" if architecture_key.startswith("ltx2") else "none"
+        )
+    else:
+        voice_reference_mode = str(configured_voice_mode or "none")
     return {
         "image": image,
         "video": {
@@ -341,11 +348,8 @@ def assess_director_model(
         # Video choices appearing in Director.
         "supports_audio_input": bool(model_def.get("any_audio_prompt")),
         "generates_audio": bool(model_def.get("returns_audio")),
-        "supports_voice_reference": architecture_key.startswith("ltx2"),
-        "voice_reference_mode": (
-            "id_lora" if architecture_key.startswith("ltx2")
-            else "none"
-        ),
+        "supports_voice_reference": voice_reference_mode != "none",
+        "voice_reference_mode": voice_reference_mode,
         "video_strategy": strategy,
         "audio_input_mode": audio_input_mode,
         "reference_mode": reference_mode,

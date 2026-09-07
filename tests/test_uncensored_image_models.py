@@ -1387,7 +1387,7 @@ class TestCuratedImageVisibility(unittest.TestCase):
         version = int(re.search(
             r"const DEFAULTS_VERSION = (\d+)", self.store,
         ).group(1))
-        self.assertEqual(version, 9)
+        self.assertGreaterEqual(version, 9)
         match = re.search(r"\n\s*9:\s*(\[[^\]]*\])", self.store)
         self.assertIsNotNone(match)
         additions = ast.literal_eval(match.group(1))
@@ -1408,7 +1408,7 @@ class TestCuratedImageVisibility(unittest.TestCase):
         # once, while a user hide persisted at v9 is not resurrected later.
         def migrate(stored_version: int, enabled: set[str]) -> set[str]:
             result = set(enabled)
-            if stored_version < version:
+            if stored_version < 9:
                 result.update(additions)
             return result
 

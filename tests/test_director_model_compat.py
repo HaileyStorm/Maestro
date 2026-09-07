@@ -155,6 +155,26 @@ class TestContinuumDirectorModelCompatGates(unittest.TestCase):
         self.assertEqual(result["video_strategy"], ROLLING_WINDOW)
         self.assertEqual(result["audio_input_mode"], "generic_audio_guide")
 
+    def test_ltx25_can_disable_generic_ltx_voice_reference(self):
+        result = assess_director_model(
+            "ltx2_25",
+            _ltx_video(director_voice_reference_mode="none"),
+            architecture="ltx2_25_22B",
+        )
+
+        self.assertFalse(result["supports_voice_reference"])
+        self.assertEqual(result["voice_reference_mode"], "none")
+
+    def test_generic_ltx_keeps_id_lora_voice_reference_default(self):
+        result = assess_director_model(
+            "ltx2_22B",
+            _ltx_video(),
+            architecture="ltx2_22B",
+        )
+
+        self.assertTrue(result["supports_voice_reference"])
+        self.assertEqual(result["voice_reference_mode"], "id_lora")
+
     def test_native_audio_output_is_not_audio_input(self):
         result = assess_director_model(
             "ovi",

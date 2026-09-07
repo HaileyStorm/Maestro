@@ -2233,6 +2233,8 @@ const DEFAULT_ENABLED_MODELS = new Set([
   // Keep LTX-2.3 Distilled available as a fast alternative. MiniMax H3
   // Base is the curated first-launch video default below.
   'ltx2_22B_distilled_1_1',
+  // Components download only when selected for the first time.
+  'ltx2_25',
   // SCAIL-2 character animation (Animate a character with a control
   // video). Fast = lightx2v distill bundled (6 steps, no CFG, ~13x).
   'scail2_14B',
@@ -2269,7 +2271,7 @@ const DEFAULT_ENABLED_MODELS = new Set([
  * a user who then disables them stays disabled forever. (This is
  * deliberately narrower than auto-enabling every unknown model — only
  * the curated list's own additions are pushed.) */
-const DEFAULTS_VERSION = 9
+const DEFAULTS_VERSION = 10
 const DEFAULTS_ADDED_IN: Record<number, string[]> = {
   // v1.2.0: the ACE-Step XL SFT pair; LM_4B becomes the music default.
   2: ['ace_step_v1_5_xl_sft', 'ace_step_v1_5_xl_sft_lm_4b'],
@@ -2301,6 +2303,11 @@ const DEFAULTS_ADDED_IN: Record<number, string[]> = {
   // Manual experimental Klein 9B layered recipe. The backend omits it from
   // the catalog unless the creator/base/encoder term graph and source match.
   9: ['flux2_klein_9b_pornmaster_v4_turbo_fp8_ponpoke'],
+  // One bounded discovery migration for the official LTX-2.5 Distilled
+  // workflow. Installs already stamped at v10 by the earlier v1.9 release
+  // traversed its LTX addition and do not replay this entry; a hide made at
+  // v10 therefore remains authoritative.
+  10: ['ltx2_25'],
 }
 const DEFAULTS_VERSION_KEY = 'maestro_defaults_version'
 
@@ -8330,6 +8337,22 @@ export const useStore = create<AppState>((set, get) => ({
       explicit_output: state.explicitOutput,
       h3_ref2va_terms_accepted: h3Ref2VATermsAccepted(),
     }
+    if (
+      state.generationMode === 'video'
+      && (params.image_mode ?? 0) === 0
+      && state.modelOptions?.infer_audio_prompt_from_guide === true
+      && params.audio_guide
+      && (!params.video_guide || !String(params.video_prompt_type || '').includes('V'))
+    ) {
+      const audioPromptType = typeof params.audio_prompt_type === 'string'
+        ? params.audio_prompt_type
+        : ''
+      if (![...'AK2'].some(letter => audioPromptType.includes(letter))) {
+        // The visible soundtrack tile and its hidden mode must travel as one
+        // contract. This also heals Load Settings from an affected sidecar.
+        params.audio_prompt_type = `A${audioPromptType}`
+      }
+    }
     // The prompt remains browser-authored. Only the exact catalog ID crosses
     // this boundary; the server resolves and compiles revision-bound guidance.
     delete params.h3_style_workflow
@@ -8362,6 +8385,19 @@ export const useStore = create<AppState>((set, get) => ({
     // value if the user switched to a model that doesn't support it.
     if (!(state.modelOptions as Record<string, unknown> | null)?.reference_pipeline) {
       delete params.reference_pipeline
+    }
+    if (state.modelOptions?.ltx25_video_vae_choices?.length) {
+      const validLtx25VideoVae = state.modelOptions.ltx25_video_vae_choices.some(
+        choice => choice.value === params.ltx25_video_vae
+      )
+      if (!validLtx25VideoVae) {
+        params.ltx25_video_vae = (
+          state.modelOptions.ltx25_video_vae_default
+          || state.modelOptions.ltx25_video_vae_choices[0].value
+        )
+      }
+    } else {
+      delete params.ltx25_video_vae
     }
 
     // Tag avatar/edit-mode generations with their sub-mode so the gallery's
@@ -10098,6 +10134,18 @@ export const useStore = create<AppState>((set, get) => ({
         && options.default_guidance_scale != null
       ) {
         paramUpdates.guidance_scale = options.default_guidance_scale
+      }
+      if (options.ltx25_video_vae_choices?.length) {
+        const currentVideoVae = get().params.ltx25_video_vae
+        const valid = options.ltx25_video_vae_choices.some(
+          choice => choice.value === currentVideoVae
+        )
+        if (!valid) {
+          paramUpdates.ltx25_video_vae = (
+            options.ltx25_video_vae_default
+            || options.ltx25_video_vae_choices[0].value
+          )
+        }
       }
       // TTS default duration. Prefer the model's declared `default` (DramaBox
       // uses 0 = auto-derive from prompt); fall back to `max` (legacy behavior
@@ -15446,16 +15494,18 @@ export const useStore = create<AppState>((set, get) => ({
 
     // Determine generation mode from model (respects per-model avatar overrides)
     const model = models.find(m => m.model_type === modelType)
+    const restoredMode = model
+      ? getModelMode(modelType, model.family)
+      : get().generationMode
     if (model) {
-      const mode = getModelMode(modelType, model.family)
-      set({ generationMode: mode })
+      set({ generationMode: restoredMode })
       // Audio outputs restore the SUB-TAB too (Speech / Music / SFX) —
       // previously the pencil landed on the Audio tab but left whatever
       // sub-tab was last open. Newer sidecars record _audio_sub_mode;
       // older ones fall back to classifying the model. Direct set, NOT
       // setAudioSubMode — that would call selectModel and clobber the
       // params restored below.
-      if (mode === 'audio') {
+      if (restoredMode === 'audio') {
         const recordedSub = p._audio_sub_mode as import('../types').AudioSubMode | undefined
         const inferredSub: import('../types').AudioSubMode =
           sfxModelTypes.has(modelType) || p.sfx_mode ? 'sfx'
@@ -15491,11 +15541,35 @@ export const useStore = create<AppState>((set, get) => ({
     // from the request, which then poisoned the next sidecar with zeros).
     // (Virtual SFX models have no LoRAs/options endpoints — same guard
     // as boot.)
+    // Publish the restored target before hydration so loadModelOptions' normal
+    // current-model guard admits this response. A user model selection while
+    // the request is in flight changes params.model_type and still wins.
+    set(s => ({
+      params: { ...s.params, model_type: modelType },
+      selectedModelPerMode: {
+        ...s.selectedModelPerMode,
+        [restoredMode]: modelType,
+      },
+    }))
     if (!sfxModelTypes.has(modelType)) {
       get().loadLoras(modelType)
       await get().loadModelOptions(modelType)
     }
-    if (restoreGeneration !== _settingsRestoreGeneration) return
+    if (
+      restoreGeneration !== _settingsRestoreGeneration
+      || get().params.model_type !== modelType
+    ) return
+    const restoredModelOptions = get().modelOptions?.model_type === modelType
+      ? get().modelOptions
+      : null
+    const restoredLtx25VideoVae = restoredModelOptions?.ltx25_video_vae_choices
+      ?.find(choice => choice.value === p.ltx25_video_vae)?.value
+    const restoredAudioScaleMaximum = restoredModelOptions?.architecture === 'ltx2_25'
+      ? 1.0
+      : 3.0
+    const restoredAudioScale = typeof p.audio_scale === 'number' && Number.isFinite(p.audio_scale)
+      ? Math.min(restoredAudioScaleMaximum, Math.max(0.1, p.audio_scale))
+      : 1.0
 
     const automaticH3Longform = !!(
       h3Longform
@@ -15587,6 +15661,8 @@ export const useStore = create<AppState>((set, get) => ({
     newParams.audio_guide = (p.audio_guide as string) || ''
     newParams.audio_guide2 = (p.audio_guide2 as string) || ''
     newParams.audio_guide3 = (p.audio_guide3 as string) || ''
+    newParams.audio_scale = restoredAudioScale
+    newParams.ltx25_video_vae = restoredLtx25VideoVae
     // Style / Music Caption (ACE-Step). Was never copied here, so the
     // pencil restored only the lyrics — clear when absent so a stale
     // caption can't leak into an unrelated restore.

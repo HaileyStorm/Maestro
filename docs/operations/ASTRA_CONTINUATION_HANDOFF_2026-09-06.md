@@ -503,7 +503,49 @@ unverified and requires the full stable-share suite on that host.
 No live share files or running service were changed or restarted. These checks
 close the recorded Linux inode-reuse defect, not every possible filesystem race
 or live service/Windows acceptance. Nine of the 16 recorded baseline cases are
-now covered by verified repairs; the seven LTX cases remain open.
+were covered at this checkpoint; the seven LTX cases are recovered below.
+
+### LTX-2.5 audio and decoder recovery — 2026-09-07 UTC
+
+Standalone soundtracks recover their missing source selector consistently in
+the API, native validation, and UI submission copy. Explicit source flags and
+image/control-video modes are preserved; malformed HTTP recovery inputs fail
+clearly, and malformed saved/internal selectors cannot become flags through
+string conversion. Audio strength uses `audio_scale`, and Load Settings safely
+restores its finite value. LTX-specific vocal isolation keeps the original song
+for delivery.
+
+Director's separate conditioning stem now survives attachment/recovery and
+sidecar handling, passes the same project-media authorization as the soundtrack,
+and stays out of public campaign settings. Only declared LTX-2.5 runtimes may
+use it; unsupported families fail before model loading. Requested and finalized
+residency evidence both include it. Audio-window decisions count samples across
+channel-first and sample-first layouts. Director respects the handler's explicit
+voice-reference mode.
+
+Fast/NAD decoder selection now travels through model options, controls,
+submission, settings restoration, and native model kwargs. A matching resident
+decoder is reused; a changed decoder triggers reload. Cross-model restoration
+hydrates the intended options while preserving a later manual model switch.
+Defaults migration 10 discovers distilled `ltx2_25` once, preserves the selected
+model and later hides, retains migration 9, and leaves Dev/NVFP4 optional.
+
+The clean broad backend run executed 4,717 tests and found four stale contract
+assertions plus a Python 3.10 `tomllib` test import. All five were repaired:
+callback ordering remains compatible, version-specific image migration tests
+retain their own version boundary, and Python 3.10 uses the installed `tomli`
+parser. The final affected-module run passed 465 tests with one explicit skip
+(466 total). Final clean UI tests passed 486/486; TypeScript/Vite build, Python
+syntax, and JSON grammar checks passed. Independent review is clean. Broad-run
+source hashes and final correction evidence are retained separately under
+`.artifacts-temp/astra-ltx-recovery-20260907/`; the broad run is not relabeled
+as a fresh full-suite pass on the corrected revision.
+
+The seven LTX baseline cases now have verified repairs. This is CPU/static,
+mock, and build evidence; no LTX model generation, live browser, GPU quality,
+service restart, or native Windows acceptance occurred. Unrelated H3/API/UI WIP
+remains unadopted. The continuous Goal and the remaining planned backlog stay
+active.
 
 ### Prompt-adapter audit — not adopted
 

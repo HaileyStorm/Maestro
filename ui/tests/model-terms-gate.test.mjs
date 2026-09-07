@@ -36,7 +36,7 @@ test('model term notices are server-backed, exact, and never browser authority',
 test('PornMaster visibility is a one-time v9 addition with no auto authority', async () => {
   const store = await source('../src/stores/useStore.ts')
   const recipe = 'flux2_klein_9b_pornmaster_v4_turbo_fp8_ponpoke'
-  assert.match(store, /const DEFAULTS_VERSION = 9/)
+  assert.match(store, /const DEFAULTS_VERSION = 10/)
   assert.match(store, new RegExp(`9: \\[\\s*'${recipe}'\\s*\\]`))
   assert.match(store, /if \(storedVer < DEFAULTS_VERSION\)/)
   const defaults = store.slice(

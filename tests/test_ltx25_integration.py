@@ -299,11 +299,11 @@ class LTX25HandlerTests(unittest.TestCase):
         self.assertIn("audio_conditioning_guide=None", wgp)
         self.assertIn('"audio_conditioning_guide", "audio_source"', wgp)
         self.assertIn("original_audio_guide = audio_guide", wgp)
-        self.assertIn("audio_guide = str(audio_conditioning_guide)", wgp)
         self.assertIn(
-            "preserving the original soundtrack for output",
+            "original_audio_guide, audio_guide = _resolve_audio_guide_roles(",
             wgp,
         )
+        self.assertIn("output_new_audio_filepath = original_audio_guide", wgp)
 
     def test_component_downloads_use_native_wangp_stack(self):
         definitions = self.handler_module.family_handler.query_model_files(
@@ -379,10 +379,33 @@ class LTX25HandlerTests(unittest.TestCase):
         self.assertIn("_attach_lora_preprocessor(self.diffuser_model)", ltx2)
         self.assertIn("LTX2_COMFY_LORA_UNDERSCORED_NAMES", ltx2)
         self.assertIn("offload.load_loras_into_model(", wgp)
-        self.assertIn(
-            "Reusing the loaded MMGP model profile for this job",
-            wgp,
-        )
+        # Verify the actual reload decision rather than optional diagnostic copy.
+        guards = [
+            node for node in ast.walk(ast.parse(wgp))
+            if isinstance(node, ast.If)
+            and ast.unparse(node.test)
+            == "model_type != transformer_type or reload_needed or profile != loaded_profile"
+        ]
+        self.assertEqual(len(guards), 1)
+        self.assertTrue(any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "load_models"
+            for statement in guards[0].body for node in ast.walk(statement)
+        ))
+        decision = compile(ast.Expression(guards[0].test), str(WGP_PATH), "eval")
+        for model, profile, reload_needed, expected in (
+            ("ltx2_25", 4, False, False),
+            ("ltx2_25", 4, True, True),
+            ("ltx2_25", 5, False, True),
+            ("ltx2_25_dev", 4, False, True),
+        ):
+            with self.subTest(model=model, profile=profile, reload=reload_needed):
+                self.assertEqual(eval(decision, {}, {
+                    "model_type": model, "transformer_type": "ltx2_25",
+                    "profile": profile, "loaded_profile": 4,
+                    "reload_needed": reload_needed,
+                }), expected)
 
     def test_int8_convrot_loras_keep_native_linear_forward(self):
         ltx2 = LTX2_PATH.read_text(encoding="utf-8")
@@ -489,7 +512,7 @@ class LTX25HandlerTests(unittest.TestCase):
             "const DEFAULT_ENABLED_MODELS = new Set([", 1
         )[1].split("])\n", 1)[0]
         self.assertIn("'ltx2_25'", default_block)
-        self.assertIn("9: ['ltx2_25']", store)
+        self.assertIn("10: ['ltx2_25']", store)
         self.assertNotIn("'ltx2_25_dev'", default_block)
         self.assertNotIn("'ltx2_25_nvfp4'", default_block)
 
