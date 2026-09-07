@@ -37,19 +37,7 @@ _FAILURE_STAGES = {
     "audio_mux", "postprocess", "flashvsr", "delivery", "publication",
     "generation",
 }
-_STAGE_DETAILS = {
-    "model_load": "The generation model could not be loaded with the available host memory.",
-    "denoise": "Generation failed during denoising.",
-    "vae_decode": "Generation failed while decoding the rendered segment.",
-    "segment_checkpoint": "The rendered segment could not be sealed for recovery.",
-    "concat": "Rendered segments could not be joined into the final output.",
-    "audio_mux": "The rendered output could not be combined with audio.",
-    "postprocess": "The rendered output failed during post-processing.",
-    "flashvsr": "The rendered output failed during FlashVSR processing.",
-    "delivery": "The requested delivery output could not be produced.",
-    "publication": "The completed output could not be published safely.",
-    "generation": "Generation failed.",
-}
+from services.public_failure_copy import FAILURE_STAGE_DETAILS as _STAGE_DETAILS
 
 
 def _suggest_lower_coefficient(current: float) -> Optional[float]:
@@ -156,9 +144,9 @@ def build_failure_details(
 ) -> dict:
     """Build one remotely safe, path/content-free failure envelope.
 
-    Raw exception text is intentionally excluded. The complete traceback stays
-    machine-local at the call site; remote status receives only a class token,
-    a stable stage/code, bounded numeric progress, and allocator counters.
+    Detail is reviewed contract copy or the stage fallback; arbitrary exception
+    text and the complete traceback stay machine-local. Remote status also carries
+    a class token, stable stage/code, bounded progress, and allocator counters.
     """
     declared_stage = getattr(exception, "stage", stage)
     normalized_stage = (
@@ -181,10 +169,19 @@ def build_failure_details(
     exception_type = type(identity).__name__
     if _SAFE_TOKEN_RE.fullmatch(exception_type) is None:
         exception_type = "Exception"
+    from services.planning_failure import (
+        public_planning_failure_message,
+        safe_public_contract_message,
+    )
+
+    stage_detail = _STAGE_DETAILS[normalized_stage]
     details = {
         "code": normalized_code,
         "stage": normalized_stage,
-        "detail": _STAGE_DETAILS[normalized_stage],
+        "detail": safe_public_contract_message(
+            public_planning_failure_message(exception, fallback=stage_detail),
+            fallback=stage_detail,
+        ),
         "exception_type": exception_type,
         "is_oom": detected_oom,
     }
@@ -256,10 +253,14 @@ def normalize_failure_details(
     exception_type = str(value.get("exception_type") or "Exception")
     if _SAFE_TOKEN_RE.fullmatch(exception_type) is None:
         exception_type = "Exception"
+    from services.planning_failure import safe_public_contract_message
+
     details = {
         "code": code,
         "stage": stage,
-        "detail": _STAGE_DETAILS[stage],
+        "detail": safe_public_contract_message(
+            value.get("detail"), fallback=_STAGE_DETAILS[stage],
+        ),
         "exception_type": exception_type,
         "is_oom": is_oom_value,
     }

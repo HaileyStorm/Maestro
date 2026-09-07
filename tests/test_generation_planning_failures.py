@@ -733,11 +733,12 @@ class GenerationPlanningFailureTests(unittest.TestCase):
                         job["id"], _request(), enhance=False,
                     )
                 self.assertEqual(job["status"], "failed")
-                expected_error = (
-                    "Generation planning mode is invalid."
-                    if suffix in {"image-mode", "prompt-mode"}
-                    else "Generation planning failed"
-                )
+                expected_error = {
+                    "image-mode": "Generation planning mode is invalid.",
+                    "prompt-mode": "Generation planning mode is invalid.",
+                    "custom": "Generation custom settings are invalid.",
+                    "loras": "Generation LoRA selection is invalid.",
+                }.get(suffix, "Generation planning failed")
                 self.assertEqual(job["error"], expected_error)
                 self.assertEqual(workers, [])
                 self.assertNotIn("synthetic-private-value", output.getvalue())

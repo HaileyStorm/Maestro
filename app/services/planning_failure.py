@@ -9,6 +9,10 @@ from pathlib import PurePosixPath
 import uuid
 from typing import Final
 
+from services.public_failure_copy import (
+    FAILURE_STAGE_DETAILS, reviewed_contract_message,
+)
+
 
 PLANNING_FAILURE_REASON_CODES: Final[frozenset[str]] = frozenset({
     "planning_authority_rejected",
@@ -66,21 +70,9 @@ PLANNING_FAILURE_ENVELOPE_KEYS: Final[frozenset[str]] = frozenset({
 
 _PUBLIC_FAILURE_TYPES: Final[tuple[type[BaseException], ...]] = (
     ValueError,
+    TypeError,
 )
 
-_PUBLIC_FAILURE_PREFIXES: Final[tuple[str, ...]] = (
-    "H3 Turbo",
-    "MiniMax H3",
-    "Spectrum Experimental",
-    "Pinned Ref2VA",
-    "Pinned FL2VA",
-    "Native MiniMax",
-    "Kijai W4A8",
-    "Generation planning mode",
-    "Generation parameters",
-    "Generation custom settings",
-    "Generation LoRA",
-)
 
 
 def classify_planning_failure(error: BaseException) -> str:
@@ -119,6 +111,7 @@ def public_planning_failure_message(
 ) -> str:
     """Return a prompt-free user message for known planner contracts."""
 
+    safe_fallback = safe_public_contract_message(None, fallback=fallback)
     try:
         error_type = type(error)
         type_name = getattr(error_type, "__name__", "")
@@ -126,16 +119,13 @@ def public_planning_failure_message(
             "H3TurboCompatibilityError",
             "SpectrumCompatibilityError",
             "H3Lightx2vCompatibilityError",
+            "H3ExperimentCompatibilityError",
         }:
-            return fallback
-        text = error.args[0] if error.args else ""
-        if type(text) is not str or not text or len(text) > 240 or "\n" in text:
-            return fallback
-        if not text.startswith(_PUBLIC_FAILURE_PREFIXES):
-            return fallback
-        return text
+            return safe_fallback
+        text = error.args[0] if error.args else None
+        return safe_public_contract_message(text, fallback=safe_fallback)
     except BaseException:
-        return fallback
+        return safe_fallback
 
 
 def _safe_phase(phase: str) -> str:
@@ -152,20 +142,27 @@ def _safe_reason(reason: str) -> str:
     return "planning_unclassified"
 
 
+def safe_public_contract_message(text: object, *, fallback: str) -> str:
+    """Publish reviewed contract copy or a known content-free fallback."""
+    safe_fallback = (
+        fallback if type(fallback) is str and (
+            fallback in _PUBLIC_FALLBACKS
+            or fallback in FAILURE_STAGE_DETAILS.values()
+        ) else _DEFAULT_FALLBACK
+    )
+    if type(text) is str and text == safe_fallback:
+        return safe_fallback
+    return reviewed_contract_message(text) or safe_fallback
+
+
 def _safe_public_message(text: object, fallback: str) -> str:
     safe_fallback = (
-        fallback
-        if (
-            type(fallback) is str
-            and fallback in _PUBLIC_FALLBACKS
-        )
+        fallback if type(fallback) is str and fallback in _PUBLIC_FALLBACKS
         else _DEFAULT_FALLBACK
     )
-    if type(text) is not str or not text or len(text) > 240 or "\n" in text:
-        return safe_fallback
-    if text in _PUBLIC_FALLBACKS or text.startswith(_PUBLIC_FAILURE_PREFIXES):
+    if type(text) is str and text in _PUBLIC_FALLBACKS:
         return text
-    return safe_fallback
+    return safe_public_contract_message(text, fallback=safe_fallback)
 
 
 def planning_failure_event(error: BaseException, *, phase: str) -> tuple[str, str]:
@@ -394,4 +391,5 @@ __all__ = [
     "planning_failure_event",
     "public_planning_failure_message",
     "remove_exact_request_manifest",
+    "safe_public_contract_message",
 ]

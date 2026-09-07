@@ -1,5 +1,27 @@
 # Astra continuation handoff — 2026-09-06
 
+## Current GPU authorization — owner update, 2026-09-06
+
+The owner explicitly authorized GPU work subject to coordinator grants and
+required the installed `gpu-coordinator-client` skill. This supersedes the
+GPU prohibition in the copied native Goal and historical CPU-only instructions
+below. It permits the planned GPU acceptance work once the client contract is
+satisfied; it does not establish that a lease exists or that any GPU acceptance
+has passed. Service restarts, credits/SSO activation, new providers, and browser
+filesystem permissions retain their separate existing boundaries.
+
+The first registration attempt for this migrated checkout was rejected by the
+client: `workspace is outside the canonical allowlist`. The coordinator was
+live, leader, and free of authority/ingress/epoch/ledger errors. Existing Maestro
+registry identities point to the former checkout and were not reused. The
+communications hub routed this blocker as `harness-a97` to the coordinator owner.
+Do not retry registration or request a lease until that owner reports a supported
+registration-path change. Then verify the exact project/workspace identity and
+use a fresh request; registration alone is never GPU authority. Validate the
+durable grant, current status/epoch/time, and exactly matching raw ledger entry
+before every start, stop by its end, and withdraw/confirm after completion.
+Independent CPU work continues while registration is blocked.
+
 ## Successor progress
 
 The successor's native Goal is active and continuous. The original handoff
@@ -178,12 +200,29 @@ production source and unrelated WIP were not changed. Evidence is under
 `.artifacts-temp/astra-stale-fixtures-20260906/`. This closes those recorded
 fixture failures, not the entire historical backend inventory.
 
-Remaining H3 work includes the native-max offload candidate and public failure
-copy. Inspect exact sealed-plan dependencies and source evidence before adopting
-the offload default; CPU tests cannot establish a GPU memory or speed benefit.
-Failure-copy integration must preserve the public error boundary and never
-accept arbitrary persisted text merely because it begins with a familiar
-prefix. Keep UI, model routing, prompt, native-boundary, and offload WIP separate.
+Public failure copy now has a shared reviewed-message publication boundary.
+Exact approved contract messages and the bounded numeric frame-limit template
+survive live production and restored envelopes. Arbitrary prefixed text, unknown
+fallbacks, string subclasses, and malformed values fall back to content-free
+stage/planning copy. Stage messages have one immutable owner in
+`services/public_failure_copy.py`; the prefix-only rules and duplicate stage
+mapping are removed. Exact TypeError preparation failures preserve actionable
+parameter/custom-settings/LoRA copy. OOM detection and stage/code classification
+are unchanged.
+
+All 401 tests in the affected planning, delivery, lifecycle, recovery, and LLM
+suites pass on the isolated candidate. A subsequent contract-comment correction
+was proved AST-equivalent outside that docstring and passed all 12 final copy
+boundary tests. Independent review findings were resolved, and final candidate
+bytes were checked against the staged index. Evidence is under
+`.artifacts-temp/astra-public-failure-copy-20260906/`. These checks are
+CPU/static/synthetic; no GPU lease or workload was started.
+
+The native-max offload candidate remains open. Its resolution-aware policy must
+be carried consistently through requested residency identity, load, wrapper,
+implementation, and retry. Verify supported canvas/model boundaries and retain
+source evidence separately from any GPU memory or performance claim. Keep UI,
+model routing, prompt, native-boundary, and offload WIP separate.
 
 For the remaining adaptive-conditioning/UI work, retain the selected FL2VA
 flavor, send the selected adaptive models and split lists in estimates, and align
