@@ -56,12 +56,11 @@ Syntax checks pass. Receipts and preserved preimages are in
 `.artifacts-temp/astra-observed-offload-20260907/`. Evidence is CPU/synthetic,
 not live OOM recovery or a GPU memory/performance claim.
 
-The native-max offload-floor WIP remains unadopted. Before changing its floor,
-reconcile sealed integer profile intent with effective fractional profiles;
-preserve completed-prefix provenance and calibration semantics. Its unstaged
-test expecting observed 4.5 to act like 5 is superseded by the observed-profile
-contract and must be corrected when that WIP is integrated. Other native-max
-policy/default and resolution-plumbing changes remain separate.
+At this earlier checkpoint, the native-max floor still needed requested/effective
+profile reconciliation and preserved completed-prefix/calibration semantics.
+The subsequent native-max integration below satisfies that source gate and
+removes the draft test that treated observed 4.5 as an attempted 5. Live GPU
+memory/performance acceptance remains separate.
 
 ## Authored-shot packing — 2026-09-07 UTC
 
@@ -547,6 +546,41 @@ service restart, or native Windows acceptance occurred. Unrelated H3/API/UI WIP
 remains unadopted. The continuous Goal and the remaining planned backlog stay
 active.
 
+## Native-max offload floor — CPU integration, 2026-09-07
+
+Explicit native-max H3 requests (1344 on the long edge) now start at MMGP
+profile 5. Smaller, missing, malformed, or auto resolution inputs retain the
+existing 4.5 baseline; resolution-free preloads are reprofiled when an explicit
+native-max generation requires 5. Resolution classification does not authorize
+an otherwise unsupported model or canvas.
+
+Queue stamping, requested residency identity, the generation wrapper and
+implementation, model loading, loaded identity, and expected-profile queries
+use the same standing floor. Different integer requests that resolve to the
+same effective profile share a residency key; a loaded 4.5 configuration is
+released/reloaded for an effective 5 request. Observed recovery still uses the
+actually loaded profile, so historical 4.5 is not relabeled as an attempted 5.
+
+The integer request helper is now explicitly separated from the floating
+expected-runtime helper. Sealed v1 plans, manual/default request values, and
+pre-v1 completed-prefix provenance remain unchanged. Expected runtime policy
+is not observed evidence; observations retain the task-bound callback and
+policy-revision gates above. The obsolete unused standing-floor helper and
+incorrect draft retry assertions were removed with preimages preserved.
+
+All 312 tests in the final ten-module integration suite pass, along with syntax
+and diff checks. Independent review is clean and separately checked floor,
+legacy-prefix, and observed-retry contracts. This is CPU/static and synthetic
+verification, not evidence of GPU memory usage, performance, OOM avoidance, or
+full-model quality. No GPU/model run, restart, browser, or Windows acceptance
+occurred. Receipts and exact source hashes are under
+`.artifacts-temp/astra-h3-native-floor-final-20260907/`.
+
+The native-floor source integration is complete. Continue the separate
+FlashVSR whole-file delivery WIP and remaining native-conditioning/prompt/UI
+work. Live GPU acceptance still requires an exact coordinator grant; browser
+acceptance retains its pending test-directory permission.
+
 ## Task-bound offload observations — CPU integration, 2026-09-07
 
 H3 benchmark and allocation observations now require an ephemeral callback
@@ -585,9 +619,8 @@ Exact source hashes, preimages, prior failed fixtures, and final receipts are in
 `.artifacts-temp/astra-h3-observed-capture-20260907/`; collector lineage is in
 `.artifacts-temp/astra-h3-observation-collector-20260907/`.
 
-Next, complete native-max floor propagation and its requested-versus-effective
-profile query contract without changing v1 seals or observed retry history.
-The earlier parked candidate needs rebasing onto this capture boundary. Preserve
+The subsequent native-max checkpoint above completes floor propagation and
+its requested-versus-effective query contract on this capture boundary. Preserve
 unrelated FlashVSR, native-conditioning, prompt-adapter, and input-policy WIP.
 Browser acceptance still awaits its separately requested test-directory gate.
 
@@ -931,11 +964,10 @@ bytes were checked against the staged index. Evidence is under
 `.artifacts-temp/astra-public-failure-copy-20260906/`. These checks are
 CPU/static/synthetic; no GPU lease or workload was started.
 
-The native-max offload candidate remains open. Its resolution-aware policy must
-be carried consistently through requested residency identity, load, wrapper,
-implementation, and retry. Verify supported canvas/model boundaries and retain
-source evidence separately from any GPU memory or performance claim. Keep UI,
-model routing, prompt, native-boundary, and offload WIP separate.
+The subsequent native-max checkpoint above carries the resolution-aware policy
+through requested identity, loading, generation, and retry. Its source evidence
+remains separate from GPU memory/performance acceptance. Other UI, routing,
+prompt, native-boundary, and delivery WIP remains independently scoped.
 
 Adaptive estimate requests now carry explicit FL2VA/Ref2VA selections and
 independent LoRA lists/weights. Missing or null lists retain the shared-list

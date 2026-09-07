@@ -20,6 +20,10 @@ H3_OOM_RELIEF_MAX_ATTEMPTS = 36
 # Profile 4 keeps more weights resident; 4.5 is the in-tree MMGP variant that
 # disables asyncTransfers so occupancy stays lower without changing output.
 H3_BASELINE_OFFLOAD_PROFILE = 4.5
+# Use the strongest standing floor for native-max H3 canvases.
+# Actual recovery remains tied to the observed loaded profile.
+H3_NATIVE_MAX_OFFLOAD_PROFILE = 5.0
+H3_NATIVE_MAX_LONG_EDGE = 1344
 # Relief-only further escalation after the baseline is already applied.
 H3_RELIEF_OFFLOAD_LADDER = (4.5, 5.0)
 _OFFLOAD_RANK = {
@@ -77,18 +81,29 @@ def offload_rank(profile: Any) -> float:
     return float(_OFFLOAD_RANK[parsed])
 
 
+def h3_native_max_canvas(resolution: Any) -> bool:
+    parsed = _parse_resolution(resolution)
+    if parsed is None:
+        return False
+    width, height = parsed
+    return max(width, height) >= H3_NATIVE_MAX_LONG_EDGE
+
+
 def apply_h3_baseline_offload_profile(
     profile: Any,
     model_type: Any = None,
+    resolution: Any = None,
 ) -> float | Any:
     """Standing H3 default: never keep HighVRAM profiles for H3 denoise."""
     if model_type is not None and not is_h3_model(model_type):
         return profile
+    floor = (H3_NATIVE_MAX_OFFLOAD_PROFILE if h3_native_max_canvas(resolution)
+             else H3_BASELINE_OFFLOAD_PROFILE)
     current = _as_profile(profile)
     if current is None:
-        return H3_BASELINE_OFFLOAD_PROFILE
-    if offload_rank(current) < offload_rank(H3_BASELINE_OFFLOAD_PROFILE):
-        return H3_BASELINE_OFFLOAD_PROFILE
+        return floor
+    if offload_rank(current) < offload_rank(floor):
+        return floor
     return current
 
 

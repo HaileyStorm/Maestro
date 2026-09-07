@@ -1,10 +1,10 @@
 """Pure, content-free sealing for one whole-job MiniMax H3 offload plan.
 
-This first contract records the profile that the existing runtime would use;
-it deliberately does not tune or apply a different profile.  The sealed plan
-is therefore an immutable baseline for later cost/evidence-driven planning and
-for exact restart parity, without exposing authored text, paths, hardware, or
-calibration evidence.
+Version 1 records integer profile requests before standing runtime floors.
+It preserves manual/default intent and exact restart parity, not evidence of
+which floating MMGP profile was loaded. Runtime policy and task-bound loaded
+observations have separate owners. The historical effective_profile argument
+is the resolved default request and must remain integer for v1 compatibility.
 """
 from __future__ import annotations
 

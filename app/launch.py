@@ -10585,7 +10585,7 @@ def _prepare_h3_peak_recovery(job: dict) -> bool:
         expected_job_id=str(job.get("id") or ""),
     )
     manifest_params = dict(manifest["params"])
-    prior_effective_profile = _h3_effective_offload_profile(manifest_params)
+    prior_requested_profile = _h3_requested_offload_profile(manifest_params)
     prior_offload_plan = manifest_params.get(H3_OFFLOAD_PLAN_PARAM_KEY)
     if prior_offload_plan is not None:
         try:
@@ -10615,9 +10615,9 @@ def _prepare_h3_peak_recovery(job: dict) -> bool:
             ))
         elif index < prefix:
             # A pre-v1 journal has no per-segment plan. Preserve its exact
-            # prior effective/manual profile rather than claiming completed
+            # prior requested/manual profile rather than claiming completed
             # work ran under the newly selected recovery profile.
-            segment_profiles.append(prior_effective_profile)
+            segment_profiles.append(prior_requested_profile)
         else:
             segment_profiles.append(recovered_profile)
     offload_plan = _seal_h3_offload_plan_for_job(
@@ -10711,7 +10711,7 @@ def _snapshot_h3_recovery_task_params(
 def _apply_h3_offload_plan_to_manifest(
     manifest: list[dict], plan: dict | None,
 ) -> None:
-    """Bind every H3 child dispatch to its sealed effective profile."""
+    """Bind every H3 child dispatch to its sealed requested profile."""
     if plan is None:
         return
     try:
@@ -39714,8 +39714,8 @@ def _h3_benchmark_input_signature(params: dict, case_id: str) -> dict:
     }
 
 
-def _h3_effective_offload_profile(params: dict) -> int:
-    """Return the effective WGP profile as a content-free runtime factor."""
+def _h3_requested_offload_profile(params: dict) -> int:
+    """Preserve the integer profile request used by immutable v1 seals."""
     try:
         override = int(params.get("override_profile", -1))
     except (TypeError, ValueError):
@@ -39728,6 +39728,25 @@ def _h3_effective_offload_profile(params: dict) -> int:
         str(params.get("model_type") or ""), image_mode,
     )
     return int(wgp.compute_profile(override, output_type))
+
+
+def _h3_effective_offload_profile(params: dict) -> float:
+    """Resolve expected runtime policy; this is never observed-load evidence."""
+    from services.h3_oom_relief import apply_h3_baseline_offload_profile
+    model_type = str(params.get("model_type") or "")
+    try:
+        image_mode = int(params.get("image_mode", 0) or 0)
+    except (TypeError, ValueError):
+        image_mode = 0
+    override = params.get("override_profile", -1)
+    if override is None:
+        override = -1
+    requested = wgp.compute_profile(
+        override, wgp.get_output_type_for_model(model_type, image_mode),
+    )
+    return float(apply_h3_baseline_offload_profile(
+        requested, model_type, params.get("resolution"),
+    ))
 
 
 def _seal_h3_offload_plan_for_job(
@@ -39746,7 +39765,7 @@ def _seal_h3_offload_plan_for_job(
     try:
         plan = seal_h3_offload_plan(
             params,
-            effective_profile=_h3_effective_offload_profile(params),
+            effective_profile=_h3_requested_offload_profile(params),
             source=source,
             replace=replace,
             segment_profiles=segment_profiles,
@@ -54640,6 +54659,7 @@ def _stamp_requested_generation_residency_locked(
         ),
         affinity_components=None,
         vram_safety_coefficient=effective_coefficient,
+        resolution=identity_params.get("resolution"),
     )
     if not base_key:
         return False

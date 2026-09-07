@@ -32,6 +32,20 @@ class H3OomReliefTests(unittest.TestCase):
         self.assertEqual(next_offload_profile(4.5), 5.0)
         self.assertIsNone(next_offload_profile(5))
 
+    def test_native_max_standing_floor_keeps_observed_retry_independent(self):
+        for model in ("minimax_h3", "minimax_h3_ref2va", "minimax_h3_pinkcherry_fl2va", "minimax_h3_w4a8_fl2va"):
+            for resolution in ("1344x768", "768x1344"):
+                for request in (-1, 1, 2, 3, 3.5, 4, 4.5, 5):
+                    self.assertEqual(apply_h3_baseline_offload_profile(request, model, resolution), 5)
+        for resolution in (None, "", "auto", "1344x0", "1344x15", "960x544", "1024x768", "768x768"):
+            self.assertEqual(apply_h3_baseline_offload_profile(4, "minimax_h3", resolution), 4.5)
+        self.assertEqual(apply_h3_baseline_offload_profile(3, "wan_2_2", "1344x768"), 3)
+        retry = decide_h3_oom_relief(resolution="1344x768", num_inference_steps=23,
+                                    offload_profile=4.5, step_now=0, attempt=2, same_setup_retries=2)
+        self.assertEqual(retry["reason"], "escalate_offload")
+        self.assertEqual(retry["override_profile"], 5)
+        self.assertFalse(retry["record_denial"])
+
     def test_step_ladder_is_two_step_nibbles_to_floor(self):
         self.assertEqual(
             step_nibble_ladder(),

@@ -6148,6 +6148,7 @@ def get_requested_residency_identity(
     vae_setting=None,
     affinity_components=None,
     vram_safety_coefficient=None,
+    resolution=None,
 ):
     """Build opaque base/optional affinity keys from load-relevant settings.
 
@@ -6160,7 +6161,9 @@ def get_requested_residency_identity(
     profile = compute_profile(override_profile, output_type)
     if str(model_type or "").startswith("minimax_h3"):
         from services.h3_oom_relief import apply_h3_baseline_offload_profile
-        profile = apply_h3_baseline_offload_profile(profile, model_type)
+        profile = apply_h3_baseline_offload_profile(
+            profile, model_type, resolution,
+        )
     effective_coefficient = (
         args.vram_safety_coefficient
         if vram_safety_coefficient is None
@@ -6325,6 +6328,7 @@ def load_models(
     residency_context=None,
     force_residency_reprofile=False,
     h3_dasiwa_admission=None,
+    resolution=None,
     **model_kwargs,
 ):
     global transformer_type, loaded_profile, reload_needed
@@ -6485,7 +6489,9 @@ def load_models(
     is_h3_load = str(base_model_type or "").startswith("minimax_h3")
     if is_h3_load:
         from services.h3_oom_relief import apply_h3_baseline_offload_profile
-        profile = apply_h3_baseline_offload_profile(profile, model_type)
+        profile = apply_h3_baseline_offload_profile(
+            profile, model_type, resolution,
+        )
     load_environment = _model_load_environment_signature(model_type, profile)
     h3_checkpoint_paths = []
     if is_h3_load:
@@ -6743,6 +6749,7 @@ def load_models(
             override_profile,
             output_type,
             loaded_vae_setting,
+            resolution=resolution,
         )
     )
     _loaded_h3_dasiwa_checkpoint_admission = (
@@ -10358,7 +10365,11 @@ def generate_video(*args, **kwargs):
             )
         _set_bound(
             "override_profile",
-            apply_h3_baseline_offload_profile(current_profile, model_type),
+            apply_h3_baseline_offload_profile(
+                current_profile,
+                model_type,
+                _bound_value("resolution"),
+            ),
         )
     while True:
         _notify_h3_profile_observer(profile_observer, "reset", model_type)
@@ -11067,7 +11078,9 @@ def _generate_video_impl(
     profile = compute_profile(override_profile, output_type)
     if str(model_type or "").startswith("minimax_h3"):
         from services.h3_oom_relief import apply_h3_baseline_offload_profile
-        profile = apply_h3_baseline_offload_profile(profile, model_type)
+        profile = apply_h3_baseline_offload_profile(
+            profile, model_type, resolution,
+        )
     dasiwa_checkpoint_admission = None
     dasiwa_lora_path = None
     dasiwa_lora_candidates = (
@@ -11204,6 +11217,7 @@ def _generate_video_impl(
             load_cancel_callback=lambda: bool(gen.get("abort", False)),
             residency_context=requested_residency_evidence_context,
             h3_dasiwa_admission=dasiwa_checkpoint_admission,
+            resolution=resolution,
             **model_kwargs,
         )
         send_cmd("status", "Model loaded")

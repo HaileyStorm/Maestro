@@ -801,10 +801,10 @@ class QueueLaunchWiringTests(unittest.TestCase):
             _function(self.launch, "_prepare_h3_peak_recovery"),
         )
         prior = recovery.index(
-            "prior_effective_profile = _h3_effective_offload_profile("
+            "prior_requested_profile = _h3_requested_offload_profile("
         )
         prefix = recovery.index(
-            "segment_profiles.append(prior_effective_profile)"
+            "segment_profiles.append(prior_requested_profile)"
         )
         suffix = recovery.index("segment_profiles.append(recovered_profile)")
         self.assertLess(prior, prefix)
