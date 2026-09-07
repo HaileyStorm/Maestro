@@ -7235,7 +7235,16 @@ def _director_h3_time_token(seconds: float) -> str:
 
 def _director_h3_record_payload(text: str, number: int) -> tuple[str, str, str]:
     """Return canonical fields without interpreting creative subject matter."""
-    compact = re.sub(r"\s+", " ", str(text or "")).strip()
+    source = str(text or "")
+    # Normalize record layout around authored dialogue, never inside it.
+    pieces = []
+    cursor = 0
+    for match in _DIRECTOR_H3_DIALOGUE_RE.finditer(source):
+        pieces.append(re.sub(r"\s+", " ", source[cursor:match.start()]))
+        pieces.append(match.group(0))
+        cursor = match.end()
+    pieces.append(re.sub(r"\s+", " ", source[cursor:]))
+    compact = "".join(pieces).strip()
     compact = re.sub(r"^\[Shot\s+\d+\]\s*", "", compact)
     exact = _DIRECTOR_H3_RECORD_PAYLOAD_RE.fullmatch(compact)
     if exact:
@@ -7278,6 +7287,12 @@ def _director_h3_canonical_prompt(
     )
     from shared.utils.prompt_parser import parse_global_timeline_prompt
 
+    if any("\n" in match.group(0) or "\r" in match.group(0)
+           for match in _DIRECTOR_H3_DIALOGUE_RE.finditer(str(prompt or ""))):
+        raise ValueError(
+            "Director H3 physical shot records require each dialogue block on one line; "
+            "preserve the authored wording when preparing the shot record"
+        )
     source = str(prompt or "").replace("\r\n", "\n").replace("\r", "\n").strip()
     requested_mode = str(mode or "").strip().casefold()
     if requested_mode not in {"", "t2va", "ref2va"}:

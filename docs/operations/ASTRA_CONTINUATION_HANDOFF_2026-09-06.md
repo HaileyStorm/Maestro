@@ -1209,3 +1209,26 @@ The reviewer was interrupted by a quota event; closure resumed after a native
 usage read confirmed capacity. No reset credit, GPU, model, service restart,
 Beads mutation or external provider was used. Preserve unrelated WIP and continue
 the existing prompt/native-conditioning, compatibility and browser backlog.
+
+### Canonical dialogue preservation prerequisite (2026-09-07)
+
+Director physical-record normalization now preserves authored whitespace inside
+recognized `<d>[language]...</d>` blocks instead of collapsing spaces and tabs.
+Repeated occurrences retain their order and exact bytes. Multiline dialogue is
+rejected before per-line normalization because this physical-record schema
+cannot retain its line breaks; no silent flattening is accepted. This is a
+structural representability check, not a content filter. The clean candidate
+passes 175 applicable tests, including a baseline-failing literal regression,
+full target-record validation, Director invariants/preflight, shared shot
+planning and visual continuity. Evidence:
+`.artifacts-temp/astra-canonical-literals-20260907/`.
+
+The adapter remains unadopted. Reuse `h3_shot_planner` for semantic compilation,
+physical clip geometry, event ownership and seals; no Director compiler
+extraction is needed. Use `h3_sequence_planner.compile_h3_reference_sequence_prompts`
+with validated reference manifests for reference-derived task prefixes. Simple
+reference counts do not establish those roles. Direct freeform output from
+`compile_h3_official_prompt` still fails strict physical-record validation;
+field wrapping alone cannot satisfy executable-prompt acceptance. Continue
+adapter integration with clip frames/FPS/source IDs, exact dialogue ownership,
+and final target-schema/seal checks. No GPU/model/runtime acceptance occurred.
