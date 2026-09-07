@@ -280,6 +280,22 @@ successfully and the lease is confirmed cancelled. See the
 for exact shapes, numerical results, source/binary hashes, and the corrected
 compiler flags.
 
-Installed-runtime rollout, reproducible distribution packaging, rollback,
-full-model generation, visual quality, performance, and Windows acceptance
-remain open. The installed package and running services were not changed.
+The following installed-runtime acceptance supersedes the earlier private-only
+boundary. Normal launcher reproducibility, full-model generation, visual
+quality, performance, and Windows acceptance remain open.
+
+## Installed CUDA-13 LightX runtime — 2026-09-07 UTC
+
+The verified wheel is installed in `app/env-rtx50`. A separate fresh lease
+validated all nine synthetic cases through the installed package without a
+private import path or library-path override. Installed payload hashes,
+unique distribution metadata, native dispatch, and actual CUDA-13-only
+library maps passed. The original package is preserved for exact rollback;
+failure-path rollback and inventory checks have separate CPU/mock evidence.
+Both processes exited and the lease is confirmed cancelled.
+
+See the [installed-runtime receipts and remaining rollout requirements](ASTRA_CONTINUATION_HANDOFF_2026-09-06.md#installed-lightx-runtime--2026-09-07-utc).
+No service restart occurred. The normal Linux launcher still installs the old
+wheel and requires integration before Update preserves this repair. This is
+installed synthetic-kernel acceptance, not live-service adoption, full-model
+quality, performance, DoRA, or Windows acceptance.

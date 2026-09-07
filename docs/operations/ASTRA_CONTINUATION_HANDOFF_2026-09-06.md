@@ -257,10 +257,57 @@ hash, and every RECORD entry passes an independent hash/size check. Wheel:
 SHA-256 `a7ebaf98817810394e24ea5e93e9b4774b615bbcb3c4db17d4574f201bac0be7`.
 This is deterministic packaging of the tested local build, not independently
 reproduced compilation or a cross-platform distribution release.
-Next: preserve installed-package rollback, make the source/build installation
-flow reproducible in the normal launcher, and validate the installed runtime
-under a separate fresh lease.
+The installed-runtime validation below completes the next local step. The
+source/build installation flow still needs integration in the normal launcher.
 Full-model generation, visual quality, performance, and Windows remain open.
+
+### Installed LightX runtime — 2026-09-07 UTC
+
+`app/env-rtx50` now contains the verified
+`lightx2v-kernel==0.0.2+torch2.10.0.cu130.maestro1` wheel. A fresh validated
+lease covered installation and nine synthetic default-cuBLAS cases through
+the installed package, without a private package import path or
+`LD_LIBRARY_PATH` override. All cases passed with finite outputs and relative
+MAE 0.0069444–0.0555556. Actual process maps confirmed the installed extension
+and selected CUDA-13 libraries, with no CUDA-12 cuBLASLt/runtime mapped.
+
+The installer binds the wheel, source, environment, and original 15-file
+package snapshot; it rejects duplicate metadata and unexpected/linked payload
+files before GPU work. CPU simulations verified exact rollback after partial
+installation and validation failures without changing unrelated files. Five
+inventory checks covered valid contents, extra payload, duplicate metadata,
+symlinks, and unknown cache files. Independent review's inventory finding was
+fixed before execution. A fresh post-run metadata/hash read verifies all five
+installed payload files. The original package remains in the private rollback
+directory; all 15 backup hashes still match. No rollback was needed in the
+successful real run.
+
+Receipts and runners: `.artifacts-temp/astra-lightx-installed-20260907/`.
+The GPU child and installer exited successfully, the lease is confirmed
+cancelled, and the exact package reservation was released. No service restart
+occurred; this does not prove an already-running service adopted the new
+package. Full-model, quality/performance, DoRA, and Windows gates remain open.
+
+The normal Linux `torch.js` path still forces installation of the older public
+wheel; launcher integration is the immediate remaining repair, since Update
+would otherwise replace this verified local installation. The mandatory
+preflight resolved Pinokio home from its configuration and confirmed this
+checkout lies in its `api` tree. Logs and the required `mochi/torch.js`
+example were inspected; its platform-selected `shell.run`, relative path,
+and selected venv pattern apply. `PINOKIO.md` documents a project-local
+Conda path and separate venv activation. No launcher script changed yet.
+
+Primary-source toolchain research favors a dedicated project-local Conda
+environment for `nvidia/label/cuda-13.0.2::cuda-nvcc=13.0.88`: its dependency
+metadata includes host GCC/G++, runtime/driver development files, NVVM/CRT,
+and sysroot. The pip `nvidia-cuda-nvcc==13.0.88` package does not supply a
+host compiler or declare CCCL; do not treat it alone as a proven build kit.
+Resolve compiler/header/library paths from the managed environment, preserve
+the selected Torch/CUDA ABI, and require a fresh compile receipt for the
+managed toolchain before claiming the launcher reproduces this build.
+Sources: [NVIDIA CUDA Linux installation](https://docs.nvidia.com/cuda/archive/13.0.3/cuda-installation-guide-linux/index.html),
+[NVIDIA Conda compiler](https://anaconda.org/nvidia/cuda-nvcc),
+[PyPI compiler metadata](https://pypi.org/pypi/nvidia-cuda-nvcc/13.0.88/json).
 
 While waiting, a direct CPU audit of the uncommitted `h3_prompt_adapt.py` found
 two reproducible blockers to integration: an embedded `summary:` label inside
