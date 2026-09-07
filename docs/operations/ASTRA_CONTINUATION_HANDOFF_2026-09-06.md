@@ -1392,3 +1392,32 @@ its source-conservation guarantee: stale reference binding, structural role
 encoding, Ref-only field ownership, source geometry and real reference/drive
 routing remain open. No GPU/model, service, browser or Windows acceptance is
 claimed. The historical tracker remains held and unrelated WIP is preserved.
+
+### Mapper provenance candidate and obsolete helper removal (2026-09-07)
+
+Removed the unused split_exact_drive_audio_reference and
+apply_exact_drive_audio_prompt_contract functions, plus their regex/import, from
+reference_manifest. Their former Studio routing path is gone; no production or
+test caller remains. The active manifest validator is AST-unchanged. All 145
+applicable CPU tests pass with two skipped; this does not resolve drive routing.
+
+The refreshed mapper prototype directly calls the shared canonicalizer, rejects
+blank input/overflow durations, and conserves non-field source prefixes. Its
+provenance companion binds exact source/schema/origin, recipe, normalized manifest,
+duration and output. It regenerates changed generated bindings from stored source
+and requires current-manifest/duration validation. Bare Ref creation is rejected;
+the separate authored constructor records explicit caller authority and must never
+be used to relabel recovery or generated strings. Independent review closed the
+prototype's origin and stale-binding findings. Final combined candidate tests pass
+23 cases, including two parent closure checks for Base semantic-input rejection
+and nested existing-plan seal drift. Evidence:
+`.artifacts-temp/astra-mapper-binding-20260907/`.
+
+These mapping files remain unadopted. Next: resolve structural role encoding and
+Ref-only field ownership, define the runtime-owned allowlisted reference/asset
+binding, enforce authoritative authoring ingress, and integrate structured records
+into atomic prompt rewriting plus dispatch/recovery with current input checks.
+Use a stable recipe version; unsupported old mappings retain exact sealed replay
+and must not acquire fabricated remapping proof. The artifact's nested-seal test
+proves storage coverage, not deployed integration. No GPU/model, service, browser
+or Windows acceptance is claimed; the continuous Goal remains active.
