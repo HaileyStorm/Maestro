@@ -198,15 +198,15 @@ export function DurationSlider() {
                 onChange={event => setParam('h3_adaptive_conditioning', event.target.checked)}
               />
               <span>
-                <span className="font-medium text-text-primary">Match each shot to its references automatically</span>
-                <span className="mt-0.5 block text-text-muted">On by default. The job appears on its card immediately while Maestro uses your start/end images, reference media, and cut timing to choose the best mode for each shot. Videos with more than one shot pause briefly for plan review, then continue automatically if you leave the plan unchanged and accept any required model terms.</span>
+                <span className="font-medium text-text-primary">Match each shot automatically</span>
+                <span className="mt-0.5 block text-text-muted">On by default. Choose one Text &amp; frames checkpoint and one References checkpoint next to Generate. Maestro matches each shot to its frames, reference media, and cut timing. Multi-shot videos appear on the job card immediately, pause for plan review, then continue automatically when the plan stays unchanged and required terms are accepted.</span>
               </span>
             </label>
           )}
           {usesSegments && (
             <details className="mt-1 pl-2 text-[8px] leading-relaxed text-text-muted">
               <summary className="mobile-control-target inline-flex cursor-pointer items-center rounded text-accent-blue hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Mode details</summary>
-              When enabled, Maestro may choose FL2VA or Ref2VA for each shot.
+              Maestro may choose FL2VA for prompts, start/end frames, and continuity, or Ref2VA for reference images, video, and audio. Each shot uses the checkpoint you chose for that group.
             </details>
           )}
         </div>

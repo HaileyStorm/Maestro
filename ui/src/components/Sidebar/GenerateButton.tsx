@@ -1,8 +1,10 @@
 import { useState, useEffect } from 'react'
 import { Play, AlertTriangle, ListPlus } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
+import { fetchH3AccelerationStatus } from '../../api/client'
 import { H3EstimateBadge } from './H3PerformanceProfiles'
 import { projectLogicalQueue } from '../../lib/queueProjection'
+import { h3ActiveCheckpoints, h3AdaptiveSelectionError } from '../../lib/h3Submission'
 
 export function GenerateButton() {
   const jobs = useStore(s => s.jobs)
@@ -10,33 +12,60 @@ export function GenerateButton() {
   const setSidebarOpen = useStore(s => s.setSidebarOpen)
   const modelOptionsLoading = useStore(s => s.modelOptionsLoading)
   const activeWorkspace = useStore(s => s.activeWorkspace)
+  const h3SelectionError = useStore(s => h3AdaptiveSelectionError(s.params))
+  const missingH3Checkpoint = useStore(s => {
+    const h3Selected = s.generationMode === 'video'
+      && (
+        s.params.model_type.startsWith('minimax_h3')
+        || String(s.modelOptions?.architecture || '').startsWith('minimax_h3')
+      )
+    if (!h3Selected || !s.modelsLoaded) return null
+    return h3ActiveCheckpoints(s.params).find(modelType => (
+      !s.models.some(candidate => candidate.model_type === modelType)
+    )) || null
+  })
+  const usesW4a8 = useStore(s => (
+    h3ActiveCheckpoints(s.params).includes('minimax_h3_w4a8_fl2va')
+  ))
   const h3LocationRequired = useStore(s => {
-    const model = s.models.find(candidate => candidate.model_type === s.params.model_type)
-    return model?.availability_status === 'location_declaration_required'
+    const types = h3ActiveCheckpoints(s.params)
+    return types.some(modelType => (
+      s.models.find(candidate => candidate.model_type === modelType)
+        ?.availability_status === 'location_declaration_required'
+    ))
   })
   const legalBlocked = useStore(s => {
-    const model = s.models.find(candidate => candidate.model_type === s.params.model_type)
-    return model?.availability_status === 'location_declaration_required'
-      || model?.availability_status === 'legal_blocked'
-      || model?.execution_allowed === false
+    const types = h3ActiveCheckpoints(s.params)
+    return types.some(modelType => {
+      const model = s.models.find(candidate => candidate.model_type === modelType)
+      return model?.availability_status === 'location_declaration_required'
+        || model?.availability_status === 'legal_blocked'
+        || model?.execution_allowed === false
+    })
   })
   const needsModelTerms = useStore(s => {
-    const model = s.models.find(candidate => candidate.model_type === s.params.model_type)
-    if (
-      model?.availability_status === 'location_declaration_required'
-      || model?.availability_status === 'legal_blocked'
-      || model?.execution_allowed === false
-    ) return false
-    return (model?.required_host_terms || []).some(
-      requirement => s.hostTerms?.[requirement.term]?.accepted !== true,
-    )
+    const types = h3ActiveCheckpoints(s.params)
+    return types.some(modelType => {
+      const model = s.models.find(candidate => candidate.model_type === modelType)
+      if (
+        model?.availability_status === 'location_declaration_required'
+        || model?.availability_status === 'legal_blocked'
+        || model?.execution_allowed === false
+      ) return false
+      return (model?.required_host_terms || []).some(
+        requirement => s.hostTerms?.[requirement.term]?.accepted !== true,
+      )
+    })
   })
   const needsManualCheckpointVerification = useStore(s => {
-    const model = s.models.find(candidate => candidate.model_type === s.params.model_type)
-    return Boolean(
-      model?.downloadable === false
-      && !model.manual_checkpoint_verified
-    )
+    const types = h3ActiveCheckpoints(s.params)
+    return types.some(modelType => {
+      const model = s.models.find(candidate => candidate.model_type === modelType)
+      return Boolean(
+        model?.downloadable === false
+        && !model.manual_checkpoint_verified
+      )
+    })
   })
   const isH3 = useStore(s => (
     s.generationMode === 'video'
@@ -48,15 +77,41 @@ export function GenerateButton() {
   const h3Estimate = useStore(s => s.h3CurrentEstimate)
   const h3EstimateLoading = useStore(s => s.h3EstimateLoading)
   const h3DownloadRequired = useStore(s => {
-    if (s.models.find(model => model.model_type === s.params.model_type)?.is_downloaded === false) return true
+    const types = h3ActiveCheckpoints(s.params)
+    if (types.some(modelType => s.models.find(model => model.model_type === modelType)?.is_downloaded === false)) {
+      return true
+    }
     const turboProfile = (s.params.custom_settings || {}).h3_turbo_profile
     return !!turboProfile && s.h3PerformanceProfiles.some(profile => (
       profile.download_required
-      && profile.settings.model_type === s.params.model_type
+      && types.includes(profile.settings.model_type)
       && profile.settings.custom_settings.h3_turbo_profile === turboProfile
     ))
   })
   const [cooldown, setCooldown] = useState(false)
+  const [w4a8Capability, setW4a8Capability] = useState<{
+    available: boolean
+    reason: string
+  } | null>(null)
+
+  useEffect(() => {
+    if (!usesW4a8) return
+    let current = true
+    fetchH3AccelerationStatus(false)
+      .then(status => {
+        if (current) setW4a8Capability({
+          available: status.w4a8.available,
+          reason: status.w4a8.reason,
+        })
+      })
+      .catch(() => {
+        if (current) setW4a8Capability({
+          available: false,
+          reason: 'W4A8 runtime support could not be checked.',
+        })
+      })
+    return () => { current = false }
+  }, [usesW4a8])
 
   // Check if i2v-only model needs a start image. Video mode only: edit
   // sub-modes supply their own source media (Recast runs the i2v-only
@@ -78,7 +133,9 @@ export function GenerateButton() {
   )
   const needsOutpaintArea = isOutpaint && !!editVideoPath && !hasOutpaintArea
   const needsProject = !activeWorkspace
-  const blocked = modelOptionsLoading || needsProject || legalBlocked || needsModelTerms || needsManualCheckpointVerification || needsImage || needsOutpaintSource || needsOutpaintArea
+  const w4a8RuntimeBlocked = usesW4a8 && w4a8Capability?.available !== true
+  const h3CheckpointBlocked = Boolean(h3SelectionError || missingH3Checkpoint || w4a8RuntimeBlocked)
+  const blocked = modelOptionsLoading || needsProject || h3CheckpointBlocked || legalBlocked || needsModelTerms || needsManualCheckpointVerification || needsImage || needsOutpaintSource || needsOutpaintArea
 
   // Brief gray flash after clicking
   useEffect(() => {
@@ -107,6 +164,12 @@ export function GenerateButton() {
       ? 'Loading model'
       : needsProject
       ? 'Select project'
+      : h3SelectionError
+      ? 'Choose H3 models'
+      : missingH3Checkpoint
+      ? 'Model unavailable'
+      : w4a8RuntimeBlocked
+      ? w4a8Capability ? 'Model unavailable' : 'Checking model'
       : legalBlocked
       ? h3LocationRequired ? 'Location needed' : 'License required'
       : needsModelTerms
@@ -124,6 +187,12 @@ export function GenerateButton() {
       ? 'Choose a larger output aspect or resize the source to create an area for Outpaint to generate.'
       : needsProject
       ? 'Choose or create a project first.'
+      : h3SelectionError
+      ? h3SelectionError
+      : missingH3Checkpoint
+      ? 'The saved H3 checkpoint is no longer in the model catalog. Open the matching model group and choose an available checkpoint.'
+      : w4a8RuntimeBlocked
+      ? w4a8Capability?.reason || 'Checking whether this computer can run the selected W4A8 checkpoint.'
       : legalBlocked
       ? h3LocationRequired
         ? 'Choose the country where this computer will actually run MiniMax H3. Maestro does not use IP or VPN location.'

@@ -41,6 +41,16 @@ test('LoRA header actions retain behavior while exposing mobile targets and focu
 
   assert.match(source, /className="mb-1\.5 flex flex-wrap items-center justify-between gap-1"/)
   assert.match(source, /className="ml-auto flex flex-wrap items-center justify-end gap-1 md:gap-2"/)
+  assert.match(source, /h3AdaptivePairActive/)
+  assert.match(source, /'Text & frames',\s*'FL2VA adapters'/)
+  assert.match(source, /'References',\s*'Ref2VA adapters'/)
+  assert.match(source, /h3LorasForArchitecture/)
+  assert.match(source, /Saved LoRA settings need repair/)
+  assert.match(source, /Clear saved \{title\} LoRAs/)
+  assert.match(source, /toggleH3ArchitectureLora\('fl2va'/)
+  assert.match(source, /toggleH3ArchitectureLora\('ref2va'/)
+  assert.match(source, /applies only to that model's shots/)
+  assert.match(source, /aria-label=\{`\$\{displayName\(filename\)\} \$\{architecture/)
 })
 
 test('mobile target utilities compile to 44px and compact only from 768px', async () => {

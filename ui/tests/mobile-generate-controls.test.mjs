@@ -8,7 +8,7 @@ const source = relative => readFile(new URL(relative, import.meta.url), 'utf8')
 
 const [
   duration, profiles, resolution, prompt, music, models, inputs, css,
-  typesSource, storeSource,
+  typesSource, storeSource, generateSource,
 ] = await Promise.all([
   source('../src/components/Sidebar/DurationSlider.tsx'),
   source('../src/components/Sidebar/H3PerformanceProfiles.tsx'),
@@ -20,6 +20,7 @@ const [
   source('../src/index.css'),
   source('../src/types/index.ts'),
   source('../src/stores/useStore.ts'),
+  source('../src/components/Sidebar/GenerateButton.tsx'),
 ])
 
 function openingTag(contents, element, marker) {
@@ -111,7 +112,7 @@ test('H3 duration controls retain planning callbacks and expose mobile targets',
   assertMobileTarget(automatic, 'Automatic/Manual segment control')
   assert.match(automatic, /aria-pressed=\{locked\}/)
   assertMobileTarget(disclosure, 'mode details disclosure')
-  assert.match(duration, /<details[^>]*>[\s\S]*<summary[^>]*>Mode details<\/summary>[\s\S]*FL2VA or Ref2VA[\s\S]*<\/details>/)
+  assert.match(duration, /<details[^>]*>[\s\S]*<summary[^>]*>Mode details<\/summary>[\s\S]*FL2VA[\s\S]*Ref2VA[\s\S]*<\/details>/)
   assert.match(duration, /htmlFor="studio-duration-seconds"/)
   assert.match(duration, /id="studio-duration-seconds"/)
   assert.match(duration, /htmlFor="studio-window-seconds"/)
@@ -123,9 +124,10 @@ test('H3 duration controls retain planning callbacks and expose mobile targets',
   assert.match(duration, /onChange=\{event => setParam\('h3_adaptive_conditioning', event\.target\.checked\)\}/)
   assert.match(duration, /mb-1\.5 flex flex-wrap items-center justify-between/)
   assert.match(duration, /Estimated shots \$\{estimatedSegmentLabel\}/)
-  assert.match(duration, /Match each shot to its references automatically/)
-  assert.match(duration, /appears on its card immediately[\s\S]*pause briefly for plan review[\s\S]*continue automatically if you leave the plan unchanged and accept any required model terms/)
-  assert.match(duration, /Mode details[\s\S]*FL2VA or Ref2VA/)
+  assert.match(duration, /Match each shot automatically/)
+  assert.match(duration, /Choose one Text &amp; frames checkpoint and one References checkpoint next to Generate/)
+  assert.match(duration, /Multi-shot videos appear on the job card immediately,[\s\S]*pause for plan review,[\s\S]*continue automatically/)
+  assert.match(duration, /Mode details[\s\S]*FL2VA[\s\S]*Ref2VA/)
 })
 
 test('performance profile and resolution selection remain exact at compact and narrow widths', () => {
@@ -152,6 +154,27 @@ test('performance profile and resolution selection remain exact at compact and n
 
   const narrowUsableWidth = 320 - 32
   assert.ok(5 * 44 <= narrowUsableWidth, 'five preset controls retain a 44px floor at 320px')
+})
+
+test('adaptive H3 controls keep independent model groups and fail closed before Generate', () => {
+  assert.match(storeSource, /selectAdaptiveH3Model/)
+  assert.match(storeSource, /h3_adaptive_fl2va_model/)
+  assert.match(storeSource, /h3_adaptive_ref2va_model/)
+  assert.match(models, /heading="Text & frames"/)
+  assert.match(models, /detail="FL2VA · follows prompts, start and end frames, and continuity"/)
+  assert.match(models, /heading="References"/)
+  assert.match(models, /detail="Ref2VA · follows reference images, video, and audio"/)
+  assert.match(models, /h3AdaptivePickerModelCompatible/)
+  assert.match(models, /allowed=\{H3_FL2VA_MODEL_SET\}/)
+  assert.match(models, /allowed=\{H3_REF2VA_MODEL_SET\}/)
+  assert.equal((models.match(/function CheckpointPicker\(/g) || []).length, 1)
+  assert.doesNotMatch(models, /function AdaptiveCheckpointPicker/)
+  assert.match(models, /disabled=\{w4a8Unavailable \|\| legalBlocked\}/)
+  assert.match(models, /aria-label=\{heading \? `\$\{heading\} model:/)
+  assert.match(models, /selectedOutsideAllowed/)
+  assert.match(models, /This saved checkpoint is no longer available/)
+  assert.match(generateSource, /h3AdaptiveSelectionError/)
+  assert.match(generateSource, /h3ActiveCheckpoints/)
 })
 
 test('external H3 experiment profile IDs remain typed and restorable', () => {
@@ -225,7 +248,7 @@ test('model selection, terms, and manual-install actions retain authority and ex
   const sourceLink = openingTag(models, 'a', 'href={currentModel.manual_installation.source_url}')
   const downloadLink = openingTag(models, 'a', 'href={currentModel.manual_installation.download_url}')
   const verify = openingTag(models, 'button', 'verifyCurrentManualCheckpoint()')
-  const option = openingTag(models, 'button', 'if (await selectModel(model.model_type)) {')
+  const option = openingTag(models, 'button', 'if (await onSelect(model.model_type)) {')
 
   for (const [name, tag] of [
     ['model trigger', trigger],
@@ -238,14 +261,24 @@ test('model selection, terms, and manual-install actions retain authority and ex
   ]) assertMobileTarget(tag, name)
 
   assert.match(trigger, /aria-expanded=\{open\}/)
-  assert.match(trigger, /aria-controls="model-selector-menu"/)
-  assert.match(models, /id="model-selector-menu"/)
+  assert.match(trigger, /aria-controls=\{menuId\}/)
+  assert.match(models, /menuId="model-selector-menu"/)
+  assert.match(models, /id=\{menuId\}/)
   assert.match(models, /max-w-\[calc\(100vw-2rem\)\]/)
   assert.match(models, /top-0/)
   assert.match(models, /-translate-y-\[calc\(100%\+0\.25rem\)\]/)
   assert.match(models, /max-h-\[min\(404px,calc\(100dvh-2rem\)\)\]/)
   assert.match(models, /min-h-0 flex-1 overflow-y-auto/)
   assert.match(models, /event\.key !== 'Escape'/)
+  const sharedPopupLifecycle = models.match(
+    /\/\/ Treat the model list as a non-modal dialog:[\s\S]*?\}, \[open\]\)/,
+  )?.[0] || ''
+  assert.match(sharedPopupLifecycle, /if \(!open\) return/)
+  assert.doesNotMatch(sharedPopupLifecycle, /includeW4a8/)
+  assert.match(sharedPopupLifecycle, /document\.addEventListener\('mousedown', handleClick\)/)
+  assert.match(sharedPopupLifecycle, /document\.addEventListener\('keydown', handleKeyDown, true\)/)
+  assert.match(models, /if \(!open \|\| !includeW4a8\) return[\s\S]*fetchH3AccelerationStatus/)
+  assert.match(models, /event\.stopImmediatePropagation\(\)/)
   assert.match(models, /popupRef\.current\?\.querySelector<HTMLElement>/)
   assert.match(models, /window\.requestAnimationFrame\(\(\) => triggerRef\.current\?\.focus\(\)\)/)
   assert.match(terms, /target="_blank"/)
@@ -258,6 +291,10 @@ test('model selection, terms, and manual-install actions retain authority and ex
   assert.match(models, /disabled=\{verifyingManualCheckpoint \|\| pendingRequirements\.length > 0\}/)
   assert.match(models, /label: 'Reference media'/)
   assert.match(models, /label: 'Reference images'/)
+  assert.match(models, /h3AdaptivePair/)
+  assert.match(models, /selectAdaptiveH3Model\('fl2va', type\)/)
+  assert.match(models, /selectAdaptiveH3Model\('ref2va', type\)/)
+  assert.match(models, /aria-label=\{heading \? `\$\{heading\} models` : 'Models'\}/)
   assert.match(option, /aria-pressed=\{isSelected\}/)
   assert.match(models, /\[&_button\]:min-h-11/)
   assert.match(models, /md:\[&_button\]:min-h-0/)

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { createPortal } from 'react-dom'
 import { Search, X, Loader2, Globe, Sparkles, BookOpen, Info, ArrowUpCircle, RefreshCw, ArrowDownAZ, Clock } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
@@ -7,6 +7,48 @@ import { formatAge } from '../../lib/format'
 import type { LoraRecommendedWeights, LoraUpdateStatus } from '../../types'
 import { sortLoraNames } from './loraSort'
 import type { LoraDates, LoraPickerSort } from './loraSort'
+import {
+  defaultAdaptiveFl2vaModel,
+  defaultAdaptiveRef2vaModel,
+  filterLorasForArchitecture,
+  h3AdaptivePairActive,
+  h3AdaptiveSelectionError,
+  h3ArchitectureForModel,
+  h3LorasForArchitecture,
+  h3LoraBlockReason,
+  parseLoraMultiplierMap,
+} from '../../lib/h3Submission'
+
+const EMPTY_LORAS: string[] = []
+const EMPTY_LORA_WEIGHTS: Record<string, number[]> = Object.create(null)
+
+type Architecture = 'fl2va' | 'ref2va'
+type ArchitectureLoraState = {
+  loras: string[]
+  multipliers: string
+  error: string | null
+}
+
+function architectureLoraState(
+  params: Parameters<typeof h3LorasForArchitecture>[0],
+  architecture: Architecture,
+): ArchitectureLoraState {
+  const otherKey = architecture === 'fl2va' ? 'h3_ref2va_loras' : 'h3_fl2va_loras'
+  try {
+    // Validate and render each side independently so a malformed saved value
+    // on one side does not hide the other side's explicit repair controls.
+    return {
+      ...h3LorasForArchitecture({ ...params, [otherKey]: EMPTY_LORAS }, architecture),
+      error: null,
+    }
+  } catch (error) {
+    return {
+      loras: EMPTY_LORAS,
+      multipliers: '',
+      error: error instanceof Error ? error.message : 'Saved LoRA settings could not be read.',
+    }
+  }
+}
 
 export function LoraGuideTooltip({ guide }: { guide: string }) {
   const [show, setShow] = useState(false)
@@ -108,14 +150,72 @@ export function LoraSelector() {
   const generationMode = useStore(s => s.generationMode)
   const editSubMode = useStore(s => s.editSubMode)
   const toggleLora = useStore(s => s.toggleLora)
+  const toggleH3ArchitectureLora = useStore(s => s.toggleH3ArchitectureLora)
   const setLoraWeight = useStore(s => s.setLoraWeight)
+  const setH3ArchitectureLoraWeight = useStore(s => s.setH3ArchitectureLoraWeight)
+  const setParams = useStore(s => s.setParams)
   const loadLoras = useStore(s => s.loadLoras)
   const openBrowser = useStore(s => s.setLoraBrowserOpen)
+  const h3Adaptive = useStore(s => h3AdaptivePairActive(
+    s.params.model_type,
+    s.params.h3_adaptive_conditioning,
+  ))
+  const h3SelectionError = useStore(s => h3AdaptiveSelectionError(s.params))
+  const adaptiveFl2vaModel = useStore(s => defaultAdaptiveFl2vaModel(
+    s.params.model_type,
+    s.params.h3_adaptive_fl2va_model,
+  ))
+  const adaptiveRef2vaModel = useStore(s => defaultAdaptiveRef2vaModel(
+    s.params.h3_adaptive_ref2va_model,
+  ))
+  const h3Fl2vaLoras = useStore(s => s.params.h3_fl2va_loras)
+  const h3Ref2vaLoras = useStore(s => s.params.h3_ref2va_loras)
+  const h3Fl2vaMultipliers = useStore(s => s.params.h3_fl2va_loras_multipliers)
+  const h3Ref2vaMultipliers = useStore(s => s.params.h3_ref2va_loras_multipliers)
+  const inheritedLoraMultipliers = useStore(s => s.params.loras_multipliers)
+  const adaptiveParams = useMemo(() => ({
+    activated_loras: activatedLoras,
+    loras_multipliers: inheritedLoraMultipliers,
+    h3_fl2va_loras: h3Fl2vaLoras,
+    h3_fl2va_loras_multipliers: h3Fl2vaMultipliers,
+    h3_ref2va_loras: h3Ref2vaLoras,
+    h3_ref2va_loras_multipliers: h3Ref2vaMultipliers,
+  }), [
+    activatedLoras,
+    h3Fl2vaLoras,
+    h3Fl2vaMultipliers,
+    h3Ref2vaLoras,
+    h3Ref2vaMultipliers,
+    inheritedLoraMultipliers,
+  ])
+  const fl2vaState = useMemo(
+    () => architectureLoraState(adaptiveParams, 'fl2va'),
+    [adaptiveParams],
+  )
+  const ref2vaState = useMemo(
+    () => architectureLoraState(adaptiveParams, 'ref2va'),
+    [adaptiveParams],
+  )
+  const detailModelTypes = useMemo(
+    () => h3Adaptive
+      ? h3SelectionError
+        ? EMPTY_LORAS
+        : Array.from(new Set([adaptiveFl2vaModel, adaptiveRef2vaModel]))
+      : modelType ? [modelType] : EMPTY_LORAS,
+    [adaptiveFl2vaModel, adaptiveRef2vaModel, h3Adaptive, h3SelectionError, modelType],
+  )
+  const activeGuideLoras = useMemo(
+    () => h3Adaptive
+      ? Array.from(new Set([...fl2vaState.loras, ...ref2vaState.loras]))
+      : activatedLoras,
+    [activatedLoras, fl2vaState.loras, h3Adaptive, ref2vaState.loras],
+  )
 
   const [search, setSearch] = useState('')
   const [guideStatus, setGuideStatus] = useState<Record<string, 'none' | 'exists' | 'generating' | 'done'>>({})
   const [guideTexts, setGuideTexts] = useState<Record<string, string>>({})
   const [loraWeightRecs, setLoraWeightRecs] = useState<Record<string, LoraRecommendedWeights>>({})
+  const [loraDetailsError, setLoraDetailsError] = useState('')
   const loraDetailsRequest = useRef(0)
   // Per-filename update_status from the cached LoRA-update manifest. The
   // backend embeds this on every /details response so we don't need to
@@ -138,34 +238,57 @@ export function LoraSelector() {
   // can deactivate them without first turning the filter off.
   const [updatableOnly, setUpdatableOnly] = useState(false)
 
+  const fetchCurrentLoraDetails = useCallback(async () => {
+    if (h3SelectionError) throw new Error(h3SelectionError)
+    const settled = await Promise.allSettled(
+      detailModelTypes.map(type => fetchLoraDetails(type)),
+    )
+    const responses = settled.flatMap(result => (
+      result.status === 'fulfilled' ? [result.value] : []
+    ))
+    if (responses.length === 0) throw new Error('LoRA details could not be loaded.')
+    return {
+      responses,
+      incomplete: responses.length !== settled.length,
+    }
+  }, [detailModelTypes, h3SelectionError])
+
   // Trigger a fresh CivitAI check, then refetch /details so the manifest's
   // newly-updated entries flow back into our updateStatuses map.
   const handleCheckUpdates = useCallback(async () => {
     if (!modelType || checking) return
+    if (h3SelectionError) {
+      setLoraDetailsError(h3SelectionError)
+      return
+    }
     setChecking(true)
     try {
       await checkLoraUpdates(true) // force=true: bypass 24h staleness window
-      const r = await fetchLoraDetails(modelType)
+      const { responses, incomplete } = await fetchCurrentLoraDetails()
       const next: Record<string, LoraUpdateStatus> = {}
       // check-updates backfills publishedAt into sidecars that predate its
       // capture, so this refetch is exactly when release dates appear —
       // refresh the age-chip map too, not just update statuses.
       const dates: Record<string, LoraDates> = {}
-      for (const info of r.loras) {
-        if (info.update_status) next[info.filename] = info.update_status
-        if (info.released_at || info.downloaded_at) {
-          dates[info.filename] = { released: info.released_at, downloaded: info.downloaded_at }
+      for (const response of responses) {
+        for (const info of response.loras) {
+          if (info.update_status) next[info.filename] = info.update_status
+          if (info.released_at || info.downloaded_at) {
+            dates[info.filename] = { released: info.released_at, downloaded: info.downloaded_at }
+          }
         }
       }
       setUpdateStatuses(next)
       setLoraDates(dates)
-      setLastCheckedAt(r.manifest_last_check_at ?? null)
+      setLastCheckedAt(responses.map(response => response.manifest_last_check_at).find(Boolean) ?? null)
+      setLoraDetailsError(incomplete ? 'Some model-specific LoRA details could not be loaded.' : '')
     } catch (e) {
       console.error('LoRA update check failed:', e)
+      setLoraDetailsError(e instanceof Error ? e.message : 'LoRA details could not be loaded.')
     } finally {
       setChecking(false)
     }
-  }, [modelType, checking])
+  }, [checking, fetchCurrentLoraDetails, h3SelectionError, modelType])
 
   // Count of LoRAs with an available update — surfaced as a badge on the
   // refresh button so the user sees at a glance whether anything's
@@ -201,9 +324,9 @@ export function LoraSelector() {
           disabled={checking || !modelType}
           aria-label={checkUpdatesLabel}
           className="flex min-h-11 min-w-11 items-center justify-center gap-0.5 rounded px-1 text-[10px] text-text-muted transition-colors hover:text-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:cursor-not-allowed disabled:opacity-50 md:min-h-0 md:min-w-0 md:justify-start md:rounded-none md:px-0"
-          title={lastCheckedAt
+          title={h3SelectionError || (lastCheckedAt
             ? `Check CivitAI for newer LoRA versions (last checked ${formatRelative(lastCheckedAt)})`
-            : 'Check CivitAI for newer LoRA versions'}
+            : 'Check CivitAI for newer LoRA versions')}
         >
           {checking
             ? <Loader2 size={10} className="animate-spin" />
@@ -241,30 +364,37 @@ export function LoraSelector() {
 
   // Load LoRA details (weight recommendations for the list, guides for activated)
   useEffect(() => {
-    if (!modelType) return
+    const detailsRequest = ++loraDetailsRequest.current
+    if (!modelType || h3SelectionError) return
     // Check guide status for activated LoRAs
-    for (const lora of activatedLoras) {
+    for (const lora of activeGuideLoras) {
       if (guideStatus[lora]) continue
-      fetchLoraGuide(modelType, lora).then(r => {
+      const guideModelType = h3Adaptive
+        ? ref2vaState.loras.includes(lora) && !fl2vaState.loras.includes(lora)
+          ? adaptiveRef2vaModel
+          : adaptiveFl2vaModel
+        : modelType
+      fetchLoraGuide(guideModelType, lora).then(r => {
         setGuideStatus(s => ({ ...s, [lora]: r.guide ? 'exists' : 'none' }))
       }).catch(() => {})
     }
     // Load weight recommendations, guides, and apply defaults to newly activated LoRAs
-    const detailsRequest = ++loraDetailsRequest.current
-    fetchLoraDetails(modelType).then(r => {
+    fetchCurrentLoraDetails().then(({ responses, incomplete }) => {
       if (detailsRequest !== loraDetailsRequest.current) return
       const recs: Record<string, LoraRecommendedWeights> = {}
       const guides: Record<string, string> = {}
       const statuses: Record<string, 'exists' | 'none'> = {}
       const updates: Record<string, LoraUpdateStatus> = {}
       const dates: Record<string, LoraDates> = {}
-      for (const info of r.loras) {
-        if (info.recommended_weights) recs[info.filename] = info.recommended_weights
-        if (info.guide) { guides[info.filename] = info.guide; statuses[info.filename] = 'exists' }
-        else if (info.has_guide) statuses[info.filename] = 'exists'
-        if (info.update_status) updates[info.filename] = info.update_status
-        if (info.released_at || info.downloaded_at) {
-          dates[info.filename] = { released: info.released_at, downloaded: info.downloaded_at }
+      for (const response of responses) {
+        for (const info of response.loras) {
+          if (info.recommended_weights) recs[info.filename] = info.recommended_weights
+          if (info.guide) { guides[info.filename] = info.guide; statuses[info.filename] = 'exists' }
+          else if (info.has_guide) statuses[info.filename] = 'exists'
+          if (info.update_status) updates[info.filename] = info.update_status
+          if (info.released_at || info.downloaded_at) {
+            dates[info.filename] = { released: info.released_at, downloaded: info.downloaded_at }
+          }
         }
       }
       setLoraWeightRecs(recs)
@@ -272,10 +402,15 @@ export function LoraSelector() {
       setGuideStatus(prev => ({ ...prev, ...statuses }))
       setUpdateStatuses(updates)
       setLoraDates(dates)
-      setLastCheckedAt(r.manifest_last_check_at ?? null)
+      setLastCheckedAt(responses.map(response => response.manifest_last_check_at).find(Boolean) ?? null)
+      setLoraDetailsError(incomplete ? 'Some model-specific LoRA details could not be loaded.' : '')
 
       // Apply recommended defaults to LoRAs that are still at the initial 1.0 fill
-      for (const lora of activatedLoras) {
+      for (const lora of activeGuideLoras) {
+        // Architecture-specific weights are an exact saved contract. Show
+        // recommendations in the UI, but do not rewrite them during detail
+        // loading; the user can move the visible slider explicitly.
+        if (h3Adaptive) continue
         const rec = recs[lora]
         if (!rec) continue
         const currentWeights = loraWeights[lora]
@@ -300,14 +435,35 @@ export function LoraSelector() {
     }).catch(error => {
       if (detailsRequest !== loraDetailsRequest.current) return
       console.error('Could not load LoRA details:', error)
+      setLoraDetailsError(error instanceof Error ? error.message : 'LoRA details could not be loaded.')
     })
-  }, [modelType, activatedLoras]) // eslint-disable-line react-hooks/exhaustive-deps
+  // The request token prevents stale writes. Including guideStatus or
+  // loraWeights would re-run this detail hydration because this effect owns
+  // those state updates.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    activeGuideLoras,
+    adaptiveFl2vaModel,
+    adaptiveRef2vaModel,
+    fetchCurrentLoraDetails,
+    fl2vaState.loras,
+    h3Adaptive,
+    h3SelectionError,
+    modelType,
+    ref2vaState.loras,
+  ])
 
-  const handleGenerateGuide = async (filename: string) => {
-    if (!modelType) return
+  const handleGenerateGuide = async (filename: string, architecture: Architecture | null) => {
+    if (h3SelectionError) return
+    const guideModelType = architecture === 'fl2va'
+      ? adaptiveFl2vaModel
+      : architecture === 'ref2va'
+        ? adaptiveRef2vaModel
+        : modelType
+    if (!guideModelType) return
     setGuideStatus(s => ({ ...s, [filename]: 'generating' }))
     try {
-      await generateLoraGuide(modelType, filename)
+      await generateLoraGuide(guideModelType, filename)
       setGuideStatus(s => ({ ...s, [filename]: 'done' }))
     } catch (e) {
       console.error('Guide generation failed:', e)
@@ -329,16 +485,277 @@ export function LoraSelector() {
     return filename.replace(/\.(safetensors|sft)$/i, '')
   }
 
-  // Filter by search term and the optional update-status filter. Activated LoRAs are always
-  // shown so the user can deactivate them without first turning off the
-  // current filter — otherwise the checkbox becomes confusing when a
-  // selected item suddenly vanishes from the list.
-  const filtered = sortLoraNames(availableLoras.filter(name => {
+  const namesFor = (
+    architecture: 'fl2va' | 'ref2va' | null,
+    activated: string[],
+  ) => sortLoraNames((architecture
+    ? filterLorasForArchitecture(availableLoras, architecture)
+    : availableLoras
+  ).filter(name => {
     if (!displayName(name).toLowerCase().includes(search.toLowerCase())) return false
-    const isActivated = activatedLoras.includes(name)
+    const isActivated = activated.includes(name)
     if (updatableOnly && !isActivated && updateStatuses[name] !== 'available') return false
     return true
   }), sortMode, loraDates)
+
+  const pinnedArchitecture = h3ArchitectureForModel(modelType)
+  const flWeightMap = fl2vaState.error
+    ? EMPTY_LORA_WEIGHTS
+    : parseLoraMultiplierMap(fl2vaState.loras, fl2vaState.multipliers, phases)
+  const refWeightMap = ref2vaState.error
+    ? EMPTY_LORA_WEIGHTS
+    : parseLoraMultiplierMap(ref2vaState.loras, ref2vaState.multipliers, phases)
+
+  const listPanel = (
+    title: string,
+    detail: string,
+    architecture: 'fl2va' | 'ref2va' | null,
+    activated: string[],
+    onToggle: (filename: string) => void,
+    onWeight: (filename: string, phase: number, value: number) => void,
+    onClear: () => void,
+    weightLookup: Record<string, number[]>,
+  ) => {
+    const filtered = namesFor(architecture, activated)
+    return (
+      <section
+        role={title ? 'group' : undefined}
+        aria-label={title ? `${title} · ${detail}` : undefined}
+        className={title ? 'mt-3 rounded-lg border border-border bg-bg-tertiary/40 p-2.5' : undefined}
+      >
+        {title && (
+          <div className="mb-1.5">
+            <div className="text-[10px] font-medium uppercase tracking-wider text-text-primary">{title}</div>
+            <div className="mt-0.5 text-[9px] leading-relaxed text-text-muted">{detail} · applies only to that model's shots</div>
+          </div>
+        )}
+        <div className="max-h-[120px] overflow-y-auto border border-border rounded-lg bg-bg-tertiary">
+          {filtered.map(filename => {
+            const isActive = activated.includes(filename)
+            const blockReason = architecture
+              ? h3LoraBlockReason(filename, architecture, activated.filter(name => name !== filename))
+              : pinnedArchitecture
+                ? h3LoraBlockReason(filename, pinnedArchitecture, activated.filter(name => name !== filename))
+                : null
+            const blocked = Boolean(!isActive && blockReason)
+            return (
+              <button
+                key={`${architecture || 'shared'}:${filename}`}
+                type="button"
+                disabled={blocked}
+                aria-pressed={isActive}
+                aria-label={`${isActive ? 'Remove' : 'Add'} ${displayName(filename)} ${architecture ? `from ${title}` : ''}`.trim()}
+                title={blockReason || undefined}
+                onClick={() => { if (!blocked) onToggle(filename) }}
+                className={`w-full text-left px-2.5 py-1.5 text-xs flex items-center gap-2 hover:bg-bg-hover transition-colors ${
+                  isActive ? 'text-accent-blue' : blocked ? 'text-text-muted opacity-45 cursor-not-allowed' : 'text-text-secondary'
+                }`}
+              >
+                <div className={`w-3.5 h-3.5 rounded border flex items-center justify-center shrink-0 ${
+                  isActive ? 'bg-accent-blue border-accent-blue' : 'border-border'
+                }`}>
+                  {isActive && (
+                    <svg width="8" height="8" viewBox="0 0 8 8" fill="none">
+                      <path d="M1.5 4L3 5.5L6.5 2" stroke="white" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                  )}
+                </div>
+                <span className="truncate flex-1">{displayName(filename)}</span>
+                {loraDates[filename] && (
+                  <LoraAgeChip
+                    released={loraDates[filename].released}
+                    downloaded={loraDates[filename].downloaded}
+                  />
+                )}
+                {guideTexts[filename] && (
+                  <span onClick={e => e.stopPropagation()}>
+                    <LoraGuideTooltip guide={guideTexts[filename]} />
+                  </span>
+                )}
+                {loraWeightRecs[filename] && (
+                  <span
+                    className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                      loraWeightRecs[filename].source === 'civitai' ? 'bg-indicator-success' : 'bg-indicator-warning'
+                    }`}
+                    title={loraWeightRecs[filename].source === 'civitai' ? 'CivitAI recommended settings' : 'Default settings'}
+                  />
+                )}
+                {updateStatuses[filename] === 'available' && (
+                  <ArrowUpCircle
+                    size={11}
+                    className="text-indicator-warning shrink-0"
+                    aria-label="Update available"
+                  />
+                )}
+              </button>
+            )
+          })}
+          {filtered.length === 0 && (
+            <div className="px-3 py-2 text-xs text-text-muted text-center">
+              {search ? 'No matches' : architecture ? `No compatible ${detail.toLowerCase()} found` : 'No LoRAs found for this model'}
+            </div>
+          )}
+        </div>
+        {activated.length > 0 && (
+          <div className="mt-3 space-y-2">
+            <div className="flex items-center justify-between">
+              <div className="text-[10px] text-text-muted uppercase tracking-wider">
+                Selected ({activated.length})
+              </div>
+              <button
+                type="button"
+                onClick={onClear}
+                className="text-[10px] text-text-muted hover:text-red-400 transition-colors"
+              >
+                Clear
+              </button>
+            </div>
+            {activated.map(filename => {
+              const storedWeights = weightLookup[filename] || loraWeights[filename] || [1.0]
+              const weights = Array.from(
+                { length: phases },
+                (_, i) => storedWeights[i] ?? storedWeights[storedWeights.length - 1] ?? 1.0,
+              )
+              return (
+                <div key={`${architecture || 'shared'}-active-${filename}`} className="bg-bg-tertiary border border-border rounded-lg px-2.5 py-2">
+                  <div className="flex items-center justify-between mb-1.5">
+                    <span className="text-xs text-text-primary truncate flex-1 mr-2 flex items-center gap-1">
+                      {displayName(filename)}
+                      {updateStatuses[filename] === 'available' && (
+                        <ArrowUpCircle
+                          size={11}
+                          className="text-indicator-warning shrink-0"
+                          aria-label="Update available"
+                        />
+                      )}
+                    </span>
+                    <div className="flex items-center gap-0.5 shrink-0">
+                      {guideStatus[filename] === 'exists' || guideStatus[filename] === 'done' ? (
+                        <span className="p-0.5 text-indicator-success" title="LoRA guide available">
+                          <BookOpen size={11} />
+                        </span>
+                      ) : guideStatus[filename] === 'generating' ? (
+                        <span className="p-0.5 text-accent-blue">
+                          <Loader2 size={11} className="animate-spin" />
+                        </span>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={(e) => { e.stopPropagation(); handleGenerateGuide(filename, architecture) }}
+                          disabled={Boolean(h3SelectionError)}
+                          aria-label={`Generate guide for ${displayName(filename)}`}
+                          className="p-0.5 rounded hover:bg-bg-hover text-text-muted hover:text-accent-blue transition-colors disabled:cursor-not-allowed disabled:opacity-45"
+                          title={h3SelectionError || 'Generate AI guide for this LoRA'}
+                        >
+                          <Sparkles size={11} />
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => onToggle(filename)}
+                        aria-label={`Remove ${displayName(filename)} from ${title || 'LoRAs'}`}
+                        className="p-0.5 rounded hover:bg-bg-hover text-text-muted hover:text-text-primary transition-colors"
+                      >
+                        <X size={12} />
+                      </button>
+                    </div>
+                  </div>
+                  {weights.map((w, i) => {
+                    const rec = loraWeightRecs[filename]
+                    const phaseRec = rec?.phases?.find(p => p.phase === i + 1)
+                    const fallbackMin = 0.6, fallbackMax = 1.0
+                    const recMin = phaseRec?.min ?? rec?.min ?? fallbackMin
+                    const recMax = phaseRec?.max ?? rec?.max ?? fallbackMax
+                    const recDefault = phaseRec?.default ?? rec?.default ?? 0.8
+                    const isCivitai = rec?.source === 'civitai' || (rec != null && rec.source !== 'default')
+                    const sliderMax = 2
+                    const zoneLeft = (recMin / sliderMax) * 100
+                    const zoneWidth = ((recMax - recMin) / sliderMax) * 100
+                    const inZone = w >= recMin && w <= recMax
+                    const zoneColor = isCivitai
+                      ? 'bg-indicator-success/20 border-indicator-success/30'
+                      : 'bg-indicator-warning/15 border-indicator-warning/25'
+                    const valueColor = inZone
+                      ? (isCivitai ? 'text-indicator-success' : 'text-indicator-warning')
+                      : 'text-text-muted'
+                    return (
+                      <div key={i} className="flex items-center gap-2">
+                        {phases > 1 && (
+                          <span className="text-[10px] text-text-muted w-12 shrink-0" title={phaseRec?.label || ''}>
+                            Phase {i + 1}
+                          </span>
+                        )}
+                        <div className="flex-1 relative">
+                          <div
+                            className={`absolute top-1/2 -translate-y-1/2 h-2 rounded-full ${zoneColor} pointer-events-none`}
+                            style={{ left: `${zoneLeft}%`, width: `${zoneWidth}%` }}
+                            title={`${isCivitai ? 'CivitAI' : 'Default'}: ${recMin}-${recMax} (${recDefault})`}
+                          />
+                          <input
+                            type="range"
+                            min={0}
+                            max={sliderMax}
+                            step={0.05}
+                            value={w}
+                            onChange={e => onWeight(filename, i, parseFloat(e.target.value))}
+                            aria-label={`${displayName(filename)} ${architecture ? `${title} ` : ''}weight${phases > 1 ? ` phase ${i + 1}` : ''}`}
+                            className="w-full relative z-10"
+                          />
+                        </div>
+                        <span className={`text-[10px] w-8 text-right shrink-0 ${valueColor}`}>
+                          {w.toFixed(2)}
+                        </span>
+                      </div>
+                    )
+                  })}
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </section>
+    )
+  }
+
+  const clearArchitectureLoras = (architecture: Architecture) => {
+    if (architecture === 'fl2va') {
+      setParams({
+        h3_fl2va_loras: [],
+        h3_fl2va_loras_multipliers: '',
+      })
+    } else {
+      setParams({
+        h3_ref2va_loras: [],
+        h3_ref2va_loras_multipliers: '',
+      })
+    }
+  }
+
+  const repairPanel = (
+    title: string,
+    detail: string,
+    architecture: Architecture,
+    message: string,
+  ) => (
+    <section
+      role="group"
+      aria-label={`${title} · ${detail}`}
+      className="mt-3 rounded-lg border border-red-500/35 bg-red-500/10 p-2.5"
+    >
+      <div className="text-[10px] font-medium uppercase tracking-wider text-text-primary">{title}</div>
+      <div className="mt-0.5 text-[9px] text-text-muted">{detail}</div>
+      <p role="status" className="mt-2 text-[10px] leading-relaxed text-red-100">
+        Saved LoRA settings need repair. {message}
+      </p>
+      <button
+        type="button"
+        onClick={() => clearArchitectureLoras(architecture)}
+        className="mobile-control-target mt-2 rounded border border-red-300/40 px-2 py-1 text-[10px] font-medium text-red-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+      >
+        Clear saved {title} LoRAs
+      </button>
+    </section>
+  )
 
   if (lorasLoading) {
     return (
@@ -353,13 +770,13 @@ export function LoraSelector() {
     )
   }
 
-  if (availableLoras.length === 0) {
+  if (availableLoras.length === 0 && !h3Adaptive) {
     return (
       <div>
         {loraHeader}
         {compatibilityNotice}
         <div className="text-xs text-text-muted bg-bg-tertiary border border-border rounded-lg px-3 py-4 text-center">
-          No LoRAs found for this model
+          {loraDetailsError || 'No LoRAs found for this model'}
         </div>
       </div>
     )
@@ -369,6 +786,11 @@ export function LoraSelector() {
     <div>
       {loraHeader}
       {compatibilityNotice}
+      {loraDetailsError && (
+        <p role="status" className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-2 text-[10px] text-amber-100">
+          {loraDetailsError}
+        </p>
+      )}
 
       {/* Search + Updatable toggle */}
       <div className="flex items-center gap-2 mb-2">
@@ -408,194 +830,42 @@ export function LoraSelector() {
         </label>
       </div>
 
-      {/* Available LoRAs list */}
-      <div className="max-h-[120px] overflow-y-auto border border-border rounded-lg bg-bg-tertiary">
-        {filtered.map(filename => {
-          const isActive = activatedLoras.includes(filename)
-          return (
-            <button
-              key={filename}
-              onClick={() => toggleLora(filename)}
-              className={`w-full text-left px-2.5 py-1.5 text-xs flex items-center gap-2 hover:bg-bg-hover transition-colors ${
-                isActive ? 'text-accent-blue' : 'text-text-secondary'
-              }`}
-            >
-              <div className={`w-3.5 h-3.5 rounded border flex items-center justify-center shrink-0 ${
-                isActive ? 'bg-accent-blue border-accent-blue' : 'border-border'
-              }`}>
-                {isActive && (
-                  <svg width="8" height="8" viewBox="0 0 8 8" fill="none">
-                    <path d="M1.5 4L3 5.5L6.5 2" stroke="white" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-                  </svg>
-                )}
-              </div>
-              <span className="truncate flex-1">{displayName(filename)}</span>
-              {loraDates[filename] && (
-                <LoraAgeChip
-                  released={loraDates[filename].released}
-                  downloaded={loraDates[filename].downloaded}
-                />
+      {h3Adaptive ? (
+        <>
+          {fl2vaState.error
+            ? repairPanel('Text & frames', 'FL2VA adapters', 'fl2va', fl2vaState.error)
+            : listPanel(
+                'Text & frames',
+                'FL2VA adapters',
+                'fl2va',
+                fl2vaState.loras,
+                filename => toggleH3ArchitectureLora('fl2va', filename),
+                (filename, phase, value) => setH3ArchitectureLoraWeight('fl2va', filename, phase, value),
+                () => { for (const name of [...fl2vaState.loras]) toggleH3ArchitectureLora('fl2va', name) },
+                flWeightMap,
               )}
-              {guideTexts[filename] && (
-                <span onClick={e => e.stopPropagation()}>
-                  <LoraGuideTooltip guide={guideTexts[filename]} />
-                </span>
+          {ref2vaState.error
+            ? repairPanel('References', 'Ref2VA adapters', 'ref2va', ref2vaState.error)
+            : listPanel(
+                'References',
+                'Ref2VA adapters',
+                'ref2va',
+                ref2vaState.loras,
+                filename => toggleH3ArchitectureLora('ref2va', filename),
+                (filename, phase, value) => setH3ArchitectureLoraWeight('ref2va', filename, phase, value),
+                () => { for (const name of [...ref2vaState.loras]) toggleH3ArchitectureLora('ref2va', name) },
+                refWeightMap,
               )}
-              {loraWeightRecs[filename] && (
-                <span
-                  // Use functional indicator tokens (NOT accent-green) so
-                  // the CivitAI vs default distinction stays visually
-                  // distinct across themes — see --color-indicator-success
-                  // / --color-indicator-warning in index.css.
-                  className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                    loraWeightRecs[filename].source === 'civitai' ? 'bg-indicator-success' : 'bg-indicator-warning'
-                  }`}
-                  title={loraWeightRecs[filename].source === 'civitai' ? 'CivitAI recommended settings' : 'Default settings'}
-                />
-              )}
-              {/* Update-available badge — only when CivitAI reports a newer
-                  version than what the user has installed. The icon is small
-                  but distinct from the recommended-weights dot above so they
-                  can coexist on the same row without confusion. */}
-              {updateStatuses[filename] === 'available' && (
-                <ArrowUpCircle
-                  size={11}
-                  className="text-indicator-warning shrink-0"
-                  aria-label="Update available"
-                />
-              )}
-            </button>
-          )
-        })}
-        {filtered.length === 0 && (
-          <div className="px-3 py-2 text-xs text-text-muted text-center">
-            No matches
-          </div>
-        )}
-      </div>
-
-      {/* Selected LoRAs with weight sliders */}
-      {activatedLoras.length > 0 && (
-        <div className="mt-3 space-y-2">
-          <div className="flex items-center justify-between">
-            <div className="text-[10px] text-text-muted uppercase tracking-wider">
-              Selected ({activatedLoras.length})
-            </div>
-            <button
-              onClick={() => { for (const l of [...activatedLoras]) toggleLora(l) }}
-              className="text-[10px] text-text-muted hover:text-red-400 transition-colors"
-            >
-              Clear all
-            </button>
-          </div>
-          {activatedLoras.map(filename => {
-            const storedWeights = loraWeights[filename] || [1.0]
-            const weights = Array.from(
-              { length: phases },
-              (_, i) => storedWeights[i] ?? storedWeights[storedWeights.length - 1] ?? 1.0,
-            )
-            return (
-              <div key={filename} className="bg-bg-tertiary border border-border rounded-lg px-2.5 py-2">
-                <div className="flex items-center justify-between mb-1.5">
-                  <span className="text-xs text-text-primary truncate flex-1 mr-2 flex items-center gap-1">
-                    {displayName(filename)}
-                    {/* Update-available indicator on the activated card —
-                        same icon as in the picker so the user can scan
-                        both views consistently. */}
-                    {updateStatuses[filename] === 'available' && (
-                      <ArrowUpCircle
-                        size={11}
-                        className="text-indicator-warning shrink-0"
-                        aria-label="Update available"
-                      />
-                    )}
-                  </span>
-                  <div className="flex items-center gap-0.5 shrink-0">
-                    {guideStatus[filename] === 'exists' || guideStatus[filename] === 'done' ? (
-                      <span className="p-0.5 text-indicator-success" title="LoRA guide available">
-                        <BookOpen size={11} />
-                      </span>
-                    ) : guideStatus[filename] === 'generating' ? (
-                      <span className="p-0.5 text-accent-blue">
-                        <Loader2 size={11} className="animate-spin" />
-                      </span>
-                    ) : (
-                      <button
-                        onClick={(e) => { e.stopPropagation(); handleGenerateGuide(filename) }}
-                        className="p-0.5 rounded hover:bg-bg-hover text-text-muted hover:text-accent-blue transition-colors"
-                        title="Generate AI guide for this LoRA"
-                      >
-                        <Sparkles size={11} />
-                      </button>
-                    )}
-                    <button
-                      onClick={() => toggleLora(filename)}
-                      className="p-0.5 rounded hover:bg-bg-hover text-text-muted hover:text-text-primary transition-colors"
-                    >
-                      <X size={12} />
-                    </button>
-                  </div>
-                </div>
-                {weights.map((w, i) => {
-                  const rec = loraWeightRecs[filename]
-                  const phaseRec = rec?.phases?.find(p => p.phase === i + 1)
-                  // Use CivitAI data if available, otherwise fallback defaults
-                  const fallbackMin = 0.6, fallbackMax = 1.0
-                  const recMin = phaseRec?.min ?? rec?.min ?? fallbackMin
-                  const recMax = phaseRec?.max ?? rec?.max ?? fallbackMax
-                  const recDefault = phaseRec?.default ?? rec?.default ?? 0.8
-                  const isCivitai = rec?.source === 'civitai' || (rec != null && rec.source !== 'default')
-                  const sliderMax = 2
-                  const zoneLeft = (recMin / sliderMax) * 100
-                  const zoneWidth = ((recMax - recMin) / sliderMax) * 100
-                  const inZone = w >= recMin && w <= recMax
-
-                  // Green = CivitAI recommendation, Yellow = fallback defaults.
-                  // Uses functional indicator tokens (--color-indicator-success
-                  // and --color-indicator-warning) so the green-vs-yellow
-                  // distinction stays meaningful across themes — Golden Hour
-                  // remaps accent-green to amber, which would collide with
-                  // the amber fallback color and erase the distinction.
-                  const zoneColor = isCivitai
-                    ? 'bg-indicator-success/20 border-indicator-success/30'
-                    : 'bg-indicator-warning/15 border-indicator-warning/25'
-                  const valueColor = inZone
-                    ? (isCivitai ? 'text-indicator-success' : 'text-indicator-warning')
-                    : 'text-text-muted'
-
-                  return (
-                  <div key={i} className="flex items-center gap-2">
-                    {phases > 1 && (
-                      <span className="text-[10px] text-text-muted w-12 shrink-0" title={phaseRec?.label || ''}>
-                        Phase {i + 1}
-                      </span>
-                    )}
-                    <div className="flex-1 relative">
-                      <div
-                        className={`absolute top-1/2 -translate-y-1/2 h-2 rounded-full ${zoneColor} pointer-events-none`}
-                        style={{ left: `${zoneLeft}%`, width: `${zoneWidth}%` }}
-                        title={`${isCivitai ? 'CivitAI' : 'Default'}: ${recMin}-${recMax} (${recDefault})`}
-                      />
-                      <input
-                        type="range"
-                        min={0}
-                        max={sliderMax}
-                        step={0.05}
-                        value={w}
-                        onChange={e => setLoraWeight(filename, i, parseFloat(e.target.value))}
-                        className="w-full relative z-10"
-                      />
-                    </div>
-                    <span className={`text-[10px] w-8 text-right shrink-0 ${valueColor}`}>
-                      {w.toFixed(2)}
-                    </span>
-                  </div>
-                  )
-                })}
-              </div>
-            )
-          })}
-        </div>
+        </>
+      ) : listPanel(
+        '',
+        '',
+        pinnedArchitecture,
+        activatedLoras,
+        toggleLora,
+        setLoraWeight,
+        () => { for (const name of [...activatedLoras]) toggleLora(name) },
+        loraWeights,
       )}
     </div>
   )

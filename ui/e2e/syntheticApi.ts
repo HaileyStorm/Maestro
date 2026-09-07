@@ -384,6 +384,8 @@ const SYNTHETIC_RESPONSIBLE_USE = {
 }
 
 export interface SyntheticApiController {
+  setAdaptiveScenario(scenario: 'base-only' | 'ready' | 'missing-reference' | 'blocked-reference'): void
+  generationRequests(): Record<string, unknown>[]
   setAccountScenario(scenario: SyntheticAccountScenario): void
   setOutputScenario(scenario: 'empty' | 'shareable'): void
   setSupportScenario(scenario: 'none' | 'donor'): void
@@ -416,6 +418,14 @@ export interface SyntheticApiController {
 
 export async function installSyntheticApi(page: Page): Promise<SyntheticApiController> {
   const unexpected: string[] = []
+  let adaptiveScenario: 'base-only' | 'ready' | 'missing-reference' | 'blocked-reference' = 'base-only'
+  const generations: Record<string, unknown>[] = []
+  const syntheticLora = {
+    filename: 'synthetic-shared.safetensors', lora_id: 'local:synthetic-shared.safetensors',
+    trained_words: [], preview_url: null, civitai_model_id: null,
+    recommended_weights: null, has_guide: false,
+    h3_architectures: ['fl2va', 'ref2va'], h3_exclusive_stack: false, h3_kind: 'ordinary',
+  }
   let queueFailure = false
   let queueHeld = false
   let queueDelayMs = 0
@@ -573,20 +583,48 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
             supports_end_frame: true,
             is_downloaded: true,
             downloadable: false,
+            manual_checkpoint_verified: adaptiveScenario !== 'base-only',
+            execution_allowed: true,
             supported_operations: ['video', 'image'],
-          }],
+          }, ...(adaptiveScenario === 'base-only' ? [] : [{
+            model_type: 'minimax_h3_pinkcherry_fl2va', name: 'Synthetic Frame Alternative',
+            family: 'h3', architecture: 'minimax_h3', is_i2v: true, is_t2v: true,
+            guidance_max_phases: 1, fps: 24, supports_end_frame: true,
+            is_downloaded: true, downloadable: false, manual_checkpoint_verified: true,
+            execution_allowed: true, supported_operations: ['video'],
+          }]), ...(adaptiveScenario === 'base-only' || adaptiveScenario === 'missing-reference' ? [] : [{
+            model_type: 'minimax_h3_ref2va', name: 'Synthetic Reference Model',
+            family: 'h3', architecture: 'minimax_h3_ref2va', is_i2v: true, is_t2v: false,
+            guidance_max_phases: 1, fps: 24, supports_ref_images: true,
+            is_downloaded: true, downloadable: false, manual_checkpoint_verified: true,
+            execution_allowed: adaptiveScenario !== 'blocked-reference',
+            availability_status: adaptiveScenario === 'blocked-reference' ? 'legal_blocked' : 'available',
+            supported_operations: ['video'],
+          }])],
         })
         return
       case 'GET /api/v1/model-visibility':
-        await json(route, { configured: true, enabled_models: ['minimax_h3'], defaults_version: 1 })
+        await json(route, { configured: true, enabled_models: adaptiveScenario === 'base-only'
+          ? ['minimax_h3'] : ['minimax_h3', 'minimax_h3_pinkcherry_fl2va', 'minimax_h3_ref2va'], defaults_version: 10 })
         return
       case 'PUT /api/v1/model-visibility':
-        await json(route, { configured: true, enabled_models: ['minimax_h3'], defaults_version: 1 })
+        await json(route, { configured: true, enabled_models: adaptiveScenario === 'base-only'
+          ? ['minimax_h3'] : ['minimax_h3', 'minimax_h3_pinkcherry_fl2va', 'minimax_h3_ref2va'], defaults_version: 10 })
         return
       case 'GET /api/v1/model-options/minimax_h3':
         await json(route, MODEL_OPTIONS)
         return
+      case 'GET /api/v1/model-options/minimax_h3_pinkcherry_fl2va':
+      case 'GET /api/v1/model-options/minimax_h3_ref2va': {
+        const modelType = url.pathname.split('/').pop()!
+        await json(route, { ...MODEL_OPTIONS, model_type: modelType,
+          architecture: modelType === 'minimax_h3_ref2va' ? modelType : 'minimax_h3',
+          minimax_h3_reference_mode: modelType === 'minimax_h3_ref2va' })
+        return
+      }
       case 'GET /api/v1/defaults/minimax_h3':
+      case 'GET /api/v1/defaults/minimax_h3_pinkcherry_fl2va':
+      case 'GET /api/v1/defaults/minimax_h3_ref2va':
         await json(route, {
           num_inference_steps: 30,
           guidance_scale: 5,
@@ -595,13 +633,31 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
         })
         return
       case 'GET /api/v1/loras/minimax_h3':
-        await json(route, { loras: [], guidance_max_phases: 1 })
+      case 'GET /api/v1/loras/minimax_h3_pinkcherry_fl2va':
+      case 'GET /api/v1/loras/minimax_h3_ref2va':
+        await json(route, { loras: adaptiveScenario === 'base-only' ? [] : [syntheticLora.filename], guidance_max_phases: 1 })
         return
       case 'GET /api/v1/loras/installed':
-        await json(route, { loras: [], manifest_last_check_at: null })
+        await json(route, { loras: adaptiveScenario === 'base-only' ? [] : [syntheticLora], manifest_last_check_at: null })
         return
       case 'GET /api/v1/loras/minimax_h3/details':
-        await json(route, { loras: [], guidance_max_phases: 1, manifest_last_check_at: null })
+      case 'GET /api/v1/loras/minimax_h3_pinkcherry_fl2va/details':
+      case 'GET /api/v1/loras/minimax_h3_ref2va/details':
+        await json(route, { loras: adaptiveScenario === 'base-only' ? [] : [syntheticLora], guidance_max_phases: 1, manifest_last_check_at: null })
+        return
+      case 'GET /api/v1/loras/minimax_h3/synthetic-shared.safetensors/guide':
+      case 'GET /api/v1/loras/minimax_h3_pinkcherry_fl2va/synthetic-shared.safetensors/guide':
+      case 'GET /api/v1/loras/minimax_h3_ref2va/synthetic-shared.safetensors/guide':
+        await json(route, { guide: null })
+        return
+      case 'POST /api/v1/generate':
+        if (adaptiveScenario === 'base-only') {
+          unexpected.push('generation outside the adaptive synthetic scenario')
+          await route.abort('blockedbyclient')
+          return
+        }
+        generations.push(request.postDataJSON() as Record<string, unknown>)
+        await json(route, { job_id: 'synthetic-adaptive-job', status: 'held', held: true })
         return
       case 'POST /api/v1/loras/check-updates':
         if (loraFailureStatus !== null) {
@@ -1329,6 +1385,13 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
   })
 
   return {
+    setAdaptiveScenario(scenario) {
+      adaptiveScenario = scenario
+      generations.length = 0
+    },
+    generationRequests() {
+      return structuredClone(generations)
+    },
     setAccountScenario(scenario) {
       accountState = accountStateFor(scenario)
       accountNonces.clear()

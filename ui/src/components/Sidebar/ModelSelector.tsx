@@ -4,15 +4,88 @@ import { useStore, getFamiliesForMode, getModelsForFamily } from '../../stores/u
 import { fetchH3AccelerationStatus, verifyManualCheckpoint } from '../../api/client'
 import { InfoTooltip } from './InfoTooltip'
 import { formatManualInstallationBytes, manualInstallationDestination } from '../../lib/manualInstallation'
+import type { ModelDef } from '../../types'
+import {
+  defaultAdaptiveFl2vaModel,
+  defaultAdaptiveRef2vaModel,
+  h3AdaptivePairActive,
+  h3AdaptivePickerModelCompatible,
+  H3_FL2VA_MODELS,
+  H3_REF2VA_MODEL,
+} from '../../lib/h3Submission'
+
+const H3_FL2VA_MODEL_SET: ReadonlySet<string> = new Set(H3_FL2VA_MODELS)
+const H3_REF2VA_MODEL_SET: ReadonlySet<string> = new Set([H3_REF2VA_MODEL])
 
 export function ModelSelector() {
+  const currentModelType = useStore(s => s.params.model_type)
+  const selectModel = useStore(s => s.selectModel)
+  const selectAdaptiveH3Model = useStore(s => s.selectAdaptiveH3Model)
+  const h3AdaptivePair = useStore(s => h3AdaptivePairActive(
+    s.params.model_type,
+    s.params.h3_adaptive_conditioning,
+  ))
+  const adaptiveFl2vaModel = useStore(s => defaultAdaptiveFl2vaModel(
+    s.params.model_type,
+    s.params.h3_adaptive_fl2va_model,
+  ))
+  const adaptiveRef2vaModel = useStore(s => defaultAdaptiveRef2vaModel(
+    s.params.h3_adaptive_ref2va_model,
+  ))
+
+  if (h3AdaptivePair) {
+    return (
+      <div className="flex min-w-0 flex-1 flex-col gap-2">
+        <CheckpointPicker
+          heading="Text & frames"
+          detail="FL2VA · follows prompts, start and end frames, and continuity"
+          selectedType={adaptiveFl2vaModel}
+          allowed={H3_FL2VA_MODEL_SET}
+          menuId="h3-fl2va-selector-menu"
+          onSelect={type => selectAdaptiveH3Model('fl2va', type)}
+        />
+        <CheckpointPicker
+          heading="References"
+          detail="Ref2VA · follows reference images, video, and audio"
+          selectedType={adaptiveRef2vaModel}
+          allowed={H3_REF2VA_MODEL_SET}
+          menuId="h3-ref2va-selector-menu"
+          onSelect={type => selectAdaptiveH3Model('ref2va', type)}
+        />
+      </div>
+    )
+  }
+
+  return (
+    <CheckpointPicker
+      selectedType={currentModelType}
+      menuId="model-selector-menu"
+      onSelect={selectModel}
+    />
+  )
+}
+
+function CheckpointPicker({
+  selectedType,
+  menuId,
+  onSelect,
+  heading,
+  detail,
+  allowed,
+}: {
+  selectedType: string
+  menuId: string
+  onSelect: (modelType: string) => Promise<boolean>
+  heading?: string
+  detail?: string
+  allowed?: ReadonlySet<string>
+}) {
   const models = useStore(s => s.models)
+  const modelsLoaded = useStore(s => s.modelsLoaded)
   const families = useStore(s => s.families)
   const enabledModels = useStore(s => s.enabledModels)
   const generationMode = useStore(s => s.generationMode)
   const editSubMode = useStore(s => s.editSubMode)
-  const currentModelType = useStore(s => s.params.model_type)
-  const selectModel = useStore(s => s.selectModel)
   const h3SelectedProfile = useStore(s => s.h3SelectedProfile)
   const h3Profiles = useStore(s => s.h3PerformanceProfiles)
   const pinkCompatibility = useStore(
@@ -36,6 +109,7 @@ export function ModelSelector() {
   const containerRef = useRef<HTMLDivElement>(null)
   const triggerRef = useRef<HTMLButtonElement>(null)
   const popupRef = useRef<HTMLDivElement>(null)
+  const includeW4a8 = !allowed || allowed.has('minimax_h3_w4a8_fl2va')
 
   // Treat the model list as a non-modal dialog: move focus into it, close on
   // Escape/outside press, and restore focus when keyboard selection closes it.
@@ -52,15 +126,17 @@ export function ModelSelector() {
     function handleKeyDown(event: KeyboardEvent) {
       if (event.key !== 'Escape') return
       event.preventDefault()
+      event.stopPropagation()
+      event.stopImmediatePropagation()
       setOpen(false)
       window.requestAnimationFrame(() => triggerRef.current?.focus())
     }
     document.addEventListener('mousedown', handleClick)
-    document.addEventListener('keydown', handleKeyDown)
+    document.addEventListener('keydown', handleKeyDown, true)
     return () => {
       window.cancelAnimationFrame(focusFrame)
       document.removeEventListener('mousedown', handleClick)
-      document.removeEventListener('keydown', handleKeyDown)
+      document.removeEventListener('keydown', handleKeyDown, true)
     }
   }, [open])
 
@@ -85,7 +161,7 @@ export function ModelSelector() {
   }, [open, h3SelectedProfile, h3CompatibilitySignature, refreshH3Compatibility])
 
   useEffect(() => {
-    if (!open) return
+    if (!open || !includeW4a8) return
     let current = true
     fetchH3AccelerationStatus(false)
       .then(status => {
@@ -101,11 +177,16 @@ export function ModelSelector() {
         })
       })
     return () => { current = false }
-  }, [open])
+  }, [includeW4a8, open])
 
   const audioSubMode = useStore(s => s.audioSubMode)
 
-  const currentModel = models.find(m => m.model_type === currentModelType)
+  const currentModel = models.find(m => m.model_type === selectedType)
+  const selectedOutsideAllowed = Boolean(allowed && !allowed.has(selectedType))
+  const currentW4a8Unavailable = Boolean(
+    currentModel?.model_type === 'minimax_h3_w4a8_fl2va'
+    && w4a8Capability?.available !== true,
+  )
   const currentModelNeedsLocation = currentModel?.availability_status === 'location_declaration_required'
   const currentModelLegalBlocked = currentModelNeedsLocation
     || currentModel?.availability_status === 'legal_blocked'
@@ -124,7 +205,7 @@ export function ModelSelector() {
 
   useEffect(() => {
     setManualVerificationError('')
-  }, [currentModelType])
+  }, [selectedType])
 
   const verifyCurrentManualCheckpoint = async () => {
     if (!currentModel || pendingRequirements.length > 0) return
@@ -155,10 +236,20 @@ export function ModelSelector() {
   const modeFamilies = getFamiliesForMode(generationMode, families, effectiveSubMode, effectiveAudioSubMode)
 
   // Build grouped model list from the user's model-visibility choices.
+  const modelVisible = (model: ModelDef) => {
+    if (!allowed) return enabledModels.has(model.model_type) || model.model_type === selectedType
+    if (!allowed.has(model.model_type)) return false
+    if (model.model_type === selectedType) return true
+    return enabledModels.has(model.model_type) && h3AdaptivePickerModelCompatible(model, {
+      allowed,
+      w4a8Available: w4a8Capability?.available ?? null,
+      selectedType,
+    })
+  }
   const groups = modeFamilies.map(family => ({
     family,
     models: getModelsForFamily(family.id, models, generationMode, effectiveSubMode)
-      .filter(m => enabledModels.has(m.model_type))
+      .filter(modelVisible)
       .sort((left, right) => left.name.localeCompare(right.name)),
   })).filter(g => g.models.length > 0)
 
@@ -166,32 +257,67 @@ export function ModelSelector() {
   // "+N" hint that nudges users toward Settings → Enabled Models.
   const disabledCount = modeFamilies.reduce((n, family) => {
     const avail = getModelsForFamily(family.id, models, generationMode, effectiveSubMode)
-    return n + avail.filter(m => (
-      !enabledModels.has(m.model_type)
-      && m.availability_status !== 'location_declaration_required'
-      && m.availability_status !== 'legal_blocked'
-      && m.execution_allowed !== false
-    )).length
+    return n + avail.filter(m => {
+      if (enabledModels.has(m.model_type)) return false
+      if (allowed) {
+        return h3AdaptivePickerModelCompatible(m, {
+          allowed,
+          w4a8Available: w4a8Capability?.available ?? null,
+        })
+      }
+      return m.availability_status !== 'location_declaration_required'
+        && m.availability_status !== 'legal_blocked'
+        && m.execution_allowed !== false
+    }).length
   }, 0)
 
   return (
-    <div className="relative flex-1 min-w-0" ref={containerRef}>
+    <div className={`relative min-w-0 flex-1 ${heading ? 'rounded-lg border border-border bg-bg-tertiary/40 p-2.5' : ''}`} ref={containerRef}>
+      {heading && (
+        <div className="mb-1.5">
+          <div className="text-[10px] font-medium uppercase tracking-wider text-text-primary">{heading}</div>
+          {detail && <div className="mt-0.5 text-[9px] leading-relaxed text-text-muted">{detail}</div>}
+        </div>
+      )}
       {/* Trigger button */}
       <button
         ref={triggerRef}
         type="button"
         onClick={() => setOpen(!open)}
-        title={currentModel?.selector_help || currentModel?.description}
+        title={currentModel?.selector_help || currentModel?.description || (selectedType ? `Saved checkpoint: ${selectedType}` : undefined)}
+        aria-label={heading ? `${heading} model: ${(currentModel?.name ?? selectedType) || 'not selected'}` : undefined}
         aria-expanded={open}
         aria-haspopup="dialog"
-        aria-controls="model-selector-menu"
+        aria-controls={menuId}
         className="mobile-control-target flex w-full items-center gap-1.5 rounded-lg border border-border bg-bg-tertiary px-2.5 py-2 text-left transition-colors hover:border-border-light focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
       >
         <span className="flex-1 min-w-0 truncate text-xs text-text-primary">
-          {currentModel?.name ?? 'Select model'}
+          {!modelsLoaded
+            ? 'Loading models…'
+            : currentModel
+              ? `${selectedOutsideAllowed ? 'Invalid · ' : ''}${currentModel.name}`
+              : selectedType ? `Unknown checkpoint · ${selectedType}` : 'Select model'}
         </span>
         <ChevronDown size={14} className={`shrink-0 text-text-muted transition-transform ${open ? 'rotate-180' : ''}`} />
       </button>
+
+      {modelsLoaded && selectedType && !currentModel && (
+        <div role="status" className="mt-1 rounded border border-red-500/35 bg-red-500/10 px-2 py-1.5 text-[9px] leading-relaxed text-red-100">
+          This saved checkpoint is no longer available. Open the list and choose another {heading?.toLowerCase() || 'model'} checkpoint.
+        </div>
+      )}
+
+      {modelsLoaded && selectedOutsideAllowed && currentModel && (
+        <div role="status" className="mt-1 rounded border border-red-500/35 bg-red-500/10 px-2 py-1.5 text-[9px] leading-relaxed text-red-100">
+          This saved checkpoint does not belong in {heading?.toLowerCase() || 'this model group'}. Open the list and choose a compatible checkpoint.
+        </div>
+      )}
+
+      {currentW4a8Unavailable && (
+        <div role="status" className="mt-1 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[9px] leading-relaxed text-amber-100">
+          {w4a8Capability?.reason || 'Checking W4A8 runtime support…'} Choose another Text &amp; frames checkpoint if this computer cannot run W4A8.
+        </div>
+      )}
 
       {currentModelLegalBlocked && (
         <div role="status" className="mt-1 rounded border border-red-500/35 bg-red-500/10 px-2 py-1.5 text-[9px] leading-relaxed text-red-100">
@@ -272,9 +398,9 @@ export function ModelSelector() {
       {open && (
         <div
           ref={popupRef}
-          id="model-selector-menu"
+          id={menuId}
           role="dialog"
-          aria-label="Models"
+          aria-label={heading ? `${heading} models` : 'Models'}
           className="absolute left-0 top-0 z-50 flex max-h-[min(404px,calc(100dvh-2rem))] w-[360px] max-w-[calc(100vw-2rem)] -translate-y-[calc(100%+0.25rem)] flex-col overflow-hidden rounded-lg border border-border bg-bg-secondary shadow-xl"
         >
           {/* Enable-more entry — sits above the enabled model list; opens
@@ -291,6 +417,17 @@ export function ModelSelector() {
             </button>
           )}
           <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain py-1">
+            {!modelsLoaded && (
+              <div role="status" className="flex items-center justify-center gap-2 px-3 py-4 text-xs text-text-muted">
+                <Loader2 size={12} className="animate-spin" />
+                Loading model catalog…
+              </div>
+            )}
+            {modelsLoaded && groups.length === 0 && (
+              <div role="status" className="px-3 py-4 text-center text-xs text-text-muted">
+                No compatible models are enabled for this group.
+              </div>
+            )}
             {groups.map(({ family, models: famModels }) => (
               <div key={family.id}>
                 {/* Family header */}
@@ -299,7 +436,7 @@ export function ModelSelector() {
                 </div>
                 {/* Models in family */}
                 {famModels.map(model => {
-                  const isSelected = model.model_type === currentModelType
+                  const isSelected = model.model_type === selectedType
                   const w4a8Unavailable = (
                     model.model_type === 'minimax_h3_w4a8_fl2va'
                     && w4a8Capability?.available !== true
@@ -342,7 +479,7 @@ export function ModelSelector() {
                             : pinkReconciliationLabel || model.selector_help || model.description
                         }
                         onClick={async () => {
-                          if (await selectModel(model.model_type)) {
+                          if (await onSelect(model.model_type)) {
                             setOpen(false)
                             window.requestAnimationFrame(() => triggerRef.current?.focus())
                           }

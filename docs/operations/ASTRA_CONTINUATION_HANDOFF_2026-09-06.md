@@ -547,6 +547,49 @@ service restart, or native Windows acceptance occurred. Unrelated H3/API/UI WIP
 remains unadopted. The continuous Goal and the remaining planned backlog stay
 active.
 
+## Adaptive H3 controls — CPU integration checkpoint, 2026-09-07
+
+Adaptive mode now exposes separate Text & frames and References checkpoint
+choices and LoRA controls. Both checkpoint preferences survive refresh; working
+LoRA settings retain the existing clean-slate refresh policy and restore through
+Load Settings. Explicit model choices take precedence over the selected FL2VA
+flavor and Base fallback. Explicit-output metadata never selects PinkCherry.
+Unavailable or malformed saved model choices remain visible for repair, and
+invalid model pairs cannot construct model-specific LoRA requests or submit.
+
+Missing/null split LoRA lists inherit compatible shared selections; explicit
+empty lists clear only that architecture. Full asset identity and positional or
+phase weights survive editing, including colliding stable IDs and literal hash
+characters in local filenames. Malformed saved LoRAs cannot prevent entering
+adaptive mode or repairing a checkpoint choice. The repair controls preserve
+raw malformed values until an explicit edit or clear; submission remains strict.
+Inventory and delayed defaults responses are fenced against changed selections.
+
+The assembled HEAD-based candidate passes all 514 UI tests, production
+TypeScript/Vite build, E2E TypeScript, and scoped ESLint. The unchanged backend
+adaptive contract passes 23 tests; 64 Python/UI request-list and compatibility
+projection cases match. Independent review, including malformed-state repair,
+is clean. These receipts cover CPU/static and mocked behavior.
+The build retains its existing large-chunk warning. Private source manifests,
+preimages, clean counterparts, and logs are under
+`.artifacts-temp/astra-adaptive-ui-20260907/`.
+
+Three sanitized image concepts were compared and the stacked-group layout was
+implemented using native components. Fresh desktop/mobile rendering, keyboard
+and accessibility acceptance, and the image-first fidelity ledger remain open.
+The synthetic browser scenarios are prepared and typechecked but have not run:
+the existing harness requires a different-filesystem cache/result directory,
+and the exact create-only copy plan still awaits the owner's permission.
+Do not infer that permission from GPU authorization, and do not claim the design
+cycle or browser acceptance complete. No real backend, model, GPU, generation,
+service restart, or Windows acceptance occurred in this slice.
+
+The obsolete uncommitted metadata-to-PinkCherry Python helper and its matching
+test were removed with preserved preimages. Other backend and UI WIP remains
+separate, including blanket mixed-input/text-only restrictions and prompt
+adaptation. Continue the open browser gate and remaining planned backlog; this
+checkpoint does not complete the continuous Goal.
+
 ### Prompt-adapter audit — not adopted
 
 While waiting, a direct CPU audit of the uncommitted `h3_prompt_adapt.py` found

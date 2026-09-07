@@ -1835,6 +1835,9 @@ export interface LoraInfo {
    *  activations, weights, and other LoRA-keyed state instead of the
    *  filename, so updating a LoRA from v1.2 → v1.5 carries settings forward. */
   lora_id: string
+  h3_architectures?: string[]
+  h3_exclusive_stack?: boolean
+  h3_kind?: string
   /** Optional public input contract. Private trigger/template expansion stays server-side. */
   parameter_schema?: LoraParameterSchema
   /** Update status from the cached CivitAI manifest. Populated by

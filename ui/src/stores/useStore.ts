@@ -4,7 +4,22 @@ import type { GenerateParams, OutputFile, MediaFilter, OutputArtifactScope, Aspe
 import * as api from '../api/client'
 import { applyThemePrefs, getStoredPrefs, type FamilyId, type ThemeMode, type ThemePrefs } from '../lib/theme'
 import { HOST_TERM_NOTICES } from '../lib/hostTerms'
-import { applyH3SegmentCeilingPolicy, hasManualH3SegmentCeiling } from '../lib/h3Submission'
+import {
+  applyH3SegmentCeilingPolicy,
+  defaultAdaptiveFl2vaModel,
+  defaultAdaptiveRef2vaModel,
+  h3AdaptivePairActive,
+  h3AdaptiveSelectionError,
+  h3ArchitectureForModel,
+  h3LorasForArchitecture,
+  h3LoraBlockReason,
+  hasManualH3SegmentCeiling,
+  H3_BASE_FL2VA_MODEL,
+  H3_FL2VA_MODELS,
+  H3_REF2VA_MODEL,
+  parseLoraMultiplierMap,
+  serializeLoraMultipliers,
+} from '../lib/h3Submission'
 import { alignStudioTotalFrames, alignTotalFrames, controlFpsTotalFrames, effectiveSlidingWindowGeometry, hasGlobalTimeline, usesStudioSegments } from '../lib/timelinePrompt'
 import { hidePrivatePreviewsForWorkspace } from '../lib/privatePreview'
 import {
@@ -35,6 +50,86 @@ const H3_STUDIO_MODELS = new Set([
   'minimax_h3_w4a8_fl2va',
   'minimax_h3_ref2va',
 ])
+
+function _seedH3ArchitectureLoras(params: GenerateParams): GenerateParams {
+  if (!H3_STUDIO_MODELS.has(String(params.model_type || ''))) return params
+  const next: GenerateParams = { ...params }
+  next.h3_adaptive_fl2va_model = defaultAdaptiveFl2vaModel(
+    next.model_type,
+    next.h3_adaptive_fl2va_model,
+  )
+  next.h3_adaptive_ref2va_model = defaultAdaptiveRef2vaModel(next.h3_adaptive_ref2va_model)
+  for (const architecture of ['fl2va', 'ref2va'] as const) {
+    const listKey = `h3_${architecture}_loras` as const
+    const multiplierKey = `h3_${architecture}_loras_multipliers` as const
+    const selected = h3LorasForArchitecture(next, architecture)
+    if (next[listKey] == null) {
+      next[listKey] = selected.loras
+      next[multiplierKey] = selected.multipliers
+    }
+  }
+  return next
+}
+
+function _prepareH3ArchitectureLorasForEdit(params: GenerateParams): GenerateParams {
+  if (!H3_STUDIO_MODELS.has(String(params.model_type || ''))) return params
+  const next: GenerateParams = {
+    ...params,
+    h3_adaptive_fl2va_model: defaultAdaptiveFl2vaModel(
+      params.model_type,
+      params.h3_adaptive_fl2va_model,
+    ),
+    h3_adaptive_ref2va_model: defaultAdaptiveRef2vaModel(params.h3_adaptive_ref2va_model),
+  }
+  for (const architecture of ['fl2va', 'ref2va'] as const) {
+    const listKey = `h3_${architecture}_loras` as const
+    if (next[listKey] != null) continue
+    const multiplierKey = `h3_${architecture}_loras_multipliers` as const
+    const oppositeKey = architecture === 'fl2va' ? 'h3_ref2va_loras' : 'h3_fl2va_loras'
+    try {
+      const selected = h3LorasForArchitecture({ ...next, [oppositeKey]: [] }, architecture)
+      next[listKey] = selected.loras
+      next[multiplierKey] = selected.multipliers
+    } catch {
+      // Repair UI must remain reachable. Keep malformed legacy fields exactly
+      // as stored; strict submission validation will still reject them.
+    }
+  }
+  return next
+}
+
+function _h3AdaptiveModelChoices(params: GenerateParams): {
+  h3_adaptive_fl2va_model: string
+  h3_adaptive_ref2va_model: string
+} {
+  return {
+    h3_adaptive_fl2va_model: defaultAdaptiveFl2vaModel(
+      params.model_type,
+      params.h3_adaptive_fl2va_model,
+    ),
+    h3_adaptive_ref2va_model: defaultAdaptiveRef2vaModel(params.h3_adaptive_ref2va_model),
+  }
+}
+
+function _storedH3AdaptiveModelChoices(
+  snapshot: SavedModeParams | undefined,
+  selectedModel: string,
+): SavedModeParams | undefined {
+  if (!snapshot) return undefined
+  const hasFl = Object.prototype.hasOwnProperty.call(snapshot, 'h3_adaptive_fl2va_model')
+  const hasRef = Object.prototype.hasOwnProperty.call(snapshot, 'h3_adaptive_ref2va_model')
+  if (!hasFl && !hasRef) return undefined
+  return {
+    h3_adaptive_fl2va_model: defaultAdaptiveFl2vaModel(
+      selectedModel,
+      snapshot.h3_adaptive_fl2va_model,
+    ),
+    h3_adaptive_ref2va_model: defaultAdaptiveRef2vaModel(
+      snapshot.h3_adaptive_ref2va_model,
+    ),
+  }
+}
+
 const H3_RESTORABLE_CUSTOM_KEYS = new Set([
   'h3_spectrum_profile',
   'h3_lightx2v_profile',
@@ -1705,6 +1800,19 @@ function _modeBlobToLoraIdKeyed(
   }
 }
 
+function _loraPersistenceKeyToFilename(
+  key: string,
+  loraIdToFilename: Record<string, string>,
+): string {
+  // A local key is already a complete filename identity. Its filename may
+  // legitimately contain '#', so decode the prefix before looking for the
+  // collision suffix used only with catalog IDs.
+  if (key.startsWith('local:')) return key.slice(6)
+  const hashIndex = key.indexOf('#')
+  if (hashIndex > 0) return key.slice(hashIndex + 1)
+  return loraIdToFilename[key] || key
+}
+
 /** Reverse: lora_id-keyed blob → filename-keyed using lora_id → filename map.
  *
  *  Disambiguated keys (`{loraId}#{filename}`) carry the filename in the
@@ -1714,11 +1822,7 @@ function _modeBlobToFilenameKeyed(
   m: LoraModeBlob,
   loraIdToFilename: Record<string, string>
 ): LoraModeBlob {
-  const fname = (id: string): string => {
-    const hashIdx = id.indexOf('#')
-    if (hashIdx > 0) return id.slice(hashIdx + 1)
-    return loraIdToFilename[id] || (id.startsWith('local:') ? id.slice(6) : id)
-  }
+  const fname = (id: string): string => _loraPersistenceKeyToFilename(id, loraIdToFilename)
   return {
     ...m,
     activated_loras: (m.activated_loras || []).map(fname),
@@ -1727,6 +1831,49 @@ function _modeBlobToFilenameKeyed(
     ),
     availableLoras: (m.availableLoras || []).map(fname),
   }
+}
+
+function _adaptiveParamsToLoraIdKeyed(
+  params: SavedModeParams,
+  filenameToLoraId: Record<string, string>,
+): SavedModeParams {
+  const translated = { ...params }
+  const baseId = (filename: string) => filenameToLoraId[filename] || `local:${filename}`
+  const filenamesById = new Map<string, Set<string>>()
+  for (const architecture of ['fl2va', 'ref2va'] as const) {
+    const names = translated[`h3_${architecture}_loras`]
+    if (!Array.isArray(names)) continue
+    for (const filename of names) {
+      const id = baseId(filename)
+      const filenames = filenamesById.get(id) || new Set<string>()
+      filenames.add(filename)
+      filenamesById.set(id, filenames)
+    }
+  }
+  for (const architecture of ['fl2va', 'ref2va'] as const) {
+    const key = `h3_${architecture}_loras` as const
+    const names = translated[key]
+    if (!Array.isArray(names)) continue
+    translated[key] = names.map(filename => {
+      const id = baseId(filename)
+      return (filenamesById.get(id)?.size || 0) > 1 ? `${id}#${filename}` : id
+    })
+  }
+  return translated
+}
+
+function _adaptiveParamsToFilenameKeyed(
+  params: SavedModeParams,
+  loraIdToFilename: Record<string, string>,
+): SavedModeParams {
+  const translated = { ...params }
+  for (const architecture of ['fl2va', 'ref2va'] as const) {
+    const key = `h3_${architecture}_loras` as const
+    const names = translated[key]
+    if (!Array.isArray(names)) continue
+    translated[key] = names.map(id => _loraPersistenceKeyToFilename(id, loraIdToFilename))
+  }
+  return translated
 }
 
 /**
@@ -1814,12 +1961,17 @@ function _saveSettings(
       // Snapshot: lora_id → filename (so load can translate back instantly)
       const snapshot: Record<string, string> = {}
       for (const [fname, id] of Object.entries(filenameToLoraId)) snapshot[id] = fname
+      const translatedParamsPerMode: Partial<Record<GenerationMode, SavedModeParams>> = {}
+      for (const [mode, params] of Object.entries(sanitizedParamsPerMode)) {
+        if (params) translatedParamsPerMode[mode as GenerationMode] =
+          _adaptiveParamsToLoraIdKeyed(params, filenameToLoraId)
+      }
       const payload = {
         _version: _PERSIST_VERSION,
         _loraFilenameSnapshot: snapshot,
         generationMode: state.generationMode,
         selectedModelPerMode: state.selectedModelPerMode,
-        savedParamsPerMode: sanitizedParamsPerMode,
+        savedParamsPerMode: translatedParamsPerMode,
         savedLoraPerMode: translatedPerMode,
         savedPromptPerMode: state.savedPromptPerMode,
       }
@@ -1848,6 +2000,13 @@ function _loadSettings(): PersistedModeSettings | null {
       for (const [mode, m] of Object.entries(parsed.savedLoraPerMode || {})) {
         if (m) translated[mode as GenerationMode] = _modeBlobToFilenameKeyed(m as LoraModeBlob, snapshot)
       }
+      const translatedParams: Partial<Record<GenerationMode, SavedModeParams>> = {}
+      for (const [mode, params] of Object.entries(parsed.savedParamsPerMode || {})) {
+        if (params) translatedParams[mode as GenerationMode] = _adaptiveParamsToFilenameKeyed(
+          params as SavedModeParams,
+          snapshot,
+        )
+      }
       return {
         generationMode: parsed.generationMode,
         selectedModelPerMode: parsed.selectedModelPerMode || {},
@@ -1857,7 +2016,7 @@ function _loadSettings(): PersistedModeSettings | null {
         // be already-clean from _saveSettings; this is the migration safety
         // net so the first post-update page load can't immediately rehydrate
         // ghost references.
-        savedParamsPerMode: _stripEphemeralParams(parsed.savedParamsPerMode || {}),
+        savedParamsPerMode: _stripEphemeralParams(translatedParams),
         savedLoraPerMode: translated,
         savedPromptPerMode: parsed.savedPromptPerMode || {},
         _loraFilenameSnapshot: snapshot,
@@ -1946,7 +2105,6 @@ const _PRIMARY_MODEL_DEFAULT_FIELDS: ReadonlyArray<string> = [
 // most recently requested model's options may touch the store.
 let _modelOptionsSeq = 0
 let _modelDefaultsSeq = 0
-let _modelsLoadSeq = 0
 let _directorResolutionOptionsSeq = 0
 let _loraLoadSeq = 0
 let _recipesLoadSeq = 0
@@ -1996,6 +2154,13 @@ const H3_PROFILE_PARAM_KEYS = new Set<keyof GenerateParams>([
   'custom_settings',
   'activated_loras',
   'loras_multipliers',
+  'h3_adaptive_conditioning',
+  'h3_adaptive_fl2va_model',
+  'h3_adaptive_ref2va_model',
+  'h3_fl2va_loras',
+  'h3_fl2va_loras_multipliers',
+  'h3_ref2va_loras',
+  'h3_ref2va_loras_multipliers',
   'tea_cache',
   'delivery_resolution',
   'delivery_fit',
@@ -3091,6 +3256,8 @@ interface AppState {
   refreshLoraIdMap: () => Promise<void>
   loadLoras: (modelType: string) => Promise<void>
   toggleLora: (filename: string) => void
+  toggleH3ArchitectureLora: (architecture: 'fl2va' | 'ref2va', filename: string) => void
+  setH3ArchitectureLoraWeight: (architecture: 'fl2va' | 'ref2va', filename: string, phaseIndex: number, value: number) => void
   /** Ensure the LTX-2.3 transition LoRA is downloaded and activated for
    *  blend mode. Called when blend mode is opened. Idempotent: no-op if
    *  the LoRA is already installed and activated. */
@@ -3227,6 +3394,7 @@ interface AppState {
 
   // Select model (triggers side effects)
   selectModel: (modelType: string) => Promise<boolean>
+  selectAdaptiveH3Model: (architecture: 'fl2va' | 'ref2va', modelType: string) => Promise<boolean>
 
   // Workspaces
   workspaces: api.Workspace[]
@@ -3653,6 +3821,8 @@ const defaultParams: GenerateParams = {
   repeat_generation: 1,
   activated_loras: [],
   loras_multipliers: '',
+  h3_adaptive_fl2va_model: H3_BASE_FL2VA_MODEL,
+  h3_adaptive_ref2va_model: H3_REF2VA_MODEL,
   settings_version: 2.52,
   h3_adaptive_conditioning: true,
   custom_settings: { h3_attention_engine: 'sol_attn' },
@@ -4788,7 +4958,6 @@ function _advanceAccountIdentityEpoch(): void {
   // them under the newly authenticated account.
   _modelOptionsSeq += 1
   _modelDefaultsSeq += 1
-  _modelsLoadSeq += 1
   _loraLoadSeq += 1
   _recipesLoadSeq += 1
   _h3ProfileApplySeq += 1
@@ -5543,6 +5712,7 @@ export const useStore = create<AppState>((set, get) => ({
   setGenerationMode: (mode) => {
     if (mode !== get().generationMode) {
       ++_h3ProfileApplySeq
+      ++_loraLoadSeq
       set(state => ({
         h3ProfileApplying: null,
         h3SelectedProfile: 'custom',
@@ -5721,19 +5891,49 @@ export const useStore = create<AppState>((set, get) => ({
     // param write flips image_mode (see videoSubModeStash).
     const prevImageMode = key === 'image_mode' ? ((get().params.image_mode as number) ?? 0) : null
     const profileSettingChanged = H3_PROFILE_PARAM_KEYS.has(key)
+    let adaptivePrepared: GenerateParams | undefined
+    if (
+      key === 'h3_adaptive_conditioning'
+      && value !== false
+      && H3_STUDIO_MODELS.has(String(get().params.model_type || ''))
+    ) {
+      adaptivePrepared = _prepareH3ArchitectureLorasForEdit({
+        ...get().params,
+        h3_adaptive_conditioning: true,
+      })
+    }
     if (profileSettingChanged) {
       ++_h3ProfileApplySeq
       ++_h3CompatibilitySeq
       ++_modelDefaultsSeq
     }
+    if (key === 'h3_adaptive_conditioning') ++_loraLoadSeq
     set(s => ({
-      params: { ...s.params, [key]: value },
+      params: adaptivePrepared || { ...s.params, [key]: value },
       ...(profileSettingChanged ? {
         h3SelectedProfile: 'custom' as const,
         h3ProfileApplying: null,
         modelOptionsLoading: s.h3ProfileApplying ? false : s.modelOptionsLoading,
       } : {}),
+      ...(key === 'h3_adaptive_conditioning' ? {
+        availableLoras: [],
+        lorasLoading: false,
+      } : {}),
     }))
+    if (key === 'h3_adaptive_conditioning') {
+      const current = get()
+      if (H3_STUDIO_MODELS.has(String(current.params.model_type || ''))) {
+        const fl = defaultAdaptiveFl2vaModel(
+          current.params.model_type,
+          current.params.h3_adaptive_fl2va_model,
+        )
+        if (value !== false && String(current.params.model_type || '') === H3_REF2VA_MODEL) {
+          void get().selectAdaptiveH3Model('fl2va', fl)
+        } else {
+          void get().loadLoras(String(current.params.model_type || ''))
+        }
+      }
+    }
     if (key === 'custom_settings' && value && typeof value === 'object') {
       const engine = (value as Record<string, unknown>).h3_attention_engine
       if (engine === 'sdpa' || engine === 'sol_attn' || engine === 'sage2') {
@@ -6832,6 +7032,14 @@ export const useStore = create<AppState>((set, get) => ({
       ))
         ? savedVideoModel
         : getDefaultModelForMode('video', families, models)
+      const storedAdaptiveVideoChoices = saved && H3_STUDIO_MODELS.has(initialVideoModelType)
+        ? _storedH3AdaptiveModelChoices(
+            saved.savedParamsPerMode?.video,
+            initialVideoModelType,
+          )
+        : undefined
+      const bootSavedParamsPerMode: Partial<Record<GenerationMode, SavedModeParams>> =
+        storedAdaptiveVideoChoices ? { video: storedAdaptiveVideoChoices } : {}
 
       if (saved) {
         // Restore saved generation mode
@@ -6867,6 +7075,9 @@ export const useStore = create<AppState>((set, get) => ({
             video: initialVideoModelType,
             [mode]: initialModelType,
           },
+          // Boot restores checkpoint identity only. Prompt, steps, and both
+          // architecture LoRA selections remain a clean page-refresh slate.
+          savedParamsPerMode: bootSavedParamsPerMode,
           // Mode-shaping mirrored from setGenerationMode: booting into
           // image mode needs image_mode 1 + Auto resolution. These used
           // to arrive via the restored params snapshot.
@@ -6874,6 +7085,7 @@ export const useStore = create<AppState>((set, get) => ({
           params: {
             ...s.params,
             model_type: initialModelType || s.params.model_type,
+            ...(mode === 'video' ? storedAdaptiveVideoChoices : {}),
             ...(mode === 'image' ? { image_mode: 1 } : {}),
           },
         }))
@@ -8353,6 +8565,27 @@ export const useStore = create<AppState>((set, get) => ({
         params.audio_prompt_type = `A${audioPromptType}`
       }
     }
+    if (h3AdaptivePairActive(params.model_type, params.h3_adaptive_conditioning)) {
+      try {
+        const seeded = _seedH3ArchitectureLoras(state.params)
+        const selectionError = h3AdaptiveSelectionError(seeded)
+        if (selectionError) throw new Error(selectionError)
+        Object.assign(params, _h3AdaptiveModelChoices(seeded), {
+          h3_fl2va_loras: seeded.h3_fl2va_loras,
+          h3_fl2va_loras_multipliers: seeded.h3_fl2va_loras_multipliers,
+          h3_ref2va_loras: seeded.h3_ref2va_loras,
+          h3_ref2va_loras_multipliers: seeded.h3_ref2va_loras_multipliers,
+        })
+        if (!H3_FL2VA_MODELS.includes(String(params.model_type) as typeof H3_FL2VA_MODELS[number])) {
+          params.model_type = params.h3_adaptive_fl2va_model
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Could not prepare the H3 model and LoRA selections.'
+        set({ h3EstimateError: message })
+        window.alert(message)
+        return
+      }
+    }
     // The prompt remains browser-authored. Only the exact catalog ID crosses
     // this boundary; the server resolves and compiles revision-bound guidance.
     delete params.h3_style_workflow
@@ -9425,6 +9658,40 @@ export const useStore = create<AppState>((set, get) => ({
       const snapshot = s._loraFilenameSnapshotAtLoad || {}
       const reconciled: typeof s.savedLoraPerMode = {}
       let changed = false
+      const renameAdaptiveFilename = (filename: string): string | null => {
+        if (byFilename[filename]) return filename
+        const found = Object.entries(snapshot).find(([, saved]) => saved === filename)?.[0]
+        if (found && byLoraId[found]) {
+          changed = true
+          return byLoraId[found]
+        }
+        // A full asset path is an exact project/runtime identity. Never
+        // collapse it to a basename or delete it on a catalog-only refresh.
+        if (filename.includes('/') || filename.includes('\\')) return filename
+        changed = true
+        return null
+      }
+      const reconcileAdaptiveParams = (params: SavedModeParams): SavedModeParams => {
+        const next = { ...params }
+        for (const architecture of ['fl2va', 'ref2va'] as const) {
+          const listKey = `h3_${architecture}_loras` as const
+          const multiplierKey = `h3_${architecture}_loras_multipliers` as const
+          const names = params[listKey]
+          if (!Array.isArray(names)) continue
+          const weights = String(params[multiplierKey] || '').trim().split(/\s+/).filter(Boolean)
+          let listChanged = false
+          const pairs = names.flatMap((name, index) => {
+            const renamed = renameAdaptiveFilename(name)
+            if (renamed !== name) listChanged = true
+            return renamed ? [[renamed, weights[index] || '1.00'] as const] : []
+          })
+          if (listChanged) {
+            next[listKey] = pairs.map(([name]) => name)
+            next[multiplierKey] = pairs.map(([, weight]) => weight).join(' ')
+          }
+        }
+        return next
+      }
       for (const [mode, blob] of Object.entries(s.savedLoraPerMode)) {
         if (!blob) continue
         const renameFilename = (fname: string): string | null => {
@@ -9461,6 +9728,12 @@ export const useStore = create<AppState>((set, get) => ({
           availableLoras: newAvailable,
         }
       }
+      const reconciledParams = Object.fromEntries(
+        Object.entries(s.savedParamsPerMode).map(([mode, params]) => [
+          mode,
+          params ? reconcileAdaptiveParams(params) : params,
+        ]),
+      ) as typeof s.savedParamsPerMode
       if (changed) {
         // Also rewrite the in-memory runtime state if its keys are stale
         const renameRuntimeFilename = (fname: string): string | null => {
@@ -9480,11 +9753,17 @@ export const useStore = create<AppState>((set, get) => ({
           const renamed = renameRuntimeFilename(fname)
           if (renamed) curWeights[renamed] = w
         }
+        const reconciledRuntimeParams = reconcileAdaptiveParams(s.params)
         set(state => ({
           loraIdByFilename: byFilename,
           filenameByLoraId: byLoraId,
           savedLoraPerMode: reconciled,
-          params: { ...state.params, activated_loras: curActivated },
+          savedParamsPerMode: reconciledParams,
+          params: {
+            ...state.params,
+            ...reconciledRuntimeParams,
+            activated_loras: curActivated,
+          },
           loraWeights: curWeights,
         }))
         // Persist the reconciled state so next boot doesn't need to redo it.
@@ -9517,21 +9796,58 @@ export const useStore = create<AppState>((set, get) => ({
 
   loadLoras: async (modelType) => {
     const seq = ++_loraLoadSeq
+    const live = get()
+    const accountIdentityEpoch = _accountIdentityEpoch
+    const generationMode = live.generationMode
+    const activeModelType = String(live.params.model_type || '')
+    const adaptivePair = h3AdaptivePairActive(
+      activeModelType,
+      live.params.h3_adaptive_conditioning,
+    )
+    const adaptiveSelectionError = h3AdaptiveSelectionError(live.params)
+    if (adaptiveSelectionError) {
+      set({ availableLoras: [], lorasLoading: false, h3EstimateError: adaptiveSelectionError })
+      return
+    }
+    const adaptiveChoices = _h3AdaptiveModelChoices(live.params)
+    const requestedFl2va = adaptivePair ? adaptiveChoices.h3_adaptive_fl2va_model || '' : ''
+    const requestedRef2va = adaptivePair ? adaptiveChoices.h3_adaptive_ref2va_model || '' : ''
+    const types = adaptivePair
+      ? Array.from(new Set([
+          requestedFl2va,
+          requestedRef2va,
+        ]))
+      : [modelType]
+    const inventoryIdentityIsCurrent = () => {
+      const current = get()
+      const currentAdaptive = h3AdaptivePairActive(
+        current.params.model_type,
+        current.params.h3_adaptive_conditioning,
+      )
+      const currentChoices = _h3AdaptiveModelChoices(current.params)
+      return (
+        seq === _loraLoadSeq
+        && accountIdentityEpoch === _accountIdentityEpoch
+        && generationMode === current.generationMode
+        && activeModelType === String(current.params.model_type || '')
+        && adaptivePair === currentAdaptive
+        && (!adaptivePair || (
+          requestedFl2va === currentChoices.h3_adaptive_fl2va_model
+          && requestedRef2va === currentChoices.h3_adaptive_ref2va_model
+        ))
+        && (adaptivePair || modelType === current.params.model_type)
+      )
+    }
     set({ lorasLoading: true })
     try {
-      const data = await api.fetchLoras(modelType)
-      if (seq !== _loraLoadSeq) return
-      if (get().params.model_type !== modelType) {
-        set({ lorasLoading: false })
-        return
-      }
-      set({ availableLoras: data.loras, lorasLoading: false })
+      const lists = await Promise.all(types.map(type => api.fetchLoras(type)))
+      if (!inventoryIdentityIsCurrent()) return
+      set({
+        availableLoras: Array.from(new Set(lists.flatMap(item => item.loras))),
+        lorasLoading: false,
+      })
     } catch {
-      if (seq !== _loraLoadSeq) return
-      if (get().params.model_type !== modelType) {
-        set({ lorasLoading: false })
-        return
-      }
+      if (!inventoryIdentityIsCurrent()) return
       set({ availableLoras: [], lorasLoading: false })
     }
   },
@@ -9542,6 +9858,15 @@ export const useStore = create<AppState>((set, get) => ({
     const { params, loraWeights, modelOptions, generationMode, editSubMode } = get()
     const current = [...params.activated_loras]
     const idx = current.indexOf(filename)
+    const architecture = h3ArchitectureForModel(params.model_type)
+    const blockReason = idx < 0 && architecture
+      ? h3LoraBlockReason(filename, architecture, current)
+      : null
+    if (blockReason) {
+      set({ h3EstimateError: blockReason })
+      window.alert(blockReason)
+      return
+    }
     const newWeights = { ...loraWeights }
     // SCAIL-2 Recast is intentionally a single-phase pipeline even though
     // the shared Wan model family advertises support for up to three phases.
@@ -9584,6 +9909,98 @@ export const useStore = create<AppState>((set, get) => ({
     }
     set({ savedLoraPerMode: updatedLoraPerMode })
     _saveSettings({ generationMode: mode, selectedModelPerMode: s.selectedModelPerMode, savedParamsPerMode: s.savedParamsPerMode, savedLoraPerMode: updatedLoraPerMode, savedPromptPerMode: s.savedPromptPerMode }, s.loraIdByFilename)
+  },
+
+  toggleH3ArchitectureLora: (architecture, filename) => {
+    ++_h3ProfileApplySeq
+    ++_modelDefaultsSeq
+    const { params, modelOptions } = get()
+    const key = architecture === 'fl2va' ? 'h3_fl2va_loras' : 'h3_ref2va_loras'
+    const multiplierKey = architecture === 'fl2va'
+      ? 'h3_fl2va_loras_multipliers'
+      : 'h3_ref2va_loras_multipliers'
+    let current: string[]
+    let weightMap: Record<string, number[]>
+    const phases = Math.max(1, modelOptions?.guidance_max_phases ?? 1)
+    try {
+      const oppositeKey = architecture === 'fl2va' ? 'h3_ref2va_loras' : 'h3_fl2va_loras'
+      const selected = h3LorasForArchitecture({ ...params, [oppositeKey]: [] }, architecture)
+      current = [...selected.loras]
+      weightMap = parseLoraMultiplierMap(current, selected.multipliers, phases)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Could not read the H3 LoRA selections.'
+      set({ h3EstimateError: message })
+      window.alert(message)
+      return
+    }
+    const idx = current.indexOf(filename)
+    if (idx >= 0) {
+      current.splice(idx, 1)
+      delete weightMap[filename]
+    } else {
+      const blockReason = h3LoraBlockReason(filename, architecture, current)
+      if (blockReason) {
+        set({ h3EstimateError: blockReason })
+        window.alert(blockReason)
+        return
+      }
+      current.push(filename)
+      weightMap[filename] = Array(phases).fill(1)
+    }
+    const multipliers = serializeLoraMultipliers(current, weightMap, phases)
+    set(s => ({
+      h3SelectedProfile: 'custom',
+      h3ProfileApplying: null,
+      h3EstimateError: null,
+      params: {
+        ...s.params,
+        [key]: current,
+        [multiplierKey]: multipliers,
+      },
+    }))
+  },
+
+  setH3ArchitectureLoraWeight: (architecture, filename, phaseIndex, value) => {
+    ++_h3ProfileApplySeq
+    ++_modelDefaultsSeq
+    const { params, modelOptions } = get()
+    const multiplierKey = architecture === 'fl2va'
+      ? 'h3_fl2va_loras_multipliers'
+      : 'h3_ref2va_loras_multipliers'
+    let names: string[]
+    let weightMap: Record<string, number[]>
+    const phases = Math.max(1, modelOptions?.guidance_max_phases ?? 1)
+    try {
+      const oppositeKey = architecture === 'fl2va' ? 'h3_ref2va_loras' : 'h3_fl2va_loras'
+      const selected = h3LorasForArchitecture({ ...params, [oppositeKey]: [] }, architecture)
+      names = [...selected.loras]
+      weightMap = parseLoraMultiplierMap(names, selected.multipliers, phases)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Could not read the H3 LoRA weights.'
+      set({ h3EstimateError: message })
+      window.alert(message)
+      return
+    }
+    if (!names.includes(filename)) return
+    if (phaseIndex < 0 || phaseIndex >= phases) return
+    if (!Number.isFinite(value)) {
+      const message = 'LoRA weights must be finite numbers.'
+      set({ h3EstimateError: message })
+      window.alert(message)
+      return
+    }
+    const currentWeights = [...(weightMap[filename] || Array(phases).fill(1.0))]
+    currentWeights[phaseIndex] = value
+    weightMap[filename] = currentWeights
+    set(s => ({
+      params: {
+        ...s.params,
+        [multiplierKey]: serializeLoraMultipliers(names, weightMap, phases),
+      },
+      h3SelectedProfile: 'custom',
+      h3ProfileApplying: null,
+      h3EstimateError: null,
+    }))
   },
 
   ensureTransitionLoraForBlend: async () => {
@@ -14577,6 +14994,58 @@ export const useStore = create<AppState>((set, get) => ({
     return true
   },
 
+  selectAdaptiveH3Model: async (architecture, modelType) => {
+    const before = get()
+    const modelAllowed = architecture === 'ref2va'
+      ? modelType === H3_REF2VA_MODEL
+      : H3_FL2VA_MODELS.includes(modelType as typeof H3_FL2VA_MODELS[number])
+    if (!modelAllowed) {
+      const message = architecture === 'ref2va'
+        ? 'Choose an available Ref2VA model for reference media.'
+        : 'Choose an available FL2VA model for text and frames.'
+      set({ h3EstimateError: message })
+      window.alert(message)
+      return false
+    }
+    const prepared = _prepareH3ArchitectureLorasForEdit({
+      ...before.params,
+      ...(architecture === 'fl2va'
+        ? { h3_adaptive_fl2va_model: modelType }
+        : { h3_adaptive_ref2va_model: modelType }),
+    })
+    ++_loraLoadSeq
+    set(s => ({
+      params: { ...s.params, ...prepared },
+      availableLoras: [],
+      lorasLoading: false,
+      h3EstimateError: null,
+    }))
+    if (architecture === 'fl2va') {
+      const ok = await get().selectModel(modelType)
+      if (!ok || get().params.model_type !== modelType) return false
+    }
+    const selected = get()
+    const choices = _h3AdaptiveModelChoices(selected.params)
+    const mode = selected.generationMode
+    const savedParamsPerMode = {
+      ...selected.savedParamsPerMode,
+      [mode]: {
+        ...(selected.savedParamsPerMode[mode] || {}),
+        ...choices,
+      },
+    }
+    set({ savedParamsPerMode })
+    _saveSettings({
+      generationMode: mode,
+      selectedModelPerMode: selected.selectedModelPerMode,
+      savedParamsPerMode,
+      savedLoraPerMode: selected.savedLoraPerMode,
+      savedPromptPerMode: selected.savedPromptPerMode,
+    }, selected.loraIdByFilename)
+    void get().loadLoras(String(get().params.model_type || modelType))
+    return true
+  },
+
   // Workspaces
   workspaces: [],
   activeWorkspace: 'default',
@@ -15417,6 +15886,7 @@ export const useStore = create<AppState>((set, get) => ({
     // and replace the settings needed to reproduce that output.
     ++_h3ProfileApplySeq
     ++_modelDefaultsSeq
+    ++_loraLoadSeq
     const restoreGeneration = ++_settingsRestoreGeneration
     let selectedOutputMeta = get().selectedOutputMetaName === pendingName
       ? get().selectedOutputMeta
@@ -15473,6 +15943,48 @@ export const useStore = create<AppState>((set, get) => ({
     const sfxVirtual = p._sfx_virtual_model as string | undefined
     if ((p._audio_sub_mode === 'sfx' || p.sfx_mode) && sfxVirtual && models.some(m => m.model_type === sfxVirtual)) {
       modelType = sfxVirtual
+    }
+
+    let restoredH3AdaptiveState: Partial<GenerateParams> = {}
+    if (H3_STUDIO_MODELS.has(modelType)) {
+      const adaptive = typeof p.h3_adaptive_conditioning === 'boolean'
+        ? p.h3_adaptive_conditioning
+        : typeof h3Longform?.adaptive_conditioning === 'boolean'
+          ? h3Longform.adaptive_conditioning
+          : true
+      const candidate = {
+        ...p,
+        model_type: modelType,
+        h3_adaptive_conditioning: adaptive,
+      } as GenerateParams
+      try {
+        const selectionError = h3AdaptiveSelectionError(candidate)
+        if (selectionError) throw new Error(selectionError)
+        restoredH3AdaptiveState = {
+          h3_adaptive_conditioning: adaptive,
+          ..._h3AdaptiveModelChoices(candidate),
+          // Missing and null lists intentionally restore the shared-list
+          // compatibility fallback. Explicit [] remains an explicit clear.
+          h3_fl2va_loras: undefined,
+          h3_fl2va_loras_multipliers: undefined,
+          h3_ref2va_loras: undefined,
+          h3_ref2va_loras_multipliers: undefined,
+        }
+        for (const architecture of ['fl2va', 'ref2va'] as const) {
+          const listKey = `h3_${architecture}_loras` as const
+          const multiplierKey = `h3_${architecture}_loras_multipliers` as const
+          if (candidate[listKey] != null) {
+            const selected = h3LorasForArchitecture(candidate, architecture)
+            restoredH3AdaptiveState[listKey] = selected.loras
+            restoredH3AdaptiveState[multiplierKey] = selected.multipliers
+          }
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Could not restore the H3 model and LoRA selections.'
+        set({ h3EstimateError: message })
+        window.alert(message)
+        return
+      }
     }
 
     // Per-sub-mode isolation: pencil-load may jump the sidebar to another
@@ -15550,9 +16062,12 @@ export const useStore = create<AppState>((set, get) => ({
         ...s.selectedModelPerMode,
         [restoredMode]: modelType,
       },
+      availableLoras: [],
     }))
     if (!sfxModelTypes.has(modelType)) {
-      get().loadLoras(modelType)
+      // Adaptive H3 inventory depends on both restored checkpoint IDs, so it
+      // starts only after the sidecar's final adaptive identity is published.
+      if (!H3_STUDIO_MODELS.has(modelType)) get().loadLoras(modelType)
       await get().loadModelOptions(modelType)
     }
     if (
@@ -15637,11 +16152,7 @@ export const useStore = create<AppState>((set, get) => ({
       settings_version: p.settings_version as number,
     }
     if (H3_STUDIO_MODELS.has(modelType)) {
-      newParams.h3_adaptive_conditioning = typeof p.h3_adaptive_conditioning === 'boolean'
-        ? p.h3_adaptive_conditioning
-        : typeof h3Longform?.adaptive_conditioning === 'boolean'
-          ? h3Longform.adaptive_conditioning
-          : true
+      Object.assign(newParams, restoredH3AdaptiveState)
     }
 
     // Copy optional fields — explicitly clear when absent to prevent stale values leaking
@@ -15916,6 +16427,25 @@ export const useStore = create<AppState>((set, get) => ({
       h3ProfileApplying: null,
     }))
     if (H3_STUDIO_MODELS.has(modelType)) {
+      const restored = get()
+      const choices = _h3AdaptiveModelChoices(restored.params)
+      const mode = restored.generationMode
+      const savedParamsPerMode = {
+        ...restored.savedParamsPerMode,
+        [mode]: {
+          ...(restored.savedParamsPerMode[mode] || {}),
+          ...choices,
+        },
+      }
+      set({ savedParamsPerMode })
+      _saveSettings({
+        generationMode: mode,
+        selectedModelPerMode: restored.selectedModelPerMode,
+        savedParamsPerMode,
+        savedLoraPerMode: restored.savedLoraPerMode,
+        savedPromptPerMode: restored.savedPromptPerMode,
+      }, restored.loraIdByFilename)
+      void get().loadLoras(modelType)
       void get().normalizeH3EditableProfile()
     }
 
