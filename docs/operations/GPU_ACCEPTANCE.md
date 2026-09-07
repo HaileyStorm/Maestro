@@ -189,3 +189,23 @@ human acceptance.
 When all applicable rows pass, update this matrix rather than deleting it. Keep
 failed or intentionally unsupported variants as provenance, and remove only a
 superseded command after its replacement is both documented and accepted.
+
+## W4A8 runtime prerequisite receipt — 2026-09-07 UTC
+
+Linux RTX 5090 / SM 12.0 passed the 256-by-256 synthetic W4A8 validation with
+Torch 2.10.0+cu130 and Triton 3.6.0. Dispatch was eager weight quantization
+and Triton W4A8 linear; relative MAE was 0.07095864661654136. The runtime
+revision is `b812819a97ac11d01f4a3a16ba47dd38de3b2519`, and the schema-2
+marker binds package digest
+`2028f87be20ad79158b47895280fdc4ecf1491d7c010bfd4058cabf89e2b778b`.
+
+The prior generic package lacked W4A8 APIs. The pinned local wheel replaced it
+under a validated coordinator lease with rollback preserved. Both the initial
+failed check and successful repair lease were withdrawn and confirmed cancelled.
+Task-private grant, dispatch, marker, and withdrawal receipts are retained in
+`.artifacts-temp/astra-w4a8-repair-20260907/`; installer CPU evidence is in
+`.artifacts-temp/astra-w4a8-installer-20260907/`.
+
+This satisfies only the small runtime prerequisite. The H3 W4A8 row remains
+open for checkpoint-bound generation, playable output, fallback checks, and
+visual/human acceptance. Native Windows runtime execution remains unverified.

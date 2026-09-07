@@ -10,17 +10,41 @@ satisfied; it does not establish that a lease exists or that any GPU acceptance
 has passed. Service restarts, credits/SSO activation, new providers, and browser
 filesystem permissions retain their separate existing boundaries.
 
-The first registration attempt for this migrated checkout was rejected by the
-client: `workspace is outside the canonical allowlist`. The coordinator was
-live, leader, and free of authority/ingress/epoch/ledger errors. Existing Maestro
-registry identities point to the former checkout and were not reused. The
-communications hub routed this blocker as `harness-a97` to the coordinator owner.
-Do not retry registration or request a lease until that owner reports a supported
-registration-path change. Then verify the exact project/workspace identity and
-use a fresh request; registration alone is never GPU authority. Validate the
+The coordinator owner resolved the initial allowlist rejection (`harness-a97`).
+This migrated checkout is now registered as `maestro-local`; former-checkout
+identities remain separate. Registration is never GPU authority: validate the
 durable grant, current status/epoch/time, and exactly matching raw ledger entry
 before every start, stop by its end, and withdraw/confirm after completion.
-Independent CPU work continues while registration is blocked.
+
+### W4A8 runtime prerequisite — 2026-09-07 UTC
+
+The first leased synthetic check failed because installed comfy-kitchen 0.2.26
+lacked the W4A8 APIs. Its lease was withdrawn. The repaired installer uses UV
+with the selected interpreter, builds archived pinned source, preserves a
+rollback copy, invalidates the old marker, and restores package/marker on
+validation failure. Package fingerprinting happens before import. Schema-2
+markers bind the installed bytes as well as revision and runtime identity;
+Sage capability remains independent.
+
+The isolated candidate passed 80 CPU tests with 11 explicit skips (91 total),
+syntax checks, and independent review. Native Windows execution remains
+unverified. A second exact lease ran the small synthetic check on Linux with
+RTX 5090 (SM 12.0), Torch 2.10.0+cu130, and Triton 3.6.0. Eager weight
+quantization and Triton W4A8 linear dispatch passed with relative MAE
+0.07095864661654136. The pinned package and matching schema-2 marker are now
+installed in `app/env-rtx50`; the prior package remains in the private rollback
+artifact. The GPU child exited and the lease was confirmed cancelled.
+
+Receipts: `.artifacts-temp/astra-w4a8-installer-20260907/`,
+`.artifacts-temp/astra-w4a8-kernel-20260907/`, and
+`.artifacts-temp/astra-w4a8-repair-20260907/`. This is runtime/kernel evidence;
+full checkpoint generation, visual quality, and human acceptance remain open
+in `GPU_ACCEPTANCE.md`. No app restart or full-model run occurred.
+
+The native-max offload-floor WIP remains unadopted. Before changing its floor,
+reconcile sealed integer profile intent with effective fractional profiles and
+observed loaded-profile retry state; preserve completed-prefix provenance and
+calibration semantics. No offload source was changed in this slice.
 
 ## Successor progress
 

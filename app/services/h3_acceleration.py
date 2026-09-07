@@ -30,7 +30,7 @@ SAGE2_VALIDATION_RECORD_SHA256 = "e0ac9b6b415d8029f077bc6dc11e9b9e22f612405bf824
 SAGE2_BASE_MODEL_REVISION = "0543966fbdce5ba05709a8f2031c94bdba629b4a"
 KIJAI_W4A8_REPOSITORY = "Kijai/MiniMax-H3-experimental"
 KIJAI_W4A8_REVISION = "8b48334e6263a39b34eef85f9f5e271ba4506945"
-COMFY_KITCHEN_W4A8_REVISION = "b812819a97ac11d01f4a3a16ba47dd38de3b2519"
+from services.h3_w4a8_provenance import RUNTIME_REVISION as COMFY_KITCHEN_W4A8_REVISION
 SOL_CHECKOUT = Path(__file__).with_name("sol_attn_kijai")
 SAGEATTENTION_CHECKOUT = Path(__file__).with_name("sageattention_thu_ml")
 
@@ -426,11 +426,17 @@ def _sage2_unavailable(reason: str, *, allow_sdpa_fallback: bool) -> None:
 
 
 def _w4a8_capability() -> tuple[bool, str]:
+    from services.h3_w4a8_provenance import locate_pinned_package, marker_package_matches
     try:
+        package_root, _digest = locate_pinned_package()
         import comfy_kitchen
-    except Exception as error:
-        return False, f"comfy-kitchen is not installed: {error}"
-    if not callable(getattr(comfy_kitchen, "w4a8_int8_linear", None)):
+        if Path(comfy_kitchen.__file__).parent.resolve() != package_root.resolve():
+            return False, "W4A8 package location changed; run Pinokio Update"
+    except Exception:
+        return False, "The pinned W4A8 runtime is not installed; run Pinokio Update"
+    if not all(callable(getattr(comfy_kitchen, name, None)) for name in (
+        "quantize_w4a8_int8_weight", "w4a8_int8_linear",
+    )):
         return False, "installed comfy-kitchen lacks merged asym_w4a8_int8 support"
     backends = comfy_kitchen.list_backends()
     triton_ready = bool((backends.get("triton") or {}).get("available"))
@@ -440,6 +446,8 @@ def _w4a8_capability() -> tuple[bool, str]:
     marker_path = Path(sys.prefix) / ".maestro_h3_w4a8_validated.json"
     try:
         marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        if not marker_package_matches(marker, package_root):
+            return False, "W4A8 package validation is stale; run Pinokio Update"
         import triton
         expected = {
             "runtime_revision": COMFY_KITCHEN_W4A8_REVISION,
