@@ -1505,3 +1505,38 @@ word list or silently invent a fixed creative policy. Also inspect whether
 sanitize_h3_prompt_text changes exact authored dialogue when escaping template
 or Context-IR syntax. Mapper/caller integration and the broader backlog remain
 open; the continuous Goal remains active.
+
+### Story dialogue literals and H3 template boundary (2026-09-07)
+
+Recognized quoted speech now retains its exact payload through extraction, story
+materialization and window rendering, including spaces, tabs, braces and field
+labels. Generated and locked payloads cannot contain H3 dialogue delimiters: an
+early structural check prevents one D-ID from becoming multiple speech blocks.
+The dialogue renderer also validates speaker/language/delivery/action metadata
+and language-label delimiters before wrapping a spoken block.
+Planning prose still uses its separate syntax sanitizer.
+
+process_template has a default-off preserve_h3_dialogue option. Strict balanced
+canonical blocks are protected before line normalization, using an input-absent
+private-use delimiter and one-pass restoration. Outside macros still expand;
+malformed tags fail structurally, and concatenated macro values cannot forge
+another literal token. Both WGP entrypoints opt in only after resolving the exact
+Base/Ref2VA architecture. Other models and legacy timeline helpers are unchanged.
+Reference-role serialization also escapes braces, so role data cannot become a
+WGP template variable.
+
+The clean six-module gate passes 248 CPU tests; the final role-brace and
+metadata closure passes 85 focused tests, followed by nine literal tests after
+moving language-label validation before truncation. Independent review closed the dialogue-delimiter
+injection finding and verified the template/caller boundary. Coverage includes
+quoted-source to mocked staging to compiled output, actual AST-extracted WGP
+flags, ordinary macros, malformed tags, multiline bytes and token collisions.
+Only one resolver fixture line is taken from test_llm_runtime; its pre-existing
+root WIP remains excluded. Evidence: `.artifacts-temp/astra-story-literals-20260907/`.
+
+Remaining literal work: recover_h3_plain_story still unwraps/sanitizes authored
+Ref2VA dialogue, and raw quoted input before WGP enhancement is not canonical
+<d> markup and is outside this opt-in. Preserve those distinctions rather than
+claiming enhancer-model or Ref-recovery byte fidelity. Age/style stripping,
+automatic classifiers, mapper/caller integration, and the broader backlog remain
+open. No model/GPU/service/browser/Windows acceptance is claimed.

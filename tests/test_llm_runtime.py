@@ -2561,6 +2561,7 @@ class LlmRuntimeTests(unittest.TestCase):
                 process_template=lambda value, **_kwargs: (value, ""),
             ),
             "get_state_model_type": lambda _state: "model",
+            "get_base_model_type": lambda model_type: model_type,
             "get_model_settings": lambda *_args: {
                 "prompt": "prompt",
                 "image_prompt_type": "S",

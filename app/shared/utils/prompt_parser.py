@@ -743,7 +743,47 @@ def is_speaker_options_line(line):
     return SPEAKER_OPTIONS_LINE_RE.search(line or "") is not None
 
 
-def process_template(input_text, keep_comments=False, keep_empty_lines=False):
+def _protect_template_h3_dialogue(source):
+    spans = []
+    opening = None
+    for token in _H3_DIALOGUE_TOKEN_RE.finditer(source):
+        if not token.group(1):
+            if opening is not None:
+                return "", [], "H3 dialogue tags must be balanced and non-nested"
+            opening = token.start()
+        else:
+            if opening is None:
+                return "", [], "H3 dialogue tags must be balanced and non-nested"
+            block = source[opening:token.end()]
+            match = re.fullmatch(r"<d>\s*\[([^\]\r\n]+)\]\s+(.+?)</d>", block, re.IGNORECASE | re.DOTALL)
+            if match is None or not match.group(1).strip() or not match.group(2).strip():
+                return "", [], "H3 dialogue requires a language label and nonempty text"
+            spans.append((opening, token.end()))
+            opening = None
+    if opening is not None:
+        return "", [], "H3 dialogue tags must be balanced and non-nested"
+    if not spans:
+        return source, [], ""
+    # A character absent from the entire input cannot be synthesized by the
+    # template engine's substring substitution or concatenation operations.
+    used = set(source)
+    marker = next((chr(code) for start, end in ((0xE000, 0xF900), (0xF0000, 0xFFFFE), (0x100000, 0x10FFFE))
+                   for code in range(start, end) if chr(code) not in used), None)
+    if marker is None:
+        return "", [], "H3 dialogue template has no available literal delimiter"
+    parts = []
+    blocks = []
+    cursor = 0
+    for index, (start, end) in enumerate(spans):
+        token = f"{marker}H3_LITERAL_{index}{marker}"
+        parts.extend((source[cursor:start], token))
+        blocks.append((token, source[start:end]))
+        cursor = end
+    parts.append(source[cursor:])
+    return "".join(parts), blocks, ""
+
+
+def process_template(input_text, keep_comments=False, keep_empty_lines=False, *, preserve_h3_dialogue=False):
     """
     Process a text template with macro instructions and variable substitution.
     Supports multiple values for variables to generate multiple output versions.
@@ -757,6 +797,20 @@ def process_template(input_text, keep_comments=False, keep_empty_lines=False):
             - output_text: Processed output with variables substituted, or empty string if error
             - error_message: Error description and problematic line, or empty string if no error
     """
+    if preserve_h3_dialogue:
+        protected, blocks, error = _protect_template_h3_dialogue(str(input_text or ""))
+        if error:
+            return "", error
+        output, error = process_template(protected, keep_comments=keep_comments, keep_empty_lines=keep_empty_lines)
+        if not blocks:
+            return output, error
+        literals = dict(blocks)
+        pattern = re.compile("|".join(re.escape(token) for token in literals))
+        # One pass consumes whole tokens before any overlapping spelling built
+        # across adjacent macro values can be considered for restoration.
+        restore = lambda value: pattern.sub(lambda match: literals[match.group(0)], value)
+        return restore(output), restore(error)
+
     normalized_input = str(input_text or "").replace("\r\n", "\n").replace("\r", "\n")
     lines = normalized_input.split("\n") if keep_empty_lines else normalized_input.strip().split("\n")
     current_variables = {}

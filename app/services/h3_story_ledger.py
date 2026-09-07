@@ -54,7 +54,8 @@ def sanitize_h3_prompt_text(value: Any) -> str:
     WGP applies a lightweight ``{variable}`` template pass after enhancement.
     JSON-like prose from an LLM therefore must not retain literal braces.  We
     also neutralize nested Context-IR labels so every compiled prompt owns one
-    and only one instance of each field.
+    and only one instance of each field. This rewrites prose; exact spoken
+    payloads must bypass it and use the H3-aware template boundary instead.
     """
 
     text = str(value or "")
@@ -152,6 +153,16 @@ def _infer_quote_speaker(source: str, quote_start: int) -> tuple[str, str]:
     return speaker, delivery
 
 
+def literal_h3_dialogue_text(value: Any) -> str:
+    """Preserve spoken bytes while refusing nested dialogue delimiters."""
+    from shared.utils.prompt_parser import _H3_DIALOGUE_TOKEN_RE
+
+    text = str(value or "")
+    if _H3_DIALOGUE_TOKEN_RE.search(text):
+        raise ValueError("H3 spoken text cannot contain dialogue delimiter tags")
+    return text
+
+
 def extract_locked_dialogue(prompt: str) -> list[dict[str, Any]]:
     """Extract user-authored quoted lines before any LLM rewriting occurs."""
 
@@ -159,8 +170,8 @@ def extract_locked_dialogue(prompt: str) -> list[dict[str, Any]]:
     pattern = re.compile(r'"([^"\r\n]{1,600})"|“([^”\r\n]{1,600})”')
     locked: list[dict[str, Any]] = []
     for match in pattern.finditer(source):
-        text = sanitize_h3_prompt_text(match.group(1) or match.group(2) or "").strip()
-        if not text or _PLACEHOLDER_DIALOGUE.fullmatch(text):
+        text = literal_h3_dialogue_text(match.group(1) or match.group(2) or "")
+        if not text.strip() or _PLACEHOLDER_DIALOGUE.fullmatch(text):
             continue
         speaker, delivery = _infer_quote_speaker(source, match.start())
         # A quoted title should not silently become dialogue. Speech cues,
@@ -429,7 +440,11 @@ def ledger_violations(
         if generated_ids != expected_generated:
             violations.append("generated dialogue IDs are not sequential")
     for item in generated:
-        text = sanitize_h3_prompt_text(item.get("text"))
+        try:
+            text = literal_h3_dialogue_text(item.get("text"))
+        except ValueError:
+            violations.append(f"{item.get('dialogue_id') or 'dialogue'} contains dialogue delimiter tags")
+            continue
         if not text or _PLACEHOLDER_DIALOGUE.fullmatch(text):
             violations.append(f"{item.get('dialogue_id') or 'dialogue'} is empty or a placeholder")
     referenced_ids = [
@@ -888,8 +903,9 @@ def _materialize_segment(
                 ),
                 "action": sanitize_h3_prompt_text(performance.get("action")),
                 # The text is inserted from the locked catalog, never copied
-                # from the segment LLM response.
-                "text": sanitize_h3_prompt_text(source.get("text")),
+                # from the segment LLM response. Preserve catalog bytes here;
+                # template syntax is handled at the H3-aware runtime boundary.
+                "text": literal_h3_dialogue_text(source.get("text")),
                 "dialogue_id": dialogue_id,
             })
         required_events = [

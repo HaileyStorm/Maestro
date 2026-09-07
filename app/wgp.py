@@ -1475,7 +1475,10 @@ def validate_settings(state, model_type, single_prompt, inputs):
         gr.Info("Adaptive Progressive Guidance and Classifier Free Guidance Star can not be set at the same time")
         return ret()
     prompt = inputs["prompt"]
-    prompt, errors = prompt_parser.process_template(prompt, keep_empty_lines=model_def.get("preserve_empty_prompt_lines", False))
+    prompt, errors = prompt_parser.process_template(
+        prompt, keep_empty_lines=model_def.get("preserve_empty_prompt_lines", False),
+        preserve_h3_dialogue=model_type in {"minimax_h3", "minimax_h3_ref2va"},
+    )
     if len(errors) > 0:
         gr.Info("Error processing prompt template: " + errors)
         return ret()
@@ -9005,7 +9008,10 @@ def _enhance_prompt_locked(state, prompt, prompt_enhancer, multi_images_gen_type
     inputs = get_model_settings(state, model_type)
     original_prompts = inputs["prompt"]
 
-    original_prompts, errors = prompt_parser.process_template(original_prompts, keep_comments= True)
+    original_prompts, errors = prompt_parser.process_template(
+        original_prompts, keep_comments=True,
+        preserve_h3_dialogue=get_base_model_type(model_type) in {"minimax_h3", "minimax_h3_ref2va"},
+    )
     if len(errors) > 0:
         gr.Info("Error processing prompt template: " + errors)
         return gr.update(), gr.update()

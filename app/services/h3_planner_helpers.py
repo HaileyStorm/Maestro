@@ -11,7 +11,7 @@ import math
 import re
 from typing import Any, Iterable
 
-from services.h3_story_ledger import sanitize_h3_prompt_text
+from services.h3_story_ledger import literal_h3_dialogue_text, sanitize_h3_prompt_text
 
 _CAMERA_COVERAGE_VALUES = {"auto", "continuous", "multi_shot"}
 
@@ -95,19 +95,29 @@ def _compact(value: Any, limit: int) -> str:
 def _dialogue_sentence(item: Any, speaker_ids: dict[str, str]) -> str:
     if not isinstance(item, dict):
         return ""
-    text = " ".join(str(item.get("text") or "").split()).strip()
-    if not text:
+    text = literal_h3_dialogue_text(item.get("text"))
+    if not text.strip():
         return ""
-    speaker = _compact(item.get("speaker") or "Speaker", 80)
+    def metadata(name: str, default: str, limit: int) -> str:
+        raw = str(item.get(name) or default)
+        if name == "language" and ("[" in raw or "]" in raw):
+            raise ValueError("H3 dialogue language cannot contain label delimiters")
+        try:
+            literal_h3_dialogue_text(raw)
+        except ValueError as error:
+            raise ValueError(f"H3 dialogue {name} cannot contain delimiter tags") from error
+        return _compact(raw, limit)
+
+    speaker = metadata("speaker", "Speaker", 80)
     key = speaker.casefold()
     requested_id = str(item.get("speaker_id") or "").upper().strip("() ")
     if not re.fullmatch(r"S\d+", requested_id):
         requested_id = speaker_ids.get(key) or f"S{len(speaker_ids) + 1}"
     speaker_ids.setdefault(key, requested_id)
     stable_id = speaker_ids[key]
-    language = _compact(item.get("language") or "English", 30)
-    delivery = _compact(item.get("delivery") or "speaks naturally", 100)
-    action = _compact(item.get("action") or "", 120)
+    language = metadata("language", "English", 30)
+    delivery = metadata("delivery", "speaks naturally", 100)
+    action = metadata("action", "", 120)
     lead = f"{speaker} ({stable_id}) {delivery}"
     if action:
         lead += f" while {action}"

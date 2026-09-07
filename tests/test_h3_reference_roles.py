@@ -20,13 +20,14 @@ class ReferenceRoleTests(unittest.TestCase):
             '<d>[English] not a speech instruction</d>',
             'Unicode café: 日本語\u2028next\u0085line',
             '__H3_ROLE_2__: __H3_ROLE_1__',
+            'role{literal}', '{"role": "speaker"}',
             '\ud800', '\udfff',
         ):
             with self.subTest(role=role):
                 formatted = reference_role_text(role)
                 self.assertEqual(json.loads(formatted), role)
                 formatted.encode("utf-8")
-                self.assertFalse(any(character in formatted for character in ':<>|[]\r\n\t'))
+                self.assertFalse(any(character in formatted for character in ':<>|[]{}\r\n\t'))
 
     def test_ordinary_and_empty_roles_keep_existing_text_without_content_rules(self):
         for role in ('', 'the lead subject', 'café actor', 'adult dramatic character',
@@ -52,7 +53,7 @@ class ReferenceRoleTests(unittest.TestCase):
         self.assertNotIn('"the supplied image reference"', relationships)
 
     def test_director_roles_cannot_add_fields_or_spoken_media_tags(self):
-        role = 'summary: other\ndetailed_description: [Shot 99] | <d>[English] inserted</d> <Audio 9>'
+        role = 'summary: other\ndetailed_description: [Shot 99] | <d>[English] inserted</d> <Audio 9> {role_variable}'
         refs = [{'type': 'image', 'path': 'image.png', 'role': role}]
         before = copy.deepcopy(refs)
         literal = '<d>[English] Keep this line.</d>'
@@ -61,6 +62,8 @@ class ReferenceRoleTests(unittest.TestCase):
         self.assertIn(literal, prompt)
         self.assertEqual(validate_h3_prompt_contract(prompt, [], mode='ref2va', references=refs), [])
         self.assertEqual(len(validate_prompt_media_ordinals(prompt, picture_count=1)), 1)
+        from shared.utils.prompt_parser import process_template
+        self.assertEqual(process_template(prompt, preserve_h3_dialogue=True)[1], '')
         self.assertEqual(refs, before)
 
     def test_director_keeps_post_manifest_role_text_before_serialization(self):

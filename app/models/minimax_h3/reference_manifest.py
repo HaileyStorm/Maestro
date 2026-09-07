@@ -53,13 +53,13 @@ def reference_role_text(role: str) -> str:
     Ordinary role prose remains unchanged. This is lexical serialization only;
     it does not inspect subject matter or decide which roles may be used.
     """
-    if not any(character in ':<>|[]"\\' or ord(character) < 32
+    if not any(character in ':<>|[]{}"\\' or ord(character) < 32
                or 0x7f <= ord(character) <= 0x9f
                or 0xd800 <= ord(character) <= 0xdfff
                or character in '\u2028\u2029' for character in role):
         return role
     encoded = json.dumps(role, ensure_ascii=True)
-    for character in ':<>|[]':
+    for character in ':<>|[]{}':
         encoded = encoded.replace(character, f'\\u{ord(character):04x}')
     return encoded
 
