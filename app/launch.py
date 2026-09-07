@@ -54907,36 +54907,10 @@ def _run_sfx_generation(job: dict, raw_params: dict, start_time: float):
 
 
 def _run_delivery_encoder(command, *, timeout, abort_check=None):
-    """Reap this delivery encoder on cancellation, timeout, or caller failure."""
-    import subprocess
-    import time
+    """Use the shared owned-process lifecycle for delivery encoders."""
+    from shared.utils.media_encoder import run_encoder
 
-    if callable(abort_check) and abort_check():
-        raise InterruptedError("Delivery encoding cancelled")
-    with subprocess.Popen(
-        command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    ) as process:
-        deadline = time.monotonic() + timeout
-        try:
-            while True:
-                if callable(abort_check) and abort_check():
-                    raise InterruptedError("Delivery encoding cancelled")
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("Delivery encoding timed out")
-                try:
-                    return process.wait(timeout=min(0.25, remaining))
-                except subprocess.TimeoutExpired:
-                    pass
-        finally:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+    return run_encoder(command, timeout=timeout, abort_check=abort_check)
 
 
 def _chunked_flashvsr_upscale(
@@ -55041,9 +55015,9 @@ def _chunked_flashvsr_upscale(
         # tiny/tiny-long yield float32 in [-1,1]; the full variant yields
         # uint8 (decode_to_cpu_uint8) which save_video takes un-normalized.
         if frames.dtype == torch.uint8:
-            saved = wgp.save_video(tensor=frames[None], save_file=path, fps=output_fps, nrow=1, normalize=False, codec_type=codec, container=container)
+            saved = wgp.save_video(tensor=frames[None], save_file=path, fps=output_fps, nrow=1, normalize=False, codec_type=codec, container=container, abort_check=abort_check, timeout=600)
         else:
-            saved = wgp.save_video(tensor=frames[None], save_file=path, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type=codec, container=container)
+            saved = wgp.save_video(tensor=frames[None], save_file=path, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type=codec, container=container, abort_check=abort_check, timeout=600)
         if saved != path:
             raise RuntimeError("Could not encode the upscaled video segment")
         if _coded_video_size(path, expected_frames=int(frames.shape[1])) != (
@@ -55201,7 +55175,7 @@ def _apply_spatial_upsampling_to_file(
                 dir=os.path.dirname(os.path.abspath(video_path)),
             )
             os.close(handle)
-            wgp.combine_video_with_audio_tracks(tmp_video, audio_tracks, tmp_muxed, audio_metadata=audio_metadata)
+            wgp.combine_video_with_audio_tracks(tmp_video, audio_tracks, tmp_muxed, audio_metadata=audio_metadata, abort_check=abort_check, timeout=600)
             if _coded_video_size(tmp_muxed) != encoded_size:
                 raise RuntimeError("Audio mux changed the upscaled canvas")
             if callable(abort_check) and abort_check():
@@ -57669,6 +57643,7 @@ def _run_tool_upscale(job_id: str):
     start_time = time.time()
     abort_state = {"abort": False}
     audio_tracks = []
+    tmp_path = None
     with generation_slot(
         _gen_lock, job,
     ) as acquired, _WgpNativeGpuExecutionSlot(acquired):
@@ -57761,7 +57736,7 @@ def _run_tool_upscale(job_id: str):
                     wgp.cleanup_temp_audio_files(audio_tracks)
                     return False
                 if has_audio:
-                    wgp.combine_video_with_audio_tracks(tmp_path, audio_tracks, final_path, audio_metadata=audio_metadata)
+                    wgp.combine_video_with_audio_tracks(tmp_path, audio_tracks, final_path, audio_metadata=audio_metadata, abort_check=_abort, timeout=600)
                     try:
                         os.remove(tmp_path)
                     except OSError:
@@ -57784,17 +57759,21 @@ def _run_tool_upscale(job_id: str):
                 output_fps = round(fps)
                 if has_audio:
                     tmp_path = wgp.get_available_filename(out_dir, os.path.basename(video_source), "_uptmp", force_extension=f".{container}")
-                    wgp.save_video(tensor=sample[None], save_file=tmp_path, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type=codec, container=container)
-                    wgp.combine_video_with_audio_tracks(tmp_path, audio_tracks, final_path, audio_metadata=audio_metadata)
+                    wgp.save_video(tensor=sample[None], save_file=tmp_path, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type=codec, container=container, abort_check=_abort, timeout=600)
+                    wgp.combine_video_with_audio_tracks(tmp_path, audio_tracks, final_path, audio_metadata=audio_metadata, abort_check=_abort, timeout=600)
                     try:
                         os.remove(tmp_path)
                     except OSError:
                         pass
                     wgp.cleanup_temp_audio_files(audio_tracks)
                 else:
-                    wgp.save_video(tensor=sample[None], save_file=final_path, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type=codec, container=container)
+                    wgp.save_video(tensor=sample[None], save_file=final_path, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type=codec, container=container, abort_check=_abort, timeout=600)
 
                 sample = None
+            if _abort():
+                from shared.utils.audio_video import _remove_encoding_temporary
+                _remove_encoding_temporary(final_path)
+                return False
             after = set(os.listdir(out_dir)) if os.path.isdir(out_dir) else set()
             new_files = sorted(f for f in (after - before) if not f.endswith(".meta.json") and "_uptmp" not in f)
             record_job_outputs(job, new_files)
@@ -57817,6 +57796,9 @@ def _run_tool_upscale(job_id: str):
             finish_job(job, "failed", error=str(e), message=f"Error: {e}")
             return False
         finally:
+            if tmp_path:
+                from shared.utils.audio_video import _remove_encoding_temporary
+                _remove_encoding_temporary(tmp_path)
             unregister_abort_state(job_id, _active_gen_states, abort_state)
             try:
                 wgp.cleanup_temp_audio_files(audio_tracks)

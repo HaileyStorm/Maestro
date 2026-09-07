@@ -444,16 +444,69 @@ def combine_and_concatenate_video_with_audio_tracks(
         raise
 
 
-def combine_video_with_audio_tracks(target_video, audio_tracks, output_video,
-                                     audio_metadata=None, verbose=False):
-    if not audio_tracks:
-        if verbose: print("No audio tracks to combine."); return False
+def _remove_encoding_temporary(path):
+    """Retry transient locks without replacing an encode/cancellation error."""
+    import time
 
-    dur = float(next(s for s in ffmpeg.probe(target_video)['streams']
-                     if s['codec_type'] == 'video')['duration'])
+    for attempt in range(5):
+        try:
+            os.remove(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except PermissionError:
+            if attempt < 4:
+                time.sleep(0.05 * (2 ** attempt))
+        except OSError:
+            break
+    print("[Media] An unfinished encoding temporary file could not be removed")
+    return False
+
+
+def combine_video_with_audio_tracks(target_video, audio_tracks, output_video,
+                                     audio_metadata=None, verbose=False, *,
+                                     abort_check=None, timeout=None):
+    """Copy audio tracks onto video, optionally bounding probe and mux together."""
+    controlled = abort_check is not None or timeout is not None
+    if not audio_tracks and (verbose or controlled):
+        if verbose:
+            print("No audio tracks to combine.")
+        return False
+    if controlled:
+        import math
+        import time
+        from shared.utils.media_encoder import run_encoder
+
+        duration_limit = float(600 if timeout is None else timeout)
+        if not math.isfinite(duration_limit) or duration_limit <= 0:
+            raise ValueError("Audio mux timeout must be finite and positive")
+        deadline = time.monotonic() + duration_limit
+        with tempfile.TemporaryFile(dir=os.path.dirname(os.path.abspath(output_video))) as probe_output:
+            result = run_encoder(
+                [os.environ.get("FFPROBE_BINARY", "ffprobe"), "-v", "error",
+                 "-select_streams", "v:0", "-show_entries", "stream=duration:format=duration",
+                 "-of", "json", target_video],
+                timeout=duration_limit, abort_check=abort_check, stdout=probe_output,
+            )
+            if result != 0:
+                raise RuntimeError("Could not read video duration for audio muxing")
+            probe_output.seek(0)
+            try:
+                metadata = json.loads(probe_output.read(65536))
+                streams = metadata.get("streams") or []
+                if not streams:
+                    raise ValueError("missing video stream")
+                dur = float(streams[0].get("duration") or metadata.get("format", {}).get("duration"))
+            except (ValueError, TypeError, KeyError) as error:
+                raise RuntimeError("Could not read video duration for audio muxing") from error
+            if not math.isfinite(dur) or dur <= 0:
+                raise RuntimeError("Video duration is invalid for audio muxing")
+    else:
+        dur = float(next(s for s in ffmpeg.probe(target_video)['streams']
+                         if s['codec_type'] == 'video')['duration'])
     if verbose: print(f"Video duration: {dur:.3f}s")
 
-    cmd = ['ffmpeg', '-y', '-i', target_video]
+    cmd = [os.environ.get('FFMPEG_BINARY', 'ffmpeg'), '-nostdin', '-y', '-i', target_video]
     for path in audio_tracks:
         cmd += ['-i', path]
 
@@ -467,9 +520,31 @@ def combine_video_with_audio_tracks(target_video, audio_tracks, output_video,
 
     cmd += ['-c:v', 'copy', '-c:a', 'copy', '-t', str(dur), output_video]
 
-    result = subprocess.run(cmd, capture_output=not verbose, text=True)
-    if result.returncode != 0:
-        raise Exception(f"FFmpeg error:\n{result.stderr}")
+    if controlled:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Audio muxing timed out")
+        handle, temporary = tempfile.mkstemp(
+            prefix=".audio-mux-", suffix=os.path.splitext(output_video)[1],
+            dir=os.path.dirname(os.path.abspath(output_video)),
+        )
+        os.close(handle)
+        cmd[-1] = temporary
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Audio muxing timed out")
+            if run_encoder(cmd, timeout=remaining, abort_check=abort_check) != 0:
+                raise RuntimeError("Audio muxing failed")
+            if callable(abort_check) and abort_check():
+                raise InterruptedError("Audio muxing cancelled")
+            os.replace(temporary, output_video)
+        finally:
+            _remove_encoding_temporary(temporary)
+    else:
+        result = subprocess.run(cmd, capture_output=not verbose, text=True)
+        if result.returncode != 0:
+            raise Exception(f"FFmpeg error:\n{result.stderr}")
     if verbose:
         print(f"Created {output_video} with {len(audio_tracks)} audio track(s)")
     return True
@@ -506,6 +581,88 @@ def cleanup_temp_audio_files(audio_tracks, verbose=False):
     return deleted_count
 
 
+class _CancellableVideoWriter:
+    """Stream RGB frames to an owned encoder without changing legacy writers."""
+
+    def __init__(self, path, fps, codec_params, *, abort_check, timeout):
+        import math
+        import time
+
+        self.timeout = float(timeout)
+        if not math.isfinite(self.timeout) or self.timeout <= 0:
+            raise ValueError("Video encoding timeout must be finite and positive")
+        self.deadline = time.monotonic() + self.timeout
+        self.path, self.fps, self.codec_params = path, fps, codec_params
+        self.abort_check = abort_check
+        self.encoder = None
+        self.shape = None
+
+    def __enter__(self):
+        return self
+
+    def append_data(self, frame):
+        import time
+        from imageio_ffmpeg import get_ffmpeg_exe
+        from imageio.core.util import image_as_uint
+        from shared.utils.media_encoder import EncoderProcess
+
+        if callable(self.abort_check) and self.abort_check():
+            raise InterruptedError("Video encoding cancelled")
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Video encoding timed out")
+        frame = image_as_uint(np.asarray(frame), bitdepth=8)
+        if frame.ndim not in (2, 3):
+            raise ValueError("Video encoding requires two-dimensional image frames")
+        height, width = frame.shape[:2]
+        depth = frame.shape[2] if frame.ndim == 3 else 1
+        pixel_format = {1: "gray", 2: "gray8a", 3: "rgb24", 4: "rgba"}.get(depth)
+        if pixel_format is None:
+            raise ValueError("Video encoding supports one to four image channels")
+        shape = (height, width, depth)
+        if self.shape is not None and shape != self.shape:
+            raise ValueError("Video frame dimensions changed during encoding")
+        if self.encoder is None:
+            codec = self.codec_params.get("codec", "libx264")
+            command = [get_ffmpeg_exe(), "-nostdin", "-y", "-f", "rawvideo",
+                       "-vcodec", "rawvideo", "-s", f"{width}x{height}",
+                       "-pix_fmt", pixel_format, "-r", f"{self.fps:.02f}", "-i", "-",
+                       "-an", "-vcodec", codec,
+                       "-pix_fmt", self.codec_params.get("pixelformat", "yuv420p")]
+            # Preserve imageio's omitted-quality and macroblock behavior.
+            quality = self.codec_params.get("quality")
+            if quality is not None:
+                inverse_quality = 1 - quality / 10.0
+                command += (["-crf", str(int(inverse_quality * 51))] if codec == "libx264"
+                            else ["-qscale:v", str(int(inverse_quality * 30) + 1)])
+            if width % 16 or height % 16:
+                command += ["-vf", f"scale={(width + 15) // 16 * 16}:{(height + 15) // 16 * 16}"]
+            command += ["-v", "error", *self.codec_params.get("output_params", []), self.path]
+            if callable(self.abort_check) and self.abort_check():
+                raise InterruptedError("Video encoding cancelled")
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Video encoding timed out")
+            self.encoder = EncoderProcess(command, timeout=remaining, abort_check=self.abort_check)
+            self.encoder.__enter__()
+            self.shape = shape
+        self.encoder.write(np.ascontiguousarray(frame).tobytes())
+
+    def __exit__(self, exc_type, exc, traceback):
+        if self.encoder is None:
+            if exc_type is None:
+                raise RuntimeError("No video frames were encoded")
+            return False
+        if exc_type is not None:
+            return self.encoder.__exit__(exc_type, exc, traceback)
+        try:
+            if self.encoder.finish() != 0:
+                raise RuntimeError("Video encoding failed")
+        finally:
+            self.encoder.__exit__(None, None, None)
+        return False
+
+
 def save_video(tensor,
                 save_file=None,
                 fps=30,
@@ -514,8 +671,12 @@ def save_video(tensor,
                 nrow=8,
                 normalize=True,
                 value_range=(-1, 1),
-                retry=5):
-    """Save tensor as video with configurable codec and container options."""
+                retry=5, *, abort_check=None, timeout=None):
+    """Save tensor as video with configurable codec and container options.
+
+    Optional cancellation/deadline controls own the encoder lifecycle and
+    propagate failures without retry. Calls without controls retain imageio.
+    """
         
     if torch.is_tensor(tensor) and len(tensor.shape) == 4:
         tensor = tensor.unsqueeze(0)
@@ -530,11 +691,25 @@ def save_video(tensor,
     
     # Process and save
     error = None
+    controlled = abort_check is not None or timeout is not None
     for _ in range(retry):
+        encode_file = cache_file
         try:
+            if controlled:
+                handle, encode_file = tempfile.mkstemp(
+                    prefix=".video-encode-", suffix=suffix,
+                    dir=os.path.dirname(os.path.abspath(cache_file)),
+                )
+                os.close(handle)
             # Write video (silence ffmpeg logs)
-            writer = imageio.get_writer(cache_file, fps=fps, ffmpeg_log_level='error', **codec_params)
-            try:
+            if abort_check is not None or timeout is not None:
+                writer = _CancellableVideoWriter(
+                    encode_file, fps, codec_params, abort_check=abort_check,
+                    timeout=600 if timeout is None else timeout,
+                )
+            else:
+                writer = imageio.get_writer(cache_file, fps=fps, ffmpeg_log_level='error', **codec_params)
+            with writer:
                 if torch.is_tensor(tensor):
                     # Stream frames to avoid materializing the full video on CPU.
                     if tensor.dtype == torch.uint8 and tensor.ndim == 5 and tensor.shape[0] == 1 and nrow == 1:
@@ -588,14 +763,21 @@ def save_video(tensor,
                 else:
                     for frame in tensor:
                         writer.append_data(frame)
-            finally:
-                writer.close()
 
+            if controlled:
+                if callable(abort_check) and abort_check():
+                    raise InterruptedError("Video encoding cancelled")
+                os.replace(encode_file, cache_file)
             return cache_file
 
         except Exception as e:
+            if abort_check is not None or timeout is not None:
+                raise
             error = e
             print(f"error saving {save_file}: {e}")
+        finally:
+            if controlled and encode_file != cache_file:
+                _remove_encoding_temporary(encode_file)
 
 
 def _get_codec_params(codec_type, container):

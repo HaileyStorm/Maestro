@@ -105,6 +105,63 @@ class DeliveryPublicationTests(unittest.TestCase):
             metadata["frame_count"] = 2
             self.assertEqual(ns["_coded_video_size"]("segment.mp4", expected_frames=2), (2016, 1152))
 
+    def test_tools_cancel_after_mux_preserves_source_without_recording_final(self):
+        # Import native-extension dependencies before patch.dict restores sys.modules.
+        from shared.utils import audio_video  # noqa: F401
+        import contextlib
+        import time
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "source.mp4"
+            source.write_bytes(b"original")
+            temporary = Path(folder) / ".upscale.mp4"
+            temporary.write_bytes(b"upscaled")
+            final = Path(folder) / "final.mp4"
+            job = {"params": {"video_path": str(source)}, "out_dir": folder}
+            def mux(video, audio, destination, **kwargs):
+                Path(destination).write_bytes(b"muxed")
+                job["cancelled"] = True
+            wgp = SimpleNamespace(save_path=folder, server_config={},
+                extract_audio_tracks=lambda _: (["audio"], []),
+                cleanup_temp_audio_files=Mock(), release_flashvsr_vram=Mock(),
+                get_available_filename=lambda *args, **kwargs: str(final),
+                combine_video_with_audio_tracks=mux,
+                flashvsr=SimpleNamespace(is_upsampling=lambda _: True))
+            record = Mock()
+            finish = Mock()
+            ns = load_functions("_run_tool_upscale", wgp=wgp, time=time,
+                _jobs={"job": job}, _gen_lock=None, _active_gen_states={},
+                generation_slot=lambda *args: contextlib.nullcontext(True),
+                _WgpNativeGpuExecutionSlot=lambda *args: contextlib.nullcontext(True),
+                try_start=lambda *args, **kwargs: True,
+                register_abort_state=lambda *args: True, unregister_abort_state=Mock(),
+                update_job=lambda *args, **kwargs: True,
+                _resolve_tool_clip_path=lambda *args: str(source),
+                _chunked_flashvsr_upscale=lambda *args, **kwargs: str(temporary),
+                record_job_outputs=record, finish_job=finish)
+            with patch.dict(sys.modules, {"shared.utils.utils": SimpleNamespace(
+                    get_video_info=lambda _: (2, 32, 32, 2))}):
+                self.assertFalse(ns["_run_tool_upscale"]("job"))
+            self.assertEqual(source.read_bytes(), b"original")
+            self.assertEqual(list(Path(folder).iterdir()), [source])
+            record.assert_not_called()
+            finish.assert_not_called()
+
+    def test_tools_upscale_binds_abort_and_deadline_for_every_encoder(self):
+        tree = ast.parse((ROOT / "app/launch.py").read_text())
+        runner = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                      and node.name == "_run_tool_upscale")
+        calls = [node for node in ast.walk(runner) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Attribute)
+                 and node.func.attr in {"save_video", "combine_video_with_audio_tracks"}]
+        self.assertEqual(len(calls), 4)
+        for call in calls:
+            keywords = {item.arg: item.value for item in call.keywords}
+            self.assertEqual(ast.unparse(keywords["abort_check"]), "_abort")
+            self.assertEqual(ast.literal_eval(keywords["timeout"]), 600)
+        self.assertTrue(any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                            and node.func.id == "_remove_encoding_temporary"
+                            for node in ast.walk(runner)))
+
     def test_api_deferral_uses_the_bridge_classifier(self):
         tree = ast.parse((ROOT / "app/launch.py").read_text())
         runner = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_run_generation")
@@ -280,6 +337,167 @@ class DeliveryCodecTests(unittest.TestCase):
                 self.assertEqual(int(video["nb_frames"]), 2)
                 self.assertTrue(any(stream["codec_type"] == "audio" for stream in data["streams"]))
                 self.assertEqual(list(Path(folder).iterdir()), [source])
+
+
+@unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "CPU media tools required")
+class SharedEncodingIntegrationTests(unittest.TestCase):
+    def test_controlled_writer_preserves_frame_conversion_and_codec(self):
+        import torch
+        from shared.utils.audio_video import save_video
+        data = torch.linspace(-1, 1, 3 * 2 * 32 * 32).reshape(1, 3, 2, 32, 32)
+        for codec, container in ((None, "mp4"), ("libx264_8", "mp4"), ("libx264_10", "mp4"),
+                                  ("libx264_lossless", "mkv")):
+            with self.subTest(codec=codec), tempfile.TemporaryDirectory() as folder:
+                before = str(Path(folder) / ("legacy." + container))
+                after = str(Path(folder) / ("controlled." + container))
+                common = dict(tensor=data, fps=2, codec_type=codec, container=container, nrow=1)
+                self.assertEqual(save_video(save_file=before, **common), before)
+                self.assertEqual(save_video(save_file=after, timeout=30, abort_check=lambda: False, **common), after)
+                def decoded(path):
+                    return subprocess.check_output([
+                        "ffmpeg", "-v", "error", "-i", path, "-threads", "1",
+                        "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], timeout=20)
+                old, new = decoded(before), decoded(after)
+                self.assertEqual(len(old), 2 * 32 * 32 * 3)
+                self.assertEqual(old, new)
+
+    def test_controlled_writer_preserves_grayscale_and_alpha_inputs(self):
+        import numpy as np
+        from shared.utils.audio_video import save_video
+        for depth in (1, 2, 4):
+            shape = (32, 32) if depth == 1 else (32, 32, depth)
+            frame = np.arange(np.prod(shape), dtype=np.uint8).reshape(shape)
+            with self.subTest(depth=depth), tempfile.TemporaryDirectory() as folder:
+                paths = [str(Path(folder) / name) for name in ("legacy.mp4", "controlled.mp4")]
+                save_video([frame, frame], save_file=paths[0], fps=2, codec_type=None)
+                save_video([frame, frame], save_file=paths[1], fps=2, codec_type=None, timeout=20)
+                decoded = [subprocess.check_output([
+                    "ffmpeg", "-v", "error", "-i", path, "-threads", "1",
+                    "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], timeout=20) for path in paths]
+                self.assertEqual(len(decoded[0]), 2 * 32 * 32 * 3)
+                self.assertEqual(*decoded)
+
+    def test_controlled_writer_cancellation_is_not_retried(self):
+        import numpy as np
+        from shared.utils.audio_video import save_video
+        checks = []
+        def cancel():
+            checks.append(True)
+            return True
+        with tempfile.TemporaryDirectory() as folder:
+            with self.assertRaises(InterruptedError):
+                save_video([np.zeros((32, 32, 3), dtype=np.uint8)],
+                           save_file=str(Path(folder) / "cancel.mp4"),
+                           abort_check=cancel, timeout=5, retry=5)
+            self.assertEqual(len(checks), 1)
+
+    def test_controlled_audio_mux_preserves_tracks_and_language(self):
+        from shared.utils.audio_video import combine_video_with_audio_tracks
+        with tempfile.TemporaryDirectory() as folder:
+            video, audio, output = [str(Path(folder) / name) for name in ("video.mp4", "audio.m4a", "mux.mp4")]
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                            "color=c=red:s=32x32:r=2:d=1", "-c:v", "libx264", "-threads", "1", video],
+                           check=True, capture_output=True, timeout=20)
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                            "sine=frequency=330:sample_rate=48000:duration=1", "-c:a", "aac", audio],
+                           check=True, capture_output=True, timeout=20)
+            self.assertTrue(combine_video_with_audio_tracks(video, [audio], output,
+                            audio_metadata=[{"language": "eng"}], abort_check=lambda: False, timeout=20))
+            data = json.loads(subprocess.check_output(["ffprobe", "-v", "error", "-show_streams", "-of", "json", output]))
+            self.assertEqual([item["codec_type"] for item in data["streams"]], ["video", "audio"])
+            self.assertEqual(data["streams"][1]["tags"]["language"], "eng")
+            self.assertEqual(data["streams"][0]["nb_frames"], "2")
+            empty_output = str(Path(folder) / "empty-audio.mp4")
+            self.assertTrue(combine_video_with_audio_tracks(video, [], empty_output))
+            self.assertFalse(combine_video_with_audio_tracks(video, [], output, timeout=5))
+            self.assertTrue(Path(empty_output).is_file())
+
+    def test_conversion_exhausting_deadline_never_starts_encoder(self):
+        import time
+        import numpy as np
+        from shared.utils import audio_video, media_encoder
+        class SlowFrame:
+            def __array__(self, dtype=None):
+                time.sleep(0.03)
+                return np.zeros((32, 32, 3), dtype=np.uint8)
+        with patch.object(media_encoder, "EncoderProcess") as encoder:
+            writer = audio_video._CancellableVideoWriter("unused.mp4", 2, {},
+                                                        abort_check=None, timeout=0.01)
+            with self.assertRaises(TimeoutError), writer:
+                writer.append_data(SlowFrame())
+            encoder.assert_not_called()
+
+    def test_cleanup_lock_preserves_cancellation_and_reports_residue(self):
+        import numpy as np
+        from shared.utils import audio_video
+        with tempfile.TemporaryDirectory() as folder:
+            destination = Path(folder) / "existing.mp4"
+            destination.write_bytes(b"existing")
+            def fail_frame(writer, frame):
+                Path(writer.path).write_bytes(b"partial")
+                raise InterruptedError("original cancellation")
+            with patch.object(audio_video._CancellableVideoWriter, "append_data", fail_frame), \
+                    patch.object(os, "remove", side_effect=PermissionError("locked")) as remove, \
+                    patch("time.sleep"), patch("builtins.print") as report:
+                with self.assertRaisesRegex(InterruptedError, "original cancellation"):
+                    audio_video.save_video([np.zeros((32, 32, 3), dtype=np.uint8)],
+                                           save_file=str(destination), timeout=5)
+                self.assertEqual(remove.call_count, 5)
+                report.assert_called_once_with("[Media] An unfinished encoding temporary file could not be removed")
+            self.assertEqual(destination.read_bytes(), b"existing")
+            self.assertEqual(len(list(Path(folder).iterdir())), 2)
+            temporary = next(path for path in Path(folder).iterdir() if path != destination)
+            real_remove = os.remove
+            attempts = []
+            def locked_then_free(path):
+                attempts.append(path)
+                if len(attempts) < 3:
+                    raise PermissionError("locked")
+                real_remove(path)
+            with patch.object(os, "remove", side_effect=locked_then_free), patch("time.sleep"):
+                self.assertTrue(audio_video._remove_encoding_temporary(str(temporary)))
+            self.assertEqual(len(attempts), 3)
+            self.assertEqual(list(Path(folder).iterdir()), [destination])
+
+    def test_controlled_shared_failures_preserve_existing_destination(self):
+        import numpy as np
+        from shared.utils import audio_video
+        from shared.utils import media_encoder
+        with tempfile.TemporaryDirectory() as folder:
+            destination = Path(folder) / "existing.mp4"
+            destination.write_bytes(b"existing")
+            def fail_frame(writer, frame):
+                Path(writer.path).write_bytes(b"partial")
+                raise InterruptedError("cancelled")
+            with patch.object(audio_video._CancellableVideoWriter, "append_data", fail_frame):
+                with self.assertRaises(InterruptedError):
+                    audio_video.save_video([np.zeros((32, 32, 3), dtype=np.uint8)],
+                        save_file=str(destination), timeout=5)
+            self.assertEqual(destination.read_bytes(), b"existing")
+            self.assertEqual(list(Path(folder).iterdir()), [destination])
+            def fail_mux(command, **kwargs):
+                if "stdout" in kwargs:
+                    kwargs["stdout"].write(b'{"streams":[{"duration":"1"}]}')
+                    return 0
+                Path(command[-1]).write_bytes(b"partial mux")
+                raise InterruptedError("cancelled")
+            with patch.object(media_encoder, "run_encoder", side_effect=fail_mux):
+                with self.assertRaises(InterruptedError):
+                    audio_video.combine_video_with_audio_tracks("video", ["audio"],
+                        str(destination), timeout=5)
+            self.assertEqual(destination.read_bytes(), b"existing")
+            self.assertEqual(list(Path(folder).iterdir()), [destination])
+
+    def test_audio_mux_pre_cancel_preserves_source(self):
+        from shared.utils.audio_video import combine_video_with_audio_tracks
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "source.mp4"
+            source.write_bytes(b"preserve")
+            with self.assertRaises(InterruptedError):
+                combine_video_with_audio_tracks(str(source), ["audio"], str(Path(folder) / "out.mp4"),
+                                               abort_check=lambda: True, timeout=5)
+            self.assertEqual(list(Path(folder).iterdir()), [source])
+            self.assertEqual(source.read_bytes(), b"preserve")
 
 
 if __name__ == "__main__":

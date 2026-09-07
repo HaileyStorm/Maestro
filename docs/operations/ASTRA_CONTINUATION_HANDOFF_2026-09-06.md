@@ -1181,3 +1181,31 @@ unproven. The owner has authorized GPU work only under fresh coordinator grants;
 this checkpoint requested no lease and performed no GPU or model work. Preserve
 the historical tracker hold and all unrelated WIP. The continuous Goal remains
 active with this and the existing planned backlog outstanding.
+
+### Shared delivery encoder cancellation (2026-09-07)
+
+The prior segment-writer/audio-mux cancellation gap is now addressed through
+optional shared abort/deadline controls. The owned encoder controller monitors
+blocked pipe writes and finalization, terminates then kills/reaps only its child,
+and joins its monitor. Controlled muxing bounds the duration probe and mux under
+one deadline. Delivery and Tools Upscale pass those controls; concat/exact-fit
+reuse the same controller. Calls without controls retain the legacy imageio
+path and existing empty-audio video-copy behavior.
+
+Controlled encoding preserves imageio's effective omitted-quality behavior,
+explicit codec options, channel conversion, macroblock sizing and frame-rate
+formatting. Private staging and atomic publication preserve existing destination
+bytes on failure or cancellation. Cleanup retries transient permission locks,
+reports residual private temporaries without paths, and preserves the primary
+error. Tools removes its owned final if cancellation arrives after muxing but
+before output recording; the source remains untouched.
+
+Evidence includes the 439-test affected integration run and 81-test final
+closure, actual CPU decoded-frame parity and audio metadata checks, blocked-pipe
+and child-reaping tests, and mocked Windows process flags. Windows execution,
+live GPU/model acceptance and browser acceptance remain separate. Evidence and
+exact source hashes: `.artifacts-temp/astra-delivery-cancellation-20260907/`.
+The reviewer was interrupted by a quota event; closure resumed after a native
+usage read confirmed capacity. No reset credit, GPU, model, service restart,
+Beads mutation or external provider was used. Preserve unrelated WIP and continue
+the existing prompt/native-conditioning, compatibility and browser backlog.
