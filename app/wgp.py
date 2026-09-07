@@ -10893,6 +10893,12 @@ def _generate_video_impl(
         )
     )
     semantic_reference_mode = bool(model_def.get("minimax_h3_reference_mode", False))
+    if semantic_reference_mode:
+        from services.h3_reference_inputs import (
+            selected_h3_video_slots,
+            prepare_h3_reference_video_slots,
+            extract_h3_reference_soundtracks,
+        )
     is_image = image_mode > 0
     audio_only = model_def.get("audio_only", False)
     duration_def = model_def.get("duration_slider", None)
@@ -11732,7 +11738,7 @@ def _generate_video_impl(
     control_audio_tracks = source_audio_tracks = source_audio_metadata = []
     if any_letters(audio_prompt_type, "R") and video_guide is not None and MMAudio_setting == 0 and not any_letters(audio_prompt_type, "ABXK"):
         control_audio_tracks, _  = extract_audio_tracks(video_guide, temp_format="wav")
-    if "K" in audio_prompt_type and video_guide is not None:
+    if "K" in audio_prompt_type and video_guide is not None and not semantic_reference_mode:
         try:
             if extract_audio_tracks(video_guide, query_only=True) == 0:
                 print(f"No audio track found in Control Video: {video_guide}")
@@ -11765,7 +11771,7 @@ def _generate_video_impl(
     # generate a video from text prompt alone without erroring on the
     # missing audio. The temp file is registered for cleanup later.
     # (Upstream Wan2GP added this in MegaMix commit ecfe88b.)
-    if "A" in audio_prompt_type and audio_guide is None:
+    if "A" in audio_prompt_type and audio_guide is None and not semantic_reference_mode:
         audio_guide = create_silent_wav_file(
             durable_output_dir or save_path,
             current_video_length / fps,
@@ -11873,8 +11879,9 @@ def _generate_video_impl(
     # False so the flag is in scope for later window-loop callers when
     # the audio block doesn't fire.
     # (Upstream Wan2GP added this in MegaMix commit ecfe88b.)
-    video_length_not_limited_by_audio = False
-    if audio_guide != None:
+    video_length_not_limited_by_audio = semantic_reference_mode
+    # Semantic soundtracks describe references, not the target audio timeline.
+    if audio_guide != None and not semantic_reference_mode:
         from preprocessing.extract_vocals import get_vocals
         import librosa
         duration = librosa.get_duration(path=audio_guide)
@@ -12469,7 +12476,7 @@ def _generate_video_impl(
             aligned_guide_start_frame = guide_start_frame - alignment_shift
             aligned_guide_end_frame = guide_end_frame - alignment_shift
             aligned_window_start_frame = window_start_frame - alignment_shift  
-            if audio_guide is not None and model_def.get("audio_guide_window_slicing", False):
+            if audio_guide is not None and model_def.get("audio_guide_window_slicing", False) and not semantic_reference_mode:
                 audio_start_frame = aligned_window_start_frame
                 if reset_control_aligment:
                     audio_start_frame += source_video_overlap_frames_count
@@ -12489,7 +12496,7 @@ def _generate_video_impl(
                 if audio_frame_offset > 0:
                     audio_energy = float(np.abs(input_waveform).mean()) if input_waveform is not None else 0
                     print(f"[Multi-Clip] clip audio_start_frame={audio_start_frame} (offset={audio_frame_offset}), frames={current_video_length}, audio_energy={audio_energy:.6f}")
-            elif model_def.get("audio_guide_window_slicing", False):
+            elif model_def.get("audio_guide_window_slicing", False) and not semantic_reference_mode:
                 # Native-audio models continue from the exact audio tail they
                 # generated in the preceding window. If the first pass begins
                 # with source-video overlap, seed it from the source soundtrack.
@@ -12906,10 +12913,29 @@ def _generate_video_impl(
                         "h3_native_boundary_conditioning"
                     ] = True
                 if semantic_reference_mode:
-                    reference_paths = [
-                        path for path in (video_guide, video_guide2, video_guide3)
-                        if path is not None
-                    ]
+                    if "K" in audio_prompt_type:
+                        def h3_soundtrack_destination(ordinal, source_path):
+                            label = "control-audio" if ordinal == 1 else f"control-audio-{ordinal}"
+                            output = _recovery_preprocess_path(label)
+                            if output is None:
+                                output = get_available_filename(
+                                    save_path, source_path,
+                                    suffix=f"_control_audio_{ordinal}", force_extension=".wav",
+                                )
+                            return output
+
+                        audio_guide, audio_guide2, audio_guide3 = extract_h3_reference_soundtracks(
+                            video_prompt_type, (video_guide, video_guide2, video_guide3),
+                            has_audio=lambda path: extract_audio_tracks(path, query_only=True) != 0,
+                            destination=h3_soundtrack_destination,
+                            extract=extract_audio_track_to_wav,
+                            register=temp_filenames_list.append,
+                            cleanup=remove_temp_filenames,
+                        )
+                    reference_slots = selected_h3_video_slots(
+                        video_prompt_type, (video_guide, video_guide2, video_guide3),
+                    )
+                    reference_paths = [path for _slot, path in reference_slots]
                     if reference_paths:
                         send_cmd("progress", [0, get_latest_status(state, "Preparing Semantic References")])
                     reference_durations = []
@@ -12927,12 +12953,10 @@ def _generate_video_impl(
                             "MiniMax H3 reference videos must total at most 15 seconds; "
                             f"found {sum(reference_durations):.2f}s."
                         )
-                    prepared_reference_videos = [
-                        prepare_semantic_reference_video(path, fps, model_def)
-                        for path in reference_paths
-                    ]
-                    prepared_reference_videos += [None] * (3 - len(prepared_reference_videos))
-                    src_video, src_video2, src_video3 = prepared_reference_videos[:3]
+                    src_video, src_video2, src_video3 = prepare_h3_reference_video_slots(
+                        video_prompt_type, (video_guide, video_guide2, video_guide3),
+                        prepare=lambda path: prepare_semantic_reference_video(path, fps, model_def),
+                    )
                 overridden_inputs = None
                 samples = call_with_lightx2v_cleanup(
                     lightx2v_runtime_requested,

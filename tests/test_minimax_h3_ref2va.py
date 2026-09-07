@@ -289,6 +289,8 @@ class TestMiniMaxH3Ref2VADefinition(unittest.TestCase):
         valid = {
             "image_refs": [object()] * 6,
             "video_prompt_type": "V+",
+            "video_guide": "one.mp4",
+            "video_guide2": "two.mp4",
             "audio_prompt_type": "ABC",
         }
         self.assertIsNone(
@@ -304,6 +306,8 @@ class TestMiniMaxH3Ref2VADefinition(unittest.TestCase):
         too_many_mixed = {
             "image_refs": [object()] * 9,
             "video_prompt_type": "V+",
+            "video_guide": "one.mp4",
+            "video_guide2": "two.mp4",
             "audio_prompt_type": "AB",
         }
         self.assertIn(

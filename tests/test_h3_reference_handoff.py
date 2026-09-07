@@ -2,12 +2,15 @@
 import ast
 import copy
 import os
+import sys
 from pathlib import Path
 import types
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 MAIN = ROOT / 'app/models/minimax_h3/minimax_h3_main.py'
+sys.path.insert(0, str(ROOT / 'app'))
+from services.h3_reference_inputs import selected_h3_video_slots
 
 
 def _helpers():
@@ -30,20 +33,18 @@ def _helpers():
 
 def _runtime_video_refs(params):
     module = ast.parse(MAIN.read_text())
-    for node in ast.walk(module):
-        if isinstance(node, ast.FunctionDef):
-            for index, item in enumerate(node.body):
-                if isinstance(item, ast.Assign) and any(
-                    isinstance(target, ast.Name) and target.id == 'selected_video_refs'
-                    for target in item.targets
-                ):
-                    namespace = {'video_prompt_type': params.get('video_prompt_type', ''),
-                                 'input_frames': params.get('video_guide'),
-                                 'input_frames2': params.get('video_guide2'),
-                                 'input_frames3': params.get('video_guide3')}
-                    exec(compile(ast.Module(body=node.body[index:index + 3], type_ignores=[]), 'runtime-video-selection', 'exec'), namespace)
-                    return namespace['video_refs']
-    raise AssertionError('active runtime selector not found')
+    assignment = next(node for node in ast.walk(module)
+                      if isinstance(node, ast.Assign) and any(
+                          isinstance(target, ast.Name) and target.id == 'video_refs'
+                          for target in node.targets
+                      ) and 'selected_h3_video_slots' in ast.unparse(node.value))
+    namespace = {'video_prompt_type': params.get('video_prompt_type', ''),
+                 'input_frames': params.get('video_guide'),
+                 'input_frames2': params.get('video_guide2'),
+                 'input_frames3': params.get('video_guide3'),
+                 'selected_h3_video_slots': selected_h3_video_slots}
+    exec(compile(ast.Module(body=[assignment], type_ignores=[]), 'runtime-video-selection', 'exec'), namespace)
+    return namespace['video_refs']
 
 
 class H3ReferenceHandoffTests(unittest.TestCase):

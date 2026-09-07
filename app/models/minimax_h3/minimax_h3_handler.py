@@ -591,6 +591,8 @@ class family_handler:
             validate_prompt_media_ordinals,
         )
 
+        from services.h3_reference_inputs import H3ReferenceInputError, selected_h3_video_slots
+
         custom_for_audio = custom_settings if isinstance(custom_settings, dict) else {}
         audio_prompt_type = inputs.get("audio_prompt_type") or ""
         video_prompt_type = inputs.get("video_prompt_type") or ""
@@ -645,16 +647,11 @@ class family_handler:
                 if _is_reference_mode(base_model_type)
                 else sum(inputs.get(key) is not None for key in ("image_start", "image_end"))
             )
-            selected_video_slots = []
-            if "V" in video_prompt_type:
-                selected_video_slots.append(inputs.get("video_guide"))
-                if "+" in video_prompt_type:
-                    selected_video_slots.append(inputs.get("video_guide2"))
-                if "++" in video_prompt_type or inputs.get("video_guide3") is not None:
-                    selected_video_slots.append(inputs.get("video_guide3"))
-            video_count_for_ordinals = sum(
-                slot is not None for slot in selected_video_slots
+            selected_video_slots = selected_h3_video_slots(
+                video_prompt_type,
+                tuple(inputs.get(key) for key in ("video_guide", "video_guide2", "video_guide3")),
             )
+            video_count_for_ordinals = len(selected_video_slots)
             legacy_audio_count = (
                 video_count_for_ordinals
                 if "K" in audio_prompt_type
@@ -677,7 +674,7 @@ class family_handler:
                     else legacy_audio_count
                 ),
             )
-        except (H3AudioCompatibilityError, H3MediaMapError) as error:
+        except (H3AudioCompatibilityError, H3MediaMapError, H3ReferenceInputError) as error:
             return str(error)
         if isinstance(custom_settings, dict) and custom_settings.get("h3_spectrum_profile"):
             from .spectrum import SpectrumCompatibilityError, validate_spectrum_request
@@ -772,15 +769,7 @@ class family_handler:
                 "Ref2VA accepts semantic references instead"
             )
         image_count = len(image_refs)
-        # WanGP currently exposes two named video-guide slots, while the model
-        # contract supports three.  Count a future third slot when supplied and
-        # otherwise derive the requested slot count from the selector flags.
-        named_video_count = sum(
-            inputs.get(key) is not None
-            for key in ("video_guide", "video_guide2", "video_guide3")
-        )
-        selected_video_count = int("V" in video_prompt_type) + video_prompt_type.count("+")
-        video_count = max(named_video_count, selected_video_count)
+        video_count = video_count_for_ordinals
         audio_count = video_count if "K" in audio_prompt_type else sum(
             letter in audio_prompt_type for letter in "ABC"
         )

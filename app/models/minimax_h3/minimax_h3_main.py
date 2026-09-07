@@ -1374,14 +1374,11 @@ class MiniMaxH3Model:
             image_refs = list(input_ref_images)
         else:
             image_refs = [input_ref_images]
-        selected_video_refs = []
-        if "V" in (video_prompt_type or ""):
-            selected_video_refs.append(input_frames)
-            if "+" in (video_prompt_type or ""):
-                selected_video_refs.append(input_frames2)
-            if "++" in (video_prompt_type or "") or input_frames3 is not None:
-                selected_video_refs.append(input_frames3)
-        video_refs = [source for source in selected_video_refs if source is not None]
+        from services.h3_reference_inputs import selected_h3_video_slots
+
+        video_refs = [value for _slot, value in selected_h3_video_slots(
+            video_prompt_type, (input_frames, input_frames2, input_frames3),
+        )]
 
         loaded_audio_guides = [
             self._load_waveform(path)

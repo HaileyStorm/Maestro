@@ -1681,3 +1681,51 @@ a late asset is authored or allow mapping to rewrite sealed source/event ownersh
 The original-source target-switch recipe and full caller integration remain open,
 as do rendered-browser and live acceptance. Continue from these active owners;
 the full continuous Goal remains active.
+
+
+### Selected runtime references and multiple soundtracks (2026-09-07)
+
+Admission, semantic video preprocessing, native model selection and continuation
+capacity now share selected_h3_video_slots. Prepared videos retain their physical
+slots until the native model presents them in compacted order. This fixes an
+implicit third reference being moved into an inactive second slot and then
+silently discarded. Capacity counts selected inputs rather than phantom selector
+slots or inactive uploads; upstream required-file admission remains unchanged.
+
+H3 K mode extracts one soundtrack for every selected reference video in the same
+presentation order, using separate recovery destinations. Outputs are registered
+before extraction and a failed attempt removes its completed and partial files,
+including on cancellation. Extraction now runs inside the generation error
+boundary. Missing or unreadable soundtracks fail with bounded actionable errors;
+ordinary probe, destination, registration and decoder errors do not expose source
+paths or stderr in that message. Cancellation still propagates. Semantic reference
+audio bypasses generic timeline trimming, normalization, target-window slicing,
+its continuation-audio fallback, and silent-audio synthesis,
+so unequal soundtrack lengths cannot shorten the requested output. The non-H3
+single-video extraction branch retains its exact prior control flow.
+
+The unused selected-path snapshot was deferred with its tests; its pre-removal
+source is retained in private evidence. It supplies no filesystem admission,
+immutable asset identity, inferred reference role or content judgment. The separate
+h3_prompt_mapping core and its composition probes remain unadopted under
+`.artifacts-temp/astra-h3-mapping-runtime-20260907/`; no active mapper caller is
+introduced by this runtime repair.
+
+The final runtime gate runs 423 tests with no failures/errors and 13 explicit
+CUDA/managed-asset skips, with stable source hashes. Syntax checks pass. A real
+CPU ffprobe/ffmpeg probe extracts distinct 440/880 Hz synthetic soundtracks from
+physical video slots one and three in the correct compacted order. Evidence is
+retained under `.artifacts-temp/astra-h3-mapping-runtime-20260907/evidence/`.
+Independent review closed the cleanup, error-boundary, output-duration and
+window-slicing findings; the unused snapshot was deferred. These are
+CPU/AST/synthetic and local codec checks, not model generation, GPU,
+rendered-browser, Windows or human acceptance.
+
+Next bind the original-source mapping recipe at the actual adaptive caller.
+Preserve raw source paths before _parse_task_manifest materializes images, then
+reconcile the late continuation reference and resolved soundtrack inputs before
+transactional per-segment prompt rewriting. Planning metadata alone cannot prove
+the selected asset or authorize resealing an existing plan. Generated Ref-to-Base
+switching must rebuild retained original source; authored Ref ownership remains
+separate. Browser and live acceptance remain open, and the continuous Goal stays
+active. The historical tracker hold and service/provider boundaries are unchanged.

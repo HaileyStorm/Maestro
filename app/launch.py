@@ -15161,20 +15161,15 @@ def _h3_preferred_fl2va_model(body: dict) -> str:
 
 def _h3_ref2va_reference_capacity(params: dict, *, handoff_seconds: float) -> dict:
     """Describe whether one rolling video or still reference can be appended."""
-    video_keys = ("video_guide", "video_guide2", "video_guide3")
+    from services.h3_reference_inputs import VIDEO_KEYS, selected_h3_video_slots
+
+    video_keys = VIDEO_KEYS
     occupied_slots = [
         slot for slot, key in enumerate(video_keys, start=1) if params.get(key)
     ]
-    video_type = str(params.get("video_prompt_type") or "")
-    selected_slots = [
-        slot for slot in occupied_slots
-        if "V" in video_type and (
-            slot == 1 or (slot == 2 and "+" in video_type)
-            or (slot == 3 and (
-                "++" in video_type or params.get("video_guide3") is not None
-            ))
-        )
-    ]
+    selected_slots = [slot for slot, path in selected_h3_video_slots(
+        params.get("video_prompt_type"), tuple(params.get(key) for key in video_keys),
+    ) if path]
     video_paths = [params[video_keys[slot - 1]] for slot in selected_slots]
     # Append after existing physical slots, never fill a gap that would
     # renumber an authored Video ordinal or enable an inactive upload.
