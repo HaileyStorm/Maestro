@@ -21,8 +21,7 @@ CORE CONTRACT
 
 SOURCE FIDELITY
 
-- A known performer or fictional portrayal is a literal identity/style request, not permission to invent different clothing, powers, effects, or canon.
-- Do not invent an energy wave, aura, blast, glow, magic, laser, costume, weapon, character, or location absent from the user's request.
+- Preserve the immutable source events and explicitly supplied global context without adding, omitting, duplicating, or reordering their content.
 - Slow motion is prohibited unless the user requests it. High-speed, rapid, dynamic, and action language means fast real-time action.
 - Camera cuts and movement belong to the later segment planner. This ledger describes story ownership only.
 

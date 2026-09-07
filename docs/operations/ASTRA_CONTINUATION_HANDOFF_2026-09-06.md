@@ -1476,3 +1476,32 @@ round trips are stable. Evidence: `.artifacts-temp/astra-reference-binding-20260
 Use this projection with validated active inputs for mapper integration, adding
 separately proven asset identity when available. No GPU/model/service/browser or
 Windows acceptance is claimed. The inherited keyword-check audit remains separate.
+
+### Planner subject-keyword enforcement removed (2026-09-07)
+
+Removed UNREQUESTED_SPECTACLE_PATTERNS, the ledger/segment keyword rejection
+branches and error copy, and the helper alias/import. The unused direct-sequence
+_schema and _plan_violations functions and orphaned minimax_h3_reference_sequence
+guide are removed. The two actively loaded story guides now express fidelity
+through immutable source events and global context, without topic-specific lists.
+Source-event IDs/order, exact dialogue and materialization, beat ownership, shape,
+shot count and contiguous timing checks remain unchanged. Validator AST comparison
+confirms that only the keyword scans and their local string copies were removed.
+
+All 211 clean-candidate CPU tests pass, including formerly listed effects and
+adult/violent/controversial wording in otherwise-valid ledger/segment fields.
+Independent review found no loss of active contracts and identified the two
+unused predecessors removed before the final gate. Evidence:
+`.artifacts-temp/astra-planner-neutrality-20260907/`. Source/guides and deleted
+preimages remain available as provenance; no GPU/model/service acceptance is
+claimed.
+
+This closes the specific spectacle-word enforcement, not every neutrality or
+literal-preservation question. Next audit the age/style fragment stripping in
+h3_story_ledger._story_fragments and the automatic dialogue/camera
+classifiers in h3_planner_helpers. Preserve explicit source syntax and owner
+settings while removing subject/age heuristics; do not replace them with another
+word list or silently invent a fixed creative policy. Also inspect whether
+sanitize_h3_prompt_text changes exact authored dialogue when escaping template
+or Context-IR syntax. Mapper/caller integration and the broader backlog remain
+open; the continuous Goal remains active.

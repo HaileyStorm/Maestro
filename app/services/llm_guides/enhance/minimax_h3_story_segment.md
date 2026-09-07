@@ -23,8 +23,7 @@ LOCAL SEGMENT CONTRACT
 
 SOURCE FIDELITY
 
-- Preserve the exact named portrayals, identities, wardrobe, setting, props, actions, powers, tone, and ending in the assigned beats.
-- Do not invent energy waves, auras, glows, magic, laser effects, costumes, weapons, characters, locations, or lore.
+- Preserve the assigned source events and global context without adding, omitting, duplicating, or reordering their content.
 - Camera creativity changes only how the assigned action is shown, never what happens.
 
 Return valid JSON matching the schema exactly.

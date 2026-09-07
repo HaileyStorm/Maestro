@@ -129,6 +129,21 @@ class H3StoryLedgerTests(unittest.TestCase):
         self.assertIn("story event is duplicated", joined)
         self.assertIn("dialogue IDs are missing, duplicated", joined)
 
+    def test_creative_wording_does_not_change_structural_plan_acceptance(self):
+        for wording in ('golden energy', 'a force field', 'telekinesis', 'a laser beam',
+                        'adult drama', 'violent conflict', 'controversial politics'):
+            with self.subTest(wording=wording):
+                ledger = _ledger()
+                ledger['ambient_audio'] = wording
+                self.assertEqual(ledger_violations(
+                    self.prompt, ledger, segment_count=2, locked_dialogue=self.locked,
+                    expect_dialogue=True), [])
+                segment = _segment(1)
+                segment['shots'][0]['sound_effects'] = wording
+                self.assertEqual(segment_violations(
+                    self.prompt, segment, segment_number=1, duration=10.0,
+                    assigned_beats=[_ledger()['beats'][0]], dialogue_catalog=self.locked), [])
+
     def test_source_events_keep_the_requested_ending_and_drop_style_fragments(self):
         prompt = (
             "Superman and Thanos are trading punches. High-speed action movie dynamic superhero fight scenes. "

@@ -11,13 +11,9 @@ import math
 import re
 from typing import Any, Iterable
 
-from services.h3_story_ledger import (
-    UNREQUESTED_SPECTACLE_PATTERNS,
-    sanitize_h3_prompt_text,
-)
+from services.h3_story_ledger import sanitize_h3_prompt_text
 
 _CAMERA_COVERAGE_VALUES = {"auto", "continuous", "multi_shot"}
-_UNREQUESTED_SPECTACLE_PATTERNS = UNREQUESTED_SPECTACLE_PATTERNS
 
 
 def normalize_h3_camera_coverage(value: Any) -> str:

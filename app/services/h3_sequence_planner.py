@@ -20,7 +20,6 @@ from services.h3_story_ledger import (
     recover_h3_plain_story,
 )
 from services.h3_planner_helpers import (
-    _UNREQUESTED_SPECTACLE_PATTERNS,
     _compact,
     _fallback_plan,
     _infer_camera_coverage,
@@ -400,120 +399,6 @@ def _reference_context(references: list[dict[str, Any]]) -> tuple[str, str, str]
                 if "audio reference" not in task_types:
                     task_types.append("audio reference")
     return " ".join(relationships), "; ".join(retention), " + ".join(task_types)
-
-
-def _schema(clip_count: int) -> dict[str, Any]:
-    dialogue = {
-        "type": "object",
-        "properties": {
-            "speaker": {"type": "string"},
-            "speaker_id": {"type": "string"},
-            "language": {"type": "string"},
-            "delivery": {"type": "string"},
-            "action": {"type": "string"},
-            "text": {"type": "string"},
-        },
-        "required": ["speaker", "speaker_id", "language", "delivery", "action", "text"],
-        "additionalProperties": False,
-    }
-    shot = {
-        "type": "object",
-        "properties": {
-            "shot": {"type": "integer"},
-            "start_seconds": {"type": "number"},
-            "end_seconds": {"type": "number"},
-            "transition": {"type": "string"},
-            "framing": {"type": "string"},
-            "camera": {"type": "string"},
-            "action": {"type": "string"},
-            "dialogue": {"type": "array", "items": dialogue},
-            "sound_effects": {"type": "string"},
-        },
-        "required": [
-            "shot", "start_seconds", "end_seconds", "transition", "framing",
-            "camera", "action", "dialogue", "sound_effects",
-        ],
-        "additionalProperties": False,
-    }
-    clip = {
-        "type": "object",
-        "properties": {
-            "clip": {"type": "integer"},
-            "title": {"type": "string"},
-            "summary": {"type": "string"},
-            "opening_state": {"type": "string"},
-            "coverage": {"type": "string"},
-            "pacing": {"type": "string"},
-            "shots": {"type": "array", "minItems": 1, "maxItems": 4, "items": shot},
-            "closing_state": {"type": "string"},
-        },
-        "required": [
-            "clip", "title", "summary", "opening_state", "coverage",
-            "pacing", "shots", "closing_state",
-        ],
-        "additionalProperties": False,
-    }
-    return {
-        "type": "object",
-        "properties": {
-            "subject_definitions": {"type": "string"},
-            "retention_analysis": {"type": "string"},
-            "setting_continuity": {"type": "string"},
-            "visual_style": {"type": "string"},
-            "ambient_audio": {"type": "string"},
-            "music": {"type": "string"},
-            "clips": {
-                "type": "array",
-                "minItems": clip_count,
-                "maxItems": clip_count,
-                "items": clip,
-            },
-        },
-        "required": [
-            "subject_definitions", "retention_analysis", "setting_continuity",
-            "visual_style", "ambient_audio", "music", "clips",
-        ],
-        "additionalProperties": False,
-    }
-
-
-def _plan_violations(
-    source_prompt: str,
-    plan: dict[str, Any] | None,
-    *,
-    clip_count: int,
-    expect_dialogue: bool,
-) -> list[str]:
-    if not isinstance(plan, dict):
-        return ["invalid plan"]
-    clips = plan.get("clips") or []
-    violations: list[str] = []
-    if len(clips) != clip_count:
-        violations.append(f"returned {len(clips)} clips instead of {clip_count}")
-    lowered_source = str(source_prompt or "").casefold()
-    lowered_plan = json.dumps(plan, ensure_ascii=False).casefold()
-    for pattern in _UNREQUESTED_SPECTACLE_PATTERNS:
-        match = re.search(pattern, lowered_plan, flags=re.IGNORECASE)
-        if match and not re.search(pattern, lowered_source, flags=re.IGNORECASE):
-            violations.append(f"invented unrequested power/effect: {match.group(0).strip()}")
-            break
-    if any(
-        not isinstance(item, dict)
-        or not any(
-            isinstance(shot, dict) and str(shot.get("action") or "").strip()
-            for shot in (item.get("shots") or [])
-        )
-        for item in clips
-    ):
-        violations.append("one or more clips contain no visible shot action")
-    if expect_dialogue and not any(
-        isinstance(line, dict) and str(line.get("text") or "").strip()
-        for item in clips if isinstance(item, dict)
-        for shot in (item.get("shots") or []) if isinstance(shot, dict)
-        for line in (shot.get("dialogue") or [])
-    ):
-        violations.append("left a long named-character interaction entirely mute")
-    return violations
 
 
 def compile_h3_reference_sequence_prompts(

@@ -19,16 +19,6 @@ from typing import Any, Callable
 
 H3_STORY_LEDGER_VERSION = 2
 
-UNREQUESTED_SPECTACLE_PATTERNS = (
-    r"\bgolden\s+energy\b",
-    r"\b(?:golden|blue|red|purple)\s+energy\s+(?:wave|pulse|blast)\b",
-    r"\b(?:visible|glowing|luminous|colored|coloured)?\s*energy\s+"
-    r"(?:wave|pulse|blast|beam|field|surge|aura)\b",
-    r"\bforce\s+field\b",
-    r"\btelekin(?:esis|etic)\b",
-    r"\b(?:magic|magical)\s+(?:aura|blast|energy|shield|beam|wave|field)\b",
-    r"\b(?:laser|lightning)\s+(?:beam|blast|bolt)\b",
-)
 
 _CONTEXT_IR_LABEL = re.compile(
     r"\b(subject_definitions|summary|retention_analysis|detailed_description|"
@@ -488,13 +478,6 @@ def ledger_violations(
                     f"segment {segment_number} generated dialogue uses {word_count} words; budget is {budget}"
                 )
 
-    lowered_source = str(prompt or "").casefold()
-    lowered_ledger = json.dumps(ledger, ensure_ascii=False).casefold()
-    for pattern in UNREQUESTED_SPECTACLE_PATTERNS:
-        match = re.search(pattern, lowered_ledger, flags=re.IGNORECASE)
-        if match and not re.search(pattern, lowered_source, flags=re.IGNORECASE):
-            violations.append(f"invented unrequested power/effect: {match.group(0).strip()}")
-            break
     if not sanitize_h3_prompt_text(ledger.get("required_final_outcome")):
         violations.append("required final outcome is empty")
     return list(dict.fromkeys(violations))
@@ -798,13 +781,6 @@ def segment_violations(
             if index and abs(start - timing[index - 1][1]) > tolerance:
                 violations.append(f"shot {index + 1} leaves a gap or overlap in the local timeline")
 
-    lowered_source = str(prompt or "").casefold()
-    lowered_segment = json.dumps(segment, ensure_ascii=False).casefold()
-    for pattern in UNREQUESTED_SPECTACLE_PATTERNS:
-        match = re.search(pattern, lowered_segment, flags=re.IGNORECASE)
-        if match and not re.search(pattern, lowered_source, flags=re.IGNORECASE):
-            violations.append(f"invented unrequested power/effect: {match.group(0).strip()}")
-            break
     if not sanitize_h3_prompt_text(segment.get("closing_state")):
         violations.append("closing state is empty")
     return list(dict.fromkeys(violations))
