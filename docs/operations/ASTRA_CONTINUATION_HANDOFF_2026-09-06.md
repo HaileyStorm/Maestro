@@ -410,7 +410,8 @@ and 19 skips. Sixteen reported cases reproduce on unchanged HEAD with original
 MMGP: Blender semantic mapping, Director anchor cleanup, LLM routing, LTX
 integration, branding/navigation, research-child cleanup, stable-share path
 handling, and checkpoint provenance. The remaining one-second audio-lane
-timing failure passes baseline and candidate replay; it is not reported fixed.
+timing failure passes baseline and candidate replay; the separate test repair
+below strengthens its synchronization and cleanup.
 These remain explicit overall-goal work, not evidence against the focused
 DoRA acceptance or a claim of a green full suite.
 
@@ -431,6 +432,22 @@ This closes the small installed DoRA numerical/native-dispatch boundary. No
 service restart, full-model generation, visual quality, performance, or Windows
 acceptance is claimed. The stopped waiter and original packages remain as
 provenance and rollback material.
+
+### Audio-analysis native-lane test ordering — 2026-09-07 UTC
+
+The CPU-only audio-lane test now waits for explicit native-wait, native-acquired,
+analysis-entered, and analysis-finished signals. It proves the worker reaches
+the held Classic lane before release, then verifies task completion and release
+of generation, native, and audio-analysis gates. Failure cleanup releases only
+the test-owned lane and settles or cancels the task within a bounded wait.
+This removes the extra default-executor waiter and its one-second timing race.
+
+The focused case and full 68-test remote-access module pass in the app runtime
+with CUDA masked. Parent review confirms the source matches the worker's clean
+preimage and inspected delta. This changes the test only and supplies no live
+GPU or service evidence. The 4,703-test suite was not repeated for this isolated
+test change; the 16 independently reproduced baseline failures/errors remain
+overall-goal work.
 
 ### Prompt-adapter audit — not adopted
 

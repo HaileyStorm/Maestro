@@ -2826,14 +2826,21 @@ class LaunchSecurityContractTests(unittest.TestCase):
                 self.status_code = status_code
                 self.detail = detail
 
+        native_wait_started = threading.Event()
+        native_slot_acquired = threading.Event()
         analysis_entered = threading.Event()
+        analysis_finished = threading.Event()
         release_analysis = threading.Event()
         progress = types.ModuleType("services.audio_analysis")
 
         def analyze(**_kwargs):
             analysis_entered.set()
-            release_analysis.wait(2)
-            return {"duration": 1.0}
+            try:
+                if not release_analysis.wait(5):
+                    raise RuntimeError("test analysis release timed out")
+                return {"duration": 1.0}
+            finally:
+                analysis_finished.set()
 
         progress.analyze = analyze
         services = types.ModuleType("services")
@@ -2847,8 +2854,11 @@ class LaunchSecurityContractTests(unittest.TestCase):
 
             def __enter__(self):
                 if self.enabled:
-                    native_gpu.acquire()
+                    native_wait_started.set()
+                    if not native_gpu.acquire(timeout=5):
+                        raise RuntimeError("test native GPU lane wait timed out")
                     self.acquired = True
+                    native_slot_acquired.set()
                 return self.acquired
 
             def __exit__(self, *_args):
@@ -2902,37 +2912,71 @@ class LaunchSecurityContractTests(unittest.TestCase):
             async def json(self):
                 return {"audio_path": "owned.wav", "workspace": "project-a"}
 
+        async def wait_for_signal(signal, description):
+            deadline = asyncio.get_running_loop().time() + 5
+            while not signal.is_set():
+                if asyncio.get_running_loop().time() >= deadline:
+                    self.fail(f"timed out waiting for {description}")
+                await asyncio.sleep(0.005)
+
         async def exercise():
             with patch.dict(sys.modules, {
                 "services": services,
                 "services.audio_analysis": progress,
             }):
-                native_gpu.acquire()
-                task = asyncio.create_task(
-                    namespace["analyze_audio"](Request())
-                )
-                for _ in range(200):
-                    if generation_lock.locked():
-                        break
-                    await asyncio.sleep(0.005)
-                self.assertTrue(generation_lock.locked())
-                self.assertFalse(analysis_entered.is_set())
-                native_gpu.release()
-                self.assertTrue(
-                    await asyncio.to_thread(analysis_entered.wait, 1)
-                )
-                release_analysis.set()
-                result = await task
-                self.assertEqual(result["duration"], 1.0)
-                self.assertFalse(generation_lock.locked())
-                self.assertFalse(native_gpu.locked())
+                task = None
+                test_owns_native_lane = False
+                try:
+                    native_gpu.acquire()
+                    test_owns_native_lane = True
+                    task = asyncio.create_task(
+                        namespace["analyze_audio"](Request())
+                    )
+                    await wait_for_signal(
+                        native_wait_started,
+                        "audio analysis to request the native GPU lane",
+                    )
+                    self.assertTrue(generation_lock.locked())
+                    self.assertFalse(native_slot_acquired.is_set())
+                    self.assertFalse(analysis_entered.is_set())
 
-        try:
-            asyncio.run(exercise())
-        finally:
-            release_analysis.set()
-            if native_gpu.locked():
-                native_gpu.release()
+                    native_gpu.release()
+                    test_owns_native_lane = False
+                    await wait_for_signal(
+                        native_slot_acquired,
+                        "audio analysis to acquire the native GPU lane",
+                    )
+                    await wait_for_signal(
+                        analysis_entered,
+                        "audio analysis to enter its worker",
+                    )
+                    release_analysis.set()
+                    result = await asyncio.wait_for(
+                        asyncio.shield(task), timeout=5,
+                    )
+                    self.assertEqual(result["duration"], 1.0)
+                    self.assertTrue(analysis_finished.is_set())
+                    self.assertTrue(task.done())
+                    self.assertFalse(generation_lock.locked())
+                    self.assertFalse(native_gpu.locked())
+                    self.assertTrue(
+                        namespace["_audio_analysis_gate"].acquire(False)
+                    )
+                    namespace["_audio_analysis_gate"].release()
+                finally:
+                    release_analysis.set()
+                    if test_owns_native_lane and native_gpu.locked():
+                        native_gpu.release()
+                    if task is not None:
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.shield(task), timeout=5,
+                            )
+                        except BaseException:
+                            task.cancel()
+                            await asyncio.gather(task, return_exceptions=True)
+
+        asyncio.run(exercise())
 
     def test_workspace_busy_checks_are_target_scoped_and_admission_is_reserved(self):
         class FakeHTTPException(Exception):
