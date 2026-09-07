@@ -1267,3 +1267,23 @@ Ref-to-Base also remain intentionally unsupported pending exact field ownership;
 those representability errors are open work, not the intended final product.
 Pair the mapper with the copy/validate/reseal transaction and real caller
 geometry/reference-role inputs only after those remaining gates pass.
+
+### Canonical no-dialogue validation (2026-09-07)
+
+The full vocal validator now recognizes the existing physical compiler's
+`dialogue_and_vocalizations: none` contract when every record uses that exact
+value and the complete physical Context-IR validates. Native I2VA/FL2VA/L2VA
+alignment headers remain supported; the full prompt validator still enforces
+the caller's selected mode. Incidental prose, malformed/mixed records and
+nonempty vocal fields do not acquire silence status. Explicit expected dialogue
+still requires its exact tagged lines; legacy dialogue and mapped-audio paths
+remain unchanged. No subject-matter inference or added prompt prose is used.
+
+All 235 applicable CPU tests pass. The ordinary speech-free mapper probe now
+passes both Base and Ref2VA direct validators with unchanged authored action,
+closing the silence-contract mismatch recorded above. Evidence:
+`.artifacts-temp/astra-canonical-silence-20260907/`. The pure mapper and
+copy/validate/reseal transaction remain unadopted: exact ownership for Ref-only
+fields, complete nested event/dialogue checks, and real per-clip geometry and
+runtime reference-role caller integration are still open. No GPU, model,
+service restart, browser or native Windows acceptance is claimed.

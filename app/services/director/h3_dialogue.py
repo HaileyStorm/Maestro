@@ -398,6 +398,21 @@ def validate_h3_vocal_contract(
             prompt,
             flags=re.IGNORECASE,
         ))
+        fields = _extract_h3_fields(prompt)
+        visual_fields = [name for name in (
+            "integrated_multimodal_description", "detailed_description",
+        ) if name in fields]
+        if len(visual_fields) == 1:
+            visual_field = visual_fields[0]
+            records = _canonical_h3_record_lines(fields[visual_field])
+            modes = ("ref2va",) if visual_field == "detailed_description" else (
+                "t2va", "i2va", "fl2va", "l2va",
+            )
+            if records and all(
+                _H3_CANONICAL_RECORD_RE.fullmatch(record).group("vocals").strip().casefold() == "none"
+                for record in records
+            ) and any(not validate_h3_context_ir_records(prompt, mode=mode) for mode in modes):
+                has_silence_contract = True
         has_mapped_audio_contract = (
             "mapped driving audio" in prompt.casefold()
             and "do not generate additional dialogue" in prompt.casefold()
