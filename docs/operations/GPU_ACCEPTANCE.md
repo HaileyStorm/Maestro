@@ -316,3 +316,26 @@ See [managed build hashes, receipts, and remaining gates](ASTRA_CONTINUATION_HAN
 This closes the current Linux managed package/build check. It does not prove
 live-service adoption, full-model generation, visual quality, performance,
 DoRA correctness, or native Windows acceptance.
+
+## MMGP DoRA package prerequisite — 2026-09-07 UTC
+
+The reviewed `3.7.12+maestro1` package and real NVFP4 scale protocol are installed
+in both local runtimes. Each passes 16 CPU numerical/dispatch tests with CUDA
+confirmed uninitialized. The final wheel SHA256 is
+`9e55e53d7ad975df7ab7d18dde82e0720b333a80a315fc189073af1fdd61c4cf`;
+the installed offload source SHA256 is
+`972451f19d3471bf96c47e241bffb1c6dca1a64e5fab3c75755fc5cd2fab5f15`.
+
+The separate eight-case synthetic installed GPU check passed on RTX 5090,
+Torch 2.10.0+cu130. Zero-effective DoRA retained native LightX quantization/GEMM
+with zero reference error. Nonzero DoRA plus ordinary LoRA matched the pinned
+BF16 rounding sequence bit-for-bit; relative MAE against the independent ideal
+reference was 0.0001430–0.0002503. Both bias states and logical rows 1/50 passed with the legacy NVFP4 fixture
+at width 64 and output width 128. Outputs were finite CUDA BF16 and packed
+bytes were unchanged. Exact source/package hashes and actual CUDA-13 library
+maps were verified. Peak allocated tensor memory was 42,388,480 bytes.
+
+The child exited and the exact coordinator lease is confirmed cancelled.
+Receipts: `.artifacts-temp/astra-mmgp-integration-20260907/`. This closes only
+the synthetic installed DoRA boundary; application/model rows, full-model
+quality, performance, Windows, and running-service adoption remain open.

@@ -24,6 +24,32 @@ if str(APP) not in sys.path:
 
 
 class TestSolEngineSourceContracts(unittest.TestCase):
+    def test_mmgp_update_repairs_current_runtime_and_full_build_uses_requirements(self):
+        loader = r"""
+const assert = require('assert');
+const update = require('./update.js');
+const { runtimeProfile } = require('./launcher_profile.js');
+(async () => {
+  for (const platform of ['linux', 'win32']) {
+    const kernel = {platform, gpu_target: 'sm_120', gpu_model: 'RTX 5090',
+                    gpu_driver: '580.1', gpu: 'nvidia', envs: {}};
+    const profile = runtimeProfile(kernel);
+    const steps = (await update(kernel)).run;
+    const current = steps.findIndex(step => step.id === 'uptodate');
+    const build = steps.findIndex(step => step.id === 'build');
+    const repair = steps.findIndex(step => step.params?.message ===
+      'uv pip install --no-deps --reinstall-package mmgp ./dependencies/mmgp');
+    assert(current < repair && repair < build);
+    assert.strictEqual(steps[repair].params.path, 'app');
+    assert.strictEqual(steps[repair].params.venv, profile.env);
+    assert.strictEqual(steps[repair].params.venv_python, profile.python);
+    assert(steps.slice(build).some(step => step.params?.message ===
+      'uv pip install -r requirements.txt' && step.params.path === 'app'));
+  }
+})().catch(error => { console.error(error); process.exit(1); });
+"""
+        subprocess.run(['node', '-e', loader], cwd=ROOT, check=True, capture_output=True, text=True)
+
     def test_linux_cuda13_lightx_repair_covers_install_and_both_update_branches(self):
         loader = r"""
 const assert = require('assert');

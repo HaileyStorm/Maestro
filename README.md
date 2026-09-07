@@ -744,6 +744,10 @@ Maestro is released under the **WanGP Non-Commercial Evaluation License 1.1**, i
 
 Third-party models, weights, and components keep their own licenses — review them before redistributing. MiniMax H3 weights remain subject to MiniMax's separate model terms and any authorization or waiver required for the user's location. Notably, the [seed-vc](https://github.com/Plachta/seed-vc) voice-conversion component is **GPL-3.0**, so it is distributed from its own repository ([Blizaine/maestro-seedvc](https://github.com/Blizaine/maestro-seedvc)) and cloned into `app/postprocessing/seedvc/` at install time rather than shipped in this tree. Other vendored components include BigVGAN (MIT), FlashVSR sparse-sage (Apache-2.0), and IndexTTS2 (bilibili model license).
 
+The MMGP dependency retains its **GPL-3.0** license. Maestro builds its pinned
+DoRA input-scale repair from the verified upstream wheel; see the
+[MMGP package recipe](app/dependencies/mmgp/README.md) for source provenance.
+
 ## Issues
 
 Bug reports and feature requests: [github.com/Blizaine/Maestro/issues](https://github.com/Blizaine/Maestro/issues).

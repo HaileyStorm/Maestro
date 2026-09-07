@@ -1,0 +1,11 @@
+[build-system]
+requires = []
+build-backend = "backend"
+backend-path = ["."]
+
+[tool.uv]
+cache-keys = [
+  { file = "pyproject.toml" },
+  { file = "backend.py" },
+  { file = "dora-input-scale.patch" },
+]

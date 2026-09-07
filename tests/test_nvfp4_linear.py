@@ -35,6 +35,8 @@ class NVFP4NativeLoraTests(unittest.TestCase):
                            missing, unexpected, errors)
         self.assertEqual((missing, unexpected, errors), ([], [], []))
         self.assertTrue(router.__dict__.get('_mm_requires_native_linear_forward'))
+        self.assertIs(router._mm_effective_weight_input_scale,
+                      router._nvfp4_pre_quant_scale)
         return router
 
     def test_actual_mmgp_lora_path_preserves_scaled_base_and_factor_delta(self):

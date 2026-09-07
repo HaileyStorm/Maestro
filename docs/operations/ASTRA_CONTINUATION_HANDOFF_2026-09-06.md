@@ -375,10 +375,64 @@ nonuniform scales, and packed-byte immutability. The baseline reproduces error
 16.0; candidate DoRA reference error is zero, with maximum error across all
 reference checks 3.814697265625e-06. CUDA remains uninitialized. Patch dry-run
 and every source/artifact hash check pass. Files are in
-`.artifacts-temp/astra-dora-protocol-20260907/`; installed MMGP and the real
-qtype are unchanged. Retain the patch and receipts as provenance. Dependency
-integration, real qtype attribute publication, independent review, and GPU
-acceptance remain required before adoption.
+`.artifacts-temp/astra-dora-protocol-20260907/`. Those receipts describe the
+unadopted prototype. Retain them as provenance; the managed package integration
+below supersedes that prototype.
+
+### Managed MMGP DoRA integration — 2026-09-07 UTC
+
+The normal requirements flow now builds `mmgp==3.7.12+maestro1` through the
+small PEP 517 recipe in `app/dependencies/mmgp`. It verifies the exact upstream
+wheel and RECORD, applies a hash-bound patch, preserves the upstream GPL-3.0
+payload and dependencies, and emits truthful version/generator metadata,
+provenance, and a new RECORD. The source tree is not vendored and no runtime
+monkeypatch is installed. Package-local Git attributes preserve the patch's
+required CRLF bytes and normalize recipe text to LF across checkouts.
+
+The real NVFP4 qtype publishes its input scale for MMGP's materialized base;
+ordinary LoRA deltas retain their original input coordinates. Zero-effective
+DoRA retains native forwarding, malformed/nonfinite scales fail explicitly,
+and simultaneous effective DoRA and LoKr fails instead of silently dropping
+DoRA. The startup version gate matches the package. Install, full Update,
+standalone requirements, and already-current Update consume the same recipe.
+
+Both installed local runtimes match every final wheel payload byte. Wheel
+SHA256: `9e55e53d7ad975df7ab7d18dde82e0720b333a80a315fc189073af1fdd61c4cf`;
+installed `offload.py` SHA256:
+`972451f19d3471bf96c47e241bffb1c6dca1a64e5fab3c75755fc5cd2fab5f15`.
+Each runtime passes all 16 NVFP4 CPU tests with CUDA confirmed uninitialized;
+the final isolated integration suite passes 117 tests with one skip. Package
+builds and isolated installs work through UV and pip; independent package and
+provenance review is clean. Original packages remain preserved for rollback.
+
+The full HEAD-based backend candidate ran 4,703 tests: 15 failures, two errors,
+and 19 skips. Sixteen reported cases reproduce on unchanged HEAD with original
+MMGP: Blender semantic mapping, Director anchor cleanup, LLM routing, LTX
+integration, branding/navigation, research-child cleanup, stable-share path
+handling, and checkpoint provenance. The remaining one-second audio-lane
+timing failure passes baseline and candidate replay; it is not reported fixed.
+These remain explicit overall-goal work, not evidence against the focused
+DoRA acceptance or a claim of a green full suite.
+
+Receipts and the unchanged-HEAD failure replay are under
+`.artifacts-temp/astra-mmgp-integration-20260907/`. A fresh coordinator grant
+then covered eight synthetic installed legacy-layout GPU cases on RTX 5090 / Torch
+2.10.0+cu130. Zero-strength DoRA retained native LightX quantization/GEMM with
+zero reference error; nonzero DoRA plus ordinary LoRA matched the pinned BF16
+rounding reference bit-for-bit, with ideal-reference relative MAE
+0.0001430–0.0002503. All outputs were CUDA BF16 and finite; packed bytes were
+unchanged. Actual maps showed the selected CUDA-13 cuBLAS, cuBLASLt, and runtime
+libraries without CUDA-12 mappings. Peak allocated tensor memory was
+42,388,480 bytes. The bounded child exited successfully, the waiter confirmed
+withdrawal, and a separate read verified the exact cancelled ledger row and
+unchanged bound source/package files.
+
+This closes the small installed DoRA numerical/native-dispatch boundary. No
+service restart, full-model generation, visual quality, performance, or Windows
+acceptance is claimed. The stopped waiter and original packages remain as
+provenance and rollback material.
+
+### Prompt-adapter audit — not adopted
 
 While waiting, a direct CPU audit of the uncommitted `h3_prompt_adapt.py` found
 two reproducible blockers to integration: an embedded `summary:` label inside

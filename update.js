@@ -76,6 +76,15 @@ module.exports = async (kernel) => {
       env: runtimeSecretEnv,
       message: "python app/scripts/ensure_environment_defaults.py --file ENVIRONMENT"
     }
+  }, {
+    method: "shell.run",
+    params: {
+      env: runtimeSecretEnv,
+      venv: runtime.env,
+      venv_python: runtime.python,
+      path: "app",
+      message: "uv pip install --no-deps --reinstall-package mmgp ./dependencies/mmgp"
+    }
   }, ...lightxRepairSteps, {
     // Reached ONLY when the repo was already current (the "build" path
     // jumps over this step). Before halting, self-heal the seed-vc

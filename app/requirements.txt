@@ -4,7 +4,7 @@
 # re-test Studio + Director end-to-end before committing. Do NOT loosen
 # pins without testing — many of these have known breakage on newer releases
 # (HuggingFace tokenizers/accelerate, torch/torchcodec/xformers ABI, etc).
-mmgp @ https://files.pythonhosted.org/packages/d1/da/df5d4be821577120eb4370dbbce9bbdd87e1fb4aa65e37c8dba0916ae1ea/mmgp-3.7.12-py3-none-any.whl#sha256=2cfb809c1000a0945101c885c687e68ad44eb37278a373a3d65b8ce747f222cf
+./dependencies/mmgp
 
 # Core AI stack
 diffusers==0.36.0

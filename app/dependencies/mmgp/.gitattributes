@@ -1,0 +1,6 @@
+.gitattributes text eol=lf
+*.py text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+# CRLF and the empty-line context prefix are hash-bound patch data.
+dora-input-scale.patch -text whitespace=-blank-at-eol

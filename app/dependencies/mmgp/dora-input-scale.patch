@@ -1,0 +1,40 @@
+--- a/mmgp/offload.py
++++ b/mmgp/offload.py
+@@ -3078,13 +3078,16 @@
+             data = loras_data.get(active_adapter + '_GPU', None)
+             if data is None:
+                 continue
+-            if data[3] is not None:
++            scaling = self._get_lora_scaling(loras_scaling, model, active_adapter) * data[4]
++            if data[3] is not None and scaling != 0:
+                 any_dora = True
+             meta = data[5]
+-            if meta.get("type", "lora") == "lokr":
++            if meta.get("type", "lora") == "lokr" and scaling != 0:
+                 any_lokr = True
+             if any_dora and any_lokr:
+                 break
++        if any_dora and any_lokr:
++            raise ValueError("MMGP cannot combine effective DoRA and LoKr adapters")
+ 
+         dtype = weight.dtype
+         if any_dora and not any_lokr: # sum base weight and lora matrices instead of applying input on each sub lora matrice if input is too large. This will save a lot VRAM and compute
+@@ -3093,6 +3096,18 @@
+                 weight = weight.view(weight.shape) # get a persistent copy of the on the fly dequantized weights
+             else:
+                 weight = weight.clone()
++            effective_weight_input_scale = getattr(submodule, "_mm_effective_weight_input_scale", None)
++            if effective_weight_input_scale is not None:
++                if not torch.is_tensor(effective_weight_input_scale):
++                    raise TypeError("_mm_effective_weight_input_scale must be a tensor")
++                if effective_weight_input_scale.ndim != 1 or effective_weight_input_scale.numel() != weight.shape[1]:
++                    raise ValueError("_mm_effective_weight_input_scale must match the input dimension")
++                effective_weight_input_scale = effective_weight_input_scale.to(
++                    device=weight.device, dtype=weight.dtype
++                )
++                if not torch.isfinite(effective_weight_input_scale).all():
++                    raise ValueError("_mm_effective_weight_input_scale must contain only finite values")
++                weight.mul_(effective_weight_input_scale[None, :])
+             for active_adapter in active_adapters:
+                 data = loras_data.get(active_adapter + '_GPU', None)
+                 if data is None:

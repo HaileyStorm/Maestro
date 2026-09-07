@@ -1212,6 +1212,9 @@ class QLinearNVFP4(QModuleMixin, torch.nn.Linear):
             # ``__dict__`` but not its ``_buffers``. Without this mirror the
             # AWQ input scale vanishes even though the checkpoint loaded it.
             self._nvfp4_pre_quant_scale = loaded_scale
+            # MMGP materializes this scaled base before merging DoRA weights.
+            # Keep adapter deltas in the original, unscaled input coordinates.
+            self._mm_effective_weight_input_scale = loaded_scale
 
         return
 

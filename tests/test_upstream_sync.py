@@ -418,14 +418,12 @@ class SelectiveIntegrationLedgerTests(unittest.TestCase):
     def test_dependency_license_and_provenance_pins_are_exact(self):
         requirements = (ROOT / "app/requirements.txt").read_text(encoding="utf-8")
         self.assertEqual(
-            [line for line in requirements.splitlines() if line.startswith("mmgp ")],
-            [
-                "mmgp @ https://files.pythonhosted.org/packages/d1/da/"
-                "df5d4be821577120eb4370dbbce9bbdd87e1fb4aa65e37c8dba0916ae1ea/"
-                "mmgp-3.7.12-py3-none-any.whl#sha256="
-                "2cfb809c1000a0945101c885c687e68ad44eb37278a373a3d65b8ce747f222cf"
-            ],
+            [line for line in requirements.splitlines() if "mmgp" in line and not line.startswith("#")],
+            ["./dependencies/mmgp"],
         )
+        backend = (ROOT / "app/dependencies/mmgp/backend.py").read_text(encoding="utf-8")
+        self.assertIn("2cfb809c1000a0945101c885c687e68ad44eb37278a373a3d65b8ce747f222cf", backend)
+        self.assertIn("5bc8514f4bc87ae8eef04f5fe78f89a33822f60a5fa451e0c47768f436c01522", backend)
         license_bytes = (ROOT / "app/LICENSE.txt").read_bytes()
         self.assertEqual(
             hashlib.sha256(license_bytes).hexdigest(),

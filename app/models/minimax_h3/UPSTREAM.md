@@ -76,9 +76,18 @@ The selectively incorporated runtime/dependency records are:
   `c49d021d43838f2fc41b14b0b2310796bc2232f5792271cb4df9f53ab22124e6`;
   its universal wheel has SHA256
   `2cfb809c1000a0945101c885c687e68ad44eb37278a373a3d65b8ce747f222cf`.
-  Maestro's requirement binds that wheel's official `files.pythonhosted.org`
-  URL and SHA256 fragment. The existing MMGP entry points used by Maestro
-  retain compatible signatures and add optional quantization/load callbacks.
+  Maestro's requirement selects `app/dependencies/mmgp`, a local PEP 517 recipe
+  that downloads that exact official wheel, verifies its SHA256 and RECORD,
+  and builds `3.7.12+maestro1` with the DoRA input-scale protocol. The recipe
+  preserves the upstream package and GPL-3.0 license, changes the bounded
+  offload implementation and package identity/generator metadata, and adds
+  provenance plus a new RECORD. No upstream source tree is vendored.
+  The source patch SHA256 is
+  `cc79f5ef357f091108adee09822f4cd6158727fb291631cdd67c0caabbb215e2`;
+  the patched `offload.py` SHA256 is
+  `972451f19d3471bf96c47e241bffb1c6dca1a64e5fab3c75755fc5cd2fab5f15`.
+  The [package recipe](../../dependencies/mmgp/README.md) owns the build and
+  replacement contract; its generated provenance binds the exact recipe bytes.
 - WanGP Community License 2.0 exactly as published at the 12.44 anchor,
   SHA256 `67c8e68389c945423c560c13936f0a960e5d2ffdcc5bb2ded4122fe1b095960f`.
 

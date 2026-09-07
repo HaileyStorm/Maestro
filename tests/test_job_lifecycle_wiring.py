@@ -79,25 +79,15 @@ class TestJobLifecycleWiring(unittest.TestCase):
             and isinstance((target := node.targets[0]), ast.Name)
             and isinstance(node.value, ast.Constant)
         }
-        with open(
-            os.path.join(_ROOT, "app", "requirements.txt"),
-            "r",
-            encoding="utf-8",
-        ) as handle:
-            requirement = next(
-                line.strip()
-                for line in handle
-                if line.strip().startswith("mmgp @ ")
-            )
-        expected_hash = (
-            "2cfb809c1000a0945101c885c687e68ad44eb37278a373a3d65b8ce747f222cf"
-        )
-        self.assertIn(
-            f"mmgp-{assignments['target_mmgp_version']}-py3-none-any.whl",
-            requirement,
-        )
-        self.assertTrue(requirement.startswith("mmgp @ https://files.pythonhosted.org/"))
-        self.assertTrue(requirement.endswith(f"#sha256={expected_hash}"))
+        with open(os.path.join(_ROOT, "app", "requirements.txt"), encoding="utf-8") as handle:
+            self.assertIn("./dependencies/mmgp", handle.read().splitlines())
+        backend = _parse("app/dependencies/mmgp/backend.py")
+        versions = [
+            node.value.value for node in backend.body
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
+            and node.value.value == assignments["target_mmgp_version"]
+        ]
+        self.assertEqual(versions, ["3.7.12+maestro1"])
         self.assertEqual(assignments["WanGP_version"], "10.9875")
         self.assertEqual(assignments["settings_version"], 2.57)
 
