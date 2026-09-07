@@ -552,7 +552,6 @@ class family_handler:
                         "h3_ref2va_handoff",
                         "h3_ref2va_handoff_video_slot",
                         "h3_ref2va_handoff_frames",
-                        "h3_ref2va_handoff_audio",
                     ],
                 }
             )

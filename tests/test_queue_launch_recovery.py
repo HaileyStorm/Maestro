@@ -7313,6 +7313,8 @@ class QueueLaunchWiringTests(unittest.TestCase):
                     "_queue_recovery_continuation_descriptor",
                     "_queue_recovery_continuation_path",
                     "_apply_h3_recovered_continuation",
+                    "_h3_ref2va_reference_capacity",
+                    "_set_h3_ref2va_tail",
                 ),
                 {
                     "os": os,
@@ -7321,7 +7323,10 @@ class QueueLaunchWiringTests(unittest.TestCase):
                         ensure_recovery_staging_directory
                     ),
                     "_recovery_sha256_file": recovery_sha256_file,
-                    "_H3_REF2VA_HANDOFF_FRAMES": 9,
+                    "_H3_REF2VA_HANDOFF_FRAMES": 56,
+                    "wgp": types.SimpleNamespace(
+                        get_video_info=lambda _path: (24, 1, 1, 24),
+                    ),
                 },
             )
             unit_id = recovery_unit_id("job-h3", "h3_segment")
@@ -7330,7 +7335,9 @@ class QueueLaunchWiringTests(unittest.TestCase):
             ](
                 str(project), str(continuation),
                 mode="temporal_tail", dependency=unit_id,
+                metadata={"video_slot": 1},
             )
+            self.assertEqual(descriptor["video_slot"], 1)
             self.assertEqual(descriptor["storage"], "recovery_staging")
             self.assertFalse(os.path.isabs(descriptor["basename"]))
             unit = {"continuation": descriptor, "unit_id": unit_id}

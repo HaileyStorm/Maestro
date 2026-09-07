@@ -773,6 +773,7 @@ class H3LongStudioPlanningTests(unittest.TestCase):
             "_trusted_h3_prepared_plan",
             "_h3_preferred_fl2va_model",
             "_prepare_h3_long_studio_request",
+            "_set_h3_ref2va_tail",
             "_public_h3_long_plan",
             "_public_h3_boundary",
             "_h3_estimate_context",

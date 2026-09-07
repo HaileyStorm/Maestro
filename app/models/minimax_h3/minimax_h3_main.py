@@ -1004,7 +1004,6 @@ class MiniMaxH3Model:
         image_refs_relative_size: float,
         generator: torch.Generator,
         override_last_video_latent: torch.Tensor | None = None,
-        override_last_audio_latent: torch.Tensor | None = None,
     ):
         presentation: list[dict] = []
         prepared: list[MiniMaxH3PreparedReference] = []
@@ -1050,12 +1049,9 @@ class MiniMaxH3Model:
                 else self._encode_reference_video(video)
             )
             soundtrack_latent = (
-                override_last_audio_latent.detach().float().cpu()
-                if is_last_video and override_last_audio_latent is not None
-                else None
+                self._encode_reference_audio(soundtrack)
+                if soundtrack is not None else None
             )
-            if soundtrack is not None and soundtrack_latent is None:
-                soundtrack_latent = self._encode_reference_audio(soundtrack)
             if soundtrack_latent is not None:
                 presentation.append({"type": "audio"})
                 audio_latents.append(soundtrack_latent)
@@ -1655,12 +1651,6 @@ class MiniMaxH3Model:
                 override_last_video_latent=(
                     cached_handoff.get("video") if use_cached_handoff else None
                 ),
-                override_last_audio_latent=(
-                    cached_handoff.get("audio")
-                    if use_cached_handoff
-                    and bool(custom_settings.get("h3_ref2va_handoff_audio"))
-                    else None
-                ),
             )
 
         prompt_presentation = list(reference_presentation)
@@ -2102,7 +2092,6 @@ class MiniMaxH3Model:
             audio_rows[layout.num_condition_audio_rows :],
             num_audio_latents,
         )
-        normalized_audio_latents = audio_latents
         audio_mean = torch.tensor(AUDIO_LATENTS_MEAN, device=self.device).view(1, -1, 1)
         audio_std = torch.tensor(AUDIO_LATENTS_STD, device=self.device).view(1, -1, 1)
         audio_latents = audio_latents * audio_std + audio_mean
@@ -2113,16 +2102,13 @@ class MiniMaxH3Model:
             # segment still carries a decoded tail file as a reload-safe
             # fallback; when this exact model instance survives, replacing the
             # final prepared reference with these generated latents avoids a
-            # lossy decode/re-encode round trip and carries audio context too.
+            # lossy video decode/re-encode round trip. Audio always comes from
+            # the durable input soundtrack, including after recovery.
             handoff_video_latents = video_latent_num_frames(56)
-            handoff_audio_latents = audio_latent_num_frames(56)
             self._ref2va_handoff_cache = {
                 "chain_id": handoff_chain_id,
                 "video": normalized_video_latents[
                     :, :, -handoff_video_latents:
-                ].detach().float().cpu(),
-                "audio": normalized_audio_latents[
-                    :, :, -handoff_audio_latents:
                 ].detach().float().cpu(),
             }
         output_video = video[0]

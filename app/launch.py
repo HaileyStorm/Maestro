@@ -8879,7 +8879,7 @@ def _queue_recovery_continuation_descriptor(
     if metadata:
         allowed = {
             "fps", "audio_sample_rate", "audio_channels", "overlap_frames",
-            "discard_frames", "boundary_type",
+            "discard_frames", "boundary_type", "video_slot",
         }
         descriptor.update({
             key: metadata[key] for key in allowed if key in metadata
@@ -10638,6 +10638,8 @@ def _prepare_task_continuation(
                 "mode": str(handoff.get("mode") or "prompt_only"),
                 "path": handoff.get("path"),
             }
+            if h3_continuation["mode"] == "temporal_tail":
+                h3_continuation["video_slot"] = handoff["video_slot"]
             print(
                 "  [H3 Ref2VA] "
                 f"{handoff['mode']} handoff for segment "
@@ -10689,20 +10691,20 @@ def _apply_h3_recovered_continuation(
         params["custom_settings"] = custom
         params.pop("_ref2va_continuation", None)
     elif mode == "temporal_tail" and path:
-        for slot, key in enumerate(
-            ("video_guide", "video_guide2", "video_guide3"), start=1,
+        capacity = _h3_ref2va_reference_capacity(
+            params, handoff_seconds=_H3_REF2VA_HANDOFF_FRAMES / 24.0,
+        )
+        if not capacity["video"]:
+            raise QueueRecoveryRuntimeError(
+                "H3 recovered video continuation cannot preserve the current references."
+            )
+        slot = capacity["video_slot"]
+        if "video_slot" in continuation and (
+            type(continuation["video_slot"]) is not int
+            or continuation["video_slot"] != slot
         ):
-            if not params.get(key):
-                params[key] = path
-                params["video_prompt_type"] = {1: "V-", 2: "V+-", 3: "V++-"}[slot]
-                custom = dict(params.get("custom_settings") or {})
-                custom.update({
-                    "h3_ref2va_handoff": "temporal_tail",
-                    "h3_ref2va_handoff_video_slot": slot,
-                    "h3_ref2va_handoff_frames": _H3_REF2VA_HANDOFF_FRAMES,
-                })
-                params["custom_settings"] = custom
-                break
+            raise QueueRecoveryRuntimeError("H3 recovered continuation video slot changed.")
+        _set_h3_ref2va_tail(params, path, slot=slot)
         params.pop("_ref2va_continuation", None)
     elif mode == "native_av_overlap" and path:
         from services.h3_boundary_policy import (
@@ -15159,11 +15161,25 @@ def _h3_preferred_fl2va_model(body: dict) -> str:
 
 def _h3_ref2va_reference_capacity(params: dict, *, handoff_seconds: float) -> dict:
     """Describe whether one rolling video or still reference can be appended."""
-    video_paths = [
-        params.get(key)
-        for key in ("video_guide", "video_guide2", "video_guide3")
-        if params.get(key)
+    video_keys = ("video_guide", "video_guide2", "video_guide3")
+    occupied_slots = [
+        slot for slot, key in enumerate(video_keys, start=1) if params.get(key)
     ]
+    video_type = str(params.get("video_prompt_type") or "")
+    selected_slots = [
+        slot for slot in occupied_slots
+        if "V" in video_type and (
+            slot == 1 or (slot == 2 and "+" in video_type)
+            or (slot == 3 and (
+                "++" in video_type or params.get("video_guide3") is not None
+            ))
+        )
+    ]
+    video_paths = [params[video_keys[slot - 1]] for slot in selected_slots]
+    # Append after existing physical slots, never fill a gap that would
+    # renumber an authored Video ordinal or enable an inactive upload.
+    append_slot = max(occupied_slots, default=0) + 1
+    can_append = occupied_slots == selected_slots and append_slot <= 3
     video_seconds = 0.0
     for path in video_paths:
         try:
@@ -15177,21 +15193,49 @@ def _h3_ref2va_reference_capacity(params: dict, *, handoff_seconds: float) -> di
             break
     image_refs = list(params.get("image_refs") or [])
     audio_type = str(params.get("audio_prompt_type") or "")
-    standalone_audio_count = sum(letter in audio_type for letter in "ABC")
-    audio_count = len(video_paths) if "K" in audio_type else standalone_audio_count
+    # K requires a real soundtrack for every video; the durable tail is silent.
+    paired_soundtracks = "K" in audio_type
+    standalone_audio_count = (
+        0 if paired_soundtracks else sum(letter in audio_type for letter in "ABC")
+    )
     mixed_count = len(image_refs) + len(video_paths) + standalone_audio_count
     return {
         "video": (
-            len(video_paths) < 3
+            can_append
+            and not paired_soundtracks
             and video_seconds + float(handoff_seconds) <= 15.0 + 1e-6
             and mixed_count < 12
         ),
         "image": len(image_refs) < 9 and mixed_count < 12,
+        "video_slot": append_slot if can_append else None,
         "video_count": len(video_paths),
         "video_seconds": video_seconds,
         "mixed_count": mixed_count,
-        "audio": audio_count < 3,
     }
+
+
+
+def _set_h3_ref2va_tail(params: dict, path: str, *, slot: int) -> None:
+    """Install a validated physical slot identically on fresh and recovered jobs."""
+    if type(slot) is not int or slot not in {1, 2, 3}:
+        raise QueueRecoveryRuntimeError("H3 continuation video slot is invalid.")
+    key = ("video_guide", "video_guide2", "video_guide3")[slot - 1]
+    if params.get(key):
+        raise QueueRecoveryRuntimeError("H3 continuation video slot is occupied.")
+    custom = dict(params.get("custom_settings") or {})
+    # Historical jobs may retain this setting; it no longer enables an audio
+    # input that differs between a warm model instance and recovery.
+    custom.pop("h3_ref2va_handoff_audio", None)
+    custom.update({
+        "h3_ref2va_handoff": "temporal_tail",
+        "h3_ref2va_handoff_video_slot": slot,
+        "h3_ref2va_handoff_frames": _H3_REF2VA_HANDOFF_FRAMES,
+    })
+    params.update({
+        key: path,
+        "video_prompt_type": {1: "V-", 2: "V+-", 3: "V++-"}[slot],
+        "custom_settings": custom,
+    })
 
 
 def _create_h3_ref2va_tail_video(
@@ -15416,25 +15460,12 @@ def _attach_h3_ref2va_handoff(
             )
         try:
             _create_h3_ref2va_tail_video(latest_video, tail_path)
-            for slot, key in enumerate(
-                ("video_guide", "video_guide2", "video_guide3"), start=1,
-            ):
-                if not next_params.get(key):
-                    next_params[key] = tail_path
-                    video_count = capacity["video_count"] + 1
-                    next_params["video_prompt_type"] = {
-                        1: "V-", 2: "V+-", 3: "V++-",
-                    }[video_count]
-                    custom = dict(next_params.get("custom_settings") or {})
-                    custom.update({
-                        "h3_ref2va_handoff": "temporal_tail",
-                        "h3_ref2va_handoff_video_slot": slot,
-                        "h3_ref2va_handoff_frames": _H3_REF2VA_HANDOFF_FRAMES,
-                        "h3_ref2va_handoff_audio": bool(capacity["audio"]),
-                    })
-                    next_params["custom_settings"] = custom
-                    result = {"mode": "temporal_tail", "path": tail_path, "boundary": boundary_type}
-                    break
+            slot = capacity["video_slot"]
+            _set_h3_ref2va_tail(next_params, tail_path, slot=slot)
+            result = {
+                "mode": "temporal_tail", "path": tail_path,
+                "boundary": boundary_type, "video_slot": slot,
+            }
         except Exception as error:
             result["warning"] = str(error)
             try:

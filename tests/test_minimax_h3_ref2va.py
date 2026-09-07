@@ -455,7 +455,7 @@ class TestMiniMaxH3Ref2VADefinition(unittest.TestCase):
         self.assertIn("self._ref2va_handoff_cache", main)
         self.assertIn('handoff_mode == "temporal_tail"', main)
         self.assertIn("override_last_video_latent", main)
-        self.assertIn("override_last_audio_latent", main)
+        self.assertNotIn("override_last_audio_latent", main)
         self.assertIn("normalized_video_latents", main)
         self.assertIn("_create_h3_ref2va_tail_video", launch)
         self.assertIn('"semantic_still"', launch)

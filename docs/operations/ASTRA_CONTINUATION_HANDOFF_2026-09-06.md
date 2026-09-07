@@ -1630,3 +1630,54 @@ chain. Generated Ref-to-Base target switching must rebuild from proven retained
 Base/freeform source. The broader backlog, rendered-browser checks and live
 acceptance remain open. No GPU/model/service/browser/Windows acceptance is added
 by this CPU milestone; the continuous Goal remains active.
+
+
+### Active reference handoff and soundtrack consistency (2026-09-07)
+
+The active reference-input owners are minimax_h3_handler admission and
+minimax_h3_main preparation, including their V/V+/V++ slot selection and K
+paired-soundtrack behavior. reference_manifest.validate_reference_manifest is
+currently reached by the dormant sequence chain, not generation admission.
+Do not substitute that planning manifest or raw attachment counts for active
+runtime inputs when integrating the adaptive mapper.
+
+The legacy Ref2VA continuation is a silent 56-frame video, separate from native
+AV boundary handling. Soundtrack-pairing mode now declines that silent video
+and uses the existing still-reference fallback when capacity permits; it never
+clears K or manufactures a missing soundtrack. K suppresses standalone ABC
+inputs in the mixed-reference capacity count. A video handoff appends after
+existing selected physical slots, preserving authored Video ordinals and never
+enabling an inactive upload or filling a gap ahead of an existing reference.
+
+Fresh and recovered temporal tails now share their slot writer. The selected
+slot survives continuation metadata and durable descriptor projection; recovery
+recomputes legal capacity and validates an explicit stored slot before mutation.
+Historical descriptors without a slot derive the legal append position from
+current inputs. Incompatible soundtrack/slot state fails closed rather than
+silently dropping or renumbering references.
+
+Removed the predecessor-audio cache override, its accepted runtime setting,
+audio cache payload and unused alias, and superseded tests. Authored soundtracks
+are encoded from their durable input. The video-latent cache and its decoded
+video fallback remain. Historical audio-setting residue is removed when a tail
+is bound; it no longer introduces an audio reference or replaces an authored
+waveform on a warm instance.
+
+The final clean-candidate gate runs 407 tests with no failures/errors and 13
+explicit skips for unavailable CUDA runtime or managed Turbo assets. Source
+hashes remain unchanged during the gate. Syntax and tracked-publication checks
+pass. Independent review closed fresh/recovered slot divergence and the retained
+audio override; parent closure verified the existing crash-recovery harness and
+removed the obsolete alias/fixtures. Evidence:
+`.artifacts-temp/astra-h3-reference-handoff-20260907/`. This is CPU/AST/synthetic
+control-flow evidence, not live model, warm/cold generation, GPU, browser or
+Windows acceptance. Unrelated root WIP remains unadopted.
+
+The mapper still needs a two-stage reference binding: planning knows uploaded
+inputs and intended predecessor dependencies, while _prepare_task_continuation
+materializes the actual late reference. Bind to the active selected slot semantics,
+paired-audio rules, verified asset identity and per-segment geometry; do not claim
+a late asset is authored or allow mapping to rewrite sealed source/event ownership.
+The original-source target-switch recipe and full caller integration remain open,
+as do rendered-browser and live acceptance. Continue from these active owners;
+the full continuous Goal remains active.
