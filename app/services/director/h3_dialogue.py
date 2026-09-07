@@ -1431,6 +1431,8 @@ def _reference_relationships(
     instead of being misrepresented as concrete keyframes.
     """
 
+    from models.minimax_h3.reference_manifest import reference_role_text
+
     definitions: list[str] = []
     retention: list[str] = []
     subject_sources: dict[int, list[str]] = {}
@@ -1468,8 +1470,9 @@ def _reference_relationships(
 
     for reference in references or []:
         kind = str(reference.get("type") or "").strip().lower()
-        role = _trim_sentence(reference.get("role", "")) or f"the supplied {kind} reference"
-        subject_match = mapped_subject(role)
+        role = str(reference.get("role") or "").strip() or f"the supplied {kind} reference"
+        subject_match = mapped_subject(_trim_sentence(role))
+        role = reference_role_text(role)
         mapped_role = (
             f"<Subject {subject_match[0]}> ({subject_match[1]})"
             if subject_match else role

@@ -1421,3 +1421,41 @@ Use a stable recipe version; unsupported old mappings retain exact sealed replay
 and must not acquire fabricated remapping proof. The artifact's nested-seal test
 proves storage coverage, not deployed integration. No GPU/model, service, browser
 or Windows acceptance is claimed; the continuous Goal remains active.
+
+### Structural reference-role serialization (2026-09-07)
+
+Planner and Director now share reference_role_text from reference_manifest.
+Ordinary/default roles stay readable and unchanged. Roles containing field/media
+syntax, JSON quoting, line separators, controls or lone surrogates become lossless
+JSON string literals with structural punctuation escaped. Formatting runs after
+manifest normalization, so expansion is not truncated to the raw role limit.
+Director preserves the role text for serialization while using a separately
+trimmed copy for existing subject matching; compiler-owned Subject labels remain
+structural. No phrase/content classifier or placeholder substitution was added.
+
+The clean seven-module CPU gate passes 173 tests with two skipped; all 23 mapper/
+provenance candidate tests also pass. Coverage includes helper JSON round trips,
+UTF-8 output for surrogate input, long escaped roles, unchanged defaults, content
+neutrality, preserved subject matching, and field/speech/media-tag isolation.
+A synthetic full-mapper probe preserves the raw role in binding metadata while
+validating the resulting prompt and media namespace. Evidence:
+`.artifacts-temp/astra-literal-roles-20260907/`. Native model understanding/quality
+of encoded roles is unverified; raw invalid-Unicode metadata persistence is also
+a separate input/binding concern. No GPU/model/service/browser/Windows acceptance
+is claimed.
+
+The mapper still needs Ref-only field ownership and actual caller integration,
+including runtime-owned allowlisted asset binding, authoritative authoring ingress,
+per-segment sealed persistence, stable recipe versions and current-input checks
+at dispatch/recovery. The structural role formatting prerequisite is implemented;
+the mapper/provenance artifacts remain unadopted.
+
+Next binding finding: h3_sequence_plan_signature already owns an allowlisted
+reference projection, but omits has_audio. A CPU probe confirms that toggling
+has_audio changes _reference_context while leaving the cache signature unchanged
+when audio_path is absent (`next-binding-gap.json` in this slice's evidence).
+Repair and reuse that owner rather than inventing a second projection. Separately
+audit the inherited _UNREQUESTED_SPECTACLE_PATTERNS prompt/plan keyword checks in
+h3_sequence_planner, h3_planner_helpers and h3_story_ledger against the project's
+local-content-neutrality rule; they were encountered during this source pass and
+are not covered by the role-formatting neutrality tests.

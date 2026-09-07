@@ -8,6 +8,7 @@ lightweight tools and CI.
 
 from __future__ import annotations
 
+import json
 import os
 
 
@@ -21,6 +22,23 @@ _VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
 _AUDIO_EXTENSIONS = {".aac", ".flac", ".m4a", ".mp3", ".ogg", ".wav"}
 _AUDIO_INTENTS = {"voice", "drive", "style"}
 _IMAGE_INTENTS = {"identity", "scene", "style", "composition"}
+
+
+def reference_role_text(role: str) -> str:
+    """Represent structural role syntax as a lossless JSON string literal.
+
+    Ordinary role prose remains unchanged. This is lexical serialization only;
+    it does not inspect subject matter or decide which roles may be used.
+    """
+    if not any(character in ':<>|[]"\\' or ord(character) < 32
+               or 0x7f <= ord(character) <= 0x9f
+               or 0xd800 <= ord(character) <= 0xdfff
+               or character in '\u2028\u2029' for character in role):
+        return role
+    encoded = json.dumps(role, ensure_ascii=True)
+    for character in ':<>|[]':
+        encoded = encoded.replace(character, f'\\u{ord(character):04x}')
+    return encoded
 
 
 def validate_reference_manifest(
