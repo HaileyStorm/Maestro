@@ -31,6 +31,19 @@ class H3ShotPlanError(ValueError):
     """Raised when authored shot semantics cannot be reconciled safely."""
 
 
+# Public planner-contract copy: two-colon clocks are H:M:S, not mm:ss.ss.
+_H3_TIMESTAMP_OUTSIDE_DURATION = (
+    "MiniMax H3 timestamps must land inside the selected duration. "
+    "Fractional seconds use a decimal on the seconds field (00:09.500 or 9.5s). "
+    "Two-colon clocks are hours:minutes:seconds, so 00:09:30 is 9 minutes 30 seconds."
+)
+_H3_RANGE_OUTSIDE_DURATION = (
+    "MiniMax H3 shot ranges must end inside the selected duration. "
+    "Fractional seconds use a decimal on the seconds field (00:09.500 or 9.5s). "
+    "Two-colon clocks are hours:minutes:seconds, so 00:09:30 is 9 minutes 30 seconds."
+)
+
+
 _DIALOGUE_RE = re.compile(
     r"<d>\s*\["
     r"(?=[^\]\r\n]*[^\s\]\r\n][^\]\r\n]*\])"
@@ -607,6 +620,7 @@ def _fold_short_terminal_clip(
     published: list[int],
     *,
     maximum_frames: int,
+    align_frame_count,
     hold_frames: int = _H3_TERMINAL_HOLD_FRAMES,
 ) -> tuple[list[int], list[int]]:
     """Absorb a short closing remainder into the previous native window.
@@ -620,17 +634,21 @@ def _fold_short_terminal_clip(
     last_pub = int(published[-1])
     prev_pub = int(published[-2])
     last_gen = int(generated[-1])
-    prev_gen = int(generated[-2])
     if (
         last_pub >= int(hold_frames)
         or last_pub < 1
         or prev_pub + last_pub > int(maximum_frames)
-        or prev_gen + last_gen > int(maximum_frames)
     ):
+        return generated, published
+    # Discard only the previous window's padding; retain the final window's
+    # full tail (including any end-anchor compensation) and realign the merge.
+    required = prev_pub + last_gen
+    merged = int(align_frame_count(required))
+    if not required <= merged <= int(maximum_frames):
         return generated, published
     folded_generated = list(generated[:-1])
     folded_published = list(published[:-1])
-    folded_generated[-1] = prev_gen + last_gen
+    folded_generated[-1] = merged
     folded_published[-1] = prev_pub + last_pub
     return folded_generated, folded_published
 
@@ -657,6 +675,77 @@ def floor_h3_frame_count(
             return aligned
         candidate -= 1
     raise H3ShotPlanError("H3 segment ceiling has no legal model-grid value")
+
+
+def _pack_authored_shot_sections(
+    requested_sections: Sequence[int],
+    generated_sections: Sequence[int],
+    *,
+    minimum_frames: int,
+    maximum_frames: int,
+    align_frame_count,
+) -> tuple[list[int], list[int], list[int]]:
+    """Pack complete authored shots into native windows.
+
+    Short shots stay with their neighbors instead of abandoning exact packing.
+    A shot splits only when it and any required end-anchor tail exceed the ceiling.
+    """
+
+    from shared.utils.prompt_parser import plan_consecutive_clip_frames
+
+    visible = [int(value) for value in requested_sections]
+    generated = [int(value) for value in generated_sections]
+    if not visible or len(visible) != len(generated):
+        return [], [], []
+    tail = max(0, generated[-1] - visible[-1])
+    maximum = int(maximum_frames)
+    groups: list[list[int]] = []
+    current: list[int] = []
+    current_visible = 0
+
+    def flush() -> None:
+        nonlocal current, current_visible
+        if current:
+            groups.append(current)
+            current = []
+            current_visible = 0
+
+    for index, shot_visible in enumerate(visible):
+        shot_generation = shot_visible + (tail if index == len(visible) - 1 else 0)
+        if shot_generation > maximum:
+            flush()
+            groups.append([index])
+            continue
+        if current and current_visible + shot_generation > maximum:
+            flush()
+        current.append(index)
+        current_visible += shot_visible
+    flush()
+
+    exact_frames: list[int] = []
+    exact_published: list[int] = []
+    boundary_after: list[int] = []
+    last_shot = len(visible) - 1
+    for group_index, shot_indices in enumerate(groups):
+        group_visible = sum(visible[index] for index in shot_indices)
+        group_generation = group_visible
+        if shot_indices[-1] == last_shot:
+            group_generation += tail
+        section_plan = plan_consecutive_clip_frames(
+            group_generation,
+            minimum_frames=minimum_frames,
+            maximum_frames=maximum_frames,
+            align_frame_count=align_frame_count,
+        )
+        section_published = list(section_plan)
+        section_published[-1] -= sum(section_plan) - group_visible
+        if section_published[-1] <= 0:
+            return [], [], []
+        exact_frames.extend(section_plan)
+        exact_published.extend(section_published)
+        if group_index < len(groups) - 1:
+            boundary_after.append(len(exact_frames) - 1)
+    return exact_frames, exact_published, boundary_after
 
 
 def plan_h3_clip_frames(
@@ -780,38 +869,25 @@ def plan_h3_clip_frames(
                 [*authored_boundaries, visible_total],
             )
         ]
-        if authored_boundaries and all(
-            section >= int(minimum_frames) for section in requested_sections
-        ):
+        if authored_boundaries:
             generated_sections = list(requested_sections)
             generated_sections[-1] += max(0, int(total_frames) - visible_total)
-            exact_frames: list[int] = []
-            exact_published: list[int] = []
-            boundary_after: list[int] = []
-            for section_index, (generation_frames, visible_frames) in enumerate(
-                zip(generated_sections, requested_sections)
-            ):
-                section_plan = plan_consecutive_clip_frames(
-                    generation_frames,
+            exact_frames, exact_published, boundary_after = (
+                _pack_authored_shot_sections(
+                    requested_sections,
+                    generated_sections,
                     minimum_frames=minimum_frames,
                     maximum_frames=maximum_frames,
                     align_frame_count=align_frame_count,
                 )
-                section_published = list(section_plan)
-                section_published[-1] -= sum(section_plan) - visible_frames
-                if section_published[-1] <= 0:
-                    exact_frames = []
-                    break
-                exact_frames.extend(section_plan)
-                exact_published.extend(section_published)
-                if section_index < len(requested_sections) - 1:
-                    boundary_after.append(len(exact_frames) - 1)
+            )
             if exact_frames:
                 before = len(exact_frames)
                 exact_frames, exact_published = _fold_short_terminal_clip(
                     exact_frames,
                     exact_published,
                     maximum_frames=int(maximum_frames),
+                    align_frame_count=align_frame_count,
                 )
                 if len(exact_frames) < before and boundary_after:
                     boundary_after = [
@@ -1557,9 +1633,7 @@ def _owner_for_frame(frame: int, ranges: Sequence[tuple[int, int]]) -> int:
     for index, (start, end) in enumerate(ranges):
         if start <= int(frame) < end:
             return index
-    raise H3ShotPlanError(
-        "H3 authored event falls outside the published physical geometry"
-    )
+    raise H3ShotPlanError(_H3_TIMESTAMP_OUTSIDE_DURATION)
 
 
 def _render_context_ir_segment(
@@ -1648,10 +1722,15 @@ def _render_context_ir_segment(
                     dialogue_occurrence_tokens=dialogue_occurrence_tokens,
                 )
             )
-            if inline_final:
+            extends_past_window = event_end > segment_end
+            if extends_past_window:
                 owner_action = (
-                    owner_action or "maintain the established visual state"
+                    "Begin this authored action in this window only; "
+                    "do not complete the shot. "
+                    + (owner_action or "maintain the established visual state")
                 )
+            if inline_final or extends_past_window:
+                owner_action = owner_action or "maintain the established visual state"
                 replacement = f"{action.group('head')}{owner_action}"
                 payload = (
                     payload[:action.start()] + replacement + " "
@@ -1832,16 +1911,12 @@ def _compile_segment_local_prompts(
         kind = str(event.get("kind") or "")
         authored_start = _h3_frame_at(event.get("start"), fps)
         if authored_start >= total_frames:
-            raise H3ShotPlanError(
-                "H3 authored event falls outside the published physical geometry"
-            )
+            raise H3ShotPlanError(_H3_TIMESTAMP_OUTSIDE_DURATION)
         if (
             kind == "range"
             and _h3_frame_at(event.get("end"), fps) > total_frames
         ):
-            raise H3ShotPlanError(
-                "H3 authored range exceeds the published physical geometry"
-            )
+            raise H3ShotPlanError(_H3_RANGE_OUTSIDE_DURATION)
 
     event_ranges = _event_frame_ranges(
         events, total_frames=total_frames, fps=fps,
@@ -2092,6 +2167,13 @@ def _compile_segment_local_prompts(
                     "CONTINUATION OF AUTHORED ACTION: " + event_text
                     if event_text else
                     "CONTINUATION OF AUTHORED NON-DIALOGUE ACTION STATE"
+                )
+            elif event_end > end:
+                event_text = (
+                    "OPENING OF AUTHORED ACTION (this window only): "
+                    + event_text
+                    if event_text else
+                    "OPENING OF AUTHORED ACTION (this window only)"
                 )
             if str(event.get("kind") or "") == "point":
                 rendered = (

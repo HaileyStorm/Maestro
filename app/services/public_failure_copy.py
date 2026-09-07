@@ -76,6 +76,7 @@ PUBLIC_CONTRACT_MESSAGES: Final[frozenset[str]] = frozenset({
     'MiniMax H3 executable records cannot contain multiple OPENING BLOCKING fields',
     'MiniMax H3 inference steps must be an integer from 2 to 50.',
     'MiniMax H3 inference steps must be between 2 and 50 scheduler grid points.',
+    'MiniMax H3 shot ranges must end inside the selected duration. Fractional seconds use a decimal on the seconds field (00:09.500 or 9.5s). Two-colon clocks are hours:minutes:seconds, so 00:09:30 is 9 minutes 30 seconds.',
     'MiniMax H3 timestamps must land inside the selected duration. Fractional seconds use a decimal on the seconds field (00:09.500 or 9.5s). Two-colon clocks are hours:minutes:seconds, so 00:09:30 is 9 minutes 30 seconds.',
     'Native MiniMax H3 boundary conditioning is unavailable; use the supported automatic segmented path',
     'Pinned FL2VA cannot use semantic references; enable adaptive conditioning or remove the semantic references',

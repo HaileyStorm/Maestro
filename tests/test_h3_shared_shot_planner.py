@@ -170,6 +170,88 @@ class H3SharedShotPlannerTests(unittest.TestCase):
             inline_policy["reason"], "authored timestamps are authoritative",
         )
 
+    def test_short_authored_shots_pack_into_native_windows(self):
+        prompt = (
+            "[Shot 1] At 0 seconds, begin. "
+            "[Shot 2] At 3 seconds, continue. "
+            "[Shot 3] At 12 seconds, finish."
+        )
+        frames, policy = plan_h3_clip_frames(
+            480,
+            prompt=prompt,
+            fps=24,
+            minimum_frames=124,
+            maximum_frames=345,
+            align_frame_count=self._align,
+            published_total_frames=480,
+        )
+        self.assertEqual(policy["id"], "authored_timeline_exact_v1")
+        self.assertEqual(len(frames), 2)
+        self.assertEqual(policy["clip_requested_frames"], [288, 192])
+        self.assertEqual(sum(policy["clip_requested_frames"]), 480)
+        self.assertTrue(all(124 <= item <= 345 for item in frames))
+
+    def test_timed_authored_sections_respect_manual_ceiling(self):
+        frames, policy = plan_h3_clip_frames(
+            384, prompt="[Shot 1] At 0 seconds, start. [Shot 2] At 3 seconds, continue. "
+            "[Shot 3] At 12 seconds, end.", fps=24,
+            minimum_frames=124, maximum_frames=192,
+            align_frame_count=self._align, manual_segment_ceiling=True,
+            published_total_frames=384,
+        )
+        self.assertEqual(frames, [124, 124, 124, 124])
+        self.assertEqual(policy["clip_requested_frames"], [72, 124, 92, 96])
+
+    def test_authored_packing_preserves_grid_cuts_and_end_anchor_tail(self):
+        from itertools import product
+        for sections in product((1, 72, 124, 200, 340, 345, 400), repeat=3):
+            for tail in (0, 17):
+                offsets = [0, sections[0], sum(sections[:2])]
+                prompt = "\n".join(
+                    f"[Shot {index + 1}] At {offset / 24:.8f} seconds, action {index + 1}."
+                    for index, offset in enumerate(offsets)
+                )
+                with self.subTest(sections=sections, tail=tail):
+                    frames, policy = plan_h3_clip_frames(
+                        sum(sections) + tail, prompt=prompt, fps=24,
+                        minimum_frames=124, maximum_frames=345,
+                        align_frame_count=self._align,
+                        published_total_frames=sum(sections),
+                    )
+                    published = policy["clip_requested_frames"]
+                    self.assertEqual(sum(published), sum(sections))
+                    self.assertTrue(all(124 <= n <= 345 and n % 17 == 5 for n in frames))
+                    self.assertTrue(all(0 < p <= g for p, g in zip(published, frames)))
+                    self.assertGreaterEqual(frames[-1] - published[-1], tail)
+                    cursor = 0
+                    for count in published[:-1]:
+                        cursor += count
+                        if cursor in offsets:
+                            continue
+                        owner = max(i for i, start in enumerate(offsets) if start < cursor)
+                        required = sections[owner] + (tail if owner == 2 else 0)
+                        self.assertGreater(required, 345, 'a fitting authored shot was split')
+
+    def test_oversize_authored_shot_is_the_only_split_window(self):
+        prompt = (
+            "[Shot 1] At 0 seconds, begin. "
+            "[Shot 2] At 6 seconds, the long action continues. "
+        )
+        frames, policy = plan_h3_clip_frames(
+            720,
+            prompt=prompt,
+            fps=24,
+            minimum_frames=124,
+            maximum_frames=345,
+            align_frame_count=self._align,
+            published_total_frames=720,
+        )
+        self.assertEqual(policy["id"], "authored_timeline_exact_v1")
+        self.assertGreaterEqual(len(frames), 3)
+        self.assertEqual(sum(policy["clip_requested_frames"]), 720)
+        self.assertIn(0, policy["authored_boundary_after_clip_indices"])
+
+
     def test_pressure_does_not_cut_an_indivisible_dialogue_action(self):
         planned, policy = plan_h3_clip_frames(
             480,
@@ -916,6 +998,36 @@ class H3SharedShotPlannerTests(unittest.TestCase):
         self.assertTrue(plan)
         self.assertGreaterEqual(len(plan.get("segments") or plan.get("clips") or [plan]), 1)
 
+    def test_timing_errors_publish_only_the_exact_reviewed_copy(self):
+        from services.h3_shot_planner import (
+            _H3_TIMESTAMP_OUTSIDE_DURATION, _H3_RANGE_OUTSIDE_DURATION,
+        )
+        from services.public_failure_copy import reviewed_contract_message
+        for message in (_H3_TIMESTAMP_OUTSIDE_DURATION, _H3_RANGE_OUTSIDE_DURATION):
+            self.assertEqual(reviewed_contract_message(message), message)
+            self.assertIsNone(reviewed_contract_message(message + ' extra input'))
+
+    def test_fractional_seconds_clock_is_decimal_not_hours_minutes_seconds(self):
+        _, events = parse_global_timeline_prompt(
+            "[Shot 2] At 00:09.500, they look closer.",
+        )
+        self.assertEqual([event["start"] for event in events], [9.5])
+        _, misread = parse_global_timeline_prompt(
+            "[Shot 2] At 00:09:30, they look closer.",
+        )
+        self.assertEqual([event["start"] for event in misread], [570.0])
+        with self.assertRaisesRegex(H3ShotPlanError, r"00:09\.500 or 9\.5s"):
+            plan_h3_native_shots(
+                global_prompt=(
+                    "[Shot 1] An adult traveler stands in a hallway.\n"
+                    "[Shot 2] At 00:09:30, they look closer.\n"
+                    "[Shot 3] At 00:21.000, they walk on.\n"
+                    "[Shot 4] At 00:38.500, they sit.\n"
+                ),
+                clip_frame_counts=[345, 345, 345, 345],
+                fps=24,
+            )
+
     def test_clock_times_past_ninety_nine_seconds_keep_full_seconds(self):
         _, events = parse_global_timeline_prompt(
             "[Shot 9] At 00:106.500, they turn around.\n"
@@ -956,13 +1068,15 @@ class H3SharedShotPlannerTests(unittest.TestCase):
             [260, 192, 141],
             [252, 192, 133],
             maximum_frames=345,
+            align_frame_count=self._align,
         )
         self.assertEqual(published, [252, 325])
-        self.assertEqual(generated, [260, 333])
+        self.assertEqual(generated, [260, 345])
         unchanged_g, unchanged_p = _fold_short_terminal_clip(
             [260, 345],
             [252, 133],
             maximum_frames=345,
+            align_frame_count=self._align,
         )
         self.assertEqual(unchanged_p, [252, 133])
         self.assertEqual(unchanged_g, [260, 345])
@@ -980,7 +1094,7 @@ class H3SharedShotPlannerTests(unittest.TestCase):
         for prompt in (canonical, "[0-20s] An adult traveler crosses the room."):
             with self.subTest(canonical=prompt is canonical):
                 with self.assertRaisesRegex(
-                    H3ShotPlanError, "published physical geometry",
+                    H3ShotPlanError, "must end inside the selected duration",
                 ):
                     plan_h3_native_shots(
                         global_prompt=prompt,
@@ -1675,6 +1789,10 @@ class H3SharedShotPlannerTests(unittest.TestCase):
             sum(dialogue in item for item in plan["clip_prompts"]), 1,
         )
         self.assertNotIn("Continuation of", plan["clip_prompts"][0])
+        self.assertIn(
+            "Begin this authored action in this window only",
+            plan["clip_prompts"][0],
+        )
         self.assertIn("Continuation of Hall crossing", plan["clip_prompts"][1])
         self.assertIn("Continuation of Hall crossing", plan["clip_prompts"][2])
         event = plan["event_ownership"][0]
@@ -1720,8 +1838,17 @@ class H3SharedShotPlannerTests(unittest.TestCase):
         self.assertNotIn(
             "CONTINUATION OF AUTHORED ACTION", plan["clip_prompts"][0],
         )
+        self.assertIn(
+            "OPENING OF AUTHORED ACTION (this window only)",
+            plan["clip_prompts"][0],
+        )
         self.assertTrue(all(
             "CONTINUATION OF AUTHORED ACTION" in plan["clip_prompts"][index]
+            for index in (1, 2)
+        ))
+        self.assertTrue(all(
+            "OPENING OF AUTHORED ACTION (this window only)"
+            not in plan["clip_prompts"][index]
             for index in (1, 2)
         ))
         self.assertEqual(

@@ -63,6 +63,31 @@ test expecting observed 4.5 to act like 5 is superseded by the observed-profile
 contract and must be corrected when that WIP is integrated. Other native-max
 policy/default and resolution-plumbing changes remain separate.
 
+## Authored-shot packing — 2026-09-07 UTC
+
+Short authored shots now pack with their neighbors into legal native windows
+without losing their published timing. A shot splits only when its required
+generation, including an end-anchor tail, exceeds the active ceiling. Final
+window folding discards previous padding, preserves the required final tail,
+and realigns the merged frame count instead of summing two grid values.
+
+A continuing authored action gets an opening-only instruction in its first
+window; later windows retain continuation and single-owner dialogue behavior.
+Cuts inside packed windows retain their authored frame position. Timestamp and
+range errors explain decimal seconds versus hours:minutes:seconds through
+exact reviewed copy, without echoing authored input.
+
+The final isolated candidate passes 452 planner/Studio/Director/duration/recovery
+tests plus 64 frame-lattice/preflight/optimization/audio tests. Its deterministic
+686-case packing matrix covers frame-grid legality, exact published totals,
+end-anchor tails, and preservation of fitting shots; a separate timed case
+covers the manual 192-frame ceiling. Independent candidate review is clean.
+A synthetic plan compiled by the prior committed planner still passes saved-seal
+validation byte-for-byte; changed new-plan instructions receive a different
+seal. This is CPU/synthetic and local codec evidence, not live model quality or
+GPU recovery acceptance. Receipts and source hashes are in
+`.artifacts-temp/astra-shot-packing-20260907/`.
+
 ## Successor progress
 
 The successor's native Goal is active and continuous. The original handoff

@@ -322,10 +322,14 @@ non_diegetic_music: N/A"""
                     ),
                     [],
                 )
-                self.assertTrue(any(
-                    boundary["type"] in {"precut", "cut"}
-                    for boundary in plan["clip_boundaries"]
-                ))
+                cut = next(item for item in semantic[0]["event_ownership"]
+                           if "train arrives" in item["executable_payload"])
+                self.assertIn("cut to a close-up", cut["executable_payload"])
+                owner = cut["owner_segment_index"]
+                self.assertEqual(
+                    sum(plan["clip_published_frames"][:owner]) + cut["local_start_frame"],
+                    15 * 24,
+                )
 
     def test_ref2va_effective_segment_requires_and_carries_terms(self):
         clips, planned = self._ref_scene(20.0)
