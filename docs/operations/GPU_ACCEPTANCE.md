@@ -209,3 +209,20 @@ Task-private grant, dispatch, marker, and withdrawal receipts are retained in
 This satisfies only the small runtime prerequisite. The H3 W4A8 row remains
 open for checkpoint-bound generation, playable output, fallback checks, and
 visual/human acceptance. Native Windows runtime execution remains unverified.
+
+## NVFP4 scale-layout check — 2026-09-07 UTC
+
+The CPU fallback now matches the eager reference for padded physical scale
+tiles at logical widths 32/64/96, both nibble layouts, and FP32/BF16/FP16.
+This is separate from native kernel acceptance.
+
+A coordinator-authorized synthetic LightX2V run on RTX 5090 (SM 12.0),
+Torch 2.10.0+cu130 reached native quantization and GEMM, then failed with
+`cuBLAS error: 7` on its first case: logical M=1, N=128, K=64, with M padded
+to 128. Zero numerical cases completed. The process exited and the lease was
+withdrawn and confirmed cancelled. No fallback or retry was attempted.
+
+Receipts: `.artifacts-temp/astra-nvfp4-scale-20260907/`. Native acceptance
+remains open under task-local `NVFP4-LIGHTX-SHAPES`: inspect the pinned kernel's
+shape and runtime contract before the next bounded lease. No full-model or
+quality conclusion follows from this attempt.

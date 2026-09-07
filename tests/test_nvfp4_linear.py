@@ -70,6 +70,53 @@ class NVFP4NativeLoraTests(unittest.TestCase):
                          (offload.hook_lora, offload._lora_generic_forward, offload._lora_linear_forward))
 
 
+class NVFP4ScaleLayoutTests(unittest.TestCase):
+    def test_deswizzle_matches_reference_packing_before_logical_crop(self):
+        from comfy_kitchen.float_utils import to_blocked
+        for rows in (1, 127, 128, 129, 256):
+            for groups in (1, 2, 3, 4, 6, 8):
+                for extra in (0, 4):
+                    with self.subTest(rows=rows, groups=groups, extra=extra):
+                        natural = torch.arange(rows * (groups + extra), dtype=torch.float32).reshape(rows, -1)
+                        blocked = to_blocked(natural, flatten=False)
+                        result = nvfp4._deswizzle_nvfp4_scale(blocked, groups * 16)
+                        torch.testing.assert_close(result[:rows], natural[:, :groups], rtol=0, atol=0)
+                        self.assertEqual(result.shape[1], groups)
+
+    def test_dequantization_matches_pinned_eager_reference_for_both_layouts(self):
+        from comfy_kitchen.float_utils import to_blocked
+        from comfy_kitchen.backends.eager.quantization import dequantize_nvfp4
+        for width in (32, 64, 96):
+            for layout in ('legacy', 'tensorcore'):
+                for dtype in (torch.float32, torch.bfloat16, torch.float16):
+                    with self.subTest(width=width, layout=layout, dtype=dtype):
+                        rows = 3
+                        packed = (torch.arange(rows * width // 2) % 256).to(torch.uint8).reshape(rows, -1)
+                        scales = ((torch.arange(rows * (width // 16)).reshape(rows, -1) % 7 + 1) / 4)
+                        scales = to_blocked(scales.to(torch.float8_e4m3fn), flatten=False)
+                        alpha, input_scale = torch.tensor(2.), torch.tensor(4.)
+                        expected = dequantize_nvfp4(
+                            packed, alpha if layout == 'tensorcore' else alpha * input_scale,
+                            scales, output_type=dtype, hi_first=layout == 'tensorcore',
+                        )
+                        actual = nvfp4._dequantize_nvfp4_weight(
+                            packed, scales, input_scale, alpha,
+                            dtype=dtype, device=torch.device('cpu'), layout=layout,
+                        )
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                        self.assertEqual(actual.dtype, dtype)
+
+    def test_incomplete_physical_tiles_fail_before_reshape(self):
+        for shape in ((127, 4), (128, 2), (128, 6)):
+            with self.subTest(shape=shape), self.assertRaisesRegex(RuntimeError, 'physical tiles'):
+                nvfp4._deswizzle_nvfp4_scale(torch.ones(shape), 32)
+        with self.assertRaisesRegex(RuntimeError, 'scale shape mismatch'):
+            nvfp4._deswizzle_nvfp4_scale(torch.ones(128, 4), 96)
+        for width in (0, 15, 33):
+            with self.subTest(width=width), self.assertRaisesRegex(RuntimeError, 'complete input blocks'):
+                nvfp4._deswizzle_nvfp4_scale(torch.ones(128, 4), width)
+
+
 class NVFP4KernelPaddingTests(unittest.TestCase):
     def weight(self):
         return types.SimpleNamespace(

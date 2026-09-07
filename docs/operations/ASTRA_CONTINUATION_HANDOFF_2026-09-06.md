@@ -113,11 +113,22 @@ mock-kernel dispatch checks, not live GPU kernel, full-model, or Windows proof.
 
 Remaining task-owned compatibility work:
 
-- `NVFP4-K32`: logical input width 32 exposes the existing scale-deswizzle
-  assumption: scale columns are cropped before the padded 128-by-4 tile is
-  reshaped. Reproduce with the retained initial CPU receipt, then reconcile
-  logical versus physical scale geometry and test widths 32/64/96. Preserve
-  pinned checkpoint scale/nibble semantics; require a fresh lease for GPU proof.
+- `NVFP4-K32`: CPU scale-layout repair is complete. Full physical 128-by-4
+  scale tiles are deswizzled before logical columns are cropped; extra complete
+  tiles remain supported and incomplete tiles fail explicitly. Tests match the
+  eager reference exactly for widths 32/64/96, both nibble layouts, and
+  FP32/BF16/FP16. The full candidate passes 124 of 134 tests (10 runtime skips),
+  plus eight focused CPU tests in the CUDA-13 environment. Source/reference
+  hashes and independent clean review are retained under
+  `.artifacts-temp/astra-nvfp4-scale-20260907/`.
+- `NVFP4-LIGHTX-SHAPES`: a fresh validated lease attempted nine small native
+  LightX2V cases on RTX 5090 / Torch 2.10.0+cu130. The first case (logical M=1,
+  N=128, K=64; padded activation rows=128) reached quantization and GEMM but
+  failed with `cuBLAS error: 7`. Zero numerical cases completed. The process
+  exited and the lease was withdrawn/confirmed cancelled. No retry, fallback,
+  package mutation, model load, or service restart occurred. Inspect the pinned
+  native kernel's shape/runtime contract before designing another bounded
+  leased test; do not infer kernel acceptance from the passing CPU reference.
 - `NVFP4-DORA`: MMGP's DoRA branch bypasses the native-forward marker and
   needs separate scaled-base/dequantization analysis and numerical acceptance.
   Ordinary low-rank LoRA evidence cannot close this item. Do not restore broad

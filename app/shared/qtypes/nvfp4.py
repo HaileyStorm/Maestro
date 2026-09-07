@@ -547,18 +547,20 @@ def _get_fp4_byte_lut(device, dtype):
 
 
 def _deswizzle_nvfp4_scale(scale, in_features, block_size=16, dtype=None):
+    if scale.ndim != 2 or block_size <= 0 or in_features <= 0 or in_features % block_size:
+        raise RuntimeError("NVFP4 scales require a matrix and complete input blocks")
     k_groups = in_features // block_size
     if scale.shape[1] < k_groups:
         raise RuntimeError(
             f"NVFP4 scale shape mismatch: expected at least {k_groups} groups, got {scale.shape[1]}"
         )
-    if scale.shape[1] > k_groups:
-        scale = scale[:, :k_groups]
-
-    m, _ = scale.shape
-    m_tiles = (m + 128 - 1) // 128
-    f = block_size * 4
-    k_tiles = (in_features + f - 1) // f
+    m, physical_groups = scale.shape
+    if m % 128 or physical_groups % 4:
+        raise RuntimeError("NVFP4 scales require complete 128-by-4 physical tiles")
+    # Padding participates in the swizzled tile layout. Trim logical groups
+    # only after undoing the permutation, including any extra complete tiles.
+    m_tiles = m // 128
+    k_tiles = physical_groups // 4
     tmp = scale if dtype is None else scale.to(dtype)
     tmp = tmp.reshape(1, m_tiles, k_tiles, 32, 4, 4)
     tmp = tmp.permute(0, 1, 4, 3, 2, 5)
