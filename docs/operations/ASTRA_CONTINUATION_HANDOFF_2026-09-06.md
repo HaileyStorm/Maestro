@@ -1729,3 +1729,53 @@ the selected asset or authorize resealing an existing plan. Generated Ref-to-Bas
 switching must rebuild retained original source; authored Ref ownership remains
 separate. Browser and live acceptance remain open, and the continuous Goal stays
 active. The historical tracker hold and service/provider boundaries are unchanged.
+
+
+### Shared reference text and mapper adoption gates (2026-09-07)
+
+Director now uses services.h3_reference_text.reference_relationships as the
+single reference-text renderer. Explicit identity, scene, style, composition,
+voice and drive intents retain Director's established subject binding. Inputs
+that reach the renderer without image/audio intent remain neutral supplied
+references and do not invoke subject matching or invent identity/voice ownership.
+Roles remain escaped literal data. The old Director renderer body is replaced by
+a small context adapter. The dormant manifest/sequence producers still insert
+some defaults upstream; this milestone does not claim those producers changed.
+
+The corrected mapper candidate delegates to this same renderer. Record validation
+now requires the current target schema, including empty-reference target switches.
+Direct Ref2VA passthrough is rejected outside explicit authoring/retained-lineage
+record flow, and malformed type/intent/origin values produce bounded errors.
+The mapper and its tests remain unadopted in the candidate until real callers and
+recovery binding are connected; do not copy the older candidate over these fixes.
+
+The combined candidate passes 399 CPU tests (370 active-path tests plus 29
+mapper-candidate tests), with no skips/failures/errors and stable source hashes.
+An independent 27-case explicit-intent comparison matches the preceding Director
+output byte-for-byte. Independent closure review is clean; compileall passes.
+Evidence, corrected candidate and the
+bounded caller design are retained under
+`.artifacts-temp/astra-adaptive-caller-20260907/`. These checks do not establish
+GPU/model generation, browser, Windows or human acceptance.
+
+The verified runtime integration point is the task loop before wgp.validate_task:
+it reads task["prompt"] and expands templates. Update both task prompt and its
+execution/sidecar projections in one validated transaction. Continuation has
+already mutated the next task there, while h3_task_sidecar_params remains an
+immutable preparse source snapshot and misses newly attached references.
+
+Load/revalidate the existing request-manifest input descriptors using the job's
+manifest pointer and owner/project evidence, then overlay only the proven late
+continuation descriptor and predecessor dependency. Do not mint authority from
+raw path hashes or treat selected K intent as proof of a soundtrack. Reuse the
+selected-slot owner and bind actual source-video audio evidence in order.
+
+Keep source plan separate from the copied whole execution plan. Use
+rewrite_h3_execution_prompts before assigning any child output, preserving
+source/event/dialogue ownership and geometry. Add the versioned mapping receipt
+to segment recovery settings before calculating unit IDs, compare it during
+completed-unit reuse, and leave legacy units without receipts unchanged. Replace
+all unadopted h3_prompt_adapt calls, including the dispatch append-and-reseal call,
+only when their actual replacement is complete. Preserve manual Base freeform
+behavior; current strict mapping still rejects some ambiguous authored forms.
+The full continuous Goal and caller integration remain active.
