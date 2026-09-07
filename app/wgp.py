@@ -10328,11 +10328,12 @@ def generate_video(*args, **kwargs):
         return default
 
     def _set_bound(name, value):
-        bound_kwargs[name] = value
         if name in param_names:
             idx = param_names.index(name)
             if idx < len(bound_args):
                 bound_args[idx] = value
+                return
+        bound_kwargs[name] = value
 
     model_type = _bound_value("model_type")
     if is_h3_model(model_type):

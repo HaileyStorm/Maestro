@@ -64,6 +64,23 @@ _SAFE_PHASE_FIELDS = {
     "generation", "model_load", "spectrum_anchor_capture",
     "spectrum_offline_replay", "postprocess",
 }
+_H3_OFFLOAD_PROFILES = frozenset({1.0, 2.0, 3.0, 3.5, 4.0, 4.5, 5.0})
+
+
+def _normalize_offload_profile(
+    value: Any,
+    *,
+    error_message: str,
+) -> int | float:
+    if isinstance(value, bool):
+        raise H3BenchmarkError(error_message)
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise H3BenchmarkError(error_message) from None
+    if not math.isfinite(numeric) or numeric not in _H3_OFFLOAD_PROFILES:
+        raise H3BenchmarkError(error_message)
+    return int(numeric) if numeric.is_integer() else numeric
 
 
 def _safe_mapping(group: str, value: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -150,14 +167,11 @@ def build_benchmark_spec(
         raise H3BenchmarkError("Quick benchmark is fixed at 124 H3-grid frames")
     if profile != "quick" and frames < 1:
         raise H3BenchmarkError("Observed H3 jobs must contain at least one frame")
-    if "offload_profile" in resolved_task:
-        try:
-            offload_profile = int(resolved_task["offload_profile"])
-        except (TypeError, ValueError):
-            raise H3BenchmarkError("H3 offload profile is invalid") from None
-        if offload_profile not in {1, 2, 3, 4, 5}:
-            raise H3BenchmarkError("H3 offload profile is invalid")
-        resolved_task["offload_profile"] = offload_profile
+    if "offload_profile" in raw_task:
+        resolved_task["offload_profile"] = _normalize_offload_profile(
+            raw_task["offload_profile"],
+            error_message="H3 offload profile is invalid",
+        )
     if "recovery_policy_version" in resolved_task:
         try:
             recovery_policy = int(resolved_task["recovery_policy_version"])
@@ -356,12 +370,13 @@ def _sanitize_record(record: Mapping[str, Any]) -> dict[str, Any] | None:
         and safe_task.get("audio_evaluations") == 8
     ):
         return None
-    if "offload_profile" in safe_task:
+    if "offload_profile" in raw_task:
         try:
-            safe_task["offload_profile"] = int(safe_task["offload_profile"])
-        except (TypeError, ValueError):
-            return None
-        if safe_task["offload_profile"] not in {1, 2, 3, 4, 5}:
+            safe_task["offload_profile"] = _normalize_offload_profile(
+                raw_task["offload_profile"],
+                error_message="H3 offload profile is invalid",
+            )
+        except H3BenchmarkError:
             return None
     if "recovery_policy_version" in safe_task:
         try:
@@ -1110,6 +1125,11 @@ def _allocation_scenario(value: Mapping[str, Any]) -> dict[str, Any]:
             if re.fullmatch(r"[A-Za-z0-9_.+-]{1,96}", token) is None:
                 raise H3BenchmarkError("Invalid H3 allocation scenario")
             result[field] = token
+        elif field == "offload_profile":
+            result[field] = _normalize_offload_profile(
+                item,
+                error_message="Invalid H3 allocation scenario",
+            )
         else:
             if isinstance(item, bool):
                 raise H3BenchmarkError("Invalid H3 allocation scenario")

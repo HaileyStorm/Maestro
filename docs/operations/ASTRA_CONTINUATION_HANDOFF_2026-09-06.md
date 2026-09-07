@@ -547,6 +547,44 @@ service restart, or native Windows acceptance occurred. Unrelated H3/API/UI WIP
 remains unadopted. The continuous Goal and the remaining planned backlog stay
 active.
 
+## Offload-profile precision prerequisite — 2026-09-07
+
+Benchmark construction, cache normalization, and allocation evidence now
+preserve supported fractional MMGP profiles 3.5 and 4.5. Whole-number profiles
+remain integers, retaining the existing canonical integer key/digest. Explicit
+malformed, Boolean, nonfinite, or unsupported profiles are rejected without
+echoing their values; an absent legacy optional field remains absent. No live
+ledger or historical record was migrated or rewritten.
+
+The legacy v1 recovery selector no longer accepts a fractional observation as
+its truncated integer profile, and nonfinite conversion cannot escape as an
+overflow. Valid integer recovery behavior is retained. The WGP wrapper now
+updates either an existing positional argument or a keyword, so positional and
+mixed calls no longer receive duplicate profile arguments. Executable tests
+cover all three calling forms through an OOM retry, including the updated task
+parameters. Independent review is clean. All 322 tests in the assembled
+benchmark, caller/wrapper, observed-offload, sealed-plan, audio, acceleration,
+and queue-recovery suites pass. Syntax and publication checks are separate
+final gates recorded in the private manifest.
+
+Native-max floor adoption remains open. Its source map distinguishes immutable
+v1 integer profile requests from the floating profile actually loaded. Current
+benchmark/allocation callers still derive their profile from a pre-floor
+request helper; serialization precision alone does not make that observed
+runtime evidence. Before changing the floor, add task-bound load/reuse evidence,
+clear it before each attempt, skip unknown/mismatched observations, and bind new
+calibration to an explicit policy revision. Preserve historical ledgers and
+completed-prefix requested-profile provenance rather than relabeling them.
+
+Then finish resolution propagation through queue identity, wrapper, load,
+loaded identity/reprofile, and recovery. Observed 4.5 must remain 4.5 until a
+real escalation runs. The parked native-floor candidate, exact incoming WIP,
+source probes, and next actions are under
+`.artifacts-temp/astra-h3-native-offload-20260907/`; serializer evidence is under
+`.artifacts-temp/astra-h3-profile-serialization-20260907/`. Incoming native-floor
+and FlashVSR WIP is preserved separately from this precision checkpoint. No
+GPU, model loading, generation, service restart, or Windows acceptance occurred.
+
 ## H3 quantized projection input dtype — 2026-09-07
 
 H3 entry projections now use a module's declared floating output dtype before

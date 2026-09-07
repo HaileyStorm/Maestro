@@ -39849,10 +39849,15 @@ def _h3_calibrated_peak_choice(
         runtime = spec.get("runtime")
         runtime = runtime if isinstance(runtime, dict) else {}
         try:
-            profile = int(task.get("offload_profile"))
+            raw_profile = task.get("offload_profile")
+            profile = int(raw_profile)
+            # Version-1 recovery plans replay integer profile requests. A
+            # fractional observation is not evidence for its truncated value.
+            if isinstance(raw_profile, bool) or float(raw_profile) != profile:
+                continue
             frames = int(task.get("frame_count"))
             peak = int(record.get("peak_gpu_memory_bytes"))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         exact = (
             profile in allowed_profiles

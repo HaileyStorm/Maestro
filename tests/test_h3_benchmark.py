@@ -60,6 +60,27 @@ class H3BenchmarkTests(unittest.TestCase):
             "residency_epoch_band": 0,
         }
 
+    def _benchmark_spec_with_offload(self, offload_profile):
+        base = spec()
+        return build_benchmark_spec(
+            case_id="ref2va",
+            hardware=base["hardware"],
+            runtime=base["runtime"],
+            model=base["model"],
+            engine=base["engine"],
+            encoder=base["encoder"],
+            input_signature={"image_count": 1},
+            task={
+                "profile": "observed_job",
+                "width": 1344,
+                "height": 768,
+                "frame_count": 243,
+                "sampling_steps": 20,
+                "recovery_policy_version": 1,
+                "offload_profile": offload_profile,
+            },
+        )
+
     def test_allocation_ledger_dedupes_bursts_and_contamination_never_votes(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger = H3AllocationLedger(Path(directory, "ledger.json"))
@@ -117,6 +138,88 @@ class H3BenchmarkTests(unittest.TestCase):
             snapshot = H3AllocationLedger(path).snapshot(scenario)
             self.assertEqual(snapshot["clean_oom_episodes"], 10)
 
+    def test_allocation_ledger_preserves_fractional_profile_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "ledger.json")
+            ledger = H3AllocationLedger(path)
+            integer = self._allocation_scenario()
+            integer["offload_profile"] = 4.0
+            fractional = {**integer, "offload_profile": 4.5}
+
+            ledger.record(integer, "clean_oom", now=900)
+            ledger.record(fractional, "clean_oom", now=1800)
+
+            payload = json.loads(path.read_text(encoding="ascii"))
+            integer_key = (
+                "9c6835105cf90043fd2a3c880c64082a81414f629eb60b6e03671077ac764c5f"
+            )
+            self.assertEqual(len(payload["scenarios"]), 2)
+            self.assertIn(integer_key, payload["scenarios"])
+            self.assertIsInstance(
+                payload["scenarios"][integer_key]["scenario"]["offload_profile"],
+                int,
+            )
+            fractional_keys = set(payload["scenarios"]) - {integer_key}
+            self.assertEqual(len(fractional_keys), 1)
+            fractional_item = payload["scenarios"][fractional_keys.pop()]
+            self.assertEqual(fractional_item["scenario"]["offload_profile"], 4.5)
+            self.assertEqual(ledger.snapshot(integer)["clean_oom_episodes"], 1)
+            self.assertEqual(ledger.snapshot(fractional)["clean_oom_episodes"], 1)
+
+    def test_allocation_ledger_reads_existing_integer_key_without_rewrite(self):
+        scenario = self._allocation_scenario()
+        integer_key = (
+            "9c6835105cf90043fd2a3c880c64082a81414f629eb60b6e03671077ac764c5f"
+        )
+        payload = {
+            "schema_version": 1,
+            "heuristic_revision": 1,
+            "scenarios": {
+                integer_key: {
+                    "scenario": scenario,
+                    "counts": {
+                        "clean_oom": 2,
+                        "contaminated_oom": 0,
+                        "production_success": 0,
+                        "confirmation_success": 0,
+                        "probe_success": 0,
+                    },
+                    "last_episode_bucket": 2,
+                    "last_outcome": "clean_oom",
+                    "contamination_reason": "",
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "ledger.json")
+            path.write_text(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                encoding="ascii",
+            )
+            path.chmod(0o600)
+            before = path.read_bytes()
+
+            snapshot = H3AllocationLedger(path).snapshot(scenario)
+
+            self.assertEqual(snapshot["clean_oom_episodes"], 2)
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_allocation_profile_rejects_unsafe_values_without_echoing_them(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = H3AllocationLedger(Path(directory, "ledger.json"))
+            for value in (
+                True, False, float("nan"), float("inf"), float("-inf"),
+                None, [], {}, 0, 3.25, 6, "private-profile-value",
+            ):
+                with self.subTest(value=repr(value)):
+                    scenario = {**self._allocation_scenario(), "offload_profile": value}
+                    with self.assertRaises(H3BenchmarkError) as caught:
+                        ledger.snapshot(scenario)
+                    self.assertEqual(
+                        str(caught.exception), "Invalid H3 allocation scenario",
+                    )
+                    self.assertNotIn("private-profile-value", str(caught.exception))
+
     def test_peak_recovery_identity_separates_offload_profile_and_policy(self):
         base = spec()
         common = {
@@ -153,6 +256,76 @@ class H3BenchmarkTests(unittest.TestCase):
         )
         self.assertNotEqual(profile4["cache_key"], profile5["cache_key"])
         self.assertNotEqual(profile4["cache_key"], next_policy["cache_key"])
+
+    def test_supported_offload_profiles_round_trip_without_precision_loss(self):
+        expected = (1, 2, 3, 3.5, 4, 4.5, 5)
+        for value in expected:
+            with self.subTest(value=value):
+                benchmark = self._benchmark_spec_with_offload(value)
+                normalized = benchmark["task"]["offload_profile"]
+                self.assertEqual(normalized, value)
+                self.assertIsInstance(
+                    normalized,
+                    int if float(value).is_integer() else float,
+                )
+
+        integer = self._benchmark_spec_with_offload(4.0)
+        fractional = self._benchmark_spec_with_offload(4.5)
+        self.assertEqual(
+            integer["cache_key"], self._benchmark_spec_with_offload(4)["cache_key"],
+        )
+        self.assertIn('"offload_profile":4', integer["cache_key"])
+        self.assertNotIn('"offload_profile":4.0', integer["cache_key"])
+        self.assertNotEqual(integer["cache_key"], fractional["cache_key"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = H3BenchmarkCache(Path(directory, "cache.json"))
+            cache.put(record_observation(
+                fractional,
+                wall_time_seconds=1,
+                output_frames=243,
+                output_valid=True,
+            ))
+            loaded = cache.load()
+            self.assertEqual(loaded[0]["spec"]["task"]["offload_profile"], 4.5)
+
+    def test_offload_profile_rejects_unsafe_values_without_echoing_them(self):
+        for value in (
+            True, False, float("nan"), float("inf"), float("-inf"),
+            None, [], {}, 0, 3.25, 6, "private-profile-value",
+        ):
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(H3BenchmarkError) as caught:
+                    self._benchmark_spec_with_offload(value)
+                self.assertEqual(
+                    str(caught.exception), "H3 offload profile is invalid",
+                )
+                self.assertNotIn("private-profile-value", str(caught.exception))
+
+        safe_record = record_observation(
+            self._benchmark_spec_with_offload(4),
+            wall_time_seconds=1,
+            output_frames=243,
+            output_valid=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            cache = H3BenchmarkCache(Path(directory, "cache.json"))
+            for value in (
+                True, float("nan"), float("inf"), None, [], {}, 3.25,
+                "private-profile-value",
+            ):
+                with self.subTest(stored_value=repr(value)):
+                    unsafe_record = json.loads(json.dumps(safe_record))
+                    unsafe_record["spec"]["task"]["offload_profile"] = value
+                    with self.assertRaises(H3BenchmarkError) as caught:
+                        cache.put(unsafe_record)
+                    self.assertEqual(
+                        str(caught.exception),
+                        "Unsafe or invalid H3 benchmark record",
+                    )
+                    self.assertNotIn(
+                        "private-profile-value", str(caught.exception),
+                    )
 
     def test_cache_key_changes_with_reference_and_engine(self):
         base = spec()
