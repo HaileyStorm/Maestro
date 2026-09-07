@@ -565,6 +565,8 @@ The install (without model downloads) typically takes **10–20 minutes** depend
 
 Click **Update** in the launcher menu. This pulls the latest launcher scripts and app code, reinstalls any new Python dependencies, refreshes pinned Blender/H3 acceleration runtimes, and rebuilds the React UI. At runtime, repositories with a declared safe version policy are checked by immutable revision and replaced only after validation; the official H3 style catalog uses the bounded daily metadata refresh described above.
 
+On Linux, the CUDA 13 runtime builds LightX2V from pinned source with a project-local compiler toolchain. Update checks this package even when the app code is already current. A matching source/runtime receipt and unchanged installed files avoid another build. Build failures leave the existing package in place; installation or package-validation failures restore the saved package. These checks verify the package and its library compatibility, not model-generation quality.
+
 ### Resetting
 
 Click **Reset** to wipe the install and start over. Removes `app/env/`, `ui/node_modules/`, `ui/dist/`, the pinned Blender MCP checkout, and the SAM venv if installed. Model checkpoints in `app/ckpts/` are NOT removed by default — delete them manually if you want a true fresh start.

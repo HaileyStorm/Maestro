@@ -257,8 +257,8 @@ hash, and every RECORD entry passes an independent hash/size check. Wheel:
 SHA-256 `a7ebaf98817810394e24ea5e93e9b4774b615bbcb3c4db17d4574f201bac0be7`.
 This is deterministic packaging of the tested local build, not independently
 reproduced compilation or a cross-platform distribution release.
-The installed-runtime validation below completes the next local step. The
-source/build installation flow still needs integration in the normal launcher.
+The installed-runtime validation and managed launcher integration below
+complete the local package repair.
 Full-model generation, visual quality, performance, and Windows remain open.
 
 ### Installed LightX runtime — 2026-09-07 UTC
@@ -288,26 +288,97 @@ cancelled, and the exact package reservation was released. No service restart
 occurred; this does not prove an already-running service adopted the new
 package. Full-model, quality/performance, DoRA, and Windows gates remain open.
 
-The normal Linux `torch.js` path still forces installation of the older public
-wheel; launcher integration is the immediate remaining repair, since Update
-would otherwise replace this verified local installation. The mandatory
+The managed integration below replaces the older public wheel in the normal
+Linux install/update paths and standalone setup configuration. The mandatory
 preflight resolved Pinokio home from its configuration and confirmed this
 checkout lies in its `api` tree. Logs and the required `mochi/torch.js`
 example were inspected; its platform-selected `shell.run`, relative path,
 and selected venv pattern apply. `PINOKIO.md` documents a project-local
-Conda path and separate venv activation. No launcher script changed yet.
+Conda path and separate venv activation.
 
 Primary-source toolchain research favors a dedicated project-local Conda
 environment for `nvidia/label/cuda-13.0.2::cuda-nvcc=13.0.88`: its dependency
 metadata includes host GCC/G++, runtime/driver development files, NVVM/CRT,
 and sysroot. The pip `nvidia-cuda-nvcc==13.0.88` package does not supply a
 host compiler or declare CCCL; do not treat it alone as a proven build kit.
-Resolve compiler/header/library paths from the managed environment, preserve
-the selected Torch/CUDA ABI, and require a fresh compile receipt for the
-managed toolchain before claiming the launcher reproduces this build.
+The implemented helper resolves compiler/header/library paths from that
+managed environment and preserves the selected Torch/CUDA ABI. The fresh
+managed-build receipt below establishes this path on the current Linux host.
 Sources: [NVIDIA CUDA Linux installation](https://docs.nvidia.com/cuda/archive/13.0.3/cuda-installation-guide-linux/index.html),
 [NVIDIA Conda compiler](https://anaconda.org/nvidia/cuda-nvcc),
 [PyPI compiler metadata](https://pypi.org/pypi/nvidia-cuda-nvcc/13.0.88/json).
+
+### Managed LightX launcher integration — 2026-09-07 UTC
+
+Linux CUDA-13 Install, both Update branches, and standalone setup now use
+`app/scripts/install_lightx2v_runtime.py`. Existing runtime markers do not
+skip its check. Windows and older-driver compatibility routes retain their
+existing choices. Standalone setup passes the selected interpreter as an
+argument vector and confines installer scripts to the app's scripts directory.
+
+The helper fetches exact Git revisions, verifies patched source/CUTLASS tree
+digests, provisions a project-local CUDA 13.0.88 / GCC 14 / CCCL 13.0.85
+toolchain, and builds all nine translation units with the verified flags and
+runtime-relative library search path. The real Conda layout places CCCL in
+`targets/x86_64-linux/include/cccl`; discovery and its regression cover that
+layout. Receipts bind installer recipe, source, runtime, and installed bytes.
+Fresh-process ABI checks reject duplicate metadata, wrong payloads, and CUDA-12
+library mappings. State/runtime locks serialize competing invocations;
+catchable termination stops subprocess groups, and installation failures
+restore package/receipt bytes while retaining all rollback attempts.
+
+The HEAD-based candidate passed 107 applicable CPU/launcher tests with one
+existing skip; the final header-layout correction also passed the complete
+20-test helper suite. Independent integration/helper review is clean. The raw
+worktree's broader launcher test still encounters the separately unadopted
+three-line account-path forwarding WIP in `start.js`; the same full launcher
+suite passes in the isolated candidate. That WIP was preserved unchanged.
+
+A fresh validated lease ran the normal helper with the provisioned toolchain
+(resolved GCC/G++ 14.4.0), installed its output in `app/env-rtx50`, and passed
+all nine installed default-cuBLAS numerical cases. Outputs were finite with
+relative MAE 0.0069444–0.0555556; peak allocated tensor memory was 42,283,520
+bytes. Actual process maps matched the selected CUDA-13 libraries with no
+CUDA-12 runtime/cuBLASLt mapping. Wheel SHA-256:
+`5f84543721b83053634c6d7df46fbe28fc21edaabc2c4d1f457059e4243104d4`;
+extension SHA-256:
+`e4e2219255b6bef545168d402071b144cd8277d6721b14a078b207af94f1a86b`.
+A second normal-helper invocation reused the verified package, created no new
+attempt, and left the receipt unchanged. This is verified reuse, not a claim
+that independent recompilations produce identical binaries.
+
+Receipts: `.artifacts-temp/astra-lightx-managed-20260907/`; candidate and
+source hashes: `.artifacts-temp/astra-lightx-launcher-20260907/`; managed build
+and rollback: `app/.lightx2v-runtime/`. An earlier dispatch was refused before
+work because too little lease time remained. A bounded task-private client
+waiter then started the same guarded workload promptly on a fresh grant,
+completed it, and confirmed withdrawal. All GPU children exited and the lease
+is cancelled. The temporary waiter is stopped and retained only as provenance.
+
+No service restart or native Pinokio UI invocation occurred. The helper's real
+execution and launcher plan tests are distinct evidence. Full-model generation,
+visual quality, performance, DoRA, and native Windows acceptance remain open.
+
+### DoRA protocol candidate — 2026-09-07 UTC
+
+Official MMGP 3.7.14 at
+[`589ba050`](https://github.com/deepbeepmeep/mmgp/commit/589ba050d320c4df879f48d11b23d6a88e6c68c8)
+still has the same unscaled DoRA base path, so upgrading alone does not close
+the earlier numerical failure. An isolated copy of installed MMGP 3.7.12 now
+contains a minimal proposed `_mm_effective_weight_input_scale` protocol: fold
+the channel scale into the materialized base before ordinary LoRA merging,
+leave ordinary adapter deltas unscaled, and keep native-forward dispatch when
+DoRA has zero effective strength.
+
+Four CPU tests cover ten numerical cases across bias states, ranks, ordering,
+nonuniform scales, and packed-byte immutability. The baseline reproduces error
+16.0; candidate DoRA reference error is zero, with maximum error across all
+reference checks 3.814697265625e-06. CUDA remains uninitialized. Patch dry-run
+and every source/artifact hash check pass. Files are in
+`.artifacts-temp/astra-dora-protocol-20260907/`; installed MMGP and the real
+qtype are unchanged. Retain the patch and receipts as provenance. Dependency
+integration, real qtype attribute publication, independent review, and GPU
+acceptance remain required before adoption.
 
 While waiting, a direct CPU audit of the uncommitted `h3_prompt_adapt.py` found
 two reproducible blockers to integration: an embedded `summary:` label inside

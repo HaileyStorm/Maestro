@@ -5,6 +5,7 @@ import subprocess
 import argparse
 import shutil
 import platform
+from pathlib import Path
 
 CONFIG_PATH = "setup_config.json"
 ENVS_FILE = "envs.json"
@@ -303,6 +304,22 @@ def show_status():
     print(f" * = Active Environment")
     print("="*95 + "\n")
 
+def run_python_script(env_type, env_path, script):
+    app_root = Path(__file__).resolve().parent
+    script_path = (app_root / script).resolve()
+    if not script_path.is_relative_to(app_root / "scripts") or not script_path.is_file():
+        raise ValueError("Kernel installer must be a file in the app scripts directory.")
+    if env_type == "conda":
+        command = ["conda", "run", "-p", str(Path(env_path).resolve()), "python"]
+    elif env_type in {"uv", "venv"}:
+        command = [str(Path(env_path).resolve() / ("Scripts/python.exe" if IS_WIN else "bin/python"))]
+    elif env_type == "none":
+        command = [sys.executable]
+    else:
+        raise ValueError("Unknown setup environment type.")
+    subprocess.run([*command, str(script_path)], cwd=app_root, check=True)
+
+
 def install_logic(env_name, env_type, env_path, py_k, torch_k, triton_k, sage_k, flash_k, kernel_list, config):
     template = ENV_TEMPLATES[env_type]
     target_py_ver = config['components']['python'][py_k]['ver']
@@ -344,8 +361,13 @@ def install_logic(env_name, env_type, env_path, py_k, torch_k, triton_k, sage_k,
         
     for k in kernel_list:
         if k in config['components']['kernels']:
-            cmd = resolve_cmd(config['components']['kernels'][k]['cmd'])
-            if cmd: run_cmd(f"{pip} {cmd}")
+            component = config['components']['kernels'][k]
+            script = resolve_cmd(component.get('python_script'))
+            if script:
+                run_python_script(env_type, env_path, script)
+            else:
+                cmd = resolve_cmd(component['cmd'])
+                if cmd: run_cmd(f"{pip} {cmd}")
 
 def menu(title, options, recommended_key=None):
     print(f"\n--- {title} ---")

@@ -105,9 +105,12 @@
             },
             "light2xv": { 
                 "label": "Light2xv NVFP4 (RTX 50xx)", 
+                "python_script": {
+                    "linux": "scripts/install_lightx2v_runtime.py"
+                },
                 "cmd": {
                     "win": "https://github.com/deepbeepmeep/kernels/releases/download/Light2xv/lightx2v_kernel-0.0.2+torch2.10.0-cp311-abi3-win_amd64.whl",
-                    "linux": "https://github.com/deepbeepmeep/kernels/releases/download/Light2xv/lightx2v_kernel-0.0.2+torch2.10.0-cp311-abi3-linux_x86_64.whl"
+                    "linux": null
                 }
             }
         }

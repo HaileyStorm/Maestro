@@ -24,6 +24,54 @@ if str(APP) not in sys.path:
 
 
 class TestSolEngineSourceContracts(unittest.TestCase):
+    def test_linux_cuda13_lightx_repair_covers_install_and_both_update_branches(self):
+        loader = r"""
+const assert = require('assert');
+const torch = require('./torch.js');
+const update = require('./update.js');
+const { runtimeProfile } = require('./launcher_profile.js');
+const helper = 'python scripts/install_lightx2v_runtime.py';
+(async () => {
+  for (const [platform, target, gpu_model, driver] of [
+    ['linux', 'sm_120', 'RTX 5090', '580.1'],
+    ['linux', 'sm_89', 'RTX 4090', '580.1'],
+    ['linux', 'sm_90', 'H100', '579.9'],
+    ['win32', 'sm_120', 'RTX 5090', '580.1'],
+  ]) {
+    const kernel = {platform, gpu_target: target, gpu_model, gpu_driver: driver,
+                    gpu: 'nvidia', envs: {}};
+    const expected = platform === 'linux' && driver.startsWith('580');
+    const profile = runtimeProfile(kernel);
+    const torchPlan = await torch(kernel);
+    const commands = torchPlan.run.filter(s => s.method === 'shell.run')
+      .flatMap(s => Array.isArray(s.params.message) ? s.params.message : [s.params.message]);
+    assert.equal(commands.filter(c => c === helper).length, expected ? 1 : 0);
+    if (expected) assert(!commands.some(c => c.includes('Light2xv/') && c.includes('linux_x86_64.whl')));
+    const plan = await update(kernel);
+    const repairs = plan.run.map((step, index) => ({step, index}))
+      .filter(({step}) => step.params?.message === helper);
+    assert.equal(repairs.length, expected ? 2 : 0);
+    if (expected) {
+      const current = plan.run.findIndex(s => s.id === 'uptodate');
+      const build = plan.run.findIndex(s => s.id === 'build');
+      const fullTorch = plan.run.findIndex(s => s.params?.uri === 'torch.js' && !s.params.params.flash_only);
+      assert(current < repairs[0].index && repairs[0].index < build);
+      assert(repairs[1].index > fullTorch && repairs[1].index > build);
+      for (const {step} of repairs) {
+        assert.equal(step.params.path, 'app');
+        assert.equal(step.params.venv, profile.env);
+        assert.equal(step.params.venv_python, profile.python);
+        assert.equal(step.params.env.CLOUDFLARE_API_TOKEN, '');
+      }
+    }
+  }
+  process.stdout.write('ok');
+})().catch(error => { console.error(error); process.exit(1); });
+"""
+        result = subprocess.run(["node", "-e", loader], cwd=ROOT, check=True,
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.stdout, "ok")
+
     def test_menu_recognizes_each_runtime_environment_as_installed(self):
         loader = r"""
 const existing = new Set(JSON.parse(process.argv[1]));

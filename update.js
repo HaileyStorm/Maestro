@@ -13,6 +13,18 @@ module.exports = async (kernel) => {
   )
   const alreadyCurrentAndReady =
     `{{/already up[- ]to[- ]date/i.test(input.stdout) && exists('${runtime.marker}') && exists('${runtime.flashMarker}') ? 'uptodate' : 'build'}}`
+  const lightxRepairSteps = (
+    kernel.platform === "linux" && isSolCapable(kernel) && !cuda13DriverUpdateRequired
+  ) ? [{
+    method: "shell.run",
+    params: {
+      env: runtimeSecretEnv,
+      venv: runtime.env,
+      venv_python: runtime.python,
+      path: "app",
+      message: "python scripts/install_lightx2v_runtime.py"
+    }
+  }] : []
   return {
     run: [{
     when: cuda13DriverUpdateRequired && isRtx50(kernel),
@@ -64,7 +76,7 @@ module.exports = async (kernel) => {
       env: runtimeSecretEnv,
       message: "python app/scripts/ensure_environment_defaults.py --file ENVIRONMENT"
     }
-  }, {
+  }, ...lightxRepairSteps, {
     // Reached ONLY when the repo was already current (the "build" path
     // jumps over this step). Before halting, self-heal the seed-vc
     // component if it's missing (GPL-3.0, cloned from its own repo — see
@@ -103,7 +115,7 @@ module.exports = async (kernel) => {
   }, {
     method: "log",
     params: {
-      raw: "Already up to date — no new commits pulled. Skipped dependency install and UI rebuild."
+      raw: "Already up to date — checked installed runtimes and skipped the full dependency refresh and UI rebuild."
     },
     next: null
   }, {
@@ -164,7 +176,7 @@ module.exports = async (kernel) => {
         xformers: true
       }
     }
-  }, {
+  }, ...lightxRepairSteps, {
     // Mirror of the install.js GGUF-kernels step — idempotent, so
     // re-runs cheaply on every update. Catches existing installs
     // up to the new behavior without forcing a reinstall.

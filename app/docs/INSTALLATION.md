@@ -355,7 +355,7 @@ These kernels will offer optimized INT4 / FP4 dequantization.
 **Please Note FP4 support is hardware dependent and will work only with RTX 50xx / sm120+ GPUs**
 
 
-### Lightx2v NVP4 Kernels Wheels for Python 3.11 / Pytorch 2.10 / Cuda 13 (RTX 50xx / sm120+ only !)
+### LightX2V NVFP4 kernels for Python 3.11 / PyTorch 2.10 / CUDA 13
 - Windows
    ```
   pip install https://github.com/deepbeepmeep/kernels/releases/download/Light2xv/lightx2v_kernel-0.0.2+torch2.10.0-cp311-abi3-win_amd64.whl
@@ -363,8 +363,17 @@ These kernels will offer optimized INT4 / FP4 dequantization.
 
 - Linux
    ```
-  pip install https://github.com/deepbeepmeep/kernels/releases/download/Light2xv/lightx2v_kernel-0.0.2+torch2.10.0-cp311-abi3-linux_x86_64.whl
+  python scripts/install_lightx2v_runtime.py
    ```
+
+Run this from the app directory in the selected Python 3.11 / Torch 2.10 CUDA 13
+environment. The installer requires Conda, Git, UV, and Binutils `readelf` on PATH and provisions
+its compiler toolchain inside the project. It builds pinned LightX2V source
+against that runtime instead of installing the older CUDA 12-linked Linux
+wheel. Build failures preserve the installed package; failed installation or
+package validation restores its backup. Pinokio Install and Update invoke the
+same helper. Package/ABI validation is separate from GPU numerical and model
+generation acceptance.
 
 
 

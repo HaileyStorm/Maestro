@@ -295,7 +295,24 @@ failure-path rollback and inventory checks have separate CPU/mock evidence.
 Both processes exited and the lease is confirmed cancelled.
 
 See the [installed-runtime receipts and remaining rollout requirements](ASTRA_CONTINUATION_HANDOFF_2026-09-06.md#installed-lightx-runtime--2026-09-07-utc).
-No service restart occurred. The normal Linux launcher still installs the old
-wheel and requires integration before Update preserves this repair. This is
+No service restart occurred. The managed launcher integration below supersedes
+the old Linux wheel path. This is
 installed synthetic-kernel acceptance, not live-service adoption, full-model
 quality, performance, DoRA, or Windows acceptance.
+
+## Managed LightX source installer — 2026-09-07 UTC
+
+The normal source installer built with the project-local CUDA 13/GCC 14
+toolchain, installed its result, and passed all nine default-cuBLAS numerical
+cases under a fresh validated lease. Fresh-process mappings prove use of the
+selected CUDA-13 libraries. A second invocation reused the verified package
+without creating another build attempt or changing its receipt. The bounded
+client waiter exited, and withdrawal is confirmed.
+
+Install, both Update branches, and standalone setup now reach that helper on
+Linux CUDA 13. Source/launcher review and 107 applicable CPU tests (one existing
+skip) support the wiring; native Pinokio UI execution was not performed.
+See [managed build hashes, receipts, and remaining gates](ASTRA_CONTINUATION_HANDOFF_2026-09-06.md#managed-lightx-launcher-integration--2026-09-07-utc).
+This closes the current Linux managed package/build check. It does not prove
+live-service adoption, full-model generation, visual quality, performance,
+DoRA correctness, or native Windows acceptance.
