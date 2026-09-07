@@ -166,6 +166,29 @@ Remaining task-owned compatibility work:
   Ordinary low-rank LoRA evidence cannot close this item. Do not restore broad
   monkeypatches or integer casts as a workaround.
 
+  A CPU reproduction using the actual installed MMGP router and the fixture
+  in `tests/test_nvfp4_linear.py` now confirms a numerical failure even at
+  adapter strength zero. With the fixture's nonuniform input scale, input
+  `arange(128).reshape(2, 64) / 128`, no bias, and DoRA magnitude equal to
+  1.1 times the dequantized weight's row norm, the routed output differs from
+  the unchanged native base by maximum absolute error 16.0. Output is finite
+  FP32 and packed weight bytes remain unchanged. This rules out treating a
+  zero-strength DoRA as harmless on the current path; it does not establish
+  a correct nonzero-strength repair. The process used the CUDA-13 environment
+  with `CUDA_VISIBLE_DEVICES=''` and loaded no model. Preserve a zero-strength
+  identity regression plus independent nonzero-strength numerical references
+  when repairing the dependency integration.
+
+  Independent source review places the repair in MMGP's DoRA weight assembly:
+  fold the module's input scale into only the dequantized base columns before
+  merging ordinary LoRA and applying DoRA normalization/magnitude blending.
+  Ordinary adapter deltas must remain in unscaled input coordinates. The
+  current dependency has no clean module hook for that step; use an explicit
+  dependency protocol and a verified pinned package rather than a production
+  wrapper duplicating private adapter logic. Acceptance must cover mixed
+  ordinary-LoRA/DoRA, zero strength, nonuniform scales, and unchanged packed
+  bytes. Do not alter the qtype while a queued build still binds its source hash.
+
 ## CUDA-13 diagnostic result — 2026-09-07 UTC
 
 The local CUDA 13.0 compiler, selected environment's cuBLASLt 13 headers/library,
@@ -199,6 +222,20 @@ runtime, assert resolved ABI dependencies and source/package provenance,
 preserve the installed baseline for rollback, and perform installed-runtime
 acceptance under a new exact lease. Do not promote the task-private operator
 or process-only CUTLASS selector into the default path.
+
+The complete nine-translation-unit package candidate is prepared under
+`.artifacts-temp/astra-lightx-package-20260907/`, with exact source/header
+manifests, one Ninja worker, CUDA-13 dependency and process-map checks, and
+nine synthetic default-cuBLAS numerical cases. Its first leased build stopped
+at compilation: Torch's extension helper disables half/BF16 conversions that
+the upstream quantizer requires. No package or numerical validation completed;
+the process exited and its lease is confirmed cancelled. `attempt1/` preserves
+the original runner, plan, grant, log, and result. Independent flag review
+confirmed that undefining the four injected suppression macros restores the
+upstream CMake contract without changing kernel source. The corrected runner
+has a refreshed source-bound plan and a separate queued request. Read the
+current coordinator response and validate it before starting; this checkpoint
+does not prove a second grant or build success.
 
 While waiting, a direct CPU audit of the uncommitted `h3_prompt_adapt.py` found
 two reproducible blockers to integration: an embedded `summary:` label inside
