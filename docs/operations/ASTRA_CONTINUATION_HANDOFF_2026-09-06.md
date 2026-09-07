@@ -126,9 +126,40 @@ Remaining task-owned compatibility work:
   N=128, K=64; padded activation rows=128) reached quantization and GEMM but
   failed with `cuBLAS error: 7`. Zero numerical cases completed. The process
   exited and the lease was withdrawn/confirmed cancelled. No retry, fallback,
-  package mutation, model load, or service restart occurred. Inspect the pinned
-  native kernel's shape/runtime contract before designing another bounded
-  leased test; do not infer kernel acceptance from the passing CPU reference.
+  package mutation, model load, or service restart occurred.
+  A subsequent source-informed, separately leased process-only
+  `LIGHTX2V_NVFP4_GEMM=cutlass` comparison passed all nine identical shapes
+  (relative MAE 0.00694–0.05556; 8,785,920 peak allocated bytes). Its lease is
+  confirmed cancelled and its selector expired with the child process.
+  Maestro's default remains unchanged; this is small synthetic kernel evidence,
+  not full-model quality/performance acceptance.
+
+  ELF/loader inspection found the extension requires `libcublasLt.so.12`,
+  resolving to CUDA 12.0's `libcublasLt.so.12.0.2.224`; that header lacks the
+  FP4 A/B scale-mode attributes used by the inspected source. The default
+  cuBLAS path is therefore strongly implicated, but the exact failing API call
+  is not instrumented. Source snapshot and installed binary selector strings
+  agree; there is no build attestation linking that snapshot to the wheel.
+  [Inspected source](https://github.com/deepbeepmeep/kernels/blob/2808bfb073bd91e4fe3ef83712f600b8d642579b/lightx2v_kernel/csrc/gemm/nvfp4_scaled_mm_kernels_sm120.cu).
+
+  A second, separately leased diagnostic exposed an existing RECORD-verified
+  cuBLASLt 12.8.3.14 library through one task-private symlink and a child-only
+  loader path. Actual process maps confirmed the intended library. The default
+  cuBLAS route moved past the prior error 7 but failed on the same first case
+  with `Unable to find suitable cuBLAS GEMM algorithm`; zero numerical cases
+  completed. The process exited, its lease is confirmed cancelled, and the exact
+  temporary link was removed. No loader path, kernel default, or installation
+  was changed permanently.
+
+  Therefore library resolution contributes to the original failure, but a
+  newer CUDA-12 library alone is not sufficient acceptance. Next: prepare a
+  provenance-bound, instrumented build against the selected CUDA-13 runtime;
+  verify actual ELF dependencies/resolution before one bounded leased case.
+  Preserve rollback and the working CUTLASS diagnostic, but do not promote a
+  permanent route from these small tensors. Source and acceptance must be
+  checked independently on Windows. Receipts are in
+  `.artifacts-temp/astra-lightx-cublas128-20260907/`; the completed CUTLASS and
+  ABI records are in `.artifacts-temp/astra-lightx-route-20260907/`.
 - `NVFP4-DORA`: MMGP's DoRA branch bypasses the native-forward marker and
   needs separate scaled-base/dequantization analysis and numerical acceptance.
   Ordinary low-rank LoRA evidence cannot close this item. Do not restore broad

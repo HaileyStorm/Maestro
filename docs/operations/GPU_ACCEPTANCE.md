@@ -226,3 +226,28 @@ Receipts: `.artifacts-temp/astra-nvfp4-scale-20260907/`. Native acceptance
 remains open under task-local `NVFP4-LIGHTX-SHAPES`: inspect the pinned kernel's
 shape and runtime contract before the next bounded lease. No full-model or
 quality conclusion follows from this attempt.
+
+## LightX2V route comparison — 2026-09-07 UTC
+
+A fresh lease ran the same nine small synthetic cases with the existing
+process-only `LIGHTX2V_NVFP4_GEMM=cutlass` selector: K=32/64/96, M=1/50/129,
+N=128. All outputs were finite and correctly shaped; relative MAE against the
+dequantized reference ranged from 0.00694 to 0.05556. Peak allocated tensor
+memory was 8,785,920 bytes. The process exited, its selector expired, and the
+lease was confirmed cancelled. Default routing was not changed or promoted.
+
+The default cuBLAS failure remains separate. ELF/loader inspection resolves the
+extension's required `libcublasLt.so.12` to CUDA 12.0, which lacks the FP4
+scale-mode attributes used by the inspected source. The exact failing call is
+still uninstrumented. A subsequent separate lease exposed an already-installed,
+RECORD-verified cuBLASLt 12.8.3.14 library through a child-only loader path.
+Process maps confirmed that library, but the first case then failed with
+`Unable to find suitable cuBLAS GEMM algorithm`; zero numerical cases completed.
+Its lease is confirmed cancelled and the task-private link was removed.
+
+The next diagnostic requires an instrumented build bound to the selected
+CUDA-13 runtime, with ELF/dependency and rollback verification before another
+bounded lease. The passing CUTLASS comparison is not promoted to a permanent
+default. Receipts: `.artifacts-temp/astra-lightx-route-20260907/` and
+`.artifacts-temp/astra-lightx-cublas128-20260907/`. This evidence does not
+establish full-model correctness, speed, or Windows acceptance.
