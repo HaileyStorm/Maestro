@@ -172,13 +172,218 @@ def _durable_replace(source: Path, destination: Path) -> None:
         raise OSError("durable runtime-file replacement failed")
 
 
-def _existing_identity(path: Path) -> tuple[int, int] | None:
+def _open_windows_runtime_file(
+    path: Path,
+    *,
+    desired_access: int,
+    creation_disposition: int,
+    descriptor_flags: int,
+    payload: bytes | None = None,
+) -> int:
+    """Open one non-following Windows handle with delete sharing."""
+
+    import ctypes
+    import msvcrt
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    )
+    create_file.restype = ctypes.c_void_p
+    # Anchors stay open through MoveFileExW or DeleteFileW. FILE_SHARE_DELETE
+    # permits those rename/delete operations, and OPEN_REPARSE_POINT prevents
+    # an intervening symbolic link from redirecting the handle.
+    file_share_read = 0x00000001
+    file_share_delete = 0x00000004
+    file_attribute_normal = 0x00000080
+    file_flag_open_reparse_point = 0x00200000
+    handle = create_file(
+        str(path),
+        desired_access,
+        file_share_read | file_share_delete,
+        None,
+        creation_disposition,
+        file_attribute_normal | file_flag_open_reparse_point,
+        None,
+    )
+    if handle in (None, ctypes.c_void_p(-1).value):
+        raise ctypes.WinError(ctypes.get_last_error())
+    crt_flags = (
+        descriptor_flags
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOINHERIT", 0)
+    )
+    descriptor = -1
     try:
-        metadata = path.lstat()
+        descriptor = msvcrt.open_osfhandle(int(handle), crt_flags)
+        if payload is not None:
+            write_file = kernel32.WriteFile
+            write_file.argtypes = (
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.c_void_p,
+            )
+            write_file.restype = ctypes.c_int
+            buffer = ctypes.create_string_buffer(payload)
+            offset = 0
+            while offset < len(payload):
+                written = ctypes.c_uint32()
+                if not write_file(
+                    handle,
+                    ctypes.byref(buffer, offset),
+                    len(payload) - offset,
+                    ctypes.byref(written),
+                    None,
+                ) or written.value <= 0:
+                    raise OSError("runtime-file write did not advance")
+                offset += written.value
+            flush_file = kernel32.FlushFileBuffers
+            flush_file.argtypes = (ctypes.c_void_p,)
+            flush_file.restype = ctypes.c_int
+            if not flush_file(handle):
+                raise OSError("runtime-file flush failed")
+        return descriptor
+    except BaseException:
+        if descriptor >= 0:
+            if payload is not None:
+                _unlink_if_held_single_link(path, descriptor)
+            os.close(descriptor)
+        else:
+            close_handle = kernel32.CloseHandle
+            close_handle.argtypes = (ctypes.c_void_p,)
+            close_handle.restype = ctypes.c_int
+            close_handle(handle)
+        raise
+
+
+def _open_windows_runtime_anchor(path: Path) -> int:
+    """Open one existing Windows file while permitting later replacement."""
+
+    generic_read = 0x80000000
+    open_existing = 3
+    return _open_windows_runtime_file(
+        path,
+        desired_access=generic_read,
+        creation_disposition=open_existing,
+        descriptor_flags=os.O_RDONLY,
+    )
+
+
+def _create_runtime_temporary(path: Path, payload: bytes) -> int:
+    if os.name == "nt":
+        generic_read_write = 0x80000000 | 0x40000000
+        create_new = 1
+        return _open_windows_runtime_file(
+            path,
+            desired_access=generic_read_write,
+            creation_disposition=create_new,
+            descriptor_flags=os.O_RDONLY,
+            payload=payload,
+        )
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise OSError("runtime-file write did not advance")
+            offset += written
+        os.fsync(descriptor)
+        return descriptor
+    except BaseException:
+        _unlink_if_held_single_link(path, descriptor)
+        os.close(descriptor)
+        raise
+
+
+def _validate_held_runtime_file(
+    path: Path,
+    descriptor: int,
+    *,
+    reason: str,
+) -> None:
+    opened = os.fstat(descriptor)
+    _validate_secure_regular(opened, reason=reason)
+    current = path.lstat()
+    _validate_secure_regular(current, reason=reason)
+    if _identity(opened) != _identity(current):
+        raise OSError(f"{reason} changed")
+
+
+def _unlink_if_held_single_link(path: Path, descriptor: int) -> None:
+    try:
+        _validate_held_runtime_file(
+            path,
+            descriptor,
+            reason="temporary_file",
+        )
+        path.unlink()
+    except (OSError, WatchConfigurationError):
+        pass
+
+
+def _open_runtime_anchor(path: Path) -> int | None:
+    """Open and validate the current destination, retaining its identity."""
+
+    try:
+        before = path.lstat()
     except FileNotFoundError:
         return None
-    _validate_secure_regular(metadata, reason="runtime_file")
-    return _identity(metadata)
+    _validate_secure_regular(before, reason="runtime_file")
+    descriptor = -1
+    try:
+        if os.name == "nt":
+            descriptor = _open_windows_runtime_anchor(path)
+        else:
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        _validate_secure_regular(opened, reason="runtime_file")
+        if _identity(before) != _identity(opened):
+            raise WatchConfigurationError("runtime_file_changed")
+        return descriptor
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+
+
+def _validate_runtime_anchor(path: Path, descriptor: int | None) -> None:
+    """Require the destination name to still identify the held original file."""
+
+    if descriptor is None:
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return
+        raise OSError("runtime destination changed")
+    try:
+        _validate_held_runtime_file(
+            path,
+            descriptor,
+            reason="runtime_file",
+        )
+    except FileNotFoundError:
+        raise OSError("runtime destination changed") from None
+    except WatchConfigurationError as error:
+        raise OSError("runtime destination changed") from error
 
 
 def secure_publish_runtime_text(
@@ -191,54 +396,66 @@ def secure_publish_runtime_text(
     if len(payload) > 512:
         raise WatchConfigurationError("runtime_file_too_large")
     directory = _validate_secure_directory(path.parent, create=True)
-    expected_destination = _existing_identity(path)
     temporary = directory / f".{path.name}.{secrets.token_hex(16)}.tmp"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(temporary, flags, 0o600)
+    destination_descriptor = _open_runtime_anchor(path)
+    descriptor = -1
     temporary_identity: tuple[int, int] | None = None
     try:
-        if hasattr(os, "fchmod") and os.name != "nt":
-            os.fchmod(descriptor, 0o600)
+        descriptor = _create_runtime_temporary(temporary, payload)
         opened = os.fstat(descriptor)
         _validate_secure_regular(opened, reason="temporary_file")
         temporary_identity = _identity(opened)
-        offset = 0
-        while offset < len(payload):
-            written = os.write(descriptor, payload[offset:])
-            if written <= 0:
-                raise OSError("runtime-file write did not advance")
-            offset += written
-        os.fsync(descriptor)
-        current_temp = temporary.lstat()
-        _validate_secure_regular(current_temp, reason="temporary_file")
-        if _identity(current_temp) != temporary_identity:
-            raise OSError("temporary runtime file changed")
-        os.close(descriptor)
-        descriptor = -1
+        _validate_held_runtime_file(
+            temporary,
+            descriptor,
+            reason="temporary_file",
+        )
         _fsync_directory(directory)
         if before_replace is not None:
             before_replace()
-        current_temp = temporary.lstat()
-        _validate_secure_regular(current_temp, reason="temporary_file")
-        if _identity(current_temp) != temporary_identity:
-            raise OSError("temporary runtime file changed")
-        if _existing_identity(path) != expected_destination:
-            raise OSError("runtime destination changed")
+        _validate_held_runtime_file(
+            temporary,
+            descriptor,
+            reason="temporary_file",
+        )
+        _validate_runtime_anchor(path, destination_descriptor)
         _durable_replace(temporary, path)
         _fsync_directory(directory)
-        published = path.lstat()
-        _validate_secure_regular(published, reason="runtime_file")
-        if _identity(published) != temporary_identity:
+        _validate_held_runtime_file(path, descriptor, reason="runtime_file")
+        if _identity(os.fstat(descriptor)) != temporary_identity:
             raise OSError("published runtime file changed")
     except BaseException:
-        try:
-            temporary.unlink()
-        except OSError:
-            pass
+        if descriptor >= 0:
+            _unlink_if_held_single_link(temporary, descriptor)
         raise
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+        if destination_descriptor is not None:
+            os.close(destination_descriptor)
+
+
+def secure_clear_runtime_text(
+    path: Path,
+    *,
+    before_unlink: Callable[[], None] | None = None,
+) -> bool:
+    """Remove only the exact securely opened runtime file."""
+
+    directory = _validate_secure_directory(path.parent)
+    destination_descriptor = _open_runtime_anchor(path)
+    if destination_descriptor is None:
+        return False
+    try:
+        _fsync_directory(directory)
+        if before_unlink is not None:
+            before_unlink()
+        _validate_runtime_anchor(path, destination_descriptor)
+        path.unlink()
+        _fsync_directory(directory)
+        return True
+    finally:
+        os.close(destination_descriptor)
 
 
 def secure_open_lock_file(path: Path) -> IO[bytes]:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import importlib.util
 import io
 import json
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import types
 import unittest
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -678,6 +680,352 @@ class StableShareReplayTests(unittest.TestCase):
                 )
             self.assertEqual(safe.read_text(encoding="utf-8").strip(), self.quick)
             self.assertEqual(list(root.glob(".*.tmp")), [])
+
+    def test_watcher_publish_rejects_replacement_and_new_hardlink_races(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "status.json"
+            original = '{"state":"first"}\n'
+            replacement = '{"state":"second"}\n'
+            self.watch.secure_publish_runtime_text(target, original)
+
+            def replace_destination():
+                target.unlink()
+                target.write_text(original, encoding="utf-8")
+                target.chmod(0o600)
+
+            with self.assertRaises(OSError):
+                self.watch.secure_publish_runtime_text(
+                    target,
+                    replacement,
+                    before_replace=replace_destination,
+                )
+            self.assertEqual(target.read_text(encoding="utf-8"), original)
+            self.assertEqual(list(root.glob(".*.tmp")), [])
+
+            added_link = root / "status-hardlink.json"
+            with self.assertRaises(OSError):
+                self.watch.secure_publish_runtime_text(
+                    target,
+                    replacement,
+                    before_replace=lambda: os.link(target, added_link),
+                )
+            self.assertEqual(target.read_text(encoding="utf-8"), original)
+            self.assertTrue(added_link.exists())
+            self.assertEqual(list(root.glob(".*.tmp")), [])
+            added_link.unlink()
+
+            initially_absent = root / "initially-absent.json"
+
+            def occupy_destination():
+                initially_absent.write_text(original, encoding="utf-8")
+                initially_absent.chmod(0o600)
+
+            with self.assertRaises(OSError):
+                self.watch.secure_publish_runtime_text(
+                    initially_absent,
+                    replacement,
+                    before_replace=occupy_destination,
+                )
+            self.assertEqual(initially_absent.read_text(encoding="utf-8"), original)
+            self.assertEqual(list(root.glob(".*.tmp")), [])
+
+    def test_publish_name_failure_never_opens_destination_or_changes_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "status.json"
+            original = '{"state":"first"}\n'
+            self.watch.secure_publish_runtime_text(target, original)
+            with (
+                mock.patch.object(
+                    self.watch.secrets,
+                    "token_hex",
+                    side_effect=RuntimeError("synthetic name failure"),
+                ),
+                mock.patch.object(
+                    self.watch,
+                    "_open_runtime_anchor",
+                    wraps=self.watch._open_runtime_anchor,
+                ) as open_anchor,
+                self.assertRaisesRegex(RuntimeError, "synthetic name failure"),
+            ):
+                self.watch.secure_publish_runtime_text(
+                    target,
+                    '{"state":"second"}\n',
+                )
+            open_anchor.assert_not_called()
+            self.assertEqual(target.read_text(encoding="utf-8"), original)
+            self.assertEqual(list(target.parent.glob(".*.tmp")), [])
+
+    def test_publish_preserves_substituted_or_hardlinked_temporary_on_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            publishers = (
+                (
+                    "watcher",
+                    lambda path, callback: self.watch.secure_publish_runtime_text(
+                        path,
+                        self.rotated + "\n",
+                        before_replace=callback,
+                    ),
+                ),
+                (
+                    "supervisor",
+                    lambda path, callback: self.supervisor.publish_quick_url(
+                        path,
+                        self.rotated,
+                        before_replace=callback,
+                    ),
+                ),
+            )
+            for name, publish in publishers:
+                with self.subTest(publisher=name):
+                    target = root / f"{name}.url"
+                    self.supervisor.publish_quick_url(target, self.quick)
+                    substituted = []
+
+                    def replace_temporary(
+                        target_path=target,
+                        substituted_paths=substituted,
+                    ):
+                        candidates = list(root.glob(f".{target_path.name}.*.tmp"))
+                        self.assertEqual(len(candidates), 1)
+                        temporary = candidates[0]
+                        temporary.unlink()
+                        temporary.write_text("foreign staged content\n", encoding="utf-8")
+                        temporary.chmod(0o600)
+                        substituted_paths.append(temporary)
+
+                    with self.assertRaises((OSError, ValueError)):
+                        publish(target, replace_temporary)
+                    self.assertEqual(
+                        substituted[0].read_text(encoding="utf-8"),
+                        "foreign staged content\n",
+                    )
+                    self.assertEqual(
+                        target.read_text(encoding="utf-8"),
+                        self.quick + "\n",
+                    )
+                    substituted[0].unlink()
+
+            target = root / "hardlinked-temp.url"
+            self.supervisor.publish_quick_url(target, self.quick)
+            added_link = root / "staged-hardlink"
+            staged = []
+
+            def hardlink_temporary():
+                candidates = list(root.glob(f".{target.name}.*.tmp"))
+                self.assertEqual(len(candidates), 1)
+                staged.extend(candidates)
+                os.link(candidates[0], added_link)
+
+            with self.assertRaises((OSError, ValueError)):
+                self.supervisor.publish_quick_url(
+                    target,
+                    self.rotated,
+                    before_replace=hardlink_temporary,
+                )
+            self.assertTrue(staged[0].exists())
+            self.assertTrue(added_link.exists())
+            self.assertTrue(staged[0].samefile(added_link))
+            self.assertEqual(target.read_text(encoding="utf-8"), self.quick + "\n")
+            staged[0].unlink()
+            added_link.unlink()
+
+            def fail_callback():
+                raise RuntimeError("synthetic callback failure")
+
+            with self.assertRaisesRegex(RuntimeError, "synthetic callback failure"):
+                self.supervisor.publish_quick_url(
+                    target,
+                    self.rotated,
+                    before_replace=fail_callback,
+                )
+            self.assertEqual(list(root.glob(".*.tmp")), [])
+            self.assertEqual(target.read_text(encoding="utf-8"), self.quick + "\n")
+
+    def test_clear_rejects_replacement_and_new_hardlink_races(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "quick.url"
+            self.supervisor.publish_quick_url(target, self.quick)
+
+            symlink = root / "quick-symlink.url"
+            symlink.symlink_to(target)
+            with self.assertRaises((OSError, ValueError)):
+                self.supervisor.clear_quick_url(symlink)
+            self.assertTrue(target.exists())
+
+            initial_hardlink = root / "quick-initial-hardlink.url"
+            os.link(target, initial_hardlink)
+            with self.assertRaises((OSError, ValueError)):
+                self.supervisor.clear_quick_url(target)
+            self.assertTrue(target.exists())
+            initial_hardlink.unlink()
+
+            def replace_destination():
+                target.unlink()
+                target.write_text(self.quick + "\n", encoding="utf-8")
+                target.chmod(0o600)
+
+            with self.assertRaises(OSError):
+                self.supervisor.clear_quick_url(
+                    target,
+                    before_unlink=replace_destination,
+                )
+            self.assertEqual(target.read_text(encoding="utf-8"), self.quick + "\n")
+
+            added_link = root / "quick-hardlink.url"
+            with self.assertRaises(OSError):
+                self.supervisor.clear_quick_url(
+                    target,
+                    before_unlink=lambda: os.link(target, added_link),
+                )
+            self.assertTrue(target.exists())
+            self.assertTrue(added_link.exists())
+            added_link.unlink()
+            self.assertTrue(self.supervisor.clear_quick_url(target))
+            self.assertFalse(self.supervisor.clear_quick_url(target))
+
+    def test_publish_retains_original_descriptor_through_atomic_replace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "quick.url"
+            self.supervisor.publish_quick_url(target, self.quick)
+            real_open = self.watch._open_runtime_anchor
+            real_create = self.watch._create_runtime_temporary
+            real_replace = self.watch._durable_replace
+            anchors = []
+            temporaries = []
+            link_counts = {"destination": [], "temporary": []}
+
+            def capture_anchor(path):
+                descriptor = real_open(path)
+                anchors.append(descriptor)
+                return descriptor
+
+            def capture_temporary(path, payload):
+                descriptor = real_create(path, payload)
+                temporaries.append(descriptor)
+                return descriptor
+
+            def inspect_replace(source, destination):
+                link_counts["destination"].append(os.fstat(anchors[-1]).st_nlink)
+                link_counts["temporary"].append(os.fstat(temporaries[-1]).st_nlink)
+                real_replace(source, destination)
+                link_counts["destination"].append(os.fstat(anchors[-1]).st_nlink)
+                link_counts["temporary"].append(os.fstat(temporaries[-1]).st_nlink)
+
+            with (
+                mock.patch.object(self.watch, "_open_runtime_anchor", capture_anchor),
+                mock.patch.object(
+                    self.watch,
+                    "_create_runtime_temporary",
+                    capture_temporary,
+                ),
+                mock.patch.object(self.watch, "_durable_replace", inspect_replace),
+            ):
+                self.watch.secure_publish_runtime_text(
+                    target,
+                    self.rotated + "\n",
+                )
+            self.assertEqual(link_counts["destination"][0], 1)
+            self.assertEqual(link_counts["temporary"], [1, 1])
+            if os.name != "nt":
+                self.assertEqual(link_counts["destination"][1], 0)
+            with self.assertRaises(OSError):
+                os.fstat(anchors[-1])
+            with self.assertRaises(OSError):
+                os.fstat(temporaries[-1])
+
+    def test_windows_anchor_requests_delete_sharing_and_no_reparse_follow(self):
+        create_file = mock.Mock(return_value=123)
+        close_handle = mock.Mock(return_value=1)
+
+        def write_all(_handle, _buffer, length, written, _overlapped):
+            written._obj.value = length
+            return 1
+
+        write_file = mock.Mock(side_effect=write_all)
+        flush_file = mock.Mock(return_value=1)
+        kernel32 = types.SimpleNamespace(
+            CreateFileW=create_file,
+            CloseHandle=close_handle,
+            WriteFile=write_file,
+            FlushFileBuffers=flush_file,
+        )
+        fake_msvcrt = types.SimpleNamespace(
+            open_osfhandle=mock.Mock(return_value=456),
+        )
+        with (
+            mock.patch.object(
+                ctypes,
+                "WinDLL",
+                return_value=kernel32,
+                create=True,
+            ) as win_dll,
+            mock.patch.dict(sys.modules, {"msvcrt": fake_msvcrt}),
+        ):
+            descriptor = self.watch._open_windows_runtime_anchor(
+                Path(r"C:\runtime\quick.url"),
+            )
+        self.assertEqual(descriptor, 456)
+        arguments = create_file.call_args.args
+        self.assertEqual(arguments[1], 0x80000000)
+        self.assertEqual(arguments[2], 0x00000001 | 0x00000004)
+        self.assertEqual(arguments[4], 3)
+        self.assertEqual(arguments[5], 0x00000080 | 0x00200000)
+        win_dll.assert_called_once_with("kernel32", use_last_error=True)
+        close_handle.assert_not_called()
+
+        fake_msvcrt.open_osfhandle.side_effect = OSError("synthetic CRT failure")
+        with (
+            mock.patch.object(
+                ctypes,
+                "WinDLL",
+                return_value=kernel32,
+                create=True,
+            ),
+            mock.patch.dict(sys.modules, {"msvcrt": fake_msvcrt}),
+            self.assertRaises(OSError),
+        ):
+            self.watch._open_windows_runtime_anchor(Path(r"C:\runtime\quick.url"))
+        close_handle.assert_called_once_with(123)
+
+        temporary_path = Path(r"C:\runtime\.quick.url.random.tmp")
+        payload = b"staged content"
+        create_file.reset_mock()
+        close_handle.reset_mock()
+        fake_msvcrt.open_osfhandle.reset_mock()
+        fake_msvcrt.open_osfhandle.side_effect = None
+        fake_msvcrt.open_osfhandle.return_value = 789
+        with (
+            mock.patch.object(self.watch.os, "name", "nt"),
+            mock.patch.object(self.watch.os, "O_BINARY", 0x8000, create=True),
+            mock.patch.object(self.watch.os, "O_NOINHERIT", 0x0080, create=True),
+            mock.patch.object(
+                ctypes,
+                "WinDLL",
+                return_value=kernel32,
+                create=True,
+            ) as win_dll,
+            mock.patch.dict(sys.modules, {"msvcrt": fake_msvcrt}),
+        ):
+            self.assertEqual(
+                self.watch._create_runtime_temporary(
+                    temporary_path,
+                    payload,
+                ),
+                789,
+            )
+        win_dll.assert_called_once_with("kernel32", use_last_error=True)
+        arguments = create_file.call_args.args
+        self.assertEqual(arguments[1], 0x80000000 | 0x40000000)
+        self.assertEqual(arguments[2], 0x00000001 | 0x00000004)
+        self.assertEqual(arguments[4], 1)
+        self.assertEqual(arguments[5], 0x00000080 | 0x00200000)
+        self.assertEqual(write_file.call_args.args[2], len(payload))
+        flush_file.assert_called_once_with(123)
+        fake_msvcrt.open_osfhandle.assert_called_once_with(123, 0x8000 | 0x0080)
+        close_handle.assert_not_called()
 
     def test_runtime_directory_and_lease_reject_link_redirection(self):
         with tempfile.TemporaryDirectory() as directory:

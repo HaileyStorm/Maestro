@@ -12,7 +12,6 @@ import argparse
 import os
 import queue
 import re
-import secrets
 import shutil
 import signal
 import subprocess
@@ -34,10 +33,9 @@ from register_share_url import (
 from share_registration_watch import (
     LeaseUnavailableError,
     RegistrationLease,
-    _identity,
-    _validate_secure_directory,
-    _validate_secure_regular,
     default_quick_url_file,
+    secure_clear_runtime_text,
+    secure_publish_runtime_text,
 )
 
 DEFAULT_TUNNEL_STARTUP_BUDGET_SECONDS = 75.0
@@ -56,58 +54,14 @@ def runtime_url_file(origin: str, *, runtime_dir: Path | None = None) -> Path:
     return default_quick_url_file(origin, runtime_dir=runtime_dir)
 
 
-def _fsync_directory(path: Path) -> None:
-    if os.name == "nt":
-        return
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
-    try:
-        opened = os.fstat(descriptor)
-        current = path.lstat()
-        if _identity(opened) != _identity(current):
-            raise OSError("runtime directory changed")
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _durable_replace(source: Path, destination: Path) -> None:
-    if os.name != "nt":
-        os.replace(source, destination)
-        return
-    import ctypes
-
-    move_file = ctypes.windll.kernel32.MoveFileExW
-    move_file.argtypes = (ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32)
-    move_file.restype = ctypes.c_int
-    replace_existing = 0x1
-    write_through = 0x8
-    if not move_file(str(source), str(destination), replace_existing | write_through):
-        raise OSError("durable runtime-file replacement failed")
-
-
-def _existing_identity(path: Path) -> tuple[int, int] | None:
-    try:
-        metadata = path.lstat()
-    except FileNotFoundError:
-        return None
-    _validate_secure_regular(metadata, reason="runtime_file")
-    return _identity(metadata)
-
-
-def clear_quick_url(path: Path) -> bool:
+def clear_quick_url(
+    path: Path,
+    *,
+    before_unlink: Callable[[], None] | None = None,
+) -> bool:
     """Remove only the exact validated runtime file and durably publish absence."""
 
-    directory = _validate_secure_directory(path.parent)
-    expected = _existing_identity(path)
-    if expected is None:
-        return False
-    _fsync_directory(directory)
-    if _existing_identity(path) != expected:
-        raise OSError("runtime destination changed")
-    path.unlink()
-    _fsync_directory(directory)
-    return True
+    return secure_clear_runtime_text(path, before_unlink=before_unlink)
 
 
 def publish_quick_url(
@@ -119,56 +73,11 @@ def publish_quick_url(
     """Atomically publish a canonical public URL in an owner-only file."""
 
     canonical = _canonical_quick_tunnel_url(quick_url)
-    directory = _validate_secure_directory(path.parent, create=True)
-    expected_destination = _existing_identity(path)
-    temporary = directory / f".{path.name}.{secrets.token_hex(16)}.tmp"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(temporary, flags, 0o600)
-    temporary_identity: tuple[int, int] | None = None
-    try:
-        if hasattr(os, "fchmod") and os.name != "nt":
-            os.fchmod(descriptor, 0o600)
-        opened = os.fstat(descriptor)
-        _validate_secure_regular(opened, reason="temporary_file")
-        temporary_identity = _identity(opened)
-        payload = (canonical + "\n").encode("utf-8")
-        offset = 0
-        while offset < len(payload):
-            written = os.write(descriptor, payload[offset:])
-            if written <= 0:
-                raise OSError("runtime-file write did not advance")
-            offset += written
-        os.fsync(descriptor)
-        current_temp = temporary.lstat()
-        _validate_secure_regular(current_temp, reason="temporary_file")
-        if _identity(current_temp) != temporary_identity:
-            raise OSError("temporary runtime file changed")
-        os.close(descriptor)
-        descriptor = -1
-        _fsync_directory(directory)
-        if before_replace is not None:
-            before_replace()
-        current_temp = temporary.lstat()
-        _validate_secure_regular(current_temp, reason="temporary_file")
-        if _identity(current_temp) != temporary_identity:
-            raise OSError("temporary runtime file changed")
-        if _existing_identity(path) != expected_destination:
-            raise OSError("runtime destination changed")
-        _durable_replace(temporary, path)
-        _fsync_directory(directory)
-        published = path.lstat()
-        _validate_secure_regular(published, reason="runtime_file")
-        if _identity(published) != temporary_identity:
-            raise OSError("published runtime file changed")
-    except BaseException:
-        try:
-            temporary.unlink()
-        except OSError:
-            pass
-        raise
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
+    secure_publish_runtime_text(
+        path,
+        canonical + "\n",
+        before_replace=before_replace,
+    )
     return canonical
 
 
