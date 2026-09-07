@@ -1232,3 +1232,24 @@ reference counts do not establish those roles. Direct freeform output from
 field wrapping alone cannot satisfy executable-prompt acceptance. Continue
 adapter integration with clip frames/FPS/source IDs, exact dialogue ownership,
 and final target-schema/seal checks. No GPU/model/runtime acceptance occurred.
+
+### Dialogue-aware field extraction (2026-09-07)
+
+The shared Context-IR field extractor now excludes apparent field headings
+inside balanced dialogue spans while retaining legacy inline headings outside
+those spans. Both official and physical validators accept original Base/Ref2VA
+prompt bytes containing labels such as `summary:` in authored speech. Nested,
+unbalanced and noncanonical dialogue still fails validation. The clean candidate
+passes 178 applicable tests; independent review passes all seven focused cases.
+The baseline parser truncates the synthetic embedded-label literal. Evidence:
+`.artifacts-temp/astra-adapter-contract-20260907/evidence/parser-*`.
+
+The unadopted resealing draft also failed two CPU audits: it could reseal a plan
+whose previous seal already disagreed, and a malformed segment index left input
+partly mutated after failure. An unadopted copy/validate/reseal transaction
+candidate passes five tests; it requires complete prompt/shot counts, prior seal
+validation, source index ownership and preservation of existing event payloads.
+Do not use append-only event restoration to repair dispatch identity. Candidate
+integration, stronger nested ownership checks, mapper target-schema validation,
+and launch/Director geometry/reference-role wiring remain open. No GPU or model
+execution occurred; the continuous Goal remains active.

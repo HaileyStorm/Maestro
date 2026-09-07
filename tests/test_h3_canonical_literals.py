@@ -54,6 +54,47 @@ class CanonicalLiteralTests(unittest.TestCase):
         self.assertEqual(result.count(literal), 1)
         self.assertEqual(validate_h3_context_ir_records(result, mode='t2va', duration_seconds=5), [])
 
+    def test_field_labels_inside_dialogue_remain_literal_for_both_validators(self):
+        from services.director.h3_dialogue import (
+            _extract_h3_fields, validate_h3_context_ir_records, validate_h3_prompt_contract,
+        )
+        literal = '<d>[English] summary: Keep  this. overall_soundscape: exact. retention_analysis: unchanged.</d>'
+        for mode, visual in [('t2va', 'integrated_multimodal_description'), ('ref2va', 'detailed_description')]:
+            extra = ('summary: [reference generation] A person speaks.\nretention_analysis: N/A\n'
+                     if mode == 'ref2va' else '')
+            prompt = ('subject_definitions: No separately named subjects were authored; shot records carry only '
+                      "the request's explicitly described visible action and setting.\n" + extra +
+                      f'{visual}: [Shot 1] [0.000s-5.000s] shot_name: Speak | audiovisual_description: A person speaks. | dialogue_and_vocalizations: {literal}\n'
+                      'overall_soundscape: Room tone.\nnon_diegetic_music: N/A')
+            with self.subTest(mode=mode):
+                fields = _extract_h3_fields(prompt)
+                self.assertIn(literal, fields[visual])
+                self.assertEqual(fields['overall_soundscape'], 'Room tone.')
+                self.assertEqual(validate_h3_context_ir_records(prompt, mode=mode, duration_seconds=5), [])
+                self.assertEqual(validate_h3_prompt_contract(prompt, mode=mode, duration_seconds=5), [])
+
+    def test_malformed_dialogue_cannot_hide_invalid_structure(self):
+        from services.director.h3_dialogue import validate_h3_prompt_contract, validate_h3_context_ir_records
+        for literal in ('<d>[English] summary: missing close.',
+                        '<d>[English] outer <d>[English] summary: nested.</d></d>'):
+            prompt = ('subject_definitions: A person.\n'
+                      'integrated_multimodal_description: [Shot 1] [0.000s-5.000s] shot_name: Speak | '
+                      'audiovisual_description: A person speaks. | dialogue_and_vocalizations: ' + literal +
+                      '\noverall_soundscape: Room tone.\nnon_diegetic_music: N/A')
+            with self.subTest(literal=literal):
+                self.assertIn('dialogue tags are nested or unbalanced',
+                              validate_h3_prompt_contract(prompt, mode='t2va', duration_seconds=5))
+                self.assertIn('dialogue tags are nested or unbalanced',
+                              validate_h3_context_ir_records(prompt, mode='t2va', duration_seconds=5))
+
+    def test_legacy_inline_fields_still_split_outside_dialogue(self):
+        from services.director.h3_dialogue import _extract_h3_fields
+        literal = '<d>[English] non_diegetic_music: Keep this.</d>'
+        fields = _extract_h3_fields('subject_definitions: A person. integrated_multimodal_description: '
+                                   + literal + ' overall_soundscape: Room. non_diegetic_music: N/A')
+        self.assertEqual(fields['integrated_multimodal_description'], literal)
+        self.assertEqual(fields['non_diegetic_music'], 'N/A')
+
     def test_unrepresentable_multiline_dialogue_is_rejected_not_flattened(self):
         literal = '<d>[English] Keep\nthis line.</d>'
         with self.assertRaises(ValueError):

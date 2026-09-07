@@ -611,12 +611,20 @@ def normalize_h3_text(value: Any) -> str:
 def _extract_h3_fields(text: str) -> dict[str, str]:
     """Extract known Context-IR fields even from legacy one-line prompts."""
 
-    matches = list(re.finditer(
+    dialogue_spans, _malformed = _dialogue_spans(text)
+    span_index = 0
+    matches = []
+    for match in re.finditer(
         r"(?i)(?<![A-Za-z0-9_])(" + "|".join(
             re.escape(field) for field in _H3_ALL_FIELDS
         ) + r")\s*:",
         text,
-    ))
+    ):
+        while span_index < len(dialogue_spans) and dialogue_spans[span_index][1] <= match.start():
+            span_index += 1
+        if span_index < len(dialogue_spans) and dialogue_spans[span_index][0] <= match.start():
+            continue
+        matches.append(match)
     fields: dict[str, str] = {}
     for index, match in enumerate(matches):
         name = match.group(1).lower()
