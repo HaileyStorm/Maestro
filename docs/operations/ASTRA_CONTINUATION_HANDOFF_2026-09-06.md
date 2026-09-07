@@ -1341,3 +1341,28 @@ the prompt contract validator still needs paired-video audio accounting. Existin
 Ref-only field ownership and geometry/caller work remain open. No content scanner
 is authorized or needed for role prose. GPU work is owner-authorized only through
 a fresh validated coordinator grant; none was requested or used for this repair.
+
+### Paired soundtrack prompt accounting (2026-09-07)
+
+Director's Ref2VA compiler now assigns an Audio ordinal to each included video
+soundtrack indicated by audio_path or has_audio, emits its paired relationship,
+partially_copy retention, and audio-reuse task type. Validation counts the same
+namespace. A later standalone audio entry therefore follows paired audio rather
+than reusing its label. Disabled or absent video audio does not consume an ordinal.
+A label found only inside dialogue cannot satisfy reference mapping validation.
+
+Paired reference audio does not activate the separate driving-audio branch, which
+can remove unstructured authored vocal tags. The regression preserves the exact
+authored line. The clean nine-module CPU gate passes 255 tests with two skipped.
+Independent review confirmed the paired correction and driving-audio separation.
+Evidence: `.artifacts-temp/astra-paired-audio-20260907/`. These are prompt-contract
+checks: native K mode currently suppresses standalone A/B/C reference audio, so
+the paired-plus-voice fixture does not establish mixed runtime support.
+
+Standalone drive intent remains inconsistent between the planner's exact-target
+prose and Director's numbered reference-audio contract. The reference_manifest
+split/remap helpers have no current production callers; do not activate them as
+a workaround. Resolve the actual target-audio versus reference-audio contract in
+the caller integration. Mapper source preservation, manifest binding, Ref-only
+field ownership, and real geometry/reference wiring remain open. No GPU/model,
+restart, browser, mixed-K runtime or Windows acceptance is claimed.

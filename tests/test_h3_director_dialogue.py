@@ -377,6 +377,44 @@ class TestH3DirectorDialogueCompiler(unittest.TestCase):
             [],
         )
 
+    def test_paired_video_soundtracks_share_the_audio_namespace(self):
+        for metadata, expected in (({"audio_path": "paired.wav"}, 2),
+                                   ({"has_audio": True}, 2),
+                                   ({"audio_path": "paired.wav", "include_audio": False}, 1),
+                                   ({}, 1)):
+            references = [{"type": "video", "role": "the moving scene", **metadata},
+                          {"type": "audio", "role": "the lead voice", "audio_intent": "voice"}]
+            with self.subTest(metadata=metadata):
+                prompt, _ = compile_h3_official_prompt(
+                    "A person says <d>[English] Keep this line.</d>", [], [],
+                    mode="ref2va", references=references,
+                )
+                self.assertIn(f"<Audio {expected}> is the voice-timbre reference", prompt)
+                self.assertIn("<d>[English] Keep this line.</d>", prompt)
+                self.assertEqual(validate_h3_prompt_contract(prompt, [], mode="ref2va", references=references), [])
+                if expected == 2:
+                    self.assertIn("<Audio 1> is the soundtrack paired with <Video 1>", prompt)
+                    self.assertIn("<Audio 1>: partially_copy -", prompt)
+                    self.assertIn("[reference generation + audio reuse + audio reference]", prompt)
+                    missing = prompt.replace("<Audio 2>", "the voice reference")
+                    self.assertTrue(any("<Audio 2>" in error for error in validate_h3_prompt_contract(
+                        missing, [], mode="ref2va", references=references)))
+                else:
+                    self.assertNotIn("audio reuse", prompt)
+
+    def test_spoken_audio_label_does_not_replace_a_reference_mapping(self):
+        references = [{"type": "video", "audio_path": "paired.wav"}]
+        prompt, _ = compile_h3_official_prompt(
+            "A person says <d>[English] Read <Audio 1> literally.</d>", [], [],
+            mode="ref2va", references=references,
+        )
+        literal = "<d>[English] Read <Audio 1> literally.</d>"
+        missing = prompt.replace("<Audio 1>", "the soundtrack").replace(
+            "<d>[English] Read the soundtrack literally.</d>", literal)
+        self.assertIn(literal, missing)
+        self.assertTrue(any("<Audio 1>" in error for error in validate_h3_prompt_contract(
+            missing, [], mode="ref2va", references=references)))
+
     def test_project_speaker_ids_remain_stable_when_cast_order_changes(self):
         plans = [
             {

@@ -1556,6 +1556,20 @@ def _reference_relationships(
             detail_bindings.append(
                 f"The requested motion and temporal behavior follow {label} without copying it as source footage."
             )
+            if (reference.get("has_audio") or reference.get("audio_path")) and reference.get("include_audio", True):
+                audio_no += 1
+                audio_label = f"<Audio {audio_no}>"
+                add_task_type("audio reuse")
+                definitions.append(
+                    f"{audio_label} is the soundtrack paired with {label}."
+                )
+                retention.append(
+                    f"{audio_label}: partially_copy - retain the paired soundtrack's "
+                    "audible timeline with its video reference."
+                )
+                detail_bindings.append(
+                    f"{audio_label} supplies the audible timeline paired with {label}."
+                )
         elif kind == "audio":
             audio_no += 1
             label = f"<Audio {audio_no}>"
@@ -2034,7 +2048,12 @@ def validate_h3_prompt_contract(
                 counts[kind] += 1
                 noun = {"image": "Picture", "video": "Video", "audio": "Audio"}[kind]
                 expected_labels.append(f"<{noun} {counts[kind]}>")
-            missing_labels = [label for label in expected_labels if label not in text]
+                if kind == "video" and (reference.get("has_audio") or reference.get("audio_path")) and reference.get("include_audio", True):
+                    counts["audio"] += 1
+                    expected_labels.append(f"<Audio {counts['audio']}>")
+            dialogue_spans, _ = _dialogue_spans(text)
+            reference_text = _replace_spans(text, dialogue_spans, [""] * len(dialogue_spans))
+            missing_labels = [label for label in expected_labels if label not in reference_text]
             if missing_labels:
                 errors.append(
                     "Ref2VA prompt does not map supplied references: "
