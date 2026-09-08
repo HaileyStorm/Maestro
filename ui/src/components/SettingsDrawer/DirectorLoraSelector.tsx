@@ -216,10 +216,8 @@ export function DirectorImageRoleLoraSelector({
   )
 }
 
-/**
- * Compact preset picker for Director mode LoRA sections.
- */
-function DirectorPresetPicker({ mode, modelType }: {
+/** Import the LoRA selection from a generation profile into this Director role. */
+function DirectorProfileLoraPicker({ mode, modelType }: {
   mode: 'image' | 'video'
   modelType: string
 }) {
@@ -238,7 +236,7 @@ function DirectorPresetPicker({ mode, modelType }: {
 
   if (modePresets.length === 0) return null
 
-  const applyPreset = (preset: typeof modePresets[0]) => {
+  const importLoras = (preset: typeof modePresets[0]) => {
     directorSetLora(
       mode,
       preset.activated_loras,
@@ -250,12 +248,14 @@ function DirectorPresetPicker({ mode, modelType }: {
 
   return (
     <div className="mb-2">
-      <label className="text-[10px] text-text-muted uppercase tracking-wider mb-1 block">Presets</label>
+      <p className="text-[10px] text-text-muted uppercase tracking-wider mb-1">LoRAs from saved profile</p>
       <div className="flex flex-wrap gap-1">
         {modePresets.map(p => (
           <button
             key={p.id}
-            onClick={() => applyPreset(p)}
+            type="button"
+            aria-label={`Use LoRAs from ${p.name}`}
+            onClick={() => importLoras(p)}
             className="flex items-center gap-1 px-2 py-1 rounded text-[10px] border border-border text-text-secondary hover:bg-bg-hover hover:text-text-primary hover:border-accent-blue transition-colors"
             title={`${p.activated_loras.length} LoRA(s): ${p.activated_loras.map(l => l.replace(/\.(safetensors|sft)$/i, '')).join(', ')}`}
           >
@@ -504,8 +504,7 @@ export function DirectorLoraSelector({ mode, modelType }: {
 
   return (
     <div>
-      {/* Preset picker */}
-      <DirectorPresetPicker mode={mode} modelType={modelType} />
+      <DirectorProfileLoraPicker mode={mode} modelType={modelType} />
 
       {/* Header with Browse */}
       <div className="flex items-center justify-between mb-1.5">

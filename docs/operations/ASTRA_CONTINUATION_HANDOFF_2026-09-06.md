@@ -1968,3 +1968,71 @@ flows and per-mode persistence, simplify the main Generate inputs/compatibility
 flow, and apply the same interaction principles through Director, project and
 reference workflows, and machine settings. The full continuous objective and
 all runtime, historical-tracker, privacy and ownership boundaries remain active.
+
+## Settings and compatibility continuation (2026-09-07)
+
+In-session mode snapshots now use the generation-profile UI field contract,
+retaining the separate prompt/media snapshots and canonical spatial-upscaling
+value. Returning modes load model capabilities without replacing restored or
+subsequently edited settings. First visits and removed-model fallbacks receive
+current model defaults. The deliberate clean-refresh boot policy is unchanged;
+H3 style workflow and Director identity guidance remain global across mode
+switches. Explicit saved profiles still capture the complete profile contract.
+Source and validation receipts belong under
+`.artifacts-temp/astra-mode-settings-20260907/`.
+
+The controls-first audit identifies four concrete remaining compatibility paths:
+
+- Short adaptive H3 frame-plus-semantic combinations need separate segments;
+  attachment choices and project-reference packs now enforce the native
+  duration boundary before submission. Long mixed plans remain supported.
+- Semantic audio references cannot outnumber visual references. The final
+  combined project-reference pack is validated before downloads, independent of
+  file iteration order. One shared helper also owns remaining media capacities.
+- SageAttention2++ must not appear usable when adaptive routing requires Ref2VA;
+  coordinate the selector with the actual engine contract instead of silently
+  presenting a different effective engine. This remains a separate source slice.
+- Previously attached inputs must stay visible and removable when a model
+  change makes them incompatible. Replace repeated explanations with concise
+  actionable controls; retain the final submission checks.
+
+Director's existing generation-profile shortcut imports only LoRAs into its
+role and is now labelled as that specific action rather than a full restore.
+Audit output-sidecar restoration separately for value loss and late-response
+overwrites; retain intentional metadata migrations and single-output batch size.
+
+H3 frame actions now expose only start/end slots. New KFI injection is not
+offered under H3 because the runtime treats every `image_refs` entry as semantic
+conditioning; restored entries remain visible and removable. Generic-model
+frame injection is preserved. Existing audio/video reference lengths must be
+measured before related additions or project-pack downloads proceed. Pending
+and unreadable lengths have separate actionable states, while independent
+image additions remain available. Project-pack completion also checks current
+duration, model-options identity and generation mode in addition to the prior
+account, project, selection and media fences.
+
+Direct semantic audio/video additions share one in-flight guard and a visible
+busy state. They verify the original render's account/project/model/settings
+and reference identities before measuring and after each asynchronous step,
+so stale picker callbacks and overlapping drops cannot replace current inputs.
+Removing restored KFI entries keeps paths, positions and process letters aligned.
+
+The final combined candidate passes all 552 UI tests and the production build.
+The first combined run found one stale function-signature test marker, which
+was corrected before the complete rerun. Independent review caught Director
+identity guidance leaking into mode snapshots and attachment-contract gaps;
+all findings are closed with focused regressions and parent verification.
+Exact source hashes remained unchanged
+through the final gate. This is source/synthetic/build evidence; browser,
+Windows, live generation and human acceptance remain open.
+
+The bounded output-restore review found concrete follow-up work in
+`useStore.ts:loadSettingsFromOutput`: same-model gallery selection does not
+invalidate a pending restore, later clip/edit-media callbacks lack the same
+identity fence, several canonical sampler fields are omitted, zero guidance
+becomes 5, and delivery/discard settings can remain stale. After the mode-switch
+writer finishes, reuse the canonical technical-field contract while retaining
+sidecar migrations and single-output batch size. Acceptance must exercise
+same-model A-to-B response races, late media responses, every canonical field's
+presence and zero/false/empty values, delivery fields and window discard. This
+is static review evidence, not an implemented or verified repair.

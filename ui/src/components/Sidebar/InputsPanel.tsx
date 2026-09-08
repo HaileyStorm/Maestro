@@ -10,8 +10,10 @@ import { classifyStudioReferenceMedia } from '../../lib/studioSemanticReferences
 import {
   filterProjectReferenceChoices,
   GENERATE_ATTACHMENT_DISABLED_TILE_CLASS,
+  H3_REFERENCE_LIMITS,
   orderGenerateAttachmentOptions,
   resolveGenerateAttachmentCapabilities,
+  resolveH3InputCompatibility,
 } from '../../lib/generateAttachmentOptions'
 
 // Unified, media-driven "Inputs" panel for Studio Frames mode (image_mode 0).
@@ -54,7 +56,6 @@ const OFFSET_PRESETS = [
 ] as const
 
 const WINDOW_TOKEN_RE = /^[Ww](\d+):(\d{1,3})$/
-const H3_REF2VA_LIMITS = { images: 9, videos: 3, audio: 3, mixed: 12 }
 const H3_STUDIO_MODELS = new Set([
   'minimax_h3',
   'minimax_h3_pinkcherry_fl2va',
@@ -157,6 +158,12 @@ interface ProjectReferenceApplyState {
   maxReferenceDuration: number | null
   maxVideoDurationTotal: number | null
   maxAudioDurationTotal: number | null
+  videoDurationStatus: 'ready' | 'pending' | 'unavailable'
+  audioDurationStatus: 'ready' | 'pending' | 'unavailable'
+  h3StudioWorkflow: boolean
+  durationSeconds: number
+  framesMaximum: number | null
+  fps: number | null
   hasStart: boolean
   hasEnd: boolean
   isExtend: boolean
@@ -330,6 +337,28 @@ async function executeProjectReferenceApply(
   if (state.maxMixedReferences != null && mixed > state.maxMixedReferences) {
     projectReferenceApplyError(`This project reference needs ${mixed - state.semanticMixedCount} reference slots, but only ${Math.max(0, state.maxMixedReferences - state.semanticMixedCount)} remain.`)
   }
+  if (state.h3StudioWorkflow) {
+    const compatibility = resolveH3InputCompatibility({
+      durationSeconds: state.durationSeconds,
+      framesMaximum: state.framesMaximum,
+      fps: state.fps,
+      hasFrameInputs: hasStart || hasEnd,
+      imageCount: semanticImages,
+      videoCount: videos,
+      audioCount: audio,
+    })
+    if (compatibility.invalidReason) projectReferenceApplyError(compatibility.invalidReason)
+    if (routed.some(entry => entry.destination === 'video') && state.videoDurationStatus !== 'ready') {
+      projectReferenceApplyError(state.videoDurationStatus === 'pending'
+        ? 'Existing reference video durations are still being checked. Try again when checking finishes.'
+        : 'An existing reference video duration is unavailable. Remove that video before adding another.')
+    }
+    if (routed.some(entry => entry.destination === 'audio') && state.audioDurationStatus !== 'ready') {
+      projectReferenceApplyError(state.audioDurationStatus === 'pending'
+        ? 'Existing reference audio durations are still being checked. Try again when checking finishes.'
+        : 'An existing reference audio duration is unavailable. Remove that audio clip before adding another.')
+    }
+  }
 
   const downloaded: PreparedProjectReferenceEntry[] = []
   for (const entry of routed) {
@@ -387,6 +416,71 @@ async function executeProjectReferenceApply(
   })
 }
 
+type SemanticMediaAdmissionResult = 'busy' | 'stale' | 'rejected' | 'committed'
+
+async function executeSemanticMediaAdmission<Measured, Prepared, Uploaded>(
+  guard: { current: object | null },
+  operations: {
+    measure: () => Promise<Measured>
+    validate: (measured: Measured) => Prepared | null
+    upload: (prepared: Prepared) => Promise<Uploaded>
+    isCurrent: () => boolean
+    commit: (uploaded: Uploaded, prepared: Prepared) => void
+  },
+): Promise<SemanticMediaAdmissionResult> {
+  if (guard.current) return 'busy'
+  const token = {}
+  guard.current = token
+  try {
+    if (!operations.isCurrent()) return 'stale'
+    const measured = await operations.measure()
+    if (guard.current !== token || !operations.isCurrent()) return 'stale'
+    const prepared = operations.validate(measured)
+    if (prepared == null) return 'rejected'
+    const uploaded = await operations.upload(prepared)
+    if (guard.current !== token || !operations.isCurrent()) return 'stale'
+    operations.commit(uploaded, prepared)
+    return 'committed'
+  } finally {
+    if (guard.current === token) guard.current = null
+  }
+}
+
+function resolveRestoredSemanticImageRemoval(
+  paths: readonly string[],
+  removeIndex: number,
+  framesPositions: unknown,
+  videoPromptType: unknown,
+): {
+  imageRefs: string[] | undefined
+  framesPositions: string | undefined
+  videoPromptType: string
+  legacyKfi: boolean
+} {
+  const imageRefs = paths.filter((_, index) => index !== removeIndex)
+  const promptType = typeof videoPromptType === 'string' ? videoPromptType : ''
+  const legacyKfi = promptType.includes('KFI')
+  if (!legacyKfi) {
+    return {
+      imageRefs: imageRefs.length > 0 ? imageRefs : undefined,
+      framesPositions: typeof framesPositions === 'string' ? framesPositions : undefined,
+      videoPromptType: promptType,
+      legacyKfi: false,
+    }
+  }
+  const positions = (typeof framesPositions === 'string' ? framesPositions : '')
+    .split(' ')
+    .filter(Boolean)
+  const alignedPositions = paths.map((_, index) => positions[index] || 'L')
+    .filter((_, index) => index !== removeIndex)
+  return {
+    imageRefs: imageRefs.length > 0 ? imageRefs : undefined,
+    framesPositions: alignedPositions.length > 0 ? alignedPositions.join(' ') : undefined,
+    videoPromptType: imageRefs.length > 0 ? promptType : promptType.replace(/KFI/g, ''),
+    legacyKfi: true,
+  }
+}
+
 export function InputsPanel() {
   const modelOptions = useStore(s => s.modelOptions)
   const startImage = useStore(s => s.startImage)
@@ -402,6 +496,7 @@ export function InputsPanel() {
   const h3SelectedProfile = useStore(s => s.h3SelectedProfile)
   const ref2vaModel = useStore(s => s.models.find(model => model.model_type === 'minimax_h3_ref2va'))
   const loadModels = useStore(s => s.loadModels)
+  const generationMode = useStore(s => s.generationMode)
   const durationSeconds = useStore(s => s.durationSeconds)
   const slidingWindowSeconds = useStore(s => s.slidingWindowSeconds)
   const slidingWindowOverlap = useStore(s => s.slidingWindowOverlap)
@@ -498,6 +593,8 @@ export function InputsPanel() {
   const [frameDragKey, setFrameDragKey] = useState<string | null>(null)
   const [frameDragOverKey, setFrameDragOverKey] = useState<string | null>(null)
   const [semanticRefDurations, setSemanticRefDurations] = useState<Record<string, number>>({})
+  const [semanticDurationProbeFailures, setSemanticDurationProbeFailures] = useState<string[]>([])
+  const [semanticMediaAdmissionBusy, setSemanticMediaAdmissionBusy] = useState<'video' | 'audio' | null>(null)
   const [h3DownloadStatus, setH3DownloadStatus] = useState<'idle' | 'downloading' | 'failed'>('idle')
   const [audioUploadTarget, setAudioUploadTarget] = useState<string | null>(null)
   const [audioUploadError, setAudioUploadError] = useState<string | null>(null)
@@ -516,6 +613,7 @@ export function InputsPanel() {
   const currentProjectRefChoices = useRef(projectRefChoices)
   const currentInjectedFrames = useRef(injectedFrames)
   const currentSemanticRefDurations = useRef(semanticRefDurations)
+  const semanticMediaAdmissionRef = useRef<object | null>(null)
   currentProjectRefChoices.current = projectRefChoices
   currentInjectedFrames.current = injectedFrames
   currentSemanticRefDurations.current = semanticRefDurations
@@ -530,6 +628,24 @@ export function InputsPanel() {
       || activeModel?.availability_status === 'legal_blocked'
       || activeModel?.execution_allowed === false
     )
+  const captureSemanticMediaCurrent = () => {
+    const submittedAccountEpoch = currentAccountIdentityEpoch()
+    return () => {
+      const current = useStore.getState()
+      return currentAccountIdentityEpoch() === submittedAccountEpoch
+        && current.activeWorkspace === activeWorkspace
+        && current.generationMode === generationMode
+        && current.params === params
+        && current.modelOptions === modelOptions
+        && current.durationSeconds === durationSeconds
+        && current.imageRefs === imageRefs
+        && current.startImage === startImage
+        && current.endImage === endImage
+        && (current.hostTerms?.minimax_h3_ref2va.accepted === true) === h3TermsAccepted
+        && h3TermsAccepted
+        && currentSemanticRefDurations.current === semanticRefDurations
+    }
+  }
 
   useEffect(() => {
     const input = filePickerRef.current
@@ -581,12 +697,15 @@ export function InputsPanel() {
 
   // ── Inject capability + window layout ──────────────────────────────
   const supportsInject = useMemo(() => {
+    // H3 sends every image_refs/KFI path through Ref2VA semantics at runtime.
+    // Only its scalar start/end anchors are frame inputs.
+    if (h3StudioWorkflow) return false
     const cfg = (modelOptions?.guide_preprocessing || modelOptions?.guide_custom_choices) as
       { choices?: [string, string][]; selection?: string[] } | undefined
     if (!cfg) return false
     const values = cfg.choices ? cfg.choices.map(([, v]) => v) : (cfg.selection || [])
     return values.some(v => typeof v === 'string' && v.includes('KFI'))
-  }, [modelOptions])
+  }, [modelOptions, h3StudioWorkflow])
 
   const windowInfo = useMemo(() => {
     const fps = modelOptions?.fps ?? 25
@@ -658,6 +777,21 @@ export function InputsPanel() {
     .filter((path): path is string => typeof path === 'string' && path.length > 0)
   const semanticAudioPaths = [params.audio_guide, params.audio_guide2, params.audio_guide3]
     .filter((path): path is string => typeof path === 'string' && path.length > 0)
+  const durationKnown = (path: string) => (
+    Number.isFinite(semanticRefDurations[path]) && semanticRefDurations[path] > 0
+  )
+  const unmeasuredSemanticVideoPaths = semanticVideoPaths.filter(path => !durationKnown(path))
+  const unmeasuredSemanticAudioPaths = semanticAudioPaths.filter(path => !durationKnown(path))
+  const semanticVideoDurationStatus = unmeasuredSemanticVideoPaths.length === 0
+    ? 'ready'
+    : unmeasuredSemanticVideoPaths.some(path => semanticDurationProbeFailures.includes(path))
+      ? 'unavailable'
+      : 'pending'
+  const semanticAudioDurationStatus = unmeasuredSemanticAudioPaths.length === 0
+    ? 'ready'
+    : unmeasuredSemanticAudioPaths.some(path => semanticDurationProbeFailures.includes(path))
+      ? 'unavailable'
+      : 'pending'
   const semanticImageCount = semanticReferenceMode
     ? imageRefs.length + (params.image_refs?.length || 0)
     : imageRefs.length
@@ -672,8 +806,17 @@ export function InputsPanel() {
   const semanticAudioDurationTotal = semanticAudioPaths.reduce(
     (sum, path) => sum + (semanticRefDurations[path] || 0), 0,
   )
+  const h3InputCompatibility = resolveH3InputCompatibility({
+    durationSeconds,
+    framesMaximum: modelOptions?.frames_maximum,
+    fps: modelOptions?.fps,
+    hasFrameInputs: h3HasFrameInputs,
+    imageCount: semanticImageCount,
+    videoCount: semanticVideoPaths.length,
+    audioCount: semanticAudioPaths.length,
+  })
   const configuredMaxRefs = semanticReferenceMode
-    ? Math.min(H3_REF2VA_LIMITS.images, H3_REF2VA_LIMITS.mixed - semanticVideoPaths.length - semanticAudioPaths.length)
+    ? Math.min(H3_REFERENCE_LIMITS.images, H3_REFERENCE_LIMITS.mixed - semanticVideoPaths.length - semanticAudioPaths.length)
     : modelOptions?.max_image_refs ?? null
   const maxRefs = configuredMaxRefs == null
     ? null
@@ -693,13 +836,19 @@ export function InputsPanel() {
   // limits remain enforced after refresh/load instead of treating old refs as
   // zero-duration.
   useEffect(() => {
-    if (!semanticReferenceMode) return
+    if (!semanticReferenceMode) {
+      setSemanticDurationProbeFailures([])
+      return
+    }
     let cancelled = false
     const missing = [
-      ...semanticVideoPaths.filter(path => semanticRefDurations[path] == null).map(path => ({ path, video: true })),
-      ...semanticAudioPaths.filter(path => semanticRefDurations[path] == null).map(path => ({ path, video: false })),
+      ...semanticVideoPaths.filter(path => !durationKnown(path)).map(path => ({ path, video: true })),
+      ...semanticAudioPaths.filter(path => !durationKnown(path)).map(path => ({ path, video: false })),
     ]
-    if (!missing.length) return
+    if (!missing.length) {
+      setSemanticDurationProbeFailures([])
+      return
+    }
     void Promise.all(missing.map(async item => ({
       path: item.path,
       duration: await getUploadedMediaDuration(item.path, item.video),
@@ -712,6 +861,11 @@ export function InputsPanel() {
         })
         return next
       })
+      setSemanticDurationProbeFailures(results
+        .filter(result => result.duration == null || !Number.isFinite(result.duration) || result.duration <= 0)
+        .map(result => result.path))
+    }).catch(() => {
+      if (!cancelled) setSemanticDurationProbeFailures(missing.map(item => item.path))
     })
     return () => { cancelled = true }
     // semanticPathsKey deliberately captures restored path identity; the
@@ -742,6 +896,7 @@ export function InputsPanel() {
 
   const pickReferences = () => {
     if (h3StudioWorkflow && !attachmentCaps.acceptsReferenceImage) return
+    if (h3StudioWorkflow && !h3InputCompatibility.canAddImage) return
     openFilePicker('.png,.jpg,.jpeg,.webp,.bmp', files => {
       const room = maxRefs == null ? files.length : Math.max(0, maxRefs - semanticImageCount)
       files.slice(0, room).forEach(addImageRef)
@@ -832,16 +987,17 @@ export function InputsPanel() {
       setParam('image_refs', undefined)
       setParam('frames_positions', undefined)
       const vpt = (params.video_prompt_type as string) || ''
-      if (vpt.includes('KFI')) setParam('video_prompt_type', vpt.replace('KFI', ''))
+      if (vpt.includes('KFI')) setParam('video_prompt_type', vpt.replace(/KFI/g, ''))
       return
     }
     setParam('image_refs', frames.map(f => f.path) as unknown as never)
     setParam('frames_positions', frames.map(f => f.position).join(' ') as unknown as never)
     const vpt = (params.video_prompt_type as string) || ''
-    if (!vpt.includes('KFI')) setParam('video_prompt_type', 'KFI')
+    if (!vpt.includes('KFI')) setParam('video_prompt_type', `${vpt}KFI`)
   }
 
   const addInjectFrame = async (file: File | null, path: string | null, previewUrl: string | null, offset: string, windowIdx = 0) => {
+    if (h3StudioWorkflow) return
     setFrameUploading(true)
     try {
       let p = path
@@ -906,7 +1062,9 @@ export function InputsPanel() {
         : (params.image_start ? `/api/v1/uploads/${basename(params.image_start as string)}` : null)
       if (startPreview) out.push({ key: 'frame-start', kind: 'start', preview: startPreview, offset: 'start', window: 0, sortKey: 0 })
     }
-    injectedFrames.forEach((f, i) => out.push({ key: `frame-inj-${i}`, kind: 'inject', injectIndex: i, preview: f.previewUrl, offset: f.offset, window: f.window, sortKey: frameKey(f.window, f.offset) }))
+    if (!h3StudioWorkflow) {
+      injectedFrames.forEach((f, i) => out.push({ key: `frame-inj-${i}`, kind: 'inject', injectIndex: i, preview: f.previewUrl, offset: f.offset, window: f.window, sortKey: frameKey(f.window, f.offset) }))
+    }
     if (!isExtend) {
       const endPreview = endImage ? URL.createObjectURL(endImage)
         : (params.image_end ? `/api/v1/uploads/${basename(params.image_end as string)}` : null)
@@ -915,7 +1073,7 @@ export function InputsPanel() {
     out.sort((a, b) => a.sortKey - b.sortKey)
     return out
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [startImage, endImage, injectedFrames, params.image_start, params.image_end, isExtend, nativeEndWindow])
+  }, [startImage, endImage, injectedFrames, params.image_start, params.image_end, isExtend, nativeEndWindow, h3StudioWorkflow])
 
   const canAddFrame = isExtend ? supportsInject : (!hasStart || (effectiveSupportsEndFrame && !hasEnd) || supportsInject)
 
@@ -926,6 +1084,7 @@ export function InputsPanel() {
   // window -> Mid.
   const handleAddFrameSmart = async (file: File) => {
     if (h3StudioWorkflow && !attachmentCaps.acceptsFirstLastFrame) return
+    if (h3StudioWorkflow && !h3InputCompatibility.canAddFrame) return
     if (!isExtend && !hasStart) { setStartImage(file); return }
     if (!isExtend && effectiveSupportsEndFrame && !hasEnd) { setEndImage(file); return }
     let w = 0, off = 'middle'
@@ -948,6 +1107,7 @@ export function InputsPanel() {
     let role = frameRoleFor(newWindow, newOffset)
     if (role === 'start' && hasStart && tile.kind !== 'start') { newOffset = '25%'; role = 'inject' }
     if (role === 'end' && hasEnd && tile.kind !== 'end') { newOffset = '75%'; role = 'inject' }
+    if (h3StudioWorkflow && role === 'inject') return
 
     if (tile.kind === role) {
       if (role === 'inject' && tile.injectIndex !== undefined) {
@@ -1118,23 +1278,43 @@ export function InputsPanel() {
   }
   const handleAddSemanticVideo = async (file: File) => {
     if (h3StudioWorkflow && !attachmentCaps.acceptsReferenceVideo) return
-    if (!h3TermsAccepted || semanticVideoPaths.length >= H3_REF2VA_LIMITS.videos || semanticMixedCount >= H3_REF2VA_LIMITS.mixed) return
-    const duration = await getMediaDuration(file)
-    if (duration == null || duration < 2 || duration > 15) {
-      window.alert('Each MiniMax H3 reference video must be between 2 and 15 seconds.')
-      return
-    }
-    const knownTotal = semanticVideoPaths.reduce((sum, path) => sum + (semanticRefDurations[path] || 0), 0)
-    if (knownTotal + duration > 15.01) {
-      window.alert('MiniMax H3 reference videos may total at most 15 seconds.')
-      return
-    }
+    if (!h3TermsAccepted
+      || semanticVideoPaths.length >= H3_REFERENCE_LIMITS.videos
+      || semanticMixedCount >= H3_REFERENCE_LIMITS.mixed
+      || (h3StudioWorkflow && semanticVideoDurationStatus !== 'ready')
+      || (h3StudioWorkflow && !h3InputCompatibility.canAddVideo)) return
+    const isCurrent = captureSemanticMediaCurrent()
+    let admitted = false
     try {
-      const result = await api.uploadImage(file)
-      setSemanticRefDurations(current => ({ ...current, [result.path]: duration }))
-      syncSemanticVideoRefs([...semanticVideoPaths, result.path])
+      await executeSemanticMediaAdmission(semanticMediaAdmissionRef, {
+        measure: () => {
+          admitted = true
+          setSemanticMediaAdmissionBusy('video')
+          return getMediaDuration(file)
+        },
+        validate: duration => {
+          if (duration == null || duration < 2 || duration > 15) {
+            window.alert('Each MiniMax H3 reference video must be between 2 and 15 seconds.')
+            return null
+          }
+          const knownTotal = semanticVideoPaths.reduce((sum, path) => sum + (semanticRefDurations[path] || 0), 0)
+          if (knownTotal + duration > 15.01) {
+            window.alert('MiniMax H3 reference videos may total at most 15 seconds.')
+            return null
+          }
+          return duration
+        },
+        upload: () => api.uploadImage(file),
+        isCurrent,
+        commit: (result, duration) => {
+          setSemanticRefDurations(current => ({ ...current, [result.path]: duration }))
+          syncSemanticVideoRefs([...semanticVideoPaths, result.path])
+        },
+      })
     } catch (e) {
       console.error('Semantic reference video upload failed:', e)
+    } finally {
+      if (admitted) setSemanticMediaAdmissionBusy(current => current === 'video' ? null : current)
     }
   }
   const removeSemanticVideo = (index: number) => {
@@ -1147,27 +1327,48 @@ export function InputsPanel() {
   }
   const handleAddSemanticAudio = async (file: File) => {
     if (h3StudioWorkflow && !attachmentCaps.acceptsReferenceAudio) return
-    if (!h3TermsAccepted || semanticAudioPaths.length >= H3_REF2VA_LIMITS.audio || semanticMixedCount >= H3_REF2VA_LIMITS.mixed) return
-    setAudioUploadTarget('semantic-audio')
-    setAudioUploadError(null)
+    if (!h3TermsAccepted
+      || semanticAudioPaths.length >= H3_REFERENCE_LIMITS.audio
+      || semanticMixedCount >= H3_REFERENCE_LIMITS.mixed
+      || (h3StudioWorkflow && semanticAudioDurationStatus !== 'ready')
+      || (h3StudioWorkflow && !h3InputCompatibility.canAddAudio)) return
+    const isCurrent = captureSemanticMediaCurrent()
+    let admitted = false
     try {
-      const duration = await getMediaDuration(file)
-      if (duration == null || duration < 2 || duration > 15) {
-        setAudioUploadError('Reference audio must be a readable clip between 2 and 15 seconds. Choose another file and try again.')
-        return
-      }
-      const knownTotal = semanticAudioPaths.reduce((sum, path) => sum + (semanticRefDurations[path] || 0), 0)
-      if (knownTotal + duration > 15.01) {
-        setAudioUploadError('Reference audio may total at most 15 seconds. Remove or shorten a clip, then try again.')
-        return
-      }
-      const result = await api.uploadAudio(file)
-      setSemanticRefDurations(current => ({ ...current, [result.path]: duration }))
-      syncSemanticAudioRefs([...semanticAudioPaths, result.path])
+      await executeSemanticMediaAdmission(semanticMediaAdmissionRef, {
+        measure: async () => {
+          admitted = true
+          setSemanticMediaAdmissionBusy('audio')
+          setAudioUploadTarget('semantic-audio')
+          setAudioUploadError(null)
+          return getMediaDuration(file)
+        },
+        validate: duration => {
+          if (duration == null || duration < 2 || duration > 15) {
+            setAudioUploadError('Reference audio must be a readable clip between 2 and 15 seconds. Choose another file and try again.')
+            return null
+          }
+          const knownTotal = semanticAudioPaths.reduce((sum, path) => sum + (semanticRefDurations[path] || 0), 0)
+          if (knownTotal + duration > 15.01) {
+            setAudioUploadError('Reference audio may total at most 15 seconds. Remove or shorten a clip, then try again.')
+            return null
+          }
+          return duration
+        },
+        upload: () => api.uploadAudio(file),
+        isCurrent,
+        commit: (result, duration) => {
+          setSemanticRefDurations(current => ({ ...current, [result.path]: duration }))
+          syncSemanticAudioRefs([...semanticAudioPaths, result.path])
+        },
+      })
     } catch (e) {
       setAudioUploadError(uploadErrorMessage('Reference audio', e))
     } finally {
-      setAudioUploadTarget(null)
+      if (admitted) {
+        setSemanticMediaAdmissionBusy(current => current === 'audio' ? null : current)
+        setAudioUploadTarget(null)
+      }
     }
   }
   const handleAddVoiceReference = async (file: File) => {
@@ -1209,6 +1410,9 @@ export function InputsPanel() {
       return currentAccountIdentityEpoch() === submittedAccountEpoch
         && current.activeWorkspace === submittedProject
         && current.params === submittedParams
+        && current.durationSeconds === submittedStore.durationSeconds
+        && current.modelOptions === submittedStore.modelOptions
+        && current.generationMode === submittedStore.generationMode
         && current.imageRefs === submittedImageRefs
         && current.startImage === submittedStartImage
         && current.endImage === submittedEndImage
@@ -1237,20 +1441,26 @@ export function InputsPanel() {
           maxSemanticImages: maxRefs,
           videoPaths: semanticVideoPaths,
           maxReferenceVideos: h3StudioWorkflow
-            ? H3_REF2VA_LIMITS.videos
+            ? H3_REFERENCE_LIMITS.videos
             : modelOptions?.reference_video_max_count ?? null,
           audioPaths: semanticAudioPaths,
           maxReferenceAudio: h3StudioWorkflow
-            ? H3_REF2VA_LIMITS.audio
+            ? H3_REFERENCE_LIMITS.audio
             : modelOptions?.reference_audio_max_count ?? null,
           semanticMixedCount,
-          maxMixedReferences: h3StudioWorkflow ? H3_REF2VA_LIMITS.mixed : null,
+          maxMixedReferences: h3StudioWorkflow ? H3_REFERENCE_LIMITS.mixed : null,
           videoDurationTotal: semanticVideoDurationTotal,
           audioDurationTotal: semanticAudioDurationTotal,
           minReferenceDuration: h3StudioWorkflow ? 2 : null,
           maxReferenceDuration: h3StudioWorkflow ? 15 : null,
           maxVideoDurationTotal: h3StudioWorkflow ? 15 : null,
           maxAudioDurationTotal: h3StudioWorkflow ? 15 : null,
+          videoDurationStatus: semanticVideoDurationStatus,
+          audioDurationStatus: semanticAudioDurationStatus,
+          h3StudioWorkflow,
+          durationSeconds,
+          framesMaximum: modelOptions?.frames_maximum ?? null,
+          fps: modelOptions?.fps ?? null,
           hasStart,
           hasEnd,
           isExtend,
@@ -1324,7 +1534,13 @@ export function InputsPanel() {
   }
 
   const selectedFrameTile = frameTiles.find(t => t.key === selected) || null
-
+  const h3DurationNotice = (
+    semanticVideoDurationStatus === 'unavailable' || semanticAudioDurationStatus === 'unavailable'
+      ? 'A saved reference duration is unavailable. Remove that clip before adding more media of the same kind.'
+      : semanticVideoDurationStatus === 'pending' || semanticAudioDurationStatus === 'pending'
+        ? 'Checking saved reference durations. Related media additions will unlock when checking finishes.'
+        : null
+  )
   return (
     <div>
       <input
@@ -1342,17 +1558,7 @@ export function InputsPanel() {
       {h3StudioWorkflow && (
         <div className="mb-2 rounded-lg border border-amber-500/35 bg-amber-500/5 p-2 space-y-1.5">
           <div className="text-[11px] font-medium text-text-primary">
-            MiniMax H3 input mode · {h3AdaptiveConditioning ? 'Automatic' : dedicatedRef2VAMode ? 'Reference media' : 'Start and end frames'}
-          </div>
-          <div className="rounded border border-border bg-bg-secondary px-2 py-1 text-[9px] text-text-secondary">
-            {h3AdaptiveConditioning
-              ? 'Automatic mode uses MiniMax H3 FL2VA and Ref2VA. Start/end frames and reference media guide separate planned segments.'
-              : <>Selected model: <span className="font-medium text-text-primary">{activeModel?.name || params.model_type}</span></>}<br />
-            {h3AdaptiveConditioning
-              ? 'Start and end frames set the opening and closing of the whole video. Reference media guides characters, setting, style, motion, or sound. Later shots can still continue from the previous shot’s last frame. Review the plan before adding the job to the queue.'
-              : dedicatedRef2VAMode
-                ? 'This model uses reference media and cannot use start or end frames.'
-                : 'This model uses start and end frames and cannot use reference media.'}
+            MiniMax H3 · {h3AdaptiveConditioning ? 'Automatic' : dedicatedRef2VAMode ? 'Reference media' : 'Start and end frames'}
           </div>
           {h3ExecutionBlocked && (
             <p role="status" className="rounded border border-red-500/35 bg-red-500/10 px-2 py-1 text-[9px] leading-relaxed text-red-100">
@@ -1361,11 +1567,13 @@ export function InputsPanel() {
                 : 'MiniMax H3 is not licensed in the owner-declared operating country. Accepting model terms does not grant access; separate written MiniMax authorization is required.'}
             </p>
           )}
-          <p className="text-[9px] leading-relaxed text-text-muted">
-            Reference media can guide characters, objects, settings, style, motion, or sound. It does not set the first or last frame.
-            {h3AdaptiveConditioning && ' An end frame always guides the end of the video.'}
-            {' '}You can add up to 9 images, 3 videos, 3 audio clips, and 12 files in total.
-          </p>
+          <details className="text-[9px] leading-relaxed text-text-muted">
+            <summary className="mobile-control-target cursor-pointer text-text-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Input details</summary>
+            <p className="pt-1">
+              Reference media guides content, style, motion, or sound. Start and end frames set timeline anchors.
+              {' '}H3 accepts up to 9 images, 3 videos, 3 audio clips, and 12 reference files total; each audio clip needs a visual reference.
+            </p>
+          </details>
           {!h3AdaptiveConditioning && !dedicatedRef2VAMode && h3HasSemanticInputs && (
             <p className="rounded border border-red-500/35 bg-red-500/10 px-2 py-1 text-[9px] text-red-200">
               This model choice cannot use the attached reference media. Turn Automatic back on or remove the references before generating.
@@ -1378,8 +1586,8 @@ export function InputsPanel() {
           )}
           {!h3ExecutionBlocked && <div className="flex flex-col items-stretch gap-2 text-[9px] leading-relaxed text-text-secondary sm:flex-row sm:items-start">
             <span className="flex-1">
-              {h3TermsAccepted ? 'MiniMax H3 Ref2VA model terms are accepted for this Maestro installation. ' : `${HOST_TERM_NOTICES.minimax_h3_ref2va.text} Notice v${HOST_TERM_NOTICES.minimax_h3_ref2va.version}. `}
-              <a href={HOST_TERM_NOTICES.minimax_h3_ref2va.href} target="_blank" rel="noreferrer" className="mobile-control-target inline-flex items-center rounded text-accent-blue hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">{HOST_TERM_NOTICES.minimax_h3_ref2va.linkLabel}</a>.
+              {!h3TermsAccepted && `${HOST_TERM_NOTICES.minimax_h3_ref2va.text} Notice v${HOST_TERM_NOTICES.minimax_h3_ref2va.version}. `}
+              <a href={HOST_TERM_NOTICES.minimax_h3_ref2va.href} target="_blank" rel="noreferrer" className="mobile-control-target inline-flex items-center rounded text-accent-blue hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">{HOST_TERM_NOTICES.minimax_h3_ref2va.linkLabel}</a>{h3TermsAccepted ? ' · Accepted' : '.'}
             </span>
             {!h3TermsAccepted && hostTerms && (
               <button
@@ -1506,9 +1714,24 @@ export function InputsPanel() {
           <Tile key={`restored-ref-${path}`} role={`Reference ${i + 1}`} filledLabel={basename(path)}
             imgSrc={api.getUploadUrl(basename(path))} selected={selected === `restored-ref-${i}`}
             onClear={() => {
-              const remaining = restoredSemanticImagePaths.filter((_, index) => index !== i)
-              setParam('image_refs', remaining.length > 0 ? remaining : undefined)
-              if (remaining.length === 0) setImageRefType('')
+              const removal = resolveRestoredSemanticImageRemoval(
+                restoredSemanticImagePaths,
+                i,
+                params.frames_positions,
+                params.video_prompt_type,
+              )
+              setParam('image_refs', removal.imageRefs)
+              if (h3StudioWorkflow && removal.legacyKfi) {
+                setParam('frames_positions', removal.framesPositions)
+                if (removal.videoPromptType !== params.video_prompt_type) {
+                  setParam('video_prompt_type', removal.videoPromptType)
+                }
+                setInjectedFrames(current => {
+                  const localIndex = current.findIndex(frame => frame.path === path)
+                  return localIndex < 0 ? current : current.filter((_, index) => index !== localIndex)
+                })
+              }
+              if (!removal.imageRefs) setImageRefType('')
               if (selected === `restored-ref-${i}`) setSelected(null)
             }}
             onSelect={() => setSelected(selected === `restored-ref-${i}` ? null : `restored-ref-${i}`)} />
@@ -1553,15 +1776,16 @@ export function InputsPanel() {
           }
           if (option.id === 'first_last_frame') {
             const atCapacity = !canAddFrame
-            const disabled = !option.enabled || frameUploading || atCapacity
+            const compatibilityReason = h3StudioWorkflow ? h3InputCompatibility.frameReason : null
+            const disabled = !option.enabled || frameUploading || atCapacity || compatibilityReason != null
             return (
               <AddTile
                 key={option.id}
                 label={frameUploading ? 'Uploading…' : 'First / last frame'}
                 icon={<Plus size={18} />}
                 disabled={disabled}
-                title={!option.enabled ? (option.reason ?? undefined) : frameUploading ? 'Uploading…' : atCapacity ? 'First and last frames are already set.' : undefined}
-                disabledClassName={incompatibleClass}
+                title={!option.enabled ? (option.reason ?? undefined) : compatibilityReason ?? (frameUploading ? 'Uploading…' : atCapacity ? 'First and last frames are already set.' : undefined)}
+                disabledClassName={disabled && !frameUploading ? GENERATE_ATTACHMENT_DISABLED_TILE_CLASS : incompatibleClass}
                 busy={frameUploading}
                 onClick={() => pickImage(handleAddFrameSmart)}
                 onDropFile={handleAddFrameSmart}
@@ -1571,20 +1795,23 @@ export function InputsPanel() {
           }
           if (option.id === 'reference_image') {
             const needsTerms = semanticReferenceMode && !h3TermsAccepted
-            const atCapacity = !canAddRef || (semanticReferenceMode && semanticMixedCount >= H3_REF2VA_LIMITS.mixed)
-            const disabled = !option.enabled || needsTerms || atCapacity
+            const compatibilityReason = h3StudioWorkflow ? h3InputCompatibility.semanticReason : null
+            const atCapacity = !canAddRef || (semanticReferenceMode && semanticMixedCount >= H3_REFERENCE_LIMITS.mixed)
+            const disabled = !option.enabled || needsTerms || atCapacity || compatibilityReason != null
             return (
               <AddTile
                 key={option.id}
                 label="Reference image"
                 icon={<Plus size={18} />}
                 disabled={disabled}
-                title={!option.enabled ? (option.reason ?? undefined) : needsTerms ? 'Accept the MiniMax H3 terms to add reference images.' : atCapacity ? 'Reference image limit reached.' : undefined}
-                disabledClassName={incompatibleClass}
+                title={!option.enabled ? (option.reason ?? undefined) : compatibilityReason ?? (needsTerms ? 'Accept the MiniMax H3 terms to add reference images.' : atCapacity ? 'Reference image limit reached.' : undefined)}
+                disabledClassName={disabled ? GENERATE_ATTACHMENT_DISABLED_TILE_CLASS : incompatibleClass}
                 onClick={pickReferences}
                 onDropFile={file => {
                   if (!option.enabled) return
-                  if (canAddRef && (!semanticReferenceMode || semanticMixedCount < H3_REF2VA_LIMITS.mixed)) addImageRef(file)
+                  if (canAddRef
+                    && (!h3StudioWorkflow || h3InputCompatibility.canAddImage)
+                    && (!semanticReferenceMode || semanticMixedCount < H3_REFERENCE_LIMITS.mixed)) addImageRef(file)
                 }}
                 dropAccept="image"
               />
@@ -1592,16 +1819,23 @@ export function InputsPanel() {
           }
           if (option.id === 'reference_video') {
             const needsTerms = semanticReferenceMode && !h3TermsAccepted
-            const atCapacity = semanticVideoPaths.length >= H3_REF2VA_LIMITS.videos || semanticMixedCount >= H3_REF2VA_LIMITS.mixed
-            const disabled = !option.enabled || needsTerms || atCapacity
+            const durationReason = h3StudioWorkflow && semanticVideoDurationStatus !== 'ready'
+              ? semanticVideoDurationStatus === 'pending'
+                ? 'Checking existing reference video durations.'
+                : 'Remove the reference video with an unavailable duration before adding another.'
+              : null
+            const compatibilityReason = h3StudioWorkflow ? h3InputCompatibility.semanticReason ?? durationReason : null
+            const atCapacity = semanticVideoPaths.length >= H3_REFERENCE_LIMITS.videos || semanticMixedCount >= H3_REFERENCE_LIMITS.mixed
+            const disabled = !option.enabled || needsTerms || atCapacity || compatibilityReason != null || semanticMediaAdmissionBusy !== null
             return (
               <AddTile
                 key={option.id}
                 label="Reference video"
                 icon={<Film size={18} />}
                 disabled={disabled}
-                title={!option.enabled ? (option.reason ?? undefined) : needsTerms ? 'Accept the MiniMax H3 terms to add reference videos.' : atCapacity ? 'Reference video limit reached.' : undefined}
-                disabledClassName={incompatibleClass}
+                title={!option.enabled ? (option.reason ?? undefined) : compatibilityReason ?? (semanticMediaAdmissionBusy !== null ? 'Wait for the current reference to finish.' : needsTerms ? 'Accept the MiniMax H3 terms to add reference videos.' : atCapacity ? 'Reference video limit reached.' : undefined)}
+                disabledClassName={disabled && semanticMediaAdmissionBusy === null ? GENERATE_ATTACHMENT_DISABLED_TILE_CLASS : incompatibleClass}
+                busy={semanticMediaAdmissionBusy === 'video'}
                 onClick={() => pickFile('.mp4,.webm,.mkv,.mov', handleAddSemanticVideo)}
                 onDropFile={handleAddSemanticVideo}
                 dropAccept="video"
@@ -1609,17 +1843,23 @@ export function InputsPanel() {
             )
           }
           const needsTerms = semanticReferenceMode && !h3TermsAccepted
-          const atCapacity = semanticAudioPaths.length >= H3_REF2VA_LIMITS.audio || semanticMixedCount >= H3_REF2VA_LIMITS.mixed
-          const disabled = !option.enabled || needsTerms || atCapacity || audioUploadTarget !== null
+          const durationReason = h3StudioWorkflow && semanticAudioDurationStatus !== 'ready'
+            ? semanticAudioDurationStatus === 'pending'
+              ? 'Checking existing reference audio durations.'
+              : 'Remove the reference audio with an unavailable duration before adding another.'
+            : null
+          const compatibilityReason = h3StudioWorkflow ? h3InputCompatibility.audioReason ?? durationReason : null
+          const atCapacity = semanticAudioPaths.length >= H3_REFERENCE_LIMITS.audio || semanticMixedCount >= H3_REFERENCE_LIMITS.mixed
+          const disabled = !option.enabled || needsTerms || atCapacity || compatibilityReason != null || audioUploadTarget !== null || semanticMediaAdmissionBusy !== null
           return (
             <AddTile
               key={option.id}
               label={audioUploadTarget === 'semantic-audio' ? 'Uploading…' : 'Reference audio'}
               icon={<Music size={18} />}
               disabled={disabled}
-              title={!option.enabled ? (option.reason ?? undefined) : audioUploadTarget === 'semantic-audio' ? 'Uploading…' : needsTerms ? 'Accept the MiniMax H3 terms to add reference audio.' : atCapacity ? 'Reference audio limit reached.' : undefined}
-              disabledClassName={incompatibleClass}
-              busy={audioUploadTarget === 'semantic-audio'}
+              title={!option.enabled ? (option.reason ?? undefined) : compatibilityReason ?? (semanticMediaAdmissionBusy !== null ? 'Wait for the current reference to finish.' : needsTerms ? 'Accept the MiniMax H3 terms to add reference audio.' : atCapacity ? 'Reference audio limit reached.' : undefined)}
+              disabledClassName={disabled && semanticMediaAdmissionBusy === null && audioUploadTarget === null ? GENERATE_ATTACHMENT_DISABLED_TILE_CLASS : incompatibleClass}
+              busy={semanticMediaAdmissionBusy === 'audio'}
               onClick={() => pickFile('.wav,.mp3,.flac,.ogg,.m4a', handleAddSemanticAudio)}
               onDropFile={handleAddSemanticAudio}
               dropAccept="audio"
@@ -1627,6 +1867,21 @@ export function InputsPanel() {
           )
         })}
       </div>
+      {semanticMediaAdmissionBusy && (
+        <p role="status" className="mt-1 text-[9px] text-text-muted">
+          Adding reference {semanticMediaAdmissionBusy}…
+        </p>
+      )}
+      {h3StudioWorkflow && h3TermsAccepted && h3InputCompatibility.invalidReason && (
+        <p role="status" className="mt-1 rounded border border-red-500/35 bg-red-500/10 px-2 py-1 text-[9px] text-red-200">
+          {h3InputCompatibility.invalidReason}
+        </p>
+      )}
+      {h3StudioWorkflow && h3TermsAccepted && h3DurationNotice && (
+        <p role="status" className={`mt-1 rounded border px-2 py-1 text-[9px] ${semanticVideoDurationStatus === 'unavailable' || semanticAudioDurationStatus === 'unavailable' ? 'border-red-500/35 bg-red-500/10 text-red-200' : 'border-amber-500/30 bg-amber-500/5 text-amber-200'}`}>
+          {h3DurationNotice}
+        </p>
+      )}
       {projectRefPickerOpen && (
         <div className="mt-2 rounded-lg border border-border bg-bg-secondary p-2" role="listbox" aria-label="Project references">
           <div className="mb-1 flex items-center justify-between gap-2">
@@ -1666,11 +1921,19 @@ export function InputsPanel() {
         </p>
       )}
       {semanticReferenceMode && h3TermsAccepted && (
-        <p className={`mt-1 text-[9px] ${semanticAudioPaths.length > semanticImageCount + semanticVideoPaths.length ? 'text-amber-400' : 'text-text-muted'}`}>
-          References: {semanticImageCount}/9 images · {semanticVideoPaths.length}/3 videos · {semanticAudioPaths.length}/3 audio clips · {semanticMixedCount}/12 total.
-          {' '}Video {semanticVideoDurationTotal.toFixed(1)}/15s · audio {semanticAudioDurationTotal.toFixed(1)}/15s.
-          {' '}Add at least one image or video for each audio clip. Every video and audio clip must be 2–15 seconds long.
-        </p>
+        <div className="mt-1 text-[9px] text-text-muted">
+          <p>
+            Remaining: {h3InputCompatibility.remaining.images} images · {h3InputCompatibility.remaining.videos} videos · {h3InputCompatibility.remaining.audio} paired audio · {h3InputCompatibility.remaining.mixed} total.
+          </p>
+          {(semanticVideoPaths.length > 0 || semanticAudioPaths.length > 0) && (
+            <details>
+              <summary className="cursor-pointer text-text-secondary">Clip usage</summary>
+              <p className="pt-0.5">
+                Video {semanticVideoDurationStatus === 'ready' ? `${semanticVideoDurationTotal.toFixed(1)}/15s` : semanticVideoDurationStatus === 'pending' ? 'checking…' : 'duration unavailable'} · audio {semanticAudioDurationStatus === 'ready' ? `${semanticAudioDurationTotal.toFixed(1)}/15s` : semanticAudioDurationStatus === 'pending' ? 'checking…' : 'duration unavailable'}. Each clip must be 2–15 seconds.
+              </p>
+            </details>
+          )}
+        </div>
       )}
 
       {/* Option strip — Frame: position picker (routes start / end / inject

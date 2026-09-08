@@ -67,7 +67,7 @@ test('submission and output restore repair only the declared LTX values', () => 
 
   const modelOptions = sliceBetween(
     store,
-    'loadModelOptions: async (modelType) =>',
+    'loadModelOptions: async (',
     '// System config',
   )
   assert.match(modelOptions, /choice => choice\.value === currentVideoVae/)

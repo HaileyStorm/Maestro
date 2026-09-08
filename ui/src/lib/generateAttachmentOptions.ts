@@ -75,11 +75,127 @@ export interface GenerateAttachmentOption {
   reason: string | null
 }
 
+export const H3_REFERENCE_LIMITS = {
+  images: 9,
+  videos: 3,
+  audio: 3,
+  mixed: 12,
+} as const
+
+export interface H3InputCompatibilityInput {
+  durationSeconds: number
+  framesMaximum?: number | null
+  fps?: number | null
+  hasFrameInputs: boolean
+  imageCount: number
+  videoCount: number
+  audioCount: number
+}
+
+export interface H3InputCompatibility {
+  nativeMaximumSeconds: number | null
+  hasSemanticInputs: boolean
+  hasShortMixedInputs: boolean
+  remaining: {
+    images: number
+    videos: number
+    audio: number
+    mixed: number
+    pairedAudio: number
+  }
+  canAddFrame: boolean
+  canAddImage: boolean
+  canAddVideo: boolean
+  canAddAudio: boolean
+  frameReason: string | null
+  semanticReason: string | null
+  audioReason: string | null
+  invalidReason: string | null
+}
+
 export const GENERATE_ATTACHMENT_DISABLED_TILE_CLASS =
   'disabled:cursor-not-allowed disabled:opacity-40'
 
 function positiveCount(value: number | null | undefined): boolean {
   return typeof value === 'number' && Number.isFinite(value) && value > 0
+}
+
+function remaining(limit: number, count: number): number {
+  return Math.max(0, limit - Math.max(0, count))
+}
+
+/**
+ * Resolve the H3 input contract against one complete prospective state.
+ * Callers can use the add affordances for one-file choices or invalidReason
+ * to preflight a staged project pack atomically.
+ */
+export function resolveH3InputCompatibility(
+  input: H3InputCompatibilityInput,
+): H3InputCompatibility {
+  const imageCount = Math.max(0, input.imageCount)
+  const videoCount = Math.max(0, input.videoCount)
+  const audioCount = Math.max(0, input.audioCount)
+  const visualCount = imageCount + videoCount
+  const mixedCount = visualCount + audioCount
+  const nativeMaximumSeconds = (
+    positiveCount(input.framesMaximum) && positiveCount(input.fps)
+      ? (input.framesMaximum as number) / (input.fps as number)
+      : null
+  )
+  const hasSemanticInputs = mixedCount > 0
+  const shortOutput = (
+    nativeMaximumSeconds != null
+    && Number.isFinite(input.durationSeconds)
+    && input.durationSeconds <= nativeMaximumSeconds
+  )
+  const hasShortMixedInputs = shortOutput && input.hasFrameInputs && hasSemanticInputs
+  const durationLabel = nativeMaximumSeconds == null
+    ? null
+    : `${nativeMaximumSeconds.toFixed(2)}s`
+  const semanticReason = shortOutput && input.hasFrameInputs
+    ? `Remove start/end frames or request more than ${durationLabel} before adding reference media.`
+    : null
+  const frameReason = shortOutput && hasSemanticInputs
+    ? `Remove reference media or request more than ${durationLabel} before adding frames.`
+    : null
+  const mixedRemaining = remaining(H3_REFERENCE_LIMITS.mixed, mixedCount)
+  const pairedAudio = Math.max(0, visualCount - audioCount)
+  const imageRemaining = Math.min(remaining(H3_REFERENCE_LIMITS.images, imageCount), mixedRemaining)
+  const videoRemaining = Math.min(remaining(H3_REFERENCE_LIMITS.videos, videoCount), mixedRemaining)
+  const audioRemaining = Math.min(
+    remaining(H3_REFERENCE_LIMITS.audio, audioCount),
+    mixedRemaining,
+    pairedAudio,
+  )
+  const audioReason = semanticReason
+    ?? (pairedAudio < 1 ? 'Add an image or video before adding another audio reference.' : null)
+  const invalidReason = hasShortMixedInputs
+    ? `Start/end frames and reference media need separate H3 segments. Request more than ${durationLabel}, or remove one input type.`
+    : audioCount > visualCount
+      ? 'MiniMax H3 needs at least one image or video for each audio reference.'
+      : null
+
+  return {
+    nativeMaximumSeconds,
+    hasSemanticInputs,
+    hasShortMixedInputs,
+    remaining: {
+      images: imageRemaining,
+      videos: videoRemaining,
+      audio: audioRemaining,
+      mixed: mixedRemaining,
+      pairedAudio,
+    },
+    canAddFrame: frameReason == null,
+    canAddImage: semanticReason == null && imageRemaining > 0,
+    canAddVideo: semanticReason == null && videoRemaining > 0,
+    canAddAudio: audioReason == null
+      && audioRemaining > 0,
+    frameReason,
+    semanticReason,
+    audioReason,
+    invalidReason,
+  }
 }
 
 export function isDedicatedRef2VAModel(input: GenerateAttachmentCatalogInput): boolean {

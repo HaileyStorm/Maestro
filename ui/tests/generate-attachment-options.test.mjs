@@ -7,6 +7,7 @@ import {
   filterProjectReferenceChoices,
   orderGenerateAttachmentOptions,
   resolveGenerateAttachmentCapabilities,
+  resolveH3InputCompatibility,
 } from '../src/lib/generateAttachmentOptions.ts'
 
 const ids = options => options.map(option => option.id)
@@ -163,4 +164,117 @@ test('labels stay honest and items are not removed when disabled', () => {
     new Set(options.map(option => option.label)),
     new Set(Object.values(GENERATE_ATTACHMENT_LABELS)),
   )
+})
+
+test('short H3 videos keep frame and semantic additions mutually eligible only before either is chosen', () => {
+  const atNativeBoundary = resolveH3InputCompatibility({
+    durationSeconds: 5,
+    framesMaximum: 120,
+    fps: 24,
+    hasFrameInputs: true,
+    imageCount: 1,
+    videoCount: 0,
+    audioCount: 0,
+  })
+  assert.equal(atNativeBoundary.nativeMaximumSeconds, 5)
+  assert.equal(atNativeBoundary.hasShortMixedInputs, true)
+  assert.equal(atNativeBoundary.canAddFrame, false)
+  assert.equal(atNativeBoundary.canAddImage, false)
+  assert.equal(atNativeBoundary.canAddVideo, false)
+  assert.match(atNativeBoundary.invalidReason, /more than 5\.00s/)
+
+  const frameOnly = resolveH3InputCompatibility({
+    durationSeconds: 5,
+    framesMaximum: 120,
+    fps: 24,
+    hasFrameInputs: true,
+    imageCount: 0,
+    videoCount: 0,
+    audioCount: 0,
+  })
+  assert.equal(frameOnly.canAddFrame, true)
+  assert.equal(frameOnly.canAddImage, false)
+  assert.match(frameOnly.semanticReason, /Remove start\/end frames/)
+
+  const textOnlyRef2VA = resolveH3InputCompatibility({
+    durationSeconds: 5,
+    framesMaximum: 120,
+    fps: 24,
+    hasFrameInputs: false,
+    imageCount: 0,
+    videoCount: 0,
+    audioCount: 0,
+  })
+  assert.equal(textOnlyRef2VA.invalidReason, null)
+  assert.equal(textOnlyRef2VA.canAddImage, true)
+  assert.equal(textOnlyRef2VA.canAddAudio, false)
+})
+
+test('long H3 videos allow mixed inputs and report exact currently addable counts', () => {
+  const compatibility = resolveH3InputCompatibility({
+    durationSeconds: 5.01,
+    framesMaximum: 120,
+    fps: 24,
+    hasFrameInputs: true,
+    imageCount: 2,
+    videoCount: 1,
+    audioCount: 1,
+  })
+  assert.equal(compatibility.hasShortMixedInputs, false)
+  assert.equal(compatibility.invalidReason, null)
+  assert.equal(compatibility.canAddFrame, true)
+  assert.equal(compatibility.canAddImage, true)
+  assert.equal(compatibility.canAddVideo, true)
+  assert.equal(compatibility.canAddAudio, true)
+  assert.deepEqual(compatibility.remaining, {
+    images: 7,
+    videos: 2,
+    audio: 2,
+    mixed: 8,
+    pairedAudio: 2,
+  })
+
+  const oneMixedSlot = resolveH3InputCompatibility({
+    durationSeconds: 20,
+    framesMaximum: 120,
+    fps: 24,
+    hasFrameInputs: false,
+    imageCount: 8,
+    videoCount: 2,
+    audioCount: 1,
+  })
+  assert.deepEqual(oneMixedSlot.remaining, {
+    images: 1,
+    videos: 1,
+    audio: 1,
+    mixed: 1,
+    pairedAudio: 9,
+  })
+})
+
+test('H3 audio eligibility never exceeds the available visual pairings', () => {
+  const paired = resolveH3InputCompatibility({
+    durationSeconds: 20,
+    framesMaximum: 120,
+    fps: 24,
+    hasFrameInputs: false,
+    imageCount: 1,
+    videoCount: 1,
+    audioCount: 2,
+  })
+  assert.equal(paired.remaining.audio, 0)
+  assert.equal(paired.canAddAudio, false)
+  assert.match(paired.audioReason, /Add an image or video/)
+
+  const invalidRestoredState = resolveH3InputCompatibility({
+    durationSeconds: 20,
+    framesMaximum: 120,
+    fps: 24,
+    hasFrameInputs: false,
+    imageCount: 1,
+    videoCount: 0,
+    audioCount: 2,
+  })
+  assert.match(invalidRestoredState.invalidReason, /one image or video for each audio/)
+  assert.equal(invalidRestoredState.canAddImage, true)
 })

@@ -10,6 +10,10 @@ const customKeys = new Set(Object.keys(schema.custom_settings))
 
 export const generationProfileParameterKeys = Object.freeze([...parameterKeys])
 export const generationProfileUiKeys = Object.freeze(Object.keys(schema.ui))
+const globalModeUiKeys = new Set(['h3StyleWorkflow', 'directorIdentityGuidanceScale'])
+export const generationModeUiKeys = Object.freeze(
+  generationProfileUiKeys.filter(key => !globalModeUiKeys.has(key)),
+)
 
 function copy(value: unknown): unknown {
   // A profile is detached from subsequent edits and contains JSON values only.
@@ -36,6 +40,33 @@ function technicalCustomSettings(value: unknown): unknown {
     if (item !== undefined) result[key] = copy(item)
   }
   return result
+}
+
+/**
+ * Mode switches use the same technical UI field catalog as saved profiles.
+ * H3 style and Director identity guidance are workspace-wide preferences, so
+ * they deliberately stay outside each mode's working set.
+ */
+export function captureGenerationModeUiSettings(state: object): Settings {
+  const source = state as Settings
+  const captured: Settings = {}
+  for (const key of generationModeUiKeys) {
+    if (own(source, key) && source[key] !== undefined) captured[key] = copy(source[key])
+  }
+  return captured
+}
+
+/** Restore a complete mode UI envelope, defaulting fields absent from legacy snapshots. */
+export function restoreGenerationModeUiSettings(snapshot: unknown, initialUi: object): Settings {
+  const stored = snapshot && typeof snapshot === 'object' && !Array.isArray(snapshot)
+    ? snapshot as Settings
+    : {}
+  const defaults = initialUi as Settings
+  const restored: Settings = {}
+  for (const key of generationModeUiKeys) {
+    restored[key] = copy(own(stored, key) ? stored[key] : defaults[key])
+  }
+  return restored
 }
 
 /** One complete configuration snapshot; current-job content stays job-local. */

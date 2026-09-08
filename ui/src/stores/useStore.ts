@@ -1,5 +1,11 @@
 import { create } from 'zustand'
-import { captureGenerationProfileSettings, restoreGenerationProfileSettings, generationProfileUiKeys } from '../lib/generationProfiles'
+import {
+  captureGenerationModeUiSettings,
+  captureGenerationProfileSettings,
+  generationProfileUiKeys,
+  restoreGenerationModeUiSettings,
+  restoreGenerationProfileSettings,
+} from '../lib/generationProfiles'
 import type { StoreApi } from 'zustand'
 import type { GenerateParams, OutputFile, MediaFilter, OutputArtifactScope, AspectRatio, ResolutionPreset, ScailResolutionProfile, GenerationJob, H3SegmentPlan, H3PlanDecision, H3PerformanceEstimate, H3SegmentCountEstimate, H3PerformanceProfile, H3PerformanceProfileId, ModelFamily, ModelDef, GenerationMode, ModelOptions, SystemConfig, SettingsTab, OutputMetadata, MultiClip, ServicesConfig, HostTermId, HostTermsStatus, LlmStatus, LlmModelOption, AudioAnalysisResult, PlannedClip, ClipPlan, DirectorClipImage, DirectorImageGenProgress, DirectorImageRole, DirectorImageRoleLoraSelection, SpeakerMapping, DirectorSkill, DirectorShotImageGuidance, ShortFilmCharacter, ShortFilmPath, CivitAIModel, CivitAIDownload, PipelineListItem, PipelineRepairState, SavedPipelineState, SystemDetectResponse, SystemStats, RecastCharacterMapping, RepaintRegionMapping, AccountAuthResult, AccountContext, AccountProjectMigrationStatus, AccountSession, AccountSummary, ResponsibleUseProjection, SupportAdminProjection, SupportFulfillmentMutationInput, SupportManualContributionInput, SupportPublicProjection, SupportSelfProjection, SupportH3LegalAccessProjection, SupportH3LegalAccessLocationInput } from '../types'
 import * as api from '../api/client'
@@ -1708,17 +1714,13 @@ const _PERSIST_VERSION = 1
 
 type LoraModeBlob = { activated_loras: string[]; loras_multipliers: string; loraWeights: Record<string, number[]>; availableLoras: string[] }
 
-/** Per-mode params snapshot stored in localStorage. Holds whatever
- *  GenerateParams the user had set in that mode, plus a couple of
- *  top-level store fields (filmGrain*) that conceptually belong to
- *  the mode but live outside `params`. Each mode keeps its own
- *  complete snapshot so settings don't leak between modes — this
- *  fixed bugs where e.g. `repeat_generation: 10` set in image mode
- *  would queue up 10 videos when the user switched to video mode,
- *  or `video_prompt_type: 'KFI'` (frames injection) would persist
- *  on a mode where it didn't apply. Partial<GenerateParams> because
- *  the user almost never sets every field. */
+/** Per-mode working set. Persistence strips job-local media paths; refresh
+ *  restores only the explicitly selected boot fields in loadModels. */
 type SavedModeParams = Partial<GenerateParams> & {
+  /** Technical UI settings, excluding global H3 style and Director identity guidance. */
+  uiSettings?: Record<string, unknown>
+  /** Envelope-owned setting kept separate from the shared profile UI catalog. */
+  spatialUpsampling?: string
   filmGrainIntensity?: number
   filmGrainSaturation?: number
   /** Top-level store field (NOT in GenerateParams), saved per-mode so
@@ -1738,12 +1740,28 @@ function _ttsAudioPromptType(count: number, options: ModelOptions | null, curren
   return selection[Math.min(count, selection.length - 1)] + ((current || '').replace(/[^NV]/g, ''))
 }
 
-function _snapshotModeParams(params: GenerateParams): SavedModeParams {
+function _snapshotModeParams(
+  params: GenerateParams,
+  state?: object,
+): SavedModeParams {
   const snapshot: SavedModeParams = { ...params }
   delete snapshot.model_type
   delete snapshot.prompt
   delete snapshot.activated_loras
   delete snapshot.loras_multipliers
+  delete snapshot.spatial_upsampling
+  if (state) {
+    const modeState = state as Record<string, unknown>
+    snapshot.uiSettings = captureGenerationModeUiSettings(state)
+    snapshot.spatialUpsampling = typeof modeState.spatialUpsampling === 'string'
+      ? modeState.spatialUpsampling
+      : ''
+    // Retain the pre-envelope mirrors while persisted legacy snapshots and
+    // older callers still inspect them directly.
+    if (typeof modeState.durationSeconds === 'number') snapshot.durationSeconds = modeState.durationSeconds
+    if (typeof modeState.filmGrainIntensity === 'number') snapshot.filmGrainIntensity = modeState.filmGrainIntensity
+    if (typeof modeState.filmGrainSaturation === 'number') snapshot.filmGrainSaturation = modeState.filmGrainSaturation
+  }
   return snapshot
 }
 
@@ -1752,6 +1770,24 @@ function _restoreModeParams(snapshot?: SavedModeParams): SavedModeParams {
   delete restored.filmGrainIntensity
   delete restored.filmGrainSaturation
   delete restored.durationSeconds
+  delete restored.uiSettings
+  delete restored.spatialUpsampling
+  delete restored.spatial_upsampling
+  return restored
+}
+
+function _restoreModeUiSettings(snapshot: SavedModeParams | undefined): Record<string, unknown> {
+  const restored = restoreGenerationModeUiSettings(
+    snapshot?.uiSettings,
+    useStore.getInitialState(),
+  )
+  // Snapshots from before the complete UI envelope stored these three fields
+  // beside params. Keep them readable while new snapshots use one owner.
+  if (snapshot && !snapshot.uiSettings) {
+    if (typeof snapshot.durationSeconds === 'number') restored.durationSeconds = snapshot.durationSeconds
+    if (typeof snapshot.filmGrainIntensity === 'number') restored.filmGrainIntensity = snapshot.filmGrainIntensity
+    if (typeof snapshot.filmGrainSaturation === 'number') restored.filmGrainSaturation = snapshot.filmGrainSaturation
+  }
   return restored
 }
 
@@ -3295,7 +3331,7 @@ interface AppState {
   // Model options
   modelOptions: ModelOptions | null
   modelOptionsLoading: boolean
-  loadModelOptions: (modelType: string) => Promise<void>
+  loadModelOptions: (modelType: string, options?: { metadataOnly?: boolean }) => Promise<void>
   h3PerformanceProfiles: H3PerformanceProfile[]
   h3CurrentEstimate: H3PerformanceEstimate | null
   h3SegmentCountEstimate: H3SegmentCountEstimate | null
@@ -3773,7 +3809,14 @@ async function _applyH3ServerProfile(
     }
     const savedParamsPerMode = {
       ...state.savedParamsPerMode,
-      [mode]: _snapshotModeParams(nextParams),
+      [mode]: _snapshotModeParams(nextParams, {
+        ...state,
+        durationSeconds,
+        ...(supportsWindows ? { slidingWindowSeconds: windowSeconds } : {}),
+        slidingWindowOverlap: overlap,
+        slidingWindowLocked: supportsWindows ? state.slidingWindowLocked : false,
+        spatialUpsampling: settings.spatial_upsampling || '',
+      }),
     }
     const selectedModelPerMode = {
       ...state.selectedModelPerMode,
@@ -5745,11 +5788,10 @@ export const useStore = create<AppState>((set, get) => ({
       const s = get()
       const prev = s.generationMode
       if (prev === 'tools') { set({ generationMode: 'tools' }); return }
-      const paramsSnapshot = _snapshotModeParams(s.params)
       const savedModels = { ...s.selectedModelPerMode, [prev]: s.params.model_type }
       const savedParams = {
         ...s.savedParamsPerMode,
-        [prev]: { ...paramsSnapshot, filmGrainIntensity: s.filmGrainIntensity, filmGrainSaturation: s.filmGrainSaturation, durationSeconds: s.durationSeconds },
+        [prev]: _snapshotModeParams(s.params, s),
       }
       const savedLoras = {
         ...s.savedLoraPerMode,
@@ -5766,7 +5808,8 @@ export const useStore = create<AppState>((set, get) => ({
       _saveSettings({ generationMode: prev, selectedModelPerMode: savedModels, savedParamsPerMode: savedParams, savedLoraPerMode: savedLoras, savedPromptPerMode: savedPrompts }, s.loraIdByFilename)
       return
     }
-    const { families, models, generationMode: prevMode, params, selectedModelPerMode, savedLoraPerMode, savedParamsPerMode, loraWeights, availableLoras, savedPromptPerMode } = get()
+    const current = get()
+    const { families, models, generationMode: prevMode, params, selectedModelPerMode, savedLoraPerMode, savedParamsPerMode, loraWeights, availableLoras, savedPromptPerMode } = current
     // Save prompt for the mode we're leaving
     const savedPrompts = { ...savedPromptPerMode, [prevMode]: params.prompt }
     // Save current model + LoRA + params state for the mode we're leaving
@@ -5789,19 +5832,9 @@ export const useStore = create<AppState>((set, get) => ({
     // video_guide, image_refs, frames_positions, MMAudio_*, etc. — is
     // captured here so it survives a switch-and-return AND doesn't
     // leak into other modes.
-    const paramsSnapshot = _snapshotModeParams(params)
     const savedParams = {
       ...savedParamsPerMode,
-      [prevMode]: {
-        ...paramsSnapshot,
-        filmGrainIntensity: get().filmGrainIntensity,
-        filmGrainSaturation: get().filmGrainSaturation,
-        // Save durationSeconds per-mode so audio's 600/1800 (Kugel/Scenema
-        // slider max) doesn't leak into video on mode-switch back. Audio
-        // mode's loadModelOptions still overrides with the slider.max on
-        // model select, so this only matters for video/image/avatar.
-        durationSeconds: get().durationSeconds,
-      },
+      [prevMode]: _snapshotModeParams(params, current),
     }
     // Restore saved model for target mode, or fall back to default
     const savedModel = savedModels[mode]
@@ -5809,6 +5842,7 @@ export const useStore = create<AppState>((set, get) => ({
       ? savedModel
       : getDefaultModelForMode(mode, families, models)
     const newModelType = restoredModel || params.model_type
+    const resolvedModels = { ...savedModels, [mode]: newModelType }
     // Restore saved LoRA state for target mode (if same model)
     const restoredLora = savedLoras[mode]
     const sameModel = restoredLora && savedModel === newModelType
@@ -5816,33 +5850,38 @@ export const useStore = create<AppState>((set, get) => ({
     // user never visited this mode before, fall back to defaultParams
     // (NOT the previous mode's params — that's what caused the leak).
     const restoredSnapshot = savedParams[mode]
-    // Extract film grain from snapshot (top-level store state, not in params)
-    const restoredFilmGrain = restoredSnapshot
-      ? { filmGrainIntensity: restoredSnapshot.filmGrainIntensity ?? 0, filmGrainSaturation: restoredSnapshot.filmGrainSaturation ?? 0.5 }
-      : { filmGrainIntensity: 0, filmGrainSaturation: 0.5 }
-    // Restore durationSeconds for the target mode. Non-audio modes (video,
-    // avatar, image) fall back to 5s on first visit. Audio mode's
-    // durationSeconds gets overridden by loadModelOptions when it sees
-    // audio_only && duration_slider, so the snapshot value is mostly
-    // ignored there — it's still saved for symmetry.
-    const restoredDuration = restoredSnapshot && typeof restoredSnapshot.durationSeconds === 'number'
-      ? restoredSnapshot.durationSeconds as number
-      : 5
-    // Strip filmGrain + durationSeconds keys before applying — they don't belong in params
+    const restoresSavedModel = Boolean(restoredSnapshot && savedModel === newModelType)
+    const restoredUiSettings = _restoreModeUiSettings(restoredSnapshot) as Partial<AppState>
+    const initialState = useStore.getInitialState()
+    const restoredSpatialUpsampling = restoredSnapshot
+      ? (typeof restoredSnapshot.spatialUpsampling === 'string'
+          ? restoredSnapshot.spatialUpsampling
+          : typeof restoredSnapshot.spatial_upsampling === 'string'
+            ? restoredSnapshot.spatial_upsampling
+            : initialState.spatialUpsampling)
+      : initialState.spatialUpsampling
+    const restoredVoiceCount = typeof restoredUiSettings.ttsVoiceCount === 'number'
+      ? restoredUiSettings.ttsVoiceCount
+      : initialState.ttsVoiceCount
+    // Strip mode-owned UI fields before applying the GenerateParams portion.
     const restoredParams = _restoreModeParams(restoredSnapshot)
     // Restore saved prompt for target mode (or empty for first visit)
     const restoredPrompt = savedPrompts[mode] ?? ''
 
     set(() => ({
       generationMode: mode,
-      selectedModelPerMode: savedModels,
+      selectedModelPerMode: resolvedModels,
       savedLoraPerMode: savedLoras,
       savedParamsPerMode: savedParams,
       savedPromptPerMode: savedPrompts,
-      // Default to Auto resolution + aspect in image mode (matches reference image)
-      ...(mode === 'image' ? { resolutionPreset: 'auto' as ResolutionPreset, aspectRatio: 'auto' as AspectRatio } : {}),
-      ...restoredFilmGrain,
-      durationSeconds: restoredDuration,
+      ...restoredUiSettings,
+      spatialUpsampling: restoredSpatialUpsampling,
+      ttsVoices: _ttsRowsForCount(current.ttsVoices, restoredVoiceCount),
+      // A first image visit starts in Auto. Returning visits keep their
+      // captured selector choices.
+      ...(mode === 'image' && !restoredSnapshot
+        ? { resolutionPreset: 'auto' as ResolutionPreset, aspectRatio: 'auto' as AspectRatio }
+        : {}),
       // Build params from defaults + restored snapshot. We deliberately
       // do NOT spread `...s.params` here — that's the line that caused
       // every previous-mode field to leak into the new mode. Starting
@@ -5856,6 +5895,7 @@ export const useStore = create<AppState>((set, get) => ({
         model_type: newModelType,
         prompt: restoredPrompt,
         image_mode: mode === 'image' ? 1 : (restoredParams.image_mode ?? 0),
+        spatial_upsampling: restoredSpatialUpsampling,
         activated_loras: sameModel ? restoredLora.activated_loras : [],
         loras_multipliers: sameModel ? restoredLora.loras_multipliers : '',
       },
@@ -5871,11 +5911,10 @@ export const useStore = create<AppState>((set, get) => ({
       // sample_solver) match what that model expects rather than what
       // the previous mode's model was using. See _applyModelDefaults
       // for the field list and rationale.
-      if (restoredSnapshot) {
-        get().loadModelOptions(newModelType)
-        // loadModelOptions still refreshes capability/geometry state, but its
-        // default-producing fields and the fresh High bundle must not
-        // replace this mode's in-session Custom snapshot.
+      if (restoresSavedModel) {
+        get().loadModelOptions(newModelType, { metadataOnly: true })
+        // Refresh capabilities without letting a late response replace the
+        // restored mode snapshot or edits made after this transition.
         ++_modelDefaultsSeq
       } else {
         _applyModelDefaults(get, set, newModelType)
@@ -5885,13 +5924,13 @@ export const useStore = create<AppState>((set, get) => ({
         get().loadModelOptions(newModelType)
       }
     }
-    if (restoredSnapshot && H3_STUDIO_MODELS.has(newModelType)) {
+    if (restoresSavedModel && H3_STUDIO_MODELS.has(newModelType)) {
       void get().normalizeH3EditableProfile()
     }
     // Persist to localStorage
     _saveSettings({
       generationMode: mode,
-      selectedModelPerMode: savedModels,
+      selectedModelPerMode: resolvedModels,
       savedParamsPerMode: savedParams,
       savedLoraPerMode: savedLoras,
       savedPromptPerMode: savedPrompts,
@@ -6056,14 +6095,9 @@ export const useStore = create<AppState>((set, get) => ({
     if (key !== 'model_type' && key !== 'prompt' && key !== 'activated_loras' && key !== 'loras_multipliers') {
       const s = get()
       const mode = s.generationMode
-      const paramsSnapshot = _snapshotModeParams(s.params)
       const updatedSavedParams = {
         ...s.savedParamsPerMode,
-        [mode]: {
-          ...paramsSnapshot,
-          filmGrainIntensity: s.filmGrainIntensity,
-          filmGrainSaturation: s.filmGrainSaturation,
-        },
+        [mode]: _snapshotModeParams(s.params, s),
       }
       set({ savedParamsPerMode: updatedSavedParams })
     }
@@ -7471,12 +7505,7 @@ export const useStore = create<AppState>((set, get) => ({
     const mode = s.generationMode
     const updatedSavedParams = {
       ...s.savedParamsPerMode,
-      [mode]: {
-        ..._snapshotModeParams(s.params),
-        durationSeconds: s.durationSeconds,
-        filmGrainIntensity: v,
-        filmGrainSaturation: s.filmGrainSaturation,
-      },
+      [mode]: _snapshotModeParams(s.params, s),
     }
     set({ savedParamsPerMode: updatedSavedParams })
   },
@@ -7487,12 +7516,7 @@ export const useStore = create<AppState>((set, get) => ({
     const mode = s.generationMode
     const updatedSavedParams = {
       ...s.savedParamsPerMode,
-      [mode]: {
-        ..._snapshotModeParams(s.params),
-        durationSeconds: s.durationSeconds,
-        filmGrainIntensity: s.filmGrainIntensity,
-        filmGrainSaturation: v,
-      },
+      [mode]: _snapshotModeParams(s.params, s),
     }
     set({ savedParamsPerMode: updatedSavedParams })
   },
@@ -10317,14 +10341,15 @@ export const useStore = create<AppState>((set, get) => ({
       }
       const mode = submitted.generationMode
       const weights = structuredClone(preset.lora_weights || {})
+      const snapshotState = {
+        ...submitted,
+        ...uiSettings,
+        ...selected,
+        spatialUpsampling: preset.spatial_upsampling,
+      }
       const savedParamsPerMode = {
         ...submitted.savedParamsPerMode,
-        [mode]: {
-          ..._snapshotModeParams(nextParams),
-          filmGrainIntensity: uiSettings.filmGrainIntensity ?? submitted.filmGrainIntensity,
-          filmGrainSaturation: uiSettings.filmGrainSaturation ?? submitted.filmGrainSaturation,
-          durationSeconds: uiSettings.durationSeconds ?? submitted.durationSeconds,
-        },
+        [mode]: _snapshotModeParams(nextParams, snapshotState),
       }
       set({
         ...uiSettings,
@@ -10554,7 +10579,9 @@ export const useStore = create<AppState>((set, get) => ({
     await _applyH3ServerProfile(profile, id, seq, get, set)
   },
 
-  loadModelOptions: async (modelType) => {
+  // Keep the historical source marker used by the focused hydration contract:
+  // loadModelOptions: async (modelType)
+  loadModelOptions: async (modelType, request = {}) => {
     const seq = ++_modelOptionsSeq
     const defaultsSeq = _modelDefaultsSeq
     const accountIdentityEpoch = _accountIdentityEpoch
@@ -10571,6 +10598,11 @@ export const useStore = create<AppState>((set, get) => ({
         || accountIdentityEpoch !== _accountIdentityEpoch
         || get().params.model_type !== modelType
       ) return
+      if (request.metadataOnly) {
+        set({ modelOptions: options, modelOptionsLoading: false })
+        void get().resumeDirectorPreview()
+        return
+      }
       const { durationSeconds, slidingWindowSeconds, slidingWindowLocked } = get()
       const fps = options.fps || 16
       // Set overlap from model defaults
@@ -15111,7 +15143,7 @@ export const useStore = create<AppState>((set, get) => ({
     const savedParamsPerMode = {
       ...selected.savedParamsPerMode,
       [mode]: {
-        ...(selected.savedParamsPerMode[mode] || {}),
+        ..._snapshotModeParams(selected.params, selected),
         ...choices,
       },
     }
@@ -16514,7 +16546,7 @@ export const useStore = create<AppState>((set, get) => ({
       const savedParamsPerMode = {
         ...restored.savedParamsPerMode,
         [mode]: {
-          ...(restored.savedParamsPerMode[mode] || {}),
+          ..._snapshotModeParams(restored.params, restored),
           ...choices,
         },
       }
