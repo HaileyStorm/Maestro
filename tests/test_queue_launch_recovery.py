@@ -1305,6 +1305,37 @@ class QueueLaunchWiringTests(unittest.TestCase):
             manual_revised["shot_plan"]["h3_style_workflow"],
             plan["h3_style_workflow"],
         )
+        from services.h3_mapping_dispatch import resolve_h3_mapping_source_plan
+        from services.director_pipeline import (_director_h3_drop_planner_carry,
+            _canonicalize_director_h3_shot_plan)
+        mapping_plan = copy.deepcopy(plan)
+        mapping_plan.pop("h3_style_workflow", None)
+        mapping_source = plan_h3_native_shots(
+            global_prompt=source, clip_frame_counts=[175, 175],
+            clip_requested_frames=[175, 171], fps=24, source_canonicalization="t2va",
+        )
+        _director_h3_drop_planner_carry(mapping_source)
+        _canonicalize_director_h3_shot_plan(mapping_source)
+        mapping_plan["shot_plan"] = mapping_source
+        mapping_plan["prompt_mapping_version"] = 1
+        _bind_director_h3_runtime_contract(mapping_plan)
+        mapping_plan["_duration_revision"] = namespace["_h3_duration_plan_revision"](mapping_plan)
+        for snap, edits, expected_count in (("down", [], 1),
+                ("manual", [{"segment_index": 2, "published_frames": 170}], 2)):
+            with self.subTest(mapping_snap=snap):
+                mapped_params = {"model_type": "minimax_h3"}
+                mapped_plan = namespace["_apply_h3_duration_approval"](
+                    mapped_params, copy.deepcopy(mapping_plan),
+                    plan_revision=mapping_plan["_duration_revision"], duration_snap_mode=snap,
+                    segment_duration_edits=edits, duration_redistribution=None if snap == "down" else "none",
+                )
+                derived = resolve_h3_mapping_source_plan(mapped_plan)
+                self.assertEqual(len(derived["clip_prompts"]), expected_count)
+                self.assertEqual(mapped_params["per_clip_prompts"], derived["clip_prompts"])
+                self.assertEqual(mapped_params["prompt"], "\n---MAESTRO-CLIP---\n".join(derived["clip_prompts"]))
+                self.assertEqual(derived["source_contracts"][0]["authored_prompt"], source)
+                _validate_director_h3_runtime_contract(mapped_plan, mapped_plan["shot_plan"])
+
         multi_source = plan_h3_native_shots(
             global_prompt="Two sealed authored sources.",
             source_prompts=["First authored source.", "Second authored source."],
@@ -3516,6 +3547,41 @@ class QueueLaunchWiringTests(unittest.TestCase):
             ],
             canonical_replanned_plan["segment_policy"],
         )
+
+        if canonicalization:
+            from services.h3_execution_contract import rewrite_h3_execution_prompts
+            from services.h3_adaptive_execution import bind_h3_execution_segment
+            from services.h3_mapping_dispatch import resolve_h3_mapping_source_plan
+            from services.director_pipeline import (_director_h3_executable_clip_prompts,
+                _director_h3_drop_planner_carry, _canonicalize_director_h3_shot_plan)
+            mapping_params = copy.deepcopy(canonical_params)
+            mapping_longform = mapping_params["_h3_longform"]
+            mapping_longform["prompt_mapping_version"] = 1
+            mapping_source = mapping_longform["shot_plan"]
+            _director_h3_drop_planner_carry(mapping_source)
+            _canonicalize_director_h3_shot_plan(mapping_source)
+            mapping_source["director_runtime_contract"]["prompt_mapping_version"] = 1
+            seal_h3_shot_plan(mapping_source)
+            executable = _director_h3_executable_clip_prompts(mapping_source, mapping_source["clip_prompts"])
+            mapping_longform["prompt_mapping_source_plan"] = rewrite_h3_execution_prompts(
+                mapping_source, executable, validate_prompt=lambda *_args: None,
+            )
+            mapping_params["per_clip_prompts"] = executable
+            before_source = resolve_h3_mapping_source_plan(mapping_longform)
+            before_receipts = [bind_h3_execution_segment(before_source, segment_index=i,
+                model_type="minimax_h3_ref2va", reference_manifest=[])["receipt"] for i in range(4)]
+            mapped_replan = namespace["_replan_h3_final_segment_for_peak"](
+                mapping_params, completed_prefix=4, choice={
+                    "frame_ceiling": 192, "offload_profile": 4,
+                    "allocation_revision": 1, "allocation_snapshot": "e" * 64,
+                },
+            )
+            after_source = resolve_h3_mapping_source_plan(mapped_replan["_h3_longform"])
+            after_receipts = [bind_h3_execution_segment(after_source, segment_index=i,
+                model_type="minimax_h3_ref2va", reference_manifest=[])["receipt"] for i in range(4)]
+            self.assertEqual(before_receipts, after_receipts)
+            self.assertEqual(mapped_replan["per_clip_prompts"][:4], executable[:4])
+            self.assertNotEqual(before_source["prompt_contract_seal"], after_source["prompt_contract_seal"])
 
         tampered_params = copy.deepcopy(canonical_params)
         tampered_plan = tampered_params["_h3_longform"]["shot_plan"]

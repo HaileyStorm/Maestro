@@ -8270,6 +8270,12 @@ def _restore_queue_recovery_on_startup(
         cleanup_orphan_request_manifests(
             project_dir, live_manifests.get(workspace, ()),
         )
+        from services.h3_reference_binding import cleanup_orphan_h3_reference_files
+        from services.queue_recovery_runtime import MANIFEST_DIRECTORY
+        cleanup_orphan_h3_reference_files(
+            os.path.join(project_dir, MANIFEST_DIRECTORY, "staging"),
+            live_staging_jobs.get(workspace, ()),
+        )
         cleanup_orphan_staged_outputs(
             project_dir, live_staging_jobs.get(workspace, ()),
         )
@@ -9658,6 +9664,18 @@ def _h3_segment_recovery_settings(clip_info: dict) -> dict:
                 "H3 semantic execution recovery geometry is invalid."
             )
         result["semantic_execution"] = execution
+    if "prompt_mapping" in clip_info:
+        from services.h3_adaptive_execution import validate_h3_mapping_receipt
+        receipt = validate_h3_mapping_receipt(clip_info["prompt_mapping"])
+        if (
+            receipt["frames"] != generated or receipt["published_frames"] != published
+            or receipt["trim_tail_frames"] != tail
+            or receipt["segment_index"] != clip_info.get("index")
+            or (clip_info.get("conditioning_model") is not None
+                and receipt["model_type"] != clip_info["conditioning_model"])
+        ):
+            raise QueueRecoveryRuntimeError("H3 mapping receipt disagrees with segment geometry or checkpoint.")
+        result["prompt_mapping"] = receipt
     return result
 
 
@@ -9669,6 +9687,9 @@ def _h3_execution_shots_for_dispatch(
     """Validate and return the semantic-to-physical child contract."""
     from services.h3_execution_contract import validate_h3_execution_shots
 
+    if isinstance(longform, dict) and "prompt_mapping_version" in longform:
+        from services.h3_mapping_dispatch import resolve_h3_mapping_source_plan
+        longform = {**longform, "shot_plan": resolve_h3_mapping_source_plan(longform)}
     return validate_h3_execution_shots(longform, prompt_lines, clip_count)
 
 def _h3_dependency_closed_recovery_prefix(job: dict) -> int | None:
@@ -9752,6 +9773,14 @@ def _replan_h3_final_segment_for_peak(
     published = list(longform.get("clip_published_frames") or [])
     trims = list(longform.get("clip_trim_tail_frames") or [])
     prompts = list(result.get("per_clip_prompts") or [])
+    original_execution_prompts = list(prompts)
+    mapping_has_derived_source = "prompt_mapping_source_plan" in longform
+    if "prompt_mapping_version" in longform:
+        from services.h3_mapping_dispatch import resolve_h3_mapping_source_plan
+        mapping_source = resolve_h3_mapping_source_plan(longform)
+        if mapping_source["clip_prompts"] != prompts:
+            raise QueueRecoveryRuntimeError("H3 recovery mapping source prompts changed.")
+        prompts = list(longform["shot_plan"]["clip_prompts"])
     models = list(longform.get("segment_models") or [])
     boundaries = list(longform.get("clip_boundaries") or [])
     if not (
@@ -10050,6 +10079,14 @@ def _replan_h3_final_segment_for_peak(
                 if item.get("segment_index") == index
             ]
 
+    if contract_version == 2 and mapping_has_derived_source:
+        from services.director_pipeline import (
+            _director_h3_drop_planner_carry, _canonicalize_director_h3_shot_plan,
+        )
+        seal_h3_shot_plan(full_shot_plan)
+        _director_h3_drop_planner_carry(full_shot_plan)
+        _canonicalize_director_h3_shot_plan(full_shot_plan)
+
     if contract_version == 2:
         full_prompts = list(full_shot_plan.get("clip_prompts") or [])
         if full_prompts[:completed_prefix] != prompts[:completed_prefix]:
@@ -10294,6 +10331,17 @@ def _replan_h3_final_segment_for_peak(
         raise QueueRecoveryRuntimeError(
             "H3 recovery changed the job publication contract."
         )
+    if mapping_has_derived_source:
+        from services.director_pipeline import _director_h3_executable_clip_prompts
+        from services.h3_execution_contract import rewrite_h3_execution_prompts
+        executable = _director_h3_executable_clip_prompts(full_shot_plan, full_prompts)
+        if executable[:completed_prefix] != original_execution_prompts[:completed_prefix]:
+            raise QueueRecoveryRuntimeError("H3 recovery changed completed mapping source prompts.")
+        longform["prompt_mapping_source_plan"] = rewrite_h3_execution_prompts(
+            full_shot_plan, executable, validate_prompt=lambda _index, _prompt: None,
+        )
+        result["per_clip_prompts"] = executable
+        result["prompt"] = _MULTI_CLIP_SEPARATOR.join(executable)
     longform["_duration_completed_locks"] = list(range(completed_prefix))
     _stamp_h3_duration_contract(result, longform)
     result["_h3_longform"] = longform
@@ -10441,14 +10489,75 @@ def _h3_source_audio_premux_settings(params: dict) -> dict | None:
     }
 
 
+def _bind_h3_task_prompt_mapping(
+    job, task, source_snapshot, initial_images, source_plan, descriptors, project_dir,
+):
+    """Bind resolved source and pinned references before WGP validates a task."""
+    from services.h3_mapping_dispatch import bind_h3_mapping_task
+    from services.h3_reference_binding import (
+        materialize_h3_reference_image, materialize_h3_reference_files,
+        cleanup_h3_reference_files,
+    )
+    from shared.utils.audio_video import extract_audio_tracks
+
+    info = (task.get("params") or {}).get("multi_clip_info") or {}
+    index = info.get("index", 0)
+    variant = info.get("output_index", 0)
+    if type(index) is not int or index < 0 or type(variant) is not int or variant < 0:
+        raise QueueRecoveryRuntimeError("H3 mapping task position is invalid.")
+    continuation = None
+    path = None
+    if any(source_snapshot.get(key) for key in (
+        "_continuation", "_ref2va_continuation", "_h3_native_boundary_request",
+    )):
+        if index == 0:
+            raise QueueRecoveryRuntimeError("H3 mapping continuation has no predecessor.")
+        predecessor = _queue_recovery_unit_matches(
+            job, kind="h3_segment", variant=variant, index=index - 1, project_dir=project_dir,
+        )
+        continuation = predecessor.get("continuation") if isinstance(predecessor, dict) else None
+        if not isinstance(continuation, dict) or continuation.get("dependency") != predecessor.get("unit_id"):
+            raise QueueRecoveryRuntimeError("H3 mapping continuation evidence is missing.")
+        path = _queue_recovery_continuation_path(project_dir, continuation)
+
+    def validate_descriptor(descriptor):
+        if descriptor in descriptors:
+            return _queue_recovery_manifest_validator(
+                descriptor, owner_digest=str(job.get("_recovery_owner_digest") or ""),
+                workspace=str(job.get("workspace") or ""), project_dir=project_dir,
+            )
+        if not isinstance(continuation, dict) or not path:
+            return False
+        expected = {
+            "field": descriptor.get("field"), "path": path,
+            "sha256": continuation.get("sha256"), "size": continuation.get("size"),
+            "dependency": continuation.get("dependency"),
+        }
+        return descriptor == expected and _queue_recovery_continuation_path(project_dir, continuation) == path
+
+    return bind_h3_mapping_task(
+        task, source_plan=source_plan, segment_index=index,
+        source_snapshot=source_snapshot, initial_images=initial_images,
+        descriptors=descriptors, validate_descriptor=validate_descriptor,
+        has_audio=lambda value: extract_audio_tracks(value, query_only=True) > 0,
+        continuation=continuation, continuation_path=path,
+        materialize_image=materialize_h3_reference_image,
+        materialize_files=lambda bindings: materialize_h3_reference_files(
+            bindings, ensure_recovery_staging_directory(project_dir),
+            job_id=str(job.get("id") or ""),
+        ),
+        cleanup_files=cleanup_h3_reference_files,
+    )
+
+
 def _snapshot_h3_recovery_task_params(
     task_params: dict, clip_info: dict | None,
 ) -> dict:
     """Freeze JSON-safe producer metadata before WGP materializes media inputs."""
     if not (
         isinstance(task_params, dict)
-        and isinstance(clip_info, dict)
-        and clip_info.get("automatic_h3_longform")
+        and ((isinstance(clip_info, dict) and clip_info.get("automatic_h3_longform"))
+             or isinstance(task_params.get("_h3_prompt_mapping_source_plan"), dict))
     ):
         return task_params
     try:
@@ -14828,6 +14937,9 @@ def _reject_client_h3_internal_state(body: dict) -> None:
         str(key) for key in body
         if isinstance(key, str) and key.startswith("_h3_")
     )
+    clip_info = body.get("multi_clip_info")
+    if isinstance(clip_info, dict) and "prompt_mapping" in clip_info:
+        internal.append("multi_clip_info.prompt_mapping")
     if internal:
         raise HTTPException(
             status_code=400,
@@ -16017,9 +16129,15 @@ def _prepare_h3_long_studio_request(body: dict) -> dict | None:
     # actual plan cannot diverge.  Missing/legacy payloads retain the model's
     # largest legal segment.
     global_prompt = str(body.get("prompt") or "")
+    planning_prompt = global_prompt
+    from services.h3_mapping_dispatch import has_h3_source_macros
+    template_source = has_h3_source_macros(global_prompt)
+    if template_source:
+        from services.h3_shot_planner import resolve_h3_source_template
+        planning_prompt = resolve_h3_source_template(global_prompt)
     clip_frames, segment_policy = plan_h3_clip_frames(
         generation_target_frames,
-        prompt=global_prompt,
+        prompt=planning_prompt,
         fps=fps,
         minimum_frames=minimum_frames,
         maximum_frames=segment_maximum,
@@ -16036,7 +16154,7 @@ def _prepare_h3_long_studio_request(body: dict) -> dict | None:
     if "clip_requested_frames" not in segment_policy:
         clip_requested_frames[-1] -= sum(clip_frames) - requested_frames
     clip_boundaries = classify_timeline_clip_boundaries(
-        global_prompt,
+        planning_prompt,
         clip_frame_counts=clip_requested_frames,
         fps=fps,
     )
@@ -16057,7 +16175,18 @@ def _prepare_h3_long_studio_request(body: dict) -> dict | None:
                 "type": requested_type,
                 "source": "user_override",
             }
-    shot_plan = plan_h3_native_shots(
+    from services.h3_prompt_mapping import source_prompt_schema
+    source_family = source_prompt_schema(planning_prompt, strict=False) if body.get("h3_adaptive_conditioning", True) is not False else None
+    if source_family == "opaque":
+        source_family = "ref2va" if str(body.get("_h3_requested_checkpoint") or model_type) == _H3_REF2VA_MODEL else "base"
+    provisional_models = _plan_h3_adaptive_models(
+        body, clip_count=len(clip_frames), clip_boundaries=clip_boundaries,
+        first_anchor=first_anchor, last_anchor=last_anchor,
+    )
+    template_mapping_source = bool(global_prompt.strip()) and body.get("h3_adaptive_conditioning", True) is not False and source_family != "ref2va" and any(
+        item.get("model_type") == _H3_REF2VA_MODEL for item in provisional_models
+    )
+    source_plan_inputs = dict(
         global_prompt=global_prompt,
         clip_frame_counts=clip_frames,
         fps=fps,
@@ -16066,6 +16195,13 @@ def _prepare_h3_long_studio_request(body: dict) -> dict | None:
         segment_frames_maximum=segment_maximum,
         segment_policy=segment_policy,
     )
+    if template_mapping_source:
+        from services.h3_mapping_dispatch import require_h3_mapping_audio_roles
+        require_h3_mapping_audio_roles(body)
+        source_plan_inputs["source_canonicalization"] = "t2va_template"
+    elif template_source:
+        source_plan_inputs["source_canonicalization"] = "template"
+    shot_plan = plan_h3_native_shots(**source_plan_inputs)
     clip_prompts = list(shot_plan["clip_prompts"])
     clip_boundaries = list(shot_plan["clip_boundaries"])
     segment_models = _plan_h3_adaptive_models(
@@ -16082,6 +16218,18 @@ def _prepare_h3_long_studio_request(body: dict) -> dict | None:
         first_anchor=first_anchor,
         last_anchor=last_anchor,
     )
+
+    if source_family == "ref2va" and any(str(item.get("model_type")) != _H3_REF2VA_MODEL for item in segment_models):
+        raise ValueError("Authored Ref2VA text cannot be mapped to Base without its original Base source. Select Ref2VA or supply that source.")
+    mapping_enabled = bool(global_prompt.strip()) and body.get("h3_adaptive_conditioning", True) is not False and any(
+        (str(item.get("model_type")) == _H3_REF2VA_MODEL) != (source_family == "ref2va")
+        for item in segment_models
+    )
+    if mapping_enabled and source_family != "ref2va" and not template_mapping_source:
+        source_plan_inputs["source_canonicalization"] = "t2va_template"
+        shot_plan = plan_h3_native_shots(**source_plan_inputs)
+        clip_prompts = list(shot_plan["clip_prompts"])
+        clip_boundaries = list(shot_plan["clip_boundaries"])
 
     clip_count = len(clip_frames)
     native_boundaries = body.get("h3_native_boundary_conditioning") is True
@@ -16122,6 +16270,7 @@ def _prepare_h3_long_studio_request(body: dict) -> dict | None:
         "continuation": continuation,
         "clip_boundaries": clip_boundaries,
         "shot_plan": shot_plan,
+        **({"prompt_mapping_version": 1} if mapping_enabled else {}),
         "segment_policy": segment_policy,
         "ref2va_continuity": (
             "rolling_reference" if reference_mode else None
@@ -39176,6 +39325,10 @@ def _plan_generation_submission(
     _validate_h3_sampling_steps(body)
     _validate_h3_explicit_multiclip_request(body)
     plan = _prepare_h3_long_studio_request(body)
+    if plan is None and not isinstance(body.get("_h3_longform"), dict) and str(body.get("model_type") or "") in _H3_LONG_STUDIO_MODELS:
+        from services.h3_mapping_dispatch import prepare_h3_single_mapping_source
+        prepare_h3_single_mapping_source(body, wgp.get_model_def(body["model_type"]) or {},
+                                         align_frame_count=wgp.align_model_frame_count)
     _validate_h3_lora_request(body, plan)
     _require_h3_acceleration_available(body, plan)
     estimate_context = _h3_estimate_context(body, plan)
@@ -58140,6 +58293,7 @@ def _run_generation(
 
     start_time = time.time()
     abort_state = None
+    h3_reference_file_tokens = []
 
     try:
         _credit_prepare_admission(job)
@@ -58648,6 +58802,22 @@ def _run_generation(
             h3_longform = raw_params.pop("_h3_longform", None)
             if not isinstance(h3_longform, dict):
                 h3_longform = None
+            if isinstance(h3_longform, dict) and "prompt_mapping_version" in h3_longform:
+                from services.h3_mapping_dispatch import resolve_h3_mapping_source_plan
+                h3_mapping_plan = resolve_h3_mapping_source_plan(h3_longform)
+            else:
+                h3_mapping_plan = raw_params.get("_h3_prompt_mapping_source_plan")
+            h3_mapping_descriptors = None
+            h3_templates_resolved = h3_mapping_plan is not None
+            if h3_mapping_plan is not None:
+                mapping_manifest = load_request_manifest(
+                    out_dir, job.get("_recovery_manifest_pointer"), expected_job_id=str(job_id),
+                )
+                validate_manifest_inputs(mapping_manifest, lambda descriptor: _queue_recovery_manifest_validator(
+                    descriptor, owner_digest=str(job.get("_recovery_owner_digest") or ""),
+                    workspace=str(job.get("workspace") or ""), project_dir=out_dir,
+                ))
+                h3_mapping_descriptors = mapping_manifest["inputs"]
             if recast_shot_manifest is not None:
                 shot_manifest = recast_shot_manifest
                 shot_workflow = "Recast"
@@ -58758,6 +58928,11 @@ def _run_generation(
                     )
                     if h3_longform else None
                 )
+                if execution_shots is not None:
+                    from services.h3_mapping_dispatch import h3_source_templates_resolved
+                    h3_templates_resolved = h3_templates_resolved or h3_source_templates_resolved(
+                        h3_longform.get("shot_plan"),
+                    )
 
                 # Get model latent_size for frame quantization — wgp.py quantizes
                 # video_length to (n-1)//latent_size*latent_size+1, so we must match
@@ -59305,8 +59480,8 @@ def _run_generation(
                     if isinstance(manifest_params, dict) else None
                 )
                 if (
-                    isinstance(manifest_info, dict)
-                    and manifest_info.get("automatic_h3_longform")
+                    (isinstance(manifest_info, dict) and manifest_info.get("automatic_h3_longform"))
+                    or h3_mapping_plan is not None
                 ):
                     h3_task_sidecar_params[str(manifest_task.get("id"))] = (
                         _snapshot_h3_recovery_task_params(
@@ -59329,6 +59504,11 @@ def _run_generation(
                     message="Task validation failed",
                 )
                 return False
+
+            h3_mapping_initial_images = {
+                str(item.get("id")): tuple((item.get("params") or {}).get("image_refs") or [])
+                for item in queue
+            } if h3_mapping_plan is not None else {}
 
             state["gen"]["queue"] = queue
 
@@ -59927,6 +60107,15 @@ def _run_generation(
             )
 
             for task_idx, task in enumerate(queue):
+                # The previous synchronous child no longer reads its inputs.
+                # Keep at most one child's file copies, including on recovery
+                # skips, rather than multiplying storage by segment count.
+                if h3_reference_file_tokens:
+                    from services.h3_reference_binding import cleanup_h3_reference_files
+                    for reference_token in h3_reference_file_tokens:
+                        if not cleanup_h3_reference_files(reference_token):
+                            raise QueueRecoveryRuntimeError("Temporary H3 reference cleanup failed before the next segment.")
+                    h3_reference_file_tokens.clear()
                 if is_cancel_requested(job):
                     cancelled = True
                     break
@@ -59989,6 +60178,25 @@ def _run_generation(
                 task_sidecar_params = h3_task_sidecar_params.get(
                     str(task.get("id")), task_params,
                 )
+                mapping_receipt = None
+                if h3_mapping_plan is not None:
+                    task, task_sidecar_params = _bind_h3_task_prompt_mapping(
+                        job, task, task_sidecar_params,
+                        h3_mapping_initial_images.pop(str(task.get("id"))),
+                        h3_mapping_plan, h3_mapping_descriptors, out_dir,
+                    )
+                    reference_token = task.pop("_h3_reference_files", None)
+                    if reference_token is not None:
+                        h3_reference_file_tokens.append(reference_token)
+                    queue[task_idx] = task
+                    task_params = task["params"]
+                    recovery_clip_info = task_params.get("multi_clip_info")
+                    mapping_receipt = task_sidecar_params["_h3_prompt_mapping_receipt"]
+                    for prior in _queue_recovery_units(job):
+                        if prior.get("kind") == "ordinary_repeat" and prior.get("state") == "completed":
+                            if (prior.get("settings") or {}).get("prompt_mapping") != mapping_receipt:
+                                raise QueueRecoveryRuntimeError("Recovered H3 output prompt mapping changed.")
+                repeat_mapping_settings = {"prompt_mapping": mapping_receipt} if mapping_receipt is not None else {}
                 if (
                     isinstance(recovery_clip_info, dict)
                     and recovery_clip_info.get("automatic_h3_longform")
@@ -60012,6 +60220,10 @@ def _run_generation(
                         index=recovery_segment,
                         project_dir=out_dir,
                     )
+                    if recovered_segment is not None and mapping_receipt is not None and (
+                        (recovered_segment.get("settings") or {}).get("prompt_mapping") != mapping_receipt
+                    ):
+                        raise QueueRecoveryRuntimeError("Recovered H3 segment prompt mapping changed.")
                     recovered_concat = (
                         _queue_recovery_unit_matches(
                             job,
@@ -60150,6 +60362,7 @@ def _run_generation(
                     validated_params = wgp.validate_task(
                         task,
                         state,
+                        **({"_h3_prompt_template_resolved": True} if h3_templates_resolved else {}),
                         _h3_turbo_validation_authorized=(
                             server_h3_turbo_validation_authorized
                         ),
@@ -60280,6 +60493,7 @@ def _run_generation(
                             job_id,
                             "ordinary_repeat",
                             index=max(0, completed_repeats - 1),
+                            settings=repeat_mapping_settings,
                         )
                         recovery_units = {
                             filename: {
@@ -60287,6 +60501,7 @@ def _run_generation(
                                 "kind": "ordinary_repeat",
                                 "unit_id": repeat_unit_id,
                                 "variant": 0,
+                                **({"settings": repeat_mapping_settings} if repeat_mapping_settings else {}),
                             }
                             for filename in new_artifacts
                         }
@@ -60300,6 +60515,7 @@ def _run_generation(
                                 new_artifacts,
                                 native_source=h3_delivery_request,
                                 recovery_units=recovery_units,
+                                task_params=task_sidecar_params if mapping_receipt is not None else None,
                                 media_paths={
                                     name: staged_media[name]
                                     for name in new_artifacts
@@ -60337,6 +60553,7 @@ def _run_generation(
                                 project_dir=out_dir,
                                 artifact_names=new_artifacts,
                                 ordinary_repeat_offset=completed_repeats,
+                                settings=repeat_mapping_settings,
                             ):
                                 job["recovery_cursor"] = prior_cursor
                                 return False
@@ -62539,6 +62756,12 @@ def _run_generation(
                     if str(candidate.get("status") or "").casefold()
                     not in {"cancelled", "canceled", "completed", "failed"}
                 ]
+                from services.h3_reference_binding import cleanup_orphan_h3_reference_files
+                from services.queue_recovery_runtime import MANIFEST_DIRECTORY
+                cleanup_orphan_h3_reference_files(
+                    os.path.join(out_dir, MANIFEST_DIRECTORY, "staging"),
+                    [*live_job_ids, str(job_id)], maximum_removals=128,
+                )
                 cleanup_orphan_staged_outputs(
                     out_dir, live_job_ids, maximum_removals=128,
                 )
@@ -62568,6 +62791,13 @@ def _run_generation(
             finish_job(job, "failed", **failure_updates)
             return False
         finally:
+            if h3_reference_file_tokens:
+                from services.h3_reference_binding import cleanup_h3_reference_files
+                for reference_token in h3_reference_file_tokens:
+                    if not cleanup_h3_reference_files(reference_token):
+                        logging.getLogger(__name__).warning(
+                            "A temporary H3 reference copy could not be removed."
+                        )
             if job.get("_h3_delivery_publication"):
                 if job.get("status") == "completed" and not is_cancel_requested(job):
                     _finalize_h3_delivery_publication(job)
@@ -64549,6 +64779,12 @@ def _replay_h3_duration_shot_plan(
             shot_plan.get("h3_style_workflow")
         )
         seal_h3_shot_plan(replayed)
+    if "prompt_mapping_version" in plan and isinstance(shot_plan.get("director_runtime_contract"), dict):
+        from services.director_pipeline import (
+            _director_h3_drop_planner_carry, _canonicalize_director_h3_shot_plan,
+        )
+        _director_h3_drop_planner_carry(replayed)
+        _canonicalize_director_h3_shot_plan(replayed)
     validate_h3_shot_plan_seal(replayed)
     return replayed
 
@@ -64671,12 +64907,12 @@ def _apply_h3_duration_approval(
             )
 
             _bind_director_h3_runtime_contract(plan)
-        prepared_params["prompt"] = _MULTI_CLIP_SEPARATOR.join(
-            list(shot_plan.get("clip_prompts") or [])
-        )
-        prepared_params["per_clip_prompts"] = list(
-            shot_plan.get("clip_prompts") or []
-        )
+        execution_plan = shot_plan
+        if "prompt_mapping_version" in plan:
+            from services.h3_mapping_dispatch import resolve_h3_mapping_source_plan
+            execution_plan = resolve_h3_mapping_source_plan(plan)
+        prepared_params["per_clip_prompts"] = list(execution_plan["clip_prompts"])
+        prepared_params["prompt"] = _MULTI_CLIP_SEPARATOR.join(prepared_params["per_clip_prompts"])
         prepared_params["per_clip_frames"] = list(generated)
         prepared_params["video_length"] = candidate_frames
         prepared_params["multi_prompts_gen_type"] = 3
@@ -64800,12 +65036,12 @@ def _apply_h3_duration_approval(
             )
 
             _bind_director_h3_runtime_contract(plan)
-        prepared_params["prompt"] = _MULTI_CLIP_SEPARATOR.join(
-            list(shot_plan.get("clip_prompts") or [])
-        )
-        prepared_params["per_clip_prompts"] = list(
-            shot_plan.get("clip_prompts") or []
-        )
+        execution_plan = shot_plan
+        if "prompt_mapping_version" in plan:
+            from services.h3_mapping_dispatch import resolve_h3_mapping_source_plan
+            execution_plan = resolve_h3_mapping_source_plan(plan)
+        prepared_params["per_clip_prompts"] = list(execution_plan["clip_prompts"])
+        prepared_params["prompt"] = _MULTI_CLIP_SEPARATOR.join(prepared_params["per_clip_prompts"])
         prepared_params["per_clip_frames"] = new_generated
         prepared_params["video_length"] = sum(new_published)
     current = sum(int(value) for value in plan.get("clip_published_frames") or [])

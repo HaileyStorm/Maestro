@@ -1416,11 +1416,71 @@ class H3LongStudioPlanningTests(unittest.TestCase):
             plans.append((plan["clip_frames"], body["per_clip_prompts"]))
         self.assertEqual(plans[0], plans[1])
 
+    def test_authored_ref_to_base_long_job_rejects_before_admission(self):
+        from services.h3_prompt_mapping import create_mapping_record
+        prepare = self._load_launch_helpers()["_prepare_h3_long_studio_request"]
+        prompt = create_mapping_record("A book opens.", "ref2va", duration_seconds=30,
+                                       reference_manifest=[])["mapped_prompt"]
+        body = dict(model_type="minimax_h3", video_length=720, sliding_window_size=192, prompt=prompt)
+        with self.assertRaisesRegex(ValueError, "original Base source"):
+            prepare(body)
+        self.assertNotIn("_h3_longform", body)
+
+    def test_manual_base_keeps_loose_subject_alias_without_mapping(self):
+        prepare = self._load_launch_helpers()["_prepare_h3_long_studio_request"]
+        prompt = "subject_definitions:\n<Subject 1>: an adult pilot\n[Shot 1] The pilot crosses.\n[Shot 2] At 00:15.000, cut to the cockpit."
+        body = dict(model_type="minimax_h3", video_length=720, sliding_window_size=192,
+                    prompt=prompt, h3_adaptive_conditioning=False)
+        plan = prepare(body)
+        self.assertNotIn("prompt_mapping_version", plan)
+        self.assertEqual(plan["shot_plan"]["source_contracts"][0]["authored_prompt"], prompt)
+        self.assertTrue(all(item["model_type"] == "minimax_h3" for item in plan["segment_models"]))
+
+    def test_same_base_long_macro_resolves_before_child_splitting(self):
+        from services.h3_mapping_dispatch import h3_source_templates_resolved
+        from shared.utils.prompt_parser import process_template
+        prepare = self._load_launch_helpers()["_prepare_h3_long_studio_request"]
+        for adaptive in (True, False):
+            for value in ('"hall"', '"hall", "room"'):
+                prompt = '!{place}=' + value + '\nA person crosses the {place}.'
+                body = dict(model_type="minimax_h3", video_length=720, sliding_window_size=192,
+                            prompt=prompt, h3_adaptive_conditioning=adaptive)
+                plan = prepare(body)
+                self.assertNotIn("prompt_mapping_version", plan)
+                self.assertTrue(h3_source_templates_resolved(plan["shot_plan"]))
+                self.assertEqual(plan["shot_plan"]["source_contracts"][0]["authored_prompt"], prompt)
+                for child in body["per_clip_prompts"]:
+                    self.assertNotIn("{place}", child)
+                    self.assertNotIn("!", child)
+                    _output, error = process_template(child, preserve_h3_dialogue=True)
+                    self.assertEqual(error, "")
+        prompt = '!{place}="{literal_value}"\nA person crosses the {place}.'
+        body = dict(model_type="minimax_h3", video_length=720, sliding_window_size=192, prompt=prompt)
+        plan = prepare(body)
+        self.assertNotIn("prompt_mapping_version", plan)
+        literal_child = next(child for child in body["per_clip_prompts"] if "{literal_value}" in child)
+        _output, error = process_template(literal_child, preserve_h3_dialogue=True)
+        self.assertTrue(error)  # A second expansion would reject valid literal output.
+        launch_tree = ast.parse((Path(APP) / "launch.py").read_text())
+        runtime_gate = next(node for node in ast.walk(launch_tree) if isinstance(node, ast.If)
+            and ast.unparse(node.test) == "execution_shots is not None"
+            and "h3_templates_resolved" in ast.unparse(node))
+        namespace = dict(execution_shots=[{}], h3_templates_resolved=False, h3_longform=plan)
+        exec(compile(ast.Module(body=[runtime_gate], type_ignores=[]), "active-template-resolution", "exec"), namespace)
+        self.assertTrue(namespace["h3_templates_resolved"])
+        wgp_tree = ast.parse((Path(APP) / "wgp.py").read_text())
+        validation_gate = next(node for node in ast.walk(wgp_tree) if isinstance(node, ast.If)
+            and ast.unparse(node.test) == "inputs.get('_h3_prompt_template_resolved') is True")
+        namespace = dict(inputs={"_h3_prompt_template_resolved": namespace["h3_templates_resolved"]}, prompt=literal_child)
+        exec(compile(ast.Module(body=[validation_gate], type_ignores=[]), "active-wgp-template-resolution", "exec"), namespace)
+        self.assertEqual(namespace["errors"], "")
+        self.assertEqual(namespace["prompt"], literal_child)
+
     def test_30s_cut_alignment_survives_final_frame_tail_reservation(self):
         prepare = self._load_launch_helpers()["_prepare_h3_long_studio_request"]
         prompt = (
             "subject_definitions:\n<Subject 1>: an adult pilot\n"
-            "[Shot 1] The pilot crosses the hangar without a cut.\n"
+            "[Shot 1] <Subject 1> crosses the hangar without a cut.\n"
             "[Shot 2] At 00:15.000, cut to the cockpit."
         )
         for final_frame, expected_clips in ((None, 4), ("last.png", 4)):

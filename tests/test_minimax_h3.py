@@ -977,6 +977,8 @@ class TestMiniMaxH3Definition(unittest.TestCase):
             "Request": object,
             "copy": copy,
             "asyncio": asyncio,
+            "wgp": types.SimpleNamespace(get_model_def=lambda _model: {"fps": 24},
+                                          align_model_frame_count=lambda frames, _definition: frames),
             "math": __import__("math"),
             "time": types.SimpleNamespace(time=lambda: 100.0),
             "_H3_LONG_STUDIO_MODELS": {"minimax_h3"},

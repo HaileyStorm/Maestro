@@ -488,7 +488,7 @@ non_diegetic_music: N/A"""
                         "supplied final-frame anchor",
                     )
 
-    def test_base_scenes_keep_schema_compatible_fl2va_routing(self):
+    def test_adaptive_base_scenes_keep_source_and_mark_ref2va_mapping(self):
         clips = [
             {"video_prompt": "A wide shot in the station."},
             {"video_prompt": "A close-up inside the train."},
@@ -512,8 +512,18 @@ non_diegetic_music: N/A"""
         self.assertEqual(plan["clip_boundaries"][0]["type"], "cut")
         self.assertEqual(
             plan["segment_models"][1]["model_type"],
-            pipeline._H3_BASE_FL2VA_MODEL,
+            pipeline._H3_REF2VA_MODEL,
         )
+
+        self.assertEqual(plan["prompt_mapping_version"], 1)
+        from services.h3_mapping_dispatch import resolve_h3_mapping_source_plan
+        from services.h3_adaptive_execution import bind_h3_execution_segment
+        source = resolve_h3_mapping_source_plan(plan)
+        mapped = bind_h3_execution_segment(source, segment_index=1,
+            model_type=pipeline._H3_REF2VA_MODEL, reference_manifest=[])
+        self.assertIn("detailed_description:", mapped["record"]["mapped_prompt"])
+        self.assertIn("integrated_multimodal_description:", plan["shot_plan"]["clip_prompts"][1])
+        self.assertEqual(mapped["plan"]["event_ownership"], source["event_ownership"])
 
     def test_explicit_metadata_does_not_select_pinkcherry_for_director(self):
         clips = [{"video_prompt": "A single continuous shot."}]
@@ -981,6 +991,8 @@ non_diegetic_music: N/A"""
         )
         saved = copy.deepcopy(params["_h3_longform"])
         saved["shot_plan"].pop("semantic_physical_contract_version", None)
+        saved.pop("prompt_mapping_version", None)
+        saved.pop("prompt_mapping_source_plan", None)
         saved["shot_plan"].pop("semantic_shots", None)
         legacy = []
         for index, frames in enumerate(saved["clip_published_frames"], start=1):
@@ -1056,6 +1068,8 @@ non_diegetic_music: N/A"""
         )
         saved = copy.deepcopy(params["_h3_longform"])
         saved["shot_plan"].pop("semantic_physical_contract_version", None)
+        saved.pop("prompt_mapping_version", None)
+        saved.pop("prompt_mapping_source_plan", None)
         saved["shot_plan"].pop("prompt_contract_seal", None)
         saved["shot_plan"].pop("semantic_shots", None)
         legacy_global = "[0-10s] Legacy scene A.\n\n[0-10s] Legacy scene B."
@@ -1297,7 +1311,7 @@ non_diegetic_music: N/A"""
                 fps=24,
             )
 
-    def test_base_schema_rejects_semantic_keyframes_before_commit(self):
+    def test_base_schema_marks_semantic_keyframes_for_bound_mapping(self):
         clips = [{"video_prompt": "Beat one. Beat two. Beat three."}]
         planned = [{"start": 0, "end": 20, "duration_sec": 20}]
         original_body = self._base_generation_params()
@@ -1306,16 +1320,16 @@ non_diegetic_music: N/A"""
             "frames_positions": "200 400",
             "video_prompt_type": "KFI",
         })
-        with self.assertRaisesRegex(
-            ValueError, "Base prompt schema cannot carry Ref2VA semantic references",
-        ):
-            pipeline._prepare_director_h3_longform(
-                original_body,
-                params={"h3_ref2va_terms_accepted": True},
-                clip_plans=clips,
-                planned_clips=planned,
-                fps=24,
-            )
+        plan = pipeline._prepare_director_h3_longform(
+            original_body, params={"h3_ref2va_terms_accepted": True},
+            clip_plans=clips, planned_clips=planned, fps=24,
+        )
+        self.assertEqual(plan["prompt_mapping_version"], 1)
+        self.assertTrue(any(item["model_type"] == pipeline._H3_REF2VA_MODEL
+                            for item in plan["segment_models"]))
+        self.assertTrue(all("integrated_multimodal_description:" in prompt
+                            for prompt in plan["shot_plan"]["clip_prompts"]))
+        self.assertEqual(original_body["image_refs"], ["keyframe-a.png", "keyframe-b.png"])
 
     def test_registered_restart_preserves_structured_h3_shot_contract(self):
         pid = "director-h3-restore"
@@ -1715,7 +1729,7 @@ non_diegetic_music: N/A"""
         )
         self.assertEqual(carried["clip_prompts"], canonical)
 
-    def test_seamless_keyframes_require_ref2va_prompt_schema(self):
+    def test_seamless_keyframes_use_bound_ref2va_mapping(self):
         clips = [{"video_prompt": "One continuous tracking shot."}]
         planned = [{"start": 0, "end": 20, "duration_sec": 20}]
         body = self._base_generation_params()
@@ -1724,16 +1738,16 @@ non_diegetic_music: N/A"""
             "frames_positions": "200 400",
             "video_prompt_type": "KFI",
         })
-        with self.assertRaisesRegex(
-            ValueError, "Base prompt schema cannot carry Ref2VA semantic references",
-        ):
-            pipeline._prepare_director_h3_longform(
-                body,
-                params={"h3_ref2va_terms_accepted": True},
-                clip_plans=clips,
-                planned_clips=planned,
-                fps=24,
-            )
+        plan = pipeline._prepare_director_h3_longform(
+            body, params={"h3_ref2va_terms_accepted": True},
+            clip_plans=clips, planned_clips=planned, fps=24,
+        )
+        self.assertEqual(plan["prompt_mapping_version"], 1)
+        self.assertTrue(any(item["model_type"] == pipeline._H3_REF2VA_MODEL
+                            for item in plan["segment_models"]))
+        self.assertTrue(all("integrated_multimodal_description:" in prompt
+                            for prompt in plan["shot_plan"]["clip_prompts"]))
+        self.assertEqual(body["image_refs"], ["keyframe-a.png", "keyframe-b.png"])
 
     def test_manual_fl2va_rejects_semantic_references_consistently(self):
         for duration in (10.0, 20.0):

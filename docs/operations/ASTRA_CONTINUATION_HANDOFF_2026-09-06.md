@@ -1779,3 +1779,64 @@ all unadopted h3_prompt_adapt calls, including the dispatch append-and-reseal ca
 only when their actual replacement is complete. Preserve manual Base freeform
 behavior; current strict mapping still rejects some ambiguous authored forms.
 The full continuous Goal and caller integration remain active.
+
+### Adaptive H3 task binding and replay (2026-09-07)
+
+Studio and Director now retain the original sealed source and map each adaptive
+child after input admission and verified continuation binding, before WGP task
+validation. The mapping transaction changes only executable prompt text. Its
+receipt binds the selected checkpoint, current published/generated geometry,
+source lineage, reference identities, and mapping record. Unchanged completed
+prefixes retain their receipts through suffix-only duration/peak replanning.
+Authored Ref2VA text cannot be converted to Base by dropping its fields; that
+conversion requires retained original Base source.
+
+Source-template recipe 2 resolves WGP macros before Base canonicalization while
+preserving raw authored text. The separate `template` recipe resolves same-Base
+long-job macros before child splitting without forcing canonicalization. WGP's
+one-time template skip comes from the validated server plan and a private keyword
+argument; client parameters cannot enable it, and it is removed from returned
+validated settings. Literal dialogue and literal braces produced by macros are
+preserved.
+
+Selected images are decoded from bytes matching the admitted size/SHA. Selected
+video/audio inputs use private copies with the same identities; K soundtrack
+presence is verified on those copies, and physical video slots stay stable.
+Cached previews made before binding are cleared. Copies are released before the
+next child and in the outer worker cleanup. Hidden identity journals support
+bounded startup/terminal orphan cleanup, preserving live jobs and rejecting
+foreign or changed entries. Real process-exit regressions cover interruption
+before a second copy's journal and after the first cleanup unlink. A hard exit
+before the first durable identity can still leave a zero-byte temporary or an
+empty directory; no reference media bytes are written during those windows.
+
+Automatic mapping with video/audio references is unavailable outside the POSIX
+implementation; use a manual checkpoint there. Experimental source-audio roles
+also require a manual checkpoint. Neither limitation changes those existing
+manual execution paths. Independent review passed 64 focused CPU tests. Real CPU
+probes exercised the WGP parser/validator, pinned image replacement, frame
+alignment, and paired soundtracks in physical video slots 1 and 3 after their
+original files were replaced. Evidence is under
+`.artifacts-temp/astra-mapper-dispatch-20260907/evidence/`.
+
+This is source/CPU evidence. No service restart, model loading, GPU generation,
+browser acceptance, or Windows acceptance is established by this milestone.
+The owner has separately authorized GPU work through current coordinator grants;
+use `gpu-coordinator-client` when a concrete GPU check is needed. The historical
+tracker hold and the other activation/restart/provider restrictions remain.
+
+Final expanded verification passed 1,768 tests with 17 explicit skips and stable
+source hashes. The superseded unadopted `h3_prompt_adapt.py` and its tests are
+retired after replacing their active WIP call sites; their preimages remain in
+the milestone evidence. Unrelated pre-existing backend, UI, launcher, and
+storage-janitor WIP remains outside this source milestone.
+
+The final caller regression maps every child of an actual Studio plan. Known
+planner carry/seam text is folded into the first visual payload without losing
+context, dialogue, or original source provenance; all eight seam keys must be
+present in order. A real WGP CPU probe also validates both carried children.
+The pending automatic Ref/FL alternation and blanket mixed/text-only rejection
+overlays were discarded after review: they could lose supplied references and
+override manual checkpoint choices. Semantic runs and explicit selections stay
+intact. Related WIP tests were aligned with those retained contracts, including
+metadata-only `explicit_output`; none may silently choose PinkCherry.

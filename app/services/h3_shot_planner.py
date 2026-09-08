@@ -20,6 +20,7 @@ H3_SEMANTIC_PHYSICAL_CONTRACT_VERSION = 2
 H3_COMPILER_INPUT_REPLAY_VERSION = 1
 H3_COMPILER_INPUT_REPLAY_CANONICAL_VERSION = 2
 H3_SOURCE_CANONICALIZATION_RECIPE_VERSION = 1
+_H3_SOURCE_TEMPLATE_RECIPE_VERSION = 2
 H3_CONTINUITY_MODES = frozenset({
     "independent", "continuous", "extend_previous",
 })
@@ -45,11 +46,24 @@ def _source_canonicalization_descriptor(value: Any) -> dict[str, Any]:
         raise H3ShotPlanError(
             "H3 source canonicalization descriptor is incomplete"
         )
+    mode = value.get("mode")
+    recipe_version = value.get("recipe_version")
     if (
-        value.get("mode") != "t2va"
-        or type(value.get("recipe_version")) is not int
-        or value.get("recipe_version")
-            != H3_SOURCE_CANONICALIZATION_RECIPE_VERSION
+        type(recipe_version) is not int
+        or not (
+            (
+                mode == "t2va"
+                and recipe_version in {
+                    H3_SOURCE_CANONICALIZATION_RECIPE_VERSION,
+                    _H3_SOURCE_TEMPLATE_RECIPE_VERSION,
+                }
+            )
+            or (
+                mode == "template"
+                and recipe_version
+                    == H3_SOURCE_CANONICALIZATION_RECIPE_VERSION
+            )
+        )
         or isinstance(value.get("duration_seconds"), bool)
         or isinstance(value.get("fps"), bool)
         or isinstance(value.get("published_frames"), bool)
@@ -86,12 +100,30 @@ def _source_canonicalization_descriptor(value: Any) -> dict[str, Any]:
             "H3 source canonicalization geometry disagrees"
         )
     return {
-        "mode": "t2va",
-        "recipe_version": H3_SOURCE_CANONICALIZATION_RECIPE_VERSION,
+        "mode": str(mode),
+        "recipe_version": int(recipe_version),
         "duration_seconds": duration,
         "fps": fps,
         "published_frames": int(value["published_frames"]),
     }
+
+
+def resolve_h3_source_template(text: object) -> str:
+    """Resolve WGP macros while preserving exact H3 dialogue literals."""
+
+    from shared.utils.prompt_parser import process_template
+
+    try:
+        output, error = process_template(
+            str(text or ""),
+            keep_empty_lines=True,
+            preserve_h3_dialogue=True,
+        )
+    except Exception as exc:
+        raise H3ShotPlanError("H3 source template is invalid") from exc
+    if error or not isinstance(output, str):
+        raise H3ShotPlanError("H3 source template is invalid")
+    return output
 
 
 def h3_effective_source(
@@ -104,6 +136,10 @@ def h3_effective_source(
     if source_canonicalization is None:
         return source
     descriptor = _source_canonicalization_descriptor(source_canonicalization)
+    if descriptor["mode"] == "template":
+        return resolve_h3_source_template(source)
+    if descriptor["recipe_version"] == _H3_SOURCE_TEMPLATE_RECIPE_VERSION:
+        source = resolve_h3_source_template(source)
     from services.h3_canonical_prompt import canonicalize_h3_prompt
 
     try:
@@ -2508,7 +2544,9 @@ def plan_h3_native_shots(
         else None
     )
     if source_canonicalization is not None:
-        if source_canonicalization != "t2va":
+        if source_canonicalization not in (
+            "t2va", "t2va_template", "template",
+        ):
             raise H3ShotPlanError(
                 "H3 source canonicalization mode is unsupported"
             )
@@ -2677,8 +2715,16 @@ def plan_h3_native_shots(
             ]
             source_descriptor = (
                 _source_canonicalization_descriptor({
-                    "mode": source_canonicalization,
-                    "recipe_version": H3_SOURCE_CANONICALIZATION_RECIPE_VERSION,
+                    "mode": (
+                        "template"
+                        if source_canonicalization == "template"
+                        else "t2va"
+                    ),
+                    "recipe_version": (
+                        _H3_SOURCE_TEMPLATE_RECIPE_VERSION
+                        if source_canonicalization == "t2va_template"
+                        else H3_SOURCE_CANONICALIZATION_RECIPE_VERSION
+                    ),
                     "duration_seconds": sum(local_published) / fps_value,
                     "fps": fps_value,
                     "published_frames": sum(local_published),
@@ -3096,6 +3142,7 @@ __all__ = [
     "infer_h3_profile_id",
     "plan_h3_clip_frames",
     "plan_h3_native_shots",
+    "resolve_h3_source_template",
     "seal_h3_shot_plan",
     "validate_h3_shot_plan_seal",
 ]

@@ -8586,9 +8586,19 @@ def _bind_director_h3_runtime_contract(plan: dict) -> None:
         field: copy.deepcopy(plan.get(field))
         for field in _DIRECTOR_H3_RUNTIME_CONTRACT_FIELDS
     }
+    if "prompt_mapping_version" in plan:
+        if type(plan["prompt_mapping_version"]) is not int or plan["prompt_mapping_version"] != 1:
+            raise ValueError("Director H3 prompt mapping version is unsupported")
+        shot_plan["director_runtime_contract"]["prompt_mapping_version"] = 1
     from services.h3_shot_planner import seal_h3_shot_plan
 
     seal_h3_shot_plan(shot_plan)
+    if "prompt_mapping_version" in plan:
+        from services.h3_execution_contract import rewrite_h3_execution_prompts
+        executable = _director_h3_executable_clip_prompts(shot_plan, shot_plan["clip_prompts"])
+        plan["prompt_mapping_source_plan"] = rewrite_h3_execution_prompts(
+            shot_plan, executable, validate_prompt=lambda _index, _prompt: None,
+        )
 
 
 def _validate_director_h3_runtime_contract(plan: dict, shot_plan: dict) -> None:
@@ -8604,6 +8614,8 @@ def _validate_director_h3_runtime_contract(plan: dict, shot_plan: dict) -> None:
         field: plan.get(field)
         for field in _DIRECTOR_H3_RUNTIME_CONTRACT_FIELDS
     }
+    if "prompt_mapping_version" in plan:
+        expected["prompt_mapping_version"] = plan["prompt_mapping_version"]
     if not isinstance(saved, dict) or saved != expected:
         raise ValueError("Saved Director H3 runtime contract disagrees")
 
@@ -8724,7 +8736,8 @@ def _rehydrate_director_h3_longform(
                 raise ValueError("Saved Director H3 segment model is invalid")
             ref_schema = _director_h3_prompt_schema(prompt) == "ref2va"
             ref_model = str(model.get("model_type") or "") == _H3_REF2VA_MODEL
-            if ref_schema != ref_model:
+            adaptive_mapping = type(plan.get("prompt_mapping_version")) is int and plan["prompt_mapping_version"] == 1 and not ref_schema and ref_model
+            if ref_schema != ref_model and not adaptive_mapping:
                 raise ValueError(
                     f"Saved Director H3 segment {index + 1} prompt schema and "
                     "checkpoint disagree"
@@ -8783,6 +8796,11 @@ def _rehydrate_director_h3_longform(
     last_anchor = plan.get("original_image_end")
     native = plan.get("native_boundary_conditioning") is True
     executable_prompts = _director_h3_executable_clip_prompts(shot_plan, prompts)
+    if "prompt_mapping_version" in plan:
+        from services.h3_mapping_dispatch import resolve_h3_mapping_source_plan
+        derived = resolve_h3_mapping_source_plan(plan)
+        if derived["clip_prompts"] != executable_prompts:
+            raise ValueError("Saved Director H3 mapping source prompts disagree")
     gen_params.update({
         "prompt": _DIRECTOR_CLIP_SEPARATOR.join(executable_prompts),
         "per_clip_prompts": executable_prompts,
@@ -9167,7 +9185,7 @@ def _prepare_director_h3_longform(
                     "native first/end-frame anchors"
                 )
             effective = _H3_REF2VA_MODEL
-        elif effective == _H3_REF2VA_MODEL:
+        elif effective == _H3_REF2VA_MODEL and params.get("h3_adaptive_conditioning", True) is False:
             raise ValueError(
                 "Director Base prompt schema cannot be paired with a Ref2VA "
                 "checkpoint; supply the six-field Ref2VA Context-IR"
@@ -9188,6 +9206,18 @@ def _prepare_director_h3_longform(
             gen_params["model_type"] = effective
         if h3_style_workflow is not None:
             gen_params["h3_style_workflow"] = dict(h3_style_workflow)
+        if effective == _H3_REF2VA_MODEL and (first_anchor or last_anchor) and params.get("h3_native_boundary_conditioning") is not True:
+            raise ValueError("Director Ref2VA cannot honor native first/end-frame anchors; select FL2VA or remove the edge anchors.")
+        if effective == _H3_REF2VA_MODEL and prompt_schema != "ref2va":
+            from services.h3_mapping_dispatch import require_h3_mapping_audio_roles
+            require_h3_mapping_audio_roles(gen_params)
+            from services.h3_execution_contract import rewrite_h3_execution_prompts
+            shot_plan = rewrite_h3_execution_prompts(
+                shot_plan, executable_prompts, validate_prompt=lambda _index, _prompt: None,
+            )
+            gen_params["_h3_prompt_mapping_source_plan"] = shot_plan
+            gen_params["video_length"] = shot_plan["clip_frames"][0]
+            gen_params["trim_tail_frames"] = shot_plan["clip_trim_tail_frames"][0]
         gen_params["prompt"] = executable_prompts[0]
         gen_params["per_clip_prompts"] = list(executable_prompts)
         if (
@@ -9244,6 +9274,8 @@ def _prepare_director_h3_longform(
                 "reason": "six-field Ref2VA prompt schema",
             })
         elif model["model_type"] == _H3_REF2VA_MODEL:
+            if params.get("h3_adaptive_conditioning", True) is not False:
+                continue
             if semantic_references and not model.get("drop_semantic_refs"):
                 raise ValueError(
                     f"Director segment {index + 1} Base prompt schema cannot "
@@ -9272,6 +9304,18 @@ def _prepare_director_h3_longform(
             "This Director H3 plan requires the separately licensed Ref2VA "
             "checkpoint for semantic references or a scene transition. "
             "Review and accept its model terms before submitting."
+        )
+
+    mapping_enabled = params.get("h3_adaptive_conditioning", True) is not False and any(
+        schema != "ref2va" and model["model_type"] == _H3_REF2VA_MODEL
+        for schema, model in zip(prompt_schemas, segment_models)
+    )
+    if mapping_enabled:
+        from services.h3_mapping_dispatch import require_h3_mapping_audio_roles
+        require_h3_mapping_audio_roles(gen_params)
+        from services.h3_execution_contract import rewrite_h3_execution_prompts
+        mapping_source_plan = rewrite_h3_execution_prompts(
+            shot_plan, executable_prompts, validate_prompt=lambda _index, _prompt: None,
         )
 
     planned_frames = sum(segment_frames)
@@ -9319,6 +9363,7 @@ def _prepare_director_h3_longform(
             ),
             "clip_boundaries": segment_boundaries,
             "shot_plan": shot_plan,
+            **({"prompt_mapping_version": 1, "prompt_mapping_source_plan": mapping_source_plan} if mapping_enabled else {}),
             "segment_policy": segment_policy,
             "segment_models": segment_models,
             "segment_source_indices": segment_source_indices,

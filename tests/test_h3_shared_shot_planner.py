@@ -1913,7 +1913,7 @@ class H3SharedShotPlannerTests(unittest.TestCase):
                 "published_frames": 96,
             },
             {
-                "mode": "t2va", "recipe_version": 2,
+                "mode": "t2va", "recipe_version": 3,
                 "duration_seconds": 4.0, "fps": 24.0,
                 "published_frames": 96,
             },

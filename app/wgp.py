@@ -1475,10 +1475,13 @@ def validate_settings(state, model_type, single_prompt, inputs):
         gr.Info("Adaptive Progressive Guidance and Classifier Free Guidance Star can not be set at the same time")
         return ret()
     prompt = inputs["prompt"]
-    prompt, errors = prompt_parser.process_template(
-        prompt, keep_empty_lines=model_def.get("preserve_empty_prompt_lines", False),
-        preserve_h3_dialogue=model_type in {"minimax_h3", "minimax_h3_ref2va"},
-    )
+    if inputs.get("_h3_prompt_template_resolved") is True:
+        errors = ""
+    else:
+        prompt, errors = prompt_parser.process_template(
+            prompt, keep_empty_lines=model_def.get("preserve_empty_prompt_lines", False),
+            preserve_h3_dialogue=model_type in {"minimax_h3", "minimax_h3_ref2va"},
+        )
     if len(errors) > 0:
         gr.Info("Error processing prompt template: " + errors)
         return ret()
@@ -14768,10 +14771,14 @@ def validate_task(
     state,
     *,
     _h3_turbo_validation_authorized=False,
+    _h3_prompt_template_resolved=False,
 ):
     """Validate a task's settings. Returns updated params dict or None if invalid."""
     params = task.get('params', {})
     if "_h3_turbo_validation_authorized" in params:
+        print("  [SKIP] Internal H3 validation state is not accepted in task params")
+        return None
+    if "_h3_prompt_template_resolved" in params:
         print("  [SKIP] Internal H3 validation state is not accepted in task params")
         return None
     model_type = params.get('model_type')
@@ -14783,6 +14790,10 @@ def validate_task(
     inputs.update(params)
     if _h3_turbo_validation_authorized is True:
         inputs["_h3_turbo_validation_authorized"] = True
+    if _h3_prompt_template_resolved is True:
+        if get_base_model_type(model_type) not in {"minimax_h3", "minimax_h3_ref2va"}:
+            return None
+        inputs["_h3_prompt_template_resolved"] = True
     inputs['prompt'] = task.get('prompt', '')
     inputs.setdefault('mode', "")
     is_single = inputs.get('multi_prompts_gen_type', 0) in (2,)
@@ -14790,6 +14801,7 @@ def validate_task(
     if override_inputs is None:
         return None
     inputs.update(override_inputs)
+    inputs.pop("_h3_prompt_template_resolved", None)
     return inputs
 
 
