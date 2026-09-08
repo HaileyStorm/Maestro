@@ -362,8 +362,7 @@ class TestMiniMaxH3Ref2VADefinition(unittest.TestCase):
         inputs_panel = _read(_INPUTS_PANEL)
         store = _read(_STORE)
         types = _read(_TYPES)
-        self.assertIn("H3_REF2VA_LIMITS = { images: 9, videos: 3, audio: 3, mixed: 12 }", inputs_panel)
-        self.assertIn("Selected model:", inputs_panel)
+        self.assertIn("H3_REFERENCE_LIMITS", inputs_panel)
         self.assertIn("Install required reference model", inputs_panel)
         self.assertIn("maestro:minimax-h3-ref2va-terms-v1", store)
         self.assertIn("acceptHostTerm('minimax_h3_ref2va')", inputs_panel)
@@ -398,7 +397,7 @@ class TestMiniMaxH3Ref2VADefinition(unittest.TestCase):
 
         # Switching between the managed H3 checkpoints must not erase either
         # side of the hybrid request before the planner can inspect it.
-        options_slice = store.split("loadModelOptions: async (modelType) =>", 1)[1].split("// System config", 1)[0]
+        options_slice = store.split("loadModelOptions: async (modelType, request = {}) =>", 1)[1].split("// System config", 1)[0]
         self.assertIn("H3 model selection must not normalize away", options_slice)
         self.assertNotIn("image_refs: undefined", options_slice)
         self.assertNotIn("image_start: undefined", options_slice)
@@ -414,7 +413,7 @@ class TestMiniMaxH3Ref2VADefinition(unittest.TestCase):
         self.assertIn("restoreSemanticH3Paths", store)
         self.assertIn("? [...(params.image_refs as string[])]", store)
         self.assertIn("state.imageRefs.length + (state.params.image_refs?.length ?? 0)", store)
-        self.assertIn("restoreGeneration !== _settingsRestoreGeneration", store)
+        self.assertIn("restoreGeneration === _settingsRestoreGeneration", store)
         self.assertIn("_h3Ref2VATermsHostAccepted", store)
         self.assertIn("_clearLegacyH3Ref2VATermsAcceptance", store)
         load_terms = store.split("loadHostTerms: async () =>", 1)[1].split(

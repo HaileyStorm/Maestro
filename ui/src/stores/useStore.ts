@@ -21,6 +21,8 @@ import {
   h3ArchitectureForModel,
   h3LorasForArchitecture,
   h3LoraBlockReason,
+  h3Sage2Eligibility,
+  h3SemanticRouteRequested,
   hasManualH3SegmentCeiling,
   H3_BASE_FL2VA_MODEL,
   H3_FL2VA_MODELS,
@@ -8049,6 +8051,52 @@ export const useStore = create<AppState>((set, get) => ({
         && state.durationSeconds <= nativeMaximumSeconds
       ) {
         window.alert(`FL2VA frame anchors and Ref2VA semantic references need separate H3 segments. Request more than ${nativeMaximumSeconds.toFixed(2)}s, or remove one conditioning type.`)
+        return
+      }
+    }
+    if (h3StudioModel && state.params.custom_settings?.h3_attention_engine === 'sage2') {
+      const submitted = state
+      const route = h3SemanticRouteRequested(submitted.params, submitted.imageRefs.length)
+      const compatible = h3Sage2Eligibility(submitted.params, route, true)
+      if (!compatible.eligible) {
+        window.alert(compatible.reason || 'Choose an available H3 attention engine.')
+        return
+      }
+      let available = false
+      try {
+        const capability = await api.fetchH3AccelerationStatus(false)
+        available = capability.sage2?.available === true
+      } catch {
+        // A failed capability read cannot authorize the selected engine.
+      }
+      const current = get()
+      if (!ownsSubmission()
+        || current.activeWorkspace !== submissionWorkspace
+        || current.generationMode !== submitted.generationMode
+        || current.params !== submitted.params
+        || current.modelOptions !== submitted.modelOptions
+        || current.imageRefs !== submitted.imageRefs
+        || current.startImage !== submitted.startImage
+        || current.endImage !== submitted.endImage
+        || current.clips !== submitted.clips
+        || current.continueVideo !== submitted.continueVideo
+        || current.continueVideoPath !== submitted.continueVideoPath
+        || current.voiceCloneRefs !== submitted.voiceCloneRefs
+        || current.privateOutput !== submitted.privateOutput
+        || current.explicitOutput !== submitted.explicitOutput
+        || current.hostTerms !== submitted.hostTerms
+        || generationProfileUiKeys.some(key => (
+          (current as unknown as Record<string, unknown>)[key]
+            !== (submitted as unknown as Record<string, unknown>)[key]
+        ))) return
+      state = current
+      const eligibility = h3Sage2Eligibility(
+        current.params,
+        h3SemanticRouteRequested(current.params, current.imageRefs.length),
+        available,
+      )
+      if (!eligibility.eligible) {
+        window.alert(eligibility.reason || 'Choose an available H3 attention engine.')
         return
       }
     }

@@ -182,12 +182,33 @@ class TestLtxAudioRuntimeContracts(unittest.TestCase):
 
     def test_audio_window_paths_use_layout_neutral_sample_counts(self):
         source = _WGP_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        native_window_conditions = [
+            node.test
+            for node in ast.walk(tree)
+            if isinstance(node, ast.If)
+            and "audio_guide_window_slicing" in ast.unparse(node.test)
+            and not any(
+                isinstance(child, ast.Name) and child.id == "audio_guide"
+                for child in ast.walk(node.test)
+            )
+        ]
 
         self.assertGreaterEqual(source.count("_audio_waveform_sample_count("), 5)
-        self.assertIn(
-            'elif model_def.get("audio_guide_window_slicing", False):',
-            source,
+        self.assertEqual(len(native_window_conditions), 1)
+        native_window_predicate = compile(
+            ast.Expression(native_window_conditions[0]),
+            str(_WGP_PATH),
+            "eval",
         )
+        self.assertTrue(eval(native_window_predicate, {}, {
+            "model_def": {"audio_guide_window_slicing": True},
+            "semantic_reference_mode": False,
+        }))
+        self.assertFalse(eval(native_window_predicate, {}, {
+            "model_def": {"audio_guide_window_slicing": True},
+            "semantic_reference_mode": True,
+        }))
         self.assertIn("input_fills_window = (", source)
         self.assertIn("resolve_generated_audio_sampling_rate(", source)
         self.assertIn('or "D" in audio_prompt_type', source)

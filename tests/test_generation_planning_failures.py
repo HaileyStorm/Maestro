@@ -190,6 +190,7 @@ class GenerationPlanningFailureTests(unittest.TestCase):
             "_queue_recovery_delivery_pending": lambda _job: None,
             "_h3_job_model_types": lambda _job: ("minimax_h3",),
             "_require_h3_legal_execution": lambda _models: None,
+            "_require_h3_acceleration_available": lambda *_args, **_kwargs: None,
             "_hold_h3_job_for_legal_access": lambda _job: None,
             "update_preparation_job": update_preparation_job,
             "_plan_generation_submission": plan,

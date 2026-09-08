@@ -658,19 +658,7 @@ class TestMiniMaxH3Definition(unittest.TestCase):
         self.assertIn("supportsSlidingWindows = modelOptions?.sliding_window === true", prompt_input)
         self.assertIn("effectiveSlidingWindowGeometry(", prompt_input)
 
-    def test_h3_attention_choice_round_trips_through_preferences_presets_and_outputs(self):
-        store = _read(_STORE_PATH)
-        advanced = _read(_APP / "../ui/src/components/Sidebar/AdvancedSettings.tsx")
-        self.assertIn("maestro:h3-attention-engine", store)
-        self.assertIn("custom_settings: { h3_attention_engine: 'sol_attn' }", store)
-        self.assertIn("custom_settings: _restorableH3CustomSettings(params.custom_settings)", store)
-        self.assertIn("_restorableH3CustomSettings(p.custom_settings)", store)
-        self.assertIn("h3_attention_engine: restoredEngine", store)
-        self.assertIn("localStorage.setItem(H3_ATTENTION_ENGINE_KEY, restoredEngine)", store)
-        self.assertIn("localStorage.setItem(H3_ATTENTION_ENGINE_KEY, engine)", store)
-        self.assertIn("event.target.value === 'sage2' ? 'sage2' : 'sol_attn'", advanced)
-        self.assertIn("Official SageAttention2++ · {h3Acceleration?.sage2.validated ? 'tested for Base H3' : 'not yet tested'}", advanced)
-        self.assertIn("params.model_type !== 'minimax_h3'", advanced)
+    def test_h3_attention_engines_reach_native_model(self):
         transformer = _read(_APP / "models/minimax_h3/transformer.py")
         main = _read(_APP / "models/minimax_h3/minimax_h3_main.py")
         self.assertIn("maybe_sage2_attention", transformer)
@@ -996,7 +984,7 @@ class TestMiniMaxH3Definition(unittest.TestCase):
             "_validate_h3_explicit_multiclip_request": lambda _body: None,
             "_validate_h3_lora_request": lambda _body, _plan=None: None,
             "_prepare_h3_long_studio_request": prepare,
-            "_require_h3_acceleration_available": lambda _body, _plan: None,
+            "_require_h3_acceleration_available": lambda _body, _plan=None: None,
             "_h3_estimate_context": lambda _body, _plan: {},
             "_validate_h3_turbo_estimate_context": lambda *_args, **_kwargs: None,
             "_validate_h3_spectrum_estimate_context": lambda _context: None,
@@ -1098,7 +1086,6 @@ class TestMiniMaxH3Definition(unittest.TestCase):
         selector = _read(_MODEL_SELECTOR_PATH)
         advanced = _read(_ADVANCED_SETTINGS_PATH)
         self.assertIn("def _require_h3_acceleration_available", launch)
-        self.assertEqual(launch.count("_require_h3_acceleration_available("), 3)
         tree = ast.parse(launch, filename=str(_LAUNCH_PATH))
         shared_planning_node = next(
             node for node in tree.body

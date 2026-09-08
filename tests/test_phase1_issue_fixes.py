@@ -2851,12 +2851,37 @@ class TestH3PerformanceProfileUI(unittest.TestCase):
     def test_h3_benchmark_collection_is_continuous_not_checkbox_gated(self):
         advanced = _read(_ADVANCED_SETTINGS_PATH)
         store = _read(_STORE_PATH)
+        launch = ast.parse(_read(_LAUNCH_PATH), filename=_LAUNCH_PATH)
+        run_generation = next(
+            node
+            for node in launch.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_run_generation"
+        )
+        capture_assignments = [
+            node
+            for node in ast.walk(run_generation)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "_capture_h3_benchmark"
+                for target in node.targets
+            )
+        ]
+        benchmark_calls = [
+            node
+            for node in ast.walk(run_generation)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_record_h3_benchmark_observation"
+        ]
         self.assertNotIn("h3_benchmark_capture", advanced)
         self.assertNotIn("h3_benchmark_capture", store)
-        self.assertIn(
-            "Successful H3 generations improve time estimates on this computer.",
-            advanced,
-        )
+        self.assertNotIn("h3_benchmark_capture", ast.unparse(run_generation))
+        self.assertEqual(len(capture_assignments), 1)
+        capture_condition = ast.unparse(capture_assignments[0].value)
+        self.assertIn("model_type", capture_condition)
+        self.assertIn("_H3_LONG_STUDIO_MODELS", capture_condition)
+        self.assertEqual(len(benchmark_calls), 1)
 
     def test_resolution_is_main_and_h3_uses_native_canvases(self):
         sidebar = _read(_SIDEBAR_PATH)

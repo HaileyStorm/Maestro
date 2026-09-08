@@ -160,7 +160,7 @@ class TestStudioInterfaceQuickWins(unittest.TestCase):
         self.assertEqual(source.count("{!isOutpaint && <LoraSelector />}"), 1)
         self.assertGreater(
             source.index("{!isOutpaint && <LoraSelector />}"),
-            source.index("<PresetManager />"),
+            source.index('<GenerationProfiles placement="advanced" loadOnMount={false} />'),
         )
         self.assertNotIn("H3 Text Encoder", source)
 

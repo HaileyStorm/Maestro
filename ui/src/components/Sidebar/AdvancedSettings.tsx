@@ -8,6 +8,7 @@ import { ControlVideoSection } from './ControlVideoSection'
 import { LoraSelector } from '../SettingsDrawer/LoraSelector'
 import { WindowSettings } from './DurationSlider'
 import { GenerationProfiles } from './GenerationProfiles'
+import { h3Sage2Eligibility, h3SemanticRouteRequested } from '../../lib/h3Submission'
 import {
   fetchH3AccelerationStatus,
   fetchH3BenchmarkReport,
@@ -184,6 +185,7 @@ export function AdvancedSettings() {
     const refs = s.params.image_refs
     return refs && refs.length > 0
   })
+  const localImageRefCount = useStore(s => s.imageRefs?.length ?? 0)
   const durationSeconds = useStore(s => s.durationSeconds)
   const setDurationSeconds = useStore(s => s.setDurationSeconds)
   const selectModel = useStore(s => s.selectModel)
@@ -196,10 +198,17 @@ export function AdvancedSettings() {
     String(modelOptions?.architecture || ''),
   )
   const minimumInferenceSteps = isH3 ? 2 : 1
-  const [h3Acceleration, setH3Acceleration] = useState<H3AccelerationStatus | null>(null)
+  const [h3AccelerationResult, setH3AccelerationResult] = useState<H3AccelerationStatus | false | null>(null)
+  const h3Acceleration = h3AccelerationResult || null
   const [h3Benchmark, setH3Benchmark] = useState<H3BenchmarkReport | null>(null)
   const h3Custom = (params.custom_settings || {}) as H3CustomSettings
   const h3Engine = String(h3Custom.h3_attention_engine || 'sol_attn')
+  const hasH3SemanticReferences = h3SemanticRouteRequested(params, localImageRefCount)
+  const sage2Eligibility = h3Sage2Eligibility(
+    params,
+    hasH3SemanticReferences,
+    h3AccelerationResult === false ? false : h3Acceleration?.sage2?.available,
+  )
   const setH3Custom = <Key extends keyof H3CustomSettings>(
     key: Key,
     value: H3CustomSettings[Key],
@@ -209,13 +218,14 @@ export function AdvancedSettings() {
     else next[key] = value
     setParam('custom_settings', Object.keys(next).length ? next : undefined)
   }
+  const useDenseSdpa = () => setH3Custom('h3_attention_engine', 'sdpa')
 
   useEffect(() => {
     if (!open || !isH3) return
     let current = true
     fetchH3AccelerationStatus(false)
-      .then(status => { if (current) setH3Acceleration(status) })
-      .catch(() => { if (current) setH3Acceleration(null) })
+      .then(status => { if (current) setH3AccelerationResult(status) })
+      .catch(() => { if (current) setH3AccelerationResult(false) })
     fetchH3BenchmarkReport()
       .then(report => { if (current) setH3Benchmark(report) })
       .catch(() => { if (current) setH3Benchmark(null) })
@@ -354,9 +364,9 @@ export function AdvancedSettings() {
                       </option>
                       <option
                         value="sage2"
-                        disabled={h3Acceleration?.sage2.available !== true || params.model_type !== 'minimax_h3'}
+                        disabled={!sage2Eligibility.eligible}
                       >
-                        Official SageAttention2++ · {h3Acceleration?.sage2.validated ? 'tested for Base H3' : 'not yet tested'}
+                        Official SageAttention2++
                       </option>
                     </select>
                     {h3Acceleration?.sol_attn.available === false && (
@@ -364,22 +374,22 @@ export function AdvancedSettings() {
                         Sol-Attn is unavailable: {h3Acceleration.sol_attn.error || (!h3Acceleration.sol_attn.hardware_ok ? 'it requires an NVIDIA SM80+ GPU with BF16 support' : 'the required Sol-Attn package is not installed')}.
                       </p>
                     )}
-                    {h3Acceleration?.sage2.available !== true && (
-                      <p className="mt-1 text-[9px] text-amber-400">
-                        SageAttention2++ is unavailable: {h3Acceleration?.sage2.reason || 'it requires the official Linux CUDA 12.8+ package for SM120 GPUs'}.
-                      </p>
+                    {h3Engine === 'sage2' && !sage2Eligibility.eligible && (
+                      <div className="mt-2 flex items-start justify-between gap-2 rounded border border-amber-500/30 bg-amber-500/5 px-2 py-1.5 text-[9px] text-amber-300">
+                        <span>{sage2Eligibility.reason}</span>
+                        <button
+                          type="button"
+                          onClick={useDenseSdpa}
+                          className="mobile-control-target shrink-0 rounded border border-amber-400/50 px-2 py-1 font-medium text-amber-200 hover:bg-amber-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+                        >
+                          Use Dense SDPA
+                        </button>
+                      </div>
                     )}
-                    {h3Acceleration?.sage2.available === true && params.model_type !== 'minimax_h3' && (
-                      <p className="mt-1 text-[9px] text-amber-400">
-                        SageAttention2++ has only been tested with Base H3. Choose Base H3 to use it; W4A8, PinkCherry, and Ref2VA are not supported.
-                      </p>
-                    )}
-                    {h3Engine === 'sage2' && (
-                      <details className="mt-2 border-l border-amber-500/30 pl-2 text-[9px] text-amber-300">
-                        <summary className="mobile-control-target focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue cursor-pointer">SageAttention2++ details</summary>
-                        <p className="mt-1">
-                          Tested for Base H3 Draft and Fast at the standard benchmark size. Automatic SDPA fallbacks are excluded from benchmark comparisons.
-                        </p>
+                    {h3Engine === 'sage2' && sage2Eligibility.eligible && h3Acceleration?.sage2?.reason && (
+                      <details className="mt-2 text-[9px] text-text-muted">
+                        <summary className="mobile-control-target cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Hardware details</summary>
+                        <p className="mt-1">{h3Acceleration.sage2.reason}</p>
                       </details>
                     )}
                     {h3Engine === 'sol_attn' && (

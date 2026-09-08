@@ -8,6 +8,10 @@ const loraSelectorSource = await readFile(
   new URL('../src/components/SettingsDrawer/LoraSelector.tsx', import.meta.url),
   'utf8',
 )
+const generateButtonSource = await readFile(
+  new URL('../src/components/Sidebar/GenerateButton.tsx', import.meta.url),
+  'utf8',
+)
 
 function asDataModule(contents) {
   return `data:text/javascript;base64,${Buffer.from(contents).toString('base64')}`
@@ -78,7 +82,14 @@ function loadControls() {
         bundle.onLoad({ filter: /.*/, namespace: 'adaptive-controls' }, args => {
           if (args.path === 'react') return { contents: `
             export const useEffect = () => {}
-            export const useState = initial => [typeof initial === 'function' ? initial() : initial, () => {}]
+            export const useState = initial => {
+              const value = globalThis.__maestroAdaptiveStateValues?.length
+                ? globalThis.__maestroAdaptiveStateValues.shift()
+                : (typeof initial === 'function' ? initial() : initial)
+              return [value, update => globalThis.__maestroAdaptiveStateUpdates?.push(
+                typeof update === 'function' ? update(value) : update,
+              )]
+            }
             export const useRef = initial => ({ current: initial })
           ` }
           if (args.path === 'jsx-runtime') return { contents: `
@@ -103,7 +114,10 @@ function loadControls() {
             export const getModelsForFamily = (family, models) => models.filter(model => model.family === family)
           ` }
           if (args.path === 'api') return { contents: `
-            export const fetchH3AccelerationStatus = async () => ({ w4a8: { available: true, reason: '' } })
+            export const fetchH3AccelerationStatus = async () => ({
+              w4a8: { available: true, reason: '' },
+              sage2: { available: true, reason: '' },
+            })
             export const verifyManualCheckpoint = async () => ({})
           ` }
           if (args.path === 'tooltip') return { contents: 'export const InfoTooltip = () => null' }
@@ -260,6 +274,59 @@ test('Generate is disabled for invalid or catalog-missing adaptive checkpoints',
   assert.equal(buttons[0]?.props.disabled, true)
   assert.match(textContent(buttons[0]), /Model unavailable/)
   assert.match(buttons[0]?.props.title, /no longer in the model catalog/)
+})
+
+test('Generate blocks incompatible saved Sage2 and repairs only the selected engine', async t => {
+  const { GenerateButton } = await loadControls()
+  const previousStore = globalThis.__maestroAdaptiveControlsStore
+  const previousStateValues = globalThis.__maestroAdaptiveStateValues
+  const previousStateUpdates = globalThis.__maestroAdaptiveStateUpdates
+  t.after(() => {
+    globalThis.__maestroAdaptiveControlsStore = previousStore
+    globalThis.__maestroAdaptiveStateValues = previousStateValues
+    globalThis.__maestroAdaptiveStateUpdates = previousStateUpdates
+  })
+
+  const changes = []
+  const store = adaptiveStore({ imageRefs: [{ id: 'local-reference' }] })
+  store.params = {
+    ...store.params,
+    custom_settings: { h3_attention_engine: 'sage2', h3_sol_tau: 1.7 },
+  }
+  store.setParam = (...args) => changes.push(args)
+  globalThis.__maestroAdaptiveControlsStore = store
+  globalThis.__maestroAdaptiveStateValues = [
+    false,
+    {
+      w4a8: { available: true, reason: '' },
+      sage2: { available: true, reason: '' },
+    },
+  ]
+  globalThis.__maestroAdaptiveStateUpdates = []
+
+  const tree = renderTree(GenerateButton())
+  const buttons = flattenElements(tree).filter(element => element.type === 'button')
+  assert.equal(buttons[0]?.props.disabled, true)
+  assert.match(textContent(buttons[0]), /Change H3 setup/)
+  assert.equal(buttons[0]?.props.title, 'SageAttention2++ cannot run with reference media. Remove the references or use Dense SDPA.')
+  const repair = buttons.find(button => textContent(button) === 'Use Dense SDPA')
+  assert.ok(repair)
+  repair.props.onClick()
+  assert.deepEqual(changes, [[
+    'custom_settings',
+    { h3_attention_engine: 'sdpa', h3_sol_tau: 1.7 },
+  ]])
+})
+
+test('Generate shares one acceleration request between W4A8 and Sage2 checks', () => {
+  const effect = generateButtonSource.slice(
+    generateButtonSource.indexOf('useEffect(() => {\n    if (!usesW4a8 && !usesSage2) return'),
+    generateButtonSource.indexOf('// Check if i2v-only model'),
+  )
+  assert.match(effect, /if \(!usesW4a8 && !usesSage2\) return/)
+  assert.equal(effect.match(/fetchH3AccelerationStatus\(false\)/g)?.length, 1)
+  assert.match(effect, /w4a8:/)
+  assert.match(effect, /sage2:/)
 })
 
 test('invalid adaptive model IDs are gated before every LoRA model endpoint', () => {

@@ -374,7 +374,7 @@ class ExplicitJobUiSourceTests(unittest.TestCase):
     def test_all_manual_pinkcherry_surfaces_warn_but_remain_selectable(self):
         self.assertIn("pinkProfileIncompatible", MODEL_SELECTOR)
         self.assertIn("pinkReconciliationLabel", MODEL_SELECTOR)
-        self.assertIn("await selectModel(model.model_type)", MODEL_SELECTOR)
+        self.assertIn("if (await onSelect(model.model_type))", MODEL_SELECTOR)
         self.assertNotIn("disabled={pinkProfileIncompatible}", MODEL_SELECTOR)
 
         # A queued plan is frozen to its exact job/project. Editing its
@@ -396,17 +396,11 @@ class ExplicitJobUiSourceTests(unittest.TestCase):
         self.assertNotIn("prompt", CONTROLS.lower())
 
         preset = STORE[
-            STORE.index("loadPreset: (preset)"):
-            STORE.index("deletePreset:", STORE.index("loadPreset: (preset)"))
-        ]
-        output_restore = STORE[
-            STORE.index("loadSettingsFromOutput: async"):
-            STORE.index("// Restore image refs as File objects")
+            STORE.index("loadPreset: async (preset)"):
+            STORE.index("deletePreset:", STORE.index("loadPreset: async (preset)"))
         ]
         self.assertNotIn("normalizeH3EditableProfile", preset)
-        self.assertIn("must not silently replace its exact", preset)
-        self.assertIn("normalizeH3EditableProfile", output_restore)
-        self.assertIn("h3ProfileMatches(profile, state.params", STORE)
+        self.assertIn("restoreGenerationProfileSettings(preset", preset)
 
     def test_model_and_lora_selections_do_not_lock_explicit_on(self):
         for token in (
@@ -441,7 +435,7 @@ class ExplicitJobUiSourceTests(unittest.TestCase):
             self.assertNotIn("loraDetailsReady", source)
             self.assertNotIn("New selections are disabled", source)
             self.assertIn("detailsRequest !== loraDetailsRequest.current", source)
-        self.assertIn("<DirectorPresetPicker", DIRECTOR_LORAS)
+        self.assertIn("<DirectorProfileLoraPicker", DIRECTOR_LORAS)
 
     def test_fresh_studio_video_uses_server_authored_role_profile(self):
         defaults = STORE[

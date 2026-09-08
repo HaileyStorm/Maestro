@@ -15196,6 +15196,16 @@ def _require_h3_acceleration_available(
         body, plan, allow_server_prepared=allow_server_prepared,
     )
     requested = set(_h3_effective_model_types(body, trusted_plan))
+    custom = body.get("custom_settings")
+    if (
+        isinstance(custom, dict)
+        and custom.get("h3_attention_engine") == "sage2"
+        and any(model_type != _H3_BASE_FL2VA_MODEL for model_type in requested)
+    ):
+        raise ValueError(
+            "SageAttention2++ requires Base H3 for every segment. Choose Dense "
+            "SDPA for this setup."
+        )
     if _H3_W4A8_FL2VA_MODEL not in requested:
         return
     from services.h3_acceleration import get_h3_acceleration_status
@@ -15263,10 +15273,6 @@ def _apply_h3_adaptive_checkpoint(body: dict) -> str:
         "supplied frame anchor" if has_frame_anchor else
         "text/audio-video generation profile"
     )
-    if effective == _H3_REF2VA_MODEL:
-        custom = body.get("custom_settings")
-        if isinstance(custom, dict) and custom.get("h3_attention_engine") == "sage2":
-            body["custom_settings"] = {**custom, "h3_attention_engine": "sdpa"}
     return effective
 
 
@@ -41812,6 +41818,7 @@ def _run_generation_preparation(
                 ) from None
             else:
                 prepared_params["activated_loras"] = list(activated_loras)
+        _require_h3_acceleration_available(prepared_params)
         if enhance:
             if not update_preparation_job(
                 job,
@@ -58509,11 +58516,6 @@ def _run_generation(
             _capture_h3_benchmark = bool(
                 str(raw_params.get("model_type") or "") in _H3_LONG_STUDIO_MODELS
             )
-            if _capture_h3_benchmark and torch.cuda.is_available():
-                try:
-                    torch.cuda.reset_peak_memory_stats()
-                except Exception:
-                    pass
 
             requested_model = str(raw_params.get("model_type") or "")
 
@@ -58580,6 +58582,11 @@ def _run_generation(
                     message="MiniMax H3 long-form planning failed",
                 )
                 return False
+            if _capture_h3_benchmark and torch.cuda.is_available():
+                try:
+                    torch.cuda.reset_peak_memory_stats()
+                except Exception:
+                    pass
             if trusted_h3_plan:
                 job["params"] = raw_params.copy()
                 job["window_total"] = int(

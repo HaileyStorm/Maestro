@@ -4,7 +4,12 @@ import { useStore } from '../../stores/useStore'
 import { fetchH3AccelerationStatus } from '../../api/client'
 import { H3EstimateBadge } from './H3PerformanceProfiles'
 import { projectLogicalQueue } from '../../lib/queueProjection'
-import { h3ActiveCheckpoints, h3AdaptiveSelectionError } from '../../lib/h3Submission'
+import {
+  h3ActiveCheckpoints,
+  h3AdaptiveSelectionError,
+  h3Sage2Eligibility,
+  h3SemanticRouteRequested,
+} from '../../lib/h3Submission'
 
 export function GenerateButton() {
   const jobs = useStore(s => s.jobs)
@@ -12,6 +17,8 @@ export function GenerateButton() {
   const setSidebarOpen = useStore(s => s.setSidebarOpen)
   const modelOptionsLoading = useStore(s => s.modelOptionsLoading)
   const activeWorkspace = useStore(s => s.activeWorkspace)
+  const params = useStore(s => s.params)
+  const setParam = useStore(s => s.setParam)
   const h3SelectionError = useStore(s => h3AdaptiveSelectionError(s.params))
   const missingH3Checkpoint = useStore(s => {
     const h3Selected = s.generationMode === 'video'
@@ -26,6 +33,18 @@ export function GenerateButton() {
   })
   const usesW4a8 = useStore(s => (
     h3ActiveCheckpoints(s.params).includes('minimax_h3_w4a8_fl2va')
+  ))
+  const usesSage2 = useStore(s => (
+    s.generationMode === 'video'
+    && (
+      s.params.model_type.startsWith('minimax_h3')
+      || String(s.modelOptions?.architecture || '').startsWith('minimax_h3')
+    )
+    && s.params.custom_settings?.h3_attention_engine === 'sage2'
+  ))
+  const hasH3SemanticReferences = useStore(s => h3SemanticRouteRequested(
+    s.params,
+    s.imageRefs?.length ?? 0,
   ))
   const h3LocationRequired = useStore(s => {
     const types = h3ActiveCheckpoints(s.params)
@@ -89,29 +108,41 @@ export function GenerateButton() {
     ))
   })
   const [cooldown, setCooldown] = useState(false)
-  const [w4a8Capability, setW4a8Capability] = useState<{
-    available: boolean
-    reason: string
+  const [h3Acceleration, setH3Acceleration] = useState<{
+    w4a8: { available: boolean; reason: string }
+    sage2: { available: boolean; reason: string }
   } | null>(null)
 
   useEffect(() => {
-    if (!usesW4a8) return
+    if (!usesW4a8 && !usesSage2) return
     let current = true
     fetchH3AccelerationStatus(false)
       .then(status => {
-        if (current) setW4a8Capability({
-          available: status.w4a8.available,
-          reason: status.w4a8.reason,
+        if (current) setH3Acceleration({
+          w4a8: {
+            available: status.w4a8.available,
+            reason: status.w4a8.reason,
+          },
+          sage2: {
+            available: status.sage2?.available === true,
+            reason: status.sage2?.reason || 'SageAttention2++ is unavailable on this computer.',
+          },
         })
       })
       .catch(() => {
-        if (current) setW4a8Capability({
-          available: false,
-          reason: 'W4A8 runtime support could not be checked.',
+        if (current) setH3Acceleration({
+          w4a8: {
+            available: false,
+            reason: 'W4A8 runtime support could not be checked.',
+          },
+          sage2: {
+            available: false,
+            reason: 'SageAttention2++ availability could not be checked.',
+          },
         })
       })
     return () => { current = false }
-  }, [usesW4a8])
+  }, [usesSage2, usesW4a8])
 
   // Check if i2v-only model needs a start image. Video mode only: edit
   // sub-modes supply their own source media (Recast runs the i2v-only
@@ -133,9 +164,26 @@ export function GenerateButton() {
   )
   const needsOutpaintArea = isOutpaint && !!editVideoPath && !hasOutpaintArea
   const needsProject = !activeWorkspace
-  const w4a8RuntimeBlocked = usesW4a8 && w4a8Capability?.available !== true
-  const h3CheckpointBlocked = Boolean(h3SelectionError || missingH3Checkpoint || w4a8RuntimeBlocked)
+  const sage2Eligibility = h3Sage2Eligibility(
+    params,
+    hasH3SemanticReferences,
+    h3Acceleration?.sage2.available,
+  )
+  const sage2Blocked = usesSage2 && !sage2Eligibility.eligible
+  const w4a8RuntimeBlocked = usesW4a8 && h3Acceleration?.w4a8.available !== true
+  const h3CheckpointBlocked = Boolean(
+    h3SelectionError || missingH3Checkpoint || sage2Blocked || w4a8RuntimeBlocked,
+  )
   const blocked = modelOptionsLoading || needsProject || h3CheckpointBlocked || legalBlocked || needsModelTerms || needsManualCheckpointVerification || needsImage || needsOutpaintSource || needsOutpaintArea
+  const sage2PrimaryBlock = !modelOptionsLoading
+    && !needsProject
+    && !h3SelectionError
+    && !missingH3Checkpoint
+    && sage2Blocked
+  const useDenseSdpa = () => setParam('custom_settings', {
+    ...(params.custom_settings || {}),
+    h3_attention_engine: 'sdpa',
+  })
 
   // Brief gray flash after clicking
   useEffect(() => {
@@ -168,8 +216,14 @@ export function GenerateButton() {
       ? 'Choose H3 models'
       : missingH3Checkpoint
       ? 'Model unavailable'
+      : sage2Blocked
+      ? sage2Eligibility.code === 'checking'
+        ? 'Checking engine'
+        : sage2Eligibility.code === 'unavailable'
+          ? 'Engine unavailable'
+          : 'Change H3 setup'
       : w4a8RuntimeBlocked
-      ? w4a8Capability ? 'Model unavailable' : 'Checking model'
+      ? h3Acceleration ? 'Model unavailable' : 'Checking model'
       : legalBlocked
       ? h3LocationRequired ? 'Location needed' : 'License required'
       : needsModelTerms
@@ -191,8 +245,10 @@ export function GenerateButton() {
       ? h3SelectionError
       : missingH3Checkpoint
       ? 'The saved H3 checkpoint is no longer in the model catalog. Open the matching model group and choose an available checkpoint.'
+      : sage2Blocked
+      ? sage2Eligibility.reason || undefined
       : w4a8RuntimeBlocked
-      ? w4a8Capability?.reason || 'Checking whether this computer can run the selected W4A8 checkpoint.'
+      ? h3Acceleration?.w4a8.reason || 'Checking whether this computer can run the selected W4A8 checkpoint.'
       : legalBlocked
       ? h3LocationRequired
         ? 'Choose the country where this computer will actually run MiniMax H3. Maestro does not use IP or VPN location.'
@@ -221,6 +277,15 @@ export function GenerateButton() {
             <ListPlus size={13} />
           </button>
         </div>
+        {sage2PrimaryBlock && (
+          <button
+            type="button"
+            onClick={useDenseSdpa}
+            className="mobile-control-target rounded px-2 py-1 text-[10px] font-medium text-accent-blue hover:bg-accent-blue/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+          >
+            Use Dense SDPA
+          </button>
+        )}
         {isH3 && <H3EstimateBadge estimate={h3Estimate} loading={h3EstimateLoading} downloadRequired={h3DownloadRequired} />}
       </div>
     )

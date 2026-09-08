@@ -1991,7 +1991,8 @@ The controls-first audit identifies four concrete remaining compatibility paths:
   file iteration order. One shared helper also owns remaining media capacities.
 - SageAttention2++ must not appear usable when adaptive routing requires Ref2VA;
   coordinate the selector with the actual engine contract instead of silently
-  presenting a different effective engine. This remains a separate source slice.
+  presenting a different effective engine. The attention-selection slice below
+  closes this source gap.
 - Previously attached inputs must stay visible and removable when a model
   change makes them incompatible. Replace repeated explanations with concise
   actionable controls; retain the final submission checks.
@@ -2086,5 +2087,54 @@ controls. Do not expose or profile them merely because sidecars retain them.
 
 Continue the top-level editor/UI projection audit, including absent mask/target
 metadata and settings whose submitted value comes from UI state, before claiming
-whole-app restoration completeness. The SageAttention2++ selector/routing flow
-and the remaining app-wide interaction work above remain open.
+whole-app restoration completeness. The remaining app-wide interaction work
+above and rendered acceptance remain open.
+
+## Attention selection and submission (2026-09-08)
+
+Generate and Advanced use the same SageAttention2++ eligibility rule: the
+effective text/frame checkpoint must be Base H3 and no semantic-reference
+route may require Ref2VA. An incompatible saved selection remains visible,
+with an explicit Use Dense SDPA action that changes only the engine. The
+selector offers available combinations and removes unconditional warning
+paragraphs. Current image, video and audio references participate in the rule.
+
+Submission rechecks capability before uploads or queue creation and cancels
+if account, project, mode, settings or inputs change while that check is
+pending. The server preserves the requested engine during adaptive routing
+and rejects a Sage request if any trusted segment needs another checkpoint.
+Known incompatibility is checked before prompt enhancement; trusted-plan
+validation and admission precede CUDA benchmark setup. Intentional curated
+profile bundles, Sol operation fallback and the explicit Sage kernel's
+fail-closed behavior remain unchanged.
+
+Actual store regressions cover rejected routes, unavailable capability,
+unchanged-engine success and late input/context changes. Backend fake execution
+proves rejected requests do not reach prompt enhancement or CUDA setup.
+Obsolete frontend source-string assertions were removed in favor of the
+profile/output/attention store suites; preparation fixtures now admit the
+new early capability check while retaining their separate failure contracts.
+
+The complete CI-masked root run exercised 5,012 tests with 19 skips. It
+reported 12 old structural/fixture failures that reproduce on unchanged HEAD,
+plus one LLM unload-timing failure. That LLM test passed on unchanged HEAD and
+the complete 82-test LLM module subsequently passed; retain the intermittent
+full-suite timing failure as a reliability follow-up rather than a production
+fix or a claim of a single clean full-suite run. The baseline test repairs
+pass all 201 cases across their six full modules (two expected CUDA skips);
+the exact candidate hashes and closure results are retained with the main run.
+
+UI validation passes all 574 tests and the production build, with unchanged
+candidate hashes. Acceptance excludes the earlier unmasked Python invocations;
+their correction record and the replacement CI-masked run are retained with
+the isolated HEAD-based candidate under
+`.artifacts-temp/astra-attention-flow-20260907/`. Browser, Windows, live
+generation and human acceptance remain open.
+
+The next bounded restore audit found Inpaint metadata gaps: output sidecars
+retain the effective target but restoration does not populate the explicit
+SAM target; mask inversion is neither persisted in the sidecar nor restored
+to its UI owner. Fix those with restore/resubmit regressions and clear absent
+mask/target metadata so previous output state cannot leak into a new restore.
+SAM targets remain current-job content, outside reusable profiles. Reconcile
+cached-mask invalidation when inversion or other segmentation settings change.

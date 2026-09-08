@@ -166,6 +166,7 @@ function createStore() {
     audioSubMode: 'tts',
     openQueueAfterSubmit: true,
     durationSeconds: 5,
+    imageRefs: [],
     setParam() {},
     setOpenQueueAfterSubmit() {},
     setDurationSeconds() {},
@@ -296,8 +297,8 @@ function dispatchKey(document, key, shiftKey = false) {
   return event
 }
 
-function resetRuntime(open, refValues = []) {
-  globalThis.__advancedDrawerStateValues = [open]
+function resetRuntime(open, refValues = [], stateValues = []) {
+  globalThis.__advancedDrawerStateValues = [open, ...stateValues]
   globalThis.__advancedDrawerStateUpdates = []
   globalThis.__advancedDrawerCleanups = []
   globalThis.__advancedDrawerStore = createStore()
@@ -460,6 +461,47 @@ test('actual trigger, backdrop, X, and Escape callbacks close and restore trigge
     assert.equal(runtime.appRoot.hasAttribute('inert'), false, `${dismissal} restores background semantics`)
     assert.equal(runtime.document.activeElement, runtime.trigger, `${dismissal} restores trigger focus`)
   }
+})
+
+test('saved Sage2 stays selected but disabled for references and repairs only the engine', async () => {
+  const { AdvancedSettings } = await loadAdvancedSettings()
+  const acceleration = {
+    sage2: { available: true, validated: true, reason: 'Available on this computer.' },
+    sol_attn: { available: true },
+    w4a8: { available: true },
+  }
+  resetRuntime(false, [], [acceleration, null])
+  const changes = []
+  const store = globalThis.__advancedDrawerStore
+  store.params = {
+    ...store.params,
+    model_type: 'minimax_h3',
+    image_refs: ['restored-reference.png'],
+    custom_settings: { h3_attention_engine: 'sage2', h3_sol_tau: 1.7 },
+  }
+  store.modelOptions = { architecture: 'minimax_h3' }
+  store.setParam = (...args) => changes.push(args)
+
+  const tree = AdvancedSettings()
+  const elements = flattenElements(tree)
+  const engine = elements.find(element => element.type === 'select' && element.props.id === 'h3-attention-engine')
+  const sage = elements.find(element => element.type === 'option' && element.props.value === 'sage2')
+  const repair = elements.find(element => element.type === 'button' && elementText(element) === 'Use Dense SDPA')
+
+  assert.equal(engine?.props.value, 'sage2')
+  assert.equal(sage?.props.disabled, true)
+  assert.match(elementText(tree), /cannot run with reference media/)
+  assert.ok(repair)
+  repair.props.onClick()
+  assert.deepEqual(changes, [[
+    'custom_settings',
+    { h3_attention_engine: 'sdpa', h3_sol_tau: 1.7 },
+  ]])
+
+  const source = await readFile(componentUrl, 'utf8')
+  assert.doesNotMatch(source, /SageAttention2\+\+ is unavailable:/)
+  assert.doesNotMatch(source, /has only been tested with Base H3/)
+  assert.doesNotMatch(source, /not yet tested/)
 })
 
 test('saved profiles sit at the top of Generate and Advanced reuses them without a second fetch', async () => {

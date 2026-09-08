@@ -109,11 +109,85 @@ export function h3AdaptivePickerModelCompatible(
   return true
 }
 
-type H3ModelSelections = {
+export type H3ModelSelections = {
   model_type?: unknown
   h3_adaptive_conditioning?: unknown
   h3_adaptive_fl2va_model?: unknown
   h3_adaptive_ref2va_model?: unknown
+  image_refs?: unknown
+  video_guide?: unknown
+  video_guide2?: unknown
+  video_guide3?: unknown
+  audio_guide?: unknown
+  audio_guide2?: unknown
+  audio_guide3?: unknown
+  audio_prompt_type?: unknown
+}
+
+export type H3Sage2Eligibility = {
+  eligible: boolean
+  code: 'model' | 'references' | 'checking' | 'unavailable' | null
+  reason: string | null
+}
+
+export function h3SemanticRouteRequested(
+  params: H3ModelSelections,
+  localImageCount = 0,
+): boolean {
+  const imageRefs = Array.isArray(params.image_refs)
+    && params.image_refs.some(value => typeof value === 'string' && value.trim().length > 0)
+  const hasGuide = [
+    params.video_guide, params.video_guide2, params.video_guide3,
+    params.audio_guide, params.audio_guide2, params.audio_guide3,
+  ].some(value => typeof value === 'string' && value.trim().length > 0)
+  const audioPromptType = typeof params.audio_prompt_type === 'string'
+    ? params.audio_prompt_type : ''
+  return (Number.isInteger(localImageCount) && localImageCount > 0)
+    || imageRefs
+    || hasGuide
+    || [...audioPromptType].some(letter => 'ABCK'.includes(letter))
+}
+
+export function h3Sage2Eligibility(
+  params: H3ModelSelections,
+  hasSemanticReferences: boolean,
+  available: boolean | null | undefined,
+): H3Sage2Eligibility {
+  const effectiveFl2vaModel = h3AdaptivePairActive(
+    params.model_type,
+    params.h3_adaptive_conditioning,
+  )
+    ? defaultAdaptiveFl2vaModel(params.model_type, params.h3_adaptive_fl2va_model)
+    : (typeof params.model_type === 'string' ? params.model_type : '')
+  if (effectiveFl2vaModel !== H3_BASE_FL2VA_MODEL) {
+    return {
+      eligible: false,
+      code: 'model',
+      reason: 'SageAttention2++ requires Base H3 for text and frames. Choose Base H3 or Dense SDPA for this setup.',
+    }
+  }
+  if (hasSemanticReferences) {
+    return {
+      eligible: false,
+      code: 'references',
+      reason: 'SageAttention2++ cannot run with reference media. Remove the references or use Dense SDPA.',
+    }
+  }
+  if (available == null) {
+    return {
+      eligible: false,
+      code: 'checking',
+      reason: 'Checking whether SageAttention2++ is available on this computer.',
+    }
+  }
+  if (!available) {
+    return {
+      eligible: false,
+      code: 'unavailable',
+      reason: 'SageAttention2++ is unavailable on this computer.',
+    }
+  }
+  return { eligible: true, code: null, reason: null }
 }
 
 export function h3AdaptiveSelectionError(params: H3ModelSelections): string | null {

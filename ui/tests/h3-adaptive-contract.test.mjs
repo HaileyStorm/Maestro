@@ -49,6 +49,56 @@ test('pinned mode excludes saved adaptive selections', () => {
   assert.equal(h3.h3ArchitectureForModel([base]), null)
 })
 
+test('Sage2 eligibility follows the effective FL2VA model before checking local availability', () => {
+  const valid = [
+    { model_type: base },
+    { model_type: ref, h3_adaptive_fl2va_model: base },
+    { model_type: pink, h3_adaptive_fl2va_model: base },
+  ]
+  for (const params of valid) {
+    assert.deepEqual(h3.h3Sage2Eligibility(params, false, true), {
+      eligible: true, code: null, reason: null,
+    })
+  }
+
+  for (const model_type of [pink, quantized, ref, 'ltx_video']) {
+    const result = h3.h3Sage2Eligibility({ model_type, h3_adaptive_conditioning: false }, false, null)
+    assert.equal(result.code, 'model')
+  }
+  assert.equal(h3.h3Sage2Eligibility({ model_type: pink }, false, false).code, 'model')
+  assert.equal(h3.h3Sage2Eligibility({ model_type: base }, true, null).code, 'references')
+  assert.equal(h3.h3Sage2Eligibility({ model_type: base }, false, null).code, 'checking')
+  assert.equal(h3.h3Sage2Eligibility({ model_type: base }, false, false).code, 'unavailable')
+})
+
+test('semantic routing recognizes only valid image, guide, local-image, and ABCK inputs', () => {
+  const routes = [
+    { image_refs: ['image.png'] },
+    { video_guide: 'video.mp4' },
+    { video_guide2: 'video-2.mp4' },
+    { video_guide3: 'video-3.mp4' },
+    { audio_guide: 'audio.wav' },
+    { audio_guide2: 'audio-2.wav' },
+    { audio_guide3: 'audio-3.wav' },
+    ...[...'ABCK'].map(audio_prompt_type => ({ audio_prompt_type })),
+  ]
+  for (const params of routes) assert.equal(h3.h3SemanticRouteRequested(params), true)
+  assert.equal(h3.h3SemanticRouteRequested({}, 1), true)
+  for (const params of [
+    {},
+    { image_refs: [] },
+    { image_refs: ['', '  '] },
+    { image_refs: 'image.png' },
+    { video_guide: [] },
+    { audio_guide: {} },
+    { audio_prompt_type: 'NV2' },
+    { audio_prompt_type: ['A'] },
+  ]) assert.equal(h3.h3SemanticRouteRequested(params), false)
+  for (const count of [0, -1, 0.5, Number.NaN]) {
+    assert.equal(h3.h3SemanticRouteRequested({}, count), false)
+  }
+})
+
 test('selected unavailable choices stay visible only within their architecture', () => {
   const options = { allowed: new Set([base, pink, quantized]), selectedType: pink }
   assert.equal(h3.h3AdaptivePickerModelCompatible({ model_type: pink, execution_allowed: false }, options), true)

@@ -434,6 +434,8 @@ class TestJobLifecycleWiring(unittest.TestCase):
                     "params": {}, "out_dir": "synthetic", "before": set(),
                     "repeat_file_cursor": 0, "repeat_audio_cursor": 0,
                     "repeat_published_artifacts": set(), "repeat_final_files": set(),
+                    "repeat_mapping_settings": {}, "mapping_receipt": None,
+                    "task_sidecar_params": {},
                     "producer_artifact_roles": {}, "recovery_staging_dir": None,
                     "h3_delivery_request": delivery, "sample_worker": False,
                     "abort_state": None, "_active_gen_states": {},
