@@ -10727,20 +10727,39 @@ def _prepare_task_continuation(
                 out_dir,
                 f"_continuation_{task_no}.png",
             )
-        frame_img.save(cont_path)
+        try:
+            frame_img.save(cont_path)
+        except BaseException:
+            try:
+                os.remove(cont_path)
+            except OSError:
+                pass
+            raise
         if ref2va_boundary:
-            handoff = _attach_h3_ref2va_handoff(
-                next_params,
-                latest_video=latest_video,
-                last_frame_path=cont_path,
-                out_dir=out_dir,
-                task_no=task_no,
-                boundary_type=str(ref2va_boundary),
-                recovery_staging_dir=recovery_staging_dir,
-                recovery_output_prefix=(
-                    recovery_output_prefix or None
-                ),
-            )
+            try:
+                handoff = _attach_h3_ref2va_handoff(
+                    next_params,
+                    latest_video=latest_video,
+                    last_frame_path=cont_path,
+                    out_dir=out_dir,
+                    task_no=task_no,
+                    boundary_type=str(ref2va_boundary),
+                    recovery_staging_dir=recovery_staging_dir,
+                    recovery_output_prefix=(
+                        recovery_output_prefix or None
+                    ),
+                )
+            except BaseException:
+                try:
+                    os.remove(cont_path)
+                except OSError:
+                    pass
+                raise
+            if handoff.get("path") != cont_path:
+                try:
+                    os.remove(cont_path)
+                except OSError:
+                    pass
             next_params.pop("_ref2va_continuation", None)
             warning = handoff.get("warning")
             h3_continuation = {
@@ -15573,13 +15592,17 @@ def _attach_h3_ref2va_handoff(
                 "mode": "temporal_tail", "path": tail_path,
                 "boundary": boundary_type, "video_slot": slot,
             }
-        except Exception as error:
-            result["warning"] = str(error)
+        except BaseException as error:
             try:
                 os.remove(tail_path)
             except OSError:
                 pass
+            if not isinstance(error, Exception) or isinstance(error, InterruptedError):
+                raise
+            result["warning"] = "Video continuity could not be prepared."
     if result["mode"] == "prompt_only" and capacity["image"]:
+        if not last_frame_path:
+            raise QueueRecoveryRuntimeError("The continuation frame is missing.")
         refs = list(next_params.get("image_refs") or [])
         refs.append(last_frame_path)
         next_params["image_refs"] = refs
@@ -15590,7 +15613,6 @@ def _attach_h3_ref2va_handoff(
         result = {"mode": "semantic_still", "path": last_frame_path, "boundary": boundary_type}
         if warning:
             result["warning"] = warning
-    next_params["_h3_ref2va_handoff_result"] = result["mode"]
     return result
 
 
@@ -61592,6 +61614,8 @@ def _run_generation(
                                             params.get("_recovery_output_prefix") or ""
                                         ),
                                     )
+                                except InterruptedError:
+                                    raise
                                 except Exception as e:
                                     message = (
                                         "Failed to prepare the required last-frame "
@@ -62767,6 +62791,10 @@ def _run_generation(
                 )
             return success and job.get("status") == "completed"
 
+        except InterruptedError:
+            # Cancellation/preemption already has an authoritative lifecycle
+            # owner. Do not relabel it as a generation failure or retry it.
+            return False
         except Exception as e:
             traceback.print_exc()
             failure_updates = _safe_failure_updates(e, job)

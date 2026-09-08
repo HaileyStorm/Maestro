@@ -1840,3 +1840,25 @@ overlays were discarded after review: they could lose supplied references and
 override manual checkpoint choices. Semantic runs and explicit selections stay
 intact. Related WIP tests were aligned with those retained contracts, including
 metadata-only `explicit_output`; none may silently choose PinkCherry.
+
+
+## H3 handoff lifecycle closure (2026-09-07)
+
+Fresh and recovered H3 handoffs now produce the same complete task parameters.
+The unused fresh-only result marker and unsupported pending `user_semantic_refs`
+mode are removed. Existing selected references remain present; when capacity
+permits, the previous shot still is appended through the supported semantic-still
+mode. Full reference capacity retains the supported prompt-only mode.
+
+Cancellation/preemption bypasses ordinary continuity fallback and generation
+retry/failure handling. Private partial tails and companion stills are cleaned
+when preparation aborts; unused successful companion stills are also removed.
+Ordinary tail failures retain the supported still fallback with bounded public
+copy. Missing continuation stills fail before reference mutation.
+
+The six-module applicable CPU gate passed 316 tests, including nine lifecycle
+regressions exercising extracted production helpers, actual caller exception
+handlers, and private staging. Evidence is retained in
+`.artifacts-temp/astra-h3-handoff-closure-20260907/evidence/`. This is CPU/static
+and synthetic caller evidence, not live worker, GPU, browser, or Windows
+acceptance. Other existing WIP remains outside this milestone.
