@@ -54117,6 +54117,8 @@ async def inpaint_endpoint(request: Request):
         # Track restore-able fields for the UI.
         "edit_video_path": video_path,
         "edit_target": intent.get("target"),
+        "edit_sam_target": explicit_sam_target,
+        "edit_invert_mask": bool(body.get("invert_mask")),
         "edit_start_time": start_time,
         "edit_end_time": end_time if end_time > 0 else (total_frames / fps if fps else 0),
     }

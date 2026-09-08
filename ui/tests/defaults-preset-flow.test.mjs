@@ -864,3 +864,39 @@ test('legacy profiles retain settings they never recorded and keep current media
     assert.equal(current.params.num_inference_steps, 20)
   })
 })
+
+
+test('profiles invalidate derived Inpaint masks only when segmentation settings change', async () => {
+  for (const changed of ['none', 'editInvertMask', 'editStartTime', 'editEndTime', 'resolution']) {
+    await withFreshStore(async (input, init) => {
+      const url = String(input)
+      if (url.includes('/api/v1/presets?') && init?.method === 'POST') {
+        return jsonResponse({ ...JSON.parse(init.body), created_at: 1 })
+      }
+      if (url.includes('/api/v1/model-options/')) return jsonResponse(h3ModelOptions('minimax_h3'))
+      if (url.includes('/api/v1/loras/')) return jsonResponse({ loras: [], guidance_max_phases: 1 })
+      throw new Error(`Unexpected mask-profile request: ${url}`)
+    }, async useStore => {
+      useStore.setState(state => ({
+        activeWorkspace: 'mask-project', generationMode: 'video',
+        editInvertMask: false, editStartTime: 0, editEndTime: 5,
+        params: { ...state.params, model_type: 'minimax_h3', resolution: '1344x768' },
+      }))
+      await useStore.getState().savePreset('Mask settings')
+      const profile = useStore.getState().presets[0]
+      useStore.setState(state => ({
+        editSamTarget: 'current job target',
+        ...(changed === 'resolution' ? { params: { ...state.params, resolution: '960x544' } }
+          : changed === 'none' ? {} : { [changed]: changed === 'editInvertMask' ? true : 2 }),
+      }))
+      useStore.setState({ editMasksPath: '/outputs/current-mask.npy', editMaskPreview: 'current-preview', editDetectedTarget: 'detected target' })
+      assert.equal(await useStore.getState().loadPreset(profile), true)
+      const restored = useStore.getState()
+      assert.equal(restored.editSamTarget, 'current job target', changed)
+      assert.equal(restored.editMasksPath, changed === 'none' ? '/outputs/current-mask.npy' : null, changed)
+      assert.equal(restored.editMaskPreview, changed === 'none' ? 'current-preview' : null, changed)
+      assert.equal(restored.editDetectedTarget, changed === 'none' ? 'detected target' : '', changed)
+      assert.equal(restored.editInvertMask, false)
+    })
+  }
+})

@@ -18,12 +18,15 @@ export function InpaintControls() {
   const clearEditVideo = useStore(s => s.clearEditVideo)
 
   const samTarget = useStore(s => s.editSamTarget)
+  const invertMask = useStore(s => s.editInvertMask)
   const setSamTarget = (v: string) => useStore.setState({ editSamTarget: v })
+  const previewInpaintMask = useStore(s => s.previewInpaintMask)
   const retakeStrength = useStore(s => s.editRetakeStrength)
   const setRetakeStrength = (v: number) => useStore.setState({ editRetakeStrength: v })
   const promptStrength = useStore(s => s.editPromptStrength)
   const setPromptStrength = (v: number) => useStore.setState({ editPromptStrength: v })
   const [previewing, setPreviewing] = useState(false)
+  const previewSequence = useRef(0)
   const [error, setError] = useState<string | null>(null)
   // Richer SAM status state — 'not_installed' is distinct from generic
   // 'unavailable' because the user-action is different (run the
@@ -94,26 +97,16 @@ export function InpaintControls() {
   // Preview Mask: single-frame only (fast, for visual feedback)
   const handlePreviewMask = async () => {
     if (!editVideoPath || !samTarget.trim()) return
+    const sequence = ++previewSequence.current
     setPreviewing(true)
     setError(null)
     try {
-      const result = await api.segmentPreview({
-        video_path: editVideoPath,
-        text: samTarget.trim(),
-        start_time: editStartTime,
-        end_time: editEndTime,
-        full_video: false,
-        invert_mask: useStore.getState().editInvertMask,
-      })
-      useStore.setState({
-        editMaskPreview: result.mask_preview,
-        editDetectedTarget: result.target || samTarget.trim(),
-      })
-      setShowingMask(true)
+      const applied = await previewInpaintMask()
+      if (sequence === previewSequence.current && applied) setShowingMask(true)
     } catch (e) {
-      setError((e as Error).message)
+      if (sequence === previewSequence.current) setError((e as Error).message)
     } finally {
-      setPreviewing(false)
+      if (sequence === previewSequence.current) setPreviewing(false)
     }
   }
 
@@ -224,8 +217,8 @@ export function InpaintControls() {
         />
         <label className="flex items-center gap-2 mt-1.5 cursor-pointer">
           <input type="checkbox"
-            checked={useStore.getState().editInvertMask}
-            onChange={e => useStore.setState({ editInvertMask: e.target.checked, editMasksPath: null, editMaskPreview: null })}
+            checked={invertMask}
+            onChange={e => useStore.setState({ editInvertMask: e.target.checked })}
             className="w-3 h-3 rounded border-border accent-accent-blue" />
           <span className="text-[10px] text-text-secondary">Invert mask</span>
           <span className="text-[9px] text-text-muted ml-auto">Edit everything except selection</span>

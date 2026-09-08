@@ -2138,3 +2138,45 @@ to its UI owner. Fix those with restore/resubmit regressions and clear absent
 mask/target metadata so previous output state cannot leak into a new restore.
 SAM targets remain current-job content, outside reusable profiles. Reconcile
 cached-mask invalidation when inversion or other segmentation settings change.
+
+
+## Inpaint selection and mask continuity (2026-09-08)
+
+Inpaint sidecars retain the explicit SAM selection, including an empty
+selection, separately from the effective detected target. They also retain
+mask inversion. Output restoration repopulates these controls, uses the
+historical detected target only when explicit-selection metadata is absent,
+and clears old mask paths, previews and target labels when metadata is absent.
+Retake and Inpaint restore the prompt-strength slider that their requests
+actually submit; zero guidance remains explicit.
+
+One store rule invalidates derived masks when the source, range, target,
+inversion, canvas or account/project scope changes. It covers direct controls,
+resolution/aspect selectors, mode/profile restoration and source replacement;
+unrelated strength edits preserve the mask. Replacing a source invalidates
+pending previews even when its path is unchanged. Output restoration publishes
+its input state before its saved mask metadata so this rule preserves the
+newly restored mask. The inversion checkbox subscribes to its state owner.
+
+Mask previews now publish through a store operation fenced by request sequence,
+account epoch, restore generation, mode and the exact segmentation inputs.
+Late responses, including changes away and back, cannot replace a newer
+preview or restored selection. The component separately fences its local
+busy/error/display state. The old component publication and profile-only
+cache invalidation were removed.
+
+The isolated candidate passes all 581 UI tests, the production build and scoped
+lint. Actual endpoint fake execution passes all four explicit-target/inversion
+combinations with CUDA masked and SAM/model/worker calls forbidden. Focused
+store tests exercise restore/resubmit, missing metadata, direct input changes,
+profile changes, newer previews, restoration races and same-path replacement.
+Independent review has no remaining findings; account-epoch and component-local
+sequence behavior have static review in addition to the surrounding shared
+identity tests. Exact source hashes and receipts are under
+`.artifacts-temp/astra-inpaint-restore-20260908/`.
+
+This is source, synthetic execution and build evidence. Browser, live generation,
+Windows and human acceptance remain open. Continue the broader app interaction
+and copy audit; these two source milestones do not establish whole-app rendered
+acceptance. The intermittent full-suite LLM timing failure above remains a
+separate reliability follow-up.

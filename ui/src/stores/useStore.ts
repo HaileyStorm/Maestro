@@ -2889,6 +2889,7 @@ interface AppState {
   editMasksPath: string | null  // cached SAM mask for inpaint
   editMaskPreview: string | null
   editDetectedTarget: string
+  previewInpaintMask: () => Promise<boolean>
   // Continue video state
   continueVideo: File | null
   continueVideoPath: string
@@ -4030,6 +4031,7 @@ let _foCachedResult: OutputFile[] = []
 let _outputsRequestGeneration = 0
 let _metadataRequestGeneration = 0
 let _settingsRestoreGeneration = 0
+let _inpaintPreviewSequence = 0
 let _outputsPaginationActive = false
 
 function computeFilteredOutputs(outputs: OutputFile[], mediaFilter: MediaFilter): OutputFile[] {
@@ -4236,6 +4238,18 @@ function _terminalJobsForAccount(
     return { jobs: [], isGenerating: false }
   }
   return {}
+}
+
+function _inpaintMaskInputsMatch(left: AppState, right: AppState): boolean {
+  return left.activeWorkspace === right.activeWorkspace
+    && _accountIdentity(left.accountContext ?? left.accessContext?.accounts)
+      === _accountIdentity(right.accountContext ?? right.accessContext?.accounts)
+    && left.editVideoPath === right.editVideoPath
+    && left.editStartTime === right.editStartTime
+    && left.editEndTime === right.editEndTime
+    && left.editSamTarget === right.editSamTarget
+    && left.editInvertMask === right.editInvertMask
+    && left.params.resolution === right.params.resolution
 }
 
 function _enhanceAccountFingerprint(
@@ -5532,6 +5546,39 @@ export const useStore = create<AppState>((set, get) => ({
   editMasksPath: null,
   editMaskPreview: null,
   editDetectedTarget: '',
+  previewInpaintMask: async () => {
+    const submitted = get()
+    if (!submitted.editVideoPath || !submitted.editSamTarget.trim()) return false
+    const sequence = ++_inpaintPreviewSequence
+    const accountEpoch = _accountIdentityEpoch
+    const restoreGeneration = _settingsRestoreGeneration
+    const current = () => {
+      const live = get()
+      return sequence === _inpaintPreviewSequence
+        && accountEpoch === _accountIdentityEpoch
+        && restoreGeneration === _settingsRestoreGeneration
+        && live.generationMode === submitted.generationMode
+        && live.editSubMode === submitted.editSubMode
+        && _inpaintMaskInputsMatch(live, submitted)
+    }
+    try {
+      const result = await api.segmentPreview({
+        video_path: submitted.editVideoPath,
+        text: submitted.editSamTarget.trim(),
+        start_time: submitted.editStartTime,
+        end_time: submitted.editEndTime,
+        full_video: false,
+        invert_mask: submitted.editInvertMask,
+      })
+      if (!current()) return false
+      set({ editMaskPreview: result.mask_preview,
+        editDetectedTarget: result.target || submitted.editSamTarget.trim() })
+      return true
+    } catch (error) {
+      if (!current()) return false
+      throw error
+    }
+  },
   continueVideo: null,
   continueVideoPath: '',
   continueVideoUrl: '',
@@ -5615,12 +5662,19 @@ export const useStore = create<AppState>((set, get) => ({
   setOutpaintWindowSize: (v) => set({ outpaintWindowSize: v }),
   outpaintWindowOverlap: 9,  // LTX-2 default
   setOutpaintWindowOverlap: (v) => set({ outpaintWindowOverlap: v }),
-  setEditVideoPath: (path) => set({ editVideoPath: path }),
-  setEditVideo: (file, path, url, duration, resolution) => set({
-    editVideoFile: file, editVideoPath: path, editVideoUrl: url,
-    editVideoDuration: duration, editVideoResolution: resolution,
-    editEndTime: duration,
-  }),
+  setEditVideoPath: (path) => {
+    ++_inpaintPreviewSequence
+    set({ editVideoPath: path, editMasksPath: null, editMaskPreview: null, editDetectedTarget: '' })
+  },
+  setEditVideo: (file, path, url, duration, resolution) => {
+    ++_inpaintPreviewSequence
+    set({
+      editVideoFile: file, editVideoPath: path, editVideoUrl: url,
+      editVideoDuration: duration, editVideoResolution: resolution,
+      editEndTime: duration,
+      editMasksPath: null, editMaskPreview: null, editDetectedTarget: '',
+    })
+  },
   clearEditVideo: () => set({
     editVideoFile: null, editVideoPath: '', editVideoUrl: '',
     editVideoDuration: 0, editVideoResolution: '', editStartTime: 0, editEndTime: 5,
@@ -8547,8 +8601,8 @@ export const useStore = create<AppState>((set, get) => ({
           result = await api.submitInpaint({
             video_path: state.editVideoPath,
             description: prompt,
-            sam_target: state.editSamTarget || undefined,
-            invert_mask: state.editInvertMask || undefined,
+            sam_target: state.editSamTarget,
+            invert_mask: state.editInvertMask,
             start_time: state.editStartTime,
             end_time: state.editEndTime,
             model_type: state.params.model_type as string,
@@ -16069,7 +16123,7 @@ export const useStore = create<AppState>((set, get) => ({
       'continueVideoPath', 'blendClipAPath', 'blendClipBPath', 'editVideoFile',
       'editVideoPath', 'editVideoUrl', 'editVideoDuration', 'editRepaintFrameFile',
       'editRepaintFramePath', 'editRepaintFrameUrl', 'editRepaintMappings', 'editDetectedTarget',
-      'editMasksPath', 'editRecastMappings', 'editRecastRefFile', 'editRecastRefPath',
+      'editSamTarget', 'editMaskPreview', 'editMasksPath', 'editRecastMappings', 'editRecastRefFile', 'editRecastRefPath',
       'editRecastRefUrl', 'editRecastRefAligned', 'editRecastTarget', 'editRecastPersonCount',
       'editRecastIsolateReference', 'editRecastAutoFaceDetail', 'editRecastEnhancePrompt', 'editRecastProtectBystanders',
       'editRecastPreserveBystanders', 'musicDescription', 'audioGuideFilename', 'audioGuide2Filename',
@@ -16735,6 +16789,10 @@ export const useStore = create<AppState>((set, get) => ({
     // generationMode from the model family, so we override here when the
     // sidecar tag is authoritative.
     const editSubMode = (p.edit_sub_mode as string) || ''
+    set({
+      editSamTarget: '', editInvertMask: false, editDetectedTarget: '',
+      editMasksPath: null, editMaskPreview: null,
+    })
     if (editSubMode) {
       set({
         generationMode: 'avatar',
@@ -16794,9 +16852,20 @@ export const useStore = create<AppState>((set, get) => ({
         if (p.retake_engine) set({ editRetakeEngine: p.retake_engine as 'native' | 'legacy' })
         if (p.regenerate_audio != null) set({ editRegenerateAudio: !!p.regenerate_audio })
       }
+      if (editSubMode === 'retake' || editSubMode === 'inpaint') {
+        set({ editPromptStrength: typeof p.guidance_scale === 'number' && Number.isFinite(p.guidance_scale)
+          ? p.guidance_scale : useStore.getInitialState().editPromptStrength })
+      }
       if (editSubMode === 'inpaint') {
-        if (p.edit_target) set({ editDetectedTarget: p.edit_target as string })
-        if (p.retake_masks_path) set({ editMasksPath: p.retake_masks_path as string })
+        set({
+          editSamTarget: typeof p.edit_sam_target === 'string' ? p.edit_sam_target
+            : typeof p.edit_target === 'string' ? p.edit_target : '',
+          editInvertMask: typeof p.edit_invert_mask === 'boolean' ? p.edit_invert_mask : p.invert_mask === true,
+        })
+        set({
+          editDetectedTarget: typeof p.edit_target === 'string' ? p.edit_target : '',
+          editMasksPath: typeof p.retake_masks_path === 'string' && p.retake_masks_path ? p.retake_masks_path : null,
+        })
       }
       if (editSubMode === 'edit_anything') {
         if (p.edit_anything_lora_strength != null) {
@@ -17689,5 +17758,14 @@ useStore.subscribe(state => {
 useStore.subscribe((state, previous) => {
   if (state.jobs !== previous.jobs && _pendingTerminalJobs === null) {
     persistTerminalJobs(state.jobs, terminalJobScope(state.accountContext))
+  }
+})
+
+
+useStore.subscribe((state, previous) => {
+  if (_inpaintMaskInputsMatch(state, previous)) return
+  ++_inpaintPreviewSequence
+  if (state.editMasksPath !== null || state.editMaskPreview !== null || state.editDetectedTarget !== '') {
+    useStore.setState({ editMasksPath: null, editMaskPreview: null, editDetectedTarget: '' })
   }
 })

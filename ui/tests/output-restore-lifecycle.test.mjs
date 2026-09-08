@@ -808,3 +808,172 @@ test('H3 estimate matches and fallback suggestions keep restored settings exact 
     }, { h3Estimate: estimate })
   }
 })
+
+
+test('Inpaint output restores and resubmits explicit target, inversion and prompt strength', async () => {
+  for (const explicitTarget of ['', 'sky']) {
+    for (const invert of [false, true]) {
+      await withStore(async ({ fetchOverrides, useStore }) => {
+        const entry = { name: 'inpaint.mp4', meta: sidecar(baseParams({
+          edit_sub_mode: 'inpaint', edit_video_path: '/outputs/source.mp4',
+          edit_target: 'detected sky', edit_sam_target: explicitTarget,
+          edit_invert_mask: invert, retake_masks_path: '/outputs/mask.npy',
+          guidance_scale: 2.25,
+        })) }
+        configureGallery(useStore, [entry])
+        useStore.setState({ editSamTarget: 'old target', editInvertMask: !invert,
+          editPromptStrength: 6, editMaskPreview: 'old-preview' })
+        assert.equal(await useStore.getState().loadSettingsFromOutput(), true)
+        const restored = useStore.getState()
+        assert.equal(restored.editSamTarget, explicitTarget)
+        assert.equal(restored.editDetectedTarget, 'detected sky')
+        assert.equal(restored.editInvertMask, invert)
+        assert.equal(restored.editMasksPath, '/outputs/mask.npy')
+        assert.equal(restored.editMaskPreview, null)
+        assert.equal(restored.editPromptStrength, 2.25)
+        let submitted
+        fetchOverrides.set('/api/v1/inpaint', async (_url, init) => {
+          submitted = JSON.parse(init.body)
+          return Response.json({ job_id: 'synthetic-inpaint', status: 'queued' })
+        })
+        useStore.setState({ _pollRecoveredJob: () => {} })
+        await useStore.getState().startGeneration()
+        assert.ok(submitted, 'restored Inpaint request was submitted')
+        assert.equal(submitted.sam_target, explicitTarget)
+        assert.equal(submitted.invert_mask, invert)
+        assert.equal(submitted.guidance_scale, 2.25)
+        assert.equal(submitted.masks_path, '/outputs/mask.npy')
+      })
+    }
+  }
+})
+
+test('legacy Inpaint target is retained and absent mask metadata clears previous output state', async () => {
+  await withStore(async ({ useStore }) => {
+    const entries = [
+      { name: 'legacy.mp4', meta: sidecar(baseParams({ edit_sub_mode: 'inpaint', edit_target: 'sky' })) },
+      { name: 'empty-inpaint.mp4', meta: sidecar(baseParams({ edit_sub_mode: 'inpaint' })) },
+      { name: 'ordinary.mp4', meta: sidecar(baseParams()) },
+    ]
+    for (let i = 0; i < entries.length; i += 1) {
+      configureGallery(useStore, entries, i)
+      useStore.setState({ editSamTarget: 'old target', editInvertMask: true })
+      useStore.setState({ editDetectedTarget: 'old detected', editMasksPath: '/outputs/old.npy', editMaskPreview: 'old-preview' })
+      assert.equal(await useStore.getState().loadSettingsFromOutput(), true)
+      const state = useStore.getState()
+      assert.equal(state.editSamTarget, i === 0 ? 'sky' : '')
+      assert.equal(state.editDetectedTarget, i === 0 ? 'sky' : '')
+      assert.equal(state.editInvertMask, false)
+      assert.equal(state.editMasksPath, null)
+      assert.equal(state.editMaskPreview, null)
+    }
+  })
+})
+
+test('editing the Inpaint target while output options load cancels restoration', async () => {
+  await withStore(async ({ fetchOverrides, useStore }) => {
+    configureGallery(useStore, [{ name: 'inpaint.mp4', meta: sidecar(baseParams({
+      edit_sub_mode: 'inpaint', edit_sam_target: 'saved sky',
+    })) }])
+    const options = delayedResponse(fetchOverrides, '/api/v1/model-options/ltx2_25',
+      () => Response.json(modelOptions('ltx2_25')))
+    const restore = useStore.getState().loadSettingsFromOutput()
+    await options.requested
+    useStore.setState({ editSamTarget: 'new selection' })
+    options.release()
+    assert.equal(await restore, false)
+    assert.equal(useStore.getState().editSamTarget, 'new selection')
+    assert.equal(useStore.getState().params.prompt, 'current unsaved prompt')
+  })
+})
+
+
+test('Retake restores the prompt-strength control that its request submits', async () => {
+  for (const guidance of [0, 4.5]) {
+    await withStore(async ({ fetchOverrides, useStore }) => {
+      configureGallery(useStore, [{ name: 'retake.mp4', meta: sidecar(baseParams({
+        edit_sub_mode: 'retake', edit_video_path: '/outputs/source.mp4', guidance_scale: guidance,
+      })) }])
+      useStore.setState({ editPromptStrength: 6 })
+      assert.equal(await useStore.getState().loadSettingsFromOutput(), true)
+      assert.equal(useStore.getState().editPromptStrength, guidance)
+      let submitted
+      fetchOverrides.set('/api/v1/retake', async (_url, init) => {
+        submitted = JSON.parse(init.body)
+        return Response.json({ job_id: 'synthetic-retake', status: 'queued' })
+      })
+      useStore.setState({ _pollRecoveredJob: () => {} })
+      await useStore.getState().startGeneration()
+      assert.ok(submitted)
+      assert.equal(submitted.guidance_scale, guidance)
+    })
+  }
+})
+
+
+test('every segmentation input invalidates cached masks while unrelated edits retain them', async () => {
+  const mutations = [
+    ['target', store => store.setState({ editSamTarget: 'tree' })],
+    ['inversion', store => store.setState({ editInvertMask: true })],
+    ['start', store => store.setState({ editStartTime: 1 })],
+    ['end', store => store.setState({ editEndTime: 3 })],
+    ['path', store => store.getState().setEditVideoPath('/outputs/other.mp4')],
+    ['source upload', store => store.getState().setEditVideo(new File(['new'], 'source.mp4'), '/outputs/source.mp4', 'blob:new', 5, '1280x720')],
+    ['resolution', store => store.getState().setParam('resolution', '640x480')],
+    ['resolution preset', store => store.getState().setResolutionPreset('480p')],
+    ['aspect ratio', store => store.getState().setAspectRatio('1:1')],
+    ['project', store => store.setState({ activeWorkspace: 'other' })],
+  ]
+  for (const [label, mutate] of mutations) {
+    await withStore(async ({ useStore }) => {
+      useStore.setState(state => ({ activeWorkspace: 'default', generationMode: 'avatar', editSubMode: 'inpaint',
+        editVideoPath: '/outputs/source.mp4', editSamTarget: 'sky', editInvertMask: false,
+        editStartTime: 0, editEndTime: 5, params: { ...state.params, resolution: '1280x720' } }))
+      useStore.setState({ editMasksPath: '/outputs/mask.npy', editMaskPreview: 'preview', editDetectedTarget: 'sky' })
+      useStore.getState().setParam('guidance_scale', 4)
+      assert.equal(useStore.getState().editMasksPath, '/outputs/mask.npy')
+      mutate(useStore)
+      assert.equal(useStore.getState().editMasksPath, null, label)
+      assert.equal(useStore.getState().editMaskPreview, null, label)
+      assert.equal(useStore.getState().editDetectedTarget, '', label)
+    })
+  }
+})
+
+test('mask previews ignore newer requests, selection changes and output restoration', async () => {
+  for (const change of ['target', 'invert', 'range', 'source', 'resolution', 'project', 'restore', 'newer-preview', 'target-away-and-back', 'same-path-upload']) {
+    await withStore(async ({ fetchOverrides, useStore }) => {
+      configureGallery(useStore, [{ name: 'inpaint.mp4', meta: sidecar(baseParams({
+        edit_sub_mode: 'inpaint', edit_video_path: '/outputs/restored.mp4',
+        edit_sam_target: 'saved target', edit_target: 'saved detected', retake_masks_path: '/outputs/saved.npy',
+      })) }])
+      useStore.setState({ generationMode: 'avatar', editSubMode: 'inpaint', editVideoPath: '/outputs/source.mp4',
+        editSamTarget: 'sky', editStartTime: 0, editEndTime: 5, editInvertMask: false })
+      const response = deferred()
+      fetchOverrides.set('/api/v1/segment/preview', async () => response.promise)
+      const pending = useStore.getState().previewInpaintMask()
+      await waitFor(() => useStore.getState().editMaskPreview === null, 'preview begins')
+      if (change === 'target') useStore.setState({ editSamTarget: 'tree' })
+      if (change === 'invert') useStore.setState({ editInvertMask: true })
+      if (change === 'range') useStore.setState({ editEndTime: 3 })
+      if (change === 'source') useStore.getState().setEditVideoPath('/outputs/new.mp4')
+      if (change === 'same-path-upload') useStore.getState().setEditVideo(new File(['replacement'], 'source.mp4'), '/outputs/source.mp4', 'blob:new', 5, '1280x720')
+      if (change === 'resolution') useStore.getState().setParam('resolution', '640x480')
+      if (change === 'project') useStore.setState({ activeWorkspace: 'other' })
+      if (change === 'target-away-and-back') {
+        useStore.setState({ editSamTarget: 'tree' })
+        useStore.setState({ editSamTarget: 'sky' })
+      }
+      if (change === 'restore') assert.equal(await useStore.getState().loadSettingsFromOutput(), true)
+      if (change === 'newer-preview') {
+        fetchOverrides.set('/api/v1/segment/preview', async () => Response.json({ mask_preview: 'new-preview', target: 'new detected' }))
+        assert.equal(await useStore.getState().previewInpaintMask(), true)
+      }
+      const expected = { preview: useStore.getState().editMaskPreview, target: useStore.getState().editDetectedTarget }
+      response.resolve(Response.json({ mask_preview: 'stale-preview', target: 'stale detected' }))
+      assert.equal(await pending, false, change)
+      assert.equal(useStore.getState().editMaskPreview, expected.preview, change)
+      assert.equal(useStore.getState().editDetectedTarget, expected.target, change)
+    })
+  }
+})
