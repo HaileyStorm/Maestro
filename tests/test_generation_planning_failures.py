@@ -298,6 +298,27 @@ class GenerationPlanningFailureTests(unittest.TestCase):
             ),
             "Generation planning failed",
         )
+        from services.h3_shot_planner import _H3_TIMESTAMP_OUTSIDE_DURATION
+        self.assertLessEqual(len(_H3_TIMESTAMP_OUTSIDE_DURATION), 240)
+        self.assertNotIn("\n", _H3_TIMESTAMP_OUTSIDE_DURATION)
+        self.assertEqual(
+            public_planning_failure_message(
+                ValueError(_H3_TIMESTAMP_OUTSIDE_DURATION),
+                fallback="Generation planning failed",
+            ),
+            _H3_TIMESTAMP_OUTSIDE_DURATION,
+        )
+        dasiwa_message = (
+            "Dasiwa cannot be stacked with another LoRA or accelerator"
+        )
+        from services.h3_dasiwa import H3ExperimentCompatibilityError
+        self.assertEqual(
+            public_planning_failure_message(
+                H3ExperimentCompatibilityError(dasiwa_message),
+                fallback="Generation planning failed",
+            ),
+            dasiwa_message,
+        )
 
         reason, event = planning_failure_event(
             HostileStatus(private_marker), phase="untrusted-phase",

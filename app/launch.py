@@ -30995,6 +30995,7 @@ async def llm_load(request: Request):
     """Load the LLM model."""
     from services import llm_service
     from services.llm_operations import run_blocking_shielded
+    from services.public_failure_copy import public_llm_preparation_failure_message
     body = {}
     if request.headers.get("content-type", "").startswith("application/json"):
         body = await request.json()
@@ -31031,7 +31032,7 @@ async def llm_load(request: Request):
         traceback.print_exc()
         raise HTTPException(
             status_code=500,
-            detail="LLM preparation failed; check the local Maestro logs",
+            detail=public_llm_preparation_failure_message(error),
         ) from error
 
 

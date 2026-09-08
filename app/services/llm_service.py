@@ -26,6 +26,7 @@ from services.llm_cancellation import (
     LlmRequestCancelled,
 )
 from services.text_integrity import repair_text
+from services.public_failure_copy import LLM_PREPARATION_FAILURE_DETAILS
 from services.llm_response_assist import (
     PrefixEchoStripper,
     RequestProgress,
@@ -3992,8 +3993,7 @@ def load_model(
                 gguf_path = _download_gguf(repo_id, gguf_file, cache_dir)
             except Exception:
                 raise RuntimeError(
-                    "The selected chat model could not be downloaded. "
-                    "Retry from this computer."
+                    LLM_PREPARATION_FAILURE_DETAILS["download"]
                 ) from None
             gguf_path = os.path.normpath(gguf_path)
 
@@ -4024,9 +4024,7 @@ def load_model(
             except Exception:
                 if registered_model:
                     raise RuntimeError(
-                        "This vision chat model needs its image projector "
-                        "before it can load. Retry the download from this "
-                        "computer."
+                        LLM_PREPARATION_FAILURE_DETAILS["projector"]
                     ) from None
                 print("[LLM] No mmproj available for this unregistered model (vision disabled)")
         else:

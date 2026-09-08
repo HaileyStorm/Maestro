@@ -1,5 +1,29 @@
 # Astra continuation handoff — 2026-09-06
 
+## Current continuation pointer — 2026-09-08
+
+Use the later dated closure sections to interpret older intake and next-action
+notes. The seven queue failures in the historical "Next work, in order" list
+have been superseded by subsequent fixes and the complete 5,012-test CPU run.
+That run's remaining baseline assertions/fixtures were repaired in six full
+modules (201 cases, two skips). Its intermittent LLM timing assertion now has
+a deterministic lease-ordering regression and an 82-test module pass. Do not
+rerun the old failure list as if it were still the current backlog.
+
+Current safe work is the broader app interaction/copy audit and review of the
+remaining inventoried WIP: H3 executable-plan startup handling and related
+Studio tests, the unused adaptive-Ref2VA helper, preserved test reordering and
+queue assertions, and the untracked storage-janitor source/tests. Inspect each
+against the committed implementation before adopting, replacing or retiring it;
+keep storage mutation disabled pending its separate ownership/acceptance gates.
+
+Profiles, mode continuity, output restore, H3 attention selection and Inpaint
+mask/preview continuity have source/test closures below. Their browser/live
+acceptance remains separate. The pending browser scratch-filesystem question
+has not been answered; preserve the E2E runner's cross-filesystem contract.
+Launcher/restart, account/credit activation, provider and GPU boundaries remain
+as stated in the owner updates and authorization sections below.
+
 ## Current GPU authorization — owner update, 2026-09-06
 
 The owner explicitly authorized GPU work subject to coordinator grants and
@@ -2205,3 +2229,28 @@ also passes independently of the collector's behavior. Independent review's
 remaining inner-timeout finding is removed and the module/probes are rerun.
 No production runtime code changed. Source, preserved WIP, controlled failure
 and closure receipts are under `.artifacts-temp/astra-llm-lease-test-20260908/`.
+
+
+## Closed LLM preparation error copy (2026-09-08)
+
+Model download and image-support failures now use one immutable copy mapping
+shared by the loader and the public load endpoint. The messages tell the user
+to try loading the model again. Only an exact built-in RuntimeError carrying
+one exact reviewed string receives this specific copy. Unexpected errors,
+subclasses, structured arguments and messages with appended data use the fixed
+preparation fallback; the public projection never stringifies exceptions.
+
+The unadopted prefix-forwarding draft was replaced and its preimage retained.
+Existing local-control admission, authorized-operation routing, success shape,
+HTTP 500 behavior and cancellation boundaries are preserved. Actual extracted
+endpoint tests cover failure and success, while adversarial cases verify that
+provider/request details cannot be appended to public messages. The existing loader failure/retry tests also check the exact messages against
+the same canonical mapping. Existing timestamp
+and Dasiwa public-error regression cases were also verified and adopted.
+
+The six applicable LLM/failure modules pass 175 tests under the shared CPU-only
+environment. Independent review has no findings. Exact source hashes, the
+isolated candidate, preserved unrelated WIP and receipts are under
+`.artifacts-temp/astra-llm-load-errors-20260908/`. This is source and synthetic
+execution evidence; no live model, provider, server restart or browser action
+was performed.

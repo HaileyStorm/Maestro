@@ -3275,8 +3275,9 @@ class LlmRuntimeTests(unittest.TestCase):
         ), mock.patch.object(
             llm_service.threading, "Timer", _RecordingTimer,
         ):
-            with self.assertRaisesRegex(RuntimeError, "could not be downloaded") as raised:
+            with self.assertRaises(RuntimeError) as raised:
                 llm_service.load_model(repo)
+            self.assertEqual(str(raised.exception), llm_service.LLM_PREPARATION_FAILURE_DETAILS["download"])
             self.assertNotIn("synthetic download failure", str(raised.exception))
             self.assertIsNone(raised.exception.__cause__)
             self.assertNotIn("synthetic download failure", "".join(traceback.format_exception(
@@ -4710,7 +4711,7 @@ class LlmRuntimeTests(unittest.TestCase):
             with self.assertRaises(RuntimeError) as raised:
                 llm_service.load_model(vision_repo)
             server.assert_not_called()
-            self.assertIn("image projector", str(raised.exception))
+            self.assertEqual(str(raised.exception), llm_service.LLM_PREPARATION_FAILURE_DETAILS["projector"])
             self.assertNotIn("PRIVATE", str(raised.exception))
             self.assertNotIn("PRIVATE", "".join(traceback.format_exception(
                 type(raised.exception), raised.exception, raised.exception.__traceback__,

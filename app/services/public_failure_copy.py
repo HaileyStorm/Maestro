@@ -11,6 +11,26 @@ import re
 from typing import Final, Mapping
 from types import MappingProxyType
 
+LLM_PREPARATION_FAILURE_DETAILS: Final[Mapping[str, str]] = MappingProxyType({
+    "download": (
+        "Chat model download failed. Try loading it again."
+    ),
+    "projector": (
+        "Image support download failed. Try loading the model again."
+    ),
+    "unknown": "LLM preparation failed; check the local Maestro logs",
+})
+
+
+def public_llm_preparation_failure_message(error: BaseException) -> str:
+    """Publish only exact producer-owned copy, without stringifying errors."""
+    if type(error) is RuntimeError and len(error.args) == 1:
+        message = error.args[0]
+        if type(message) is str and message in LLM_PREPARATION_FAILURE_DETAILS.values():
+            return message
+    return LLM_PREPARATION_FAILURE_DETAILS["unknown"]
+
+
 FAILURE_STAGE_DETAILS: Final[Mapping[str, str]] = MappingProxyType({
     "model_load": "The generation model could not be loaded with the available host memory.",
     "denoise": "Generation failed during denoising.",
