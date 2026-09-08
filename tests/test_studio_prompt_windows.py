@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import ast
+import copy
+import hashlib
 import json
 import importlib.util
 from pathlib import Path
@@ -25,6 +27,7 @@ from services.h3_legal_access import (
     h3_public_availability,
     record_h3_operating_location,
 )
+from services.queue_recovery_runtime import QueueRecoveryRuntimeError
 
 # Load the dependency-light module directly. Importing shared.utils first
 # executes its package initializer, which intentionally imports Torch-backed
@@ -88,6 +91,27 @@ class _GlobalTimelineParserTestMixin:
             any("16:9" in line or "9:16" in line for line in global_lines),
         )
         self.assertTrue(has_global_timeline(prompt))
+
+    def test_fractional_seconds_use_decimal_not_two_colon_clocks(self):
+        cases = (
+            ("[Shot 2] At 00:09.500, look closer.", 9.5),
+            ("[Shot 2] At 00:09.5, look closer.", 9.5),
+            ("[Shot 2] At 9.5s, look closer.", 9.5),
+            ("[Shot 2] At 9.5 seconds, look closer.", 9.5),
+            ("[Shot 2] [9.5s] look closer.", 9.5),
+            ("[Shot 2 | 9.5s] look closer.", 9.5),
+            ("[Shot 2] [9.5s-21.00s] look closer.", 9.5),
+        )
+        for line, expected in cases:
+            with self.subTest(line=line):
+                _global, events = parse_global_timeline_prompt(line)
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0]["start"], expected)
+        _global, events = parse_global_timeline_prompt(
+            "[Shot 2] At 00:09:30, look closer.",
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["start"], 570.0)
 
 
 class EnhancedPromptCardinalityTests(unittest.TestCase):
@@ -717,6 +741,67 @@ class H3LongStudioPlanningTests(unittest.TestCase):
             plan["clip_trim_tail_frames"],
         )
 
+    def test_authored_ranges_at_native_max_ceiling_keep_exact_publication(self):
+        prepare = self._load_launch_helpers()["_prepare_h3_long_studio_request"]
+        frames = round(57.46 * 24)
+        body = {
+            "model_type": "minimax_h3",
+            "video_length": frames,
+            "prompt": "\n".join([
+                "[Shot 1] [0s-9.5s] First beat.",
+                "[Shot 2] [9.5s-21.00s] Second beat.",
+                "[Shot 3] [21s-38.5s] Third beat.",
+                "[Shot 4] [38.5s-57.46s] Fourth beat.",
+            ]),
+        }
+        plan = prepare(body)
+        self.assertEqual(plan["clip_count"], 6)
+        self.assertEqual(sum(plan["clip_published_frames"]), frames)
+        self.assertEqual(plan["segment_policy"]["id"], "authored_timeline_exact_v1")
+        self.assertTrue(all(
+            124 <= generated <= 345 for generated in plan["clip_frames"]
+        ))
+
+    def test_authored_ranges_dispatch_after_visual_carry(self):
+        helpers = self._load_launch_helpers()
+        prepare = helpers["_prepare_h3_long_studio_request"]
+        dispatch = helpers["_h3_execution_shots_for_dispatch"]
+        frames = round(57.46 * 24)
+        body = {
+            "model_type": "minimax_h3",
+            "video_length": frames,
+            "prompt": "\n".join([
+                "[Shot 1] [0s-9.5s] First beat.",
+                "[Shot 2] [9.5s-21.00s] Second beat.",
+                "[Shot 3] [21s-38.5s] Third beat.",
+                "[Shot 4] [38.5s-57.46s] Fourth beat.",
+            ]),
+        }
+        plan = prepare(body)
+        self.assertGreater(plan["clip_count"], 1)
+        prompt_lines = plan["shot_plan"]["clip_prompts"]
+        shots = dispatch(plan, prompt_lines, plan["clip_count"])
+        self.assertEqual(len(shots), plan["clip_count"])
+        self.assertEqual(shots[0]["execution_cursor_frame"], 0)
+        self.assertEqual(
+            [shot["prompt"] for shot in shots],
+            prompt_lines,
+        )
+
+    def test_two_colon_clock_outside_duration_is_rejected(self):
+        prepare = self._load_launch_helpers()["_prepare_h3_long_studio_request"]
+        with self.assertRaisesRegex(ValueError, "00:09.500 or 9.5s"):
+            prepare({
+                "model_type": "minimax_h3",
+                "video_length": round(57.46 * 24),
+                "prompt": "\n".join([
+                    "[Shot 1] First beat.",
+                    "[Shot 2] At 00:09:30, Second beat.",
+                    "[Shot 3] At 00:21.000, Third beat.",
+                    "[Shot 4] At 00:38.500, Fourth beat.",
+                ]),
+            })
+
     def test_global_timestamps_are_consecutive_and_clip_local(self):
         prompts = build_global_timeline_clip_prompts(
             "\n".join([
@@ -788,6 +873,9 @@ class H3LongStudioPlanningTests(unittest.TestCase):
             "_h3_generation_requirements",
             "_validate_h3_sampling_steps",
             "_validate_h3_explicit_multiclip_request",
+            "_h3_execution_shots_for_dispatch",
+            "_attach_h3_ref2va_handoff",
+            "_h3_ref2va_reference_capacity",
         }
         helpers = [
             node for node in module.body
@@ -843,8 +931,16 @@ class H3LongStudioPlanningTests(unittest.TestCase):
                     maximum=model_def["frames_maximum"],
                 )
 
+            @staticmethod
+            def get_video_info(path):
+                return 24, 1, 1, 24
+
         namespace = {
             "math": __import__("math"),
+            "os": os,
+            "copy": copy,
+            "hashlib": hashlib,
+            "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
             "wgp": FakeWgp,
             "H3_LEGAL_BLOCKED_DETAIL": H3_LEGAL_BLOCKED_DETAIL,
             "h3_legal_access_decision": h3_legal_access_decision,
@@ -868,6 +964,7 @@ class H3LongStudioPlanningTests(unittest.TestCase):
                 "minimax_h3_w4a8_fl2va",
             },
             "_MULTI_CLIP_SEPARATOR": "\n---CLIP_BOUNDARY---\n",
+            "_H3_REF2VA_HANDOFF_FRAMES": 56,
             "_check_model_downloaded": lambda model_type: model_type != "minimax_h3_ref2va",
             "_variant_group_downloaded": lambda urls: True,
         }
@@ -1213,6 +1310,128 @@ class H3LongStudioPlanningTests(unittest.TestCase):
                 "h3_adaptive_conditioning": False,
                 "image_refs": ["character.png"],
             })
+
+    def test_long_hybrid_inputs_survive_checkpoint_routing(self):
+        apply_adaptive = self._load_launch_helpers()["_apply_h3_adaptive_checkpoint"]
+        body = dict(model_type="minimax_h3", video_length=700,
+                    image_start="first.png", image_refs=["character.png"])
+        self.assertEqual(apply_adaptive(body), "minimax_h3_ref2va")
+        self.assertEqual(body["image_start"], "first.png")
+        self.assertEqual(body["image_refs"], ["character.png"])
+
+    def test_adaptive_clip_prompts_map_to_segment_families(self):
+        helpers = self._load_launch_helpers()
+        prepare = helpers["_prepare_h3_long_studio_request"]
+        body = {
+            "model_type": "minimax_h3",
+            "video_length": 700,
+            "h3_adaptive_conditioning": True,
+            "image_refs": ["subject.png"],
+            "prompt": "A walker crosses the long room.",
+        }
+        plan = prepare(body)
+        models = [item["model_type"] for item in plan["segment_models"]]
+        prompts = body["per_clip_prompts"]
+        self.assertEqual(len(models), len(prompts))
+        self.assertIn("minimax_h3_ref2va", models)
+        from services.h3_adaptive_execution import bind_h3_execution_segment
+        from services.h3_prompt_mapping import source_prompt_schema
+        source_plan = copy.deepcopy(plan["shot_plan"])
+        for index, model_type in enumerate(models):
+            references = [{"type": "image", "path": "subject.png"}] if str(model_type).endswith("ref2va") else []
+            bound = bind_h3_execution_segment(source_plan, segment_index=index,
+                model_type=model_type, reference_manifest=references)
+            prompt = bound["plan"]["clip_prompts"][index]
+            family = source_prompt_schema(prompt)
+            if str(model_type).endswith("ref2va"):
+                self.assertEqual(family, "ref2va")
+                self.assertIn("detailed_description:", prompt)
+            else:
+                self.assertNotEqual(family, "ref2va")
+        self.assertEqual(plan["shot_plan"], source_plan)
+
+    def test_text_only_adaptive_metadata_does_not_select_pinkcherry(self):
+        apply_adaptive = self._load_launch_helpers()["_apply_h3_adaptive_checkpoint"]
+        body = dict(model_type="minimax_h3_ref2va", h3_adaptive_conditioning=True,
+                    explicit_output=True)
+        self.assertEqual(apply_adaptive(body), "minimax_h3")
+        self.assertEqual(body["_h3_requested_checkpoint"], "minimax_h3_ref2va")
+
+    def test_text_only_manual_ref2va_selection_is_preserved(self):
+        apply_adaptive = self._load_launch_helpers()["_apply_h3_adaptive_checkpoint"]
+        body = dict(model_type="minimax_h3_ref2va", h3_adaptive_conditioning=False)
+        self.assertEqual(apply_adaptive(body), "minimax_h3_ref2va")
+
+    def test_inactive_ref2va_lora_selection_survives_text_routing(self):
+        apply_adaptive = self._load_launch_helpers()["_apply_h3_adaptive_checkpoint"]
+        selection = ["dasiwa_ref2va_hybrid_v1_4step.safetensors"]
+        body = dict(model_type="minimax_h3_ref2va", h3_adaptive_conditioning=True,
+                    h3_ref2va_loras=list(selection))
+        self.assertEqual(apply_adaptive(body), "minimax_h3")
+        self.assertEqual(body["h3_ref2va_loras"], selection)
+
+    def test_adaptive_text_only_cuts_use_ref2va_from_previous_frame(self):
+        helpers = self._load_launch_helpers()
+        plan = helpers["_plan_h3_adaptive_models"](
+            {
+                "model_type": "minimax_h3_ref2va",
+                "h3_adaptive_conditioning": True,
+                "explicit_output": True,
+                "h3_adaptive_fl2va_model": "minimax_h3_pinkcherry_fl2va",
+            },
+            clip_count=3,
+            clip_boundaries=[
+                {"type": "cut"},
+                {"type": "cut"},
+            ],
+            first_anchor=None,
+            last_anchor=None,
+        )
+        self.assertEqual(
+            [item["model_type"] for item in plan],
+            [
+                "minimax_h3_pinkcherry_fl2va",
+                "minimax_h3_ref2va",
+                "minimax_h3_ref2va",
+            ],
+        )
+
+    def test_cut_without_user_refs_uses_previous_last_frame_as_reference(self):
+        helpers = self._load_launch_helpers()
+        next_params = {}
+        result = helpers["_attach_h3_ref2va_handoff"](
+            next_params,
+            latest_video="prev.mp4",
+            last_frame_path="prev-last.png",
+            out_dir="/tmp",
+            task_no=2,
+            boundary_type="cut",
+        )
+        self.assertEqual(result["mode"], "semantic_still")
+        self.assertEqual(next_params["image_refs"], ["prev-last.png"])
+
+        kept = {"image_refs": ["character.png"]}
+        kept_result = helpers["_attach_h3_ref2va_handoff"](
+            kept,
+            latest_video="prev.mp4",
+            last_frame_path="prev-last.png",
+            out_dir="/tmp",
+            task_no=2,
+            boundary_type="cut",
+        )
+        self.assertEqual(kept_result["mode"], "semantic_still")
+        self.assertEqual(kept["image_refs"], ["character.png", "prev-last.png"])
+
+    def test_adaptive_refs_are_not_automatically_dropped_after_first_segment(self):
+        helpers = self._load_launch_helpers()
+        plan = helpers["_plan_h3_adaptive_models"](
+            dict(model_type="minimax_h3", h3_adaptive_conditioning=True,
+                 h3_adaptive_fl2va_model="minimax_h3_pinkcherry_fl2va",
+                 image_refs=["character.png"]),
+            clip_count=3, clip_boundaries=[{"type": "continuous"}, {"type": "cut"}],
+            first_anchor=None, last_anchor=None)
+        self.assertEqual([item["model_type"] for item in plan], ["minimax_h3_ref2va"] * 3)
+        self.assertTrue(all(not item.get("drop_semantic_refs") for item in plan))
 
     def test_segment_override_validation_uses_effective_model_grid(self):
         validate = self._load_launch_helpers()["_validate_h3_segment_plan"]
@@ -1830,7 +2049,10 @@ process.stdout.write(JSON.stringify(effectiveSlidingWindowGeometry(10, 5, 5, opt
         self.assertIn("enhance_before_generate", generation)
         self.assertIn("enhanceBeforeGenerate", generation)
         self.assertNotIn("get().enhancePrompt()", generation)
-        self.assertLess(generation.index("jobs: [newJob, ...s.jobs]"), generation.index("api.submitGeneration(params, holdForQueue)"))
+        self.assertLess(
+            generation.index("jobs: [newJob, ...s.jobs]"),
+            generation.index("api.submitGeneration(params, holdForQueue)"),
+        )
         self.assertIn("enhanceBeforeGenerate && s.activeWorkspace === submissionWorkspace", generation)
         self.assertIn("? { studioPromptEnhance: false }", generation)
         self.assertIn("get().activeWorkspace !== submissionWorkspace", generation)

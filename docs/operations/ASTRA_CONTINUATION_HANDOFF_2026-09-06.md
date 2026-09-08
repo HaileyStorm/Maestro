@@ -11,9 +11,10 @@ a deterministic lease-ordering regression and an 82-test module pass. Do not
 rerun the old failure list as if it were still the current backlog.
 
 Current safe work is the broader app interaction/copy audit and review of the
-remaining inventoried WIP: H3 executable-plan startup handling and related
-Studio tests, the unused adaptive-Ref2VA helper, preserved test reordering and
-queue assertions, and the untracked storage-janitor source/tests. Inspect each
+remaining inventoried WIP: the unused adaptive-Ref2VA helper, preserved test
+reordering and queue assertions, and the untracked storage-janitor source/tests.
+H3 executable-plan startup handling and the related Studio tests have the
+source/test closure recorded below. Inspect each
 against the committed implementation before adopting, replacing or retiring it;
 keep storage mutation disabled pending its separate ownership/acceptance gates.
 
@@ -2254,3 +2255,41 @@ isolated candidate, preserved unrelated WIP and receipts are under
 `.artifacts-temp/astra-llm-load-errors-20260908/`. This is source and synthetic
 execution evidence; no live model, provider, server restart or browser action
 was performed.
+
+
+## H3 saved-plan startup and recovery flow — 2026-09-08
+
+A saved H3 plan now has an early execution-contract check before CUDA benchmark
+setup, model/version preparation, or reference/LoRA provisioning. The check
+binds the actual multi-clip prompt parser, requested frame counts, publication
+and trim geometry, and semantic execution slices to the saved plan. Empty or
+malformed stored plans and incompatible execution modes fail explicitly;
+server-prepared plans are preserved rather than silently regenerated. Legacy
+aggregate final-trim plans remain supported. The late dispatch check remains
+as a defense against changes after preparation and uses the same resolver.
+
+A mismatch finishes with the structured `h3_plan_mismatch` failure code and
+clears stale OOM details. The queue card shows a short state description and,
+for users allowed to generate, an **Open Generate** action. It does not offer
+an exact retry of the invalid saved plan. Read-only users see no unavailable
+action instruction. The action uses normal Generate navigation and does not submit a job or
+restore the failed job's settings.
+
+The former inline multi-clip parser is replaced by one shared non-mutating
+helper. A 288-case synthetic comparison matched the prior parser's values and
+parameter removal behavior. Existing authored-shot Studio test additions passed
+against the prior committed source (97 tests) before adoption. The obsolete
+source-format assertion now verifies shared-parser wiring and authored
+multi-line prompt preservation.
+
+Verification receipts are under `.artifacts-temp/astra-h3-startup-20260908/`.
+The full UI suite passes all 581 tests and the production build passes. Python
+checks use the local CI CPU environment mask; no model load, GPU generation,
+restart, browser, Windows, or human acceptance is claimed. Independent review
+closed the frame, plan-presence, permission-copy, aggregate-duration and clip-count
+findings. The final 435-case CPU gate (nine skips) found only a recovery fixture
+missing the producer's duration and aggregate-trim fields. Those two fields were
+added, then the complete 163-test recovery module passed; the other nine modules retain
+their passing evidence against unchanged source. Compilation, JSON-grammar,
+publication-boundary and diff checks pass. Staged source/test hashes match the
+isolated candidate, and unrelated whitespace and test reordering remain intact.

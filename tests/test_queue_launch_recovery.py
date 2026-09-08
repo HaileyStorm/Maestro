@@ -3945,6 +3945,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
             "clip_trim_tail_frames": tail_trims,
             "requested_frames": sum(published_frames),
             "planned_frames": sum(clip_frames),
+            "final_trim_frames": sum(tail_trims),
             "clip_boundaries": [{
                 "type": "cut", "source": "synthetic",
             }] * 5,
@@ -3970,6 +3971,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
             ),
             "per_clip_prompts": list(shot_plan["clip_prompts"]),
             "per_clip_frames": clip_frames,
+            "video_length": sum(published_frames),
             "num_inference_steps": 20,
             "override_profile": -1,
             "repeat_generation": 1,

@@ -1757,11 +1757,14 @@ test('Reference queue navigation uses one payload-free event with exact cleanup'
 test('failed-card retry follows current project permissions and the advertised action', async t => {
   const previous = globalThis.__resourceWaitStore
   const calls = []
+  const navigationCalls = []
   globalThis.__resourceWaitStore = {
     accessContext: { remote: true, machine_controls: false, accounts: { enabled: true }, account_project_access_active: true },
     activeWorkspace: 'project-a',
     workspaces: [{ name: 'project-a', project_permissions: ['project.read', 'project.generate'] }],
     retryJobRecovery: async id => { calls.push(id) },
+    setSidebarMode: mode => { navigationCalls.push(['mode', mode]) },
+    setSidebarOpen: open => { navigationCalls.push(['open', open]) },
     hostTerms: { minimax_h3_ref2va: { accepted: true } },
   }
   t.after(() => { globalThis.__resourceWaitStore = previous })
@@ -1783,19 +1786,47 @@ test('failed-card retry follows current project permissions and the advertised a
   const retries = tree => flattenElements(tree).filter(element => (
     element.type === 'button' && elementText(element) === 'Retry generation'
   ))
+  const openGenerate = tree => flattenElements(tree).filter(element => (
+    element.type === 'button' && elementText(element) === 'Open Generate'
+  ))
   const buttons = retries(renderCard({}))
   assert.equal(buttons.length, 1)
   buttons[0].props.onClick()
   await new Promise(resolve => setImmediate(resolve))
   assert.deepEqual(calls, [job.id])
-  assert.equal(retries(renderCard({ recoveryActions: [] })).length, 0)
+  const withoutRetry = renderCard({ recoveryActions: [] })
+  assert.equal(retries(withoutRetry).length, 0)
+  assert.equal(openGenerate(withoutRetry).length, 0)
   assert.equal(retries(renderCard({ status: 'cancelled' })).length, 0)
   const blocked = renderCard({ recoveryState: 'blocked', recoveryBlocked: true })
   assert.equal(retries(blocked).length, 0)
   assert.equal(flattenElements(blocked).filter(element => (
     element.type === 'button' && elementText(element) === 'Retry recovery'
   )).length, 1)
+
+  const mismatchDetail = 'This saved H3 plan cannot run.'
+  const mismatch = renderCard({
+    recoveryActions: [],
+    failureDetails: { code: 'h3_plan_mismatch', detail: mismatchDetail, is_oom: false },
+  })
+  assert.equal(retries(mismatch).length, 0)
+  assert.equal(flattenElements(mismatch).filter(element => (
+    element.type === 'p' && elementText(element) === mismatchDetail
+  )).length, 1)
+  const mismatchActions = openGenerate(mismatch)
+  assert.equal(mismatchActions.length, 1)
+  mismatchActions[0].props.onClick()
+  assert.deepEqual(navigationCalls, [['mode', 'studio'], ['open', true]])
+  assert.deepEqual(calls, [job.id], 'opening Generate must not retry the failed job')
+
   globalThis.__resourceWaitStore.workspaces[0].project_permissions = ['project.read']
   assert.equal(retries(renderCard({})).length, 0)
+  const readOnlyMismatch = renderCard({
+    recoveryActions: [],
+    failureDetails: { code: 'h3_plan_mismatch', detail: mismatchDetail, is_oom: false },
+  })
+  assert.equal(openGenerate(readOnlyMismatch).length, 0)
+  assert.doesNotMatch(elementText(readOnlyMismatch), /Open Generate/)
+  assert.match(elementText(readOnlyMismatch), /This saved H3 plan cannot run\./)
   assert.deepEqual(calls, [job.id])
 })

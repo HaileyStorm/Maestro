@@ -1295,6 +1295,8 @@ function JobPlaceholder({
   logError?: string | null
 }) {
   const models = useStore(s => s.models ?? [])
+  const setSidebarMode = useStore(s => s.setSidebarMode)
+  const setSidebarOpen = useStore(s => s.setSidebarOpen)
   const machineControls = useStore(s => s.accessContext?.machine_controls === true)
   const accessContext = useStore(s => s.accessContext)
   const accountProjectMigration = useStore(s => s.accountProjectMigration)
@@ -1363,6 +1365,9 @@ function JobPlaceholder({
   const hasFailedChild = !!failedChildJobId
   const failedChildDetail = job.failureDetails?.detail || null
   const failedChildCode = job.failureDetails?.code || null
+  const h3PlanMismatchDetail = job.status === 'failed' && failedChildCode === 'h3_plan_mismatch'
+    ? failedChildDetail || 'This saved H3 plan cannot run.'
+    : null
   const jobModelLabel = visibleModelName(job.modelType, models)
   const resourcePresentation = describeResourceExecution(job.resourceDescriptor)
   const recoveryAttemptLabel = Number.isInteger(job.recoveryAttempt)
@@ -1635,6 +1640,8 @@ function JobPlaceholder({
                 <p className="text-center text-[11px] text-text-secondary">
                   {job.status === 'cancelled'
                     ? 'This generation was cancelled.'
+                    : h3PlanMismatchDetail
+                      ? h3PlanMismatchDetail
                     : nativeRecoveryAvailable
                       ? `Generation finished, but creating the ${deliveryTarget.toLowerCase()} ran out of GPU memory${(job.oomInfo?.retry_count ?? 0) > 0 ? ' after one automatic retry' : ''}. Maestro saved the original result privately; recovery options are below.`
                       : isDeliveryRecoveryChild
@@ -1673,14 +1680,19 @@ function JobPlaceholder({
                     />
                   </div>
                 )}
-                {job.status === 'failed' && canManageGeneration && job.recoveryActions?.includes('retry') && (
+                {job.status === 'failed' && canManageGeneration && (h3PlanMismatchDetail || job.recoveryActions?.includes('retry')) && (
                   <div className="mt-2 flex justify-center">
                     <button
                       type="button"
-                      onClick={() => onRecoveryAction?.('retry')}
+                      onClick={h3PlanMismatchDetail
+                        ? () => {
+                            setSidebarMode('studio')
+                            setSidebarOpen(true)
+                          }
+                        : () => onRecoveryAction?.('retry')}
                       className="rounded bg-accent-green/15 px-2.5 py-1 text-[10px] font-medium text-accent-green hover:bg-accent-green/25"
                     >
-                      Retry generation
+                      {h3PlanMismatchDetail ? 'Open Generate' : 'Retry generation'}
                     </button>
                   </div>
                 )}

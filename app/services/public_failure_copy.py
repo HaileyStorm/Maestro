@@ -45,7 +45,12 @@ FAILURE_STAGE_DETAILS: Final[Mapping[str, str]] = MappingProxyType({
     "generation": "Generation failed."
 })
 
+H3_PLAN_MISMATCH_DETAIL: Final[str] = (
+    "This saved H3 plan cannot run."
+)
+
 PUBLIC_CONTRACT_MESSAGES: Final[frozenset[str]] = frozenset({
+    H3_PLAN_MISMATCH_DETAIL,
     'Dasiwa artifact verification failed',
     'Dasiwa cannot be stacked with another LoRA or accelerator',
     'Dasiwa cannot be stacked with another accelerator',

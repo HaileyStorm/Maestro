@@ -8,6 +8,84 @@ import json
 from services.queue_recovery_runtime import QueueRecoveryRuntimeError
 
 
+def resolve_h3_execution_shots(longform: dict, prompt_lines: list[str], clip_count: int) -> list[dict] | None:
+    if isinstance(longform, dict) and "prompt_mapping_version" in longform:
+        from services.h3_mapping_dispatch import resolve_h3_mapping_source_plan
+        longform = {**longform, "shot_plan": resolve_h3_mapping_source_plan(longform)}
+    return validate_h3_execution_shots(longform, prompt_lines, clip_count)
+
+
+def validate_h3_execution_request(params: dict, longform: dict, *, separator: str) -> None:
+    """Check the exact manifest inputs before model or preprocessing setup."""
+    if not isinstance(longform, dict) or not longform or params.get("multi_prompts_gen_type") != 3:
+        raise QueueRecoveryRuntimeError("H3 execution plan or mode is invalid.")
+    from services.multiclip_inputs import multiclip_prompt_inputs
+    prompts, starts, _ends = multiclip_prompt_inputs(params, separator=separator)
+    count = max(len(prompts), len(starts), 1)
+    shots = resolve_h3_execution_shots(longform, prompts, count)
+    frames = longform.get("clip_frames")
+    requested_frames = params.get("per_clip_frames")
+    if (
+        not isinstance(frames, list) or len(frames) != count
+        or any(type(value) is not int or value <= 0 for value in frames)
+        or not isinstance(requested_frames, list)
+        or any(type(value) is not int for value in requested_frames)
+        or requested_frames != frames
+        or type(longform.get("clip_count")) is not int
+        or longform["clip_count"] != count
+    ):
+        raise QueueRecoveryRuntimeError("H3 execution frame counts do not match the saved plan.")
+    trims = longform.get("clip_trim_tail_frames")
+    published = longform.get("clip_published_frames")
+    if trims is None and published is None:
+        # Older committed plans record only the aggregate final trim.
+        final_trim = longform.get("final_trim_frames", 0)
+        if type(final_trim) is not int or final_trim < 0:
+            raise QueueRecoveryRuntimeError("H3 final trim is invalid.")
+        trims = [0] * (count - 1) + [final_trim]
+        published = [frame - trim for frame, trim in zip(frames, trims)]
+    if (
+        not isinstance(trims, list) or len(trims) != count
+        or not isinstance(published, list) or len(published) != count
+    ):
+        raise QueueRecoveryRuntimeError("H3 publication geometry is incomplete.")
+    for index, (frame, trim, output) in enumerate(zip(frames, trims, published)):
+        if (
+            type(trim) is not int or not 0 <= trim < frame
+            or type(output) is not int or output != frame - trim
+        ):
+            raise QueueRecoveryRuntimeError("H3 publication geometry is invalid.")
+        if shots is not None:
+            shot = shots[index]
+            execution_slice = shot["execution_slice"]
+            if (
+                type(shot.get("frames")) is not int or shot["frames"] != frame
+                or type(shot.get("trim_tail_frames")) is not int
+                or shot["trim_tail_frames"] != trim
+                or type(shot.get("published_frames")) is not int
+                or shot["published_frames"] != output
+                or execution_slice["end_frame_exclusive"] - execution_slice["start_frame"] != output
+            ):
+                raise QueueRecoveryRuntimeError("H3 execution slice geometry is invalid.")
+    # Older saved plans use requested_frames as the published total; when both
+    # aliases are present they must describe the same output.
+    totals = {
+        "planned_frames": sum(frames),
+        "requested_frames": sum(published),
+        "final_trim_frames": sum(trims),
+    }
+    for field, expected in totals.items():
+        if type(longform.get(field)) is not int or longform[field] != expected:
+            raise QueueRecoveryRuntimeError("H3 aggregate frame geometry is invalid.")
+    published_total = longform.get("published_frames", longform["requested_frames"])
+    if (
+        type(published_total) is not int or published_total != sum(published)
+        or type(params.get("video_length")) is not int
+        or params["video_length"] != published_total
+    ):
+        raise QueueRecoveryRuntimeError("H3 requested duration does not match the saved plan.")
+
+
 def validate_h3_execution_shots(
     longform: dict,
     prompt_lines: list[str],

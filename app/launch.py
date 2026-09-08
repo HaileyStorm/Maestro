@@ -9685,12 +9685,8 @@ def _h3_execution_shots_for_dispatch(
     clip_count: int,
 ) -> list[dict] | None:
     """Validate and return the semantic-to-physical child contract."""
-    from services.h3_execution_contract import validate_h3_execution_shots
-
-    if isinstance(longform, dict) and "prompt_mapping_version" in longform:
-        from services.h3_mapping_dispatch import resolve_h3_mapping_source_plan
-        longform = {**longform, "shot_plan": resolve_h3_mapping_source_plan(longform)}
-    return validate_h3_execution_shots(longform, prompt_lines, clip_count)
+    from services.h3_execution_contract import resolve_h3_execution_shots
+    return resolve_h3_execution_shots(longform, prompt_lines, clip_count)
 
 def _h3_dependency_closed_recovery_prefix(job: dict) -> int | None:
     """Return a contiguous verified H3 prefix before concat/delivery."""
@@ -40193,10 +40189,6 @@ def _h3_estimate_context(body: dict, plan: dict | None = None) -> dict:
     except (TypeError, ValueError, ZeroDivisionError):
         window_seconds = 345 / 24
     images = body.get("image_refs")
-    estimate_reference = body.get("reference_shape")
-    estimate_reference = (
-        estimate_reference if isinstance(estimate_reference, dict) else {}
-    )
     raw_segment_scenes = body.get("segment_scenes")
     segment_scenes = []
     if raw_segment_scenes is not None:
@@ -58272,6 +58264,16 @@ def _run_generation(
                 **updates,
             )
 
+    def fail_h3_plan_mismatch() -> None:
+        from services.public_failure_copy import H3_PLAN_MISMATCH_DETAIL
+        updates = _safe_failure_updates({
+            "stage": "generation", "code": "h3_plan_mismatch",
+            "detail": H3_PLAN_MISMATCH_DETAIL,
+            "exception_type": "QueueRecoveryRuntimeError", "is_oom": False,
+        }, job)
+        updates["oom_info"] = None
+        finish_job(job, "failed", **updates)
+
     def register_abort_state(
         target: dict,
         target_id: str,
@@ -58504,6 +58506,9 @@ def _run_generation(
             server_prepared_h3_plan = _trusted_h3_prepared_plan(
                 raw_params, allow_server_prepared=True,
             )
+            if "_h3_longform" in raw_params and not isinstance(raw_params["_h3_longform"], dict):
+                fail_h3_plan_mismatch()
+                return False
             if server_prepared_h3_plan is None:
                 try:
                     _apply_h3_adaptive_checkpoint(raw_params)
@@ -58530,12 +58535,25 @@ def _run_generation(
                 _require_h3_native_boundary_experimental(raw_params)
                 _validate_h3_sampling_steps(raw_params)
                 _validate_h3_explicit_multiclip_request(raw_params)
-                worker_h3_plan = _prepare_h3_long_studio_request(raw_params)
+                worker_h3_plan = (
+                    server_prepared_h3_plan if server_prepared_h3_plan is not None
+                    else _prepare_h3_long_studio_request(raw_params)
+                )
                 trusted_h3_plan = _trusted_h3_prepared_plan(
                     raw_params,
                     worker_h3_plan,
                     allow_server_prepared=True,
                 )
+                if trusted_h3_plan is not None:
+                    from services.h3_execution_contract import validate_h3_execution_request
+                    update_job(job, message="Checking generation plan")
+                    try:
+                        validate_h3_execution_request(
+                            raw_params, trusted_h3_plan, separator=_MULTI_CLIP_SEPARATOR,
+                        )
+                    except QueueRecoveryRuntimeError:
+                        fail_h3_plan_mismatch()
+                        return False
                 if trusted_h3_plan:
                     _validate_h3_segment_plan(
                         raw_params,
@@ -58924,26 +58942,11 @@ def _run_generation(
 
             # Multi-clip mode: split single request into per-clip tasks
             elif raw_params.get("multi_prompts_gen_type") == 3:
-                prompt_text = raw_params.get("prompt", "")
-                planned_clip_prompts = raw_params.pop(
-                    "per_clip_prompts", None,
+                from services.multiclip_inputs import multiclip_prompt_inputs
+                prompt_lines, image_starts, image_ends = multiclip_prompt_inputs(
+                    raw_params, separator=_MULTI_CLIP_SEPARATOR,
                 )
-                # Use clip boundary separator if present (Director v2 with sliding window support),
-                # otherwise fall back to newline split (Studio mode / legacy Director)
-                if isinstance(planned_clip_prompts, list) and planned_clip_prompts:
-                    prompt_lines = [
-                        str(prompt) for prompt in planned_clip_prompts
-                    ]
-                elif _MULTI_CLIP_SEPARATOR in prompt_text:
-                    prompt_lines = [p.strip() for p in prompt_text.split(_MULTI_CLIP_SEPARATOR) if p.strip()]
-                else:
-                    prompt_lines = [l.strip() for l in prompt_text.split("\n") if l.strip()]
-                image_starts = raw_params.get("image_start", [])
-                if not isinstance(image_starts, list):
-                    image_starts = [image_starts] if image_starts else []
-                image_ends = raw_params.get("image_end", [])
-                if not isinstance(image_ends, list):
-                    image_ends = [image_ends] if image_ends else []
+                raw_params.pop("per_clip_prompts", None)
                 sw_size = raw_params.get("sliding_window_size", raw_params.get("video_length", 121))
                 per_clip_frames = raw_params.pop("per_clip_frames", None)  # optional per-clip durations
                 per_clip_keyframes = raw_params.pop("per_clip_keyframes", None)  # optional keyframe injection per clip
@@ -58953,12 +58956,18 @@ def _run_generation(
                 # prevented exact segment/concat reconciliation.
                 group_id = f"mc_{job_id}"
                 clip_count = max(len(prompt_lines), len(image_starts), 1)
-                execution_shots = (
-                    _h3_execution_shots_for_dispatch(
-                        h3_longform, prompt_lines, clip_count,
+                if h3_longform:
+                    update_job(job, message="Preparing segments")
+                try:
+                    execution_shots = (
+                        _h3_execution_shots_for_dispatch(
+                            h3_longform, prompt_lines, clip_count,
+                        )
+                        if h3_longform else None
                     )
-                    if h3_longform else None
-                )
+                except QueueRecoveryRuntimeError:
+                    fail_h3_plan_mismatch()
+                    return False
                 if execution_shots is not None:
                     from services.h3_mapping_dispatch import h3_source_templates_resolved
                     h3_templates_resolved = h3_templates_resolved or h3_source_templates_resolved(

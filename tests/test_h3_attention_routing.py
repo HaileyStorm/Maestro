@@ -27,6 +27,7 @@ SAGE_ERROR = (
     "SageAttention2++ requires Base H3 for every segment. Choose Dense SDPA "
     "for this setup."
 )
+SEPARATOR = "\n---CLIP_BOUNDARY---\n"
 
 
 def _load_helpers() -> dict:
@@ -249,6 +250,8 @@ class H3AttentionRoutingTests(unittest.TestCase):
         self.assertEqual(job["error"], "Prompt enhancement failed")
 
     def test_worker_rejects_mixed_sage_plan_before_cuda_benchmark_setup(self):
+        from services.queue_recovery_runtime import QueueRecoveryRuntimeError
+
         namespace, _acceleration, *_rest = _w4a8_admission_namespace()
         cuda_calls: list[str] = []
 
@@ -268,6 +271,13 @@ class H3AttentionRoutingTests(unittest.TestCase):
                 {"model_type": REF},
             ],
             "clip_frames": [81, 81],
+            "clip_count": 2,
+            "clip_published_frames": [81, 81],
+            "clip_trim_tail_frames": [0, 0],
+            "planned_frames": 162,
+            "requested_frames": 162,
+            "published_frames": 162,
+            "final_trim_frames": 0,
         }
         custom = {"h3_attention_engine": "sage2"}
         job = {
@@ -275,6 +285,11 @@ class H3AttentionRoutingTests(unittest.TestCase):
             "params": {
                 "model_type": BASE,
                 "custom_settings": custom,
+                "multi_prompts_gen_type": 3,
+                "prompt": SEPARATOR.join(["First segment.", "Second segment."]),
+                "per_clip_prompts": ["First segment.", "Second segment."],
+                "per_clip_frames": [81, 81],
+                "video_length": 162,
                 "_h3_longform": plan,
             },
             "status": "queued",
@@ -309,6 +324,8 @@ class H3AttentionRoutingTests(unittest.TestCase):
                 lambda *_args, **_kwargs: None
             ),
             "_require_h3_generation_terms": lambda *_args, **_kwargs: None,
+            "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+            "_MULTI_CLIP_SEPARATOR": SEPARATOR,
             "torch": types.SimpleNamespace(cuda=types.SimpleNamespace(
                 is_available=(
                     lambda: cuda_calls.append("is_available") or True

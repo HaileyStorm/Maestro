@@ -8,6 +8,7 @@ dropped compact `2m 8s` formatter or treat the wrapper as the impl.
 from __future__ import annotations
 
 import ast
+import copy
 import math
 import os
 import subprocess
@@ -2146,17 +2147,36 @@ class TestJobLifecycleWiring(unittest.TestCase):
         ), 2)
 
     def test_director_multiclip_dispatch_preserves_structured_h3_prompts(self):
+        from services.multiclip_inputs import multiclip_prompt_inputs
+
         generation = _function(self.launch, "_run_generation")
         with open(
             os.path.join(_ROOT, "app", "launch.py"), "r", encoding="utf-8",
         ) as handle:
             source = ast.get_source_segment(handle.read(), generation)
-        self.assertIn('raw_params.pop(\n                    "per_clip_prompts"', source)
+        self.assertIn("multiclip_prompt_inputs(", source)
         self.assertNotIn('"per_clip_prompt_modes"', source)
         self.assertIn(
             '2 if h3_longform else (1 if "\\n" in clip_prompt else 0)',
             source,
         )
+        params = {
+            "prompt": "fallback prompt",
+            "per_clip_prompts": [
+                "First authored line.\nSecond authored line.",
+                "Another physical child.",
+            ],
+            "image_start": [],
+            "image_end": [],
+        }
+        original = copy.deepcopy(params)
+        prompts, starts, ends = multiclip_prompt_inputs(
+            params, separator="\n---CLIP_BOUNDARY---\n",
+        )
+        self.assertEqual(prompts, params["per_clip_prompts"])
+        self.assertEqual(starts, [])
+        self.assertEqual(ends, [])
+        self.assertEqual(params, original)
 
     def test_failed_audio_mux_removes_partial_output(self):
         combine = _load_isolated_function(
