@@ -293,12 +293,12 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
 
   const handleLoadSettings = useCallback(() => {
     setSelectedOutput(index)
-    setTimeout(() => loadSettingsFromOutput(), 50)
+    void loadSettingsFromOutput()
   }, [index, setSelectedOutput, loadSettingsFromOutput])
 
   const handleReroll = useCallback(() => {
     setSelectedOutput(index)
-    setTimeout(() => rerollGeneration(), 50)
+    void rerollGeneration()
   }, [index, setSelectedOutput, rerollGeneration])
 
   const handleCopyPrompt = () => {

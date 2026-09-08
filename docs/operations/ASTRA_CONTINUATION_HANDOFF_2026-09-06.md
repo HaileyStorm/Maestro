@@ -2035,4 +2035,56 @@ writer finishes, reuse the canonical technical-field contract while retaining
 sidecar migrations and single-output batch size. Acceptance must exercise
 same-model A-to-B response races, late media responses, every canonical field's
 presence and zero/false/empty values, delivery fields and window discard. This
-is static review evidence, not an implemented or verified repair.
+was the static review intake for the repair below.
+
+## Output settings restoration (2026-09-07)
+
+Output-sidecar restoration now projects the 76 canonical technical parameters
+and 21 declared custom settings through the shared profile field catalogue.
+Present zero, false, empty and supported null values survive; omitted optional
+values clear unrelated editor state. Unknown/private/creative nested custom
+keys are excluded. Existing H3 long-form lineage, Recast migration, LTX decoder
+and audio constraints, creative/media restoration and single-output batch size
+remain explicit transformations. Zero guidance and film-grain saturation are
+preserved, as are sampler, delivery and window-discard settings.
+
+Model options are read before authored state is changed. Output, account,
+project, model/settings and media identities fence the read. Late image, clip,
+edit-source, repaint and recast hydration cannot overwrite a changed selection
+or replacement input. Edit-source metadata fills source properties without
+resetting the saved trim end. Explicit H3 output restores remain Custom and
+refresh estimates without applying a matching profile or fallback.
+The saved H3 style-workflow value also populates its authoritative UI selection.
+Audio duration uses the saved seconds value, including automatic duration,
+instead of an unrelated video-frame calculation.
+
+The pre-commit fence covers all authored fields that restoration writes,
+including music descriptions, edit mappings and mask results. An AST check
+classifies direct restore writes as authored state or lifecycle bookkeeping.
+Models absent from the current catalogue fail before model-options
+loading or authored-state mutation, after documented compatibility remaps.
+
+Gallery actions start against the clicked selection immediately. Restore
+returns a confirmed result; reroll stops when restoration is missing or
+cancelled, and no longer schedules generation after an arbitrary delay.
+Preview hydration remains asynchronous and uses preserved server media paths.
+
+The final combined candidate passes 565 UI tests, the production build,
+and 21 H3 profile tests. Two obsolete Python checks of frontend source strings
+were retired because the real store is now exercised by the profile, mode and
+output lifecycle suites. Source/test digests and validation receipts are under
+`.artifacts-temp/astra-output-restore-20260907/`. Independent review findings
+are closed through focused regressions and parent verification; exact candidate
+hashes remain stable through validation. Browser, Windows, live generation and
+human acceptance remain open.
+
+The targeted Recast/Inpaint/Post Processing control audit found no additional
+visible technical knobs missing from profiles in those checked surfaces.
+Mapping targets, reference alignment/counts and SAM targets remain current-job
+content or derived metadata; hidden legacy Recast flags are not new profile
+controls. Do not expose or profile them merely because sidecars retain them.
+
+Continue the top-level editor/UI projection audit, including absent mask/target
+metadata and settings whose submitted value comes from UI state, before claiming
+whole-app restoration completeness. The SageAttention2++ selector/routing flow
+and the remaining app-wide interaction work above remain open.

@@ -42,6 +42,17 @@ function technicalCustomSettings(value: unknown): unknown {
   return result
 }
 
+function projectTechnicalCustomSettings(value: unknown): unknown {
+  if (value == null) return value
+  if (typeof value !== 'object' || Array.isArray(value)) return undefined
+  const source = value as Settings
+  const projected: Settings = {}
+  for (const key of customKeys) {
+    if (own(source, key)) projected[key] = copy(source[key])
+  }
+  return projected
+}
+
 /**
  * Mode switches use the same technical UI field catalog as saved profiles.
  * H3 style and Director identity guidance are workspace-wide preferences, so
@@ -67,6 +78,26 @@ export function restoreGenerationModeUiSettings(snapshot: unknown, initialUi: ob
     restored[key] = copy(own(stored, key) ? stored[key] : defaults[key])
   }
   return restored
+}
+
+/**
+ * Project a generation sidecar onto the canonical technical parameter set.
+ * This is intentionally shape-only: old sidecars need not satisfy the saved
+ * profile protocol, and content/private runtime fields are not in this list.
+ * Missing keys are emitted as undefined so an output restore clears unrelated
+ * optional settings already present in the editor.
+ */
+export function projectGenerationProfileParameters(source: object): Settings {
+  const settings = source as Settings
+  const projected: Settings = {}
+  for (const key of generationProfileParameterKeys) {
+    projected[key] = own(settings, key)
+      ? key === 'custom_settings'
+        ? projectTechnicalCustomSettings(settings[key])
+        : copy(settings[key])
+      : undefined
+  }
+  return projected
 }
 
 /** One complete configuration snapshot; current-job content stays job-local. */

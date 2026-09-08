@@ -84,8 +84,6 @@ test('submission and output restore repair only the declared LTX values', () => 
   assert.match(restore, /typeof p\.audio_scale === 'number' && Number\.isFinite\(p\.audio_scale\)/)
   assert.match(restore, /Math\.min\(restoredAudioScaleMaximum, Math\.max\(0\.1, p\.audio_scale\)\)/)
   assert.match(restore, /newParams\.audio_scale = restoredAudioScale/)
-  assert.match(restore, /params: \{ \.\.\.s\.params, model_type: modelType \}/)
-  assert.match(restore, /get\(\)\.params\.model_type !== modelType/)
 })
 
 function asDataModule(contents) {

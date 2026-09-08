@@ -3,6 +3,7 @@ import {
   captureGenerationModeUiSettings,
   captureGenerationProfileSettings,
   generationProfileUiKeys,
+  projectGenerationProfileParameters,
   restoreGenerationModeUiSettings,
   restoreGenerationProfileSettings,
 } from '../lib/generationProfiles'
@@ -3504,7 +3505,7 @@ interface AppState {
   selectedOutputMetaName: string | null
   metadataLoading: boolean
   loadOutputMetadata: (name: string) => Promise<void>
-  loadSettingsFromOutput: () => Promise<void>
+  loadSettingsFromOutput: () => Promise<boolean>
   rerollGeneration: () => Promise<void>
   deleteSelectedOutput: (name?: string, workspace?: string) => Promise<void>
   rejoinClipGroup: (groupId: string) => Promise<void>
@@ -15661,6 +15662,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
   selectedOutput: 0,
   setSelectedOutput: (i) => {
+    ++_settingsRestoreGeneration
     set({ selectedOutput: i })
     const outputs = get().filteredOutputs()
     const output = outputs[i]
@@ -15992,38 +15994,75 @@ export const useStore = create<AppState>((set, get) => ({
     // may not have landed — or may have failed — by the time "Load Settings" is
     // clicked, leaving selectedOutputMeta null and this a silent no-op. Re-fetch
     // on demand so the click is self-healing regardless of the background state.
-    const pendingOutput = get().filteredOutputs()[get().selectedOutput]
+    const submitted = get()
+    const pendingOutput = submitted.filteredOutputs()[submitted.selectedOutput]
     const pendingName = pendingOutput?.name
-    if (!pendingName) return
+    if (!pendingName) return false
     // A pending fresh-model hydration must never land after a sidecar restore
     // and replace the settings needed to reproduce that output.
     ++_h3ProfileApplySeq
     ++_modelDefaultsSeq
     ++_loraLoadSeq
     const restoreGeneration = ++_settingsRestoreGeneration
+    const accountEpoch = _accountIdentityEpoch
+    const selectionCurrent = () => {
+      const current = get()
+      const output = current.filteredOutputs()[current.selectedOutput]
+      return restoreGeneration === _settingsRestoreGeneration
+        && accountEpoch === _accountIdentityEpoch
+        && current.activeWorkspace === submitted.activeWorkspace
+        && output?.name === pendingName
+        && output.workspace === pendingOutput.workspace
+        && output.revision === pendingOutput.revision
+    }
+    const authoredFields = [
+      'params', 'generationMode', 'startImage', 'endImage',
+      'imageRefs', 'clips', 'ttsVoices', 'voiceCloneRefs',
+      'continueVideoPath', 'blendClipAPath', 'blendClipBPath', 'editVideoFile',
+      'editVideoPath', 'editVideoUrl', 'editVideoDuration', 'editRepaintFrameFile',
+      'editRepaintFramePath', 'editRepaintFrameUrl', 'editRepaintMappings', 'editDetectedTarget',
+      'editMasksPath', 'editRecastMappings', 'editRecastRefFile', 'editRecastRefPath',
+      'editRecastRefUrl', 'editRecastRefAligned', 'editRecastTarget', 'editRecastPersonCount',
+      'editRecastIsolateReference', 'editRecastAutoFaceDetail', 'editRecastEnhancePrompt', 'editRecastProtectBystanders',
+      'editRecastPreserveBystanders', 'musicDescription', 'audioGuideFilename', 'audioGuide2Filename',
+      'ttsSpeakerName1', 'ttsSpeakerName2', 'ttsSpeakerNamesManual', 'spatialUpsampling',
+      'explicitOutput', 'privateOutput', 'loraWeights', 'h3SelectedProfile',
+      'h3ProfileApplying', 'videoSubModeStash',
+    ] as const satisfies readonly (keyof AppState)[]
+    const settingsUnchanged = () => {
+      const current = get()
+      return selectionCurrent()
+        && authoredFields.every(key => current[key] === submitted[key])
+        && generationProfileUiKeys.every(key => (
+          (current as unknown as Record<string, unknown>)[key]
+            === (submitted as unknown as Record<string, unknown>)[key]
+        ))
+    }
+    let publishedState: AppState | null = null
+    const hydrationCurrent = () => {
+      const current = get()
+      return publishedState !== null && selectionCurrent()
+        && current.params === publishedState.params
+        && current.generationMode === publishedState.generationMode
+        && current.editSubMode === publishedState.editSubMode
+    }
     let selectedOutputMeta = get().selectedOutputMetaName === pendingName
       ? get().selectedOutputMeta
       : null
-    console.log('[LoadSettings] clicked — meta present:', !!selectedOutputMeta?.params,
-                '| metadataLoading:', get().metadataLoading, '| selectedOutput idx:', get().selectedOutput)
     if (!selectedOutputMeta?.params) {
-      console.log('[LoadSettings] no meta yet — on-demand fetch for:', pendingOutput?.name ?? '(no output at index)')
       if (pendingOutput) {
         await get().loadOutputMetadata(pendingOutput.name)
-        if (restoreGeneration !== _settingsRestoreGeneration) return
+        if (!settingsUnchanged()) return false
         const current = get().filteredOutputs()[get().selectedOutput]
         selectedOutputMeta = current?.name === pendingName && get().selectedOutputMetaName === pendingName
           ? get().selectedOutputMeta
           : null
-        console.log('[LoadSettings] after on-demand fetch — params present:', !!selectedOutputMeta?.params,
-                    '| source:', selectedOutputMeta?.source)
       }
     }
     if (!selectedOutputMeta?.params) {
-      console.warn('[LoadSettings] ABORT — no params available after fetch attempt; button is a no-op')
-      return
+      return false
     }
-    if (restoreGeneration !== _settingsRestoreGeneration) return
+    if (!settingsUnchanged()) return false
     const { models } = get()
     const p = selectedOutputMeta.params as Record<string, unknown>
     const uploadFilenames = selectedOutputMeta.upload_filenames as Record<string, string> | undefined
@@ -16032,14 +16071,13 @@ export const useStore = create<AppState>((set, get) => ({
         ? p._h3_longform as Record<string, unknown>
         : null
     )
-    console.log('[LoadSettings] applying settings — model_type:', p.model_type, '| param keys:', Object.keys(p).length)
 
     let modelType = (p.model_type as string) || ''
     const requestedH3Checkpoint = String(p._h3_requested_checkpoint || '')
     if (H3_STUDIO_MODELS.has(requestedH3Checkpoint)) {
       modelType = requestedH3Checkpoint
     }
-    if (!modelType) return
+    if (!modelType) return false
 
     // Migrate Recast sidecars made before the dedicated model existed. Those
     // jobs used the general I2V Fast accelerator with replacement conditioning;
@@ -16096,9 +16134,32 @@ export const useStore = create<AppState>((set, get) => ({
         const message = error instanceof Error ? error.message : 'Could not restore the H3 model and LoRA selections.'
         set({ h3EstimateError: message })
         window.alert(message)
-        return
+        return false
       }
     }
+
+    const model = models.find(m => m.model_type === modelType)
+    if (!model) {
+      window.alert('This output’s model is unavailable. Enable or install it, then try again.')
+      return false
+    }
+    const restoredMode = getModelMode(modelType, model.family)
+    const optionsSequence = ++_modelOptionsSeq
+    let restoredModelOptions: ModelOptions | null = null
+    set({ modelOptionsLoading: true })
+    try {
+      if (!sfxModelTypes.has(modelType)) {
+        restoredModelOptions = await api.fetchModelOptions(modelType)
+      }
+      if (!settingsUnchanged() || optionsSequence !== _modelOptionsSeq) return false
+      if (restoredModelOptions && restoredModelOptions.model_type !== modelType) return false
+    } catch {
+      if (settingsUnchanged()) window.alert('Saved model settings could not be loaded. Try again.')
+      return false
+    } finally {
+      if (optionsSequence === _modelOptionsSeq) set({ modelOptionsLoading: false })
+    }
+    set({ modelOptions: restoredModelOptions, availableLoras: [] })
 
     // Per-sub-mode isolation: pencil-load may jump the sidebar to another
     // video sub-mode (or clobber the current one) by writing params
@@ -16117,11 +16178,6 @@ export const useStore = create<AppState>((set, get) => ({
       }
     }
 
-    // Determine generation mode from model (respects per-model avatar overrides)
-    const model = models.find(m => m.model_type === modelType)
-    const restoredMode = model
-      ? getModelMode(modelType, model.family)
-      : get().generationMode
     if (model) {
       set({ generationMode: restoredMode })
       // Audio outputs restore the SUB-TAB too (Speech / Music / SFX) —
@@ -16155,41 +16211,6 @@ export const useStore = create<AppState>((set, get) => ({
       }
     }
 
-    // Load model capabilities BEFORE applying the restored params.
-    // loadModelOptions merges model-default steps/guidance into params when
-    // its fetch resolves; it used to be fired at the END of this restore,
-    // so the defaults landed after the sidecar values and silently reverted
-    // num_inference_steps / guidance_scale on every pencil click. Awaiting
-    // it here means defaults land first and the restored values win — and
-    // modelOptions matches the restored model before rerollGeneration
-    // submits (stale capabilities used to strip stg_scale/perturbation_*
-    // from the request, which then poisoned the next sidecar with zeros).
-    // (Virtual SFX models have no LoRAs/options endpoints — same guard
-    // as boot.)
-    // Publish the restored target before hydration so loadModelOptions' normal
-    // current-model guard admits this response. A user model selection while
-    // the request is in flight changes params.model_type and still wins.
-    set(s => ({
-      params: { ...s.params, model_type: modelType },
-      selectedModelPerMode: {
-        ...s.selectedModelPerMode,
-        [restoredMode]: modelType,
-      },
-      availableLoras: [],
-    }))
-    if (!sfxModelTypes.has(modelType)) {
-      // Adaptive H3 inventory depends on both restored checkpoint IDs, so it
-      // starts only after the sidecar's final adaptive identity is published.
-      if (!H3_STUDIO_MODELS.has(modelType)) get().loadLoras(modelType)
-      await get().loadModelOptions(modelType)
-    }
-    if (
-      restoreGeneration !== _settingsRestoreGeneration
-      || get().params.model_type !== modelType
-    ) return
-    const restoredModelOptions = get().modelOptions?.model_type === modelType
-      ? get().modelOptions
-      : null
     const restoredLtx25VideoVae = restoredModelOptions?.ltx25_video_vae_choices
       ?.find(choice => choice.value === p.ltx25_video_vae)?.value
     const restoredAudioScaleMaximum = restoredModelOptions?.architecture === 'ltx2_25'
@@ -16241,7 +16262,8 @@ export const useStore = create<AppState>((set, get) => ({
 
     // Build params from metadata
     // For image_mode: use 1 (I2V UI toggle) if start image was used, else 0
-    const newParams: Partial<GenerateParams> = {
+    const newParams = {
+      ...projectGenerationProfileParameters(p),
       prompt: originalPrompt,
       model_type: modelType,
       resolution: (p.resolution as string) || '1280x720',
@@ -16251,7 +16273,11 @@ export const useStore = create<AppState>((set, get) => ({
       num_inference_steps: H3_STUDIO_MODELS.has(modelType)
         ? Math.max(2, Math.min(50, Number(p.num_inference_steps) || 20))
         : migratedLegacyRecast ? 8 : (p.num_inference_steps as number) || 20,
-      guidance_scale: migratedLegacyRecast ? 1 : (p.guidance_scale as number) || 5.0,
+      guidance_scale: migratedLegacyRecast
+        ? 1
+        : Object.prototype.hasOwnProperty.call(p, 'guidance_scale')
+          ? p.guidance_scale
+          : 5.0,
       seed: (p.seed as number) ?? -1,
       // Restore the ACTUAL saved output mode (0 = video, 1 = image). The old
       // `hadStartImage ? 1 : 0` was wrong: an I2V *video* clip has a start image
@@ -16262,8 +16288,7 @@ export const useStore = create<AppState>((set, get) => ({
       repeat_generation: 1,
       activated_loras: (p.activated_loras as string[]) || [],
       loras_multipliers: (p.loras_multipliers as string) || '',
-      settings_version: p.settings_version as number,
-    }
+    } as Partial<GenerateParams>
     if (H3_STUDIO_MODELS.has(modelType)) {
       Object.assign(newParams, restoredH3AdaptiveState)
     }
@@ -16274,14 +16299,7 @@ export const useStore = create<AppState>((set, get) => ({
         ? Number(h3Longform?.segment_frames_maximum || p.sliding_window_size || 0) || undefined
         : undefined
       : (p.sliding_window_size as number) ?? undefined
-    newParams.sliding_window_overlap = (p.sliding_window_overlap as number) ?? undefined
-    newParams.guidance_phases = (p.guidance_phases as number) ?? undefined
-    newParams.video_prompt_type = (p.video_prompt_type as string) || ''
-    newParams.audio_prompt_type = (p.audio_prompt_type as string) || ''
-    newParams.image_prompt_type = (p.image_prompt_type as string) || ''
-    newParams.input_video_strength = (p.input_video_strength as number) ?? undefined
-    newParams.flow_shift = migratedLegacyRecast ? 1 : (p.flow_shift as number) ?? undefined
-    newParams.self_refiner_setting = (p.self_refiner_setting as number) ?? undefined
+    if (migratedLegacyRecast) newParams.flow_shift = 1
     newParams.audio_guide = (p.audio_guide as string) || ''
     newParams.audio_guide2 = (p.audio_guide2 as string) || ''
     newParams.audio_guide3 = (p.audio_guide3 as string) || ''
@@ -16296,13 +16314,11 @@ export const useStore = create<AppState>((set, get) => ({
     newParams.video_guide3 = (p.video_guide3 as string) || ''
     newParams.image_refs = Array.isArray(p.image_refs) ? (p.image_refs as string[]) : []
     newParams.frames_positions = (p.frames_positions as string) || ''
-    newParams.injection_strength = (p.injection_strength as number) ?? undefined
-    newParams.remove_background_images_ref = (p.remove_background_images_ref as number) ?? 0
-    newParams.tea_cache = (p.tea_cache as number) ?? undefined
-    const restoredH3Custom = _restorableH3CustomSettings(p.custom_settings)
+    const restoredH3Custom = _restorableH3CustomSettings(newParams.custom_settings)
     if (modelType.startsWith('minimax_h3')) {
       const restoredEngine = _normalizeH3AttentionEngine(restoredH3Custom.h3_attention_engine)
       newParams.custom_settings = {
+        ...(newParams.custom_settings || {}),
         h3_attention_engine: restoredEngine,
         ...restoredH3Custom,
       }
@@ -16311,8 +16327,6 @@ export const useStore = create<AppState>((set, get) => ({
       } catch {
         // The restored output settings still apply for this session.
       }
-    } else {
-      newParams.custom_settings = undefined
     }
 
     // Progressive 3-stage pipeline settings
@@ -16330,28 +16344,6 @@ export const useStore = create<AppState>((set, get) => ({
       (newParams as Record<string, unknown>).single_stage_pipeline = true;
       (newParams as Record<string, unknown>).progressive_pipeline = false;
     }
-    // Reference two-stage pipeline (10Eros) — restore so re-generating an
-    // STG-era sidecar reproduces the pipeline that made it.
-    (newParams as Record<string, unknown>).reference_pipeline = (p.reference_pipeline as boolean) ?? undefined;
-
-    // Advanced pipeline settings
-    (newParams as Record<string, unknown>).stage2_steps = (p.stage2_steps as number) ?? undefined;
-    (newParams as Record<string, unknown>).stg_scale = (p.stg_scale as number) ?? undefined;
-    // Perturbation config rides along with stg_scale so re-generating an STG
-    // run is faithful. Old sidecars (pre-STG-wiring) simply lack these keys.
-    (newParams as Record<string, unknown>).perturbation_switch = (p.perturbation_switch as number) ?? undefined;
-    (newParams as Record<string, unknown>).perturbation_layers = Array.isArray(p.perturbation_layers) ? (p.perturbation_layers as number[]) : undefined;
-    (newParams as Record<string, unknown>).perturbation_start_perc = (p.perturbation_start_perc as number) ?? undefined;
-    (newParams as Record<string, unknown>).perturbation_end_perc = (p.perturbation_end_perc as number) ?? undefined;
-    (newParams as Record<string, unknown>).cfg_rescale = (p.cfg_rescale as number) ?? undefined;
-    (newParams as Record<string, unknown>).modality_scale = (p.modality_scale as number) ?? undefined;
-    (newParams as Record<string, unknown>).use_gradient_estimation = (p.use_gradient_estimation as boolean) ?? undefined;
-    (newParams as Record<string, unknown>).ge_gamma = (p.ge_gamma as number) ?? undefined;
-    (newParams as Record<string, unknown>).keyframe_conditioning_mode = (p.keyframe_conditioning_mode as string) ?? undefined;
-    (newParams as Record<string, unknown>).keyframe_inject_mode = (p.keyframe_inject_mode as string) ?? undefined;
-    (newParams as Record<string, unknown>).temperature = (p.temperature as number) ?? undefined;
-    (newParams as Record<string, unknown>).audio_guidance_scale = (p.audio_guidance_scale as number) ?? undefined
-
     // Detect multi-clip output and reconstruct clips
     if (!automaticH3Longform && p.multi_prompts_gen_type === 3 && Array.isArray(p.image_start)) {
       // Director Mode joins per-clip prompts with `\n---CLIP_BOUNDARY---\n`
@@ -16444,7 +16436,7 @@ export const useStore = create<AppState>((set, get) => ({
           fetch(api.getUploadUrl(fname))
             .then(r => r.ok ? r.blob() : null)
             .then(blob => {
-              if (!blob) return
+              if (!blob || !hydrationCurrent() || get().clips[idx] !== clips[idx]) return
               const file = new File([blob], fname, { type: blob.type })
               get().setClipStartImage(idx, file)
             })
@@ -16483,7 +16475,9 @@ export const useStore = create<AppState>((set, get) => ({
     // Restore post-processing settings from metadata
     const restoredSpatialUpsampling = (p.spatial_upsampling as string) || ''
     const restoredFilmGrainIntensity = (p.film_grain_intensity as number) || 0
-    const restoredFilmGrainSaturation = (p.film_grain_saturation as number) || 0.5
+    const restoredFilmGrainSaturation = typeof p.film_grain_saturation === 'number'
+      ? p.film_grain_saturation
+      : 0.5
 
     // Restore audio guide filename from upload_filenames. Fall back to
     // deriving basename from params.audio_guide for sidecars that pre-date
@@ -16516,6 +16510,9 @@ export const useStore = create<AppState>((set, get) => ({
         ? { explicitOutput: true, privateOutput: true }
         : {}),
       params: { ...s.params, ...newParams },
+      ...(H3_STUDIO_MODELS.has(modelType) ? {
+        h3StyleWorkflow: typeof newParams.h3_style_workflow === 'string' ? newParams.h3_style_workflow : '',
+      } : {}),
       selectedModelPerMode: { ...s.selectedModelPerMode, [s.generationMode]: modelType },
       loraWeights,
       startImage: null,
@@ -16539,29 +16536,6 @@ export const useStore = create<AppState>((set, get) => ({
       h3SelectedProfile: 'custom',
       h3ProfileApplying: null,
     }))
-    if (H3_STUDIO_MODELS.has(modelType)) {
-      const restored = get()
-      const choices = _h3AdaptiveModelChoices(restored.params)
-      const mode = restored.generationMode
-      const savedParamsPerMode = {
-        ...restored.savedParamsPerMode,
-        [mode]: {
-          ..._snapshotModeParams(restored.params, restored),
-          ...choices,
-        },
-      }
-      set({ savedParamsPerMode })
-      _saveSettings({
-        generationMode: mode,
-        selectedModelPerMode: restored.selectedModelPerMode,
-        savedParamsPerMode,
-        savedLoraPerMode: restored.savedLoraPerMode,
-        savedPromptPerMode: restored.savedPromptPerMode,
-      }, restored.loraIdByFilename)
-      void get().loadLoras(modelType)
-      void get().normalizeH3EditableProfile()
-    }
-
     // Restore image refs as File objects (for image mode reference images)
     // Skip if this is a KFI (frames injection) output — those refs are handled by ControlVideoSection
     const imageRefPaths = newParams.image_refs || []
@@ -16589,7 +16563,7 @@ export const useStore = create<AppState>((set, get) => ({
             .catch(() => null)
         })
         Promise.all(refPromises).then(files => {
-          if (restoreGeneration !== _settingsRestoreGeneration) return
+          if (!hydrationCurrent() || get().imageRefs !== publishedState?.imageRefs) return
           const ordered = files.filter((f): f is File => f !== null)
           set({ imageRefs: ordered })
         })
@@ -16606,7 +16580,12 @@ export const useStore = create<AppState>((set, get) => ({
       : Math.max(1, Math.round(Number(newParams.video_length || 81)))
     newParams.video_length = restoredFrames
     const timingState: Partial<AppState> = {
-      durationSeconds: Math.round((restoredFrames / fps) * 1000) / 1000,
+      durationSeconds: restoredOptions?.audio_only
+        && typeof newParams.duration_seconds === 'number'
+        && Number.isFinite(newParams.duration_seconds)
+        && newParams.duration_seconds >= 0
+          ? newParams.duration_seconds
+          : Math.round((restoredFrames / fps) * 1000) / 1000,
     }
     if (restoredOptions && (restoredOptions.sliding_window || usesStudioSegments(restoredOptions))) {
       const defaults = restoredOptions.sliding_window_defaults || {}
@@ -16619,7 +16598,7 @@ export const useStore = create<AppState>((set, get) => ({
       const windowFrames = segmented
         ? alignTotalFrames(clampedWindow, restoredOptions)
         : Math.floor((clampedWindow - 1) / latent) * latent + 1
-      const discard = Math.max(0, Math.trunc(defaults.discard_last_frames || 0))
+      const discard = Math.max(0, Math.trunc(Number(newParams.sliding_window_discard_last_frames ?? defaults.discard_last_frames ?? 0)))
       const safeOverlapMax = Math.max(0, Math.min(
         Math.trunc(defaults.overlap_max ?? windowFrames),
         windowFrames - discard - latent,
@@ -16683,7 +16662,7 @@ export const useStore = create<AppState>((set, get) => ({
       fetch(api.getUploadUrl(startFile))
         .then(r => r.ok ? r.blob() : null)
         .then(blob => {
-          if (!blob || restoreGeneration !== _settingsRestoreGeneration) return
+          if (!blob || !hydrationCurrent() || get().startImage !== publishedState?.startImage) return
           const file = new File([blob], startFile, { type: blob.type })
           set({ startImage: file })
         })
@@ -16693,7 +16672,7 @@ export const useStore = create<AppState>((set, get) => ({
       fetch(api.getUploadUrl(endFile))
         .then(r => r.ok ? r.blob() : null)
         .then(blob => {
-          if (!blob || restoreGeneration !== _settingsRestoreGeneration) return
+          if (!blob || !hydrationCurrent() || get().endImage !== publishedState?.endImage) return
           const file = new File([blob], endFile, { type: blob.type })
           set({ endImage: file })
         })
@@ -16729,20 +16708,23 @@ export const useStore = create<AppState>((set, get) => ({
           video.src = url
           video.muted = true
           video.onloadedmetadata = () => {
+            if (!hydrationCurrent() || get().editVideoPath !== editVideoPath) return
             const duration = video.duration && isFinite(video.duration) ? video.duration : 0
             const resolution = `${video.videoWidth}x${video.videoHeight}`
             fetch(url)
               .then(r => r.ok ? r.blob() : null)
               .then(blob => {
-                if (!blob) return
+                if (!blob || !hydrationCurrent()
+                  || get().editVideoPath !== editVideoPath
+                  || get().editVideoFile !== publishedState?.editVideoFile) return
                 const file = new File([blob], fname, { type: blob.type || 'video/mp4' })
-                get().setEditVideo(file, editVideoPath, url, duration, resolution)
+                set({ editVideoFile: file, editVideoDuration: duration, editVideoResolution: resolution })
               })
               .catch(() => {})
           }
           // If metadata never loads (file moved/deleted), still set the path
           // so the user can re-attach manually.
-          set({ editVideoPath, editVideoUrl: url })
+          set({ editVideoPath, editVideoUrl: url, editVideoFile: null, editVideoDuration: 0, editVideoResolution: '' })
         }
       }
 
@@ -16809,7 +16791,9 @@ export const useStore = create<AppState>((set, get) => ({
           fetch(repaintUrl)
             .then(r => r.ok ? r.blob() : null)
             .then(blob => {
-              if (!blob) return
+              if (!blob || !hydrationCurrent()
+                || get().editRepaintFramePath !== repaintFrame
+                || get().editRepaintFrameFile !== publishedState?.editRepaintFrameFile) return
               get().setEditRepaintFrame(
                 new File([blob], repaintFrameName, { type: blob.type || 'image/png' }),
                 repaintFrame,
@@ -16896,10 +16880,13 @@ export const useStore = create<AppState>((set, get) => ({
           const refName = recastRef.replace(/\\/g, '/').split('/').pop() || ''
           // Recast references can be either uploads or Image-mode outputs.
           const refUrl = api.getFileUrl(refName)
+          get().setEditRecastRef(null, recastRef, refUrl, p.edit_recast_ref_aligned === true)
           fetch(refUrl)
             .then(r => r.ok ? r.blob() : null)
             .then(blob => {
-              if (!blob) return
+              if (!blob || !hydrationCurrent()
+                || get().editRecastRefPath !== recastRef
+                || get().editRecastMappings !== publishedState?.editRecastMappings) return
               const file = new File([blob], refName, { type: blob.type || 'image/png' })
               get().setEditRecastRef(
                 file,
@@ -16990,14 +16977,46 @@ export const useStore = create<AppState>((set, get) => ({
         }
       }
     }
+    publishedState = get()
+    if (H3_STUDIO_MODELS.has(modelType)) {
+      const restored = get()
+      const choices = _h3AdaptiveModelChoices(restored.params)
+      const mode = restored.generationMode
+      const savedParamsPerMode = {
+        ...restored.savedParamsPerMode,
+        [mode]: {
+          ..._snapshotModeParams(restored.params, restored),
+          ...choices,
+        },
+      }
+      set({ savedParamsPerMode })
+      _saveSettings({
+        generationMode: mode,
+        selectedModelPerMode: restored.selectedModelPerMode,
+        savedParamsPerMode,
+        savedLoraPerMode: restored.savedLoraPerMode,
+        savedPromptPerMode: restored.savedPromptPerMode,
+      }, restored.loraIdByFilename)
+      void get().refreshH3PerformanceEstimates()
+    }
+
+    if (!sfxModelTypes.has(modelType)) void get().loadLoras(modelType)
+    return true
   },
 
   rerollGeneration: async () => {
-    // Await the (now async, self-healing) settings load before generating, so a
-    // slow on-demand metadata fetch can't let the reroll fire with stale params.
-    await get().loadSettingsFromOutput()
-    // Small delay to let state settle, then generate
-    setTimeout(() => get().startGeneration(), 100)
+    const state = get()
+    const output = state.filteredOutputs()[state.selectedOutput]
+    const accountEpoch = _accountIdentityEpoch
+    if (!output || !await state.loadSettingsFromOutput()) return
+    const current = get()
+    const selected = current.filteredOutputs()[current.selectedOutput]
+    if (accountEpoch !== _accountIdentityEpoch
+      || current.activeWorkspace !== state.activeWorkspace
+      || selected?.name !== output.name
+      || selected.workspace !== output.workspace
+      || selected.revision !== output.revision) return
+    await current.startGeneration()
   },
 
   rejoinClipGroup: async (groupId) => {

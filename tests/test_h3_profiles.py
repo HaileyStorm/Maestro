@@ -21,6 +21,8 @@ from services.h3_profiles import (  # noqa: E402
     profile_settings,
 )
 
+# Restore and hydration races execute the real store in ui/tests/
+# defaults-preset-flow, mode-switch-profile-continuity and output-restore-lifecycle.
 class H3ProfileTests(unittest.TestCase):
     def test_profile_estimate_uses_actual_path_free_checkpoint_receipt_status(self):
         source = (APP / "launch.py").read_text(encoding="utf-8")
@@ -641,23 +643,6 @@ class H3ProfileTests(unittest.TestCase):
         self.assertNotIn("privateOutput", hydration)
         self.assertNotIn("h3_adaptive_conditioning", hydration)
 
-    def test_preset_and_output_restore_cancel_fresh_hydration_as_custom(self):
-        store = (ROOT / "ui" / "src" / "stores" / "useStore.ts").read_text(
-            encoding="utf-8"
-        )
-        preset_start = store.rindex("loadPreset: (preset)")
-        preset = store[preset_start:store.index("deletePreset:", preset_start)]
-        output = store[
-            store.index("loadSettingsFromOutput: async"):
-            store.index("// Restore image refs as File objects")
-        ]
-        self.assertIn("++_modelDefaultsSeq", preset)
-        self.assertIn("h3SelectedProfile: 'custom'", preset)
-        self.assertIn("delivery_resolution: typeof preset.params.delivery_resolution", preset)
-        self.assertIn("delivery_fit: typeof preset.params.delivery_fit", preset)
-        self.assertIn("spatialUpsampling: preset.spatial_upsampling || ''", preset)
-        self.assertIn("++_modelDefaultsSeq", output)
-        self.assertIn("h3SelectedProfile: 'custom'", output)
 
     def test_native_resolution_override_atomically_clears_delivery_chain(self):
         store = (ROOT / "ui" / "src" / "stores" / "useStore.ts").read_text(
@@ -673,35 +658,6 @@ class H3ProfileTests(unittest.TestCase):
         self.assertIn("spatialUpsampling: ''", action)
         self.assertIn("h3SelectedProfile: 'custom'", action)
 
-    def test_manual_and_restored_custom_state_wins_async_default_races(self):
-        store = (ROOT / "ui" / "src" / "stores" / "useStore.ts").read_text(
-            encoding="utf-8"
-        )
-        mode_switch = store[
-            store.index("setGenerationMode: (mode)"):
-            store.index("params: { ...defaultParams }")
-        ]
-        resolution = store[
-            store.index("setResolutionPreset: (preset)"):
-            store.index("durationSeconds: 5")
-        ]
-        loras = store[
-            store.rindex("toggleLora: (filename)"):
-            store.rindex("// Presets")
-        ]
-        options = store[
-            store.rindex("loadModelOptions: async (modelType)"):
-            store.index("// System config", store.rindex("loadModelOptions: async (modelType)"))
-        ]
-        self.assertIn("if (restoredSnapshot)", mode_switch)
-        self.assertIn("++_modelDefaultsSeq", mode_switch)
-        self.assertIn("_applyModelDefaults(get, set, newModelType)", mode_switch)
-        self.assertGreaterEqual(resolution.count("++_modelDefaultsSeq"), 2)
-        self.assertGreaterEqual(loras.count("++_modelDefaultsSeq"), 2)
-        self.assertIn("const defaultsSeq = _modelDefaultsSeq", options)
-        self.assertGreaterEqual(
-            options.count("defaultsSeq === _modelDefaultsSeq"), 2
-        )
 
 
 if __name__ == "__main__":
