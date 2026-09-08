@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 
@@ -8,9 +9,22 @@ const UI_ROOT = new URL('..', import.meta.url).pathname
 
 const source = relative => readFile(new URL(relative, import.meta.url), 'utf8')
 
-const [advanced, store] = await Promise.all([
+function verifyProfileWire(preset) {
+  const payload = { ...preset }
+  delete payload.id
+  delete payload.created_at
+  const validated = JSON.parse(execFileSync(process.env.MAESTRO_TEST_PYTHON || 'python', [
+    '-c',
+    'import json,sys; sys.path.insert(0,"app"); from services.generation_presets import _normalize_preset; print(json.dumps(_normalize_preset(json.load(sys.stdin))))',
+  ], { cwd: new URL('../..', import.meta.url), input: JSON.stringify(payload), encoding: 'utf8' }))
+  assert.deepEqual(validated, payload, 'actual browser payload round-trips through the Python storage contract')
+}
+
+
+const [advanced, store, profileComponent] = await Promise.all([
   source('../src/components/Sidebar/AdvancedSettings.tsx'),
   source('../src/stores/useStore.ts'),
+  source('../src/components/Sidebar/GenerationProfiles.tsx'),
 ])
 
 function asDataModule(contents) {
@@ -293,11 +307,11 @@ test('fresh model hydration is role-exact in both response orders', async t => {
           })
           if (url.endsWith('/api/v1/defaults/minimax_h3')) {
             defaultsStarted = true
-            return defaultsRequest.promise
+            return (await defaultsRequest.promise).clone()
           }
           if (url.endsWith('/api/v1/model-options/minimax_h3')) {
             optionsStarted = true
-            return optionsRequest.promise
+            return (await optionsRequest.promise).clone()
           }
           if (url.endsWith('/api/v1/loras/minimax_h3')) {
             return jsonResponse({ loras: [], guidance_max_phases: 1 })
@@ -589,8 +603,8 @@ test('manual and loaded-preset values win over late model hydration', async t =>
     const optionsRequest = deferred()
     await withFreshStore(async input => {
       const url = String(input)
-      if (url.endsWith('/api/v1/defaults/minimax_h3')) return defaultsRequest.promise
-      if (url.endsWith('/api/v1/model-options/minimax_h3')) return optionsRequest.promise
+      if (url.endsWith('/api/v1/defaults/minimax_h3')) return (await defaultsRequest.promise).clone()
+      if (url.endsWith('/api/v1/model-options/minimax_h3')) return (await optionsRequest.promise).clone()
       if (url.endsWith('/api/v1/loras/minimax_h3')) {
         return jsonResponse({ loras: [], guidance_max_phases: 1 })
       }
@@ -634,8 +648,8 @@ test('manual and loaded-preset values win over late model hydration', async t =>
     }
     await withFreshStore(async input => {
       const url = String(input)
-      if (url.endsWith('/api/v1/defaults/minimax_h3')) return defaultsRequest.promise
-      if (url.endsWith('/api/v1/model-options/minimax_h3')) return optionsRequest.promise
+      if (url.endsWith('/api/v1/defaults/minimax_h3')) return (await defaultsRequest.promise).clone()
+      if (url.endsWith('/api/v1/model-options/minimax_h3')) return (await optionsRequest.promise).clone()
       if (url.endsWith('/api/v1/loras/minimax_h3')) {
         return jsonResponse({ loras: [], guidance_max_phases: 1 })
       }
@@ -647,11 +661,12 @@ test('manual and loaded-preset values win over late model hydration', async t =>
       useStore.setState({ activeWorkspace: 'preset-project' })
       await useStore.getState().selectModel('minimax_h3')
       await useStore.getState().loadPresets()
-      useStore.getState().loadPreset(useStore.getState().presets[0])
+      const profileLoad = useStore.getState().loadPreset(useStore.getState().presets[0])
       await settleInOrder(
         () => optionsRequest.resolve(jsonResponse(h3ModelOptions())),
         () => defaultsRequest.resolve(jsonResponse(h3Defaults('user'))),
       )
+      await profileLoad
       await waitForCondition(() => useStore.getState().modelOptionsLoading === false, 'preset model options')
       assert.equal(useStore.getState().params.num_inference_steps, 32)
       assert.equal(useStore.getState().params.resolution, '1024x768')
@@ -661,32 +676,22 @@ test('manual and loaded-preset values win over late model hydration', async t =>
   })
 })
 
-test('preset save waits for scoped insertion before clearing and reports bounded status', () => {
-  const manager = sliceBetween(advanced, 'function PresetManager()', '/** Active advanced features')
-  assert.match(manager, /const \[saving, setSaving\] = useState\(false\)/)
+test('profile save confirms scoped insertion before clearing the form', () => {
+  const manager = profileComponent
   assert.match(manager, /await savePreset\(name\)/)
-  assert.ok(
-    manager.indexOf('await savePreset(name)') < manager.indexOf("setSaveName('')"),
-    'the name clears only after save resolution',
-  )
-  assert.ok(
-    manager.indexOf('await savePreset(name)') < manager.indexOf('setShowSave(false)'),
-    'the form closes only after save resolution',
-  )
-  assert.match(manager, /disabled=\{!saveName\.trim\(\) \|\| saving\}/)
-  assert.match(manager, /aria-busy=\{saving\}/)
-  assert.match(manager, /Saving…/)
+  assert.ok(manager.indexOf('await savePreset(name)') < manager.indexOf("setSaveName('')"))
+  assert.ok(manager.indexOf('await savePreset(name)') < manager.indexOf('setShowSave(false)'))
+  assert.match(manager, /await loadPreset\(selected\)/)
+  assert.match(manager, /loaded === false/)
   assert.match(manager, /role="status"/)
   assert.match(manager, /aria-live="polite"/)
-  assert.match(manager, /Preset saved\./)
-  assert.match(manager, /Preset save could not be confirmed\. Check your connection and try again\./)
-  assert.doesNotMatch(manager, /saveNotice[^\n]*error instanceof Error/)
+  assert.doesNotMatch(manager, /setNotice[^\n]*error instanceof Error/)
 })
 
 test('preset store confirms account-project scope and keeps Recipes separate', () => {
-  const presetStore = sliceBetween(store, '// Presets\n  presets: []', '// Model options')
-  const save = sliceBetween(presetStore, 'savePreset: async (name)', 'loadPreset: (preset)')
-  const load = sliceBetween(presetStore, 'loadPreset: (preset)', 'deletePreset: async')
+  const presetStore = sliceBetween(store, '  savePreset: async', '  // Model options\n  modelOptions:')
+  const save = sliceBetween(presetStore, 'savePreset: async (name)', 'loadPreset: async (preset)')
+  const load = sliceBetween(presetStore, 'loadPreset: async (preset)', 'deletePreset: async')
 
   assert.match(save, /await api\.createPreset\(activeWorkspace/)
   assert.match(save, /accountIdentityEpoch !== _accountIdentityEpoch/)
@@ -703,4 +708,159 @@ test('preset store confirms account-project scope and keeps Recipes separate', (
   assert.match(load, /\+\+_modelDefaultsSeq/)
   assert.doesNotMatch(presetStore, /\/recipes|Recipes|applyRecipe/)
   assert.doesNotMatch(presetStore, /prompt:|negative_prompt|image_refs/)
+})
+
+test('full saved profiles round-trip settings after model options and retain current job inputs', async () => {
+  let saved
+  let defaultsCalls = 0
+  await withFreshStore(async (input, init) => {
+    const url = String(input)
+    if (url.includes('/api/v1/presets?') && init?.method === 'POST') {
+      saved = { ...JSON.parse(init.body), created_at: 1 }
+      return jsonResponse(saved)
+    }
+    if (url.includes('/api/v1/model-options/')) return jsonResponse(h3ModelOptions('minimax_h3'))
+    if (url.includes('/api/v1/defaults/')) { defaultsCalls += 1; return jsonResponse(h3Defaults('user')) }
+    if (url.includes('/api/v1/loras/')) return jsonResponse({ loras: [], guidance_max_phases: 1 })
+    throw new Error(`Unexpected profile request: ${url}`)
+  }, async useStore => {
+    useStore.setState(state => ({
+      activeWorkspace: 'profile-project', generationMode: 'video', spatialUpsampling: 'realesrgan',
+      durationSeconds: 20.875, slidingWindowSeconds: 10.875, slidingWindowOverlap: 17,
+      slidingWindowLocked: true, filmGrainIntensity: 0.2, filmGrainSaturation: 0.7,
+      voiceCloneEnabled: false, voiceCloneMode: 'single', studioPromptEnhance: false,
+      params: { ...state.params, prompt: 'not profile content', negative_prompt: 'not profile content',
+        image_refs: ['/job-only/ref.png'], spatial_upsampling: 'realesrgan', video_length: 501, num_inference_steps: 31, seed: 10000000000000000,
+        h3_adaptive_conditioning: false, h3_fl2va_loras: [], h3_fl2va_loras_multipliers: '',
+        h3_ref2va_loras: ['retained.safetensors'], h3_ref2va_loras_multipliers: '0.75',
+        use_gradient_estimation: false, cfg_rescale: 0, stg_scale: 0,
+        custom_settings: { h3_attention_engine: 'sdpa', h3_sol_tau: 1.25 },
+      },
+    }))
+    useStore.getState().setSpatialUpsampling('')
+    await useStore.getState().savePreset('Whole setup')
+    assert.equal(saved.spatial_upsampling, '')
+    assert.equal('spatial_upsampling' in saved.params, false)
+    assert.equal('spatialUpsampling' in saved.ui_settings, false)
+    assert.equal(saved.profile_version, 2)
+    verifyProfileWire(saved)
+    assert.equal('prompt' in saved.params, false)
+    assert.equal('image_refs' in saved.params, false)
+    const profile = useStore.getState().presets[0]
+    useStore.setState(state => ({
+      durationSeconds: 5, slidingWindowSeconds: 5, slidingWindowOverlap: 1,
+      slidingWindowLocked: false, filmGrainIntensity: 0.9, voiceCloneEnabled: true,
+      params: { ...state.params, prompt: 'current job', image_refs: ['/current/ref.png'],
+        num_inference_steps: 4, h3_fl2va_loras: ['stale.safetensors'],
+        progressive_stage3_sigma: 0.9, cfg_rescale: 0.8, use_gradient_estimation: true,
+      },
+    }))
+    assert.equal(await useStore.getState().loadPreset(profile), true)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    const restored = useStore.getState()
+    assert.equal(restored.spatialUpsampling, '')
+    assert.equal(restored.params.spatial_upsampling, '')
+    assert.equal(restored.params.prompt, 'current job')
+    assert.deepEqual(restored.params.image_refs, ['/current/ref.png'])
+    for (const [key, value] of Object.entries(saved.params)) assert.deepEqual(restored.params[key], value, key)
+    for (const [key, value] of Object.entries(saved.ui_settings)) {
+      assert.deepEqual(restored[key], value, key)
+    }
+    assert.equal('progressive_stage3_sigma' in restored.params, false)
+    assert.equal(restored.savedParamsPerMode.video.num_inference_steps, 31)
+    assert.equal(restored.savedParamsPerMode.video.durationSeconds, 20.875)
+    assert.equal(defaultsCalls, 0, 'full snapshots must not be replaced by account defaults')
+  })
+})
+
+test('an edit during profile hydration wins and a failed model lookup changes no settings', async () => {
+  const options = deferred()
+  let failLookup = false
+  await withFreshStore(async (input, init) => {
+    const url = String(input)
+    if (url.includes('/api/v1/presets?') && init?.method === 'POST') return jsonResponse({ ...JSON.parse(init.body), created_at: 1 })
+    if (url.includes('/api/v1/model-options/')) return failLookup ? jsonResponse({}, 503) : options.promise
+    throw new Error(`Unexpected interrupted profile request: ${url}`)
+  }, async useStore => {
+    useStore.setState({ activeWorkspace: 'profile-project' })
+    await useStore.getState().savePreset('Saved')
+    const profile = useStore.getState().presets[0]
+    const loading = useStore.getState().loadPreset(profile)
+    useStore.getState().setParam('num_inference_steps', 19)
+    options.resolve(jsonResponse(h3ModelOptions()))
+    assert.equal(await loading, false)
+    assert.equal(useStore.getState().params.num_inference_steps, 19)
+    const before = useStore.getState().params
+    failLookup = true
+    await assert.rejects(useStore.getState().loadPreset(profile), /Could not load this profile/)
+    assert.equal(useStore.getState().params, before)
+    assert.equal(useStore.getState().modelOptionsLoading, false)
+  })
+})
+
+test('profile voice counts pad current voice cards and preserve media when the count decreases', async () => {
+  await withFreshStore(async (input, init) => {
+    const url = String(input)
+    if (url.includes('/api/v1/presets?') && init?.method === 'POST') {
+      const body = JSON.parse(init.body)
+      verifyProfileWire(body)
+      return jsonResponse({ ...body, created_at: 1 })
+    }
+    if (url.includes('/api/v1/model-options/')) return jsonResponse({ model_type: 'audio-test', fps: 24, audio_prompt_type_sources: { selection: ['', 'A2', 'AB2'] } })
+    if (url.includes('/api/v1/loras/')) return jsonResponse({ loras: [], guidance_max_phases: 1 })
+    throw new Error(`Unexpected voice-profile request: ${url}`)
+  }, async useStore => {
+    const voice = { name: 'Current speaker', filename: 'voice.wav', path: '/current/voice.wav' }
+    useStore.setState(state => ({ activeWorkspace: 'voices', generationMode: 'audio', audioSubMode: 'speech',
+      modelOptions: { audio_prompt_type_sources: { selection: ['', 'A2', 'AB2'] } },
+      params: { ...state.params, model_type: 'audio-test', prompt: '', audio_prompt_type: 'AB2' },
+      ttsVoiceCount: 4, ttsVoices: [voice],
+    }))
+    await useStore.getState().savePreset('Four speakers')
+    const four = useStore.getState().presets[0]
+    useStore.setState({ ttsVoiceCount: 1 })
+    assert.equal(await useStore.getState().loadPreset(four), true)
+    assert.equal(useStore.getState().ttsVoiceCount, 4)
+    assert.equal(useStore.getState().ttsVoices.length, 4)
+    assert.equal(useStore.getState().ttsVoices[0], voice)
+    assert.equal(useStore.getState().params.audio_prompt_type, 'AB2')
+    useStore.getState().setTtsVoiceCount(1)
+    await useStore.getState().savePreset('One speaker')
+    const one = useStore.getState().presets.at(-1)
+    useStore.getState().setTtsVoiceCount(4)
+    assert.equal(await useStore.getState().loadPreset(one), true)
+    assert.equal(useStore.getState().ttsVoiceCount, 1)
+    assert.equal(useStore.getState().ttsVoices.length, 4, 'inactive job-local references remain available')
+    assert.equal(useStore.getState().ttsVoices[0], voice)
+    assert.equal(useStore.getState().params.audio_prompt_type, 'A2')
+  })
+})
+
+test('legacy profiles retain settings they never recorded and keep current media', async () => {
+  const legacy = { id: 'legacy', name: 'Older profile', mode: 'avatar', model_type: 'edit-test',
+    activated_loras: [], loras_multipliers: '', lora_weights: {}, spatial_upsampling: '',
+    params: { num_inference_steps: 20, guidance_scale: 1, resolution: '1024x1024', seed: 0 }, created_at: 1 }
+  await withFreshStore(async input => {
+    const url = String(input)
+    if (url.includes('/api/v1/presets?')) return jsonResponse({ presets: [legacy] })
+    if (url.includes('/api/v1/model-options/')) return jsonResponse({ model_type: 'edit-test', fps: 24 })
+    if (url.includes('/api/v1/loras/')) return jsonResponse({ loras: [], guidance_max_phases: 1 })
+    throw new Error(`Unexpected legacy-profile request: ${url}`)
+  }, async useStore => {
+    useStore.setState(state => ({ activeWorkspace: 'legacy-project', generationMode: 'avatar',
+      editStartTime: 3, editEndTime: 8, editVideoPath: '/current/edit.mp4', filmGrainIntensity: 0.4,
+      durationSeconds: 12, ttsVoiceCount: 2, params: { ...state.params, cfg_rescale: 0.5 },
+    }))
+    await useStore.getState().loadPresets()
+    assert.equal(await useStore.getState().loadPreset(useStore.getState().presets[0]), true)
+    const current = useStore.getState()
+    assert.equal(current.editStartTime, 3)
+    assert.equal(current.editEndTime, 8)
+    assert.equal(current.editVideoPath, '/current/edit.mp4')
+    assert.equal(current.durationSeconds, 12)
+    assert.equal(current.filmGrainIntensity, 0.4)
+    assert.equal(current.ttsVoiceCount, 2)
+    assert.equal(current.params.cfg_rescale, 0.5)
+    assert.equal(current.params.num_inference_steps, 20)
+  })
 })

@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { captureGenerationProfileSettings, restoreGenerationProfileSettings, generationProfileUiKeys } from '../lib/generationProfiles'
 import type { StoreApi } from 'zustand'
 import type { GenerateParams, OutputFile, MediaFilter, OutputArtifactScope, AspectRatio, ResolutionPreset, ScailResolutionProfile, GenerationJob, H3SegmentPlan, H3PlanDecision, H3PerformanceEstimate, H3SegmentCountEstimate, H3PerformanceProfile, H3PerformanceProfileId, ModelFamily, ModelDef, GenerationMode, ModelOptions, SystemConfig, SettingsTab, OutputMetadata, MultiClip, ServicesConfig, HostTermId, HostTermsStatus, LlmStatus, LlmModelOption, AudioAnalysisResult, PlannedClip, ClipPlan, DirectorClipImage, DirectorImageGenProgress, DirectorImageRole, DirectorImageRoleLoraSelection, SpeakerMapping, DirectorSkill, DirectorShotImageGuidance, ShortFilmCharacter, ShortFilmPath, CivitAIModel, CivitAIDownload, PipelineListItem, PipelineRepairState, SavedPipelineState, SystemDetectResponse, SystemStats, RecastCharacterMapping, RepaintRegionMapping, AccountAuthResult, AccountContext, AccountProjectMigrationStatus, AccountSession, AccountSummary, ResponsibleUseProjection, SupportAdminProjection, SupportFulfillmentMutationInput, SupportManualContributionInput, SupportPublicProjection, SupportSelfProjection, SupportH3LegalAccessProjection, SupportH3LegalAccessLocationInput } from '../types'
 import * as api from '../api/client'
@@ -1726,6 +1727,17 @@ type SavedModeParams = Partial<GenerateParams> & {
   durationSeconds?: number
 }
 
+function _ttsRowsForCount(current: AppState['ttsVoices'], count: number): AppState['ttsVoices'] {
+  const voices = [...current]
+  while (voices.length < count) voices.push({ name: '', filename: null, path: null })
+  return voices
+}
+
+function _ttsAudioPromptType(count: number, options: ModelOptions | null, current: string | undefined): string {
+  const selection = (options?.audio_prompt_type_sources?.selection as string[] | undefined) || ['', 'A', 'AB']
+  return selection[Math.min(count, selection.length - 1)] + ((current || '').replace(/[^NV]/g, ''))
+}
+
 function _snapshotModeParams(params: GenerateParams): SavedModeParams {
   const snapshot: SavedModeParams = { ...params }
   delete snapshot.model_type
@@ -3271,11 +3283,13 @@ interface AppState {
   setLoraWeight: (filename: string, phaseIndex: number, value: number) => void
 
   // Presets
+  selectedGenerationProfileId: string
+  setSelectedGenerationProfileId: (id: string) => void
   presets: import('../api/client').GenerationPreset[]
   presetsLoading: boolean
   loadPresets: () => Promise<void>
   savePreset: (name: string) => Promise<void>
-  loadPreset: (preset: import('../api/client').GenerationPreset) => void
+  loadPreset: (preset: import('../api/client').GenerationPreset) => Promise<boolean>
   deletePreset: (id: string) => Promise<void>
 
   // Model options
@@ -4137,6 +4151,7 @@ let _accessContextRequestSequence = 0
 let _accountProjectMigrationRequestSequence = 0
 let _sampleCampaignQueueRequestSequence = 0
 let _presetLoadSequence = 0
+let _presetApplySequence = 0
 const _presetScopes = new WeakMap<api.GenerationPreset, {
   accountIdentityEpoch: number
   workspace: string
@@ -5039,6 +5054,7 @@ function _scrubAccountBoundProjectUi(state: AppState): Partial<AppState> {
     directorQueueLoading: false,
     presets: [],
     presetsLoading: false,
+    selectedGenerationProfileId: '',
     recipes: [],
     recipesLoading: false,
     recipesError: null,
@@ -7439,6 +7455,7 @@ export const useStore = create<AppState>((set, get) => ({
       spatialUpsampling: v,
       params: {
         ...state.params,
+        spatial_upsampling: v,
         delivery_resolution: undefined,
         delivery_fit: undefined,
       },
@@ -7547,22 +7564,12 @@ export const useStore = create<AppState>((set, get) => ({
   ttsVoices: [],
   setTtsVoiceCount: (count) => {
     const prevCount = get().ttsVoiceCount
-    const current = get().ttsVoices
-    const voices = [...current]
-    while (voices.length < count) {
-      voices.push({ name: '', filename: null, path: null })
-    }
-    // Derive audio_prompt_type from voice count using the model's own selection
-    // list. KugelAudio's selection = ["", "A", "AB"] → 0→"", 1→"A", 2+→"AB".
-    // Scenema's selection = ["", "A2", "AB2"] → 0→"", 1→"A2", 2+→"AB2".
-    // Other (non-Scenema/Kugel) audio-only models keep the legacy ""/A/AB
-    // mapping for backward compat.
-    const selection = (get().modelOptions?.audio_prompt_type_sources?.selection as string[] | undefined) || ['', 'A', 'AB']
-    const audioType = selection[Math.min(count, selection.length - 1)]
+    const voices = _ttsRowsForCount(get().ttsVoices, count)
+    const audioType = _ttsAudioPromptType(count, get().modelOptions, get().params.audio_prompt_type)
     set(s => ({
       ttsVoiceCount: count,
-      ttsVoices: voices.slice(0, Math.max(count, voices.length)),
-      params: { ...s.params, audio_prompt_type: audioType + ((s.params.audio_prompt_type as string || '').replace(/[^NV]/g, '')) },
+      ttsVoices: voices,
+      params: { ...s.params, audio_prompt_type: audioType },
     }))
     // If user added voices to an existing prompt (e.g. typed/pasted a
     // dialogue script first, THEN added voice slots), parse the names
@@ -8711,7 +8718,7 @@ export const useStore = create<AppState>((set, get) => ({
     }
 
     // Post-processing settings
-    if (state.spatialUpsampling) params.spatial_upsampling = state.spatialUpsampling
+    params.spatial_upsampling = state.spatialUpsampling
     if (state.filmGrainIntensity > 0) {
       params.film_grain_intensity = state.filmGrainIntensity
       params.film_grain_saturation = state.filmGrainSaturation
@@ -10150,6 +10157,8 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   // Presets
+  selectedGenerationProfileId: '',
+  setSelectedGenerationProfileId: id => set({ selectedGenerationProfileId: id }),
   presets: [],
   presetsLoading: false,
 
@@ -10187,9 +10196,10 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   savePreset: async (name) => {
+    const snapshot = get()
     const {
       params, loraWeights, generationMode, activeWorkspace, spatialUpsampling,
-    } = get()
+    } = snapshot
     const accountIdentityEpoch = _accountIdentityEpoch
     const presetName = name.trim()
     if (!activeWorkspace) {
@@ -10206,19 +10216,7 @@ export const useStore = create<AppState>((set, get) => ({
       loras_multipliers: params.loras_multipliers,
       lora_weights: loraWeights,
       spatial_upsampling: spatialUpsampling,
-      params: {
-        num_inference_steps: params.num_inference_steps,
-        guidance_scale: params.guidance_scale,
-        resolution: params.resolution,
-        seed: params.seed,
-        flow_shift: params.flow_shift,
-        self_refiner_setting: params.self_refiner_setting,
-        stage2_steps: params.stage2_steps,
-        tea_cache: params.tea_cache,
-        delivery_resolution: params.delivery_resolution,
-        delivery_fit: params.delivery_fit,
-        custom_settings: _restorableH3CustomSettings(params.custom_settings),
-      },
+      ...captureGenerationProfileSettings(params, snapshot),
     })
     if (
       accountIdentityEpoch !== _accountIdentityEpoch
@@ -10239,53 +10237,130 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
-  loadPreset: (preset) => {
+  loadPreset: async (preset) => {
     const scope = _presetScopes.get(preset)
+    const submitted = get()
     if (
       !scope
       || scope.accountIdentityEpoch !== _accountIdentityEpoch
       || scope.workspace !== get().activeWorkspace
       || !get().presets.includes(preset)
-    ) return
+      || preset.mode !== submitted.generationMode
+    ) return false
+    const sequence = ++_presetApplySequence
+    const optionsSequence = ++_modelOptionsSeq
     ++_h3ProfileApplySeq
     ++_h3CompatibilitySeq
     ++_modelDefaultsSeq
-    const newParams: Partial<GenerateParams> = {
-      model_type: preset.model_type,
-      activated_loras: preset.activated_loras,
-      loras_multipliers: preset.loras_multipliers,
-      ...(preset.params as Partial<GenerateParams>),
-      delivery_resolution: typeof preset.params.delivery_resolution === 'string'
-        ? preset.params.delivery_resolution
-        : undefined,
-      delivery_fit: typeof preset.params.delivery_fit === 'string'
-        ? preset.params.delivery_fit
-        : undefined,
+    ++_loraLoadSeq
+    ++_settingsRestoreGeneration
+    const current = () => {
+      const live = get()
+      return sequence === _presetApplySequence
+        && optionsSequence === _modelOptionsSeq
+        && scope.accountIdentityEpoch === _accountIdentityEpoch
+        && scope.workspace === live.activeWorkspace
+        && live.presets.includes(preset)
+        && live.generationMode === submitted.generationMode
+        && live.params === submitted.params
+        && live.ttsVoices === submitted.ttsVoices
+        && live.voiceCloneRefs === submitted.voiceCloneRefs
+        && live.startImage === submitted.startImage
+        && live.endImage === submitted.endImage
+        && live.imageRefs === submitted.imageRefs
+        && live.editVideoPath === submitted.editVideoPath
+        && live.continueVideoPath === submitted.continueVideoPath
+        && live.blendClipAPath === submitted.blendClipAPath
+        && live.blendClipBPath === submitted.blendClipBPath
+        && generationProfileUiKeys.every(key => (
+          (live as unknown as Record<string, unknown>)[key]
+            === (submitted as unknown as Record<string, unknown>)[key]
+        ))
     }
-    if (preset.model_type.startsWith('minimax_h3')) {
-      const restored = _restorableH3CustomSettings(newParams.custom_settings)
-      const engine = _normalizeH3AttentionEngine(restored.h3_attention_engine)
-      newParams.custom_settings = { h3_attention_engine: engine, ...restored }
-      try {
-        localStorage.setItem(H3_ATTENTION_ENGINE_KEY, engine)
-      } catch {
-        // The active generation still receives the preset when storage is unavailable.
+    set({ modelOptionsLoading: true })
+    try {
+      const options = await api.fetchModelOptions(preset.model_type)
+      if (!current()) return false
+      // Legacy profiles remain partial overlays. Only full snapshots clear
+      // omitted optional settings; neither format replaces job-local media.
+      const restored = restoreGenerationProfileSettings(preset, submitted.params, useStore.getInitialState())
+      const nextParams = {
+        ...restored.params,
+        model_type: preset.model_type,
+        activated_loras: [...preset.activated_loras],
+        loras_multipliers: preset.loras_multipliers,
+        spatial_upsampling: preset.spatial_upsampling,
+      } as GenerateParams
+      const uiSettings = restored.uiSettings as Partial<AppState>
+      uiSettings.spatialUpsampling = preset.spatial_upsampling
+      if (preset.profile_version === 2 && uiSettings.ttsVoiceCount != null) {
+        uiSettings.ttsVoices = _ttsRowsForCount(submitted.ttsVoices, uiSettings.ttsVoiceCount)
+        if (submitted.generationMode === 'audio' && (uiSettings.audioSubMode || submitted.audioSubMode) === 'speech') {
+          nextParams.audio_prompt_type = _ttsAudioPromptType(uiSettings.ttsVoiceCount, options, nextParams.audio_prompt_type)
+        }
+      }
+      const selected: Partial<AppState> = { resolutionPreset: 'auto', aspectRatio: 'auto' }
+      const maps = [
+        ...Object.entries(options.resolution_presets || {}).map(([name, definition]) => [name, definition.values || {}] as const),
+        ...Object.entries(resolutionMap),
+      ]
+      for (const [name, ratios] of maps) {
+        const match = Object.entries(ratios).find(([, resolution]) => resolution === nextParams.resolution)
+        if (!match) continue
+        selected.resolutionPreset = name as ResolutionPreset
+        selected.aspectRatio = match[0] as AspectRatio
+        break
+      }
+      if (preset.profile_version === 2) {
+        if (typeof preset.ui_settings?.resolutionPreset === 'string') selected.resolutionPreset = preset.ui_settings.resolutionPreset as ResolutionPreset
+        if (typeof preset.ui_settings?.aspectRatio === 'string') selected.aspectRatio = preset.ui_settings.aspectRatio as AspectRatio
+      }
+      const mode = submitted.generationMode
+      const weights = structuredClone(preset.lora_weights || {})
+      const savedParamsPerMode = {
+        ...submitted.savedParamsPerMode,
+        [mode]: {
+          ..._snapshotModeParams(nextParams),
+          filmGrainIntensity: uiSettings.filmGrainIntensity ?? submitted.filmGrainIntensity,
+          filmGrainSaturation: uiSettings.filmGrainSaturation ?? submitted.filmGrainSaturation,
+          durationSeconds: uiSettings.durationSeconds ?? submitted.durationSeconds,
+        },
+      }
+      set({
+        ...uiSettings,
+        ...selected,
+        params: nextParams,
+        modelOptions: options,
+        modelOptionsLoading: false,
+        loraWeights: weights,
+        availableLoras: [],
+        selectedModelPerMode: { ...submitted.selectedModelPerMode, [mode]: preset.model_type },
+        savedParamsPerMode,
+        savedLoraPerMode: {
+          ...submitted.savedLoraPerMode,
+          [mode]: { activated_loras: [...preset.activated_loras], loras_multipliers: preset.loras_multipliers, loraWeights: weights, availableLoras: [] },
+        },
+        h3SelectedProfile: 'custom',
+        h3ProfileApplying: null,
+      })
+      const applied = get()
+      _saveSettings({
+        generationMode: mode,
+        selectedModelPerMode: applied.selectedModelPerMode,
+        savedParamsPerMode,
+        savedLoraPerMode: applied.savedLoraPerMode,
+        savedPromptPerMode: applied.savedPromptPerMode,
+      }, applied.loraIdByFilename)
+      void get().loadLoras(preset.model_type)
+      return true
+    } catch {
+      if (!current()) return false
+      throw new Error('Could not load this profile. Check that its model is available and try again.')
+    } finally {
+      if (sequence === _presetApplySequence && optionsSequence === _modelOptionsSeq) {
+        set({ modelOptionsLoading: false })
       }
     }
-    set(s => ({
-      params: { ...s.params, ...newParams },
-      selectedModelPerMode: {
-        ...s.selectedModelPerMode,
-        [s.generationMode]: preset.model_type,
-      },
-      loraWeights: preset.lora_weights || {},
-      spatialUpsampling: preset.spatial_upsampling || '',
-      h3SelectedProfile: 'custom',
-      h3ProfileApplying: null,
-    }))
-    // A saved preset is explicit authored state. Compatibility feedback may
-    // be refreshed later, but loading must not silently replace its exact
-    // steps or delivery chain with a catalog fallback.
   },
 
   deletePreset: async (id) => {
@@ -10297,9 +10372,12 @@ export const useStore = create<AppState>((set, get) => ({
       if (
         accountIdentityEpoch === _accountIdentityEpoch
         && get().activeWorkspace === workspace
-      ) set(s => ({ presets: s.presets.filter(p => p.id !== id) }))
-    } catch (e) {
-      console.error('Failed to delete preset:', e)
+      ) set(s => ({
+        presets: s.presets.filter(p => p.id !== id),
+        selectedGenerationProfileId: s.selectedGenerationProfileId === id ? '' : s.selectedGenerationProfileId,
+      }))
+    } catch {
+      throw new Error('Could not delete this profile. Try again.')
     }
   },
 

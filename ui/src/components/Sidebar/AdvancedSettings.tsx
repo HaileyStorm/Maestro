@@ -1,12 +1,13 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { createPortal } from 'react-dom'
-import { X, Save, Trash2, FolderOpen, SlidersHorizontal } from 'lucide-react'
+import { X, SlidersHorizontal } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import { closeModalIfTop, installModalFocus } from '../../lib/modalFocus'
 import { PostProcessing } from './PostProcessing'
 import { ControlVideoSection } from './ControlVideoSection'
 import { LoraSelector } from '../SettingsDrawer/LoraSelector'
 import { WindowSettings } from './DurationSlider'
+import { GenerationProfiles } from './GenerationProfiles'
 import {
   fetchH3AccelerationStatus,
   fetchH3BenchmarkReport,
@@ -45,153 +46,6 @@ function withNumericCustomSetting(
   return Object.keys(next).length > 0 ? next : undefined
 }
 
-function PresetManager() {
-  const presets = useStore(s => s.presets)
-  const loadPresets = useStore(s => s.loadPresets)
-  const savePreset = useStore(s => s.savePreset)
-  const loadPresetFn = useStore(s => s.loadPreset)
-  const deletePreset = useStore(s => s.deletePreset)
-  const generationMode = useStore(s => s.generationMode)
-  const currentModel = useStore(s => s.params.model_type)
-  const [saveName, setSaveName] = useState('')
-  const [showSave, setShowSave] = useState(false)
-  const [saving, setSaving] = useState(false)
-  const [saveNotice, setSaveNotice] = useState<{
-    kind: 'success' | 'error'
-    text: string
-  } | null>(null)
-  const saveInFlight = useRef(false)
-  const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
-
-  useEffect(() => { loadPresets() }, [loadPresets])
-
-  const modePresets = presets.filter(p => p.mode === generationMode && p.model_type === currentModel)
-
-  const handleSave = async () => {
-    const name = saveName.trim()
-    if (!name || saveInFlight.current) return
-    saveInFlight.current = true
-    setSaving(true)
-    setSaveNotice(null)
-    try {
-      await savePreset(name)
-      setSaveName('')
-      setShowSave(false)
-      setSaveNotice({ kind: 'success', text: 'Preset saved.' })
-    } catch {
-      setSaveNotice({
-        kind: 'error',
-        text: 'Preset save could not be confirmed. Check your connection and try again.',
-      })
-    } finally {
-      saveInFlight.current = false
-      setSaving(false)
-    }
-  }
-
-  const handleDelete = (id: string) => {
-    if (confirmDelete === id) {
-      deletePreset(id)
-      setConfirmDelete(null)
-    } else {
-      setConfirmDelete(id)
-      setTimeout(() => setConfirmDelete(null), 3000)
-    }
-  }
-
-  return (
-    <div>
-      <div className="flex items-center justify-between mb-1.5">
-        <span className="text-[11px] text-text-muted uppercase tracking-wider">Presets</span>
-        <button
-          type="button"
-          onClick={() => {
-            const opening = !showSave
-            setShowSave(opening)
-            if (opening) setSaveNotice(null)
-          }}
-          disabled={saving}
-          aria-expanded={showSave}
-          aria-controls="advanced-preset-save-form"
-          className="mobile-control-target text-[10px] text-accent-blue hover:text-accent-blue-hover flex items-center gap-0.5 disabled:cursor-wait disabled:opacity-60"
-        >
-          <Save aria-hidden="true" size={10} /> Save Current
-        </button>
-      </div>
-
-      {showSave && (
-        <div id="advanced-preset-save-form" className="flex gap-1.5 mb-2">
-          <input
-            type="text"
-            aria-label="Preset name"
-            value={saveName}
-            onChange={e => setSaveName(e.target.value)}
-            onKeyDown={e => {
-              if (e.key !== 'Enter') return
-              e.preventDefault()
-              void handleSave()
-            }}
-            disabled={saving}
-            placeholder="Preset name..."
-            className="mobile-control-target min-w-0 flex-1 bg-bg-tertiary border border-border rounded px-2 py-1 text-xs text-text-primary focus:outline-none focus:border-accent-blue focus-visible:ring-2 focus-visible:ring-accent-blue"
-            autoFocus
-          />
-          <button
-            type="button"
-            onClick={() => { void handleSave() }}
-            disabled={!saveName.trim() || saving}
-            aria-busy={saving}
-            className="mobile-control-target px-2 py-1 text-xs bg-accent-blue text-white rounded hover:bg-accent-blue-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:cursor-wait disabled:opacity-50"
-          >
-            {saving ? 'Saving…' : 'Save'}
-          </button>
-        </div>
-      )}
-
-      <p
-        role="status"
-        aria-live="polite"
-        className={`mb-1.5 min-h-4 text-[10px] ${
-          saveNotice?.kind === 'error' ? 'text-red-400' : 'text-text-muted'
-        }`}
-      >
-        {saveNotice?.text || ''}
-      </p>
-
-      {modePresets.length > 0 ? (
-        <div className="space-y-1 max-h-[120px] overflow-y-auto">
-          {modePresets.map(p => (
-            <div key={p.id} className="flex items-center gap-1.5 group">
-              <button
-                type="button"
-                onClick={() => loadPresetFn(p)}
-                className="mobile-control-target flex-1 text-left px-2 py-1.5 rounded text-xs text-text-secondary hover:bg-bg-hover hover:text-text-primary transition-colors truncate flex items-center gap-1.5 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
-                title={`${p.name}\n${p.activated_loras.length} LoRA(s) - ${p.model_type}`}
-              >
-                <FolderOpen size={10} className="shrink-0 text-text-muted" />
-                <span className="truncate">{p.name}</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => handleDelete(p.id)}
-                aria-label={`${confirmDelete === p.id ? 'Confirm delete' : 'Delete'} preset ${p.name}`}
-                className={`mobile-control-target flex shrink-0 items-center justify-center rounded p-1 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue ${
-                  confirmDelete === p.id
-                    ? 'text-red-400 bg-red-500/20'
-                    : 'text-text-muted opacity-100 md:opacity-0 md:group-hover:opacity-100 focus:opacity-100 focus-visible:opacity-100 hover:text-red-400'
-                }`}
-              >
-                <Trash2 aria-hidden="true" size={10} />
-              </button>
-            </div>
-          ))}
-        </div>
-      ) : (
-        <p className="text-[10px] text-text-muted">No {generationMode} presets for this model</p>
-      )}
-    </div>
-  )
-}
 
 /** Active advanced features as human-readable labels. Drives the badge
  *  count AND its hover tooltip, so a surprising number names its source
@@ -459,6 +313,12 @@ export function AdvancedSettings() {
 
             {/* Scrollable content */}
             <div className="flex-1 overflow-y-auto px-4 py-4 space-y-5">
+              <GenerationProfiles placement="advanced" loadOnMount={false} />
+
+              <h2 className="border-b border-border pb-2 text-[11px] font-semibold uppercase tracking-wider text-text-secondary">
+                Model &amp; timing
+              </h2>
+
               {/* Window Settings */}
               {(isVideo || (isAvatar && !isScailEdit))
                 && modelOptions?.sliding_window
@@ -471,9 +331,7 @@ export function AdvancedSettings() {
                       <label className="text-[11px] text-text-muted uppercase tracking-wider">H3 Performance</label>
                       <span className="text-[9px] text-text-muted">For this generation</span>
                     </div>
-                    <p className="mt-1 text-[9px] text-text-muted">
-                      Quality favors speed with Sol-Attn. Tested Base speed presets use SageAttention2++. Ultra favors accuracy with Dense SDPA.
-                    </p>
+                    <p className="mt-1 text-[9px] text-text-muted">Choose the attention engine for this generation.</p>
                   </div>
 
                   <div>
@@ -517,15 +375,19 @@ export function AdvancedSettings() {
                       </p>
                     )}
                     {h3Engine === 'sage2' && (
-                      <p className="mt-2 border-l border-amber-500/30 pl-2 text-[9px] text-amber-300">
-                        Usually faster than Dense SDPA on the tested Base H3 profiles. If a run switches to SDPA, Continuum leaves it out of benchmark comparisons. Base Draft at 608×352 and Fast at 864×480 have been tested for video and audio; other H3 models have not.
-                      </p>
+                      <details className="mt-2 border-l border-amber-500/30 pl-2 text-[9px] text-amber-300">
+                        <summary className="mobile-control-target focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue cursor-pointer">SageAttention2++ details</summary>
+                        <p className="mt-1">
+                          Tested for Base H3 Draft and Fast at the standard benchmark size. Automatic SDPA fallbacks are excluded from benchmark comparisons.
+                        </p>
+                      </details>
                     )}
                     {h3Engine === 'sol_attn' && (
                       <div className="mt-2 space-y-2 border-l border-amber-500/30 pl-2">
-                        <p className="text-[9px] text-amber-300">
-                          Faster approximate attention with a small quality tradeoff. Opening steps and reference-image setup use Dense SDPA, and unsupported operations switch back to Dense SDPA automatically.
-                        </p>
+                        <details className="text-[9px] text-amber-300">
+                          <summary className="mobile-control-target focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue cursor-pointer">Sol-Attn details</summary>
+                          <p className="mt-1">Opening steps, reference setup, and unsupported operations use Dense SDPA.</p>
+                        </details>
                         <div>
                           <div className="flex justify-between text-[10px] text-text-muted"><span>Routing tau</span><span>{Number(h3Custom.h3_sol_tau ?? 1).toFixed(1)}</span></div>
                           <input type="range" min={0.5} max={2.5} step={0.1} value={Number(h3Custom.h3_sol_tau ?? 1)} onChange={event => setH3Custom('h3_sol_tau', Number(event.target.value))} className="w-full" />
@@ -538,15 +400,15 @@ export function AdvancedSettings() {
                     )}
                   </div>
 
-                  <div className="rounded border border-border/70 bg-bg-primary/40 p-2 text-[9px] text-text-muted">
-                    <div className="font-medium text-text-secondary">Reference-image model</div>
+                  <details className="rounded border border-border/70 bg-bg-primary/40 p-2 text-[9px] text-text-muted">
+                    <summary className="mobile-control-target focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue cursor-pointer font-medium text-text-secondary">Reference-image model</summary>
                     <div className="mt-0.5">
                       {params.model_type === 'minimax_h3_pinkcherry_fl2va'
                         ? 'Heretic Qwen3-VL-32B INT8 ConvRot · explicit PinkCherry profile'
                         : 'Official Qwen3-VL-32B NVFP4-AWQ · base fidelity/performance profile'}
                     </div>
                     <div className="mt-1">Helps H3 follow reference images. It does not rewrite or enhance your prompt.</div>
-                  </div>
+                  </details>
 
                   <label className="flex items-start gap-2 text-[10px] text-text-muted">
                     <input
@@ -563,13 +425,9 @@ export function AdvancedSettings() {
                     />
                     <span>
                       <span className="block text-text-secondary">Kijai W4A8 FL2VA transformer · experimental, may use less memory</span>
-                      <span className="block text-[9px]">{h3Acceleration?.w4a8.reason || 'Checking merged W4A8 runtime…'} Compatible only with base FL2VA text/first/last-frame segments; PinkCherry and Ref2VA use their own weights.</span>
+                      <span className="block text-[9px]">{h3Acceleration?.w4a8.reason || 'Checking merged W4A8 runtime…'} Base FL2VA only.</span>
                     </span>
                   </label>
-
-                  <p className="text-[9px] text-text-muted">
-                    {h3Acceleration?.sol_attn.available ? 'Sol-Attn is available on this computer.' : 'Sol-Attn is unavailable, so generations use Dense SDPA.'} Published speed claims are not measurements from this computer.
-                  </p>
 
                   <div className="space-y-2 border-t border-border pt-2">
                     <div className="flex items-center justify-between gap-2">
@@ -591,9 +449,7 @@ export function AdvancedSettings() {
                         Apply benchmark settings
                       </button>
                     </div>
-                    <p className="text-[9px] text-text-muted">
-                      Successful H3 generations improve time estimates on this computer. Use these standard settings with text only, a first frame, first and last frames, or Ref2VA references for comparable results.
-                    </p>
+                    <p className="text-[9px] text-text-muted">Standard settings keep local results comparable.</p>
                     {(h3Benchmark?.records.length || 0) > 0 ? (
                       <div className="max-h-32 space-y-1 overflow-y-auto">
                         {h3Benchmark!.records.slice(-8).reverse().map(record => (
@@ -778,6 +634,10 @@ export function AdvancedSettings() {
                   )}
                 </>
               )}
+
+              <h2 className="border-b border-border pb-2 text-[11px] font-semibold uppercase tracking-wider text-text-secondary">
+                Finishing &amp; sampling
+              </h2>
 
               {/* Post Processing */}
               {!isAudio && !isScailEdit && <PostProcessing />}
@@ -1126,6 +986,10 @@ export function AdvancedSettings() {
                 </>
               )}
 
+              <h2 className="border-b border-border pb-2 text-[11px] font-semibold uppercase tracking-wider text-text-secondary">
+                References &amp; sound
+              </h2>
+
               {/* Keyframe Conditioning Mode — Start/End frames */}
               {!isScailEdit && (isVideo || isAvatar) && (hasStartImage || hasEndImage) && (
                 <div>
@@ -1214,9 +1078,6 @@ export function AdvancedSettings() {
                 </div>
               )}
 
-              {/* Presets */}
-              <PresetManager />
-
               {/* Official Outpaint owns its stage-one-only IC-LoRA schedule. */}
               {!isOutpaint && <LoraSelector />}
 
@@ -1226,6 +1087,10 @@ export function AdvancedSettings() {
                 !isScailEdit && (
                 <ControlVideoSection />
               )}
+
+              <h2 className="border-b border-border pb-2 text-[11px] font-semibold uppercase tracking-wider text-text-secondary">
+                Output
+              </h2>
 
               {/* Dedicated Recast/Repaint submissions create one edit job. */}
               {!isScailEdit && <div>

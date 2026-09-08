@@ -45,7 +45,7 @@ _MULTIPLIER_RE = re.compile(
     r"[-+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][-+]?[0-9]+)?\Z",
 )
 _MODES = frozenset({"image", "video", "audio", "avatar", "tools"})
-_PRESET_KEYS = frozenset(
+_LEGACY_PRESET_KEYS = frozenset(
     {
         "name",
         "mode",
@@ -55,6 +55,19 @@ _PRESET_KEYS = frozenset(
         "lora_weights",
         "spatial_upsampling",
         "params",
+    }
+)
+_V2_PRESET_KEYS = _LEGACY_PRESET_KEYS | {"profile_version", "ui_settings"}
+_V2_REQUIRED_PARAM_KEYS = frozenset(
+    {
+        "resolution",
+        "video_length",
+        "num_inference_steps",
+        "guidance_scale",
+        "seed",
+        "image_mode",
+        "repeat_generation",
+        "settings_version",
     }
 )
 _PARAM_KEYS = frozenset(
@@ -84,8 +97,9 @@ _CUSTOM_SETTING_KEYS = frozenset(
         "h3_turbo_profile",
     }
 )
-_PUBLIC_RECORD_KEYS = _PRESET_KEYS | {"id", "created_at"}
-_STORED_RECORD_KEYS = _PUBLIC_RECORD_KEYS | {"sequence"}
+_RECORD_METADATA_KEYS = frozenset({"id", "created_at"})
+_STORED_METADATA_KEYS = _RECORD_METADATA_KEYS | {"sequence"}
+_PROFILE_FIELDS_PATH = Path(__file__).with_name("generation_profile_fields.json")
 
 
 class GenerationPresetError(ValueError):
@@ -112,6 +126,132 @@ class _DuplicateJsonKey(ValueError):
     pass
 
 
+def _validate_profile_descriptor(descriptor: Any) -> None:
+    descriptor_keys = {
+        "type", "nullable", "max_items", "max_bytes", "properties",
+        "enum", "pattern", "minimum", "maximum",
+    }
+    supported_types = {
+        "string", "number", "integer", "boolean", "string_array",
+        "number_array", "object",
+    }
+    if (
+        type(descriptor) is not dict
+        or not set(descriptor).issubset(descriptor_keys)
+        or descriptor.get("type") not in supported_types
+        or (
+            "nullable" in descriptor
+            and type(descriptor["nullable"]) is not bool
+        )
+        or (
+            "max_items" in descriptor
+            and (
+                type(descriptor["max_items"]) is not int
+                or not 1 <= descriptor["max_items"] <= 512
+            )
+        )
+        or (
+            "max_bytes" in descriptor
+            and (
+                type(descriptor["max_bytes"]) is not int
+                or not 1 <= descriptor["max_bytes"] <= 4_096
+            )
+        )
+    ):
+        raise RuntimeError("generation profile field manifest is invalid")
+    kind = descriptor["type"]
+    if "max_items" in descriptor and kind not in {"string_array", "number_array"}:
+        raise RuntimeError("generation profile field manifest is invalid")
+    if "max_bytes" in descriptor and kind not in {"string", "string_array"}:
+        raise RuntimeError("generation profile field manifest is invalid")
+    limits = [descriptor.get("minimum"), descriptor.get("maximum")]
+    if any(limit is not None for limit in limits):
+        if kind not in {"number", "integer", "number_array"} or any(
+            type(limit) not in (int, float) or not math.isfinite(limit)
+            for limit in limits
+            if limit is not None
+        ):
+            raise RuntimeError("generation profile field manifest is invalid")
+        if kind == "integer" and any(
+            type(limit) is not int for limit in limits if limit is not None
+        ):
+            raise RuntimeError("generation profile field manifest is invalid")
+        if limits[0] is not None and limits[1] is not None and limits[0] > limits[1]:
+            raise RuntimeError("generation profile field manifest is invalid")
+    pattern = descriptor.get("pattern")
+    if pattern is not None:
+        if kind != "string" or type(pattern) is not str or not pattern or len(pattern) > 512:
+            raise RuntimeError("generation profile field manifest is invalid")
+        try:
+            re.compile(pattern)
+        except re.error:
+            raise RuntimeError("generation profile field manifest is invalid") from None
+    choices = descriptor.get("enum")
+    if choices is not None:
+        if (
+            kind not in {"string", "number", "integer", "boolean"}
+            or type(choices) is not list
+            or not 1 <= len(choices) <= 128
+        ):
+            raise RuntimeError("generation profile field manifest is invalid")
+        allowed_type = {
+            "string": str,
+            "number": (int, float),
+            "integer": int,
+            "boolean": bool,
+        }[kind]
+        for choice in choices:
+            if (
+                type(choice) is bool and kind != "boolean"
+            ) or not isinstance(choice, allowed_type) or (
+                type(choice) is float and not math.isfinite(choice)
+            ):
+                raise RuntimeError("generation profile field manifest is invalid")
+        if len({_canonical(choice) for choice in choices}) != len(choices):
+            raise RuntimeError("generation profile field manifest is invalid")
+    properties = descriptor.get("properties")
+    if properties is not None:
+        if kind != "object" or type(properties) is not dict or not properties:
+            raise RuntimeError("generation profile field manifest is invalid")
+        for name, child in properties.items():
+            if type(name) is not str or not name:
+                raise RuntimeError("generation profile field manifest is invalid")
+            _validate_profile_descriptor(child)
+
+
+def _load_profile_fields() -> dict[str, Any]:
+    try:
+        value = json.loads(
+            _PROFILE_FIELDS_PATH.read_text(encoding="utf-8"),
+            object_pairs_hook=_unique_object,
+        )
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+        raise RuntimeError("generation profile field manifest is unreadable") from error
+    if type(value) is not dict or set(value) != {
+        "version", "params", "excluded_params", "ui", "custom_settings",
+    } or value.get("version") != 2:
+        raise RuntimeError("generation profile field manifest is invalid")
+    for section in ("params", "ui", "custom_settings"):
+        fields = value[section]
+        if type(fields) is not dict or not fields:
+            raise RuntimeError("generation profile field manifest is invalid")
+        for key, descriptor in fields.items():
+            if type(key) is not str or not key:
+                raise RuntimeError("generation profile field manifest is invalid")
+            _validate_profile_descriptor(descriptor)
+    excluded = value["excluded_params"]
+    if type(excluded) is not dict or any(
+        type(key) is not str or not key or type(category) is not str or not category
+        for key, category in excluded.items()
+    ):
+        raise RuntimeError("generation profile field manifest is invalid")
+    classified = set(value["params"])
+    excluded_top_level = {key for key in excluded if "." not in key}
+    if classified & excluded_top_level:
+        raise RuntimeError("generation profile field manifest is invalid")
+    return value
+
+
 def _canonical(value: Any) -> bytes:
     return json.dumps(
         value,
@@ -129,6 +269,9 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise _DuplicateJsonKey("duplicate JSON key")
         result[key] = value
     return result
+
+
+GENERATION_PROFILE_FIELDS = _load_profile_fields()
 
 
 def _bounded_text(
@@ -264,6 +407,214 @@ def _plain_json(value: Any, *, depth: int = 0, counter: list[int]) -> Any:
     raise GenerationPresetError("params must contain only plain JSON values")
 
 
+def _profile_field_value(
+    value: Any,
+    descriptor: Mapping[str, Any],
+    name: str,
+) -> Any:
+    if value is None:
+        if descriptor.get("nullable") is True:
+            return None
+        raise GenerationPresetError(f"{name} cannot be null")
+    kind = descriptor["type"]
+    if kind == "string":
+        normalized = _bounded_text(
+            value,
+            name,
+            maximum_bytes=descriptor.get("max_bytes", 4_096),
+            allow_empty=True,
+        )
+        if "enum" in descriptor and normalized not in descriptor["enum"]:
+            raise GenerationPresetError(f"{name} is not a supported choice")
+        pattern = descriptor.get("pattern")
+        if pattern is not None and re.fullmatch(pattern, normalized) is None:
+            raise GenerationPresetError(f"{name} has an invalid format")
+        return normalized
+    if kind == "number":
+        normalized = _number(
+            value, name,
+            minimum=descriptor.get("minimum", -1_000_000_000_000),
+            maximum=descriptor.get("maximum", 1_000_000_000_000),
+        )
+        if "enum" in descriptor and normalized not in descriptor["enum"]:
+            raise GenerationPresetError(f"{name} is not a supported choice")
+        return normalized
+    if kind == "integer":
+        normalized = _integer(
+            value, name,
+            minimum=descriptor.get("minimum", -9_007_199_254_740_991),
+            maximum=descriptor.get("maximum", 9_007_199_254_740_991),
+        )
+        if "enum" in descriptor and normalized not in descriptor["enum"]:
+            raise GenerationPresetError(f"{name} is not a supported choice")
+        return normalized
+    if kind == "boolean":
+        if type(value) is not bool:
+            raise GenerationPresetError(f"{name} must be a boolean")
+        if "enum" in descriptor and value not in descriptor["enum"]:
+            raise GenerationPresetError(f"{name} is not a supported choice")
+        return value
+    if kind in {"string_array", "number_array"}:
+        if type(value) is not list or len(value) > descriptor.get("max_items", 512):
+            raise GenerationPresetError(f"{name} must be a bounded list")
+        item_descriptor = {
+            "type": "string" if kind == "string_array" else "number",
+            "max_bytes": descriptor.get("max_bytes", 4_096),
+            **(
+                {"minimum": descriptor["minimum"]}
+                if "minimum" in descriptor else {}
+            ),
+            **(
+                {"maximum": descriptor["maximum"]}
+                if "maximum" in descriptor else {}
+            ),
+        }
+        return [
+            _profile_field_value(item, item_descriptor, f"{name} item")
+            for item in value
+        ]
+    if kind == "object":
+        if type(value) is not dict:
+            raise GenerationPresetError(f"{name} must be a plain object")
+        properties = descriptor.get("properties")
+        if properties is not None:
+            if set(value) != set(properties):
+                raise GenerationPresetError(f"{name} has invalid fields")
+            return {
+                key: _profile_field_value(item, properties[key], f"{name}.{key}")
+                for key, item in value.items()
+            }
+        return _plain_json(value, counter=[0])
+    raise GenerationPresetError(f"{name} has an unsupported field type")
+
+
+def _validated_resolution(value: Any, name: str) -> str:
+    if type(value) is not str:
+        raise GenerationPresetError(f"{name} must be a string")
+    match = _RESOLUTION_RE.fullmatch(value)
+    if match is None or any(
+        not 16 <= int(dimension) <= 32_768
+        for dimension in match.groups()
+    ):
+        raise GenerationPresetError(f"{name} must be a supported WxH value")
+    return value
+
+
+def _normalize_v2_custom_settings(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if type(value) is not dict:
+        raise GenerationPresetError("custom_settings must be a plain object")
+    descriptors = GENERATION_PROFILE_FIELDS["custom_settings"]
+    if not set(value).issubset(descriptors):
+        raise GenerationPresetError(
+            "custom_settings contain unsupported or private fields",
+        )
+    return {
+        key: _profile_field_value(item, descriptors[key], f"custom_settings.{key}")
+        for key, item in value.items()
+    }
+
+
+def _validate_profile_lora_pair(
+    params: Mapping[str, Any],
+    list_key: str,
+    multiplier_key: str,
+) -> None:
+    selected = params.get(list_key)
+    multipliers = params.get(multiplier_key)
+    names = [] if selected is None else selected
+    weights = "" if multipliers is None else multipliers
+    if any(not name for name in names) or len(set(names)) != len(names):
+        raise GenerationPresetError(f"params.{list_key} contains invalid assets")
+    if not names and weights:
+        raise GenerationPresetError(
+            f"params.{multiplier_key} requires selected assets",
+        )
+    tokens = weights.split()
+    if len(tokens) > len(names):
+        raise GenerationPresetError(
+            f"params.{multiplier_key} exceeds selected assets",
+        )
+    for token in tokens:
+        phases = token.split(";")
+        if not 1 <= len(phases) <= 3:
+            raise GenerationPresetError(
+                f"params.{multiplier_key} has invalid phases",
+            )
+        try:
+            values = [float(phase) for phase in phases]
+        except (OverflowError, ValueError):
+            raise GenerationPresetError(
+                f"params.{multiplier_key} has invalid weights",
+            ) from None
+        if any(not math.isfinite(item) or not -10 <= item <= 10 for item in values):
+            raise GenerationPresetError(
+                f"params.{multiplier_key} has invalid weights",
+            )
+
+
+def _normalize_v2_params(value: Any) -> dict[str, Any]:
+    if type(value) is not dict:
+        raise GenerationPresetError("params must be a plain JSON object")
+    descriptors = GENERATION_PROFILE_FIELDS["params"]
+    if not set(value).issubset(descriptors):
+        raise GenerationPresetError("params contain unsupported or private fields")
+    if not _V2_REQUIRED_PARAM_KEYS.issubset(value):
+        raise GenerationPresetError(
+            "params are missing required generation fields",
+        )
+    normalized = {
+        key: (
+            _normalize_v2_custom_settings(item)
+            if key == "custom_settings"
+            else _profile_field_value(item, descriptors[key], f"params.{key}")
+        )
+        for key, item in value.items()
+    }
+    _validated_resolution(normalized["resolution"], "resolution")
+    delivery_resolution = normalized.get("delivery_resolution")
+    if delivery_resolution not in (None, ""):
+        _validated_resolution(delivery_resolution, "delivery_resolution")
+    for architecture in ("fl2va", "ref2va"):
+        _validate_profile_lora_pair(
+            normalized,
+            f"h3_{architecture}_loras",
+            f"h3_{architecture}_loras_multipliers",
+        )
+    try:
+        encoded = _canonical(normalized)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise GenerationPresetError("params cannot be serialized safely") from error
+    if len(encoded) > MAX_PARAMS_BYTES:
+        raise GenerationPresetLimitError("params exceed their serialized bound")
+    return normalized
+
+
+def _normalize_ui_settings(value: Any) -> dict[str, Any]:
+    if type(value) is not dict:
+        raise GenerationPresetError("ui_settings must be a plain JSON object")
+    descriptors = GENERATION_PROFILE_FIELDS["ui"]
+    if set(value) != set(descriptors):
+        raise GenerationPresetError(
+            "ui_settings are incomplete, unsupported, or private",
+        )
+    normalized = {
+        key: _profile_field_value(item, descriptors[key], f"ui_settings.{key}")
+        for key, item in value.items()
+    }
+    edit_resolution = normalized.get("editVideoResolution")
+    if edit_resolution:
+        _validated_resolution(edit_resolution, "editVideoResolution")
+    try:
+        encoded = _canonical(normalized)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise GenerationPresetError("ui_settings cannot be serialized safely") from error
+    if len(encoded) > MAX_PARAMS_BYTES:
+        raise GenerationPresetLimitError("ui_settings exceed their serialized bound")
+    return normalized
+
+
 def _normalize_params(value: Any) -> dict[str, Any]:
     if type(value) is not dict:
         raise GenerationPresetError("params must be a plain JSON object")
@@ -291,12 +642,7 @@ def _normalize_params(value: Any) -> dict[str, Any]:
     resolution = _bounded_text(
         value["resolution"], "resolution", maximum_bytes=32,
     )
-    resolution_match = _RESOLUTION_RE.fullmatch(resolution)
-    if resolution_match is None or any(
-        not 16 <= int(dimension) <= 32_768
-        for dimension in resolution_match.groups()
-    ):
-        raise GenerationPresetError("resolution must be a supported WxH value")
+    _validated_resolution(resolution, "resolution")
     _integer(
         value["seed"], "seed", minimum=-1, maximum=9_223_372_036_854_775_807,
     )
@@ -383,7 +729,18 @@ def _normalize_lora_weights(value: Any) -> dict[str, list[int | float]]:
 
 
 def _normalize_preset(value: Any) -> dict[str, Any]:
-    if type(value) is not dict or set(value) != _PRESET_KEYS:
+    if type(value) is not dict:
+        raise GenerationPresetError(
+            "preset fields are incomplete, unsupported, or private",
+        )
+    profile_version = value.get("profile_version")
+    if profile_version is None:
+        expected_keys = _LEGACY_PRESET_KEYS
+    elif profile_version == 2 and type(profile_version) is int:
+        expected_keys = _V2_PRESET_KEYS
+    else:
+        raise GenerationPresetError("generation profile version is unsupported")
+    if set(value) != expected_keys:
         raise GenerationPresetError(
             "preset fields are incomplete, unsupported, or private",
         )
@@ -396,6 +753,8 @@ def _normalize_preset(value: Any) -> dict[str, Any]:
     model_type = _bounded_text(
         value["model_type"], "model type", maximum_bytes=256,
     )
+    if profile_version == 2 and _TECHNICAL_ID_RE.fullmatch(model_type) is None:
+        raise GenerationPresetError("model type is invalid")
     raw_loras = value["activated_loras"]
     if type(raw_loras) is not list or len(raw_loras) > 64:
         raise GenerationPresetError("activated_loras must be a bounded plain list")
@@ -466,7 +825,7 @@ def _normalize_preset(value: Any) -> dict[str, Any]:
                 raise GenerationPresetError(
                     "LoRA multipliers and lora_weights do not agree",
                 )
-    return {
+    normalized = {
         "name": name,
         "mode": mode,
         "model_type": model_type,
@@ -474,8 +833,20 @@ def _normalize_preset(value: Any) -> dict[str, Any]:
         "loras_multipliers": multipliers,
         "lora_weights": lora_weights,
         "spatial_upsampling": spatial_upsampling,
-        "params": _normalize_params(value["params"]),
+        "params": (
+            _normalize_v2_params(value["params"])
+            if profile_version == 2
+            else _normalize_params(value["params"])
+        ),
     }
+    if profile_version == 2:
+        normalized["profile_version"] = 2
+        normalized["ui_settings"] = _normalize_ui_settings(value["ui_settings"])
+    return normalized
+
+
+def _preset_keys(value: Mapping[str, Any]) -> frozenset[str]:
+    return _V2_PRESET_KEYS if value.get("profile_version") == 2 else _LEGACY_PRESET_KEYS
 
 
 def _empty_state() -> dict[str, Any]:
@@ -839,12 +1210,15 @@ class GenerationPresetStore:
                 identifiers: set[str] = set()
                 previous: tuple[int, str] | None = None
                 for record in records:
-                    if type(record) is not dict or set(record) != _STORED_RECORD_KEYS:
+                    if type(record) is not dict:
+                        raise ValueError
+                    preset_keys = _preset_keys(record)
+                    if set(record) != preset_keys | _STORED_METADATA_KEYS:
                         raise ValueError
                     normalized = _normalize_preset(
-                        {key: record[key] for key in _PRESET_KEYS},
+                        {key: record[key] for key in preset_keys},
                     )
-                    if any(record[key] != normalized[key] for key in _PRESET_KEYS):
+                    if any(record[key] != normalized[key] for key in preset_keys):
                         raise ValueError
                     identifier = _preset_id(record["id"])
                     created_at = record["created_at"]
@@ -881,7 +1255,8 @@ class GenerationPresetStore:
 
     @staticmethod
     def _public(record: Mapping[str, Any]) -> dict[str, Any]:
-        return deepcopy({key: record[key] for key in _PUBLIC_RECORD_KEYS})
+        keys = _preset_keys(record) | _RECORD_METADATA_KEYS
+        return deepcopy({key: record[key] for key in keys})
 
     def list(self, *, account_scope: str, project_scope: str) -> list[dict[str, Any]]:
         """Return only presets in the exact caller-supplied scope."""
@@ -919,7 +1294,11 @@ class GenerationPresetStore:
                     None,
                 )
                 if existing is not None:
-                    if all(existing[key] == normalized[key] for key in _PRESET_KEYS):
+                    normalized_keys = _preset_keys(normalized)
+                    if (
+                        _preset_keys(existing) == normalized_keys
+                        and all(existing[key] == normalized[key] for key in normalized_keys)
+                    ):
                         return self._public(existing)
                     raise GenerationPresetConflict(
                         "preset id is already bound to different settings",

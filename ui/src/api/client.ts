@@ -5989,6 +5989,8 @@ export async function directorV2Plan(
 // --- Presets ---
 
 export interface GenerationPreset {
+  profile_version?: 2
+  ui_settings?: Record<string, unknown>
   id: string
   name: string
   mode: string

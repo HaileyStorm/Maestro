@@ -6,10 +6,11 @@ const advancedUrl = new URL('../src/components/Sidebar/AdvancedSettings.tsx', im
 const postProcessingUrl = new URL('../src/components/Sidebar/PostProcessing.tsx', import.meta.url)
 const cssUrl = new URL('../src/index.css', import.meta.url)
 
-const [advanced, postProcessing, css] = await Promise.all([
+const [advanced, postProcessing, css, profiles] = await Promise.all([
   readFile(advancedUrl, 'utf8'),
   readFile(postProcessingUrl, 'utf8'),
   readFile(cssUrl, 'utf8'),
+  readFile(new URL('../src/components/Sidebar/GenerationProfiles.tsx', import.meta.url), 'utf8'),
 ])
 
 test('Advanced mobile controls expose 44px targets without changing their handlers', () => {
@@ -20,7 +21,6 @@ test('Advanced mobile controls expose 44px targets without changing their handle
   assert.match(advanced, /mobile-control-target[^"\n]*focus-visible:ring-2 focus-visible:ring-accent-blue/)
 
   for (const marker of [
-    'aria-controls="advanced-preset-save-form"',
     'id="h3-attention-engine"',
     'id="advanced-seed-label"',
     'id="advanced-seed"',
@@ -36,22 +36,22 @@ test('Advanced mobile controls expose 44px targets without changing their handle
     assert.match(advanced, new RegExp(marker), marker)
   }
 
-  assert.match(advanced, /aria-controls="advanced-preset-save-form"[\s\S]{0,240}mobile-control-target[\s\S]{0,240}Save Current/)
+  assert.match(profiles, /aria-controls=\{saveFormId\}[\s\S]{0,300}mobile-control-target/)
   assert.match(advanced, /setH3Custom\('h3_sol_dense_steps', 0\)[\s\S]{0,240}mobile-control-target[\s\S]{0,240}Apply benchmark settings/)
   assert.match(advanced, /setParam\('seed', -1\)[\s\S]{0,240}mobile-control-target[\s\S]{0,240}Random/)
   assert.match(advanced, /mobile-control-target[^"\n]*flex items-center gap-2 cursor-pointer group/)
   assert.match(advanced, /onClick=\{\(\) => setParam\('seed', -1\)\}/)
   assert.match(advanced, /onChange=\{e => setParam\('repeat_generation', Number\(e\.target\.value\)\)\}/)
-  assert.match(advanced, /aria-label="Preset name"/)
-  assert.match(advanced, /mobile-control-target min-w-0 flex-1/)
-  assert.match(advanced, /mobile-control-target flex shrink-0 items-center justify-center/)
-  assert.match(advanced, /opacity-100 md:opacity-0 md:group-hover:opacity-100/)
+  assert.match(profiles, /aria-label="New profile name"/)
+  assert.match(profiles, /mobile-control-target min-w-0 flex-1/)
+  assert.match(profiles, /mobile-control-target flex items-center/)
+  assert.match(profiles, /aria-label=\{`\$\{confirmDelete/ )
 })
 
 test('H3 advanced copy leads with practical tradeoffs and labels local measurements clearly', () => {
   assert.match(advanced, /H3 Performance/)
   assert.match(advanced, /Kijai Sol-Attn · faster, small quality tradeoff/)
-  assert.match(advanced, /Published speed claims are not measurements from this computer/)
+  assert.match(advanced, /Published speed claims are shown separately and are not treated as local results/)
   assert.match(advanced, /Benchmark on this computer/)
   assert.match(advanced, /Each result is one measured run/)
   assert.doesNotMatch(advanced, /fail-closed|kernel, visual, and audio gates|conditioning prefix|privacy-safe timing|this-PC|authored distilled schedule/i)

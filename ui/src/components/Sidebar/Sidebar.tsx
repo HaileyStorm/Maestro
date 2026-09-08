@@ -6,6 +6,7 @@ import { useIsMobile } from '../../lib/useIsMobile'
 import { PRODUCT_NAME, PRODUCT_NAME_VISUAL, PRODUCT_PROVENANCE } from '../../lib/branding'
 import { WhatsNewButton } from '../WhatsNewDialog'
 import { GenerationModeSelector } from './GenerationModeSelector'
+import { GenerationProfiles } from './GenerationProfiles'
 import { InputsPanel } from './InputsPanel'
 import { PromptInput } from './PromptInput'
 import { ImageRefSection } from './ImageRefSection'
@@ -233,6 +234,7 @@ export function Sidebar() {
           crush sections into each other. */}
       <div className={`${isMobile ? 'flex-none overflow-visible' : 'flex-1 overflow-y-auto min-h-0'} px-4 py-4 flex flex-col gap-4 [&>*]:shrink-0`}>
         <GenerationModeSelector />
+        {!isTools && <GenerationProfiles />}
 
         {/* Tools mode: standalone post-processing (upscale / revoice) on any
             existing clip. Renders in place of the generation controls. */}

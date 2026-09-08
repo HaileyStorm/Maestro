@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict'
 import { Buffer } from 'node:buffer'
+import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 
 import { build } from 'esbuild'
 
 const componentUrl = new URL('../src/components/Sidebar/AdvancedSettings.tsx', import.meta.url)
+const profilesUrl = new URL('../src/components/Sidebar/GenerationProfiles.tsx', import.meta.url)
+const sidebarUrl = new URL('../src/components/Sidebar/Sidebar.tsx', import.meta.url)
 
 function asDataModule(source) {
   return `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`
@@ -31,6 +34,7 @@ async function loadAdvancedSettings() {
         bundle.onResolve({ filter: /api\/client$/ }, () => ({ path: 'api', namespace: 'advanced-drawer' }))
         bundle.onResolve({ filter: /\.\/(PostProcessing|ControlVideoSection|DurationSlider)$/ }, args => ({ path: args.path, namespace: 'advanced-drawer' }))
         bundle.onResolve({ filter: /SettingsDrawer\/LoraSelector$/ }, () => ({ path: 'LoraSelector', namespace: 'advanced-drawer' }))
+        bundle.onResolve({ filter: /\.\/GenerationProfiles$/ }, () => ({ path: 'GenerationProfiles', namespace: 'advanced-drawer' }))
         bundle.onLoad({ filter: /.*/, namespace: 'advanced-drawer' }, args => {
           if (args.path === 'react') {
             return { contents: `
@@ -81,7 +85,64 @@ async function loadAdvancedSettings() {
               export const fetchH3BenchmarkReport = async () => null
             ` }
           }
-          return { contents: 'export const PostProcessing = () => null, ControlVideoSection = () => null, LoraSelector = () => null, WindowSettings = () => null' }
+          return { contents: 'export const PostProcessing = () => null, ControlVideoSection = () => null, LoraSelector = () => null, WindowSettings = () => null, GenerationProfiles = () => null' }
+        })
+      },
+    }],
+  })
+  return import(asDataModule(result.outputFiles[0].text))
+}
+
+async function loadGenerationProfiles() {
+  const result = await build({
+    entryPoints: [profilesUrl.pathname],
+    bundle: true,
+    format: 'esm',
+    jsx: 'automatic',
+    logLevel: 'silent',
+    platform: 'node',
+    treeShaking: true,
+    write: false,
+    plugins: [{
+      name: 'generation-profiles-runtime',
+      setup(bundle) {
+        bundle.onResolve({ filter: /^react$/ }, () => ({ path: 'react', namespace: 'generation-profiles' }))
+        bundle.onResolve({ filter: /^react\/jsx-runtime$/ }, () => ({ path: 'jsx-runtime', namespace: 'generation-profiles' }))
+        bundle.onResolve({ filter: /^lucide-react$/ }, () => ({ path: 'lucide', namespace: 'generation-profiles' }))
+        bundle.onResolve({ filter: /stores\/useStore$/ }, () => ({ path: 'store', namespace: 'generation-profiles' }))
+        bundle.onLoad({ filter: /.*/, namespace: 'generation-profiles' }, args => {
+          if (args.path === 'react') {
+            return { contents: `
+              export const useEffect = effect => effect()
+              export const useMemo = factory => factory()
+              export const useRef = initial => ({ current: initial })
+              export const useState = initial => {
+                const value = globalThis.__profileStateValues.length
+                  ? globalThis.__profileStateValues.shift()
+                  : (typeof initial === 'function' ? initial() : initial)
+                const setter = update => globalThis.__profileStateUpdates.push(
+                  typeof update === 'function' ? update(value) : update,
+                )
+                return [value, setter]
+              }
+            ` }
+          }
+          if (args.path === 'jsx-runtime') {
+            return { contents: `
+              export const Fragment = Symbol.for('generation-profiles-fragment')
+              export const jsx = (type, props, key) => ({ type, key, props: props || {} })
+              export const jsxs = jsx
+            ` }
+          }
+          if (args.path === 'lucide') {
+            return { contents: `
+              export const FolderOpen = 'FolderOpen', Save = 'Save', Trash2 = 'Trash2'
+            ` }
+          }
+          if (args.path === 'store') {
+            return { contents: 'export const useStore = selector => selector(globalThis.__profileStore)' }
+          }
+          throw new Error(`Unexpected generation profile dependency: ${args.path}`)
         })
       },
     }],
@@ -121,6 +182,56 @@ function flattenElements(value, result = []) {
   if ('type' in value && 'props' in value) result.push(value)
   flattenElements(value.props?.children, result)
   return result
+}
+
+function elementText(value) {
+  if (Array.isArray(value)) return value.map(elementText).join('')
+  if (typeof value === 'string' || typeof value === 'number') return String(value)
+  if (!value || typeof value !== 'object') return ''
+  return elementText(value.props?.children)
+}
+
+function preset(id, name, mode, modelType) {
+  return {
+    id,
+    name,
+    mode,
+    model_type: modelType,
+    activated_loras: [],
+    loras_multipliers: '',
+    lora_weights: {},
+    spatial_upsampling: '',
+    params: {},
+    created_at: 1,
+  }
+}
+
+function resetProfileRuntime({ stateValues, generationMode = 'video' }) {
+  const calls = { delete: [], load: [], refresh: 0, save: [] }
+  globalThis.__profileStateValues = stateValues.slice(1)
+  globalThis.__profileStateUpdates = []
+  globalThis.__profileStore = {
+    selectedGenerationProfileId: stateValues[0],
+    setSelectedGenerationProfileId: value => { globalThis.__profileStore.selectedGenerationProfileId = value; globalThis.__profileStateUpdates.push(value) },
+    presets: [
+      preset('video-a', 'Everyday', 'video', 'minimax_h3'),
+      preset('video-b', 'Detailed', 'video', 'ltx_video'),
+      preset('image-a', 'Still', 'image', 'qwen_image'),
+    ],
+    presetsLoading: false,
+    modelsLoaded: true,
+    models: [{ model_type: 'minimax_h3', name: 'MiniMax H3' }, { model_type: 'ltx_video', name: 'LTX Video' }],
+    generationMode,
+    loadPresets: async () => { calls.refresh += 1 },
+    savePreset: async name => { calls.save.push(name) },
+    loadPreset: async value => { calls.load.push(value.id); return true },
+    deletePreset: async id => { calls.delete.push(id) },
+  }
+  return calls
+}
+
+async function flushAsyncAction() {
+  await new Promise(resolve => setImmediate(resolve))
 }
 
 class FakeDocument extends EventTarget {
@@ -349,4 +460,96 @@ test('actual trigger, backdrop, X, and Escape callbacks close and restore trigge
     assert.equal(runtime.appRoot.hasAttribute('inert'), false, `${dismissal} restores background semantics`)
     assert.equal(runtime.document.activeElement, runtime.trigger, `${dismissal} restores trigger focus`)
   }
+})
+
+test('saved profiles sit at the top of Generate and Advanced reuses them without a second fetch', async () => {
+  const [sidebar, advanced] = await Promise.all([
+    readFile(sidebarUrl, 'utf8'),
+    readFile(componentUrl, 'utf8'),
+  ])
+  const modeSelector = sidebar.indexOf('<GenerationModeSelector />')
+  const profiles = sidebar.indexOf('<GenerationProfiles />')
+  const modeControls = sidebar.indexOf('{/* Tools mode:')
+
+  assert.ok(modeSelector >= 0)
+  assert.ok(profiles > modeSelector)
+  assert.ok(modeControls > profiles)
+  assert.match(advanced, /<GenerationProfiles placement="advanced" loadOnMount=\{false\} \/>/)
+  assert.doesNotMatch(advanced, /PresetManager/)
+  for (const section of ['Model &amp; timing', 'Finishing &amp; sampling', 'References &amp; sound', 'Output']) {
+    assert.ok(advanced.includes(section), `${section} groups existing Advanced controls`)
+  }
+
+  const { GenerationProfiles } = await loadGenerationProfiles()
+  const mainCalls = resetProfileRuntime({
+    stateValues: ['', '', false, null, false, null],
+  })
+  const main = GenerationProfiles()
+  const mainElements = flattenElements(main)
+  const options = mainElements
+    .filter(element => element.type === 'option')
+    .map(element => elementText(element))
+
+  assert.equal(mainCalls.refresh, 1)
+  assert.ok(options.some(text => text.includes('Everyday · MiniMax H3')))
+  assert.ok(options.some(text => text.includes('Detailed · LTX Video')))
+  assert.ok(options.every(text => !text.includes('Still')), 'picker filters by mode, not current model')
+
+  const advancedCalls = resetProfileRuntime({
+    stateValues: ['', '', false, null, false, null],
+  })
+  GenerationProfiles({ placement: 'advanced', loadOnMount: false })
+  assert.equal(advancedCalls.refresh, 0)
+})
+
+test('profile Load, Save as new, and confirmed Delete expose async actions', async () => {
+  const { GenerationProfiles } = await loadGenerationProfiles()
+
+  const loadCalls = resetProfileRuntime({
+    stateValues: ['video-a', '', false, null, false, null],
+  })
+  let elements = flattenElements(GenerationProfiles({ loadOnMount: false }))
+  globalThis.__profileStateUpdates = []
+  const loadButton = elements.find(element => element.type === 'button' && elementText(element).trim() === 'Load')
+  loadButton.props.onClick()
+  await flushAsyncAction()
+  assert.deepEqual(loadCalls.load, ['video-a'])
+  assert.ok(globalThis.__profileStateUpdates.some(value => value?.text === 'Everyday loaded.'))
+
+  const saveCalls = resetProfileRuntime({
+    stateValues: ['', 'Night profile', true, null, false, null],
+  })
+  elements = flattenElements(GenerationProfiles({ loadOnMount: false }))
+  globalThis.__profileStateUpdates = []
+  const saveButton = elements.find(element => element.type === 'button' && elementText(element).trim() === 'Save as new')
+  saveButton.props.onClick()
+  await flushAsyncAction()
+  assert.deepEqual(saveCalls.save, ['Night profile'])
+  assert.ok(globalThis.__profileStateUpdates.some(value => value?.text === 'Profile saved.'))
+
+  const deleteCalls = resetProfileRuntime({
+    stateValues: ['video-a', '', false, null, true, null],
+  })
+  elements = flattenElements(GenerationProfiles({ loadOnMount: false }))
+  globalThis.__profileStateUpdates = []
+  const deleteButton = elements.find(element => element.type === 'button' && elementText(element).trim() === 'Confirm')
+  deleteButton.props.onClick()
+  await flushAsyncAction()
+  assert.deepEqual(deleteCalls.delete, ['video-a'])
+  assert.ok(globalThis.__profileStateUpdates.includes(''), 'deleting clears the selected profile')
+  assert.ok(globalThis.__profileStateUpdates.some(value => value?.text === 'Profile deleted.'))
+})
+
+test('profile selection is shared with Advanced and unavailable models leave deletion available', async () => {
+  const { GenerationProfiles } = await loadGenerationProfiles()
+  resetProfileRuntime({ stateValues: ['video-b', '', false, null, false, null] })
+  globalThis.__profileStore.models = [{ model_type: 'minimax_h3', name: 'MiniMax H3' }]
+  const tree = GenerationProfiles({ placement: 'advanced', loadOnMount: false })
+  const elements = flattenElements(tree)
+  assert.equal(globalThis.__profileStore.selectedGenerationProfileId, 'video-b')
+  const unavailable = elements.find(element => element.type === 'button' && elementText(element).includes('Model unavailable'))
+  assert.equal(unavailable?.props.disabled, true)
+  const remove = elements.find(element => element.type === 'button' && element.props['aria-label'] === 'Delete profile Detailed')
+  assert.equal(remove?.props.disabled, false)
+  assert.ok(elements.some(element => element.type === 'select' && element.props.value === 'video-b'))
 })

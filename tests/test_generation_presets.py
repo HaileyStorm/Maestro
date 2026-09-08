@@ -7,6 +7,7 @@ import asyncio
 import json
 import multiprocessing
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -61,6 +62,67 @@ def preset_payload(
                 "h3_sol_dense_steps": 10,
             },
         },
+    }
+
+
+def _profile_value(descriptor: dict) -> object:
+    if "enum" in descriptor:
+        return descriptor["enum"][0]
+    kind = descriptor["type"]
+    if kind == "string":
+        return ""
+    if kind == "number":
+        return descriptor.get("minimum", 0.0)
+    if kind == "integer":
+        return descriptor.get("minimum", 0)
+    if kind == "boolean":
+        return False
+    if kind in {"string_array", "number_array"}:
+        return []
+    if kind == "object":
+        properties = descriptor.get("properties")
+        if properties:
+            return {
+                key: _profile_value(field_descriptor)
+                for key, field_descriptor in properties.items()
+            }
+        return {}
+    raise AssertionError(f"unsupported test descriptor {kind}")
+
+
+def v2_preset_payload() -> dict:
+    fields = presets.GENERATION_PROFILE_FIELDS
+    params = {
+        key: _profile_value(descriptor)
+        for key, descriptor in fields["params"].items()
+    }
+    params.update({
+        "resolution": "1280x720",
+        "settings_version": 2.52,
+        "h3_adaptive_conditioning": False,
+        "delivery_resolution": None,
+        "custom_settings": {
+            key: _profile_value(descriptor)
+            for key, descriptor in fields["custom_settings"].items()
+        },
+    })
+    ui_settings = {
+        key: _profile_value(descriptor)
+        for key, descriptor in fields["ui"].items()
+    }
+    ui_settings.update({
+        "durationSeconds": 12.5,
+        "slidingWindowSeconds": 8.0,
+        "voiceCloneEnabled": False,
+        "imageRefType": "",
+        "outputCount": 0,
+        "h3StyleWorkflow": "",
+    })
+    return {
+        **preset_payload(name="Complete profile", model_type="minimax_h3"),
+        "profile_version": 2,
+        "params": params,
+        "ui_settings": ui_settings,
     }
 
 
@@ -235,6 +297,233 @@ class GenerationPresetStoreTests(unittest.TestCase):
             )],
             [23, 28, 32],
         )
+
+    def test_v2_complete_profile_round_trips_every_classified_field_exactly(self) -> None:
+        payload = v2_preset_payload()
+        created = self.create(payload=payload, preset_id="complete-v2")
+        self.assertEqual(created["profile_version"], 2)
+        self.assertEqual(created["params"], payload["params"])
+        self.assertEqual(created["ui_settings"], payload["ui_settings"])
+        self.assertNotIn("model_type", created["params"])
+        self.assertNotIn("activated_loras", created["params"])
+        self.assertNotIn("loras_multipliers", created["params"])
+        self.assertIsNone(created["params"]["delivery_resolution"])
+        self.assertIs(created["params"]["h3_adaptive_conditioning"], False)
+        self.assertEqual(created["activated_loras"], payload["activated_loras"])
+        self.assertEqual(created["spatial_upsampling"], "")
+        self.assertEqual(created["ui_settings"]["outputCount"], 0)
+
+        reopened = presets.GenerationPresetStore(
+            self.runtime_root, scope_key=SCOPE_KEY,
+        )
+        self.assertEqual(
+            reopened.list(account_scope=ACCOUNT_A, project_scope=PROJECT_A),
+            [created],
+        )
+
+    def test_v2_manifest_classifies_generate_params_and_known_exclusions(self) -> None:
+        fields = presets.GENERATION_PROFILE_FIELDS
+        self.assertEqual(set(fields), {
+            "version", "params", "excluded_params", "ui", "custom_settings",
+        })
+        self.assertEqual(fields["version"], 2)
+        types_source = (ROOT / "ui" / "src" / "types" / "index.ts").read_text(
+            encoding="utf-8",
+        )
+        generate = types_source.split(
+            "export interface GenerateParams extends H3AdaptiveSelection {", 1,
+        )[1].split("\n}", 1)[0]
+        adaptive = types_source.split(
+            "export interface H3AdaptiveSelection {", 1,
+        )[1].split("\n}", 1)[0]
+        declared = set(re.findall(
+            r"^\s{2}([A-Za-z_][A-Za-z0-9_]*)\??:",
+            generate + "\n" + adaptive,
+            re.MULTILINE,
+        ))
+        classified = set(fields["params"]) | {
+            key for key in fields["excluded_params"] if "." not in key
+        }
+        self.assertFalse(declared - classified)
+        self.assertEqual(fields["excluded_params"]["prompt"], "content")
+        self.assertEqual(fields["excluded_params"]["image_start"], "media")
+        self.assertEqual(fields["excluded_params"]["model_type"], "envelope")
+        self.assertEqual(
+            fields["excluded_params"]["activated_loras"], "envelope",
+        )
+        self.assertEqual(
+            fields["excluded_params"]["loras_multipliers"], "envelope",
+        )
+        self.assertEqual(
+            fields["excluded_params"]["spatial_upsampling"], "envelope",
+        )
+        self.assertNotIn("spatial_upsampling", fields["params"])
+        self.assertNotIn("spatialUpsampling", fields["ui"])
+        self.assertEqual(
+            fields["excluded_params"]["custom_settings.image_ref_keyword_content"],
+            "content",
+        )
+        for key in (
+            "durationSeconds", "resolutionPreset", "aspectRatio",
+            "h3StyleWorkflow", "outpaintVideoBox", "blendAnchorStrength",
+        ):
+            self.assertIn(key, fields["ui"])
+        for key in (
+            "sample_solver", "embedded_guidance_scale", "audio_guidance_scale",
+            "top_p", "top_k", "alt_guidance_scale", "modality_scale",
+            "sfx_text_weight",
+        ):
+            self.assertIn(key, fields["params"])
+
+    def test_v2_rejects_unknown_content_media_authority_and_incomplete_ui(self) -> None:
+        cases = []
+        for key, value in (
+            ("prompt", "private creative text"),
+            ("image_start", "/private/reference.png"),
+            ("h3_ref2va_terms_accepted", True),
+            ("unknown_technical_knob", 1),
+        ):
+            payload = v2_preset_payload()
+            payload["params"][key] = value
+            cases.append(payload)
+        creative_custom = v2_preset_payload()
+        creative_custom["params"]["custom_settings"][
+            "image_ref_keyword_content"
+        ] = "private subject"
+        cases.append(creative_custom)
+        unknown_custom = v2_preset_payload()
+        unknown_custom["params"]["custom_settings"]["unknown"] = 1
+        cases.append(unknown_custom)
+        unknown_ui = v2_preset_payload()
+        unknown_ui["ui_settings"]["accountId"] = "private"
+        cases.append(unknown_ui)
+        missing_ui = v2_preset_payload()
+        del missing_ui["ui_settings"]["durationSeconds"]
+        cases.append(missing_ui)
+
+        for index, payload in enumerate(cases):
+            with self.subTest(index=index), self.assertRaisesRegex(
+                presets.GenerationPresetError,
+                "unsupported or private|incomplete",
+            ):
+                self.create(payload=payload, preset_id=f"rejected-v2-{index}")
+        self.assertEqual(self.listing(), [])
+
+    def test_v2_requires_runtime_core_and_rejects_invalid_descriptors(self) -> None:
+        missing = v2_preset_payload()
+        del missing["params"]["video_length"]
+        missing_metadata = v2_preset_payload()
+        del missing_metadata["params"]["settings_version"]
+
+        cases = [
+            (missing, "missing required"),
+            (missing_metadata, "missing required"),
+        ]
+        for location, key, value in (
+            ("params", "video_length", 0),
+            ("params", "num_inference_steps", 0),
+            ("params", "guidance_scale", 101),
+            ("params", "settings_version", None),
+            ("params", "resolution", "99999x720"),
+            ("params", "ltx25_video_vae", "experimental"),
+            ("params", "top_p", 1.1),
+            ("params", "sample_solver", "a prose solver"),
+            ("params", "h3_adaptive_fl2va_model", "/tmp/checkpoint"),
+            ("params", "h3_fl2va_loras", [""]),
+            ("params", "h3_fl2va_loras_multipliers", "strong weight"),
+            ("params", "h3_ref2va_loras_multipliers", "11.0"),
+            ("params", "h3_style_workflow", "cinematic workflow"),
+            ("ui_settings", "voiceCloneMode", "three"),
+            ("ui_settings", "filmGrainIntensity", 1.01),
+            ("ui_settings", "resolutionPreset", "4k"),
+            ("ui_settings", "h3StyleWorkflow", "/tmp/workflow"),
+            ("ui_settings", "outpaintVideoBox", {
+                "x": 0, "y": 0, "w": 0, "h": 1,
+            }),
+        ):
+            payload = v2_preset_payload()
+            payload[location][key] = value
+            cases.append((
+                payload,
+                "invalid|outside|supported|bounded|requires|exceeds|cannot",
+            ))
+        for model_type in ("a prose model name", "/tmp/model"):
+            payload = v2_preset_payload()
+            payload["model_type"] = model_type
+            cases.append((payload, "model type is invalid"))
+        for duplicate in ("params", "ui_settings"):
+            payload = v2_preset_payload()
+            key = "spatial_upsampling" if duplicate == "params" else "spatialUpsampling"
+            payload[duplicate][key] = "flashvsr2"
+            cases.append((payload, "unsupported or private|incomplete"))
+
+        for index, (payload, error) in enumerate(cases):
+            with self.subTest(index=index), self.assertRaisesRegex(
+                presets.GenerationPresetError, error,
+            ):
+                self.create(payload=payload, preset_id=f"invalid-v2-{index}")
+        self.assertEqual(self.listing(), [])
+
+    def test_v2_accepts_real_selector_codes_and_signed_lora_weights(self) -> None:
+        payload = v2_preset_payload()
+        payload["params"].update({
+            "video_prompt_type": "V#1#",
+            "force_fps": "control",
+            "ltx25_video_vae": "nad",
+            "sample_solver": "unipc",
+            "top_p": 0.9,
+            "top_k": 50,
+            "alt_guidance_scale": 2.5,
+            "h3_fl2va_loras": ["nested/custom motion.safetensors"],
+            "h3_fl2va_loras_multipliers": "-0.75;1.00",
+        })
+        payload["params"]["custom_settings"].update({
+            "keyscale": "F# minor",
+            "timesignature": 6,
+        })
+        payload["ui_settings"].update({
+            "voiceCloneMode": "two",
+            "imageRefType": "KI",
+            "audioSubMode": "music",
+            "editSubMode": "recast",
+            "resolutionPreset": "768p",
+            "aspectRatio": "auto",
+            "outpaintVideoBox": {"x": -0.25, "y": 0, "w": 1.25, "h": 1},
+        })
+        payload["lora_weights"] = {
+            "detail.safetensors": [-0.8, 0.8],
+            "lighting.safetensors": [1.15, -0.9],
+        }
+        payload["loras_multipliers"] = "-0.80;0.80 1.15;-0.90"
+
+        created = self.create(payload=payload, preset_id="actual-controls")
+        self.assertEqual(created["params"]["video_prompt_type"], "V#1#")
+        self.assertEqual(created["params"]["custom_settings"]["keyscale"], "F# minor")
+        self.assertEqual(created["ui_settings"]["resolutionPreset"], "768p")
+        self.assertEqual(created["lora_weights"], payload["lora_weights"])
+
+    def test_v2_accepts_exact_runtime_core_with_optional_params_absent(self) -> None:
+        payload = v2_preset_payload()
+        payload["params"] = {
+            key: payload["params"][key]
+            for key in (
+                "resolution", "video_length", "num_inference_steps",
+                "guidance_scale", "seed", "image_mode", "repeat_generation",
+                "settings_version",
+            )
+        }
+        created = self.create(payload=payload, preset_id="runtime-core")
+        self.assertEqual(created["params"], payload["params"])
+        self.assertNotIn("delivery_resolution", created["params"])
+
+    def test_legacy_and_v2_records_coexist_without_shape_migration(self) -> None:
+        legacy_payload = preset_payload(name="Legacy")
+        legacy = self.create(payload=legacy_payload, preset_id="legacy")
+        modern_payload = v2_preset_payload()
+        modern = self.create(payload=modern_payload, preset_id="modern")
+        self.assertNotIn("profile_version", legacy)
+        self.assertEqual(modern["profile_version"], 2)
+        self.assertEqual(self.listing(), [legacy, modern])
 
     def test_h3_delivery_chain_round_trips_without_stale_inheritance(self) -> None:
         payload = preset_payload(name="1080p delivery", steps=32)
@@ -602,7 +891,10 @@ class GenerationPresetStoreTests(unittest.TestCase):
         created = self.create(payload=preset_payload(name="Content free"))
         self.assertNotIn("prompt", created)
         self.assertNotIn("sequence", created)
-        self.assertEqual(set(created), set(presets._PUBLIC_RECORD_KEYS))
+        self.assertEqual(
+            set(created),
+            set(preset_payload()) | {"id", "created_at"},
+        )
         raw = self.store.path.read_bytes()
         self.assertNotIn(private_text.encode("utf-8"), raw)
         self.assertNotIn(ACCOUNT_A.encode("utf-8"), raw)
@@ -672,7 +964,7 @@ class GenerationPresetStoreTests(unittest.TestCase):
             client.index("// --- Presets ---"):
             client.index("// --- LoRAs ---")
         ]
-        store_start = store.index("// Presets\n  presets: []")
+        store_start = store.index("  savePreset: async (name) => {")
         store_contract = store[
             store_start:store.index("// Model options", store_start)
         ]
@@ -682,6 +974,34 @@ class GenerationPresetStoreTests(unittest.TestCase):
         self.assertNotIn("prompt: ''", store_contract)
         self.assertNotIn("negative_prompt", store_contract)
         self.assertIn("activeWorkspace", store_contract)
+
+    def test_route_accepts_both_profile_versions_through_the_real_store(self) -> None:
+        source = (APP / "launch.py").read_text(encoding="utf-8")
+        nodes = [node for node in ast.parse(source).body
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                 and node.name in {"create_preset", "_raise_generation_preset_error"}]
+        for node in nodes:
+            node.decorator_list = []
+        class RouteHttpError(Exception):
+            def __init__(self, status_code, detail):
+                self.status_code, self.detail = status_code, detail
+        class Request:
+            def __init__(self, body):
+                self.body = body
+            async def json(self):
+                return json.loads(json.dumps(self.body))
+        namespace = dict(Request=Request, HTTPException=RouteHttpError,
+                         _generation_preset_scope=lambda *_args, **_kwargs: (ACCOUNT_A, PROJECT_A),
+                         _generation_preset_store=lambda: self.store)
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "profile-route", "exec"), namespace)
+        for index, payload in enumerate((preset_payload(), v2_preset_payload())):
+            created = asyncio.run(namespace["create_preset"](Request({"id": f"route-{index}", **payload}), "project"))
+            self.assertEqual(created["params"], payload["params"])
+            self.assertEqual(created.get("ui_settings"), payload.get("ui_settings"))
+        with self.assertRaises(RouteHttpError) as caught:
+            asyncio.run(namespace["create_preset"](Request({"id": "invalid", **v2_preset_payload(), "private": "not a setting"}), "project"))
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertEqual(len(self.listing()), 2)
 
     def test_unauthorized_create_route_never_reads_the_request_body(self) -> None:
         launch_path = APP / "launch.py"

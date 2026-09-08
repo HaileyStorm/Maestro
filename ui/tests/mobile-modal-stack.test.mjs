@@ -327,8 +327,10 @@ test('compiled viewport CSS and drawer sources cover narrow, breakpoint, and lan
   assert.match(advanced, /z-\[80\]/)
   assert.match(advanced, /pt-\[env\(safe-area-inset-top\)\].*pr-\[env\(safe-area-inset-right\)\].*pb-\[env\(safe-area-inset-bottom\)\].*pl-\[env\(safe-area-inset-left\)\]/s)
   assert.match(advanced, /closeModalIfTop\(document, panelRef\.current, closeDrawer\)/)
-  assert.match(advanced, /focus-visible:opacity-100/)
-  assert.match(advanced, /aria-label=\{`\$\{confirmDelete === p\.id \? 'Confirm delete' : 'Delete'\} preset \$\{p\.name\}`\}/)
+  const profiles = await readFile(new URL('src/components/Sidebar/GenerationProfiles.tsx', uiRoot), 'utf8')
+  assert.match(profiles, /focus-visible:ring-2/)
+  assert.doesNotMatch(profiles, /(?:^|[:\s])opacity-0(?:\s|$)/)
+  assert.match(profiles, /aria-label=\{`\$\{confirmDelete \? 'Confirm delete' : 'Delete'\} profile \$\{selected\.name\}`\}/)
   assert.match(drawerUtilities, /@supports \(height:\s*100dvh\)/)
   assert.match(drawerUtilities, /height: 100dvh/)
 

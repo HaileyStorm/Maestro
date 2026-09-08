@@ -1918,3 +1918,53 @@ CPU/static/synthetic/build evidence, not browser, GPU, Windows, or human
 acceptance. The six synthetic Generate/Advanced layout concepts and selection
 are retained under that artifact's `design/` directory; implementation and
 rendered fidelity remain open.
+
+## Full generation-profile source milestone (2026-09-07)
+
+New saves use one versioned settings contract shared by the browser and durable
+preset store. It covers declared generation parameters, model-specific tuning,
+independent adaptive model/LoRA choices, and top-level timing, output, voice,
+blend, and outpaint settings. A classification regression covers every declared
+generation parameter; unclassified settings stop saving rather than disappear.
+Required fields, ranges, enums, technical identifiers, multiplier structure,
+and account/project storage boundaries are validated. The real HTTP route
+uses the same versioned validator as durable storage.
+
+Full-profile restoration clears omitted optional settings and applies captured
+values after model options arrive. Edits or account/project/media changes during
+that read cancel restoration. Empty selections, disabled values, zeroes, custom
+settings, timing and voice-card state have round-trip coverage, including an
+actual browser-generated payload passed through the Python validator. Spatial
+upsampling has one authoritative saved value, and an explicit empty selection
+also clears the submitted value. Older partial presets remain readable and
+change only the fields they originally recorded.
+
+Saved profiles now appear near the top of Generate and at the top of Advanced,
+sharing selection and avoiding duplicate fetches. Profiles for unavailable
+models remain visible, with Load disabled and Delete available. Advanced uses
+concise groups and optional detail disclosures. Save/load/delete feedback waits
+for confirmed results. Prompt text, attached media, account/consent state and
+job identities remain with the current job under the stated default; the
+owner's optional question about including creative inputs is still pending.
+
+The frozen candidate passed 538 UI tests, 27 complete preset/backend tests,
+TypeScript and the production build. Targeted component/helper lint and E2E
+typechecking pass. Independent review findings are closed through focused
+regressions; the final speech-mode check uses the real `speech` enum and passes
+its generated payload through Python validation. Source/test hashes stayed
+stable through the gate. Evidence is retained under
+`.artifacts-temp/astra-full-profiles-20260907/evidence/`.
+
+Rendered acceptance remains open. A synthetic desktop/mobile profile browser
+case is prepared in `ui/e2e/generation-profiles.spec.ts`; it has been typechecked,
+not executed. The owner has been asked to authorize one task-specific test tree
+under `/dev/shm/maestro-profile-review-*`, because the runner requires a different
+filesystem and project policy requires approval for external writes. Existing
+browser versions match; no download or Maestro restart is needed. Do not treat
+the generated concepts, source tests, or build as rendered acceptance.
+
+Continue the broader owner-directed work: complete comparable saved-settings
+flows and per-mode persistence, simplify the main Generate inputs/compatibility
+flow, and apply the same interaction principles through Director, project and
+reference workflows, and machine settings. The full continuous objective and
+all runtime, historical-tracker, privacy and ownership boundaries remain active.

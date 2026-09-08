@@ -21212,10 +21212,9 @@ async def create_preset(request: Request, workspace: str = ""):
         body = await request.json()
     except Exception as error:
         raise HTTPException(status_code=400, detail="Invalid preset request") from error
-    if not isinstance(body, dict) or set(body) != {
-        "id", "name", "mode", "model_type", "activated_loras",
-        "loras_multipliers", "lora_weights", "spatial_upsampling", "params",
-    }:
+    # The store owns the complete versioned settings schema. Keep one parser
+    # for legacy and full profiles rather than a second endpoint allowlist.
+    if type(body) is not dict or "id" not in body:
         raise HTTPException(status_code=400, detail="Invalid preset request")
     preset_id = body.pop("id")
     try:
