@@ -3434,44 +3434,97 @@ class LlmRuntimeTests(unittest.TestCase):
     def test_generate_lease_blocks_unload_until_failure_finalizes(self):
         request_started = threading.Event()
         release_request = threading.Event()
+        unload_attempted = threading.Event()
+        failure_finalized = threading.Event()
         unload_done = threading.Event()
         errors = []
+        unload_errors = []
+        contended = []
+        finalization_at_acquire = []
+        real_lock = llm_service._lock
+        real_finalize = llm_service._end_model_activity
+        generation = None
+        unloading = None
+
+        class ObservedLock:
+            def __enter__(self):
+                if threading.current_thread() is unloading:
+                    acquired = real_lock.acquire(blocking=False)
+                    contended.append(not acquired)
+                    unload_attempted.set()
+                    if not acquired:
+                        real_lock.acquire()
+                    finalization_at_acquire.append(failure_finalized.is_set())
+                else:
+                    real_lock.acquire()
+                return self
+
+            def __exit__(self, *_args):
+                real_lock.release()
+
+        def finalize(identity):
+            result = real_finalize(identity)
+            if threading.current_thread() is generation:
+                failure_finalized.set()
+            return result
 
         def post(*_args, **_kwargs):
             request_started.set()
-            release_request.wait(timeout=2)
+            release_request.wait()
             raise llm_service.requests.ConnectionError("synthetic")
+
+        def generate():
+            try:
+                llm_service.generate("prompt")
+            except BaseException as error:
+                errors.append(error)
+
+        def unload():
+            try:
+                llm_service.unload_model()
+                unload_done.set()
+            except BaseException as error:
+                unload_errors.append(error)
 
         with mock.patch.object(
             llm_service.threading, "Timer", _RecordingTimer,
+        ), mock.patch.object(
+            llm_service, "_lock", ObservedLock(),
+        ), mock.patch.object(
+            llm_service, "_end_model_activity", side_effect=finalize,
+        ), mock.patch.object(
+            llm_service.gc, "collect", return_value=0,
+        ), mock.patch.object(
+            llm_service.requests, "post", side_effect=post,
         ):
+            # Collection latency is unrelated to the lease ordering contract.
             llm_service.load_model(
                 "remote-a", provider="remote",
                 remote_url="http://remote-a.invalid",
             )
-
-            def generate():
-                try:
-                    llm_service.generate("prompt")
-                except RuntimeError as error:
-                    errors.append(error)
-
-            def unload():
-                llm_service.unload_model()
-                unload_done.set()
-
-            with mock.patch.object(llm_service.requests, "post", side_effect=post):
-                generation = threading.Thread(target=generate)
+            generation = threading.Thread(target=generate)
+            unloading = threading.Thread(target=unload)
+            try:
                 generation.start()
-                self.assertTrue(request_started.wait(timeout=1))
-                unloading = threading.Thread(target=unload)
+                self.assertTrue(request_started.wait(timeout=5))
                 unloading.start()
-                self.assertFalse(unload_done.wait(timeout=0.05))
+                self.assertTrue(unload_attempted.wait(timeout=5))
+                self.assertEqual(contended, [True])
+                self.assertFalse(unload_done.is_set())
+                self.assertFalse(failure_finalized.is_set())
+            finally:
                 release_request.set()
-                generation.join(timeout=2)
-                unloading.join(timeout=2)
+                if generation.ident is not None:
+                    generation.join(timeout=5)
+                if unloading.ident is not None:
+                    unloading.join(timeout=5)
 
+            self.assertFalse(generation.is_alive())
+            self.assertFalse(unloading.is_alive())
+            self.assertEqual(unload_errors, [])
             self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], RuntimeError)
+            self.assertEqual(finalization_at_acquire, [True])
             self.assertTrue(unload_done.is_set())
             self.assertFalse(llm_service.is_loaded())
             self.assertIsNone(llm_service._idle_timer)

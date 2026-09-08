@@ -2123,6 +2123,7 @@ full-suite timing failure as a reliability follow-up rather than a production
 fix or a claim of a single clean full-suite run. The baseline test repairs
 pass all 201 cases across their six full modules (two expected CUDA skips);
 the exact candidate hashes and closure results are retained with the main run.
+The deterministic lease-test repair below closes the test-reliability follow-up.
 
 UI validation passes all 574 tests and the production build, with unchanged
 candidate hashes. Acceptance excludes the earlier unmasked Python invocations;
@@ -2178,5 +2179,29 @@ identity tests. Exact source hashes and receipts are under
 This is source, synthetic execution and build evidence. Browser, live generation,
 Windows and human acceptance remain open. Continue the broader app interaction
 and copy audit; these two source milestones do not establish whole-app rendered
-acceptance. The intermittent full-suite LLM timing failure above remains a
-separate reliability follow-up.
+acceptance. The deterministic lease-test repair below addresses the intermittent full-suite
+LLM assertion; its historical runtime timing remains uninstrumented.
+
+
+## Deterministic LLM lease regression (2026-09-08)
+
+The unload-ordering test no longer measures an unrelated garbage-collection
+deadline. A controlled three-second collector delay reproduced its previous
+assertion failure after model state had already cleared and showed the worker
+outliving the old test. This demonstrates the test's timing vulnerability;
+the earlier full-suite run did not capture a collector stack or timing trace.
+
+The replacement observes the unload worker's actual failed nonblocking acquire
+on the same real re-entrant lock held by generation. It then checks that model
+activity finalization completed before that acquire returns. Collection is
+mocked out for this contract. The fake request ends only when explicitly
+released; a finally block releases it and joins all started workers. Assertions
+reject surviving workers, unexpected errors, stale loaded state and idle timers.
+
+The complete 82-test LLM module passes with the shared CPU-only environment.
+Mutation probes reject both a removed generation lease and removed unload
+locking, and confirm both workers exit on those failure paths. The valid test
+also passes independently of the collector's behavior. Independent review's
+remaining inner-timeout finding is removed and the module/probes are rerun.
+No production runtime code changed. Source, preserved WIP, controlled failure
+and closure receipts are under `.artifacts-temp/astra-llm-lease-test-20260908/`.
