@@ -875,3 +875,58 @@ test('cross-model Load Settings fetches inventory only after the final adaptive 
     },
   })
 })
+
+test('video submode round trip preserves live adaptive model and independent LoRA selections', async () => {
+  await withFreshStore(async ({ useStore }) => {
+    useStore.setState(state => ({
+      generationMode: 'video',
+      params: { ...state.params, image_mode: 0, prompt: 'frames prompt',
+        h3_adaptive_conditioning: false, h3_adaptive_fl2va_model: 'minimax_h3', h3_fl2va_loras: ['old.safetensors'],
+        h3_fl2va_loras_multipliers: '0.1', h3_ref2va_loras: ['old-ref.safetensors'],
+      },
+    }))
+    useStore.getState().setParam('image_mode', 1)
+    const selection = {
+      model_type: 'minimax_h3_w4a8_fl2va', h3_adaptive_conditioning: true,
+      h3_adaptive_fl2va_model: 'minimax_h3_w4a8_fl2va',
+      h3_adaptive_ref2va_model: 'minimax_h3_ref2va',
+      h3_fl2va_loras: ['current.safetensors'], h3_fl2va_loras_multipliers: '0.25;0.5',
+      h3_ref2va_loras: [], h3_ref2va_loras_multipliers: '',
+      activated_loras: ['current.safetensors'], loras_multipliers: '0.25;0.5',
+    }
+    useStore.setState(state => ({ params: { ...state.params, ...selection, prompt: 'multi prompt' } }))
+    useStore.getState().setParam('image_mode', 0)
+    assert.equal(useStore.getState().params.prompt, 'frames prompt')
+    for (const [key, value] of Object.entries(selection)) assert.deepEqual(useStore.getState().params[key], value, key)
+    useStore.getState().setParam('image_mode', 1)
+    assert.equal(useStore.getState().params.prompt, 'multi prompt')
+    for (const [key, value] of Object.entries(selection)) assert.deepEqual(useStore.getState().params[key], value, key)
+  })
+})
+
+
+test('grain controls preserve the complete current per-mode parameter snapshot', async () => {
+  await withFreshStore(async ({ useStore }) => {
+    useStore.setState(state => ({
+      generationMode: 'video', durationSeconds: 21.75,
+      params: { ...state.params, seed: 42, num_inference_steps: 28,
+        h3_adaptive_conditioning: true, h3_adaptive_fl2va_model: 'minimax_h3_w4a8_fl2va',
+        h3_fl2va_loras: ['keep.safetensors'], h3_fl2va_loras_multipliers: '0.5',
+        repeat_generation: 3, sliding_window_overlap: 17,
+        custom_settings: { h3_attention_engine: 'sdpa', h3_sol_tau: 1.25 },
+      },
+    }))
+    const before = structuredClone(useStore.getState().params)
+    for (const [action, value] of [['setFilmGrainIntensity', 0.2], ['setFilmGrainSaturation', 0.7]]) {
+      useStore.getState()[action](value)
+      const saved = useStore.getState().savedParamsPerMode.video
+      for (const [key, setting] of Object.entries(before)) {
+        if (['model_type', 'prompt', 'activated_loras', 'loras_multipliers'].includes(key)) continue
+        assert.deepEqual(saved[key], setting, `${action} preserves ${key}`)
+      }
+      assert.equal(saved.durationSeconds, 21.75)
+    }
+    assert.equal(useStore.getState().savedParamsPerMode.video.filmGrainIntensity, 0.2)
+    assert.equal(useStore.getState().savedParamsPerMode.video.filmGrainSaturation, 0.7)
+  })
+})

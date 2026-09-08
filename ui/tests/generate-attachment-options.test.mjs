@@ -25,6 +25,7 @@ test('H3 Ref2VA disables first/last and keeps it last after project refs', () =>
     referenceImageMaxCount: 9,
     referenceVideoMaxCount: 3,
     referenceAudioMaxCount: 3,
+    adaptiveConditioning: false,
   }))
   assert.deepEqual(ids(options), [
     'project_reference',
@@ -53,7 +54,7 @@ test('H3 FL2VA disables reference kinds and keeps them last', () => {
     mutuallyExclusiveConditioning: true,
     supportsEndFrame: true,
     supportsRefImages: false,
-    adaptiveConditioning: true,
+    adaptiveConditioning: false,
   }))
   assert.equal(options[0].id, 'project_reference')
   assert.equal(options[0].enabled, true)
@@ -65,6 +66,19 @@ test('H3 FL2VA disables reference kinds and keeps them last', () => {
   ])
   assert.equal(options.at(-1).id, 'reference_audio')
   assert.match(options.find(option => option.id === 'reference_image').reason, /first\/last frames, not reference images/)
+})
+
+test('explicit adaptive H3 offers edge anchors and semantic media across planned segments', () => {
+  for (const modelType of ['minimax_h3', 'minimax_h3_ref2va']) {
+    const caps = resolveGenerateAttachmentCapabilities({
+      modelType, mutuallyExclusiveConditioning: true, supportsEndFrame: false,
+      supportsRefImages: false, adaptiveConditioning: true,
+    })
+    assert.deepEqual(enabledIds(orderGenerateAttachmentOptions(caps)), [
+      'project_reference', 'first_last_frame', 'reference_image', 'reference_video', 'reference_audio',
+    ])
+    assert.deepEqual(disabledIds(orderGenerateAttachmentOptions(caps)), [])
+  }
 })
 
 test('LightX2V and Spectrum stay FL2VA-only even if ref flags leak', () => {
@@ -109,6 +123,7 @@ test('project references come first and filter to accepted kinds', () => {
     conditioningMode: 'first_last_frames',
     mutuallyExclusiveConditioning: true,
     supportsEndFrame: true,
+    adaptiveConditioning: false,
   })
   const choices = [
     { key: 'img', kind: 'image' },

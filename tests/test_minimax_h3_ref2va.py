@@ -392,7 +392,8 @@ class TestMiniMaxH3Ref2VADefinition(unittest.TestCase):
         self.assertIn("h3StudioWorkflow && (h3AdaptiveConditioning || h3HasSemanticInputs)", inputs_panel)
         self.assertIn("const canAttachFrameAnchors = !dedicatedRef2VAMode || h3AdaptiveConditioning", inputs_panel)
         self.assertIn("const showFrameAnchorControls = canAttachFrameAnchors || h3HasFrameInputs", inputs_panel)
-        self.assertIn("const canAttachSemanticReferences = dedicatedRef2VAMode || (", inputs_panel)
+        self.assertIn("adaptiveConditioning: h3AdaptiveConditioning", inputs_panel)
+        self.assertIn("state.durationSeconds <= nativeMaximumSeconds", store)
         self.assertIn("const needsTerms = semanticReferenceMode && !h3TermsAccepted", inputs_panel)
 
         # Switching between the managed H3 checkpoints must not erase either

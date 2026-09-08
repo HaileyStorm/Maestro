@@ -216,9 +216,13 @@ export function reviewH3Prompt(input: H3PromptReviewInput): H3PromptReview | nul
     label: 'Model and field family',
     status: ref2vaBaseMismatch || fl2vaRef2vaMismatch ? 'consider' : 'info',
     detail: ref2vaBaseMismatch
-      ? 'Effective Ref2VA routing and structured Base fields use different prompt families.'
+      ? input.adaptiveConditioning
+        ? 'Base fields are mapped to Ref2VA fields before each reference-guided segment starts. The original prompt is preserved.'
+        : 'Effective Ref2VA routing and structured Base fields use different prompt families.'
       : fl2vaRef2vaMismatch
-        ? 'Effective FL2VA routing and structured Ref2VA fields use different prompt families.'
+        ? input.adaptiveConditioning
+          ? 'FL2VA segments need original Base fields. Ref2VA fields alone cannot be converted back; supply Base fields or choose Ref2VA manually.'
+          : 'Effective FL2VA routing and structured Ref2VA fields use different prompt families.'
         : 'No static model-family mismatch is indicated by the current structure and routing inputs.',
   })
 

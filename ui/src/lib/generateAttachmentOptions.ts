@@ -105,14 +105,19 @@ export function resolveGenerateAttachmentCapabilities(
     || String(input.architecture || '').startsWith('minimax_h3')
   )
   const fl2vaOnlyProfile = isFl2vaOnlyH3Profile(input.h3ProfileId)
-  // Adaptive routing can mix segment checkpoints; the selected model still
-  // owns this add-list. H3 FL2VA and Ref2VA stay mutually exclusive here.
-  void input.adaptiveConditioning
+  const adaptiveHybrid = (
+    h3Studio
+    && input.adaptiveConditioning === true
+    && !fl2vaOnlyProfile
+  )
   const exclusive = (
-    dedicatedRef2VA
-    || h3Studio
-    || input.mutuallyExclusiveConditioning === true
-    || fl2vaOnlyProfile
+    !adaptiveHybrid
+    && (
+      dedicatedRef2VA
+      || h3Studio
+      || input.mutuallyExclusiveConditioning === true
+      || fl2vaOnlyProfile
+    )
   )
   const catalogRefImages = (
     input.supportsRefImages === true
@@ -135,16 +140,24 @@ export function resolveGenerateAttachmentCapabilities(
     || positiveCount(input.referenceAudioMaxCount)
   )
 
-  const acceptsFirstLastFrame = !dedicatedRef2VA && catalogFirstLast
-  const acceptsReferenceImage = exclusive
-    ? dedicatedRef2VA || (catalogRefImages && !catalogFirstLast && !fl2vaOnlyProfile)
-    : catalogRefImages
-  const acceptsReferenceVideo = exclusive
-    ? dedicatedRef2VA || (catalogRefVideo && !catalogFirstLast && !fl2vaOnlyProfile)
-    : catalogRefVideo
-  const acceptsReferenceAudio = exclusive
-    ? (dedicatedRef2VA && catalogRefAudio) || (!catalogFirstLast && catalogRefAudio && !fl2vaOnlyProfile)
-    : catalogRefAudio
+  const acceptsFirstLastFrame = adaptiveHybrid
+    ? true
+    : !dedicatedRef2VA && catalogFirstLast
+  const acceptsReferenceImage = adaptiveHybrid
+    ? true
+    : exclusive
+      ? dedicatedRef2VA || (catalogRefImages && !catalogFirstLast && !fl2vaOnlyProfile)
+      : catalogRefImages
+  const acceptsReferenceVideo = adaptiveHybrid
+    ? true
+    : exclusive
+      ? dedicatedRef2VA || (catalogRefVideo && !catalogFirstLast && !fl2vaOnlyProfile)
+      : catalogRefVideo
+  const acceptsReferenceAudio = adaptiveHybrid
+    ? true
+    : exclusive
+      ? (dedicatedRef2VA && catalogRefAudio) || (!catalogFirstLast && catalogRefAudio && !fl2vaOnlyProfile)
+      : catalogRefAudio
   const acceptsAnyReference = (
     acceptsFirstLastFrame
     || acceptsReferenceImage

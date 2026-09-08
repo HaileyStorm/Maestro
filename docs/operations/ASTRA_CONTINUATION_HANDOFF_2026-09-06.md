@@ -1862,3 +1862,59 @@ handlers, and private staging. Evidence is retained in
 `.artifacts-temp/astra-h3-handoff-closure-20260907/evidence/`. This is CPU/static
 and synthetic caller evidence, not live worker, GPU, browser, or Windows
 acceptance. Other existing WIP remains outside this milestone.
+
+## Owner-directed profile and interaction contract (2026-09-07)
+
+Saved profiles in Generate and comparable workflows must round-trip all
+user-adjustable settings. Audit capture, storage, restore order, model-default
+loading, and every secondary settings surface; do not treat a passing test for
+a small allowlist as proof of completeness. Keep project/account authorization
+and transient runtime identity separate from reusable settings.
+
+Place profiles near the top of Generate, with save/update access from Advanced.
+Simplify Generate and Advanced, then apply the same interaction rules throughout
+Director, project/reference flows, and settings: common actions first, consistent
+labels and control placement, eligible combinations offered through the controls,
+and longer explanations behind optional details. Preserve explicit selections
+and provide an actionable path when a saved selection is unavailable; do not
+silently replace it or use paragraphs of warnings as the main interaction.
+
+This is an addition to the full continuous objective, not a replacement for the
+active reference-import closure or the remaining backend work. Image-first
+exploration uses only a synthetic brief; no private project material is sent to
+an image provider. Browser acceptance still requires the existing filesystem
+and synthetic-network gates; source/build evidence alone is insufficient.
+
+## Adaptive inputs and settings preservation closure (2026-09-07)
+
+Explicit adaptive H3 offers both attachment families for separately planned
+segments. Manual model and performance-profile restrictions remain, as does the
+short mixed-input guard: a native-length request cannot preserve both channels.
+Prompt review describes the actual late Base-to-Ref mapping and does not promise
+unsupported Ref-to-Base conversion.
+
+Project-reference packs are prepared before input mutation, retaining authored
+order and roles, existing video/audio paths, and measured durations. Capacity,
+terms, account/project identity, selected outputs, and current input state are
+checked before commit. All potentially failing preview allocations happen
+before setters; preparation failure leaves Generate inputs unchanged. H3 alone
+receives its duration bounds; generic media retains positive finite-duration
+validation. An interrupted operation can leave an unused uploaded file, but
+cannot attach it to a changed project or partially apply the pack.
+
+Submode restoration retains the live Auto toggle, checkpoint pair, and both
+LoRA groups/weights. Film-grain edits preserve the full current parameter
+snapshot and duration instead of replacing it with four fields. Comprehensive
+saved-profile capture/server-schema/restore remains open under the owner
+contract above; these fixes do not establish that broader requirement.
+
+The exact candidate passed all 526 UI tests and the production build, plus 104
+backend bridge/Studio tests with two explicit skips. Independent import review
+is closed. The initial isolated UI run lacked the root version metadata; after
+copying those unchanged HEAD files, the complete rerun passed. Evidence and
+source digests are retained under
+`.artifacts-temp/astra-adaptive-ui-closure-20260907/evidence/`. This is
+CPU/static/synthetic/build evidence, not browser, GPU, Windows, or human
+acceptance. The six synthetic Generate/Advanced layout concepts and selection
+are retained under that artifact's `design/` directory; implementation and
+rendered fidelity remain open.

@@ -246,11 +246,13 @@ non_diegetic_music: N/A
     modelType: 'minimax_h3_ref2va', prompt: ref2vaPrompt, adaptiveConditioning: true,
   }))
   assert.equal(check(adaptiveRef2vaWithoutRefsOnRef, 'model-family').status, 'consider')
+  assert.match(check(adaptiveRef2vaWithoutRefsOnRef, 'model-family').detail, /Ref2VA fields alone cannot be converted back/)
 
   const adaptiveFl2vaWithoutRefs = reviewH3Prompt(baseInput({
     modelType: 'minimax_h3', prompt: ref2vaPrompt, adaptiveConditioning: true,
   }))
   assert.equal(check(adaptiveFl2vaWithoutRefs, 'model-family').status, 'consider')
+  assert.match(check(adaptiveFl2vaWithoutRefs, 'model-family').detail, /Ref2VA fields alone cannot be converted back/)
 
   const adaptiveFl2vaWithRefs = reviewH3Prompt(baseInput({
     modelType: 'minimax_h3', prompt: ref2vaPrompt, adaptiveConditioning: true, imageCount: 1,
@@ -261,6 +263,12 @@ non_diegetic_music: N/A
     modelType: 'minimax_h3', prompt: ref2vaPrompt, adaptiveConditioning: false, imageCount: 1,
   }))
   assert.equal(check(pinnedFl2vaWithRefs, 'model-family').status, 'consider')
+
+  const mappedBase = reviewH3Prompt(baseInput({
+    modelType: 'minimax_h3', prompt: basePrompt, adaptiveConditioning: true, imageCount: 1,
+  }))
+  assert.match(check(mappedBase, 'model-family').detail, /before each reference-guided segment starts/)
+  assert.match(check(mappedBase, 'model-family').detail, /original prompt is preserved/)
 
   const adaptiveRef2vaWithRefs = reviewH3Prompt(baseInput({
     modelType: 'minimax_h3_ref2va', prompt: ref2vaPrompt, adaptiveConditioning: true, audioCount: 1,
