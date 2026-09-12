@@ -10,7 +10,14 @@ modules (201 cases, two skips). Its intermittent LLM timing assertion now has
 a deterministic lease-ordering regression and an 82-test module pass. Do not
 rerun the old failure list as if it were still the current backlog.
 
-Current safe work is the broader app interaction/copy audit and review of the
+The next concrete app-flow fix is Improve before Generate in
+`ui/src/components/Sidebar/PromptInput.tsx`: it is currently offered for Blend
+and avatar Edit, while `useStore.ts` rejects those choices only after Generate.
+Use a shared eligibility decision for the control and submission, retain the
+standalone prompt-improvement action, and account for a stored toggle when
+switching modes so hiding the checkbox cannot leave generation blocked.
+
+Current safe work also includes the broader app interaction/copy audit and review of the
 remaining inventoried WIP: the unused adaptive-Ref2VA helper, preserved test
 reordering and queue assertions, and the untracked storage-janitor source/tests.
 H3 executable-plan startup handling and the related Studio tests have the
@@ -2293,3 +2300,37 @@ added, then the complete 163-test recovery module passed; the other nine modules
 their passing evidence against unchanged source. Compilation, JSON-grammar,
 publication-boundary and diff checks pass. Staged source/test hashes match the
 isolated candidate, and unrelated whitespace and test reordering remain intact.
+
+
+## Automatic conditioning repair and prompt-helper copy — 2026-09-12
+
+Retained H3 inputs that conflict with manual conditioning now offer **Use
+Automatic** beside a short state description. Attachments remain visible and
+removable. The shot-matching checkbox description is concise and its existing
+technical disclosure remains available.
+
+Enabling Automatic from Ref2VA previously selected FL2VA through ordinary
+model defaults, overwriting unrelated authored settings. Adaptive checkpoint
+selection now updates model identity and fetches metadata only, preserving
+technical settings, timing, attachments, delivery values and architecture-owned
+LoRAs. Existing sequence guards invalidate earlier default/profile/option
+responses; subsequent edits survive delayed metadata. Preserved profile values
+are labelled Custom. Ordinary explicit model selection keeps its existing
+behavior and final compatibility validation remains authoritative.
+
+The Studio prompt-helper default option now says **Maestro default prompt
+helper**, matching the backend's dedicated default rather than promising
+Director inheritance. Unsupported performance comparisons and duplicate helper
+copy were removed.
+
+All 583 UI tests, production build, targeted ESLint and diff checks pass on the
+isolated candidate. The actual-store regression covers Ref2VA-to-Automatic
+settings/media preservation and delayed metadata with later LoRA edits.
+Independent bounded review delivered a clean closure before its turn subsequently
+reported a usage-limit error; the delivered review evidence is retained. On
+resume every owned source/test hash matched that tested candidate, so no
+unchanged suite was repeated. Receipts live under
+`.artifacts-temp/astra-attachment-repair-20260908/`. This is source, synthetic
+component/store and build evidence; browser, live generation and Windows
+acceptance remain open. The next concrete prompt-improvement flow issue is
+recorded in the current continuation pointer.

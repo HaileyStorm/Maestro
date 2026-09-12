@@ -376,4 +376,6 @@ test('Services settings explain model location and external data use in plain la
   assert.match(services, /terms and privacy policy apply separately/)
   assert.match(services, /The first use may download about 4 GB of model files, which Maestro saves for later/)
   assert.doesNotMatch(services, /dialect-specific enhance pipeline|shared host cache/)
+  assert.match(services, /<option value="">Maestro default prompt helper<\/option>/)
+  assert.doesNotMatch(services, /Same as Director|leave it blank to use Director|which may be slower but more capable/)
 })

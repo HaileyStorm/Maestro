@@ -603,6 +603,119 @@ test('enabling adaptive mode exposes invalid saved checkpoint choices for repair
   })
 })
 
+test('enabling Automatic from Ref2VA preserves authored settings attachments and split LoRAs', async () => {
+  const defaultsRequests = []
+  await withFreshStore(async ({ useStore }) => {
+    const startImage = { name: 'start.png' }
+    const endImage = { name: 'end.png' }
+    const imageRefs = [{ name: 'character.png' }]
+    const shared = 'project/loras/shared.safetensors'
+    const refOnly = 'project/loras/dasiwa_ref2va_hybrid_v1_4step.safetensors'
+    useStore.setState(state => ({
+      families,
+      models,
+      modelsLoaded: true,
+      generationMode: 'video',
+      selectedModelPerMode: { video: 'minimax_h3_ref2va' },
+      modelOptions: modelOptions('minimax_h3_ref2va'),
+      durationSeconds: 12.75,
+      slidingWindowSeconds: 9.25,
+      slidingWindowOverlap: 7,
+      slidingWindowLocked: true,
+      spatialUpsampling: '2x',
+      startImage,
+      endImage,
+      imageRefs,
+      loraWeights: {
+        [shared]: [0.25, 0.5],
+        [refOnly]: [0.8, 0.9],
+      },
+      params: {
+        ...state.params,
+        model_type: 'minimax_h3_ref2va',
+        prompt: 'Authored prompt remains exact.',
+        negative_prompt: 'Authored negative prompt.',
+        num_inference_steps: 17,
+        guidance_scale: 0.65,
+        resolution: '768x1344',
+        tea_cache: 0.37,
+        custom_settings: {
+          h3_attention_engine: 'sdpa',
+          h3_sol_tau: 0.42,
+        },
+        delivery_resolution: '1920x1080',
+        delivery_fit: 'contain',
+        spatial_upsampling: '2x',
+        image_start: 'uploads/start.png',
+        image_end: 'uploads/end.png',
+        image_refs: ['uploads/character.png'],
+        video_guide: 'uploads/reference.mp4',
+        audio_guide: 'uploads/reference.wav',
+        h3_adaptive_conditioning: false,
+        h3_adaptive_fl2va_model: 'minimax_h3',
+        h3_adaptive_ref2va_model: 'minimax_h3_ref2va',
+        activated_loras: [shared, refOnly],
+        loras_multipliers: '0.25;0.5 0.8;0.9',
+        h3_fl2va_loras: undefined,
+        h3_fl2va_loras_multipliers: undefined,
+        h3_ref2va_loras: undefined,
+        h3_ref2va_loras_multipliers: undefined,
+      },
+    }))
+
+    useStore.getState().setParam('h3_adaptive_conditioning', true)
+    await settleAsyncWork()
+
+    const state = useStore.getState()
+    assert.equal(state.params.model_type, 'minimax_h3')
+    assert.equal(state.selectedModelPerMode.video, 'minimax_h3')
+    assert.equal(state.params.h3_adaptive_conditioning, true)
+    assert.equal(state.params.prompt, 'Authored prompt remains exact.')
+    assert.equal(state.params.negative_prompt, 'Authored negative prompt.')
+    assert.equal(state.params.num_inference_steps, 17)
+    assert.equal(state.params.guidance_scale, 0.65)
+    assert.equal(state.params.resolution, '768x1344')
+    assert.equal(state.params.tea_cache, 0.37)
+    assert.deepEqual(state.params.custom_settings, {
+      h3_attention_engine: 'sdpa', h3_sol_tau: 0.42,
+    })
+    assert.equal(state.params.delivery_resolution, '1920x1080')
+    assert.equal(state.params.delivery_fit, 'contain')
+    assert.equal(state.params.spatial_upsampling, '2x')
+    assert.equal(state.durationSeconds, 12.75)
+    assert.equal(state.slidingWindowSeconds, 9.25)
+    assert.equal(state.slidingWindowOverlap, 7)
+    assert.equal(state.slidingWindowLocked, true)
+    assert.equal(state.spatialUpsampling, '2x')
+    assert.equal(state.startImage, startImage)
+    assert.equal(state.endImage, endImage)
+    assert.equal(state.imageRefs, imageRefs)
+    assert.equal(state.params.image_start, 'uploads/start.png')
+    assert.equal(state.params.image_end, 'uploads/end.png')
+    assert.deepEqual(state.params.image_refs, ['uploads/character.png'])
+    assert.equal(state.params.video_guide, 'uploads/reference.mp4')
+    assert.equal(state.params.audio_guide, 'uploads/reference.wav')
+    assert.deepEqual(state.params.activated_loras, [shared, refOnly])
+    assert.equal(state.params.loras_multipliers, '0.25;0.5 0.8;0.9')
+    assert.deepEqual(state.params.h3_fl2va_loras, [shared])
+    assert.equal(state.params.h3_fl2va_loras_multipliers, '0.25;0.5')
+    assert.deepEqual(state.params.h3_ref2va_loras, [shared, refOnly])
+    assert.equal(state.params.h3_ref2va_loras_multipliers, '0.25;0.5 0.8;0.9')
+    assert.deepEqual(state.loraWeights, {
+      [shared]: [0.25, 0.5],
+      [refOnly]: [0.8, 0.9],
+    })
+    assert.equal(state.modelOptions.model_type, 'minimax_h3')
+    assert.deepEqual(defaultsRequests, [])
+  }, {
+    fetchHandler(input, init) {
+      const url = String(input)
+      if (url.startsWith('/api/v1/defaults/')) defaultsRequests.push(url)
+      return baseFetch(input, init)
+    },
+  })
+})
+
 test('malformed saved LoRAs do not hide adaptive or model repair, but submission remains strict', async () => {
   let generationRequests = 0
   await withFreshStore(async ({ alerts, useStore }) => {
@@ -699,9 +812,9 @@ test('malformed saved LoRAs do not hide adaptive or model repair, but submission
   })
 })
 
-test('delayed defaults cannot overwrite newer split LoRA edits', async () => {
-  const delayedDefaults = deferred()
-  let defaultsStarted = false
+test('delayed adaptive metadata cannot overwrite newer split LoRA edits', async () => {
+  const delayedOptions = deferred()
+  let optionsStarted = false
   await withFreshStore(async ({ useStore }) => {
     useStore.setState(state => ({
       generationMode: 'video',
@@ -723,7 +836,7 @@ test('delayed defaults cannot overwrite newer split LoRA edits', async () => {
       await useStore.getState().selectAdaptiveH3Model('fl2va', 'minimax_h3_w4a8_fl2va'),
       true,
     )
-    await waitForCondition(() => defaultsStarted, 'delayed W4A8 defaults')
+    await waitForCondition(() => optionsStarted, 'delayed W4A8 metadata')
     useStore.setState(state => ({
       params: {
         ...state.params,
@@ -733,7 +846,7 @@ test('delayed defaults cannot overwrite newer split LoRA edits', async () => {
         h3_ref2va_loras_multipliers: '0.7;0.75',
       },
     }))
-    delayedDefaults.resolve(Response.json(modelDefaults()))
+    delayedOptions.resolve(Response.json(modelOptions('minimax_h3_w4a8_fl2va')))
     await settleAsyncWork()
     const current = useStore.getState().params
     assert.deepEqual(current.h3_fl2va_loras, ['fl-new.safetensors'])
@@ -742,9 +855,9 @@ test('delayed defaults cannot overwrite newer split LoRA edits', async () => {
     assert.equal(current.h3_ref2va_loras_multipliers, '0.7;0.75')
   }, {
     fetchHandler(input, init) {
-      if (String(input) === '/api/v1/defaults/minimax_h3_w4a8_fl2va') {
-        defaultsStarted = true
-        return delayedDefaults.promise
+      if (String(input) === '/api/v1/model-options/minimax_h3_w4a8_fl2va') {
+        optionsStarted = true
+        return delayedOptions.promise
       }
       return baseFetch(input, init)
     },

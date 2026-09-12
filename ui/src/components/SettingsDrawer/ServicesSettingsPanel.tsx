@@ -348,10 +348,6 @@ export function ServicesSettingsPanel() {
         )}
       </div>
 
-      {/* Studio Prompt Enhancer — experimental gate. Default UI uses
-          the Director LLM for the sparkle button without exposing the
-          full enhancer/Wan2GP-alternative config; advanced users opt
-          in via the Experimental toggle to reach this. */}
       {servicesConfig.show_experimental && <>
       <hr className="border-border" />
 
@@ -359,8 +355,7 @@ export function ServicesSettingsPanel() {
       <div className="space-y-4">
         <h3 className="text-[11px] text-text-secondary uppercase tracking-wider font-medium">Studio Prompt Helper</h3>
         <p className="text-[10px] text-text-muted">
-          Controls the sparkle button in Studio. It adapts your prompt for the selected model.
-          Choose a separate writing model here, or leave it blank to use Director's model.
+          Adapts Studio prompts for the selected generation model.
         </p>
 
         <div>
@@ -372,19 +367,13 @@ export function ServicesSettingsPanel() {
             onChange={e => updateConfig({ enhance_llm_model_id: e.target.value })}
             className="w-full bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-accent-blue"
           >
-            <option value="">Same as Director</option>
+            <option value="">Maestro default prompt helper</option>
             {llmModels.map(m => (
               <option key={m.id} value={m.id}>
                 {m.label} ({m.size_hint})
               </option>
             ))}
           </select>
-          <p className="text-[10px] text-text-muted mt-1">
-            {servicesConfig.enhance_llm_model_id
-              ? 'Uses a separate model for Studio prompts, which can be smaller and faster.'
-              : 'Uses Director\'s writing model, which may be slower but more capable.'
-            }
-          </p>
         </div>
 
         {servicesConfig.enhance_llm_model_id && (

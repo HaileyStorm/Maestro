@@ -1574,15 +1574,20 @@ export function InputsPanel() {
               {' '}H3 accepts up to 9 images, 3 videos, 3 audio clips, and 12 reference files total; each audio clip needs a visual reference.
             </p>
           </details>
-          {!h3AdaptiveConditioning && !dedicatedRef2VAMode && h3HasSemanticInputs && (
-            <p className="rounded border border-red-500/35 bg-red-500/10 px-2 py-1 text-[9px] text-red-200">
-              This model choice cannot use the attached reference media. Turn Automatic back on or remove the references before generating.
-            </p>
-          )}
-          {!h3AdaptiveConditioning && dedicatedRef2VAMode && (hasStart || hasEnd) && (
-            <p className="rounded border border-red-500/35 bg-red-500/10 px-2 py-1 text-[9px] text-red-200">
-              This model choice cannot use the attached start or end frames. Turn Automatic back on or remove those frames before generating.
-            </p>
+          {!h3AdaptiveConditioning && (
+            (!dedicatedRef2VAMode && h3HasSemanticInputs)
+            || (dedicatedRef2VAMode && (hasStart || hasEnd))
+          ) && (
+            <div role="status" className="flex flex-wrap items-center justify-between gap-2 rounded border border-amber-500/35 bg-amber-500/10 px-2 py-1 text-[10px] text-amber-100">
+              <span>{dedicatedRef2VAMode ? 'Frame anchors need Automatic.' : 'Reference media needs Automatic.'}</span>
+              <button
+                type="button"
+                onClick={() => setParam('h3_adaptive_conditioning', true)}
+                className="mobile-control-target rounded border border-amber-300/40 px-2 py-1 font-medium hover:bg-amber-500/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300"
+              >
+                Use Automatic
+              </button>
+            </div>
           )}
           {!h3ExecutionBlocked && <div className="flex flex-col items-stretch gap-2 text-[9px] leading-relaxed text-text-secondary sm:flex-row sm:items-start">
             <span className="flex-1">

@@ -125,8 +125,8 @@ test('H3 duration controls retain planning callbacks and expose mobile targets',
   assert.match(duration, /mb-1\.5 flex flex-wrap items-center justify-between/)
   assert.match(duration, /Estimated shots \$\{estimatedSegmentLabel\}/)
   assert.match(duration, /Match each shot automatically/)
-  assert.match(duration, /Choose one Text &amp; frames checkpoint and one References checkpoint next to Generate/)
-  assert.match(duration, /Multi-shot videos appear on the job card immediately,[\s\S]*pause for plan review,[\s\S]*continue automatically/)
+  assert.match(duration, /Use the selected checkpoints to match each shot’s frames and reference media/)
+  assert.doesNotMatch(duration, /Multi-shot videos appear on the job card immediately/)
   assert.match(duration, /Mode details[\s\S]*FL2VA[\s\S]*Ref2VA/)
 })
 

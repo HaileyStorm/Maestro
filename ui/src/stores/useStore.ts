@@ -15237,8 +15237,31 @@ export const useStore = create<AppState>((set, get) => ({
       h3EstimateError: null,
     }))
     if (architecture === 'fl2va') {
-      const ok = await get().selectModel(modelType)
-      if (!ok || get().params.model_type !== modelType) return false
+      // Adaptive routing changes the active FL2VA checkpoint identity, but it
+      // is not an explicit model reset. Keep the authored prompt, references,
+      // timing, profile values, delivery settings, and migrated architecture
+      // LoRAs while refreshing only the target checkpoint's capabilities.
+      // Invalidate every older defaults/options/profile response first so a
+      // late pinned-Ref2VA request cannot overwrite this transition or an edit
+      // made immediately after it.
+      ++_h3ProfileApplySeq
+      ++_h3EstimateSeq
+      ++_h3CompatibilitySeq
+      ++_modelOptionsSeq
+      ++_modelDefaultsSeq
+      const mode = get().generationMode
+      set(s => ({
+        params: { ...s.params, model_type: modelType },
+        selectedModelPerMode: {
+          ...s.selectedModelPerMode,
+          [mode]: modelType,
+        },
+        h3SelectedProfile: 'custom',
+        h3ProfileApplying: null,
+      }))
+      if (!sfxModelTypes.has(modelType)) {
+        void get().loadModelOptions(modelType, { metadataOnly: true })
+      }
     }
     const selected = get()
     const choices = _h3AdaptiveModelChoices(selected.params)

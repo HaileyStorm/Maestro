@@ -199,7 +199,7 @@ export function DurationSlider() {
               />
               <span>
                 <span className="font-medium text-text-primary">Match each shot automatically</span>
-                <span className="mt-0.5 block text-text-muted">On by default. Choose one Text &amp; frames checkpoint and one References checkpoint next to Generate. Maestro matches each shot to its frames, reference media, and cut timing. Multi-shot videos appear on the job card immediately, pause for plan review, then continue automatically when the plan stays unchanged and required terms are accepted.</span>
+                <span className="mt-0.5 block text-text-muted">Use the selected checkpoints to match each shot’s frames and reference media.</span>
               </span>
             </label>
           )}
