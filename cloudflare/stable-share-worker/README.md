@@ -43,8 +43,9 @@ status replaces the generic copy with its escaped message, a plain-language
 heading, and an availability summary. Exact state, reason, and UTC timing stay
 available in a collapsed `Technical details` section instead of dominating the
 ordinary-user copy. Malformed, expired, future, or unreadable status falls back
-to the generic page, which explains the uncertainty and tells the studio owner
-to retry or start Maestro locally from Pinokio. API calls and non-navigation
+to the generic page. Both pages offer **Try again**, a same-page navigation
+link that works without scripts. The generic page also directs the studio owner
+to start Maestro from Pinokio. API calls and non-navigation
 requests always receive the same small `503` JSON response. Both pages have no
 scripts, remote assets, forms, analytics, or executable user content and are
 served with a restrictive CSP.

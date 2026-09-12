@@ -2516,3 +2516,33 @@ isolated candidate at `.artifacts-temp/astra-profile-scope-20260912/`. The full
 5,037-test backend result remains applicable to unchanged backend source.
 Browser and live acceptance remain separate. This closes the profile-panel
 local-state audit identified at the integration checkpoint.
+
+
+## Offline recovery action and browser availability — 2026-09-12
+
+Read-only browser inspection found the existing stable Maestro tab displaying
+its offline page, and the user Continuum service reports inactive. No service
+was started or restarted. This proves the inspected access surface was offline,
+not that the newly committed app UI has passed rendered acceptance.
+
+The offline Worker source now offers a keyboard-focusable **Try again** link
+on both generic offline and current service-update pages. It navigates to the
+same page without scripts or reflected request URLs. The generic explanation
+is reduced to the reachability result and a short owner action. Repeated
+no-tracking/no-content disclaimers are removed from primary copy; the same
+security headers, static-page restrictions and API 503 JSON contracts remain.
+One shared link/style definition keeps the two pages consistent.
+
+All 35 Worker tests, Node syntax and diff checks pass. The tests retain escaped
+status, unavailable-origin, API/browser distinction, no external URL reflection
+and restrictive-CSP coverage, and require the retry link for every status state.
+Receipts and a synthetic offline HTML artifact are under
+`.artifacts-temp/astra-offline-retry-20260912/`. Browser URL policy rejected the
+local-file preview; no alternate browser route or security-policy workaround
+was attempted. The source change is not deployed, and its rendered appearance
+remains unverified. A separately authorized Worker deployment would be required
+to change the live offline page.
+
+The Worker reservation registry initially required reconciliation. A complete
+read-only status found zero sentinels, and the supported reconcile command
+rebuilt the empty registry before acquisition. No foreign claim was removed.
