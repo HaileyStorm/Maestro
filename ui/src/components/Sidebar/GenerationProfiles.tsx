@@ -1,3 +1,4 @@
+import { GenerationProfileRefreshStatus } from '../GenerationProfileRefreshStatus'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { FolderOpen, Save, Trash2 } from 'lucide-react'
 import type { GenerationPreset } from '../../api/client'
@@ -220,19 +221,7 @@ export function GenerationProfiles({
         </div>
       )}
 
-      {presetsError && (
-        <div role="status" className="mt-2 flex items-center justify-between gap-2 text-[10px] text-red-400">
-          <span>{presetsError}</span>
-          <button
-            type="button"
-            onClick={() => { void loadPresets() }}
-            disabled={busy}
-            className="mobile-control-target rounded border border-border px-2 py-1 text-text-secondary hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50"
-          >
-            Retry
-          </button>
-        </div>
-      )}
+      <GenerationProfileRefreshStatus error={presetsError} busy={busy} onRetry={() => { void loadPresets() }} />
 
       {selected && (
         <div className="mt-2 flex items-center justify-between gap-2 border-t border-border/70 pt-2">

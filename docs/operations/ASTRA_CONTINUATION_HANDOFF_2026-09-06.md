@@ -2423,3 +2423,21 @@ statuses with the expected recovery events. Receipts and candidate hashes:
 `.artifacts-temp/astra-profile-refresh-20260912/`. No browser, runtime, GPU or
 Windows acceptance is claimed. Continue auditing other saved-profile consumers
 (such as Director's LoRA-only import) for consistent loading/error affordances.
+
+
+## Shared profile feedback in Director — 2026-09-12
+
+Director's LoRAs from saved profile area no longer disappears during loading
+or an unsuccessful initial fetch. It shows loading state or the same Retry
+feedback used by Generate and Advanced. Matching cached LoRA selections remain
+usable during transient refresh failures; explicit access denial still clears
+records through the shared store. The action retains its LoRA-only label and
+payload, without implying a full generation-settings restore.
+
+The stateless GenerationProfileRefreshStatus component owns common failure
+copy layout and retry behavior without importing sidebar state or model-picker
+dependencies. The previous inline status implementation is removed. Synthetic
+component tests cover empty/loading/error states, disabled retry, retry dispatch,
+and exact LoRA-only import payload. All 591 UI tests, production build,
+targeted ESLint and diff checks pass on the isolated candidate. Receipts: `.artifacts-temp/astra-profile-consumers-20260912/`.
+Browser and live acceptance remain separate.

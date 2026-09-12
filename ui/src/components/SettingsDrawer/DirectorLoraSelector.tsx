@@ -1,3 +1,4 @@
+import { GenerationProfileRefreshStatus } from '../GenerationProfileRefreshStatus'
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { Search, X, Loader2, FolderOpen, Globe, Sparkles, BookOpen } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
@@ -222,6 +223,8 @@ function DirectorProfileLoraPicker({ mode, modelType }: {
   modelType: string
 }) {
   const presets = useStore(s => s.presets)
+  const presetsLoading = useStore(s => s.presetsLoading)
+  const presetsError = useStore(s => s.presetsError)
   const loadPresets = useStore(s => s.loadPresets)
   const directorSetLora = useStore(s => s.directorSetLora)
   const savedLora = useStore(s => s.savedLoraPerMode[mode])
@@ -234,7 +237,7 @@ function DirectorProfileLoraPicker({ mode, modelType }: {
     && p.activated_loras.length > 0
   )
 
-  if (modePresets.length === 0) return null
+  if (modePresets.length === 0 && !presetsLoading && !presetsError) return null
 
   const importLoras = (preset: typeof modePresets[0]) => {
     directorSetLora(
@@ -249,6 +252,8 @@ function DirectorProfileLoraPicker({ mode, modelType }: {
   return (
     <div className="mb-2">
       <p className="text-[10px] text-text-muted uppercase tracking-wider mb-1">LoRAs from saved profile</p>
+      {presetsLoading && <p role="status" className="text-[10px] text-text-muted">Loading profiles…</p>}
+      <GenerationProfileRefreshStatus error={presetsError} busy={presetsLoading} onRetry={() => { void loadPresets() }} />
       <div className="flex flex-wrap gap-1">
         {modePresets.map(p => (
           <button

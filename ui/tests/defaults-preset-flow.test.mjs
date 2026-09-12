@@ -953,7 +953,7 @@ test('late profile failures cannot replace newer success or another project stat
     assert.deepEqual(useStore.getState().presets, [])
   })
   assert.match(profileComponent, /presetsError \? 'Profiles unavailable' : 'No saved profiles'/)
-  assert.match(profileComponent, /onClick=\{\(\) => \{ void loadPresets\(\) \}\}/)
+  assert.match(profileComponent, /onRetry=\{\(\) => \{ void loadPresets\(\) \}\}/)
 })
 
 test('profile access denial clears cached profiles and requests scoped access recovery', async () => {
