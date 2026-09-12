@@ -16,8 +16,10 @@ improvement without an inactive saved toggle blocking submission; see the
 closure below. Continue the broader app-flow audit and remaining WIP review.
 
 Current safe work also includes the broader app interaction/copy audit and review of the
-remaining inventoried WIP: preserved test reordering and queue assertions,
-and the untracked storage-janitor source/tests.
+remaining inventoried WIP: launcher account-path configuration, launch-file
+whitespace, and the untracked storage-janitor source/tests. The storage pair
+requires explicit ownership recovery under FRESH_THREAD_HANDOFF.md before
+claiming, modifying or adopting it.
 H3 executable-plan startup handling and the related Studio tests have the
 source/test closure recorded below. Inspect each
 against the committed implementation before adopting, replacing or retiring it;
@@ -2370,3 +2372,29 @@ request fields or substituting another checkpoint. All 27 tests across the
 LoRA compatibility and adaptive-execution modules pass in the isolated CPU-only
 candidate. No GPU, model load, runtime restart or browser acceptance occurred.
 Remaining launcher, test-reordering, queue and storage drafts are preserved.
+
+
+## Queue regression and test-residue reconciliation — 2026-09-12
+
+The queue polling-readiness draft is now executable coverage of the actual
+component effect. It verifies the ready state is untouched, loss of admission
+increments the request sequence and aborts the pending request, clears the
+scheduler snapshot and active campaign state, and retains failed/cancelled
+cards with their original identity and failure details. Repeated admission loss
+does not re-abort the old controller. All 586 UI tests and targeted ESLint pass;
+application source is unchanged, so the preceding build evidence remains valid.
+
+The remaining LLM-test reorder and recovery-test blank-line drafts were proven
+AST-identical to the committed tests (with unique class methods normalized by
+name). Their preimages and parity receipt are preserved under
+`.artifacts-temp/astra-queue-reconcile-20260912/evidence/`; the committed ordering
+was restored without deleting or changing any test body. The queue source-only
+assertion was replaced rather than retained alongside its executable replacement.
+No runtime, GPU or browser acceptance is inferred from these checks.
+
+Current planned-work review found storage-janitor drafts are a pure policy core,
+but FRESH_THREAD_HANDOFF.md explicitly reserves their adoption behind ownership
+recovery. Do not treat their absence from imports as permission to delete them.
+Remaining safe work is the broader app interaction/settings audit and launcher
+WIP inspection under the launcher-specific workflow; live account, provider,
+service restart and storage activation remain separately gated.

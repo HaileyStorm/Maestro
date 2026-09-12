@@ -84,6 +84,51 @@ test('queue refresh retains the complete last success across transient failures'
   assert.equal(successB.lastSuccessAt, 1_725_000_015_000)
 })
 
+test('queue admission loss aborts polling and retains failed or cancelled cards', async () => {
+  const source = await readFile(mainUrl, 'utf8')
+  const start = source.indexOf('useEffect(() => {\n    if (queuePollingReady) return')
+  const end = source.indexOf('}, [queuePollingReady])', start)
+  assert.ok(start >= 0 && end > start)
+  const effectBody = source.slice(start + 'useEffect(() => {'.length, end)
+  const result = await transform(`
+    export function run({queuePollingReady, queuePollSequence, queuePollAbort, setQueueTabSnapshot, useStore}) {
+      ${effectBody}
+    }
+  `, { loader: 'ts', format: 'esm' })
+  const { run } = await import(asDataModule(result.code))
+  const jobs = ['running', 'queued', 'failed', 'cancelled', 'completed', 'waiting_for_plan_approval']
+    .map((status, index) => ({ id: String(index), status, error: status === 'failed' ? 'Retained failure' : undefined }))
+  let state = { jobs, sampleCampaignPairs: [{ id: 'campaign' }], isGenerating: true }
+  const queuePollSequence = { current: 7 }
+  let aborted = 0
+  const controller = { abort: () => { aborted += 1 } }
+  const queuePollAbort = { current: controller }
+  const snapshots = []
+  const environment = {
+    queuePollingReady: true, queuePollSequence, queuePollAbort,
+    setQueueTabSnapshot: snapshot => snapshots.push(snapshot),
+    useStore: { setState: update => { state = { ...state, ...update(state) } } },
+  }
+  run(environment)
+  assert.equal(queuePollSequence.current, 7)
+  assert.equal(aborted, 0)
+  assert.equal(state.jobs, jobs)
+  assert.deepEqual(snapshots, [])
+  environment.queuePollingReady = false
+  run(environment)
+  assert.equal(queuePollSequence.current, 8)
+  assert.equal(aborted, 1)
+  assert.equal(queuePollAbort.current, null)
+  assert.deepEqual(state.jobs, [jobs[2], jobs[3]])
+  assert.equal(state.jobs[0], jobs[2], 'failure detail and card identity survive')
+  assert.equal(state.isGenerating, false)
+  assert.deepEqual(state.sampleCampaignPairs, [])
+  assert.deepEqual(snapshots, [{ state: null, jobs: [], error: null, lastSuccessAt: null }])
+  run(environment)
+  assert.equal(aborted, 1, 'repeated loss does not re-abort an old request')
+  assert.deepEqual(state.jobs, [jobs[2], jobs[3]])
+})
+
 test('initial failure stays unavailable and abort or supersession is fenced', async () => {
   const { queueRefreshIsStale, queueTabDisplayJobs, reduceQueueTabSnapshot } = await loadQueueRefreshLifecycle()
   const initialFailure = reduceQueueTabSnapshot(
