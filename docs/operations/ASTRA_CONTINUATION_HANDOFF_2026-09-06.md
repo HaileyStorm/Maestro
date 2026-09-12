@@ -5,7 +5,7 @@
 The complete committed-tree backend suite at `4402792` passes 5,037 tests with
 19 skips and zero failures. Python compilation, JSON grammar regressions and
 the root tracked-publication guard pass. The latest unchanged UI source has
-591 passing tests plus a passing production build and targeted lint. Earlier
+594 passing tests plus a passing production build and targeted lint. Earlier
 failure lists and partial-suite checkpoints below are historical, not current
 backlog; do not rerun them merely to rediscover resolved failures.
 
@@ -2494,3 +2494,25 @@ acceptance. The broader Goal remains active. Next source audit: profile-panel
 local notices and pending actions across account/project changes, followed by
 remaining app interaction consistency. Preserve separate browser filesystem,
 storage ownership, activation and GPU authorization gates.
+
+
+## Profile panel lifetime and delayed deletion — 2026-09-12
+
+The shared profile panel now remounts its local form state on account identity
+epoch, account, project or generation-mode changes. Draft names, confirmations,
+notices and pending-action busy state cannot carry into the new context; old
+async completions target their old unmounted panel. The prior mode-only notice
+reset is superseded by this keyed lifetime.
+
+Removed the component's unconditional selected-profile clear after deletion.
+The existing store action owns that update and clears only the deleted ID in
+the same account/project, preserving a newer selection. Regressions exercise
+the delayed-delete panel callback and the actual store action across selection,
+project and account changes, plus collision-safe scope keys. The existing mock
+renderer now executes the nested panel and supplies the account epoch.
+
+All 594 UI tests, production build, targeted ESLint and diff checks pass on the
+isolated candidate at `.artifacts-temp/astra-profile-scope-20260912/`. The full
+5,037-test backend result remains applicable to unchanged backend source.
+Browser and live acceptance remain separate. This closes the profile-panel
+local-state audit identified at the integration checkpoint.

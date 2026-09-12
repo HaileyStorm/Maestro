@@ -130,7 +130,7 @@ async function loadGenerationProfiles() {
           if (args.path === 'jsx-runtime') {
             return { contents: `
               export const Fragment = Symbol.for('generation-profiles-fragment')
-              export const jsx = (type, props, key) => ({ type, key, props: props || {} })
+              export const jsx = (type, props, key) => typeof type === "function" ? type(props || {}) : ({ type, key, props: props || {} })
               export const jsxs = jsx
             ` }
           }
@@ -140,7 +140,7 @@ async function loadGenerationProfiles() {
             ` }
           }
           if (args.path === 'store') {
-            return { contents: 'export const useStore = selector => selector(globalThis.__profileStore)' }
+            return { contents: 'export const useStore = selector => selector(globalThis.__profileStore); export const currentAccountIdentityEpoch = () => 1' }
           }
           throw new Error(`Unexpected generation profile dependency: ${args.path}`)
         })
@@ -578,7 +578,7 @@ test('profile Load, Save as new, and confirmed Delete expose async actions', asy
   deleteButton.props.onClick()
   await flushAsyncAction()
   assert.deepEqual(deleteCalls.delete, ['video-a'])
-  assert.ok(globalThis.__profileStateUpdates.includes(''), 'deleting clears the selected profile')
+  assert.ok(!globalThis.__profileStateUpdates.includes(''), 'selection clearing belongs to the scope-checked store action')
   assert.ok(globalThis.__profileStateUpdates.some(value => value?.text === 'Profile deleted.'))
 })
 

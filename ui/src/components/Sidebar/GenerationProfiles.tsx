@@ -2,7 +2,7 @@ import { GenerationProfileRefreshStatus } from '../GenerationProfileRefreshStatu
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { FolderOpen, Save, Trash2 } from 'lucide-react'
 import type { GenerationPreset } from '../../api/client'
-import { useStore } from '../../stores/useStore'
+import { currentAccountIdentityEpoch, useStore } from '../../stores/useStore'
 import { GenerationProfileSettingsError } from '../../lib/generationProfiles'
 
 
@@ -16,7 +16,15 @@ interface GenerationProfilesProps {
   placement?: 'sidebar' | 'advanced'
 }
 
-export function GenerationProfiles({
+export function GenerationProfiles(props: GenerationProfilesProps = {}) {
+  const account = useStore(state => state.accountContext)
+  const workspace = useStore(state => state.activeWorkspace)
+  const mode = useStore(state => state.generationMode)
+  const scopeKey = JSON.stringify([currentAccountIdentityEpoch(), account?.account?.id, workspace, mode])
+  return <GenerationProfilesPanel key={scopeKey} {...props} />
+}
+
+function GenerationProfilesPanel({
   loadOnMount = true,
   placement = 'sidebar',
 }: GenerationProfilesProps = {}) {
@@ -54,11 +62,6 @@ export function GenerationProfiles({
   useEffect(() => {
     if (selectedId && !selected) setSelectedId('')
   }, [selected, selectedId, setSelectedId])
-
-  useEffect(() => {
-    setConfirmDelete(false)
-    setNotice(null)
-  }, [generationMode])
 
   const beginAction = (action: 'save' | 'load' | 'delete'): boolean => {
     if (actionInFlight.current) return false
@@ -114,7 +117,6 @@ export function GenerationProfiles({
     if (!beginAction('delete')) return
     try {
       await deletePreset(selected.id)
-      setSelectedId('')
       setConfirmDelete(false)
       setNotice({ kind: 'success', text: 'Profile deleted.' })
     } catch {
