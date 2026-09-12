@@ -1,14 +1,13 @@
 # Astra continuation handoff — 2026-09-06
 
-## Current continuation pointer — 2026-09-08
+## Current continuation pointer — 2026-09-12
 
-Use the later dated closure sections to interpret older intake and next-action
-notes. The seven queue failures in the historical "Next work, in order" list
-have been superseded by subsequent fixes and the complete 5,012-test CPU run.
-That run's remaining baseline assertions/fixtures were repaired in six full
-modules (201 cases, two skips). Its intermittent LLM timing assertion now has
-a deterministic lease-ordering regression and an 82-test module pass. Do not
-rerun the old failure list as if it were still the current backlog.
+The complete committed-tree backend suite at `4402792` passes 5,037 tests with
+19 skips and zero failures. Python compilation, JSON grammar regressions and
+the root tracked-publication guard pass. The latest unchanged UI source has
+591 passing tests plus a passing production build and targeted lint. Earlier
+failure lists and partial-suite checkpoints below are historical, not current
+backlog; do not rerun them merely to rediscover resolved failures.
 
 Improve before Generate now shares workflow eligibility between its control
 and submission. Blend, avatar Edit and audio-only paths retain standalone
@@ -16,9 +15,9 @@ improvement without an inactive saved toggle blocking submission; see the
 closure below. Continue the broader app-flow audit and remaining WIP review.
 
 Current safe work also includes the broader app interaction/copy audit and review of the
-remaining inventoried WIP: launch-file whitespace and the untracked
-storage-janitor source/tests. Launcher account-path forwarding is now verified
-and adopted below. The storage pair
+remaining inventoried WIP: only the protected untracked storage-janitor
+source/test pair. Tracked source is reconciled; launcher account-path forwarding
+is adopted and the launch-file whitespace residue was verified and retired. The storage pair
 requires explicit ownership recovery under FRESH_THREAD_HANDOFF.md before
 claiming, modifying or adopting it.
 H3 executable-plan startup handling and the related Studio tests have the
@@ -2465,3 +2464,33 @@ quoted spaces, hash characters, Windows-style paths, empty overrides and global
 fallback. They do not start the application. Receipts and preflight record:
 `.artifacts-temp/astra-account-path-launcher-20260912/`. Live restart, migration,
 account activation and Windows execution remain separately unverified/gated.
+
+
+## Full committed-tree CPU integration — 2026-09-12
+
+A clean archive of `4402792` completed the full Python unittest discovery:
+5,037 tests in 1,361 seconds, with 19 skips and no failures. The run used the
+existing app interpreter and `scripts/run_local_ci.py:cpu_only_environment()`;
+only the archive's app directory was added to its Python import path. Untracked
+storage-janitor drafts and machine-local models/configuration were excluded.
+The synthetic failure line printed by the local-CI runner regression was an
+expected test fixture; the authoritative unittest result and process exit are
+both successful. Python syntax, JSON grammar and tracked publication-boundary
+checks also pass. The latest unchanged UI source retains its 591-test/build/lint
+pass; no redundant UI rerun was needed for this backend integration checkpoint.
+
+The remaining three blank-line edits in `app/launch.py` were verified against
+HEAD by equal nonblank lines and equal AST, preserved as an exact preimage, and
+retired. The tracked worktree is now reconciled. The literal control-key audit
+found 55 distinct setParam keys in component TSX files, all classified by the
+profile schema or its explicit exclusions. This does not prove coverage of
+all dynamic keys, content/media fields, or every UI-only state variable.
+
+Receipts: `.artifacts-temp/astra-integrated-cpu-20260912/` contains source
+identity, full test log/result, auxiliary check logs, profile key audit and
+whitespace parity/preimage. Evidence is CPU/static/synthetic; it does not prove
+browser, native Windows, provider, live-device, acoustic/visual or human
+acceptance. The broader Goal remains active. Next source audit: profile-panel
+local notices and pending actions across account/project changes, followed by
+remaining app interaction consistency. Preserve separate browser filesystem,
+storage ownership, activation and GPU authorization gates.
