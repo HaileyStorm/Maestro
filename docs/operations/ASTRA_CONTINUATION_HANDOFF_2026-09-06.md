@@ -16,8 +16,8 @@ improvement without an inactive saved toggle blocking submission; see the
 closure below. Continue the broader app-flow audit and remaining WIP review.
 
 Current safe work also includes the broader app interaction/copy audit and review of the
-remaining inventoried WIP: the unused adaptive-Ref2VA helper, preserved test
-reordering and queue assertions, and the untracked storage-janitor source/tests.
+remaining inventoried WIP: preserved test reordering and queue assertions,
+and the untracked storage-janitor source/tests.
 H3 executable-plan startup handling and the related Studio tests have the
 source/test closure recorded below. Inspect each
 against the committed implementation before adopting, replacing or retiring it;
@@ -2352,3 +2352,21 @@ returning from Blend. All 585 UI tests, the production build, targeted ESLint,
 97 Studio tests under the CPU-only environment, and diff checks pass. Evidence:
 `.artifacts-temp/astra-enhance-eligibility-20260912/`. Browser, live generation
 and Windows acceptance remain separate; no service or model was started.
+
+
+## Unused adaptive checkpoint helper retirement — 2026-09-12
+
+The uncommitted `default_adaptive_ref2va_model` helper, duplicate constant and
+export had no production callers. Their proposed validation was already owned
+by `_apply_h3_adaptive_checkpoint`. The draft and its helper-only test were
+preserved as private preimages under
+`.artifacts-temp/astra-ref-helper-retirement-20260912/evidence/` and retired.
+The service now matches its committed baseline byte-for-byte.
+
+The replacement regression executes the actual launch selection function for
+both H3 starting architectures, both explicit checkpoint fields, and unknown
+or malformed choices. It proves rejection occurs without mutating authored
+request fields or substituting another checkpoint. All 27 tests across the
+LoRA compatibility and adaptive-execution modules pass in the isolated CPU-only
+candidate. No GPU, model load, runtime restart or browser acceptance occurred.
+Remaining launcher, test-reordering, queue and storage drafts are preserved.

@@ -148,6 +148,25 @@ class H3LoraLaunchProjectionTests(unittest.TestCase):
         }
         exec(compile(module, 'lora-launch-projection', 'exec'), cls.helpers)
 
+    def test_adaptive_request_rejects_unknown_checkpoint_before_mutation(self):
+        import copy
+        for selected in ('minimax_h3', 'minimax_h3_ref2va'):
+            for field in ('h3_adaptive_fl2va_model', 'h3_adaptive_ref2va_model'):
+                for invalid in ('unavailable', [], {}, False):
+                    with self.subTest(selected=selected, field=field, invalid=invalid):
+                        body = {
+                            'model_type': selected,
+                            'h3_adaptive_conditioning': True,
+                            field: invalid,
+                            'prompt': 'An authored prompt.',
+                            'image_refs': ['reference.png'],
+                            'num_inference_steps': 17,
+                        }
+                        original = copy.deepcopy(body)
+                        with self.assertRaisesRegex(ValueError, 'model selection is unavailable'):
+                            self.helpers['_apply_h3_adaptive_checkpoint'](body)
+                        self.assertEqual(body, original)
+
     def request(self):
         return {
             'model_type': 'minimax_h3_ref2va',
