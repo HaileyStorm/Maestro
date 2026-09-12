@@ -16,8 +16,9 @@ improvement without an inactive saved toggle blocking submission; see the
 closure below. Continue the broader app-flow audit and remaining WIP review.
 
 Current safe work also includes the broader app interaction/copy audit and review of the
-remaining inventoried WIP: launcher account-path configuration, launch-file
-whitespace, and the untracked storage-janitor source/tests. The storage pair
+remaining inventoried WIP: launch-file whitespace and the untracked
+storage-janitor source/tests. Launcher account-path forwarding is now verified
+and adopted below. The storage pair
 requires explicit ownership recovery under FRESH_THREAD_HANDOFF.md before
 claiming, modifying or adopting it.
 H3 executable-plan startup handling and the related Studio tests have the
@@ -2441,3 +2442,26 @@ component tests cover empty/loading/error states, disabled retry, retry dispatch
 and exact LoRA-only import payload. All 591 UI tests, production build,
 targeted ESLint and diff checks pass on the isolated candidate. Receipts: `.artifacts-temp/astra-profile-consumers-20260912/`.
 Browser and live acceptance remain separate.
+
+
+## Account path forwarding in Start — 2026-09-12
+
+Adopted the three-line launcher draft forwarding `MAESTRO_ACCOUNT_STORE_PATH`,
+`MAESTRO_ACCOUNT_PROJECT_MIGRATION_PATH` and
+`MAESTRO_ACCOUNT_PROJECT_MEMBERSHIP_PATH` through the existing freshly resolved
+backend environment. Per-app configuration wins over global values; explicit
+empty values select backend defaults. No path is hardcoded, and forwarding does
+not enable accounts, bootstrap or migration, move data, or change credentials.
+README documents the path behavior.
+
+The launcher checklist resolved the current checkout under the configured
+Pinokio home, inspected the latest start log, and checked the existing shell.run
+environment pattern against the mochi example. The project's stronger captured
+URL rule remains unchanged (`input.event[1]`), as do daemon mode, relative app
+working directory and runtime selection. The complete launcher compatibility
+suite passes 34 tests with one existing skip; Node syntax and diff checks pass.
+Tests evaluate launcher definitions with synthetic configuration, including
+quoted spaces, hash characters, Windows-style paths, empty overrides and global
+fallback. They do not start the application. Receipts and preflight record:
+`.artifacts-temp/astra-account-path-launcher-20260912/`. Live restart, migration,
+account activation and Windows execution remain separately unverified/gated.

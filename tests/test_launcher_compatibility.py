@@ -806,6 +806,9 @@ const explicitBackendEnvironment = (definition) => {
         captured = json.loads(completed.stdout)
         expected_params_env_keys = {
             "MAESTRO_ACCOUNTS_ENABLED",
+            "MAESTRO_ACCOUNT_STORE_PATH",
+            "MAESTRO_ACCOUNT_PROJECT_MIGRATION_PATH",
+            "MAESTRO_ACCOUNT_PROJECT_MEMBERSHIP_PATH",
             "MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED",
             "MAESTRO_PUBLIC_REGISTRATION_ENABLED",
             "MAESTRO_HOSTED_CREDIT_ENFORCEMENT_ENABLED",
@@ -879,6 +882,30 @@ Promise.resolve(build({port: async () => 7860, envs}))
                 timeout=10,
             )
         return json.loads(completed.stdout)
+
+    def test_account_data_paths_follow_explicit_app_environment_precedence(self):
+        keys = (
+            "MAESTRO_ACCOUNT_STORE_PATH",
+            "MAESTRO_ACCOUNT_PROJECT_MIGRATION_PATH",
+            "MAESTRO_ACCOUNT_PROJECT_MEMBERSHIP_PATH",
+        )
+        global_values = {key: f"global/{index}.json" for index, key in enumerate(keys)}
+        for app_value in (None, "", "storage/account data.json", r"C:\Maestro Data\account.json", "storage/account #1.json"):
+            with self.subTest(app_value=app_value):
+                environment = "" if app_value is None else "\n".join(
+                    f'{key}="{app_value}" # explicit app override' for key in keys
+                )
+                definition = self._load_start_with_environment(environment, global_values)
+                backend = next(
+                    step["params"] for step in definition["run"]
+                    if step.get("method") == "shell.run"
+                    and any("python launch.py" in command for command in step.get("params", {}).get("message", []))
+                )
+                for key in keys:
+                    self.assertEqual(backend["env"][key], global_values[key] if app_value is None else app_value)
+                self.assertEqual(backend["path"], "app")
+                self.assertEqual(backend["env"]["MAESTRO_ACCOUNTS_ENABLED"], "")
+                self.assertEqual(backend["env"]["MAESTRO_ACCOUNT_BOOTSTRAP_ENABLED"], "")
 
     def test_app_cloudflare_true_overrides_global_false_for_delayed_registration(self):
         definition = self._load_start_with_environment(
