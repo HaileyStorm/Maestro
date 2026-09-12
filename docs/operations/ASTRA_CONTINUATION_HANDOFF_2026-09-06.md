@@ -2398,3 +2398,28 @@ recovery. Do not treat their absence from imports as permission to delete them.
 Remaining safe work is the broader app interaction/settings audit and launcher
 WIP inspection under the launcher-specific workflow; live account, provider,
 service restart and storage activation remain separately gated.
+
+
+## Profile-list failure and access recovery — 2026-09-12
+
+Generation profile refresh no longer turns a network/server failure into an
+empty saved-profile list. Same-scope transient failures retain the last successful
+records and show a short error with Retry in the shared Generate/Advanced panel.
+An initial failure shows Profiles unavailable, distinct from a confirmed empty
+list. Successful retry replaces the list and clears the error.
+
+The API preserves HTTP status in the existing protected-read error type. Current
+401/403/423 responses clear cached profiles and selection, then request the
+existing account/project recovery flow; 404 also clears inaccessible records.
+Only the still-current request/account/project may publish errors, alter loading
+state or request recovery. Account/project resets clear the error state, and no
+raw transport/server details are shown. Retained records remain scope-bound by
+the existing preset application checks.
+
+All 589 UI tests, production build, targeted ESLint and diff checks pass in the
+isolated candidate. Added actual-store tests cover failed refresh retention,
+successful retry, newer-success and project-switch races, and all four access
+statuses with the expected recovery events. Receipts and candidate hashes:
+`.artifacts-temp/astra-profile-refresh-20260912/`. No browser, runtime, GPU or
+Windows acceptance is claimed. Continue auditing other saved-profile consumers
+(such as Director's LoRA-only import) for consistent loading/error affordances.

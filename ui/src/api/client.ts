@@ -6012,7 +6012,7 @@ function newGenerationPresetId(): string {
 export async function fetchPresets(workspace: string): Promise<{ presets: GenerationPreset[] }> {
   const query = new URLSearchParams({ workspace })
   const res = await fetch(`${BASE}/api/v1/presets?${query.toString()}`)
-  if (!res.ok) throw new Error('Failed to fetch presets')
+  if (!res.ok) throw new ProtectedReadApiError('workspaces', res.status)
   return res.json()
 }
 

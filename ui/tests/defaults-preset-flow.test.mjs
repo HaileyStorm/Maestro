@@ -900,3 +900,74 @@ test('profiles invalidate derived Inpaint masks only when segmentation settings 
     })
   }
 })
+
+test('profile refresh failure retains saved setups and retry replaces them', async () => {
+  let fail = false
+  let records = [{ id: 'kept', name: 'Saved setup', mode: 'video', model_type: 'model-a', activated_loras: [] }]
+  await withFreshStore(async input => {
+    assert.match(String(input), /\/api\/v1\/presets\?/)
+    if (fail) throw new Error('PRIVATE transport detail')
+    return jsonResponse({ presets: records })
+  }, async useStore => {
+    useStore.setState({ activeWorkspace: 'profiles' })
+    await useStore.getState().loadPresets()
+    const retained = useStore.getState().presets
+    fail = true
+    await useStore.getState().loadPresets()
+    assert.equal(useStore.getState().presets, retained)
+    assert.equal(useStore.getState().presetsLoading, false)
+    assert.equal(useStore.getState().presetsError, 'Profiles could not be refreshed.')
+    fail = false
+    records = []
+    await useStore.getState().loadPresets()
+    assert.deepEqual(useStore.getState().presets, [])
+    assert.equal(useStore.getState().presetsError, null)
+  })
+})
+
+test('late profile failures cannot replace newer success or another project state', async () => {
+  const pending = []
+  await withFreshStore(async () => {
+    const request = deferred()
+    pending.push(request)
+    return request.promise
+  }, async useStore => {
+    useStore.setState({ activeWorkspace: 'old' })
+    const older = useStore.getState().loadPresets()
+    await waitForCondition(() => pending.length === 1, 'first profile request')
+    const newer = useStore.getState().loadPresets()
+    await waitForCondition(() => pending.length === 2, 'second profile request')
+    pending[1].resolve(jsonResponse({ presets: [{ id: 'new' }] }))
+    await newer
+    pending[0].reject(new Error('old failure'))
+    await older
+    assert.equal(useStore.getState().presets[0].id, 'new')
+    assert.equal(useStore.getState().presetsError, null)
+    const previousProject = useStore.getState().loadPresets()
+    await waitForCondition(() => pending.length === 3, 'old project request')
+    useStore.setState({ activeWorkspace: 'next', presets: [], presetsError: null, presetsLoading: false })
+    pending[2].reject(new Error('wrong project'))
+    await previousProject
+    assert.equal(useStore.getState().presetsError, null)
+    assert.equal(useStore.getState().presetsLoading, false)
+    assert.deepEqual(useStore.getState().presets, [])
+  })
+  assert.match(profileComponent, /presetsError \? 'Profiles unavailable' : 'No saved profiles'/)
+  assert.match(profileComponent, /onClick=\{\(\) => \{ void loadPresets\(\) \}\}/)
+})
+
+test('profile access denial clears cached profiles and requests scoped access recovery', async () => {
+  for (const status of [401, 403, 404, 423]) {
+    await withFreshStore(async () => jsonResponse({ detail: 'PRIVATE server detail' }, status), async useStore => {
+      const events = []
+      window.addEventListener('maestro:access-recovery', event => events.push(event.detail))
+      useStore.setState({ activeWorkspace: 'restricted', presets: [{ id: 'private' }], selectedGenerationProfileId: 'private' })
+      await useStore.getState().loadPresets()
+      assert.deepEqual(useStore.getState().presets, [])
+      assert.equal(useStore.getState().selectedGenerationProfileId, '')
+      assert.equal(useStore.getState().presetsError, 'Profile access is unavailable.')
+      assert.equal(useStore.getState().presetsLoading, false)
+      assert.deepEqual(events, status === 404 ? [] : [{ status, recovery: status === 401 ? 'account' : 'project' }])
+    })
+  }
+})

@@ -21,6 +21,7 @@ export function GenerationProfiles({
 }: GenerationProfilesProps = {}) {
   const presets = useStore(state => state.presets)
   const presetsLoading = useStore(state => state.presetsLoading)
+  const presetsError = useStore(state => state.presetsError)
   const loadPresets = useStore(state => state.loadPresets)
   const savePreset = useStore(state => state.savePreset)
   const loadPreset = useStore(state => state.loadPreset)
@@ -159,7 +160,7 @@ export function GenerationProfiles({
             <option value="">
               {presetsLoading
                 ? 'Loading profiles…'
-                : modeProfiles.length > 0 ? 'Choose a profile' : 'No saved profiles'}
+                : modeProfiles.length > 0 ? 'Choose a profile' : presetsError ? 'Profiles unavailable' : 'No saved profiles'}
             </option>
             {modeProfiles.map(profileOption)}
           </select>
@@ -215,6 +216,20 @@ export function GenerationProfiles({
             className="mobile-control-target rounded-md bg-accent-blue px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-accent-blue-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:cursor-not-allowed disabled:opacity-50"
           >
             {activeAction === 'save' ? 'Saving…' : 'Save as new'}
+          </button>
+        </div>
+      )}
+
+      {presetsError && (
+        <div role="status" className="mt-2 flex items-center justify-between gap-2 text-[10px] text-red-400">
+          <span>{presetsError}</span>
+          <button
+            type="button"
+            onClick={() => { void loadPresets() }}
+            disabled={busy}
+            className="mobile-control-target rounded border border-border px-2 py-1 text-text-secondary hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50"
+          >
+            Retry
           </button>
         </div>
       )}

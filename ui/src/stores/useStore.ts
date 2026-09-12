@@ -3328,6 +3328,7 @@ interface AppState {
   setSelectedGenerationProfileId: (id: string) => void
   presets: import('../api/client').GenerationPreset[]
   presetsLoading: boolean
+  presetsError: string | null
   loadPresets: () => Promise<void>
   savePreset: (name: string) => Promise<void>
   loadPreset: (preset: import('../api/client').GenerationPreset) => Promise<boolean>
@@ -5114,6 +5115,7 @@ function _scrubAccountBoundProjectUi(state: AppState): Partial<AppState> {
     directorQueue: null,
     directorQueueLoading: false,
     presets: [],
+    presetsError: null,
     presetsLoading: false,
     selectedGenerationProfileId: '',
     recipes: [],
@@ -10283,6 +10285,7 @@ export const useStore = create<AppState>((set, get) => ({
   selectedGenerationProfileId: '',
   setSelectedGenerationProfileId: id => set({ selectedGenerationProfileId: id }),
   presets: [],
+  presetsError: null,
   presetsLoading: false,
 
   loadPresets: async () => {
@@ -10290,10 +10293,10 @@ export const useStore = create<AppState>((set, get) => ({
     const accountIdentityEpoch = _accountIdentityEpoch
     const workspace = get().activeWorkspace
     if (!workspace) {
-      set({ presets: [], presetsLoading: false })
+      set({ presets: [], presetsLoading: false, presetsError: null })
       return
     }
-    set({ presetsLoading: true })
+    set({ presetsLoading: true, presetsError: null })
     try {
       const { presets } = await api.fetchPresets(workspace)
       if (
@@ -10304,15 +10307,28 @@ export const useStore = create<AppState>((set, get) => ({
         for (const preset of presets) {
           _presetScopes.set(preset, { accountIdentityEpoch, workspace })
         }
-        set({ presets })
+        set({ presets, presetsError: null })
       }
-    } catch (e) {
-      if (requestSequence === _presetLoadSequence) {
-        console.error('Failed to load presets:', e)
-        set({ presets: [] })
+    } catch (error) {
+      if (
+        requestSequence === _presetLoadSequence
+        && accountIdentityEpoch === _accountIdentityEpoch
+        && get().activeWorkspace === workspace
+      ) {
+        const status = api.accessRecoveryStatus(error)
+        if (status !== null || (error instanceof api.ProtectedReadApiError && error.status === 404)) {
+          set({ presets: [], selectedGenerationProfileId: '', presetsError: 'Profile access is unavailable.' })
+          if (status !== null) api.requestAccessRecovery(status, api.accessRecoveryKind(error) || 'project')
+        } else {
+          set({ presetsError: 'Profiles could not be refreshed.' })
+        }
       }
     } finally {
-      if (requestSequence === _presetLoadSequence) {
+      if (
+        requestSequence === _presetLoadSequence
+        && accountIdentityEpoch === _accountIdentityEpoch
+        && get().activeWorkspace === workspace
+      ) {
         set({ presetsLoading: false })
       }
     }
@@ -15362,6 +15378,7 @@ export const useStore = create<AppState>((set, get) => ({
           ...(projectChanged || previousAccessRevoked ? {
             browsingUploads: false,
             presets: [],
+            presetsError: null,
             presetsLoading: false,
             outputs: [],
             outputsTotal: 0,
@@ -15445,6 +15462,7 @@ export const useStore = create<AppState>((set, get) => ({
         browsingUploads: false,
         activeWorkspace: name,
         presets: [],
+        presetsError: null,
         outputs: [],
         outputsTotal: 0,
         selectedOutput: 0,
@@ -15498,6 +15516,7 @@ export const useStore = create<AppState>((set, get) => ({
         browsingUploads: false,
         activeWorkspace: name,
         presets: [],
+        presetsError: null,
         outputs: [],
         outputsTotal: 0,
         selectedOutput: 0,
@@ -15578,6 +15597,7 @@ export const useStore = create<AppState>((set, get) => ({
       set({
         browsingUploads: false,
         presets: [],
+        presetsError: null,
         presetsLoading: false,
         outputs: [],
         outputsTotal: 0,
@@ -15636,6 +15656,7 @@ export const useStore = create<AppState>((set, get) => ({
         ...(lockedActiveWorkspace ? {
           browsingUploads: false,
           presets: [],
+          presetsError: null,
           presetsLoading: false,
           outputs: [],
           outputsTotal: 0,
@@ -15689,6 +15710,7 @@ export const useStore = create<AppState>((set, get) => ({
         browsingUploads: false,
         activeWorkspace: 'default',
         presets: [],
+        presetsError: null,
         presetsLoading: false,
         outputs: [],
         outputsTotal: 0,
