@@ -21230,6 +21230,31 @@ async def create_preset(request: Request, workspace: str = ""):
         _raise_generation_preset_error(error)
 
 
+@api.put("/api/v1/presets/{preset_id}")
+async def update_preset(preset_id: str, request: Request, workspace: str = ""):
+    """Replace a profile only when the caller's saved revision still matches."""
+    account_scope, project_scope = _generation_preset_scope(
+        request, workspace, permission="project.mutate",
+    )
+    try:
+        body = await request.json()
+    except Exception as error:
+        raise HTTPException(status_code=400, detail="Invalid preset request") from error
+    if type(body) is not dict or "expected_revision" not in body:
+        raise HTTPException(status_code=400, detail="Invalid preset request")
+    expected_revision = body.pop("expected_revision")
+    try:
+        return _generation_preset_store().update(
+            account_scope=account_scope,
+            project_scope=project_scope,
+            preset_id=preset_id,
+            preset=body,
+            expected_revision=expected_revision,
+        )
+    except Exception as error:
+        _raise_generation_preset_error(error)
+
+
 @api.delete("/api/v1/presets/{preset_id}")
 def delete_preset(preset_id: str, request: Request, workspace: str = ""):
     """Idempotently delete within one exact authorized account project."""

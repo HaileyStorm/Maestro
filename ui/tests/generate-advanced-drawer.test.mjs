@@ -95,7 +95,11 @@ async function loadAdvancedSettings() {
 
 async function loadGenerationProfiles() {
   const result = await build({
-    entryPoints: [profilesUrl.pathname],
+    stdin: {
+      contents: `${await readFile(profilesUrl, 'utf8')}\nexport { GenerationPresetConflictError }\n`,
+      resolveDir: new URL('.', profilesUrl).pathname,
+      loader: 'tsx',
+    },
     bundle: true,
     format: 'esm',
     jsx: 'automatic',
@@ -208,7 +212,7 @@ function preset(id, name, mode, modelType) {
 }
 
 function resetProfileRuntime({ stateValues, generationMode = 'video' }) {
-  const calls = { delete: [], load: [], refresh: 0, save: [] }
+  const calls = { delete: [], load: [], refresh: 0, save: [], update: [] }
   globalThis.__profileStateValues = stateValues.slice(1)
   globalThis.__profileStateUpdates = []
   globalThis.__profileStore = {
@@ -225,6 +229,7 @@ function resetProfileRuntime({ stateValues, generationMode = 'video' }) {
     generationMode,
     loadPresets: async () => { calls.refresh += 1 },
     savePreset: async name => { calls.save.push(name) },
+    updatePreset: async value => { calls.update.push(value.id); return true },
     loadPreset: async value => { calls.load.push(value.id); return true },
     deletePreset: async id => { calls.delete.push(id) },
   }
@@ -594,4 +599,32 @@ test('profile selection is shared with Advanced and unavailable models leave del
   const remove = elements.find(element => element.type === 'button' && element.props['aria-label'] === 'Delete profile Detailed')
   assert.equal(remove?.props.disabled, false)
   assert.ok(elements.some(element => element.type === 'select' && element.props.value === 'video-b'))
+})
+
+
+test('profile Save offers a distinct update for the selected profile', async () => {
+  const { GenerationProfiles } = await loadGenerationProfiles()
+  const calls = resetProfileRuntime({ stateValues: ['video-a', '', true, null, false, null] })
+  const elements = flattenElements(GenerationProfiles({ loadOnMount: false }))
+  const update = elements.find(element => element.type === 'button' && elementText(element).trim() === 'Update Everyday')
+  assert.ok(update)
+  assert.ok(elements.some(element => element.type === 'button' && elementText(element).trim() === 'Save as new'))
+  update.props.onClick()
+  await flushAsyncAction()
+  assert.deepEqual(calls.update, ['video-a'])
+  assert.deepEqual(calls.save, [])
+  assert.ok(globalThis.__profileStateUpdates.some(value => value?.text === 'Everyday updated.'))
+})
+
+
+test('profile update conflict stays distinct and leaves the save form open', async () => {
+  const { GenerationProfiles, GenerationPresetConflictError } = await loadGenerationProfiles()
+  resetProfileRuntime({ stateValues: ['video-a', '', true, null, false, null] })
+  globalThis.__profileStore.updatePreset = async () => { throw new GenerationPresetConflictError('conflict') }
+  const elements = flattenElements(GenerationProfiles({ loadOnMount: false }))
+  globalThis.__profileStateUpdates = []
+  elements.find(element => element.type === 'button' && elementText(element).trim() === 'Update Everyday').props.onClick()
+  await flushAsyncAction()
+  assert.ok(globalThis.__profileStateUpdates.some(value => value?.text === 'Profile changed elsewhere. Review it before updating.'))
+  assert.ok(!globalThis.__profileStateUpdates.includes(false), 'conflict does not close the save form')
 })

@@ -1256,7 +1256,9 @@ class GenerationPresetStore:
     @staticmethod
     def _public(record: Mapping[str, Any]) -> dict[str, Any]:
         keys = _preset_keys(record) | _RECORD_METADATA_KEYS
-        return deepcopy({key: record[key] for key in keys})
+        public = deepcopy({key: record[key] for key in keys})
+        public["revision"] = hashlib.sha256(_canonical(record)).hexdigest()
+        return public
 
     def list(self, *, account_scope: str, project_scope: str) -> list[dict[str, Any]]:
         """Return only presets in the exact caller-supplied scope."""
@@ -1330,6 +1332,65 @@ class GenerationPresetStore:
             state["scopes"][scope_key] = records
             self._write_unlocked(state)
             return self._public(record)
+
+    def update(
+        self,
+        *,
+        account_scope: str,
+        project_scope: str,
+        preset_id: str,
+        preset: Mapping[str, Any],
+        expected_revision: str,
+    ) -> dict[str, Any]:
+        """Replace one exact-scope preset using its public revision."""
+        scope_key = _scope_digest(
+            self._scope_key, account_scope, project_scope,
+        )
+        identifier = _preset_id(preset_id)
+        normalized = _normalize_preset(preset)
+        if (
+            type(expected_revision) is not str
+            or _HEX64_RE.fullmatch(expected_revision) is None
+        ):
+            raise GenerationPresetError("expected preset revision is invalid")
+        with self._locked():
+            state = self._read_unlocked()
+            records = state["scopes"].get(scope_key, [])
+            existing_index = next(
+                (
+                    index
+                    for index, record in enumerate(records)
+                    if record["id"] == identifier
+                ),
+                None,
+            )
+            if existing_index is None:
+                raise GenerationPresetConflict(
+                    "preset changed or is unavailable",
+                )
+            existing = records[existing_index]
+            normalized_keys = _preset_keys(normalized)
+            if (
+                _preset_keys(existing) == normalized_keys
+                and all(existing[key] == normalized[key] for key in normalized_keys)
+            ):
+                return self._public(existing)
+            current_revision = hashlib.sha256(_canonical(existing)).hexdigest()
+            if not hmac.compare_digest(current_revision, expected_revision):
+                raise GenerationPresetConflict(
+                    "preset changed or is unavailable",
+                )
+            replacement = {
+                "id": existing["id"],
+                **normalized,
+                "created_at": existing["created_at"],
+                "sequence": state["next_sequence"],
+            }
+            state["next_sequence"] += 1
+            records[existing_index] = replacement
+            records.sort(key=lambda record: (record["sequence"], record["id"]))
+            self._write_unlocked(state)
+            return self._public(replacement)
 
     def delete(
         self,

@@ -167,6 +167,28 @@ def _same_id_create(
         results.put(("error", type(error).__name__))
 
 
+def _concurrent_update(
+    runtime_root: str,
+    name: str,
+    expected_revision: str,
+    gate: multiprocessing.synchronize.Event,
+    results: multiprocessing.queues.Queue,
+) -> None:
+    store = presets.GenerationPresetStore(runtime_root, scope_key=SCOPE_KEY)
+    gate.wait()
+    try:
+        record = store.update(
+            account_scope=ACCOUNT_A,
+            project_scope=PROJECT_A,
+            preset_id="race-update",
+            preset=preset_payload(name=name),
+            expected_revision=expected_revision,
+        )
+        results.put(("ok", record["name"], record["revision"]))
+    except Exception as error:  # pragma: no cover - parent reports details
+        results.put(("error", type(error).__name__))
+
+
 class GenerationPresetStoreTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -192,6 +214,23 @@ class GenerationPresetStoreTests(unittest.TestCase):
             project_scope=project_scope,
             preset=preset_payload() if payload is None else payload,
             preset_id=preset_id,
+        )
+
+    def update(
+        self,
+        *,
+        payload: dict,
+        preset_id: str = "preset-a",
+        expected_revision: str,
+        account_scope: str = ACCOUNT_A,
+        project_scope: str = PROJECT_A,
+    ) -> dict:
+        return self.store.update(
+            account_scope=account_scope,
+            project_scope=project_scope,
+            preset_id=preset_id,
+            preset=payload,
+            expected_revision=expected_revision,
         )
 
     def listing(
@@ -320,6 +359,154 @@ class GenerationPresetStoreTests(unittest.TestCase):
             reopened.list(account_scope=ACCOUNT_A, project_scope=PROJECT_A),
             [created],
         )
+
+    def test_update_replaces_every_v2_setting_and_preserves_stable_identity(self) -> None:
+        original = self.create(
+            payload=v2_preset_payload(),
+            preset_id="complete-v2",
+        )
+        second = self.create(
+            payload=preset_payload(name="Keep order"),
+            preset_id="second",
+        )
+        desired = v2_preset_payload()
+        desired.update({
+            "name": "Updated complete profile",
+            "mode": "video",
+            "activated_loras": [],
+            "loras_multipliers": "",
+            "lora_weights": {},
+            "spatial_upsampling": "flashvsr1.5",
+        })
+        desired["params"].update({
+            "num_inference_steps": 48,
+            "guidance_scale": 7.25,
+            "seed": 0,
+            "delivery_resolution": "1920x1080",
+            "h3_adaptive_conditioning": True,
+        })
+        desired["params"]["custom_settings"].update({
+            "h3_attention_engine": "sdpa",
+            "h3_sol_dense_steps": 0,
+        })
+        desired["ui_settings"].update({
+            "durationSeconds": 33.25,
+            "slidingWindowSeconds": 4.0,
+            "voiceCloneEnabled": True,
+            "imageRefType": "KI",
+            "outputCount": 4,
+        })
+
+        updated = self.update(
+            payload=desired,
+            preset_id=original["id"],
+            expected_revision=original["revision"],
+        )
+
+        self.assertEqual(updated["id"], original["id"])
+        self.assertEqual(updated["created_at"], original["created_at"])
+        self.assertNotEqual(updated["revision"], original["revision"])
+        self.assertEqual(
+            {key: updated[key] for key in presets._preset_keys(updated)},
+            desired,
+        )
+        listed = self.listing()
+        self.assertEqual(
+            [record["id"] for record in listed],
+            [second["id"], updated["id"]],
+        )
+        self.assertEqual(listed[-1], updated)
+        self.assertEqual(len(listed), 2)
+
+    def test_public_revision_is_derived_from_the_complete_stored_record(self) -> None:
+        legacy = self.create(preset_id="legacy-revision")
+        modern = self.create(
+            payload=v2_preset_payload(),
+            preset_id="modern-revision",
+        )
+        envelope = json.loads(self.store.path.read_text(encoding="utf-8"))
+        records = {
+            record["id"]: record
+            for values in envelope["state"]["scopes"].values()
+            for record in values
+        }
+        self.assertNotIn("revision", records[legacy["id"]])
+        self.assertNotIn("revision", records[modern["id"]])
+        self.assertEqual(
+            legacy["revision"],
+            presets.hashlib.sha256(
+                presets._canonical(records[legacy["id"]]),
+            ).hexdigest(),
+        )
+        self.assertEqual(
+            modern["revision"],
+            presets.hashlib.sha256(
+                presets._canonical(records[modern["id"]]),
+            ).hexdigest(),
+        )
+
+    def test_update_conflicts_for_wrong_scope_missing_record_and_stale_revision(self) -> None:
+        original = self.create()
+        desired = preset_payload(name="Updated", steps=32)
+        for account_scope, project_scope, preset_id in (
+            (ACCOUNT_B, PROJECT_A, original["id"]),
+            (ACCOUNT_A, PROJECT_B, original["id"]),
+            (ACCOUNT_A, PROJECT_A, "missing-preset"),
+        ):
+            with self.subTest(
+                account_scope=account_scope,
+                project_scope=project_scope,
+                preset_id=preset_id,
+            ), self.assertRaisesRegex(
+                presets.GenerationPresetConflict,
+                "preset changed or is unavailable",
+            ):
+                self.update(
+                    payload=desired,
+                    preset_id=preset_id,
+                    expected_revision=original["revision"],
+                    account_scope=account_scope,
+                    project_scope=project_scope,
+                )
+
+        updated = self.update(
+            payload=desired,
+            expected_revision=original["revision"],
+        )
+        with self.assertRaisesRegex(
+            presets.GenerationPresetConflict,
+            "preset changed or is unavailable",
+        ):
+            self.update(
+                payload=preset_payload(name="Later change", steps=36),
+                expected_revision=original["revision"],
+            )
+        self.assertEqual(self.listing(), [updated])
+        for invalid_revision in (None, "", "A" * 64, "0" * 63, True):
+            with self.subTest(revision=invalid_revision), self.assertRaisesRegex(
+                presets.GenerationPresetError,
+                "expected preset revision is invalid",
+            ):
+                self.update(
+                    payload=desired,
+                    expected_revision=invalid_revision,
+                )
+
+    def test_identical_update_retry_does_not_write_or_duplicate(self) -> None:
+        original = self.create()
+        desired = preset_payload(name="Updated once", steps=32)
+        updated = self.update(
+            payload=desired,
+            expected_revision=original["revision"],
+        )
+        before = self.store.path.read_bytes()
+        replay = self.update(
+            payload=desired,
+            expected_revision=original["revision"],
+        )
+        self.assertEqual(replay, updated)
+        self.assertEqual(self.store.path.read_bytes(), before)
+        self.assertEqual(self.listing(), [updated])
 
     def test_v2_manifest_classifies_generate_params_and_known_exclusions(self) -> None:
         fields = presets.GENERATION_PROFILE_FIELDS
@@ -697,6 +884,48 @@ class GenerationPresetStoreTests(unittest.TestCase):
             1,
         )
 
+    def test_concurrent_updates_allow_exactly_one_revision_winner(self) -> None:
+        original = self.create(preset_id="race-update")
+        context = multiprocessing.get_context(
+            "spawn" if os.name == "nt" else "fork",
+        )
+        gate = context.Event()
+        results = context.Queue()
+        workers = [
+            context.Process(
+                target=_concurrent_update,
+                args=(
+                    str(self.runtime_root),
+                    name,
+                    original["revision"],
+                    gate,
+                    results,
+                ),
+            )
+            for name in ("First update", "Second update")
+        ]
+        for worker in workers:
+            worker.start()
+        gate.set()
+        reports = [results.get(timeout=20) for _worker in workers]
+        for worker in workers:
+            worker.join(timeout=20)
+            self.assertEqual(worker.exitcode, 0)
+
+        self.assertEqual(
+            sorted(report[0] for report in reports),
+            ["error", "ok"],
+        )
+        self.assertIn(
+            ("error", "GenerationPresetConflict"),
+            reports,
+        )
+        listed = self.listing()
+        self.assertEqual(len(listed), 1)
+        winner = next(report for report in reports if report[0] == "ok")
+        self.assertEqual(listed[0]["name"], winner[1])
+        self.assertEqual(listed[0]["revision"], winner[2])
+
     @unittest.skipIf(os.name == "nt", "directory fsync is POSIX-specific")
     def test_post_commit_directory_sync_failure_is_indeterminate_and_retryable(self) -> None:
         real_fsync = os.fsync
@@ -717,6 +946,38 @@ class GenerationPresetStoreTests(unittest.TestCase):
         self.assertEqual(committed[0]["id"], "preset-a")
         self.assertEqual(self.create(), committed[0])
         self.assertEqual(len(self.listing()), 1)
+
+    @unittest.skipIf(os.name == "nt", "directory fsync is POSIX-specific")
+    def test_indeterminate_update_replays_with_original_revision(self) -> None:
+        original = self.create()
+        desired = preset_payload(name="Committed update", steps=32)
+        real_fsync = os.fsync
+
+        def fail_directory_sync(descriptor: int) -> None:
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                raise OSError("simulated directory sync failure")
+            real_fsync(descriptor)
+
+        with mock.patch.object(
+            presets.os, "fsync", side_effect=fail_directory_sync,
+        ):
+            with self.assertRaises(presets.GenerationPresetCommitIndeterminate):
+                self.update(
+                    payload=desired,
+                    expected_revision=original["revision"],
+                )
+
+        committed = self.listing()
+        self.assertEqual(len(committed), 1)
+        self.assertEqual(committed[0]["name"], "Committed update")
+        self.assertEqual(
+            self.update(
+                payload=desired,
+                expected_revision=original["revision"],
+            ),
+            committed[0],
+        )
+        self.assertEqual(self.listing(), committed)
 
     def test_pre_commit_sync_failure_does_not_publish_partial_state(self) -> None:
         real_fsync = os.fsync
@@ -893,7 +1154,7 @@ class GenerationPresetStoreTests(unittest.TestCase):
         self.assertNotIn("sequence", created)
         self.assertEqual(
             set(created),
-            set(preset_payload()) | {"id", "created_at"},
+            set(preset_payload()) | {"id", "created_at", "revision"},
         )
         raw = self.store.path.read_bytes()
         self.assertNotIn(private_text.encode("utf-8"), raw)
@@ -947,11 +1208,19 @@ class GenerationPresetStoreTests(unittest.TestCase):
         self.assertIn('permission="project.mutate"', routes)
         create_route = routes[
             routes.index("async def create_preset"):
-            routes.index('@api.delete("/api/v1/presets/{preset_id}")')
+            routes.index('@api.put("/api/v1/presets/{preset_id}")')
         ]
         self.assertLess(
             create_route.index("_generation_preset_scope("),
             create_route.index("await request.json()"),
+        )
+        update_route = routes[
+            routes.index("async def update_preset"):
+            routes.index('@api.delete("/api/v1/presets/{preset_id}")')
+        ]
+        self.assertLess(
+            update_route.index("_generation_preset_scope("),
+            update_route.index("await request.json()"),
         )
 
         client = (ROOT / "ui" / "src" / "api" / "client.ts").read_text(
@@ -979,7 +1248,10 @@ class GenerationPresetStoreTests(unittest.TestCase):
         source = (APP / "launch.py").read_text(encoding="utf-8")
         nodes = [node for node in ast.parse(source).body
                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                 and node.name in {"create_preset", "_raise_generation_preset_error"}]
+                 and node.name in {
+                     "create_preset", "update_preset",
+                     "_raise_generation_preset_error",
+                 }]
         for node in nodes:
             node.decorator_list = []
         class RouteHttpError(Exception):
@@ -998,23 +1270,30 @@ class GenerationPresetStoreTests(unittest.TestCase):
             created = asyncio.run(namespace["create_preset"](Request({"id": f"route-{index}", **payload}), "project"))
             self.assertEqual(created["params"], payload["params"])
             self.assertEqual(created.get("ui_settings"), payload.get("ui_settings"))
+        current = self.listing()[1]
+        desired = v2_preset_payload()
+        desired["name"] = "Updated through route"
+        desired["params"]["num_inference_steps"] = 52
+        desired["ui_settings"]["durationSeconds"] = 24.5
+        updated = asyncio.run(namespace["update_preset"](
+            "route-1",
+            Request({"expected_revision": current["revision"], **desired}),
+            "project",
+        ))
+        self.assertEqual(updated["id"], current["id"])
+        self.assertEqual(updated["created_at"], current["created_at"])
+        self.assertNotEqual(updated["revision"], current["revision"])
+        self.assertEqual(updated["params"], desired["params"])
+        self.assertEqual(updated["ui_settings"], desired["ui_settings"])
         with self.assertRaises(RouteHttpError) as caught:
             asyncio.run(namespace["create_preset"](Request({"id": "invalid", **v2_preset_payload(), "private": "not a setting"}), "project"))
         self.assertEqual(caught.exception.status_code, 400)
         self.assertEqual(len(self.listing()), 2)
 
-    def test_unauthorized_create_route_never_reads_the_request_body(self) -> None:
+    def test_unauthorized_mutation_routes_never_read_the_request_body(self) -> None:
         launch_path = APP / "launch.py"
         source = launch_path.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(launch_path))
-        node = next(
-            item for item in tree.body
-            if isinstance(item, ast.AsyncFunctionDef)
-            and item.name == "create_preset"
-        )
-        node.decorator_list = []
-        module = ast.Module(body=[node], type_ignores=[])
-        ast.fix_missing_locations(module)
 
         class RouteHttpError(Exception):
             def __init__(self, status_code: int, detail: str):
@@ -1031,15 +1310,29 @@ class GenerationPresetStoreTests(unittest.TestCase):
         def deny(*_args, **_kwargs):
             raise RouteHttpError(404, "Project not found")
 
-        namespace = {
-            "Request": Request,
-            "HTTPException": RouteHttpError,
-            "_generation_preset_scope": deny,
-        }
-        exec(compile(module, str(launch_path), "exec"), namespace)
-        with self.assertRaises(RouteHttpError) as denied:
-            asyncio.run(namespace["create_preset"](Request(), "foreign"))
-        self.assertEqual(denied.exception.status_code, 404)
+        for function_name, arguments in (
+            ("create_preset", lambda: (Request(), "foreign")),
+            ("update_preset", lambda: ("preset-a", Request(), "foreign")),
+        ):
+            node = next(
+                item for item in tree.body
+                if isinstance(item, ast.AsyncFunctionDef)
+                and item.name == function_name
+            )
+            node.decorator_list = []
+            module = ast.Module(body=[node], type_ignores=[])
+            ast.fix_missing_locations(module)
+            namespace = {
+                "Request": Request,
+                "HTTPException": RouteHttpError,
+                "_generation_preset_scope": deny,
+            }
+            exec(compile(module, str(launch_path), "exec"), namespace)
+            with self.subTest(route=function_name), self.assertRaises(
+                RouteHttpError,
+            ) as denied:
+                asyncio.run(namespace[function_name](*arguments()))
+            self.assertEqual(denied.exception.status_code, 404)
         self.assertEqual(body_reads, [])
 
 

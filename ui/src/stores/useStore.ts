@@ -3331,6 +3331,7 @@ interface AppState {
   presetsError: string | null
   loadPresets: () => Promise<void>
   savePreset: (name: string) => Promise<void>
+  updatePreset: (preset: api.GenerationPreset) => Promise<boolean>
   loadPreset: (preset: import('../api/client').GenerationPreset) => Promise<boolean>
   deletePreset: (id: string) => Promise<void>
 
@@ -5256,6 +5257,19 @@ function _beginAccountMutation(advanceIdentity = true): number {
   _invalidateAccountRequests()
   if (advanceIdentity) _advanceAccountIdentityEpoch()
   return ++_accountMutationRequestSequence
+}
+
+function generationPresetPayload(snapshot: AppState, name: string) {
+  return {
+    name,
+    mode: snapshot.generationMode,
+    model_type: snapshot.params.model_type,
+    activated_loras: snapshot.params.activated_loras,
+    loras_multipliers: snapshot.params.loras_multipliers,
+    lora_weights: snapshot.loraWeights,
+    spatial_upsampling: snapshot.spatialUpsampling,
+    ...captureGenerationProfileSettings(snapshot.params, snapshot),
+  }
 }
 
 export const useStore = create<AppState>((set, get) => ({
@@ -10336,9 +10350,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   savePreset: async (name) => {
     const snapshot = get()
-    const {
-      params, loraWeights, generationMode, activeWorkspace, spatialUpsampling,
-    } = snapshot
+    const { activeWorkspace } = snapshot
     const accountIdentityEpoch = _accountIdentityEpoch
     const presetName = name.trim()
     if (!activeWorkspace) {
@@ -10347,16 +10359,8 @@ export const useStore = create<AppState>((set, get) => ({
     if (!presetName) {
       throw new Error('Enter a preset name before saving.')
     }
-    const preset = await api.createPreset(activeWorkspace, {
-      name: presetName,
-      mode: generationMode,
-      model_type: params.model_type,
-      activated_loras: params.activated_loras,
-      loras_multipliers: params.loras_multipliers,
-      lora_weights: loraWeights,
-      spatial_upsampling: spatialUpsampling,
-      ...captureGenerationProfileSettings(params, snapshot),
-    })
+    const preset = await api.createPreset(activeWorkspace, generationPresetPayload(snapshot, presetName))
+
     if (
       accountIdentityEpoch !== _accountIdentityEpoch
       || get().activeWorkspace !== activeWorkspace
@@ -10374,6 +10378,40 @@ export const useStore = create<AppState>((set, get) => ({
     if (!get().presets.includes(preset)) {
       throw new Error('The saved preset could not be confirmed in this project.')
     }
+  },
+
+  updatePreset: async (preset) => {
+    const snapshot = get()
+    const scope = _presetScopes.get(preset)
+    if (!scope || scope.accountIdentityEpoch !== _accountIdentityEpoch
+      || scope.workspace !== snapshot.activeWorkspace
+      || !snapshot.presets.includes(preset) || preset.mode !== snapshot.generationMode) return false
+    if (!preset.revision) {
+      await get().loadPresets()
+      throw new api.GenerationPresetConflictError('Refresh the profile before updating.')
+    }
+    const current = () => scope.accountIdentityEpoch === _accountIdentityEpoch
+      && scope.workspace === get().activeWorkspace
+    let updated: api.GenerationPreset
+    try {
+      updated = await api.updatePreset(scope.workspace, preset.id, preset.revision,
+        generationPresetPayload(snapshot, preset.name))
+    } catch (error) {
+      if (error instanceof api.GenerationPresetConflictError && current()) await get().loadPresets()
+      throw error
+    }
+    if (!current()) return false
+    if (updated.id !== preset.id) throw new Error('Updated profile identity did not match')
+    const live = get().presets.find(existing => existing.id === preset.id)
+    if (live?.revision === updated.revision) return true
+    if (!live || live.revision !== preset.revision) return false
+    _presetScopes.set(updated, scope)
+    ++_presetLoadSequence
+    set(state => ({
+      presets: state.presets.map(existing => existing.id === preset.id ? updated : existing),
+      presetsLoading: false,
+    }))
+    return get().presets.includes(updated)
   },
 
   loadPreset: async (preset) => {

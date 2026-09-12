@@ -1,7 +1,7 @@
 import { GenerationProfileRefreshStatus } from '../GenerationProfileRefreshStatus'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { FolderOpen, Save, Trash2 } from 'lucide-react'
-import type { GenerationPreset } from '../../api/client'
+import { GenerationPresetConflictError, type GenerationPreset } from '../../api/client'
 import { currentAccountIdentityEpoch, useStore } from '../../stores/useStore'
 import { GenerationProfileSettingsError } from '../../lib/generationProfiles'
 
@@ -33,6 +33,7 @@ function GenerationProfilesPanel({
   const presetsError = useStore(state => state.presetsError)
   const loadPresets = useStore(state => state.loadPresets)
   const savePreset = useStore(state => state.savePreset)
+  const updatePreset = useStore(state => state.updatePreset)
   const loadPreset = useStore(state => state.loadPreset)
   const deletePreset = useStore(state => state.deletePreset)
   const generationMode = useStore(state => state.generationMode)
@@ -42,7 +43,7 @@ function GenerationProfilesPanel({
   const setSelectedId = useStore(state => state.setSelectedGenerationProfileId)
   const [saveName, setSaveName] = useState('')
   const [showSave, setShowSave] = useState(false)
-  const [activeAction, setActiveAction] = useState<'save' | 'load' | 'delete' | null>(null)
+  const [activeAction, setActiveAction] = useState<'save' | 'update' | 'load' | 'delete' | null>(null)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [notice, setNotice] = useState<ProfileNotice | null>(null)
   const actionInFlight = useRef(false)
@@ -63,7 +64,7 @@ function GenerationProfilesPanel({
     if (selectedId && !selected) setSelectedId('')
   }, [selected, selectedId, setSelectedId])
 
-  const beginAction = (action: 'save' | 'load' | 'delete'): boolean => {
+  const beginAction = (action: 'save' | 'update' | 'load' | 'delete'): boolean => {
     if (actionInFlight.current) return false
     actionInFlight.current = true
     setActiveAction(action)
@@ -88,6 +89,23 @@ function GenerationProfilesPanel({
       setNotice({ kind: 'error', text: error instanceof GenerationProfileSettingsError
         ? 'Keep this setup open. Its settings could not all be saved.'
         : 'Profile could not be saved. Try again.' })
+    } finally {
+      finishAction()
+    }
+  }
+
+  const handleUpdate = async () => {
+    if (!selected || !beginAction('update')) return
+    try {
+      if (!await updatePreset(selected)) throw new Error('Profile context changed')
+      setShowSave(false)
+      setNotice({ kind: 'success', text: `${selected.name} updated.` })
+    } catch (error) {
+      setNotice({ kind: 'error', text: error instanceof GenerationPresetConflictError
+        ? 'Profile changed elsewhere. Review it before updating.'
+        : error instanceof GenerationProfileSettingsError
+          ? 'Keep this setup open. Its settings could not all be saved.'
+          : 'Profile could not be updated. Try again.' })
     } finally {
       finishAction()
     }
@@ -195,7 +213,17 @@ function GenerationProfilesPanel({
       </div>
 
       {showSave && (
-        <div id={saveFormId} className="mt-2 flex gap-2">
+        <div id={saveFormId} className="mt-2 flex flex-wrap gap-2">
+          {selected && <button
+            type="button"
+            onClick={() => { void handleUpdate() }}
+            disabled={busy}
+            aria-busy={activeAction === 'update'}
+            className="mobile-control-target w-full rounded-md border border-accent-blue/60 px-3 py-2 text-xs text-accent-blue hover:bg-accent-blue/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50"
+          >
+            {activeAction === 'update' ? 'Updating…' : `Update ${selected.name}`}
+          </button>}
+
           <input
             type="text"
             aria-label="New profile name"

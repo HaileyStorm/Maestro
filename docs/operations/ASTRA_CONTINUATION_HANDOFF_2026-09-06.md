@@ -5,7 +5,7 @@
 The complete committed-tree backend suite at `4402792` passes 5,037 tests with
 19 skips and zero failures. Python compilation, JSON grammar regressions and
 the root tracked-publication guard pass. The latest unchanged UI source has
-594 passing tests plus a passing production build and targeted lint. Earlier
+601 passing tests plus a passing production build and targeted lint. Earlier
 failure lists and partial-suite checkpoints below are historical, not current
 backlog; do not rerun them merely to rediscover resolved failures.
 
@@ -2546,3 +2546,40 @@ to change the live offline page.
 The Worker reservation registry initially required reconciliation. A complete
 read-only status found zero sentinels, and the supported reconcile command
 rebuilt the empty registry before acquisition. No foreign claim was removed.
+
+
+## Existing-profile update and concurrency — 2026-09-12
+
+Completion audit found the requested save/update flow lacked Update. The shared
+Generate/Advanced Save area now offers Update [profile name] alongside Save as
+new. Both use the same complete technical-settings capture helper. Updating
+keeps the selected profile ID/name and creation time; it does not duplicate the
+profile or replace the current prompt/media. An unavailable saved model can be
+repaired by updating the profile from the current setup.
+
+Public preset records now include a revision derived from the full stored
+record and its sequence. Existing on-disk schema and old records remain valid.
+PUT `/api/v1/presets/{preset_id}?workspace=...` authorizes project.mutate before
+reading the body, then atomically replaces normalized settings only in that
+account/project with matching expected_revision. Missing, foreign and stale
+records are indistinguishable conflicts. Identical desired settings replay
+without another write after an uncertain commit. Changed records receive a new
+sequence/revision under the existing cross-process lock and durable write path.
+The client retries 503 with the exact same serialized payload and revision.
+
+Conflicts refresh the saved record and show a distinct review message while
+preserving form settings. Delayed responses cannot overwrite a newer fetched
+revision, resurrect a removed list entry, or enter another project/account.
+A response already represented by the same live revision is accepted without
+replacing that newer list object. Cached profiles without revision first refresh.
+
+All 125 tests across preset storage/routes, account auth, project membership and
+migration pass under the CPU-only environment. All 601 UI tests, production
+build, targeted lint and diff checks pass. Tests cover full v2 replacement,
+legacy revisions, exact scope, a cross-process one-winner race, post-commit
+fsync replay, body-read authorization order, exact retry payload, conflict UI,
+and delayed account/project/revision changes. Independent review closed its
+stale-success finding; its two suggested coverage gaps were added and passed.
+Receipts: `.artifacts-temp/astra-profile-update-20260912/`. Full backend discovery
+predates this bounded storage/API addition; do not label its 5,037-case result
+as testing this new endpoint. Browser/live acceptance remains open.

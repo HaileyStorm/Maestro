@@ -690,7 +690,7 @@ test('profile save confirms scoped insertion before clearing the form', () => {
 
 test('preset store confirms account-project scope and keeps Recipes separate', () => {
   const presetStore = sliceBetween(store, '  savePreset: async', '  // Model options\n  modelOptions:')
-  const save = sliceBetween(presetStore, 'savePreset: async (name)', 'loadPreset: async (preset)')
+  const save = sliceBetween(presetStore, 'savePreset: async (name)', 'updatePreset: async (preset)')
   const load = sliceBetween(presetStore, 'loadPreset: async (preset)', 'deletePreset: async')
 
   assert.match(save, /await api\.createPreset\(activeWorkspace/)
@@ -970,4 +970,132 @@ test('profile access denial clears cached profiles and requests scoped access re
       assert.deepEqual(events, status === 404 ? [] : [{ status, recovery: status === 401 ? 'account' : 'project' }])
     })
   }
+})
+
+test('updating a profile keeps identity and sends the complete current technical setup', async () => {
+  const puts = []
+  let saved
+  await withFreshStore(async (input, init) => {
+    if (init?.method === 'POST') {
+      saved = { ...JSON.parse(init.body), created_at: 1, revision: 'a'.repeat(64) }
+      return jsonResponse(saved)
+    }
+    if (init?.method === 'PUT') {
+      puts.push(JSON.parse(init.body))
+      if (puts.length === 1) return jsonResponse({}, 503)
+      const {expected_revision, ...payload} = puts.at(-1)
+      return jsonResponse({...payload,id:saved.id,created_at:1,revision:'b'.repeat(64)})
+    }
+    throw new Error(`Unexpected update request ${input}`)
+  }, async useStore => {
+    useStore.setState({activeWorkspace:'update-project'})
+    await useStore.getState().savePreset('Keep this name')
+    const original = useStore.getState().presets[0]
+    useStore.setState(state=>({params:{...state.params,seed:123,num_inference_steps:31,prompt:'Unsaved creative content'},filmGrainIntensity:0.4,voiceCloneEnabled:true}))
+    assert.equal(await useStore.getState().updatePreset(original),true)
+    assert.equal(puts.length,2)
+    assert.deepEqual(puts[0],puts[1], 'indeterminate commit retry reuses exact payload and revision')
+    assert.equal(puts[0].expected_revision,original.revision)
+    assert.equal(puts[0].params.seed,123)
+    assert.equal(puts[0].params.num_inference_steps,31)
+    assert.equal(puts[0].ui_settings.filmGrainIntensity,0.4)
+    assert.equal(puts[0].ui_settings.voiceCloneEnabled,true)
+    assert.equal(puts[0].params.prompt,undefined)
+    assert.deepEqual(Object.keys(puts[0].params).sort(),Object.keys(saved.params).sort())
+    assert.deepEqual(Object.keys(puts[0].ui_settings).sort(),Object.keys(saved.ui_settings).sort())
+    assert.equal(useStore.getState().presets.length,1)
+    assert.equal(useStore.getState().presets[0].id,original.id)
+    assert.equal(useStore.getState().presets[0].name,original.name)
+    assert.equal(useStore.getState().presets[0].revision,'b'.repeat(64))
+    assert.equal(useStore.getState().params.prompt,'Unsaved creative content')
+  })
+})
+
+test('conflicting update refreshes the profile without replacing current form settings', async () => {
+  let saved
+  await withFreshStore(async (_input,init)=>{
+    if (init?.method==='POST') {
+      saved={...JSON.parse(init.body),created_at:1,revision:'a'.repeat(64)}
+      return jsonResponse(saved)
+    }
+    if (init?.method==='PUT') return jsonResponse({},409)
+    return jsonResponse({presets:[{...saved,revision:'b'.repeat(64)}]})
+  },async useStore=>{
+    useStore.setState({activeWorkspace:'conflict-project'})
+    await useStore.getState().savePreset('Existing')
+    const preset=useStore.getState().presets[0]
+    useStore.getState().setParam('seed',123)
+    await assert.rejects(useStore.getState().updatePreset(preset),/Profile changed elsewhere/)
+    assert.equal(useStore.getState().params.seed,123)
+    assert.equal(useStore.getState().presets[0].revision,'b'.repeat(64))
+    assert.equal(await useStore.getState().updatePreset(preset),false,'stale object cannot submit again')
+  })
+})
+
+test('completed profile update cannot enter a different project', async () => {
+  const delayed=deferred()
+  let saved
+  await withFreshStore(async (_input,init)=>{
+    if (init?.method==='POST') {
+      saved={...JSON.parse(init.body),created_at:1,revision:'a'.repeat(64)}
+      return jsonResponse(saved)
+    }
+    return delayed.promise
+  },async useStore=>{
+    useStore.setState({activeWorkspace:'before'})
+    await useStore.getState().savePreset('Existing')
+    const pending=useStore.getState().updatePreset(useStore.getState().presets[0])
+    useStore.setState({activeWorkspace:'after',presets:[]})
+    delayed.resolve(jsonResponse({...saved,revision:'b'.repeat(64)}))
+    assert.equal(await pending,false)
+    assert.deepEqual(useStore.getState().presets,[])
+  })
+})
+
+test('delayed update success cannot overwrite a newer refreshed profile revision', async () => {
+  for (const latestRevision of ['b'.repeat(64), 'c'.repeat(64)]) {
+    const delayed=deferred()
+    let saved
+    await withFreshStore(async (_input,init)=>{
+      if (init?.method==='POST') {
+        saved={...JSON.parse(init.body),created_at:1,revision:'a'.repeat(64)}
+        return jsonResponse(saved)
+      }
+      if (init?.method==='PUT') return delayed.promise
+      return jsonResponse({presets:[{...saved,revision:latestRevision}]})
+    },async useStore=>{
+      useStore.setState({activeWorkspace:'racing-update'})
+      await useStore.getState().savePreset('Existing')
+      const pending=useStore.getState().updatePreset(useStore.getState().presets[0])
+      await useStore.getState().loadPresets()
+      const refreshed=useStore.getState().presets[0]
+      delayed.resolve(jsonResponse({...saved,revision:'b'.repeat(64)}))
+      assert.equal(await pending,latestRevision==='b'.repeat(64))
+      assert.equal(useStore.getState().presets[0],refreshed)
+      assert.equal(useStore.getState().presets[0].revision,latestRevision)
+    })
+  }
+})
+
+test('delayed profile update is rejected after account identity changes in the same project', async () => {
+  const delayed=deferred()
+  let saved
+  await withFreshStore(async (input,init)=>{
+    if (String(input).includes('/access-context')) return jsonResponse(accessContext('user'))
+    if (init?.method==='POST') {
+      saved={...JSON.parse(init.body),created_at:1,revision:'a'.repeat(64)}
+      return jsonResponse(saved)
+    }
+    return delayed.promise
+  },async useStore=>{
+    useStore.setState({activeWorkspace:'same-project',accountContext:accountContext('owner')})
+    await useStore.getState().savePreset('Existing')
+    const pending=useStore.getState().updatePreset(useStore.getState().presets[0])
+    await useStore.getState().loadAccessContext(false)
+    const other={...saved,name:'Other account profile'}
+    useStore.setState({activeWorkspace:'same-project',presets:[other]})
+    delayed.resolve(jsonResponse({...saved,revision:'b'.repeat(64)}))
+    assert.equal(await pending,false)
+    assert.equal(useStore.getState().presets[0],other)
+  })
 })

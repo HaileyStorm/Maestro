@@ -607,6 +607,7 @@ The current Pinokio Start/Restart procedure, including RTX 50 compatibility
 fallback and dynamic ports, is in [docs/operations/CONTINUATION.md](docs/operations/CONTINUATION.md).
 
 - **Sidebar** — peer workspaces (Generate / Director / References), model picker, prompt, LoRAs, and advanced settings
+- **Saved profiles** — choose a profile near the top of Generate. Under **Save**, use **Update [name]** to replace its settings or **Save as new** to keep both. A profile changed elsewhere must be reviewed before updating; current form settings stay intact.
 - **Recipes** — open the bundled preset library from the empty Gallery or Generate sidebar; applying a recipe deliberately returns to Generate with editable settings and prompt
 - **Main feed** — generated outputs, dashboard, Director pipeline status
 - **Settings drawer** (gear icon) — model visibility, performance auto-tune, services (LLM, API keys, mature prompt guidance, theme)

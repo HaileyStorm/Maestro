@@ -5989,6 +5989,7 @@ export async function directorV2Plan(
 // --- Presets ---
 
 export interface GenerationPreset {
+  revision?: string
   profile_version?: 2
   ui_settings?: Record<string, unknown>
   id: string
@@ -6034,6 +6035,27 @@ export async function createPreset(
     }
   }
   throw new Error('Failed to create preset')
+}
+
+export class GenerationPresetConflictError extends Error {}
+
+export async function updatePreset(
+  workspace: string,
+  id: string,
+  expectedRevision: string,
+  preset: Omit<GenerationPreset, 'id' | 'created_at' | 'revision'>,
+): Promise<GenerationPreset> {
+  const query = new URLSearchParams({ workspace })
+  const body = JSON.stringify({ ...preset, expected_revision: expectedRevision })
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const res = await fetch(`${BASE}/api/v1/presets/${encodeURIComponent(id)}?${query}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body,
+    })
+    if (res.ok) return res.json()
+    if (res.status === 409) throw new GenerationPresetConflictError('Profile changed elsewhere.')
+    if (res.status !== 503 || attempt === 1) throw new Error('Failed to update profile')
+  }
+  throw new Error('Failed to update profile')
 }
 
 export async function deletePreset(id: string, workspace: string): Promise<void> {
