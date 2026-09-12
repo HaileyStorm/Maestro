@@ -1,3 +1,4 @@
+import { supportsPromptPreparation } from '../lib/promptEnhancement'
 import { create } from 'zustand'
 import {
   captureGenerationModeUiSettings,
@@ -8157,20 +8158,15 @@ export const useStore = create<AppState>((set, get) => ({
     // Enhancement is durable job preparation. Submit the intent with the
     // original frozen request so the browser gets a job ID immediately and
     // never repeats the LLM work after a disconnect or refresh.
-    const enhanceRequested = state.studioPromptEnhance
+    const enhanceRequested = state.studioPromptEnhance && supportsPromptPreparation(
+      state.generationMode, state.params.image_mode, state.editSubMode,
+      state.modelOptions?.audio_only,
+    )
     if (enhanceRequested && !state.params.prompt.trim()) {
       window.alert('Enter a prompt before using Enhance before Generate.')
       return
     }
     const enhanceBeforeGenerate = enhanceRequested
-    const usesDedicatedGenerationEndpoint = (
-      (state.generationMode === 'video' && (state.params.image_mode as number) === 4)
-      || (state.generationMode === 'avatar' && Boolean(state.editSubMode))
-    )
-    if (enhanceBeforeGenerate && usesDedicatedGenerationEndpoint) {
-      window.alert('Enhance before Generate is available for standard Studio generations. Use the standalone Enhance action first for this Blend or Edit workflow.')
-      return
-    }
 
     // Validate: i2v-only models require a start image — Video mode only.
     // Edit sub-modes supply their own source media and validate in their

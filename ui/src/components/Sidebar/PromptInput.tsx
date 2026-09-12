@@ -1,3 +1,4 @@
+import { supportsPromptPreparation } from '../../lib/promptEnhancement'
 import { useState, useRef, useEffect } from 'react'
 import { Sparkles, Loader2, ChevronUp } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
@@ -232,7 +233,7 @@ export function PromptInput() {
       setDurationSeconds(authoredTimelineEnd)
     }
   }, [authoredTimelineEnd, durationSeconds, generationMode, imageMode, setDurationSeconds])
-  const enhancerFooter = !isAudioOnly
+  const enhancerFooter = supportsPromptPreparation(generationMode, imageMode, editSubMode, isAudioOnly)
   const modePlaceholder = generationMode === 'avatar' && editSubMode === 'recast'
     ? 'Describe the finished video and replacement characters...'
     : generationMode === 'avatar' && editSubMode === 'restyle'

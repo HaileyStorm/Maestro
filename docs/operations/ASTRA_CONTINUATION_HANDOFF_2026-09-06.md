@@ -10,12 +10,10 @@ modules (201 cases, two skips). Its intermittent LLM timing assertion now has
 a deterministic lease-ordering regression and an 82-test module pass. Do not
 rerun the old failure list as if it were still the current backlog.
 
-The next concrete app-flow fix is Improve before Generate in
-`ui/src/components/Sidebar/PromptInput.tsx`: it is currently offered for Blend
-and avatar Edit, while `useStore.ts` rejects those choices only after Generate.
-Use a shared eligibility decision for the control and submission, retain the
-standalone prompt-improvement action, and account for a stored toggle when
-switching modes so hiding the checkbox cannot leave generation blocked.
+Improve before Generate now shares workflow eligibility between its control
+and submission. Blend, avatar Edit and audio-only paths retain standalone
+improvement without an inactive saved toggle blocking submission; see the
+closure below. Continue the broader app-flow audit and remaining WIP review.
 
 Current safe work also includes the broader app interaction/copy audit and review of the
 remaining inventoried WIP: the unused adaptive-Ref2VA helper, preserved test
@@ -2334,3 +2332,23 @@ unchanged suite was repeated. Receipts live under
 component/store and build evidence; browser, live generation and Windows
 acceptance remain open. The next concrete prompt-improvement flow issue is
 recorded in the current continuation pointer.
+
+
+## Prompt preparation workflow eligibility — 2026-09-12
+
+Improve before Generate is offered only where the generation endpoint accepts
+that preparation step. The control and submission share `supportsPromptPreparation`;
+Blend, avatar Edit and audio-only models omit the checkbox and keep their
+existing standalone improvement actions. The saved preference is retained but
+inactive in unsupported workflows, so a previous selection no longer causes a
+late rejection or prevents a prompt-optional workflow from submitting. Returning
+to a supported workflow restores the preference. Explicit empty-prompt checks
+remain for active prompt preparation.
+
+The obsolete late alert and duplicated endpoint predicate are removed. The
+regression matrix exercises the actual submission expression across modes,
+image modes, edit submodes, audio capability and saved-toggle values, including
+returning from Blend. All 585 UI tests, the production build, targeted ESLint,
+97 Studio tests under the CPU-only environment, and diff checks pass. Evidence:
+`.artifacts-temp/astra-enhance-eligibility-20260912/`. Browser, live generation
+and Windows acceptance remain separate; no service or model was started.

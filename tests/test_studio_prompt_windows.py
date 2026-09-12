@@ -2058,7 +2058,7 @@ process.stdout.write(JSON.stringify(effectiveSlidingWindowGeometry(10, 5, 5, opt
         self.assertIn("get().activeWorkspace !== submissionWorkspace", generation)
         self.assertIn("reconnectedJobExists", generation)
         self.assertIn("promptPreview: durablePreparationExpected ? ''", generation)
-        self.assertIn("usesDedicatedGenerationEndpoint", generation)
+        self.assertIn("supportsPromptPreparation(", generation)
         self.assertIn("enhanceRequested && !state.params.prompt.trim()", generation)
         self.assertIn("Enter a prompt before using Enhance before Generate.", generation)
         self.assertIn("Improve before Generate", prompt_ui)
