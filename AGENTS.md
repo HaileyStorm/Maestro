@@ -110,11 +110,12 @@ To guarantee every contribution follows this guide precisely, obey this checklis
   out of that critical path.
 - New unpinned Codex tasks use GPT-6 Astra at medium as the primary
   controller. An explicit user, picker, task, or project model and reasoning
-  choice always wins. Astra owns synthesis and acceptance; use the global
-  Astra-first Pareto envelope for specialists: Sol high for bounded
-  implementation, invariant, and review work, and Luna high or xhigh for
-  read-heavy scouting and documentation. Use another route only when current
-  task evidence supports it.
+  choice always wins. Astra owns synthesis and acceptance. For eligible
+  bounded packets containing only public or sanitized material, prefer exact
+  Nous `deepseek/deepseek-v4.1-flash` at max under the shared provider policy;
+  use GPT-5.6 Luna max as the native fallback for private, ineligible, or
+  unavailable work. Keep private prompts, media, logs, credentials, and owner
+  data off Nous.
 - For genuinely multi-file or cross-layer work, choose the smallest useful set
   of one to three bounded, read-only ownership, invariant, or test guard roles.
   Do not require a fixed three-map ceremony. Synthesize centrally, then use one
@@ -153,7 +154,13 @@ If any step cannot be completed, stop immediately and ask the user how to procee
 ## Diversified brainstorming
 
 - For genuinely open-ended product or architecture brainstorming where variety has material value, use at least two independent perspectives and intentionally vary their roles or model families. Do not fan out bounded factual questions or create token churn.
-- External DeepSeek/Nous may participate only after the existing live catalog, credit, privacy, and transport gates pass; provide it only a sanitized public brief, and treat its output as provisional breadth evidence, never architecture, security, or release authority. Use Spark only for bounded, Spark-suitable breadth.
+- Follow the shared provider policy (`providers.md`) beside the active global
+  `AGENTS.md` for Nous identity, privacy disclosure, adapter/replay acceptance,
+  scoped writes, and terminal failures. External DeepSeek/Nous may receive only
+  a sanitized public brief and remains provisional breadth evidence, never
+  architecture, security, or release authority. Do not add project-local
+  credit/proof/confirmation or persistent stop-flag preflights. Use Spark only
+  for bounded, Spark-suitable breadth.
 - Consolidate with `packetizer`, stop when findings converge, and keep one writer per file or symbol cluster.
 
 ## Local Content Neutrality (Maestro Continuum)
