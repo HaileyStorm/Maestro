@@ -4,6 +4,30 @@ A one-click AI **video, image, and audio studio** for creators. Maestro pairs a 
 
 ![Maestro UI](Maestro_UI_02.jpg)
 
+## Open Maestro on this Linux installation
+
+Run this command from any terminal:
+
+```bash
+maestro
+```
+
+The command starts Pinokio and Maestro through the installed persistent user
+services, shows startup progress, and opens the current local page after health
+checks pass. Closing the terminal does not stop Maestro. Cold startup can take
+several minutes.
+
+For agents or terminal-only use, run `maestro --no-open`; use
+`maestro --status` for a read-only status check. The repository entrypoint is
+`python3 scripts/maestro_open.py` (`--help` lists options). This helper uses the
+existing Linux services; other platforms continue to use Pinokio **Start**.
+Use Pinokio **Restart Maestro** for a deliberate restart.
+
+If startup fails, inspect `journalctl --user -u maestro-continuum -n40 --no-pager`
+and the latest `logs/api/start.js` log. After moving an installation, verify that
+activating the selected environment resolves its current interpreter; an old
+activation path can silently run a different installation.
+
 ## What it does
 
 ### 🎬 Director Mode — automatic music videos and short films
