@@ -89,7 +89,7 @@ export default defineConfig({
     timezoneId: 'UTC',
   },
   webServer: {
-    command: `npm run dev -- --config e2e/vite.config.ts --configLoader runner --host 127.0.0.1 --port ${runPort} --strictPort`,
+    command: `node node_modules/vite/bin/vite.js --config e2e/vite.config.ts --configLoader runner --host 127.0.0.1 --port ${runPort} --strictPort`,
     url: healthURL,
     reuseExistingServer: false,
     timeout: 60_000,

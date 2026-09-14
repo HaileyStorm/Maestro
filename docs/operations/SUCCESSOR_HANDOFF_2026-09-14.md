@@ -93,3 +93,49 @@ A bounded Nous code-review request failed terminally with HTTP 400 at the provid
 The fresh successor task has been created in this same saved project with Astra medium and has confirmed its detailed continuous native Goal is active. It is waiting for the predecessor's explicit publication/ownership release before writes. The predecessor retains no roadmap execution after transfer. The final task message supplies the source commit and ownership release; preserve that message as the last transition evidence.
 
 Latest cross-task updates: the successor reproduced the footer defect independently and reported another terminal Nous HTTP 400. At the owner's explicit request, the predecessor sent the failure and permission update to provider/harness task `01a0a059-2491-7d60-abf6-66f944ddfaf4`, requesting recovery findings go to the successor. Keep Maestro delivery moving via native fallback; the provider owner handles that incident. The successor's fresh activation audit reports Dolt metadata despite historical hold documentation. Treat this as current tracker-policy drift requiring reconciliation evidence, not authority to perform a migration or blindly apply historical SQLite claims; the successor is preserving the no-mutation hold pending verified current policy.
+
+## Successor milestone — Generate footer and browser coverage
+
+The predecessor published `861bf35` and explicitly released ownership before
+successor edits. The successor's detailed continuous native Goal is active.
+
+Owner operating instruction: whenever possible, leave Maestro Continuum
+running, including its stable Cloudflare access. Restart when necessary, but
+avoid stopping it without bringing it back up. Preserve this availability
+priority during GPU coordination and subsequent implementation milestones.
+The owner allows a reasonable delay when immediate restart would create churn
+or a pointless wait.
+
+Generate now gives its model choices a full-width row, with paired desktop
+cards and stacked mobile cards. The action row wraps instead of starving the
+selectors. Model names have their own line in the popup, capability badges
+wrap, and completed manual-file verification uses a short neutral status.
+Group descriptions remain available to assistive technology and hover.
+Generate, queue, and LoRA actions use the existing mobile touch-target rule.
+
+Synthetic browser startup was blocked by the shared profile-schema import.
+The harness now exposes that exact checked-in JSON as a virtual module while
+retaining its backend, external-network, and general filesystem guards. Its
+adaptive held-job fixture also answers polling for the exact synthetic job ID.
+The desktop/mobile opening helper, responsive remount checks, profile fixture,
+and footer geometry/name/reachability regressions are repaired.
+
+Evidence: 601 UI tests, production build, targeted lint, E2E typecheck and
+suite discovery pass. All 16 adaptive-controls/profile browser tests pass in
+Firefox and Android-like Chromium, with a final two-browser layout recheck and
+four network-boundary checks. The runner now invokes installed Vite directly;
+its final startup/teardown completes cleanly without an npm lifecycle wrapper.
+The real local app was also inspected; health/readiness and served-build
+identity were checked. This is not GPU, Windows, LAN, or human acceptance.
+The stable Cloudflare URL reaches Maestro's normal sign-in screen in Chrome.
+Python probes were rejected by Cloudflare error 1010; no service restart was
+needed. Authenticated remote account/project parity was not exercised.
+
+The broader 96-test browser sweep is **not green**: it was stopped after 18
+passes, 10 failures and one interruption, with 67 tests not run. Its footer
+failure was subsequently fixed. Remaining smoke findings include render-fault
+injection that React now recovers before the boundary, stale Support/What's New
+navigation expectations, LoRA-dialog touch targets, and overlay accessibility.
+Continue those as the next bounded browser/interaction work; retain the full
+results rather than weakening assertions. The historical tracker hold and
+protected storage-janitor work remain unchanged.

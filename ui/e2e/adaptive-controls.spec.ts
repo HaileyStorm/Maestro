@@ -3,12 +3,63 @@ import { expect, test, type Locator, type Page } from '@playwright/test'
 import { installSyntheticApi, type SyntheticApiController } from './syntheticApi'
 
 async function openGenerate(page: Page) {
-  await page.getByRole('button', { name: 'Open Generate, Director, and References menu' }).click()
-  const menu = page.getByRole('dialog', { name: 'Generate, Director, and References menu', exact: true })
-  await menu.getByRole('button', { name: 'Open Generate', exact: true }).click()
-  await expect(menu.getByRole('button', { name: /^Text & frames model:/ })).toBeVisible()
-  await expect(menu.getByRole('button', { name: /^References model:/ })).toBeVisible()
-  return menu
+  await expect(page.getByRole('tab', { name: 'Gallery', exact: true })).toBeVisible()
+  const menu = page.getByRole('dialog', {
+    name: 'Generate, Director, and References menu', exact: true, includeHidden: true,
+  })
+  if ((page.viewportSize()?.width ?? 0) < 768) {
+    await expect(menu).toHaveCount(1)
+    if (await menu.getAttribute('aria-hidden') === 'true') {
+      const mobileMenuButton = page.getByRole('button', { name: 'Open Generate, Director, and References menu' })
+      await expect(mobileMenuButton).toBeVisible()
+      await mobileMenuButton.click()
+    }
+    await expect(menu).toHaveAttribute('aria-hidden', 'false')
+    await menu.getByRole('button', { name: 'Open Generate', exact: true }).click()
+    await expect(menu.getByRole('button', { name: /^Text & frames model:/ })).toBeVisible()
+    await expect(menu.getByRole('button', { name: /^References model:/ })).toBeVisible()
+    return menu
+  }
+  const desktopMenu = page.locator('aside').filter({ has: page.locator('[data-generation-footer]') })
+  await expect(desktopMenu).toBeVisible()
+  await expect(desktopMenu.getByRole('button', { name: /^Text & frames model:/ })).toBeVisible()
+  await expect(desktopMenu.getByRole('button', { name: /^References model:/ })).toBeVisible()
+  return desktopMenu
+}
+
+async function adaptiveFooterLayout(menu: Locator) {
+  return menu.locator('[data-generation-footer]').evaluate(footer => {
+    const footerBox = footer.getBoundingClientRect()
+    const sidebarBox = footer.closest('aside')?.getBoundingClientRect()
+    return {
+      footerWidth: footerBox.width,
+      footerHeight: footerBox.height,
+      footerRight: footerBox.right,
+      sidebarWidth: sidebarBox?.width ?? 0,
+      sidebarRight: sidebarBox?.right ?? 0,
+      selectorWidths: Array.from(
+        footer.querySelectorAll<HTMLButtonElement>('button[aria-controls^="h3-"]'),
+      ).map(button => button.getBoundingClientRect().width),
+    }
+  })
+}
+
+async function expectPopupModelName(option: Locator, expectedName: string) {
+  const label = await option.evaluate((button, expected) => {
+    const node = Array.from(button.querySelectorAll<HTMLElement>('span'))
+      .find(candidate => candidate.textContent?.trim() === expected)
+    if (!node) return null
+    return {
+      text: node.textContent?.trim() || '',
+      clientWidth: node.clientWidth,
+      scrollWidth: node.scrollWidth,
+    }
+  }, expectedName)
+  expect(label).not.toBeNull()
+  if (!label) return
+  expect(label.text).toBe(expectedName)
+  expect(label.clientWidth).toBeGreaterThan(0)
+  expect(label.scrollWidth).toBeLessThanOrEqual(label.clientWidth + 1)
 }
 
 async function boot(page: Page, scenario: Parameters<SyntheticApiController['setAdaptiveScenario']>[0]) {
@@ -74,6 +125,13 @@ test('adaptive controls keep both choices visible, keyboard operable and respons
   await page.setViewportSize(mobile ? { width: 390, height: 844 } : { width: 1440, height: 900 })
   await page.emulateMedia({ reducedMotion: 'reduce' })
   const { api, menu } = await boot(page, 'ready')
+  const layout = await adaptiveFooterLayout(menu)
+  expect(layout.sidebarWidth).toBeGreaterThan(0)
+  expect(layout.footerWidth).toBeGreaterThanOrEqual(layout.sidebarWidth - 36)
+  expect(layout.footerRight).toBeLessThanOrEqual(layout.sidebarRight + 1)
+  expect(layout.footerHeight).toBeLessThanOrEqual(320)
+  expect(layout.selectorWidths).toHaveLength(2)
+  for (const width of layout.selectorWidths) expect(width).toBeGreaterThanOrEqual(180)
   const frames = menu.getByRole('button', { name: /^Text & frames model:/ })
   const references = menu.getByRole('button', { name: /^References model:/ })
   await expect(frames).toHaveAccessibleName(/Synthetic H3/)
@@ -86,13 +144,20 @@ test('adaptive controls keep both choices visible, keyboard operable and respons
     const openPopup = menu.getByRole('dialog', { name, exact: true })
     await expect(openPopup).toBeVisible()
     await expect.poll(() => openPopup.evaluate(element => element.contains(document.activeElement))).toBe(true)
+    const expectedName = name === 'Text & frames models' ? 'Synthetic H3' : 'Synthetic Reference Model'
+    await expectPopupModelName(
+      openPopup.getByRole('button', { name: new RegExp(`^${expectedName}`) }).first(),
+      expectedName,
+    )
     await page.keyboard.press('Escape')
     await expect(openPopup).toBeHidden()
     await expect(menu).toBeVisible()
     await expect(trigger).toBeFocused()
     expect(await trigger.evaluate(element => {
       const style = getComputedStyle(element)
-      return style.outlineStyle !== 'none' || style.boxShadow !== 'none'
+      return !element.matches(':focus-visible')
+        || style.outlineStyle !== 'none'
+        || style.boxShadow !== 'none'
     })).toBe(true)
     expect(await trigger.evaluate(element => (
       Math.max(...getComputedStyle(element).transitionDuration.split(',').map(value => parseFloat(value)))
@@ -115,13 +180,49 @@ test('adaptive controls keep both choices visible, keyboard operable and respons
     .analyze()
   expect(axe.violations).toEqual([])
   await page.setViewportSize({ width: 320, height: 568 })
-  for (const trigger of [frames, references]) {
+  const narrowMenu = await openGenerate(page)
+  const narrowLayout = await adaptiveFooterLayout(narrowMenu)
+  expect(narrowLayout.sidebarWidth).toBeGreaterThan(0)
+  expect(narrowLayout.footerWidth).toBeGreaterThanOrEqual(narrowLayout.sidebarWidth - 36)
+  expect(narrowLayout.footerRight).toBeLessThanOrEqual(narrowLayout.sidebarRight + 1)
+  expect(narrowLayout.footerHeight).toBeLessThanOrEqual(320)
+  expect(narrowLayout.selectorWidths).toHaveLength(2)
+  for (const width of narrowLayout.selectorWidths) expect(width).toBeGreaterThanOrEqual(180)
+  const narrowFrames = narrowMenu.getByRole('button', { name: /^Text & frames model:/ })
+  const narrowReferences = narrowMenu.getByRole('button', { name: /^References model:/ })
+  for (const trigger of [narrowFrames, narrowReferences]) {
     await trigger.scrollIntoViewIfNeeded()
     const box = await trigger.boundingBox()
     expect(box).not.toBeNull()
     expect(box!.height).toBeGreaterThanOrEqual(44)
     expect(box!.x).toBeGreaterThanOrEqual(0)
     expect(box!.x + box!.width).toBeLessThanOrEqual(321)
+  }
+  for (const [trigger, name, expectedName] of [
+    [narrowFrames, 'Text & frames models', 'Synthetic Frame Alternative'],
+    [narrowReferences, 'References models', 'Synthetic Reference Model'],
+  ] as const) {
+    await trigger.click()
+    const popup = narrowMenu.getByRole('dialog', { name, exact: true })
+    await expect(popup).toBeVisible()
+    await expectPopupModelName(
+      popup.getByRole('button', { name: new RegExp(`^${expectedName}`) }).first(),
+      expectedName,
+    )
+    await page.keyboard.press('Escape')
+    await expect(popup).toBeHidden()
+    await expect(trigger).toBeFocused()
+  }
+  for (const action of await narrowMenu.locator('[data-generation-footer]').getByRole('button').all()) {
+    await action.scrollIntoViewIfNeeded()
+    const box = await action.boundingBox()
+    expect(box).not.toBeNull()
+    expect(box!.width).toBeGreaterThanOrEqual(44)
+    expect(box!.height).toBeGreaterThanOrEqual(44)
+    expect(box!.x).toBeGreaterThanOrEqual(0)
+    expect(box!.x + box!.width).toBeLessThanOrEqual(321)
+    expect(box!.y).toBeGreaterThanOrEqual(0)
+    expect(box!.y + box!.height).toBeLessThanOrEqual(569)
   }
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true)
   await page.screenshot({ path: info.outputPath('adaptive-models-narrow.png') })

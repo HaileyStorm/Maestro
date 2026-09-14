@@ -17,6 +17,7 @@ const STATIC_PATHS = new Set([
   '/maestro.svg',
   '/@vite/client',
   '/@react-refresh',
+  '/@id/__x00__maestro-generation-profile-schema',
   '/node_modules/vite/dist/client/env.mjs',
 ])
 const STATIC_PREFIXES = [
@@ -753,16 +754,17 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
           queue: { paused: false, pause_after_current: false },
         }] })
         return
+      case 'GET /api/v1/status/synthetic-adaptive-job':
       case 'GET /api/v1/status/synthetic-queue-item':
         await json(route, {
-          job_id: 'synthetic-queue-item',
+          job_id: url.pathname.split('/').at(-1),
           created_at: 1,
           status: 'queued',
           progress: 0,
           step: 0,
           total_steps: 1,
           phase: 'queued',
-          message: 'Waiting in the synthetic queue',
+          message: key.endsWith('/synthetic-adaptive-job') ? 'Held in the synthetic queue' : 'Waiting in the synthetic queue',
           output_files: [],
           error: null,
           prompt_preview: '',
@@ -777,10 +779,10 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
           window_progress: 0,
           overall_progress: 0,
           queue_priority: 0,
-          queue_held: queueHeld,
+          queue_held: key.endsWith('/synthetic-adaptive-job') || queueHeld,
           hold_after_output: false,
           queue_position: 1,
-          queue_wait_reason: queueHeld ? 'held' : 'waiting_for_turn',
+          queue_wait_reason: key.endsWith('/synthetic-adaptive-job') || queueHeld ? 'held' : 'waiting_for_turn',
           queue_reorder_reason: 'queue_order',
           queue_residency_bypass_count: 0,
           queue_residency_bypassed_waiters: 0,

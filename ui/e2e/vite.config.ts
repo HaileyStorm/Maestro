@@ -1,4 +1,5 @@
 import { mergeConfig, type Plugin } from 'vite'
+import { readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import appConfig from '../vite.config'
@@ -14,6 +15,23 @@ if (!cacheDir || !runPort || !portPattern.test(runPort) || !runToken || !uuidPat
 }
 
 const uiRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const profileSchemaPath = resolve(uiRoot, '../app/services/generation_profile_fields.json')
+const profileSchemaId = '\0maestro-generation-profile-schema'
+// Bundle this checked-in technical schema without granting browser access to
+// the backend tree or adding another independently maintained field list.
+const profileSchemaModule = `export default ${JSON.stringify(JSON.parse(readFileSync(profileSchemaPath, 'utf8')))}`
+const canonicalProfileSchema: Plugin = {
+  name: 'maestro-synthetic-profile-schema',
+  enforce: 'pre',
+  resolveId(source, importer) {
+    if (importer && resolve(dirname(importer.split('?')[0]), source) === profileSchemaPath) {
+      return profileSchemaId
+    }
+  },
+  load(id) {
+    if (id === profileSchemaId) return profileSchemaModule
+  },
+}
 const appOrigin = `http://127.0.0.1:${runPort}`
 const healthPath = `/__maestro_e2e_health/${runToken}`
 const viteCacheFsPrefix = `/@fs/${cacheDir.replaceAll('\\', '/').replace(/^\/+/, '')}/deps/`
@@ -86,7 +104,7 @@ const syntheticNetworkBoundary: Plugin = {
 
 const config = mergeConfig(appConfig, {
   cacheDir,
-  plugins: [syntheticNetworkBoundary],
+  plugins: [canonicalProfileSchema, syntheticNetworkBoundary],
   optimizeDeps: {
     noDiscovery: true,
     include: [

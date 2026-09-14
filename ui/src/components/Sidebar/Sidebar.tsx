@@ -308,12 +308,13 @@ export function Sidebar() {
         )}
       </div>
 
-      {/* Bottom Bar: Advanced + LoRA Browser + Model + Generate.
+      {/* Give model choices the sidebar width, above the compact action row.
           Hidden in Tools mode — ToolsPanel has its own Run button and
           owns no model. */}
       {!isTools && (
-      <div className="px-3 py-2.5 border-t border-border">
-        <div className="flex items-center gap-2">
+      <div className="shrink-0 space-y-2 px-3 py-2.5 border-t border-border" data-generation-footer>
+        <ModelSelector />
+        <div className="flex flex-wrap items-center gap-2">
           <AdvancedSettings />
           <button
             type="button"
@@ -327,16 +328,13 @@ export function Sidebar() {
           {machineControls && !isOutpaint && (
             <button
               onClick={() => openLoraBrowser(true, modelType)}
-              className="p-2 rounded-lg bg-bg-tertiary border border-border hover:border-border-light text-text-secondary hover:text-accent-blue transition-colors shrink-0"
+              className="mobile-control-target p-2 rounded-lg bg-bg-tertiary border border-border hover:border-border-light text-text-secondary hover:text-accent-blue transition-colors shrink-0"
               title="Browse LoRAs on CivitAI"
             >
               <Globe size={14} />
             </button>
           )}
-          <div className="flex-1 min-w-0">
-            <ModelSelector />
-          </div>
-          <div className="shrink-0">
+          <div className="ml-auto shrink-0">
             <GenerateButton />
           </div>
         </div>

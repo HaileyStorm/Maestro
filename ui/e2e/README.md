@@ -6,6 +6,14 @@ WebSockets, external origins, and Vite filesystem paths outside the isolated
 dependency cache are rejected. It never intentionally connects to a Maestro
 backend or uses real accounts, prompts, jobs, media, or storage state.
 
+The canonical generation-profile field schema is read from its checked-in JSON
+at server startup and exposed as one exact virtual module. This keeps the UI's
+real field contract in use without allowing browser filesystem requests into
+the backend source tree.
+
+Playwright starts the installed Vite binary directly through Node. This avoids
+an extra npm lifecycle process and its cache housekeeping during server teardown.
+
 From `ui/`:
 
 ```sh

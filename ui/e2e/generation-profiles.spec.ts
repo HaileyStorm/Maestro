@@ -8,7 +8,7 @@ test('saved profiles lead Generate and restore through Advanced without replacin
   const records: Array<Record<string, unknown>> = []
   await page.route(`${baseURL}/api/v1/presets**`, async route => {
     if (route.request().method() === 'POST') {
-      const record = { ...route.request().postDataJSON(), created_at: 1 }
+      const record = { ...route.request().postDataJSON(), revision: 'a'.repeat(64), created_at: 1 }
       records.push(record)
       await route.fulfill({ json: record })
     } else if (route.request().method() === 'GET') {
@@ -20,6 +20,7 @@ test('saved profiles lead Generate and restore through Advanced without replacin
   await page.addInitScript(() => localStorage.setItem('maestro_welcome_seen_v1', '1'))
   await page.emulateMedia({ reducedMotion: 'reduce' })
   await page.goto('/')
+  await expect(page.getByRole('tab', { name: 'Gallery', exact: true })).toBeVisible()
   const mobileMenu = page.getByRole('button', { name: 'Open Generate, Director, and References menu' })
   if (await mobileMenu.isVisible()) await mobileMenu.click()
   const profiles = page.locator('[data-generation-profiles="sidebar"]')

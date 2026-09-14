@@ -35,7 +35,7 @@ export function ModelSelector() {
 
   if (h3AdaptivePair) {
     return (
-      <div className="flex min-w-0 flex-1 flex-col gap-2">
+      <div className="grid min-w-0 grid-cols-1 gap-2 md:grid-cols-2">
         <CheckpointPicker
           heading="Text & frames"
           detail="FL2VA · follows prompts, start and end frames, and continuity"
@@ -274,10 +274,7 @@ function CheckpointPicker({
   return (
     <div className={`relative min-w-0 flex-1 ${heading ? 'rounded-lg border border-border bg-bg-tertiary/40 p-2.5' : ''}`} ref={containerRef}>
       {heading && (
-        <div className="mb-1.5">
-          <div className="text-[10px] font-medium uppercase tracking-wider text-text-primary">{heading}</div>
-          {detail && <div className="mt-0.5 text-[9px] leading-relaxed text-text-muted">{detail}</div>}
-        </div>
+        <div title={detail} className="mb-1.5 text-[10px] font-medium uppercase tracking-wider text-text-primary">{heading}</div>
       )}
       {/* Trigger button */}
       <button
@@ -286,6 +283,7 @@ function CheckpointPicker({
         onClick={() => setOpen(!open)}
         title={currentModel?.selector_help || currentModel?.description || (selectedType ? `Saved checkpoint: ${selectedType}` : undefined)}
         aria-label={heading ? `${heading} model: ${(currentModel?.name ?? selectedType) || 'not selected'}` : undefined}
+        aria-description={detail}
         aria-expanded={open}
         aria-haspopup="dialog"
         aria-controls={menuId}
@@ -347,8 +345,10 @@ function CheckpointPicker({
         <p role="status" className="mt-1 text-[9px] text-red-300">{hostTermsError}</p>
       )}
       {currentModel?.downloadable === false && !currentModelLegalBlocked && (
-        <div role="status" className="mt-1 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[9px] leading-relaxed text-amber-100">
-          {currentModel.manual_installation && (
+        <div role="status" className={currentModel.manual_checkpoint_verified
+          ? 'mt-1 text-[9px] text-text-muted'
+          : 'mt-1 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[9px] leading-relaxed text-amber-100'}>
+          {!currentModel.manual_checkpoint_verified && currentModel.manual_installation && (
             <dl className="mb-1.5 grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5">
               <dt className="text-amber-200">Filename</dt>
               <dd className="break-all font-mono select-all">{currentModel.manual_installation.filename}</dd>
@@ -360,14 +360,14 @@ function CheckpointPicker({
               <dd className="break-all font-mono select-all">{currentModel.manual_installation.sha256}</dd>
             </dl>
           )}
-          {currentModel.manual_installation && (
+          {!currentModel.manual_checkpoint_verified && currentModel.manual_installation && (
             <div className="mb-1 flex flex-wrap gap-2">
               <a href={currentModel.manual_installation.source_url} target="_blank" rel="noreferrer" className="mobile-control-target inline-flex items-center rounded text-accent-blue hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">About this model</a>
               <a href={currentModel.manual_installation.download_url} target="_blank" rel="noreferrer" className="mobile-control-target inline-flex items-center rounded text-accent-blue hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Download the required file</a>
             </div>
           )}
           {currentModel.manual_checkpoint_verified ? (
-            <p>The computer running Maestro has verified the required model file. Maestro will not repeatedly check it during normal model updates.</p>
+            <p>Model file checked.</p>
           ) : (
             <>
               <p>Download the required model file yourself and save it in the folder above. Maestro will check its size and SHA-256 fingerprint on the computer where it runs; it will not download this file for you.</p>
@@ -486,7 +486,7 @@ function CheckpointPicker({
                         }}
                         className="mobile-control-target flex min-w-0 flex-1 flex-wrap items-center gap-2 px-3 py-1.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-blue disabled:cursor-not-allowed disabled:opacity-45"
                       >
-                        <span className="flex-1 min-w-0 text-xs truncate">{model.name}</span>
+                        <span className="w-full min-w-0 break-words text-xs">{model.name}</span>
                         <ModelBadges model={model} />
                         {pinkReconciliationLabel && (
                           <span className="text-[9px] text-amber-300">{pinkReconciliationLabel}</span>
@@ -542,7 +542,7 @@ function ModelBadges({ model }: {
   })
   if (badges.length === 0) return null
   return (
-    <span className="flex shrink-0 flex-wrap justify-end gap-0.5">
+    <span className="flex min-w-0 flex-wrap gap-0.5">
       {badges.map(b => (
         <span key={b.label} title={b.title} className="text-[9px] px-1 py-0.5 rounded bg-bg-tertiary text-text-muted leading-none">
           {b.label}
