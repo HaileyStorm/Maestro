@@ -83,14 +83,14 @@ _PROFILES = (
         "id": "spectrum_experimental",
         "label": "Spectrum Experimental",
         "description": (
-            "Experimental clean-room H3 forecast accelerator: the High 1344x768 "
-            "28-step Sol bundle captures 11 paired hidden-feature anchors and nine "
+            "Experimental clean-room H3 forecast accelerator: the 1344x768 "
+            "20-evaluation Sol bundle captures 11 paired hidden-feature anchors and nine "
             "causal forecast slots, then replays every step without transformer blocks. "
             "Audio uses local interpolation only; "
             "quality and speed still require live validation."
         ),
         "accelerator": "spectrum",
-        "num_inference_steps": 28,
+        "num_inference_steps": 20,
         "resolution": "1344x768",
         "attention_engine": "sol_attn",
     },

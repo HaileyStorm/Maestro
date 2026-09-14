@@ -20,6 +20,10 @@ from services.h3_profiles import (  # noqa: E402
     profile_definitions,
     profile_settings,
 )
+from models.minimax_h3.spectrum import (  # noqa: E402
+    SpectrumCompatibilityError,
+    validate_spectrum_request,
+)
 
 # Restore and hydration races execute the real store in ui/tests/
 # defaults-preset-flow, mode-switch-profile-continuity and output-restore-lifecycle.
@@ -100,7 +104,7 @@ class H3ProfileTests(unittest.TestCase):
                 profiles["spectrum_experimental"]["num_inference_steps"],
                 profiles["spectrum_experimental"]["resolution"],
             ),
-            ("spectrum", "sol_attn", 28, "1344x768"),
+            ("spectrum", "sol_attn", 20, "1344x768"),
         )
         self.assertIn("11 paired hidden-feature anchors", profiles["spectrum_experimental"]["description"])
         self.assertIn("quality and speed still require live validation", profiles["spectrum_experimental"]["description"])
@@ -421,6 +425,43 @@ class H3ProfileTests(unittest.TestCase):
         self.assertEqual(
             seen[0]["custom_settings"]["h3_spectrum_profile"],
             "spectrum_h3_v1",
+        )
+
+    def test_spectrum_curated_settings_pass_actual_runtime_contract(self):
+        settings = profile_settings("minimax_h3", "spectrum_experimental")
+        validated = []
+
+        def runtime_compatibility(candidate):
+            try:
+                config = validate_spectrum_request(
+                    selected_model_type=candidate["model_type"],
+                    model_def={},
+                    reference_mode=False,
+                    sampling_steps=candidate["num_inference_steps"],
+                    attention_engine=candidate["custom_settings"]["h3_attention_engine"],
+                    custom_settings=candidate["custom_settings"],
+                    activated_loras=candidate["activated_loras"],
+                    loras_multipliers=candidate["loras_multipliers"],
+                    skip_steps_cache_type=candidate["tea_cache"],
+                    native_boundary=False,
+                )
+            except SpectrumCompatibilityError as error:
+                return False, str(error)
+            validated.append(config)
+            return True, None
+
+        options = build_profile_options(
+            {"model_type": "minimax_h3", "reference_shape": {}},
+            model_exists=lambda _model: True,
+            model_downloaded=lambda _model: True,
+            spectrum_compatibility=runtime_compatibility,
+        )
+        spectrum = next(item for item in options if item["id"] == "spectrum_experimental")
+        self.assertTrue(spectrum["available"])
+        self.assertEqual(len(validated), 1)
+        self.assertEqual(
+            validated[0].profile_id,
+            settings["custom_settings"]["h3_spectrum_profile"],
         )
 
     def test_fast_keeps_sage_settings_but_waits_for_its_exact_geometry_gate(self):

@@ -139,3 +139,25 @@ navigation expectations, LoRA-dialog touch targets, and overlay accessibility.
 Continue those as the next bounded browser/interaction work; retain the full
 results rather than weakening assertions. The historical tracker hold and
 protected storage-janitor work remain unchanged.
+
+## Availability and browser follow-up
+
+The owner requested resolution of all model/profile unavailability. Spectrum's
+curated preset incorrectly selected 28 evaluations while its implementation
+requires exactly 20. The preset and copy now use 20; a regression passes the
+curated settings through the real validator. All 64 affected CPU tests pass
+(profiles, Spectrum, host limits, LightX2V). High remains the 28-step default;
+Spectrum remains experimental. Backend rollout and GPU acceptance are pending.
+
+Draft/Fast require a matching SageAttention build/validation for CUDA 13. The
+installer's prebuilt-wheel path and H3's source-marker requirement need
+reconciliation before recommending another Update. Ref2VA-only experiments
+must retain their real model/checkpoint/asset gates and use effective adaptive
+routing context when explaining applicability.
+
+Recovery Control traced a stalled Node process to an NTFS kernel write crash.
+Do not start new write-heavy E2E work on that mount or weaken the cross-filesystem
+guard. The owner has been asked to approve Linux-native temporary browser
+scratch. Preserve recovery's no-signal/no-restart boundary until cleared.
+Maestro remains running. UI recovery/navigation and keyboard/touch fixes are
+in progress; the full browser matrix is not yet accepted.
