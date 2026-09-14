@@ -110,11 +110,12 @@ To guarantee every contribution follows this guide precisely, obey this checklis
   out of that critical path.
 - New unpinned Codex tasks use GPT-6 Astra at medium as the primary
   controller. An explicit user, picker, task, or project model and reasoning
-  choice always wins. Astra owns synthesis and acceptance; use the global
-  Astra-first Pareto envelope for specialists: Sol high for bounded
-  implementation, invariant, and review work, and Luna high or xhigh for
-  read-heavy scouting and documentation. Use another route only when current
-  task evidence supports it.
+  choice always wins. Astra owns synthesis and acceptance. Use GPT-5.6 Luna
+  max as the native fallback for bounded implementation, invariant, review,
+scouting, and documentation work. Eligible public or sanitized packets may
+  prefer exact Nous deepseek/deepseek-v4.1-flash at max; never send private
+  Maestro prompts, jobs, media, logs, credentials, or implicit parent history to
+  Nous. Preserve explicit local or domain-provider choices.
 - For genuinely multi-file or cross-layer work, choose the smallest useful set
   of one to three bounded, read-only ownership, invariant, or test guard roles.
   Do not require a fixed three-map ceremony. Synthesize centrally, then use one
