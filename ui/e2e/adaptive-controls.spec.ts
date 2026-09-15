@@ -194,9 +194,16 @@ test('adaptive controls keep both choices visible, keyboard operable and respons
     await trigger.scrollIntoViewIfNeeded()
     const box = await trigger.boundingBox()
     expect(box).not.toBeNull()
-    expect(box!.height).toBeGreaterThanOrEqual(44)
-    expect(box!.x).toBeGreaterThanOrEqual(0)
-    expect(box!.x + box!.width).toBeLessThanOrEqual(321)
+    if (!box) continue
+    // Firefox can report the CSS-pixel target a few floating-point ulps
+    // below its authored 44px size (for example 43.999969px). Round the
+    // measured geometry to sub-pixel precision without loosening the target.
+    const width = Math.round(box.width * 1_000) / 1_000
+    const height = Math.round(box.height * 1_000) / 1_000
+    expect(height).toBeGreaterThanOrEqual(44)
+    expect(width).toBeGreaterThanOrEqual(44)
+    expect(box.x).toBeGreaterThanOrEqual(0)
+    expect(box.x + box.width).toBeLessThanOrEqual(321)
   }
   for (const [trigger, name, expectedName] of [
     [narrowFrames, 'Text & frames models', 'Synthetic Frame Alternative'],
@@ -217,8 +224,11 @@ test('adaptive controls keep both choices visible, keyboard operable and respons
     await action.scrollIntoViewIfNeeded()
     const box = await action.boundingBox()
     expect(box).not.toBeNull()
-    expect(box!.width).toBeGreaterThanOrEqual(44)
-    expect(box!.height).toBeGreaterThanOrEqual(44)
+    if (!box) continue
+    const width = Math.round(box.width * 1_000) / 1_000
+    const height = Math.round(box.height * 1_000) / 1_000
+    expect(width).toBeGreaterThanOrEqual(44)
+    expect(height).toBeGreaterThanOrEqual(44)
     expect(box!.x).toBeGreaterThanOrEqual(0)
     expect(box!.x + box!.width).toBeLessThanOrEqual(321)
     expect(box!.y).toBeGreaterThanOrEqual(0)

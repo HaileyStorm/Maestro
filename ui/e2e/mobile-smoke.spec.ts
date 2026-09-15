@@ -172,7 +172,9 @@ async function routeMigratedUserAccess(page: Page, username: string) {
 }
 
 async function openAccountSupport(page: Page) {
-  const trigger = page.getByRole('button', { name: /Open Support/ }).first()
+  const trigger = page.getByRole('button', {
+    name: /^Open (?:support|account and support|sign in and account help)$/i,
+  }).first()
   if (await page.evaluate(() => innerWidth <= 767)) await expectMinimumTarget(trigger)
   await trigger.click()
   const drawer = page.locator('#account-support-drawer[role="dialog"]')
@@ -965,7 +967,8 @@ for (const viewport of [
     await expectRenderedActionsReachable(gallerySearch)
     await gallerySearch.getByRole('button', { name: 'Clear search text and close search' }).click()
 
-    await page.locator('button[aria-controls="gallery-filter-popover"]').click()
+    const filterTrigger = page.locator('button[aria-controls="gallery-filter-popover"]')
+    await filterTrigger.click()
     const filters = page.getByRole('dialog', { name: 'Gallery filters' })
     await expect(filters).toBeVisible()
     const references = filters.getByRole('combobox', { name: 'References' })
@@ -975,6 +978,8 @@ for (const viewport of [
     await expectRenderedActionsReachable(filters)
     await expectNoBlockingAxeFindings(page)
     await filters.getByRole('button', { name: 'Close Gallery filters' }).click()
+    await expect(filters).toBeHidden()
+    await expect(filterTrigger).toBeFocused()
 
     const galleryFeed = page.getByRole('region', { name: 'Gallery outputs', exact: true })
     await galleryFeed.focus()
@@ -1017,8 +1022,7 @@ for (const viewport of [
     await director.getByRole('button', { name: 'Close Director dashboard' }).last().click()
     await menu.getByRole('button', { name: 'Close creative workspace menu' }).click()
 
-    await page.getByRole('button', { name: 'Open Support' }).click()
-    const support = page.getByRole('dialog', { name: /Support/ })
+    const { drawer: support } = await openAccountSupport(page)
     await expect(support).toBeVisible()
     await expectEveryRenderedActionMinimumTarget(support)
     await expectRenderedActionsReachable(support)
@@ -1220,7 +1224,7 @@ test('accounts-disabled compatibility, local bootstrap, and remote bootstrap bou
   api!.setAccountScenario('local-pristine')
   await gotoSyntheticApp(page)
   opened = await openAccountSupport(page)
-  await expect(opened.drawer).toHaveAccessibleName('Support & account')
+  await expect(opened.drawer).toHaveAccessibleName('Account & support')
   await opened.drawer.getByRole('tab', { name: 'Account' }).click()
   const bootstrap = opened.drawer.getByRole('heading', { name: 'Create the first owner account' })
     .locator('xpath=../..')
@@ -1229,11 +1233,12 @@ test('accounts-disabled compatibility, local bootstrap, and remote bootstrap bou
   )
   await bootstrap.getByLabel('Username', { exact: true }).fill('Synthetic Owner')
   await bootstrap.getByLabel('Password', { exact: true }).fill('synthetic-bootstrap-password')
+  await bootstrap.getByLabel('Confirm password', { exact: true }).fill('synthetic-bootstrap-password')
   await bootstrap.getByLabel('Device label', { exact: true }).fill('Synthetic browser')
   const createOwnerAction = bootstrap.getByRole('button', { name: 'Create owner account' })
   if (browserName !== 'webkit') {
     await expectPrimaryActionContrast(createOwnerAction)
-    await expectPrimaryActionContrast(opened.drawer.getByRole('button', { name: 'Sign in', exact: true }))
+    await expectPrimaryActionContrast(opened.drawer.getByRole('button', { name: 'Sign in', exact: true }).last())
   }
   await createOwnerAction.click()
   await expect(opened.drawer.getByText('Owner account created and signed in.')).toBeVisible()
@@ -1289,7 +1294,7 @@ test('anonymous login, owner reauthentication, account-session sign-out, and log
   await expect(drawer.getByRole('button', { name: 'Sign out other account sessions' })).toBeDisabled()
 
   const confirmation = drawer.getByRole('heading', { name: 'Confirm your password' }).locator('xpath=..')
-  await confirmation.getByLabel('Current password').fill('synthetic-owner-password')
+  await confirmation.getByLabel('Current password', { exact: true }).fill('synthetic-owner-password')
   const confirmPasswordAction = confirmation.getByRole('button', { name: 'Confirm password' })
   if (browserName !== 'webkit') await expectPrimaryActionContrast(confirmPasswordAction)
   await confirmPasswordAction.click()
@@ -1650,6 +1655,7 @@ for (const viewport of PRODUCT_ACCEPTANCE_VIEWPORTS) {
     await page.setViewportSize({ width: viewport.width, height: viewport.height })
     await skipWelcome(page)
     api!.setAccountScenario('remote-user')
+    await routeMigratedUserAccess(page, 'Synthetic User')
     await page.addInitScript(() => {
       const target = globalThis as typeof globalThis & { __maestroCopiedStudio?: string }
       Object.defineProperty(navigator, 'clipboard', {
@@ -1673,7 +1679,7 @@ for (const viewport of PRODUCT_ACCEPTANCE_VIEWPORTS) {
     await expect(copyStudio).toContainText('Copied')
     expect(await page.evaluate(() => (
       globalThis as typeof globalThis & { __maestroCopiedStudio?: string }
-    ).__maestroCopiedStudio || '')).toBe(`${E2E_ORIGIN}/`)
+    ).__maestroCopiedStudio || '')).toBe('https://stable.example.test/')
 
     const memberForm = panel.locator('[data-project-member-form]')
     await memberForm.locator('[data-project-member-username]').fill('Synthetic Collaborator')
