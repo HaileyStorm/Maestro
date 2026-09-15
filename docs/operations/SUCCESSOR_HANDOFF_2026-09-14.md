@@ -228,10 +228,8 @@ not enter the Director profile envelope.
 
 The panel waits for the backend's explicit `director_profiles_supported` flag.
 An older running backend keeps it hidden. Source publication and a rebuilt UI
-therefore do not establish live Director profile acceptance. Preserve the
-Recovery Control restart hold; once released, coordinate a single restart and
-verify profile save/update/load through the intended local and stable-share
-surfaces before claiming rollout.
+therefore do not establish live Director profile acceptance. Use the coordinated restart flow and verify profile save/update/load through
+the intended local and stable-share surfaces before claiming rollout.
 
 Model-bound snapshots prevent stale technical settings from crossing a model
 switch. Unbound or mismatched image/video LoRAs stay visible for explicit
@@ -242,7 +240,7 @@ for settings/reference changes across asynchronous work, preserves newer user
 edits and asks for a fresh submission rather than sending an obsolete request.
 
 Deliberate CPU evidence includes the complete affected profile/cancellation
-modules (109 tests), all 631 UI tests, TypeScript, lint, Python syntax,
+modules (110 tests), all 632 UI tests, TypeScript, lint, Python syntax,
 and production build. Local health/readiness and the served build identity
 were verified without restarting Maestro. The browser matrix remains pending approved Linux-native
 scratch. No generation, native Sage acceptance, GPU access, service restart or
@@ -258,12 +256,33 @@ First reconcile the visible Insert/duration/strength controls with what the
 backend actually consumes; do not save controls that have no generation effect.
 
 
-The final image-role confirmation correction is verified in a separate
-Linux-native production build. A worker's default Vite build removed the
-parent-owned served-build reservation marker; Recovery Control owns supported
-orphan-registry reconciliation. The original successful claim receipt was
-recovered from the task history and supplied to that owner. Do not recreate the
-marker, hand-edit registry state or write the served build until that boundary
-is recovered. The running app remains on the preceding healthy UI build; the
-last role-confirmation correction still needs deployment as well as browser
-acceptance. Intact source work and its checks remain independent of this hold.
+The owner explicitly authorized recovery and deployment work. The missing
+served-build reservation was recovered through the shared tool's exact orphan
+work-ID release, with original acquisition evidence and dual native locks;
+no marker was fabricated and no foreign reservation was changed. Ordinary
+acquisition now works again. Preserve reservation markers during Vite builds
+with `--emptyOutDir false`, and keep one writer for the served build.
+
+A real local profile-save test exposed a schema mismatch absent from the
+mocked defaults: H3 reports `guidance_phases=0`, while the profile descriptor
+incorrectly required at least one. The schema now preserves zero for both
+Studio and Director profiles. Director still uses at least one LoRA multiplier,
+matching Studio for models with no CFG phases. Regression checks cover save,
+load, invalid bounds, and submission without generation.
+
+
+Live local acceptance now covers Director profile save, update, load and delete
+without generation. A temporary H3 profile was saved, its unavailable Ref2VA
+model was truthfully rejected for the selected production, then repaired by
+updating it to supported FL2VA settings. Loading restored the saved 20-step
+choice after changing the control to 28. The temporary record was deleted and
+the controls returned to their initial screen. Local health/readiness and the
+served build were verified. Stable Cloudflare access reaches the normal sign-in
+screen and the coordinated restart notice cleared; authenticated remote
+profile parity was not exercised.
+
+The browser sweep also found the longer authenticated account label covering
+the project selector at the desktop breakpoint. The narrow desktop account
+control now keeps its accessible name while showing only its icon; the wider
+layout reserves enough space for the full label. An ordinary live Chrome click
+opens the project selector at the failing width. UI tests, build and lint pass.

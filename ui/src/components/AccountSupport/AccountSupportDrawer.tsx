@@ -321,7 +321,7 @@ export function AccountSupportButton({ compact = false }: { compact?: boolean })
       }`}
     >
       <TriggerIcon size={compact ? 18 : 14} aria-hidden="true" />
-      {!compact && <span className="max-w-32 truncate">{visibleLabel}</span>}
+      {!compact && <span className="hidden max-w-32 truncate lg:inline">{visibleLabel}</span>}
     </button>
   )
 }

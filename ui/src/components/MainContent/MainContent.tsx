@@ -3286,7 +3286,7 @@ export function MainContent() {
               </button>
             )}
           </div>
-          <div className="shrink-0 md:mr-28"><WorkspaceSelector /></div>
+          <div className="shrink-0 md:mr-28 lg:mr-56"><WorkspaceSelector /></div>
         </div>
         <div
           data-main-toolbar-view
