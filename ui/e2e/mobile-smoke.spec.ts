@@ -294,13 +294,23 @@ async function collectRenderedActionTargetViolations(root: Locator, minimum = 44
   }), minimum)
 }
 
+function isExposedByDetails(element: Element): boolean {
+  // WebKit may report geometry for content inside a closed disclosure. Only
+  // its first direct summary (and that summary's children) remains exposed.
+  for (let parent = element.parentElement; parent; parent = parent.parentElement) {
+    if (parent instanceof HTMLDetailsElement && !parent.open
+      && !parent.querySelector(':scope > summary')?.contains(element)) return false
+  }
+  return true
+}
+
 async function collectRenderedActionReachabilityViolations(root: Locator) {
   const controls = root.locator(ACTION_SELECTOR)
   const violations: Array<{ name: string; reason: string }> = []
   const count = await controls.count()
   for (let index = 0; index < count; index += 1) {
     const control = controls.nth(index)
-    if (!await control.isVisible()) continue
+    if (!await control.isVisible() || !await control.evaluate(isExposedByDetails)) continue
     await control.scrollIntoViewIfNeeded()
     const finding = await control.evaluate(element => {
       const node = element as HTMLElement
@@ -532,6 +542,28 @@ test.afterEach(async () => {
   if (failures.length > 0) {
     throw new AggregateError(failures, 'Synthetic UI cleanup checks failed')
   }
+})
+
+test('rendered-action checks honor nested disclosure visibility without skipping exposed summaries', async ({ page }) => {
+  await page.setContent(`
+    <div id="disclosures" style="height:80px;overflow:auto">
+      <details><summary>Outer disclosure</summary>
+        <details><summary>Details and sources</summary><button>Nested action</button></details>
+      </details>
+    </div>
+  `)
+  const outer = page.getByText('Outer disclosure', { exact: true })
+  const inner = page.getByText('Details and sources', { exact: true })
+  const action = page.locator('#disclosures button')
+  expect(await outer.evaluate(isExposedByDetails)).toBe(true)
+  expect(await inner.evaluate(isExposedByDetails)).toBe(false)
+  expect(await action.evaluate(isExposedByDetails)).toBe(false)
+  await outer.click()
+  expect(await inner.evaluate(isExposedByDetails)).toBe(true)
+  expect(await action.evaluate(isExposedByDetails)).toBe(false)
+  await inner.click()
+  expect(await action.evaluate(isExposedByDetails)).toBe(true)
+  await expectRenderedActionsReachable(page.locator('#disclosures'))
 })
 
 for (const target of ['sidebar', 'main', 'account', 'portal'] as const) {

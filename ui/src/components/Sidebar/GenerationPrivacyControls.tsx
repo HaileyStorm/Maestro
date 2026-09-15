@@ -13,6 +13,8 @@ export function GenerationPrivacyControls() {
   const hostTermsLoading = useStore(s => s.hostTermsLoading)
   const hostTermsError = useStore(s => s.hostTermsError)
   const loadHostTerms = useStore(s => s.loadHostTerms)
+  const refreshHostTerms = useStore(s => s.refreshHostTerms)
+  const accountId = useStore(s => s.accountContext?.account?.id)
   const acceptHostTerm = useStore(s => s.acceptHostTerm)
   const llmProvider = useStore(s => s.servicesConfig?.llm_provider || 'local')
   const sidebarMode = useStore(s => s.sidebarMode)
@@ -29,8 +31,8 @@ export function GenerationPrivacyControls() {
   ))
 
   useEffect(() => {
-    if (activeWorkspace && !hostTerms && !hostTermsLoading) void loadHostTerms()
-  }, [activeWorkspace, hostTerms, hostTermsLoading, loadHostTerms])
+    void loadHostTerms()
+  }, [activeWorkspace, accountId, loadHostTerms])
 
   useEffect(() => {
     if (automaticModelSelection.current) {
@@ -137,8 +139,15 @@ export function GenerationPrivacyControls() {
           </button>
         </div>
       )}
-      {explicitOutput && hostTermsError && (
-        <p className="mt-1 text-center text-[9px] text-red-300">{hostTermsError}</p>
+      {hostTermsError && (
+        <div className="mt-1 flex items-center gap-2 text-[9px] text-red-300" role="status">
+          <span className="min-w-0 flex-1">{hostTermsError}</span>
+          <button type="button" disabled={hostTermsLoading}
+            onClick={() => { void refreshHostTerms() }}
+            className="mobile-control-target shrink-0 rounded border border-border px-2 py-1 text-text-secondary disabled:opacity-50">
+            Retry model notices
+          </button>
+        </div>
       )}
       {explicitOutput && llmProvider !== 'local' && (
         <p className="mt-1 text-center text-[9px] text-text-muted">

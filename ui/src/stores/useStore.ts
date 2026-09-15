@@ -194,6 +194,7 @@ function _setH3Ref2VATermsAccepted(accepted: boolean): void {
 }
 
 let _hostTermsOperationTail: Promise<void> = Promise.resolve()
+let _hostTermsRead: { scope: string; promise: Promise<void> } | null = null
 
 function _queueHostTermsOperation<T>(operation: () => Promise<T>): Promise<T> {
   const result = _hostTermsOperationTail.then(operation, operation)
@@ -3574,6 +3575,7 @@ interface AppState {
   hostTermsLoading: boolean
   hostTermsError: string | null
   loadHostTerms: () => Promise<void>
+  refreshHostTerms: () => Promise<void>
   acceptHostTerm: (term: HostTermId) => Promise<boolean>
   /** Per-browser, per-job intent. This is deliberately not hydrated from the
    *  host's durable mature-capability setting or persisted to localStorage. */
@@ -12499,7 +12501,7 @@ export const useStore = create<AppState>((set, get) => ({
         servicesConfigError: null,
       })
       void get().resumeDirectorPreview()
-      void get().loadHostTerms()
+      void get().refreshHostTerms()
     } catch (e) {
       console.error('Failed to load services config:', e)
       set({
@@ -12524,26 +12526,29 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
   loadHostTerms: async () => {
-    await _queueHostTermsOperation(async () => {
-      const workspace = get().activeWorkspace
-      if (!workspace) {
-        _setH3Ref2VATermsAccepted(false)
-        set({ hostTerms: null, hostTermsLoading: false, hostTermsError: null })
-        return
-      }
-      set({ hostTermsLoading: true, hostTermsError: null })
+    const workspace = get().activeWorkspace
+    const accountEpoch = _accountIdentityEpoch
+    const scope = JSON.stringify([accountEpoch, workspace])
+    // Several mounted panes need the same status. Retain the settled result
+    // (including failure) so their loading effects cannot create a retry loop.
+    // A project/account change or the explicit retry action starts a new read.
+    if (_hostTermsRead?.scope === scope) return _hostTermsRead.promise
+    const request = { scope, promise: Promise.resolve() }
+    _hostTermsRead = request
+    const current = () => _hostTermsRead === request
+      && _accountIdentityEpoch === accountEpoch && get().activeWorkspace === workspace
+    request.promise = _queueHostTermsOperation(async () => {
+      if (!current() || !workspace) return
       try {
         const result = await api.fetchHostTerms(workspace)
+        if (!current()) return
         if (result.terms.minimax_h3_ref2va.accepted) {
           _clearLegacyH3Ref2VATermsAcceptance()
         }
         _setH3Ref2VATermsAccepted(result.terms.minimax_h3_ref2va.accepted)
-        set({
-          hostTerms: result.terms,
-          hostTermsLoading: false,
-          hostTermsError: null,
-        })
+        set({ hostTerms: result.terms, hostTermsLoading: false, hostTermsError: null })
       } catch (error) {
+        if (!current()) return
         _setH3Ref2VATermsAccepted(false)
         set({
           hostTermsLoading: false,
@@ -12551,6 +12556,13 @@ export const useStore = create<AppState>((set, get) => ({
         })
       }
     })
+    _setH3Ref2VATermsAccepted(false)
+    set({ hostTerms: null, hostTermsLoading: Boolean(workspace), hostTermsError: null })
+    await request.promise
+  },
+  refreshHostTerms: async () => {
+    _hostTermsRead = null
+    await get().loadHostTerms()
   },
   acceptHostTerm: async (term) => {
     return _queueHostTermsOperation(async () => {

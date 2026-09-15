@@ -314,7 +314,7 @@ export function Sidebar() {
       {!isTools && (
       <div className="shrink-0 space-y-2 px-3 py-2.5 border-t border-border" data-generation-footer>
         <ModelSelector />
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex flex-wrap items-center gap-1 sm:gap-2">
           <AdvancedSettings />
           <button
             type="button"

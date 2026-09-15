@@ -27,8 +27,9 @@ keep storage mutation disabled pending its separate ownership/acceptance gates.
 
 Profiles, mode continuity, output restore, H3 attention selection and Inpaint
 mask/preview continuity have source/test closures below. Their browser/live
-acceptance remains separate. The pending browser scratch-filesystem question
-has not been answered; preserve the E2E runner's cross-filesystem contract.
+acceptance remains separate. The owner authorized Linux browser scratch and
+recovery on September 14; the E2E runner's cross-filesystem contract remains
+in force. The September 15 checkpoint below records current browser evidence.
 Launcher/restart, account/credit activation, provider and GPU boundaries remain
 as stated in the owner updates and authorization sections below.
 
@@ -2583,3 +2584,36 @@ stale-success finding; its two suggested coverage gaps were added and passed.
 Receipts: `.artifacts-temp/astra-profile-update-20260912/`. Full backend discovery
 predates this bounded storage/API addition; do not label its 5,037-case result
 as testing this new endpoint. Browser/live acceptance remains open.
+
+
+## Browser and model-notice recovery — 2026-09-15
+
+The owner has authorized recovery and operational work; do not reopen the old
+browser scratch approval question. Browser binaries, results and Vite caches
+now run on a separate Linux tmpfs through the guarded synthetic runner.
+
+The narrow Generate action row uses smaller gaps below the small breakpoint,
+which prevents WebKit's scrollbar from wrapping the controls into another row.
+The tested footer decreased from 359 to 307 pixels while preserving the model
+grid. Disclosure reachability checks now honor closed ancestor details while
+still testing their exposed summaries, with a nested-disclosure regression.
+
+Failed model-notice reads previously triggered repeated mounted-pane effects
+(102 requests in one diagnostic run). Reads now coalesce per account epoch and
+project, stale responses cannot cross either boundary, and an explicit Retry
+model notices action starts a new read. Three store tests cover failed-read
+coalescing, explicit recovery and delayed project/account responses.
+
+All 635 UI tests, TypeScript, lint and production build pass. Firefox and
+Chromium pass 98 synthetic browser tests and WebKit passes all 49, for 147
+total across the three engines. The deployed index matches the served local page, with health and
+readiness both returning 200. A fresh stable Cloudflare browser load reaches
+the normal sign-in page; authenticated remote flows were not exercised. This
+UI update required no service restart.
+
+SageAttention's source installer now uses UV with the selected interpreter and
+forces native CUDA compilation even if the caller inherited the upstream skip
+flag. The scoped CPU suite ran 29 tests with one skip. Native build, release
+profile measurements and human visual/audio acceptance remain distinct gates.
+The planned Blend output-settings restoration and remaining app-wide work are
+still open; this checkpoint does not close the sprint.
