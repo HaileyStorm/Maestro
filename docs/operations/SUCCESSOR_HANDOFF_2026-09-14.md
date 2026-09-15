@@ -172,3 +172,43 @@ representative overlay cases passed before the NTFS stop. The final Director
 scroll correction was checked in live Chrome (Tab enters the region; Escape
 restores launcher focus); its landscape automation remains pending approved
 scratch. No service restart or GPU workload was performed.
+
+## Sage source installer and next interaction gaps
+
+The Sage installer repair removes the Python 3.10-only launcher predicate and
+uses the existing pinned LightX2V CUDA 13 runtime/toolchain identities for the
+selected cu130 environment. A private temporary linker alias supplies the
+runtime's versioned CUDA library to the source build without changing shared
+runtime files. Matching source/package-digest markers can be reused without
+requiring the compiler; missing digests cannot pass that check. Legacy CUDA
+12.8 setup and release-bound profile validation remain separate.
+
+Deliberate CPU/mock checks pass: 28 H3 acceleration tests (one skipped), 18 Sol
+engine tests and 20 LightX2V installer tests, plus source syntax and whitespace
+checks. Independent review caught and resolved a linker-precedence defect:
+explicit alias/runtime library flags now precede the toolchain's library path,
+with a captured setuptools link-command regression that executes no compiler.
+The build also disables user-site Python packages. This does not prove a successful CUDA
+13 Sage build or enable Draft/Fast; native kernel and human acceptance remain.
+
+Separately, a worker accidentally invoked the Sage installer with `--help`
+without masking CUDA. This script has no help-only parser. Its pipeline did
+not retain a reliable child exit status or output, so CUDA/installation effects
+are unverified. A later bounded process inspection found no matching installer
+or build process; that does not establish absence of earlier effects. Recovery
+Control owns the incident. No rerun, cleanup, signal or restart is authorized
+by this checkpoint; keep deliberate mocked test evidence separate.
+
+The next concrete interaction audit found Director's profile picker imports
+LoRAs only: its separate resolution, guidance, step/shot limits and final
+postprocessing settings lack a complete reusable profile round-trip. Blend
+output Load Settings also lacks restoration of Blend mode/tuning. Map those
+technical envelopes before implementation; preserve creative-input and
+account/project exclusions, and do not expose internal temporary media paths.
+Director's envelope must include its video model/settings/LoRAs and both image
+role model overrides/parameterized LoRAs, not merely the scalar controls. Keep
+automatic role selection explicit, revalidate current capabilities/catalogs,
+and retain stale saved choices for repair instead of silently substituting.
+Use a distinct Director profile context with isolated capture/restore and the
+existing account/project storage and revision-CAS rules. Do not add hidden
+Director fields to ordinary Studio profile restoration.

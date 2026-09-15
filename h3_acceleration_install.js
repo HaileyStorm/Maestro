@@ -9,9 +9,6 @@ module.exports = async (kernel) => {
   const runtime = runtimeProfile(kernel)
   const selectedVenv = `{{args && args.venv ? args.venv : '${runtime.env}'}}`
   const selectedPython = `{{args && args.venv_python ? args.venv_python : '${runtime.python}'}}`
-  const legacySageWhen = (condition) => (
-    `{{(args && args.venv_python ? args.venv_python : '${runtime.python}') === '3.10' && ${condition}}}`
-  )
   return {
     run: [
     {
@@ -39,7 +36,7 @@ module.exports = async (kernel) => {
       }
     },
     {
-      when: legacySageWhen("platform === 'linux' && gpu === 'nvidia' && !exists('app/services/sageattention_thu_ml/.git')"),
+      when: "{{platform === 'linux' && gpu === 'nvidia' && !exists('app/services/sageattention_thu_ml/.git')}}",
       method: "shell.run",
       params: {
         env: runtimeSecretEnv,
@@ -50,7 +47,7 @@ module.exports = async (kernel) => {
       }
     },
     {
-      when: legacySageWhen("platform === 'linux' && gpu === 'nvidia'"),
+      when: "{{platform === 'linux' && gpu === 'nvidia'}}",
       method: "shell.run",
       params: {
         env: runtimeSecretEnv,
@@ -64,7 +61,7 @@ module.exports = async (kernel) => {
       }
     },
     {
-      when: legacySageWhen("platform === 'linux' && gpu === 'nvidia'"),
+      when: "{{platform === 'linux' && gpu === 'nvidia'}}",
       method: "shell.run",
       params: {
         env: runtimeSecretEnv,

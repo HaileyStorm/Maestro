@@ -4,13 +4,15 @@ import ast
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 from types import ModuleType
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 try:
     import torch
@@ -33,6 +35,47 @@ def _load_sage_installer():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _cuda13_fixture(root: Path):
+    runtime_root = root / "runtime"
+    include = runtime_root / "include"
+    library = runtime_root / "lib"
+    include.mkdir(parents=True)
+    library.mkdir()
+    (include / "cuda.h").write_text("fixture\n", encoding="utf-8")
+    (library / "libcudart.so.13").write_bytes(b"fixture")
+
+    prefix = root / ".lightx2v-runtime" / "toolchain"
+    for directory in (
+        prefix / "bin",
+        prefix / "lib",
+        prefix / "targets/x86_64-linux/include/cccl/cuda/std",
+    ):
+        directory.mkdir(parents=True)
+    executables = {}
+    for name in ("nvcc", "ninja", "x86_64-conda-linux-gnu-gcc", "x86_64-conda-linux-gnu-g++"):
+        path = prefix / "bin" / name
+        path.write_text("#!/bin/sh\n", encoding="utf-8")
+        path.chmod(0o755)
+        executables[name] = path
+
+    runtime = {
+        "torch": "2.10.0+cu130",
+        "torch_cuda": "13.0",
+        "cuda_include": str(include),
+        "cuda_lib": str(library),
+        "cuda_runtime": str(library / "libcudart.so.13"),
+        "executable": sys.executable,
+    }
+    toolchain = {
+        "nvcc": str(executables["nvcc"]),
+        "ninja": str(executables["ninja"]),
+        "cc": str(executables["x86_64-conda-linux-gnu-gcc"]),
+        "cxx": str(executables["x86_64-conda-linux-gnu-g++"]),
+        "cccl_include": str(prefix / "targets/x86_64-linux/include/cccl"),
+    }
+    return runtime, toolchain, prefix
 
 
 def _evaluate_mutated_validation_record(record):
@@ -428,6 +471,380 @@ class H3AccelerationTests(unittest.TestCase):
             "--channel", "conda-forge",
             "cuda-toolkit=12.8.1",
         ], check=True)
+
+    def test_cuda13_uses_shared_runtime_and_managed_toolchain_identities(self):
+        helper = _load_sage_installer()
+        fake_torch = SimpleNamespace(
+            __version__="2.10.0+cu130", version=SimpleNamespace(cuda="13.0"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, toolchain, prefix = _cuda13_fixture(root)
+            identity_module = SimpleNamespace(
+                _runtime_identity=lambda torch_module: runtime,
+                _toolchain_identity=lambda selected: toolchain,
+            )
+            with patch.object(helper, "APP_ROOT", root), patch.object(
+                helper, "_lightx2v_installer_module", return_value=identity_module,
+            ):
+                selected_runtime, selected_toolchain, selected_prefix, inputs = helper._cuda13_identities(
+                    fake_torch
+                )
+        self.assertEqual(selected_runtime, runtime)
+        self.assertEqual(selected_toolchain, toolchain)
+        self.assertEqual(selected_prefix, prefix)
+        self.assertEqual(inputs["cuda_include"], Path(runtime["cuda_include"]).resolve())
+        self.assertEqual(inputs["cccl_include"], Path(toolchain["cccl_include"]).resolve())
+
+    def test_cuda13_identity_mismatch_fails_closed_before_toolchain_lookup(self):
+        helper = _load_sage_installer()
+        fake_torch = SimpleNamespace(
+            __version__="2.10.0+cu130", version=SimpleNamespace(cuda="13.0"),
+        )
+        toolchain_lookup = Mock(side_effect=AssertionError("toolchain must not be read"))
+        identity_module = SimpleNamespace(
+            _runtime_identity=lambda torch_module: (_ for _ in ()).throw(
+                RuntimeError("found Torch 2.7.0+cu128 with CUDA 12.8")
+            ),
+            _toolchain_identity=toolchain_lookup,
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            helper, "APP_ROOT", Path(directory)
+        ), patch.object(helper, "_lightx2v_installer_module", return_value=identity_module):
+            with self.assertRaisesRegex(RuntimeError, r"run Update|CUDA 13"):
+                helper._cuda13_identities(fake_torch)
+        toolchain_lookup.assert_not_called()
+
+    def test_cuda13_missing_header_or_linker_fails_closed(self):
+        helper = _load_sage_installer()
+        fake_torch = SimpleNamespace(
+            __version__="2.10.0+cu130", version=SimpleNamespace(cuda="13.0"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, toolchain, _prefix = _cuda13_fixture(root)
+            identity_module = SimpleNamespace(
+                _runtime_identity=lambda torch_module: runtime,
+                _toolchain_identity=lambda selected: toolchain,
+            )
+            with patch.object(helper, "APP_ROOT", root), patch.object(
+                helper, "_lightx2v_installer_module", return_value=identity_module,
+            ):
+                Path(runtime["cuda_include"], "cuda.h").unlink()
+                with self.assertRaisesRegex(RuntimeError, "cuda.h"):
+                    helper._cuda13_identities(fake_torch)
+
+                Path(runtime["cuda_include"], "cuda.h").write_text("fixture\n", encoding="utf-8")
+                Path(runtime["cuda_runtime"]).unlink()
+                with self.assertRaisesRegex(RuntimeError, "libcudart\\.so\\.13"):
+                    helper._cuda13_identities(fake_torch)
+
+    def test_cuda13_symlinked_managed_toolchain_prefix_fails_closed(self):
+        helper = _load_sage_installer()
+        fake_torch = SimpleNamespace(
+            __version__="2.10.0+cu130", version=SimpleNamespace(cuda="13.0"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime_root = root / "runtime"
+            include = runtime_root / "include"
+            library = runtime_root / "lib"
+            include.mkdir(parents=True)
+            library.mkdir()
+            (include / "cuda.h").write_text("fixture\n", encoding="utf-8")
+            (library / "libcudart.so.13").write_bytes(b"fixture")
+            prefix = root / ".lightx2v-runtime" / "toolchain"
+            target = root / "toolchain-target"
+            target.mkdir(parents=True)
+            prefix.parent.mkdir(parents=True)
+            prefix.symlink_to(target, target_is_directory=True)
+            runtime = {
+                "torch": "2.10.0+cu130", "torch_cuda": "13.0",
+                "cuda_include": str(include), "cuda_lib": str(library),
+                "cuda_runtime": str(library / "libcudart.so.13"),
+            }
+            lookup = Mock(side_effect=AssertionError("symlinked prefix must not be inspected"))
+            identity_module = SimpleNamespace(
+                _runtime_identity=lambda torch_module: runtime,
+                _toolchain_identity=lookup,
+            )
+            with patch.object(helper, "APP_ROOT", root), patch.object(
+                helper, "_lightx2v_installer_module", return_value=identity_module,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "exactly app/\\.lightx2v-runtime/toolchain"):
+                    helper._cuda13_identities(fake_torch)
+            lookup.assert_not_called()
+
+    def test_cuda13_marker_fast_path_does_not_require_compiler(self):
+        helper = _load_sage_installer()
+        fake_torch = SimpleNamespace(
+            __version__="2.10.0+cu130",
+            version=SimpleNamespace(cuda="13.0"),
+            cuda=SimpleNamespace(
+                is_available=lambda: True,
+                get_device_capability=lambda index: (12, 0),
+            ),
+        )
+        with patch.dict(sys.modules, {"torch": fake_torch}), patch.object(
+            helper.platform, "system", return_value="Linux",
+        ), patch.object(
+            helper, "_git_revision", return_value=helper.REVISION,
+        ), patch.object(
+            helper, "_git_source_clean", return_value=True,
+        ), patch.object(
+            helper, "_verified_install", return_value=True,
+        ), patch.object(
+            helper, "_cuda13_identities", side_effect=AssertionError("compiler must not be inspected"),
+        ):
+            self.assertEqual(helper.main(), 0)
+
+    def test_marker_fast_path_requires_a_real_distribution_digest(self):
+        helper = _load_sage_installer()
+        expected = {
+            "revision": helper.REVISION,
+            "version": helper.VERSION,
+            "torch": "2.10.0+cu130",
+            "torch_cuda": "13.0",
+            "compute_capability": [12, 0],
+        }
+        with patch.object(helper, "_read_marker", return_value=expected), patch.object(
+            helper, "_installed_version", return_value=helper.VERSION,
+        ), patch.object(
+            helper, "_distribution_source", return_value=helper.CHECKOUT.resolve(),
+        ), patch.object(helper, "_distribution_digest", return_value=None):
+            self.assertFalse(helper._verified_install(expected))
+
+    def test_cuda13_build_exposes_private_linker_alias_and_trusted_paths(self):
+        helper = _load_sage_installer()
+        fake_torch = SimpleNamespace(
+            __version__="2.10.0+cu130", version=SimpleNamespace(cuda="13.0"),
+            cuda=SimpleNamespace(
+                is_available=lambda: True,
+                get_device_capability=lambda index: (12, 0),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, toolchain, prefix = _cuda13_fixture(root)
+            inputs = {
+                "cuda_include": Path(runtime["cuda_include"]),
+                "cuda_header": Path(runtime["cuda_include"]) / "cuda.h",
+                "cuda_lib": Path(runtime["cuda_lib"]),
+                "cuda_runtime": Path(runtime["cuda_runtime"]),
+                "nvcc": Path(toolchain["nvcc"]),
+                "ninja": Path(toolchain["ninja"]),
+                "cc": Path(toolchain["cc"]),
+                "cxx": Path(toolchain["cxx"]),
+                "cccl_include": Path(toolchain["cccl_include"]),
+                "toolchain_lib": prefix / "lib",
+            }
+            run_calls = []
+
+            def fake_run(command, **kwargs):
+                run_calls.append((command, kwargs))
+                library_path = kwargs["env"]["LIBRARY_PATH"].split(os.pathsep)[0]
+                alias = Path(library_path) / "libcudart.so"
+                self.assertTrue(alias.is_symlink())
+                self.assertEqual(alias.resolve(), Path(runtime["cuda_runtime"]).resolve())
+                self.assertEqual(
+                    kwargs["env"]["CPATH"].split(os.pathsep),
+                    [str(Path(runtime["cuda_include"])), str(Path(toolchain["cccl_include"]))],
+                )
+                self.assertEqual(kwargs["env"]["CUDA_HOME"], str(prefix))
+                self.assertEqual(kwargs["env"]["PYTHONNOUSERSITE"], "1")
+                self.assertEqual(kwargs["env"]["CC"], toolchain["cc"])
+                self.assertEqual(kwargs["env"]["CXX"], toolchain["cxx"])
+                self.assertEqual(
+                    kwargs["env"]["LDFLAGS"].split(),
+                    [
+                        f"-L{library_path}",
+                        f"-L{Path(runtime['cuda_lib'])}",
+                    ],
+                )
+                self.assertNotIn("legacy", kwargs["env"]["LD_LIBRARY_PATH"])
+
+            with patch.dict(sys.modules, {"torch": fake_torch}), patch.object(
+                helper.platform, "system", return_value="Linux",
+            ), patch.object(helper, "APP_ROOT", root), patch.object(
+                helper, "_git_revision", return_value=helper.REVISION,
+            ), patch.object(helper, "_git_source_clean", return_value=True), patch.object(
+                helper, "_verified_install", return_value=False,
+            ), patch.object(
+                helper, "_cuda13_identities", return_value=(runtime, toolchain, prefix, inputs),
+            ), patch.object(helper.subprocess, "run", side_effect=fake_run), patch.object(
+                helper, "_installed_version", return_value=helper.VERSION,
+            ), patch.object(
+                helper, "_distribution_source", return_value=helper.CHECKOUT.resolve(),
+            ), patch.object(
+                helper, "_distribution_digest", return_value="digest",
+            ), patch.object(helper, "_write_marker") as write_marker:
+                self.assertEqual(helper.main(), 0)
+            self.assertEqual(len(run_calls), 1)
+            command, _environment = run_calls[0]
+            self.assertEqual(
+                command,
+                [
+                    sys.executable, "-m", "pip", "install", "--no-build-isolation",
+                    "--no-deps", "--force-reinstall", ".",
+                ],
+            )
+            write_marker.assert_called_once()
+            self.assertEqual(write_marker.call_args.args[0]["distribution_sha256"], "digest")
+
+    def test_cuda13_ldflags_precede_cuda_home_library_search_in_setuptools_link(self):
+        from setuptools._distutils import ccompiler
+        from setuptools._distutils import sysconfig as distutils_sysconfig
+
+        helper = _load_sage_installer()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, toolchain, prefix = _cuda13_fixture(root)
+            inputs = {
+                "cuda_include": Path(runtime["cuda_include"]),
+                "cuda_header": Path(runtime["cuda_include"]) / "cuda.h",
+                "cuda_lib": Path(runtime["cuda_lib"]),
+                "cuda_runtime": Path(runtime["cuda_runtime"]),
+                "nvcc": Path(toolchain["nvcc"]),
+                "ninja": Path(toolchain["ninja"]),
+                "cc": Path(toolchain["cc"]),
+                "cxx": Path(toolchain["cxx"]),
+                "cccl_include": Path(toolchain["cccl_include"]),
+                "toolchain_lib": prefix / "lib",
+            }
+            object_file = root / "fixture.o"
+            object_file.write_bytes(b"object")
+            captured = []
+            with helper._private_cuda13_linker(runtime) as linker_directory, patch.dict(
+                os.environ,
+                helper._cuda13_environment(prefix, inputs, linker_directory),
+                clear=True,
+            ):
+                compiler = ccompiler.new_compiler()
+                distutils_sysconfig.customize_compiler(compiler)
+                capture = lambda command: captured.append(command)
+                # Python 3.10's vendored distutils uses ``spawn`` while newer
+                # setuptools compilers call ``call`` for the final link.
+                compiler.call = capture
+                compiler.spawn = capture
+                compiler.link_shared_object(
+                    [str(object_file)], str(root / "fixture.so"),
+                    libraries=["cudart"], library_dirs=[str(prefix / "lib")],
+                )
+            self.assertEqual(len(captured), 1)
+            command = captured[0]
+            alias_flag = f"-L{linker_directory}"
+            runtime_flag = f"-L{inputs['cuda_lib']}"
+            toolchain_flag = f"-L{prefix / 'lib'}"
+            self.assertLess(command.index(alias_flag), command.index(toolchain_flag))
+            self.assertLess(command.index(runtime_flag), command.index(toolchain_flag))
+            self.assertLess(command.index(alias_flag), command.index("-lcudart"))
+
+    def test_cuda13_mismatched_toolchain_skips_without_build_or_marker_write(self):
+        helper = _load_sage_installer()
+        fake_torch = SimpleNamespace(
+            __version__="2.10.0+cu130", version=SimpleNamespace(cuda="13.0"),
+            cuda=SimpleNamespace(
+                is_available=lambda: True,
+                get_device_capability=lambda index: (12, 0),
+            ),
+        )
+        run = Mock()
+        write_marker = Mock()
+        with patch.dict(sys.modules, {"torch": fake_torch}), patch.object(
+            helper.platform, "system", return_value="Linux",
+        ), patch.object(helper, "_git_revision", return_value=helper.REVISION), patch.object(
+            helper, "_git_source_clean", return_value=True,
+        ), patch.object(helper, "_verified_install", return_value=False), patch.object(
+            helper, "_cuda13_identities",
+            side_effect=RuntimeError(
+                "the selected CUDA 13 compiler toolchain is incomplete or mismatched; run Update first"
+            ),
+        ), patch.object(helper.subprocess, "run", run), patch.object(
+            helper, "_write_marker", write_marker,
+        ):
+            self.assertEqual(helper.main(), 0)
+        run.assert_not_called()
+        write_marker.assert_not_called()
+
+    def test_cuda13_missing_runtime_header_skips_without_build_or_marker_write(self):
+        helper = _load_sage_installer()
+        fake_torch = SimpleNamespace(
+            __version__="2.10.0+cu130", version=SimpleNamespace(cuda="13.0"),
+            cuda=SimpleNamespace(
+                is_available=lambda: True,
+                get_device_capability=lambda index: (12, 0),
+            ),
+        )
+        run = Mock()
+        write_marker = Mock()
+        with patch.dict(sys.modules, {"torch": fake_torch}), patch.object(
+            helper.platform, "system", return_value="Linux",
+        ), patch.object(helper, "_git_revision", return_value=helper.REVISION), patch.object(
+            helper, "_git_source_clean", return_value=True,
+        ), patch.object(helper, "_verified_install", return_value=False), patch.object(
+            helper, "_cuda13_identities",
+            side_effect=RuntimeError("verified CUDA 13 cuda.h is missing or not an ordinary file"),
+        ), patch.object(helper.subprocess, "run", run), patch.object(
+            helper, "_write_marker", write_marker,
+        ):
+            self.assertEqual(helper.main(), 0)
+        run.assert_not_called()
+        write_marker.assert_not_called()
+
+    def test_cuda13_build_failure_removes_temporary_alias_without_success_marker(self):
+        helper = _load_sage_installer()
+        fake_torch = SimpleNamespace(
+            __version__="2.10.0+cu130", version=SimpleNamespace(cuda="13.0"),
+            cuda=SimpleNamespace(
+                is_available=lambda: True,
+                get_device_capability=lambda index: (12, 0),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime, toolchain, prefix = _cuda13_fixture(root)
+            inputs = {
+                "cuda_include": Path(runtime["cuda_include"]),
+                "cuda_header": Path(runtime["cuda_include"]) / "cuda.h",
+                "cuda_lib": Path(runtime["cuda_lib"]),
+                "cuda_runtime": Path(runtime["cuda_runtime"]),
+                "nvcc": Path(toolchain["nvcc"]),
+                "ninja": Path(toolchain["ninja"]),
+                "cc": Path(toolchain["cc"]),
+                "cxx": Path(toolchain["cxx"]),
+                "cccl_include": Path(toolchain["cccl_include"]),
+                "toolchain_lib": prefix / "lib",
+            }
+            marker = root / "marker.json"
+            marker.write_text("old marker", encoding="utf-8")
+            alias_paths = []
+
+            def failing_run(command, **kwargs):
+                library_path = kwargs["env"]["LIBRARY_PATH"].split(os.pathsep)[0]
+                alias_paths.append(Path(library_path) / "libcudart.so")
+                raise subprocess.CalledProcessError(1, command)
+
+            write_marker = Mock()
+            with patch.dict(sys.modules, {"torch": fake_torch}), patch.object(
+                helper.platform, "system", return_value="Linux",
+            ), patch.object(helper, "MARKER", marker), patch.object(
+                helper, "_git_revision", return_value=helper.REVISION,
+            ), patch.object(helper, "_git_source_clean", return_value=True), patch.object(
+                helper, "_verified_install", return_value=False,
+            ), patch.object(
+                helper, "_cuda13_identities", return_value=(runtime, toolchain, prefix, inputs),
+            ), patch.object(helper.subprocess, "run", side_effect=failing_run), patch.object(
+                helper, "_installed_version", return_value=helper.VERSION,
+            ), patch.object(
+                helper, "_distribution_source", return_value=helper.CHECKOUT.resolve(),
+            ), patch.object(
+                helper, "_distribution_digest", return_value="digest",
+            ), patch.object(helper, "_write_marker", write_marker):
+                self.assertEqual(helper.main(), 0)
+            self.assertEqual(len(alias_paths), 1)
+            self.assertFalse(alias_paths[0].exists())
+            self.assertFalse(marker.exists())
+            write_marker.assert_not_called()
 
 
 if __name__ == "__main__":

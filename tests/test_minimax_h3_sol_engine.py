@@ -275,7 +275,7 @@ const childNames = [
   const evaluateWhen = (when, args = undefined) => new Function(
     'args', 'platform', 'gpu', 'exists', `return (${when.slice(2, -2)});`
   )(args, 'linux', 'nvidia', () => false);
-  assert.equal(evaluateWhen(sageInstall.when), false);
+  assert.equal(evaluateWhen(sageInstall.when), true);
   assert(sm120H3.run.some((step) =>
     String(step.params.message).includes('sol_attn_kijai')
   ));
