@@ -339,7 +339,7 @@ export function DirectorLoraSelector({ mode, modelType }: {
       setLoading(true)
       api.fetchLoras(modelType).then(data => {
         if (cancelled) return
-        const newPhases = data.guidance_max_phases ?? 1
+        const newPhases = Math.max(1, data.guidance_max_phases ?? 1)
         setAvailableLoras(data.loras)
         setPhases(newPhases)
         // A catalog refresh is not permission to remove or rebind selections.

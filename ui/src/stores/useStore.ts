@@ -5391,6 +5391,8 @@ async function _checkDirectorProfileVideoLoras(modelType: string, blob: Pick<Lor
 }
 
 function _directorVideoLoraPhasesMismatch(blob: Pick<LoraModeBlob, 'activated_loras' | 'loraWeights' | 'loras_multipliers'>, phases: number): boolean {
+  // Zero CFG phases still use one LoRA multiplier, as in Studio.
+  phases = Math.max(1, phases)
   const tokens = blob.loras_multipliers.trim().split(/\s+/)
   return blob.activated_loras.some((name, index) => (blob.loraWeights[name]?.length ?? tokens[index]?.split(';').length ?? 1) !== phases)
 }

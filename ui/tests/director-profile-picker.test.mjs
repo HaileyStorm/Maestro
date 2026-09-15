@@ -68,6 +68,7 @@ test('catalog refresh never drops selected video LoRAs or silently changes their
   for (const catalog of [
     { loras: ['new.safetensors'], guidance_max_phases: 1 },
     { loras: ['old.safetensors'], guidance_max_phases: 2 },
+    { loras: ['old.safetensors'], guidance_max_phases: 0 },
   ]) {
     let selected = ['old.safetensors']
     let weights = { 'old.safetensors': [0] }
@@ -84,7 +85,7 @@ test('catalog refresh never drops selected video LoRAs or silently changes their
     })
     await new Promise(resolve => setImmediate(resolve))
     assert.deepEqual(available, catalog.loras)
-    assert.equal(phases, catalog.guidance_max_phases)
+    assert.equal(phases, Math.max(1, catalog.guidance_max_phases))
     assert.deepEqual(selected, ['old.safetensors'])
     assert.deepEqual(weights, { 'old.safetensors': [0] })
     assert.deepEqual(writes, [], 'a catalog response is not a user selection or confirmation')

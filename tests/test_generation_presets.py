@@ -469,6 +469,21 @@ class GenerationPresetStoreTests(unittest.TestCase):
         self.assertEqual(listed[-1], updated)
         self.assertEqual(len(listed), 2)
 
+    def test_h3_profiles_preserve_zero_guidance_phases(self) -> None:
+        # H3 declares guidance_max_phases=0; the live defaults endpoint returns
+        # guidance_phases=0. It means no CFG phases, not an invalid profile.
+        for version, factory in ((2, v2_preset_payload), (3, director_preset_payload)):
+            with self.subTest(version=version):
+                payload = factory()
+                payload["model_type"] = "minimax_h3"
+                payload["params"]["guidance_phases"] = 0
+                created = self.create(payload=payload, preset_id=f"h3-zero-{version}")
+                self.assertEqual(created["params"]["guidance_phases"], 0)
+                for invalid in (-1, 4):
+                    payload["params"]["guidance_phases"] = invalid
+                    with self.assertRaises(presets.GenerationPresetError):
+                        self.create(payload=payload, preset_id=f"h3-invalid-{version}-{invalid}")
+
     def test_v3_complete_director_profile_round_trips_and_replays_exactly(self) -> None:
         payload = director_preset_payload()
         created = self.create(payload=payload, preset_id="complete-director")

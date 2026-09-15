@@ -22,7 +22,7 @@ function deferred() {
   const promise = new Promise(done => { resolve = done })
   return { promise, resolve }
 }
-const videoDefaults = { resolution: '640x480', video_length: 81, num_inference_steps: 8, guidance_scale: 4, seed: -1, image_mode: 0, repeat_generation: 1, settings_version: 2.52 }
+const videoDefaults = { resolution: '640x480', video_length: 81, num_inference_steps: 8, guidance_scale: 4, seed: -1, image_mode: 0, repeat_generation: 1, settings_version: 2.52, guidance_phases: 0 }
 const ready = model_type => ({ model_type, compatible: true, ready: true, reasons: [], actions: [], enabled: true, downloaded: true })
 
 async function withStore(action, { legacyRoles = false } = {}) {
@@ -145,6 +145,7 @@ test('Director save update and load round-trip all technical settings without ch
     assert.equal(profile.model_type, 'video_a')
     assert.equal(profile.params.guidance_scale, 0)
     assert.equal(profile.params.seed, 0)
+    assert.equal(profile.params.guidance_phases, 0)
     assert.equal('image_refs' in profile.params, false)
     assert.equal('ui_settings' in profile, false)
     assert.equal(profile.director_settings.image_roles.creator.model_override, '')
@@ -435,5 +436,21 @@ test('image-role picker edits and removals preserve the old model until confirma
     const legacyChange = makeChange(store.getState().setDirectorImageRoleLoras, 'creator', true, null, 'creator_b')
     legacyChange([{ id: 'look.safetensors', multiplier: 0 }])
     assert.equal(store.getState().directorImageRoleLoraModels.creator, null)
+  })
+})
+
+
+test('a video model with zero CFG phases preserves its one LoRA multiplier', async () => {
+  await withStore(async (store, { control, requests }) => {
+    control.videoLoras = ['video-look.safetensors']
+    control.phases = 0
+    store.getState().directorSetLora('video', control.videoLoras, '0', { 'video-look.safetensors': [0] }, control.videoLoras, 'video_a')
+    await store.getState().savePreset('No CFG', 'director')
+    assert.equal(store.getState().presets[0].params.guidance_phases, 0)
+    assert.equal(store.getState().presets[0].loras_multipliers, '0')
+    await store.getState().startDirectorPipeline('queue')
+    const queued = requests.find(r => r.url === '/api/v1/director/queue')
+    assert.ok(queued, store.getState().directorError)
+    assert.equal(JSON.parse(queued.body).params.video_loras.loras_multipliers, '0')
   })
 })
