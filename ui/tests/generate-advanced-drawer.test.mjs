@@ -218,12 +218,15 @@ function resetProfileRuntime({ stateValues, generationMode = 'video' }) {
   globalThis.__profileStore = {
     selectedGenerationProfileId: stateValues[0],
     setSelectedGenerationProfileId: value => { globalThis.__profileStore.selectedGenerationProfileId = value; globalThis.__profileStateUpdates.push(value) },
+    selectedDirectorProfileId: stateValues[0],
+    setSelectedDirectorProfileId: value => { globalThis.__profileStore.selectedDirectorProfileId = value; globalThis.__profileStateUpdates.push(value) },
     presets: [
       preset('video-a', 'Everyday', 'video', 'minimax_h3'),
       preset('video-b', 'Detailed', 'video', 'ltx_video'),
       preset('image-a', 'Still', 'image', 'qwen_image'),
     ],
     presetsLoading: false,
+    directorProfilesSupported: true,
     modelsLoaded: true,
     models: [{ model_type: 'minimax_h3', name: 'MiniMax H3' }, { model_type: 'ltx_video', name: 'LTX Video' }],
     generationMode,
@@ -627,4 +630,65 @@ test('profile update conflict stays distinct and leaves the save form open', asy
   await flushAsyncAction()
   assert.ok(globalThis.__profileStateUpdates.some(value => value?.text === 'Profile changed elsewhere. Review it before updating.'))
   assert.ok(!globalThis.__profileStateUpdates.includes(false), 'conflict does not close the save form')
+})
+
+test('Director profiles stay separate and save in Director context from any active generation mode', async () => {
+  const { GenerationProfiles } = await loadGenerationProfiles()
+  const calls = resetProfileRuntime({ generationMode: 'audio', stateValues: ['director-a', 'New shoot', true, null, false, null] })
+  const director = {
+    ...preset('director-a', 'Night shoot', 'video', 'minimax_h3'),
+    profile_version: 3, profile_context: 'director', director_settings: {},
+  }
+  globalThis.__profileStore.presets.push(director)
+  globalThis.__profileStore.savePreset = async (...args) => { calls.save.push(args) }
+  const elements = flattenElements(GenerationProfiles({ placement: 'director', loadOnMount: false }))
+  const options = elements.filter(element => element.type === 'option').map(elementText)
+  assert.ok(options.some(text => text.includes('Night shoot')))
+  assert.ok(options.every(text => !text.includes('Everyday') && !text.includes('Detailed') && !text.includes('Still')))
+  assert.ok(elements.some(element => element.props['aria-label'] === 'Director profiles'))
+  elements.find(element => element.type === 'button' && elementText(element).trim() === 'Save as new').props.onClick()
+  await flushAsyncAction()
+  assert.deepEqual(calls.save, [['New shoot', 'director']])
+})
+
+test('ordinary profile panels cannot accidentally load a Director-only envelope', async () => {
+  const { GenerationProfiles } = await loadGenerationProfiles()
+  resetProfileRuntime({ stateValues: ['', '', false, null, false, null] })
+  globalThis.__profileStore.presets.push({
+    ...preset('director-a', 'Night shoot', 'video', 'minimax_h3'),
+    profile_version: 3, profile_context: 'director', director_settings: {},
+  })
+  globalThis.__profileStore.selectedDirectorProfileId = 'director-a'
+  const options = flattenElements(GenerationProfiles({ loadOnMount: false }))
+    .filter(element => element.type === 'option').map(elementText)
+  assert.ok(options.some(text => text.includes('Everyday')))
+  assert.ok(options.every(text => !text.includes('Night shoot')))
+  assert.equal(globalThis.__profileStore.selectedDirectorProfileId, 'director-a', 'ordinary panel cannot clear the Director selection')
+})
+
+test('Director profile controls wait for backend support but still discover it once', async () => {
+  const { GenerationProfiles } = await loadGenerationProfiles()
+  const calls = resetProfileRuntime({ stateValues: ['', '', false, null, false, null] })
+  globalThis.__profileStore.directorProfilesSupported = false
+  assert.equal(GenerationProfiles({ placement: 'director' }), null)
+  assert.equal(calls.refresh, 1)
+  assert.deepEqual(calls.save, [])
+  assert.deepEqual(calls.load, [])
+})
+
+test('an unavailable Director profile model can be repaired by updating from the current setup', async () => {
+  const { GenerationProfiles } = await loadGenerationProfiles()
+  const calls = resetProfileRuntime({ generationMode: 'audio', stateValues: ['director-a', '', true, null, false, null] })
+  globalThis.__profileStore.presets.push({
+    ...preset('director-a', 'Old shoot', 'video', 'missing_video'),
+    profile_version: 3, profile_context: 'director', director_settings: {},
+  })
+  const elements = flattenElements(GenerationProfiles({ placement: 'director', loadOnMount: false }))
+  const load = elements.find(element => element.type === 'button' && elementText(element).trim() === 'Model unavailable')
+  const update = elements.find(element => element.type === 'button' && elementText(element).trim() === 'Update Old shoot')
+  assert.equal(load.props.disabled, true)
+  assert.equal(update.props.disabled, false)
+  update.props.onClick()
+  await flushAsyncAction()
+  assert.deepEqual(calls.update, ['director-a'])
 })

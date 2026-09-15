@@ -218,16 +218,16 @@ export function DirectorImageRoleLoraSelector({
 }
 
 /** Import the LoRA selection from a generation profile into this Director role. */
-function DirectorProfileLoraPicker({ mode, modelType }: {
+function DirectorProfileLoraPicker({ mode, modelType, availableLoras }: {
   mode: 'image' | 'video'
   modelType: string
+  availableLoras: string[]
 }) {
   const presets = useStore(s => s.presets)
   const presetsLoading = useStore(s => s.presetsLoading)
   const presetsError = useStore(s => s.presetsError)
   const loadPresets = useStore(s => s.loadPresets)
   const directorSetLora = useStore(s => s.directorSetLora)
-  const savedLora = useStore(s => s.savedLoraPerMode[mode])
 
   useEffect(() => { loadPresets() }, [loadPresets])
 
@@ -245,7 +245,8 @@ function DirectorProfileLoraPicker({ mode, modelType }: {
       preset.activated_loras,
       preset.loras_multipliers,
       preset.lora_weights || {},
-      savedLora?.availableLoras || [],
+      availableLoras,
+      modelType,
     )
   }
 
@@ -275,7 +276,8 @@ function DirectorProfileLoraPicker({ mode, modelType }: {
 
 /**
  * Standalone LoRA selector for Director mode with recommended weight zones,
- * guide indicators, CivitAI browser trigger, and auto-apply defaults.
+ * guide indicators, CivitAI browser trigger, and deliberate defaults when a
+ * new LoRA is selected.
  */
 export function DirectorLoraSelector({ mode, modelType }: {
   mode: 'image' | 'video'
@@ -300,10 +302,20 @@ export function DirectorLoraSelector({ mode, modelType }: {
   const sortMode = useStore(s => s.loraPickerSort)
   const setSortSticky = useStore(s => s.setLoraPickerSort)
 
-  const persist = useCallback((newLoras: string[], newWeights: Record<string, number[]>) => {
+  // Keep a stale selection bound to its original model until the user confirms
+  // that it should move. An empty working set is a fresh selection and should
+  // use the currently selected model through the store's default.
+  const previousBinding = savedLora?.activated_loras?.length
+    ? (savedLora.model_type ?? '')
+    : undefined
+  const persist = useCallback((
+    newLoras: string[],
+    newWeights: Record<string, number[]>,
+    bindingModelType: string | undefined = previousBinding,
+  ) => {
     const multipliers = serializeMultipliers(newLoras, newWeights)
-    directorSetLora(mode, newLoras, multipliers, newWeights, availableLoras)
-  }, [mode, availableLoras, directorSetLora])
+    directorSetLora(mode, newLoras, multipliers, newWeights, availableLoras, bindingModelType)
+  }, [mode, previousBinding, availableLoras, directorSetLora])
 
   const updateWeight = useCallback((filename: string, phaseIndex: number, value: number) => {
     if (!Number.isFinite(value)) return
@@ -330,24 +342,8 @@ export function DirectorLoraSelector({ mode, modelType }: {
         const newPhases = data.guidance_max_phases ?? 1
         setAvailableLoras(data.loras)
         setPhases(newPhases)
-        setActivatedLoras(prev => {
-          const valid = prev.filter(l => data.loras.includes(l))
-          const adjustedWeights: Record<string, number[]> = {}
-          valid.forEach(l => {
-            const existing = loraWeights[l] || Array(newPhases).fill(1.0)
-            if (existing.length < newPhases) {
-              adjustedWeights[l] = [...existing, ...Array(newPhases - existing.length).fill(1.0)]
-            } else {
-              adjustedWeights[l] = existing.slice(0, newPhases)
-            }
-          })
-          if (valid.length !== prev.length || newPhases !== (loraWeights[valid[0]]?.length ?? 1)) {
-            const multipliers = serializeMultipliers(valid, adjustedWeights)
-            directorSetLora(mode, valid, multipliers, adjustedWeights, data.loras)
-          }
-          setLoraWeights(adjustedWeights)
-          return valid
-        })
+        // A catalog refresh is not permission to remove or rebind selections.
+        // Keep missing names visible and adapt phases only after confirmation.
         setLoading(false)
       }).catch(() => {
         if (!cancelled) {
@@ -357,7 +353,7 @@ export function DirectorLoraSelector({ mode, modelType }: {
       })
     })
     return () => { cancelled = true }
-  }, [modelType]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [modelType])
 
   // Load weight recommendations and guide status
   useEffect(() => {
@@ -381,26 +377,6 @@ export function DirectorLoraSelector({ mode, modelType }: {
       setGuideTexts(prev => ({ ...prev, ...guides }))
       setGuideStatus(prev => ({ ...prev, ...statuses }))
       setLoraDates(dates)
-
-      // Auto-apply recommended defaults to newly activated LoRAs at 1.0 fill
-      for (const lora of activatedLoras) {
-        const rec = recs[lora]
-        if (!rec) continue
-        const currentWeights = loraWeights[lora]
-        if (!currentWeights || !currentWeights.every(w => w === 1.0)) continue
-        const newWeights = currentWeights.map((_, i) => {
-          const phaseRec = rec.phases?.find(p => p.phase === i + 1)
-          const d = phaseRec?.default ?? rec.default
-          const min = phaseRec?.min ?? rec.min
-          const max = phaseRec?.max ?? rec.max
-          if (d != null && d >= min && d <= max) return d
-          if (min != null && max != null) return Math.round(((min + max) / 2) * 20) / 20
-          return d ?? 0.8
-        })
-        for (let i = 0; i < newWeights.length; i++) {
-          updateWeight(lora, i, newWeights[i])
-        }
-      }
     }).catch(error => {
       if (detailsRequest !== loraDetailsRequest.current) return
       console.error('Could not load Director LoRA details:', error)
@@ -423,7 +399,6 @@ export function DirectorLoraSelector({ mode, modelType }: {
       if (cancelled) return
       setActivatedLoras(savedLora.activated_loras || [])
       setLoraWeights(savedLora.loraWeights || {})
-      if (savedLora.availableLoras?.length) setAvailableLoras(savedLora.availableLoras)
     })
     return () => { cancelled = true }
   }, [savedLora])
@@ -484,6 +459,21 @@ export function DirectorLoraSelector({ mode, modelType }: {
     loraDates,
   )
 
+  const unavailable = activatedLoras.filter(name => !availableLoras.includes(name))
+  const needsConfirmation = activatedLoras.length > 0 && (
+    savedLora?.model_type !== modelType
+    || activatedLoras.some(name => (loraWeights[name]?.length ?? 1) !== phases)
+  )
+  const confirmSelection = () => {
+    if (unavailable.length) return
+    const weights = Object.fromEntries(activatedLoras.map(name => {
+      const previous = loraWeights[name] || [1]
+      return [name, Array.from({ length: phases }, (_, index) => previous[index] ?? previous.at(-1) ?? 1)]
+    }))
+    setLoraWeights(weights)
+    persist(activatedLoras, weights, modelType)
+  }
+
   if (loading) {
     return (
       <div className="text-xs text-text-muted bg-bg-tertiary border border-border rounded-lg px-3 py-3 text-center flex items-center justify-center gap-2">
@@ -493,7 +483,7 @@ export function DirectorLoraSelector({ mode, modelType }: {
     )
   }
 
-  if (availableLoras.length === 0) {
+  if (availableLoras.length === 0 && activatedLoras.length === 0) {
     return (
       <div className="flex items-center justify-between">
         <div className="text-xs text-text-muted">No LoRAs found</div>
@@ -509,7 +499,17 @@ export function DirectorLoraSelector({ mode, modelType }: {
 
   return (
     <div>
-      <DirectorProfileLoraPicker mode={mode} modelType={modelType} />
+      <DirectorProfileLoraPicker mode={mode} modelType={modelType} availableLoras={availableLoras} />
+      {needsConfirmation && (
+        <div className="mb-2 space-y-1 text-[10px] text-text-secondary">
+          <p>Review these LoRAs for the selected model.</p>
+          <button type="button" onClick={confirmSelection} disabled={unavailable.length > 0}
+            className="mobile-control-target rounded border border-border px-2 py-1 text-accent-blue disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">
+            Use these LoRAs
+          </button>
+        </div>
+      )}
+      {unavailable.length > 0 && <p role="status" className="mb-2 text-[10px] text-amber-400">Remove unavailable LoRAs or choose another model.</p>}
 
       {/* Header with Browse */}
       <div className="flex items-center justify-between mb-1.5">
@@ -612,6 +612,7 @@ export function DirectorLoraSelector({ mode, modelType }: {
                 <div className="flex items-center justify-between mb-1">
                   <span className="text-xs text-text-primary truncate flex-1 mr-2">
                     {displayName(filename)}
+                    {!availableLoras.includes(filename) && <span className="ml-1 text-amber-400">· Unavailable</span>}
                   </span>
                   <div className="flex items-center gap-0.5 shrink-0">
                     {guideStatus[filename] === 'exists' || guideStatus[filename] === 'done' ? (

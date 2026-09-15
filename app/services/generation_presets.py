@@ -58,6 +58,9 @@ _LEGACY_PRESET_KEYS = frozenset(
     }
 )
 _V2_PRESET_KEYS = _LEGACY_PRESET_KEYS | {"profile_version", "ui_settings"}
+_V3_PRESET_KEYS = _LEGACY_PRESET_KEYS | {
+    "profile_version", "profile_context", "director_settings",
+}
 _V2_REQUIRED_PARAM_KEYS = frozenset(
     {
         "resolution",
@@ -100,6 +103,45 @@ _CUSTOM_SETTING_KEYS = frozenset(
 _RECORD_METADATA_KEYS = frozenset({"id", "created_at"})
 _STORED_METADATA_KEYS = _RECORD_METADATA_KEYS | {"sequence"}
 _PROFILE_FIELDS_PATH = Path(__file__).with_name("generation_profile_fields.json")
+
+_DIRECTOR_RESOLUTION_PRESETS = frozenset(
+    {"auto", "480p", "540p", "720p", "768p", "1080p"},
+)
+_DIRECTOR_ASPECT_RATIOS = frozenset(
+    {"auto", "16:9", "9:16", "1:1", "4:3", "3:4"},
+)
+_DIRECTOR_SHOT_IMAGE_GUIDANCE = frozenset(
+    {"auto", "prompt_only", "generate"},
+)
+_DIRECTOR_ROLE_NAMES = frozenset({"creator", "editor"})
+_DIRECTOR_SETTINGS_KEYS = frozenset(
+    {
+        "resolution",
+        "aspect_ratio",
+        "seamless",
+        "shot_image_guidance",
+        "h3_style_workflow",
+        "video_inference_steps",
+        "video_max_shot_frames",
+        "video_film_grain_intensity",
+        "video_film_grain_saturation",
+        "video_self_refiner",
+        "audio_scale",
+        "identity_guidance_scale",
+        "image_roles",
+    },
+)
+_DIRECTOR_IMAGE_ROLE_KEYS = frozenset(
+    {"model_override", "lora_model_type", "loras"},
+)
+_DIRECTOR_ROLE_LORA_KEYS = (
+    frozenset({"id", "multiplier"}),
+    frozenset({
+        "id", "multiplier", "parameter_schema_digest", "parameter_values",
+    }),
+)
+_LORA_PARAMETER_ID_RE = re.compile(r"[A-Za-z][A-Za-z0-9._:-]{0,63}\Z")
+_DIRECTOR_MAX_SHOT_FRAMES = 16_777_216
 
 
 class GenerationPresetError(ValueError):
@@ -272,6 +314,12 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 GENERATION_PROFILE_FIELDS = _load_profile_fields()
+_DIRECTOR_IDENTITY_GUIDANCE_DESCRIPTOR = GENERATION_PROFILE_FIELDS["ui"][
+    "directorIdentityGuidanceScale"
+]
+_DIRECTOR_STYLE_WORKFLOW_DESCRIPTOR = GENERATION_PROFILE_FIELDS["ui"][
+    "h3StyleWorkflow"
+]
 
 
 def _bounded_text(
@@ -615,6 +663,239 @@ def _normalize_ui_settings(value: Any) -> dict[str, Any]:
     return normalized
 
 
+def _director_model_id(value: Any, name: str, *, allow_empty: bool = False) -> str | None:
+    if type(value) is not str:
+        raise GenerationPresetError(f"{name} must be a technical model id")
+    if not value and allow_empty:
+        return ""
+    if _TECHNICAL_ID_RE.fullmatch(value) is None:
+        raise GenerationPresetError(f"{name} is invalid")
+    return value
+
+
+def _director_lora_id(value: Any, name: str) -> str:
+    identifier = _bounded_text(value, name, maximum_bytes=512)
+    if (
+        not identifier
+        or identifier in {".", ".."}
+        or "/" in identifier
+        or "\\" in identifier
+    ):
+        raise GenerationPresetError(f"{name} must be a catalog filename")
+    return identifier
+
+
+def _normalize_director_parameter_values(
+    value: Any,
+    name: str,
+) -> dict[str, bool | int | float | str]:
+    """Keep role parameter values scalar until the runtime schema is resolved."""
+    if type(value) is not dict or len(value) > 64:
+        raise GenerationPresetError(f"{name} must be a bounded plain object")
+    normalized: dict[str, bool | int | float | str] = {}
+    for key, item in value.items():
+        if type(key) is not str or _LORA_PARAMETER_ID_RE.fullmatch(key) is None:
+            raise GenerationPresetError(f"{name} contains an invalid parameter id")
+        if type(item) is bool:
+            normalized[key] = item
+        elif type(item) is int:
+            if abs(item) > 9_007_199_254_740_991:
+                raise GenerationPresetError(f"{name} contains an unsafe integer")
+            normalized[key] = item
+        elif type(item) is float:
+            if not math.isfinite(item) or abs(item) > 1_000_000_000_000:
+                raise GenerationPresetError(f"{name} contains an unsafe number")
+            normalized[key] = item
+        elif type(item) is str:
+            normalized[key] = _bounded_text(
+                item,
+                f"{name}.{key}",
+                maximum_bytes=500,
+                allow_empty=True,
+            )
+        else:
+            raise GenerationPresetError(
+                f"{name} must contain only scalar parameter values",
+            )
+    return normalized
+
+
+def _normalize_director_role_loras(
+    value: Any,
+    name: str,
+) -> list[dict[str, Any]]:
+    if type(value) is not list or len(value) > 64:
+        raise GenerationPresetError(f"{name} must be a bounded plain list")
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(value):
+        item_name = f"{name}[{index}]"
+        if type(item) is not dict or frozenset(item) not in _DIRECTOR_ROLE_LORA_KEYS:
+            raise GenerationPresetError(f"{item_name} has invalid fields")
+        identifier = _director_lora_id(item.get("id"), f"{item_name}.id")
+        if identifier in seen:
+            raise GenerationPresetError(f"{name} contains duplicate LoRA ids")
+        seen.add(identifier)
+        multiplier = _number(
+            item.get("multiplier"),
+            f"{item_name}.multiplier",
+            minimum=-10,
+            maximum=10,
+        )
+        row: dict[str, Any] = {
+            "id": identifier,
+            "multiplier": multiplier,
+        }
+        if frozenset(item) == _DIRECTOR_ROLE_LORA_KEYS[1]:
+            digest = item.get("parameter_schema_digest")
+            if type(digest) is not str or _HEX64_RE.fullmatch(digest) is None:
+                raise GenerationPresetError(
+                    f"{item_name}.parameter_schema_digest is invalid",
+                )
+            row["parameter_schema_digest"] = digest
+            row["parameter_values"] = _normalize_director_parameter_values(
+                item.get("parameter_values"),
+                f"{item_name}.parameter_values",
+            )
+        normalized.append(row)
+    return normalized
+
+
+def _normalize_director_image_role(value: Any, name: str) -> dict[str, Any]:
+    if type(value) is not dict or set(value) != _DIRECTOR_IMAGE_ROLE_KEYS:
+        raise GenerationPresetError(f"{name} has invalid fields")
+    model_override = _director_model_id(
+        value["model_override"], f"{name}.model_override", allow_empty=True,
+    )
+    lora_model_type = _director_model_id(
+        value["lora_model_type"], f"{name}.lora_model_type",
+    ) if value["lora_model_type"] is not None else None
+    loras = _normalize_director_role_loras(value["loras"], f"{name}.loras")
+    if loras and lora_model_type is None:
+        raise GenerationPresetError(
+            f"{name}.lora_model_type is required when LoRAs are selected",
+        )
+    if not loras and lora_model_type is not None:
+        raise GenerationPresetError(
+            f"{name}.lora_model_type requires selected LoRAs",
+        )
+    if loras and model_override and model_override != lora_model_type:
+        raise GenerationPresetError(
+            f"{name}.model_override must match lora_model_type",
+        )
+    return {
+        "model_override": model_override,
+        "lora_model_type": lora_model_type,
+        "loras": loras,
+    }
+
+
+def _normalize_director_settings(value: Any) -> dict[str, Any]:
+    if type(value) is not dict or set(value) != _DIRECTOR_SETTINGS_KEYS:
+        raise GenerationPresetError(
+            "director_settings are incomplete, unsupported, or private",
+        )
+    resolution = value["resolution"]
+    if type(resolution) is not str or resolution not in _DIRECTOR_RESOLUTION_PRESETS:
+        raise GenerationPresetError("director resolution is invalid")
+    aspect_ratio = value["aspect_ratio"]
+    if type(aspect_ratio) is not str or aspect_ratio not in _DIRECTOR_ASPECT_RATIOS:
+        raise GenerationPresetError("director aspect ratio is invalid")
+    seamless = value["seamless"]
+    if type(seamless) is not bool:
+        raise GenerationPresetError("director seamless setting must be a boolean")
+    shot_image_guidance = value["shot_image_guidance"]
+    if (
+        type(shot_image_guidance) is not str
+        or shot_image_guidance not in _DIRECTOR_SHOT_IMAGE_GUIDANCE
+    ):
+        raise GenerationPresetError("director shot image guidance is invalid")
+    h3_style_workflow = _profile_field_value(
+        value["h3_style_workflow"],
+        _DIRECTOR_STYLE_WORKFLOW_DESCRIPTOR,
+        "director H3 style workflow",
+    )
+    video_inference_steps = value["video_inference_steps"]
+    if video_inference_steps is not None:
+        video_inference_steps = _integer(
+            video_inference_steps,
+            "director video inference steps",
+            minimum=1,
+            maximum=50,
+        )
+    video_max_shot_frames = value["video_max_shot_frames"]
+    if video_max_shot_frames is not None:
+        video_max_shot_frames = _integer(
+            video_max_shot_frames,
+            "director maximum shot frames",
+            minimum=1,
+            maximum=_DIRECTOR_MAX_SHOT_FRAMES,
+        )
+    video_film_grain_intensity = _number(
+        value["video_film_grain_intensity"],
+        "director film grain intensity",
+        minimum=0,
+        maximum=1,
+    )
+    video_film_grain_saturation = _number(
+        value["video_film_grain_saturation"],
+        "director film grain saturation",
+        minimum=0,
+        maximum=1,
+    )
+    video_self_refiner = _integer(
+        value["video_self_refiner"],
+        "director self refiner",
+        minimum=0,
+        maximum=2,
+    )
+    audio_scale = _number(
+        value["audio_scale"],
+        "director audio scale",
+        minimum=0,
+        maximum=5,
+    )
+    identity_guidance_scale = _profile_field_value(
+        value["identity_guidance_scale"],
+        _DIRECTOR_IDENTITY_GUIDANCE_DESCRIPTOR,
+        "director identity guidance scale",
+    )
+    image_roles = value["image_roles"]
+    if type(image_roles) is not dict or set(image_roles) != _DIRECTOR_ROLE_NAMES:
+        raise GenerationPresetError("director image roles are incomplete or invalid")
+    normalized = {
+        "resolution": resolution,
+        "aspect_ratio": aspect_ratio,
+        "seamless": seamless,
+        "shot_image_guidance": shot_image_guidance,
+        "h3_style_workflow": h3_style_workflow,
+        "video_inference_steps": video_inference_steps,
+        "video_max_shot_frames": video_max_shot_frames,
+        "video_film_grain_intensity": video_film_grain_intensity,
+        "video_film_grain_saturation": video_film_grain_saturation,
+        "video_self_refiner": video_self_refiner,
+        "audio_scale": audio_scale,
+        "identity_guidance_scale": identity_guidance_scale,
+        "image_roles": {
+            role: _normalize_director_image_role(
+                image_roles[role], f"director image role {role}",
+            )
+            for role in ("creator", "editor")
+        },
+    }
+    try:
+        encoded = _canonical(normalized)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise GenerationPresetError(
+            "director_settings cannot be serialized safely",
+        ) from error
+    if len(encoded) > MAX_PARAMS_BYTES:
+        raise GenerationPresetLimitError(
+            "director_settings exceed their serialized bound",
+        )
+    return normalized
+
+
 def _normalize_params(value: Any) -> dict[str, Any]:
     if type(value) is not dict:
         raise GenerationPresetError("params must be a plain JSON object")
@@ -738,6 +1019,8 @@ def _normalize_preset(value: Any) -> dict[str, Any]:
         expected_keys = _LEGACY_PRESET_KEYS
     elif profile_version == 2 and type(profile_version) is int:
         expected_keys = _V2_PRESET_KEYS
+    elif profile_version == 3 and type(profile_version) is int:
+        expected_keys = _V3_PRESET_KEYS
     else:
         raise GenerationPresetError("generation profile version is unsupported")
     if set(value) != expected_keys:
@@ -750,10 +1033,17 @@ def _normalize_preset(value: Any) -> dict[str, Any]:
     mode = value["mode"]
     if type(mode) is not str or mode not in _MODES:
         raise GenerationPresetError("generation mode is invalid")
+    if profile_version == 3:
+        if mode != "video":
+            raise GenerationPresetError(
+                "Director profiles require video generation mode",
+            )
+        if value["profile_context"] != "director":
+            raise GenerationPresetError("Director profile context is invalid")
     model_type = _bounded_text(
         value["model_type"], "model type", maximum_bytes=256,
     )
-    if profile_version == 2 and _TECHNICAL_ID_RE.fullmatch(model_type) is None:
+    if profile_version in {2, 3} and _TECHNICAL_ID_RE.fullmatch(model_type) is None:
         raise GenerationPresetError("model type is invalid")
     raw_loras = value["activated_loras"]
     if type(raw_loras) is not list or len(raw_loras) > 64:
@@ -835,18 +1125,29 @@ def _normalize_preset(value: Any) -> dict[str, Any]:
         "spatial_upsampling": spatial_upsampling,
         "params": (
             _normalize_v2_params(value["params"])
-            if profile_version == 2
+            if profile_version in {2, 3}
             else _normalize_params(value["params"])
         ),
     }
     if profile_version == 2:
         normalized["profile_version"] = 2
         normalized["ui_settings"] = _normalize_ui_settings(value["ui_settings"])
+    elif profile_version == 3:
+        normalized["profile_version"] = 3
+        normalized["profile_context"] = "director"
+        normalized["director_settings"] = _normalize_director_settings(
+            value["director_settings"],
+        )
     return normalized
 
 
 def _preset_keys(value: Mapping[str, Any]) -> frozenset[str]:
-    return _V2_PRESET_KEYS if value.get("profile_version") == 2 else _LEGACY_PRESET_KEYS
+    profile_version = value.get("profile_version")
+    if profile_version == 2:
+        return _V2_PRESET_KEYS
+    if profile_version == 3:
+        return _V3_PRESET_KEYS
+    return _LEGACY_PRESET_KEYS
 
 
 def _empty_state() -> dict[str, Any]:
@@ -1370,6 +1671,13 @@ class GenerationPresetStore:
                 )
             existing = records[existing_index]
             normalized_keys = _preset_keys(normalized)
+            if (
+                (existing.get("profile_context") == "director")
+                != (normalized.get("profile_context") == "director")
+            ):
+                raise GenerationPresetConflict(
+                    "preset changed or is unavailable",
+                )
             if (
                 _preset_keys(existing) == normalized_keys
                 and all(existing[key] == normalized[key] for key in normalized_keys)

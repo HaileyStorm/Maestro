@@ -1,9 +1,10 @@
 import { GenerationProfileRefreshStatus } from '../GenerationProfileRefreshStatus'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { FolderOpen, Save, Trash2 } from 'lucide-react'
-import { GenerationPresetConflictError, type GenerationPreset } from '../../api/client'
+import { DirectorRequestError, GenerationPresetConflictError, type GenerationPreset } from '../../api/client'
 import { currentAccountIdentityEpoch, useStore } from '../../stores/useStore'
 import { GenerationProfileSettingsError } from '../../lib/generationProfiles'
+import { isDirectorProfile } from '../../lib/directorProfiles'
 
 
 type ProfileNotice = {
@@ -13,15 +14,22 @@ type ProfileNotice = {
 
 interface GenerationProfilesProps {
   loadOnMount?: boolean
-  placement?: 'sidebar' | 'advanced'
+  placement?: 'sidebar' | 'advanced' | 'director'
 }
 
 export function GenerationProfiles(props: GenerationProfilesProps = {}) {
   const account = useStore(state => state.accountContext)
   const workspace = useStore(state => state.activeWorkspace)
-  const mode = useStore(state => state.generationMode)
+  const currentMode = useStore(state => state.generationMode)
+  const directorSupported = useStore(state => state.directorProfilesSupported)
+  const loadPresets = useStore(state => state.loadPresets)
+  const mode = props.placement === 'director' ? 'director' : currentMode
   const scopeKey = JSON.stringify([currentAccountIdentityEpoch(), account?.account?.id, workspace, mode])
-  return <GenerationProfilesPanel key={scopeKey} {...props} />
+  useEffect(() => {
+    if (props.placement === 'director' && props.loadOnMount !== false) void loadPresets()
+  }, [loadPresets, props.placement, props.loadOnMount, scopeKey])
+  if (props.placement === 'director' && !directorSupported) return null
+  return <GenerationProfilesPanel key={scopeKey} {...props} loadOnMount={props.placement === 'director' ? false : props.loadOnMount} />
 }
 
 function GenerationProfilesPanel({
@@ -36,11 +44,13 @@ function GenerationProfilesPanel({
   const updatePreset = useStore(state => state.updatePreset)
   const loadPreset = useStore(state => state.loadPreset)
   const deletePreset = useStore(state => state.deletePreset)
-  const generationMode = useStore(state => state.generationMode)
+  const currentMode = useStore(state => state.generationMode)
+  const director = placement === 'director'
+  const generationMode = director ? 'video' : currentMode
   const models = useStore(state => state.models) || []
   const modelsLoaded = useStore(state => state.modelsLoaded)
-  const selectedId = useStore(state => state.selectedGenerationProfileId)
-  const setSelectedId = useStore(state => state.setSelectedGenerationProfileId)
+  const selectedId = useStore(state => director ? state.selectedDirectorProfileId : state.selectedGenerationProfileId)
+  const setSelectedId = useStore(state => director ? state.setSelectedDirectorProfileId : state.setSelectedGenerationProfileId)
   const [saveName, setSaveName] = useState('')
   const [showSave, setShowSave] = useState(false)
   const [activeAction, setActiveAction] = useState<'save' | 'update' | 'load' | 'delete' | null>(null)
@@ -55,8 +65,9 @@ function GenerationProfilesPanel({
   }, [loadOnMount, loadPresets])
 
   const modeProfiles = useMemo(
-    () => presets.filter(profile => profile.mode === generationMode),
-    [generationMode, presets],
+    () => presets.filter(profile => profile.mode === generationMode
+      && (director ? isDirectorProfile(profile) : profile.profile_context !== 'director')),
+    [director, generationMode, presets],
   )
   const selected = modeProfiles.find(profile => profile.id === selectedId) || null
 
@@ -81,13 +92,16 @@ function GenerationProfilesPanel({
     const name = saveName.trim()
     if (!name || !beginAction('save')) return
     try {
-      await savePreset(name)
+      if (director) await savePreset(name, 'director')
+      else await savePreset(name)
       setSaveName('')
       setShowSave(false)
       setNotice({ kind: 'success', text: 'Profile saved.' })
     } catch (error) {
-      setNotice({ kind: 'error', text: error instanceof GenerationProfileSettingsError
-        ? 'Keep this setup open. Its settings could not all be saved.'
+      setNotice({ kind: 'error', text: director && error instanceof DirectorRequestError
+        ? 'Check the highlighted Director setting, then save again.'
+        : error instanceof GenerationProfileSettingsError
+        ? director ? error.message : 'Keep this setup open. Its settings could not all be saved.'
         : 'Profile could not be saved. Try again.' })
     } finally {
       finishAction()
@@ -103,8 +117,10 @@ function GenerationProfilesPanel({
     } catch (error) {
       setNotice({ kind: 'error', text: error instanceof GenerationPresetConflictError
         ? 'Profile changed elsewhere. Review it before updating.'
+        : director && error instanceof DirectorRequestError
+          ? 'Check the highlighted Director setting, then update again.'
         : error instanceof GenerationProfileSettingsError
-          ? 'Keep this setup open. Its settings could not all be saved.'
+          ? director ? error.message : 'Keep this setup open. Its settings could not all be saved.'
           : 'Profile could not be updated. Try again.' })
     } finally {
       finishAction()
@@ -117,8 +133,11 @@ function GenerationProfilesPanel({
       const loaded = await loadPreset(selected)
       if (loaded === false) throw new Error('Profile load was not confirmed')
       setNotice({ kind: 'success', text: `${selected.name} loaded.` })
-    } catch {
-      setNotice({ kind: 'error', text: 'Profile could not be loaded. Try again.' })
+    } catch (error) {
+      setNotice({ kind: 'error', text: error instanceof DirectorRequestError
+        ? 'Check the highlighted Director setting, then load again.'
+        : director && error instanceof GenerationProfileSettingsError ? error.message
+        : 'Profile could not be loaded. Try again.' })
     } finally {
       finishAction()
     }
@@ -156,7 +175,7 @@ function GenerationProfilesPanel({
 
   return (
     <section
-      aria-label="Generation profiles"
+      aria-label={director ? 'Director profiles' : 'Generation profiles'}
       data-generation-profiles={placement}
       className={`rounded-lg border border-border bg-bg-tertiary/45 ${
         placement === 'advanced' ? 'p-3' : 'p-2.5'
@@ -165,7 +184,7 @@ function GenerationProfilesPanel({
       <div className="flex items-end gap-2">
         <label htmlFor={selectId} className="min-w-0 flex-1">
           <span className="mb-1 block text-[10px] font-medium uppercase tracking-wider text-text-muted">
-            Saved profile
+            {director ? 'Director profile' : 'Saved profile'}
           </span>
           <select
             id={selectId}
@@ -256,7 +275,7 @@ function GenerationProfilesPanel({
       {selected && (
         <div className="mt-2 flex items-center justify-between gap-2 border-t border-border/70 pt-2">
           <span className="min-w-0 truncate text-[10px] text-text-muted">
-            {selected.model_type} · {selected.activated_loras.length} LoRA{selected.activated_loras.length === 1 ? '' : 's'}
+            {selectedModel?.name || selected.model_type} · {selected.activated_loras.length} {director ? 'video ' : ''}LoRA{selected.activated_loras.length === 1 ? '' : 's'}
           </span>
           <button
             type="button"

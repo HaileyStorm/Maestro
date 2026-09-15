@@ -126,6 +126,57 @@ def v2_preset_payload() -> dict:
     }
 
 
+def director_preset_payload() -> dict:
+    payload = v2_preset_payload()
+    payload.update({
+        "name": "Complete Director profile",
+        "mode": "video",
+        "model_type": "ltx2_22B_distilled_1_1",
+        "profile_version": 3,
+        "profile_context": "director",
+    })
+    payload.pop("ui_settings")
+    payload["director_settings"] = {
+        "resolution": "720p",
+        "aspect_ratio": "16:9",
+        "seamless": False,
+        "shot_image_guidance": "auto",
+        "h3_style_workflow": "",
+        "video_inference_steps": None,
+        "video_max_shot_frames": None,
+        "video_film_grain_intensity": 0,
+        "video_film_grain_saturation": 0,
+        "video_self_refiner": 0,
+        "audio_scale": 0,
+        "identity_guidance_scale": 0,
+        "image_roles": {
+            "creator": {
+                "model_override": "",
+                "lora_model_type": "image_creator_model",
+                "loras": [{
+                    "id": "creator-style.safetensors",
+                    "multiplier": 0,
+                    "parameter_schema_digest": "a" * 64,
+                    "parameter_values": {
+                        "enabled": False,
+                        "strength": 0,
+                        "label": "",
+                    },
+                }],
+            },
+            "editor": {
+                "model_override": "image_editor_model",
+                "lora_model_type": "image_editor_model",
+                "loras": [{
+                    "id": "editor-style.safetensors",
+                    "multiplier": -10,
+                }],
+            },
+        },
+    }
+    return payload
+
+
 def _concurrent_create(
     runtime_root: str,
     index: int,
@@ -417,6 +468,393 @@ class GenerationPresetStoreTests(unittest.TestCase):
         )
         self.assertEqual(listed[-1], updated)
         self.assertEqual(len(listed), 2)
+
+    def test_v3_complete_director_profile_round_trips_and_replays_exactly(self) -> None:
+        payload = director_preset_payload()
+        created = self.create(payload=payload, preset_id="complete-director")
+
+        self.assertEqual(created["profile_version"], 3)
+        self.assertEqual(created["profile_context"], "director")
+        self.assertEqual(created["mode"], "video")
+        self.assertNotIn("ui_settings", created)
+        self.assertEqual(
+            {key: created[key] for key in presets._preset_keys(created)},
+            payload,
+        )
+        self.assertIs(created["director_settings"]["seamless"], False)
+        self.assertEqual(created["director_settings"]["video_inference_steps"], None)
+        self.assertEqual(
+            created["director_settings"]["image_roles"]["creator"]["loras"][0][
+                "parameter_values"
+            ],
+            {"enabled": False, "strength": 0, "label": ""},
+        )
+
+        before = self.store.path.read_bytes()
+        replay = self.create(
+            payload=json.loads(json.dumps(payload)),
+            preset_id="complete-director",
+        )
+        self.assertEqual(replay, created)
+        self.assertEqual(self.store.path.read_bytes(), before)
+
+        reopened = presets.GenerationPresetStore(
+            self.runtime_root, scope_key=SCOPE_KEY,
+        )
+        self.assertEqual(
+            reopened.list(account_scope=ACCOUNT_A, project_scope=PROJECT_A),
+            [created],
+        )
+
+    def test_v3_update_replaces_settings_with_cas_and_idempotent_retry(self) -> None:
+        original = self.create(
+            payload=director_preset_payload(), preset_id="director-update",
+        )
+        desired = json.loads(json.dumps(director_preset_payload()))
+        desired.update({
+            "name": "Updated Director profile",
+            "spatial_upsampling": "director_upscale",
+        })
+        desired["params"].update({
+            "num_inference_steps": 50,
+            "seed": 0,
+        })
+        settings = desired["director_settings"]
+        settings.update({
+            "resolution": "1080p",
+            "aspect_ratio": "9:16",
+            "seamless": True,
+            "shot_image_guidance": "generate",
+            "h3_style_workflow": "cinematic_v1",
+            "video_inference_steps": 50,
+            "video_max_shot_frames": 16_777_216,
+            "video_film_grain_intensity": 1,
+            "video_film_grain_saturation": 0.75,
+            "video_self_refiner": 2,
+            "audio_scale": 5,
+            "identity_guidance_scale": 10,
+        })
+        settings["image_roles"]["creator"].update({
+            "model_override": "image_creator_model",
+        })
+        settings["image_roles"]["creator"]["loras"][0]["parameter_values"].update({
+            "enabled": True,
+            "strength": 1.25,
+            "label": "updated",
+        })
+
+        updated = self.update(
+            payload=desired,
+            preset_id=original["id"],
+            expected_revision=original["revision"],
+        )
+        self.assertEqual(updated["id"], original["id"])
+        self.assertEqual(updated["created_at"], original["created_at"])
+        self.assertNotEqual(updated["revision"], original["revision"])
+        self.assertEqual(
+            {key: updated[key] for key in presets._preset_keys(updated)},
+            desired,
+        )
+
+        before = self.store.path.read_bytes()
+        replay = self.update(
+            payload=json.loads(json.dumps(desired)),
+            preset_id=original["id"],
+            expected_revision=original["revision"],
+        )
+        self.assertEqual(replay, updated)
+        self.assertEqual(self.store.path.read_bytes(), before)
+
+        stale = json.loads(json.dumps(desired))
+        stale["name"] = "Stale Director profile"
+        with self.assertRaises(presets.GenerationPresetConflict):
+            self.update(
+                payload=stale,
+                preset_id=original["id"],
+                expected_revision=original["revision"],
+            )
+
+    def test_update_rejects_director_cross_version_conversion_without_mutation(self) -> None:
+        director = self.create(
+            payload=director_preset_payload(), preset_id="director-cross-version",
+        )
+        before_director = self.store.path.read_bytes()
+        with self.assertRaisesRegex(
+            presets.GenerationPresetConflict,
+            "preset changed or is unavailable",
+        ):
+            self.update(
+                payload=v2_preset_payload(),
+                preset_id=director["id"],
+                expected_revision=director["revision"],
+            )
+        self.assertEqual(self.store.path.read_bytes(), before_director)
+        self.assertEqual(self.listing()[0], director)
+
+        modern = self.create(
+            payload=v2_preset_payload(), preset_id="v2-cross-version",
+        )
+        before_modern = self.store.path.read_bytes()
+        with self.assertRaisesRegex(
+            presets.GenerationPresetConflict,
+            "preset changed or is unavailable",
+        ):
+            self.update(
+                payload=director_preset_payload(),
+                preset_id=modern["id"],
+                expected_revision=modern["revision"],
+            )
+        self.assertEqual(self.store.path.read_bytes(), before_modern)
+        self.assertEqual(self.listing(), [director, modern])
+
+        legacy = self.create(
+            payload=preset_payload(name="Legacy upgrade"),
+            preset_id="legacy-upgrade",
+        )
+        upgrade = v2_preset_payload()
+        upgrade["name"] = "Legacy upgraded to v2"
+        upgraded = self.update(
+            payload=upgrade,
+            preset_id=legacy["id"],
+            expected_revision=legacy["revision"],
+        )
+        self.assertEqual(upgraded["id"], legacy["id"])
+        self.assertEqual(upgraded["profile_version"], 2)
+        self.assertEqual(upgraded["name"], "Legacy upgraded to v2")
+
+    def test_v3_rejects_incomplete_private_and_invalid_director_fields(self) -> None:
+        cases = [
+            ("missing profile context", lambda p: p.pop("profile_context")),
+            ("unsupported profile version", lambda p: p.__setitem__("profile_version", 4)),
+            ("wrong profile mode", lambda p: p.__setitem__("mode", "image")),
+            ("unknown root field", lambda p: p.__setitem__("plan", {})),
+            ("legacy ui settings field", lambda p: p.__setitem__("ui_settings", {})),
+            (
+                "missing director field",
+                lambda p: p["director_settings"].pop("aspect_ratio"),
+            ),
+            (
+                "unknown director field",
+                lambda p: p["director_settings"].__setitem__("private", 1),
+            ),
+            (
+                "private params field",
+                lambda p: p["params"].__setitem__("prompt", "private creative text"),
+            ),
+            (
+                "missing v2 runtime field",
+                lambda p: p["params"].pop("video_length"),
+            ),
+            (
+                "invalid resolution",
+                lambda p: p["director_settings"].__setitem__("resolution", "4k"),
+            ),
+            (
+                "invalid aspect ratio",
+                lambda p: p["director_settings"].__setitem__("aspect_ratio", "2:1"),
+            ),
+            (
+                "invalid shot image guidance",
+                lambda p: p["director_settings"].__setitem__(
+                    "shot_image_guidance", "always",
+                ),
+            ),
+            (
+                "invalid H3 style workflow",
+                lambda p: p["director_settings"].__setitem__(
+                    "h3_style_workflow", "/tmp/workflow",
+                ),
+            ),
+            (
+                "invalid video inference steps",
+                lambda p: p["director_settings"].__setitem__(
+                    "video_inference_steps", 51,
+                ),
+            ),
+            (
+                "video inference steps below minimum",
+                lambda p: p["director_settings"].__setitem__(
+                    "video_inference_steps", 0,
+                ),
+            ),
+            (
+                "invalid maximum shot frames",
+                lambda p: p["director_settings"].__setitem__(
+                    "video_max_shot_frames", 16_777_217,
+                ),
+            ),
+            (
+                "maximum shot frames below minimum",
+                lambda p: p["director_settings"].__setitem__(
+                    "video_max_shot_frames", 0,
+                ),
+            ),
+            (
+                "invalid film grain intensity",
+                lambda p: p["director_settings"].__setitem__(
+                    "video_film_grain_intensity", float("nan"),
+                ),
+            ),
+            (
+                "film grain intensity below minimum",
+                lambda p: p["director_settings"].__setitem__(
+                    "video_film_grain_intensity", -0.01,
+                ),
+            ),
+            (
+                "invalid film grain saturation",
+                lambda p: p["director_settings"].__setitem__(
+                    "video_film_grain_saturation", 1.01,
+                ),
+            ),
+            (
+                "film grain saturation below minimum",
+                lambda p: p["director_settings"].__setitem__(
+                    "video_film_grain_saturation", -0.01,
+                ),
+            ),
+            (
+                "invalid self refiner",
+                lambda p: p["director_settings"].__setitem__("video_self_refiner", 1.5),
+            ),
+            (
+                "self refiner below minimum",
+                lambda p: p["director_settings"].__setitem__("video_self_refiner", -1),
+            ),
+            (
+                "invalid audio scale",
+                lambda p: p["director_settings"].__setitem__("audio_scale", 5.01),
+            ),
+            (
+                "audio scale below minimum",
+                lambda p: p["director_settings"].__setitem__("audio_scale", -0.01),
+            ),
+            (
+                "invalid identity guidance",
+                lambda p: p["director_settings"].__setitem__(
+                    "identity_guidance_scale", 10.01,
+                ),
+            ),
+            (
+                "identity guidance below minimum",
+                lambda p: p["director_settings"].__setitem__(
+                    "identity_guidance_scale", -0.01,
+                ),
+            ),
+            (
+                "invalid root model id",
+                lambda p: p.__setitem__("model_type", "/tmp/model"),
+            ),
+            (
+                "invalid role model id",
+                lambda p: p["director_settings"]["image_roles"]["editor"].__setitem__(
+                    "model_override", "/tmp/model",
+                ),
+            ),
+            (
+                "invalid role lora path",
+                lambda p: p["director_settings"]["image_roles"]["creator"]["loras"][0].__setitem__(
+                    "id", "../creator.safetensors",
+                ),
+            ),
+            (
+                "duplicate role lora id",
+                lambda p: p["director_settings"]["image_roles"]["creator"]["loras"].append(
+                    json.loads(json.dumps(
+                        p["director_settings"]["image_roles"]["creator"]["loras"][0],
+                    )),
+                ),
+            ),
+            (
+                "invalid digest",
+                lambda p: p["director_settings"]["image_roles"]["creator"]["loras"][0].__setitem__(
+                    "parameter_schema_digest", "A" * 64,
+                ),
+            ),
+            (
+                "short digest",
+                lambda p: p["director_settings"]["image_roles"]["creator"]["loras"][0].__setitem__(
+                    "parameter_schema_digest", "a" * 63,
+                ),
+            ),
+            (
+                "nonfinite role multiplier",
+                lambda p: p["director_settings"]["image_roles"]["editor"]["loras"][0].__setitem__(
+                    "multiplier", float("nan"),
+                ),
+            ),
+            (
+                "role multiplier outside range",
+                lambda p: p["director_settings"]["image_roles"]["editor"]["loras"][0].__setitem__(
+                    "multiplier", 10.01,
+                ),
+            ),
+            (
+                "nested role parameter",
+                lambda p: p["director_settings"]["image_roles"]["creator"]["loras"][0][
+                    "parameter_values"
+                ].__setitem__("nested", {"value": 1}),
+            ),
+            (
+                "private role parameter",
+                lambda p: p["director_settings"]["image_roles"]["creator"]["loras"][0][
+                    "parameter_values"
+                ].__setitem__("_secret", 1),
+            ),
+            (
+                "null role parameter",
+                lambda p: p["director_settings"]["image_roles"]["creator"]["loras"][0][
+                    "parameter_values"
+                ].__setitem__("nullable", None),
+            ),
+            (
+                "missing lora model type",
+                lambda p: p["director_settings"]["image_roles"]["creator"].__setitem__(
+                    "lora_model_type", None,
+                ),
+            ),
+            (
+                "orphan lora model type",
+                lambda p: (
+                    p["director_settings"]["image_roles"]["editor"].__setitem__(
+                        "loras", [],
+                    ),
+                    p["director_settings"]["image_roles"]["editor"].__setitem__(
+                        "lora_model_type", "image_editor_model",
+                    ),
+                ),
+            ),
+            (
+                "role model binding mismatch",
+                lambda p: p["director_settings"]["image_roles"]["creator"].__setitem__(
+                    "model_override", "different_image_model",
+                ),
+            ),
+            (
+                "unknown role field",
+                lambda p: p["director_settings"]["image_roles"]["creator"].__setitem__(
+                    "private", True,
+                ),
+            ),
+            (
+                "too many role loras",
+                lambda p: p["director_settings"]["image_roles"]["editor"].__setitem__(
+                    "loras", [
+                        {"id": f"editor-{index}.safetensors", "multiplier": 0}
+                        for index in range(65)
+                    ],
+                ),
+            ),
+        ]
+
+        for index, (label, mutate) in enumerate(cases):
+            payload = director_preset_payload()
+            mutate(payload)
+            with self.subTest(case=label), self.assertRaises(
+                presets.GenerationPresetError,
+            ):
+                self.create(payload=payload, preset_id=f"invalid-director-{index}")
+        self.assertEqual(self.listing(), [])
 
     def test_public_revision_is_derived_from_the_complete_stored_record(self) -> None:
         legacy = self.create(preset_id="legacy-revision")
@@ -1233,7 +1671,7 @@ class GenerationPresetStoreTests(unittest.TestCase):
             client.index("// --- Presets ---"):
             client.index("// --- LoRAs ---")
         ]
-        store_start = store.index("  savePreset: async (name) => {")
+        store_start = store.index("  savePreset: async (name, context) => {")
         store_contract = store[
             store_start:store.index("// Model options", store_start)
         ]
@@ -1243,6 +1681,36 @@ class GenerationPresetStoreTests(unittest.TestCase):
         self.assertNotIn("prompt: ''", store_contract)
         self.assertNotIn("negative_prompt", store_contract)
         self.assertIn("activeWorkspace", store_contract)
+
+    def test_list_route_advertises_director_profiles_and_preserves_presets(self) -> None:
+        source = (APP / "launch.py").read_text(encoding="utf-8")
+        node = next(
+            item for item in ast.parse(source).body
+            if isinstance(item, ast.FunctionDef) and item.name == "list_presets"
+        )
+        node.decorator_list = []
+
+        class Store:
+            def list(self, **_kwargs):
+                return [{"id": "saved-director"}]
+
+        store = Store()
+        namespace = {
+            "_generation_preset_scope": lambda *_args, **_kwargs: (
+                ACCOUNT_A, PROJECT_A,
+            ),
+            "_generation_preset_store": lambda: store,
+            "_raise_generation_preset_error": lambda error: (_ for _ in ()).throw(error),
+        }
+        module = ast.Module(body=[node], type_ignores=[])
+        ast.fix_missing_locations(module)
+        exec(compile(module, "preset-list-route", "exec"), namespace)
+
+        response = namespace["list_presets"](object(), "project")
+        self.assertEqual(response, {
+            "presets": [{"id": "saved-director"}],
+            "director_profiles_supported": True,
+        })
 
     def test_route_accepts_both_profile_versions_through_the_real_store(self) -> None:
         source = (APP / "launch.py").read_text(encoding="utf-8")

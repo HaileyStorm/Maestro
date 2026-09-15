@@ -5,6 +5,7 @@ import { downloadModel, estimateH3Performance, fetchDefaults, fetchModelOptions,
 import type { DirectorFailureComponent, DirectorImageRoleCandidate, DirectorReadinessReason } from '../../api/client'
 import { DirectorImageRoleLoraSelector, DirectorLoraSelector } from '../SettingsDrawer/DirectorLoraSelector'
 import { DirectorSongSetup } from './DirectorSongSetup'
+import { GenerationProfiles } from './GenerationProfiles'
 import { DirectorShotDeck } from '../DirectorShotDeck'
 import { InfoTooltip } from './InfoTooltip'
 import { H3StyleWorkflowField } from './PromptInput'
@@ -676,6 +677,7 @@ export function DirectorChat() {
     <div ref={directorRootRef} className="flex-1 flex flex-col min-h-0">
       {/* Message list */}
       <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
+        <GenerationProfiles placement="director" />
         {/* Header with Start Over */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-1.5">
@@ -2339,6 +2341,10 @@ function DirectorAdvancedAccordion() {
     const timer = window.setTimeout(() => {
       setH3SegmentEstimate(null)
       setH3EstimateUnavailable(false)
+      if (savedVideoLoras?.activated_loras.length && savedVideoLoras.model_type !== videoModel) {
+        setH3EstimateUnavailable(true)
+        return
+      }
       const customSettings = (
         matchingVideoParams.custom_settings
         || videoDefaults.custom_settings
@@ -2830,6 +2836,7 @@ function DirectorImageRoleControl({ role }: { role: DirectorImageRole }) {
     ? s.directorImageCreatorModelOverride : s.directorImageEditorModelOverride)
   const setRoleModel = useStore(s => s.setDirectorImageRoleModel)
   const selections = useStore(s => s.directorImageRoleLoras[role])
+  const boundModel = useStore(s => s.directorImageRoleLoraModels?.[role])
   const setSelections = useStore(s => s.setDirectorImageRoleLoras)
   const explicitOutput = useStore(s => s.explicitOutput)
   const componentError = useStore(s => s.directorComponentError)
@@ -2847,7 +2854,8 @@ function DirectorImageRoleControl({ role }: { role: DirectorImageRole }) {
     ? 'image_creator_model' : 'continuity_editor_model'
   const loraComponent: DirectorFailureComponent = role === 'creator'
     ? 'image_creator_lora' : 'continuity_editor_lora'
-  const lorasExpanded = lorasOpen || componentError?.component === loraComponent
+  const needsLoraConfirmation = selections.length > 0 && boundModel !== effectiveModel
+  const lorasExpanded = lorasOpen || needsLoraConfirmation || componentError?.component === loraComponent
 
   return (
     <fieldset
@@ -2889,13 +2897,22 @@ function DirectorImageRoleControl({ role }: { role: DirectorImageRole }) {
       )}
       <div data-director-component={loraComponent} tabIndex={-1} className="outline-none">
         <DirectorComponentAlert component={loraComponent} />
+        {needsLoraConfirmation && candidate?.ready && (
+          <div className="mt-2 space-y-1 text-[10px] text-text-secondary">
+            <p>Review these LoRAs for {modelName(effectiveModel)}.</p>
+            <button type="button" onClick={() => setSelections(role, selections, effectiveModel)}
+              className="mobile-control-target rounded border border-border px-2 py-1 text-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">
+              Use these LoRAs
+            </button>
+          </div>
+        )}
         {effectiveModel && candidate?.ready && (
           <div className={`mt-2 overflow-hidden rounded border ${componentError?.component === loraComponent ? 'border-red-500/60' : 'border-border'}`}>
             <button type="button" aria-expanded={lorasExpanded} onClick={() => setLorasOpen(!lorasExpanded)} className="flex w-full items-center justify-between px-2 py-1 text-[10px] text-text-secondary hover:bg-bg-hover">
               <span>{role === 'creator' ? 'Creator LoRAs' : 'Editor LoRAs'}{selections.length > 0 ? ` (${selections.length})` : ''}</span>
               {lorasExpanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
             </button>
-            {lorasExpanded && <div className="border-t border-border p-2"><DirectorImageRoleLoraSelector role={role} modelType={effectiveModel} selections={selections} onChange={next => setSelections(role, next)} /></div>}
+            {lorasExpanded && <div className="border-t border-border p-2"><DirectorImageRoleLoraSelector role={role} modelType={effectiveModel} selections={selections} onChange={next => setSelections(role, next, needsLoraConfirmation ? boundModel ?? '' : effectiveModel)} /></div>}
           </div>
         )}
       </div>

@@ -3,12 +3,18 @@ import { create } from 'zustand'
 import {
   captureGenerationModeUiSettings,
   captureGenerationProfileSettings,
+  GenerationProfileSettingsError,
   generationProfileUiKeys,
   projectGenerationProfileParameters,
   restoreGenerationModeUiSettings,
   restoreGenerationProfileSettings,
 } from '../lib/generationProfiles'
 import type { StoreApi } from 'zustand'
+import {
+  captureDirectorProfileSettings, captureDirectorVideoParameters,
+  directorProfileRoleMismatch, directorProfileStateKeys,
+  isDirectorProfile, restoreDirectorProfileSettings,
+} from '../lib/directorProfiles'
 import type { GenerateParams, OutputFile, MediaFilter, OutputArtifactScope, AspectRatio, ResolutionPreset, ScailResolutionProfile, GenerationJob, H3SegmentPlan, H3PlanDecision, H3PerformanceEstimate, H3SegmentCountEstimate, H3PerformanceProfile, H3PerformanceProfileId, ModelFamily, ModelDef, GenerationMode, ModelOptions, SystemConfig, SettingsTab, OutputMetadata, MultiClip, ServicesConfig, HostTermId, HostTermsStatus, LlmStatus, LlmModelOption, AudioAnalysisResult, PlannedClip, ClipPlan, DirectorClipImage, DirectorImageGenProgress, DirectorImageRole, DirectorImageRoleLoraSelection, SpeakerMapping, DirectorSkill, DirectorShotImageGuidance, ShortFilmCharacter, ShortFilmPath, CivitAIModel, CivitAIDownload, PipelineListItem, PipelineRepairState, SavedPipelineState, SystemDetectResponse, SystemStats, RecastCharacterMapping, RepaintRegionMapping, AccountAuthResult, AccountContext, AccountProjectMigrationStatus, AccountSession, AccountSummary, ResponsibleUseProjection, SupportAdminProjection, SupportFulfillmentMutationInput, SupportManualContributionInput, SupportPublicProjection, SupportSelfProjection, SupportH3LegalAccessProjection, SupportH3LegalAccessLocationInput } from '../types'
 import * as api from '../api/client'
 import { applyThemePrefs, getStoredPrefs, type FamilyId, type ThemeMode, type ThemePrefs } from '../lib/theme'
@@ -227,6 +233,8 @@ interface PersistedDirectorImageRoles {
   editor_model_override: string
   creator_loras: DirectorImageRoleLoraSelection[]
   editor_loras: DirectorImageRoleLoraSelection[]
+  creator_lora_model?: string | null
+  editor_lora_model?: string | null
 }
 
 function _loadDirectorImageRoles(): PersistedDirectorImageRoles | null {
@@ -241,6 +249,8 @@ function _loadDirectorImageRoles(): PersistedDirectorImageRoles | null {
         ? parsed.editor_model_override : '',
       creator_loras: Array.isArray(parsed.creator_loras) ? parsed.creator_loras : [],
       editor_loras: Array.isArray(parsed.editor_loras) ? parsed.editor_loras : [],
+      creator_lora_model: typeof parsed.creator_lora_model === 'string' ? parsed.creator_lora_model : null,
+      editor_lora_model: typeof parsed.editor_lora_model === 'string' ? parsed.editor_lora_model : null,
     }
   } catch {
     return null
@@ -1716,7 +1726,7 @@ const STORAGE_KEY = 'maestro_mode_settings'
 //       /api/v1/loras/installed) happens after boot in `loadModels()`.
 const _PERSIST_VERSION = 1
 
-type LoraModeBlob = { activated_loras: string[]; loras_multipliers: string; loraWeights: Record<string, number[]>; availableLoras: string[] }
+type LoraModeBlob = { model_type?: string; activated_loras: string[]; loras_multipliers: string; loraWeights: Record<string, number[]>; availableLoras: string[] }
 
 /** Per-mode working set. Persistence strips job-local media paths; refresh
  *  restores only the explicitly selected boot fields in loadModels. */
@@ -1749,7 +1759,9 @@ function _snapshotModeParams(
   state?: object,
 ): SavedModeParams {
   const snapshot: SavedModeParams = { ...params }
-  delete snapshot.model_type
+  // Keep the model identity in the snapshot as a binding marker. The
+  // selectedModelPerMode map remains authoritative for the active model;
+  // _restoreModeParams strips this marker before rebuilding GenerateParams.
   delete snapshot.prompt
   delete snapshot.activated_loras
   delete snapshot.loras_multipliers
@@ -1771,6 +1783,10 @@ function _snapshotModeParams(
 
 function _restoreModeParams(snapshot?: SavedModeParams): SavedModeParams {
   const restored = { ...(snapshot || {}) }
+  // model_type is retained in snapshots only to prove that their technical
+  // settings belong to the selected model. The mode's model map owns the
+  // value that is written back into GenerateParams.
+  delete restored.model_type
   delete restored.filmGrainIntensity
   delete restored.filmGrainSaturation
   delete restored.durationSeconds
@@ -1778,6 +1794,34 @@ function _restoreModeParams(snapshot?: SavedModeParams): SavedModeParams {
   delete restored.spatialUpsampling
   delete restored.spatial_upsampling
   return restored
+}
+
+function _matchingModeParams(
+  snapshot: SavedModeParams | undefined,
+  modelType: string,
+): SavedModeParams | undefined {
+  return snapshot?.model_type === modelType ? snapshot : undefined
+}
+
+function _projectTechnicalParams(source: object): Record<string, unknown> {
+  const projected = projectGenerationProfileParameters(source)
+  return Object.fromEntries(
+    Object.entries(projected).filter(([, value]) => value !== undefined),
+  )
+}
+
+/**
+ * Project a model-bound snapshot onto Director's technical video settings.
+ * Mode snapshots also retain job-local media and UI envelope state in memory;
+ * the profile catalog is the canonical allow-list for this request boundary.
+ */
+function _directorVideoParams(
+  snapshot: SavedModeParams | undefined,
+  modelType: string,
+): Record<string, unknown> {
+  const matching = _matchingModeParams(snapshot, modelType)
+  if (!matching) return {}
+  return _projectTechnicalParams(matching)
 }
 
 function _restoreModeUiSettings(snapshot: SavedModeParams | undefined): Record<string, unknown> {
@@ -3007,7 +3051,7 @@ interface AppState {
   sendMusicToDirector: () => void
   selectedModelPerAudioSubMode: Partial<Record<import('../types').AudioSubMode, string>>
   selectedModelPerMode: Partial<Record<GenerationMode, string>>
-  savedLoraPerMode: Partial<Record<GenerationMode, { activated_loras: string[]; loras_multipliers: string; loraWeights: Record<string, number[]>; availableLoras: string[] }>>
+  savedLoraPerMode: Partial<Record<GenerationMode, LoraModeBlob>>
   savedParamsPerMode: Partial<Record<GenerationMode, SavedModeParams>>
   savedPromptPerMode: Partial<Record<string, string>>
   /** Snapshot of lora_id → filename loaded from localStorage at boot.
@@ -3326,11 +3370,14 @@ interface AppState {
   // Presets
   selectedGenerationProfileId: string
   setSelectedGenerationProfileId: (id: string) => void
+  selectedDirectorProfileId: string
+  setSelectedDirectorProfileId: (id: string) => void
+  directorProfilesSupported: boolean
   presets: import('../api/client').GenerationPreset[]
   presetsLoading: boolean
   presetsError: string | null
   loadPresets: () => Promise<void>
-  savePreset: (name: string) => Promise<void>
+  savePreset: (name: string, context?: 'director') => Promise<void>
   updatePreset: (preset: api.GenerationPreset) => Promise<boolean>
   loadPreset: (preset: import('../api/client').GenerationPreset) => Promise<boolean>
   deletePreset: (id: string) => Promise<void>
@@ -3628,6 +3675,7 @@ interface AppState {
   directorImageCreatorModelOverride: string
   directorImageEditorModelOverride: string
   directorImageRoleLoras: Record<DirectorImageRole, DirectorImageRoleLoraSelection[]>
+  directorImageRoleLoraModels: Record<DirectorImageRole, string | null>
   setDirectorAutoMode: (v: boolean) => void
   setDirectorSeamless: (v: boolean) => void
   setDirectorShotImageGuidance: (v: DirectorShotImageGuidance) => void
@@ -3643,9 +3691,9 @@ interface AppState {
   }) => Promise<api.DirectorCapabilities>
   activateDirectorImageRoles: () => void
   setDirectorImageRoleModel: (role: DirectorImageRole, modelType: string) => void
-  setDirectorImageRoleLoras: (role: DirectorImageRole, selections: DirectorImageRoleLoraSelection[]) => void
+  setDirectorImageRoleLoras: (role: DirectorImageRole, selections: DirectorImageRoleLoraSelection[], modelType?: string) => void
   selectDirectorVideoModel: (modelType: string) => Promise<void>
-  directorSetLora: (mode: 'image' | 'video', activated_loras: string[], loras_multipliers: string, loraWeights: Record<string, number[]>, availableLoras: string[]) => void
+  directorSetLora: (mode: 'image' | 'video', activated_loras: string[], loras_multipliers: string, loraWeights: Record<string, number[]>, availableLoras: string[], modelType?: string) => void
   setSidebarMode: (mode: SidebarMode) => void
   directorSetSpeakerMapping: (speakerId: string, name: string, role: SpeakerMapping['role']) => void
   directorInsertSpeakerMention: (speakerId: string) => void
@@ -3808,6 +3856,7 @@ async function _applyH3ServerProfile(
     const savedLoraPerMode = {
       ...state.savedLoraPerMode,
       [mode]: {
+        model_type: target,
         activated_loras: [...settings.activated_loras],
         loras_multipliers: settings.loras_multipliers,
         loraWeights: { ...settings.lora_weights },
@@ -4152,6 +4201,13 @@ async function _captureDirectorImageRoleRequest(
     ['editor', effectiveEditor, editorLoras] as const,
   ]) {
     if (selections.length === 0) continue
+    const boundModel = state.directorImageRoleLoraModels?.[role]
+    if (boundModel !== modelType) {
+      throw new api.DirectorRequestError(
+        'director_role_lora_unavailable',
+        role === 'creator' ? 'image_creator_lora' : 'continuity_editor_lora',
+      )
+    }
     let catalog: Awaited<ReturnType<typeof api.fetchLoraDetails>>
     try {
       catalog = await api.fetchLoraDetails(modelType)
@@ -5119,6 +5175,8 @@ function _scrubAccountBoundProjectUi(state: AppState): Partial<AppState> {
     presetsError: null,
     presetsLoading: false,
     selectedGenerationProfileId: '',
+    selectedDirectorProfileId: '',
+    directorProfilesSupported: false,
     recipes: [],
     recipesLoading: false,
     recipesError: null,
@@ -5269,6 +5327,233 @@ function generationPresetPayload(snapshot: AppState, name: string) {
     lora_weights: snapshot.loraWeights,
     spatial_upsampling: snapshot.spatialUpsampling,
     ...captureGenerationProfileSettings(snapshot.params, snapshot),
+  }
+}
+
+function _directorProfileSnapshotCurrent(snapshot: AppState, live: AppState): boolean {
+  const before = snapshot as unknown as Record<string, unknown>
+  const after = live as unknown as Record<string, unknown>
+  return live.directorProfilesSupported && live.sidebarMode === 'director' && live.generationMode === snapshot.generationMode
+    && live.explicitOutput === snapshot.explicitOutput && live.shortFilmPath === snapshot.shortFilmPath
+    && live.directorReferenceImage === snapshot.directorReferenceImage
+    && live.directorReferenceImagePath === snapshot.directorReferenceImagePath
+    && live.directorCharacterRefs === snapshot.directorCharacterRefs
+    && live.directorCharacterRefPaths === snapshot.directorCharacterRefPaths
+    && live.directorLocationRefs === snapshot.directorLocationRefs
+    && live.directorLocationRefPaths === snapshot.directorLocationRefPaths
+    && live.params === snapshot.params
+    && live.selectedModelPerMode.video === snapshot.selectedModelPerMode.video
+    && live.savedParamsPerMode.video === snapshot.savedParamsPerMode.video
+    && live.savedLoraPerMode.video === snapshot.savedLoraPerMode.video
+    && live.directorImageRoleLoraModels === snapshot.directorImageRoleLoraModels
+    && directorProfileStateKeys.every(key => before[key] === after[key])
+}
+
+function _directorPipelineSnapshotCurrent(snapshot: AppState, live: AppState): boolean {
+  const keys = [
+    ...directorProfileStateKeys,
+    'explicitOutput', 'privateOutput', 'shortFilmPath', 'shortFilmCharacters',
+    'shortFilmTargetDuration', 'shortFilmNarrative', 'directorImageRoleLoraModels',
+    'directorPlannedClips', 'directorSceneDescription', 'directorAudioPath',
+    'directorAnalysis', 'directorAutoMode', 'directorSpeakerMappings',
+    'directorVisualStyle', 'directorCustomVisualStyle', 'directorReferenceImage',
+    'directorReferenceImagePath', 'directorCharacterRefs', 'directorCharacterRefPaths',
+    'directorCharacterRefLabels', 'directorLocationRefs', 'directorLocationRefPaths',
+    'directorLocationRefLabels', 'directorVoiceRef', 'directorVoiceRefPath',
+    'servicesConfig', 'directorRequestId', 'directorRequestWorkspace',
+  ]
+  const before = snapshot as unknown as Record<string, unknown>
+  const after = live as unknown as Record<string, unknown>
+  return snapshot.selectedModelPerMode.video === live.selectedModelPerMode.video
+    && snapshot.savedParamsPerMode.video === live.savedParamsPerMode.video
+    && snapshot.savedLoraPerMode.video === live.savedLoraPerMode.video
+    && keys.every(key => before[key] === after[key])
+}
+
+function _directorProfileError(set: StoreApi<AppState>['setState'], error: unknown): void {
+  if (error instanceof api.DirectorRequestError) {
+    set({ directorError: error.message, directorComponentError: {
+      code: error.code, component: error.component, message: error.message,
+    } })
+  }
+}
+
+async function _checkDirectorProfileVideoLoras(modelType: string, blob: Pick<LoraModeBlob, 'activated_loras' | 'loraWeights' | 'loras_multipliers'>): Promise<void> {
+  const loras = blob.activated_loras
+  if (!loras.length) return
+  const catalog = await api.fetchLoras(modelType)
+  if (loras.some(name => !catalog.loras.includes(name))) {
+    throw new GenerationProfileSettingsError('Some Video LoRAs are unavailable. Choose compatible LoRAs, then update or save the profile.')
+  }
+  if (_directorVideoLoraPhasesMismatch(blob, catalog.guidance_max_phases ?? 1)) {
+    throw new GenerationProfileSettingsError('Review the Video LoRA weights, then choose Use these LoRAs.')
+  }
+}
+
+function _directorVideoLoraPhasesMismatch(blob: Pick<LoraModeBlob, 'activated_loras' | 'loraWeights' | 'loras_multipliers'>, phases: number): boolean {
+  const tokens = blob.loras_multipliers.trim().split(/\s+/)
+  return blob.activated_loras.some((name, index) => (blob.loraWeights[name]?.length ?? tokens[index]?.split(';').length ?? 1) !== phases)
+}
+
+function _directorVideoLorasNeedConfirmation(blob: LoraModeBlob | undefined, modelType: string, phases?: number): boolean {
+  return !!blob?.activated_loras.length && (blob.model_type !== modelType
+    || (phases !== undefined && _directorVideoLoraPhasesMismatch(blob, phases)))
+}
+
+function _directorPublicVideoLoras(blob: LoraModeBlob | undefined, modelType: string): Omit<LoraModeBlob, 'model_type'> {
+  if (_directorVideoLorasNeedConfirmation(blob, modelType)) {
+    throw new GenerationProfileSettingsError('Review the Video LoRAs for this model, then choose Use these LoRAs.')
+  }
+  return {
+    activated_loras: [...(blob?.activated_loras || [])],
+    loras_multipliers: blob?.loras_multipliers || '',
+    loraWeights: structuredClone(blob?.loraWeights || {}),
+    availableLoras: [],
+  }
+}
+
+async function _directorGenerationPresetPayload(snapshot: AppState, name: string) {
+  if (!snapshot.directorProfilesSupported || snapshot.sidebarMode !== 'director') {
+    throw new GenerationProfileSettingsError('Director profiles are not available in this session.')
+  }
+  const videoModel = snapshot.selectedModelPerMode.video || ''
+  if (!videoModel) throw new api.DirectorRequestError('director_model_unavailable', 'video_model')
+  const videoLoras = _directorPublicVideoLoras(snapshot.savedLoraPerMode.video, videoModel)
+  const [defaults, roles] = await Promise.all([
+    api.fetchDefaults(videoModel),
+    _captureDirectorImageRoleRequest(() => snapshot, snapshot.explicitOutput),
+    _checkDirectorProfileVideoLoras(videoModel, videoLoras),
+  ])
+  const videoSnapshot = snapshot.generationMode === 'video' && snapshot.params.model_type === videoModel
+    ? snapshot.params : snapshot.savedParamsPerMode.video
+  return {
+    name, mode: 'video', model_type: videoModel,
+    activated_loras: [...videoLoras.activated_loras],
+    loras_multipliers: videoLoras.loras_multipliers,
+    lora_weights: structuredClone(videoLoras.loraWeights),
+    spatial_upsampling: snapshot.directorVideoSpatialUpsampling,
+    profile_version: 3 as const, profile_context: 'director' as const,
+    params: captureDirectorVideoParameters(
+      { ...defaultParams, ...defaults }, videoSnapshot as Record<string, unknown> | undefined, videoModel,
+    ),
+    director_settings: captureDirectorProfileSettings(snapshot, videoModel, {
+      creator: roles.effective_creator_model, editor: roles.effective_editor_model,
+    }),
+  }
+}
+
+async function _loadDirectorGenerationPreset(
+  get: () => AppState, set: StoreApi<AppState>['setState'], preset: api.GenerationPreset,
+): Promise<boolean> {
+  const submitted = get()
+  const scope = _presetScopes.get(preset)
+  if (!isDirectorProfile(preset) || !scope || !submitted.directorProfilesSupported
+    || submitted.sidebarMode !== 'director' || !submitted.presets.includes(preset)
+    || scope.accountIdentityEpoch !== _accountIdentityEpoch || scope.workspace !== submitted.activeWorkspace) return false
+  const sequence = ++_presetApplySequence
+  const current = () => sequence === _presetApplySequence
+    && scope.accountIdentityEpoch === _accountIdentityEpoch && scope.workspace === get().activeWorkspace
+    && get().presets.includes(preset) && _directorProfileSnapshotCurrent(submitted, get())
+  try {
+    const restored = restoreDirectorProfileSettings(preset.director_settings, preset.model_type, submitted)
+    const roleModels = {
+      creator: preset.director_settings.image_roles.creator.lora_model_type,
+      editor: preset.director_settings.image_roles.editor.lora_model_type,
+    }
+    const candidate = { ...submitted, ...restored, directorImageRoleLoraModels: roleModels } as AppState
+    const [options, roles] = await Promise.all([
+      api.fetchModelOptions(preset.model_type),
+      _captureDirectorImageRoleRequest(() => candidate, submitted.explicitOutput),
+      _checkDirectorProfileVideoLoras(preset.model_type, { ...preset, loraWeights: preset.lora_weights }),
+    ])
+    if (!current()) return false
+    if (options.model_type !== preset.model_type) {
+      throw new api.DirectorRequestError('director_model_unavailable', 'video_model')
+    }
+    const mismatch = directorProfileRoleMismatch(preset.director_settings, {
+      creator: roles.effective_creator_model, editor: roles.effective_editor_model,
+    })
+    if (mismatch) throw new api.DirectorRequestError('director_role_lora_unavailable',
+      mismatch === 'creator' ? 'image_creator_lora' : 'continuity_editor_lora')
+    const pipelineType: api.DirectorPipelineType = submitted.shortFilmPath === 'story'
+      ? 'short_film_story' : submitted.shortFilmPath === 'audio' ? 'short_film_audio' : 'music_video'
+    const preflight = await api.preflightDirectorPipeline({
+      pipeline_type: pipelineType, explicit_output: submitted.explicitOutput,
+      video_model: preset.model_type, image_creator_model: roles.effective_creator_model,
+      continuity_editor_model: roles.effective_editor_model,
+      image_creator_loras: roles.wire.image_creator_loras,
+      continuity_editor_loras: roles.wire.image_editor_loras,
+      director_resolution_preset: restored.directorResolution as ResolutionPreset,
+      director_aspect_ratio: restored.directorAspectRatio as AspectRatio,
+      reference_presence: {
+        starting_image: !!(submitted.directorReferenceImage || submitted.directorReferenceImagePath),
+        character: submitted.directorCharacterRefs.length > 0 || submitted.directorCharacterRefPaths.length > 0,
+        location: submitted.directorLocationRefs.length > 0 || submitted.directorLocationRefPaths.length > 0,
+      },
+    })
+    if (!current()) return false
+    if (preflight.resolved.video_model !== preset.model_type
+      || preflight.resolved.image_creator_model !== roles.effective_creator_model
+      || preflight.resolved.continuity_editor_model !== roles.effective_editor_model
+      || preflight.resolved.director_resolution_preset !== restored.directorResolution
+      || preflight.resolved.director_aspect_ratio !== restored.directorAspectRatio) {
+      throw new api.DirectorRequestError('director_model_unavailable', 'video_model')
+    }
+    const priorVideo = submitted.savedParamsPerMode.video
+    const activeVideo = submitted.generationMode === 'video'
+    const priorParams = activeVideo ? submitted.params : _restoreModeParams(priorVideo)
+    const technical = restoreGenerationProfileSettings({ profile_version: 2, params: preset.params }, priorParams, {}).params
+    const videoParams = {
+      ...technical, model_type: preset.model_type,
+      prompt: activeVideo ? submitted.params.prompt : (submitted.savedPromptPerMode.video || ''),
+      activated_loras: [...preset.activated_loras], loras_multipliers: preset.loras_multipliers,
+    } as GenerateParams
+    const selection: { resolutionPreset: ResolutionPreset; aspectRatio: AspectRatio } = { resolutionPreset: 'auto', aspectRatio: 'auto' }
+    for (const [name, definition] of Object.entries(options.resolution_presets || {})) {
+      const match = Object.entries(definition.values || {}).find(([, value]) => value === videoParams.resolution)
+      if (match) { selection.resolutionPreset = name as ResolutionPreset; selection.aspectRatio = match[0] as AspectRatio; break }
+    }
+    const videoUi = activeVideo ? submitted : { ...submitted, ..._restoreModeUiSettings(priorVideo),
+      spatialUpsampling: priorVideo?.spatialUpsampling || '' }
+    const savedParamsPerMode = { ...submitted.savedParamsPerMode,
+      video: _snapshotModeParams(videoParams, { ...videoUi, ...selection }) }
+    const weights = structuredClone(preset.lora_weights)
+    ++_directorResolutionOptionsSeq
+    if (activeVideo) {
+      ++_modelDefaultsSeq
+      ++_modelOptionsSeq
+      ++_loraLoadSeq
+      ++_h3ProfileApplySeq
+      ++_h3CompatibilitySeq
+      ++_settingsRestoreGeneration
+    }
+    set({
+      ...restored as Partial<AppState>, directorVideoSpatialUpsampling: preset.spatial_upsampling,
+      directorImageRoleLoraModels: roleModels,
+      selectedModelPerMode: { ...submitted.selectedModelPerMode, video: preset.model_type },
+      savedParamsPerMode,
+      savedLoraPerMode: { ...submitted.savedLoraPerMode, video: {
+        model_type: preset.model_type,
+        activated_loras: [...preset.activated_loras], loras_multipliers: preset.loras_multipliers,
+        loraWeights: weights, availableLoras: [],
+      } },
+      directorResolutionModelType: preset.model_type, directorResolutionOptions: options,
+      directorResolutionOptionsLoading: false, directorResolutionOptionsError: null,
+      directorShotDeck: null, directorError: null, directorComponentError: null,
+      ...(activeVideo ? { params: videoParams, modelOptions: options, modelOptionsLoading: false,
+        loraWeights: weights, availableLoras: [], ...selection,
+        h3SelectedProfile: 'custom' as const, h3ProfileApplying: null } : {}),
+    })
+    get().activateDirectorImageRoles()
+    const applied = get()
+    _saveSettings({ generationMode: applied.generationMode, selectedModelPerMode: applied.selectedModelPerMode,
+      savedParamsPerMode, savedLoraPerMode: applied.savedLoraPerMode, savedPromptPerMode: applied.savedPromptPerMode }, applied.loraIdByFilename)
+    if (activeVideo) void get().loadLoras(preset.model_type)
+    return true
+  } catch (error) {
+    if (!current()) return false
+    _directorProfileError(set, error)
+    throw error
   }
 }
 
@@ -5869,7 +6154,7 @@ export const useStore = create<AppState>((set, get) => ({
       }
       const savedLoras = {
         ...s.savedLoraPerMode,
-        [prev]: { activated_loras: s.params.activated_loras || [], loras_multipliers: s.params.loras_multipliers || '', loraWeights: s.loraWeights, availableLoras: s.availableLoras },
+        [prev]: s.sidebarMode === 'director' && _directorVideoLorasNeedConfirmation(s.savedLoraPerMode[prev], s.params.model_type) ? s.savedLoraPerMode[prev] : { model_type: s.params.model_type, activated_loras: s.params.activated_loras || [], loras_multipliers: s.params.loras_multipliers || '', loraWeights: s.loraWeights, availableLoras: s.availableLoras },
       }
       const savedPrompts = { ...s.savedPromptPerMode, [prev]: s.params.prompt }
       set({
@@ -5890,16 +6175,17 @@ export const useStore = create<AppState>((set, get) => ({
     const savedModels = { ...selectedModelPerMode, [prevMode]: params.model_type }
     const savedLoras = {
       ...savedLoraPerMode,
-      [prevMode]: {
+      [prevMode]: current.sidebarMode === 'director' && _directorVideoLorasNeedConfirmation(savedLoraPerMode[prevMode], params.model_type) ? savedLoraPerMode[prevMode] : {
+        model_type: params.model_type,
         activated_loras: params.activated_loras || [],
         loras_multipliers: params.loras_multipliers || '',
         loraWeights,
         availableLoras,
       },
     }
-    // Save the FULL params snapshot for the leaving mode. Strip the
-    // fields that are tracked separately in their own per-mode state
-    // structures (model_type → selectedModelPerMode, prompt →
+    // Save the FULL params snapshot for the leaving mode. Keep model_type as
+    // binding metadata, while stripping the fields that are tracked
+    // separately in their own per-mode state structures (prompt →
     // savedPromptPerMode, activated_loras / loras_multipliers →
     // savedLoraPerMode) to avoid double-bookkeeping. Everything else
     // — including repeat_generation, negative_prompt, video_prompt_type,
@@ -5919,12 +6205,32 @@ export const useStore = create<AppState>((set, get) => ({
     const resolvedModels = { ...savedModels, [mode]: newModelType }
     // Restore saved LoRA state for target mode (if same model)
     const restoredLora = savedLoras[mode]
-    const sameModel = restoredLora && savedModel === newModelType
     // Restore the saved params snapshot for the target mode. If the
     // user never visited this mode before, fall back to defaultParams
     // (NOT the previous mode's params — that's what caused the leak).
     const restoredSnapshot = savedParams[mode]
-    const restoresSavedModel = Boolean(restoredSnapshot && savedModel === newModelType)
+    // A snapshot is usable only when both model authorities agree: the
+    // selected-model map chooses this model and the snapshot was captured
+    // from that same model. Legacy snapshots without model_type therefore
+    // fail closed instead of applying stale settings to a newly selected
+    // model.
+    const restoredSnapshotForModel = savedModel === newModelType
+      ? _matchingModeParams(restoredSnapshot, newModelType)
+      : undefined
+    const sameModel = Boolean(
+      restoredLora
+      && savedModel === newModelType
+      && (!restoredLora.model_type || restoredLora.model_type === newModelType)
+      // An explicitly stored snapshot must be model-bound before its LoRA
+      // companion is trusted. Legacy modes with no snapshot keep their
+      // existing same-model LoRA behavior.
+      && (!restoredSnapshot || restoredSnapshotForModel),
+    )
+    const trustedLora = sameModel && restoredLora ? restoredLora : undefined
+    const restoresSavedModel = Boolean(restoredSnapshotForModel)
+    // UI envelope and job-local content/media are mode-owned state. Keep
+    // those fields even when the technical snapshot is bound to a different
+    // model; only model-specific profile parameters need the identity fence.
     const restoredUiSettings = _restoreModeUiSettings(restoredSnapshot) as Partial<AppState>
     const initialState = useStore.getInitialState()
     const restoredSpatialUpsampling = restoredSnapshot
@@ -5938,7 +6244,17 @@ export const useStore = create<AppState>((set, get) => ({
       ? restoredUiSettings.ttsVoiceCount
       : initialState.ttsVoiceCount
     // Strip mode-owned UI fields before applying the GenerateParams portion.
-    const restoredParams = _restoreModeParams(restoredSnapshot)
+    // For a mismatched or unbound snapshot, restoreGenerationProfileSettings
+    // clears the canonical technical catalog while retaining deliberately
+    // excluded job-local/content fields, including excluded custom_settings
+    // entries.
+    const restoredParams = restoredSnapshotForModel
+      ? _restoreModeParams(restoredSnapshot)
+      : restoreGenerationProfileSettings(
+          { profile_version: 2, params: {} },
+          _restoreModeParams(restoredSnapshot),
+          initialState,
+        ).params as SavedModeParams
     // Restore saved prompt for target mode (or empty for first visit)
     const restoredPrompt = savedPrompts[mode] ?? ''
 
@@ -5970,11 +6286,11 @@ export const useStore = create<AppState>((set, get) => ({
         prompt: restoredPrompt,
         image_mode: mode === 'image' ? 1 : (restoredParams.image_mode ?? 0),
         spatial_upsampling: restoredSpatialUpsampling,
-        activated_loras: sameModel ? restoredLora.activated_loras : [],
-        loras_multipliers: sameModel ? restoredLora.loras_multipliers : '',
+        activated_loras: trustedLora ? trustedLora.activated_loras : [],
+        loras_multipliers: trustedLora ? trustedLora.loras_multipliers : '',
       },
-      loraWeights: sameModel ? restoredLora.loraWeights : {},
-      availableLoras: sameModel ? restoredLora.availableLoras : [],
+      loraWeights: trustedLora ? trustedLora.loraWeights : {},
+      availableLoras: trustedLora ? trustedLora.availableLoras : [],
     }))
     if (newModelType && !sfxModelTypes.has(newModelType)) {
       if (!sameModel) {
@@ -6695,7 +7011,7 @@ export const useStore = create<AppState>((set, get) => ({
         selectedModelPerMode: { ...s.selectedModelPerMode, [mode]: recipe.model_type },
         savedLoraPerMode: {
           ...s.savedLoraPerMode,
-          [mode]: { activated_loras: activated, loras_multipliers: multipliers, loraWeights, availableLoras },
+          [mode]: { model_type: recipe.model_type, activated_loras: activated, loras_multipliers: multipliers, loraWeights, availableLoras },
         },
       }))
       get().setGenerationMode(mode)
@@ -7130,6 +7446,14 @@ export const useStore = create<AppState>((set, get) => ({
             _saveEnabledModels(get().enabledModels)
           }
         } catch { /* localStorage blocked — defaults only apply this session */ }
+      }
+
+      // Catalog refreshes must not replay boot hydration over working settings.
+      // Director refreshes admission immediately before submission; preserve
+      // in-session snapshots and selections even when a model is now missing.
+      if (get().modelsLoaded) {
+        set({ families, models })
+        return
       }
 
       // Hydrate persisted per-mode settings from localStorage.
@@ -10054,7 +10378,7 @@ export const useStore = create<AppState>((set, get) => ({
     const mode = s.generationMode
     const updatedLoraPerMode = {
       ...s.savedLoraPerMode,
-      [mode]: { activated_loras: current, loras_multipliers: multipliers, loraWeights: newWeights, availableLoras: s.availableLoras },
+      [mode]: { model_type: s.params.model_type, activated_loras: current, loras_multipliers: multipliers, loraWeights: newWeights, availableLoras: s.availableLoras },
     }
     set({ savedLoraPerMode: updatedLoraPerMode })
     _saveSettings({ generationMode: mode, selectedModelPerMode: s.selectedModelPerMode, savedParamsPerMode: s.savedParamsPerMode, savedLoraPerMode: updatedLoraPerMode, savedPromptPerMode: s.savedPromptPerMode }, s.loraIdByFilename)
@@ -10289,7 +10613,7 @@ export const useStore = create<AppState>((set, get) => ({
     const mode = s.generationMode
     const updatedLoraPerMode = {
       ...s.savedLoraPerMode,
-      [mode]: { activated_loras: s.params.activated_loras, loras_multipliers: multipliers, loraWeights: newWeights, availableLoras: s.availableLoras },
+      [mode]: { model_type: s.params.model_type, activated_loras: s.params.activated_loras, loras_multipliers: multipliers, loraWeights: newWeights, availableLoras: s.availableLoras },
     }
     set({ savedLoraPerMode: updatedLoraPerMode })
     _saveSettings({ generationMode: mode, selectedModelPerMode: s.selectedModelPerMode, savedParamsPerMode: s.savedParamsPerMode, savedLoraPerMode: updatedLoraPerMode, savedPromptPerMode: s.savedPromptPerMode }, s.loraIdByFilename)
@@ -10298,6 +10622,9 @@ export const useStore = create<AppState>((set, get) => ({
   // Presets
   selectedGenerationProfileId: '',
   setSelectedGenerationProfileId: id => set({ selectedGenerationProfileId: id }),
+  selectedDirectorProfileId: '',
+  setSelectedDirectorProfileId: id => set({ selectedDirectorProfileId: id }),
+  directorProfilesSupported: false,
   presets: [],
   presetsError: null,
   presetsLoading: false,
@@ -10307,12 +10634,12 @@ export const useStore = create<AppState>((set, get) => ({
     const accountIdentityEpoch = _accountIdentityEpoch
     const workspace = get().activeWorkspace
     if (!workspace) {
-      set({ presets: [], presetsLoading: false, presetsError: null })
+      set({ presets: [], presetsLoading: false, presetsError: null, directorProfilesSupported: false, selectedDirectorProfileId: '' })
       return
     }
     set({ presetsLoading: true, presetsError: null })
     try {
-      const { presets } = await api.fetchPresets(workspace)
+      const { presets, director_profiles_supported } = await api.fetchPresets(workspace)
       if (
         requestSequence === _presetLoadSequence
         && accountIdentityEpoch === _accountIdentityEpoch
@@ -10321,7 +10648,7 @@ export const useStore = create<AppState>((set, get) => ({
         for (const preset of presets) {
           _presetScopes.set(preset, { accountIdentityEpoch, workspace })
         }
-        set({ presets, presetsError: null })
+        set({ presets, presetsError: null, directorProfilesSupported: director_profiles_supported === true })
       }
     } catch (error) {
       if (
@@ -10331,7 +10658,7 @@ export const useStore = create<AppState>((set, get) => ({
       ) {
         const status = api.accessRecoveryStatus(error)
         if (status !== null || (error instanceof api.ProtectedReadApiError && error.status === 404)) {
-          set({ presets: [], selectedGenerationProfileId: '', presetsError: 'Profile access is unavailable.' })
+          set({ presets: [], selectedGenerationProfileId: '', selectedDirectorProfileId: '', directorProfilesSupported: false, presetsError: 'Profile access is unavailable.' })
           if (status !== null) api.requestAccessRecovery(status, api.accessRecoveryKind(error) || 'project')
         } else {
           set({ presetsError: 'Profiles could not be refreshed.' })
@@ -10348,7 +10675,7 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
-  savePreset: async (name) => {
+  savePreset: async (name, context) => {
     const snapshot = get()
     const { activeWorkspace } = snapshot
     const accountIdentityEpoch = _accountIdentityEpoch
@@ -10359,7 +10686,19 @@ export const useStore = create<AppState>((set, get) => ({
     if (!presetName) {
       throw new Error('Enter a preset name before saving.')
     }
-    const preset = await api.createPreset(activeWorkspace, generationPresetPayload(snapshot, presetName))
+    let payload: Omit<api.GenerationPreset, 'id' | 'created_at'>
+    if (context === 'director') {
+      try {
+        payload = await _directorGenerationPresetPayload(snapshot, presetName)
+      } catch (error) {
+        if (accountIdentityEpoch === _accountIdentityEpoch && get().activeWorkspace === activeWorkspace
+          && _directorProfileSnapshotCurrent(snapshot, get())) _directorProfileError(set, error)
+        throw error
+      }
+      if (accountIdentityEpoch !== _accountIdentityEpoch || get().activeWorkspace !== activeWorkspace
+        || !_directorProfileSnapshotCurrent(snapshot, get())) throw new Error('Director setup changed before the profile could be saved.')
+    } else payload = generationPresetPayload(snapshot, presetName)
+    const preset = await api.createPreset(activeWorkspace, payload)
 
     if (
       accountIdentityEpoch !== _accountIdentityEpoch
@@ -10385,7 +10724,8 @@ export const useStore = create<AppState>((set, get) => ({
     const scope = _presetScopes.get(preset)
     if (!scope || scope.accountIdentityEpoch !== _accountIdentityEpoch
       || scope.workspace !== snapshot.activeWorkspace
-      || !snapshot.presets.includes(preset) || preset.mode !== snapshot.generationMode) return false
+      || !snapshot.presets.includes(preset)
+      || (isDirectorProfile(preset) ? snapshot.sidebarMode !== 'director' : preset.mode !== snapshot.generationMode)) return false
     if (!preset.revision) {
       await get().loadPresets()
       throw new api.GenerationPresetConflictError('Refresh the profile before updating.')
@@ -10394,10 +10734,15 @@ export const useStore = create<AppState>((set, get) => ({
       && scope.workspace === get().activeWorkspace
     let updated: api.GenerationPreset
     try {
+      const payload = isDirectorProfile(preset)
+        ? await _directorGenerationPresetPayload(snapshot, preset.name)
+        : generationPresetPayload(snapshot, preset.name)
+      if (!current() || (isDirectorProfile(preset) && !_directorProfileSnapshotCurrent(snapshot, get()))) return false
       updated = await api.updatePreset(scope.workspace, preset.id, preset.revision,
-        generationPresetPayload(snapshot, preset.name))
+        payload)
     } catch (error) {
       if (error instanceof api.GenerationPresetConflictError && current()) await get().loadPresets()
+      if (current() && isDirectorProfile(preset) && _directorProfileSnapshotCurrent(snapshot, get())) _directorProfileError(set, error)
       throw error
     }
     if (!current()) return false
@@ -10415,6 +10760,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   loadPreset: async (preset) => {
+    if (isDirectorProfile(preset)) return _loadDirectorGenerationPreset(get, set, preset)
     const scope = _presetScopes.get(preset)
     const submitted = get()
     if (
@@ -10516,7 +10862,7 @@ export const useStore = create<AppState>((set, get) => ({
         savedParamsPerMode,
         savedLoraPerMode: {
           ...submitted.savedLoraPerMode,
-          [mode]: { activated_loras: [...preset.activated_loras], loras_multipliers: preset.loras_multipliers, loraWeights: weights, availableLoras: [] },
+          [mode]: { model_type: preset.model_type, activated_loras: [...preset.activated_loras], loras_multipliers: preset.loras_multipliers, loraWeights: weights, availableLoras: [] },
         },
         h3SelectedProfile: 'custom',
         h3ProfileApplying: null,
@@ -10553,6 +10899,7 @@ export const useStore = create<AppState>((set, get) => ({
       ) set(s => ({
         presets: s.presets.filter(p => p.id !== id),
         selectedGenerationProfileId: s.selectedGenerationProfileId === id ? '' : s.selectedGenerationProfileId,
+        selectedDirectorProfileId: s.selectedDirectorProfileId === id ? '' : s.selectedDirectorProfileId,
       }))
     } catch {
       throw new Error('Could not delete this profile. Try again.')
@@ -13238,6 +13585,10 @@ export const useStore = create<AppState>((set, get) => ({
     creator: _initialDirectorImageRoles?.creator_loras || [],
     editor: _initialDirectorImageRoles?.editor_loras || [],
   },
+  directorImageRoleLoraModels: {
+    creator: _initialDirectorImageRoles?.creator_lora_model || null,
+    editor: _initialDirectorImageRoles?.editor_lora_model || null,
+  },
   directorVideoInferenceStepsByModel: {},
   directorVideoMaxShotFramesByModel: {},
   shortFilmCharacters: [],
@@ -13394,6 +13745,8 @@ export const useStore = create<AppState>((set, get) => ({
       editor_model_override: current.directorImageEditorModelOverride,
       creator_loras: current.directorImageRoleLoras.creator,
       editor_loras: current.directorImageRoleLoras.editor,
+      creator_lora_model: current.directorImageRoleLoraModels.creator,
+      editor_lora_model: current.directorImageRoleLoraModels.editor,
     }
     _saveDirectorImageRoles(persisted)
     set({ directorImageRolesConfigured: true, directorLegacyImageModel: '' })
@@ -13406,9 +13759,18 @@ export const useStore = create<AppState>((set, get) => ({
     get().activateDirectorImageRoles()
   },
 
-  setDirectorImageRoleLoras: (role, selections) => {
+  setDirectorImageRoleLoras: (role, selections, modelType) => {
     set(s => ({
       directorImageRoleLoras: { ...s.directorImageRoleLoras, [role]: selections },
+      directorImageRoleLoraModels: {
+        ...s.directorImageRoleLoraModels,
+        [role]: !selections.length ? null
+          : modelType !== undefined ? modelType || null
+          : (role === 'creator' ? s.directorImageCreatorModelOverride : s.directorImageEditorModelOverride)
+            || (s.directorCapabilitiesExplicitOutput === s.explicitOutput
+              ? s.directorCapabilities?.image_roles[role].resolved_model : null)
+            || null,
+      },
       directorComponentError: null,
       directorError: null,
       directorShotDeck: null,
@@ -13435,14 +13797,18 @@ export const useStore = create<AppState>((set, get) => ({
     }, s.loraIdByFilename)
   },
 
-  directorSetLora: (mode, activated_loras, loras_multipliers, loraWeights, availableLoras) => {
+  directorSetLora: (mode, activated_loras, loras_multipliers, loraWeights, availableLoras, modelType) => {
     const s = get()
     const updatedLoraPerMode = {
       ...s.savedLoraPerMode,
-      [mode]: { activated_loras, loras_multipliers, loraWeights, availableLoras },
+      [mode]: { model_type: modelType ?? s.selectedModelPerMode[mode], activated_loras, loras_multipliers, loraWeights, availableLoras },
     }
     set({
       savedLoraPerMode: updatedLoraPerMode,
+      ...(s.generationMode === mode && s.params.model_type === updatedLoraPerMode[mode]?.model_type ? {
+        params: { ...s.params, activated_loras, loras_multipliers },
+        loraWeights,
+      } : {}),
       directorShotDeck: null,
     })
     _saveSettings({
@@ -14474,12 +14840,16 @@ export const useStore = create<AppState>((set, get) => ({
       return
     }
     const savedVideoParams = savedParamsPerMode.video
-    const videoParams = savedVideoParams?.model_type === videoModel
-      ? { ...savedVideoParams }
-      : {}
+    const videoParams = _directorVideoParams(savedVideoParams, videoModel)
     const directorSteps = directorVideoInferenceStepsByModel[videoModel]
     if (directorSteps != null) videoParams.num_inference_steps = directorSteps
     const videoLora = savedLoraPerMode.video
+    if (_directorVideoLorasNeedConfirmation(videoLora, videoModel,
+      get().directorResolutionOptions?.model_type === videoModel
+        ? get().directorResolutionOptions?.guidance_max_phases ?? 1 : undefined)) {
+      set({ directorError: 'Review the Video LoRAs for this model, then choose Use these LoRAs.' })
+      return
+    }
 
     const fps = get().modelOptions?.fps ?? 16
     const totalDuration = directorAnalysis?.duration ?? 180
@@ -14523,8 +14893,8 @@ export const useStore = create<AppState>((set, get) => ({
       params: {
         ...s.params,
         ...(videoModel ? { model_type: videoModel } : {}),
-        ...(videoParams || {}),
-        ...(videoLora ? { activated_loras: videoLora.activated_loras, loras_multipliers: (videoLora.loras_multipliers || '').split(' ').map(m => m.split(';')[0]).join(' ') } : {}),
+        ...(videoParams as Partial<GenerateParams>),
+        ...(videoLora ? { activated_loras: videoLora.activated_loras, loras_multipliers: videoLora.loras_multipliers || '' } : {}),
         image_mode: 2,
         video_length: totalFrames,
         sliding_window_size: maxClipFrames,
@@ -14574,7 +14944,7 @@ export const useStore = create<AppState>((set, get) => ({
       return
     }
     const savedVideoParams = savedParamsPerMode.video || {}
-    const matchingVideoParams = savedVideoParams.model_type === videoModel ? savedVideoParams : {}
+    const matchingVideoParams = _directorVideoParams(savedVideoParams, videoModel)
     const defaultSteps = directorVideoOptions?.default_num_inference_steps ?? 8
     const videoParams = {
       ...matchingVideoParams,
@@ -14583,8 +14953,14 @@ export const useStore = create<AppState>((set, get) => ({
         : (directorVideoInferenceStepsByModel[videoModel] ?? defaultSteps),
       guidance_scale: matchingVideoParams.guidance_scale ?? directorVideoOptions?.default_guidance_scale ?? 1,
       resolution: directorRes,
-    }
+    } as Partial<GenerateParams>
     const videoLora = savedLoraPerMode.video
+    if (_directorVideoLorasNeedConfirmation(videoLora, videoModel,
+      get().directorResolutionOptions?.model_type === videoModel
+        ? get().directorResolutionOptions?.guidance_max_phases ?? 1 : undefined)) {
+      set({ directorError: 'Review the Video LoRAs for this model, then choose Use these LoRAs.' })
+      return
+    }
 
     const fps = directorVideoOptions?.fps ?? 16
     const totalDuration = directorAnalysis?.duration ?? 180
@@ -14631,8 +15007,8 @@ export const useStore = create<AppState>((set, get) => ({
       params: {
         ...s.params,
         ...(videoModel ? { model_type: videoModel } : {}),
-        ...(videoParams || {}),
-        ...(videoLora ? { activated_loras: videoLora.activated_loras, loras_multipliers: (videoLora.loras_multipliers || '').split(' ').map(m => m.split(';')[0]).join(' ') } : {}),
+        ...(videoParams as Partial<GenerateParams>),
+        ...(videoLora ? { activated_loras: videoLora.activated_loras, loras_multipliers: videoLora.loras_multipliers || '' } : {}),
         image_mode: 2,
         video_length: totalFrames,
         sliding_window_size: maxClipFrames,
@@ -15416,6 +15792,8 @@ export const useStore = create<AppState>((set, get) => ({
           ...(projectChanged || previousAccessRevoked ? {
             browsingUploads: false,
             presets: [],
+            directorProfilesSupported: false,
+            selectedDirectorProfileId: '',
             presetsError: null,
             presetsLoading: false,
             outputs: [],
@@ -15500,6 +15878,8 @@ export const useStore = create<AppState>((set, get) => ({
         browsingUploads: false,
         activeWorkspace: name,
         presets: [],
+        directorProfilesSupported: false,
+        selectedDirectorProfileId: '',
         presetsError: null,
         outputs: [],
         outputsTotal: 0,
@@ -15554,6 +15934,8 @@ export const useStore = create<AppState>((set, get) => ({
         browsingUploads: false,
         activeWorkspace: name,
         presets: [],
+        directorProfilesSupported: false,
+        selectedDirectorProfileId: '',
         presetsError: null,
         outputs: [],
         outputsTotal: 0,
@@ -15635,6 +16017,8 @@ export const useStore = create<AppState>((set, get) => ({
       set({
         browsingUploads: false,
         presets: [],
+        directorProfilesSupported: false,
+        selectedDirectorProfileId: '',
         presetsError: null,
         presetsLoading: false,
         outputs: [],
@@ -15694,6 +16078,8 @@ export const useStore = create<AppState>((set, get) => ({
         ...(lockedActiveWorkspace ? {
           browsingUploads: false,
           presets: [],
+          directorProfilesSupported: false,
+          selectedDirectorProfileId: '',
           presetsError: null,
           presetsLoading: false,
           outputs: [],
@@ -15748,6 +16134,8 @@ export const useStore = create<AppState>((set, get) => ({
         browsingUploads: false,
         activeWorkspace: 'default',
         presets: [],
+        directorProfilesSupported: false,
+        selectedDirectorProfileId: '',
         presetsError: null,
         presetsLoading: false,
         outputs: [],
@@ -17266,6 +17654,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   startDirectorPipeline: async (mode = 'now') => {
     const state = get()
+    let expectedState = state
     const requestWorkspace = state.activeWorkspace
     const { directorPlannedClips, directorSceneDescription,
             directorAudioPath, directorAnalysis, directorReferenceImagePath,
@@ -17280,14 +17669,24 @@ export const useStore = create<AppState>((set, get) => ({
 
     set({ directorError: null, directorComponentError: null })
     const lifecycle = _beginDirectorPipelineLifecycle(requestWorkspace)
+    const assertCurrent = () => {
+      if (!lifecycle.ownsWorkspace()) {
+        throw new DOMException('The browser stopped waiting', 'AbortError')
+      }
+      if (!_directorPipelineSnapshotCurrent(expectedState, get())) {
+        throw new Error('Director settings changed while preparing. Review your setup and submit again.')
+      }
+    }
     try {
     // Model visibility writes are serialized. Await the current tail before
     // and after the catalog refresh so an immediate Director submission
     // cannot race a just-enabled exact recipe or a one-time visibility write.
     await _refreshDirectorModelAdmissionCatalog(() => get().loadModels())
-    if (!lifecycle.ownsWorkspace()) return
+    assertCurrent()
     await _ensureSelectedH3StyleWorkflowReady(get)
+    assertCurrent()
     const imageRoleRequest = await _captureDirectorImageRoleRequest(get, state.explicitOutput)
+    assertCurrent()
     const workflowRequestState = get()
     const selectedVideoPreference = (workflowRequestState.selectedModelPerMode.video || '').trim()
     if (!selectedVideoPreference) {
@@ -17299,6 +17698,9 @@ export const useStore = create<AppState>((set, get) => ({
       workflowRequestState.h3StyleWorkflow,
     )
     const selectedVideoModel = h3WorkflowRequest.video_model
+    const selectedVideoLoras = _directorPublicVideoLoras(savedLoraPerMode.video, selectedVideoModel)
+    await _checkDirectorProfileVideoLoras(selectedVideoModel, selectedVideoLoras)
+    assertCurrent()
     const pipelineType: api.DirectorPipelineType = shortFilmPath === 'story'
       ? 'short_film_story'
       : shortFilmPath === 'audio'
@@ -17308,11 +17710,6 @@ export const useStore = create<AppState>((set, get) => ({
     // Resolve every selected local reference before claiming its presence to
     // preflight. All uploads settle, but paths and labels are committed only
     // when the complete indexed selection succeeds.
-    const assertCurrent = () => {
-      if (!lifecycle.ownsWorkspace()) {
-        throw new DOMException('The browser stopped waiting', 'AbortError')
-      }
-    }
     const referenceUploads = await Promise.allSettled([
       (async () => {
         if (directorReferenceImagePath) return directorReferenceImagePath
@@ -17344,7 +17741,7 @@ export const useStore = create<AppState>((set, get) => ({
         assertCurrent,
       ),
     ])
-    if (!lifecycle.ownsWorkspace()) return
+    assertCurrent()
     const failedReferenceUpload = referenceUploads.find(
       (result): result is PromiseRejectedResult => result.status === 'rejected',
     )
@@ -17362,11 +17759,14 @@ export const useStore = create<AppState>((set, get) => ({
     const charLabels = characterReferences.labels
     const locPaths = locationReferences.paths
     const locLabels = locationReferences.labels
-    set({
+    assertCurrent()
+    const referencePatch = {
       directorReferenceImagePath: refImagePath,
       directorCharacterRefPaths: charPaths,
       directorLocationRefPaths: locPaths,
-    })
+    }
+    set(referencePatch)
+    expectedState = { ...expectedState, ...referencePatch }
 
     const directorPreflight = await api.preflightDirectorPipeline({
       pipeline_type: pipelineType,
@@ -17416,12 +17816,12 @@ export const useStore = create<AppState>((set, get) => ({
       api.fetchDefaults(selectedVideoModel).catch(() => ({})),
       api.fetchModelOptions(selectedVideoModel).catch(() => null),
     ])
-    if (!lifecycle.ownsWorkspace()) return
+    assertCurrent()
     const directorImageResolution = directorPreflight.resolved.image_resolution
     const directorVideoResolution = directorPreflight.resolved.video_resolution
     const fps = videoModelOptions?.fps ?? 16
     const savedVideoParams = savedParamsPerMode.video || {}
-    const matchingVideoParams = savedVideoParams.model_type === selectedVideoModel ? savedVideoParams : {}
+    const matchingVideoParams = _directorVideoParams(savedVideoParams, selectedVideoModel)
     const rawDefaultVideoSteps = (
       videoModelOptions?.default_num_inference_steps
       ?? (videoModelDefaults as Record<string, unknown>).num_inference_steps
@@ -17447,19 +17847,20 @@ export const useStore = create<AppState>((set, get) => ({
     let voiceRefPath = state.directorVoiceRefPath
     if (supportsVoiceReference && !voiceRefPath && state.directorVoiceRef) {
       try {
-        if (!lifecycle.ownsWorkspace()) return
+        assertCurrent()
         const uploaded = await api.uploadAudio(state.directorVoiceRef)
-        if (!lifecycle.ownsWorkspace()) return
+        assertCurrent()
         voiceRefPath = uploaded.path
         set({ directorVoiceRefPath: voiceRefPath })
+        expectedState = { ...expectedState, directorVoiceRefPath: voiceRefPath }
       } catch {
-        if (!lifecycle.ownsWorkspace()) return
+        assertCurrent()
         /* skip */
       }
     }
 
     const directorVideoParams: Record<string, unknown> = {
-      ...videoModelDefaults,
+      ..._projectTechnicalParams(videoModelDefaults),
       ...matchingVideoParams,
       num_inference_steps: directorVideoSteps,
       resolution: directorVideoResolution,
@@ -17537,12 +17938,12 @@ export const useStore = create<AppState>((set, get) => ({
       // Video gen settings
       video_model: selectedVideoModel,
       video_params: directorVideoParams,
-      video_loras: savedLoraPerMode.video || {},
+      video_loras: selectedVideoLoras,
       video_spatial_upsampling: directorVideoSpatialUpsampling,
       video_film_grain_intensity: directorVideoFilmGrainIntensity,
       video_film_grain_saturation: directorVideoFilmGrainSaturation,
       video_self_refiner: directorVideoSelfRefiner,
-      audio_scale: get().directorAudioScale,
+      audio_scale: state.directorAudioScale,
 
       // Voice identity (ID-LoRA). The CelebVHQ ID-LoRA auto-loads
       // for both dev and distilled pipelines when voice_reference is
@@ -17555,7 +17956,7 @@ export const useStore = create<AppState>((set, get) => ({
       } : {}),
     }
 
-      if (!lifecycle.ownsWorkspace()) return
+      assertCurrent()
       if (mode === 'queue') {
         const queued = await api.enqueueDirectorPipeline(pipelineParams)
         if (!lifecycle.ownsWorkspace()) return

@@ -690,7 +690,7 @@ test('profile save confirms scoped insertion before clearing the form', () => {
 
 test('preset store confirms account-project scope and keeps Recipes separate', () => {
   const presetStore = sliceBetween(store, '  savePreset: async', '  // Model options\n  modelOptions:')
-  const save = sliceBetween(presetStore, 'savePreset: async (name)', 'updatePreset: async (preset)')
+  const save = sliceBetween(presetStore, 'savePreset: async (name, context)', 'updatePreset: async (preset)')
   const load = sliceBetween(presetStore, 'loadPreset: async (preset)', 'deletePreset: async')
 
   assert.match(save, /await api\.createPreset\(activeWorkspace/)
@@ -699,7 +699,8 @@ test('preset store confirms account-project scope and keeps Recipes separate', (
   assert.match(save, /_presetScopes\.set\(preset/)
   assert.match(save, /get\(\)\.presets\.includes\(preset\)/)
   assert.doesNotMatch(save, /console\.(?:error|warn)/)
-  assert.doesNotMatch(save, /catch\s*\(/)
+  // Director may report a component error, but must still reject the save;
+  // director-profile-flow exercises that propagation without source matching.
 
   assert.match(load, /const scope = _presetScopes\.get\(preset\)/)
   assert.match(load, /scope\.accountIdentityEpoch !== _accountIdentityEpoch/)

@@ -5988,9 +5988,34 @@ export async function directorV2Plan(
 
 // --- Presets ---
 
+export interface DirectorProfileImageRole {
+  model_override: string
+  /** The catalogued model for these LoRAs; null when no LoRAs are selected. */
+  lora_model_type: string | null
+  loras: DirectorImageRoleLoraSelection[]
+}
+
+export interface DirectorProfileSettings {
+  resolution: string
+  aspect_ratio: string
+  seamless: boolean
+  shot_image_guidance: 'auto' | 'prompt_only' | 'generate'
+  video_inference_steps: number | null
+  video_max_shot_frames: number | null
+  video_film_grain_intensity: number
+  video_film_grain_saturation: number
+  video_self_refiner: number
+  audio_scale: number
+  identity_guidance_scale: number
+  h3_style_workflow: string
+  image_roles: Record<'creator' | 'editor', DirectorProfileImageRole>
+}
+
 export interface GenerationPreset {
   revision?: string
-  profile_version?: 2
+  profile_version?: 2 | 3
+  profile_context?: 'director'
+  director_settings?: DirectorProfileSettings
   ui_settings?: Record<string, unknown>
   id: string
   name: string
@@ -6010,7 +6035,10 @@ function newGenerationPresetId(): string {
   return `preset_${Array.from(random, value => value.toString(16).padStart(2, '0')).join('')}`
 }
 
-export async function fetchPresets(workspace: string): Promise<{ presets: GenerationPreset[] }> {
+export async function fetchPresets(workspace: string): Promise<{
+  presets: GenerationPreset[]
+  director_profiles_supported?: boolean
+}> {
   const query = new URLSearchParams({ workspace })
   const res = await fetch(`${BASE}/api/v1/presets?${query.toString()}`)
   if (!res.ok) throw new ProtectedReadApiError('workspaces', res.status)

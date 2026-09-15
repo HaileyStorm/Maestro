@@ -1153,6 +1153,138 @@ class TestDirectorCancellation(unittest.TestCase):
             submitted[0]["_director_final_video_postprocess"], 1,
         )
 
+    def test_video_lora_missing_fails_before_native_submit(self):
+        pid = "pipe-video-lora-missing"
+        self._add_pipeline(pid, "running")
+        lora_dir = os.path.join(self.temp_dir.name, "video-loras")
+        os.makedirs(lora_dir)
+        params = {
+            "pipeline_type": "short_film_story",
+            "seamless": False,
+            "video_model": "ltx2_22B_distilled_1_1",
+            "video_params": {"resolution": "1280x720"},
+            "video_loras": {
+                "activated_loras": ["missing.safetensors"],
+                "loras_multipliers": "0",
+            },
+            "fps": 25,
+        }
+        pipeline._wgp = SimpleNamespace(
+            save_path=self.temp_dir.name,
+            get_lora_dir=lambda _model: lora_dir,
+            get_model_def=lambda _model: {"fps": 25},
+            get_model_min_frames_and_step=lambda _model: (17, 8, 8),
+        )
+
+        with patch.object(pipeline, "_submit_and_wait") as submit:
+            with self.assertRaisesRegex(
+                pipeline.DirectorModelCompatibilityError,
+                r"unavailable or incompatible.*missing\.safetensors",
+            ):
+                pipeline._run_video_generation(
+                    pid,
+                    params,
+                    [{"video_prompt": "first motion"}],
+                    [{"start": 0, "end": 5, "duration_sec": 5}],
+                    [],
+                    out_dir=self.temp_dir.name,
+                )
+
+        submit.assert_not_called()
+
+    def test_video_lora_selection_preserves_names_and_zero_signed_multipliers(self):
+        pid = "pipe-video-lora-preserve"
+        self._add_pipeline(pid, "running")
+        lora_dir = os.path.join(self.temp_dir.name, "video-loras")
+        os.makedirs(lora_dir)
+        for filename in ("first.safetensors", "second.sft"):
+            with open(os.path.join(lora_dir, filename), "wb") as handle:
+                handle.write(b"lora")
+        selected = ["first.safetensors", "second.sft"]
+        multipliers = "0 -0.75"
+        params = {
+            "pipeline_type": "short_film_story",
+            "seamless": False,
+            "video_model": "ltx2_22B_distilled_1_1",
+            "video_params": {"resolution": "1280x720"},
+            "video_loras": {
+                "activated_loras": selected.copy(),
+                "loras_multipliers": multipliers,
+            },
+            "fps": 25,
+        }
+        pipeline._wgp = SimpleNamespace(
+            save_path=self.temp_dir.name,
+            get_lora_dir=lambda _model: lora_dir,
+            get_model_def=lambda _model: {"fps": 25},
+            get_model_min_frames_and_step=lambda _model: (17, 8, 8),
+        )
+        submitted: list[dict] = []
+
+        with patch.object(
+            pipeline,
+            "_submit_and_wait",
+            side_effect=lambda gen_params, **_kwargs: (
+                submitted.append(gen_params) or ["clip.mp4"]
+            ),
+        ):
+            outputs = pipeline._run_video_generation(
+                pid,
+                params,
+                [{"video_prompt": "first motion"}],
+                [{"start": 0, "end": 5, "duration_sec": 5}],
+                [],
+                out_dir=self.temp_dir.name,
+            )
+
+        self.assertEqual(outputs, ["clip.mp4"])
+        self.assertEqual(submitted[0]["activated_loras"], selected)
+        self.assertEqual(submitted[0]["loras_multipliers"], multipliers)
+        self.assertEqual(params["video_loras"]["activated_loras"], selected)
+        self.assertEqual(params["video_loras"]["loras_multipliers"], multipliers)
+
+    def test_video_lora_resolution_failure_is_actionable_and_pre_submit(self):
+        pid = "pipe-video-lora-unverifiable"
+        self._add_pipeline(pid, "running")
+        params = {
+            "pipeline_type": "short_film_story",
+            "seamless": False,
+            "video_model": "ltx2_22B_distilled_1_1",
+            "video_params": {"resolution": "1280x720"},
+            "video_loras": {
+                "activated_loras": ["stale.safetensors"],
+                "loras_multipliers": "1",
+            },
+            "fps": 25,
+        }
+
+        def fail_resolve(_model, _name):
+            raise OSError("private filesystem detail")
+
+        pipeline._wgp = SimpleNamespace(
+            save_path=self.temp_dir.name,
+            resolve_lora_path=fail_resolve,
+            get_model_def=lambda _model: {"fps": 25},
+            get_model_min_frames_and_step=lambda _model: (17, 8, 8),
+        )
+
+        with patch.object(pipeline, "_submit_and_wait") as submit:
+            with self.assertRaisesRegex(
+                pipeline.DirectorModelCompatibilityError,
+                r"Unable to verify selected video LoRA",
+            ) as raised:
+                pipeline._run_video_generation(
+                    pid,
+                    params,
+                    [{"video_prompt": "first motion"}],
+                    [{"start": 0, "end": 5, "duration_sec": 5}],
+                    [],
+                    out_dir=self.temp_dir.name,
+                )
+
+        self.assertNotIn("private filesystem detail", str(raised.exception))
+        submit.assert_not_called()
+
     def test_standard_video_uses_first_planned_time_as_audio_origin(self):
         pid = "pipe-video-audio-origin"
         self._add_pipeline(pid, "running")

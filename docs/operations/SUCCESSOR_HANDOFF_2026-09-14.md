@@ -212,3 +212,58 @@ and retain stale saved choices for repair instead of silently substituting.
 Use a distinct Director profile context with isolated capture/restore and the
 existing account/project storage and revision-CAS rules. Do not add hidden
 Director fields to ordinary Studio profile restoration.
+
+
+## Complete Director profiles: source milestone
+
+Director now uses a distinct version 3 profile context in the existing scoped
+profile store. Save, Update and Load round-trip the selected video model,
+canonical technical defaults/overrides, video LoRAs and weights, resolution,
+aspect ratio, seamless behavior, shot guidance, step/shot limits, final video
+postprocessing, audio/identity scales, H3 workflow, and both image-role overrides
+and parameterized LoRAs. Ordinary Studio profiles remain version 2; changing a
+record between the two contexts is rejected without changing its revision.
+Prompts, media, account/project authority and other active generation modes do
+not enter the Director profile envelope.
+
+The panel waits for the backend's explicit `director_profiles_supported` flag.
+An older running backend keeps it hidden. Source publication and a rebuilt UI
+therefore do not establish live Director profile acceptance. Preserve the
+Recovery Control restart hold; once released, coordinate a single restart and
+verify profile save/update/load through the intended local and stable-share
+surfaces before claiming rollout.
+
+Model-bound snapshots prevent stale technical settings from crossing a model
+switch. Unbound or mismatched image/video LoRAs stay visible for explicit
+confirmation. Catalog refreshes no longer silently drop video LoRAs, and the
+backend rejects unresolved selections before native submission. Selected names,
+zero weights and multiphase values remain intact. Submission preparation checks
+for settings/reference changes across asynchronous work, preserves newer user
+edits and asks for a fresh submission rather than sending an obsolete request.
+
+Deliberate CPU evidence includes the complete affected profile/cancellation
+modules (109 tests), all 631 UI tests, TypeScript, lint, Python syntax,
+and production build. Local health/readiness and the served build identity
+were verified without restarting Maestro. The browser matrix remains pending approved Linux-native
+scratch. No generation, native Sage acceptance, GPU access, service restart or
+new authenticated Cloudflare acceptance is implied. Keep the existing Sage
+incident and NTFS recovery boundaries separate from these source results.
+
+The next independent source slice is Blend output restoration. Its current
+metadata uses a generic Frames envelope and internal temporary clip paths;
+public redaction alone cannot restore an authorized source. Design a versioned
+Blend envelope containing only effective consumed settings and scoped source
+identities, with a recoverable reattach path for unavailable legacy sources.
+First reconcile the visible Insert/duration/strength controls with what the
+backend actually consumes; do not save controls that have no generation effect.
+
+
+The final image-role confirmation correction is verified in a separate
+Linux-native production build. A worker's default Vite build removed the
+parent-owned served-build reservation marker; Recovery Control owns supported
+orphan-registry reconciliation. The original successful claim receipt was
+recovered from the task history and supplied to that owner. Do not recreate the
+marker, hand-edit registry state or write the served build until that boundary
+is recovered. The running app remains on the preceding healthy UI build; the
+last role-confirmation correction still needs deployment as well as browser
+acceptance. Intact source work and its checks remain independent of this hold.

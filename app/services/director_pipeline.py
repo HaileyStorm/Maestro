@@ -9412,61 +9412,79 @@ def _run_video_generation(pid: str, params: dict, clip_plans: list[dict],
         print(f"[Pipeline] No video_model in params, using fallback: {video_model}")
     video_params = params.get("video_params", {})
     video_loras = params.get("video_loras", {})
-    # Mirror of the image-LoRA file-existence filter — see _run_image_generation
-    # for the rationale. Filter video_loras to those actually present in
-    # video_model's LoRA directory so a stale activation from a different
-    # video model doesn't crash wgp validation upfront.
-    try:
-        _vid_activated = list(video_loras.get("activated_loras", []) or [])
-        _vid_mults = video_loras.get("loras_multipliers", "") or ""
-        if _vid_activated:
-            print(
-                f"[Pipeline {pid}] Video LoRAs received: {len(_vid_activated)} | "
-                f"model={video_model} | "
-                f"names={[os.path.basename(n) for n in _vid_activated]} | "
-                f"multipliers={_vid_mults!r}"
-            )
-            try:
-                _vid_lora_dir = _wgp.get_lora_dir(video_model)
-            except Exception:
-                _vid_lora_dir = ""
-            if _vid_lora_dir and os.path.isdir(_vid_lora_dir):
-                _vid_existing = {
-                    f for f in os.listdir(_vid_lora_dir)
-                    if f.lower().endswith((".safetensors", ".sft"))
-                }
-                _vid_mult_tokens = _vid_mults.split()
-                _vid_kept: list[str] = []
-                _vid_kept_mults: list[str] = []
-                _vid_skipped: list[str] = []
-                for _idx, _name in enumerate(_vid_activated):
-                    _basename = os.path.basename(_name)
-                    if _basename in _vid_existing:
-                        _vid_kept.append(_name)
-                        if _idx < len(_vid_mult_tokens):
-                            _vid_kept_mults.append(_vid_mult_tokens[_idx])
-                    else:
-                        _vid_skipped.append(_basename)
-                if _vid_skipped:
-                    _warn = (
-                        f"Skipped {len(_vid_skipped)} video LoRA(s) not present in "
-                        f"{os.path.basename(_vid_lora_dir)}/: {_vid_skipped}. These "
-                        f"were likely activated when a different video model was "
-                        f"selected. Re-select your video LoRAs for {video_model}."
-                    )
-                    print(f"[Pipeline {pid}] {_warn}")
-                    _exw = _pipelines.get(pid, {}).get("lora_warnings", []) or []
-                    _update_pipeline(pid, lora_warnings=[*_exw, _warn])
-                video_loras = {
-                    "activated_loras": _vid_kept,
-                    "loras_multipliers": " ".join(_vid_kept_mults),
-                }
-                print(
-                    f"[Pipeline {pid}] Video LoRAs after existence filter: "
-                    f"{len(_vid_kept)} kept, {len(_vid_skipped)} skipped"
+    # Validate every selected video LoRA before building a native request. A
+    # saved Director selection can outlive a model switch or a removed file;
+    # silently dropping those entries also drops their multiplier positions and
+    # changes the user's request. Resolve through wgp's model-aware helper so
+    # linked read-only LoRA folders remain valid, and fail closed when a
+    # selection cannot be resolved for the selected video model.
+    _vid_activated = list(video_loras.get("activated_loras", []) or [])
+    _vid_mults = video_loras.get("loras_multipliers", "") or ""
+    if _vid_activated:
+        _vid_names = [os.path.basename(name) for name in _vid_activated]
+        print(
+            f"[Pipeline {pid}] Video LoRAs received: {len(_vid_activated)} | "
+            f"model={video_model} | names={_vid_names} | "
+            f"multipliers={_vid_mults!r}"
+        )
+        _vid_missing: list[str] = []
+        _vid_resolver = getattr(_wgp, "resolve_lora_path", None)
+        if callable(_vid_resolver):
+            for _name, _display_name in zip(_vid_activated, _vid_names):
+                try:
+                    _resolved_path = _vid_resolver(video_model, _name)
+                except Exception as _resolver_error:
+                    raise DirectorModelCompatibilityError(
+                        f"Unable to verify selected video LoRA(s) for "
+                        f"'{video_model}'. Refresh the video LoRA catalog and "
+                        "re-select them before generating."
+                    ) from _resolver_error
+                if (
+                    not isinstance(_resolved_path, (str, bytes, os.PathLike))
+                    or not _resolved_path
+                    or not os.path.isfile(_resolved_path)
+                ):
+                    _vid_missing.append(_display_name)
+        else:
+            # Keep model-free/unit-test doubles and older integrations useful,
+            # while retaining the same strict behavior when only get_lora_dir
+            # is available.
+            _vid_dir_getter = getattr(_wgp, "get_lora_dir", None)
+            if not callable(_vid_dir_getter):
+                raise DirectorModelCompatibilityError(
+                    f"Unable to verify selected video LoRA(s) for "
+                    f"'{video_model}'. Refresh the video LoRA catalog and "
+                    "re-select them before generating."
                 )
-    except Exception as _e:
-        print(f"[Pipeline {pid}] Video LoRA file-existence filter skipped: {_e}")
+            try:
+                _vid_lora_dir = _vid_dir_getter(video_model)
+                if not _vid_lora_dir or not os.path.isdir(_vid_lora_dir):
+                    _vid_missing.extend(_vid_names)
+                else:
+                    for _name, _display_name in zip(_vid_activated, _vid_names):
+                        _candidate = os.path.join(
+                            _vid_lora_dir, os.path.basename(_name),
+                        )
+                        if not os.path.isfile(_candidate):
+                            _vid_missing.append(_display_name)
+            except Exception as _dir_error:
+                raise DirectorModelCompatibilityError(
+                    f"Unable to verify selected video LoRA(s) for "
+                    f"'{video_model}'. Refresh the video LoRA catalog and "
+                    "re-select them before generating."
+                ) from _dir_error
+
+        if _vid_missing:
+            _vid_missing = list(dict.fromkeys(_vid_missing))
+            raise DirectorModelCompatibilityError(
+                f"Selected video LoRA(s) are unavailable or incompatible with "
+                f"video model '{video_model}': {_vid_missing}. Refresh the "
+                "video LoRA catalog and re-select them before generating."
+            )
+        print(
+            f"[Pipeline {pid}] Video LoRAs validated for model {video_model}: "
+            f"{len(_vid_activated)} selected"
+        )
 
     audio_path = params.get("audio_path")
     seamless = params.get("seamless", True)

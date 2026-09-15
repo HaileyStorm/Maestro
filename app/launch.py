@@ -21201,7 +21201,7 @@ def list_presets(request: Request, workspace: str = ""):
         )
     except Exception as error:
         _raise_generation_preset_error(error)
-    return {"presets": presets}
+    return {"presets": presets, "director_profiles_supported": True}
 
 
 @api.post("/api/v1/presets")

@@ -1528,8 +1528,9 @@ test('model hydration seeds the authoritative video default and preserves a vali
     savedLoraPerMode: {},
     savedPromptPerMode: {},
   }))
-  await useStore.getState().loadModels()
-  assert.equal(useStore.getState().selectedModelPerMode.video, 'ltx2_22B_distilled_1_1')
+  const { useStore: reloadedStore } = await loadFreshStoreHelper('video-saved-boot')
+  await reloadedStore.getState().loadModels()
+  assert.equal(reloadedStore.getState().selectedModelPerMode.video, 'ltx2_22B_distilled_1_1')
 })
 
 test('model download polling emits progress, reaches terminal state, and cancels before fetch', async t => {
