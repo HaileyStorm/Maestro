@@ -262,6 +262,14 @@ def _validated_cuda13_inputs(runtime: dict[str, object], toolchain: dict[str, ob
             raise RuntimeError(f"verified CUDA 13 {name} escaped the managed compiler prefix")
     cccl_include = _ordinary_directory(toolchain.get("cccl_include"), "CCCL include directory")
     _ordinary_directory(cccl_include / "cuda" / "std", "CCCL cuda/std directory")
+    toolchain_include = _ordinary_directory(
+        cccl_include.parent, "compiler target include directory"
+    )
+    if not toolchain_include.is_relative_to(prefix.resolve()):
+        raise RuntimeError("verified CUDA 13 compiler target include path escaped the managed prefix")
+    crt_host_defines = _ordinary_file(
+        toolchain_include / "crt" / "host_defines.h", "CUDA crt/host_defines.h"
+    )
     if not toolchain_bin.is_relative_to(prefix.resolve()) or not toolchain_lib.is_relative_to(prefix.resolve()):
         raise RuntimeError("verified CUDA 13 compiler paths escaped the managed compiler prefix")
     return {
@@ -274,6 +282,8 @@ def _validated_cuda13_inputs(runtime: dict[str, object], toolchain: dict[str, ob
         "cc": cc,
         "cxx": cxx,
         "cccl_include": cccl_include,
+        "toolchain_include": toolchain_include,
+        "crt_host_defines": crt_host_defines,
         "toolchain_lib": toolchain_lib,
     }
 
@@ -330,7 +340,12 @@ def _cuda13_environment(
 ) -> dict[str, str]:
     environment = os.environ.copy()
     include_paths = os.pathsep.join(
-        str(path) for path in (inputs["cuda_include"], inputs["cccl_include"])
+        str(path)
+        for path in (
+            inputs["cuda_include"],
+            inputs["toolchain_include"],
+            inputs["cccl_include"],
+        )
     )
     library_paths = os.pathsep.join(
         str(path) for path in (linker_directory, inputs["cuda_lib"], inputs["toolchain_lib"])
@@ -444,13 +459,23 @@ def main() -> int:
         )
         build_executable = sys.executable
 
+    uv = shutil.which("uv")
+    if uv is None:
+        print("[H3 Sage2] skipped: Pinokio UV is unavailable for the pinned source build; run Update from Pinokio")
+        return 0
+
     try:
         with build_context as linker_directory:
             if linker_directory is not None:
                 environment = _cuda13_environment(toolchain_prefix, inputs, linker_directory)
+            # Sage's setup.py treats inherited truthy values as a request to
+            # install a pure-Python package, which would make the marker lie
+            # about the required native CUDA extension.
+            environment["SAGEATTN_SKIP_CUDA_BUILD"] = "0"
             command = [
-                build_executable, "-m", "pip", "install", "--no-build-isolation",
-                "--no-deps", "--force-reinstall", ".",
+                uv, "pip", "install", "--python", build_executable,
+                "--no-build-isolation",
+                "--no-deps", "--reinstall", ".",
             ]
             print(f"[H3 Sage2] building official SageAttention v{VERSION} from pinned source {REVISION[:12]}")
             try:

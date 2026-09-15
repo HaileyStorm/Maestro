@@ -51,8 +51,12 @@ def _cuda13_fixture(root: Path):
         prefix / "bin",
         prefix / "lib",
         prefix / "targets/x86_64-linux/include/cccl/cuda/std",
+        prefix / "targets/x86_64-linux/include/crt",
     ):
         directory.mkdir(parents=True)
+    (prefix / "targets/x86_64-linux/include/crt/host_defines.h").write_text(
+        "fixture\n", encoding="utf-8"
+    )
     executables = {}
     for name in ("nvcc", "ninja", "x86_64-conda-linux-gnu-gcc", "x86_64-conda-linux-gnu-g++"):
         path = prefix / "bin" / name
@@ -446,6 +450,10 @@ class H3AccelerationTests(unittest.TestCase):
         self.assertIn('CUDA_TOOLKIT_VERSION = "12.8.1"', helper)
         self.assertIn('nvidia/label/cuda-', helper)
         self.assertIn('"--no-build-isolation"', helper)
+        self.assertIn('"--reinstall"', helper)
+        self.assertIn('environment["SAGEATTN_SKIP_CUDA_BUILD"] = "0"', helper)
+        self.assertNotIn('"-m", "pip"', helper)
+        self.assertNotIn('"--force-reinstall"', helper)
         self.assertNotIn("wheel", installer.lower())
 
     def test_cuda_toolkit_uses_pinned_nvidia_then_dependency_channel_only(self):
@@ -495,6 +503,14 @@ class H3AccelerationTests(unittest.TestCase):
         self.assertEqual(selected_prefix, prefix)
         self.assertEqual(inputs["cuda_include"], Path(runtime["cuda_include"]).resolve())
         self.assertEqual(inputs["cccl_include"], Path(toolchain["cccl_include"]).resolve())
+        self.assertEqual(
+            inputs["toolchain_include"],
+            (prefix / "targets/x86_64-linux/include").resolve(),
+        )
+        self.assertEqual(
+            inputs["crt_host_defines"],
+            (prefix / "targets/x86_64-linux/include/crt/host_defines.h").resolve(),
+        )
 
     def test_cuda13_identity_mismatch_fails_closed_before_toolchain_lookup(self):
         helper = _load_sage_installer()
@@ -535,6 +551,13 @@ class H3AccelerationTests(unittest.TestCase):
                     helper._cuda13_identities(fake_torch)
 
                 Path(runtime["cuda_include"], "cuda.h").write_text("fixture\n", encoding="utf-8")
+                Path(toolchain["cccl_include"]).parent.joinpath("crt/host_defines.h").unlink()
+                with self.assertRaisesRegex(RuntimeError, "host_defines\\.h"):
+                    helper._cuda13_identities(fake_torch)
+
+                Path(toolchain["cccl_include"]).parent.joinpath("crt/host_defines.h").write_text(
+                    "fixture\n", encoding="utf-8"
+                )
                 Path(runtime["cuda_runtime"]).unlink()
                 with self.assertRaisesRegex(RuntimeError, "libcudart\\.so\\.13"):
                     helper._cuda13_identities(fake_torch)
@@ -636,6 +659,7 @@ class H3AccelerationTests(unittest.TestCase):
                 "cc": Path(toolchain["cc"]),
                 "cxx": Path(toolchain["cxx"]),
                 "cccl_include": Path(toolchain["cccl_include"]),
+                "toolchain_include": prefix / "targets/x86_64-linux/include",
                 "toolchain_lib": prefix / "lib",
             }
             run_calls = []
@@ -648,9 +672,14 @@ class H3AccelerationTests(unittest.TestCase):
                 self.assertEqual(alias.resolve(), Path(runtime["cuda_runtime"]).resolve())
                 self.assertEqual(
                     kwargs["env"]["CPATH"].split(os.pathsep),
-                    [str(Path(runtime["cuda_include"])), str(Path(toolchain["cccl_include"]))],
+                    [
+                        str(Path(runtime["cuda_include"])),
+                        str(prefix / "targets/x86_64-linux/include"),
+                        str(Path(toolchain["cccl_include"])),
+                    ],
                 )
                 self.assertEqual(kwargs["env"]["CUDA_HOME"], str(prefix))
+                self.assertEqual(kwargs["env"]["SAGEATTN_SKIP_CUDA_BUILD"], "0")
                 self.assertEqual(kwargs["env"]["PYTHONNOUSERSITE"], "1")
                 self.assertEqual(kwargs["env"]["CC"], toolchain["cc"])
                 self.assertEqual(kwargs["env"]["CXX"], toolchain["cxx"])
@@ -663,7 +692,9 @@ class H3AccelerationTests(unittest.TestCase):
                 )
                 self.assertNotIn("legacy", kwargs["env"]["LD_LIBRARY_PATH"])
 
-            with patch.dict(sys.modules, {"torch": fake_torch}), patch.object(
+            with patch.dict(os.environ, {"SAGEATTN_SKIP_CUDA_BUILD": "TRUE"}), patch.dict(
+                sys.modules, {"torch": fake_torch}
+            ), patch.object(
                 helper.platform, "system", return_value="Linux",
             ), patch.object(helper, "APP_ROOT", root), patch.object(
                 helper, "_git_revision", return_value=helper.REVISION,
@@ -671,7 +702,8 @@ class H3AccelerationTests(unittest.TestCase):
                 helper, "_verified_install", return_value=False,
             ), patch.object(
                 helper, "_cuda13_identities", return_value=(runtime, toolchain, prefix, inputs),
-            ), patch.object(helper.subprocess, "run", side_effect=fake_run), patch.object(
+            ), patch.object(helper.shutil, "which", return_value="/pinokio/bin/uv"), patch.object(
+                helper.subprocess, "run", side_effect=fake_run), patch.object(
                 helper, "_installed_version", return_value=helper.VERSION,
             ), patch.object(
                 helper, "_distribution_source", return_value=helper.CHECKOUT.resolve(),
@@ -684,12 +716,45 @@ class H3AccelerationTests(unittest.TestCase):
             self.assertEqual(
                 command,
                 [
-                    sys.executable, "-m", "pip", "install", "--no-build-isolation",
-                    "--no-deps", "--force-reinstall", ".",
+                    "/pinokio/bin/uv", "pip", "install", "--python", sys.executable,
+                    "--no-build-isolation",
+                    "--no-deps", "--reinstall", ".",
                 ],
             )
             write_marker.assert_called_once()
             self.assertEqual(write_marker.call_args.args[0]["distribution_sha256"], "digest")
+
+    def test_missing_uv_skips_before_optional_build(self):
+        helper = _load_sage_installer()
+        fake_torch = SimpleNamespace(
+            __version__="2.10.0+cu130", version=SimpleNamespace(cuda="13.0"),
+            cuda=SimpleNamespace(
+                is_available=lambda: True,
+                get_device_capability=lambda index: (12, 0),
+            ),
+        )
+        runtime = {"executable": sys.executable}
+        run = Mock()
+        write_marker = Mock()
+        with patch.dict(sys.modules, {"torch": fake_torch}), patch.object(
+            helper.platform, "system", return_value="Linux",
+        ), patch.object(helper, "_git_revision", return_value=helper.REVISION), patch.object(
+            helper, "_git_source_clean", return_value=True,
+        ), patch.object(helper, "_verified_install", return_value=False), patch.object(
+            helper, "_cuda13_identities",
+            return_value=(runtime, {}, Path("/var/tmp/maestro-h3-test-toolchain"), {}),
+        ), patch.object(helper.shutil, "which", return_value=None) as which, patch.object(
+            helper.subprocess, "run", run,
+        ), patch.object(helper, "_write_marker", write_marker), patch(
+            "builtins.print"
+        ) as output:
+            self.assertEqual(helper.main(), 0)
+        which.assert_called_once_with("uv")
+        run.assert_not_called()
+        write_marker.assert_not_called()
+        output.assert_any_call(
+            "[H3 Sage2] skipped: Pinokio UV is unavailable for the pinned source build; run Update from Pinokio"
+        )
 
     def test_cuda13_ldflags_precede_cuda_home_library_search_in_setuptools_link(self):
         from setuptools._distutils import ccompiler
@@ -709,6 +774,7 @@ class H3AccelerationTests(unittest.TestCase):
                 "cc": Path(toolchain["cc"]),
                 "cxx": Path(toolchain["cxx"]),
                 "cccl_include": Path(toolchain["cccl_include"]),
+                "toolchain_include": prefix / "targets/x86_64-linux/include",
                 "toolchain_lib": prefix / "lib",
             }
             object_file = root / "fixture.o"
@@ -813,6 +879,7 @@ class H3AccelerationTests(unittest.TestCase):
                 "cc": Path(toolchain["cc"]),
                 "cxx": Path(toolchain["cxx"]),
                 "cccl_include": Path(toolchain["cccl_include"]),
+                "toolchain_include": prefix / "targets/x86_64-linux/include",
                 "toolchain_lib": prefix / "lib",
             }
             marker = root / "marker.json"

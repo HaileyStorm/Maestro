@@ -2617,3 +2617,33 @@ flag. The scoped CPU suite ran 29 tests with one skip. Native build, release
 profile measurements and human visual/audio acceptance remain distinct gates.
 The planned Blend output-settings restoration and remaining app-wide work are
 still open; this checkpoint does not close the sprint.
+
+
+## Native SageAttention CUDA 13 availability — 2026-09-15
+
+The pinned official SageAttention 2.2.0 source now builds in the preferred
+Torch 2.10.0+cu130 / CUDA 13.0 environment. The installer uses UV's supported
+`--reinstall` flag with the selected interpreter, forces native compilation,
+and adds the verified managed compiler target include directory after the
+selected runtime headers. A real first build exposed the missing
+`crt/host_defines.h` include; the corrected build completed successfully.
+No shared runtime packages were downgraded.
+
+Native evidence on the RTX 5090: the strict Maestro H3 attention seam executed
+FP16 and BF16 with fallback disabled, finite outputs and matching shape/dtype.
+For the small synthetic 1×256×4×128 cases, relative L2 differences from FP32
+SDPA were 0.03664 and 0.03571. This is kernel execution evidence, not generation
+quality or performance acceptance. The installed marker and package provenance
+match the pinned source revision. The live capability endpoint now reports
+Sage2 available without restarting Maestro.
+
+The old release-bound validation record correctly reports a build mismatch;
+no validated profiles or model types were promoted. The serial native/Turbo
+comparison cases and human visual/audio review remain open. Before running
+server-owned generation, its lease monitor must cancel the exact owned job on
+authority loss; killing only a benchmark client does not stop server GPU work.
+
+The final scoped CPU/mock suite ran 29 tests with one skip; independent review
+closed the UV CLI incompatibility. Runtime/source reservations were released
+after build and smoke verification, and the GPU request was withdrawn.
+Historical tracker and unrelated dirty-work holds remain unchanged.
