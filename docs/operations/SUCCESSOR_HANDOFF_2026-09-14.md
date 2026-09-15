@@ -161,3 +161,14 @@ guard. The owner has been asked to approve Linux-native temporary browser
 scratch. Preserve recovery's no-signal/no-restart boundary until cleared.
 Maestro remains running. UI recovery/navigation and keyboard/touch fixes are
 in progress; the full browser matrix is not yet accepted.
+
+The UI follow-up makes Gallery and Director dashboard scroll regions keyboard
+focusable and gives Advanced's LoRA search/filter controls mobile-sized targets.
+The recovery fixture now uses a commit-phase fault instead of one React can
+recover during render; retry/no-loop and uncaught-error assertions remain.
+Support and What's New tests follow the current navigation. All 601 UI tests,
+build and lint pass; eight recovery and two nested-modal checks pass. Five
+representative overlay cases passed before the NTFS stop. The final Director
+scroll correction was checked in live Chrome (Tab enters the region; Escape
+restores launcher focus); its landscape automation remains pending approved
+scratch. No service restart or GPU workload was performed.

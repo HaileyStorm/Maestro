@@ -76,39 +76,46 @@ async function gotoSyntheticApp(page: Page) {
 type RootFaultTarget = 'sidebar' | 'main' | 'account' | 'portal'
 
 async function routeOneShotRootFault(page: Page, target: RootFaultTarget) {
+  // React may recover a one-off render error before the boundary commits.
+  // Insertion effects exercise the boundary without StrictMode effect replay.
+  const cacheDir = process.env.MAESTRO_VITE_CACHE_DIR
+  if (!cacheDir) throw new Error('Root fault tests require the isolated Vite cache')
+  const dependencies = `/@fs/${cacheDir.replaceAll('\\', '/').replace(/^\/+/, '')}/deps/`
   const once = `
+    import React from ${JSON.stringify(`${dependencies}react.js`)};
+    const { useInsertionEffect } = React;
     function failOnce() {
       const counts = globalThis.__maestroRootFaultCounts ||= {};
       counts.${target} = (counts.${target} || 0) + 1;
-      if (counts.${target} === 1) throw new Error('Synthetic synchronous render fault');
+      if (counts.${target} === 1) throw new Error('Synthetic synchronous commit fault');
     }
   `
   const modules: Record<RootFaultTarget, { path: string; source: string }> = {
     sidebar: {
       path: '**/src/components/Sidebar/Sidebar.tsx',
-      source: `${once} export function Sidebar() { failOnce(); return null }`,
+      source: `${once} export function Sidebar() { useInsertionEffect(failOnce, []); return null }`,
     },
     main: {
       path: '**/src/components/MainContent/MainContent.tsx',
-      source: `${once} export function MainContent() { failOnce(); return null }`,
+      source: `${once} export function MainContent() { useInsertionEffect(failOnce, []); return null }`,
     },
     account: {
       path: '**/src/components/AccountSupport/AccountSupportDrawer.tsx',
       source: `${once}
         export function AccountSupportButton() { return null }
-        export function AccountSupportDrawer() { failOnce(); return null }
+        export function AccountSupportDrawer() { useInsertionEffect(failOnce, []); return null }
       `,
     },
     portal: {
       path: '**/src/components/WhatsNewDialog.tsx',
       source: `
-        import { createElement } from '/node_modules/.vite/deps/react.js';
-        import { createPortal } from '/node_modules/.vite/deps/react-dom.js';
+        import ReactDOM from ${JSON.stringify(`${dependencies}react-dom.js`)};
+        const { createPortal } = ReactDOM;
         ${once}
-        function PortalFault() { failOnce(); return null }
+        function PortalFault() { useInsertionEffect(failOnce, []); return null }
         export function WhatsNewButton() { return null }
         export function WhatsNewDialogHost() {
-          return createPortal(createElement(PortalFault), document.body)
+          return createPortal(React.createElement(PortalFault), document.body)
         }
       `,
     },
@@ -526,7 +533,7 @@ test.afterEach(async () => {
 })
 
 for (const target of ['sidebar', 'main', 'account', 'portal'] as const) {
-  test(`root recovery boundary retries one synchronous ${target} render fault without a loop`, async ({ page }) => {
+  test(`root recovery boundary retries one synchronous ${target} commit fault without a loop`, async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 })
     await skipWelcome(page)
     await routeOneShotRootFault(page, target)
@@ -611,7 +618,7 @@ test('shared toolbar keeps view hierarchy and panel baseline stable across simul
         await expect(viewRow.locator('button[aria-controls="gallery-filter-popover"]')).toBeVisible()
         if (viewport.width === 768 || viewport.width === 1024) {
           const workspaceTrigger = primaryRow.getByRole('button', { name: /Current project: .*Open project selector/ })
-          const supportTrigger = page.getByRole('button', { name: 'Open Support', exact: true })
+          const supportTrigger = page.getByRole('button', { name: 'Open support', exact: true })
           await expect(workspaceTrigger).toBeVisible()
           await expect(supportTrigger).toBeVisible()
           const [workspaceBox, supportBox] = await Promise.all([
@@ -836,7 +843,7 @@ test('mobile nested modal stack keeps only the top dialog interactive', async ({
         ? [controls]
         : []
     }))
-  expect(disclosureIds.sort()).toEqual(['advanced-preset-save-form', 'post-processing-settings'])
+  expect(disclosureIds.sort()).toEqual(['generation-profile-save-advanced', 'post-processing-settings'])
 
   let expandedViolations: Awaited<ReturnType<typeof collectRenderedActionTargetViolations>> = []
   let voiceClone: Locator | undefined
@@ -969,6 +976,14 @@ for (const viewport of [
     await expectNoBlockingAxeFindings(page)
     await filters.getByRole('button', { name: 'Close Gallery filters' }).click()
 
+    const galleryFeed = page.getByRole('region', { name: 'Gallery outputs', exact: true })
+    await galleryFeed.focus()
+    await expect(galleryFeed).toBeFocused()
+    if (await galleryFeed.evaluate(element => element.scrollHeight > element.clientHeight)) {
+      await page.keyboard.press('PageDown')
+      await expect.poll(() => galleryFeed.evaluate(element => element.scrollTop)).toBeGreaterThan(0)
+    }
+
     const menuButton = page.getByRole('button', { name: 'Open Generate, Director, and References menu' })
     await menuButton.click()
     const menu = page.locator('#maestro-mobile-sidebar[role="dialog"]')
@@ -1010,7 +1025,8 @@ for (const viewport of [
     await expectNoBlockingAxeFindings(page)
     await support.getByRole('button', { name: 'Close Support panel' }).last().click()
 
-    await page.getByRole('button', { name: /What's new in/ }).click()
+    await page.getByRole('button', { name: 'Open Generate, Director, and References menu' }).click()
+    await menu.getByRole('button', { name: /What's new in/ }).click()
     const whatsNew = page.getByRole('dialog', { name: /What's new in/ })
     await expect(whatsNew).toBeVisible()
     await expect(whatsNew.locator('[class~="cursor-pointer"]')).not.toHaveCount(0)

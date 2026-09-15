@@ -830,7 +830,12 @@ function DirectorDashboardInner() {
       </div>
 
       {/* Content */}
-      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain p-3 [-webkit-overflow-scrolling:touch] sm:p-4">
+      <div
+        role="region"
+        aria-label="Director dashboard contents"
+        tabIndex={0}
+        className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain p-3 [-webkit-overflow-scrolling:touch] sm:p-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-blue"
+      >
         {(loading || pipelineListHydrating) && (
           <div className="flex items-center justify-center py-12 text-text-muted">
             <Loader2 size={20} className="animate-spin mr-2" />

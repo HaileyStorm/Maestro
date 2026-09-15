@@ -3348,7 +3348,10 @@ export function MainContent() {
         {/* Scrollable media feed */}
         <div
           ref={feedRef}
-          className="flex-1 overflow-y-auto p-3 md:p-4"
+          role="region"
+          aria-label="Gallery outputs"
+          tabIndex={0}
+          className="flex-1 overflow-y-auto p-3 md:p-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-blue"
           onScroll={handleFeedScroll}
         >
           {/* Position container for virtualized output items */}

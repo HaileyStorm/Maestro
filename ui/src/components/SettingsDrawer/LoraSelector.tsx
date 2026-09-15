@@ -801,7 +801,7 @@ export function LoraSelector() {
             value={search}
             onChange={e => setSearch(e.target.value)}
             placeholder="Search LoRAs..."
-            className="w-full bg-bg-tertiary border border-border rounded-lg pl-7 pr-3 py-1.5 text-xs text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent-blue"
+            className="mobile-control-target w-full bg-bg-tertiary border border-border rounded-lg pl-7 pr-3 py-1.5 text-xs text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent-blue"
           />
         </div>
         {/* Updatable-only filter — only meaningful when at least one LoRA
@@ -809,7 +809,7 @@ export function LoraSelector() {
             unconditionally so the affordance is discoverable, but the
             label dims when there's nothing to filter. */}
         <label
-          className="flex items-center gap-1 cursor-pointer shrink-0 select-none"
+          className="mobile-control-target flex items-center gap-1 cursor-pointer shrink-0 select-none"
           title={updatableCount > 0
             ? `${updatableCount} LoRA${updatableCount === 1 ? ' has' : 's have'} updates available — check to filter`
             : 'No updates available — check "Check" first to refresh from CivitAI'}
