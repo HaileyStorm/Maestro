@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
 import { X, Film, ArrowRight } from 'lucide-react'
-import { useStore } from '../../stores/useStore'
+import { currentAccountIdentityEpoch, useStore } from '../../stores/useStore'
 import * as api from '../../api/client'
 
 function ClipDropZone({ label, file, url, duration, onUpload, onClear }: {
@@ -92,23 +92,89 @@ export function BlendControls() {
   }, [ensureTransitionLoraForBlend])
 
   const [error, setError] = useState<string | null>(null)
+  const uploadSequence = useRef({ A: 0, B: 0 })
+  const pendingVideo = useRef<Partial<Record<'A' | 'B', () => void>>>({})
+
+  useEffect(() => {
+    const scope = () => {
+      const state = useStore.getState()
+      return JSON.stringify([currentAccountIdentityEpoch(), state.activeWorkspace,
+        state.generationMode, state.params.image_mode])
+    }
+    const invalidate = () => {
+      for (const target of ['A', 'B'] as const) {
+        uploadSequence.current[target]++
+        pendingVideo.current[target]?.()
+      }
+    }
+    let previous = scope()
+    // Observe each transition, including leaving and returning to one project
+    // before React renders again or a pending upload finishes.
+    const unsubscribe = useStore.subscribe(() => {
+      const next = scope()
+      if (next === previous) return
+      previous = next
+      invalidate()
+      setError(null)
+    })
+    return () => { unsubscribe(); invalidate() }
+  }, [])
 
   const uploadClip = useCallback(async (file: File, target: 'A' | 'B') => {
+    const sequence = ++uploadSequence.current[target]
+    pendingVideo.current[target]?.()
+    const workspace = useStore.getState().activeWorkspace
+    const accountEpoch = currentAccountIdentityEpoch()
+    const current = () => {
+      const state = useStore.getState()
+      return sequence === uploadSequence.current[target]
+        && accountEpoch === currentAccountIdentityEpoch()
+        && state.activeWorkspace === workspace
+        && state.generationMode === 'video' && state.params.image_mode === 4
+    }
     setError(null)
     try {
       const result = await api.uploadImage(file)
+      if (!current()) return
       const url = URL.createObjectURL(file)
       if (file.type.startsWith('video/')) {
         const video = document.createElement('video')
-        video.src = url
+        let finished = false
+        let timer = 0
+        const cleanup = (retainUrl = false) => {
+          if (finished) return
+          finished = true
+          window.clearTimeout(timer)
+          video.onloadedmetadata = null
+          video.onerror = null
+          video.removeAttribute('src')
+          video.load()
+          if (!retainUrl) URL.revokeObjectURL(url)
+          if (pendingVideo.current[target] === abort) delete pendingVideo.current[target]
+        }
+        const abort = () => cleanup()
+        const fail = () => {
+          if (finished) return
+          cleanup()
+          if (current()) setError('Could not read this video. Try another file.')
+        }
+        pendingVideo.current[target] = abort
         video.onloadedmetadata = () => {
-          const duration = video.duration && isFinite(video.duration) ? video.duration : 0
+          if (finished) return
+          if (!current()) { cleanup(); return }
+          const duration = video.duration
+          if (!Number.isFinite(duration) || duration <= 0) { fail(); return }
+          cleanup(true)
           if (target === 'A') {
             setBlendClipA(file, result.path, url, duration)
           } else {
             setBlendClipB(file, result.path, url, duration)
           }
         }
+        video.onerror = fail
+        video.preload = 'metadata'
+        timer = window.setTimeout(fail, 15_000)
+        video.src = url
       } else {
         if (target === 'A') {
           setBlendClipA(file, result.path, url, 0)
@@ -117,7 +183,7 @@ export function BlendControls() {
         }
       }
     } catch {
-      setError('Failed to upload')
+      if (current()) setError('Upload failed. Try again.')
     }
   }, [setBlendClipA, setBlendClipB])
 
@@ -148,7 +214,7 @@ export function BlendControls() {
         <p className="text-[9px] text-text-muted mt-1">
           {blendMode === 'insert'
             ? 'Adds new footage between clips. Total duration increases.'
-            : 'Replaces the end of A and start of B with a generated transition. Total duration stays the same.'}
+            : 'Replaces the end of A and start of B with one transition, shortening the total by the overlap.'}
         </p>
       </div>
 
@@ -160,7 +226,11 @@ export function BlendControls() {
           url={blendClipAUrl}
           duration={blendClipADuration}
           onUpload={f => uploadClip(f, 'A')}
-          onClear={clearBlendClipA}
+          onClear={() => {
+            uploadSequence.current.A++
+            pendingVideo.current.A?.()
+            clearBlendClipA()
+          }}
         />
         <ArrowRight size={16} className="text-text-muted shrink-0" />
         <ClipDropZone
@@ -169,7 +239,11 @@ export function BlendControls() {
           url={blendClipBUrl}
           duration={blendClipBDuration}
           onUpload={f => uploadClip(f, 'B')}
-          onClear={clearBlendClipB}
+          onClear={() => {
+            uploadSequence.current.B++
+            pendingVideo.current.B?.()
+            clearBlendClipB()
+          }}
         />
       </div>
 

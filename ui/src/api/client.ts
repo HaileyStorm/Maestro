@@ -6531,7 +6531,7 @@ export async function submitBlend(params: {
   num_inference_steps?: number;
   guidance_scale?: number;
   negative_prompt?: string;
-  /** @deprecated no longer used; kept for back-compat with existing call sites */
+  /** Duration of new footage added between the complete clips in Insert mode. */
   transition_sec?: number;
   /** @deprecated bell-curve weighting is applied automatically */
   strength_a?: number;
@@ -6539,7 +6539,10 @@ export async function submitBlend(params: {
   strength_b?: number;
   /** @deprecated superseded by anchor_frames; kept for back-compat */
   denoise_strength?: number;
-}): Promise<{ job_id: string; status: string; overlap_sec?: number; frames?: number }> {
+}): Promise<{
+  job_id: string; status: string; blend_mode?: 'insert' | 'overlap';
+  transition_sec?: number; overlap_sec?: number; frames?: number;
+}> {
   const res = await fetch(`${BASE}/api/v1/blend`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

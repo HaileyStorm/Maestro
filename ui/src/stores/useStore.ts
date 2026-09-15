@@ -195,6 +195,19 @@ function _setH3Ref2VATermsAccepted(accepted: boolean): void {
 
 let _hostTermsOperationTail: Promise<void> = Promise.resolve()
 let _hostTermsRead: { scope: string; promise: Promise<void> } | null = null
+const _blendObjectUrls = new Set<string>()
+const EMPTY_BLEND_MEDIA = {
+  blendClipA: null, blendClipAPath: '', blendClipAUrl: '', blendClipADuration: 0,
+  blendClipB: null, blendClipBPath: '', blendClipBUrl: '', blendClipBDuration: 0,
+} as const
+
+function _releaseUnusedBlendUrls(urlA: string, urlB: string): void {
+  for (const url of _blendObjectUrls) {
+    if (url === urlA || url === urlB) continue
+    _blendObjectUrls.delete(url)
+    try { URL.revokeObjectURL(url) } catch { /* browser is disposing the document */ }
+  }
+}
 
 function _queueHostTermsOperation<T>(operation: () => Promise<T>): Promise<T> {
   const result = _hostTermsOperationTail.then(operation, operation)
@@ -5158,6 +5171,7 @@ function _scrubAccountBoundProjectUi(state: AppState): Partial<AppState> {
   _directorPreviewRecoveryToken = null
   _directorPreviewActiveOwnership = null
   return {
+    ...EMPTY_BLEND_MEDIA,
     workspaces: [],
     activeWorkspace: '',
     browsingUploads: false,
@@ -5911,20 +5925,21 @@ export const useStore = create<AppState>((set, get) => ({
       },
     })
   },
-  blendClipA: null, blendClipAPath: '', blendClipAUrl: '', blendClipADuration: 0,
-  blendClipB: null, blendClipBPath: '', blendClipBUrl: '', blendClipBDuration: 0,
+  ...EMPTY_BLEND_MEDIA,
   blendTransitionSec: 5,
   blendStrengthA: 1.0,
   blendStrengthB: 0.7,
   blendMotionPrefixSec: 1.0,
   blendMotionSuffixSec: 1.0,
   blendAnchorStrength: 0.7,
-  setBlendClipA: (file, path, url, duration) => set({
-    blendClipA: file, blendClipAPath: path, blendClipAUrl: url, blendClipADuration: duration,
-  }),
-  setBlendClipB: (file, path, url, duration) => set({
-    blendClipB: file, blendClipBPath: path, blendClipBUrl: url, blendClipBDuration: duration,
-  }),
+  setBlendClipA: (file, path, url, duration) => {
+    if (url.startsWith('blob:')) _blendObjectUrls.add(url)
+    set({ blendClipA: file, blendClipAPath: path, blendClipAUrl: url, blendClipADuration: duration })
+  },
+  setBlendClipB: (file, path, url, duration) => {
+    if (url.startsWith('blob:')) _blendObjectUrls.add(url)
+    set({ blendClipB: file, blendClipBPath: path, blendClipBUrl: url, blendClipBDuration: duration })
+  },
   clearBlendClipA: () => set({ blendClipA: null, blendClipAPath: '', blendClipAUrl: '', blendClipADuration: 0 }),
   clearBlendClipB: () => set({ blendClipB: null, blendClipBPath: '', blendClipBUrl: '', blendClipBDuration: 0 }),
   setBlendTransitionSec: (sec) => set({ blendTransitionSec: sec }),
@@ -8544,10 +8559,14 @@ export const useStore = create<AppState>((set, get) => ({
           model_type: state.params.model_type as string,
           blend_mode: state.blendMode,
           overlap_sec: state.blendOverlapSec,
-          // Blend-specific tuning knobs (exposed in BlendControls sliders)
-          motion_prefix_sec: state.blendMotionPrefixSec,
-          motion_suffix_sec: state.blendMotionSuffixSec,
-          input_video_strength: state.blendAnchorStrength,
+          transition_sec: state.blendTransitionSec,
+          // These controls are shown only for Overlap. Insert keeps its
+          // ordinary technical settings without hidden Overlap overrides.
+          ...(state.blendMode === 'overlap' ? {
+            motion_prefix_sec: state.blendMotionPrefixSec,
+            motion_suffix_sec: state.blendMotionSuffixSec,
+            input_video_strength: state.blendAnchorStrength,
+          } : {}),
           seed: (state.params.seed as number) ?? -1,
           activated_loras: (state.params.activated_loras as string[]) || [],
           loras_multipliers: (state.params.loras_multipliers as string) || '',
@@ -18239,6 +18258,19 @@ export const useStore = create<AppState>((set, get) => ({
     setTimeout(poll, 1000)
   },
 }))
+
+let _blendMediaScope = JSON.stringify([_accountIdentityEpoch, useStore.getState().activeWorkspace])
+useStore.subscribe(state => {
+  const scope = JSON.stringify([_accountIdentityEpoch, state.activeWorkspace])
+  if (scope !== _blendMediaScope) {
+    _blendMediaScope = scope
+    _releaseUnusedBlendUrls('', '')
+    // Store ownership outlives the Blend panel, but never its account/project.
+    useStore.setState(EMPTY_BLEND_MEDIA)
+    return
+  }
+  _releaseUnusedBlendUrls(state.blendClipAUrl, state.blendClipBUrl)
+})
 
 useStore.subscribe(state => {
   const card = state.enhanceQueueCard

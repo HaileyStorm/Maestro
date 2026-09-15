@@ -2611,6 +2611,11 @@ readiness both returning 200. A fresh stable Cloudflare browser load reaches
 the normal sign-in page; authenticated remote flows were not exercised. This
 UI update required no service restart.
 
+When `ui/dist` has an active reservation, build with
+`npm run build -- --emptyOutDir false` so Vite preserves its ownership marker.
+Release that exact reservation after deployment verification; never recreate a
+marker deleted by an unguarded build.
+
 SageAttention's source installer now uses UV with the selected interpreter and
 forces native CUDA compilation even if the caller inherited the upstream skip
 flag. The scoped CPU suite ran 29 tests with one skip. Native build, release
@@ -2647,3 +2652,44 @@ The final scoped CPU/mock suite ran 29 tests with one skip; independent review
 closed the UV CLI incompatibility. Runtime/source reservations were released
 after build and smoke verification, and the GPU request was withdrawn.
 Historical tracker and unrelated dirty-work holds remain unchanged.
+
+
+### Backend gate reconciliation
+
+The full CPU backend run exercised 5,116 tests in 1,333 seconds and finished
+with one failure, 14 errors and 17 skips. The failure was a test/source race:
+the process had loaded the old UV flag assertion before the final correction.
+The final H3 module rerun completed successfully: 29 tests, one skipped. The 14 launcher
+errors came from a pre-existing temporary-root package manifest declaring ESM,
+which changed Node's interpretation of copied CommonJS launcher files. The
+full launcher compatibility module completed successfully (34 tests, one
+skipped) under an
+isolated temporary root outside that package boundary. The foreign manifest
+was preserved. Publication-boundary, Python syntax and separate JSON grammar
+checks passed. Do not describe the original aggregate run as a clean pass;
+its failures were resolved by these scoped final checks.
+
+
+## Blend media ownership and client preparation — 2026-09-15
+
+Blend uploads now remain bound to their initiating account, project and panel
+operation. A new upload, clear, unmount, account change or project round trip
+invalidates pending completions. Failed video metadata reads have a bounded
+timeout and release their pending object URL.
+
+Installed clips belong to the store: both File/path/URL/duration slots clear
+synchronously on account or project transitions, including with no Blend panel
+mounted. Replacing or clearing a clip releases its blob URL only after neither
+slot references it. Same-project mode switches intentionally retain selected
+clips and their previews. Thirteen focused component/store/request tests cover
+these boundaries; all 648 UI tests and 147 Firefox/Chromium/WebKit browser tests
+pass, as do TypeScript and lint. Independent review closed the installed-media
+scope and URL-lifetime findings.
+
+The client also sends the selected Insert transition duration, omits hidden
+Overlap-only overrides in Insert, and describes Overlap duration accurately.
+These request changes are additive for the currently running backend. The
+backend Insert assembly/metadata changes are a separate in-progress unit and
+must not be described as live until their reviewed source is restarted and
+verified. No GPU inference or authenticated remote upload acceptance is claimed
+by this UI milestone.
