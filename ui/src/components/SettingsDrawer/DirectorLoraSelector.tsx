@@ -56,7 +56,7 @@ function DirectorRoleLoraParameterField({
         <select id={id} value={value === true ? 'true' : value === false ? 'false' : ''} onChange={event => {
           if (event.target.value === '') onClear()
           else onChange(event.target.value === 'true')
-        }} className="mt-0.5 w-full rounded border border-border bg-bg-primary px-1.5 py-1 text-[9px]">
+        }} className="mobile-control-target mt-0.5 w-full rounded border border-border bg-bg-primary px-1.5 py-1 text-[9px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">
           <option value="">Choose…</option>
           <option value="false">No</option>
           <option value="true">Yes</option>
@@ -74,7 +74,7 @@ function DirectorRoleLoraParameterField({
             api.getLoraParameterOptionToken(candidate.value) === event.target.value
           ))
           if (option) onChange(option.value)
-        }} className="mt-0.5 w-full rounded border border-border bg-bg-primary px-1.5 py-1 text-[9px]">
+        }} className="mobile-control-target mt-0.5 w-full rounded border border-border bg-bg-primary px-1.5 py-1 text-[9px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">
           {value === undefined && <option value="">Choose…</option>}
           {(parameter.options ?? []).map(option => (
             <option key={api.getLoraParameterOptionToken(option.value)} value={api.getLoraParameterOptionToken(option.value)}>{option.label}</option>
@@ -89,14 +89,14 @@ function DirectorRoleLoraParameterField({
         {label}
         <input id={id} type="number" value={typeof value === 'number' ? value : ''} min={parameter.minimum} max={parameter.maximum} step={parameter.step ?? (parameter.type === 'integer' ? 1 : 'any')} onChange={event => {
           if (Number.isFinite(event.target.valueAsNumber)) onChange(event.target.valueAsNumber)
-        }} className="mt-0.5 w-full rounded border border-border bg-bg-primary px-1.5 py-1 text-[9px]" />
+        }} className="mobile-control-target mt-0.5 w-full rounded border border-border bg-bg-primary px-1.5 py-1 text-[9px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue" />
       </label>
     )
   }
   return (
     <label htmlFor={id} className="block text-[9px] text-text-secondary">
       {label}
-      <input id={id} type="text" value={typeof value === 'string' ? value : ''} minLength={parameter.min_length} maxLength={parameter.max_length} onChange={event => onChange(event.target.value)} className="mt-0.5 w-full rounded border border-border bg-bg-primary px-1.5 py-1 text-[9px]" />
+      <input id={id} type="text" value={typeof value === 'string' ? value : ''} minLength={parameter.min_length} maxLength={parameter.max_length} onChange={event => onChange(event.target.value)} className="mobile-control-target mt-0.5 w-full rounded border border-border bg-bg-primary px-1.5 py-1 text-[9px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue" />
     </label>
   )
 }
@@ -172,13 +172,13 @@ export function DirectorImageRoleLoraSelector({
           <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-1.5">
             <div className="relative">
               <Search size={11} className="absolute left-2 top-1/2 -translate-y-1/2 text-text-muted" />
-              <input aria-label={`Search ${directorRoleLabel(role)} LoRAs`} value={search} onChange={event => setSearch(event.target.value)} placeholder="Search compatible LoRAs" className="w-full rounded border border-border bg-bg-tertiary py-1 pl-6 pr-2 text-[10px]" />
+              <input aria-label={`Search ${directorRoleLabel(role)} LoRAs`} value={search} onChange={event => setSearch(event.target.value)} placeholder="Search compatible LoRAs" className="mobile-control-target w-full rounded border border-border bg-bg-tertiary py-1 pl-6 pr-2 text-[10px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue" />
             </div>
-            <button type="button" onClick={() => openBrowser(true, modelType)} className="inline-flex items-center gap-1 rounded border border-border px-2 py-1 text-[9px] text-accent-blue"><Globe size={10} /> Browse</button>
+            <button type="button" aria-label={`Browse ${directorRoleLabel(role)} LoRAs`} onClick={() => openBrowser(true, modelType)} className="mobile-control-target inline-flex items-center justify-center gap-1 rounded border border-border px-2 py-1 text-[9px] text-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"><Globe size={10} /> Browse</button>
           </div>
           <div className="max-h-28 overflow-y-auto rounded border border-border bg-bg-tertiary">
             {available.slice(0, 100).map(lora => (
-              <button key={lora.filename} type="button" disabled={selections.length >= 64} onClick={() => onChange([...selections, api.createDirectorImageRoleLoraSelection(lora)])} className="flex w-full items-center justify-between gap-2 border-b border-border/40 px-2 py-1 text-left text-[10px] text-text-secondary last:border-b-0 hover:bg-bg-hover disabled:opacity-40">
+              <button key={lora.filename} type="button" disabled={selections.length >= 64} onClick={() => onChange([...selections, api.createDirectorImageRoleLoraSelection(lora)])} className="mobile-control-target flex w-full items-center justify-between gap-2 border-b border-border/40 px-2 py-1 text-left text-[10px] text-text-secondary last:border-b-0 hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-blue disabled:opacity-40">
                 <span className="truncate">{lora.filename.replace(/\.(safetensors|sft)$/i, '')}</span>
                 <span className="shrink-0 text-[8px] text-text-muted">{lora.parameter_schema ? 'Inputs' : 'Strength'}</span>
               </button>
@@ -197,8 +197,8 @@ export function DirectorImageRoleLoraSelector({
               <span className="truncate text-[10px] text-text-secondary" title={selection.id}>{selection.id}</span>
               <input aria-label={`${selection.id} multiplier`} type="number" min={-10} max={10} step={0.05} value={selection.multiplier} onChange={event => {
                 if (Number.isFinite(event.target.valueAsNumber)) onChange(updateDirectorRoleSelection(selections, selection.id, { multiplier: event.target.valueAsNumber }))
-              }} className="w-full rounded border border-border bg-bg-primary px-1 py-0.5 text-right text-[9px]" />
-              <button type="button" aria-label={`Remove ${selection.id}`} onClick={() => onChange(selections.filter(candidate => candidate.id !== selection.id))} className="rounded p-0.5 text-text-muted hover:text-red-300"><X size={11} /></button>
+              }} className="mobile-control-target w-full rounded border border-border bg-bg-primary px-1 py-0.5 text-right text-[9px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue" />
+              <button type="button" aria-label={`Remove ${selection.id}`} onClick={() => onChange(selections.filter(candidate => candidate.id !== selection.id))} className="mobile-control-target flex items-center justify-center rounded p-0.5 text-text-muted hover:text-red-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"><X size={11} /></button>
             </div>
             {schema && selection.parameter_schema_digest === schema.schema_digest && (
               <div className="mt-2 grid grid-cols-1 gap-1.5 sm:grid-cols-2">
@@ -262,7 +262,7 @@ function DirectorProfileLoraPicker({ mode, modelType, availableLoras }: {
             type="button"
             aria-label={`Use LoRAs from ${p.name}`}
             onClick={() => importLoras(p)}
-            className="flex items-center gap-1 px-2 py-1 rounded text-[10px] border border-border text-text-secondary hover:bg-bg-hover hover:text-text-primary hover:border-accent-blue transition-colors"
+            className="mobile-control-target flex items-center justify-center gap-1 px-2 py-1 rounded text-[10px] border border-border text-text-secondary hover:bg-bg-hover hover:text-text-primary hover:border-accent-blue transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
             title={`${p.activated_loras.length} LoRA(s): ${p.activated_loras.map(l => l.replace(/\.(safetensors|sft)$/i, '')).join(', ')}`}
           >
             <FolderOpen size={9} className="shrink-0" />
@@ -488,8 +488,10 @@ export function DirectorLoraSelector({ mode, modelType }: {
       <div className="flex items-center justify-between">
         <div className="text-xs text-text-muted">No LoRAs found</div>
         <button
+          type="button"
+          aria-label="Browse CivitAI"
           onClick={() => openBrowser(true, modelType)}
-          className="text-[10px] text-accent-blue hover:text-accent-blue-hover flex items-center gap-0.5"
+          className="mobile-control-target flex items-center justify-center gap-0.5 rounded text-[10px] text-accent-blue hover:text-accent-blue-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
         >
           <Globe size={10} /> Browse
         </button>
@@ -517,8 +519,10 @@ export function DirectorLoraSelector({ mode, modelType }: {
         <div className="flex items-center gap-2">
           <LoraSortToggle sort={sortMode} onChange={setSortSticky} />
           <button
+            type="button"
+            aria-label="Browse CivitAI"
             onClick={() => openBrowser(true, modelType)}
-            className="text-[10px] text-accent-blue hover:text-accent-blue-hover flex items-center gap-0.5 transition-colors"
+            className="mobile-control-target flex items-center justify-center gap-0.5 rounded text-[10px] text-accent-blue hover:text-accent-blue-hover transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
             title="Browse CivitAI"
           >
             <Globe size={10} /> Browse
@@ -533,23 +537,25 @@ export function DirectorLoraSelector({ mode, modelType }: {
           type="text"
           value={search}
           onChange={e => setSearch(e.target.value)}
+          aria-label="Search Director LoRAs"
           placeholder="Search LoRAs..."
-          className="w-full bg-bg-tertiary border border-border rounded-lg pl-7 pr-3 py-1.5 text-xs text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent-blue"
+          className="mobile-control-target w-full bg-bg-tertiary border border-border rounded-lg pl-7 pr-3 py-1.5 text-xs text-text-primary placeholder:text-text-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
         />
       </div>
 
       {/* Available LoRAs list */}
       <div className="max-h-[120px] overflow-y-auto border border-border rounded-lg bg-bg-tertiary">
-        {filtered.map(filename => {
+            {filtered.map(filename => {
           const isActive = activatedLoras.includes(filename)
           return (
-            <button
-              key={filename}
-              onClick={() => toggleLora(filename)}
-              className={`w-full text-left px-2.5 py-1.5 text-xs flex items-center gap-2 hover:bg-bg-hover transition-colors ${
-                isActive ? 'text-accent-blue' : 'text-text-secondary'
-              }`}
-            >
+            <div key={filename} className="flex items-center border-b border-border/40 last:border-b-0">
+              <button
+                type="button"
+                onClick={() => toggleLora(filename)}
+                className={`mobile-control-target min-w-0 flex-1 text-left px-2.5 py-1.5 text-xs flex items-center gap-2 hover:bg-bg-hover transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-blue ${
+                  isActive ? 'text-accent-blue' : 'text-text-secondary'
+                }`}
+              >
               <div className={`w-3.5 h-3.5 rounded border flex items-center justify-center shrink-0 ${
                 isActive ? 'bg-accent-blue border-accent-blue' : 'border-border'
               }`}>
@@ -566,11 +572,6 @@ export function DirectorLoraSelector({ mode, modelType }: {
                   downloaded={loraDates[filename].downloaded}
                 />
               )}
-              {guideTexts[filename] && (
-                <span onClick={e => e.stopPropagation()}>
-                  <LoraGuideTooltip guide={guideTexts[filename]} />
-                </span>
-              )}
               {loraWeightRecs[filename] && (
                 <span
                   // Functional indicator tokens, not accent-green: Golden
@@ -583,7 +584,9 @@ export function DirectorLoraSelector({ mode, modelType }: {
                   title={loraWeightRecs[filename].source === 'civitai' ? 'CivitAI recommended settings' : 'Default settings'}
                 />
               )}
-            </button>
+              </button>
+              {guideTexts[filename] && <LoraGuideTooltip guide={guideTexts[filename]} />}
+            </div>
           )
         })}
         {filtered.length === 0 && (
@@ -599,8 +602,10 @@ export function DirectorLoraSelector({ mode, modelType }: {
               Selected ({activatedLoras.length})
             </div>
             <button
+              type="button"
+              aria-label="Clear all Director LoRAs"
               onClick={clearAll}
-              className="text-[10px] text-text-muted hover:text-red-400 transition-colors"
+              className="mobile-control-target flex items-center justify-center rounded text-[10px] text-text-muted hover:text-red-400 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
             >
               Clear all
             </button>
@@ -625,16 +630,20 @@ export function DirectorLoraSelector({ mode, modelType }: {
                       </span>
                     ) : (
                       <button
+                        type="button"
+                        aria-label={`Generate guide for ${filename}`}
                         onClick={(e) => { e.stopPropagation(); handleGenerateGuide(filename) }}
-                        className="p-0.5 rounded hover:bg-bg-hover text-text-muted hover:text-accent-blue transition-colors"
+                        className="mobile-control-target flex items-center justify-center p-0.5 rounded hover:bg-bg-hover text-text-muted hover:text-accent-blue transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
                         title="Generate AI guide for this LoRA"
                       >
                         <Sparkles size={11} />
                       </button>
                     )}
                     <button
+                      type="button"
+                      aria-label={`Remove ${filename}`}
                       onClick={() => toggleLora(filename)}
-                      className="p-0.5 rounded hover:bg-bg-hover text-text-muted hover:text-text-primary transition-colors"
+                      className="mobile-control-target flex items-center justify-center p-0.5 rounded hover:bg-bg-hover text-text-muted hover:text-text-primary transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
                     >
                       <X size={12} />
                     </button>
@@ -690,7 +699,7 @@ export function DirectorLoraSelector({ mode, modelType }: {
                         step={0.05}
                         value={w}
                         onChange={e => updateWeight(filename, i, Number(e.target.value))}
-                        className={`w-12 shrink-0 rounded border border-border bg-bg-tertiary px-1 py-0.5 text-right text-[10px] tabular-nums outline-none focus:border-accent-blue ${valueColor}`}
+                        className={`mobile-control-target w-12 shrink-0 rounded border border-border bg-bg-tertiary px-1 py-0.5 text-right text-[10px] tabular-nums focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue ${valueColor}`}
                       />
                     </div>
                   )

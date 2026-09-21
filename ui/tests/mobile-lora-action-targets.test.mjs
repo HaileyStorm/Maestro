@@ -5,6 +5,39 @@ import test from 'node:test'
 import { compile } from 'tailwindcss'
 
 const selectorUrl = new URL('../src/components/SettingsDrawer/LoraSelector.tsx', import.meta.url)
+const directorSelectorUrl = new URL('../src/components/SettingsDrawer/DirectorLoraSelector.tsx', import.meta.url)
+const stylesUrl = new URL('../src/index.css', import.meta.url)
+
+function openingTags(source, tagName) {
+  const tags = []
+  const needle = `<${tagName}`
+  let cursor = 0
+  while ((cursor = source.indexOf(needle, cursor)) !== -1) {
+    const start = cursor
+    let quote = null
+    let braces = 0
+    cursor += needle.length
+    for (; cursor < source.length; cursor += 1) {
+      const char = source[cursor]
+      if (quote) {
+        if (char === quote && source[cursor - 1] !== '\\') quote = null
+        continue
+      }
+      if (char === '"' || char === "'" || char === '`') {
+        quote = char
+      } else if (char === '{') {
+        braces += 1
+      } else if (char === '}') {
+        braces = Math.max(0, braces - 1)
+      } else if (char === '>' && braces === 0) {
+        tags.push(source.slice(start, cursor + 1))
+        cursor += 1
+        break
+      }
+    }
+  }
+  return tags
+}
 
 function buttonOpeningTag(source, marker) {
   const markerIndex = source.indexOf(marker)
@@ -63,4 +96,48 @@ test('mobile target utilities compile to 44px and compact only from 768px', asyn
   assert.match(css, /@media \(width >= 48rem\)/)
   assert.match(css, /min-height: calc\(var\(--spacing\) \* 0\)/)
   assert.match(css, /min-width: calc\(var\(--spacing\) \* 0\)/)
+})
+
+test('Director LoRA actions and fields share the mobile target and keyboard focus contract', async () => {
+  const [source, sharedSource, styles] = await Promise.all([
+    readFile(directorSelectorUrl, 'utf8'),
+    readFile(selectorUrl, 'utf8'),
+    readFile(stylesUrl, 'utf8'),
+  ])
+  const buttons = openingTags(source, 'button')
+  const fields = [
+    ...openingTags(source, 'input').filter(tag => !/type="range"/.test(tag)),
+    ...openingTags(source, 'select'),
+  ]
+
+  assert.ok(buttons.length >= 10, 'covers every Director LoRA action family')
+  assert.ok(fields.length >= 7, 'covers search, parameter, multiplier, and numeric weight fields')
+  for (const [kind, controls] of [['button', buttons], ['field', fields]]) {
+    for (const control of controls) {
+      if (kind === 'button') assert.match(control, /type="button"/, 'button cannot submit a surrounding form')
+      assert.match(control, /mobile-control-target/, `${kind} uses the shared <=767px target contract`)
+      assert.match(control, /focus-visible:outline-none/, `${kind} removes the default outline only with a replacement`)
+      assert.match(control, /focus-visible:ring-2/, `${kind} shows a two-pixel keyboard focus ring`)
+      assert.match(control, /focus-visible:ring-accent-blue/, `${kind} uses the visible accent focus color`)
+    }
+  }
+
+  assert.match(source, /aria-label="Search Director LoRAs"/)
+  assert.match(source, /aria-label=\{`Browse \$\{directorRoleLabel\(role\)\} LoRAs`\}/)
+  assert.match(source, /aria-label="Clear all Director LoRAs"/)
+  assert.match(source, /aria-label=\{`Generate guide for \$\{filename\}`\}/)
+  assert.match(source, /aria-label=\{`Remove \$\{filename\}`\}/)
+  const guideButton = openingTags(sharedSource, 'button').find(tag => tag.includes('aria-label="Show LoRA guide"'))
+  assert.ok(guideButton, 'shared LoRA guide control is discoverable to assistive technology')
+  assert.match(guideButton, /type="button"/)
+  assert.match(guideButton, /mobile-control-target/)
+  assert.match(guideButton, /focus-visible:ring-2/)
+  assert.match(guideButton, /focus-visible:ring-accent-blue/)
+  assert.match(guideButton, /aria-expanded=\{show\}/)
+  for (const pickerSource of [source, sharedSource]) {
+    assert.doesNotMatch(pickerSource, /<span onClick=\{e => e\.stopPropagation\(\)\}>\s*<LoraGuideTooltip/)
+    assert.match(pickerSource, /<\/button>\s*\{guideTexts\[filename\] && <LoraGuideTooltip/)
+  }
+  assert.match(styles, /@media \(max-width: 767px\)[\s\S]*?\.mobile-control-target\s*\{\s*min-width: 44px;\s*min-height: 44px;/)
+  assert.doesNotMatch(styles, /@media \(min-width: 768px\)[\s\S]*?\.mobile-control-target/)
 })

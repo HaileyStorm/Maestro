@@ -64,14 +64,17 @@ export function LoraGuideTooltip({ guide }: { guide: string }) {
   return (
     <>
       <button
+        type="button"
         ref={btnRef}
+        aria-label="Show LoRA guide"
+        aria-expanded={show}
         onMouseEnter={() => { updatePos(); setShow(true) }}
         onMouseLeave={() => setShow(false)}
         onClick={e => { e.stopPropagation(); updatePos(); setShow(!show) }}
         // Functional indicator (LoRA has a guide) — paired with the
         // BookOpen "guide available" badge below. Uses indicator-success
         // so the green meaning stays consistent across themes.
-        className="p-0.5 text-indicator-success hover:text-indicator-success/80 transition-colors"
+        className="mobile-control-target flex items-center justify-center rounded p-0.5 text-indicator-success hover:text-indicator-success/80 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
       >
         <Info size={11} />
       </button>
@@ -539,18 +542,18 @@ export function LoraSelector() {
                 : null
             const blocked = Boolean(!isActive && blockReason)
             return (
-              <button
-                key={`${architecture || 'shared'}:${filename}`}
-                type="button"
-                disabled={blocked}
-                aria-pressed={isActive}
-                aria-label={`${isActive ? 'Remove' : 'Add'} ${displayName(filename)} ${architecture ? `from ${title}` : ''}`.trim()}
-                title={blockReason || undefined}
-                onClick={() => { if (!blocked) onToggle(filename) }}
-                className={`w-full text-left px-2.5 py-1.5 text-xs flex items-center gap-2 hover:bg-bg-hover transition-colors ${
-                  isActive ? 'text-accent-blue' : blocked ? 'text-text-muted opacity-45 cursor-not-allowed' : 'text-text-secondary'
-                }`}
-              >
+              <div key={`${architecture || 'shared'}:${filename}`} className="flex items-center">
+                <button
+                  type="button"
+                  disabled={blocked}
+                  aria-pressed={isActive}
+                  aria-label={`${isActive ? 'Remove' : 'Add'} ${displayName(filename)} ${architecture ? `from ${title}` : ''}`.trim()}
+                  title={blockReason || undefined}
+                  onClick={() => { if (!blocked) onToggle(filename) }}
+                  className={`mobile-control-target min-w-0 flex-1 text-left px-2.5 py-1.5 text-xs flex items-center gap-2 hover:bg-bg-hover transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-blue ${
+                    isActive ? 'text-accent-blue' : blocked ? 'text-text-muted opacity-45 cursor-not-allowed' : 'text-text-secondary'
+                  }`}
+                >
                 <div className={`w-3.5 h-3.5 rounded border flex items-center justify-center shrink-0 ${
                   isActive ? 'bg-accent-blue border-accent-blue' : 'border-border'
                 }`}>
@@ -567,11 +570,6 @@ export function LoraSelector() {
                     downloaded={loraDates[filename].downloaded}
                   />
                 )}
-                {guideTexts[filename] && (
-                  <span onClick={e => e.stopPropagation()}>
-                    <LoraGuideTooltip guide={guideTexts[filename]} />
-                  </span>
-                )}
                 {loraWeightRecs[filename] && (
                   <span
                     className={`w-1.5 h-1.5 rounded-full shrink-0 ${
@@ -587,7 +585,9 @@ export function LoraSelector() {
                     aria-label="Update available"
                   />
                 )}
-              </button>
+                </button>
+                {guideTexts[filename] && <LoraGuideTooltip guide={guideTexts[filename]} />}
+              </div>
             )
           })}
           {filtered.length === 0 && (
