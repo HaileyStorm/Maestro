@@ -189,7 +189,7 @@ function output(name = 'technical.mp4') {
   }
 }
 
-function installOutput(useStore, params, name = 'technical.mp4') {
+function installOutput(useStore, params, name = 'technical.mp4', uploadFilenames = {}) {
   useStore.setState(state => ({
     models: [{
       model_type: 'test_model',
@@ -204,7 +204,7 @@ function installOutput(useStore, params, name = 'technical.mp4') {
     outputsTotal: 1,
     selectedOutput: 0,
     selectedOutputMetaName: name,
-    selectedOutputMeta: { source: 'sidecar', params, upload_filenames: {} },
+    selectedOutputMeta: { source: 'sidecar', params, upload_filenames: uploadFilenames },
     params: {
       ...state.params,
       model_type: 'test_model',
@@ -243,6 +243,50 @@ test('canonical projection is closed, presence-aware, and independent of profile
     const omitted = projectGenerationProfileParameters({})
     assert.deepEqual(Object.keys(omitted).sort(), [...canonicalKeys].sort())
     for (const key of canonicalKeys) assert.equal(omitted[key], undefined, `${key} clears when omitted`)
+  })
+})
+
+test('Load Settings restores reference cleanup and safe Voice Clone reattachment metadata', async () => {
+  await withFreshStore(async ({ useStore }) => {
+    installOutput(useStore, {
+      model_type: 'test_model', prompt: 'voice clone restore', resolution: '1280x720',
+      video_length: 81, num_inference_steps: 20, guidance_scale: 1,
+      seed: 7, image_mode: 0, remove_background_images_ref: 1,
+      voice_clone_enabled: true, voice_clone_mode: 'two',
+      voice_clone_refs: ['/private/uploads/alice.wav', '/private/uploads/bob.wav'],
+    }, 'voice-clone.mp4', {
+      voice_clone_refs: ['/private/published/alice.wav', String.raw`C:\private\published\bob.wav`],
+    })
+
+    assert.equal(await useStore.getState().loadSettingsFromOutput(), true)
+    const restored = useStore.getState()
+    assert.equal(restored.removeBackgroundRefs, true)
+    assert.equal(restored.voiceCloneEnabled, true)
+    assert.equal(restored.voiceCloneMode, 'two')
+    assert.deepEqual(restored.voiceCloneRefs, [
+      { filename: 'alice.wav', path: '' },
+      { filename: 'bob.wav', path: '' },
+    ])
+    assert.equal(restored.voiceCloneRefs.some(ref => ref.path.includes('/private/')), false)
+
+    const alerts = []
+    window.alert = message => alerts.push(String(message))
+    await restored.startGeneration()
+    assert.deepEqual(alerts, [
+      'Attach both voice references before generating with Voice Clone.',
+    ])
+
+    installOutput(useStore, {
+      model_type: 'test_model', prompt: 'legacy scalar voice clone', resolution: '1280x720',
+      video_length: 81, num_inference_steps: 20, guidance_scale: 1,
+      seed: 8, image_mode: 0, voice_clone_enabled: true, voice_clone_mode: 'single',
+    }, 'voice-clone-scalar.mp4', {
+      voice_clone_refs: '/private/published/narrator.wav',
+    })
+    assert.equal(await useStore.getState().loadSettingsFromOutput(), true)
+    assert.deepEqual(useStore.getState().voiceCloneRefs, [
+      { filename: 'narrator.wav', path: '' },
+    ])
   })
 })
 

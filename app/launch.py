@@ -14105,6 +14105,45 @@ def _strip_director_image_role_internals(params: dict) -> dict:
     return params
 
 
+def _prepare_generation_sidecar_params(source_params: dict):
+    """Return restorable params plus path-free attachment display names."""
+    upload_filenames = {}
+    for key in [
+        "image_start", "image_end", "video_guide", "video_guide2",
+        "video_guide3", "audio_guide",
+        "audio_guide2", "audio_guide3", "audio_guide4",
+        "audio_guide5", "audio_guide6",
+        "audio_conditioning_guide", "voice_clone_refs",
+    ]:
+        value = source_params.get(key)
+        if value and isinstance(value, str):
+            upload_filenames[key] = value.replace("\\", "/").rsplit("/", 1)[-1]
+        elif value and isinstance(value, list):
+            upload_filenames[key] = [
+                item.replace("\\", "/").rsplit("/", 1)[-1]
+                if isinstance(item, str) and item else ""
+                for item in value
+            ]
+    sidecar_params = source_params.copy()
+    # Voice references are reusable only after the user attaches them again.
+    # Publish their basenames, never the workspace-local paths used by the job.
+    sidecar_params.pop("voice_clone_refs", None)
+    return upload_filenames, sidecar_params
+
+
+def _attach_voice_clone_sidecar_request(
+    params: dict, *, enabled: bool, mode: str, refs,
+) -> dict:
+    """Carry the original SeedVC request into an H3 task snapshot."""
+    result = params.copy()
+    safe_refs = [ref for ref in (refs or []) if isinstance(ref, str) and ref]
+    if enabled and safe_refs:
+        result["voice_clone_enabled"] = True
+        result["voice_clone_mode"] = "two" if mode == "two" else "single"
+        result["voice_clone_refs"] = safe_refs
+    return result
+
+
 def _director_explicit_creator_resolution(*, unrestricted: bool) -> dict:
     """Resolve only the automatic creator choice; explicit overrides bypass it."""
     if unrestricted:
@@ -60103,8 +60142,13 @@ def _run_generation(
                     or h3_mapping_plan is not None
                 ):
                     h3_task_sidecar_params[str(manifest_task.get("id"))] = (
-                        _snapshot_h3_recovery_task_params(
-                            manifest_params, manifest_info,
+                        _attach_voice_clone_sidecar_request(
+                            _snapshot_h3_recovery_task_params(
+                                manifest_params, manifest_info,
+                            ),
+                            enabled=pp_voice_clone_enabled,
+                            mode=pp_voice_clone_mode,
+                            refs=pp_voice_clone_refs,
                         )
                     )
 
@@ -60193,24 +60237,9 @@ def _run_generation(
                     if isinstance(task_params, dict)
                     else job["params"]
                 )
-                upload_filenames = {}
-                for key in [
-                    "image_start", "image_end", "video_guide", "video_guide2",
-                    "video_guide3", "audio_guide",
-                    "audio_guide2", "audio_guide3", "audio_guide4",
-                    "audio_guide5", "audio_guide6",
-                    "audio_conditioning_guide",
-                ]:
-                    val = source_params.get(key)
-                    if val and isinstance(val, str):
-                        upload_filenames[key] = os.path.basename(val)
-                    elif val and isinstance(val, list):
-                        upload_filenames[key] = [
-                            os.path.basename(v)
-                            if isinstance(v, str) and v else ""
-                            for v in val
-                        ]
-                sidecar_params = source_params.copy()
+                upload_filenames, sidecar_params = (
+                    _prepare_generation_sidecar_params(source_params)
+                )
                 # Native boundary descriptors are private, retry-scoped
                 # recovery inputs. Persist only the separately sealed producer
                 # continuation evidence, never staging paths or stale requests.

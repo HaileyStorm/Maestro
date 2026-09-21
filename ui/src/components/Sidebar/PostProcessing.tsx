@@ -235,6 +235,11 @@ export function PostProcessing() {
                               className="hidden"
                               onChange={e => { const f = e.target.files?.[0]; if (f) handleVcUpload(idx, f) }}
                             />
+                            {ref?.filename && (
+                              <p className="mt-1 truncate text-[9px] text-indicator-warning">
+                                Reattach {ref.filename}
+                              </p>
+                            )}
                           </>
                         ) : (
                           <div className="flex items-center gap-2 bg-bg-tertiary border border-border rounded-lg px-2 py-1.5">

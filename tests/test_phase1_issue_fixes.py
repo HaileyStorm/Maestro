@@ -125,6 +125,54 @@ def _load_functions(path: str, names: tuple[str, ...], namespace=None) -> dict:
     return loaded
 
 
+class OutputSidecarPrivacyTests(unittest.TestCase):
+    def test_voice_clone_sidecar_keeps_only_reattachment_names(self):
+        prepare = _load_functions(
+            _LAUNCH_PATH,
+            ("_prepare_generation_sidecar_params",),
+            {"os": os},
+        )["_prepare_generation_sidecar_params"]
+        source = {
+            "prompt": "keep me",
+            "voice_clone_enabled": True,
+            "voice_clone_mode": "two",
+            "voice_clone_refs": [
+                "/private/uploads/alice.wav",
+                r"C:\\private\\uploads\\bob.wav",
+            ],
+        }
+
+        upload_filenames, sidecar_params = prepare(source)
+
+        self.assertEqual(
+            upload_filenames["voice_clone_refs"],
+            ["alice.wav", "bob.wav"],
+        )
+        self.assertNotIn("voice_clone_refs", sidecar_params)
+        self.assertEqual(sidecar_params["voice_clone_enabled"], True)
+        self.assertEqual(sidecar_params["voice_clone_mode"], "two")
+        self.assertEqual(sidecar_params["prompt"], "keep me")
+
+    def test_h3_task_snapshot_retains_clone_request_for_safe_publication(self):
+        attach = _load_functions(
+            _LAUNCH_PATH,
+            ("_attach_voice_clone_sidecar_request",),
+        )["_attach_voice_clone_sidecar_request"]
+
+        snapshot = attach(
+            {"prompt": "mapped H3 segment"},
+            enabled=True,
+            mode="two",
+            refs=["/private/alice.wav", "/private/bob.wav"],
+        )
+
+        self.assertTrue(snapshot["voice_clone_enabled"])
+        self.assertEqual(snapshot["voice_clone_mode"], "two")
+        self.assertEqual(snapshot["voice_clone_refs"], [
+            "/private/alice.wav", "/private/bob.wav",
+        ])
+
+
 class TestOutpaintSampling(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

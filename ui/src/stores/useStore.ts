@@ -8407,6 +8407,17 @@ export const useStore = create<AppState>((set, get) => ({
       window.alert('The selected H3 workflow is no longer in the server catalog. Choose another workflow before generating.')
       return
     }
+    if (state.voiceCloneEnabled
+      && (state.generationMode === 'video' || state.generationMode === 'avatar')) {
+      const requiredVoiceRefs = state.voiceCloneMode === 'two' ? 2 : 1
+      const attachedVoiceRefs = state.voiceCloneRefs
+        .slice(0, requiredVoiceRefs)
+        .filter(ref => ref?.path)
+      if (attachedVoiceRefs.length !== requiredVoiceRefs) {
+        window.alert(`Attach ${requiredVoiceRefs === 2 ? 'both voice references' : 'a voice reference'} before generating with Voice Clone.`)
+        return
+      }
+    }
     const h3StudioModel = H3_STUDIO_MODELS.has(state.params.model_type)
     const h3AdaptiveConditioning = state.params.h3_adaptive_conditioning !== false
     const h3FixedRef2VA = (
@@ -16674,7 +16685,7 @@ export const useStore = create<AppState>((set, get) => ({
     if (!settingsUnchanged()) return false
     const { models } = get()
     const p = selectedOutputMeta.params as Record<string, unknown>
-    const uploadFilenames = selectedOutputMeta.upload_filenames as Record<string, string> | undefined
+    const uploadFilenames = selectedOutputMeta.upload_filenames as Record<string, string | string[]> | undefined
     const blendContract = selectedOutputMeta.blend_contract
     let restoredBlend: {
       mode: 'insert' | 'overlap'
@@ -17203,6 +17214,24 @@ export const useStore = create<AppState>((set, get) => ({
     const restoredAudioGuide2Filename =
       (typeof uploadFilenames?.audio_guide2 === 'string' ? uploadFilenames.audio_guide2 : null)
       || _deriveBase(p.audio_guide2)
+    const restoredRemoveBackgroundRefs = p.remove_background_images_ref === true
+      || p.remove_background_images_ref === 1
+    const restoredVoiceCloneMode: 'single' | 'two' = p.voice_clone_mode === 'two'
+      ? 'two'
+      : 'single'
+    const publishedVoiceCloneNames = Array.isArray(uploadFilenames?.voice_clone_refs)
+      ? uploadFilenames.voice_clone_refs
+      : typeof uploadFilenames?.voice_clone_refs === 'string'
+        ? [uploadFilenames.voice_clone_refs]
+        : Array.isArray(p.voice_clone_refs)
+          ? p.voice_clone_refs
+          : []
+    const restoredVoiceCloneRefs = publishedVoiceCloneNames
+      .map(_deriveBase)
+      .filter((name): name is string => typeof name === 'string' && name.trim().length > 0)
+      .slice(0, restoredVoiceCloneMode === 'two' ? 2 : 1)
+      .map(filename => ({ filename, path: '' }))
+    const restoredVoiceCloneEnabled = p.voice_clone_enabled === true
     // Restore TTS speaker names (1-6)
     const restoredSpeakerName1 = (p._tts_speaker_name1 as string) || ''
     const restoredSpeakerName2 = (p._tts_speaker_name2 as string) || ''
@@ -17229,6 +17258,10 @@ export const useStore = create<AppState>((set, get) => ({
       startImage: null,
       endImage: null,
       imageRefs: [],  // Clear — will repopulate below if image_refs exist
+      removeBackgroundRefs: restoredRemoveBackgroundRefs,
+      voiceCloneEnabled: restoredVoiceCloneEnabled,
+      voiceCloneMode: restoredVoiceCloneMode,
+      voiceCloneRefs: restoredVoiceCloneRefs,
       outputCount: 1,
       ...(restoredDuration > 0 ? { durationSeconds: restoredDuration } : {}),
       spatialUpsampling: restoredSpatialUpsampling,
