@@ -2,27 +2,30 @@ import { useState, useRef, useCallback, useEffect } from 'react'
 import { X, Film, ArrowRight } from 'lucide-react'
 import { currentAccountIdentityEpoch, useStore } from '../../stores/useStore'
 import * as api from '../../api/client'
+import { BLEND_MEDIA_ACCEPT, isBlendMediaFile, isBlendVideoFile } from './blendMediaTypes'
 
-function ClipDropZone({ label, file, url, duration, onUpload, onClear }: {
+function ClipDropZone({ label, file, url, duration, sourceName, onUpload, onClear }: {
   label: string
   file: File | null
   url: string
   duration: number
+  sourceName: string
   onUpload: (file: File) => void
   onClear: () => void
 }) {
   const fileRef = useRef<HTMLInputElement>(null)
+  const isVideo = file ? isBlendVideoFile(file) : false
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault()
     const f = e.dataTransfer.files[0]
-    if (f && (f.type.startsWith('video/') || f.type.startsWith('image/'))) onUpload(f)
+    if (f) onUpload(f)
   }, [onUpload])
 
   if (file) {
     return (
       <div className="relative rounded-lg overflow-hidden border border-border flex-1">
-        {file.type.startsWith('video/')
+        {isVideo
           ? <video src={url} className="w-full h-16 object-cover" muted />
           : <img src={url} className="w-full h-16 object-cover" alt="" />
         }
@@ -48,12 +51,17 @@ function ClipDropZone({ label, file, url, duration, onUpload, onClear }: {
     >
       <Film size={14} className="mx-auto mb-1 text-text-muted" />
       <p className="text-[10px] text-text-secondary">{label}</p>
+      {sourceName && <p className="mt-0.5 truncate text-[9px] text-indicator-warning">Reattach {sourceName}</p>}
       <input
         ref={fileRef}
         type="file"
-        accept="video/*,image/*"
+        accept={BLEND_MEDIA_ACCEPT}
         className="hidden"
-        onChange={e => { const f = e.target.files?.[0]; if (f) onUpload(f) }}
+        onChange={e => {
+          const f = e.target.files?.[0]
+          e.currentTarget.value = ''
+          if (f) onUpload(f)
+        }}
       />
     </div>
   )
@@ -63,9 +71,11 @@ export function BlendControls() {
   const blendClipA = useStore(s => s.blendClipA)
   const blendClipAUrl = useStore(s => s.blendClipAUrl)
   const blendClipADuration = useStore(s => s.blendClipADuration)
+  const blendClipASourceName = useStore(s => s.blendClipASourceName)
   const blendClipB = useStore(s => s.blendClipB)
   const blendClipBUrl = useStore(s => s.blendClipBUrl)
   const blendClipBDuration = useStore(s => s.blendClipBDuration)
+  const blendClipBSourceName = useStore(s => s.blendClipBSourceName)
   const setBlendClipA = useStore(s => s.setBlendClipA)
   const setBlendClipB = useStore(s => s.setBlendClipB)
   const clearBlendClipA = useStore(s => s.clearBlendClipA)
@@ -99,7 +109,8 @@ export function BlendControls() {
     const scope = () => {
       const state = useStore.getState()
       return JSON.stringify([currentAccountIdentityEpoch(), state.activeWorkspace,
-        state.generationMode, state.params.image_mode])
+        state.generationMode, state.params.image_mode, state.selectedOutput,
+        state.selectedOutputMetaName, state.blendRestoreSourceKey])
     }
     const invalidate = () => {
       for (const target of ['A', 'B'] as const) {
@@ -133,11 +144,15 @@ export function BlendControls() {
         && state.generationMode === 'video' && state.params.image_mode === 4
     }
     setError(null)
+    if (!isBlendMediaFile(file)) {
+      setError('Choose a PNG, JPEG, WebP, BMP, TIFF, MP4, MKV, AVI, MOV, or WebM file.')
+      return
+    }
     try {
       const result = await api.uploadImage(file)
       if (!current()) return
       const url = URL.createObjectURL(file)
-      if (file.type.startsWith('video/')) {
+      if (isBlendVideoFile(file)) {
         const video = document.createElement('video')
         let finished = false
         let timer = 0
@@ -225,6 +240,7 @@ export function BlendControls() {
           file={blendClipA}
           url={blendClipAUrl}
           duration={blendClipADuration}
+          sourceName={blendClipASourceName}
           onUpload={f => uploadClip(f, 'A')}
           onClear={() => {
             uploadSequence.current.A++
@@ -238,6 +254,7 @@ export function BlendControls() {
           file={blendClipB}
           url={blendClipBUrl}
           duration={blendClipBDuration}
+          sourceName={blendClipBSourceName}
           onUpload={f => uploadClip(f, 'B')}
           onClear={() => {
             uploadSequence.current.B++
@@ -248,6 +265,12 @@ export function BlendControls() {
       </div>
 
       {error && <p className="text-[10px] text-red-400">{error}</p>}
+
+      {!blendClipA && !blendClipB && (blendClipASourceName || blendClipBSourceName) && (
+        <p className="text-[10px] text-indicator-warning">
+          Saved settings are loaded. Reattach the original sources; Maestro does not reuse a file by name alone.
+        </p>
+      )}
 
       {/* Transition duration (Insert mode) */}
       {blendMode === 'insert' && (
@@ -293,11 +316,11 @@ export function BlendControls() {
           <div>
             <div className="flex items-center justify-between mb-1">
               <label className="text-[10px] text-text-muted">Motion Prefix</label>
-              <span className="text-[10px] text-text-secondary">{motionPrefixSec.toFixed(1)}s</span>
+              <span className="text-[10px] text-text-secondary">{motionPrefixSec.toFixed(2)}s</span>
             </div>
             <input
               type="range"
-              min={0} max={Math.min(3, Math.floor(overlapSec * 0.7))} step={0.5}
+              min={0} max={Math.min(3, Math.floor(overlapSec * 0.7))} step="any"
               value={motionPrefixSec}
               onChange={e => setMotionPrefixSec(parseFloat(e.target.value))}
               className="w-full"
@@ -305,17 +328,17 @@ export function BlendControls() {
             <p className="text-[9px] text-text-muted mt-0.5">
               {motionPrefixSec === 0
                 ? 'Pure start+end mode — no motion carried from Clip A'
-                : `First ${motionPrefixSec.toFixed(1)}s of blend replays Clip A's tail so rotation/pan carries through`}
+                : `First ${motionPrefixSec.toFixed(2)}s of blend replays Clip A's tail so rotation/pan carries through`}
             </p>
           </div>
           <div>
             <div className="flex items-center justify-between mb-1">
               <label className="text-[10px] text-text-muted">Motion Suffix</label>
-              <span className="text-[10px] text-text-secondary">{motionSuffixSec.toFixed(1)}s</span>
+              <span className="text-[10px] text-text-secondary">{motionSuffixSec.toFixed(2)}s</span>
             </div>
             <input
               type="range"
-              min={0} max={Math.min(3, Math.floor(overlapSec * 0.7))} step={0.5}
+              min={0} max={Math.min(3, Math.floor(overlapSec * 0.7))} step="any"
               value={motionSuffixSec}
               onChange={e => setMotionSuffixSec(parseFloat(e.target.value))}
               className="w-full"
@@ -323,7 +346,7 @@ export function BlendControls() {
             <p className="text-[9px] text-text-muted mt-0.5">
               {motionSuffixSec === 0
                 ? 'Single end-frame anchor — model may slow-mo into the landing'
-                : `Last ${motionSuffixSec.toFixed(1)}s of blend previews Clip B's head so motion lands at real speed`}
+                : `Last ${motionSuffixSec.toFixed(2)}s of blend previews Clip B's head so motion lands at real speed`}
             </p>
           </div>
           <div>

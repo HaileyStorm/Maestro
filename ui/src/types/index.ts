@@ -1531,6 +1531,18 @@ export interface OutputMetadata {
   private?: boolean
   explicit?: boolean
   upload_filenames?: Record<string, string | string[]>
+  blend_contract?: {
+    version: number
+    legacy: boolean
+    mode: 'insert' | 'overlap'
+    requested_duration_sec: number | null
+    effective_duration_sec: number
+    fps: number | null
+    sources?: {
+      clip_a?: { filename?: string }
+      clip_b?: { filename?: string }
+    }
+  }
   job_id?: string
   generation_time?: number
   created_at?: number

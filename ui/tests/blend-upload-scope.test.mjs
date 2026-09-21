@@ -4,9 +4,11 @@ import test from 'node:test'
 import { transform } from 'esbuild'
 
 const source = await readFile(new URL('../src/components/Sidebar/BlendControls.tsx', import.meta.url), 'utf8')
+const mediaContract = await readFile(new URL('../src/components/Sidebar/blendMediaTypes.ts', import.meta.url), 'utf8')
 const body = source.split('\n').filter(line => !line.startsWith('import ')).join('\n')
   .replace('export function BlendControls', 'function BlendControls')
 const compiled = await transform(`
+${mediaContract.replaceAll('export ', '')}
 export function createHarness() {
   let epoch = 1, state, nextUrl = 0, nextTimer = 0
   const listeners = new Set(), timers = new Map(), cleanups = []
@@ -35,6 +37,7 @@ export function createHarness() {
   }
   state = {
     activeWorkspace:'project-a',generationMode:'video',params:{image_mode:4},
+    selectedOutput:0,selectedOutputMetaName:'blend-a.mp4',blendRestoreSourceKey:'',
     blendClipA:null,blendClipB:null,blendClipAUrl:'',blendClipBUrl:'',blendClipADuration:0,blendClipBDuration:0,
     blendTransitionSec:5,blendMode:'overlap',blendOverlapSec:3,blendMotionPrefixSec:1,blendMotionSuffixSec:1,blendAnchorStrength:0.7,
     setBlendClipA:(...args)=>install('A',...args),setBlendClipB:(...args)=>install('B',...args),
@@ -57,11 +60,23 @@ const image = name => ({name,type:'image/png'})
 const video = {name:'clip.mp4',type:'video/mp4'}
 const complete = (request,path='uploaded.png') => request.resolve({path})
 
-test('late Blend uploads cannot cross a project round trip, account epoch, or mode change', async () => {
+test('unsupported browser media is rejected before upload with an actionable format list', async () => {
+  const h=createHarness()
+  await h.upload({name:'animated.gif',type:'image/gif'})
+  assert.equal(h.requests.length,0)
+  assert.deepEqual(h.errors.filter(Boolean),[
+    'Choose a PNG, JPEG, WebP, BMP, TIFF, MP4, MKV, AVI, MOV, or WebM file.',
+  ])
+  h.dispose()
+})
+
+test('late Blend uploads cannot cross project, account, mode, output, or restore boundaries', async () => {
   for (const change of [
     h=>{h.change({activeWorkspace:'project-b'});h.change({activeWorkspace:'project-a'})},
     h=>h.accountChange(),
     h=>{h.change({params:{image_mode:0}});h.change({params:{image_mode:4}})},
+    h=>h.change({selectedOutput:1,selectedOutputMetaName:'blend-b.mp4'}),
+    h=>h.change({blendRestoreSourceKey:'restored-output'}),
   ]) {
     const h=createHarness(), pending=h.upload(image('old.png'))
     change(h);complete(h.requests[0]);await pending

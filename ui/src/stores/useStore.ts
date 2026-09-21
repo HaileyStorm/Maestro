@@ -197,8 +197,9 @@ let _hostTermsOperationTail: Promise<void> = Promise.resolve()
 let _hostTermsRead: { scope: string; promise: Promise<void> } | null = null
 const _blendObjectUrls = new Set<string>()
 const EMPTY_BLEND_MEDIA = {
-  blendClipA: null, blendClipAPath: '', blendClipAUrl: '', blendClipADuration: 0,
-  blendClipB: null, blendClipBPath: '', blendClipBUrl: '', blendClipBDuration: 0,
+  blendClipA: null, blendClipAPath: '', blendClipAUrl: '', blendClipADuration: 0, blendClipASourceName: '',
+  blendClipB: null, blendClipBPath: '', blendClipBUrl: '', blendClipBDuration: 0, blendClipBSourceName: '',
+  blendRestoreSourceKey: '',
 } as const
 
 function _releaseUnusedBlendUrls(urlA: string, urlB: string): void {
@@ -2965,10 +2966,13 @@ interface AppState {
   blendClipAPath: string
   blendClipAUrl: string
   blendClipADuration: number
+  blendClipASourceName: string
   blendClipB: File | null
   blendClipBPath: string
   blendClipBUrl: string
   blendClipBDuration: number
+  blendClipBSourceName: string
+  blendRestoreSourceKey: string
   blendTransitionSec: number
   blendStrengthA: number
   blendStrengthB: number
@@ -5934,14 +5938,14 @@ export const useStore = create<AppState>((set, get) => ({
   blendAnchorStrength: 0.7,
   setBlendClipA: (file, path, url, duration) => {
     if (url.startsWith('blob:')) _blendObjectUrls.add(url)
-    set({ blendClipA: file, blendClipAPath: path, blendClipAUrl: url, blendClipADuration: duration })
+    set({ blendClipA: file, blendClipAPath: path, blendClipAUrl: url, blendClipADuration: duration, blendClipASourceName: file.name })
   },
   setBlendClipB: (file, path, url, duration) => {
     if (url.startsWith('blob:')) _blendObjectUrls.add(url)
-    set({ blendClipB: file, blendClipBPath: path, blendClipBUrl: url, blendClipBDuration: duration })
+    set({ blendClipB: file, blendClipBPath: path, blendClipBUrl: url, blendClipBDuration: duration, blendClipBSourceName: file.name })
   },
-  clearBlendClipA: () => set({ blendClipA: null, blendClipAPath: '', blendClipAUrl: '', blendClipADuration: 0 }),
-  clearBlendClipB: () => set({ blendClipB: null, blendClipBPath: '', blendClipBUrl: '', blendClipBDuration: 0 }),
+  clearBlendClipA: () => set({ blendClipA: null, blendClipAPath: '', blendClipAUrl: '', blendClipADuration: 0, blendClipASourceName: '' }),
+  clearBlendClipB: () => set({ blendClipB: null, blendClipBPath: '', blendClipBUrl: '', blendClipBDuration: 0, blendClipBSourceName: '' }),
   setBlendTransitionSec: (sec) => set({ blendTransitionSec: sec }),
   setBlendStrengthA: (v) => set({ blendStrengthA: v }),
   setBlendStrengthB: (v) => set({ blendStrengthB: v }),
@@ -16620,7 +16624,10 @@ export const useStore = create<AppState>((set, get) => ({
     const authoredFields = [
       'params', 'generationMode', 'startImage', 'endImage',
       'imageRefs', 'clips', 'ttsVoices', 'voiceCloneRefs',
-      'continueVideoPath', 'blendClipAPath', 'blendClipBPath', 'editVideoFile',
+      'continueVideoPath', 'blendClipA', 'blendClipAPath', 'blendClipAUrl', 'blendClipADuration',
+      'blendClipASourceName', 'blendClipB', 'blendClipBPath', 'blendClipBUrl', 'blendClipBDuration',
+      'blendClipBSourceName', 'blendRestoreSourceKey', 'blendMode', 'blendTransitionSec', 'blendOverlapSec',
+      'blendMotionPrefixSec', 'blendMotionSuffixSec', 'blendAnchorStrength', 'editVideoFile',
       'editVideoPath', 'editVideoUrl', 'editVideoDuration', 'editRepaintFrameFile',
       'editRepaintFramePath', 'editRepaintFrameUrl', 'editRepaintMappings', 'editDetectedTarget',
       'editSamTarget', 'editMaskPreview', 'editMasksPath', 'editRecastMappings', 'editRecastRefFile', 'editRecastRefPath',
@@ -16668,6 +16675,83 @@ export const useStore = create<AppState>((set, get) => ({
     const { models } = get()
     const p = selectedOutputMeta.params as Record<string, unknown>
     const uploadFilenames = selectedOutputMeta.upload_filenames as Record<string, string> | undefined
+    const blendContract = selectedOutputMeta.blend_contract
+    let restoredBlend: {
+      mode: 'insert' | 'overlap'
+      duration: number
+      motionPrefix: number
+      motionSuffix: number
+      anchorStrength: number
+      sourceA: string
+      sourceB: string
+    } | null = null
+    if (blendContract) {
+      const mode = blendContract.mode
+      const numberValue = (value: unknown): number => (
+        typeof value === 'number' && Number.isFinite(value) ? value : Number.NaN
+      )
+      const duration = numberValue(
+        blendContract.requested_duration_sec ?? blendContract.effective_duration_sec,
+      )
+      const motionPrefix = mode === 'overlap' ? numberValue(p._blend_motion_prefix_sec ?? 0) : 0
+      const motionSuffix = mode === 'overlap' ? numberValue(p._blend_motion_suffix_sec ?? 0) : 0
+      const anchorStrength = mode === 'overlap' ? numberValue(p.input_video_strength ?? 0.7) : 0.7
+      const contractVersion = numberValue(blendContract.version)
+      const contractEffectiveDuration = numberValue(blendContract.effective_duration_sec)
+      const contractFps = numberValue(blendContract.fps)
+      const paramsFps = numberValue(p._blend_fps)
+      const matches = (left: number, right: number) => (
+        Number.isFinite(left) && Number.isFinite(right) && Math.abs(left - right) <= 1e-9
+      )
+      const versionMatches = contractVersion === 0
+        ? blendContract.legacy === true && mode === 'overlap'
+        : contractVersion === 1
+          && blendContract.legacy === false
+          && p._blend_contract_version === 1
+          && p._blend_mode === mode
+          && matches(numberValue(p._blend_requested_duration_sec), duration)
+      const metadataMatches = versionMatches && (
+        contractVersion === 0
+          ? matches(contractEffectiveDuration, numberValue(p._blend_overlap_sec))
+            && ((blendContract.fps == null && p._blend_fps == null)
+              || matches(contractFps, paramsFps))
+          : matches(contractEffectiveDuration, numberValue(p._blend_duration_sec))
+            && matches(contractFps, paramsFps)
+      )
+      const sourceA = blendContract.sources?.clip_a?.filename
+      const sourceB = blendContract.sources?.clip_b?.filename
+      const sourceDisplayName = (value: unknown): string => (
+        typeof value === 'string'
+          ? (value.replace(/\\/g, '/').split('/').pop() || '').trim()
+          : ''
+      )
+      const sourceAName = sourceDisplayName(sourceA)
+      const sourceBName = sourceDisplayName(sourceB)
+      const sourcesValid = sourceAName.length > 0 && sourceBName.length > 0
+      const durationValid = Number.isFinite(duration)
+        && (mode === 'insert' ? duration >= 2 && duration <= 10 : duration >= 1 && duration <= 8)
+        && Math.abs(duration - Math.round(duration)) <= 1e-9
+      const overlapMotionMaximum = mode === 'overlap' ? Math.min(3, Math.floor(duration * 0.7)) : 0
+      const tuningValid = Number.isFinite(motionPrefix) && motionPrefix >= 0 && motionPrefix <= overlapMotionMaximum
+        && Number.isFinite(motionSuffix) && motionSuffix >= 0 && motionSuffix <= overlapMotionMaximum
+        && Number.isFinite(anchorStrength) && anchorStrength >= 0.3 && anchorStrength <= 1
+        && Math.abs((anchorStrength - 0.3) / 0.05 - Math.round((anchorStrength - 0.3) / 0.05)) <= 1e-9
+      if (!metadataMatches
+        || (mode !== 'insert' && mode !== 'overlap')
+        || !sourcesValid || !durationValid || !tuningValid) {
+        window.alert('Saved Blend settings cannot be restored exactly. Start a new blend.')
+        return false
+      }
+      restoredBlend = {
+        mode,
+        duration,
+        motionPrefix,
+        motionSuffix,
+        anchorStrength,
+        sourceA: sourceAName,
+        sourceB: sourceBName,
+      }
+    }
     const h3Longform = (
       p._h3_longform && typeof p._h3_longform === 'object'
         ? p._h3_longform as Record<string, unknown>
@@ -16891,6 +16975,7 @@ export const useStore = create<AppState>((set, get) => ({
       activated_loras: (p.activated_loras as string[]) || [],
       loras_multipliers: (p.loras_multipliers as string) || '',
     } as Partial<GenerateParams>
+    if (restoredBlend) newParams.image_mode = 4
     if (H3_STUDIO_MODELS.has(modelType)) {
       Object.assign(newParams, restoredH3AdaptiveState)
     }
@@ -17080,6 +17165,29 @@ export const useStore = create<AppState>((set, get) => ({
     const restoredFilmGrainSaturation = typeof p.film_grain_saturation === 'number'
       ? p.film_grain_saturation
       : 0.5
+    const blendRestoreSourceKey = restoredBlend
+      ? JSON.stringify([pendingOutput.workspace, pendingOutput.name, pendingOutput.revision])
+      : ''
+    const preserveRestoredBlendMedia = restoredBlend
+      && submitted.blendRestoreSourceKey === blendRestoreSourceKey
+      && submitted.blendClipA !== null && submitted.blendClipAPath !== ''
+      && submitted.blendClipB !== null && submitted.blendClipBPath !== ''
+    const restoredBlendMedia = preserveRestoredBlendMedia ? {
+      blendClipA: submitted.blendClipA,
+      blendClipAPath: submitted.blendClipAPath,
+      blendClipAUrl: submitted.blendClipAUrl,
+      blendClipADuration: submitted.blendClipADuration,
+      blendClipASourceName: submitted.blendClipASourceName,
+      blendClipB: submitted.blendClipB,
+      blendClipBPath: submitted.blendClipBPath,
+      blendClipBUrl: submitted.blendClipBUrl,
+      blendClipBDuration: submitted.blendClipBDuration,
+      blendClipBSourceName: submitted.blendClipBSourceName,
+      blendRestoreSourceKey,
+    } : {
+      ...EMPTY_BLEND_MEDIA,
+      blendRestoreSourceKey,
+    }
 
     // Restore audio guide filename from upload_filenames. Fall back to
     // deriving basename from params.audio_guide for sidecars that pre-date
@@ -17108,6 +17216,7 @@ export const useStore = create<AppState>((set, get) => ({
     }
 
     set(s => ({
+      ...restoredBlendMedia,
       ...(restoredExplicitOutput
         ? { explicitOutput: true, privateOutput: true }
         : {}),
@@ -17137,6 +17246,18 @@ export const useStore = create<AppState>((set, get) => ({
       } : {}),
       h3SelectedProfile: 'custom',
       h3ProfileApplying: null,
+      ...(restoredBlend ? {
+        blendMode: restoredBlend.mode,
+        blendTransitionSec: restoredBlend.mode === 'insert'
+          ? restoredBlend.duration : s.blendTransitionSec,
+        blendOverlapSec: restoredBlend.mode === 'overlap'
+          ? restoredBlend.duration : s.blendOverlapSec,
+        blendMotionPrefixSec: restoredBlend.motionPrefix,
+        blendMotionSuffixSec: restoredBlend.motionSuffix,
+        blendAnchorStrength: restoredBlend.anchorStrength,
+        blendClipASourceName: restoredBlend.sourceA,
+        blendClipBSourceName: restoredBlend.sourceB,
+      } : {}),
     }))
     // Restore image refs as File objects (for image mode reference images)
     // Skip if this is a KFI (frames injection) output — those refs are handled by ControlVideoSection
@@ -17633,6 +17754,11 @@ export const useStore = create<AppState>((set, get) => ({
       || selected?.name !== output.name
       || selected.workspace !== output.workspace
       || selected.revision !== output.revision) return
+    if (current.generationMode === 'video' && current.params.image_mode === 4
+      && (!current.blendClipAPath || !current.blendClipBPath)) {
+      window.alert('Blend settings loaded. Reattach Clip A and Clip B before generating again.')
+      return
+    }
     await current.startGeneration()
   },
 

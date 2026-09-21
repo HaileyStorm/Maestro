@@ -520,7 +520,7 @@ test('every direct restore write is covered by the shared UI catalog, authored g
     ...lifecycleBookkeeping,
   ])
   assert.deepEqual(unsupportedSetShapes, [])
-  assert.deepEqual([...mergedSpreads].sort(), ['timingState'])
+  assert.deepEqual([...mergedSpreads].sort(), ['restoredBlendMedia', 'timingState'])
   assert.deepEqual(
     [...directWrites].filter(field => !classified.has(field)).sort(),
     [],
@@ -908,6 +908,211 @@ test('Retake restores the prompt-strength control that its request submits', asy
       assert.equal(submitted.guidance_scale, guidance)
     })
   }
+})
+
+test('Blend output restores only effective controls and requires explicit source reattachment', async () => {
+  for (const scenario of [
+    {
+      mode: 'insert', requested: 5, effective: 5.04,
+      prefix: 0, suffix: 0, anchor: 0.7,
+    },
+    {
+      mode: 'overlap', requested: 4, effective: 4,
+      prefix: 2, suffix: 1.5, anchor: 0.55,
+    },
+  ]) {
+    await withStore(async ({ alerts, fetchOverrides, useStore }) => {
+      const meta = {
+        ...sidecar(baseParams({
+          _blend_contract_version: 1,
+          _blend_mode: scenario.mode,
+          _blend_requested_duration_sec: scenario.requested,
+          _blend_duration_sec: scenario.effective,
+          _blend_motion_prefix_sec: scenario.prefix,
+          _blend_motion_suffix_sec: scenario.suffix,
+          _blend_fps: 25,
+          input_video_strength: scenario.anchor,
+        })),
+        blend_contract: {
+          version: 1,
+          legacy: false,
+          mode: scenario.mode,
+          requested_duration_sec: scenario.requested,
+          effective_duration_sec: scenario.effective,
+          fps: 25,
+          sources: {
+            clip_a: { filename: 'first-source.mp4' },
+            clip_b: { filename: 'second-source.mkv' },
+          },
+        },
+      }
+      configureGallery(useStore, [{ name: `blend-${scenario.mode}.mp4`, meta }])
+      useStore.setState({
+        blendMode: scenario.mode === 'insert' ? 'overlap' : 'insert',
+        blendTransitionSec: 2,
+        blendOverlapSec: 1,
+        blendMotionPrefixSec: 0,
+        blendMotionSuffixSec: 0,
+        blendAnchorStrength: 1,
+        blendClipA: new File(['old-a'], 'old-a.mp4', { type: 'video/mp4' }),
+        blendClipAPath: '/uploads/old-a.mp4',
+        blendClipAUrl: 'blob:old-a',
+        blendClipADuration: 2,
+        blendClipASourceName: 'old-a.mp4',
+        blendClipB: new File(['old-b'], 'old-b.mp4', { type: 'video/mp4' }),
+        blendClipBPath: '/uploads/old-b.mp4',
+        blendClipBUrl: 'blob:old-b',
+        blendClipBDuration: 2,
+        blendClipBSourceName: 'old-b.mp4',
+      })
+
+      assert.equal(await useStore.getState().loadSettingsFromOutput(), true)
+      const restored = useStore.getState()
+      assert.equal(restored.generationMode, 'video')
+      assert.equal(restored.params.image_mode, 4)
+      assert.equal(restored.blendMode, scenario.mode)
+      assert.equal(restored.blendTransitionSec, scenario.mode === 'insert' ? scenario.requested : 2)
+      assert.equal(restored.blendOverlapSec, scenario.mode === 'overlap' ? scenario.requested : 1)
+      assert.equal(restored.blendMotionPrefixSec, scenario.prefix)
+      assert.equal(restored.blendMotionSuffixSec, scenario.suffix)
+      assert.equal(restored.blendAnchorStrength, scenario.anchor)
+      assert.equal(restored.blendClipA, null)
+      assert.equal(restored.blendClipAPath, '')
+      assert.equal(restored.blendClipASourceName, 'first-source.mp4')
+      assert.equal(restored.blendClipB, null)
+      assert.equal(restored.blendClipBPath, '')
+      assert.equal(restored.blendClipBSourceName, 'second-source.mkv')
+
+      let submitted = false
+      fetchOverrides.set('/api/v1/blend', async () => {
+        submitted = true
+        return Response.json({ job_id: 'unexpected-blend', status: 'queued' })
+      })
+      await useStore.getState().rerollGeneration()
+      assert.equal(submitted, false)
+      assert.equal(alerts.at(-1), 'Blend settings loaded. Reattach Clip A and Clip B before generating again.')
+
+      useStore.getState().setBlendClipA(
+        new File(['new-a'], 'reattached-a.mp4', { type: 'video/mp4' }),
+        '/uploads/reattached-a.mp4', 'blob:reattached-a', 4,
+      )
+      useStore.getState().setBlendClipB(
+        new File(['new-b'], 'reattached-b.mkv', { type: 'video/x-matroska' }),
+        '/uploads/reattached-b.mkv', 'blob:reattached-b', 5,
+      )
+      useStore.setState({ _pollRecoveredJob: () => {} })
+      await useStore.getState().rerollGeneration()
+      assert.equal(submitted, true)
+      assert.equal(useStore.getState().blendClipAPath, '/uploads/reattached-a.mp4')
+      assert.equal(useStore.getState().blendClipBPath, '/uploads/reattached-b.mkv')
+    })
+  }
+})
+
+test('legacy Blend output restores from its overlap field without requiring historical fps', async () => {
+  await withStore(async ({ useStore }) => {
+    const meta = {
+      ...sidecar(baseParams({
+        _blend_mode: 'insert',
+        _blend_overlap_sec: 3,
+      })),
+      blend_contract: {
+        version: 0,
+        legacy: true,
+        mode: 'overlap',
+        requested_duration_sec: null,
+        effective_duration_sec: 3,
+        fps: null,
+        sources: {
+          clip_a: { filename: 'legacy-first.mp4' },
+          clip_b: { filename: 'legacy-second.mp4' },
+        },
+      },
+    }
+    configureGallery(useStore, [{ name: 'legacy-blend.mp4', meta }])
+
+    assert.equal(await useStore.getState().loadSettingsFromOutput(), true)
+    const restored = useStore.getState()
+    assert.equal(restored.params.image_mode, 4)
+    assert.equal(restored.blendMode, 'overlap')
+    assert.equal(restored.blendOverlapSec, 3)
+    assert.equal(restored.blendClipASourceName, 'legacy-first.mp4')
+    assert.equal(restored.blendClipBSourceName, 'legacy-second.mp4')
+  })
+})
+
+test('Blend output with controls outside the visible exact range fails closed', async () => {
+  await withStore(async ({ alerts, useStore }) => {
+    const meta = {
+      ...sidecar(baseParams({
+        _blend_contract_version: 1,
+        _blend_mode: 'insert',
+        _blend_requested_duration_sec: 12,
+        _blend_duration_sec: 12,
+        _blend_fps: 25,
+      })),
+      blend_contract: {
+        version: 1, legacy: false, mode: 'insert',
+        requested_duration_sec: 12, effective_duration_sec: 12, fps: 25,
+        sources: {},
+      },
+    }
+    configureGallery(useStore, [{ name: 'invalid-blend.mp4', meta }])
+    assert.equal(await useStore.getState().loadSettingsFromOutput(), false)
+    assert.equal(useStore.getState().params.prompt, 'current unsaved prompt')
+    assert.deepEqual(alerts, ['Saved Blend settings cannot be restored exactly. Start a new blend.'])
+  })
+})
+
+test('Blend output without both source descriptors fails before changing the editor', async () => {
+  await withStore(async ({ alerts, useStore }) => {
+    const meta = {
+      ...sidecar(baseParams({
+        _blend_contract_version: 1, _blend_mode: 'insert',
+        _blend_requested_duration_sec: 5, _blend_duration_sec: 5.04, _blend_fps: 25,
+      })),
+      blend_contract: {
+        version: 1, legacy: false, mode: 'insert',
+        requested_duration_sec: 5, effective_duration_sec: 5.04, fps: 25,
+        sources: { clip_a: { filename: 'only-a.mp4' } },
+      },
+    }
+    configureGallery(useStore, [{ name: 'missing-source-blend.mp4', meta }])
+    assert.equal(await useStore.getState().loadSettingsFromOutput(), false)
+    assert.equal(useStore.getState().params.prompt, 'current unsaved prompt')
+    assert.deepEqual(alerts, ['Saved Blend settings cannot be restored exactly. Start a new blend.'])
+  })
+})
+
+test('editing a Blend control while model options load cancels restoration', async () => {
+  await withStore(async ({ fetchOverrides, useStore }) => {
+    const meta = {
+      ...sidecar(baseParams({
+        _blend_contract_version: 1, _blend_mode: 'overlap',
+        _blend_requested_duration_sec: 4, _blend_duration_sec: 4, _blend_fps: 25,
+        _blend_motion_prefix_sec: 1.52, _blend_motion_suffix_sec: 1, input_video_strength: 0.7,
+      })),
+      blend_contract: {
+        version: 1, legacy: false, mode: 'overlap',
+        requested_duration_sec: 4, effective_duration_sec: 4, fps: 25,
+        sources: {
+          clip_a: { filename: 'first.mp4' }, clip_b: { filename: 'second.mp4' },
+        },
+      },
+    }
+    configureGallery(useStore, [{ name: 'delayed-blend.mp4', meta }])
+    const options = delayedResponse(fetchOverrides, '/api/v1/model-options/ltx2_25',
+      () => Response.json(modelOptions('ltx2_25')))
+    const restore = useStore.getState().loadSettingsFromOutput()
+    await options.requested
+    useStore.getState().setBlendMode('insert')
+    useStore.getState().setBlendTransitionSec(6)
+    options.release()
+    assert.equal(await restore, false)
+    assert.equal(useStore.getState().blendMode, 'insert')
+    assert.equal(useStore.getState().blendTransitionSec, 6)
+    assert.equal(useStore.getState().params.prompt, 'current unsaved prompt')
+  })
 })
 
 
