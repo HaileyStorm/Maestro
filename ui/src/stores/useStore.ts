@@ -17334,6 +17334,12 @@ export const useStore = create<AppState>((set, get) => ({
         ? { explicitOutput: true, privateOutput: true }
         : {}),
       params: { ...s.params, ...newParams },
+      // The restored settings came from this output's sidecar rather than the
+      // reusable profile that may still be highlighted in the editor. Clear
+      // both profile selectors only after every restore guard has passed so
+      // the UI cannot offer to update an unrelated profile.
+      selectedGenerationProfileId: '',
+      selectedDirectorProfileId: '',
       ...(H3_STUDIO_MODELS.has(modelType) ? {
         h3StyleWorkflow: typeof newParams.h3_style_workflow === 'string' ? newParams.h3_style_workflow : '',
       } : {}),

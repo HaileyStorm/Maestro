@@ -3440,10 +3440,11 @@ function VideoPromptsReview({
             {isAutoGenerating ? 'Auto Generating...' : 'Generating...'}
           </button>
         ) : (
-          <div className="grid grid-cols-[1fr_auto] gap-1.5">
+          <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-1.5">
             <button
+              type="button"
               onClick={directorGenerate}
-              className="w-full py-2.5 rounded-lg bg-accent-green hover:bg-accent-green-hover text-white text-sm font-semibold transition-colors flex items-center justify-center gap-1.5"
+              className="mobile-control-target flex min-w-0 w-full touch-manipulation items-center justify-center gap-1.5 rounded-lg bg-accent-green py-2.5 text-sm font-semibold text-white transition-colors hover:bg-accent-green-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
             >
               <Play size={14} fill="white" /> Generate
             </button>
@@ -3451,7 +3452,8 @@ function VideoPromptsReview({
               type="button"
               onClick={() => { void queueCurrentDirectorPipeline() }}
               title="Hold this complete project in the persistent queue without starting it"
-              className="px-3 py-2.5 rounded-lg border border-border text-text-secondary hover:bg-bg-hover hover:text-text-primary transition-colors"
+              aria-label="Hold this complete project in the persistent queue without starting it"
+              className="mobile-control-target touch-manipulation rounded-lg border border-border px-3 py-2.5 text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
             >
               <ListPlus size={14} />
             </button>

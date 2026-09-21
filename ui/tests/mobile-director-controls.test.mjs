@@ -91,3 +91,16 @@ test('Director first-run disclosures expose mobile targets, focus, and expanded 
     assert.match(select, /focus-visible:ring-accent-blue/)
   }
 })
+
+test('Director review actions expose mobile geometry, names, and keyboard focus', async () => {
+  const source = await readFile(directorUrl, 'utf8')
+  assert.match(source, /grid min-w-0 grid-cols-\[minmax\(0,1fr\)_auto\] gap-1\.5/)
+
+  const generate = openingTagContaining(source, 'button', 'onClick={directorGenerate}')
+  assertMobileButton(generate, 'review generate')
+  assert.match(generate, /min-w-0/, 'review generate can shrink without overflowing the viewport')
+
+  const hold = openingTagContaining(source, 'button', 'onClick={() => { void queueCurrentDirectorPipeline() }}')
+  assertMobileButton(hold, 'review hold')
+  assert.match(hold, /aria-label="Hold this complete project in the persistent queue without starting it"/)
+})

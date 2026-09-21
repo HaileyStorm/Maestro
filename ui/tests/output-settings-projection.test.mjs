@@ -305,8 +305,12 @@ test('Load Settings restores every canonical technical key with only documented 
       film_grain_saturation: 0,
       _private_runtime_token: 'must-not-project',
     })
+    useStore.setState({
+      selectedGenerationProfileId: 'stale-studio-profile',
+      selectedDirectorProfileId: 'stale-director-profile',
+    })
     installOutput(useStore, source)
-    await useStore.getState().loadSettingsFromOutput()
+    assert.equal(await useStore.getState().loadSettingsFromOutput(), true)
     const restored = useStore.getState()
 
     const expected = { ...source, repeat_generation: 1 }
@@ -319,6 +323,8 @@ test('Load Settings restores every canonical technical key with only documented 
     assert.equal(restored.outputCount, 1, 'output restore deliberately resets batch size')
     assert.equal(restored.filmGrainIntensity, 0)
     assert.equal(restored.filmGrainSaturation, 0)
+    assert.equal(restored.selectedGenerationProfileId, '')
+    assert.equal(restored.selectedDirectorProfileId, '')
   })
 })
 

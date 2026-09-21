@@ -855,6 +855,8 @@ test('an unavailable saved model fails before reads or editor mutation and canno
     useStore.setState(state => ({
       savedParamsPerMode: { ...state.savedParamsPerMode, video: originalModeBucket },
       videoSubModeStash: originalVideoStash,
+      selectedGenerationProfileId: 'current-studio-profile',
+      selectedDirectorProfileId: 'current-director-profile',
     }))
     let generationCalls = 0
     useStore.setState({ startGeneration: async () => { generationCalls += 1 } })
@@ -867,6 +869,8 @@ test('an unavailable saved model fails before reads or editor mutation and canno
     assert.strictEqual(useStore.getState().videoSubModeStash, originalVideoStash)
     assert.equal(useStore.getState().generationMode, before.generationMode)
     assert.equal(useStore.getState().modelOptions, before.modelOptions)
+    assert.equal(useStore.getState().selectedGenerationProfileId, 'current-studio-profile')
+    assert.equal(useStore.getState().selectedDirectorProfileId, 'current-director-profile')
     assert.match(alerts.at(-1), /model is unavailable/i)
 
     await useStore.getState().rerollGeneration()
@@ -960,6 +964,8 @@ test('every direct restore write is covered by the shared UI catalog, authored g
     'modelOptions',
     'modelOptionsLoading',
     'savedParamsPerMode',
+    'selectedDirectorProfileId',
+    'selectedGenerationProfileId',
     'selectedModelPerAudioSubMode',
     'selectedModelPerMode',
   ])
