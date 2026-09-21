@@ -2693,3 +2693,40 @@ backend Insert assembly/metadata changes are a separate in-progress unit and
 must not be described as live until their reviewed source is restarted and
 verified. No GPU inference or authenticated remote upload acceptance is claimed
 by this UI milestone.
+
+
+## Blend Insert and Overlap backend — 2026-09-21
+
+The backend now treats Insert and Overlap as distinct versioned operations.
+Insert keeps complete A and B media and places the generated transition between
+their boundary frames. Overlap retains the historical source-window trims, and
+pre-contract jobs continue to resolve as legacy Overlap. Requested duration,
+effective frame-lattice duration, mode and fps must agree before generation.
+Unreadable or unsupported source media fails before queue publication.
+
+Blend jobs now carry the initiating session and inherited output policy, and
+durable recovery seals both source inputs. Final assembly runs in an owned
+staging directory, observes cancellation while ffmpeg is active, and publishes
+media only after matching transition metadata has been validated and the final
+sidecar is ready. Cancellation, timeout, ffmpeg failure, malformed metadata and
+missing sidecars remove staged/final media and intermediate transitions. Final
+metadata removes absolute source paths, records basename-only source descriptors,
+and re-stamps job, workspace and private/explicit policy from the queued job.
+Legacy outputs declare an explicit version-0 Overlap contract.
+
+CPU verification covers 31 focused Blend contracts, 60 lifecycle-wiring tests,
+163 queue/recovery tests and 83 remote-access/upload-policy tests. Five real
+ffmpeg assemblies cover video Insert (65 frames), video Overlap (31), still-image
+Insert (19), mixed Insert (42), and still-image Overlap (17), with audio and
+sidecar checks. The coordinated Pinokio restart moved the live backend to
+`http://127.0.0.1:42004`; health/readiness and an empty queue return 200. The
+stable Cloudflare address reaches the normal Maestro sign-in surface, and the
+exact public restart generation was cleared. Continuum remains running.
+
+Source reattachment after a user moves or deletes an authorized Blend input is
+still fail-closed; the durable manifest detects the missing source but there is
+no interactive reattach flow yet. The client file chooser also accepts a wider
+browser media family than the backend's documented raster/video extensions, so
+unsupported GIF, AVIF, M4V and similar selections currently receive a generic
+read failure. No GPU generation or human audiovisual acceptance is claimed by
+this backend milestone.

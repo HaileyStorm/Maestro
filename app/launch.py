@@ -4822,7 +4822,7 @@ _RECOVERABLE_INPUT_KEYS = frozenset({
     "edit_video_path", "retake_masks_path", "retake_user_start_anchor",
     "retake_user_end_anchor", "voice_reference", "voice_clone_refs",
     "audio_path", "reference_image_path", "character_ref_paths",
-    "location_ref_paths", "image_paths",
+    "location_ref_paths", "image_paths", "_blend_clip_a", "_blend_clip_b",
 })
 
 
@@ -53099,7 +53099,10 @@ async def outpaint_endpoint(request: Request):
 
 @api.post("/api/v1/blend")
 async def blend_endpoint(request: Request):
-    """Blend two clips with an AI-generated transition (Sora-1 style overlap).
+    """Blend two clips with an AI-generated transition.
+
+    Insert mode emits the complete A clip, generated transition, and complete
+    B clip.  Overlap mode preserves the original shared-window behavior.
 
     For `overlap` mode: the last `overlap_sec` of Clip A blends with the
     first `overlap_sec` of Clip B during a shared window. Total output
@@ -53116,7 +53119,8 @@ async def blend_endpoint(request: Request):
         clip_a_path: str, clip_b_path: str,
         prompt?: str — describe the *transition itself*, not just "smooth blend".
         model_type: str,
-        blend_mode?: 'insert'|'overlap', overlap_sec?: float (default 3),
+        blend_mode?: 'insert'|'overlap', transition_sec?: float (insert,
+            default 3), overlap_sec?: float (overlap, default 3),
         motion_prefix_sec?: float (default 1.0) — seconds of A's overlap-zone
             start used as `video_source`, switching the pipeline from SE to
             VE mode. Gives the model real motion history to extrapolate so
@@ -53165,11 +53169,37 @@ async def blend_endpoint(request: Request):
     if not model_type:
         raise HTTPException(status_code=400, detail="model_type is required")
 
-    blend_mode = body.get("blend_mode", "overlap")
-    overlap_sec = float(body.get("overlap_sec", 3))
+    # Validate mode and duration before importing media tooling or creating the
+    # per-job temporary directory.  Insert uses transition_sec; overlap keeps
+    # its historical overlap_sec field.  normalize_blend_request intentionally
+    # accepts overlap_sec for insert when an older client has not been updated.
+    from services.blend_plan import (
+        BLEND_IMAGE_EXTENSIONS,
+        BLEND_VIDEO_EXTENSIONS,
+        normalize_blend_request,
+    )
+
+    try:
+        request_plan = normalize_blend_request(body)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    blend_mode = request_plan["mode"]
+    requested_duration_sec = request_plan["duration_sec"]
+
+    session_id = request.state.maestro_session_id
+    inherited_policy = _inherit_media_access_policy(
+        [clip_a_path, clip_b_path], workspace, session_id,
+    )
+    if body.get("private_output") is None:
+        body["private_output"] = inherited_policy["private"]
+    if body.get("explicit_output") is None:
+        body["explicit_output"] = inherited_policy["explicit"]
+    access_policy = _http_output_policy_from_request(
+        body,
+        owner_session_id=session_id,
+    )
 
     import tempfile
-    import math
     import decord
     import numpy as np
     from PIL import Image as PILImage
@@ -53180,24 +53210,43 @@ async def blend_endpoint(request: Request):
         # ── Probe both clips ─────────────────────────────────────────────
         def _probe(path):
             ext = os.path.splitext(path)[1].lower()
-            if ext in (".mp4", ".mkv", ".avi", ".mov", ".webm"):
+            if ext in BLEND_VIDEO_EXTENSIONS:
                 vr = decord.VideoReader(path)
-                fps = float(vr.get_avg_fps()) or 24.0
+                frame_count = len(vr)
+                if frame_count <= 0:
+                    raise ValueError("source video has no frames")
+                from services.blend_plan import validate_blend_fps
+
+                fps = validate_blend_fps(
+                    vr.get_avg_fps(), field="source video frame rate",
+                )
                 h, w = vr[0].shape[:2]
-                return {"is_video": True, "fps": fps, "frames": len(vr), "h": h, "w": w, "reader": vr}
+                return {"is_video": True, "fps": fps, "frames": frame_count, "h": h, "w": w, "reader": vr}
+            if ext not in BLEND_IMAGE_EXTENSIONS:
+                raise ValueError("unsupported Blend media extension")
             img = PILImage.open(path).convert("RGB")
             return {"is_video": False, "fps": 24.0, "frames": 1, "h": img.size[1], "w": img.size[0], "image": img}
 
-        info_a = _probe(clip_a_path)
-        info_b = _probe(clip_b_path)
+        try:
+            info_a = _probe(clip_a_path)
+            info_b = _probe(clip_b_path)
+        except Exception as error:
+            raise HTTPException(
+                status_code=400,
+                detail="One or both Blend clips could not be read",
+            ) from error
 
         # ── Target geometry (A's native, aligned to 32 for LTX) ──────────
         fps = info_a["fps"]
-        # LTX-2 frames schedule: must be >= 17 and (n - 17) % 8 == 0
-        raw_frames = max(17, int(round(overlap_sec * fps)))
-        transition_frames = 17 + 8 * math.ceil((raw_frames - 17) / 8) if raw_frames > 17 else 17
-        # Effective overlap after rounding (for frame-accurate trim/concat)
-        overlap_sec_eff = transition_frames / fps
+        from services.blend_plan import build_blend_plan
+
+        blend_plan = build_blend_plan(blend_mode, requested_duration_sec, fps)
+        transition_frames = blend_plan["transition_frames"]
+        effective_duration_sec = blend_plan["effective_duration_sec"]
+        # The overlap path historically calls this value overlap_sec_eff. Keep
+        # a local alias for its existing extraction/motion calculations while
+        # Insert treats it strictly as the generated transition duration.
+        overlap_sec_eff = effective_duration_sec
 
         # Snap resolution to LTX's 32-px alignment
         src_w = (info_a["w"] // 32) * 32
@@ -53219,34 +53268,50 @@ async def blend_endpoint(request: Request):
             idx = np.linspace(0, len(resized) - 1, target_len).astype(int)
             return [resized[i] for i in idx]
 
-        # ── Extract A's tail (last overlap_sec_eff seconds) ──────────────
-        if info_a["is_video"]:
-            src_frames_a = max(1, int(round(overlap_sec_eff * info_a["fps"])))
-            start_idx_a = max(0, info_a["frames"] - src_frames_a)
-            raw_a = [info_a["reader"][i].asnumpy() for i in range(start_idx_a, info_a["frames"])]
-            del info_a["reader"]
+        if blend_mode == "insert":
+            # Insert anchors only the clips' touching boundary frames.  The
+            # generated transition is inserted between complete A and B clips;
+            # no source motion prefix/suffix or weak replay anchors are added.
+            if info_a["is_video"]:
+                raw_a = [info_a["reader"][info_a["frames"] - 1].asnumpy()]
+                del info_a["reader"]
+            else:
+                raw_a = [np.array(info_a["image"])]
+            if info_b["is_video"]:
+                raw_b = [info_b["reader"][0].asnumpy()]
+                del info_b["reader"]
+            else:
+                raw_b = [np.array(info_b["image"])]
         else:
-            raw_a = [np.array(info_a["image"])]
+            # ── Extract A's tail (last overlap_sec_eff seconds) ──────────
+            if info_a["is_video"]:
+                src_frames_a = max(1, int(round(overlap_sec_eff * info_a["fps"])))
+                start_idx_a = max(0, info_a["frames"] - src_frames_a)
+                raw_a = [info_a["reader"][i].asnumpy() for i in range(start_idx_a, info_a["frames"])]
+                del info_a["reader"]
+            else:
+                raw_a = [np.array(info_a["image"])]
 
-        # ── Extract B's head (first overlap_sec_eff seconds) ─────────────
-        if info_b["is_video"]:
-            src_frames_b = max(1, int(round(overlap_sec_eff * info_b["fps"])))
-            end_idx_b = min(src_frames_b, info_b["frames"])
-            raw_b = [info_b["reader"][i].asnumpy() for i in range(end_idx_b)]
-            del info_b["reader"]
-        else:
-            raw_b = [np.array(info_b["image"])]
+            # ── Extract B's head (first overlap_sec_eff seconds) ─────────
+            if info_b["is_video"]:
+                src_frames_b = max(1, int(round(overlap_sec_eff * info_b["fps"])))
+                end_idx_b = min(src_frames_b, info_b["frames"])
+                raw_b = [info_b["reader"][i].asnumpy() for i in range(end_idx_b)]
+                del info_b["reader"]
+            else:
+                raw_b = [np.array(info_b["image"])]
 
         frames_a = _resample_frames(raw_a, transition_frames, src_w, src_h)
         frames_b = _resample_frames(raw_b, transition_frames, src_w, src_h)
 
         # ── Anchor frames for seamless concat at both seams ────────────────
-        # Correct frame selection for overlap semantics (a):
-        #   A_pre = A[0 : L_a - O]          → last frame = A[L_a-O-1]
-        #   blend starts at A[L_a - O]       → first blend frame
-        #   blend ends   at B[O - 1]         → last blend frame
-        #   B_post = B[O : L_b]              → first frame = B[O]
-        b_end_path = os.path.join(temp_dir, "b_overlap_end.png")
+        # Overlap anchors the edges of the shared windows.  Insert anchors the
+        # final frame of A and first frame of B because both source clips stay
+        # complete in the final concat.
+        b_end_path = os.path.join(
+            temp_dir,
+            "b_insert_start.png" if blend_mode == "insert" else "b_overlap_end.png",
+        )
         PILImage.fromarray(frames_b[-1]).save(b_end_path)
 
         # ── Motion-prefix mode: video_source from A's overlap-zone start ───
@@ -53266,10 +53331,14 @@ async def blend_endpoint(request: Request):
         # The "still-frame joggers" regression was caused by image_mode
         # from base_params coercing the pipeline into image-only output,
         # not by VE mode itself.
-        motion_prefix_sec = float(body.get("motion_prefix_sec", 1.0))
-        motion_prefix_sec = max(0.0, min(motion_prefix_sec, overlap_sec_eff * 0.8))
-        K_prefix = int(round(motion_prefix_sec * fps)) if motion_prefix_sec > 0 else 0
-        K_prefix = max(0, min(K_prefix, len(frames_a) - 2))  # leave room for generation
+        if blend_mode == "insert":
+            motion_prefix_sec = 0.0
+            K_prefix = 0
+        else:
+            motion_prefix_sec = float(body.get("motion_prefix_sec", 1.0))
+            motion_prefix_sec = max(0.0, min(motion_prefix_sec, overlap_sec_eff * 0.8))
+            K_prefix = int(round(motion_prefix_sec * fps)) if motion_prefix_sec > 0 else 0
+            K_prefix = max(0, min(K_prefix, len(frames_a) - 2))  # leave room for generation
 
         def _write_mp4(path: str, frames: list, fps_val: float):
             import imageio
@@ -53287,7 +53356,10 @@ async def blend_endpoint(request: Request):
             _write_mp4(video_source_path, frames_a[:K_prefix], fps)
         else:
             # Pure SE fallback: single-frame anchor at blend start
-            a_start_path = os.path.join(temp_dir, "a_overlap_start.png")
+            a_start_path = os.path.join(
+                temp_dir,
+                "a_insert_end.png" if blend_mode == "insert" else "a_overlap_start.png",
+            )
             PILImage.fromarray(frames_a[0]).save(a_start_path)
 
         # ── Motion-suffix mode: video_end from B's overlap-zone end ────────
@@ -53302,13 +53374,17 @@ async def blend_endpoint(request: Request):
         # They are EXACTLY the frames of B's overlap zone that B_post was
         # going to skip anyway, so the blend → B_post seam stays frame-
         # perfect (blend[N-1] = B[O-1] → B_post[0] = B[O]).
-        motion_suffix_sec = float(body.get("motion_suffix_sec", 1.0))
-        motion_suffix_sec = max(0.0, min(motion_suffix_sec, overlap_sec_eff * 0.8))
-        K_suffix = int(round(motion_suffix_sec * fps)) if motion_suffix_sec > 0 else 0
-        # Cap so suffix + prefix don't exceed transition length with no room
-        # for AI-invented middle. Leave at least 9 frames (1 latent chunk + 1)
-        # for the generator.
-        K_suffix = max(0, min(K_suffix, len(frames_b) - 1, transition_frames - K_prefix - 9))
+        if blend_mode == "insert":
+            motion_suffix_sec = 0.0
+            K_suffix = 0
+        else:
+            motion_suffix_sec = float(body.get("motion_suffix_sec", 1.0))
+            motion_suffix_sec = max(0.0, min(motion_suffix_sec, overlap_sec_eff * 0.8))
+            K_suffix = int(round(motion_suffix_sec * fps)) if motion_suffix_sec > 0 else 0
+            # Cap so suffix + prefix don't exceed transition length with no room
+            # for AI-invented middle. Leave at least 9 frames (1 latent chunk + 1)
+            # for the generator.
+            K_suffix = max(0, min(K_suffix, len(frames_b) - 1, transition_frames - K_prefix - 9))
 
         video_end_path = None
         if K_suffix > 0:
@@ -53326,9 +53402,12 @@ async def blend_endpoint(request: Request):
         #
         # Default 0 = pure SE (proven to produce great creative bridges).
         # Try 2-3 with injection_strength=0.3 to carry some motion context.
-        n_anchors = int(body.get("anchor_frames", 0))
-        max_anchors = min(len(frames_a) - 1, len(frames_b) - 1, max(1, transition_frames // 4))
-        n_anchors = max(0, min(n_anchors, max_anchors))
+        if blend_mode == "insert":
+            n_anchors = 0
+        else:
+            n_anchors = int(body.get("anchor_frames", 0))
+            max_anchors = min(len(frames_a) - 1, len(frames_b) - 1, max(1, transition_frames // 4))
+            n_anchors = max(0, min(n_anchors, max_anchors))
 
         extra_refs = []
         extra_positions = []
@@ -53365,15 +53444,21 @@ async def blend_endpoint(request: Request):
 
         print(f"[Blend] A={os.path.basename(clip_a_path)} ({info_a['w']}x{info_a['h']}@{info_a['fps']:.1f}), "
               f"B={os.path.basename(clip_b_path)} ({info_b['w']}x{info_b['h']}@{info_b['fps']:.1f})")
-        # Describe the blend mode selected by prefix/suffix config
-        _end_desc = (
-            f"video_end={K_suffix} frames ({motion_suffix_sec:.2f}s) of B's overlap end"
-            if video_end_path is not None else "image_end=B[O-1]"
-        )
-        if video_source_path is not None:
-            print(f"[Blend] VE mode: video_source={K_prefix} frames ({motion_prefix_sec:.2f}s) of A's overlap start, {_end_desc}")
+        if blend_mode == "insert":
+            print(
+                f"[Blend] Insert mode: A[last] → transition ({effective_duration_sec:.3f}s) "
+                "→ B[first]; source motion replay and extra anchors disabled"
+            )
         else:
-            print(f"[Blend] SE mode (no motion prefix): image_start=A[L-O], {_end_desc}")
+            # Describe the overlap mode selected by prefix/suffix config.
+            _end_desc = (
+                f"video_end={K_suffix} frames ({motion_suffix_sec:.2f}s) of B's overlap end"
+                if video_end_path is not None else "image_end=B[O-1]"
+            )
+            if video_source_path is not None:
+                print(f"[Blend] VE mode: video_source={K_prefix} frames ({motion_prefix_sec:.2f}s) of A's overlap start, {_end_desc}")
+            else:
+                print(f"[Blend] SE mode (no motion prefix): image_start=A[L-O], {_end_desc}")
         if extra_refs:
             print(f"[Blend]   + {len(extra_refs)} weak anchors @ strength={injection_strength:.2f}, "
                   f"positions={' '.join(str(p) for p in extra_positions)}")
@@ -53443,8 +53528,12 @@ async def blend_endpoint(request: Request):
             "_blend_clip_a": clip_a_path,
             "_blend_clip_b": clip_b_path,
             "_blend_temp_dir": temp_dir,
+            "_blend_contract_version": blend_plan["contract_version"],
             "_blend_mode": blend_mode,
-            "_blend_overlap_sec": overlap_sec_eff,
+            "_blend_requested_duration_sec": blend_plan["requested_duration_sec"],
+            "_blend_duration_sec": effective_duration_sec,
+            "_blend_motion_prefix_sec": K_prefix / fps,
+            "_blend_motion_suffix_sec": K_suffix / fps,
             "_blend_fps": fps,
             "_blend_out_w": src_w,
             "_blend_out_h": src_h,
@@ -53524,6 +53613,10 @@ async def blend_endpoint(request: Request):
             "phase": "", "message": "Queued (blend)", "created_at": time.time(),
             "params": gen_params, "output_files": [], "error": None,
             "workspace": workspace, "out_dir": job_out_dir,
+            "session_id": session_id,
+            "access_policy": access_policy,
+            "private": access_policy["private"],
+            "explicit": access_policy["explicit"],
         }
         _queue_recovery_register_and_publish(
             job,
@@ -53532,7 +53625,14 @@ async def blend_endpoint(request: Request):
             thread_name=f"studio-blend-{job_id}",
         )
 
-        return {"job_id": job_id, "status": "queued", "overlap_sec": overlap_sec_eff, "frames": transition_frames}
+        response = {
+            "job_id": job_id,
+            "status": "queued",
+            "blend_mode": blend_mode,
+            "frames": transition_frames,
+        }
+        response["transition_sec" if blend_mode == "insert" else "overlap_sec"] = effective_duration_sec
+        return response
 
     except Exception:
         # Setup failed before the background thread took ownership of temp_dir.
@@ -53543,9 +53643,12 @@ async def blend_endpoint(request: Request):
 
 
 def _run_blend_generation(job_id: str):
-    """Background thread: run VG blend generation, then concatenate
-    A[:L_a - O] + generated_blend + B[O:] so the blend replaces the
-    last O seconds of A and the first O seconds of B (overlap semantics).
+    """Background thread: run VG blend generation, then assemble the clips.
+
+    Versioned Insert jobs concatenate complete A + generated transition +
+    complete B.  Versioned Overlap jobs retain the original shared-window
+    trims.  Jobs without a contract marker predate Insert and therefore keep
+    their historical overlap assembly even if ``_blend_mode`` says insert.
 
     Uses filter_complex with explicit scale+fps normalization so the three
     segments (A at native res/fps, LTX output at snapped res/fps, B at
@@ -53554,8 +53657,38 @@ def _run_blend_generation(job_id: str):
     job = _jobs[job_id]
     temp_dir = job["params"].get("_blend_temp_dir")
     assembly_state = {"abort": False}
+    blend_path = None
+    blend_staging_path = None
+    blend_sidecar_path = None
+    final_output_committed = False
+    transition_path = None
+    transition_sidecar_path = None
+    transition_is_final_output = False
 
     try:
+        blend_params = job["params"]
+        from services.blend_plan import (
+            BLEND_IMAGE_EXTENSIONS,
+            BLEND_VIDEO_EXTENSIONS,
+            BLEND_METADATA_INVALID_MESSAGE,
+            build_blend_assembly,
+            resolve_blend_metadata,
+            rewrite_blend_sidecar,
+        )
+
+        try:
+            blend_metadata = resolve_blend_metadata(blend_params)
+        except ValueError as error:
+            fail_queued_job(
+                job,
+                error=f"Blend metadata invalid: {error}",
+                message=BLEND_METADATA_INVALID_MESSAGE,
+            )
+            return
+        blend_mode = blend_metadata["mode"]
+        blend_duration_sec = blend_metadata["duration_sec"]
+        blend_legacy = blend_metadata["legacy"]
+
         if not _run_generation(job_id, finalize=False):
             return
 
@@ -53575,10 +53708,8 @@ def _run_blend_generation(job_id: str):
             )
             return
 
-        blend_params = job["params"]
         clip_a = blend_params.get("_blend_clip_a")
         clip_b = blend_params.get("_blend_clip_b")
-        overlap_sec = float(blend_params.get("_blend_overlap_sec", 3))
         # Generation dims (32-snapped, e.g. 1280x704 for a 1280x720 source)
         out_w = int(blend_params.get("_blend_out_w", 0))
         out_h = int(blend_params.get("_blend_out_h", 0))
@@ -53588,7 +53719,7 @@ def _run_blend_generation(job_id: str):
         # scaled to these dims (small vertical stretch if aspect differs).
         concat_w = int(blend_params.get("_blend_concat_w", out_w))
         concat_h = int(blend_params.get("_blend_concat_h", out_h))
-        out_fps = float(blend_params.get("_blend_fps", 24.0))
+        out_fps = float(blend_metadata.get("fps") or 24.0)
 
         if not clip_a or not clip_b or not temp_dir:
             finish_job(
@@ -53602,6 +53733,9 @@ def _run_blend_generation(job_id: str):
         transition_file = job["output_files"][0]
         out_dir = job.get("out_dir", _workspace_dir())
         transition_path = os.path.join(out_dir, transition_file)
+        transition_sidecar_path = os.path.join(
+            out_dir, os.path.splitext(transition_file)[0] + ".meta.json",
+        )
 
         if not os.path.isfile(transition_path):
             print(f"[Blend] Transition file not found: {transition_path}")
@@ -53612,26 +53746,54 @@ def _run_blend_generation(job_id: str):
             return
 
         # ── Durations ────────────────────────────────────────────────────
+        import math
+
         def _duration(path):
             ext = os.path.splitext(path)[1].lower()
-            if ext not in (".mp4", ".mkv", ".avi", ".mov", ".webm"):
-                return 0.0
+            if ext in BLEND_IMAGE_EXTENSIONS:
+                # Insert keeps still-image sources as one frame at the output
+                # rate.  Overlap historically used images only as anchors and
+                # therefore contributes no flanking segment.
+                return 1.0 / out_fps if blend_mode == "insert" else 0.0
+            if ext not in BLEND_VIDEO_EXTENSIONS:
+                return None
             try:
                 import decord
+
                 vr = decord.VideoReader(path)
-                d = len(vr) / (float(vr.get_avg_fps()) or 24.0)
+                frame_count = len(vr)
+                source_fps = float(vr.get_avg_fps())
                 del vr
-                return d
+                if frame_count <= 0 or not math.isfinite(source_fps) or source_fps <= 0:
+                    return None
+                duration = frame_count / source_fps
+                return duration if math.isfinite(duration) and duration > 0 else None
             except Exception:
-                return 0.0
+                return None
 
         dur_a = _duration(clip_a)
         dur_b = _duration(clip_b)
-        a_pre_dur = max(0.0, dur_a - overlap_sec)
+        if dur_a is None or dur_b is None:
+            raise ValueError("Blend source media could not be read")
+        assembly_plan = build_blend_assembly(
+            blend_mode,
+            blend_duration_sec,
+            dur_a,
+            dur_b,
+            fps=out_fps,
+            legacy=blend_legacy,
+        )
+        a_start_sec = assembly_plan["a_start_sec"]
+        a_segment_dur = assembly_plan["a_duration_sec"]
+        b_start_sec = assembly_plan["b_start_sec"]
+        b_segment_dur = assembly_plan["b_duration_sec"]
 
-        print(f"[Blend] Post: A={dur_a:.2f}s (pre={a_pre_dur:.2f}s), "
-              f"B={dur_b:.2f}s (post={max(0.0, dur_b - overlap_sec):.2f}s), "
-              f"blend gen={out_w}x{out_h} → concat={concat_w}x{concat_h}@{out_fps:.2f}fps")
+        print(
+            f"[Blend] Post ({blend_mode}): A={dur_a:.2f}s "
+            f"(segment={a_segment_dur:.2f}s), B={dur_b:.2f}s "
+            f"(segment={b_segment_dur:.2f}s), blend gen={out_w}x{out_h} "
+            f"({blend_duration_sec:.3f}s) → concat={concat_w}x{concat_h}@{out_fps:.2f}fps"
+        )
 
         # ── Build ffmpeg filter_complex concat pipeline ──────────────────
         # We pass A, blend, B as three separate inputs, scale+fps-normalize
@@ -53639,12 +53801,81 @@ def _run_blend_generation(job_id: str):
         # demuxer's strict codec-param matching requirements and handles
         # arbitrary input resolutions/fps cleanly.
         import datetime
-        ts = datetime.datetime.now().strftime("%Y-%m-%d-%Hh%Mm%Ss")
-        blend_name = f"{ts}_blend.mp4"
+        ts = datetime.datetime.now().strftime("%Y-%m-%d-%Hh%Mm%Ss-%f")
+        blend_name = f"{ts}_{job_id}_blend.mp4"
         blend_path = os.path.join(out_dir, blend_name)
+        blend_staging_path = os.path.join(temp_dir, blend_name)
 
-        have_pre = a_pre_dur > 0.05
-        have_post = dur_b > overlap_sec + 0.05
+        def _rewrite_final_sidecar(output_name):
+            """Rebind the transition sidecar before deleting blend temp data."""
+
+            meta_src = os.path.join(
+                out_dir, os.path.splitext(transition_file)[0] + ".meta.json",
+            )
+            if not os.path.isfile(meta_src):
+                raise ValueError("Generated Blend transition metadata was not found")
+            with open(meta_src, "r", encoding="utf-8") as handle:
+                transition_sidecar = json.load(handle)
+            sidecar_params = transition_sidecar.get("params")
+            if not isinstance(sidecar_params, dict):
+                raise ValueError("Generated Blend transition metadata is incomplete")
+            for key in (
+                "_blend_clip_a",
+                "_blend_clip_b",
+                "_blend_requested_duration_sec",
+            ):
+                if sidecar_params.get(key) != blend_params.get(key):
+                    raise ValueError("Generated Blend transition metadata does not match its job")
+            for sidecar_key, job_key in (
+                ("job_id", "id"),
+                ("workspace", "workspace"),
+                ("private", "private"),
+                ("explicit", "explicit"),
+            ):
+                if job_key in job and transition_sidecar.get(sidecar_key) != job.get(job_key):
+                    raise ValueError("Generated Blend transition metadata does not match its job")
+            sidecar_metadata = resolve_blend_metadata(sidecar_params)
+            if (
+                sidecar_metadata["contract_version"] != blend_metadata["contract_version"]
+                or sidecar_metadata["legacy"] != blend_metadata["legacy"]
+                or sidecar_metadata["mode"] != blend_metadata["mode"]
+                or sidecar_metadata["fps"] != blend_metadata["fps"]
+                or not math.isclose(
+                    sidecar_metadata["duration_sec"],
+                    blend_metadata["duration_sec"],
+                    rel_tol=1e-9,
+                    abs_tol=1e-9,
+                )
+            ):
+                raise ValueError("Generated Blend transition metadata does not match its job")
+            final_sidecar = rewrite_blend_sidecar(
+                transition_sidecar,
+                output_filename=output_name,
+                temp_dir=temp_dir,
+            )
+            final_sidecar["job_id"] = job_id
+            for key in ("workspace", "private", "explicit"):
+                if key in job:
+                    final_sidecar[key] = job[key]
+            meta_dst = os.path.join(
+                out_dir, os.path.splitext(output_name)[0] + ".meta.json",
+            )
+            _atomic_write_json(meta_dst, final_sidecar)
+            return meta_dst
+
+        def _discard_uncommitted_output():
+            """Remove assembly artifacts that were never published as complete."""
+
+            for path in (blend_sidecar_path, blend_path, blend_staging_path):
+                if path and os.path.isfile(path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+
+        segment_threshold = 0.000001 if blend_mode == "insert" else 0.05
+        have_pre = a_segment_dur > segment_threshold
+        have_post = b_segment_dur > segment_threshold
 
         # Video normalization filters — all targeting concat_w × concat_h
         # (A's native dimensions, even). Using fully-named args for scale
@@ -53699,22 +53930,62 @@ def _run_blend_generation(job_id: str):
             except Exception:
                 return False
 
-        # A_pre (trimmed A)
+        def _source_input(
+            path,
+            start_sec,
+            duration_sec,
+            total_sec,
+            *,
+            trim_end=False,
+            still_image=False,
+        ):
+            """Build an ffmpeg input spec while preserving overlap ordering."""
+
+            args = []
+            if still_image:
+                # Image inputs otherwise produce one frame and end before the
+                # concat clock starts. Loop exactly one output-frame duration;
+                # the filter graph then normalizes it to the shared fps.
+                return [
+                    "-loop", "1",
+                    "-t", f"{duration_sec:.4f}",
+                    "-i", path,
+                ]
+            if start_sec > 0.00005:
+                args += ["-ss", f"{start_sec:.4f}"]
+            # A's overlap segment historically always carried an explicit -t;
+            # retain that exact trim even when the overlap is very short.  B's
+            # post-overlap input reaches the source end and therefore keeps the
+            # historical -ss-only shape. Insert passes complete source clips.
+            if trim_end or start_sec + duration_sec < total_sec - 0.000001:
+                if duration_sec < total_sec:
+                    args += ["-t", f"{duration_sec:.4f}"]
+            args += ["-i", path]
+            return args
+
+        # A segment (complete A for Insert, trimmed A for Overlap).
         if have_pre:
-            inputs += ["-t", f"{a_pre_dur:.4f}", "-i", clip_a]
+            inputs += _source_input(
+                clip_a,
+                a_start_sec,
+                a_segment_dur,
+                dur_a,
+                trim_end=blend_mode == "overlap",
+                still_image=os.path.splitext(clip_a)[1].lower() in BLEND_IMAGE_EXTENSIONS,
+            )
             filter_parts.append(_norm_v(f"{input_idx}:v:0", f"v{input_idx}"))
             concat_v_labels.append(f"v{input_idx}")
             if _has_audio(clip_a):
-                filter_parts.append(_norm_a(f"{input_idx}:a:0", f"a{input_idx}", a_pre_dur))
+                filter_parts.append(_norm_a(f"{input_idx}:a:0", f"a{input_idx}", a_segment_dur))
             else:
-                filter_parts.append(_silent_a(f"a{input_idx}", a_pre_dur))
+                filter_parts.append(_silent_a(f"a{input_idx}", a_segment_dur))
             concat_a_labels.append(f"a{input_idx}")
             input_idx += 1
 
         # Generated blend (the transition) — full duration.
         # Force-scale to concat dims so the 32-snapped render (e.g. 1280x704)
         # fills the native frame (e.g. 1280x720) without pillar/letterboxing.
-        blend_dur = overlap_sec
+        blend_dur = blend_duration_sec
         inputs += ["-i", transition_path]
         filter_parts.append(_norm_v_stretch(f"{input_idx}:v:0", f"v{input_idx}"))
         concat_v_labels.append(f"v{input_idx}")
@@ -53725,23 +53996,33 @@ def _run_blend_generation(job_id: str):
         concat_a_labels.append(f"a{input_idx}")
         input_idx += 1
 
-        # B_post (B skipped by overlap_sec)
+        # B segment (complete B for Insert, post-overlap B for Overlap).
         if have_post:
-            b_post_dur = dur_b - overlap_sec
-            inputs += ["-ss", f"{overlap_sec:.4f}", "-i", clip_b]
+            inputs += _source_input(
+                clip_b,
+                b_start_sec,
+                b_segment_dur,
+                dur_b,
+                still_image=os.path.splitext(clip_b)[1].lower() in BLEND_IMAGE_EXTENSIONS,
+            )
             filter_parts.append(_norm_v(f"{input_idx}:v:0", f"v{input_idx}"))
             concat_v_labels.append(f"v{input_idx}")
             if _has_audio(clip_b):
-                filter_parts.append(_norm_a(f"{input_idx}:a:0", f"a{input_idx}", b_post_dur))
+                filter_parts.append(_norm_a(f"{input_idx}:a:0", f"a{input_idx}", b_segment_dur))
             else:
-                filter_parts.append(_silent_a(f"a{input_idx}", b_post_dur))
+                filter_parts.append(_silent_a(f"a{input_idx}", b_segment_dur))
             concat_a_labels.append(f"a{input_idx}")
             input_idx += 1
 
         if input_idx <= 1:
             # Only the blend — nothing to concat. Leave job output as-is.
             print(f"[Blend] No flanking segments; output is the blend alone ({transition_file}).")
-            finish_job(
+            if is_cancel_requested(job):
+                return
+            _rewrite_final_sidecar(transition_file)
+            if is_cancel_requested(job):
+                return
+            transition_is_final_output = bool(finish_job(
                 job,
                 "completed",
                 progress=100,
@@ -53749,7 +54030,7 @@ def _run_blend_generation(job_id: str):
                 total_steps=0,
                 phase="",
                 message="Done",
-            )
+            ))
             return
 
         # Concat filter. ffmpeg's concat demands inputs **interleaved** as
@@ -53781,47 +54062,103 @@ def _run_blend_generation(job_id: str):
             "-c:v", "libx264", "-crf", "18", "-preset", "fast",
             "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart",
-            blend_path,
+            blend_staging_path,
         ]
 
         if is_cancel_requested(job):
             return
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        blend_ready = result.returncode == 0 and os.path.isfile(blend_path)
-        if blend_ready:
-            record_job_outputs(job, [blend_name])
+        import time as _time
+
+        ffmpeg_stderr_path = os.path.join(temp_dir, "ffmpeg-stderr.log")
+        with open(ffmpeg_stderr_path, "w", encoding="utf-8") as stderr_handle:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_handle,
+                text=True,
+            )
+            deadline = _time.monotonic() + 300.0
+            cancelled = False
+            while process.poll() is None:
+                if is_cancel_requested(job):
+                    cancelled = True
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                    break
+                if _time.monotonic() >= deadline:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                    raise subprocess.TimeoutExpired(cmd, 300)
+                _time.sleep(0.1)
+
+        if cancelled:
+            _discard_uncommitted_output()
+            return
+
+        returncode = process.returncode
+        try:
+            with open(ffmpeg_stderr_path, "r", encoding="utf-8", errors="replace") as handle:
+                stderr = handle.read()[-800:]
+        except OSError:
+            stderr = ""
+        blend_ready = returncode == 0 and os.path.isfile(blend_staging_path)
         if is_cancel_requested(job):
+            _discard_uncommitted_output()
             return
         if blend_ready:
-            if not update_job(job, output_files=[blend_name]):
+            blend_sidecar_path = _rewrite_final_sidecar(blend_name)
+            if is_cancel_requested(job):
+                _discard_uncommitted_output()
                 return
-            print(f"[Blend] Concatenated {n} segments "
-                  f"({'A_pre+' if have_pre else ''}blend{'+B_post' if have_post else ''}) → {blend_name}")
+            os.replace(blend_staging_path, blend_path)
+            if is_cancel_requested(job):
+                _discard_uncommitted_output()
+                return
+            a_label = "A+" if blend_mode == "insert" else "A_pre+"
+            b_label = "+B" if blend_mode == "insert" else "+B_post"
+            print(
+                f"[Blend] Concatenated {n} segments "
+                f"({a_label if have_pre else ''}blend{b_label if have_post else ''}) "
+                f"→ {blend_name}"
+            )
 
-            # Copy metadata sidecar from transition to blend
-            meta_src = os.path.join(out_dir, os.path.splitext(transition_file)[0] + ".meta.json")
-            meta_dst = os.path.join(out_dir, os.path.splitext(blend_name)[0] + ".meta.json")
-            if os.path.isfile(meta_src):
-                import shutil
-                shutil.copy2(meta_src, meta_dst)
-            finish_job(
+            # The final sidecar was rebound before publishing the output, so a
+            # consumer never observes a completed Blend without its metadata.
+            completed = finish_job(
                 job,
                 "completed",
+                output_files=[blend_name],
                 progress=100,
                 step=0,
                 total_steps=0,
                 phase="",
                 message="Done",
             )
+            final_output_committed = bool(completed)
+            if final_output_committed:
+                record_job_outputs(
+                    job,
+                    [blend_name],
+                    final_output_files=[blend_name],
+                )
         else:
-            print(f"[Blend] ffmpeg concat failed (returncode={result.returncode})")
+            _discard_uncommitted_output()
+            print(f"[Blend] ffmpeg concat failed (returncode={returncode})")
             print(f"[Blend] filter_complex was:\n  {filter_complex}")
             print(f"[Blend] cmd: {' '.join(repr(c) for c in cmd)}")
-            print(f"[Blend] stderr tail:\n{result.stderr[-800:]}")
+            print(f"[Blend] stderr tail:\n{stderr}")
             finish_job(
                 job,
                 "failed",
-                error=f"Blend assembly failed (ffmpeg exit {result.returncode})",
+                error=f"Blend assembly failed (ffmpeg exit {returncode})",
                 message="Blend assembly failed",
             )
 
@@ -53831,6 +54168,20 @@ def _run_blend_generation(job_id: str):
         traceback.print_exc()
         finish_job(job, "failed", error=str(e), message=f"Error: {e}")
     finally:
+        if not final_output_committed:
+            for path in (blend_sidecar_path, blend_path, blend_staging_path):
+                if path and os.path.isfile(path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+        if not transition_is_final_output:
+            for path in (transition_sidecar_path, transition_path):
+                if path and os.path.isfile(path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
         unregister_abort_state(job_id, _active_gen_states, assembly_state)
         if temp_dir and os.path.isdir(temp_dir):
             import shutil
