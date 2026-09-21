@@ -5148,7 +5148,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
         self.assertEqual(restored["resource_state"], "released")
         self.assertEqual(worker_calls, [])
 
-    def test_prompt_enhancement_startup_checkpoints_terminal_conversion_once(self):
+    def test_startup_checkpoints_terminal_conversions_once(self):
         class Registry(dict):
             def prepare(self, job):
                 return job
@@ -5157,6 +5157,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 self[job_id] = job
 
         job_id = "0f6f216342f741d0a26079b697081d96"
+        adopted_id = "5d2330d8e1ff49e2b858f15cc5b606d0"
         snapshots = {
             job_id: {
                 "id": job_id,
@@ -5164,6 +5165,13 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "status": "running",
                 "workspace": "default",
                 "message": "Enhancing prompt",
+            },
+            adopted_id: {
+                "id": adopted_id,
+                "kind": "generation",
+                "status": "queued",
+                "workspace": "default",
+                "message": "Recovery blocked",
             },
         }
         checkpoints = []
@@ -5173,7 +5181,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
         def materialize(snapshot, _projects):
             job = dict(snapshot)
             if snapshot["status"] in {"queued", "running"}:
-                job.update({
+                terminal = {
                     "status": "failed",
                     "finished_at": 1234.5,
                     "queue_held": False,
@@ -5182,7 +5190,14 @@ class QueueLaunchWiringTests(unittest.TestCase):
                     "reruns_denoise": False,
                     "message": "Prompt enhancement was interrupted",
                     "resource_state": "released",
-                })
+                }
+                if snapshot["id"] == adopted_id:
+                    terminal.update({
+                        "status": "completed",
+                        "message": "Completed",
+                        "_recovery_final_adoption": {"state": "adopted"},
+                    })
+                job.update(terminal)
             return job, False
 
         def checkpoint(job, **updates):
@@ -5220,16 +5235,18 @@ class QueueLaunchWiringTests(unittest.TestCase):
         )
 
         self.assertTrue(namespace["_restore_queue_recovery_on_startup"]())
-        self.assertEqual(len(checkpoints), 1)
+        self.assertEqual(len(checkpoints), 2)
         self.assertEqual(snapshots[job_id]["status"], "failed")
         self.assertEqual(snapshots[job_id]["finished_at"], 1234.5)
+        self.assertEqual(snapshots[adopted_id]["status"], "completed")
         self.assertEqual(worker_calls, [])
 
         namespace["_queue_recovery_workers_started"] = False
         registry.clear()
         self.assertTrue(namespace["_restore_queue_recovery_on_startup"]())
-        self.assertEqual(len(checkpoints), 1)
+        self.assertEqual(len(checkpoints), 2)
         self.assertEqual(registry[job_id]["status"], "failed")
+        self.assertEqual(registry[adopted_id]["status"], "completed")
         self.assertEqual(worker_calls, [])
 
     def test_completed_h3_requires_exact_adopted_finals_before_terminal_state(self):
@@ -5259,6 +5276,13 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "validate_manifest_inputs": lambda *_args: None,
                 "_queue_recovery_manifest_validator": lambda *_args, **_kwargs: True,
                 "_require_h3_offload_plan_parity": lambda *_args, **_kwargs: None,
+                "is_registered_h3_family": lambda model_type: str(
+                    model_type or ""
+                ).startswith("minimax_h3"),
+                "_job_uses_registered_h3": lambda job: str(
+                    job.get("model_type") or ""
+                ).startswith("minimax_h3"),
+                "_queue_recovery_worker": lambda _job: None,
                 "_queue_recovery_reconcile_cursor": lambda job, _path: job.update({
                     "output_files": [],
                 }),
@@ -5285,6 +5309,83 @@ class QueueLaunchWiringTests(unittest.TestCase):
         self.assertEqual(adopted["output_files"], [
             f"final-{index}.mp4" for index in range(4)
         ])
+
+        queued_snapshot = {
+            **snapshot,
+            "status": "queued",
+            "queue_held": True,
+            "finished_at": 1234.5,
+            "progress": 12,
+            "step": 2,
+            "total_steps": 20,
+            "window_current": 1,
+            "window_total": 3,
+            "window_step": 2,
+            "window_total_steps": 20,
+            "window_progress": 10,
+            "overall_progress": 19,
+            "clip_current": 1,
+            "clip_total": 2,
+            "clip_progress": 23,
+            "failure_details": {"code": "stale"},
+            "oom_info": {"kind": "stale"},
+            "failed_child_job_id": "stale-child",
+            "failed_child_status": "failed",
+            "failed_child_reason": "stale reason",
+            "plan_review_required": True,
+            "plan_review_terms_required": True,
+            "plan_review_deadline": 9999.0,
+            "_recovery_reason_code": "h3_legal_access_required",
+        }
+        adopted_queued, may_start = namespace[
+            "_queue_recovery_materialize_job"
+        ](queued_snapshot, projects)
+        self.assertFalse(may_start)
+        self.assertEqual(adopted_queued["status"], "completed")
+        self.assertEqual(adopted_queued["recovery_state"], "terminal")
+        self.assertFalse(adopted_queued["queue_held"])
+        self.assertEqual(adopted_queued["resource_state"], "released")
+        self.assertEqual(adopted_queued["finished_at"], 1234.5)
+        self.assertEqual(adopted_queued["progress"], 100)
+        self.assertEqual(adopted_queued["step"], 20)
+        self.assertEqual(adopted_queued["window_current"], 3)
+        self.assertEqual(adopted_queued["window_step"], 20)
+        self.assertEqual(adopted_queued["window_progress"], 100)
+        self.assertEqual(adopted_queued["overall_progress"], 100)
+        self.assertEqual(adopted_queued["clip_current"], 2)
+        self.assertEqual(adopted_queued["clip_progress"], 100)
+        self.assertFalse(adopted_queued["plan_review_required"])
+        self.assertFalse(adopted_queued["plan_review_terms_required"])
+        self.assertIsNone(adopted_queued["plan_review_deadline"])
+        self.assertIsNone(adopted_queued["failure_details"])
+        self.assertIsNone(adopted_queued["oom_info"])
+        self.assertIsNone(adopted_queued["failed_child_job_id"])
+        self.assertIsNone(adopted_queued["failed_child_status"])
+        self.assertIsNone(adopted_queued["failed_child_reason"])
+        self.assertNotIn("_recovery_reason_code", adopted_queued)
+
+        cancelled_queued, may_start = namespace[
+            "_queue_recovery_materialize_job"
+        ]({**queued_snapshot, "cancel_requested": True}, projects)
+        self.assertFalse(may_start)
+        self.assertEqual(cancelled_queued["status"], "cancelled")
+        self.assertEqual(cancelled_queued["recovery_state"], "cancelled")
+
+        ordinary_queued = {
+            **queued_snapshot,
+            "id": "job-ordinary-adopted",
+            "recovery_cursor": {"completed_units": []},
+            "model_type": "flux",
+        }
+        finality[("project-a", "job-ordinary-adopted")] = {
+            **finality[("project-a", "job-completed")],
+        }
+        ordinary_result, may_start = namespace[
+            "_queue_recovery_materialize_job"
+        ](ordinary_queued, projects)
+        self.assertFalse(may_start)
+        self.assertEqual(ordinary_result["status"], "queued")
+        self.assertEqual(ordinary_result["recovery_state"], "blocked_preparation")
 
         finality[("project-a", "job-completed")] = {
             "state": "quarantined",

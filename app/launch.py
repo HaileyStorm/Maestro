@@ -7084,6 +7084,21 @@ def _queue_recovery_materialize_job(
     final_adoption = globals().get(
         "_queue_recovery_final_adoption_jobs", {}
     ).get((workspace, job_id))
+    adopted_outputs = (
+        final_adoption.get("output_files")
+        if isinstance(final_adoption, dict) else None
+    )
+    verified_final_adoption = bool(
+        isinstance(final_adoption, dict)
+        and final_adoption.get("state") == "adopted"
+        and type(final_adoption.get("declared")) is int
+        and final_adoption["declared"] > 0
+        and final_adoption.get("adopted") == final_adoption["declared"]
+        and final_adoption.get("missing") == 0
+        and final_adoption.get("quarantined") == 0
+        and isinstance(adopted_outputs, list)
+        and len(adopted_outputs) == final_adoption["declared"]
+    )
     if isinstance(final_adoption, dict):
         runtime["_recovery_final_adoption"] = dict(final_adoption)
     snapshot_cursor = snapshot.get("recovery_cursor")
@@ -7100,16 +7115,22 @@ def _queue_recovery_materialize_job(
         isinstance(unit, dict) and unit.get("kind") == "h3_segment"
         for unit in (snapshot_units if isinstance(snapshot_units, list) else [])
     )
+    h3_classifier = globals().get("is_registered_h3_family")
+    verified_h3_final_adoption = bool(
+        verified_final_adoption
+        and (
+            had_h3_unit_evidence
+            or (
+                callable(h3_classifier)
+                and h3_classifier(runtime.get("model_type"))
+            )
+        )
+    )
     publication_recovery = globals().get(
         "_project_reference_publication_recovery_requested"
     )
     project_reference_finalization = bool(
         callable(publication_recovery) and publication_recovery(snapshot)
-    )
-    completed_final_adoption = bool(
-        isinstance(final_adoption, dict)
-        and final_adoption.get("state") == "adopted"
-        and str(snapshot.get("status") or "").casefold() == "completed"
     )
     current = projects.get(workspace)
     blocked_reason = "Recovery project is missing or was recreated"
@@ -7117,7 +7138,7 @@ def _queue_recovery_materialize_job(
     manifest = None
     if current is not None and hmac.compare_digest(current[1], expected_project):
         runtime["out_dir"] = current[0]
-        if project_reference_finalization or completed_final_adoption:
+        if project_reference_finalization or verified_h3_final_adoption:
             # Completion-only recovery is authorized entirely by the sealed,
             # content-free recovery unit/receipt and committed asset evidence.
             # It must never reload private request inputs or rerun generation.
@@ -7167,22 +7188,16 @@ def _queue_recovery_materialize_job(
                 blocked_reason = "Recovery request or input validation failed"
                 blocked_code = "input_missing_or_changed"
 
-    if not blocked_reason and isinstance(final_adoption, dict):
-        adopted_outputs = final_adoption.get("output_files")
-        if (
-            final_adoption.get("state") == "adopted"
-            and isinstance(adopted_outputs, list)
-            and len(adopted_outputs) == final_adoption.get("adopted")
-        ):
-            runtime["output_files"] = list(adopted_outputs)
-            artifacts = [
-                name for name in runtime.get("artifact_files") or []
-                if isinstance(name, str) and name
-            ]
-            for name in adopted_outputs:
-                if name not in artifacts:
-                    artifacts.append(name)
-            runtime["artifact_files"] = artifacts
+    if not blocked_reason and verified_h3_final_adoption:
+        runtime["output_files"] = list(adopted_outputs)
+        artifacts = [
+            name for name in runtime.get("artifact_files") or []
+            if isinstance(name, str) and name
+        ]
+        for name in adopted_outputs:
+            if name not in artifacts:
+                artifacts.append(name)
+        runtime["artifact_files"] = artifacts
 
     status = str(snapshot.get("status") or "queued").casefold()
     if (
@@ -7231,6 +7246,81 @@ def _queue_recovery_materialize_job(
             "error": None,
         })
         return runtime, False
+    if status in {"cancelled", "canceled"} or snapshot.get("cancel_requested"):
+        runtime.update({
+            "status": "cancelled",
+            "cancel_requested": True,
+            "recovery_state": "cancelled",
+            "message": "Cancelled",
+        })
+        return runtime, False
+    if verified_h3_final_adoption and not blocked_reason:
+        # A final-adoption receipt binds every declared output to this job and
+        # project. It is stronger completion evidence than a stale pre-crash
+        # queue status, and it must never send an already-published H3 final
+        # back through generation or a now-irrelevant legal-access hold.
+        runtime.pop("_recovery_reason_code", None)
+        total_steps = (
+            runtime.get("total_steps")
+            if type(runtime.get("total_steps")) is int
+            and runtime["total_steps"] >= 0 else 0
+        )
+        window_total = (
+            runtime.get("window_total")
+            if type(runtime.get("window_total")) is int
+            and runtime["window_total"] >= 0 else 0
+        )
+        window_total_steps = (
+            runtime.get("window_total_steps")
+            if type(runtime.get("window_total_steps")) is int
+            and runtime["window_total_steps"] >= 0 else 0
+        )
+        clip_total = (
+            runtime.get("clip_total")
+            if type(runtime.get("clip_total")) is int
+            and runtime["clip_total"] >= 0 else 0
+        )
+        runtime.update({
+            "status": "completed",
+            "queue_held": False,
+            "recovery_state": "terminal",
+            "reruns_denoise": False,
+            "hold_after_output": False,
+            "plan_review_required": False,
+            "plan_review_terms_required": False,
+            "plan_review_deadline": None,
+            "phase": "completed",
+            "message": "Completed",
+            "error": None,
+            "failure_details": None,
+            "oom_info": None,
+            "failed_child_job_id": None,
+            "failed_child_status": None,
+            "failed_child_reason": None,
+            "progress": 100,
+            "step": total_steps,
+            "total_steps": total_steps,
+            "window_current": window_total,
+            "window_total": window_total,
+            "window_step": window_total_steps,
+            "window_total_steps": window_total_steps,
+            "window_progress": 100,
+            "overall_progress": 100,
+            "clip_current": clip_total,
+            "clip_total": clip_total,
+            "clip_progress": 100,
+            "resource_execution": "standard",
+            "preemption_mode": "none",
+            "resource_state": "released",
+            "finished_at": (
+                snapshot.get("finished_at")
+                if type(snapshot.get("finished_at")) in {int, float}
+                and math.isfinite(float(snapshot["finished_at"]))
+                and float(snapshot["finished_at"]) >= 0.0
+                else time.time()
+            ),
+        })
+        return runtime, False
     if snapshot.get("resource_intent") in {"text", "generation"}:
         # A process-local CPU lease and runtime tokens never survive restart.
         # Preserve the attempt counter for stale-result fences, but reacquire
@@ -7246,14 +7336,6 @@ def _queue_recovery_materialize_job(
             ),
         })
     remote = bool(snapshot.get("source_remote", False))
-    if status in {"cancelled", "canceled"} or snapshot.get("cancel_requested"):
-        runtime.update({
-            "status": "cancelled",
-            "cancel_requested": True,
-            "recovery_state": "cancelled",
-            "message": "Cancelled",
-        })
-        return runtime, False
     if status == "failed" and not blocked_reason:
         # Older journals did not persist safe OOM details.  A fully verified
         # contiguous H3 prefix plus exactly one missing final segment may be
@@ -8123,7 +8205,8 @@ def _restore_queue_recovery_on_startup(
                 job, persist_baseline=True,
             ):
                 unsettled_terminal_credit = True
-        # Persist running->interrupted/blocked conversion before publication.
+        # Persist every startup normalization before publication, including a
+        # receipt-proven final that closes an older nonterminal snapshot.
         if (
             job.get("status") not in {"completed", "failed", "cancelled"}
             or str(snapshot.get("status") or "").casefold() in {
@@ -8134,6 +8217,13 @@ def _restore_queue_recovery_on_startup(
                 and job.get("status") == "failed"
                 and str(snapshot.get("status") or "").casefold()
                     in {"queued", "running"}
+            )
+            or (
+                str(job.get("status") or "").casefold() == "completed"
+                and str(snapshot.get("status") or "").casefold()
+                    not in {"completed", "failed", "cancelled", "canceled"}
+                and isinstance(job.get("_recovery_final_adoption"), dict)
+                and job["_recovery_final_adoption"].get("state") == "adopted"
             )
         ):
             _queue_recovery_checkpoint(
