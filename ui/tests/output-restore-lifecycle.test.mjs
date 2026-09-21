@@ -68,6 +68,7 @@ async function waitFor(predicate, label, timeoutMs = 2_000) {
 const families = [
   { id: 'ltx2', label: 'LTX 2', order: 0 },
   { id: 'h3', label: 'MiniMax H3', order: 1 },
+  { id: 'tts', label: 'Audio', order: 2 },
 ]
 
 const models = [
@@ -83,9 +84,40 @@ const models = [
     model_type: 'minimax_h3_ref2va', name: 'MiniMax H3 Ref2VA', family: 'h3', architecture: 'minimax_h3',
     is_i2v: true, is_t2v: true, guidance_max_phases: 2, fps: 24,
   },
+  {
+    model_type: 'kugelaudio_0_open', name: 'KugelAudio 0 Open', family: 'tts', architecture: 'kugelaudio',
+    is_i2v: false, is_t2v: false, guidance_max_phases: 1, fps: 1,
+  },
+  {
+    model_type: 'ace_step_v1_5_turbo_lm_4b', name: 'ACE-Step Turbo LM 4B', family: 'tts', architecture: 'ace_step',
+    is_i2v: false, is_t2v: false, guidance_max_phases: 1, fps: 1,
+  },
+  {
+    model_type: 'scenema_audio', name: 'Scenema Audio', family: 'tts', architecture: 'scenema_audio',
+    is_i2v: false, is_t2v: false, guidance_max_phases: 0, fps: 1,
+  },
 ]
 
 function modelOptions(modelType) {
+  if (modelType === 'kugelaudio_0_open' || modelType === 'scenema_audio' || modelType.startsWith('ace_step')) {
+    return {
+      model_type: modelType,
+      architecture: 'kugelaudio',
+      fps: 1,
+      frames_steps: 1,
+      latent_size: 1,
+      frames_minimum: 0,
+      frames_maximum: 0,
+      guidance_max_phases: 1,
+      sliding_window: false,
+      default_num_inference_steps: 0,
+      default_guidance_scale: 1,
+      audio_only: true,
+      max_voice_count: modelType === 'scenema_audio' ? 2 : 6,
+      resolutions: [],
+      supports_end_frame: false,
+    }
+  }
   const h3 = modelType.startsWith('minimax_h3')
   return {
     model_type: modelType,
@@ -388,6 +420,371 @@ test('selecting another output immediately restores that card across generation 
     assert.equal(state.params.prompt, 'restore this video')
     assert.equal(state.params.resolution, '608x352')
     assert.ok(requests.some(({ url }) => url === '/api/v1/model-options/minimax_h3'))
+  })
+})
+
+test('multi-speaker output restores safe voice identities and replaces stale guide slots', async () => {
+  await withStore(async ({ fetchOverrides, useStore }) => {
+    const speech = {
+      name: 'three-speaker.wav',
+      meta: sidecar({
+        ...baseParams({
+          model_type: 'kugelaudio_0_open',
+          prompt: 'Speaker 1: First\nSpeaker 2: Second\nSpeaker 3: Third',
+          video_length: 0,
+        }),
+        _audio_sub_mode: 'speech',
+        _tts_original_prompt: 'Alice: First\nBob: Second\nCarol: Third',
+        _tts_voice_count: 3,
+        _tts_speaker_name1: 'Alice',
+        _tts_speaker_name2: 'Bob',
+        _tts_speaker_name3: 'Carol',
+        audio_guide: '/authorized/uploads/alice.wav',
+        audio_guide2: '/authorized/uploads/bob.wav',
+        audio_guide3: '/authorized/uploads/carol.wav',
+      }, {
+        audio_guide: 'alice.wav',
+        audio_guide2: String.raw`C:\published\bob.wav`,
+        audio_guide3: '/published/carol.wav',
+      }),
+    }
+    configureGallery(useStore, [speech])
+    useStore.setState(state => ({
+      params: {
+        ...state.params,
+        audio_guide: '/stale/one.wav',
+        audio_guide2: '/stale/two.wav',
+        audio_guide3: '/stale/three.wav',
+        audio_guide4: '/stale/four.wav',
+        audio_guide5: '/stale/five.wav',
+        audio_guide6: '/stale/six.wav',
+      },
+      ttsVoiceCount: 6,
+      ttsVoices: Array.from({ length: 6 }, (_, index) => ({
+        name: `Stale ${index + 1}`,
+        filename: `stale-${index + 1}.wav`,
+        path: `/stale/${index + 1}.wav`,
+      })),
+    }))
+
+    assert.equal(await useStore.getState().loadSettingsFromOutput(), true)
+    const restored = useStore.getState()
+    assert.equal(restored.generationMode, 'audio')
+    assert.equal(restored.audioSubMode, 'speech')
+    assert.equal(restored.ttsVoiceCount, 3)
+    assert.deepEqual(restored.ttsVoices, [
+      { name: 'Alice', filename: 'alice.wav', path: '/authorized/uploads/alice.wav' },
+      { name: 'Bob', filename: 'bob.wav', path: '/authorized/uploads/bob.wav' },
+      { name: 'Carol', filename: 'carol.wav', path: '/authorized/uploads/carol.wav' },
+    ])
+    assert.equal(restored.params.audio_guide, '/authorized/uploads/alice.wav')
+    assert.equal(restored.params.audio_guide2, '/authorized/uploads/bob.wav')
+    assert.equal(restored.params.audio_guide3, '/authorized/uploads/carol.wav')
+    for (let i = 4; i <= 6; i += 1) assert.equal(restored.params[`audio_guide${i}`], '')
+
+    let submitted
+    fetchOverrides.set('/api/v1/generate', async (_url, init) => {
+      submitted = JSON.parse(init.body)
+      return Response.json({ job_id: 'synthetic-speech', status: 'queued' })
+    })
+    useStore.setState({ _pollRecoveredJob: () => {} })
+    await useStore.getState().startGeneration()
+    assert.ok(submitted, 'restored speech request was submitted')
+    assert.equal(submitted.audio_guide, '/authorized/uploads/alice.wav')
+    assert.equal(submitted.audio_guide2, '/authorized/uploads/bob.wav')
+    assert.equal(submitted.audio_guide3, '/authorized/uploads/carol.wav')
+    for (let i = 4; i <= 6; i += 1) assert.equal(Object.hasOwn(submitted, `audio_guide${i}`), false)
+  })
+})
+
+test('music output without speaker rows preserves its ordinary source audio', async () => {
+  await withStore(async ({ fetchOverrides, useStore }) => {
+    const music = {
+      name: 'source-audio-song.wav',
+      meta: sidecar({
+        ...baseParams({
+          model_type: 'ace_step_v1_5_turbo_lm_4b',
+          prompt: '[Verse] Keep the source',
+          video_length: 0,
+        }),
+        _audio_sub_mode: 'music',
+        _tts_voice_count: 0,
+        audio_guide: '/authorized/uploads/source-song.wav',
+      }, { audio_guide: 'source-song.wav' }),
+    }
+    configureGallery(useStore, [music])
+    useStore.setState({
+      ttsVoiceCount: 3,
+      ttsVoices: [
+        { name: 'Old A', filename: 'old-a.wav', path: '/stale/old-a.wav' },
+        { name: 'Old B', filename: 'old-b.wav', path: '/stale/old-b.wav' },
+        { name: 'Old C', filename: 'old-c.wav', path: '/stale/old-c.wav' },
+      ],
+    })
+
+    assert.equal(await useStore.getState().loadSettingsFromOutput(), true)
+    const restored = useStore.getState()
+    assert.equal(restored.generationMode, 'audio')
+    assert.equal(restored.audioSubMode, 'music')
+    assert.equal(restored.ttsVoiceCount, 0)
+    assert.deepEqual(restored.ttsVoices, [])
+    assert.equal(restored.params.audio_guide, '/authorized/uploads/source-song.wav')
+
+    let submitted
+    fetchOverrides.set('/api/v1/generate', async (_url, init) => {
+      submitted = JSON.parse(init.body)
+      return Response.json({ job_id: 'synthetic-music', status: 'queued' })
+    })
+    useStore.setState({ _pollRecoveredJob: () => {} })
+    await useStore.getState().startGeneration()
+    assert.equal(submitted.audio_guide, '/authorized/uploads/source-song.wav')
+  })
+})
+
+test('manual Speech to Music switch ignores stale speaker rows and preserves source audio', async () => {
+  await withStore(async ({ fetchOverrides, useStore }) => {
+    useStore.setState(state => ({
+      generationMode: 'audio',
+      audioSubMode: 'speech',
+      selectedModelPerAudioSubMode: {
+        ...state.selectedModelPerAudioSubMode,
+        music: 'ace_step_v1_5_turbo_lm_4b',
+      },
+      ttsVoiceCount: 2,
+      ttsVoices: [
+        { name: 'Old A', filename: 'old-a.wav', path: '/stale/old-a.wav' },
+        { name: 'Old B', filename: 'old-b.wav', path: '/stale/old-b.wav' },
+      ],
+      params: {
+        ...state.params,
+        audio_guide: '/stale/old-a.wav',
+        audio_guide2: '/stale/old-b.wav',
+        audio_guide6: '/stale/old-f.wav',
+        audio_prompt_type: 'AB',
+      },
+      audioGuideFilename: 'old-a.wav',
+      audioGuide2Filename: 'old-b.wav',
+    }))
+    useStore.getState().setAudioSubMode('music')
+    assert.equal(useStore.getState().audioSubMode, 'music')
+    for (let i = 1; i <= 6; i += 1) {
+      const key = i === 1 ? 'audio_guide' : `audio_guide${i}`
+      assert.equal(Object.hasOwn(useStore.getState().params, key), false)
+    }
+    assert.equal(useStore.getState().audioGuideFilename, null)
+    assert.equal(useStore.getState().audioGuide2Filename, null)
+    assert.equal(String(useStore.getState().params.audio_prompt_type || ''), '')
+    useStore.setState(state => ({
+      params: {
+        ...state.params,
+        model_type: 'ace_step_v1_5_turbo_lm_4b',
+        prompt: '[Verse] Keep this lyric intact',
+        audio_guide: '/authorized/uploads/source-song.wav',
+        audio_guide2: '/authorized/uploads/reference-timbre.wav',
+        audio_prompt_type: 'AB',
+      },
+      modelOptions: modelOptions('ace_step_v1_5_turbo_lm_4b'),
+    }))
+
+    let submitted
+    fetchOverrides.set('/api/v1/generate', async (_url, init) => {
+      submitted = JSON.parse(init.body)
+      return Response.json({ job_id: 'manual-switch-music', status: 'queued' })
+    })
+    useStore.setState({ _pollRecoveredJob: () => {} })
+    await useStore.getState().startGeneration()
+
+    assert.equal(submitted.audio_guide, '/authorized/uploads/source-song.wav')
+    assert.equal(submitted.audio_guide2, '/authorized/uploads/reference-timbre.wav')
+    for (let i = 3; i <= 6; i += 1) {
+      assert.equal(Object.hasOwn(submitted, `audio_guide${i}`), false)
+    }
+    assert.equal(submitted.prompt, '[Verse] Keep this lyric intact')
+    assert.equal(Object.hasOwn(submitted, '_tts_voice_count'), false)
+    for (let i = 1; i <= 6; i += 1) {
+      assert.equal(Object.hasOwn(submitted, `_tts_speaker_name${i}`), false)
+    }
+  })
+})
+
+test('Speech to Music to Speech round trip cannot resurrect detached voice files', async () => {
+  await withStore(async ({ fetchOverrides, useStore }) => {
+    useStore.setState(state => ({
+      generationMode: 'audio',
+      audioSubMode: 'speech',
+      ttsVoiceCount: 2,
+      ttsVoices: [
+        { name: 'Alice', filename: 'alice.wav', path: '/stale/alice.wav' },
+        { name: 'Bob', filename: 'bob.wav', path: '/stale/bob.wav' },
+      ],
+      params: {
+        ...state.params,
+        audio_guide: '/stale/alice.wav',
+        audio_guide2: '/stale/bob.wav',
+      },
+    }))
+
+    useStore.getState().setAudioSubMode('music')
+    assert.deepEqual(useStore.getState().ttsVoices, [
+      { name: 'Alice', filename: null, path: null },
+      { name: 'Bob', filename: null, path: null },
+    ])
+    useStore.getState().setAudioSubMode('speech')
+    useStore.setState(state => ({
+      params: {
+        ...state.params,
+        model_type: 'kugelaudio_0_open',
+        prompt: 'Alice: Reattach me explicitly',
+      },
+      modelOptions: modelOptions('kugelaudio_0_open'),
+    }))
+
+    let submitted
+    fetchOverrides.set('/api/v1/generate', async (_url, init) => {
+      submitted = JSON.parse(init.body)
+      return Response.json({ job_id: 'round-trip-speech', status: 'queued' })
+    })
+    useStore.setState({ _pollRecoveredJob: () => {} })
+    await useStore.getState().startGeneration()
+    for (let i = 1; i <= 6; i += 1) {
+      const key = i === 1 ? 'audio_guide' : `audio_guide${i}`
+      assert.equal(Object.hasOwn(submitted, key), false)
+    }
+  })
+})
+
+test('Speech to Music switch resets the audio task so text-only Music can submit', async () => {
+  await withStore(async ({ fetchOverrides, useStore }) => {
+    useStore.setState(state => ({
+      generationMode: 'audio',
+      audioSubMode: 'speech',
+      params: {
+        ...state.params,
+        audio_prompt_type: 'AB',
+        audio_guide: '/stale/speaker-a.wav',
+        audio_guide2: '/stale/speaker-b.wav',
+      },
+    }))
+    useStore.getState().setAudioSubMode('music')
+    useStore.setState(state => ({
+      params: {
+        ...state.params,
+        model_type: 'ace_step_v1_5_turbo_lm_4b',
+        prompt: '[Instrumental]',
+      },
+      modelOptions: modelOptions('ace_step_v1_5_turbo_lm_4b'),
+    }))
+
+    let submitted
+    fetchOverrides.set('/api/v1/generate', async (_url, init) => {
+      submitted = JSON.parse(init.body)
+      return Response.json({ job_id: 'text-only-music', status: 'queued' })
+    })
+    useStore.setState({ _pollRecoveredJob: () => {} })
+    await useStore.getState().startGeneration()
+    assert.ok(submitted, 'text-only Music request was submitted')
+    assert.equal(String(submitted.audio_prompt_type || ''), '')
+    assert.equal(Object.hasOwn(submitted, 'audio_guide'), false)
+    assert.equal(Object.hasOwn(submitted, 'audio_guide2'), false)
+  })
+})
+
+test('text-only Speech clears prior voices and removing the final voice clears every guide', async () => {
+  await withStore(async ({ fetchOverrides, useStore }) => {
+    const speech = {
+      name: 'text-only-speech.wav',
+      meta: sidecar({
+        ...baseParams({ model_type: 'kugelaudio_0_open', prompt: 'Narration only', video_length: 0 }),
+        _audio_sub_mode: 'speech',
+        _tts_original_prompt: 'Narration only',
+        _tts_voice_count: 0,
+      }),
+    }
+    configureGallery(useStore, [speech])
+    useStore.setState(state => ({
+      ttsVoiceCount: 2,
+      ttsVoices: [
+        { name: 'Old A', filename: 'old-a.wav', path: '/stale/old-a.wav' },
+        { name: 'Old B', filename: 'old-b.wav', path: '/stale/old-b.wav' },
+      ],
+      params: {
+        ...state.params,
+        audio_guide: '/stale/old-a.wav',
+        audio_guide2: '/stale/old-b.wav',
+        audio_guide6: '/stale/old-f.wav',
+      },
+    }))
+
+    assert.equal(await useStore.getState().loadSettingsFromOutput(), true)
+    assert.equal(useStore.getState().ttsVoiceCount, 0)
+    assert.deepEqual(useStore.getState().ttsVoices, [])
+
+    let submitted
+    fetchOverrides.set('/api/v1/generate', async (_url, init) => {
+      submitted = JSON.parse(init.body)
+      return Response.json({ job_id: 'synthetic-text-speech', status: 'queued' })
+    })
+    useStore.setState({ _pollRecoveredJob: () => {} })
+    await useStore.getState().startGeneration()
+    for (let i = 1; i <= 6; i += 1) {
+      const key = i === 1 ? 'audio_guide' : `audio_guide${i}`
+      assert.equal(Object.hasOwn(submitted, key), false)
+    }
+
+    useStore.setState(state => ({
+      ttsVoiceCount: 1,
+      ttsVoices: [{ name: 'Temporary', filename: 'temporary.wav', path: '/uploads/temporary.wav' }],
+      params: { ...state.params, audio_guide: '/uploads/temporary.wav', audio_guide6: '/stale/six.wav' },
+    }))
+    useStore.getState().removeTtsVoice(0)
+    assert.equal(useStore.getState().ttsVoiceCount, 0)
+    assert.deepEqual(useStore.getState().ttsVoices, [])
+    for (let i = 1; i <= 6; i += 1) {
+      const key = i === 1 ? 'audio_guide' : `audio_guide${i}`
+      assert.equal(Object.hasOwn(useStore.getState().params, key), false)
+    }
+  })
+})
+
+test('malformed saved TTS voice counts stay within the six-slot contract', async () => {
+  for (const [voiceCount, expected] of [[-4, 0], [1.5, 0], [99, 6]]) {
+    await withStore(async ({ useStore }) => {
+      const entry = {
+        name: `malformed-${String(voiceCount)}.wav`,
+        meta: sidecar({
+          ...baseParams({ model_type: 'kugelaudio_0_open', prompt: 'Bounded voices', video_length: 0 }),
+          _audio_sub_mode: 'speech',
+          _tts_voice_count: voiceCount,
+        }),
+      }
+      configureGallery(useStore, [entry])
+      assert.equal(await useStore.getState().loadSettingsFromOutput(), true)
+      assert.equal(useStore.getState().ttsVoiceCount, expected)
+      assert.equal(useStore.getState().ttsVoices.length, expected)
+    })
+  }
+})
+
+test('restored TTS voices respect the selected model voice limit', async () => {
+  await withStore(async ({ useStore }) => {
+    const entry = {
+      name: 'bounded-scenema.wav',
+      meta: sidecar({
+        ...baseParams({ model_type: 'scenema_audio', prompt: 'Two voices only', video_length: 0 }),
+        _audio_sub_mode: 'speech',
+        _tts_voice_count: 99,
+        _tts_speaker_name1: 'Alice',
+        _tts_speaker_name2: 'Bob',
+        _tts_speaker_name3: 'Carol',
+        audio_guide: '/authorized/uploads/alice.wav',
+        audio_guide2: '/authorized/uploads/bob.wav',
+        audio_guide3: '/authorized/uploads/carol.wav',
+      }),
+    }
+    configureGallery(useStore, [entry])
+    assert.equal(await useStore.getState().loadSettingsFromOutput(), true)
+    assert.equal(useStore.getState().ttsVoiceCount, 2)
+    assert.deepEqual(useStore.getState().ttsVoices.map(voice => voice.name), ['Alice', 'Bob'])
   })
 })
 

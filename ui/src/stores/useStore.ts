@@ -1746,6 +1746,9 @@ type LoraModeBlob = { model_type?: string; activated_loras: string[]; loras_mult
 /** Per-mode working set. Persistence strips job-local media paths; refresh
  *  restores only the explicitly selected boot fields in loadModels. */
 type SavedModeParams = Partial<GenerateParams> & {
+  audio_guide4?: string
+  audio_guide5?: string
+  audio_guide6?: string
   /** Technical UI settings, excluding global H3 style and Director identity guidance. */
   uiSettings?: Record<string, unknown>
   /** Envelope-owned setting kept separate from the shared profile UI catalog. */
@@ -2025,6 +2028,9 @@ const EPHEMERAL_PARAM_FIELDS: ReadonlyArray<keyof SavedModeParams> = [
   'audio_guide',
   'audio_guide2',
   'audio_guide3',
+  'audio_guide4',
+  'audio_guide5',
+  'audio_guide6',
   'frames_positions',
 ]
 
@@ -6056,7 +6062,23 @@ export const useStore = create<AppState>((set, get) => ({
     const targetModel = (saved && models.some(m => m.model_type === saved))
       ? saved
       : audioSubModeDefaults[subMode]
-    set({ audioSubMode: subMode, selectedModelPerAudioSubMode: savedModels })
+    // Audio guide slots have different meanings across Speech, Music, and
+    // SFX. Clear the outgoing sub-mode's attachments at the transition so a
+    // Speech voice cannot silently become a Music source or reference timbre.
+    // Voice rows remain available if the user switches back to Speech.
+    const nextParams: GenerateParams & Record<string, unknown> = { ...params }
+    for (let i = 0; i < 6; i++) {
+      delete nextParams[i === 0 ? 'audio_guide' : `audio_guide${i + 1}`]
+    }
+    delete nextParams.audio_prompt_type
+    set({
+      audioSubMode: subMode,
+      selectedModelPerAudioSubMode: savedModels,
+      params: nextParams,
+      audioGuideFilename: null,
+      audioGuide2Filename: null,
+      ttsVoices: get().ttsVoices.map(voice => ({ ...voice, filename: null, path: null })),
+    })
     if (targetModel && models.some(m => m.model_type === targetModel)) {
       get().selectModel(targetModel)
     }
@@ -8072,6 +8094,13 @@ export const useStore = create<AppState>((set, get) => ({
       // Same model-aware mapping as setTtsVoiceCount above.
       const selection = (s.modelOptions?.audio_prompt_type_sources?.selection as string[] | undefined) || ['', 'A', 'AB']
       const audioType = selection[Math.min(newCount, selection.length - 1)]
+      const nextParams: GenerateParams & Record<string, unknown> = { ...s.params }
+      if (newCount === 0) {
+        for (let i = 0; i < 6; i++) {
+          delete nextParams[i === 0 ? 'audio_guide' : `audio_guide${i + 1}`]
+        }
+      }
+      nextParams.audio_prompt_type = audioType + ((s.params.audio_prompt_type as string || '').replace(/[^NV]/g, ''))
       return {
         ttsVoices: voices,
         ttsVoiceCount: newCount,
@@ -8079,7 +8108,7 @@ export const useStore = create<AppState>((set, get) => ({
         ttsSpeakerName2: voices[1]?.name || '',
         audioGuideFilename: voices[0]?.filename || null,
         audioGuide2Filename: voices[1]?.filename || null,
-        params: { ...s.params, audio_prompt_type: audioType + ((s.params.audio_prompt_type as string || '').replace(/[^NV]/g, '')) },
+        params: nextParams,
       }
     })
   },
@@ -9298,31 +9327,43 @@ export const useStore = create<AppState>((set, get) => ({
         params.video_length = 0
         params.image_mode = 0
         params.multi_prompts_gen_type = 2  // Preserve full text as one prompt (don't split by newlines)
+        const isSpeech = state.audioSubMode === 'speech'
         // Save original prompt + speaker names before swap (for load settings)
         params._tts_original_prompt = params.prompt
-        params._tts_speaker_name1 = state.ttsSpeakerName1 || ''
-        params._tts_speaker_name2 = state.ttsSpeakerName2 || ''
-        // Save all voice names for metadata
-        for (let i = 0; i < state.ttsVoices.length; i++) {
-          (params as Record<string, unknown>)[`_tts_speaker_name${i + 1}`] = state.ttsVoices[i]?.name || ''
+        if (isSpeech) params._tts_voice_count = state.ttsVoiceCount
+        else delete params._tts_voice_count
+        for (let i = 0; i < 6; i++) {
+          const speakerKey = `_tts_speaker_name${i + 1}`
+          if (isSpeech && i < state.ttsVoiceCount) {
+            ;(params as Record<string, unknown>)[speakerKey] = state.ttsVoices[i]?.name || ''
+          } else {
+            delete (params as Record<string, unknown>)[speakerKey]
+          }
         }
-        params._tts_voice_count = state.ttsVoiceCount
         // Swap character names → Speaker N: for TTS multi-voice mode
         const escapeRegex = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
         let text = params.prompt as string
-        for (let i = 0; i < state.ttsVoices.length; i++) {
+        for (let i = 0; isSpeech && i < state.ttsVoices.length; i++) {
           const name = state.ttsVoices[i]?.name
           if (name) {
             text = text.replace(new RegExp(escapeRegex(name) + '\\s*:', 'gi'), `Speaker ${i + 1}:`)
           }
         }
         params.prompt = text
-        // Set audio_guide paths for each voice (audio_guide, audio_guide2, audio_guide3, etc.)
-        for (let i = 0; i < state.ttsVoices.length; i++) {
+        // Voice rows own the six audio-guide slots while multi-speaker TTS is
+        // active. Clear every slot first so removing voices, or restoring a
+        // smaller cast after a larger one, cannot resubmit stale references.
+        if (isSpeech) {
+          for (let i = 0; i < 6; i++) {
+            const key = i === 0 ? 'audio_guide' : `audio_guide${i + 1}`
+            delete (params as Record<string, unknown>)[key]
+          }
+        }
+        for (let i = 0; isSpeech && i < Math.min(state.ttsVoiceCount, state.ttsVoices.length, 6); i++) {
           const voice = state.ttsVoices[i]
           if (voice?.path) {
             const key = i === 0 ? 'audio_guide' : `audio_guide${i + 1}`
-            params[key as keyof typeof params] = voice.path as never
+            ;(params as Record<string, unknown>)[key] = voice.path
           }
         }
         // TTS duration (max duration for the model to generate)
@@ -17019,9 +17060,10 @@ export const useStore = create<AppState>((set, get) => ({
         : undefined
       : (p.sliding_window_size as number) ?? undefined
     if (migratedLegacyRecast) newParams.flow_shift = 1
-    newParams.audio_guide = (p.audio_guide as string) || ''
-    newParams.audio_guide2 = (p.audio_guide2 as string) || ''
-    newParams.audio_guide3 = (p.audio_guide3 as string) || ''
+    for (let i = 0; i < 6; i++) {
+      const key = i === 0 ? 'audio_guide' : `audio_guide${i + 1}`
+      ;(newParams as Record<string, unknown>)[key] = typeof p[key] === 'string' ? p[key] : ''
+    }
     newParams.audio_scale = restoredAudioScale
     newParams.ltx25_video_vae = restoredLtx25VideoVae
     // Style / Music Caption (ACE-Step). Was never copied here, so the
@@ -17254,15 +17296,36 @@ export const useStore = create<AppState>((set, get) => ({
       .map(filename => ({ filename, path: '' }))
     const restoredVoiceCloneEnabled = p.voice_clone_enabled === true
     // Restore TTS speaker names (1-6)
-    const restoredSpeakerName1 = (p._tts_speaker_name1 as string) || ''
-    const restoredSpeakerName2 = (p._tts_speaker_name2 as string) || ''
-    const restoredVoiceCount = (p._tts_voice_count as number) || 0
+    const restoredSpeakerNames = Array.from({ length: 6 }, (_, index) => (
+      typeof p[`_tts_speaker_name${index + 1}`] === 'string'
+        ? p[`_tts_speaker_name${index + 1}`] as string
+        : ''
+    ))
+    const restoredSpeakerName1 = restoredSpeakerNames[0]
+    const restoredSpeakerName2 = restoredSpeakerNames[1]
+    const requestedVoiceCount = p._tts_voice_count
+    const inferredVoiceCount = restoredSpeakerNames.reduce(
+      (count, name, index) => name ? index + 1 : count,
+      0,
+    )
+    const restoredMaxVoiceCount = (restoredModelOptions as { max_voice_count?: number } | null)?.max_voice_count
+    const restoredVoiceLimit = typeof restoredMaxVoiceCount === 'number'
+      && Number.isFinite(restoredMaxVoiceCount)
+      ? Math.max(0, Math.min(6, Math.floor(restoredMaxVoiceCount)))
+      : 6
+    const restoredVoiceCount = typeof requestedVoiceCount === 'number'
+      && Number.isInteger(requestedVoiceCount)
+      ? Math.max(0, Math.min(restoredVoiceLimit, requestedVoiceCount))
+      : Math.min(restoredVoiceLimit, inferredVoiceCount)
     const restoredVoices: { name: string; filename: string | null; path: string | null }[] = []
-    for (let i = 0; i < Math.max(restoredVoiceCount, 2); i++) {
-      const name = (p[`_tts_speaker_name${i + 1}`] as string) || ''
-      if (name || i < restoredVoiceCount) {
-        restoredVoices.push({ name, filename: null, path: null })
-      }
+    for (let i = 0; i < restoredVoiceCount; i++) {
+      const name = restoredSpeakerNames[i]
+      const guideKey = i === 0 ? 'audio_guide' : `audio_guide${i + 1}`
+      const path = typeof p[guideKey] === 'string' && p[guideKey]
+        ? p[guideKey] as string
+        : null
+      const filename = _deriveBase(uploadFilenames?.[guideKey]) || _deriveBase(path)
+      restoredVoices.push({ name, filename, path })
     }
 
     set(s => ({
@@ -17290,13 +17353,15 @@ export const useStore = create<AppState>((set, get) => ({
       filmGrainSaturation: restoredFilmGrainSaturation,
       audioGuideFilename: restoredAudioGuideFilename,
       audioGuide2Filename: restoredAudioGuide2Filename,
-      // TTS state
-      ...(restoredSpeakerName1 || restoredSpeakerName2 || restoredVoiceCount > 0 ? {
-        ttsSpeakerName1: restoredSpeakerName1,
-        ttsSpeakerName2: restoredSpeakerName2,
-        ttsSpeakerNamesManual: true,
-        ttsVoiceCount: restoredVoiceCount,
-        ttsVoices: restoredVoices,
+      // Audio output restore owns the visible voice rows. A text-only Speech,
+      // Music source-audio, or SFX output must clear voices from the previous
+      // audio sub-mode instead of silently resubmitting them.
+      ...(restoredMode === 'audio' ? {
+        ttsSpeakerName1: sfxModelTypes.has(modelType) ? '' : restoredSpeakerName1,
+        ttsSpeakerName2: sfxModelTypes.has(modelType) ? '' : restoredSpeakerName2,
+        ttsSpeakerNamesManual: !sfxModelTypes.has(modelType) && restoredVoiceCount > 0,
+        ttsVoiceCount: sfxModelTypes.has(modelType) ? 0 : restoredVoiceCount,
+        ttsVoices: sfxModelTypes.has(modelType) ? [] : restoredVoices,
       } : {}),
       h3SelectedProfile: 'custom',
       h3ProfileApplying: null,

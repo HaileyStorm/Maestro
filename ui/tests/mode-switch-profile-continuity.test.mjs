@@ -210,6 +210,14 @@ test('mode round-trip restores the complete profile UI envelope and fences late 
       directorShotDeck: directorDeck,
       startImage: media,
     })
+    useStore.setState(state => ({
+      params: {
+        ...state.params,
+        audio_guide4: '/job-only/voice-4.wav',
+        audio_guide5: '/job-only/voice-5.wav',
+        audio_guide6: '/job-only/voice-6.wav',
+      },
+    }))
 
     useStore.getState().setGenerationMode('image')
     const firstVisit = useStore.getState()
@@ -248,6 +256,9 @@ test('mode round-trip restores the complete profile UI envelope and fences late 
     assert.equal(Object.hasOwn(restored.params, 'uiSettings'), false)
     const persisted = JSON.parse(globalThis.localStorage.getItem('maestro_mode_settings'))
     assert.equal(Object.hasOwn(persisted.savedParamsPerMode.video, 'image_start'), false)
+    assert.equal(Object.hasOwn(persisted.savedParamsPerMode.video, 'audio_guide4'), false)
+    assert.equal(Object.hasOwn(persisted.savedParamsPerMode.video, 'audio_guide5'), false)
+    assert.equal(Object.hasOwn(persisted.savedParamsPerMode.video, 'audio_guide6'), false)
     assert.equal(persisted.savedParamsPerMode.video.model_type, 'test_video_model')
     assert.equal(Object.hasOwn(persisted.savedParamsPerMode.video, 'uiSettings'), true)
 
