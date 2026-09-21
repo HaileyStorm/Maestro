@@ -4042,6 +4042,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "_apply_h3_offload_plan_to_manifest",
                 "_require_h3_offload_plan_parity",
                 "_snapshot_h3_recovery_task_params",
+                "_attach_voice_clone_sidecar_request",
                 "_expand_h3_longform_outputs",
                 "_run_generation",
             ),
