@@ -18,6 +18,7 @@ interface Props {
   file: OutputFile
   index: number
   isActive: boolean
+  onSelect: (index: number) => void
   onVisible: (index: number) => void
   measurementEpoch: number
   onMeasured: (identity: string, epoch: number, height: number) => void
@@ -76,8 +77,7 @@ function RetryImage({ url, alt }: { url: string; alt: string }) {
   )
 }
 
-export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpoch, onMeasured, style }: Props) {
-  const setSelectedOutput = useStore(s => s.setSelectedOutput)
+export function MediaFeedItem({ file, index, isActive, onSelect, onVisible, measurementEpoch, onMeasured, style }: Props) {
   const loadSettingsFromOutput = useStore(s => s.loadSettingsFromOutput)
   const rerollGeneration = useStore(s => s.rerollGeneration)
   const deleteOutput = useStore(s => s.deleteSelectedOutput)
@@ -281,8 +281,8 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
   const imageEndFile = Array.isArray(rawEnd) ? (rawEnd.find((f: string) => f) || null) : rawEnd
 
   const handleSelect = useCallback(() => {
-    setSelectedOutput(index)
-  }, [index, setSelectedOutput])
+    onSelect(index)
+  }, [index, onSelect])
 
   const handleCardKeyDown = useCallback((event: KeyboardEvent<HTMLDivElement>) => {
     if (event.target !== event.currentTarget) return
@@ -292,14 +292,14 @@ export function MediaFeedItem({ file, index, isActive, onVisible, measurementEpo
   }, [handleSelect])
 
   const handleLoadSettings = useCallback(() => {
-    setSelectedOutput(index)
+    onSelect(index)
     void loadSettingsFromOutput()
-  }, [index, setSelectedOutput, loadSettingsFromOutput])
+  }, [index, onSelect, loadSettingsFromOutput])
 
   const handleReroll = useCallback(() => {
-    setSelectedOutput(index)
+    onSelect(index)
     void rerollGeneration()
-  }, [index, setSelectedOutput, rerollGeneration])
+  }, [index, onSelect, rerollGeneration])
 
   const handleCopyPrompt = () => {
     if (!prompt) return

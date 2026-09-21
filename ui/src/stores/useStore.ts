@@ -16658,6 +16658,21 @@ export const useStore = create<AppState>((set, get) => ({
             === (submitted as unknown as Record<string, unknown>)[key]
         ))
     }
+    const reportRestoreCancellation = (phase: string) => {
+      const current = get()
+      const changedFields = [
+        ...authoredFields.filter(key => current[key] !== submitted[key]),
+        ...generationProfileUiKeys.filter(key => (
+          (current as unknown as Record<string, unknown>)[key]
+            !== (submitted as unknown as Record<string, unknown>)[key]
+        )),
+      ]
+      console.warn('[LoadSettings] restore cancelled', {
+        phase,
+        selection_current: selectionCurrent(),
+        changed_fields: changedFields,
+      })
+    }
     let publishedState: AppState | null = null
     const hydrationCurrent = () => {
       const current = get()
@@ -16672,7 +16687,10 @@ export const useStore = create<AppState>((set, get) => ({
     if (!selectedOutputMeta?.params) {
       if (pendingOutput) {
         await get().loadOutputMetadata(pendingOutput.name)
-        if (!settingsUnchanged()) return false
+        if (!settingsUnchanged()) {
+          reportRestoreCancellation('metadata_refresh')
+          return false
+        }
         const current = get().filteredOutputs()[get().selectedOutput]
         selectedOutputMeta = current?.name === pendingName && get().selectedOutputMetaName === pendingName
           ? get().selectedOutputMeta
@@ -16682,7 +16700,10 @@ export const useStore = create<AppState>((set, get) => ({
     if (!selectedOutputMeta?.params) {
       return false
     }
-    if (!settingsUnchanged()) return false
+    if (!settingsUnchanged()) {
+      reportRestoreCancellation('metadata_ready')
+      return false
+    }
     const { models } = get()
     const p = selectedOutputMeta.params as Record<string, unknown>
     const uploadFilenames = selectedOutputMeta.upload_filenames as Record<string, string | string[]> | undefined

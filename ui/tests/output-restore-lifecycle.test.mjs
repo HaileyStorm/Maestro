@@ -302,6 +302,7 @@ async function withStore(action, setup = {}) {
 
 test('gallery actions select their card and immediately start that card operation', async () => {
   const component = await source('../src/components/MainContent/MediaFeedItem.tsx')
+  const mainContent = await source('../src/components/MainContent/MainContent.tsx')
   for (const [handler, operation] of [
     ['handleLoadSettings', 'loadSettingsFromOutput'],
     ['handleReroll', 'rerollGeneration'],
@@ -312,8 +313,22 @@ test('gallery actions select their card and immediately start that card operatio
     assert.notEqual(end, -1, `found end of ${handler}`)
     const body = component.slice(start, end)
     assert.equal(body.includes('setTimeout'), false, `${handler} must not defer across another gallery selection`)
-    assert.ok(body.indexOf('setSelectedOutput(index)') < body.indexOf(`${operation}()`), `${handler} selects before ${operation}`)
+    assert.ok(body.indexOf('onSelect(index)') < body.indexOf(`${operation}()`), `${handler} selects before ${operation}`)
   }
+
+  const explicitSelectionStart = mainContent.indexOf('const handleItemSelect = useCallback')
+  assert.notEqual(explicitSelectionStart, -1, 'found explicit card selection handler')
+  const explicitSelectionEnd = mainContent.indexOf('\n  }, [', explicitSelectionStart)
+  assert.notEqual(explicitSelectionEnd, -1, 'found end of explicit card selection handler')
+  const explicitSelection = mainContent.slice(explicitSelectionStart, explicitSelectionEnd)
+  assert.ok(
+    explicitSelection.indexOf('scrollTarget.current = null') < explicitSelection.indexOf('setSelectedOutput(index)'),
+    'explicit card selection cancels stale thumbnail alignment before publishing selection',
+  )
+  assert.ok(
+    explicitSelection.indexOf('isUserScrolling.current = false') < explicitSelection.indexOf('setSelectedOutput(index)'),
+    'explicit card selection blocks queued visibility callbacks before publishing selection',
+  )
 
   await withStore(async ({ fetchOverrides, metadata, useStore }) => {
     const a = { name: 'same-model-a.mp4', meta: sidecar(baseParams({ prompt: 'A must lose' })) }
@@ -336,6 +351,43 @@ test('gallery actions select their card and immediately start that card operatio
     assert.equal(useStore.getState().selectedOutput, 1)
     assert.equal(useStore.getState().selectedOutputMetaName, b.name)
     assert.equal(useStore.getState().params.prompt, 'current unsaved prompt')
+  })
+})
+
+test('selecting another output immediately restores that card across generation modes', async () => {
+  await withStore(async ({ metadata, requests, useStore }) => {
+    const audio = {
+      name: 'current-audio.wav',
+      meta: sidecar(baseParams({ model_type: 'ace_step_v1_5_turbo_lm_4b', prompt: 'current song' })),
+    }
+    const video = {
+      name: 'selected-video.mp4',
+      meta: sidecar(baseParams({
+        model_type: 'minimax_h3',
+        prompt: 'restore this video',
+        resolution: '608x352',
+        video_length: 124,
+      })),
+    }
+    metadata.set(video.name, video.meta)
+    configureGallery(useStore, [audio, video])
+    useStore.setState(state => ({
+      generationMode: 'audio',
+      selectedModelPerMode: { ...state.selectedModelPerMode, audio: 'ace_step_v1_5_turbo_lm_4b' },
+      params: { ...state.params, model_type: 'ace_step_v1_5_turbo_lm_4b', prompt: 'current song' },
+    }))
+
+    useStore.getState().setSelectedOutput(1)
+    assert.equal(await useStore.getState().loadSettingsFromOutput(), true)
+
+    const state = useStore.getState()
+    assert.equal(state.selectedOutput, 1)
+    assert.equal(state.selectedOutputMetaName, video.name)
+    assert.equal(state.generationMode, 'video')
+    assert.equal(state.params.model_type, 'minimax_h3')
+    assert.equal(state.params.prompt, 'restore this video')
+    assert.equal(state.params.resolution, '608x352')
+    assert.ok(requests.some(({ url }) => url === '/api/v1/model-options/minimax_h3'))
   })
 })
 

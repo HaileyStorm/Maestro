@@ -3070,6 +3070,20 @@ export function MainContent() {
     }
   }, [outputIdentities, setSelectedOutput])
 
+  const handleItemSelect = useCallback((index: number) => {
+    const identity = outputIdentities[index]
+    if (!identity) return
+    selectedOutputIdentity.current = identity
+    // Card actions are explicit selections. Ignore already-queued visibility
+    // callbacks until the user scrolls again, otherwise a still-visible prior
+    // card can cancel Load Settings or Reroll while metadata is loading.
+    // Also invalidate any thumbnail alignment loop that was targeting a
+    // different card before this action won selection.
+    scrollTarget.current = null
+    isUserScrolling.current = false
+    setSelectedOutput(index)
+  }, [outputIdentities, setSelectedOutput])
+
   const handleThumbnailClick = useCallback((index: number) => {
     const identity = outputIdentities[index]
     if (!identity) return
@@ -3208,6 +3222,7 @@ export function MainContent() {
           file={file}
           index={i}
           isActive={activeIndex === i}
+          onSelect={handleItemSelect}
           onVisible={handleItemVisible}
           measurementEpoch={measurementEpoch}
           onMeasured={handleItemMeasured}
@@ -3221,7 +3236,7 @@ export function MainContent() {
       )
     }
     return items
-  }, [startIndex, endIndex, outputs, activeIndex, handleItemVisible, measurementEpoch, handleItemMeasured, itemOffsets])
+  }, [startIndex, endIndex, outputs, activeIndex, handleItemSelect, handleItemVisible, measurementEpoch, handleItemMeasured, itemOffsets])
 
   return (
     <main className="min-w-0 flex-1 flex flex-col h-full overflow-hidden">
