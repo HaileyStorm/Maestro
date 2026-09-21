@@ -609,8 +609,9 @@ def _normalize_v2_params(value: Any) -> dict[str, Any]:
     if not set(value).issubset(descriptors):
         raise GenerationPresetError("params contain unsupported or private fields")
     if not _V2_REQUIRED_PARAM_KEYS.issubset(value):
+        missing = ", ".join(sorted(_V2_REQUIRED_PARAM_KEYS - set(value)))
         raise GenerationPresetError(
-            "params are missing required generation fields",
+            f"params are missing required generation fields: {missing}",
         )
     normalized = {
         key: (

@@ -37,6 +37,7 @@ import gc
 import base64
 import atexit
 import copy
+import logging
 import hashlib
 import hmac
 import ipaddress
@@ -21223,7 +21224,7 @@ def _raise_generation_preset_error(error: Exception) -> None:
             status_code=503, detail="Preset storage is temporarily unavailable",
         ) from error
     if isinstance(error, GenerationPresetError):
-        logging.getLogger(__name__).warning(
+        __import__("logging").getLogger(__name__).warning(
             "Generation profile settings rejected: %s", error,
         )
         raise HTTPException(status_code=400, detail="Preset settings are invalid") from error
