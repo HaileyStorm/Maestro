@@ -871,6 +871,33 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
       case 'GET /api/v1/director/pipelines':
         await json(route, { pipelines: [] })
         return
+      case 'GET /api/v1/director/capabilities':
+        await json(route, {
+          schema_version: 1,
+          readiness_reason_values: [
+            'director_incompatible', 'manual_verification_required', 'model_disabled',
+            'model_not_downloaded', 'model_terms_required', 'model_unavailable',
+          ],
+          readiness_action_values: [
+            'accept_terms', 'download_model', 'enable_model', 'select_model',
+            'verify_manual_checkpoint',
+          ],
+          image_roles: {
+            creator: {
+              resolved_model: null,
+              selection_source: 'safe_fallback',
+              candidates: [],
+              lora_catalog_endpoint: '/api/v1/loras/{model_type}/details',
+            },
+            editor: {
+              resolved_model: null,
+              selection_source: 'safe_fallback',
+              candidates: [],
+              lora_catalog_endpoint: '/api/v1/loras/{model_type}/details',
+            },
+          },
+        })
+        return
       case 'GET /api/v1/director/queue':
         await json(route, { paused: false, running: false, entries: [] })
         return

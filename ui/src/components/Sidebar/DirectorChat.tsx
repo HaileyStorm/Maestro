@@ -712,8 +712,9 @@ export function DirectorChat() {
             </button>
             {(skill || step !== 'upload') && (
               <button
+                type="button"
                 onClick={reset}
-                className="text-[10px] text-text-muted hover:text-text-primary flex items-center gap-0.5 transition-colors"
+                className="mobile-control-target flex touch-manipulation items-center justify-center gap-0.5 px-2 text-[10px] text-text-muted transition-colors hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue md:px-0"
                 title="Start over"
               >
                 <RotateCcw size={10} /> Start Over
@@ -747,7 +748,7 @@ export function DirectorChat() {
                 type="button"
                 onClick={() => void generateTrack()}
                 disabled={loading}
-                className="shrink-0 rounded bg-accent-blue/15 px-2 py-1 text-[10px] font-medium text-accent-blue hover:bg-accent-blue/25 disabled:opacity-40"
+                className="mobile-control-target shrink-0 touch-manipulation rounded bg-accent-blue/15 px-2 py-1 text-[10px] font-medium text-accent-blue hover:bg-accent-blue/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-40"
               >
                 Continue
               </button>
@@ -826,9 +827,11 @@ export function DirectorChat() {
                         const active = (musicSource || 'upload') === opt
                         return (
                           <button
+                            type="button"
                             key={opt}
                             onClick={() => setMusicSource(opt)}
-                            className={`flex-1 px-2 py-1.5 rounded-md text-[11px] font-medium transition-all ${
+                            aria-pressed={active}
+                            className={`mobile-control-target flex-1 touch-manipulation rounded-md px-2 py-1.5 text-[11px] font-medium transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue ${
                               active ? 'bg-accent-blue text-white' : 'text-text-secondary hover:text-text-primary'
                             }`}
                           >
@@ -1185,7 +1188,7 @@ export function DirectorChat() {
         {skill && (
           <div className="space-y-2">
             <div className="flex items-center gap-4">
-              <label className="flex items-center gap-1.5 cursor-pointer select-none" title="Each clip's end frame uses the next clip's start image for smooth transitions">
+              <label className="mobile-control-target flex cursor-pointer touch-manipulation select-none items-center justify-center gap-1.5 focus-within:outline-none focus-within:ring-2 focus-within:ring-accent-blue" title="Each clip's end frame uses the next clip's start image for smooth transitions">
                 <input
                   type="checkbox"
                   checked={seamless}
@@ -1195,7 +1198,7 @@ export function DirectorChat() {
                 />
                 <span className={`text-[10px] ${selectedVideoSupportsSeamless ? 'text-text-secondary' : 'text-text-muted'}`}>Seamless</span>
               </label>
-              <label className="flex items-center gap-1.5 cursor-pointer select-none" title="Skip all review steps and generate automatically">
+              <label className="mobile-control-target flex cursor-pointer touch-manipulation select-none items-center justify-center gap-1.5 focus-within:outline-none focus-within:ring-2 focus-within:ring-accent-blue" title="Skip all review steps and generate automatically">
                 <input
                   type="checkbox"
                   checked={autoMode}
@@ -1238,16 +1241,19 @@ export function DirectorChat() {
               }
             }}
             placeholder={chatInputPlaceholder}
+            aria-label="Director prompt"
             disabled={!chatInputEnabled}
             rows={2}
             minHeight={56}
             maxHeight={240}
-            className="flex-1 bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm text-text-primary placeholder:text-text-muted resize-none focus:outline-none focus:border-accent-blue transition-colors disabled:opacity-50 disabled:cursor-not-allowed scrollbar-visible"
+            className="mobile-control-target flex-1 resize-none rounded-lg border border-border bg-bg-tertiary px-3 py-2 text-sm text-text-primary placeholder:text-text-muted transition-colors focus:border-accent-blue focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:cursor-not-allowed disabled:opacity-50 scrollbar-visible"
           />
           <button
+            type="button"
             onClick={handleChatSubmit}
             disabled={!chatInputEnabled || !(mvGenerateSetup ? songDescription : sceneDescription).trim()}
-            className="p-2 rounded-lg bg-accent-blue text-white hover:bg-accent-blue-hover transition-colors disabled:opacity-30 disabled:cursor-not-allowed shrink-0"
+            aria-label="Send Director prompt"
+            className="mobile-control-target shrink-0 touch-manipulation rounded-lg bg-accent-blue p-2 text-white transition-colors hover:bg-accent-blue-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:cursor-not-allowed disabled:opacity-30"
           >
             {loading && (step === 'style' || isMusicVideo) ? (
               <Loader2 size={16} className="animate-spin" />
@@ -1490,10 +1496,11 @@ function SkillSelector({ onSelect }: { onSelect: (skill: DirectorSkill) => void 
       <div role="group" aria-labelledby="director-skills-guidance" className="grid grid-cols-2 gap-2">
       {skills.map((s) => (
         <button
+          type="button"
           key={s.label}
           onClick={() => s.active && onSelect(s.id)}
           disabled={!s.active}
-          className={`relative p-3 rounded-lg border text-left transition-all ${
+          className={`mobile-control-target relative touch-manipulation rounded-lg border p-3 text-left transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue ${
             s.active
               ? 'border-accent-blue/30 bg-bg-tertiary/50 hover:border-accent-blue hover:bg-accent-blue/5 cursor-pointer'
               : 'border-border/30 bg-bg-tertiary/20 opacity-50 cursor-not-allowed'
@@ -1523,9 +1530,10 @@ function PathChooser({ onSelect }: { onSelect: (path: ShortFilmPath) => void }) 
     <div className="grid grid-cols-2 gap-2">
       {paths.map((p) => (
         <button
+          type="button"
           key={p.id}
           onClick={() => onSelect(p.id)}
-          className="p-3 rounded-lg border border-accent-blue/30 bg-bg-tertiary/50 hover:border-accent-blue hover:bg-accent-blue/5 cursor-pointer text-left transition-all"
+          className="mobile-control-target cursor-pointer touch-manipulation rounded-lg border border-accent-blue/30 bg-bg-tertiary/50 p-3 text-left transition-all hover:border-accent-blue hover:bg-accent-blue/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
         >
           <p.icon size={16} className="text-accent-blue mb-1.5" />
           <div className="text-xs font-medium text-text-primary">{p.label}</div>
@@ -1837,7 +1845,7 @@ function AdditionalRefsSection() {
         type="button"
         onClick={() => setExpanded(!expanded)}
         aria-expanded={expanded}
-        className="flex w-full items-center gap-1 text-[9px] text-text-muted transition-colors hover:text-text-secondary"
+        className="mobile-control-target flex w-full touch-manipulation items-center gap-1 text-[9px] text-text-muted transition-colors hover:text-text-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
       >
         {expanded ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
         <Users size={10} />
@@ -1847,13 +1855,13 @@ function AdditionalRefsSection() {
       {expanded && (
         <div className="mt-2 space-y-2">
           <div className="grid grid-cols-2 gap-1.5" aria-label="Additional reference methods">
-            <label className="cursor-pointer rounded border border-border bg-bg-secondary p-1.5 text-[9px] text-text-secondary hover:border-accent-blue/50">
+            <label className="mobile-control-target cursor-pointer touch-manipulation rounded border border-border bg-bg-secondary p-1.5 text-[9px] text-text-secondary hover:border-accent-blue/50 focus-within:outline-none focus-within:ring-2 focus-within:ring-accent-blue">
               <ImageIcon size={11} className="mb-1 text-accent-blue" />
               <span className="block font-medium">Character photos</span>
               <span className="block text-[8px] text-text-muted">Add identity refs</span>
               <input type="file" accept={IMAGE_ACCEPT} multiple className="sr-only" onChange={event => handleFiles(event.target.files, 'char')} />
             </label>
-            <label className="cursor-pointer rounded border border-border bg-bg-secondary p-1.5 text-[9px] text-text-secondary hover:border-accent-blue/50">
+            <label className="mobile-control-target cursor-pointer touch-manipulation rounded border border-border bg-bg-secondary p-1.5 text-[9px] text-text-secondary hover:border-accent-blue/50 focus-within:outline-none focus-within:ring-2 focus-within:ring-accent-blue">
               <ImageIcon size={11} className="mb-1 text-accent-blue" />
               <span className="block font-medium">Scene photos</span>
               <span className="block text-[8px] text-text-muted">Add setting refs</span>
@@ -1864,7 +1872,7 @@ function AdditionalRefsSection() {
           <div data-director-component="character_reference" tabIndex={-1} className="outline-none">
             <div className="flex items-center justify-between mb-1">
               <span className="text-[10px] text-text-secondary">Character refs</span>
-              <label className="cursor-pointer text-[9px] text-accent-blue hover:underline">
+              <label className="mobile-control-target flex cursor-pointer touch-manipulation items-center justify-center text-[9px] text-accent-blue hover:underline focus-within:outline-none focus-within:ring-2 focus-within:ring-accent-blue">
                 + Add
                 <input type="file" accept={IMAGE_ACCEPT} multiple className="hidden"
                   onChange={e => handleFiles(e.target.files, 'char')} />
@@ -1891,7 +1899,7 @@ function AdditionalRefsSection() {
           <div data-director-component="location_reference" tabIndex={-1} className="outline-none">
             <div className="flex items-center justify-between mb-1">
               <span className="text-[10px] text-text-secondary">Location refs</span>
-              <label className="cursor-pointer text-[9px] text-accent-blue hover:underline">
+              <label className="mobile-control-target flex cursor-pointer touch-manipulation items-center justify-center text-[9px] text-accent-blue hover:underline focus-within:outline-none focus-within:ring-2 focus-within:ring-accent-blue">
                 + Add
                 <input type="file" accept={IMAGE_ACCEPT} multiple className="hidden"
                   onChange={e => handleFiles(e.target.files, 'loc')} />
@@ -2412,8 +2420,10 @@ function DirectorAdvancedAccordion() {
   return (
     <div className="border border-border rounded-lg overflow-hidden">
       <button
+        type="button"
         onClick={() => setOpen(!open)}
-        className="w-full flex items-center justify-between px-2.5 py-1.5 text-[11px] text-text-secondary hover:bg-bg-hover transition-colors"
+        aria-expanded={open}
+        className="mobile-control-target flex w-full touch-manipulation items-center justify-between px-2.5 py-1.5 text-[11px] text-text-secondary transition-colors hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
       >
         <span>Advanced</span>
         {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
@@ -2649,11 +2659,12 @@ function DirectorModelPicker({ value, onChange }: {
           Video
         </span>
         <select
+          aria-label="Director video model"
           value={value}
           onChange={e => { void Promise.resolve(onChange(e.target.value)) }}
           disabled={compatibleModels.length === 0}
           title={pickerTitle}
-          className="flex-1 min-w-0 bg-bg-tertiary border border-border rounded-lg px-2 py-1 text-[11px] text-text-primary focus:outline-none focus:border-accent-blue"
+          className="mobile-control-target min-w-0 flex-1 rounded-lg border border-border bg-bg-tertiary px-2 py-1 text-[11px] text-text-primary focus:border-accent-blue focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
         >
           {!known && value && <option value={value}>Selected model · unavailable right now</option>}
           {!value && <option value="">{compatibleModels.length === 0 ? 'No compatible models enabled' : 'Choose a video model'}</option>}
@@ -2864,7 +2875,7 @@ function DirectorImageRoleControl({ role }: { role: DirectorImageRole }) {
     >
       <legend className="px-1 text-[10px] font-medium text-text-secondary">{label}</legend>
       <p className="mb-1.5 text-[9px] text-text-muted">{description}</p>
-      <select aria-label={`Director ${label}`} value={override} onChange={event => setRoleModel(role, event.target.value)} disabled={!capability} className="w-full rounded border border-border bg-bg-tertiary px-2 py-1 text-[10px] text-text-primary disabled:opacity-50">
+      <select aria-label={`Director ${label}`} value={override} onChange={event => setRoleModel(role, event.target.value)} disabled={!capability} className="mobile-control-target w-full rounded border border-border bg-bg-tertiary px-2 py-1 text-[10px] text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50">
         <option value="">Automatic · {effectiveModel ? modelName(effectiveModel) : 'unavailable in this session'}</option>
         {override && !candidate && <option value={override}>{modelName(override)} · unavailable in this session</option>}
         {compatibleCandidates.map(item => <option key={item.model_type} value={item.model_type}>{modelName(item.model_type)}{item.ready ? '' : ' · setup required'}</option>)}
@@ -2908,7 +2919,7 @@ function DirectorImageRoleControl({ role }: { role: DirectorImageRole }) {
         )}
         {effectiveModel && candidate?.ready && (
           <div className={`mt-2 overflow-hidden rounded border ${componentError?.component === loraComponent ? 'border-red-500/60' : 'border-border'}`}>
-            <button type="button" aria-expanded={lorasExpanded} onClick={() => setLorasOpen(!lorasExpanded)} className="flex w-full items-center justify-between px-2 py-1 text-[10px] text-text-secondary hover:bg-bg-hover">
+            <button type="button" aria-expanded={lorasExpanded} onClick={() => setLorasOpen(!lorasExpanded)} className="mobile-control-target flex w-full touch-manipulation items-center justify-between px-2 py-1 text-[10px] text-text-secondary hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">
               <span>{role === 'creator' ? 'Creator LoRAs' : 'Editor LoRAs'}{selections.length > 0 ? ` (${selections.length})` : ''}</span>
               {lorasExpanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
             </button>
@@ -2960,7 +2971,7 @@ function DirectorLoraAccordion() {
         </div>
       )}
       {capabilitiesLoading && !capabilities && <div role="status" className="flex items-center gap-1.5 rounded border border-border p-2 text-[10px] text-text-muted"><Loader2 size={11} className="animate-spin" /> Loading Director image roles…</div>}
-      {capabilitiesError && <div role="alert" className="rounded border border-red-500/30 bg-red-500/10 p-2 text-[9px] text-red-300">{capabilitiesError}<button type="button" onClick={() => { void loadCapabilities({ explicitOutput, force: true }).catch(() => {}) }} className="ml-2 underline">Retry</button></div>}
+      {capabilitiesError && <div role="alert" className="rounded border border-red-500/30 bg-red-500/10 p-2 text-[9px] text-red-300">{capabilitiesError}<button type="button" onClick={() => { void loadCapabilities({ explicitOutput, force: true }).catch(() => {}) }} className="mobile-control-target ml-2 touch-manipulation underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Retry</button></div>}
       {capabilities && (
         <div className="grid grid-cols-1 gap-2" aria-label="Director image roles">
           <DirectorImageRoleControl role="creator" />
@@ -2973,8 +2984,10 @@ function DirectorLoraAccordion() {
       {videoModel && (
         <div className="border border-border rounded-lg overflow-hidden">
           <button
+            type="button"
             onClick={() => setVideoOpen(!videoOpen)}
-            className="w-full flex items-center justify-between px-2.5 py-1.5 text-[11px] text-text-secondary hover:bg-bg-hover transition-colors"
+            aria-expanded={videoOpen}
+            className="mobile-control-target flex w-full touch-manipulation items-center justify-between px-2.5 py-1.5 text-[11px] text-text-secondary transition-colors hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
           >
             <span>Video LoRAs</span>
             {videoOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
@@ -3032,7 +3045,7 @@ function StyleForm({
 
       <fieldset className="rounded-lg border border-border bg-bg-tertiary/50 p-2">
         <legend className="px-1 text-[10px] font-medium text-text-secondary">Visual style</legend>
-        <select aria-label="Director visual style" value={visualStyle} onChange={event => setVisualStyle(event.target.value)} className="w-full rounded border border-border bg-bg-secondary px-2 py-1.5 text-[10px] text-text-primary">
+        <select aria-label="Director visual style" value={visualStyle} onChange={event => setVisualStyle(event.target.value)} className="mobile-control-target w-full rounded border border-border bg-bg-secondary px-2 py-1.5 text-[10px] text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">
           <option value="">Realistic (default)</option>
           <option value="cinematic">Cinematic</option>
           <option value="stylized 3D animation">Stylized 3D animation</option>
@@ -3040,7 +3053,7 @@ function StyleForm({
           <option value="anime">Anime</option>
           <option value="custom">Custom…</option>
         </select>
-        {visualStyle === 'custom' && <input aria-label="Custom Director visual style" value={customVisualStyle} onChange={event => setCustomVisualStyle(event.target.value)} placeholder="e.g. hand-painted stop motion" className="mt-1.5 w-full rounded border border-border bg-bg-secondary px-2 py-1.5 text-[10px] text-text-primary" />}
+        {visualStyle === 'custom' && <input aria-label="Custom Director visual style" value={customVisualStyle} onChange={event => setCustomVisualStyle(event.target.value)} placeholder="e.g. hand-painted stop motion" className="mobile-control-target mt-1.5 w-full rounded border border-border bg-bg-secondary px-2 py-1.5 text-[10px] text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue" />}
         <p className="mt-1 text-[9px] leading-relaxed text-text-muted">Realistic is used when no style is chosen. Pick a preset, or choose Custom to describe your own style.</p>
       </fieldset>
 

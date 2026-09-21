@@ -264,7 +264,7 @@ async function collectRenderedActionTargetViolations(root: Locator, minimum = 44
     let hitTarget: HTMLElement = control
     if (
       control instanceof HTMLInputElement
-      && (control.type === 'checkbox' || control.type === 'radio')
+      && (control.type === 'checkbox' || control.type === 'radio' || control.type === 'file')
     ) {
       const wrappingLabel = control.closest('label')
       const associatedLabel = control.id
@@ -405,6 +405,23 @@ async function collectPrimaryTargetStates(page: Page) {
       await modeButton.click()
       await expect(modeButton).toHaveAttribute('aria-pressed', 'true')
       findings[`menu${mode}`] = await collectRenderedActionTargetViolations(menu)
+
+      if (mode === 'Director') {
+        const musicVideo = menu.getByRole('button', { name: /^Music Video\b/ })
+        await musicVideo.click()
+        findings.menuDirectorMusicFirstRun = await collectRenderedActionTargetViolations(menu)
+
+        await menu.getByRole('button', { name: 'Start Over', exact: true }).click()
+        await modeButton.click()
+        await expect(modeButton).toHaveAttribute('aria-pressed', 'true')
+        await menu.getByRole('button', { name: /^Short Film\b/ }).click()
+        findings.menuDirectorShortFilmPath = await collectRenderedActionTargetViolations(menu)
+
+        await menu.getByRole('button', { name: /^Describe a Story\b/ }).click()
+        findings.menuDirectorStoryComposer = await collectRenderedActionTargetViolations(menu)
+        await expect(menu.getByRole('textbox', { name: 'Director prompt' })).toBeVisible()
+        await expectNoHorizontalOverflow(page)
+      }
 
       const summaries = menu.locator('summary')
       const summaryCount = await summaries.count()
@@ -934,6 +951,7 @@ test('mobile nested modal stack keeps only the top dialog interactive', async ({
 for (const viewport of [
   { name: '320 narrow', width: 320, height: 568 },
   { name: '390 mobile', width: 390, height: 844 },
+  { name: '767 boundary', width: 767, height: 1024 },
 ] as const) {
   test(`all primary mobile action states meet target geometry: ${viewport.name}`, async ({ page }) => {
     await page.setViewportSize({ width: viewport.width, height: viewport.height })
