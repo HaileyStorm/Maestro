@@ -290,6 +290,23 @@ class QueueFinalAdoptionTests(unittest.TestCase):
         self.assertTrue((self.project / f"{Path(output).stem}.meta.json").is_file())
         self.assertEqual(media.name.split("-", 1)[1], output)
 
+    def test_adopts_complete_public_h3_concat(self):
+        fixture = self._concat_job("job-public-h3", 1)
+        for _media, sidecar in fixture["components"] + fixture["finals"]:
+            meta = json.loads(sidecar.read_text(encoding="utf-8"))
+            meta["private"] = False
+            sidecar.write_text(json.dumps(meta, sort_keys=True), encoding="utf-8")
+
+        summary = adopt_quarantined_final_groups(
+            self.project,
+            workspace=self.workspace,
+        )
+
+        self.assertEqual(summary["declared_groups"], 1)
+        self.assertEqual(summary["adopted_groups"], 1)
+        self.assertEqual(summary["quarantined_groups"], 0)
+        self.assertTrue((self.project / "job-public-h3-v0-final.mp4").is_file())
+
     def test_adopts_exact_four_plus_one_and_keeps_components_quarantined(self):
         first = self._concat_job("job-four", 4)
         second = self._concat_job("job-one", 1)

@@ -377,10 +377,11 @@ def _candidate(
     if position is None and kind == "ordinary_repeat":
         position = (1, 0)
     expected_role = "component" if kind == "h3_segment" else "final"
-    private_ok = (
-        meta.get("private") is True
-        or (kind == "ordinary_repeat" and meta.get("private") is False)
-    )
+    # ``private`` is a Gallery-preview choice, not an authorization boundary.
+    # Both boolean values are valid producer evidence; workspace confinement,
+    # project-local quarantine, and the sealed artifact graph provide the
+    # recovery boundary.
+    private_ok = type(meta.get("private")) is bool
     if (
         type(job_id) is not str
         or _JOB_ID.fullmatch(job_id) is None
