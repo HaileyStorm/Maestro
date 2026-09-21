@@ -1451,6 +1451,12 @@ test('Blend output restores only effective controls and requires explicit source
         new File(['new-a'], 'reattached-a.mp4', { type: 'video/mp4' }),
         '/uploads/reattached-a.mp4', 'blob:reattached-a', 4,
       )
+      await useStore.getState().rerollGeneration()
+      assert.equal(submitted, false)
+      assert.equal(useStore.getState().blendClipAPath, '/uploads/reattached-a.mp4')
+      assert.equal(useStore.getState().blendClipBPath, '')
+      assert.equal(alerts.at(-1), 'Blend settings loaded. Reattach Clip A and Clip B before generating again.')
+
       useStore.getState().setBlendClipB(
         new File(['new-b'], 'reattached-b.mkv', { type: 'video/x-matroska' }),
         '/uploads/reattached-b.mkv', 'blob:reattached-b', 5,

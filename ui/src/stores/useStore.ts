@@ -17242,24 +17242,28 @@ export const useStore = create<AppState>((set, get) => ({
     const blendRestoreSourceKey = restoredBlend
       ? JSON.stringify([pendingOutput.workspace, pendingOutput.name, pendingOutput.revision])
       : ''
-    const preserveRestoredBlendMedia = restoredBlend
+    const restoredBlendSourceMatches = restoredBlend
       && submitted.blendRestoreSourceKey === blendRestoreSourceKey
+    const preserveRestoredBlendA = restoredBlendSourceMatches
       && submitted.blendClipA !== null && submitted.blendClipAPath !== ''
+    const preserveRestoredBlendB = restoredBlendSourceMatches
       && submitted.blendClipB !== null && submitted.blendClipBPath !== ''
-    const restoredBlendMedia = preserveRestoredBlendMedia ? {
-      blendClipA: submitted.blendClipA,
-      blendClipAPath: submitted.blendClipAPath,
-      blendClipAUrl: submitted.blendClipAUrl,
-      blendClipADuration: submitted.blendClipADuration,
-      blendClipASourceName: submitted.blendClipASourceName,
-      blendClipB: submitted.blendClipB,
-      blendClipBPath: submitted.blendClipBPath,
-      blendClipBUrl: submitted.blendClipBUrl,
-      blendClipBDuration: submitted.blendClipBDuration,
-      blendClipBSourceName: submitted.blendClipBSourceName,
-      blendRestoreSourceKey,
-    } : {
+    const restoredBlendMedia = {
       ...EMPTY_BLEND_MEDIA,
+      ...(preserveRestoredBlendA ? {
+        blendClipA: submitted.blendClipA,
+        blendClipAPath: submitted.blendClipAPath,
+        blendClipAUrl: submitted.blendClipAUrl,
+        blendClipADuration: submitted.blendClipADuration,
+        blendClipASourceName: submitted.blendClipASourceName,
+      } : {}),
+      ...(preserveRestoredBlendB ? {
+        blendClipB: submitted.blendClipB,
+        blendClipBPath: submitted.blendClipBPath,
+        blendClipBUrl: submitted.blendClipBUrl,
+        blendClipBDuration: submitted.blendClipBDuration,
+        blendClipBSourceName: submitted.blendClipBSourceName,
+      } : {}),
       blendRestoreSourceKey,
     }
 

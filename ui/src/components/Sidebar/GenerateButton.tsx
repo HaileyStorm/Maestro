@@ -164,6 +164,12 @@ export function GenerateButton() {
   )
   const needsOutpaintArea = isOutpaint && !!editVideoPath && !hasOutpaintArea
   const needsProject = !activeWorkspace
+  const blendClipAPath = useStore(s => s.blendClipAPath)
+  const blendClipBPath = useStore(s => s.blendClipBPath)
+  const missingBlendSources = generationMode === 'video' && params.image_mode === 4
+    ? [!blendClipAPath ? 'Clip A' : '', !blendClipBPath ? 'Clip B' : ''].filter(Boolean)
+    : []
+  const needsBlendSources = missingBlendSources.length > 0
   const sage2Eligibility = h3Sage2Eligibility(
     params,
     hasH3SemanticReferences,
@@ -174,7 +180,7 @@ export function GenerateButton() {
   const h3CheckpointBlocked = Boolean(
     h3SelectionError || missingH3Checkpoint || sage2Blocked || w4a8RuntimeBlocked,
   )
-  const blocked = modelOptionsLoading || needsProject || h3CheckpointBlocked || legalBlocked || needsModelTerms || needsManualCheckpointVerification || needsImage || needsOutpaintSource || needsOutpaintArea
+  const blocked = modelOptionsLoading || needsProject || h3CheckpointBlocked || legalBlocked || needsModelTerms || needsManualCheckpointVerification || needsImage || needsOutpaintSource || needsOutpaintArea || needsBlendSources
   const sage2PrimaryBlock = !modelOptionsLoading
     && !needsProject
     && !h3SelectionError
@@ -232,6 +238,8 @@ export function GenerateButton() {
       ? 'Model file needed'
       : needsImage
       ? 'Need image'
+      : needsBlendSources
+      ? 'Reattach clips'
       : needsOutpaintSource
         ? 'Need source'
         : 'Choose canvas'
@@ -257,6 +265,8 @@ export function GenerateButton() {
       ? 'Read and accept the selected model\'s terms for this Maestro installation.'
       : needsManualCheckpointVerification
       ? 'Download the required model file yourself, then use the model selector to check it on the computer running Maestro. Maestro will not download this file.'
+      : needsBlendSources
+      ? `Reattach ${missingBlendSources.join(' and ')} before generating this Blend.`
       : undefined
     return (
       <div className="flex flex-col items-end gap-0.5">

@@ -77,6 +77,16 @@ test('Studio ListPlus holds without taking the generating lock', () => {
   assert.match(generation, /Ready - waiting for Start Queue/)
 })
 
+test('Studio Generate keeps an incomplete Blend open with an actionable source gate', () => {
+  assert.match(generateButton, /const blendClipAPath = useStore\(s => s\.blendClipAPath\)/)
+  assert.match(generateButton, /const blendClipBPath = useStore\(s => s\.blendClipBPath\)/)
+  assert.match(generateButton, /generationMode === 'video' && params\.image_mode === 4/)
+  assert.match(generateButton, /!blendClipAPath \? 'Clip A'/)
+  assert.match(generateButton, /!blendClipBPath \? 'Clip B'/)
+  assert.match(generateButton, /\? 'Reattach clips'/)
+  assert.match(generateButton, /Reattach \$\{missingBlendSources\.join\(' and '\)\} before generating this Blend\./)
+})
+
 test('submitGeneration posts Continuum _queue_mode held or now', () => {
   const submit = slice(
     client,
