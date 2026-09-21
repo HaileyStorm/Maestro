@@ -2718,8 +2718,8 @@ CPU verification covers 31 focused Blend contracts, 60 lifecycle-wiring tests,
 163 queue/recovery tests and 83 remote-access/upload-policy tests. Five real
 ffmpeg assemblies cover video Insert (65 frames), video Overlap (31), still-image
 Insert (19), mixed Insert (42), and still-image Overlap (17), with audio and
-sidecar checks. The coordinated Pinokio restart moved the live backend to
-`http://127.0.0.1:42004`; health/readiness and an empty queue return 200. The
+sidecar checks. The final coordinated Pinokio restart serves the live backend at
+`http://127.0.0.1:42003`; health/readiness and an empty queue return 200. The
 stable Cloudflare address reaches the normal Maestro sign-in surface, and the
 exact public restart generation was cleared. Continuum remains running.
 
