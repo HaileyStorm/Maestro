@@ -602,14 +602,15 @@ def _validate_profile_lora_pair(
             )
 
 
-def _normalize_v2_params(value: Any) -> dict[str, Any]:
+def _normalize_v2_params(value: Any, *, mode: str) -> dict[str, Any]:
     if type(value) is not dict:
         raise GenerationPresetError("params must be a plain JSON object")
     descriptors = GENERATION_PROFILE_FIELDS["params"]
     if not set(value).issubset(descriptors):
         raise GenerationPresetError("params contain unsupported or private fields")
-    if not _V2_REQUIRED_PARAM_KEYS.issubset(value):
-        missing = ", ".join(sorted(_V2_REQUIRED_PARAM_KEYS - set(value)))
+    required = _V2_REQUIRED_PARAM_KEYS - ({"resolution"} if mode == "audio" else set())
+    if not required.issubset(value):
+        missing = ", ".join(sorted(required - set(value)))
         raise GenerationPresetError(
             f"params are missing required generation fields: {missing}",
         )
@@ -621,7 +622,8 @@ def _normalize_v2_params(value: Any) -> dict[str, Any]:
         )
         for key, item in value.items()
     }
-    _validated_resolution(normalized["resolution"], "resolution")
+    if "resolution" in normalized:
+        _validated_resolution(normalized["resolution"], "resolution")
     delivery_resolution = normalized.get("delivery_resolution")
     if delivery_resolution not in (None, ""):
         _validated_resolution(delivery_resolution, "delivery_resolution")
@@ -1125,7 +1127,7 @@ def _normalize_preset(value: Any) -> dict[str, Any]:
         "lora_weights": lora_weights,
         "spatial_upsampling": spatial_upsampling,
         "params": (
-            _normalize_v2_params(value["params"])
+            _normalize_v2_params(value["params"], mode=mode)
             if profile_version in {2, 3}
             else _normalize_params(value["params"])
         ),

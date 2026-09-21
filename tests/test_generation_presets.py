@@ -1112,8 +1112,10 @@ class GenerationPresetStoreTests(unittest.TestCase):
             "model_type": "ace_step_v1_5_xl_sft_lm_4b",
         })
         audio["params"]["video_length"] = 0
+        del audio["params"]["resolution"]
         created = self.create(payload=audio, preset_id="audio-only")
         self.assertEqual(created["params"]["video_length"], 0)
+        self.assertNotIn("resolution", created["params"])
 
         video = v2_preset_payload()
         video["params"]["video_length"] = 0
