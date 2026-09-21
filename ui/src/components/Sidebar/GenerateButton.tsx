@@ -150,7 +150,10 @@ export function GenerateButton() {
   const generationMode = useStore(s => s.generationMode)
   const isI2vOnly = useStore(s => s.modelOptions?.i2v_class && !s.modelOptions?.t2v_class)
   const hasStartImage = useStore(s => !!(s.startImage || s.params.image_start))
-  const needsImage = generationMode === 'video' && isI2vOnly && !hasStartImage
+  const needsImage = generationMode === 'video'
+    && params.image_mode !== 4
+    && isI2vOnly
+    && !hasStartImage
   const editSubMode = useStore(s => s.editSubMode)
   const editVideoPath = useStore(s => s.editVideoPath)
   const outpaintVideoBox = useStore(s => s.outpaintVideoBox)

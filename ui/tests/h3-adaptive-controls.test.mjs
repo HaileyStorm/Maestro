@@ -276,6 +276,38 @@ test('Generate is disabled for invalid or catalog-missing adaptive checkpoints',
   assert.match(buttons[0]?.props.title, /no longer in the model catalog/)
 })
 
+test('i2v-only Blend needs its clips instead of a separate start image', async t => {
+  const { GenerateButton } = await loadControls()
+  const previous = globalThis.__maestroAdaptiveControlsStore
+  t.after(() => { globalThis.__maestroAdaptiveControlsStore = previous })
+
+  const blend = adaptiveStore({
+    blendClipAPath: '',
+    blendClipBPath: '',
+    modelOptions: { architecture: 'ltx2', i2v_class: true, t2v_class: false },
+  })
+  blend.params = {
+    ...blend.params,
+    model_type: 'ltx2_19B',
+    image_mode: 4,
+    h3_adaptive_conditioning: false,
+  }
+  globalThis.__maestroAdaptiveControlsStore = blend
+  let buttons = flattenElements(renderTree(GenerateButton())).filter(element => element.type === 'button')
+  assert.equal(buttons[0]?.props.disabled, true)
+  assert.match(textContent(buttons[0]), /Reattach clips/)
+  assert.equal(buttons[0]?.props.title, 'Reattach Clip A and Clip B before generating this Blend.')
+
+  globalThis.__maestroAdaptiveControlsStore = {
+    ...blend,
+    blendClipAPath: '/uploads/a.mp4',
+    blendClipBPath: '/uploads/b.mp4',
+  }
+  buttons = flattenElements(renderTree(GenerateButton())).filter(element => element.type === 'button')
+  assert.equal(buttons[0]?.props.disabled, false)
+  assert.match(textContent(buttons[0]), /Generate/)
+})
+
 test('Generate blocks incompatible saved Sage2 and repairs only the selected engine', async t => {
   const { GenerateButton } = await loadControls()
   const previousStore = globalThis.__maestroAdaptiveControlsStore

@@ -8578,7 +8578,11 @@ export const useStore = create<AppState>((set, get) => ({
     const isI2vOnly = state.modelOptions?.i2v_class && !state.modelOptions?.t2v_class
     const hasStartImage = state.startImage || state.params.image_start
     const hasMultiClipImages = state.clips.some(c => c.startImage || c.startImagePath)
-    if (state.generationMode === 'video' && isI2vOnly && !hasStartImage && !hasMultiClipImages) {
+    if (state.generationMode === 'video'
+      && state.params.image_mode !== 4
+      && isI2vOnly
+      && !hasStartImage
+      && !hasMultiClipImages) {
       console.error('This model requires a start image')
       // Could show a toast/notification here in the future
       return
@@ -8586,12 +8590,20 @@ export const useStore = create<AppState>((set, get) => ({
 
     // ── Video mode: Blend ──────────────────────────────────────────
     if (state.generationMode === 'video' && (state.params.image_mode as number) === 4) {
+      const blendSubmissionIsCurrent = () => (
+        ownsSubmission() && get().activeWorkspace === submissionWorkspace
+      )
+      if (!blendSubmissionIsCurrent()) return
       if (!state.blendClipAPath || !state.blendClipBPath) return
       const prompt = (state.params.prompt as string || '').trim()
 
       const newJob: GenerationJob = {
-        id: '', status: 'queued', progress: 0, step: 0, totalSteps: 0,
+        id: '', createdAt: Date.now() / 1000,
+        status: 'queued', progress: 0, step: 0, totalSteps: 0,
         phase: '', message: 'Submitting blend...', outputFiles: [], error: null, oomInfo: null,
+        modelType: String(state.params.model_type || ''),
+        generationMode: 'video',
+        workspace: submissionWorkspace,
       }
       set(s => ({ isGenerating: true, jobs: [newJob, ...s.jobs] }))
 
@@ -8614,7 +8626,7 @@ export const useStore = create<AppState>((set, get) => ({
           seed: (state.params.seed as number) ?? -1,
           activated_loras: (state.params.activated_loras as string[]) || [],
           loras_multipliers: (state.params.loras_multipliers as string) || '',
-          workspace: state.activeWorkspace,
+          workspace: submissionWorkspace,
           private_output: state.privateOutput,
           explicit_output: state.explicitOutput,
           // Pass the full Studio params so the backend can inherit the user's
@@ -8624,7 +8636,7 @@ export const useStore = create<AppState>((set, get) => ({
           // resolution, image_prompt_type) are overridden server-side.
           base_params: state.params as unknown as Record<string, unknown>,
         })
-        if (!ownsSubmission()) {
+        if (!blendSubmissionIsCurrent()) {
           _discardStaleGenerationPlaceholder(newJob)
           return
         }
@@ -8635,7 +8647,7 @@ export const useStore = create<AppState>((set, get) => ({
         get()._pollRecoveredJob(result.job_id)
         window.dispatchEvent(new CustomEvent('maestro:queue-refresh'))
       } catch (e) {
-        if (!ownsSubmission()) {
+        if (!blendSubmissionIsCurrent()) {
           _discardStaleGenerationPlaceholder(newJob)
           return
         }

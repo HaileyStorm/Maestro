@@ -8,7 +8,7 @@ const bundle = build({
 }).then(result => result.outputFiles[0].text)
 let realm = 0
 
-async function submitBlend(mode, transition, overlap) {
+async function submitBlend(mode, transition, overlap, { switchWorkspaceWhilePending = false } = {}) {
   const names = ['fetch', 'window', 'document', 'localStorage', 'sessionStorage']
   const originals = Object.fromEntries(names.map(name => [name, globalThis[name]]))
   const storage = () => {
@@ -16,6 +16,11 @@ async function submitBlend(mode, transition, overlap) {
     return { getItem: key => values.get(key) ?? null, setItem: (key, value) => values.set(key, String(value)), removeItem: key => values.delete(key) }
   }
   const requests = []
+  let pollCount = 0
+  let releaseResponse = () => {}
+  const responseGate = switchWorkspaceWhilePending
+    ? new Promise(resolve => { releaseResponse = resolve })
+    : Promise.resolve()
   globalThis.localStorage = storage()
   globalThis.sessionStorage = storage()
   globalThis.window = Object.assign(new EventTarget(), {
@@ -29,25 +34,40 @@ async function submitBlend(mode, transition, overlap) {
     assert.equal(String(input), '/api/v1/blend')
     assert.equal(options.method, 'POST')
     requests.push(JSON.parse(options.body))
+    await responseGate
     return Response.json({ job_id: 'blend-test-job', status: 'queued' })
   }
   try {
     const { useStore } = await import(`data:text/javascript;base64,${Buffer.from(await bundle).toString('base64')}#blend-submit-${++realm}`)
     useStore.setState(state => ({
       activeWorkspace: 'blend-test', generationMode: 'video',
-      modelOptionsLoading: false, modelOptions: { i2v_class: true, t2v_class: true },
-      _pollRecoveredJob() {},
+      modelOptionsLoading: false, modelOptions: { i2v_class: true, t2v_class: false },
+      _pollRecoveredJob() { pollCount += 1 },
       params: { ...state.params, model_type: 'ltx2_19B', image_mode: 4, prompt: 'A continuous camera move', seed: 71 },
     }))
     useStore.setState({ blendClipAPath: 'clip-a.mp4', blendClipBPath: 'clip-b.mp4' })
     useStore.getState().setBlendMode(mode)
     useStore.getState().setBlendTransitionSec(transition)
     useStore.getState().setBlendOverlapSec(overlap)
-    await useStore.getState().startGeneration('queue')
+    const submission = useStore.getState().startGeneration('queue')
+    if (switchWorkspaceWhilePending) {
+      assert.equal(requests.length, 1)
+      useStore.setState({ activeWorkspace: 'blend-other' })
+      releaseResponse()
+    }
+    await submission
     assert.equal(requests.length, 1)
     assert.equal(requests[0].workspace, 'blend-test')
     assert.equal(requests[0].seed, 71)
-    assert.equal(useStore.getState().jobs[0].id, 'blend-test-job')
+    if (switchWorkspaceWhilePending) {
+      assert.equal(pollCount, 0)
+      assert.equal(useStore.getState().jobs.some(job => job.id === 'blend-test-job'), false)
+      assert.equal(useStore.getState().jobs.some(job => job.message === 'Submitting blend...'), false)
+    } else {
+      assert.equal(pollCount, 1)
+      assert.equal(useStore.getState().jobs[0].id, 'blend-test-job')
+      assert.equal(useStore.getState().jobs[0].workspace, 'blend-test')
+    }
     return requests[0]
   } finally {
     for (const name of names) {
@@ -75,4 +95,8 @@ test('Overlap keeps its selected trim duration when Insert has a different durat
   assert.equal(request.motion_prefix_sec, 1)
   assert.equal(request.motion_suffix_sec, 1)
   assert.equal(request.input_video_strength, 0.7)
+})
+
+test('Blend discards a delayed submission result after the active project changes', async () => {
+  await submitBlend('insert', 7, 2, { switchWorkspaceWhilePending: true })
 })
