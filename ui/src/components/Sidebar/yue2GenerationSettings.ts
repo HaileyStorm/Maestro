@@ -9,6 +9,30 @@ export type Yue2GenerationSettings = {
   maxTokens: number
 }
 
+export type Yue2ComposeDraft = {
+  workspace: string
+  description: string
+  language: string
+  instrumental: boolean
+  style: string
+  lyrics: string
+  abc: string
+}
+
+export function sameYue2ComposeDraft(left: Yue2ComposeDraft, right: Yue2ComposeDraft): boolean {
+  return left.workspace === right.workspace
+    && left.description === right.description
+    && left.language === right.language
+    && left.instrumental === right.instrumental
+    && left.style === right.style
+    && left.lyrics === right.lyrics
+    && left.abc === right.abc
+}
+
+export function reviewedAbcForContinuation(original: string, current: string): string | undefined {
+  return current === original ? undefined : current
+}
+
 const DEFAULTS: Yue2GenerationSettings = {
   cot: 'full',
   cfgScale: 1,

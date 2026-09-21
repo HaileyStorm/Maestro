@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Check, Loader2, Music2, RefreshCw, Sparkles, Square } from 'lucide-react'
 import * as api from '../../api/client'
-import { preferredYue2Checkpoint, resolveYue2GenerationSettings } from './yue2GenerationSettings'
+import { preferredYue2Checkpoint, resolveYue2GenerationSettings, reviewedAbcForContinuation, sameYue2ComposeDraft } from './yue2GenerationSettings'
 
 type Props = {
   workspace: string
@@ -27,20 +27,53 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
   const [error, setError] = useState<string | null>(null)
   const [guides, setGuides] = useState<string[]>([])
   const [reviewTake, setReviewTake] = useState<string | null>(null)
+  const [reviewedAbc, setReviewedAbc] = useState<string | null>(null)
+  const [reviewLoading, setReviewLoading] = useState(false)
+  const [reviewError, setReviewError] = useState<string | null>(null)
+  const workspaceRef = useRef(workspace)
+  const refreshSequence = useRef(0)
+  const composeSequence = useRef(0)
+  const planSequence = useRef(0)
+  const abcRef = useRef(abc)
+  const composeDraftRef = useRef({ workspace, description, language, instrumental, style, lyrics, abc })
+  workspaceRef.current = workspace
+  abcRef.current = abc
+  composeDraftRef.current = { workspace, description, language, instrumental, style, lyrics, abc }
 
   const refresh = useCallback(async () => {
     if (!workspace) return
+    const requestWorkspace = workspace
+    const sequence = ++refreshSequence.current
     try {
       const [nextStatus, library] = await Promise.all([
-        api.fetchYue2Status(workspace),
-        api.fetchYue2Library(workspace),
+        api.fetchYue2Status(requestWorkspace),
+        api.fetchYue2Library(requestWorkspace),
       ])
+      if (workspaceRef.current !== requestWorkspace || refreshSequence.current !== sequence) return
       setStatus(nextStatus)
-      setTracks(library.tracks.filter(track => track.project === workspace))
+      setTracks(library.tracks.filter(track => track.project === requestWorkspace))
       setError(null)
     } catch (cause) {
+      if (workspaceRef.current !== requestWorkspace || refreshSequence.current !== sequence) return
       setError(cause instanceof Error ? cause.message : 'YuE2 status is unavailable')
     }
+  }, [workspace])
+
+  useEffect(() => {
+    refreshSequence.current += 1
+    composeSequence.current += 1
+    planSequence.current += 1
+    setStatus(null)
+    setTracks([])
+    setTitle('Untitled YuE2 song')
+    setAbc('')
+    setBusy(null)
+    setError(null)
+    setGuides([])
+    setReviewTake(null)
+    setReviewedAbc(null)
+    setReviewLoading(false)
+    setReviewError(null)
   }, [workspace])
 
   useEffect(() => { void refresh() }, [refresh])
@@ -50,18 +83,39 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
     return () => window.clearInterval(timer)
   }, [refresh, tracks])
 
-  useEffect(() => {
-    const waiting = tracks.find(track => track.status === 'needs-review')
-    if (!waiting || reviewTake === waiting.id) return
-    setReviewTake(waiting.id)
-    void api.fetchYue2Plan(waiting.id, workspace)
-      .then(plan => setAbc(plan.abc))
-      .catch(cause => setError(cause instanceof Error ? cause.message : 'Score review is unavailable'))
-  }, [reviewTake, tracks, workspace])
+  const loadPlan = useCallback(async (take: api.Yue2Track) => {
+    const requestWorkspace = workspace
+    const requestAbc = abcRef.current
+    const sequence = ++planSequence.current
+    setReviewTake(take.id)
+    setReviewedAbc(null)
+    setReviewLoading(true)
+    setReviewError(null)
+    try {
+      const plan = await api.fetchYue2Plan(take.id, requestWorkspace)
+      if (workspaceRef.current !== requestWorkspace || planSequence.current !== sequence) return
+      if (!plan.reviewable) throw new Error('This YuE2 score is no longer available for review. Refresh its status.')
+      if (abcRef.current !== requestAbc) throw new Error('The ABC score changed while its saved plan was loading. Retry score review.')
+      setAbc(plan.abc)
+      setReviewedAbc(plan.abc)
+    } catch (cause) {
+      if (workspaceRef.current !== requestWorkspace || planSequence.current !== sequence) return
+      setReviewError(cause instanceof Error ? cause.message : 'Score review is unavailable')
+    } finally {
+      if (workspaceRef.current === requestWorkspace && planSequence.current === sequence) setReviewLoading(false)
+    }
+  }, [workspace])
 
+  useEffect(() => {
+    const waiting = tracks.find(track => track.project === workspace && track.status === 'needs-review')
+    if (!waiting || reviewTake === waiting.id) return
+    void loadPlan(waiting)
+  }, [loadPlan, reviewTake, tracks, workspace])
+
+  const projectTracks = useMemo(() => tracks.filter(track => track.project === workspace), [tracks, workspace])
   const activeTrack = useMemo(
-    () => tracks.find(track => ['needs-review', 'running', 'queued'].includes(track.status)) || tracks[0],
-    [tracks],
+    () => projectTracks.find(track => ['needs-review', 'running', 'queued'].includes(track.status)) || projectTracks[0],
+    [projectTracks],
   )
   const selectedGroups = useMemo(
     () => (status?.loras || []).filter(group => selectedLoras[group.id] !== undefined),
@@ -80,17 +134,22 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
 
   const compose = async () => {
     if (!description.trim() || busy) return
+    const requestWorkspace = workspace
+    const requestDraft = { ...composeDraftRef.current }
+    const sequence = ++composeSequence.current
     setBusy('compose'); setError(null)
     try {
-      const result = await api.composeYue2({ workspace, description: description.trim(), language, instrumental })
+      const result = await api.composeYue2({ workspace: requestWorkspace, description: description.trim(), language, instrumental })
+      if (composeSequence.current !== sequence || !sameYue2ComposeDraft(composeDraftRef.current, requestDraft)) return
       onStyle(result.style)
       onLyrics(instrumental ? '[Instrumental]' : result.lyrics)
       setAbc(result.abc)
       setGuides(result.guides)
     } catch (cause) {
+      if (workspaceRef.current !== requestWorkspace || composeSequence.current !== sequence) return
       setError(cause instanceof Error ? cause.message : 'YuE2 composition drafting failed')
     } finally {
-      setBusy(null)
+      if (workspaceRef.current === requestWorkspace && composeSequence.current === sequence) setBusy(null)
     }
   }
 
@@ -101,6 +160,7 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
       return
     }
     setBusy('submit'); setError(null)
+    const requestWorkspace = workspace
     const loras = (status?.loras || []).flatMap(group => {
       const strength = selectedLoras[group.id]
       const checkpoint = preferredYue2Checkpoint(group)
@@ -109,10 +169,10 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
     const generation = resolvedGeneration.settings
     try {
       await api.submitYue2({
-        workspace,
+        workspace: requestWorkspace,
         requestId: `maestro-${crypto.randomUUID()}`,
         form: {
-          description, title, lyrics, style, count: 1, project: workspace,
+          description, title, lyrics, style, count: 1, project: requestWorkspace,
           cot: generation.cot,
           abc: generation.cot === 'off' ? '' : abc,
           planFirst: generation.cot === 'off' ? false : planFirst,
@@ -133,23 +193,31 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
       })
       await refresh()
     } catch (cause) {
+      if (workspaceRef.current !== requestWorkspace) return
       setError(cause instanceof Error ? cause.message : 'YuE2 generation could not be queued')
     } finally {
-      setBusy(null)
+      if (workspaceRef.current === requestWorkspace) setBusy(null)
     }
   }
 
   const continuePlan = async () => {
-    if (!activeTrack || busy) return
+    if (!activeTrack || busy || reviewedAbc === null) return
+    const requestWorkspace = workspace
+    const requestTake = activeTrack.id
+    const editedAbc = reviewedAbcForContinuation(reviewedAbc, abc)
     setBusy('continue'); setError(null)
     try {
-      await api.continueYue2(activeTrack.id, workspace, abc)
+      await api.continueYue2(requestTake, requestWorkspace, editedAbc)
+      if (workspaceRef.current !== requestWorkspace) return
       setReviewTake(null)
+      setReviewedAbc(null)
+      setReviewError(null)
       await refresh()
     } catch (cause) {
+      if (workspaceRef.current !== requestWorkspace) return
       setError(cause instanceof Error ? cause.message : 'YuE2 score could not be continued')
     } finally {
-      setBusy(null)
+      if (workspaceRef.current === requestWorkspace) setBusy(null)
     }
   }
 
@@ -184,7 +252,7 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
       {guides.length > 0 && <p className="text-[9px] text-text-muted">Guides: {guides.join(', ')}</p>}
 
       <label className="block text-[9px] uppercase tracking-wider text-text-muted">ABC score
-        <textarea value={abc} onChange={event => setAbc(event.target.value)} placeholder={'X:1\nM:4/4\nV: Vocal\n…\nV: Ins\n…'} className={`${fieldClass} mt-1 min-h-[8rem] resize-y font-mono text-[10px]`} />
+        <textarea value={abc} onChange={event => setAbc(event.target.value)} disabled={reviewLoading} placeholder={'X:1\nM:4/4\nV: Vocal\n…\nV: Ins\n…'} className={`${fieldClass} mt-1 min-h-[8rem] resize-y font-mono text-[10px] disabled:cursor-wait disabled:opacity-60`} />
       </label>
 
       {(status?.loras?.length || 0) > 0 && (
@@ -224,9 +292,15 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
       </label>
 
       {activeTrack?.status === 'needs-review' ? (
-        <button type="button" onClick={() => void continuePlan()} disabled={!abc.trim() || !!busy} className="mobile-control-target flex w-full items-center justify-center gap-1.5 rounded-lg bg-cta px-3 text-[10px] font-semibold text-cta-foreground hover:ring-2 hover:ring-accent-blue/40 disabled:opacity-40">
-          {busy === 'continue' ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />} Continue with reviewed score
-        </button>
+        reviewError ? (
+          <button type="button" onClick={() => void loadPlan(activeTrack)} disabled={reviewLoading} className="mobile-control-target flex w-full items-center justify-center gap-1.5 rounded-lg border border-red-400/30 bg-red-400/10 px-3 text-[10px] font-semibold text-red-300 hover:bg-red-400/20 disabled:opacity-40">
+            {reviewLoading ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />} Retry score review
+          </button>
+        ) : (
+          <button type="button" onClick={() => void continuePlan()} disabled={reviewLoading || reviewedAbc === null || !abc.trim() || !!busy} className="mobile-control-target flex w-full items-center justify-center gap-1.5 rounded-lg bg-cta px-3 text-[10px] font-semibold text-cta-foreground hover:ring-2 hover:ring-accent-blue/40 disabled:opacity-40">
+            {reviewLoading || busy === 'continue' ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />} {reviewLoading ? 'Loading score review…' : 'Continue with reviewed score'}
+          </button>
+        )
       ) : (
         <button type="button" onClick={() => void submit()} disabled={!status?.available || !style.trim() || !lyrics.trim() || !!busy || !resolvedGeneration.settings || ['queued', 'running'].includes(activeTrack?.status || '')} className="mobile-control-target flex w-full items-center justify-center gap-1.5 rounded-lg bg-cta px-3 text-[10px] font-semibold text-cta-foreground hover:ring-2 hover:ring-accent-blue/40 disabled:opacity-40">
           {busy === 'submit' ? <Loader2 size={12} className="animate-spin" /> : <Music2 size={12} />} Generate with YuE2
@@ -242,6 +316,7 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
           {['queued', 'running'].includes(activeTrack.status) && <button type="button" onClick={() => void api.cancelYue2(activeTrack.id, workspace).then(refresh)} className="flex items-center gap-1 text-red-300 hover:text-red-200"><Square size={10} /> Cancel</button>}
         </div>
       )}
+      {reviewError && <p className="text-[10px] text-red-400">{reviewError}</p>}
       {error && <p className="text-[10px] text-red-400">{error}</p>}
     </section>
   )
