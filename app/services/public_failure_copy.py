@@ -84,6 +84,7 @@ PUBLIC_CONTRACT_MESSAGES: Final[frozenset[str]] = frozenset({
     'H3 Turbo steps must be an integer from 4 through 8',
     'H3 Turbo supports exactly 4 through 8 model evaluations',
     'H3 Turbo user-LoRA stacking is unsupported on W4A8/PinkCherry: their packed/INT8 generic adapter path is not dtype-safe',
+    'LightX2V H3 is limited to one native segment',
     'MiniMax H3 LoRA multipliers exceed the selected asset count.',
     'MiniMax H3 LoRA multipliers must be text.',
     'MiniMax H3 LoRA selection is incompatible with its architecture.',

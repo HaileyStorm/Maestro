@@ -99,7 +99,7 @@ test('every production token-gradient call site uses its semantic foreground cla
     }
   }
 
-  assert.equal(callSites.length, 9, 'expected all nine production token-gradient call sites')
+  assert.equal(callSites.length, 11, 'expected all eleven production token-gradient call sites')
   const decorativeImageSites = callSites.filter(site => site.decorativeImage)
   assert.deepEqual(
     decorativeImageSites.map(site => site.relativePath),

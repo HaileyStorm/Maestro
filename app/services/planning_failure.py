@@ -118,7 +118,7 @@ def public_planning_failure_message(
         if error_type not in _PUBLIC_FAILURE_TYPES and type_name not in {
             "H3TurboCompatibilityError",
             "SpectrumCompatibilityError",
-            "H3Lightx2vCompatibilityError",
+            "H3LightX2VCompatibilityError",
             "H3ExperimentCompatibilityError",
         }:
             return safe_fallback

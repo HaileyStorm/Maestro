@@ -91,6 +91,17 @@ class TestLtxAudioRuntimeContracts(unittest.TestCase):
         self.assertEqual(count(np.zeros((2, 0), dtype=np.float32)), 0)
         self.assertEqual(count(None), 0)
 
+    def test_generated_audio_uses_model_sample_rate_with_safe_fallback(self):
+        resolve = _load_wgp_helpers("resolve_generated_audio_sampling_rate")[
+            "resolve_generated_audio_sampling_rate"
+        ]
+
+        self.assertEqual(resolve({"audio_sampling_rate": 24_000}, 16_000), 24_000)
+        self.assertEqual(resolve({}, 16_000), 16_000)
+        self.assertEqual(resolve({"audio_sampling_rate": 0}, 16_000), 16_000)
+        self.assertEqual(resolve({"audio_sampling_rate": "invalid"}, 16_000), 16_000)
+        self.assertEqual(resolve(None, 16_000), 16_000)
+
     def test_conditioning_role_keeps_original_delivery_audio(self):
         namespace = _load_wgp_helpers(
             "_validate_audio_conditioning_guide",

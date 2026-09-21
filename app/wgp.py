@@ -9971,6 +9971,19 @@ def resolve_mux_audio_sampling_rate(default_rate, source_audio_metadata=None, au
     return max(sample_rates)
 
 
+def resolve_generated_audio_sampling_rate(result, default_rate):
+    """Honor a model's native output rate for every generated-audio path."""
+
+    fallback = max(1, int(default_rate))
+    if not isinstance(result, dict):
+        return fallback
+    try:
+        sample_rate = int(result.get("audio_sampling_rate", fallback) or fallback)
+    except (TypeError, ValueError):
+        return fallback
+    return sample_rate if sample_rate > 0 else fallback
+
+
 def resolve_mux_audio_contract(
     base_model_type,
     generated_audio,

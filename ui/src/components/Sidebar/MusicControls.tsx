@@ -4,6 +4,7 @@ import { useStore } from '../../stores/useStore'
 import * as api from '../../api/client'
 import type { GenerateParams } from '../../types'
 import { MusicLyricPlayground } from './MusicLyricPlayground'
+import { Yue2Controls } from './Yue2Controls'
 
 const TEXTAREA_BASE =
   'w-full bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm text-text-primary ' +
@@ -90,6 +91,14 @@ export function MusicControls() {
   const isMusic3 = modelType === 'minimax_music3'
   const [writing, setWriting] = useState(false)
   const [writeError, setWriteError] = useState<string | null>(null)
+  const [engine, setEngineState] = useState<'maestro' | 'yue2'>(() =>
+    window.localStorage.getItem('maestro.music.engine') === 'yue2' ? 'yue2' : 'maestro',
+  )
+  const setEngine = (value: 'maestro' | 'yue2') => {
+    window.localStorage.setItem('maestro.music.engine', value)
+    setEngineState(value)
+    window.dispatchEvent(new CustomEvent('maestro-music-engine', { detail: value }))
+  }
 
   // alt_prompt = Music Caption (style); prompt = Lyrics. Both remain the
   // shared music-model submission fields.
@@ -149,6 +158,10 @@ export function MusicControls() {
 
   return (
     <div className="space-y-3">
+      <div className="grid grid-cols-2 gap-1 rounded-lg border border-border bg-bg-tertiary p-1" aria-label="Music engine">
+        <button type="button" onClick={() => setEngine('maestro')} className={`mobile-control-target rounded px-2 text-[10px] font-medium ${engine === 'maestro' ? 'bg-accent-blue text-white' : 'text-text-muted hover:text-text-primary'}`}>Maestro models</button>
+        <button type="button" onClick={() => setEngine('yue2')} className={`mobile-control-target rounded px-2 text-[10px] font-medium ${engine === 'yue2' ? 'bg-accent-blue text-white' : 'text-text-muted hover:text-text-primary'}`}>YuE2</button>
+      </div>
       {/* Header + instrumental toggle */}
       <div className="flex items-center justify-between">
         <label className="text-[11px] text-text-muted uppercase tracking-wider flex items-center gap-1.5">
@@ -177,7 +190,7 @@ export function MusicControls() {
             ariaLabel="Describe your song"
           />
         </div>
-        <button
+        {engine === 'maestro' && <button
           onClick={handleWriteSong}
           disabled={!description.trim() || writing}
           className={`w-full px-4 py-2 rounded-lg flex items-center justify-center gap-1.5 font-medium text-xs transition-all ${
@@ -188,16 +201,31 @@ export function MusicControls() {
         >
           {writing ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
           {writing ? 'Writing…' : 'Write Song'}
-        </button>
+        </button>}
         {writeError && <p className="text-[10px] text-red-400 leading-snug">{writeError}</p>}
         <p className="text-[10px] text-text-muted leading-snug">
-          Your configured AI writing assistant can draft the Style{instrumental ? '' : ' + Lyrics'} from your description. Review and edit the draft below, or write either field yourself, then Generate.
+          {engine === 'maestro'
+            ? <>Your configured AI writing assistant can draft the Style{instrumental ? '' : ' + Lyrics'} from your description. Review and edit the draft below, or write either field yourself, then Generate.</>
+            : <>YuE2 can build a structured draft from selected local music guides below. Review every field before rendering.</>}
         </p>
       </div>
 
       {/* Style + Lyrics (editable, auto-sizing). Lyrics hidden when instrumental. */}
       <StyleField value={style} onChange={setStyle} />
-      {isMusic3
+      {engine === 'yue2' ? (
+        <>
+          {!instrumental && <LyricsField value={lyrics} onChange={setLyrics} />}
+          <Yue2Controls
+            workspace={activeWorkspace}
+            description={description}
+            style={style}
+            lyrics={instrumental ? '[Instrumental]' : lyrics}
+            instrumental={instrumental}
+            onStyle={setStyle}
+            onLyrics={setLyrics}
+          />
+        </>
+      ) : isMusic3
         ? instrumental
           ? (
               <section aria-label="Instrumental Music3 handoff" className="rounded-xl border border-accent-blue/20 bg-bg-secondary/70 p-2.5">

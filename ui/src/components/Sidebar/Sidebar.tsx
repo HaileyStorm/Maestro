@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Settings, X, Globe, BookMarked } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
@@ -68,8 +68,20 @@ export function Sidebar() {
   const isImage = generationMode === 'image'
   const isAudio = generationMode === 'audio'
   const audioSubMode = useStore(s => s.audioSubMode)
+  const [musicEngine, setMusicEngine] = useState<'maestro' | 'yue2'>(() =>
+    window.localStorage.getItem('maestro.music.engine') === 'yue2' ? 'yue2' : 'maestro',
+  )
+  useEffect(() => {
+    const update = (event: Event) => {
+      const value = (event as CustomEvent).detail
+      if (value === 'maestro' || value === 'yue2') setMusicEngine(value)
+    }
+    window.addEventListener('maestro-music-engine', update)
+    return () => window.removeEventListener('maestro-music-engine', update)
+  }, [])
   const isEdit = generationMode === 'avatar'
   const isTools = generationMode === 'tools'
+  const isYue2Music = isAudio && audioSubMode === 'music' && musicEngine === 'yue2'
   const isRetake = isEdit && editSubMode === 'retake'
   const isRestyle = isEdit && editSubMode === 'restyle'
   const isInpaint = isEdit && editSubMode === 'inpaint'
@@ -311,7 +323,7 @@ export function Sidebar() {
       {/* Give model choices the sidebar width, above the compact action row.
           Hidden in Tools mode — ToolsPanel has its own Run button and
           owns no model. */}
-      {!isTools && (
+      {!isTools && !isYue2Music && (
       <div className="shrink-0 space-y-2 px-3 py-2.5 border-t border-border" data-generation-footer>
         <ModelSelector />
         <div className="flex flex-wrap items-center gap-1 sm:gap-2">

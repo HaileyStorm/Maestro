@@ -34058,6 +34058,30 @@ def _normalize_written_song_for_model(model_type, style, lyrics):
     return normalize_generated_music3_song(style, lyrics)
 
 
+def _parse_yue2_composition(raw):
+    """Validate the local writer's bounded YuE2 composition contract."""
+    text = str(raw or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError("The local music writer did not return structured JSON.")
+    payload = json.loads(text[start:end + 1])
+    if not isinstance(payload, dict):
+        raise ValueError("The local music writer returned an invalid composition.")
+    style = str(payload.get("style") or "").strip()
+    lyrics = str(payload.get("lyrics") or "").strip()
+    abc = str(payload.get("abc") or "").strip()
+    if not style or not lyrics or not abc:
+        raise ValueError("The local music writer omitted style, lyrics, or ABC.")
+    if "V: Vocal" not in abc or "V: Ins" not in abc:
+        raise ValueError("The generated ABC must contain Vocal and Ins voices.")
+    if re.search(r"(?im)^\s*w\s*:", abc):
+        raise ValueError("Lyrics must stay outside the generated ABC score.")
+    return {"style": style, "lyrics": lyrics, "abc": abc}
+
+
 @api.post("/api/v1/llm/write-song")
 async def llm_write_song(request: Request):
     """Music-mode Simple writer: from a free-text description, produce a Music
@@ -34126,6 +34150,179 @@ async def llm_write_song(request: Request):
         body.get("model_type"), style, lyrics,
     )
     return {"style": style, "lyrics": lyrics, "raw": raw}
+
+
+# --- YuE2: installed Sound/Vision bridge and local document-backed writer ---
+
+def _yue2_bridge():
+    from services.yue2_bridge import Yue2Bridge
+    return Yue2Bridge()
+
+
+def _raise_yue2_bridge_error(error):
+    from services.yue2_bridge import Yue2BridgeError
+    if isinstance(error, Yue2BridgeError):
+        raise HTTPException(status_code=error.status_code, detail=str(error)) from error
+    raise error
+
+
+@api.get("/api/v1/yue2/status")
+async def yue2_status(request: Request, workspace: str | None = None):
+    selected = _request_project_workspace(request, workspace)
+    _require_project_access(request, selected, permission="project.open")
+    from services.yue2_bridge import public_status
+    return public_status(_yue2_bridge())
+
+
+@api.get("/api/v1/yue2/library")
+async def yue2_library(request: Request, workspace: str | None = None):
+    selected = _request_project_workspace(request, workspace)
+    _require_project_access(request, selected, permission="project.open")
+    try:
+        return _yue2_bridge().project_library(selected)
+    except Exception as error:
+        _raise_yue2_bridge_error(error)
+
+
+@api.post("/api/v1/yue2/generations")
+async def yue2_submit(request: Request):
+    body = await request.json()
+    workspace = _request_project_workspace(request, body.get("workspace"))
+    _require_project_access(request, workspace, permission="project.generate")
+    payload = {key: value for key, value in body.items() if key != "workspace"}
+    form = payload.get("form")
+    if not isinstance(form, dict):
+        raise HTTPException(status_code=400, detail="YuE2 song form is required.")
+    form = dict(form)
+    form["project"] = workspace
+    payload["form"] = form
+    try:
+        return _yue2_bridge().submit(payload)
+    except Exception as error:
+        _raise_yue2_bridge_error(error)
+
+
+@api.get("/api/v1/yue2/takes/{take_id}/plan")
+async def yue2_plan(take_id: str, request: Request, workspace: str | None = None):
+    selected = _request_project_workspace(request, workspace)
+    _require_project_access(request, selected, permission="project.open")
+    try:
+        bridge = _yue2_bridge()
+        bridge.require_take(take_id, selected)
+        return bridge.plan(take_id)
+    except Exception as error:
+        _raise_yue2_bridge_error(error)
+
+
+@api.post("/api/v1/yue2/takes/{take_id}/continue")
+async def yue2_continue(take_id: str, request: Request):
+    body = await request.json()
+    workspace = _request_project_workspace(request, body.get("workspace"))
+    _require_project_access(request, workspace, permission="project.generate")
+    try:
+        bridge = _yue2_bridge()
+        bridge.require_take(take_id, workspace)
+        return bridge.continue_plan(take_id, body.get("abc"))
+    except Exception as error:
+        _raise_yue2_bridge_error(error)
+
+
+@api.post("/api/v1/yue2/takes/{take_id}/cancel")
+async def yue2_cancel(take_id: str, request: Request):
+    body = await request.json()
+    workspace = _request_project_workspace(request, body.get("workspace"))
+    _require_project_access(request, workspace, permission="project.generate")
+    try:
+        bridge = _yue2_bridge()
+        bridge.require_take(take_id, workspace)
+        return bridge.cancel(take_id)
+    except Exception as error:
+        _raise_yue2_bridge_error(error)
+
+
+@api.get("/api/v1/yue2/takes/{take_id}/audio.{fmt}")
+async def yue2_audio(take_id: str, fmt: str, request: Request, workspace: str | None = None):
+    selected = _request_project_workspace(request, workspace)
+    _require_project_access(request, selected, permission="project.open")
+    try:
+        bridge = _yue2_bridge()
+        await asyncio.to_thread(bridge.require_take, take_id, selected)
+        raw, content_type = await asyncio.to_thread(bridge.audio, take_id, fmt)
+    except Exception as error:
+        _raise_yue2_bridge_error(error)
+    return Response(content=raw, media_type=content_type)
+
+
+@api.post("/api/v1/yue2/compose")
+async def yue2_compose(request: Request):
+    """Use selected local Markdown guides as bounded context for a local LLM."""
+    from services import llm_service
+    from services.llm_operations import run_blocking_shielded
+    from services.music_document_router import (
+        composition_system_prompt,
+        load_music_document_context,
+    )
+
+    body = await request.json()
+    workspace = _request_project_workspace(request, body.get("workspace"))
+    _require_project_access(request, workspace, permission="project.generate")
+    brief = str(body.get("description") or "").strip()
+    if not brief:
+        raise HTTPException(status_code=400, detail="Describe the song first.")
+    if len(brief) > 20_000:
+        raise HTTPException(status_code=413, detail="The song brief is too long.")
+    context = load_music_document_context(
+        brief,
+        language=str(body.get("language") or ""),
+    )
+    if not context.text:
+        raise HTTPException(
+            status_code=503,
+            detail="Local music-writing guides are not installed on this host.",
+        )
+    selection = await run_blocking_shielded(_resolve_direct_llm_selection, request)
+    if str(selection.get("provider") or "local").casefold() != "local":
+        raise HTTPException(
+            status_code=409,
+            detail="Music-guide drafting requires a local language model.",
+        )
+    prompt = (
+        brief
+        + "\n\nRequested language: "
+        + (str(body.get("language") or "unspecified"))
+        + ("\nInstrumental: yes" if body.get("instrumental") else "\nInstrumental: no")
+    )
+    try:
+        raw = await run_blocking_shielded(
+            _run_authorized_llm_with_selection,
+            request,
+            selection,
+            _run_llm_route_operation,
+            request,
+            body,
+            selection,
+            llm_service.generate,
+            prompt=prompt,
+            system_prompt=composition_system_prompt(context),
+            max_new_tokens=min(4096, max(768, int(body.get("max_new_tokens", 3072)))),
+            temperature=float(body.get("temperature", 0.72)),
+            top_p=float(body.get("top_p", 0.9)),
+            seed=body.get("seed"),
+        )
+        result = _parse_yue2_composition(raw)
+    except HTTPException:
+        raise
+    except Exception as error:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=str(error) if isinstance(error, ValueError) else "YuE2 composition drafting failed; check the local Maestro logs.",
+        ) from error
+    return {
+        **result,
+        "guides": list(context.selected),
+        "missingGuides": list(context.missing),
+    }
 
 
 def _build_music_gen_params(model_type: str, lyrics: str, style: str, duration_seconds, seed) -> dict:
@@ -40710,6 +40907,10 @@ def _h3_profile_estimate_payload(
             # rather than merge with, the previously selected profile.
             "custom_settings": dict(settings["custom_settings"]),
         })
+        if int(candidate.get("_planned_segment_count") or 0) <= 0:
+            candidate["_planned_segment_count"] = int(
+                _h3_segment_count_estimate(candidate).get("likely") or 0
+            )
         names, weights = h3_request_loras_for_model(candidate, candidate["model_type"])
         candidate["activated_loras"] = names
         candidate["loras_multipliers"] = weights
@@ -40941,7 +41142,9 @@ def _validate_h3_lightx2v_estimate_context(context: dict) -> None:
         selected_model_type=selected, model_def=model_def,
         custom_settings=custom, authored_steps=context.get("num_inference_steps"),
         semantic_references=semantic,
-        multisegment=isinstance(segments, list) and len(segments) > 1,
+        multisegment=(
+            isinstance(segments, list) and len(segments) > 1
+        ) or int(context.get("_planned_segment_count") or 0) > 1,
         activated_loras=context.get("activated_loras"),
         loras_multipliers=context.get("loras_multipliers"),
         skip_steps_cache_type=context.get("tea_cache"),

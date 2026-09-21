@@ -292,6 +292,11 @@ class H3LightX2VTests(unittest.TestCase):
             "tea_cache": 0,
         }
         validate(context)
+        with self.assertRaisesRegex(
+            H3LightX2VCompatibilityError,
+            "limited to one native segment",
+        ):
+            validate({**context, "_planned_segment_count": 2})
         with self.assertRaises(H3LightX2VCompatibilityError):
             validate({**context, "_segment_contexts": [context, context]})
         with self.assertRaises(H3LightX2VCompatibilityError):

@@ -319,6 +319,15 @@ class GenerationPlanningFailureTests(unittest.TestCase):
             ),
             dasiwa_message,
         )
+        from services.h3_lightx2v import H3LightX2VCompatibilityError
+        lightx2v_message = "LightX2V H3 is limited to one native segment"
+        self.assertEqual(
+            public_planning_failure_message(
+                H3LightX2VCompatibilityError(lightx2v_message),
+                fallback="Generation planning failed",
+            ),
+            lightx2v_message,
+        )
 
         reason, event = planning_failure_event(
             HostileStatus(private_marker), phase="untrusted-phase",

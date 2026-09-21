@@ -1480,6 +1480,125 @@ export async function writeSong(params: {
   )
 }
 
+export interface Yue2LoraCheckpoint {
+  id: string
+  sha256: string
+  filename: string
+  step?: number | null
+  label?: string
+  experts?: string[]
+}
+
+export interface Yue2LoraGroup {
+  id: string
+  name: string
+  kind: string
+  trigger?: string
+  preferredStep?: number | null
+  generation?: Record<string, unknown>
+  checkpoints: Yue2LoraCheckpoint[]
+}
+
+export interface Yue2Status {
+  available: boolean
+  message?: string
+  model?: string
+  decoder?: string
+  sampleRate?: number
+  formats?: string[]
+  license?: string
+  queue?: string
+  loraEngine?: string
+  loras: Yue2LoraGroup[]
+}
+
+export interface Yue2Track {
+  id: string
+  title: string
+  subtitle?: string
+  project: string
+  requestId: string
+  status: 'queued' | 'running' | 'needs-review' | 'succeeded' | 'failed' | 'cancelled' | string
+  stage: string
+  duration: number
+  elapsed: number
+  error?: string | null
+  warnings?: string[]
+  truncated?: { abc?: boolean; semantic?: boolean } | null
+  audioUrl?: string | null
+}
+
+async function yue2Json<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(url, { cache: 'no-store', ...init })
+  if (!res.ok) {
+    const detail = await res.json().catch(() => ({ detail: 'YuE2 request failed' }))
+    throw new Error(detail.detail || 'YuE2 request failed')
+  }
+  return res.json()
+}
+
+export function fetchYue2Status(workspace: string): Promise<Yue2Status> {
+  const query = new URLSearchParams({ workspace })
+  return yue2Json(`${BASE}/api/v1/yue2/status?${query}`)
+}
+
+export function fetchYue2Library(workspace: string): Promise<{ tracks: Yue2Track[] }> {
+  const query = new URLSearchParams({ workspace })
+  return yue2Json(`${BASE}/api/v1/yue2/library?${query}`)
+}
+
+export function composeYue2(params: {
+  workspace: string
+  description: string
+  language?: string
+  instrumental?: boolean
+}, options?: LlmRequestOptions): Promise<{ style: string; lyrics: string; abc: string; guides: string[]; missingGuides: string[] }> {
+  return withLlmPreparation(
+    { workspace: params.workspace, purpose: 'configured' },
+    options,
+    () => yue2Json(`${BASE}/api/v1/yue2/compose`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+      signal: options?.signal,
+    }),
+  )
+}
+
+export function submitYue2(payload: Record<string, unknown>): Promise<{ requestId: string; tracks: Yue2Track[]; reused: boolean }> {
+  return yue2Json(`${BASE}/api/v1/yue2/generations`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
+export function fetchYue2Plan(takeId: string, workspace: string): Promise<{ abc: string; reviewable: boolean }> {
+  const query = new URLSearchParams({ workspace })
+  return yue2Json(`${BASE}/api/v1/yue2/takes/${encodeURIComponent(takeId)}/plan?${query}`)
+}
+
+export function continueYue2(takeId: string, workspace: string, abc?: string): Promise<{ status: string }> {
+  return yue2Json(`${BASE}/api/v1/yue2/takes/${encodeURIComponent(takeId)}/continue`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ workspace, ...(abc === undefined ? {} : { abc }) }),
+  })
+}
+
+export function cancelYue2(takeId: string, workspace: string): Promise<{ status: string }> {
+  return yue2Json(`${BASE}/api/v1/yue2/takes/${encodeURIComponent(takeId)}/cancel`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ workspace }),
+  })
+}
+
+export function yue2AudioUrl(takeId: string, workspace: string, format: 'mp3' | 'wav' | 'flac' = 'mp3'): string {
+  const query = new URLSearchParams({ workspace })
+  return `${BASE}/api/v1/yue2/takes/${encodeURIComponent(takeId)}/audio.${format}?${query}`
+}
+
 // Director Music Video: generate a music track (writes the song first if only
 // a description is given) and return the authorized audio reference so it can
 // flow straight into the existing analyze → plan-structure → pipeline chain.
