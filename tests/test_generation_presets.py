@@ -98,6 +98,7 @@ def v2_preset_payload() -> dict:
     }
     params.update({
         "resolution": "1280x720",
+        "video_length": 81,
         "settings_version": 2.52,
         "h3_adaptive_conditioning": False,
         "delivery_resolution": None,
@@ -1103,6 +1104,24 @@ class GenerationPresetStoreTests(unittest.TestCase):
             ):
                 self.create(payload=payload, preset_id=f"invalid-v2-{index}")
         self.assertEqual(self.listing(), [])
+
+    def test_v2_accepts_zero_video_length_only_for_audio_profiles(self) -> None:
+        audio = v2_preset_payload()
+        audio.update({
+            "mode": "audio",
+            "model_type": "ace_step_v1_5_xl_sft_lm_4b",
+        })
+        audio["params"]["video_length"] = 0
+        created = self.create(payload=audio, preset_id="audio-only")
+        self.assertEqual(created["params"]["video_length"], 0)
+
+        video = v2_preset_payload()
+        video["params"]["video_length"] = 0
+        with self.assertRaisesRegex(
+            presets.GenerationPresetError,
+            "positive outside audio generation mode",
+        ):
+            self.create(payload=video, preset_id="video-zero")
 
     def test_v2_accepts_real_selector_codes_and_signed_lora_weights(self) -> None:
         payload = v2_preset_payload()

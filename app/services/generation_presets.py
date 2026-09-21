@@ -1129,6 +1129,14 @@ def _normalize_preset(value: Any) -> dict[str, Any]:
             else _normalize_params(value["params"])
         ),
     }
+    if (
+        profile_version in {2, 3}
+        and mode != "audio"
+        and normalized["params"]["video_length"] == 0
+    ):
+        raise GenerationPresetError(
+            "video_length must be positive outside audio generation mode",
+        )
     if profile_version == 2:
         normalized["profile_version"] = 2
         normalized["ui_settings"] = _normalize_ui_settings(value["ui_settings"])
