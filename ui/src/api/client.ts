@@ -211,6 +211,7 @@ export interface QueueRecoveryMetadata {
   recovery_reason_text?: string | null
   recovery_actionable?: boolean
   recovery_actions?: QueueRecoveryAction[]
+  recovery_input_roles?: Array<'clip_a' | 'clip_b'>
   estimate_after_resume?: import('../types').H3PerformanceEstimate | null
 }
 
@@ -955,6 +956,28 @@ async function queueRecoveryRequest(
 
 export const resumeQueueRecovery = (jobId: string) => queueRecoveryRequest(jobId, 'resume')
 export const retryQueueRecovery = (jobId: string) => queueRecoveryRequest(jobId, 'retry')
+
+export async function reattachBlendRecoveryInputs(
+  jobId: string,
+  clipA: File,
+  clipB: File,
+): Promise<{ job_id: string; reattached: Array<'clip_a' | 'clip_b'>; recovery_state: 'blocked' }> {
+  const form = new FormData()
+  form.append('clip_a', clipA)
+  form.append('clip_b', clipB)
+  const res = await fetch(
+    `${BASE}/api/v1/queue/${encodeURIComponent(jobId)}/blend-reattach`,
+    { method: 'POST', cache: 'no-store', body: form },
+  )
+  if (!res.ok) {
+    const payload = await res.json().catch(() => ({})) as { detail?: unknown }
+    const detail = typeof payload.detail === 'string' ? payload.detail : ''
+    if (res.status === 404) throw new Error('That Blend recovery is no longer available.')
+    if (res.status === 409) throw new Error(detail || 'The saved Blend sources changed. Refresh and try again.')
+    throw new Error(detail || 'The Blend sources could not be reattached.')
+  }
+  return res.json()
+}
 
 export interface JobLogEvent {
   at: number

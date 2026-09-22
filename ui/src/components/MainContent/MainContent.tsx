@@ -21,6 +21,7 @@ import { copyTextToClipboard } from '../../lib/clipboard'
 import { subscribeQueueView } from '../../lib/mainViewNavigation'
 import { isActiveLogicalQueueJob, projectLogicalQueue } from '../../lib/queueProjection'
 import { formatApproximateDuration, formatMediaDuration } from '../../lib/format'
+import { BLEND_MEDIA_ACCEPT, isBlendMediaFile } from '../Sidebar/blendMediaTypes'
 
 const QUEUE_REFRESH_EVENT = 'maestro:queue-refresh'
 const REQUEST_WORKSPACE_UNLOCK_EVENT = 'maestro:request-workspace-unlock'
@@ -1277,6 +1278,7 @@ function JobPlaceholder({
   onDismiss,
   onToggleLog,
   onRecoveryAction,
+  onBlendReattach,
   onReviewPlan,
   logOpen = false,
   logEvents = [],
@@ -1289,6 +1291,7 @@ function JobPlaceholder({
   onDismiss: () => void
   onToggleLog?: () => void
   onRecoveryAction?: (action: api.QueueRecoveryAction) => void
+  onBlendReattach?: (clipA: File, clipB: File) => Promise<void>
   onReviewPlan?: () => void
   logOpen?: boolean
   logEvents?: api.JobLogEvent[]
@@ -1303,6 +1306,10 @@ function JobPlaceholder({
   const accountProjectAccessActive = api.isAccountProjectAccessActive(accessContext, accountProjectMigration)
   const ref2vaTermsAccepted = useStore(s => s.hostTerms?.minimax_h3_ref2va.accepted === true)
   const [reviewNowMs, setReviewNowMs] = useState(() => Date.now())
+  const [recoveryClipA, setRecoveryClipA] = useState<File | null>(null)
+  const [recoveryClipB, setRecoveryClipB] = useState<File | null>(null)
+  const [recoveryClipError, setRecoveryClipError] = useState<string | null>(null)
+  const [recoverySubmitting, setRecoverySubmitting] = useState(false)
   useEffect(() => {
     if (job.status !== 'waiting_for_plan_approval' || job.planReviewDeadline == null) return
     const immediate = window.setTimeout(() => setReviewNowMs(Date.now()), 0)
@@ -1375,6 +1382,25 @@ function JobPlaceholder({
     && (job.recoveryAttemptLimit ?? 0) > 0
     ? `Recovery attempt ${job.recoveryAttempt} of ${job.recoveryAttemptLimit}.`
     : null
+  const blendReattachRequired = (
+    job.recoveryReason === 'input_missing_or_changed'
+    && job.recoveryInputRoles?.length === 2
+    && job.recoveryInputRoles.includes('clip_a')
+    && job.recoveryInputRoles.includes('clip_b')
+  )
+  const selectRecoveryClip = (
+    role: 'clip_a' | 'clip_b',
+    file: File | undefined,
+  ) => {
+    if (!file) return
+    if (!isBlendMediaFile(file)) {
+      setRecoveryClipError('Choose a supported Blend image or video file.')
+      return
+    }
+    setRecoveryClipError(null)
+    if (role === 'clip_a') setRecoveryClipA(file)
+    else setRecoveryClipB(file)
+  }
   const resourceWaitTitle = job.queueWaitReason === 'resource_wait' ? RESOURCE_WAIT_TITLE : undefined
   const queueWaitLabel = job.status !== 'running' && !isFailed && !recoveryBlocked ? ({
     held: 'Held — use Start next or Resume when ready',
@@ -1534,7 +1560,49 @@ function JobPlaceholder({
                     Estimated work after resume: {formatApproximateDuration(estimateRuntime(job.estimateAfterResume))}.
                   </p>
                 )}
-                {!!job.recoveryActions?.length && canManageGeneration && (
+                {blendReattachRequired && canManageGeneration && (
+                  <div className="mt-2 space-y-2 rounded border border-amber-300/20 bg-bg-secondary/70 p-2">
+                    <p className="text-[10px] text-amber-100">
+                      Select the original Clip A and Clip B again. Maestro verifies both files before replacing this job’s recovery inputs.
+                    </p>
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      <label className="block text-[10px] text-text-secondary">
+                        <span>Original Clip A</span>
+                        <input
+                          type="file"
+                          accept={BLEND_MEDIA_ACCEPT}
+                          onChange={event => selectRecoveryClip('clip_a', event.target.files?.[0])}
+                          className="mt-1 block w-full text-[10px] file:mr-2 file:rounded file:border-0 file:bg-amber-300/15 file:px-2 file:py-1 file:text-amber-100"
+                        />
+                      </label>
+                      <label className="block text-[10px] text-text-secondary">
+                        <span>Original Clip B</span>
+                        <input
+                          type="file"
+                          accept={BLEND_MEDIA_ACCEPT}
+                          onChange={event => selectRecoveryClip('clip_b', event.target.files?.[0])}
+                          className="mt-1 block w-full text-[10px] file:mr-2 file:rounded file:border-0 file:bg-amber-300/15 file:px-2 file:py-1 file:text-amber-100"
+                        />
+                      </label>
+                    </div>
+                    {recoveryClipError && <p className="text-[10px] text-red-300">{recoveryClipError}</p>}
+                    <button
+                      type="button"
+                      disabled={!recoveryClipA || !recoveryClipB || recoverySubmitting}
+                      onClick={() => {
+                        if (recoveryClipA && recoveryClipB && !recoverySubmitting) {
+                          setRecoverySubmitting(true)
+                          void onBlendReattach?.(recoveryClipA, recoveryClipB)
+                            .finally(() => setRecoverySubmitting(false))
+                        }
+                      }}
+                      className="rounded bg-amber-300/15 px-2.5 py-1 text-[10px] font-medium text-amber-100 hover:bg-amber-300/25 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      {recoverySubmitting ? 'Verifying both clips…' : 'Reattach both and retry'}
+                    </button>
+                  </div>
+                )}
+                {!!job.recoveryActions?.length && canManageGeneration && !blendReattachRequired && (
                   <div className="mt-2 flex flex-wrap gap-1.5">
                     {job.recoveryActions.map(action => (
                       <button
@@ -2103,6 +2171,14 @@ function QueuePanel({
       : retryJobRecovery(job.id))
   }
 
+  const reattachBlend = async (job: GenerationJob, clipA: File, clipB: File) => {
+    if (job.recoveryReason !== 'input_missing_or_changed') return
+    await act(async () => {
+      await api.reattachBlendRecoveryInputs(job.id, clipA, clipB)
+      await retryJobRecovery(job.id)
+    })
+  }
+
   return (
     <div className="flex-1 overflow-y-auto p-3 [&_button]:min-h-11 [&_button]:min-w-11 [&_input:not([type=checkbox])]:min-h-11 [&_summary]:min-h-11 md:p-4 md:[&_button]:min-h-0 md:[&_button]:min-w-0 md:[&_input:not([type=checkbox])]:min-h-0 md:[&_summary]:min-h-0">
       <div className="mx-auto max-w-4xl space-y-3">
@@ -2328,6 +2404,7 @@ function QueuePanel({
                 onDismiss={() => onDismiss(job.id)}
                 onToggleLog={() => void toggleLog(effectiveJob)}
                 onRecoveryAction={action => recover(job, action)}
+                onBlendReattach={(clipA, clipB) => reattachBlend(job, clipA, clipB)}
                 onReviewPlan={() => void openH3PlanReview(job.id)}
                 logOpen={logJobId === effectiveJob.id}
                 logEvents={logJobId === effectiveJob.id && effectiveJob.logEvents?.length ? effectiveJob.logEvents : logEvents}

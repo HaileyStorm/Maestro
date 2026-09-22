@@ -354,6 +354,7 @@ let _directorPreviewActiveOwnership: (api.DirectorV2OperationScope & {
   claimToken: string
 }) | null = null
 let _directorPipelineLifecycleToken: symbol | null = null
+const _blendSubmissionRequests = new Map<string, symbol>()
 
 function _beginWorkspaceLlmRequest(
   workspace: string,
@@ -1479,6 +1480,7 @@ function _jobStatusDetails(
     recoveryReasonText: status.recovery_reason_text ?? null,
     recoveryActionable: status.recovery_actionable === true,
     recoveryActions: status.recovery_actions || [],
+    recoveryInputRoles: status.recovery_input_roles || [],
     estimateAfterResume: status.estimate_after_resume ?? null,
     logEvents: status.events,
   }
@@ -1620,6 +1622,7 @@ function _queueJobDetails(
     recoveryReasonText: status.recovery_reason_text ?? null,
     recoveryActionable: status.recovery_actionable === true,
     recoveryActions: status.recovery_actions || [],
+    recoveryInputRoles: status.recovery_input_roles || [],
     estimateAfterResume: status.estimate_after_resume ?? null,
   }
 }
@@ -8596,6 +8599,10 @@ export const useStore = create<AppState>((set, get) => ({
       if (!blendSubmissionIsCurrent()) return
       if (!state.blendClipAPath || !state.blendClipBPath) return
       const prompt = (state.params.prompt as string || '').trim()
+      const submissionKey = `${accountIdentityEpoch}:${submissionWorkspace}`
+      if (_blendSubmissionRequests.has(submissionKey)) return
+      const submissionToken = Symbol('blend-submission')
+      _blendSubmissionRequests.set(submissionKey, submissionToken)
 
       const newJob: GenerationJob = {
         id: '', createdAt: Date.now() / 1000,
@@ -8660,6 +8667,10 @@ export const useStore = create<AppState>((set, get) => ({
           isGenerating: s.jobs.some(j => j !== newJob && _isActiveGenerationJob(j)),
         }))
         console.error('Blend failed:', msg)
+      } finally {
+        if (_blendSubmissionRequests.get(submissionKey) === submissionToken) {
+          _blendSubmissionRequests.delete(submissionKey)
+        }
       }
       return
     }

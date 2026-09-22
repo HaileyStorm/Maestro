@@ -105,6 +105,7 @@ async function loadJobPlaceholder() {
                 return context.account_project_access_active === true
               }
               export const fetchJobLog = async () => ({ events: [] })
+              export const reattachBlendRecoveryInputs = async (...args) => record('reattachBlendRecoveryInputs', ...args)
               export const fetchProjectAssets = async project => globalThis.__resourceWaitFetchProjectAssets?.(project) ?? []
               export const projectReferenceJobQualitySummary = (assets, jobId) => globalThis.__resourceWaitSummarizeQuality?.(assets, jobId) ?? null
               export const resumeQueue = async () => record('resumeQueue'), pauseQueueAfterOutput = async value => record('pauseQueueAfterOutput', value), setQueueOutputCount = async (id, value) => record('setQueueOutputCount', id, value), startQueueJobNext = async id => record('startQueueJobNext', id), setQueuePriority = async (id, value) => record('setQueuePriority', id, value), resumeQueueJob = async id => record('resumeQueueJob', id), holdQueueJob = async id => record('holdQueueJob', id)
@@ -1100,6 +1101,51 @@ test('blocked recovery omits an invented zero-of-zero attempt count', async t =>
   assert.match(text, /Choose how to continue/)
   assert.doesNotMatch(text, /Recovery attempt/)
   assert.doesNotMatch(text, /0 of 0/)
+})
+
+test('blocked Blend recovery asks for both original clips before retrying', async t => {
+  const previousStore = globalThis.__resourceWaitStore
+  globalThis.__resourceWaitStore = {
+    accessContext: { machine_controls: false },
+    hostTerms: { minimax_h3_ref2va: { accepted: true } },
+  }
+  t.after(() => { globalThis.__resourceWaitStore = previousStore })
+
+  const { JobPlaceholder } = await loadJobPlaceholder()
+  const tree = JobPlaceholder({
+    job: {
+      id: 'blend-recovery',
+      status: 'queued',
+      recoveryState: 'blocked',
+      recoveryBlocked: true,
+      recoveryReason: 'input_missing_or_changed',
+      recoveryReasonText: 'A required input is missing or changed',
+      recoveryActions: ['retry'],
+      recoveryInputRoles: ['clip_a', 'clip_b'],
+      progress: 0,
+      step: 0,
+      totalSteps: 0,
+      phase: '',
+      message: '',
+      outputFiles: [],
+      error: null,
+    },
+    canManageGeneration: true,
+    onStop() {},
+    onDismiss() {},
+  })
+  const elements = flattenElements(tree)
+  const text = elementText(tree)
+  assert.match(text, /Select the original Clip A and Clip B again/)
+  assert.match(text, /Original Clip A/)
+  assert.match(text, /Original Clip B/)
+  assert.equal(elements.filter(element => element.type === 'input' && element.props.type === 'file').length, 2)
+  const reattach = elements.find(element => (
+    element.type === 'button' && elementText(element) === 'Reattach both and retry'
+  ))
+  assert.ok(reattach)
+  assert.equal(reattach.props.disabled, true)
+  assert.doesNotMatch(text, /Retry recovery/)
 })
 
 test('project recovery follows active account access while retaining legacy unlock copy', async t => {

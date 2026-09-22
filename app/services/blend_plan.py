@@ -306,9 +306,19 @@ def rewrite_blend_sidecar(
         clean_params = dict(original_params)
         source_filenames = {}
         for role, key in (("clip_a", "_blend_clip_a"), ("clip_b", "_blend_clip_b")):
+            original_name = clean_params.pop(
+                f"_blend_original_{role}_name", None,
+            )
             source_path = clean_params.pop(key, None)
             if isinstance(source_path, str) and source_path:
-                source_filenames[role] = {"filename": os.path.basename(source_path)}
+                filename = os.path.basename(source_path)
+                if (
+                    isinstance(original_name, str)
+                    and original_name
+                    and os.path.basename(original_name) == original_name
+                ):
+                    filename = original_name
+                source_filenames[role] = {"filename": filename}
                 changed_params[key] = (source_path, None)
         for key, value in list(clean_params.items()):
             relation = _temp_path_relation(value, temp_dir)

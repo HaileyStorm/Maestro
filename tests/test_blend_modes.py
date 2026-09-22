@@ -296,6 +296,7 @@ class TestBlendPlans(unittest.TestCase):
                         "/media/source.png",
                     ],
                     "_blend_clip_a": "/media/source-a.mp4",
+                    "_blend_original_clip_a_name": "original-a.mov",
                     "prompt": "keep this prompt",
                 },
                 "upload_filenames": {
@@ -317,8 +318,9 @@ class TestBlendPlans(unittest.TestCase):
         self.assertNotIn("_blend_clip_a", rewritten["params"])
         self.assertEqual(
             rewritten["blend_contract"]["sources"]["clip_a"],
-            {"filename": "source-a.mp4"},
+            {"filename": "original-a.mov"},
         )
+        self.assertNotIn("_blend_original_clip_a_name", rewritten["params"])
         self.assertNotIn("/media/", json.dumps(rewritten["blend_contract"]))
         self.assertNotIn("image_start", rewritten["upload_filenames"])
         self.assertEqual(rewritten["upload_filenames"]["image_refs"], ["source.png"])

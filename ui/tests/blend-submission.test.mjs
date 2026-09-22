@@ -8,7 +8,10 @@ const bundle = build({
 }).then(result => result.outputFiles[0].text)
 let realm = 0
 
-async function submitBlend(mode, transition, overlap, { switchWorkspaceWhilePending = false } = {}) {
+async function submitBlend(mode, transition, overlap, {
+  switchWorkspaceWhilePending = false,
+  duplicateWhilePending = false,
+} = {}) {
   const names = ['fetch', 'window', 'document', 'localStorage', 'sessionStorage']
   const originals = Object.fromEntries(names.map(name => [name, globalThis[name]]))
   const storage = () => {
@@ -18,7 +21,7 @@ async function submitBlend(mode, transition, overlap, { switchWorkspaceWhilePend
   const requests = []
   let pollCount = 0
   let releaseResponse = () => {}
-  const responseGate = switchWorkspaceWhilePending
+  const responseGate = switchWorkspaceWhilePending || duplicateWhilePending
     ? new Promise(resolve => { releaseResponse = resolve })
     : Promise.resolve()
   globalThis.localStorage = storage()
@@ -50,12 +53,20 @@ async function submitBlend(mode, transition, overlap, { switchWorkspaceWhilePend
     useStore.getState().setBlendTransitionSec(transition)
     useStore.getState().setBlendOverlapSec(overlap)
     const submission = useStore.getState().startGeneration('queue')
+    let duplicateSubmission = Promise.resolve()
+    if (duplicateWhilePending) {
+      assert.equal(requests.length, 1)
+      duplicateSubmission = useStore.getState().startGeneration('queue')
+      assert.equal(requests.length, 1)
+      releaseResponse()
+    }
     if (switchWorkspaceWhilePending) {
       assert.equal(requests.length, 1)
       useStore.setState({ activeWorkspace: 'blend-other' })
       releaseResponse()
     }
     await submission
+    await duplicateSubmission
     assert.equal(requests.length, 1)
     assert.equal(requests[0].workspace, 'blend-test')
     assert.equal(requests[0].seed, 71)
@@ -99,4 +110,8 @@ test('Overlap keeps its selected trim duration when Insert has a different durat
 
 test('Blend discards a delayed submission result after the active project changes', async () => {
   await submitBlend('insert', 7, 2, { switchWorkspaceWhilePending: true })
+})
+
+test('Blend accepts only one submission while the same project request is pending', async () => {
+  await submitBlend('insert', 7, 2, { duplicateWhilePending: true })
 })

@@ -5058,6 +5058,10 @@ def _queue_recovery_input_descriptors(job: dict, owner_digest: str) -> list[dict
     out_dir = os.path.realpath(str(job.get("out_dir") or ""))
     uploads = os.path.realpath(os.path.join(_app_dir, "uploads"))
     audio_uploads = os.path.realpath(os.path.join(_app_dir, "uploads", "audio"))
+    recovery_uploads = os.path.realpath(
+        os.path.join(_app_dir, "uploads", ".maestro-recovery")
+    )
+    job_id = str(job.get("id") or "")
     descriptors = []
     for field, path in _queue_recovery_file_values(params):
         resolved = os.path.realpath(path)
@@ -5069,7 +5073,40 @@ def _queue_recovery_input_descriptors(job: dict, owner_digest: str) -> list[dict
             "size": size,
         }
         parent = os.path.realpath(os.path.dirname(resolved))
-        if parent in {uploads, audio_uploads}:
+        recovery_relative = ""
+        try:
+            if os.path.commonpath([resolved, recovery_uploads]) == recovery_uploads:
+                recovery_relative = os.path.relpath(resolved, recovery_uploads)
+        except ValueError:
+            recovery_relative = ""
+        recovery_parts = recovery_relative.split(os.sep) if recovery_relative else []
+        if (
+            len(recovery_parts) == 2
+            and job_id
+            and recovery_parts[0].startswith(f"{job_id}-")
+        ):
+            access = read_upload_access_sidecar(resolved)
+            if not isinstance(access, dict):
+                raise QueueRecoveryRuntimeError(
+                    "A recovery upload is missing owner evidence."
+                )
+            access_path = f"{resolved}.access.json"
+            sidecar_size, sidecar_digest = _recovery_sha256_file(access_path)
+            access_owner = owner_principal_digest(
+                _session_secret(), str(access.get("owner_session_id") or ""),
+            )
+            if not hmac.compare_digest(access_owner, owner_digest):
+                raise QueueRecoveryRuntimeError(
+                    "A recovery upload no longer belongs to this job owner."
+                )
+            descriptor.update({
+                "scope": "recovery_upload",
+                "recovery_job_id": job_id,
+                "sidecar_path": access_path,
+                "sidecar_sha256": sidecar_digest,
+                "sidecar_size": sidecar_size,
+            })
+        elif parent in {uploads, audio_uploads}:
             access = read_upload_access_sidecar(resolved)
             if not isinstance(access, dict):
                 raise QueueRecoveryRuntimeError(
@@ -5134,6 +5171,30 @@ def _queue_recovery_manifest_validator(
                 else os.path.join(_app_dir, "uploads")
             )
             if os.path.realpath(os.path.dirname(path)) != root:
+                return False
+            access = read_upload_access_sidecar(path)
+            if not isinstance(access, dict):
+                return False
+            candidate_owner = owner_principal_digest(
+                _session_secret(), str(access.get("owner_session_id") or ""),
+            )
+            if not hmac.compare_digest(candidate_owner, owner_digest):
+                return False
+        elif scope == "recovery_upload":
+            recovery_root = os.path.realpath(
+                os.path.join(_app_dir, "uploads", ".maestro-recovery")
+            )
+            relative = os.path.relpath(path, recovery_root)
+            parts = relative.split(os.sep)
+            recovery_job_id = str(descriptor.get("recovery_job_id") or "")
+            if (
+                len(parts) != 2
+                or not recovery_job_id
+                or not parts[0].startswith(f"{recovery_job_id}-")
+                or os.path.commonpath([path, recovery_root]) != recovery_root
+                or os.path.islink(path)
+                or os.path.islink(os.path.dirname(path))
+            ):
                 return False
             access = read_upload_access_sidecar(path)
             if not isinstance(access, dict):
@@ -38020,8 +38081,6 @@ def _public_director_recovery_metadata(pipeline: dict) -> dict:
         "recovery_reason_text": reason_text,
         "recovery_actions": actions,
     }
-
-
 def _saved_pipeline_live_recovery_overlay(pid: str) -> dict:
     """Overlay only bounded live recovery facts on authorized saved state."""
     from services.director_pipeline import get_pipeline
@@ -64811,6 +64870,12 @@ def _public_queue_recovery_metadata(job: dict) -> dict:
         "recovery_actionable": bool(actions),
         "recovery_actions": actions,
     }
+    if (
+        blocked
+        and reason == "input_missing_or_changed"
+        and job.get("kind") == "studio_blend"
+    ):
+        public["recovery_input_roles"] = ["clip_a", "clip_b"]
     finality = job.get("_recovery_final_adoption")
     if isinstance(finality, dict):
         finality_state = str(finality.get("state") or "")
@@ -65137,11 +65202,20 @@ def cancel_job(job_id: str, request: Request, response: Response):
             raise HTTPException(status_code=404, detail="Job not found")
         return {"status": status["status"], "was_running": was_running}
 
+    cleanup_blocked_blend = bool(
+        job.get("kind") == "studio_blend"
+        and str(job.get("recovery_state") or "") == "blocked"
+        and bool(job.get("queue_held"))
+    )
     result = request_cancel(
         job,
         job_id=job_id,
         active_states=_active_gen_states,
     )
+    if cleanup_blocked_blend:
+        _cleanup_blend_recovery_stage(
+            job.get("params") if isinstance(job.get("params"), dict) else {}
+        )
     # Cancellation is already the durable terminal winner before touching the
     # process. Abort only the exact CPU-runtime generation/attempt bound to
     # this job; stale tokens can never terminate a replacement request.
@@ -66653,6 +66727,471 @@ def resume_held_job(job_id: str, request: Request, response: Response):
             detail="This job has no pending or active hold",
         )
     return {"job_id": job_id, "held": False, "hold_after_output": False}
+
+
+def _rebuild_blend_recovery_params(
+    source_params: dict,
+    *,
+    clip_a_path: str,
+    clip_b_path: str,
+    stage_dir: str,
+    owner_session_id: str,
+) -> dict:
+    """Recreate only server-derived Blend inputs from exact source bytes."""
+    import numpy as np
+    from PIL import Image as PILImage
+    from services.blend_plan import (
+        BLEND_IMAGE_EXTENSIONS,
+        BLEND_VIDEO_EXTENSIONS,
+        build_blend_plan,
+        resolve_blend_metadata,
+    )
+
+    params = copy.deepcopy(source_params)
+    try:
+        metadata = resolve_blend_metadata(params)
+        mode = str(metadata["mode"])
+        fps = float(
+            metadata["fps"]
+            if metadata["fps"] is not None
+            else params["_blend_fps"]
+        )
+        duration = float(metadata["duration_sec"])
+        transition_frames = int(params["video_length"])
+        out_w = int(params["_blend_out_w"])
+        out_h = int(params["_blend_out_h"])
+        prefix_seconds = float(params.get("_blend_motion_prefix_sec", 0.0))
+        suffix_seconds = float(params.get("_blend_motion_suffix_sec", 0.0))
+    except (KeyError, TypeError, ValueError, OverflowError):
+        raise QueueRecoveryRuntimeError("Blend recovery geometry is invalid.") from None
+    if (
+        not all(math.isfinite(value) for value in (fps, duration, prefix_seconds, suffix_seconds))
+        or fps <= 0
+        or duration <= 0
+        or not 1 <= transition_frames <= 10000
+        or out_w <= 0
+        or out_h <= 0
+        or prefix_seconds < 0
+        or suffix_seconds < 0
+    ):
+        raise QueueRecoveryRuntimeError("Blend recovery geometry is invalid.")
+    if not metadata["legacy"]:
+        expected_plan = build_blend_plan(
+            mode, params["_blend_requested_duration_sec"], fps,
+        )
+        if transition_frames != expected_plan["transition_frames"]:
+            raise QueueRecoveryRuntimeError(
+                "Blend recovery frame lattice is invalid."
+            )
+
+    def probe(path: str) -> dict:
+        extension = os.path.splitext(path)[1].lower()
+        if extension in BLEND_VIDEO_EXTENSIONS:
+            import decord
+            reader = decord.VideoReader(path)
+            frame_count = len(reader)
+            if frame_count <= 0:
+                raise QueueRecoveryRuntimeError("A Blend source has no frames.")
+            source_fps = float(reader.get_avg_fps())
+            if not math.isfinite(source_fps) or source_fps <= 0:
+                raise QueueRecoveryRuntimeError("A Blend source frame rate is invalid.")
+            height, width = reader[0].shape[:2]
+            return {
+                "video": True, "fps": source_fps, "frames": frame_count,
+                "h": int(height), "w": int(width), "reader": reader,
+            }
+        if extension not in BLEND_IMAGE_EXTENSIONS:
+            raise QueueRecoveryRuntimeError("A Blend source format is unsupported.")
+        with PILImage.open(path) as opened:
+            image = opened.convert("RGB")
+        return {
+            "video": False, "fps": 24.0, "frames": 1,
+            "h": image.size[1], "w": image.size[0], "image": image,
+        }
+
+    info_a = probe(clip_a_path)
+    info_b = probe(clip_b_path)
+    if (
+        (info_a["w"] // 32) * 32 != out_w
+        or (info_a["h"] // 32) * 32 != out_h
+        or not math.isclose(float(info_a["fps"]), fps, rel_tol=1e-5, abs_tol=1e-5)
+    ):
+        raise QueueRecoveryRuntimeError("Clip A no longer matches the saved Blend geometry.")
+
+    if mode == "insert":
+        raw_a = [
+            info_a["reader"][info_a["frames"] - 1].asnumpy()
+            if info_a["video"] else np.array(info_a["image"])
+        ]
+        raw_b = [
+            info_b["reader"][0].asnumpy()
+            if info_b["video"] else np.array(info_b["image"])
+        ]
+    else:
+        if info_a["video"]:
+            count_a = max(1, int(round(duration * info_a["fps"])))
+            start_a = max(0, info_a["frames"] - count_a)
+            raw_a = [
+                info_a["reader"][index].asnumpy()
+                for index in range(start_a, info_a["frames"])
+            ]
+        else:
+            raw_a = [np.array(info_a["image"])]
+        if info_b["video"]:
+            count_b = max(1, int(round(duration * info_b["fps"])))
+            raw_b = [
+                info_b["reader"][index].asnumpy()
+                for index in range(min(count_b, info_b["frames"]))
+            ]
+        else:
+            raw_b = [np.array(info_b["image"])]
+
+    def resample(frames: list, target: int) -> list:
+        resized = []
+        for frame in frames:
+            if frame.shape[0] != out_h or frame.shape[1] != out_w:
+                frame = np.array(PILImage.fromarray(frame).resize(
+                    (out_w, out_h), PILImage.Resampling.LANCZOS,
+                ))
+            resized.append(frame)
+        indices = np.linspace(0, len(resized) - 1, target).astype(int)
+        return [resized[index] for index in indices]
+
+    frames_a = resample(raw_a, transition_frames)
+    frames_b = resample(raw_b, transition_frames)
+    for info in (info_a, info_b):
+        info.pop("reader", None)
+
+    def write_video(path: str, frames: list) -> None:
+        import imageio
+        writer = imageio.get_writer(path, fps=fps, codec="libx264", quality=9)
+        try:
+            for frame in frames:
+                writer.append_data(frame)
+        finally:
+            writer.close()
+
+    generated_paths = []
+    b_end_path = os.path.join(stage_dir, "b_end.png")
+    PILImage.fromarray(frames_b[-1]).save(b_end_path)
+    generated_paths.append(b_end_path)
+
+    prefix_frames = int(round(prefix_seconds * fps))
+    suffix_frames = int(round(suffix_seconds * fps))
+    for key in ("image_start", "image_end", "video_source", "video_end", "image_refs"):
+        params.pop(key, None)
+    params["image_end"] = b_end_path
+    if prefix_frames > 0:
+        if prefix_frames > len(frames_a) - 2:
+            raise QueueRecoveryRuntimeError("Blend recovery motion prefix is invalid.")
+        video_source = os.path.join(stage_dir, "motion_prefix.mp4")
+        write_video(video_source, frames_a[:prefix_frames])
+        generated_paths.append(video_source)
+        params["video_source"] = video_source
+        params["image_prompt_type"] = "VE"
+    else:
+        image_start = os.path.join(stage_dir, "a_start.png")
+        PILImage.fromarray(frames_a[0]).save(image_start)
+        generated_paths.append(image_start)
+        params["image_start"] = image_start
+        params["image_prompt_type"] = "SE"
+    if suffix_frames > 0:
+        if suffix_frames > len(frames_b) - 1:
+            raise QueueRecoveryRuntimeError("Blend recovery motion suffix is invalid.")
+        video_end = os.path.join(stage_dir, "motion_suffix.mp4")
+        write_video(video_end, frames_b[-suffix_frames:])
+        generated_paths.append(video_end)
+        params["video_end"] = video_end
+
+    prior_refs = source_params.get("image_refs")
+    prior_refs = prior_refs if isinstance(prior_refs, list) else []
+    if len(prior_refs) % 2:
+        raise QueueRecoveryRuntimeError("Blend recovery anchors are invalid.")
+    anchor_count = len(prior_refs) // 2
+    if anchor_count > max(0, transition_frames - 2):
+        raise QueueRecoveryRuntimeError("Blend recovery anchors are invalid.")
+    refs = []
+    positions = []
+    for index in range(1, anchor_count + 1):
+        path = os.path.join(stage_dir, f"a_hint_{index:02d}.png")
+        PILImage.fromarray(frames_a[index]).save(path)
+        generated_paths.append(path)
+        refs.append(path)
+        positions.append(index + 1)
+    for index in range(1, anchor_count + 1):
+        path = os.path.join(stage_dir, f"b_hint_{index:02d}.png")
+        PILImage.fromarray(frames_b[-1 - index]).save(path)
+        generated_paths.append(path)
+        refs.append(path)
+        positions.append(transition_frames - index)
+    if refs:
+        params["image_refs"] = refs
+        params["frames_positions"] = " ".join(str(position) for position in positions)
+        params["video_prompt_type"] = "KFI"
+    else:
+        params.pop("frames_positions", None)
+        params.pop("image_refs", None)
+
+    params.update({
+        "_blend_clip_a": clip_a_path,
+        "_blend_clip_b": clip_b_path,
+        "_blend_temp_dir": stage_dir,
+        "_blend_mode": mode,
+    })
+    for path in (clip_a_path, clip_b_path, *generated_paths):
+        write_upload_access_sidecar(path, owner_session_id, private=True)
+    return params
+
+
+def _cleanup_blend_recovery_stage(params: Mapping[str, Any]) -> None:
+    """Remove one private recovery stage without following outside paths."""
+    import shutil
+
+    candidate = str(params.get("_blend_temp_dir") or "")
+    recovery_root = os.path.realpath(
+        os.path.join(_app_dir, "uploads", ".maestro-recovery")
+    )
+    if not candidate:
+        return
+    resolved = os.path.realpath(candidate)
+    try:
+        contained = (
+            os.path.commonpath([resolved, recovery_root]) == recovery_root
+        )
+    except ValueError:
+        contained = False
+    if (
+        not contained
+        or os.path.dirname(resolved) != recovery_root
+        or os.path.islink(candidate)
+        or not os.path.isdir(candidate)
+    ):
+        return
+    shutil.rmtree(candidate, ignore_errors=True)
+
+
+@api.post("/api/v1/queue/{job_id}/blend-reattach")
+async def reattach_blend_recovery_inputs(
+    job_id: str,
+    request: Request,
+    response: Response,
+    clip_a: UploadFile = File(...),
+    clip_b: UploadFile = File(...),
+):
+    """Rebind exact original Blend bytes and reseal one immutable revision."""
+    _set_recovery_no_store(response)
+    _require_upload_content_access(request)
+    with _queue_recovery_checkpoint_lock:
+        preliminary = _require_owned_job(job_id, request)
+        workspace = str(preliminary.get("workspace") or "default")
+    with _reserve_workspace_operations(workspace):
+        return await _reattach_blend_recovery_inputs_reserved(
+            job_id=job_id,
+            workspace=workspace,
+            request=request,
+            clip_a=clip_a,
+            clip_b=clip_b,
+        )
+
+
+async def _reattach_blend_recovery_inputs_reserved(
+    *,
+    job_id: str,
+    workspace: str,
+    request: Request,
+    clip_a: UploadFile,
+    clip_b: UploadFile,
+) -> dict:
+    """Run one reattachment while its existing project cannot be deleted."""
+    import shutil
+
+    stage_dir = ""
+    pointer = None
+    with _queue_recovery_checkpoint_lock:
+        job = _require_owned_job(job_id, request)
+        if (
+            job.get("kind") != "studio_blend"
+            or str(job.get("recovery_state") or "") != "blocked"
+            or _queue_recovery_reason_code(job) != "input_missing_or_changed"
+            or str(job.get("status") or "") in {"cancelled", "completed"}
+            or is_cancel_requested(job)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="This Blend job is not waiting for source reattachment",
+            )
+        if str(job.get("workspace") or "default") != workspace:
+            raise HTTPException(status_code=409, detail="The recovery project changed")
+        project_dir = _require_project_access(
+            request,
+            workspace,
+            existing_only=True,
+            permission="project.generate",
+        )
+        request_owner = owner_principal_digest(
+            _session_secret(), request.state.maestro_session_id,
+        )
+        if not hmac.compare_digest(
+            request_owner, str(job.get("_recovery_owner_digest") or ""),
+        ):
+            raise HTTPException(status_code=404, detail="Job not found")
+        try:
+            project_digest = _queue_recovery_existing_project_identity(project_dir)
+        except (OSError, ValueError, QueueRecoveryAdapterError):
+            raise HTTPException(status_code=409, detail="The recovery project changed") from None
+        if not hmac.compare_digest(
+            project_digest, str(job.get("_recovery_project_digest") or ""),
+        ):
+            raise HTTPException(status_code=409, detail="The recovery project changed")
+        try:
+            manifest = load_request_manifest(
+                project_dir,
+                job.get("_recovery_manifest_pointer") or {},
+                expected_job_id=job_id,
+            )
+        except QueueRecoveryRuntimeError as error:
+            raise HTTPException(
+                status_code=409, detail="The saved Blend request changed",
+            ) from error
+        descriptors = {
+            str(item.get("field") or ""): item
+            for item in manifest.get("inputs") or []
+            if isinstance(item, dict)
+        }
+        expected = {
+            "clip_a": descriptors.get("_blend_clip_a:0"),
+            "clip_b": descriptors.get("_blend_clip_b:0"),
+        }
+        if any(not isinstance(item, dict) for item in expected.values()):
+            raise HTTPException(status_code=409, detail="The saved Blend sources are incomplete")
+        captured_pointer = dict(job.get("_recovery_manifest_pointer") or {})
+
+    recovery_root = os.path.join(_app_dir, "uploads", ".maestro-recovery")
+    os.makedirs(recovery_root, mode=0o700, exist_ok=True)
+    recovery_root_info = os.lstat(recovery_root)
+    if not stat.S_ISDIR(recovery_root_info.st_mode) or stat.S_ISLNK(
+        recovery_root_info.st_mode
+    ):
+        raise HTTPException(status_code=409, detail="Blend recovery storage is unsafe")
+    os.chmod(recovery_root, 0o700)
+    stage_dir = os.path.join(recovery_root, f"{job_id}-{uuid.uuid4().hex}")
+    os.mkdir(stage_dir, mode=0o700)
+
+    async def save_exact(role: str, upload: UploadFile) -> str:
+        descriptor = expected[role]
+        size = descriptor.get("size")
+        digest = str(descriptor.get("sha256") or "")
+        if type(size) is not int or size < 1 or size > MAX_IMAGE_UPLOAD_BYTES:
+            raise HTTPException(status_code=409, detail="The saved Blend source size is invalid")
+        content = await upload.read(size + 1)
+        if len(content) != size or not hmac.compare_digest(
+            hashlib.sha256(content).hexdigest(), digest,
+        ):
+            label = "Clip A" if role == "clip_a" else "Clip B"
+            raise HTTPException(
+                status_code=409,
+                detail=f"{label} does not match the original source",
+            )
+        extension = os.path.splitext(str(descriptor.get("path") or ""))[1].lower()
+        from services.blend_plan import BLEND_IMAGE_EXTENSIONS, BLEND_VIDEO_EXTENSIONS
+        if extension not in BLEND_IMAGE_EXTENSIONS | BLEND_VIDEO_EXTENSIONS:
+            raise HTTPException(status_code=409, detail="The saved Blend source format is invalid")
+        path = os.path.join(stage_dir, f"{role}{extension}")
+        with open(path, "xb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        return path
+
+    try:
+        clip_a_path = await save_exact("clip_a", clip_a)
+        clip_b_path = await save_exact("clip_b", clip_b)
+        rebuilt = _rebuild_blend_recovery_params(
+            dict(manifest["params"]),
+            clip_a_path=clip_a_path,
+            clip_b_path=clip_b_path,
+            stage_dir=stage_dir,
+            owner_session_id=request.state.maestro_session_id,
+        )
+        for role in ("clip_a", "clip_b"):
+            original_key = f"_blend_original_{role}_name"
+            original_name = str(manifest["params"].get(original_key) or "")
+            if not original_name or os.path.basename(original_name) != original_name:
+                original_name = os.path.basename(
+                    str(expected[role].get("path") or "")
+                )
+            rebuilt[original_key] = original_name
+        replacement_job = {**job, "params": rebuilt}
+        replacement_inputs = _queue_recovery_input_descriptors(
+            replacement_job, request_owner,
+        )
+        pointer = write_sealed_request_manifest(
+            project_dir,
+            job_id=job_id,
+            params=rebuilt,
+            inputs=replacement_inputs,
+        )
+        with _queue_recovery_checkpoint_lock:
+            current = _require_owned_job(job_id, request)
+            current_project_dir = _require_project_access(
+                request,
+                workspace,
+                existing_only=True,
+                permission="project.generate",
+            )
+            current_pointer = dict(current.get("_recovery_manifest_pointer") or {})
+            try:
+                current_project_digest = _queue_recovery_existing_project_identity(
+                    current_project_dir,
+                )
+            except (OSError, ValueError, QueueRecoveryAdapterError):
+                current_project_digest = ""
+            if (
+                current is not job
+                or os.path.realpath(current_project_dir) != os.path.realpath(project_dir)
+                or current_pointer != captured_pointer
+                or not hmac.compare_digest(current_project_digest, project_digest)
+                or current.get("kind") != "studio_blend"
+                or str(current.get("recovery_state") or "") != "blocked"
+                or _queue_recovery_reason_code(current) != "input_missing_or_changed"
+                or str(current.get("status") or "") in {"cancelled", "completed"}
+                or is_cancel_requested(current)
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="This Blend recovery changed before reattachment finished",
+                )
+            cursor = copy.deepcopy(current.get("recovery_cursor") or {})
+            history = list(cursor.get("request_manifest_history") or [])
+            if captured_pointer and captured_pointer not in history:
+                history.append(captured_pointer)
+            cursor["request_manifest_history"] = history[-8:]
+            committed = block_generation_recovery(
+                current,
+                request_manifest=pointer,
+                params=rebuilt,
+                kind="studio_blend",
+                recovery_cursor=cursor,
+                _recovery_manifest_pointer=dict(pointer),
+                _recovery_reason_code="input_missing_or_changed",
+                queue_held=True,
+                recovery_state="blocked",
+                reruns_denoise=True,
+                message="Blend sources reattached; retry recovery when ready",
+            )
+            if not committed:
+                raise QueueRecoveryRuntimeError("Blend recovery state changed.")
+    except Exception:
+        if pointer is not None:
+            remove_request_manifest(project_dir, pointer)
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        raise
+    _cleanup_blend_recovery_stage(manifest["params"])
+    return {
+        "job_id": job_id,
+        "reattached": ["clip_a", "clip_b"],
+        "recovery_state": "blocked",
+    }
 
 
 def _resume_recovered_job(

@@ -1212,6 +1212,7 @@ export interface GenerationJob {
   recoveryReasonText?: string | null
   recoveryActionable?: boolean
   recoveryActions?: import('../api/client').QueueRecoveryAction[]
+  recoveryInputRoles?: Array<'clip_a' | 'clip_b'>
   /** Frozen estimate shown only as work expected after a safe resume. */
   estimateAfterResume?: H3PerformanceEstimate | null
   logEvents?: import('../api/client').JobLogEvent[]

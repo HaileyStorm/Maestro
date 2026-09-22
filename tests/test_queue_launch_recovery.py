@@ -6223,6 +6223,15 @@ class QueueLaunchWiringTests(unittest.TestCase):
             "_recovery_reason_code": "project_missing_or_recreated",
         })
         self.assertEqual(missing["recovery_actions"], [])
+
+        blend = public({
+            "kind": "studio_blend",
+            "status": "queued",
+            "recovery_state": "blocked",
+            "recovery_attempt": 1,
+            "_recovery_reason_code": "input_missing_or_changed",
+        })
+        self.assertEqual(blend["recovery_input_roles"], ["clip_a", "clip_b"])
         preparation = public({
             "recovery_state": "blocked_preparation",
             "recovery_attempt": 1,
@@ -6232,6 +6241,89 @@ class QueueLaunchWiringTests(unittest.TestCase):
             preparation["recovery_reason"], "preparation_must_resubmit",
         )
         self.assertEqual(preparation["recovery_actions"], [])
+
+    def test_blend_recovery_reattach_is_exact_owned_and_immutable(self):
+        endpoint = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "reattach_blend_recovery_inputs"),
+        )
+        reserved = ast.get_source_segment(
+            self.launch_source,
+            _function(self.launch, "_reattach_blend_recovery_inputs_reserved"),
+        )
+        implementation = endpoint + reserved
+        for required in (
+            "_require_owned_job", "_require_project_access",
+            "hmac.compare_digest", "hashlib.sha256", "is_cancel_requested",
+            "write_sealed_request_manifest", "request_manifest_history",
+            "block_generation_recovery", "_reserve_workspace_operations",
+            "existing_only=True", 'permission="project.generate"',
+        ):
+            self.assertIn(required, implementation)
+        self.assertGreaterEqual(implementation.count('permission="project.generate"'), 2)
+        self.assertNotIn("upload.filename", implementation)
+        self.assertIn('job.get("kind") != "studio_blend"', implementation)
+        self.assertIn('"_blend_clip_a:0"', implementation)
+        self.assertIn('"_blend_clip_b:0"', implementation)
+
+    def test_blend_recovery_rebuilds_server_derived_inputs(self):
+        namespace = _isolated_functions(
+            self.launch,
+            ("_rebuild_blend_recovery_params",),
+            {
+                "copy": copy,
+                "math": __import__("math"),
+                "os": os,
+                "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+                "write_upload_access_sidecar": lambda path, owner, private: {
+                    "path": path, "owner": owner, "private": private,
+                },
+            },
+        )
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            clip_a = root / "clip-a.png"
+            clip_b = root / "clip-b.png"
+            stage = root / "stage"
+            stage.mkdir()
+            Image.new("RGB", (64, 64), (255, 0, 0)).save(clip_a)
+            Image.new("RGB", (64, 64), (0, 0, 255)).save(clip_b)
+            rebuilt = namespace["_rebuild_blend_recovery_params"]({
+                "_blend_contract_version": 1,
+                "_blend_mode": "insert",
+                "_blend_fps": 24.0,
+                "_blend_requested_duration_sec": 1.0,
+                "_blend_duration_sec": 25 / 24,
+                "_blend_motion_prefix_sec": 0.0,
+                "_blend_motion_suffix_sec": 0.0,
+                "_blend_out_w": 64,
+                "_blend_out_h": 64,
+                "video_length": 25,
+                "image_prompt_type": "SE",
+            }, clip_a_path=str(clip_a), clip_b_path=str(clip_b),
+                stage_dir=str(stage), owner_session_id="owner-session")
+            self.assertEqual(rebuilt["_blend_clip_a"], str(clip_a))
+            self.assertEqual(rebuilt["_blend_clip_b"], str(clip_b))
+            self.assertEqual(rebuilt["_blend_temp_dir"], str(stage))
+            self.assertTrue(Path(rebuilt["image_start"]).is_file())
+            self.assertTrue(Path(rebuilt["image_end"]).is_file())
+            self.assertNotIn("video_source", rebuilt)
+            self.assertNotIn("video_end", rebuilt)
+
+            legacy = namespace["_rebuild_blend_recovery_params"]({
+                "_blend_mode": "insert",
+                "_blend_fps": 24.0,
+                "_blend_overlap_sec": 1.0,
+                "_blend_motion_prefix_sec": 0.0,
+                "_blend_motion_suffix_sec": 0.0,
+                "_blend_out_w": 64,
+                "_blend_out_h": 64,
+                "video_length": 25,
+                "image_prompt_type": "SE",
+            }, clip_a_path=str(clip_a), clip_b_path=str(clip_b),
+                stage_dir=str(stage), owner_session_id="owner-session")
+            self.assertEqual(legacy["_blend_mode"], "overlap")
 
     def test_failed_retry_projection_and_execution_share_the_guarded_contract(self):
         class Denied(Exception):
