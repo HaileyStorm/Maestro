@@ -51,6 +51,7 @@ async function loadHarness() {
     `],
     ['../Recipes/SaveRecipeDialog', 'export function SaveRecipeDialog() { return null }'],
     ['../../stores/useStore', `
+      export function currentAccountIdentityEpoch() { return 0 }
       export function useStore(selector) { return selector(globalThis.__outputShareStore) }
       useStore.getState = () => globalThis.__outputShareStore
       useStore.setState = () => {}

@@ -1,7 +1,8 @@
 import { useState, useRef, useEffect, useCallback, type CSSProperties, type KeyboardEvent } from 'react'
 import { Play, Pencil, RefreshCw, Copy, Trash2, Check, Combine, Loader2, Heart, ArrowLeftToLine, Download, FolderInput, Scissors, FastForward, BookMarked, EyeOff, Share2, Link2Off } from 'lucide-react'
 import { SaveRecipeDialog } from '../Recipes/SaveRecipeDialog'
-import { useStore } from '../../stores/useStore'
+import { currentAccountIdentityEpoch, useStore } from '../../stores/useStore'
+import { prepareGalleryContinuation, retainContinuationPreview } from '../../lib/galleryContinuation'
 import { createOutputShare, deleteOutputComponents, getUploadUrl, fetchOutputMetadata, getFileUrl, moveOutput, revokeOutputShare, uploadImage } from '../../api/client'
 import type { OutputFile, OutputMetadata } from '../../types'
 import { formatGenerationDuration } from '../../lib/format'
@@ -127,6 +128,12 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onVisible, meas
   const [sentToInput, setSentToInput] = useState(false)
   const [showMoveMenu, setShowMoveMenu] = useState(false)
   const [moving, setMoving] = useState(false)
+  const [continuing, setContinuing] = useState(false)
+  const [continueError, setContinueError] = useState('')
+  const continuationRequest = useRef<AbortController | null>(null)
+  useEffect(() => () => {
+    continuationRequest.current?.abort()
+  }, [file.name, file.workspace, file.revision])
   const privateRevealKey = privatePreviewIdentity(file.workspace, file.name, file.revision)
   const [revealedPrivateKey, setRevealedPrivateKey] = useState(() =>
     file.private && privatePreviewWasRevealed(privateRevealKey) ? privateRevealKey : '',
@@ -576,25 +583,61 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onVisible, meas
   }
 
   const handleContinueFrom = async () => {
-    if (file.type !== 'video') return
-    try {
-      const res = await fetch(getFileUrl(file.name, file.workspace))
-      const blob = await res.blob()
-      const videoFile = new File([blob], file.name, { type: blob.type || 'video/mp4' })
-      const url = URL.createObjectURL(videoFile)
-      const video = document.createElement('video')
-      video.src = url
-      video.onloadedmetadata = async () => {
-        const duration = video.duration && isFinite(video.duration) ? video.duration : 0
-        const uploaded = await uploadImage(videoFile)
-        // Switch sub-mode FIRST: the switch stashes the current sub-mode's
-        // working set and opens Extend's own slate. Setting the source
-        // after keeps it from being wiped by that swap.
-        setParam('image_mode', 3)
-        setContinueVideo(videoFile, uploaded.path, url, duration)
+    if (file.type !== 'video' || continuationRequest.current) return
+    const controller = new AbortController()
+    continuationRequest.current = controller
+    const epoch = currentAccountIdentityEpoch()
+    const captured = useStore.getState()
+    let current = true
+    const unsubscribe = useStore.subscribe(state => {
+      if (currentAccountIdentityEpoch() !== epoch
+        || state.activeWorkspace !== captured.activeWorkspace
+        || state.params !== captured.params
+        || state.generationMode !== captured.generationMode
+        || state.sidebarMode !== captured.sidebarMode
+        || state.continueVideo !== captured.continueVideo) {
+        current = false
+        controller.abort()
       }
+    })
+    setContinuing(true)
+    setContinueError('')
+    try {
+      await prepareGalleryContinuation({
+        sourceUrl: getFileUrl(file.name, file.workspace),
+        filename: file.name,
+        signal: controller.signal,
+        isCurrent: () => current && currentAccountIdentityEpoch() === epoch,
+        upload: uploadImage,
+        commit: (videoFile, path, url, duration) => {
+          unsubscribe()
+          const state = useStore.getState()
+          state.setSidebarMode('studio')
+          state.setGenerationMode('video')
+          setParam('image_mode', 3)
+          setContinueVideo(videoFile, path, url, duration)
+          state.setSidebarOpen(true)
+          retainContinuationPreview(url, () => {
+            const currentState = useStore.getState()
+            if (currentAccountIdentityEpoch() !== epoch) return []
+            // Same-account project switches retain Studio inputs and their previews.
+            return [
+              currentState.continueVideoUrl,
+              ...Object.values(currentState.videoSubModeStash).map(value => value?.continueVideoUrl),
+            ]
+          }, listener => useStore.subscribe(listener))
+        },
+      })
     } catch (e) {
-      console.error('Failed to load video for continuation:', e)
+      if (current && !controller.signal.aborted) {
+        setContinueError(e instanceof Error ? e.message : 'The video could not be opened in Extend.')
+      }
+    } finally {
+      unsubscribe()
+      if (continuationRequest.current === controller) {
+        continuationRequest.current = null
+        setContinuing(false)
+      }
     }
   }
 
@@ -844,13 +887,15 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onVisible, meas
                   </button>
                   <button
                     onClick={handleContinueFrom}
+                    disabled={continuing}
                     type="button"
                     aria-label={`Extend ${file.name} with new content`}
                     className="min-h-11 min-w-11 rounded-lg p-1.5 text-text-secondary transition-colors hover:bg-bg-hover hover:text-accent-blue md:min-h-0 md:min-w-0"
-                    title="Extend this video with new content"
+                    title={continueError || 'Extend this video with new content'}
                   >
-                    <FastForward size={13} />
+                    {continuing ? <Loader2 size={13} className="animate-spin" /> : <FastForward size={13} />}
                   </button>
+                  {continueError && <span role="alert" className="text-xs text-red-400">{continueError}</span>}
                 </>
               )}
               {groupId && (

@@ -269,6 +269,7 @@ async function loadMediaFeedItemHarness() {
     `],
     ['../Recipes/SaveRecipeDialog', 'export function SaveRecipeDialog() { return null }'],
     ['../../stores/useStore', `
+      export function currentAccountIdentityEpoch() { return 0 }
       export function useStore(selector) { return selector(globalThis.__mediaFeedStore) }
       useStore.getState = () => globalThis.__mediaFeedStore
       useStore.setState = () => {}

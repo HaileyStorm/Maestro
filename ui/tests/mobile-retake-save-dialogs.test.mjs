@@ -364,6 +364,7 @@ async function loadMediaFeedItemHarness() {
       export function SaveRecipeDialog(props) { return { type: 'save-recipe-dialog', props } }
     `],
     ['../../stores/useStore', `
+      export function currentAccountIdentityEpoch() { return 0 }
       export function useStore(selector) { return selector(globalThis.__mediaStore) }
     `],
     ['../../api/client', `
