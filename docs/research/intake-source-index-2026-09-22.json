@@ -1,0 +1,2606 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-22",
+  "baseline_commit": "d4dff8442979b6c0559d27b4272462f3c0ade4a7",
+  "scope": "Ten tracked development/research notes plus one ignored owner-observation note. 225 unique URL spellings include aliases and supporting evidence, not distinct products. Historical capture and current implementation reconciliation, not refreshed external-page or GPU acceptance.",
+  "notes": [
+    {
+      "path": "docs/development/feature-wave-2026-08-media-models.md",
+      "sha256": "7e9d6e759da9c2c2faa6367391c368c391dff9c9e4de96d92e269a825d6b598d",
+      "lines": 349
+    },
+    {
+      "path": "docs/development/feature-wave-2026-08.md",
+      "sha256": "9c1a8307f6a1c1ba17656cc75e60cd05615f3f6df08978853228c00e65cf61b8",
+      "lines": 378
+    },
+    {
+      "path": "docs/development/minimax-h3-fast-runtime-research.md",
+      "sha256": "ebfbedc7dc37bdc3bfb1ee070a85e2c7ac9eee92d6f7e372344f7ed8143243bb",
+      "lines": 400
+    },
+    {
+      "path": "docs/research/H3-MOTION-LORA-ACCEPTANCE.md",
+      "sha256": "b03ede7586e04187d0d5a0575ad6f6dbddf5a7a1dc79e8d9e5bc869fd4adcbe2",
+      "lines": 106
+    },
+    {
+      "path": "docs/research/H3-ecosystem-watch-2026-08-18.md",
+      "sha256": "e12b3e804f19088ef0ff1930e14bcda50aa3b78c99ede8cfa7d13ac0ddd19333",
+      "lines": 41
+    },
+    {
+      "path": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+      "sha256": "4198693632d60dd88c14af17bd6f6cd732708b147e801d1d5102fec020e04dee",
+      "lines": 592
+    },
+    {
+      "path": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+      "sha256": "96c99af08a2c20a13b186036a9eb1b61674c8c5025a2f164ef06419860aed28b",
+      "lines": 537
+    },
+    {
+      "path": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+      "sha256": "ebe1bef74c6d5d7fed4d8aab17d0c120ee00c3504ef05e6287508b2d49e835dd",
+      "lines": 388
+    },
+    {
+      "path": "docs/research/H3-workflow-refresh-2026-08-23.md",
+      "sha256": "a477aecd7bc8d4aac6f551fd7826bd9a65af6112fb87ddd10cd35f9ab749540c",
+      "lines": 400
+    },
+    {
+      "path": "docs/research/candidate-intake-2026-08-19.md",
+      "sha256": "d77fb9c3538f0ad3f6a4cb24b4e0587bcd1742677f0b0458ad1fdc79326290e4",
+      "lines": 636
+    },
+    {
+      "path": "docs/development/segment-horizontal-flip-continuity-2026-08-19.md",
+      "sha256": "fed4813077112634afeeb330df2902e0498756ce90a31a9d084471e027a8553a",
+      "lines": 159,
+      "tracking": "ignored historical note",
+      "source_kind": "owner observation; no URL"
+    }
+  ],
+  "url_count": 225,
+  "sources": [
+    {
+      "id": "source-001",
+      "url": "https://api.fxtwitter.com/2/conversation/2092998752332341410",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 519
+        }
+      ]
+    },
+    {
+      "id": "source-002",
+      "url": "https://api.fxtwitter.com/2/conversation/2093165511920046289",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 520
+        }
+      ]
+    },
+    {
+      "id": "source-003",
+      "url": "https://api.fxtwitter.com/2/conversation/2093198730958897335",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 518
+        }
+      ]
+    },
+    {
+      "id": "source-004",
+      "url": "https://api.fxtwitter.com/2/conversation/2093288708359282982",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 522
+        }
+      ]
+    },
+    {
+      "id": "source-005",
+      "url": "https://api.fxtwitter.com/2/conversation/2093304933160526010",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 523
+        }
+      ]
+    },
+    {
+      "id": "source-006",
+      "url": "https://api.fxtwitter.com/2/conversation/2093429094168002757",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 521
+        }
+      ]
+    },
+    {
+      "id": "source-007",
+      "url": "https://arxiv.org/abs/2507.02860",
+      "occurrences": [
+        {
+          "note": "docs/development/minimax-h3-fast-runtime-research.md",
+          "line": 204
+        }
+      ]
+    },
+    {
+      "id": "source-008",
+      "url": "https://arxiv.org/abs/2608.09696",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08.md",
+          "line": 371
+        }
+      ]
+    },
+    {
+      "id": "source-009",
+      "url": "https://civitai.com/models/2719904",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 591
+        }
+      ]
+    },
+    {
+      "id": "source-010",
+      "url": "https://civitai.com/models/2719904/fn-mix-anima-turbo?modelVersionId=3228288",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 59
+        }
+      ]
+    },
+    {
+      "id": "source-011",
+      "url": "https://civitai.red/models/2344781/h3-ltx-23-ltx2-better-nsfw-motion?modelVersionId=3257589",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 505
+        }
+      ]
+    },
+    {
+      "id": "source-012",
+      "url": "https://design.minimax.io",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 55
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 584
+        }
+      ]
+    },
+    {
+      "id": "source-013",
+      "url": "https://docs.comfy.org/built-in-nodes/EasyCache",
+      "occurrences": [
+        {
+          "note": "docs/development/minimax-h3-fast-runtime-research.md",
+          "line": 202
+        }
+      ]
+    },
+    {
+      "id": "source-014",
+      "url": "https://docs.sglang.io/get_started/install.html",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08.md",
+          "line": 348
+        }
+      ]
+    },
+    {
+      "id": "source-015",
+      "url": "https://engturtle.github.io/hermes-memconflict/report/",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08.md",
+          "line": 372
+        }
+      ]
+    },
+    {
+      "id": "source-016",
+      "url": "https://github.com/AIMixer/ComfyUI_MiniMaxH3_Director/tree/a267324a9f88141ff4e4b0e8c1a6ed90b4e45db7",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-workflow-refresh-2026-08-23.md",
+          "line": 386
+        }
+      ]
+    },
+    {
+      "id": "source-017",
+      "url": "https://github.com/BMB12d3/minimax-h3-prompt-composer",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 496
+        }
+      ]
+    },
+    {
+      "id": "source-018",
+      "url": "https://github.com/BMB12d3/minimax-h3-prompt-composer/tree/58a76b31f5e78445c69d873d39c0bb31158cedb8",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 531
+        }
+      ]
+    },
+    {
+      "id": "source-019",
+      "url": "https://github.com/Carasibana/ComfyUI-H3-FaceRefine",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08-media-models.md",
+          "line": 339
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-18.md",
+          "line": 24
+        }
+      ]
+    },
+    {
+      "id": "source-020",
+      "url": "https://github.com/Comfy-Org/ComfyUI/blob/master/comfy_extras/nodes_easycache.py",
+      "occurrences": [
+        {
+          "note": "docs/development/minimax-h3-fast-runtime-research.md",
+          "line": 203
+        }
+      ]
+    },
+    {
+      "id": "source-021",
+      "url": "https://github.com/Comfy-Org/ComfyUI/commit/924743af083c151296cc16f925aeab113b6484e8",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 533
+        }
+      ]
+    },
+    {
+      "id": "source-022",
+      "url": "https://github.com/Comfy-Org/ComfyUI/commit/e01fb4c56b7a88149d469b99cbbfe3223d715054",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-workflow-refresh-2026-08-23.md",
+          "line": 369
+        }
+      ]
+    },
+    {
+      "id": "source-023",
+      "url": "https://github.com/Comfy-Org/ComfyUI/pull/15375",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 298
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 512
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 56
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 585
+        }
+      ]
+    },
+    {
+      "id": "source-024",
+      "url": "https://github.com/Comfy-Org/ComfyUI/pull/15808",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 503
+        }
+      ]
+    },
+    {
+      "id": "source-025",
+      "url": "https://github.com/Comfy-Org/workflow_templates/tree/0e0f4577453136eaa1c0e9d4b700e3e5ce5bb416",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-workflow-refresh-2026-08-23.md",
+          "line": 367
+        }
+      ]
+    },
+    {
+      "id": "source-026",
+      "url": "https://github.com/HerrgottMargott/Herrgotts-H3-Infinite-Continuation-Suite/tree/4b1edd678de7356beebf3761b2532a35e07d0389",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-workflow-refresh-2026-08-23.md",
+          "line": 382
+        }
+      ]
+    },
+    {
+      "id": "source-027",
+      "url": "https://github.com/KellerJordan/modded-nanogpt/pull/315",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08.md",
+          "line": 378
+        }
+      ]
+    },
+    {
+      "id": "source-028",
+      "url": "https://github.com/MiniMax-AI/MiniMax-H3/commit/6da473b48daf91e5aebfb56451f8a0b116348df5",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-workflow-refresh-2026-08-23.md",
+          "line": 361
+        }
+      ]
+    },
+    {
+      "id": "source-029",
+      "url": "https://github.com/MiniMax-AI/MiniMax-H3/tree/597042140567efefd8c4adcfe8124c20f63a3399/skills",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-workflow-refresh-2026-08-23.md",
+          "line": 363
+        }
+      ]
+    },
+    {
+      "id": "source-030",
+      "url": "https://github.com/MiniMax-AI/awesome-minimax-h3-integration/tree/f6ea3b6514ae6c8e4d280638cfa3884124292b56",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-workflow-refresh-2026-08-23.md",
+          "line": 365
+        }
+      ]
+    },
+    {
+      "id": "source-031",
+      "url": "https://github.com/ModelTC/Minimax-H3-Turbo",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-18.md",
+          "line": 25
+        }
+      ]
+    },
+    {
+      "id": "source-032",
+      "url": "https://github.com/NVlabs/Sana/tree/sol-engine",
+      "occurrences": [
+        {
+          "note": "docs/development/minimax-h3-fast-runtime-research.md",
+          "line": 187
+        }
+      ]
+    },
+    {
+      "id": "source-033",
+      "url": "https://github.com/NVlabs/Sana/tree/sol-engine/models/minimax_h3",
+      "occurrences": [
+        {
+          "note": "docs/development/minimax-h3-fast-runtime-research.md",
+          "line": 188
+        }
+      ]
+    },
+    {
+      "id": "source-034",
+      "url": "https://github.com/NVlabs/Sana/tree/sol-engine/techniques/sparse_backends",
+      "occurrences": [
+        {
+          "note": "docs/development/minimax-h3-fast-runtime-research.md",
+          "line": 189
+        }
+      ]
+    },
+    {
+      "id": "source-035",
+      "url": "https://github.com/Nekodificador/ComfyUI-NKD-Preview-Tools",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 542
+        }
+      ]
+    },
+    {
+      "id": "source-036",
+      "url": "https://github.com/Nekodificador/ComfyUI-NKD-VFX-Tools",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 541
+        }
+      ]
+    },
+    {
+      "id": "source-037",
+      "url": "https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context/tree/f80e36bc1d7887a143b12e6645313fd6b9cd2aee",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-workflow-refresh-2026-08-23.md",
+          "line": 384
+        }
+      ]
+    },
+    {
+      "id": "source-038",
+      "url": "https://github.com/NomaDamas/CozyClay",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 502
+        }
+      ]
+    },
+    {
+      "id": "source-039",
+      "url": "https://github.com/PrimeIntellect-ai/prime-agent",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08.md",
+          "line": 375
+        }
+      ]
+    },
+    {
+      "id": "source-040",
+      "url": "https://github.com/PrimeIntellect-ai/prime-agent/issues/1182",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08.md",
+          "line": 376
+        }
+      ]
+    },
+    {
+      "id": "source-041",
+      "url": "https://github.com/QwenLM/Qwen3.8-Flash-Next/tree/513aa6e18a335296fc13e538232a8735b230877d",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 516
+        }
+      ]
+    },
+    {
+      "id": "source-042",
+      "url": "https://github.com/SandAI-org/MAGI-2-preview",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08-media-models.md",
+          "line": 341
+        }
+      ]
+    },
+    {
+      "id": "source-043",
+      "url": "https://github.com/Tr1dae/ComfyUI-MiniMaxH3_LatentUpscaler",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-18.md",
+          "line": 22
+        }
+      ]
+    },
+    {
+      "id": "source-044",
+      "url": "https://github.com/VictorTaelin/OptMem",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08.md",
+          "line": 373
+        }
+      ]
+    },
+    {
+      "id": "source-045",
+      "url": "https://github.com/andrewdidi/minimax-h3-serverless/tree/5d8567df26148c8d6f7477a761875efc4fba4c38",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-workflow-refresh-2026-08-23.md",
+          "line": 394
+        }
+      ]
+    },
+    {
+      "id": "source-046",
+      "url": "https://github.com/calesthio/OpenMontage",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 349
+        }
+      ]
+    },
+    {
+      "id": "source-047",
+      "url": "https://github.com/calesthio/OpenMontage/blob/cd9f3c1f03368be87b140af494914b8ee4e3c7a4/LICENSE",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 81
+        }
+      ]
+    },
+    {
+      "id": "source-048",
+      "url": "https://github.com/calesthio/OpenMontage/issues/493",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 93
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 315
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 365
+        }
+      ]
+    },
+    {
+      "id": "source-049",
+      "url": "https://github.com/calesthio/OpenMontage/issues/526",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 92
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 314
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 364
+        }
+      ]
+    },
+    {
+      "id": "source-050",
+      "url": "https://github.com/calesthio/OpenMontage/issues/528",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 91
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 313
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 363
+        }
+      ]
+    },
+    {
+      "id": "source-051",
+      "url": "https://github.com/calesthio/OpenMontage/issues/542",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 90
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 312
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 362
+        }
+      ]
+    },
+    {
+      "id": "source-052",
+      "url": "https://github.com/calesthio/OpenMontage/tree/cd9f3c1f03368be87b140af494914b8ee4e3c7a4",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 79
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 361
+        }
+      ]
+    },
+    {
+      "id": "source-053",
+      "url": "https://github.com/cosmicstack-labs/lazy-frames",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 599
+        }
+      ]
+    },
+    {
+      "id": "source-054",
+      "url": "https://github.com/cseti007/ComfyUI-CrossViewWarp",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 629
+        }
+      ]
+    },
+    {
+      "id": "source-055",
+      "url": "https://github.com/diffusionstudio/editor",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 219
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 489
+        }
+      ]
+    },
+    {
+      "id": "source-056",
+      "url": "https://github.com/diffusionstudio/editor/blob/main/reference/report.md",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 227
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 502
+        }
+      ]
+    },
+    {
+      "id": "source-057",
+      "url": "https://github.com/diffusionstudio/editor/issues",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 230
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 503
+        }
+      ]
+    },
+    {
+      "id": "source-058",
+      "url": "https://github.com/diffusionstudio/editor/releases/tag/v0.200.0",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 221
+        }
+      ]
+    },
+    {
+      "id": "source-059",
+      "url": "https://github.com/duolahypercho/codex-router",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08.md",
+          "line": 377
+        }
+      ]
+    },
+    {
+      "id": "source-060",
+      "url": "https://github.com/ethanfel/ComfyUI-MiniMax-H3-Edit/tree/98f9467625bc34829da735e3ac1391b9b06bbcc6",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-workflow-refresh-2026-08-23.md",
+          "line": 376
+        }
+      ]
+    },
+    {
+      "id": "source-061",
+      "url": "https://github.com/ethanfel/ComfyUI-MiniMax-H3-Guide/tree/054ccb822864aac57f98c87e66fb13d2e5aa3b7a",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-workflow-refresh-2026-08-23.md",
+          "line": 374
+        }
+      ]
+    },
+    {
+      "id": "source-062",
+      "url": "https://github.com/ethanfel/ComfyUI-MiniMaxH3-Contex-Loop",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 537
+        }
+      ]
+    },
+    {
+      "id": "source-063",
+      "url": "https://github.com/friction2d/friction",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 254
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 509
+        }
+      ]
+    },
+    {
+      "id": "source-064",
+      "url": "https://github.com/hao-ai-lab/FastVideo/issues/1606",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 119
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 500
+        }
+      ]
+    },
+    {
+      "id": "source-065",
+      "url": "https://github.com/huggingface/transformers/commit/fc5c5bde8e656dad91cbf34e61940d984b1c7b91",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 517
+        }
+      ]
+    },
+    {
+      "id": "source-066",
+      "url": "https://github.com/jlucasmcrell/ComfyUI-H3-Multishot",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08-media-models.md",
+          "line": 335
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-18.md",
+          "line": 21
+        }
+      ]
+    },
+    {
+      "id": "source-067",
+      "url": "https://github.com/jlucasmcrell/ComfyUI-H3-Multishot/issues",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08-media-models.md",
+          "line": 337
+        }
+      ]
+    },
+    {
+      "id": "source-068",
+      "url": "https://github.com/karuvanan/MiniMax-H3-Director-Cut-Studio",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 354
+        }
+      ]
+    },
+    {
+      "id": "source-069",
+      "url": "https://github.com/karuvanan/MiniMax-H3-Director-Cut-Studio/commit/e3fa37b78548e918c676309d04c697e61226e98b",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 101
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 366
+        }
+      ]
+    },
+    {
+      "id": "source-070",
+      "url": "https://github.com/kijai/ComfyUI-SolAttn_triton",
+      "occurrences": [
+        {
+          "note": "docs/development/minimax-h3-fast-runtime-research.md",
+          "line": 190
+        }
+      ]
+    },
+    {
+      "id": "source-071",
+      "url": "https://github.com/localai-org/kimodo.cpp",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 539
+        }
+      ]
+    },
+    {
+      "id": "source-072",
+      "url": "https://github.com/lumos675/ComfyUI-OrbitSheets",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 626
+        }
+      ]
+    },
+    {
+      "id": "source-073",
+      "url": "https://github.com/madebyollin/taehv",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08.md",
+          "line": 354
+        }
+      ]
+    },
+    {
+      "id": "source-074",
+      "url": "https://github.com/madebyollin/taehv/issues/24",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08.md",
+          "line": 355
+        }
+      ]
+    },
+    {
+      "id": "source-075",
+      "url": "https://github.com/microsoft/ShadowFrog",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08.md",
+          "line": 374
+        }
+      ]
+    },
+    {
+      "id": "source-076",
+      "url": "https://github.com/midrender/revideo",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 237
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 505
+        }
+      ]
+    },
+    {
+      "id": "source-077",
+      "url": "https://github.com/midrender/revideo/blob/main/README.md",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 239
+        }
+      ]
+    },
+    {
+      "id": "source-078",
+      "url": "https://github.com/midrender/revideo/issues",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 242
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 506
+        }
+      ]
+    },
+    {
+      "id": "source-079",
+      "url": "https://github.com/motion-canvas/motion-canvas",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 244
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 507
+        }
+      ]
+    },
+    {
+      "id": "source-080",
+      "url": "https://github.com/ncounterspecialist/twick",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 248
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 508
+        }
+      ]
+    },
+    {
+      "id": "source-081",
+      "url": "https://github.com/remotion-dev/remotion",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 504
+        }
+      ]
+    },
+    {
+      "id": "source-082",
+      "url": "https://github.com/remotion-dev/remotion/blob/main/LICENSE.md",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 183
+        }
+      ]
+    },
+    {
+      "id": "source-083",
+      "url": "https://github.com/remotion-dev/remotion/issues/9539",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 186
+        }
+      ]
+    },
+    {
+      "id": "source-084",
+      "url": "https://github.com/remotion-dev/remotion/releases/tag/v4.0.518",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 177
+        }
+      ]
+    },
+    {
+      "id": "source-085",
+      "url": "https://github.com/ruashots/ComfyUI-OpenH3-IR/tree/8660988b033d427f346e72fdbcf2d45ede48edbe",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-workflow-refresh-2026-08-23.md",
+          "line": 388
+        }
+      ]
+    },
+    {
+      "id": "source-086",
+      "url": "https://github.com/scraed/LanPaint/tree/32cf848e93971da380d868936e007f5611218bee",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-workflow-refresh-2026-08-23.md",
+          "line": 390
+        }
+      ]
+    },
+    {
+      "id": "source-087",
+      "url": "https://github.com/seitanism/ComfyUI-H3-Motion-Context-MultiRef/tree/87de57ba619297503fa49c9594c0c021d5b0c261",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-workflow-refresh-2026-08-23.md",
+          "line": 380
+        }
+      ]
+    },
+    {
+      "id": "source-088",
+      "url": "https://github.com/sgl-project/sglang",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08.md",
+          "line": 347
+        }
+      ]
+    },
+    {
+      "id": "source-089",
+      "url": "https://github.com/sgl-project/sglang/issues/34954",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08.md",
+          "line": 349
+        }
+      ]
+    },
+    {
+      "id": "source-090",
+      "url": "https://github.com/sgl-project/sglang/issues/34959",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08.md",
+          "line": 350
+        }
+      ]
+    },
+    {
+      "id": "source-091",
+      "url": "https://github.com/thu-ml/SageAttention",
+      "occurrences": [
+        {
+          "note": "docs/development/minimax-h3-fast-runtime-research.md",
+          "line": 178
+        }
+      ]
+    },
+    {
+      "id": "source-092",
+      "url": "https://github.com/tonyd2wild/minimax-h3-local/blob/76abed188f3e7ef210a223ee23a2ce1b005d5c9a/scripts/verify_output.sh",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-workflow-refresh-2026-08-23.md",
+          "line": 392
+        }
+      ]
+    },
+    {
+      "id": "source-093",
+      "url": "https://github.com/tritant/ComfyUI_MiniMax_H3_Extender",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-18.md",
+          "line": 21
+        }
+      ]
+    },
+    {
+      "id": "source-094",
+      "url": "https://github.com/ttulttul/ComfyUI-Minimax-H3-Continuation/tree/e1768d5fdfc6f9519d2090dcf78458c2d9625f80",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-workflow-refresh-2026-08-23.md",
+          "line": 378
+        }
+      ]
+    },
+    {
+      "id": "source-095",
+      "url": "https://github.com/vizart-vj/ComfyUI-MiniMax-H3-LongMedia",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08.md",
+          "line": 356
+        }
+      ]
+    },
+    {
+      "id": "source-096",
+      "url": "https://github.com/vizart-vj/ComfyUI-MiniMax-H3-LongMedia/issues/1",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08.md",
+          "line": 357
+        }
+      ]
+    },
+    {
+      "id": "source-097",
+      "url": "https://github.com/vizart-vj/ComfyUI-MiniMax-H3-LongMedia/issues/2",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08.md",
+          "line": 358
+        }
+      ]
+    },
+    {
+      "id": "source-098",
+      "url": "https://github.com/yichengup/ComfyUI-YCNodes-MiniMax-H3",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 625
+        }
+      ]
+    },
+    {
+      "id": "source-099",
+      "url": "https://github.com/ysharma3501/LuxTTS",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 62
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 596
+        }
+      ]
+    },
+    {
+      "id": "source-100",
+      "url": "https://haoailab.com/blogs/fasth3-preview/",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 107
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 499
+        }
+      ]
+    },
+    {
+      "id": "source-101",
+      "url": "https://huggingface.co/Alissonerdx/CharacterSheet",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08-media-models.md",
+          "line": 329
+        }
+      ]
+    },
+    {
+      "id": "source-102",
+      "url": "https://huggingface.co/Alissonerdx/LTX-Best-Face-ID",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08-media-models.md",
+          "line": 333
+        }
+      ]
+    },
+    {
+      "id": "source-103",
+      "url": "https://huggingface.co/CQdesign/LTX-2.5-CQ-Video-and-Image-Enhancer-LoRAs",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 57
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 587
+        }
+      ]
+    },
+    {
+      "id": "source-104",
+      "url": "https://huggingface.co/Cseti/LTX2.3-22B_IC-LoRA-CrossView-Warp_v2",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 628
+        }
+      ]
+    },
+    {
+      "id": "source-105",
+      "url": "https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 486
+        }
+      ]
+    },
+    {
+      "id": "source-106",
+      "url": "https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA/blob/bcf40ca6f457ed66f8badf13514943e390205fca/LICENSE",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 113
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 498
+        }
+      ]
+    },
+    {
+      "id": "source-107",
+      "url": "https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA/blob/bcf40ca6f457ed66f8badf13514943e390205fca/adapter_manifest.json",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 101
+        }
+      ]
+    },
+    {
+      "id": "source-108",
+      "url": "https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA/discussions/1",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 122
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 501
+        }
+      ]
+    },
+    {
+      "id": "source-109",
+      "url": "https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA/tree/bcf40ca6f457ed66f8badf13514943e390205fca",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 87
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 497
+        }
+      ]
+    },
+    {
+      "id": "source-110",
+      "url": "https://huggingface.co/FastVideo/FastVideo-Minimax-FastH3-Preview-v0.2",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 475
+        }
+      ]
+    },
+    {
+      "id": "source-111",
+      "url": "https://huggingface.co/Inner-Reflections/MiniMax-H3-Looping-Sketch-Anime",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08.md",
+          "line": 365
+        }
+      ]
+    },
+    {
+      "id": "source-112",
+      "url": "https://huggingface.co/Kijai/MiniMax-H3-experimental",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08.md",
+          "line": 362
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-18.md",
+          "line": 31
+        }
+      ]
+    },
+    {
+      "id": "source-113",
+      "url": "https://huggingface.co/LiconStudio/LTX-2.5-Multiple-Subject-Reference",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-18.md",
+          "line": 26
+        }
+      ]
+    },
+    {
+      "id": "source-114",
+      "url": "https://huggingface.co/MATLOWAI/MiniMax-H3-Motion-Adapter",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 535
+        }
+      ]
+    },
+    {
+      "id": "source-115",
+      "url": "https://huggingface.co/MiniMaxAI/MiniMax-H3",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 529
+        }
+      ]
+    },
+    {
+      "id": "source-116",
+      "url": "https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 514
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 375
+        }
+      ]
+    },
+    {
+      "id": "source-117",
+      "url": "https://huggingface.co/MiniMaxAI/MiniMax-Music3",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08-media-models.md",
+          "line": 324
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-18.md",
+          "line": 32
+        }
+      ]
+    },
+    {
+      "id": "source-118",
+      "url": "https://huggingface.co/MiniMaxAI/MiniMax-Music3/discussions",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08-media-models.md",
+          "line": 327
+        }
+      ]
+    },
+    {
+      "id": "source-119",
+      "url": "https://huggingface.co/PoopMan333/H3_Character_Sheet_Generator",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 351
+        }
+      ]
+    },
+    {
+      "id": "source-120",
+      "url": "https://huggingface.co/PoopMan333/H3_Character_Sheet_Generator/tree/ccc9d411b6b7056b43edf2690503e063560a5acd",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 150
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 368
+        }
+      ]
+    },
+    {
+      "id": "source-121",
+      "url": "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/tree/f5d08274bafd880402bd16f5e3e6c514136ec06c",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 515
+        }
+      ]
+    },
+    {
+      "id": "source-122",
+      "url": "https://huggingface.co/SexGod1979/PinkFluffyBunny-MiniMax-H3",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08.md",
+          "line": 366
+        }
+      ]
+    },
+    {
+      "id": "source-123",
+      "url": "https://huggingface.co/YatharthS/LuxTTS",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 597
+        }
+      ]
+    },
+    {
+      "id": "source-124",
+      "url": "https://huggingface.co/alibaba-pai/MiniMax-H3-Acc-LoRAs",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 353
+        }
+      ]
+    },
+    {
+      "id": "source-125",
+      "url": "https://huggingface.co/alibaba-pai/MiniMax-H3-Acc-LoRAs/discussions/1",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 231
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 370
+        }
+      ]
+    },
+    {
+      "id": "source-126",
+      "url": "https://huggingface.co/alibaba-pai/MiniMax-H3-Acc-LoRAs/tree/335001fb9e5455d68a0caa18ec2e319072150328",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 226
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 369
+        }
+      ]
+    },
+    {
+      "id": "source-127",
+      "url": "https://huggingface.co/alibaba-pai/MiniMax-H3-Fun-Controlnet-Union",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 506
+        }
+      ]
+    },
+    {
+      "id": "source-128",
+      "url": "https://huggingface.co/cicalooo/10Eros-Max-h3-int8-convrot",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 497
+        }
+      ]
+    },
+    {
+      "id": "source-129",
+      "url": "https://huggingface.co/collections/sensenova/sensenova-u15",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 482
+        }
+      ]
+    },
+    {
+      "id": "source-130",
+      "url": "https://huggingface.co/conradlocke/krea2-identity-edit/discussions/16",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08-media-models.md",
+          "line": 331
+        }
+      ]
+    },
+    {
+      "id": "source-131",
+      "url": "https://huggingface.co/datasets/malcolmrey/various/blob/main/h3-center/known-characters/INDEX.md",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 481
+        }
+      ]
+    },
+    {
+      "id": "source-132",
+      "url": "https://huggingface.co/diffusers-modular/minimax-h3-inpainting/tree/dca1cd614f8c6bc5496594d82602a82a8ad4edba",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 274
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 511
+        }
+      ]
+    },
+    {
+      "id": "source-133",
+      "url": "https://huggingface.co/fal/MiniMax-H3-Realism-People-LoRA",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08.md",
+          "line": 364
+        }
+      ]
+    },
+    {
+      "id": "source-134",
+      "url": "https://huggingface.co/guillaume127/MiniMax-Music-3-Turbo-FP8",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 487
+        }
+      ]
+    },
+    {
+      "id": "source-135",
+      "url": "https://huggingface.co/iamkaikai/MiniMax-H3-Single-Frame-VAE-500K",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 491
+        }
+      ]
+    },
+    {
+      "id": "source-136",
+      "url": "https://huggingface.co/javawock7618/comfy-MiniMax-H3-workflows",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08.md",
+          "line": 363
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 474
+        }
+      ]
+    },
+    {
+      "id": "source-137",
+      "url": "https://huggingface.co/lightx2v/MiniMax-H3-Prompt-Rewriter-LoRA-8B",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 508
+        }
+      ]
+    },
+    {
+      "id": "source-138",
+      "url": "https://huggingface.co/lightx2v/Minimax-h3-Turbo-SLA",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 493
+        }
+      ]
+    },
+    {
+      "id": "source-139",
+      "url": "https://huggingface.co/lightx2v/Minimax-h3-Turbo/blob/05ef678438e84933c406131b59abbf86919b3aac/minimax_h3_fl2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 245
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 371
+        }
+      ]
+    },
+    {
+      "id": "source-140",
+      "url": "https://huggingface.co/lightx2v/Minimax-h3-Turbo/blob/main/minimax_h3_fl2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 357
+        }
+      ]
+    },
+    {
+      "id": "source-141",
+      "url": "https://huggingface.co/lightx2v/Minimax-h3-Turbo/discussions/33",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 258
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 374
+        }
+      ]
+    },
+    {
+      "id": "source-142",
+      "url": "https://huggingface.co/lightx2v/Minimax-h3-Turbo/discussions/44",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 256
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 373
+        }
+      ]
+    },
+    {
+      "id": "source-143",
+      "url": "https://huggingface.co/lightx2v/Minimax-h3-Turbo/discussions/48",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 254
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 372
+        }
+      ]
+    },
+    {
+      "id": "source-144",
+      "url": "https://huggingface.co/lovis93/studio-1939-old-animation-lora-minimax-h3",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 350
+        }
+      ]
+    },
+    {
+      "id": "source-145",
+      "url": "https://huggingface.co/lovis93/studio-1939-old-animation-lora-minimax-h3/tree/19214d4c3989de6caca673d534d0d4b16b73b0f7",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 192
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 367
+        }
+      ]
+    },
+    {
+      "id": "source-146",
+      "url": "https://huggingface.co/mvp-lab/MiniMax-H3-RAVEN-Streaming-LoRA",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 58
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 589
+        }
+      ]
+    },
+    {
+      "id": "source-147",
+      "url": "https://huggingface.co/ntc-ai/minimax-music3-concept-sliders",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 627
+        }
+      ]
+    },
+    {
+      "id": "source-148",
+      "url": "https://huggingface.co/siraxe/3d_to_real_detail_slider_H3",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 624
+        }
+      ]
+    },
+    {
+      "id": "source-149",
+      "url": "https://huggingface.co/spaces/linoyts/minimax-h3-inpainting",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 493
+        }
+      ]
+    },
+    {
+      "id": "source-150",
+      "url": "https://huggingface.co/spaces/linoyts/minimax-h3-inpainting/discussions/1",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 513
+        }
+      ]
+    },
+    {
+      "id": "source-151",
+      "url": "https://huggingface.co/spaces/linoyts/minimax-h3-inpainting/tree/1c0ab6b0b8a2e1bed7c20205050e07d1ba868837",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 272
+        },
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 510
+        }
+      ]
+    },
+    {
+      "id": "source-152",
+      "url": "https://huggingface.co/t8star/Minimax-H3-Dasiwa-V1-Hybird-4steps",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 488
+        }
+      ]
+    },
+    {
+      "id": "source-153",
+      "url": "https://lazy-frames.cosmicstack.ai",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 64
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 598
+        }
+      ]
+    },
+    {
+      "id": "source-154",
+      "url": "https://mirelo.ai/",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 544
+        }
+      ]
+    },
+    {
+      "id": "source-155",
+      "url": "https://mirelo.ai/video-to-audio",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 544
+        }
+      ]
+    },
+    {
+      "id": "source-156",
+      "url": "https://note.com/aisamanogeboku/n/n05fb3f74ea2e",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 60
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 593
+        }
+      ]
+    },
+    {
+      "id": "source-157",
+      "url": "https://note.com/sepiablue/n/n76c317fa560f",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 63
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 595
+        }
+      ]
+    },
+    {
+      "id": "source-158",
+      "url": "https://nvlabs.github.io/Sana/Sol-Attn/",
+      "occurrences": [
+        {
+          "note": "docs/development/minimax-h3-fast-runtime-research.md",
+          "line": 186
+        }
+      ]
+    },
+    {
+      "id": "source-159",
+      "url": "https://nvlabs.github.io/Sana/Sol-Engine/H3-Super-Acceleration/",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 527
+        }
+      ]
+    },
+    {
+      "id": "source-160",
+      "url": "https://www.reddit.com/r/StableDiffusion/comments/1vmdxzk/psa_im_the_creator_of_heretic_and_i_advise_you_to/",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08.md",
+          "line": 367
+        }
+      ]
+    },
+    {
+      "id": "source-161",
+      "url": "https://www.reddit.com/r/StableDiffusion/comments/1vmjdiw/minimax_h3_25_steps_should_be_the_lowest_setting/",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08-media-models.md",
+          "line": 349
+        }
+      ]
+    },
+    {
+      "id": "source-162",
+      "url": "https://www.reddit.com/r/StableDiffusion/comments/1vo5vnz/redetail_upscale_minimax_h3_renders_with_the/",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08-media-models.md",
+          "line": 343
+        }
+      ]
+    },
+    {
+      "id": "source-163",
+      "url": "https://www.reddit.com/r/StableDiffusion/comments/1vr5nvc/using_h3_as_a_character_reference_sheet_generator/",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 61
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 594
+        }
+      ]
+    },
+    {
+      "id": "source-164",
+      "url": "https://www.reddit.com/r/StableDiffusion/comments/1vv03ly/look_what_i_discovered_prompt_intelligence/?share_id=p-BSX0wPkIvWcZcEC85tu&utm_content=2&utm_medium=android_app&utm_name=androidcss&utm_source=share&utm_term=1",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 476
+        }
+      ]
+    },
+    {
+      "id": "source-165",
+      "url": "https://www.reddit.com/r/StableDiffusion/comments/1vzykd7/generating_fake_speedpaint_timelapse_with_minimax/?share_id=Sek-eLtl3VGmrwFwIsaAJ&utm_content=2&utm_medium=android_app&utm_name=androidcss&utm_source=share&utm_term=2",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 492
+        }
+      ]
+    },
+    {
+      "id": "source-166",
+      "url": "https://www.remotion.dev",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 491
+        }
+      ]
+    },
+    {
+      "id": "source-167",
+      "url": "https://www.remotion.dev/docs/player",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 179
+        }
+      ]
+    },
+    {
+      "id": "source-168",
+      "url": "https://x.com/DmitryEdit/status/2089851392127049974/video/1",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 376
+        }
+      ]
+    },
+    {
+      "id": "source-169",
+      "url": "https://x.com/HeyAbhishek/status/2092622327389503903",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 356
+        }
+      ]
+    },
+    {
+      "id": "source-170",
+      "url": "https://x.com/Kashiko_AIart/status/2090450507269914742",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 473
+        }
+      ]
+    },
+    {
+      "id": "source-171",
+      "url": "https://x.com/Kashiko_AIart/status/2093304933160526010",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 490
+        }
+      ]
+    },
+    {
+      "id": "source-172",
+      "url": "https://x.com/Machinedelusion/status/2093429094168002757",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 487
+        }
+      ]
+    },
+    {
+      "id": "source-173",
+      "url": "https://x.com/Mayz1169/status/2090071170943185174",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 485
+        }
+      ]
+    },
+    {
+      "id": "source-174",
+      "url": "https://x.com/Mayz1169/status/2091469241543455115",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 501
+        }
+      ]
+    },
+    {
+      "id": "source-175",
+      "url": "https://x.com/Mayz1169/status/2092597548863402041",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 355
+        }
+      ]
+    },
+    {
+      "id": "source-176",
+      "url": "https://x.com/MiniMax_AI/status/2092008802984001919",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 484
+        }
+      ]
+    },
+    {
+      "id": "source-177",
+      "url": "https://x.com/MireloAI/status/2090135900990701611",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 486
+        }
+      ]
+    },
+    {
+      "id": "source-178",
+      "url": "https://x.com/Naonekozamurai/status/2091072883040600420",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 498
+        }
+      ]
+    },
+    {
+      "id": "source-179",
+      "url": "https://x.com/Nekodificador/status/2090511775783391266",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 483
+        }
+      ]
+    },
+    {
+      "id": "source-180",
+      "url": "https://x.com/PhotogenicWeekE/status/2093198730958897335",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 483
+        }
+      ]
+    },
+    {
+      "id": "source-181",
+      "url": "https://x.com/ShamsAmin56/status/2089699228427948519",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 490
+        }
+      ]
+    },
+    {
+      "id": "source-182",
+      "url": "https://x.com/Stefan_3D_AI/status/2091531702183350276",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 479
+        }
+      ]
+    },
+    {
+      "id": "source-183",
+      "url": "https://x.com/ailker/status/2093165511920046289",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 485
+        }
+      ]
+    },
+    {
+      "id": "source-184",
+      "url": "https://x.com/aimikoda/status/2090556776156742071",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 494
+        }
+      ]
+    },
+    {
+      "id": "source-185",
+      "url": "https://x.com/aimikoda/status/2091893350748025010",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 489
+        }
+      ]
+    },
+    {
+      "id": "source-186",
+      "url": "https://x.com/airina_xyz/status/2093288708359282982",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 488
+        }
+      ]
+    },
+    {
+      "id": "source-187",
+      "url": "https://x.com/alexfredo87/status/2086824831165587859",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08.md",
+          "line": 360
+        }
+      ]
+    },
+    {
+      "id": "source-188",
+      "url": "https://x.com/andrew_n_carr/status/2091560238558429560",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 477
+        }
+      ]
+    },
+    {
+      "id": "source-189",
+      "url": "https://x.com/bond_ai1/status/2092455923877060644",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 348
+        }
+      ]
+    },
+    {
+      "id": "source-190",
+      "url": "https://x.com/dave392750/status/2090257804984828244",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 492
+        }
+      ]
+    },
+    {
+      "id": "source-191",
+      "url": "https://x.com/grmchn4ai/status/2087070449289343039",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08.md",
+          "line": 361
+        }
+      ]
+    },
+    {
+      "id": "source-192",
+      "url": "https://x.com/ihteshamali/status/2092998752332341410",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28-wave-2.md",
+          "line": 484
+        }
+      ]
+    },
+    {
+      "id": "source-193",
+      "url": "https://x.com/kiyoshi_shin/status/2087652240152756252",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08-media-models.md",
+          "line": 347
+        }
+      ]
+    },
+    {
+      "id": "source-194",
+      "url": "https://x.com/koldo2k/status/2092621357896933487",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 347
+        }
+      ]
+    },
+    {
+      "id": "source-195",
+      "url": "https://x.com/lepadphone/status/2091441060153278565",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 480
+        }
+      ]
+    },
+    {
+      "id": "source-196",
+      "url": "https://x.com/meAsifAi/status/2092365498134696162",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-28.md",
+          "line": 352
+        }
+      ]
+    },
+    {
+      "id": "source-197",
+      "url": "https://x.com/renataro9/status/2090573248752934994",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 495
+        }
+      ]
+    },
+    {
+      "id": "source-198",
+      "url": "https://x.com/servasyy_ai/status/2087343267277160510",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08-media-models.md",
+          "line": 345
+        },
+        {
+          "note": "docs/development/feature-wave-2026-08.md",
+          "line": 359
+        }
+      ]
+    },
+    {
+      "id": "source-199",
+      "url": "https://x.com/techhalla/status/2091102688645644384",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 500
+        }
+      ]
+    },
+    {
+      "id": "source-200",
+      "url": "https://x.com/techhalla/status/2091149136737546441",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 499
+        }
+      ]
+    },
+    {
+      "id": "source-201",
+      "url": "https://x.com/techhalla/status/2091457020213838151",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 478
+        }
+      ]
+    },
+    {
+      "id": "source-202",
+      "url": "https://x.com/techhalla/status/2091676049251688806",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 504
+        }
+      ]
+    },
+    {
+      "id": "source-203",
+      "url": "https://x.com/tokyo_Valentine/status/2089987272838095022",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-25.md",
+          "line": 507
+        }
+      ]
+    },
+    {
+      "id": "source-204",
+      "url": "https://xcancel.com/0x0SojalSec/status/2089349548347105623",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 308
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 608
+        }
+      ]
+    },
+    {
+      "id": "source-205",
+      "url": "https://xcancel.com/CharaspowerAI/status/2089359531495059783",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 310
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 610
+        }
+      ]
+    },
+    {
+      "id": "source-206",
+      "url": "https://xcancel.com/ChrisGwinnLA/status/2089560817192825136",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 312
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 612
+        }
+      ]
+    },
+    {
+      "id": "source-207",
+      "url": "https://xcancel.com/EEJ_OOXO/status/2089624347388633438",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 321
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 622
+        }
+      ]
+    },
+    {
+      "id": "source-208",
+      "url": "https://xcancel.com/MaxForAI/status/2089678026242154678",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 319
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 620
+        }
+      ]
+    },
+    {
+      "id": "source-209",
+      "url": "https://xcancel.com/Mayz1169/status/2089329615290716363",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 311
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 611
+        }
+      ]
+    },
+    {
+      "id": "source-210",
+      "url": "https://xcancel.com/Mayz1169/status/2090071861354995996",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 302
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 602
+        }
+      ]
+    },
+    {
+      "id": "source-211",
+      "url": "https://xcancel.com/SD_Tutorial/status/2089380306851905745",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 313
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 613
+        }
+      ]
+    },
+    {
+      "id": "source-212",
+      "url": "https://xcancel.com/ai_hakase_/status/2089986485063688566",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 307
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 607
+        }
+      ]
+    },
+    {
+      "id": "source-213",
+      "url": "https://xcancel.com/aiaicreate/status/2089570098017366185",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 318
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 619
+        }
+      ]
+    },
+    {
+      "id": "source-214",
+      "url": "https://xcancel.com/beginnersblog1/status/2089701404059574320",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 305
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 605
+        }
+      ]
+    },
+    {
+      "id": "source-215",
+      "url": "https://xcancel.com/beginnersblog1/status/2090051365322252386",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 303
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 603
+        }
+      ]
+    },
+    {
+      "id": "source-216",
+      "url": "https://xcancel.com/deadsun_0/status/2089393566745330134",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 316
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 616
+        }
+      ]
+    },
+    {
+      "id": "source-217",
+      "url": "https://xcancel.com/fadeaway2024/status/2089931180170949040",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 304
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 604
+        }
+      ]
+    },
+    {
+      "id": "source-218",
+      "url": "https://xcancel.com/nakazakifam/status/2089591129293386152",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 309
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 609
+        }
+      ]
+    },
+    {
+      "id": "source-219",
+      "url": "https://xcancel.com/rS_alonewolf/status/2090033091188240661",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 301
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 601
+        }
+      ]
+    },
+    {
+      "id": "source-220",
+      "url": "https://xcancel.com/sep_is_heim/status/2089369376223043837",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 317
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 617
+        }
+      ]
+    },
+    {
+      "id": "source-221",
+      "url": "https://xcancel.com/tanabe_fragm/status/2089934724697555303",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 306
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 606
+        }
+      ]
+    },
+    {
+      "id": "source-222",
+      "url": "https://xcancel.com/techhalla/status/2089459241543221537",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 314
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 614
+        }
+      ]
+    },
+    {
+      "id": "source-223",
+      "url": "https://xcancel.com/tkz_aiart/status/2089552425367847191",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 315
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 615
+        }
+      ]
+    },
+    {
+      "id": "source-224",
+      "url": "https://xcancel.com/yachimat_manga/status/2089469482397761958",
+      "occurrences": [
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 320
+        },
+        {
+          "note": "docs/research/candidate-intake-2026-08-19.md",
+          "line": 621
+        }
+      ]
+    },
+    {
+      "id": "source-225",
+      "url": "https://yunpeng1998.github.io/Qwen-Video-Edit-Page/",
+      "occurrences": [
+        {
+          "note": "docs/research/H3-ecosystem-watch-2026-08-18.md",
+          "line": 30
+        }
+      ]
+    }
+  ]
+}
