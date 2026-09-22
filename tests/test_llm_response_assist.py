@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import io
 import inspect
 import os
 from pathlib import Path
@@ -394,6 +395,58 @@ class ResponseAssistHelperTests(unittest.TestCase):
 
 
 class LlmResponseAssistRuntimeTests(unittest.TestCase):
+    def test_json_generation_uses_utf8_despite_wrong_charset(self):
+        text = '日本語 café مرحبا'
+        for method in ('generate', 'generate_chat', '_generate_anthropic'):
+            with self.subTest(method=method):
+                payload = ({'content': [{'type': 'text', 'text': text}]}
+                           if method == '_generate_anthropic' else
+                           {'choices': [{'message': {'content': text}, 'finish_reason': 'stop'}]})
+                response = llm_service.requests.Response()
+                response.status_code = 200
+                response.encoding = 'ISO-8859-1'
+                response._content = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+                patches = self._runtime_patches([response])
+                with patches[0], patches[1], patches[2], patches[3], patches[4], mock.patch.object(llm_service, 'load_model'):
+                    if method == 'generate_chat':
+                        result = llm_service.generate_chat(
+                            [{'role': 'user', 'content': 'request'}],
+                            model_id=llm_service.DEFAULT_HF_REPO, enable_thinking=False,
+                        )
+                    elif method == '_generate_anthropic':
+                        result = llm_service._generate_anthropic(
+                            [{'role': 'user', 'content': 'request'}], 100, 0.7, 0.9,
+                        )
+                    else:
+                        result = llm_service.generate('request', enable_thinking=False)
+                self.assertEqual(result, text)
+
+    def test_utf8_stream_preserves_non_ascii_and_unicode_line_separators(self):
+        text = '日本語 café م\u2028next\u0085line'
+        wire = ('data: ' + json.dumps(
+            {'choices': [{'delta': {'content': text}}]}, ensure_ascii=False,
+        ) + '\n\ndata: [DONE]\n\n').encode('utf-8')
+        for method in ('generate', 'generate_streaming', 'generate_chat'):
+            with self.subTest(method=method):
+                response = llm_service.requests.Response()
+                response.status_code = 200
+                response.encoding = 'ISO-8859-1'
+                response.raw = io.BytesIO(wire)
+                patches = self._runtime_patches([response])
+                with patches[0], patches[1], patches[2], patches[3], patches[4], mock.patch.object(llm_service, 'load_model'):
+                    if method == 'generate_chat':
+                        result = llm_service.generate_chat(
+                            [{'role': 'user', 'content': 'request'}],
+                            model_id=llm_service.DEFAULT_HF_REPO,
+                            enable_thinking=False, progress_callback=lambda event: None,
+                        )
+                    else:
+                        result = getattr(llm_service, method)(
+                            'request', enable_thinking=False,
+                            progress_callback=lambda event: None,
+                        )
+                self.assertEqual(result, text)
+
     def _runtime_patches(self, responses):
         previous = {
             name: getattr(llm_service, name)

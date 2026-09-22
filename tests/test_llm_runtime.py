@@ -3640,7 +3640,7 @@ class LlmRuntimeTests(unittest.TestCase):
                 ("build/bin/libllama.so.0", None, "libllama.so.0.0.10300"),
             ])
             asset_url = (
-                "https://example.invalid/llama-b10300-bin-ubuntu-x64.tar.gz"
+                "https://github.com/ggml-org/llama.cpp/releases/download/b10300/llama-b10300-bin-ubuntu-x64.tar.gz"
             )
             release = json.dumps({
                 "tag_name": "b10300",
@@ -3692,8 +3692,8 @@ class LlmRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             (tmp_path / "llama-server.exe").write_bytes(b"old")
-            server_url = "https://example.invalid/llama-win.zip"
-            cudart_url = "https://example.invalid/cudart-win.zip"
+            server_url = "https://github.com/ggml-org/llama.cpp/releases/download/b10300/llama-b10300-bin-win-cuda-12.4-x64.zip"
+            cudart_url = "https://github.com/ggml-org/llama.cpp/releases/download/b10300/cudart-llama-bin-win-cuda-12.4-x64.zip"
             release = json.dumps({
                 "tag_name": "b10300",
                 "assets": [
@@ -3760,8 +3760,8 @@ class LlmRuntimeTests(unittest.TestCase):
             tmp_path = Path(tmp)
             old_server = tmp_path / "llama-server.exe"
             old_server.write_bytes(b"old")
-            server_url = "https://example.invalid/llama-win.zip"
-            cudart_url = "https://example.invalid/cudart-win.zip"
+            server_url = "https://github.com/ggml-org/llama.cpp/releases/download/b10300/llama-b10300-bin-win-cuda-12.4-x64.zip"
+            cudart_url = "https://github.com/ggml-org/llama.cpp/releases/download/b10300/cudart-llama-bin-win-cuda-12.4-x64.zip"
             release = json.dumps({
                 "tag_name": "b10300",
                 "assets": [

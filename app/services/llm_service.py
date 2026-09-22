@@ -3257,6 +3257,90 @@ def _extract_linux_tar(tar, bin_dir: str) -> None:
     _repair_linux_soname_links(bin_dir)
 
 
+def _resolve_llama_download_release(asset_specs, *, open_request=None) -> dict:
+    """Resolve official semantic releases to a complete binary nightly.
+
+    Adapted from upstream Maestro 1.9.1; binary installation remains owned by
+    Continuum's existing staged installer and cached-runtime checks.
+    """
+    import json
+    import re
+    from urllib.request import Request, urlopen
+
+    opener = open_request or urlopen
+    api_root = "https://api.github.com/repos/ggml-org/llama.cpp/releases"
+
+    def read(url, limit):
+        with opener(Request(url, headers={"Accept": "application/vnd.github+json"}), timeout=15) as response:
+            data = response.read(limit + 1)
+        if len(data) > limit:
+            raise ValueError("llama release response is too large")
+        return data
+
+    def complete(release):
+        if not isinstance(release, dict):
+            return False
+        tag = release.get("tag_name")
+        if not isinstance(tag, str) or not re.fullmatch(r"b[0-9]+", tag):
+            return False
+        if int(tag[1:]) < MIN_LLAMA_BUILD:
+            return False
+        assets = release.get("assets")
+        if not isinstance(assets, list):
+            return False
+        prefix_url = f"https://github.com/ggml-org/llama.cpp/releases/download/{tag}/"
+        return all(any(
+            isinstance(asset, dict)
+            and asset.get("name") == (
+                f"llama-{tag}-{contains}" if prefix == "llama-"
+                else f"{prefix}llama-{contains}"
+            )
+            and asset.get("browser_download_url") == prefix_url + str(asset.get("name", ""))
+            for asset in assets
+        ) for prefix, contains in asset_specs)
+
+    def validated_assets(release):
+        tag = release["tag_name"]
+        prefix_url = f"https://github.com/ggml-org/llama.cpp/releases/download/{tag}/"
+        names = {
+            f"llama-{tag}-{contains}" if prefix == "llama-"
+            else f"{prefix}llama-{contains}"
+            for prefix, contains in asset_specs
+        }
+        # The installer selects the first matching asset. Do not let an
+        # invalid duplicate precede the valid asset that satisfied complete().
+        return {**release, "assets": [
+            asset for asset in release["assets"]
+            if isinstance(asset, dict)
+            and str(asset.get("name", "")) in names
+            and asset.get("browser_download_url") == prefix_url + str(asset.get("name", ""))
+        ]}
+
+    release = json.loads(read(api_root + "/latest", 2 * 1024 * 1024))
+    if complete(release):
+        return validated_assets(release)
+    if not isinstance(release, dict):
+        raise ValueError("llama release metadata is invalid")
+    tag = release.get("tag_name")
+    assets = release.get("assets")
+    if not isinstance(tag, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", tag):
+        raise ValueError("llama release tag is invalid")
+    if not isinstance(assets, list) or not any(
+        isinstance(asset, dict) and asset.get("name") == "nightly-tag.txt"
+        for asset in assets
+    ):
+        raise ValueError("llama release has no complete binaries or nightly pointer")
+    pointer = read(
+        f"https://github.com/ggml-org/llama.cpp/releases/download/{tag}/nightly-tag.txt", 128,
+    ).decode("ascii").strip()
+    if not re.fullmatch(r"b[0-9]{1,12}", pointer):
+        raise ValueError("llama nightly pointer is invalid")
+    release = json.loads(read(api_root + "/tags/" + pointer, 2 * 1024 * 1024))
+    if not complete(release) or release.get("tag_name") != pointer:
+        raise ValueError("llama nightly release lacks compatible binaries")
+    return validated_assets(release)
+
+
 def _ensure_llama_server(bin_dir: str, requested_device: str = "cpu") -> dict:
     """Auto-download llama-server from llama.cpp GitHub releases if missing.
 
@@ -3422,15 +3506,11 @@ def _ensure_llama_server(bin_dir: str, requested_device: str = "cpu") -> dict:
     release_info = None
     tag = None
     try:
-        req = Request(
-            "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest",
-            headers={"Accept": "application/vnd.github+json"},
-        )
-        with urlopen(req, timeout=15) as r:
-            release_info = json.load(r)
-        tag = release_info.get("tag_name", FALLBACK_TAG)
-    except (URLError, HTTPError, json.JSONDecodeError, TimeoutError) as e:
-        print(f"[LLM] GitHub API unavailable ({e}); falling back to pinned tag {FALLBACK_TAG}")
+        release_info = _resolve_llama_download_release(asset_specs)
+        tag = release_info["tag_name"]
+    except (URLError, HTTPError, ValueError, UnicodeError, TimeoutError) as e:
+        release_info = None
+        print(f"[LLM] Release resolution unavailable ({type(e).__name__}); falling back to pinned tag {FALLBACK_TAG}")
         tag = FALLBACK_TAG
 
     # Resolve each asset spec to a download URL — prefer GitHub API
@@ -4815,7 +4895,11 @@ def generate_chat(
                 _register_cancellable_response(cancel_handle, response)
                 response.raise_for_status()
                 import json as _json_mod
-                for line in response.iter_lines(decode_unicode=True):
+                for line in response.iter_lines(decode_unicode=False):
+                    # Split SSE bytes before UTF-8 decoding; Unicode line separators
+                    # inside generated text are content, not event boundaries.
+                    if isinstance(line, bytes):
+                        line = line.decode("utf-8")
                     _cancellation_checkpoint(cancel_handle)
                     if not line or not line.startswith("data: "):
                         continue
@@ -4941,6 +5025,7 @@ def generate_chat(
             )
             _register_cancellable_response(cancel_handle, response)
             response.raise_for_status()
+            response.encoding = "utf-8"
             response_data = response.json()
             _cancellation_checkpoint(cancel_handle)
             _observe_runtime_output_metrics(response_data, request_pass=1)
@@ -5160,6 +5245,7 @@ def generate(
             )
             _register_cancellable_response(cancel_handle, resp)
             resp.raise_for_status()
+            resp.encoding = "utf-8"
             data = resp.json()
             _cancellation_checkpoint(cancel_handle)
             _observe_runtime_output_metrics(data, request_pass=attempt)
@@ -5450,7 +5536,11 @@ def generate_streaming(
             resp.raise_for_status()
 
             import json as _json_mod
-            for line in resp.iter_lines(decode_unicode=True):
+            for line in resp.iter_lines(decode_unicode=False):
+                # Split SSE bytes before UTF-8 decoding; Unicode line separators
+                # inside generated text are content, not event boundaries.
+                if isinstance(line, bytes):
+                    line = line.decode("utf-8")
                 _cancellation_checkpoint(cancel_handle)
                 if not line or not line.startswith("data: "):
                     continue
@@ -5673,6 +5763,7 @@ def _generate_anthropic(
         )
         _register_cancellable_response(cancel_handle, resp)
         resp.raise_for_status()
+        resp.encoding = "utf-8"
         data = resp.json()
         _cancellation_checkpoint(cancel_handle)
     except requests.exceptions.RequestException:

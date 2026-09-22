@@ -8,6 +8,8 @@ Do not invent leftover receipts just to keep a build-zero install.
 from __future__ import annotations
 
 import os
+import io
+import json
 import sys
 import tempfile
 import unittest
@@ -39,6 +41,54 @@ def _probe_output(text: str, returncode: int = 0):
 
 
 class TestLlamaBuildMetadata(unittest.TestCase):
+    def test_binary_release_and_semantic_nightly_pointer(self):
+        specs = [('llama-', 'bin-ubuntu-x64.tar.gz')]
+        name = 'llama-b10488-bin-ubuntu-x64.tar.gz'
+        binary = {'tag_name': 'b10488', 'assets': [{
+            'name': name,
+            'browser_download_url': 'https://github.com/ggml-org/llama.cpp/releases/download/b10488/' + name,
+        }]}
+        for semantic in (False, True):
+            with self.subTest(semantic=semantic):
+                data = [json.dumps(binary).encode()]
+                if semantic:
+                    data = [json.dumps({'tag_name': 'v0.3.0', 'assets': [{'name': 'nightly-tag.txt'}]}).encode(), b'b10488\n', *data]
+                urls = []
+                def opener(request, timeout):
+                    urls.append(request.full_url)
+                    return io.BytesIO(data.pop(0))
+                result = llm_service._resolve_llama_download_release(specs, open_request=opener)
+                self.assertEqual(result, binary)
+                self.assertEqual(len(urls), 3 if semantic else 1)
+                if semantic:
+                    self.assertTrue(urls[-1].endswith('/tags/b10488'))
+
+    def test_invalid_or_incomplete_nightly_is_rejected_before_install(self):
+        semantic = json.dumps({'tag_name': 'v0.3.0', 'assets': [{'name': 'nightly-tag.txt'}]}).encode()
+        for pointer, binary in ((b'../evil', None), (b'x' * 129, None), (b'b10488', {'tag_name': 'b10488', 'assets': []})):
+            with self.subTest(pointer=pointer):
+                data = [semantic, pointer, json.dumps(binary).encode()]
+                with self.assertRaises(ValueError):
+                    llm_service._resolve_llama_download_release(
+                        [('llama-', 'bin-win-cuda-12.4-x64.zip'), ('cudart-', 'bin-win-cuda-12.4-x64.zip')],
+                        open_request=lambda request, timeout: io.BytesIO(data.pop(0)),
+                    )
+
+    def test_resolved_assets_cannot_select_an_invalid_duplicate_first(self):
+        name = 'llama-b10488-bin-ubuntu-x64.tar.gz'
+        valid = {'name': name, 'browser_download_url':
+                 'https://github.com/ggml-org/llama.cpp/releases/download/b10488/' + name}
+        release = {'tag_name': 'b10488', 'assets': [
+            {'name': name, 'browser_download_url': 'https://example.invalid/archive'},
+            {'name': name + '.sig', 'browser_download_url': valid['browser_download_url'] + '.sig'},
+            valid,
+        ]}
+        result = llm_service._resolve_llama_download_release(
+            [('llama-', 'bin-ubuntu-x64.tar.gz')],
+            open_request=lambda request, timeout: io.BytesIO(json.dumps(release).encode()),
+        )
+        self.assertEqual(result['assets'], [valid])
+
     def test_continuum_has_no_leftover_receipt_helpers(self):
         for name in _LEFTOVER_HELPERS:
             with self.subTest(name=name):
