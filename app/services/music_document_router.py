@@ -103,7 +103,7 @@ def load_music_document_context(
     selected = select_music_guides(brief, language=language)
     chunks: list[str] = []
     missing: list[str] = []
-    used = 0
+    documents: list[tuple[str, str]] = []
     for name in selected:
         path = root / name / "SKILL.md"
         try:
@@ -111,13 +111,30 @@ def load_music_document_context(
         except OSError:
             missing.append(name)
             continue
-        allowance = min(per_guide_chars, total_chars - used)
+        if body.strip():
+            documents.append((name, body))
+        else:
+            missing.append(name)
+    # Reserve a share for every available document. Core guides must not
+    # exhaust the budget before the requested language/style gets context.
+    included: list[str] = []
+    remaining = max(0, total_chars)
+    for index, (name, body) in enumerate(documents):
+        separator = "\n\n" if chunks else ""
+        header = f"## {name}\n"
+        share = remaining // (len(documents) - index)
+        allowance = min(max(0, per_guide_chars), share - len(separator) - len(header))
         if allowance <= 0:
-            break
+            continue
         excerpt = body[:allowance].rstrip()
-        chunks.append(f"## {name}\n{excerpt}")
-        used += len(excerpt)
-    return MusicDocumentContext(selected, "\n\n".join(chunks), tuple(missing))
+        if not excerpt:
+            continue
+        chunk = separator + header + excerpt
+        chunks.append(chunk)
+        included.append(name)
+        remaining -= len(chunk)
+    # The public selection describes only documents actually sent to the LLM.
+    return MusicDocumentContext(tuple(included), "".join(chunks), tuple(missing))
 
 
 def composition_system_prompt(context: MusicDocumentContext) -> str:

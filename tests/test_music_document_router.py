@@ -36,6 +36,32 @@ class MusicDocumentRouterTests(unittest.TestCase):
         self.assertIn("documentation, not executable tools", prompt)
         self.assertIn("must not contain w:", prompt)
 
+    def test_long_core_guides_cannot_starve_requested_language_and_style(self):
+        brief = 'Japanese city pop with jazz harmony'
+        guides = select_music_guides(brief)
+        with tempfile.TemporaryDirectory() as folder_name:
+            root = Path(folder_name)
+            for name in guides:
+                folder = root / name
+                folder.mkdir()
+                (folder / 'SKILL.md').write_text(f'Guidance for {name}\n' + 'x' * 6000)
+            context = load_music_document_context(brief, root=root)
+        self.assertEqual(context.selected, guides)
+        for name in ('lw-japanese', 'mc-style-citypop-rnb', 'mc-style-jazz', 'mc-harmony'):
+            self.assertIn(f'Guidance for {name}', context.text)
+        self.assertLessEqual(len(context.text), 28000)
+
+    def test_tiny_budget_reports_only_included_guides_and_all_missing(self):
+        with tempfile.TemporaryDirectory() as folder_name:
+            root = Path(folder_name)
+            folder = root / 'mc-workflow'
+            folder.mkdir()
+            (folder / 'SKILL.md').write_text('Available guide')
+            context = load_music_document_context('Japanese', root=root, total_chars=4)
+        self.assertEqual(context.selected, ())
+        self.assertEqual(context.text, '')
+        self.assertIn('lw-japanese', context.missing)
+
 
 if __name__ == "__main__":
     unittest.main()
