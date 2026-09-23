@@ -434,7 +434,9 @@ class TestDirectorProjectRevisionsAndQueue(unittest.TestCase):
         # Returning False models cancellation after entering the normal GPU
         # waiter and deliberately stops before LLM or model work. The frozen
         # prepared plans must be copied successfully before that point.
-        with patch.object(pipeline, "_wait_for_gpu", return_value=False) as wait:
+        # This checks queue admission, not the host's changing free space.
+        with (patch.object(pipeline, "_wait_for_gpu", return_value=False) as wait,
+              patch("shutil.disk_usage", return_value=SimpleNamespace(free=10 * 1024 ** 3))):
             pipeline._run_pipeline(pid)
 
         wait.assert_called_once_with(pid)

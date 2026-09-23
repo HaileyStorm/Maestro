@@ -192,8 +192,8 @@ class UiPollingStateTests(unittest.TestCase):
             self.assertIn(source_state, tracker)
 
         active_poll = STORE[
-            STORE.index("_pollRecoveredJob: (jobId)"):
-            STORE.index("reconnectJobs: async", STORE.index("_pollRecoveredJob: (jobId)"))
+            STORE.index("_pollRecoveredJob: (jobId, expectedWorkspace)"):
+            STORE.index("reconnectJobs: async", STORE.index("_pollRecoveredJob: (jobId, expectedWorkspace)"))
         ]
         self.assertIn("_activeOutputRefreshDue", active_poll)
         self.assertIn("document.removeEventListener('visibilitychange'", active_poll)
@@ -252,7 +252,7 @@ class UiPollingStateTests(unittest.TestCase):
         review = STORE[
             review_start:STORE.index("closeH3PlanReview: () =>", review_start)
         ]
-        recurring_start = STORE.index("_pollRecoveredJob: (jobId) => {")
+        recurring_start = STORE.index("_pollRecoveredJob: (jobId, expectedWorkspace) => {")
         recurring = STORE[
             recurring_start:STORE.index("reconnectJobs: async", recurring_start)
         ]

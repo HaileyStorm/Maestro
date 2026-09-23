@@ -196,14 +196,19 @@ class FlipRouteTests(unittest.TestCase):
             with self.subTest(target=target):
                 job = self.worker_namespace()
                 original_link = os.link
+                from services.atomic_file_publish import publish_file_no_replace
                 def racing_link(src, dst, *args, **kw):
                     if ('_hflip_' in str(dst) and not str(Path(dst).parent).endswith('.hflip')
                         and Path(dst).parent == Path(self.root)
                         and (str(dst).endswith('.meta.json') == (target == 'metadata'))):
                         Path(dst).write_bytes(b'foreign-winner')
                     return original_link(src, dst, *args, **kw)
+                def racing_publish(src, dst):
+                    if target == 'metadata':
+                        Path(dst).write_bytes(b'foreign-winner')
+                    return publish_file_no_replace(src, dst)
                 def encode(src, dst, **kw): Path(dst).write_bytes(b'flipped')
-                with patch('services.video_transform.horizontal_flip', side_effect=encode), patch('os.link', side_effect=racing_link):
+                with patch('services.video_transform.horizontal_flip', side_effect=encode), patch('os.link', side_effect=racing_link), patch('services.atomic_file_publish.publish_file_no_replace', side_effect=racing_publish):
                     self.assertFalse(self.ns['_run_tool_hflip'](job['id']))
                 winners = list(Path(self.root).glob('*_hflip_*'))
                 self.assertEqual(len(winners), 1)

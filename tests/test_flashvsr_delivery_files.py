@@ -116,14 +116,14 @@ class DeliveryPublicationTests(unittest.TestCase):
             temporary = Path(folder) / ".upscale.mp4"
             temporary.write_bytes(b"upscaled")
             final = Path(folder) / "final.mp4"
-            job = {"params": {"video_path": str(source)}, "out_dir": folder}
+            job = {"params": {"video_path": str(source)}, "out_dir": folder, "workspace": "project-a"}
             def mux(video, audio, destination, **kwargs):
                 Path(destination).write_bytes(b"muxed")
                 job["cancelled"] = True
             wgp = SimpleNamespace(save_path=folder, server_config={},
                 extract_audio_tracks=lambda _: (["audio"], []),
                 cleanup_temp_audio_files=Mock(), release_flashvsr_vram=Mock(),
-                get_available_filename=lambda *args, **kwargs: str(final),
+                get_available_filename=lambda directory, *args, **kwargs: str(Path(directory) / final.name),
                 combine_video_with_audio_tracks=mux,
                 flashvsr=SimpleNamespace(is_upsampling=lambda _: True))
             record = Mock()
@@ -135,9 +135,12 @@ class DeliveryPublicationTests(unittest.TestCase):
                 try_start=lambda *args, **kwargs: True,
                 register_abort_state=lambda *args: True, unregister_abort_state=Mock(),
                 update_job=lambda *args, **kwargs: True,
-                _resolve_tool_clip_path=lambda *args: str(source),
+                _existing_workspace_dir=lambda workspace: folder,
+                _reserve_workspace_operations=lambda *args: contextlib.nullcontext(),
+                _resume_processed_tool_output=lambda job: None,
+                _validated_tool_input_paths=lambda job: [str(source)],
                 _chunked_flashvsr_upscale=lambda *args, **kwargs: str(temporary),
-                record_job_outputs=record, finish_job=finish)
+                _publish_processed_tool_output=record, finish_job=finish)
             with patch.dict(sys.modules, {"shared.utils.utils": SimpleNamespace(
                     get_video_info=lambda _: (2, 32, 32, 2))}):
                 self.assertFalse(ns["_run_tool_upscale"]("job"))
@@ -268,6 +271,7 @@ class ChunkOwnershipTests(unittest.TestCase):
             events.append("release")
         def save(**kwargs):
             events.append("encode")
+            self.assertEqual(Path(kwargs["save_file"]).parent, private_stage)
             Path(kwargs["save_file"]).write_bytes(b"partial")
             raise RuntimeError("encode failed")
         wgp = SimpleNamespace(
@@ -290,10 +294,13 @@ class ChunkOwnershipTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder, patch.dict(sys.modules, modules):
             source = Path(folder) / "source.mp4"
             source.write_bytes(b"original")
+            private_stage = Path(folder) / "private-stage"
+            private_stage.mkdir()
             with self.assertRaisesRegex(RuntimeError, "encode failed"):
-                ns["_chunked_flashvsr_upscale"](str(source), "flashvsr2")
+                ns["_chunked_flashvsr_upscale"](str(source), "flashvsr2", scratch_directory=str(private_stage))
             self.assertEqual(events, ["release", "cache", "encode", "release_flashvsr"])
-            self.assertEqual(list(Path(folder).iterdir()), [source])
+            self.assertCountEqual(Path(folder).iterdir(), [source, private_stage])
+            self.assertEqual(list(private_stage.iterdir()), [])
             self.assertEqual(wgp.server_config["flashvsr_persistence"], 0)
             events.clear()
             def partial_save(**kwargs):
@@ -301,13 +308,14 @@ class ChunkOwnershipTests(unittest.TestCase):
                 return None
             wgp.save_video = partial_save
             with self.assertRaisesRegex(RuntimeError, "Could not encode"):
-                ns["_chunked_flashvsr_upscale"](str(source), "flashvsr2")
-            self.assertEqual(list(Path(folder).iterdir()), [source])
+                ns["_chunked_flashvsr_upscale"](str(source), "flashvsr2", scratch_directory=str(private_stage))
+            self.assertCountEqual(Path(folder).iterdir(), [source, private_stage])
+            self.assertEqual(list(private_stage.iterdir()), [])
             self.assertEqual(source.read_bytes(), b"original")
             events.clear()
             wgp.release_generation_residency_for_postprocess = Mock(side_effect=RuntimeError("release failed"))
             with self.assertRaisesRegex(RuntimeError, "release failed"):
-                ns["_chunked_flashvsr_upscale"](str(source), "flashvsr2")
+                ns["_chunked_flashvsr_upscale"](str(source), "flashvsr2", scratch_directory=str(private_stage))
             self.assertEqual(events, [])
 
 

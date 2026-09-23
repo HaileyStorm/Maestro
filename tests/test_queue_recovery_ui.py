@@ -193,7 +193,7 @@ class QueueRecoveryUiContracts(unittest.TestCase):
         # Existing cards merge against their prior state above; genuinely new
         # reconnect cards have no prior client state and map the server record.
         self.assertIn(".map(_newGenerationJobFromStatus)", new_jobs)
-        terminal_poll = source_slice(STORE, "_pollRecoveredJob: (jobId)", "reconnectJobs: async")
+        terminal_poll = source_slice(STORE, "_pollRecoveredJob: (jobId, expectedWorkspace)", "reconnectJobs: async")
         self.assertIn("_recoveryJobPolls.get(jobId)", terminal_poll)
         self.assertIn("api.fetchJobStatus(jobId)", terminal_poll)
         self.assertIn("status.status === 'completed'", terminal_poll)

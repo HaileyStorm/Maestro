@@ -4825,7 +4825,7 @@ _RECOVERABLE_INPUT_KEYS = frozenset({
     "retake_user_end_anchor", "voice_reference", "voice_clone_refs",
     "audio_path", "reference_image_path", "character_ref_paths",
     "location_ref_paths", "image_paths", "_blend_clip_a", "_blend_clip_b",
-    "hflip_source_path",
+    "hflip_source_path", "_tool_input_paths",
 })
 
 
@@ -5068,6 +5068,8 @@ def _queue_recovery_input_descriptors(job: dict, owner_digest: str) -> list[dict
     for field, path in _queue_recovery_file_values(params):
         if field.startswith("hflip_source_path:") and job.get("kind") != "tool_hflip":
             raise QueueRecoveryRuntimeError("Unexpected transform input in this job.")
+        if field.startswith("_tool_input_paths:") and job.get("kind") not in {"tool_upscale", "tool_revoice"}:
+            raise QueueRecoveryRuntimeError("Unexpected tool input in this job.")
         resolved = os.path.realpath(path)
         size, digest = _recovery_sha256_file(resolved)
         descriptor = {
@@ -5135,7 +5137,7 @@ def _queue_recovery_input_descriptors(job: dict, owner_digest: str) -> list[dict
             sidecar_path = os.path.join(
                 out_dir, os.path.splitext(os.path.basename(resolved))[0] + ".meta.json",
             )
-            if field == "hflip_source_path:0" and not os.path.lexists(sidecar_path):
+            if (field == "hflip_source_path:0" or field.startswith("_tool_input_paths:")) and not os.path.lexists(sidecar_path):
                 # Legacy gallery media remains usable in this session. Without
                 # prior project sidecar evidence, restart recovery stays blocked.
                 descriptor["scope"] = "derived"
@@ -5708,6 +5710,8 @@ def _queue_recovery_worker(job: dict):
         # Private prompt execution is never reconstructed from durable bytes.
         # A fresh explicit route submission creates a new canonical job.
         return None
+    if kind in {"tool_upscale", "tool_revoice"}:
+        return globals().get("_run_" + kind)
     if kind == "tool_hflip":
         return globals().get("_run_tool_hflip")
     if kind == "studio_blend":
@@ -55656,7 +55660,7 @@ def _run_delivery_encoder(command, *, timeout, abort_check=None):
 
 def _chunked_flashvsr_upscale(
     video_path: str, method: str, *, job: dict = None, abort_check=None,
-    progress_callback=None, update_job_fn=None,
+    progress_callback=None, update_job_fn=None, scratch_directory=None,
 ):
     """Chunked FlashVSR upscale of a saved video -> tmp VIDEO-ONLY file.
 
@@ -55747,7 +55751,7 @@ def _chunked_flashvsr_upscale(
     def _scratch(suffix):
         handle, path = tempfile.mkstemp(
             prefix=".flashvsr-", suffix=suffix,
-            dir=os.path.dirname(os.path.abspath(video_path)),
+            dir=scratch_directory or os.path.dirname(os.path.abspath(video_path)),
         )
         os.close(handle)
         return path
@@ -58338,7 +58342,7 @@ def _inherit_media_access_policy(
     return {"private": private, "explicit": explicit}
 
 
-def _write_tool_sidecar(out_dir, filename, *, source_name, tool, params, elapsed, job_id, source_revision=None):
+def _write_tool_sidecar(out_dir, filename, *, source_name, tool, params, elapsed, job_id, source_revision=None, producer=None):
     """Publish access-stamped tool metadata; transforms retain source settings."""
     sidecar = {
         "params": dict(params) if tool == "hflip" else {**params, "edit_sub_mode": tool},
@@ -58359,6 +58363,8 @@ def _write_tool_sidecar(out_dir, filename, *, source_name, tool, params, elapsed
         sidecar["transform"] = {
             "kind": "horizontal_flip", "video_only": True, "audio": "copied",
         }
+    if producer:
+        sidecar.update(producer)
     stamp_sidecar_policy(
         sidecar,
         job.get("access_policy") or {},
@@ -58366,23 +58372,18 @@ def _write_tool_sidecar(out_dir, filename, *, source_name, tool, params, elapsed
     )
     meta_path = os.path.join(out_dir, os.path.splitext(filename)[0] + ".meta.json")
     temp_path = f"{meta_path}.{uuid.uuid4().hex[:8]}.tmp"
+    from services.atomic_file_publish import PublishedFileDurabilityError
     metadata_owned = False
     try:
         with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(sidecar, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
-        if tool == "hflip":
-            os.link(temp_path, meta_path)
-            metadata_owned = True
-            os.unlink(temp_path)
-        else:
-            os.replace(temp_path, meta_path)
+        from services.atomic_file_publish import publish_file_no_replace
+        publish_file_no_replace(temp_path, meta_path)
+        metadata_owned = True
     except Exception as exc:
-        if tool == "hflip":
-            cleanup_paths = (temp_path, meta_path) if metadata_owned else (temp_path,)
-        else:
-            cleanup_paths = (temp_path, os.path.join(out_dir, filename))
+        cleanup_paths = (temp_path, meta_path) if (metadata_owned or isinstance(exc, PublishedFileDurabilityError)) else (temp_path,)
         for path in cleanup_paths:
             try:
                 os.remove(path)
@@ -58536,15 +58537,183 @@ async def tools_hflip(request: Request):
     return {"job_id": job_id, "status": "queued"}
 
 
+
+class _ToolInputChanged(ValueError):
+    """An authorized tool input no longer matches its submitted identity."""
+
+
+def _validated_tool_input_paths(job: dict) -> list[str]:
+    """Use only exact inputs authorized at submission and pinned in its manifest.
+
+    Project assets and legacy outputs without sidecars may run in the original
+    process after request authorization. That volatile permission is never
+    restored; normal recovery still requires durable ownership evidence.
+    """
+    try:
+        kind = job.get("kind")
+        if kind not in {"tool_upscale", "tool_revoice"}:
+            raise ValueError("Unsupported tool job")
+        project_dir = _existing_workspace_dir(job["workspace"])
+        if not hmac.compare_digest(
+            _queue_recovery_existing_project_identity(project_dir),
+            str(job.get("_recovery_project_digest") or ""),
+        ):
+            raise ValueError("Project identity changed")
+        manifest = load_request_manifest(
+            project_dir, job.get("_recovery_manifest_pointer") or {},
+            expected_job_id=job["id"],
+        )
+        params = job["params"]
+        paths = [params.get("video_path")]
+        if kind == "tool_revoice":
+            refs = params.get("voice_ref_paths")
+            if not isinstance(refs, list) or not refs:
+                raise ValueError("Voice references are missing")
+            paths.extend(refs)
+        if (manifest.get("params") != params or params.get("_tool_input_paths") != paths
+                or any(not isinstance(path, str) or not os.path.isabs(path) for path in paths)):
+            raise ValueError("Tool input identity changed")
+        descriptors = manifest.get("inputs") or []
+        for index, path in enumerate(paths):
+            matches = [d for d in descriptors
+                       if d.get("field") == f"_tool_input_paths:{index}" and d.get("path") == path]
+            if len(matches) != 1:
+                raise ValueError("Input authorization is missing")
+            descriptor = matches[0]
+            if descriptor.get("scope") == "derived":
+                size, digest = _recovery_sha256_file(path)
+                valid = (job.get("_tool_inputs_authorized_live") is True
+                         and size == descriptor.get("size") and digest == descriptor.get("sha256"))
+            else:
+                valid = _queue_recovery_manifest_validator(
+                    descriptor, owner_digest=job["_recovery_owner_digest"],
+                    workspace=job["workspace"], project_dir=project_dir,
+                )
+            if not valid:
+                raise ValueError("Input ownership or content changed")
+        return paths
+    except (KeyError, TypeError, ValueError, OSError, QueueRecoveryRuntimeError, QueueRecoveryAdapterError):
+        raise _ToolInputChanged("Tool inputs changed or their authorization expired. Select the files again.") from None
+
+
+
+def _processed_tool_settings(job):
+    return {"tool_kind": job["kind"],
+            "request_manifest": dict(job["_recovery_manifest_pointer"])}
+
+
+def _resume_processed_tool_output(job):
+    """Adopt a verified published result before invoking a processor again."""
+    project_dir = _existing_workspace_dir(job["workspace"])
+    settings = _processed_tool_settings(job)
+    unit_id = recovery_unit_id(job["id"], "ordinary_repeat", variant=0, index=0, settings=settings)
+    with _output_lineage_mutation_guard(project_dir):
+        _validated_tool_input_paths(job)
+        _queue_recovery_reconcile_cursor(job, project_dir)
+        unit = _queue_recovery_unit_matches(job, kind="ordinary_repeat", variant=0,
+                                           index=0, project_dir=project_dir)
+        if unit and unit.get("unit_id") == unit_id and unit.get("settings") == settings:
+            names = [item["basename"] for item in unit["artifacts"]]
+            if len(names) != 1:
+                raise ValueError("Tool recovery output is ambiguous.")
+            completed = finish_job(job, "completed", output_files=names,
+                                   progress=100, phase="", message="Done")
+            if not completed and is_cancel_requested(job):
+                for descriptor in unit["artifacts"]:
+                    # Re-check exact ownership after the cancellation transition;
+                    # never remove a file that changed while completion raced.
+                    if validate_artifact_descriptor(project_dir, descriptor,
+                                                    producer_unit_id=unit_id):
+                        os.remove(os.path.join(project_dir, descriptor["basename"]))
+                        os.remove(os.path.join(project_dir, descriptor["sidecar_basename"]))
+            return completed
+        # A crash can also occur after metadata publication but before media.
+        # Remove only this request's exact, regular, single-link orphan marker.
+        for name in os.listdir(project_dir):
+            if not name.endswith(".meta.json") or job["id"] not in name:
+                continue
+            path = os.path.join(project_dir, name)
+            try:
+                size, _ = _recovery_sha256_file(path)
+                if size > 1024 * 1024:
+                    continue
+                with open(path, encoding="utf-8") as handle:
+                    meta = json.load(handle)
+                if not isinstance(meta, dict):
+                    continue
+                output = meta.get("output_filename")
+                if (meta.get("job_id") == job["id"]
+                        and meta.get("producer_unit_id") == unit_id
+                        and meta.get("producer_unit_settings") == settings
+                        and isinstance(output, str) and os.path.basename(output) == output
+                        and name == os.path.splitext(output)[0] + ".meta.json"
+                        and not os.path.lexists(os.path.join(project_dir, output))):
+                    os.remove(path)
+            except (OSError, ValueError, QueueRecoveryRuntimeError):
+                continue
+    return None
+
+
+def _publish_processed_tool_output(job, staged_path, *, source, tool, params, elapsed):
+    """Seal the result before create-only publication and durable completion."""
+    from services.atomic_file_publish import publish_file_no_replace, PublishedFileDurabilityError
+
+    size, digest = _recovery_sha256_file(staged_path)
+    if size <= 0:
+        raise ValueError("The tool produced no output video.")
+    out_dir = _existing_workspace_dir(job["workspace"])
+    filename = f"{os.path.splitext(os.path.basename(source))[0]}_{tool}_{job['id']}{os.path.splitext(staged_path)[1]}"
+    destination = os.path.join(out_dir, filename)
+    meta_path = os.path.splitext(destination)[0] + ".meta.json"
+    settings = _processed_tool_settings(job)
+    producer = {
+        "producer_unit_id": recovery_unit_id(job["id"], "ordinary_repeat", variant=0, index=0, settings=settings),
+        "producer_unit_kind": "ordinary_repeat", "producer_unit_variant": 0,
+        "producer_unit_index": 0, "producer_unit_dependencies": [],
+        "producer_unit_settings": settings, "producer_unit_artifact_names": [filename],
+        "producer_media_size": size, "producer_media_sha256": digest,
+        "producer_artifact_class": "final", "artifact_class": "final",
+    }
+    with _output_lineage_mutation_guard(out_dir):
+        _validated_tool_input_paths(job)
+        if is_cancel_requested(job):
+            return False
+        if os.path.lexists(destination) or os.path.lexists(meta_path):
+            raise ValueError("The tool output already exists. Refresh the gallery.")
+        _write_tool_sidecar(out_dir, filename, source_name=os.path.basename(source),
+                            tool=tool, params=params, elapsed=elapsed, job_id=job["id"], producer=producer)
+        media_owned = False
+        def rollback():
+            if not (job.get("status") == "completed" and filename in (job.get("output_files") or [])):
+                if media_owned:
+                    os.remove(destination)
+                os.remove(meta_path)
+        try:
+            publish_file_no_replace(staged_path, destination)
+            media_owned = True
+            completed = finish_job(job, "completed", output_files=[filename],
+                                   progress=100, phase="", message="Done")
+        except Exception as exc:
+            media_owned = media_owned or isinstance(exc, PublishedFileDurabilityError)
+            rollback()
+            raise
+        # Process death leaves the sealed artifact for normal cursor recovery.
+        if not completed:
+            rollback()
+        return completed
+
+
 def _run_tool_upscale(job_id: str):
     """Background worker: upscale an existing clip with the configured spatial
     upsampler (FlashVSR / Lanczos), preserving the original audio. Thin extract
     of edit_video's postprocessing path — no model generation/Gradio state."""
+    import tempfile
     job = _jobs[job_id]
     start_time = time.time()
     abort_state = {"abort": False}
     audio_tracks = []
     tmp_path = None
+    previous_save_path = wgp.save_path
     with generation_slot(
         _gen_lock, job,
     ) as acquired, _WgpNativeGpuExecutionSlot(acquired):
@@ -58563,140 +58732,140 @@ def _run_tool_upscale(job_id: str):
             ):
                 return False
 
-            params = job["params"]
-            workspace = job.get("workspace")
-            out_dir = job.get("out_dir") or wgp.save_path
-            os.makedirs(out_dir, exist_ok=True)
-            wgp.save_path = out_dir
+            with _reserve_workspace_operations(job["workspace"]):
+                params = job["params"]
+                workspace = job["workspace"]
+                project_dir = _existing_workspace_dir(workspace)
+                authorized_inputs = _validated_tool_input_paths(job)
+                resumed = _resume_processed_tool_output(job)
+                if resumed is not None:
+                    return resumed
+                with tempfile.TemporaryDirectory(prefix=".tool-", dir=project_dir) as out_dir:
+                    wgp.save_path = out_dir
 
-            method = params.get("method") or "flashvsr2"
-            video_source = _resolve_tool_clip_path(params.get("video_path"), workspace)
-            if not video_source:
-                finish_job(
-                    job, "failed", error="Input clip not found",
-                    message="Error: input clip not found",
-                )
-                return False
-
-            before = set(os.listdir(out_dir)) if os.path.isdir(out_dir) else set()
-
-            from shared.utils.utils import get_video_info
-            fps, _width, _height, _frames = get_video_info(video_source)
-
-            # Preserve original audio — re-muxed onto the upscaled video.
-            audio_tracks, audio_metadata = wgp.extract_audio_tracks(video_source)
-            has_audio = len(audio_tracks) > 0
-
-            if not update_job(
-                job, message="Upscaling...", phase="Upscaling", progress=5,
-            ):
-                wgp.cleanup_temp_audio_files(audio_tracks)
-                return False
-
-            def _abort():
-                return bool(abort_state.get("abort")) or is_cancel_requested(job)
-
-            # FlashVSR's _report_progress always calls back with
-            # (phase, current_step, total_steps); the latter two may be None.
-            def _progress(phase, current_step=None, total_steps=None):
-                changes = {}
-                if phase:
-                    changes.update(message=str(phase), phase=str(phase))
-                try:
-                    if total_steps:
-                        step = int(current_step or 0)
-                        total = int(total_steps)
-                        # Map reported steps onto 5..95% so the bar moves.
-                        changes.update(
-                            step=step,
-                            total_steps=total,
-                            progress=max(5, min(95, int(step / total * 100))),
+                    method = params.get("method") or "flashvsr2"
+                    video_source = authorized_inputs[0]
+                    if not video_source:
+                        finish_job(
+                            job, "failed", error="Input clip not found",
+                            message="Error: input clip not found",
                         )
-                except (TypeError, ValueError, ZeroDivisionError):
-                    pass
-                if changes:
-                    update_job(job, **changes)
+                        return False
 
-            container = wgp.server_config.get("video_container", "mp4")
-            codec = wgp.server_config.get("video_output_codec", None)
-            final_path = wgp.get_available_filename(out_dir, os.path.basename(video_source), "_upscaled", force_extension=f".{container}")
+                    from shared.utils.utils import get_video_info
+                    fps, _width, _height, _frames = get_video_info(video_source)
 
-            if wgp.flashvsr.is_upsampling(method):
-                # Chunked engine (shared with the post-generation pass) —
-                # bounds RAM on long clips. The previous unchunked path let
-                # FlashVSR allocate its float32 output buffer for the WHOLE
-                # video: a 4-minute 2x upscale tried 280+ GB and died in
-                # DefaultCPUAllocator.
-                tmp_path = _chunked_flashvsr_upscale(video_source, method, job=job, abort_check=_abort, progress_callback=_progress)
-                if tmp_path is None or _abort():
-                    if tmp_path and os.path.isfile(tmp_path):
+                    # Preserve original audio — re-muxed onto the upscaled video.
+                    audio_tracks, audio_metadata = wgp.extract_audio_tracks(video_source)
+                    has_audio = len(audio_tracks) > 0
+
+                    if not update_job(
+                        job, message="Upscaling...", phase="Upscaling", progress=5,
+                    ):
+                        wgp.cleanup_temp_audio_files(audio_tracks)
+                        return False
+
+                    def _abort():
+                        return bool(abort_state.get("abort")) or is_cancel_requested(job)
+
+                    # FlashVSR's _report_progress always calls back with
+                    # (phase, current_step, total_steps); the latter two may be None.
+                    def _progress(phase, current_step=None, total_steps=None):
+                        changes = {}
+                        if phase:
+                            changes.update(message=str(phase), phase=str(phase))
                         try:
-                            os.remove(tmp_path)
-                        except OSError:
+                            if total_steps:
+                                step = int(current_step or 0)
+                                total = int(total_steps)
+                                # Map reported steps onto 5..95% so the bar moves.
+                                changes.update(
+                                    step=step,
+                                    total_steps=total,
+                                    progress=max(5, min(95, int(step / total * 100))),
+                                )
+                        except (TypeError, ValueError, ZeroDivisionError):
                             pass
-                    wgp.cleanup_temp_audio_files(audio_tracks)
-                    return False
-                if has_audio:
-                    wgp.combine_video_with_audio_tracks(tmp_path, audio_tracks, final_path, audio_metadata=audio_metadata, abort_check=_abort, timeout=600)
-                    try:
-                        os.remove(tmp_path)
-                    except OSError:
-                        pass
-                    wgp.cleanup_temp_audio_files(audio_tracks)
-                else:
-                    os.replace(tmp_path, final_path)
-            else:
-                # Lanczos & friends — cheap stateless resize, legacy inline path.
-                sample = wgp.get_resampled_video(video_source, 0, wgp.max_source_video_frames, fps)
-                sample = sample.permute(-1, 0, 1, 2)  # [F,H,W,C] -> [C,F,H,W]
-                sample = wgp.perform_spatial_upsampling(
-                    sample, method, seed=int(params.get("seed", -1)),
-                    abort_callback=_abort, progress_callback=_progress,
-                )
+                        if changes:
+                            update_job(job, **changes)
 
-                if _abort():
-                    return False
+                    container = wgp.server_config.get("video_container", "mp4")
+                    codec = wgp.server_config.get("video_output_codec", None)
+                    final_path = wgp.get_available_filename(out_dir, os.path.basename(video_source), "_upscaled", force_extension=f".{container}")
 
-                output_fps = round(fps)
-                if has_audio:
-                    tmp_path = wgp.get_available_filename(out_dir, os.path.basename(video_source), "_uptmp", force_extension=f".{container}")
-                    wgp.save_video(tensor=sample[None], save_file=tmp_path, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type=codec, container=container, abort_check=_abort, timeout=600)
-                    wgp.combine_video_with_audio_tracks(tmp_path, audio_tracks, final_path, audio_metadata=audio_metadata, abort_check=_abort, timeout=600)
-                    try:
-                        os.remove(tmp_path)
-                    except OSError:
-                        pass
-                    wgp.cleanup_temp_audio_files(audio_tracks)
-                else:
-                    wgp.save_video(tensor=sample[None], save_file=final_path, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type=codec, container=container, abort_check=_abort, timeout=600)
+                    if wgp.flashvsr.is_upsampling(method):
+                        # Chunked engine (shared with the post-generation pass) —
+                        # bounds RAM on long clips. The previous unchunked path let
+                        # FlashVSR allocate its float32 output buffer for the WHOLE
+                        # video: a 4-minute 2x upscale tried 280+ GB and died in
+                        # DefaultCPUAllocator.
+                        tmp_path = _chunked_flashvsr_upscale(video_source, method, job=job, abort_check=_abort, progress_callback=_progress, scratch_directory=out_dir)
+                        if tmp_path is None and not _abort():
+                            raise ValueError("Upscaling produced no video.")
+                        if tmp_path is None or _abort():
+                            if tmp_path and os.path.isfile(tmp_path):
+                                try:
+                                    os.remove(tmp_path)
+                                except OSError:
+                                    pass
+                            wgp.cleanup_temp_audio_files(audio_tracks)
+                            return False
+                        if has_audio:
+                            wgp.combine_video_with_audio_tracks(tmp_path, audio_tracks, final_path, audio_metadata=audio_metadata, abort_check=_abort, timeout=600)
+                            try:
+                                os.remove(tmp_path)
+                            except OSError:
+                                pass
+                            wgp.cleanup_temp_audio_files(audio_tracks)
+                        else:
+                            os.replace(tmp_path, final_path)
+                    else:
+                        # Lanczos & friends — cheap stateless resize, legacy inline path.
+                        sample = wgp.get_resampled_video(video_source, 0, wgp.max_source_video_frames, fps)
+                        sample = sample.permute(-1, 0, 1, 2)  # [F,H,W,C] -> [C,F,H,W]
+                        sample = wgp.perform_spatial_upsampling(
+                            sample, method, seed=int(params.get("seed", -1)),
+                            abort_callback=_abort, progress_callback=_progress,
+                        )
 
-                sample = None
-            if _abort():
-                from shared.utils.audio_video import _remove_encoding_temporary
-                _remove_encoding_temporary(final_path)
-                return False
-            after = set(os.listdir(out_dir)) if os.path.isdir(out_dir) else set()
-            new_files = sorted(f for f in (after - before) if not f.endswith(".meta.json") and "_uptmp" not in f)
-            record_job_outputs(job, new_files)
-            if is_cancel_requested(job):
-                return False
-            for fname in new_files:
-                _write_tool_sidecar(out_dir, fname, source_name=os.path.basename(video_source), tool="upscale", params={"method": method, "model_type": "post_processing"}, elapsed=time.time() - start_time, job_id=job_id)
+                        if _abort():
+                            return False
 
-            completed = finish_job(
-                job,
-                "completed",
-                progress=100,
-                phase="",
-                message="Done",
-            )
-            print(f"[Tools/upscale] {os.path.basename(video_source)} -> {new_files} ({wgp.format_time(time.time() - start_time)})")
-            return completed
+                        output_fps = round(fps)
+                        if has_audio:
+                            tmp_path = wgp.get_available_filename(out_dir, os.path.basename(video_source), "_uptmp", force_extension=f".{container}")
+                            wgp.save_video(tensor=sample[None], save_file=tmp_path, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type=codec, container=container, abort_check=_abort, timeout=600)
+                            wgp.combine_video_with_audio_tracks(tmp_path, audio_tracks, final_path, audio_metadata=audio_metadata, abort_check=_abort, timeout=600)
+                            try:
+                                os.remove(tmp_path)
+                            except OSError:
+                                pass
+                            wgp.cleanup_temp_audio_files(audio_tracks)
+                        else:
+                            wgp.save_video(tensor=sample[None], save_file=final_path, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type=codec, container=container, abort_check=_abort, timeout=600)
+
+                        sample = None
+                    if _abort():
+                        from shared.utils.audio_video import _remove_encoding_temporary
+                        _remove_encoding_temporary(final_path)
+                        return False
+                    return _publish_processed_tool_output(
+                        job, final_path, source=video_source, tool="upscale",
+                        params={"method": method, "model_type": "post_processing"},
+                        elapsed=time.time() - start_time,
+                    )
         except Exception as e:
+            if job.get("status") == "completed":
+                return True
             traceback.print_exc()
-            finish_job(job, "failed", error=str(e), message=f"Error: {e}")
+            if isinstance(e, _ToolInputChanged):
+                detail = "Tool inputs changed or their authorization expired. Select the files again."
+                finish_job(job, "failed", error=detail, message=detail)
+            else:
+                finish_job(job, "failed", **_safe_failure_updates(e, job, stage="flashvsr"))
             return False
         finally:
+            wgp.save_path = previous_save_path
             if tmp_path:
                 from shared.utils.audio_video import _remove_encoding_temporary
                 _remove_encoding_temporary(tmp_path)
@@ -58716,6 +58885,7 @@ def _run_tool_revoice(job_id: str):
     Always writes a NEW file (copy first, convert the copy) — the source clip
     is never mutated."""
     import shutil
+    import tempfile
     job = _jobs[job_id]
     start_time = time.time()
     abort_state = {"abort": False}
@@ -58738,104 +58908,98 @@ def _run_tool_revoice(job_id: str):
             ):
                 return False
 
-            params = job["params"]
-            workspace = job.get("workspace")
-            out_dir = job.get("out_dir") or wgp.save_path
-            os.makedirs(out_dir, exist_ok=True)
+            with _reserve_workspace_operations(job["workspace"]):
+                params = job["params"]
+                workspace = job["workspace"]
+                project_dir = _existing_workspace_dir(workspace)
+                authorized_inputs = _validated_tool_input_paths(job)
+                resumed = _resume_processed_tool_output(job)
+                if resumed is not None:
+                    return resumed
 
-            video_source = _resolve_tool_clip_path(params.get("video_path"), workspace)
-            if not video_source:
-                finish_job(
-                    job, "failed", error="Input clip not found",
-                    message="Error: input clip not found",
-                )
-                return False
+                with tempfile.TemporaryDirectory(prefix=".tool-", dir=project_dir) as out_dir:
+                    video_source = authorized_inputs[0]
+                    if not video_source:
+                        finish_job(
+                            job, "failed", error="Input clip not found",
+                            message="Error: input clip not found",
+                        )
+                        return False
 
-            mode = params.get("mode", "single")
-            voice_refs = []
-            for ref in (params.get("voice_ref_paths") or []):
-                resolved = _resolve_tool_clip_path(ref, workspace)
-                if resolved:
-                    voice_refs.append(resolved)
-            if not voice_refs:
-                finish_job(
-                    job, "failed", error="No voice reference found",
-                    message="Error: no voice reference found",
-                )
-                return False
+                    mode = params.get("mode", "single")
+                    voice_refs = authorized_inputs[1:]
+                    if not voice_refs:
+                        finish_job(
+                            job, "failed", error="No voice reference found",
+                            message="Error: no voice reference found",
+                        )
+                        return False
 
-            # Copy source -> new output, then revoice the copy in place so the
-            # original gallery clip is never modified.
-            src_ext = os.path.splitext(video_source)[1] or ".mp4"
-            final_path = wgp.get_available_filename(out_dir, os.path.basename(video_source), "_revoiced", force_extension=src_ext)
-            if is_cancel_requested(job):
-                return False
-            shutil.copyfile(video_source, final_path)
-            if is_cancel_requested(job):
-                try:
-                    os.remove(final_path)
-                except OSError:
-                    pass
-                return False
+                    # Copy source -> new output, then revoice the copy in place so the
+                    # original gallery clip is never modified.
+                    src_ext = os.path.splitext(video_source)[1] or ".mp4"
+                    final_path = wgp.get_available_filename(out_dir, os.path.basename(video_source), "_revoiced", force_extension=src_ext)
+                    if is_cancel_requested(job):
+                        return False
+                    shutil.copyfile(video_source, final_path)
+                    if is_cancel_requested(job):
+                        try:
+                            os.remove(final_path)
+                        except OSError:
+                            pass
+                        return False
 
-            if not update_job(
-                job,
-                message="Replacing voice (SeedVC)...",
-                phase="Voice Conversion",
-                progress=10,
-            ):
-                try:
-                    os.remove(final_path)
-                except OSError:
-                    pass
-                return False
+                    if not update_job(
+                        job,
+                        message="Replacing voice (SeedVC)...",
+                        phase="Voice Conversion",
+                        progress=10,
+                    ):
+                        try:
+                            os.remove(final_path)
+                        except OSError:
+                            pass
+                        return False
 
-            from postprocessing.voice_clone import apply_voice_clone_to_file
-            ok = apply_voice_clone_to_file(
-                final_path, voice_refs, mode=mode,
-                diffusion_steps=int(params.get("diffusion_steps", 25)),
-                cfg_rate=float(params.get("cfg_rate", 0.5)),
-            )
-            if is_cancel_requested(job):
-                try:
-                    os.remove(final_path)
-                except OSError:
-                    pass
-                return False
-            if not ok:
-                try:
-                    os.remove(final_path)
-                except OSError:
-                    pass
-                finish_job(
-                    job,
-                    "failed",
-                    error="Voice replacement failed (clip has no audio, or SeedVC is unavailable)",
-                    message="Error: voice replacement failed",
-                )
-                return False
+                    from postprocessing.voice_clone import apply_voice_clone_to_file
+                    ok = apply_voice_clone_to_file(
+                        final_path, voice_refs, mode=mode,
+                        diffusion_steps=int(params.get("diffusion_steps", 25)),
+                        cfg_rate=float(params.get("cfg_rate", 0.5)),
+                    )
+                    if is_cancel_requested(job):
+                        try:
+                            os.remove(final_path)
+                        except OSError:
+                            pass
+                        return False
+                    if not ok:
+                        try:
+                            os.remove(final_path)
+                        except OSError:
+                            pass
+                        finish_job(
+                            job,
+                            "failed",
+                            error="Voice replacement failed (clip has no audio, or SeedVC is unavailable)",
+                            message="Error: voice replacement failed",
+                        )
+                        return False
 
-            fname = os.path.basename(final_path)
-            if not update_job(job, output_files=[fname]):
-                try:
-                    os.remove(final_path)
-                except OSError:
-                    pass
-                return False
-            _write_tool_sidecar(out_dir, fname, source_name=os.path.basename(video_source), tool="revoice", params={"mode": mode, "model_type": "post_processing"}, elapsed=time.time() - start_time, job_id=job_id)
-
-            completed = finish_job(
-                job,
-                "completed",
-                progress=100,
-                phase="",
-                message="Done",
-            )
-            print(f"[Tools/revoice] {os.path.basename(video_source)} -> {fname} ({wgp.format_time(time.time() - start_time)})")
-            return completed
+                    return _publish_processed_tool_output(
+                        job, final_path, source=video_source, tool="revoice",
+                        params={"mode": mode, "model_type": "post_processing"},
+                        elapsed=time.time() - start_time,
+                    )
         except Exception as e:
+            if job.get("status") == "completed":
+                return True
             traceback.print_exc()
-            finish_job(job, "failed", error=str(e), message=f"Error: {e}")
+            if isinstance(e, _ToolInputChanged):
+                detail = "Tool inputs changed or their authorization expired. Select the files again."
+                finish_job(job, "failed", error=detail, message=detail)
+            else:
+                finish_job(job, "failed", **_safe_failure_updates(e, job, stage="postprocess"))
             return False
         finally:
             unregister_abort_state(job_id, _active_gen_states, abort_state)
@@ -58847,50 +59011,56 @@ async def tools_upscale(request: Request):
     configured spatial upsampler. Returns a job_id; poll /api/v1/status/{job_id}.
 
     Body: { video_path: str, method?: str (default "flashvsr2"),
-            seed?: int, workspace?: str }
+            seed?: int, workspace?: str (required remotely) }
     """
     body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Tool request must be an object")
     video_path = body.get("video_path")
     if not video_path:
         raise HTTPException(status_code=400, detail="video_path is required")
-    workspace = body.get("workspace") or _get_active_workspace()
-    job_out_dir = _require_project_access(
-        request, workspace, permission="project.generate",
-    )
-    resolved = _resolve_authorized_request_media(request, video_path, workspace)
-    if not resolved:
-        raise HTTPException(status_code=400, detail=f"Clip not found: {video_path}")
-    inherited = _inherit_media_access_policy(
-        [resolved], workspace, request.state.maestro_session_id,
-    )
-    if body.get("private_output") is None:
-        body["private_output"] = inherited["private"]
-    if body.get("explicit_output") is None:
-        body["explicit_output"] = inherited["explicit"]
+    workspace = _request_project_workspace(request, body.get("workspace"))
+    with _reserve_workspace_operations(workspace):
+        job_out_dir = _require_project_access(
+            request, workspace, permission="project.generate",
+        )
+        with _output_lineage_mutation_guard(job_out_dir):
+            resolved = _resolve_authorized_request_media(request, video_path, workspace)
+            if not resolved:
+                raise HTTPException(status_code=400, detail="Clip not found or not accessible")
+            inherited = _inherit_media_access_policy(
+                [resolved], workspace, request.state.maestro_session_id,
+            )
+            if body.get("private_output") is None:
+                body["private_output"] = inherited["private"]
+            if body.get("explicit_output") is None:
+                body["explicit_output"] = inherited["explicit"]
 
-    job_id = _new_generation_job_id()
-    job = {
-        "id": job_id, "status": "queued", "progress": 0, "step": 0, "total_steps": 0,
-        "kind": "tool_upscale",
-        "session_id": request.state.maestro_session_id,
-        "source_remote": bool(_request_remote.get()),
-        "phase": "", "message": "Queued (upscale)", "created_at": time.time(),
-        "params": {
-            "video_path": resolved,
-            "method": body.get("method") or "flashvsr2",
-            "seed": body.get("seed", -1),
-            "private_output": body.get("private_output"),
-            "explicit_output": body.get("explicit_output"),
-        },
-        "output_files": [], "error": None,
-        "workspace": workspace, "out_dir": job_out_dir,
-    }
-    _queue_recovery_register_and_publish(
-        job,
-        worker=_run_tool_upscale,
-        recovery_kind="tool_upscale",
-        thread_name=f"tool-upscale-{job_id}",
-    )
+            job_id = _new_generation_job_id()
+            job = {
+                "id": job_id, "status": "queued", "progress": 0, "step": 0, "total_steps": 0,
+                "kind": "tool_upscale",
+                "_tool_inputs_authorized_live": True,
+                "session_id": request.state.maestro_session_id,
+                "source_remote": bool(_request_remote.get()),
+                "phase": "", "message": "Queued (upscale)", "created_at": time.time(),
+                "params": {
+                    "video_path": resolved,
+                    "_tool_input_paths": [resolved],
+                    "method": body.get("method") or "flashvsr2",
+                    "seed": body.get("seed", -1),
+                    "private_output": body.get("private_output"),
+                    "explicit_output": body.get("explicit_output"),
+                },
+                "output_files": [], "error": None,
+                "workspace": workspace, "out_dir": job_out_dir,
+            }
+            _queue_recovery_register_and_publish(
+                job,
+                worker=_run_tool_upscale,
+                recovery_kind="tool_upscale",
+                thread_name=f"tool-upscale-{job_id}",
+            )
     return {"job_id": job_id, "status": "queued"}
 
 
@@ -58900,71 +59070,76 @@ async def tools_revoice(request: Request):
 
     Body: { video_path: str, voice_ref_paths: [str, ...],
             mode?: "single"|"two", diffusion_steps?: int, cfg_rate?: float,
-            workspace?: str }
+            workspace?: str (required remotely) }
     """
     body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Tool request must be an object")
     video_path = body.get("video_path")
     if not video_path:
         raise HTTPException(status_code=400, detail="video_path is required")
-    workspace = body.get("workspace") or _get_active_workspace()
-    job_out_dir = _require_project_access(
-        request, workspace, permission="project.generate",
-    )
-    resolved = _resolve_authorized_request_media(request, video_path, workspace)
-    if not resolved:
-        raise HTTPException(status_code=400, detail=f"Clip not found: {video_path}")
+    workspace = _request_project_workspace(request, body.get("workspace"))
+    with _reserve_workspace_operations(workspace):
+        job_out_dir = _require_project_access(
+            request, workspace, permission="project.generate",
+        )
+        with _output_lineage_mutation_guard(job_out_dir):
+            resolved = _resolve_authorized_request_media(request, video_path, workspace)
+            if not resolved:
+                raise HTTPException(status_code=400, detail="Clip not found or not accessible")
 
-    voice_refs = body.get("voice_ref_paths")
-    if not voice_refs and body.get("voice_ref_path"):
-        voice_refs = [body.get("voice_ref_path")]
-    if not voice_refs:
-        raise HTTPException(status_code=400, detail="At least one voice_ref_path is required")
+            voice_refs = body.get("voice_ref_paths")
+            if not voice_refs and body.get("voice_ref_path"):
+                voice_refs = [body.get("voice_ref_path")]
+            if not isinstance(voice_refs, list) or not voice_refs or any(not isinstance(ref, str) or not ref for ref in voice_refs):
+                raise HTTPException(status_code=400, detail="At least one voice_ref_path is required")
 
-    mode = body.get("mode", "single")
-    if mode not in ("single", "two"):
-        mode = "single"
+            mode = body.get("mode", "single")
+            if mode not in ("single", "two"):
+                mode = "single"
 
-    resolved_voice_refs = [
-        resolved_ref for ref in voice_refs
-        if (resolved_ref := _resolve_authorized_request_media(request, ref, workspace))
-    ]
-    if not resolved_voice_refs:
-        raise HTTPException(status_code=400, detail="No authorized voice reference found")
-    inherited = _inherit_media_access_policy(
-        [resolved, *resolved_voice_refs],
-        workspace,
-        request.state.maestro_session_id,
-    )
-    if body.get("private_output") is None:
-        body["private_output"] = inherited["private"]
-    if body.get("explicit_output") is None:
-        body["explicit_output"] = inherited["explicit"]
+            resolved_voice_refs = [
+                _resolve_authorized_request_media(request, ref, workspace) for ref in voice_refs
+            ]
+            if any(not ref for ref in resolved_voice_refs):
+                raise HTTPException(status_code=400, detail="No authorized voice reference found")
+            inherited = _inherit_media_access_policy(
+                [resolved, *resolved_voice_refs],
+                workspace,
+                request.state.maestro_session_id,
+            )
+            if body.get("private_output") is None:
+                body["private_output"] = inherited["private"]
+            if body.get("explicit_output") is None:
+                body["explicit_output"] = inherited["explicit"]
 
-    job_id = _new_generation_job_id()
-    job = {
-        "id": job_id, "status": "queued", "progress": 0, "step": 0, "total_steps": 0,
-        "kind": "tool_revoice",
-        "session_id": request.state.maestro_session_id,
-        "source_remote": bool(_request_remote.get()),
-        "phase": "", "message": "Queued (revoice)", "created_at": time.time(),
-        "params": {
-            "video_path": resolved,
-            "voice_ref_paths": resolved_voice_refs,
-            "mode": mode,
-            "diffusion_steps": body.get("diffusion_steps", 25),
-            "cfg_rate": body.get("cfg_rate", 0.5),
-            "private_output": body.get("private_output"),
-            "explicit_output": body.get("explicit_output"),
-        },
-        "output_files": [], "error": None,
-        "workspace": workspace, "out_dir": job_out_dir,
-    }
-    _queue_recovery_register_and_publish(
-        job,
-        worker=_run_tool_revoice,
-        recovery_kind="tool_revoice",
-        thread_name=f"tool-revoice-{job_id}",
-    )
+            job_id = _new_generation_job_id()
+            job = {
+                "id": job_id, "status": "queued", "progress": 0, "step": 0, "total_steps": 0,
+                "kind": "tool_revoice",
+                "_tool_inputs_authorized_live": True,
+                "session_id": request.state.maestro_session_id,
+                "source_remote": bool(_request_remote.get()),
+                "phase": "", "message": "Queued (revoice)", "created_at": time.time(),
+                "params": {
+                    "video_path": resolved,
+                    "_tool_input_paths": [resolved, *resolved_voice_refs],
+                    "voice_ref_paths": resolved_voice_refs,
+                    "mode": mode,
+                    "diffusion_steps": body.get("diffusion_steps", 25),
+                    "cfg_rate": body.get("cfg_rate", 0.5),
+                    "private_output": body.get("private_output"),
+                    "explicit_output": body.get("explicit_output"),
+                },
+                "output_files": [], "error": None,
+                "workspace": workspace, "out_dir": job_out_dir,
+            }
+            _queue_recovery_register_and_publish(
+                job,
+                worker=_run_tool_revoice,
+                recovery_kind="tool_revoice",
+                thread_name=f"tool-revoice-{job_id}",
+            )
     return {"job_id": job_id, "status": "queued"}
 
 

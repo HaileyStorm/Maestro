@@ -101,9 +101,15 @@ class TestJobLifecycleWiring(unittest.TestCase):
             "_run_recast": {"try_start", "register_abort_state", "try_requeue"},
             "_run_tool_upscale": {
                 "try_start", "register_abort_state", "finish_job",
-                "record_job_outputs",
+                "_publish_processed_tool_output",
             },
-            "_run_tool_revoice": {"try_start", "register_abort_state", "finish_job"},
+            "_run_tool_revoice": {
+                "try_start", "register_abort_state", "finish_job",
+                "_publish_processed_tool_output",
+            },
+            "_publish_processed_tool_output": {
+                "finish_job", "_validated_tool_input_paths", "_write_tool_sidecar",
+            },
             "_run_blend_generation": {
                 "register_abort_state", "finish_job", "record_job_outputs",
             },
