@@ -976,6 +976,8 @@ class ZImagePipeline(DiffusionPipeline, FromSingleFileMixin):
         if output_type == "latent":
             image = latents
         else:
+            # The text/transformer path may be BF16 while the VAE is FP32.
+            latents = latents.to(dtype=self.vae.dtype)
             latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
 
             image = self.vae.decode(latents, return_dict=False)[0]
