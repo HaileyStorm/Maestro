@@ -16,6 +16,7 @@ const {
   resolveYue2GenerationSettings,
   reviewedAbcForContinuation,
   sameYue2ComposeDraft,
+  unavailableYue2LoraSelections,
   yue2LyricDensityWarning,
 } = module
 
@@ -90,6 +91,12 @@ test('stale checkpoint IDs or hashes fail closed instead of falling back to pref
   assert.match(missingCatalog.error, /No installed checkpoint is available/)
   assert.equal(invalidHash.checkpoint, null)
   assert.match(invalidHash.error, /missing a valid installed ID or SHA-256/)
+})
+
+test('a selected LoRA missing after a catalog refresh cannot silently fall out of a stack', () => {
+  const selected = { dream: 1, artist: 0.7 }
+  assert.deepEqual(unavailableYue2LoraSelections(selected, [group('dream')]), ['artist'])
+  assert.deepEqual(unavailableYue2LoraSelections(selected, [group('dream'), group('artist')]), [])
 })
 
 test('an untouched reviewed score resumes the exact saved YuE2 plan', () => {

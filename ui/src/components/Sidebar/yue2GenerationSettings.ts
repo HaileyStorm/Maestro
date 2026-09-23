@@ -120,6 +120,14 @@ export function preferredYue2Checkpoint(group: Yue2LoraGroup) {
     || checkpoints.at(-1)
 }
 
+/** Keep selected adapters visible as a blocking choice if a catalog refresh loses them. */
+export function unavailableYue2LoraSelections(
+  selected: Record<string, number>, groups: Yue2LoraGroup[],
+): string[] {
+  const available = new Set(groups.map(group => group.id))
+  return Object.keys(selected).filter(id => !available.has(id))
+}
+
 /** Resolve a LoRA to the exact installed ID and checksum, never a nearby fallback. */
 export function resolveYue2CheckpointSelection(
   group: Yue2LoraGroup,

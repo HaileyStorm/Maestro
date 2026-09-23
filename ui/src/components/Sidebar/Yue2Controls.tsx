@@ -7,6 +7,7 @@ import {
   resolveYue2GenerationSettings,
   reviewedAbcForContinuation,
   sameYue2ComposeDraft,
+  unavailableYue2LoraSelections,
   USE_PREFERRED_YUE2_CHECKPOINT,
   yue2CheckpointSelectionKey,
   yue2LyricDensityWarning,
@@ -132,6 +133,12 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
     () => (status?.loras || []).filter(group => selectedLoras[group.id] !== undefined),
     [selectedLoras, status?.loras],
   )
+  const unavailableLoras = useMemo(
+    () => status?.available
+      ? unavailableYue2LoraSelections(selectedLoras, status.loras || [])
+      : [],
+    [selectedLoras, status],
+  )
   const resolvedGeneration = useMemo(() => {
     try {
       return { settings: resolveYue2GenerationSettings(selectedGroups), error: null }
@@ -179,8 +186,10 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
 
   const submit = async () => {
     if (!style.trim() || !lyrics.trim() || busy) return
-    if (!resolvedGeneration.settings || checkpointError) {
-      setError(resolvedGeneration.error || checkpointError)
+    if (!resolvedGeneration.settings || checkpointError || unavailableLoras.length) {
+      setError(unavailableLoras.length
+        ? 'A selected YuE2 LoRA is no longer available. Remove the unavailable selection before generating.'
+        : resolvedGeneration.error || checkpointError)
       return
     }
     setBusy('submit'); setError(null)
@@ -350,6 +359,17 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
         </div>
       )}
 
+      {unavailableLoras.length > 0 && (
+        <div role="alert" className="space-y-1 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[10px] text-amber-200">
+          <p>{unavailableLoras.length === 1 ? 'A selected YuE2 LoRA is' : 'Some selected YuE2 LoRAs are'} no longer available. Remove the unavailable selection before generating.</p>
+          <button type="button" className="underline" onClick={() => setSelectedLoras(current => {
+            const next = { ...current }
+            for (const id of unavailableLoras) delete next[id]
+            return next
+          })}>Remove unavailable selection{unavailableLoras.length === 1 ? '' : 's'}</button>
+        </div>
+      )}
+
       {resolvedGeneration.settings && selectedGroups.length > 0 && (
         <p className="rounded bg-bg-tertiary px-2 py-1 text-[9px] text-text-muted">
           LoRA settings · {resolvedGeneration.settings.cot === 'off' ? 'no ABC planning' : `${resolvedGeneration.settings.cot} ABC`}
@@ -375,7 +395,7 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
           </button>
         )
       ) : (
-        <button type="button" onClick={() => void submit()} disabled={!status?.available || !style.trim() || !lyrics.trim() || !!busy || !resolvedGeneration.settings || !!checkpointError || ['queued', 'running'].includes(activeTrack?.status || '')} className="mobile-control-target flex w-full items-center justify-center gap-1.5 rounded-lg bg-cta px-3 text-[10px] font-semibold text-cta-foreground hover:ring-2 hover:ring-accent-blue/40 disabled:opacity-40">
+        <button type="button" onClick={() => void submit()} disabled={!status?.available || !style.trim() || !lyrics.trim() || !!busy || !resolvedGeneration.settings || !!checkpointError || unavailableLoras.length > 0 || ['queued', 'running'].includes(activeTrack?.status || '')} className="mobile-control-target flex w-full items-center justify-center gap-1.5 rounded-lg bg-cta px-3 text-[10px] font-semibold text-cta-foreground hover:ring-2 hover:ring-accent-blue/40 disabled:opacity-40">
           {busy === 'submit' ? <Loader2 size={12} className="animate-spin" /> : <Music2 size={12} />} Generate with YuE2
         </button>
       )}
