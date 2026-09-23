@@ -739,6 +739,62 @@ media evidence. Browser Play and owner listening/visual acceptance remain
 unverified; the W4A8 row is still open for those judgments, fallback checks,
 and any required parity retest.
 
+On source `b1403c4`, a second signed-in stable-share W4A8 Turbo 8/Dense SDPA
+request used an authored two-beat, 15.79-second brief and fixed seed
+`314159265`. The plan contained two FL2VA segments, 192 generated frames
+each, with 379 published frames and no model switch. The current six-hour
+`maestro-local` coordinator grant was validated before submission and at
+eight-second intervals during execution. Both segments completed eight
+denoising steps using the pinned W4A8 checkpoint; the worker logged no active
+LoRAs or checkpoint fallback. The joined private Gallery output has SHA-256
+`535bafba788b26edafce0dbdf8a86bc8002694fad186c82f43abce6eb68519f2`,
+matching its sidecar. FFprobe found 379 H.264 frames at 608×352/24 fps,
+15.791667 seconds of video, and 15.792 seconds of stereo 32 kHz AAC. FFmpeg
+decoded both streams without errors; audio measured mean -22.6 dBFS and peak
+-2.0 dBFS. Sampled beginning, post-join, and ending frames retain the red
+robot and yellow chest emblem without an obvious identity break. The requested
+turn and wave are not clearly visible in those samples, so prompt adherence
+remains partial. The signed-in queue returned idle and the joined video
+appeared in Gallery through stable-share. An approval click near the automatic
+plan deadline briefly displayed a stale-review conflict while the server
+auto-approved and completed the job; that confusing UI race remains open.
+Owner visual and listening acceptance remains open.
+
+### 2026-09-23 SageAttention2++ candidate kernel check
+
+On the same validated six-hour `maestro-local` lease, the installed official
+SageAttention 2.2.0 source build reported available on Linux SM120 but its
+release-bound validation record did not match the installed distribution.
+One direct BF16 NHD 1×128×16×128 kernel call returned finite output with
+mean absolute difference 0.00395 from PyTorch SDPA and no recorded fallback
+or error. This is a kernel smoke check only. The signed-in UI correctly keeps
+Official SageAttention2++ disabled; the existing benchmark client has no
+account sign-in path, so the required native and paired Turbo video cases did
+not run. The validation record must not be refreshed from this single call:
+checkpoint-bound media, the required kernel-call count, source and runtime
+binding, visual/audio review, and the prescribed same-seed comparison remain
+open.
+
+### 2026-09-23 idle model-release recovery
+
+The live **Release models** API returned 409 with an empty visible queue both
+before and after a restart. A bounded diagnostic on the restarted process
+identified its first guard: durable H3 jobs held for legal-access recovery and
+a Director recovery entry remained `queued` in other projects. They were not
+generating, but the endpoint rejected every queued record before trying its
+generation and native-GPU locks. The guard now rejects `running` jobs while
+those locks continue to serialize a queued worker that starts concurrently.
+A focused race test made a queued worker attempt admission during unload and
+confirmed that model work waited. After the coordinated restart, local and
+stable-share health/readiness returned 200 and the same idle API request
+returned 200 with `released: []`. This proves the false 409 is gone with the
+held records still present. A subsequent signed-in stable-share local Gemma 4
+31B chat returned the exact requested marker. With that LLM resident, the
+same release API returned 200 with `released: ["LLM"]`; the local llama-server
+process exited, while local and stable-share readiness stayed 200. This accepts
+one loaded-LLM release path. A generation model was not resident in these
+requests, so its unload path remains a separate live check.
+
 ## NVFP4 scale-layout check — 2026-09-07 UTC
 
 The CPU fallback now matches the eager reference for padded physical scale

@@ -21836,22 +21836,29 @@ def system_release_model():
     for users who want the memory back now — wgp reloads transparently
     on the next job. Refuses while anything is generating.
     """
+    # Queued jobs may be held for recovery or waiting on another resource;
+    # neither is generating. The locks below serialize an ordinary queued job
+    # that starts while this request unloads the resident model.
     for j in _jobs.values():
-        if j.get("status") in ("queued", "running"):
+        if j.get("status") == "running":
+            print("[ReleaseModel] blocked by running job")
             raise HTTPException(status_code=409, detail="A generation is in progress — stop it or wait for it to finish first.")
     try:
         from services.director_pipeline import _pipelines
         if any(p.get("status") == "running" for p in _pipelines.values()):
+            print("[ReleaseModel] blocked by running Director pipeline")
             raise HTTPException(status_code=409, detail="A Director run is in progress — stop it first.")
     except ImportError:
         pass
     if not _gen_lock.acquire(blocking=False):
+        print("[ReleaseModel] blocked by generation lock")
         raise HTTPException(status_code=409, detail="A generation is in progress — stop it or wait for it to finish first.")
     native_gpu_slot = _WgpNativeGpuExecutionSlot(blocking=False)
     native_gpu_acquired = False
     try:
         native_gpu_acquired = native_gpu_slot.__enter__()
         if not native_gpu_acquired:
+            print("[ReleaseModel] blocked by native GPU slot")
             raise HTTPException(
                 status_code=409,
                 detail=(

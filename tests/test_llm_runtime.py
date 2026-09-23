@@ -670,7 +670,65 @@ class LlmRuntimeTests(unittest.TestCase):
                 release_namespace["system_release_model"](),
                 {"released": ["generation model"]},
             )
-        self.assertEqual(release_calls, ["released"])
+            release_namespace["_jobs"] = {
+                "held": {
+                    "status": "queued", "queue_held": True,
+                    "recovery_state": "blocked",
+                },
+                "waiting": {"status": "queued"},
+            }
+            self.assertEqual(
+                release_namespace["system_release_model"](),
+                {"released": ["generation model"]},
+            )
+            release_namespace["_jobs"]["running"] = {"status": "running"}
+            with self.assertRaises(HttpError) as raised:
+                release_namespace["system_release_model"]()
+            self.assertEqual(raised.exception.status_code, 409)
+            release_namespace["_jobs"] = {
+                "waiting": {"status": "queued"},
+            }
+            release_entered = threading.Event()
+            allow_release = threading.Event()
+            queued_generation_attempting = threading.Event()
+            queued_generation_entered = threading.Event()
+
+            def slow_release():
+                release_entered.set()
+                self.assertTrue(allow_release.wait(timeout=5))
+                release_calls.append("released")
+
+            def start_queued_generation():
+                queued_generation_attempting.set()
+                with release_namespace["_gen_lock"]:
+                    with slot_class() as acquired:
+                        if acquired:
+                            queued_generation_entered.set()
+                        return acquired
+
+            fake_wgp.release_model = slow_release
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                unloading = executor.submit(
+                    release_namespace["system_release_model"],
+                )
+                try:
+                    self.assertTrue(release_entered.wait(timeout=2))
+                    generation = executor.submit(start_queued_generation)
+                    self.assertTrue(
+                        queued_generation_attempting.wait(timeout=2),
+                    )
+                    self.assertFalse(
+                        queued_generation_entered.wait(timeout=0.1),
+                    )
+                finally:
+                    allow_release.set()
+                self.assertEqual(
+                    unloading.result(timeout=2),
+                    {"released": ["generation model"]},
+                )
+                self.assertTrue(generation.result(timeout=2))
+                self.assertTrue(queued_generation_entered.is_set())
+        self.assertEqual(release_calls, ["released"] * 3)
 
     def test_safe_output_yield_releases_native_before_generation_slot(self):
         launch_path = Path(__file__).resolve().parents[1] / "app" / "launch.py"
