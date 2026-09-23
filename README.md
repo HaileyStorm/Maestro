@@ -137,6 +137,7 @@ Multiple isolated output directories with a quick switcher in the sidebar. Usefu
 - **Reference** is a persistent sidebar peer to Generate and Director. Its create/manage workspace stays mounted while inactive so authored state survives navigation; Queue leaves Reference only after the submission and job reconnect are durably confirmed. Locked projects disable entry, and a newly locked active project returns to the prior workspace after clearing private Reference state.
 - Reference makes reusable character, setting, item, and style cards, generates multiple candidates, and lets you keep/reject/delete variants before using them in Director or Generate semantic-reference workflows. The catalog includes explicit Moody Krea 2 quick-select cards when a recipe is enabled and present; disabled, missing, and manual-install states remain visible and are never auto-enabled or auto-selected.
 - Gallery selection supports bulk move, privacy, and deletion. Finals are shown by default; All, Components, Windows, and Temporary views expose intermediate artifacts when needed. Deleting a final can atomically include its linked parts.
+- **Flip horizontally** in a video's Gallery actions creates a separate flipped copy on the CPU. It preserves the original and copies every audio stream unchanged. Keep the original to undo the choice, or delete only the flipped copy. The queued operation supports cancellation and retains source/provenance and privacy metadata.
 - Read-only single-output share links work for local owners and through the same Cloudflare URL, and are revoked when the output is moved, changed, deleted, or its project is removed.
 
 ### 🧭 Generation queue
@@ -747,6 +748,20 @@ curl -fsS -b cookies.txt -H "Origin: $BASE" -H 'Content-Type: application/json' 
   -d '{"workspace":"my-project","frame_start":0,"frame_end":240,"objects":[{"name":"Block","keyframes":[{"frame":0,"location":[0,0,0]},{"frame":240,"location":[4,0,0]}]}]}' \
   "$BASE/api/v1/blender/animate"
 ```
+
+To flip a listed video, use its exact `name` and `revision` from the outputs
+response. The authenticated account needs generation permission in that project:
+
+```bash
+curl -fsS -b cookies.txt -H "Origin: $BASE" -H 'Content-Type: application/json' \
+  -d '{"workspace":"my-project","name":"clip.mp4","revision":"<revision from outputs>"}' \
+  "$BASE/api/v1/tools/hflip"
+```
+
+The response contains `job_id`; poll `GET /api/v1/status/{job_id}` for the new
+output filename. A stale selection returns 409 at submission; a later source
+change fails the job rather than flipping a different revision. No model or GPU is used. MP4/M4V, MOV, and WebM keep a compatible
+container; other video containers produce Matroska so audio can remain copied.
 
 Python and JavaScript clients use the same JSON bodies with their normal cookie-aware HTTP client (`requests.Session` or `fetch(..., {credentials: 'include'})`). Blender preview sampling is `POST /api/v1/blender/render` with `frames` containing 2–32 integers; previews are stamped with project/privacy metadata and registered as project reference candidates by default.
 

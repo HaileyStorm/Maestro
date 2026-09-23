@@ -3283,6 +3283,8 @@ interface AppState {
   runTool: () => Promise<void>
   /** Gallery one-click: upscale a specific clip now, with the configured method. */
   quickUpscaleClip: (name: string, url: string | null) => Promise<void>
+  /** Gallery one-click: queue a CPU horizontal flip for an exact output revision. */
+  flipSelectedClip: (output: Pick<OutputFile, 'workspace' | 'name' | 'revision'>) => Promise<void>
   /** Gallery one-click: load a clip into the Tools panel for a tool that needs
    *  setup before running (e.g. revoice needs voice references), and switch to it. */
   sendClipToTools: (name: string, url: string | null, tool: 'upscale' | 'revoice') => void
@@ -3360,7 +3362,7 @@ interface AppState {
   reconnectJobs: (accountIdentityEpoch?: number) => Promise<void>
   resumeJobRecovery: (jobId: string) => Promise<void>
   retryJobRecovery: (jobId: string) => Promise<void>
-  _pollRecoveredJob: (jobId: string) => void
+  _pollRecoveredJob: (jobId: string, expectedWorkspace?: string) => void
 
   // LoRA state
   availableLoras: string[]
@@ -7921,6 +7923,47 @@ export const useStore = create<AppState>((set, get) => ({
     set({ toolsTool: 'upscale', toolsSourcePath: name, toolsSourceName: name, toolsSourceUrl: url })
     await get().runTool()
   },
+  flipSelectedClip: async (output) => {
+    const accountIdentityEpoch = _accountIdentityEpoch
+    const { workspace, name, revision } = output
+    if (!workspace || !name || !revision || get().activeWorkspace !== workspace) return
+
+    const newJob: GenerationJob = {
+      id: '', status: 'queued', progress: 0, step: 0, totalSteps: 0,
+      phase: '', message: 'Submitting horizontal flip...', outputFiles: [], error: null,
+      workspace,
+    }
+    set(st => ({ isGenerating: true, jobs: [newJob, ...st.jobs] }))
+
+    try {
+      const result = await api.submitToolHflip({ workspace, name, revision })
+      if (!_accountIdentityIsCurrent(accountIdentityEpoch) || get().activeWorkspace !== workspace) {
+        _discardStaleGenerationPlaceholder(newJob)
+        return
+      }
+      set(st => ({
+        jobs: st.jobs.map(j => j === newJob
+          ? { ...j, id: result.job_id, status: 'queued', message: 'Queued...' }
+          : j),
+      }))
+      get()._pollRecoveredJob(result.job_id, workspace)
+      window.dispatchEvent(new CustomEvent('maestro:queue-refresh'))
+    } catch (error) {
+      if (!_accountIdentityIsCurrent(accountIdentityEpoch) || get().activeWorkspace !== workspace) {
+        _discardStaleGenerationPlaceholder(newJob)
+        return
+      }
+      const message = error instanceof Error ? error.message : 'Horizontal flip failed'
+      set(st => ({
+        jobs: st.jobs.map(j => j === newJob
+          ? { ...j, id: j.id || `tool-hflip-fail-${Date.now()}`, status: 'failed', message, error: message }
+          : j),
+        isGenerating: st.jobs.some(j => j !== newJob && _isActiveGenerationJob(j)),
+      }))
+      console.error('Tool hflip failed:', message)
+      throw error instanceof Error ? error : new Error(message)
+    }
+  },
   sendClipToTools: (name, url, tool) => {
     set({ toolsTool: tool, toolsSourcePath: name, toolsSourceName: name, toolsSourceUrl: url })
     get().setGenerationMode('tools')
@@ -9973,7 +10016,7 @@ export const useStore = create<AppState>((set, get) => ({
     await get().reconnectJobs(accountIdentityEpoch)
   },
 
-  _pollRecoveredJob: (jobId) => {
+  _pollRecoveredJob: (jobId, expectedWorkspace) => {
     const accountIdentityEpoch = _accountIdentityEpoch
     const existing = _recoveryJobPolls.get(jobId)
     if (existing) {
@@ -9982,6 +10025,7 @@ export const useStore = create<AppState>((set, get) => ({
     }
     const initialJob = get().jobs.find(job => job.id === jobId)
     if (!initialJob) return
+    const ownsWorkspace = () => !expectedWorkspace || get().activeWorkspace === expectedWorkspace
 
     let consecutivePollFailures = 0
     let running = false
@@ -10024,6 +10068,10 @@ export const useStore = create<AppState>((set, get) => ({
 
     const tick = async (queuedSafety = false) => {
       if (stopped) return
+      if (!ownsWorkspace()) {
+        stop()
+        return
+      }
       if (running) {
         pendingWake = true
         return
@@ -10044,6 +10092,7 @@ export const useStore = create<AppState>((set, get) => ({
         if (
           stopped
           || !_accountIdentityIsCurrent(accountIdentityEpoch)
+          || !ownsWorkspace()
           || _recoveryJobPolls.get(jobId) !== poll
         ) {
           stop()
@@ -10054,7 +10103,7 @@ export const useStore = create<AppState>((set, get) => ({
           jobs: s.jobs.map(job => job.id !== jobId ? job : _mergeJobStatus(job, status)),
         }))
         _publishTerminalJobStatus(status)
-        if (_activeOutputRefreshDue(outputRefresh, status, !document.hidden)) {
+        if (ownsWorkspace() && _activeOutputRefreshDue(outputRefresh, status, !document.hidden)) {
           void get().refreshOutputs()
         }
         if (status.status === 'completed') {
@@ -10066,7 +10115,7 @@ export const useStore = create<AppState>((set, get) => ({
               isGenerating: remaining.some(_isActiveGenerationJob),
             }
           })
-          get().loadOutputs()
+          if (ownsWorkspace()) get().loadOutputs()
         } else if (status.status === 'failed' || status.status === 'cancelled') {
           // Terminal failures stay visible so their error/recovery controls
           // remain actionable; only the poller and global generating state stop.
@@ -10076,7 +10125,7 @@ export const useStore = create<AppState>((set, get) => ({
               job.id !== jobId && _isActiveGenerationJob(job)
             )),
           }))
-          get().loadOutputs()
+          if (ownsWorkspace()) get().loadOutputs()
         }
       } catch {
         if (stopped || _recoveryJobPolls.get(jobId) !== poll) {
@@ -10120,7 +10169,7 @@ export const useStore = create<AppState>((set, get) => ({
     }
 
     function onVisibilityChange() {
-      if (!_accountIdentityIsCurrent(accountIdentityEpoch)) {
+      if (!_accountIdentityIsCurrent(accountIdentityEpoch) || !ownsWorkspace()) {
         stop()
         return
       }

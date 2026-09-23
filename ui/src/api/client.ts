@@ -1715,6 +1715,23 @@ export async function submitToolUpscale(params: {
   return res.json()
 }
 
+export async function submitToolHflip(params: {
+  workspace: string
+  name: string
+  revision: string
+}): Promise<{ job_id: string; status: 'queued' }> {
+  const res = await fetch(`${BASE}/api/v1/tools/hflip`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Horizontal flip failed' }))
+    throw new Error(err.detail || 'Horizontal flip failed')
+  }
+  return res.json()
+}
+
 export async function submitToolRevoice(params: {
   video_path: string
   voice_ref_paths: string[]

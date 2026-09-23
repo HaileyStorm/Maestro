@@ -324,7 +324,7 @@ async function loadDialogComponent(entryUrl, exportName) {
 
 async function loadMediaFeedItemHarness() {
   const iconNames = [
-    'Play', 'Pencil', 'RefreshCw', 'Copy', 'Trash2', 'Check', 'Combine', 'Loader2',
+    'Play', 'Pencil', 'RefreshCw', 'FlipHorizontal', 'Copy', 'Trash2', 'Check', 'Combine', 'Loader2',
     'Heart', 'ArrowLeftToLine', 'Download', 'FolderInput', 'Scissors', 'FastForward',
     'BookMarked', 'EyeOff', 'Share2', 'Link2Off',
   ]

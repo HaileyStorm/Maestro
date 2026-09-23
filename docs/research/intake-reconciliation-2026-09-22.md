@@ -106,7 +106,7 @@ checkpoint was installed.
 | FlashVSR / latent upscale / RIFE comparisons | Benchmark lead | FlashVSR technical delivery paths and some prior output checks exist. `ComfyUI-MiniMaxH3_LatentUpscaler` and RIFE comparisons and owner detail acceptance remain. |
 | Sage2 / Sol / step/cache anecdotes | Benchmark lead | Current kernels/choices and bounded older evidence exist. The tracked Sage record binds an older Torch/CUDA release; do not treat it as current release-wide proof. The older Sol Adopt decision is retained as an opt-in experiment; it does not authorize a default. No universal fastest-engine or few-step default. |
 | EasyCache / FirstBlockCache | Defer | Historical fast-runtime advice is superseded; no automatic revival from the old note. |
-| Manual per-clip horizontal flip | Adopt, unfinished | Ignored note `docs/development/segment-horizontal-flip-continuity-2026-08-19.md` was found during this audit. Needs reversible review control, pixel-only transform, original audio and provenance. CPU implementation/testing can proceed without GPU. |
+| Manual per-clip horizontal flip | Adopt, CPU and live flow verified | Source: ignored `docs/development/segment-horizontal-flip-continuity-2026-08-19.md`. Mounted Gallery action plus CPU queue worker preserve the source, copy every audio stream and write provenance on a separate final output. Actual MP4/AAC, WebM/Opus and MOV/PCM tests pass. Signed-in stable Cloudflare action produced a new playable-format MP4 with unchanged 608×352 / 24 fps / 5.166667 s geometry and duration, equal encoded audio hash, unchanged source hash and correct mirrored pixels. Legacy sidecarless inputs can run but remain blocked after restart without existing project ownership evidence. Hard-crash publication recovery and human acceptance remain separate gates. |
 | Suggested geometric flip | Experiment | Needs fixtures and an opt-in proposal; default automatic flip remains rejected. Later automated execution stays deferred. |
 | Facing/screen-direction carry | Adapt | Complementary planner enhancement; existing general continuity is not proof of an explicit facing field. |
 
@@ -137,7 +137,7 @@ checkpoint was installed.
 | 1.9.1 llama binary-release pointer (`1d1610d`) | Adapt semantic release → nightly resolution and asset checks; retain Continuum staged install, SONAME repair, cached reuse and CUDA-build policy. |
 | 2.1.3 UTF-8 transport (`5b47516`) | Adapt byte-first SSE decoding at both current streaming paths and explicit UTF-8 JSON response decoding; preserve existing cancellation/retry/progress machinery. |
 | 2.2.3 H3 RMSNorm (`f614f61`) | Adapt inference chunking with Continuum's existing 8192-token limit; preserve native normalization, hooks, gradients and settings. GPU memory/throughput acceptance remains pending. |
-| 2.0.1 Gallery Extend handoff (`5734846`) | Evaluate next as a bounded UI fix; retain workspace-qualified URLs and account/project/result fences. Not included in the three backend ports above. |
+| 2.0.1 Gallery Extend handoff (`5734846`) | Adapted and shipped as `81f43e7`: existing Continuum actions open Studio / Video / Extend and attach the selected clip. Workspace-qualified fetches, stale-request cancellation, visible errors and active/stashed preview ownership are covered by 688 UI tests plus lint/build. Signed-in stable Cloudflare flow from Audio to Extend was exercised with an existing 5.2-second clip; no generation submitted. |
 | 2.0 Editor / layered timeline / export | Useful substantial addition; requires adaptation to current project authorization, output transactions, cancellation and durable queue. Upstream cross-folder browsing is not authorization. |
 | 2.0–2.2 H3 character/story/targeted-window repair | Compare with native Reference and H3 authored/durable contracts. Port improvements by behavior; no replacement of current identity or recovery authority. |
 | 2.1 VAE/residency/INT8/NVFP4/VDN/Viggle/audio refinement | Separate runtime/compatibility changes; benchmark each accepted path under a fresh lease. Preserve existing manual profiles and working kernels. |
@@ -169,10 +169,20 @@ mocked release pointer/asset failures; music guide budget and missing-file cases
 Device-masked H3 suites retain their CUDA skips. Current deployment/check
 receipts and exact publication commits are reported with the delivery message.
 
+Follow-on Gallery flip verification: 693 UI tests, lint/build, 10 route/lifecycle
+checks, 7 actual FFmpeg transform checks, and 165 queue-recovery checks pass.
+The full backend discovery ran 5,183 tests with 17 skips and exposed two existing
+fixture problems: the H3 profile namespace omitted a real helper, and a lease
+exclusion test included unbounded whole-process garbage-collection latency in
+its two-second join. Both fixtures were corrected; their complete modules pass
+17 and 31 tests respectively. The 5,183-test run itself was not repeated after
+these fixture corrections. The separate five JSON-grammar checks also pass.
+
 ## Outstanding work and promotion order
 
-1. Finish CPU-ready user improvements such as reversible per-clip flip and
-   Gallery Extend; keep their output/account/provenance contract intact.
+1. Finish shared Upscale/Revoice execution repairs (workers reference a removed
+   resolver and lack explicit recovery dispatch). Gallery Extend and manual flip
+   now have CPU/UI/live-flow evidence; retain separate crash/human acceptance.
 2. Implement currently missing Music3 and CharacterSheet executors in coherent
    slices; their static scaffolds must not be advertised as working products.
 3. Adapt upstream Qwen2.1, native YuE2 training/library and Editor as separate

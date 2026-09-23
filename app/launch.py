@@ -2016,6 +2016,7 @@ def _startup_recovery_sensitive_path(path: str, method: str = "") -> bool:
             "/api/v1/inpaint",
             "/api/v1/tools/upscale",
             "/api/v1/tools/revoice",
+            "/api/v1/tools/hflip",
             "/api/v1/system/release-model",
             "/api/v1/director/generate-music",
             "/api/v1/director/classify-sections",
@@ -2691,7 +2692,7 @@ _CREDIT_INTERNAL_PARAMS = frozenset({
     _CREDIT_BASELINE_PARAM,
     _CREDIT_CLEANUP_PARAM,
 })
-_CREDIT_EXEMPT_JOB_KINDS = frozenset({"tool_upscale", "tool_revoice"})
+_CREDIT_EXEMPT_JOB_KINDS = frozenset({"tool_upscale", "tool_revoice", "tool_hflip"})
 _CREDIT_LINEAGE_JOB_KINDS = frozenset({
     "director_pipeline",
     "director_preparation",
@@ -3673,7 +3674,7 @@ def _credit_reservation(job: dict, quote, *, consumed: bool):
 
 
 def _credit_job_exempt(job: dict) -> bool:
-    """Keep standalone GPU tools outside the unavailable billing surface."""
+    """Keep standalone media tools outside the unavailable billing surface."""
     return str(job.get("kind") or "") in _CREDIT_EXEMPT_JOB_KINDS
 
 
@@ -4824,6 +4825,7 @@ _RECOVERABLE_INPUT_KEYS = frozenset({
     "retake_user_end_anchor", "voice_reference", "voice_clone_refs",
     "audio_path", "reference_image_path", "character_ref_paths",
     "location_ref_paths", "image_paths", "_blend_clip_a", "_blend_clip_b",
+    "hflip_source_path",
 })
 
 
@@ -5064,6 +5066,8 @@ def _queue_recovery_input_descriptors(job: dict, owner_digest: str) -> list[dict
     job_id = str(job.get("id") or "")
     descriptors = []
     for field, path in _queue_recovery_file_values(params):
+        if field.startswith("hflip_source_path:") and job.get("kind") != "tool_hflip":
+            raise QueueRecoveryRuntimeError("Unexpected transform input in this job.")
         resolved = os.path.realpath(path)
         size, digest = _recovery_sha256_file(resolved)
         descriptor = {
@@ -5131,6 +5135,12 @@ def _queue_recovery_input_descriptors(job: dict, owner_digest: str) -> list[dict
             sidecar_path = os.path.join(
                 out_dir, os.path.splitext(os.path.basename(resolved))[0] + ".meta.json",
             )
+            if field == "hflip_source_path:0" and not os.path.lexists(sidecar_path):
+                # Legacy gallery media remains usable in this session. Without
+                # prior project sidecar evidence, restart recovery stays blocked.
+                descriptor["scope"] = "derived"
+                descriptors.append(descriptor)
+                continue
             sidecar_size, sidecar_digest = _recovery_sha256_file(sidecar_path)
             descriptor.update({
                 "scope": "project",
@@ -5698,6 +5708,8 @@ def _queue_recovery_worker(job: dict):
         # Private prompt execution is never reconstructed from durable bytes.
         # A fresh explicit route submission creates a new canonical job.
         return None
+    if kind == "tool_hflip":
+        return globals().get("_run_tool_hflip")
     if kind == "studio_blend":
         return globals().get("_run_blend_generation")
     if kind == "studio_outpaint_preparation":
@@ -58326,11 +58338,10 @@ def _inherit_media_access_policy(
     return {"private": private, "explicit": explicit}
 
 
-def _write_tool_sidecar(out_dir, filename, *, source_name, tool, params, elapsed, job_id):
-    """Write a .meta.json sidecar so a Tools output shows up in the gallery
-    with the right mode + edit_sub_mode tag (mirrors _run_sfx_generation)."""
+def _write_tool_sidecar(out_dir, filename, *, source_name, tool, params, elapsed, job_id, source_revision=None):
+    """Publish access-stamped tool metadata; transforms retain source settings."""
     sidecar = {
-        "params": {**params, "edit_sub_mode": tool},
+        "params": dict(params) if tool == "hflip" else {**params, "edit_sub_mode": tool},
         "generation_mode": "video",
         "tool": tool,
         "tool_source": source_name,
@@ -58340,6 +58351,14 @@ def _write_tool_sidecar(out_dir, filename, *, source_name, tool, params, elapsed
         "output_filename": filename,
     }
     job = _jobs.get(job_id) or {}
+    if tool == "hflip":
+        sidecar["artifact_class"] = "final"
+        sidecar["params"].pop("multi_clip_info", None)
+        sidecar["tool_source_workspace"] = job.get("workspace")
+        sidecar["tool_source_revision"] = source_revision
+        sidecar["transform"] = {
+            "kind": "horizontal_flip", "video_only": True, "audio": "copied",
+        }
     stamp_sidecar_policy(
         sidecar,
         job.get("access_policy") or {},
@@ -58347,14 +58366,24 @@ def _write_tool_sidecar(out_dir, filename, *, source_name, tool, params, elapsed
     )
     meta_path = os.path.join(out_dir, os.path.splitext(filename)[0] + ".meta.json")
     temp_path = f"{meta_path}.{uuid.uuid4().hex[:8]}.tmp"
+    metadata_owned = False
     try:
         with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(sidecar, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(temp_path, meta_path)
+        if tool == "hflip":
+            os.link(temp_path, meta_path)
+            metadata_owned = True
+            os.unlink(temp_path)
+        else:
+            os.replace(temp_path, meta_path)
     except Exception as exc:
-        for path in (temp_path, os.path.join(out_dir, filename)):
+        if tool == "hflip":
+            cleanup_paths = (temp_path, meta_path) if metadata_owned else (temp_path,)
+        else:
+            cleanup_paths = (temp_path, os.path.join(out_dir, filename))
+        for path in cleanup_paths:
             try:
                 os.remove(path)
             except OSError:
@@ -58362,6 +58391,149 @@ def _write_tool_sidecar(out_dir, filename, *, source_name, tool, params, elapsed
         raise RuntimeError(
             f"Failed to publish protected {tool} metadata for {filename}"
         ) from exc
+
+
+
+def _hflip_source(job: dict) -> tuple[str, dict]:
+    """Revalidate the exact gallery input; never resolve a replacement upload."""
+    from services.win_safe_files import safe_direct_file_under
+
+    params = job["params"]
+    out_dir = _existing_workspace_dir(job["workspace"])
+    name = params["hflip_source_name"]
+    source = safe_direct_file_under(out_dir, name)
+    if (
+        not source or not os.path.isfile(source)
+        or source != params["hflip_source_path"]
+        or _output_revision(source, out_dir, name) != params["hflip_source_revision"]
+    ):
+        raise ValueError("The source clip changed or was removed. Select it again.")
+    metadata = load_media_sidecars(out_dir, {name}).get(name) or {}
+    return source, metadata
+
+
+def _run_tool_hflip(job_id: str):
+    """CPU-only video transform with normal queue finality and cancellation."""
+    import tempfile
+    from services.video_transform import horizontal_flip
+
+    job = _jobs[job_id]
+    abort_state = {"abort": False}
+    start_time = time.time()
+    with generation_slot(_gen_lock, job) as acquired:
+        if not acquired:
+            return False
+        try:
+            if not try_start(job, generation_lock=_gen_lock,
+                             message="Flipping video...", phase="Flipping"):
+                return False
+            if not register_abort_state(job, job_id, _active_gen_states, abort_state):
+                return False
+            def aborted():
+                return bool(abort_state.get("abort")) or is_cancel_requested(job)
+
+            workspace = job["workspace"]
+            with _reserve_workspace_operations(workspace):
+                out_dir = _existing_workspace_dir(workspace)
+                with _output_lineage_mutation_guard(out_dir):
+                    source, metadata = _hflip_source(job)
+                extension = os.path.splitext(source)[1].lower()
+                if extension in {".mp4", ".m4v"}:
+                    container = ".mp4"
+                else:
+                    container = extension if extension in {".mov", ".webm"} else ".mkv"
+                filename = f"{os.path.splitext(os.path.basename(source))[0]}_hflip_{job_id}{container}"
+                final_path = os.path.join(out_dir, filename)
+                meta_path = os.path.splitext(final_path)[0] + ".meta.json"
+                with tempfile.TemporaryDirectory(prefix=".hflip-", dir=out_dir) as staging:
+                    staged = os.path.join(staging, filename)
+                    horizontal_flip(source, staged, abort_check=aborted, timeout=3600)
+                    with _output_lineage_mutation_guard(out_dir):
+                        _hflip_source(job)
+                        if aborted():
+                            return False
+                        if os.path.lexists(final_path) or os.path.lexists(meta_path):
+                            raise ValueError("The flipped output already exists. Refresh the gallery.")
+                        # Preserve the original generation settings for Use settings;
+                        # hflip is transform metadata, not an avatar/edit submode.
+                        source_params = metadata.get("params")
+                        _write_tool_sidecar(
+                            out_dir, filename, source_name=os.path.basename(source),
+                            source_revision=job["params"]["hflip_source_revision"],
+                            tool="hflip", params=source_params if isinstance(source_params, dict) else {},
+                            elapsed=time.time() - start_time, job_id=job_id,
+                        )
+                        media_owned = False
+                        try:
+                            # Atomic create-if-absent; a concurrent file creator
+                            # must never be overwritten after the earlier check.
+                            os.link(staged, final_path)
+                            media_owned = True
+                            # Output identity and terminal state enter the durable
+                            # journal together, so late cancellation cannot leave
+                            # a cancelled job with an unrecorded gallery result.
+                            return finish_job(
+                                job, "completed", output_files=[filename],
+                                progress=100, phase="", message="Done",
+                            )
+                        finally:
+                            if not (job.get("status") == "completed"
+                                    and filename in (job.get("output_files") or [])):
+                                if media_owned:
+                                    os.remove(final_path)
+                                os.remove(meta_path)
+        except Exception:
+            if job.get("status") == "completed":
+                return True
+            if not is_cancel_requested(job):
+                finish_job(job, "failed", error="The video could not be flipped. Refresh the source clip and try again.",
+                           message="Video flip failed")
+            return False
+        finally:
+            unregister_abort_state(job_id, _active_gen_states, abort_state)
+
+
+@api.post("/api/v1/tools/hflip")
+async def tools_hflip(request: Request):
+    """Create a new horizontally flipped project video; copy original audio."""
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="A video selection is required")
+    if not isinstance(body.get("workspace"), str) or not body["workspace"]:
+        raise HTTPException(status_code=400, detail="workspace is required")
+    workspace = _request_project_workspace(request, body["workspace"])
+    name, revision = body.get("name"), body.get("revision")
+    if not isinstance(name, str) or not isinstance(revision, str) or not revision:
+        raise HTTPException(status_code=400, detail="Select a current video from the gallery")
+    if os.path.splitext(name)[1].lower() not in {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v"}:
+        raise HTTPException(status_code=400, detail="Select a video to flip")
+    with _reserve_workspace_operations(workspace):
+        out_dir = _require_project_access(request, workspace, permission="project.generate")
+        with _output_lineage_mutation_guard(out_dir):
+            _out_dir, source, sidecar = _require_authorized_output(request, workspace, name)
+            if _output_revision(source, out_dir, name) != revision:
+                raise HTTPException(status_code=409, detail="The source clip changed. Refresh and select it again.")
+            policy = sidecar if isinstance(sidecar, dict) else {}
+            job_id = _new_generation_job_id()
+            job = {
+                "id": job_id, "kind": "tool_hflip", "status": "queued",
+                "progress": 0, "step": 0, "total_steps": 0,
+                "session_id": request.state.maestro_session_id,
+                "source_remote": bool(_request_remote.get()),
+                "phase": "", "message": "Queued (video flip)", "created_at": time.time(),
+                "params": {
+                    "hflip_source_name": name, "hflip_source_revision": revision,
+                    "hflip_source_path": source,
+                    "private_output": bool(policy.get("private", False)),
+                    "explicit_output": bool(policy.get("explicit", False)),
+                },
+                "output_files": [], "error": None, "workspace": workspace, "out_dir": out_dir,
+            }
+            _queue_recovery_register_and_publish(
+                job, worker=_run_tool_hflip, recovery_kind="tool_hflip",
+                thread_name=f"tool-hflip-{job_id}",
+            )
+    return {"job_id": job_id, "status": "queued"}
 
 
 def _run_tool_upscale(job_id: str):

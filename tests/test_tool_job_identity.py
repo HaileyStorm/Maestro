@@ -1,4 +1,4 @@
-"""Unreserved contracts for tools/upscale job IDs and queue recovery."""
+"""Contracts for standalone media-tool job IDs and queue recovery."""
 
 from __future__ import annotations
 
@@ -75,7 +75,7 @@ class ToolJobIdentityTests(unittest.TestCase):
             new_unique_job_id(AlwaysOccupied())
 
     def test_tool_kinds_require_recovery_registration(self):
-        self.assertEqual(TOOL_JOB_KINDS, {"tool_upscale", "tool_revoice"})
+        self.assertEqual(TOOL_JOB_KINDS, {"tool_upscale", "tool_revoice", "tool_hflip"})
         self.assertTrue(tool_job_requires_recovery_registration(
             {"kind": "tool_upscale"},
         ))

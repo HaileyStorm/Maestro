@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback, type CSSProperties, type KeyboardEvent } from 'react'
-import { Play, Pencil, RefreshCw, Copy, Trash2, Check, Combine, Loader2, Heart, ArrowLeftToLine, Download, FolderInput, Scissors, FastForward, BookMarked, EyeOff, Share2, Link2Off } from 'lucide-react'
+import { Play, Pencil, RefreshCw, FlipHorizontal, Copy, Trash2, Check, Combine, Loader2, Heart, ArrowLeftToLine, Download, FolderInput, Scissors, FastForward, BookMarked, EyeOff, Share2, Link2Off } from 'lucide-react'
 import { SaveRecipeDialog } from '../Recipes/SaveRecipeDialog'
 import { currentAccountIdentityEpoch, useStore } from '../../stores/useStore'
 import { prepareGalleryContinuation, retainContinuationPreview } from '../../lib/galleryContinuation'
@@ -83,6 +83,7 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onVisible, meas
   const rerollGeneration = useStore(s => s.rerollGeneration)
   const deleteOutput = useStore(s => s.deleteSelectedOutput)
   const rejoinClipGroup = useStore(s => s.rejoinClipGroup)
+  const flipSelectedClip = useStore(s => s.flipSelectedClip)
   const toggleFavorite = useStore(s => s.toggleFavorite)
   const setStartImage = useStore(s => s.setStartImage)
   const addImageRef = useStore(s => s.addImageRef)
@@ -130,9 +131,17 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onVisible, meas
   const [moving, setMoving] = useState(false)
   const [continuing, setContinuing] = useState(false)
   const [continueError, setContinueError] = useState('')
+  const [flipping, setFlipping] = useState(false)
+  const [flipError, setFlipError] = useState('')
+  const flipRequestRef = useRef(0)
   const continuationRequest = useRef<AbortController | null>(null)
   useEffect(() => () => {
     continuationRequest.current?.abort()
+  }, [file.name, file.workspace, file.revision])
+  useEffect(() => {
+    flipRequestRef.current += 1
+    setFlipping(false)
+    setFlipError('')
   }, [file.name, file.workspace, file.revision])
   const privateRevealKey = privatePreviewIdentity(file.workspace, file.name, file.revision)
   const [revealedPrivateKey, setRevealedPrivateKey] = useState(() =>
@@ -641,6 +650,28 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onVisible, meas
     }
   }
 
+  const handleFlip = async (event: React.MouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation()
+    if (flipping) return
+    const requestId = ++flipRequestRef.current
+    const target = {
+      workspace: file.workspace,
+      name: file.name,
+      revision: file.revision,
+    }
+    setFlipping(true)
+    setFlipError('')
+    try {
+      await flipSelectedClip(target)
+    } catch (error) {
+      if (requestId === flipRequestRef.current) {
+        setFlipError(error instanceof Error ? error.message : 'Horizontal flip failed')
+      }
+    } finally {
+      if (requestId === flipRequestRef.current) setFlipping(false)
+    }
+  }
+
   return (
     <div
       ref={itemRef}
@@ -895,6 +926,26 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onVisible, meas
                   >
                     {continuing ? <Loader2 size={13} className="animate-spin" /> : <FastForward size={13} />}
                   </button>
+                  <button
+                    onClick={handleFlip}
+                    disabled={flipping}
+                    type="button"
+                    aria-busy={flipping}
+                    aria-label={flipping ? `Flipping ${file.name} horizontally` : `Flip ${file.name} horizontally`}
+                    className="mobile-control-target min-h-11 min-w-11 rounded-lg p-1.5 text-text-secondary transition-colors hover:bg-bg-hover hover:text-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50 md:min-h-0 md:min-w-0"
+                    title={flipError ? `Flip horizontally failed: ${flipError}` : 'Flip horizontally — creates a copy and keeps original audio'}
+                  >
+                    {flipping ? <Loader2 size={13} className="animate-spin" /> : <FlipHorizontal size={13} />}
+                  </button>
+                  {(flipping || flipError) && (
+                    <span
+                      role={flipError ? 'alert' : 'status'}
+                      aria-live="polite"
+                      className={`text-xs ${flipError ? 'text-red-400' : 'text-text-muted'}`}
+                    >
+                      {flipError ? `Horizontal flip failed: ${flipError}` : 'Flipping horizontally...'}
+                    </span>
+                  )}
                   {continueError && <span role="alert" className="text-xs text-red-400">{continueError}</span>}
                 </>
               )}

@@ -1,14 +1,4 @@
-"""Opaque job IDs and the queue-recovery contract for standalone tools.
-
-Generate already mints 32-hex unique IDs via ``launch._new_generation_job_id``
-and registers them with queue recovery before any lifecycle transition.
-``/api/v1/tools/upscale`` and ``/api/v1/tools/revoice`` still mint 8-hex IDs
-and assign ``_jobs[job_id]`` directly. The first ``try_start`` then dies with
-``Queue recovery job must be registered before transition``.
-
-This module is the unreserved helper those owners should call. Do not edit
-``launch.py`` or ``queue_recovery_adapter.py`` from this wave.
-"""
+"""Opaque job identities and durable registration for standalone media tools."""
 
 from __future__ import annotations
 
@@ -18,7 +8,7 @@ from typing import Any
 
 
 JOB_ID_HEX_LENGTH = 32
-TOOL_JOB_KINDS = frozenset({"tool_upscale", "tool_revoice"})
+TOOL_JOB_KINDS = frozenset({"tool_upscale", "tool_revoice", "tool_hflip"})
 _UNIQUE_ID_ATTEMPTS = 32
 
 
@@ -50,7 +40,7 @@ def is_unique_generation_job_id(value: Any) -> bool:
 
 
 def tool_job_requires_recovery_registration(job: Mapping[str, Any]) -> bool:
-    """Standalone GPU tools still persist through the ordinary recovery hook."""
+    """Standalone media tools still persist through the ordinary recovery hook."""
 
     try:
         kind = job.get("kind")
