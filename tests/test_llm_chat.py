@@ -491,7 +491,11 @@ class ChatRuntimeTests(unittest.TestCase):
             )
             switch_done.set()
 
-        with mock.patch.object(llm_service.threading, "Timer", _ChatTimer):
+        # This test measures lease exclusion, not whole-process garbage
+        # collection. A large discovery suite can spend seconds in unload
+        # collection after the lock has correctly been released.
+        with mock.patch.object(llm_service.threading, "Timer", _ChatTimer), \
+                mock.patch.object(llm_service.gc, "collect", return_value=0):
             holder = threading.Thread(target=hold_lease)
             holder.start()
             self.assertTrue(lease_entered.wait(timeout=1))

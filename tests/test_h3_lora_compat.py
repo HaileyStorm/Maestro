@@ -132,10 +132,19 @@ class H3LoraLaunchProjectionTests(unittest.TestCase):
             '_h3_lora_asset_selections', '_apply_h3_loras_to_manifest',
             '_h3_estimate_context', '_apply_h3_adaptive_checkpoint',
             '_h3_preferred_fl2va_model', '_validate_h3_turbo_estimate_context',
+            '_h3_segment_count_estimate',
         }
         module = ast.Module(body=[n for n in ast.parse(source).body
                                   if isinstance(n, ast.FunctionDef) and n.name in names],
                             type_ignores=[])
+        wgp_source = ast.parse((APP / 'wgp.py').read_text())
+        align_function = next(
+            n for n in ast.walk(wgp_source)
+            if isinstance(n, ast.FunctionDef) and n.name == 'align_model_frame_count'
+        )
+        align_namespace = {}
+        exec(compile(ast.Module(body=[align_function], type_ignores=[]),
+                     'h3-lora-wgp', 'exec'), align_namespace)
         cls.helpers = {
             '_H3_LONG_STUDIO_MODELS': {
                 'minimax_h3', 'minimax_h3_pinkcherry_fl2va',
@@ -144,7 +153,11 @@ class H3LoraLaunchProjectionTests(unittest.TestCase):
             '_H3_REF2VA_MODEL': 'minimax_h3_ref2va',
             '_H3_BASE_FL2VA_MODEL': 'minimax_h3',
             '_H3_FL2VA_MODELS': {'minimax_h3', 'minimax_h3_pinkcherry_fl2va', 'minimax_h3_w4a8_fl2va'},
-            'wgp': types.SimpleNamespace(get_model_def=lambda _: {'fps': 24, 'frames_maximum': 360}, get_base_model_type=lambda m: m),
+            'wgp': types.SimpleNamespace(
+                get_model_def=lambda _: {'fps': 24, 'frames_maximum': 360},
+                get_base_model_type=lambda m: m,
+                align_model_frame_count=align_namespace['align_model_frame_count'],
+            ),
         }
         exec(compile(module, 'lora-launch-projection', 'exec'), cls.helpers)
 
@@ -285,7 +298,7 @@ class H3LoraLaunchProjectionTests(unittest.TestCase):
         context = self.helpers['_h3_estimate_context'](body, plan)
         function = next(n for n in ast.walk(ast.parse((APP/'launch.py').read_text()))
                         if isinstance(n, ast.FunctionDef) and n.name == 'candidate_for_settings')
-        namespace = {'context': context}
+        namespace = {**self.helpers, 'context': context}
         exec(compile(ast.Module(body=[function], type_ignores=[]), 'profile-candidate', 'exec'), namespace)
         settings = {'model_type': 'minimax_h3_ref2va', 'num_inference_steps': 20,
                     'resolution': '1344x768', 'activated_loras': ['profile.safetensors'],
