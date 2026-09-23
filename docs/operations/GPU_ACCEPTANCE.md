@@ -126,6 +126,31 @@ the selected model and returned the exact synthetic response requested. This
 is live stable-share Chat evidence, separate from the image and earlier
 retained responses; it does not establish other LLM/provider behavior.
 
+A separate signed-in Z-Image Turbo 6B Studio request initially completed all
+eight denoising steps but failed at VAE decode. The installed VAE loaded in
+FP32 while the pipeline passed BF16 latents; a direct component reproduction
+raised a convolution input/bias dtype error, and decoding succeeded when the
+latent was cast to the VAE dtype. After the narrow pipeline fix and a
+coordinated Pinokio restart, a fresh 848x480 RGB PNG completed in 14 seconds
+through the stable-share queue on RTX 5090 with `app/env-rtx50` (Torch
+2.10.0+cu130); those source bytes were published as `05207df`. The main
+`ZImageTurbo_quanto_bf16_int8.safetensors` and
+`ZImageTurbo_VAE_bf16.safetensors` SHA-256 values are respectively
+`dd4b9172c0c4d69aa6d03a61f5be56c5fee5a9bc4ce1fcca5fc8633cec78d850` and
+`f5b59a26851551b67ae1fe58d32e76486e1e812def4696a4bea97f16604d40a3`;
+the VAE and scheduler config digests are respectively
+`e80af1e64a71883a9d10c3159d2e493e5934508da57852f6a180ae6ae63b14bd` and
+`3b979ab0956e4f5e8d02ec409ac6a4ece1555191d15bd10788fdc85fea5d13fc`.
+The output SHA-256 is
+`e70c767867b83405fb1bc3ec8f34cdd3e1ba1a96b9dfc72acbd2cab672d4f59c`,
+matching the sidecar `producer_media_sha256`; the Gallery displayed the new
+output. Agent inspection found a recognizable red robot on the requested pale
+blue setting, though its chest emblem was rectangular rather than triangular.
+This accepts this Z-Image execution and decode path, not exact prompt fidelity
+or owner quality. After the failed job, the idle generation-model release API
+also returned success and cleared its loaded flag while local and stable
+`/ready` remained healthy.
+
 A fresh ACE-Step v1.5 Turbo LM_4B Studio music job also completed through the
 signed-in stable-share queue. The saved stereo 48 kHz PCM WAV has SHA-256
 `f778081be934a1d80302727e7c98e11d7104aabd94772d7b0ffbc122a501e391`,
