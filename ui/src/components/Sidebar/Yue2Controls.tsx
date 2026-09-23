@@ -1,7 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Check, Loader2, Music2, RefreshCw, Sparkles, Square } from 'lucide-react'
 import * as api from '../../api/client'
-import { preferredYue2Checkpoint, resolveYue2GenerationSettings, reviewedAbcForContinuation, sameYue2ComposeDraft } from './yue2GenerationSettings'
+import {
+  preferredYue2Checkpoint,
+  resolveYue2CheckpointSelection,
+  resolveYue2GenerationSettings,
+  reviewedAbcForContinuation,
+  sameYue2ComposeDraft,
+  USE_PREFERRED_YUE2_CHECKPOINT,
+  yue2CheckpointSelectionKey,
+} from './yue2GenerationSettings'
+import type { Yue2CheckpointSelection } from './yue2GenerationSettings'
 
 type Props = {
   workspace: string
@@ -23,6 +32,7 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
   const [abc, setAbc] = useState('')
   const [planFirst, setPlanFirst] = useState(true)
   const [selectedLoras, setSelectedLoras] = useState<Record<string, number>>({})
+  const [checkpointSelections, setCheckpointSelections] = useState<Record<string, Yue2CheckpointSelection>>({})
   const [busy, setBusy] = useState<'compose' | 'submit' | 'continue' | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [guides, setGuides] = useState<string[]>([])
@@ -131,6 +141,15 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
       }
     }
   }, [selectedGroups])
+  const resolvedLoraCheckpoints = useMemo(
+    () => selectedGroups.map(group => ({
+      group,
+      strength: selectedLoras[group.id],
+      ...resolveYue2CheckpointSelection(group, checkpointSelections[group.id]),
+    })),
+    [checkpointSelections, selectedGroups, selectedLoras],
+  )
+  const checkpointError = resolvedLoraCheckpoints.find(result => result.error)?.error || null
 
   const compose = async () => {
     if (!description.trim() || busy) return
@@ -155,17 +174,15 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
 
   const submit = async () => {
     if (!style.trim() || !lyrics.trim() || busy) return
-    if (!resolvedGeneration.settings) {
-      setError(resolvedGeneration.error)
+    if (!resolvedGeneration.settings || checkpointError) {
+      setError(resolvedGeneration.error || checkpointError)
       return
     }
     setBusy('submit'); setError(null)
     const requestWorkspace = workspace
-    const loras = (status?.loras || []).flatMap(group => {
-      const strength = selectedLoras[group.id]
-      const checkpoint = preferredYue2Checkpoint(group)
-      return strength && checkpoint ? [{ id: checkpoint.id, sha256: checkpoint.sha256, strength }] : []
-    })
+    const loras = resolvedLoraCheckpoints.flatMap(({ checkpoint, strength }) => (
+      strength && checkpoint ? [{ id: checkpoint.id, sha256: checkpoint.sha256, strength }] : []
+    ))
     const generation = resolvedGeneration.settings
     try {
       await api.submitYue2({
@@ -260,18 +277,66 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
           <p className="text-[9px] uppercase tracking-wider text-text-muted">Native LoRAs</p>
           {status!.loras.map(group => {
             const selected = selectedLoras[group.id] !== undefined
+            const checkpoints = Array.isArray(group.checkpoints) ? group.checkpoints : []
+            const preferredCheckpoint = preferredYue2Checkpoint(group)
+            const savedCheckpoint = checkpointSelections[group.id]
+            const selectedCheckpointValue = savedCheckpoint
+              ? yue2CheckpointSelectionKey(savedCheckpoint)
+              : USE_PREFERRED_YUE2_CHECKPOINT
             return (
-              <div key={group.id} className="flex items-center gap-2 rounded-lg border border-border px-2 py-1.5">
-                <label className="flex min-w-0 flex-1 items-center gap-2 text-[10px] text-text-secondary">
-                  <input type="checkbox" checked={selected} onChange={event => setSelectedLoras(current => {
-                    const next = { ...current }
-                    if (event.target.checked && Object.keys(next).length < 4) next[group.id] = 1
-                    else delete next[group.id]
-                    return next
-                  })} className="accent-accent-blue" />
-                  <span className="truncate">{group.name} · {group.kind}</span>
-                </label>
-                {selected && <input aria-label={`${group.name} strength`} type="number" min="0.1" max="2" step="0.05" value={selectedLoras[group.id]} onChange={event => setSelectedLoras(current => ({ ...current, [group.id]: Number(event.target.value) }))} className="w-16 rounded border border-border bg-bg-tertiary px-1 py-0.5 text-[10px] text-text-primary" />}
+              <div key={group.id} className="space-y-1 rounded-lg border border-border px-2 py-1.5">
+                <div className="flex items-center gap-2">
+                  <label className="flex min-w-0 flex-1 items-center gap-2 text-[10px] text-text-secondary">
+                    <input type="checkbox" checked={selected} onChange={event => setSelectedLoras(current => {
+                      const next = { ...current }
+                      if (event.target.checked && Object.keys(next).length < 4) next[group.id] = 1
+                      else delete next[group.id]
+                      return next
+                    })} className="accent-accent-blue" />
+                    <span className="truncate">{group.name} · {group.kind}</span>
+                  </label>
+                  {selected && <input aria-label={`${group.name} strength`} type="number" min="0.1" max="2" step="0.05" value={selectedLoras[group.id]} onChange={event => setSelectedLoras(current => ({ ...current, [group.id]: Number(event.target.value) }))} className="w-16 rounded border border-border bg-bg-tertiary px-1 py-0.5 text-[10px] text-text-primary" />}
+                </div>
+                {selected && (
+                  <label className="block text-[9px] text-text-muted">Checkpoint
+                    <select
+                      aria-label={`${group.name} checkpoint`}
+                      value={selectedCheckpointValue}
+                      onChange={event => setCheckpointSelections(current => {
+                        const next = { ...current }
+                        if (event.target.value === USE_PREFERRED_YUE2_CHECKPOINT) {
+                          delete next[group.id]
+                        } else {
+                          const checkpoint = checkpoints.find(candidate => yue2CheckpointSelectionKey(candidate) === event.target.value)
+                          if (!checkpoint) return current
+                          next[group.id] = { id: checkpoint.id, sha256: checkpoint.sha256 }
+                        }
+                        return next
+                      })}
+                      className="mt-0.5 w-full rounded border border-border bg-bg-tertiary px-1.5 py-1 text-[9px] text-text-primary"
+                    >
+                      <option value={USE_PREFERRED_YUE2_CHECKPOINT}>
+                        {preferredCheckpoint
+                          ? `Preferred · ${preferredCheckpoint.label || preferredCheckpoint.filename} · ${preferredCheckpoint.id} · SHA-256 ${preferredCheckpoint.sha256}`
+                          : 'Preferred checkpoint unavailable'}
+                      </option>
+                      {savedCheckpoint && !checkpoints.some(candidate => candidate.id === savedCheckpoint.id && candidate.sha256 === savedCheckpoint.sha256) && (
+                        <option value={yue2CheckpointSelectionKey(savedCheckpoint)}>
+                          Unavailable · {savedCheckpoint.id} · SHA-256 {savedCheckpoint.sha256}
+                        </option>
+                      )}
+                      {checkpoints.map(checkpoint => {
+                        const isPreferred = preferredCheckpoint?.id === checkpoint.id && preferredCheckpoint.sha256 === checkpoint.sha256
+                        const step = checkpoint.step == null ? '' : ` · step ${checkpoint.step}`
+                        return (
+                          <option key={yue2CheckpointSelectionKey(checkpoint)} value={yue2CheckpointSelectionKey(checkpoint)}>
+                            {checkpoint.label || checkpoint.filename}{step} · {checkpoint.id} · SHA-256 {checkpoint.sha256}{isPreferred ? ' · preferred' : ''}
+                          </option>
+                        )
+                      })}
+                    </select>
+                  </label>
+                )}
               </div>
             )
           })}
@@ -285,6 +350,7 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
         </p>
       )}
       {resolvedGeneration.error && <p className="text-[10px] text-red-400">{resolvedGeneration.error}</p>}
+      {checkpointError && <p className="text-[10px] text-red-400">{checkpointError}</p>}
 
       <label className="flex items-center gap-2 text-[10px] text-text-secondary">
         <input type="checkbox" checked={planFirst && resolvedGeneration.settings?.cot !== 'off'} disabled={resolvedGeneration.settings?.cot === 'off'} onChange={event => setPlanFirst(event.target.checked)} className="accent-accent-blue" />
@@ -302,7 +368,7 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
           </button>
         )
       ) : (
-        <button type="button" onClick={() => void submit()} disabled={!status?.available || !style.trim() || !lyrics.trim() || !!busy || !resolvedGeneration.settings || ['queued', 'running'].includes(activeTrack?.status || '')} className="mobile-control-target flex w-full items-center justify-center gap-1.5 rounded-lg bg-cta px-3 text-[10px] font-semibold text-cta-foreground hover:ring-2 hover:ring-accent-blue/40 disabled:opacity-40">
+        <button type="button" onClick={() => void submit()} disabled={!status?.available || !style.trim() || !lyrics.trim() || !!busy || !resolvedGeneration.settings || !!checkpointError || ['queued', 'running'].includes(activeTrack?.status || '')} className="mobile-control-target flex w-full items-center justify-center gap-1.5 rounded-lg bg-cta px-3 text-[10px] font-semibold text-cta-foreground hover:ring-2 hover:ring-accent-blue/40 disabled:opacity-40">
           {busy === 'submit' ? <Loader2 size={12} className="animate-spin" /> : <Music2 size={12} />} Generate with YuE2
         </button>
       )}

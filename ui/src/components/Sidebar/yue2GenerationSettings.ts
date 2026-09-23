@@ -1,4 +1,16 @@
-import type { Yue2LoraGroup } from '../../api/client'
+import type { Yue2LoraCheckpoint, Yue2LoraGroup } from '../../api/client'
+
+export type Yue2CheckpointSelection = Pick<Yue2LoraCheckpoint, 'id' | 'sha256'>
+export type Yue2CheckpointResolution = {
+  checkpoint: Yue2LoraCheckpoint | null
+  error: string | null
+}
+
+export const USE_PREFERRED_YUE2_CHECKPOINT = '__preferred_yue2_checkpoint__'
+
+export function yue2CheckpointSelectionKey(checkpoint: Yue2CheckpointSelection): string {
+  return JSON.stringify([checkpoint.id, checkpoint.sha256])
+}
 
 export type Yue2CotMode = 'full' | 'melody' | 'off'
 
@@ -79,6 +91,37 @@ export function resolveYue2GenerationSettings(groups: Yue2LoraGroup[]): Yue2Gene
 }
 
 export function preferredYue2Checkpoint(group: Yue2LoraGroup) {
-  return group.checkpoints.find(checkpoint => checkpoint.step === group.preferredStep)
-    || group.checkpoints.at(-1)
+  const checkpoints = Array.isArray(group.checkpoints) ? group.checkpoints : []
+  return checkpoints.find(checkpoint => checkpoint.step === group.preferredStep)
+    || checkpoints.at(-1)
+}
+
+/** Resolve a LoRA to the exact installed ID and checksum, never a nearby fallback. */
+export function resolveYue2CheckpointSelection(
+  group: Yue2LoraGroup,
+  selection?: Yue2CheckpointSelection,
+): Yue2CheckpointResolution {
+  const checkpoints = Array.isArray(group.checkpoints) ? group.checkpoints : []
+  const checkpoint = selection
+    ? checkpoints.find(candidate => candidate.id === selection.id && candidate.sha256 === selection.sha256)
+    : preferredYue2Checkpoint(group)
+
+  if (!checkpoint) {
+    return {
+      checkpoint: null,
+      error: selection
+        ? `The selected checkpoint for ${group.name} is no longer installed or its checksum changed. Choose an available checkpoint before generating.`
+        : `No installed checkpoint is available for ${group.name}. Refresh YuE2 status before generating.`,
+    }
+  }
+
+  if (typeof checkpoint.id !== 'string' || !checkpoint.id.trim()
+    || typeof checkpoint.sha256 !== 'string' || !/^[a-f\d]{64}$/i.test(checkpoint.sha256)) {
+    return {
+      checkpoint: null,
+      error: `The checkpoint for ${group.name} is missing a valid installed ID or SHA-256. Refresh YuE2 status before generating.`,
+    }
+  }
+
+  return { checkpoint, error: null }
 }
