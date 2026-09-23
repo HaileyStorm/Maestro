@@ -812,13 +812,40 @@ SageAttention 2.2.0 source build reported available on Linux SM120 but its
 release-bound validation record did not match the installed distribution.
 One direct BF16 NHD 1×128×16×128 kernel call returned finite output with
 mean absolute difference 0.00395 from PyTorch SDPA and no recorded fallback
-or error. This is a kernel smoke check only. The signed-in UI correctly keeps
-Official SageAttention2++ disabled; the existing benchmark client has no
-account sign-in path, so the required native and paired Turbo video cases did
-not run. The validation record must not be refreshed from this single call:
-checkpoint-bound media, the required kernel-call count, source and runtime
-binding, visual/audio review, and the prescribed same-seed comparison remain
-open.
+or error. This is a kernel smoke check only. The signed-in UI keeps the curated
+Draft/Fast Sage profiles disabled because the release-bound validation record
+does not match this installed source build. Advanced Settings still permits an
+explicit Sage2 choice for a bounded candidate run.
+
+Through the signed-in stable-share Studio, three subsequent Base FL2VA jobs
+used the same synthetic robot brief, seed `314159265`, 124 frames at 24 fps,
+no references or extra LoRAs, and produced Gallery-visible HEVC/AAC outputs:
+
+| Case | Settings | Job | Runtime field | Output SHA-256 |
+| --- | --- | --- | ---: | --- |
+| `base_native_sage2` | 608×352, 20 steps, Sage2, no Turbo | `40b53bd75a844f5185267906ddb5dcb5` | 63 s | `cd36cddb67c59e3f99d59a87387008b8793bfe330f04874985e8990ee4bf9ece` |
+| `base_fast_864_turbo_8_sdpa` | 864×480, 8 steps, Turbo V4, dense SDPA | `ed076e0c2fb3476286b9a1d81c2a6ad3` | 71 s | `ea2fb1458807eec91afd85a1e9fce5b6620f31fa5f603bc61145a1cd93461ec9` |
+| `base_fast_864_turbo_8_sage2` | 864×480, 8 steps, Turbo V4, Sage2 | `2a33dd9fa25c4e0c8276916f604dd1b9` | 38 s | `9af7fcb1a6bb4821637e8ba2d87308698b4a9a316dc53cef418a3ddcaa745c44` |
+
+Each sidecar records the stated model, seed, schedule, attention engine, and
+absence of other LoRAs; each output matches its sidecar media hash, decodes all
+124 video frames and its audio stream without error, and lasts 5.166667 s.
+Sampled middle frames show a coherent red walking robot against the requested
+pale blue background in both Turbo outputs. The yellow triangle is visible on
+the robot's side rather than clearly on its chest, so prompt adherence is
+partial. The native sample is also coherent in sampled frames. Audio is
+present and non-silent in all three, but owner listening remains open.
+
+After the native job the process reported 1,000 Sage2 calls, zero Sage2
+fallbacks, and zero errors; after the matched Turbo Sage2 job it reported
+1,400 calls with the same zero fallback/error counts. The intervening dense
+job did not increment the Sage2 count. This proves candidate Base FL2VA kernel
+execution on this host, including the Turbo schedule. The 71 s versus 38 s
+sidecar fields do not isolate model load, cache state, or other run conditions,
+so they are not a validated speedup. Do not refresh the release validation
+record or enable curated Sage profiles from these three samples alone. Source,
+runtime, checkpoint and broader quality binding, owner visual/listening
+acceptance, and other H3 checkpoint families remain open.
 
 ### 2026-09-23 idle model-release recovery
 

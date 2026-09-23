@@ -251,9 +251,13 @@ environment. This does not establish GPU generation or owner acceptance.
    integrations with complete settings/restore/access/recovery coverage.
 4. The owner opened a September 23 GPU window. The completed H3/FlashVSR/SeedVC
    checks used one exact six-hour coordinator grant, then withdrew it after
-   the jobs reached terminal success. Request and validate a fresh multi-hour
-   grant for each further GPU slice; a grant alone does not establish runtime
-   or quality acceptance.
+   the jobs reached terminal success. A later six-hour grant covered the
+   signed-in Sage2 candidate native and same-seed Turbo comparison recorded in
+   [GPU_ACCEPTANCE.md](../operations/GPU_ACCEPTANCE.md). The owner has since
+   asked for future grants sized to the work, typically 10–30 minutes; the
+   already-issued grant remains valid. Request and validate a fresh exact grant
+   for each later GPU slice. A grant alone does not establish runtime or
+   quality acceptance.
 5. Keep experimental acceleration/LoRA/preview/repair candidates opt-in until
    exact artifact, cancellation, recovery and quality checks pass. Windows and
    owner listening/visual acceptance remain separate targets.
