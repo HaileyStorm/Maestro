@@ -5,14 +5,13 @@ from __future__ import annotations
 import os
 
 import torch
-
 from shared.utils import files_locator as fl
-from .minimax_music3.prompting import validate_music3_lyrics
 
+from .minimax_music3.prompting import validate_music3_lyrics
 
 MODEL_TYPE = "minimax_music3"
 OFFICIAL_REPO_ID = "MiniMaxAI/MiniMax-Music3"
-OFFICIAL_REVISION = "bd348f9c49ea3c1b39f33ace3436f8fad435f24e"
+OFFICIAL_REVISION = "fbdf52fbaaca799592917417eb05f1899f1255ec"
 OPTIMIZED_REPO_ID = "DeepBeepMeep/TTS"
 OPTIMIZED_REVISION = "d31b4665414200fcab779ced520b01bd9f5e07ba"
 PROJECT_FOLDER = "MiniMax-Music3"
@@ -62,6 +61,7 @@ def _model_definition():
     return {
         "group": "music",
         "audio_only": True,
+        "returns_audio": True,
         "image_outputs": False,
         "sliding_window": False,
         "guidance_max_phases": 0,
@@ -201,6 +201,10 @@ class family_handler:
         lm_decoder_engine="legacy",
         **kwargs,
     ):
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "MiniMax-Music3 needs an available CUDA GPU before model loading."
+            )
         del (
             base_model_type,
             model_def,

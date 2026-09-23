@@ -35,6 +35,12 @@ export const HOST_TERM_NOTICES: Record<HostTermId, {
     href: 'https://huggingface.co/krea/Krea-2-Turbo/blob/98e0fe1/README.md',
     linkLabel: 'Review Krea 2 terms',
   },
+  minimax_music3_self_review: {
+    version: 1,
+    text: 'Review the MiniMax-Music3 Community License and Acceptable Use Policy before downloading or using this model. Keep its copyright notice with copies, show MiniMax-Music3 prominently in commercial products, and review the license\'s revenue and third-party service conditions if they apply to your use.',
+    href: 'https://huggingface.co/MiniMaxAI/MiniMax-Music3/blob/fbdf52fbaaca799592917417eb05f1899f1255ec/LICENSE',
+    linkLabel: 'Review Music3 terms',
+  },
   ponpoke_flux2_klein_4b_self_review: {
     version: 1,
     text: 'Confirm the separately gated Ponpoke FLUX.2 Klein 4B encoder access conditions and FLUX non-commercial v2.1 terms apply, and remain responsible for compliance and lawful use. Optional local fidelity QA evaluates quality only; it is not moderation, does not decide permissibility, and never accepts terms.',

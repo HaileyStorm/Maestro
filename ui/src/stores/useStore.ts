@@ -7663,6 +7663,12 @@ export const useStore = create<AppState>((set, get) => ({
   durationSeconds: 5,
   setDurationSeconds: (s) => {
     const options = get().modelOptions
+    // Audio durations are seconds, including 0 for models that auto-derive
+    // length. Video frame alignment can round a displayed 30s below 30s.
+    if (options?.audio_only) {
+      set({ durationSeconds: s })
+      return
+    }
     const fps = options?.fps ?? 16
     const frames = options
       ? alignStudioTotalFrames(Math.round(s * fps), options)
@@ -9432,14 +9438,10 @@ export const useStore = create<AppState>((set, get) => ({
             ;(params as Record<string, unknown>)[key] = voice.path
           }
         }
-        // TTS duration (max duration for the model to generate)
+        // Audio duration is initialized from the model's slider default and
+        // updated directly by its control. Preserve short requests and 0 auto.
         if (state.modelOptions?.audio_only) {
-          // Prefer the slider's `default` (some TTS models — e.g. DramaBox —
-          // set default=0 to mean "auto-derive duration from prompt"); fall
-          // back to `max` then 600.
-          const ds = state.modelOptions.duration_slider
-          const sliderDefault = ds?.default ?? ds?.max ?? 600
-          params.duration_seconds = state.durationSeconds < 30 ? sliderDefault : state.durationSeconds
+          params.duration_seconds = state.durationSeconds
         }
         // Let the TTS model use its own defaults for steps/guidance if ours are video defaults
         if ((params.num_inference_steps as number) > 0 && state.modelOptions?.default_num_inference_steps == null) {
@@ -14206,6 +14208,7 @@ export const useStore = create<AppState>((set, get) => ({
     if (!description) return
     const lifecycle = _beginDirectorLlmRequest(s.activeWorkspace)
     const requestModel = s.directorMusicModel
+    const requestDuration = s.directorSongDuration
     const requestInstrumental = s.directorSongInstrumental
     const requestStyle = s.directorSongStyle
     const requestLyrics = s.directorSongLyrics
@@ -14224,6 +14227,7 @@ export const useStore = create<AppState>((set, get) => ({
         description,
         instrumental: requestInstrumental,
         model_type: requestModel || undefined,
+        duration_seconds: requestDuration,
         reference_image_path: refPath || undefined,
       }, { signal: lifecycle.signal })
       const current = get()
@@ -14231,6 +14235,7 @@ export const useStore = create<AppState>((set, get) => ({
         !lifecycle.ownsWorkspace()
         || current.directorSongDescription.trim() !== description
         || current.directorMusicModel !== requestModel
+        || current.directorSongDuration !== requestDuration
         || current.directorSongInstrumental !== requestInstrumental
         || current.directorSongStyle !== requestStyle
         || current.directorSongLyrics !== requestLyrics

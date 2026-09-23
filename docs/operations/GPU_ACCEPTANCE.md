@@ -66,7 +66,7 @@ the signed-in owner UI; do not weaken account enforcement or substitute a static
 | Official H3 SageAttention2++ | Run `base_native_sage2`, then the same-seed `base_fast_864_turbo_8_sdpa` / `base_fast_864_turbo_8_sage2` pair. | The pinned source build and validation record bind to the current GPU/Torch/CUDA/Triton/checkpoint; kernel execution is proven with no fallback; video and audio are both reviewed; any speed statement separates cold load from generation. Do not promote Sage to W4A8, Ref2VA, or PinkCherry from Base-only evidence. |
 | Sol runtime | From the installed Sol environment run `python scripts/verify_sol_runtime.py`, then complete `base_exact_dense_sol` and `base_high_native_sol`. | Verification reports the exact supported CUDA capability and required Python/PyTorch/CUDA/Triton versions; generated cases record `sol_attn`; output is finite with synchronized audio and no silent SDPA/Sage fallback. Compatibility aliases `start_sol.js` and `sol_install.js` must still enter the canonical start/update flows rather than a separate runtime. |
 | Optional FlashAttention | Run Maestro's normal startup preflight with the installed optional FlashAttention wheel, then exercise one feature that selects it and one forced incompatibility/fallback check. | The current wheel imports and executes on the actual GPU/runtime when compatible. When incompatible or broken, Maestro disables it once, reports the bounded fallback, and successfully uses SageAttention/SDPA without poisoning later imports. Import success alone is not kernel acceptance. |
-| Music3 Studio generation | Verify the published runtime with `python app/scripts/start_music3_runtime.py verify --pinokio-root "$PINOKIO_HOME"`, start it through the normal Pinokio flow, and generate one private lyrical song plus one instrumental song in Studio. | The exact pinned runtime/model generation is active, LAN/Cloudflare Music3 access remains off as intended, cancellation works, both outputs are playable with requested duration/style, lyric sections stay ordered, and the owner accepts musical and vocal quality. Runtime verification without a song does not close this row. |
+| Music3 Studio generation | After GPU clearance, obtain a fresh exact coordinator lease; review the pinned MiniMax host term, fetch the native WanGP checkpoint manifest, and generate one private lyrical song plus one instrumental song in Studio. Repeat a bounded cancellation and restart/recovery case. | The official license and optimized asset revisions match the approved native recipe; the normal project queue records playable audio and provenance, requested duration/style and lyric sections hold, cancellation/recovery do not duplicate or lose results, and the owner accepts musical and vocal quality. Confirm authorized local, LAN, and stable Cloudflare parity. Source checks or a listening server without a song do not close this row. |
 | Music3 to Director | Use **Send to Director** from an edited Lyric Playground song, generate the soundtrack, approve it, and continue through one short Director output. | Director receives the exact workspace, model, style, lyrics, duration, and instrumental state; stale preparation is rejected after an edit; the accepted song's measured structure drives the video plan; the final audio/video is aligned and accepted by the owner. |
 | Scene Kit to Generate | Build a Character/Location selection from at least two kept variants with known output IDs and apply it to a reference-capable generation. | The submitted job contains the exact ordered output IDs, paths, labels, and asset/variant identities selected; no path-only recovered row is accepted; the generated output visibly follows both references; changing project/account/asset state during staging cannot commit a partial set. |
 | Scene Kit to Director | Apply a Cast Board/Scene Kit selection, create a Director preview, then generate and rerun one clip. | Preview, queued clip, saved project, final join, and rerun preserve the exact selected output IDs and labels; project/account epoch changes fail atomically; the final clip visibly retains the intended cast and setting. UI attachment alone does not close the row. |
@@ -83,6 +83,80 @@ and residual gap. Keep the actual media in the project's normal private output
 store, not in Git. A model-free test, downloaded asset, runtime marker, printed
 URL, completed queue plan, or screenshot of controls is not generated-output or
 human acceptance.
+
+### 2026-09-21 general generation recovery, rechecked 2026-09-23
+
+The existing private live-matrix project contains completed generated files,
+rechecked against their sidecar `producer_media_sha256` values. One FLUX.2
+Klein 9B image is a decodable 672x672 PNG (SHA-256
+`d04359472788c634da4a63f0ea17adef72ba8c3fb4ee950b163cea860faa3f55`).
+One H3 Base short video is a 5.167-second 608x352 HEVC/AAC file (SHA-256
+`c6630eff5a113063ec743c17b0a29f19fabc0cd8c97211ac29ddd7313ed75282`);
+the joined long-form result is 16.167 seconds at 608x352 with H.264/AAC
+(SHA-256
+`ebd0093951d7bcaf45ac7d2b7cd0bea04242581d2d9c7cf16d20b91b1bcb3a4a`).
+One ACE-Step Turbo music output is a 120-second, stereo 48 kHz PCM WAV
+(SHA-256
+`6f932a872811de7ded0da481527529474c776d3eaf5f93ce240b02beed9c9c2f`);
+an audio-level probe found mean -11.7 dBFS and peak 0.0 dBFS, so it is not
+silent, though this does not judge musical quality.
+The signed-in stable Cloudflare UI also displayed two completed local chat
+replies to exact-match synthetic prompts in the same project. The image and a
+frame from the long-form video were visually inspected during the recheck.
+This is retained generated-artifact and browser evidence for the earlier
+recovery wave, not a fresh generation on the current Music3 revision or owner
+acceptance of quality. The original release revision is not recorded in these
+sidecars, so do not infer an exact source binding from this retrospective check.
+
+### 2026-09-23 fresh signed-in image generation
+
+With the exact `maestro-local` coordinator grant validated before submission and
+continuously checked during the job, the signed-in stable Cloudflare UI queued
+one FLUX.2 Klein 9B Studio image on the running `f432921` service revision.
+The normal queue changed from waiting to running to clear, and the project item
+count increased by one. The four-step, 672x672 RGB PNG completed in 89 seconds;
+its SHA-256 is
+`65872c808bbc34fda31f06af967795181b42dfd44aecaca1707dd8a645a903a7`,
+matching the sidecar `producer_media_sha256`. Direct inspection showed the
+requested two objects and no visible text. This is fresh live GPU, stable-share
+browser, generated-artifact, and agent visual evidence for this single image
+case; it does not accept other models, Music3, or owner quality.
+In the same signed-in browser, a fresh local Gemma 4 31B Chat request loaded
+the selected model and returned the exact synthetic response requested. This
+is live stable-share Chat evidence, separate from the image and earlier
+retained responses; it does not establish other LLM/provider behavior.
+
+A fresh ACE-Step v1.5 Turbo LM_4B Studio music job also completed through the
+signed-in stable-share queue. The saved stereo 48 kHz PCM WAV has SHA-256
+`f778081be934a1d80302727e7c98e11d7104aabd94772d7b0ffbc122a501e391`,
+matching its sidecar, and measurable audio (mean -15.0 dBFS, peak 0.0 dBFS).
+The Advanced Settings control visibly showed a 30-second request, but the
+sidecar records `duration_seconds: 120` and the output measures exactly 120
+seconds. This is a live duration mismatch on the pre-deployment `f432921`
+service; it must be diagnosed and retested before duration control is accepted.
+No owner listening judgment is implied.
+
+A fresh MiniMax H3 Base FL2VA **Quality** Studio job then completed on the same
+pre-deployment service, with 23 steps at 960x544. The 5.167-second HEVC/AAC
+file has SHA-256
+`d06891432e2b712e1c75c2c74dd22c6a9c12f768bb4e4b016228e3c5a0336273`,
+matching its sidecar. The stereo 32 kHz audio is non-silent (mean -16.0 dBFS,
+peak -1.9 dBFS). Frames at 0.5, 2, and 4 seconds showed the requested blue
+pinwheel with a changed blade orientation. This accepts one short Base
+generation path technically and visually; long-form continuity, reference
+conditioning, other profiles, and owner quality remain separate rows.
+
+A second signed-in H3 Base FL2VA Quality request used a 16.17-second authored
+two-beat timeline. Both planned segments completed, and the final 960x544,
+24 fps H.264/AAC file measures 16.167 seconds. Its SHA-256 is
+`5277f36208a392bfc572071d614e469e340f28f7dfc32726b20e257e99149914`,
+matching the sidecar. Stereo 32 kHz audio is non-silent (mean -18.9 dBFS,
+peak -1.4 dBFS). Sampled frames before and after the 8-second join retain
+the same pinwheel, table, and room, with the requested color change in the
+second beat. This accepts one >15-second two-segment path technically and by
+agent visual inspection. During staging, the server logged `Object of type
+Image is not JSON serializable` while embedding MP4 metadata. The final media
+and sidecar were still published; embedded metadata reliability remains open.
 
 ### 2026-08-27 PinkCherry beta-0.6 runtime receipt
 

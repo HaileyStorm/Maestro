@@ -26,8 +26,11 @@ are settled.
 
 ## Already decided
 
-- Music 3 is approved for a local-only install and benchmark. Show its required
-  credit; keep LAN and Cloudflare access off for now.
+- Music 3 is approved for a native local install and private benchmark. Show
+  its required credit and host notice. The single owner's authorized LAN and
+  stable Cloudflare sessions may use the same model and project controls, with
+  the normal account, project, and model-visibility checks. A third-party
+  hosted service needs its own licensing and operational review.
 - Character Sheets start from a FLUX anchor. Quad FLUX is the safe default;
   Krea choices are explicit, and Dynamic Krea stays experimental. Visual quality checks are
   optional and start Off; Qwen Image Edit remains available for repairs.

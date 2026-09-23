@@ -5,13 +5,17 @@ from __future__ import annotations
 import ast
 import importlib.util
 import json
+import math
 import os
-from pathlib import Path
 import re
 import subprocess
 import sys
 import types
 import unittest
+from pathlib import Path
+
+if str(Path(__file__).resolve().parents[1] / "app") not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -82,7 +86,10 @@ def _load_handler_namespace():
             selected.append(node)
     namespace = {
         "os": os,
-        "torch": types.SimpleNamespace(bfloat16="bf16"),
+        "torch": types.SimpleNamespace(
+            bfloat16="bf16",
+            cuda=types.SimpleNamespace(is_available=lambda: False),
+        ),
         "fl": types.SimpleNamespace(),
         "validate_music3_lyrics": _load_prompting_module().validate_music3_lyrics,
     }
@@ -146,6 +153,32 @@ def _load_write_song_namespace():
     module = ast.Module(body=selected, type_ignores=[])
     ast.fix_missing_locations(module)
     return selected[0]
+
+
+class _HTTPException(Exception):
+    def __init__(self, *, status_code, detail):
+        self.status_code = status_code
+        self.detail = detail
+
+
+def _load_song_writer_prompt():
+    tree = ast.parse(_read(_LAUNCH), filename=str(_LAUNCH))
+    selected = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_song_writer_system_prompt"
+    )
+    module = ast.Module(body=[selected], type_ignores=[])
+    ast.fix_missing_locations(module)
+
+    namespace = {
+        "HTTPException": _HTTPException,
+        "math": math,
+        "_SONG_WRITER_FALLBACK": "ACE vocal fallback",
+        "_SONG_WRITER_FALLBACK_INSTRUMENTAL": "ACE instrumental fallback",
+    }
+    exec(compile(module, str(_LAUNCH), "exec"), namespace)
+    return namespace["_song_writer_system_prompt"]
 
 
 def _load_engine_resolver(*, vllm_supported: bool):
@@ -238,6 +271,11 @@ class MiniMaxMusic3Tests(unittest.TestCase):
         self.assertIn("tokenizer.json", flattened)
         self.assertEqual(license_manifest["repoId"], "MiniMaxAI/MiniMax-Music3")
         self.assertIn("LICENSE", license_manifest["fileList"][0])
+
+    def test_handler_rejects_cpu_before_loading_weights(self):
+        handler = _load_handler_namespace()["family_handler"]
+        with self.assertRaisesRegex(RuntimeError, "available CUDA GPU"):
+            handler.load_model(None, model_type="minimax_music3")
 
     def test_music3_auto_engine_keeps_a4500_class_cards_on_cuda_graph_sdpa(self):
         without_flash_attention = _load_engine_resolver(vllm_supported=False)
@@ -418,9 +456,9 @@ class MiniMaxMusic3Tests(unittest.TestCase):
         quanto = _read(_QUANTO_INT8)
         handler = _read(_HANDLER)
         launch = _read(_LAUNCH)
-        self.assertNotIn('"models.TTS.minimax_music3_handler"', wgp)
+        self.assertIn('"models.TTS.minimax_music3_handler"', wgp)
         self.assertIn("minimax_music3_handler", _read(_APP / "models" / "TTS" / "__init__.py"))
-        self.assertIn("def _music3_virtual_catalog_model(", launch)
+        self.assertNotIn("def _music3_virtual_catalog_model(", launch)
         self.assertIn("Qwen2TokenizerFast.from_pretrained", pipeline)
         self.assertIn("Qwen3Config.from_pretrained", pipeline)
         self.assertIn("normalize_music3_qwen_config", pipeline)
@@ -447,8 +485,7 @@ class MiniMaxMusic3Tests(unittest.TestCase):
         self.assertIn("torch.inference_mode()", cuda_graph)
         self.assertIn("scaled_dot_product_attention", attention)
         self.assertIn("configure_tiny_m_shape_overrides", quanto)
-        self.assertIn("this entry cannot be enabled, downloaded, selected, or run", launch)
-        self.assertIn("LOCAL_EXPERIMENT_AUTHORIZATION_SCOPE", launch)
+        self.assertIn("_require_model_recipe_terms([model_type])", launch)
         self.assertNotIn("compute_music3_weight_budget", launch)
         self.assertNotIn("resident Music3 profile will reload", launch)
         self.assertNotIn("MiniMax-Music3 ran out of VRAM while planning the song", wgp)
@@ -463,14 +500,16 @@ class MiniMaxMusic3Tests(unittest.TestCase):
         self.assertIn("api.writeSong({", ui)
         self.assertIn("description: requestDescription", ui)
         self.assertIn("model_type: requestModelType || undefined", ui)
+        self.assertIn("duration_seconds: requestDuration", ui)
         self.assertIn("MusicLyricPlayground", ui)
         self.assertNotIn("music3_structured_caption", ui)
         self.assertIn("duration_seconds?: number", client)
         self.assertIn("model_type?: string", client)
         self.assertIn('load_guide("music", "song_writer")', launch)
         self.assertIn('load_guide("music", "song_writer_instrumental")', launch)
-        self.assertNotIn('load_guide("music", "song_writer_minimax_music3")', launch)
-        self.assertNotIn("_music3_writer_duration_instruction", launch)
+        self.assertIn('"song_writer_minimax_music3"', launch)
+        self.assertIn('"song_writer_minimax_music3_instrumental"', launch)
+        self.assertIn("_song_writer_system_prompt(", launch)
 
     def test_music3_writer_receives_a_bounded_runtime_contract(self):
         write_song = _load_write_song_namespace()
@@ -479,11 +518,24 @@ class MiniMaxMusic3Tests(unittest.TestCase):
             for node in ast.walk(write_song)
             if isinstance(node, ast.Constant)
         }
-        self.assertIn("song_writer", constants)
-        self.assertIn("song_writer_instrumental", constants)
         self.assertIn(1024, constants)
-        self.assertNotIn("song_writer_minimax_music3", constants)
-        self.assertNotIn("_music3_writer_duration_instruction", constants)
+        self.assertIn("duration_seconds", constants)
+        self.assertIn("_song_writer_system_prompt", {
+            node.id for node in ast.walk(write_song)
+            if isinstance(node, ast.Name)
+        })
+        prompt = _load_song_writer_prompt()
+        vocal = prompt("minimax_music3", False, 37)
+        self.assertIn("MiniMax-Music3", vocal)
+        self.assertIn("### Arrangement", vocal)
+        self.assertIn("Selected song duration: 37 seconds", vocal)
+        instrumental = prompt("minimax_music3", True, 300)
+        self.assertIn("[LYRICS]\n[Instrumental]", instrumental)
+        self.assertIn("Selected song duration: 300 seconds", instrumental)
+        for duration in (4, 301, float("nan")):
+            with self.subTest(duration=duration), self.assertRaises(_HTTPException) as raised:
+                prompt("minimax_music3", False, duration)
+            self.assertEqual(raised.exception.status_code, 400)
 
     def test_director_can_select_and_submit_music3(self):
         store = _read(_STORE)
@@ -497,7 +549,7 @@ class MiniMaxMusic3Tests(unittest.TestCase):
         self.assertIn("directorSongDuration", store)
         self.assertIn("duration_seconds: s.directorSongDuration", store)
         self.assertIn("model_type: s.directorMusicModel || undefined", store)
-        self.assertIn("_music3_virtual_catalog_model", launch)
+        self.assertNotIn("_music3_virtual_catalog_model", launch)
         self.assertNotIn("1536 if is_minimax_music3 else 1024", launch)
 
     def test_music3_guides_follow_official_structure(self):

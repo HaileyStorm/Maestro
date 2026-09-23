@@ -12,12 +12,12 @@ from collections.abc import Mapping, MutableMapping
 from datetime import datetime, timezone
 from typing import Any
 
-
 LAWFUL_USE_TERM = "lawful_use"
 REF2VA_TERM = "minimax_h3_ref2va"
 BFL_FLUX1_REVIEW_TERM = "bfl_flux1_self_review"
 BFL_FLUX2_REVIEW_TERM = "bfl_flux2_self_review"
 KREA2_REVIEW_TERM = "krea2_self_review"
+MUSIC3_REVIEW_TERM = "minimax_music3_self_review"
 KREA2_MOODY_MIX_V7_CREATOR_TERM = (
     "civitai_2731187_3209007_creator_terms"
 )
@@ -254,6 +254,7 @@ CURRENT_HOST_TERM_VERSIONS = {
     BFL_FLUX1_REVIEW_TERM: 1,
     BFL_FLUX2_REVIEW_TERM: 1,
     KREA2_REVIEW_TERM: 2,
+    MUSIC3_REVIEW_TERM: 1,
     KREA2_MOODY_MIX_V7_CREATOR_TERM: 1,
     KREA2_MOODY_CUTIE_V4_CREATOR_TERM: 1,
     PONPOKE_FLUX2_KLEIN4B_TERM: 1,
@@ -293,6 +294,14 @@ CURRENT_HOST_TERM_BINDINGS = {
         "revision": "98e0fe1",
         "license_repository": "krea-ai/krea-2",
         "license_revision": "db3984fbc6e13b34c0064990fc2d95ac64d00058",
+    },
+    MUSIC3_REVIEW_TERM: {
+        "license_id": "minimax-music3-community-license-2026-08-06",
+        "repository": "MiniMaxAI/MiniMax-Music3",
+        "revision": "fbdf52fbaaca799592917417eb05f1899f1255ec",
+        "license_sha256": "b21d12df2adae59dad3fcf80c1d81492654c662342f497d9a9770198c9317e58",
+        "optimized_repository": "DeepBeepMeep/TTS",
+        "optimized_revision": "d31b4665414200fcab779ced520b01bd9f5e07ba",
     },
     KREA2_MOODY_MIX_V7_CREATOR_TERM: {
         "license_id": KREA2_MOODY_MIX_V7_RECIPE_GRAPH["checkpoint"][
@@ -525,8 +534,6 @@ __all__ = [
     "CURRENT_HOST_TERM_BINDINGS",
     "CURRENT_HOST_TERM_VERSIONS",
     "HOST_TERMS_CONFIG_KEY",
-    "LAWFUL_USE_TERM",
-    "KREA2_REVIEW_TERM",
     "KREA2_MOODY_CUTIE_V4_CREATOR_TERM",
     "KREA2_MOODY_CUTIE_V4_RECIPE_GRAPH",
     "KREA2_MOODY_CUTIE_V4_RECIPE_ID",
@@ -534,6 +541,9 @@ __all__ = [
     "KREA2_MOODY_MIX_V7_RECIPE_GRAPH",
     "KREA2_MOODY_MIX_V7_RECIPE_ID",
     "KREA2_MOODY_RECIPE_GRAPHS",
+    "KREA2_REVIEW_TERM",
+    "LAWFUL_USE_TERM",
+    "MUSIC3_REVIEW_TERM",
     "PONPOKE_FLUX2_KLEIN4B_TERM",
     "PONPOKE_FLUX2_KLEIN9B_TERM",
     "PORNMASTER_V4_RECIPE_GRAPH",

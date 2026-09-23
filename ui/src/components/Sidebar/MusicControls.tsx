@@ -120,6 +120,7 @@ export function MusicControls() {
     const requestDescription = description.trim()
     const requestInstrumental = instrumental
     const requestModelType = modelType
+    const requestDuration = Number(params.duration_seconds ?? 120)
     const requestStyle = style
     const requestLyrics = lyrics
     const controller = new AbortController()
@@ -132,6 +133,7 @@ export function MusicControls() {
         && current.musicDescription.trim() === requestDescription
         && current.musicInstrumental === requestInstrumental
         && String(current.params.model_type || '') === requestModelType
+        && Number(current.params.duration_seconds ?? 120) === requestDuration
         && String(current.params.alt_prompt || '') === requestStyle
         && String(current.params.prompt || '') === requestLyrics
     }
@@ -143,6 +145,7 @@ export function MusicControls() {
         description: requestDescription,
         instrumental: requestInstrumental,
         model_type: requestModelType || undefined,
+        duration_seconds: requestDuration,
       }, { signal: controller.signal })
       if (!requestIsCurrent()) return
       if (r.style) setStyle(r.style)

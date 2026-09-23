@@ -420,3 +420,19 @@ test('audio output duration restores seconds and auto duration instead of the vi
     }, { audio_only: true, sliding_window: false, duration_slider: { min: 0, max: 1800, default: 0 } })
   }
 })
+
+test('audio duration control keeps exact short seconds outside the video frame grid', async () => {
+  await withFreshStore(async ({ useStore }) => {
+    const audioOptions = {
+      ...options(), audio_only: true, fps: 16, latent_size: 4,
+      frames_steps: 4, duration_slider: { min: 5, max: 360, default: 120 },
+    }
+    useStore.setState({ modelOptions: audioOptions, generationMode: 'audio' })
+    const priorVideoLength = useStore.getState().params.video_length
+    for (const seconds of [5, 29, 30, 120, 0]) {
+      useStore.getState().setDurationSeconds(seconds)
+      assert.equal(useStore.getState().durationSeconds, seconds)
+      assert.equal(useStore.getState().params.video_length, priorVideoLength)
+    }
+  })
+})

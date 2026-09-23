@@ -22,6 +22,12 @@ export function DirectorSongSetup() {
   const setInstrumental = useStore(s => s.setDirectorSongInstrumental)
   const duration = useStore(s => s.directorSongDuration)
   const setDuration = useStore(s => s.setDirectorSongDuration)
+  const activeWorkspace = useStore(s => s.activeWorkspace)
+  const hostTerms = useStore(s => s.hostTerms)
+  const hostTermsLoading = useStore(s => s.hostTermsLoading)
+  const hostTermsError = useStore(s => s.hostTermsError)
+  const loadHostTerms = useStore(s => s.loadHostTerms)
+  const acceptHostTerm = useStore(s => s.acceptHostTerm)
 
   const musicModels = DIRECTOR_MUSIC_MODEL_ORDER
     .map(modelType => models.find(model => model.model_type === modelType))
@@ -34,7 +40,16 @@ export function DirectorSongSetup() {
   const selectedModel = musicModels.find(model => model.model_type === effectiveModel)
   const isMusic3 = selectedModel?.model_type === 'minimax_music3'
   const executionUnavailable = selectedModel?.execution_allowed === false
+  const pendingRequirements = (selectedModel?.required_host_terms || []).filter(
+    requirement => hostTerms?.[requirement.term]?.accepted !== true,
+  )
   const maximumDuration = isMusic3 ? 300 : 360
+
+  useEffect(() => {
+    if (activeWorkspace && selectedModel?.required_host_terms?.length && !hostTerms && !hostTermsLoading) {
+      void loadHostTerms()
+    }
+  }, [activeWorkspace, selectedModel, hostTerms, hostTermsLoading, loadHostTerms])
 
   useEffect(() => {
     if (effectiveModel && effectiveModel !== musicModel) {
@@ -86,6 +101,18 @@ export function DirectorSongSetup() {
               {selectedModel?.is_downloaded === false ? ' Downloads on first use.' : ''}
             </p>
             {executionUnavailable && <p role="status" className="mt-1 text-[10px] leading-snug text-amber-300">Song setup is available for authoring and handoff, but this model is not executable on the current host yet.</p>}
+            {pendingRequirements.map(requirement => (
+              <div key={requirement.term} role="status" className="mt-2 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[10px] leading-snug text-amber-100">
+                <p>{requirement.notice}</p>
+                <div className="mt-1 flex flex-wrap items-center gap-2">
+                  <a href={requirement.license_url} target="_blank" rel="noreferrer" className="text-accent-blue hover:underline">Read model terms</a>
+                  <button type="button" disabled={hostTermsLoading || !hostTerms} onClick={() => { void acceptHostTerm(requirement.term) }} className="rounded border border-amber-400/40 px-2 py-0.5 disabled:opacity-40">
+                    Accept for this Maestro installation
+                  </button>
+                </div>
+              </div>
+            ))}
+            {pendingRequirements.length > 0 && hostTermsError && <p role="status" className="mt-1 text-[10px] text-red-300">{hostTermsError}</p>}
           </>
         ) : (
           <p className="text-[10px] text-amber-400 leading-snug">

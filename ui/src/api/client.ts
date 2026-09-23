@@ -1481,6 +1481,7 @@ export async function writeSong(params: {
   description: string
   instrumental?: boolean
   model_type?: string
+  duration_seconds?: number
   seed?: number
   reference_image_path?: string
 }, options?: LlmRequestOptions): Promise<{ style: string; lyrics: string; raw: string }> {

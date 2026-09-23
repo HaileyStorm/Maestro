@@ -10,12 +10,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-
 ROOT = Path(__file__).resolve().parents[1]
 APP_ROOT = ROOT / "app"
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
+from models.TTS import minimax_music3_handler as music3_handler  # noqa: E402
 from services.host_terms import (  # noqa: E402
     BFL_FLUX1_REVIEW_TERM,
     BFL_FLUX2_REVIEW_TERM,
@@ -29,6 +29,7 @@ from services.host_terms import (  # noqa: E402
     KREA2_MOODY_MIX_V7_RECIPE_GRAPH,
     KREA2_MOODY_MIX_V7_RECIPE_ID,
     KREA2_REVIEW_TERM,
+    MUSIC3_REVIEW_TERM,
     PONPOKE_FLUX2_KLEIN4B_TERM,
     PONPOKE_FLUX2_KLEIN9B_TERM,
     PORNMASTER_V4_RECIPE_GRAPH,
@@ -36,17 +37,17 @@ from services.host_terms import (  # noqa: E402
 )
 from services.model_terms import (  # noqa: E402
     MODEL_TERM_DOCUMENTS,
-    ModelTermsContractError,
-    ModelTermsRequiredError,
     PORNMASTER_V4_PONPOKE_RECIPE,
     PORNMASTER_V4_REQUIRED_TERMS,
+    ModelTermsContractError,
+    ModelTermsRequiredError,
     model_availability_policy,
     model_terms_manifest_valid,
     model_terms_status,
     model_terms_statuses,
+    require_model_terms,
     required_model_term,
     required_model_terms,
-    require_model_terms,
 )
 
 
@@ -58,6 +59,67 @@ def _definitions(*names: str) -> dict[str, dict]:
         ) as handle:
             definitions[name] = json.load(handle)["model"]
     return definitions
+
+
+class Music3NativeTermTests(unittest.TestCase):
+    def setUp(self):
+        definition = music3_handler._model_definition()
+        definition.update(_definitions("minimax_music3")["minimax_music3"])
+        self.definitions = {"minimax_music3": definition}
+
+    def test_exact_native_sources_require_current_host_review(self):
+        binding = CURRENT_HOST_TERM_BINDINGS[MUSIC3_REVIEW_TERM]
+        self.assertEqual(music3_handler.OFFICIAL_REVISION, binding["revision"])
+        self.assertEqual(music3_handler.OPTIMIZED_REVISION, binding["optimized_revision"])
+        sources = music3_handler.family_handler.query_model_files(None, "minimax_music3")
+        self.assertEqual(sources[0]["repoId"], binding["optimized_repository"])
+        self.assertEqual(sources[0]["revision"], binding["optimized_revision"])
+        self.assertEqual(sources[1]["repoId"], binding["repository"])
+        self.assertEqual(sources[1]["revision"], binding["revision"])
+        self.assertIn("LICENSE", sources[1]["fileList"][0])
+        self.assertTrue(model_terms_manifest_valid(
+            "minimax_music3", self.definitions,
+        ))
+        self.assertEqual(
+            required_model_terms("minimax_music3", self.definitions),
+            (MUSIC3_REVIEW_TERM,),
+        )
+        services = {}
+        with self.assertRaises(ModelTermsRequiredError):
+            require_model_terms(services, "minimax_music3", self.definitions)
+        accept_host_term(services, MUSIC3_REVIEW_TERM, 1)
+        require_model_terms(services, "minimax_music3", self.definitions)
+
+    def test_source_or_notice_drift_fails_even_after_acceptance(self):
+        services = {}
+        accept_host_term(services, MUSIC3_REVIEW_TERM, 1)
+        for field, value in (
+            ("URLs", ["https://example.invalid/changed.safetensors"]),
+            ("license_url", "https://huggingface.co/MiniMaxAI/MiniMax-Music3/blob/main/LICENSE"),
+            ("required_host_terms", []),
+        ):
+            with self.subTest(field=field):
+                definitions = copy.deepcopy(self.definitions)
+                definitions["minimax_music3"][field] = value
+                self.assertFalse(model_terms_manifest_valid(
+                    "minimax_music3", definitions,
+                ))
+                with self.assertRaises(ModelTermsContractError):
+                    require_model_terms(services, "minimax_music3", definitions)
+
+    def test_handler_source_drift_cannot_bypass_native_term_binding(self):
+        with patch.object(music3_handler, "OFFICIAL_REVISION", "changed"):
+            self.assertFalse(model_terms_manifest_valid(
+                "minimax_music3", self.definitions,
+            ))
+        with patch.object(
+            music3_handler.family_handler,
+            "query_model_files",
+            return_value=[{"repoId": "other", "revision": "other"}],
+        ):
+            self.assertFalse(model_terms_manifest_valid(
+                "minimax_music3", self.definitions,
+            ))
 
 
 class ImageRecipeTermTests(unittest.TestCase):

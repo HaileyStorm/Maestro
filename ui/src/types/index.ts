@@ -1566,6 +1566,7 @@ export type HostTermId =
   | 'bfl_flux1_self_review'
   | 'bfl_flux2_self_review'
   | 'krea2_self_review'
+  | 'minimax_music3_self_review'
   | 'civitai_2731187_3209007_creator_terms'
   | 'civitai_2764429_3211049_creator_terms'
   | 'ponpoke_flux2_klein_4b_self_review'
@@ -1578,6 +1579,9 @@ export interface HostTermBinding {
   revision: string
   license_repository?: string
   license_revision?: string
+  license_sha256?: string
+  optimized_repository?: string
+  optimized_revision?: string
   covered_repositories?: Array<{
     repository: string
     revision: string
@@ -1613,6 +1617,7 @@ export interface HostTermsStatus {
   bfl_flux1_self_review: HostTermStatus
   bfl_flux2_self_review: HostTermStatus
   krea2_self_review: HostTermStatus
+  minimax_music3_self_review: HostTermStatus
   civitai_2731187_3209007_creator_terms: HostTermStatus
   civitai_2764429_3211049_creator_terms: HostTermStatus
   ponpoke_flux2_klein_4b_self_review: HostTermStatus

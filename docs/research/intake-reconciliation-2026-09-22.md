@@ -63,7 +63,7 @@ checkpoint was installed.
 
 | Candidate | Retained decision | Actual state / requirement before promotion |
 | --- | --- | --- |
-| MiniMax Music3 | Adapt / isolated experiment | Runtime/stage/SGLang contracts and writer UI exist; `launch.py` virtual catalog reports `execution_allowed: false`. End-to-end generation and Studio/Director publication remain unfinished. The 2026-09-23 source refresh confirms model revision `fbdf52fbaaca799592917417eb05f1899f1255ec` and [LICENSE](https://huggingface.co/MiniMaxAI/MiniMax-Music3/blob/fbdf52fbaaca799592917417eb05f1899f1255ec/LICENSE) SHA-256 `b21d12df2adae59dad3fcf80c1d81492654c662342f497d9a9770198c9317e58`; that document has no specific US-country restriction. The managed start command now supplies `--model-name MiniMaxAI/MiniMax-Music3`, matching the exact client identity rather than SGLang’s default pipeline name (39 runtime checks and 82 runtime/catalog/staging checks pass). The old `united_states_approval` field and external HTTPS attestation service are adapter requirements, not demonstrated upstream protocol requirements. Resolve these against existing host terms acceptance and same-owner LAN/Cloudflare parity before executor promotion; keep all inference local. |
+| MiniMax Music3 | Adopt native WanGP path; retain SGLang as isolated experiment | The upstream-native Music3 handler is registered for Studio and Director's existing audio queue, project output, recovery and same-owner local/LAN/Cloudflare access. The catalog exposes the real model only through the normal visibility whitelist; download and execution require the versioned host review term and exact official/optimized source manifest. The [official LICENSE](https://huggingface.co/MiniMaxAI/MiniMax-Music3/blob/fbdf52fbaaca799592917417eb05f1899f1255ec/LICENSE) is pinned at `fbdf52fbaaca799592917417eb05f1899f1255ec` with SHA-256 `b21d12df2adae59dad3fcf80c1d81492654c662342f497d9a9770198c9317e58`; the optimized WanGP assets are pinned separately at `DeepBeepMeep/TTS@d31b4665414200fcab779ced520b01bd9f5e07ba`. Byte-level lineage from that conversion to the newer official commit is not independently proven, so keep both source identities visible. CPU tests cover source drift, terms admission and catalog parity. No checkpoint has been downloaded, no GPU song has been generated, and quality/cancellation/recovery still need live acceptance. The separate SGLang runtime/client remains unconnected to production, with an adapter-only external signature and country gate; neither is an official license requirement. |
 | Music3 Turbo FP8 and MiniMax Music Slider LoRA | Watch | No accepted managed recipe. Need exact artifact, base compatibility, adapter control and audio evidence after the Music3 executor. |
 | YuE2 and installed Sound/Vision LoRAs | Adopt | Bridge-based generation/composition delivered. Native training, dataset preparation, checkpoint auditions and upstream My Music library are separate work. |
 | CharacterSheet / Krea identity LoRAs | Adapt | `character_sheet_workflow.py`, capabilities and profile gates are planning/validation only; profiles explicitly unavailable/non-executable. Ordinary Reference Packs are a different delivered capability. Need exact artifacts, runnable sheet/repair stages and identity acceptance. |
@@ -198,14 +198,15 @@ change passes 82 runtime/catalog/staging checks. Abrupt process
 termination can still leave private temporary directories for later cleanup;
 no arbitrary prefix-based deletion is authorized by these changes.
 
-Music3 CPU groundwork (2026-09-23): the managed SGLang start command now binds
-the exact served model name, and a loopback-only HTTP transport bounds response
-bytes, rejects redirects and unsupported encodings, and closes its request on
-cancellation. Ten disposable HTTP-server tests and 36 client tests pass. This
-does not provide a production Director caller, staged runtime, project artifact,
-or GPU cancellation proof. The pinned model/license identity is source-verified;
-adapter-only country and external-signature gates still need reconciliation to
-the actual model terms before a first-class generation flow is exposed.
+Music3 CPU groundwork (2026-09-23): the upstream-native WanGP handler now enters
+the normal Studio and Director generation path, and its source/license graph is
+checked before download and execution. The separate managed SGLang command binds
+the exact served model name, while its loopback HTTP transport bounds responses,
+rejects redirects and unsupported encodings, and closes its request on
+cancellation. Ten disposable HTTP-server tests and 36 client tests pass for that
+isolated path. SGLang does not provide the production Music3 caller. Neither
+native source checks nor transport tests prove a playable song, GPU cancellation,
+or crash recovery; those remain live acceptance targets.
 
 H3/inpaint CPU repairs (2026-09-23): the H3 continuation encoders now have their
 required subprocess import. Prompt mapping loads its sealed manifest from the
@@ -239,16 +240,18 @@ environment. This does not establish GPU generation or owner acceptance.
    collection have CPU-tested repairs. Exact manifest inputs and create-only
    publication now support verified crash-result adoption without processor
    replay; FlashVSR scratch files stay in private project staging. Actual
-   FlashVSR/SeedVC output quality, cancellation and GPU recovery remain pending
-   the owner's GPU clearance. Gallery Extend and manual flip have CPU/UI/live-flow
+   FlashVSR/SeedVC output quality, cancellation and GPU recovery remain open
+   under the owner's September 23 GPU clearance. Gallery Extend and manual flip have CPU/UI/live-flow
    evidence; flip hard-crash adoption and human acceptance remain distinct.
-2. Implement currently missing Music3 and CharacterSheet executors in coherent
-   slices; their static scaffolds must not be advertised as working products.
+2. Complete Music3 native live generation and recovery acceptance after the
+   pinned host-term review and asset download. Implement the missing CharacterSheet executor in coherent slices;
+   its static scaffold must not be advertised as a working product.
 3. Adapt upstream Qwen2.1, native YuE2 training/library and Editor as separate
    integrations with complete settings/restore/access/recovery coverage.
-4. When the owner reports GPU availability, request/validate exact coordinator
-   leases for the selected candidate acceptance matrix. No queued lease or
-   visible idle GPU authorizes execution now.
+4. The owner opened a September 23 GPU window, and an exact multi-hour
+   coordinator grant now covers the current Maestro live checks. Revalidate
+   its authority before and during each selected case; the grant itself does
+   not establish a model's runtime or quality acceptance.
 5. Keep experimental acceleration/LoRA/preview/repair candidates opt-in until
    exact artifact, cancellation, recovery and quality checks pass. Windows and
    owner listening/visual acceptance remain separate targets.

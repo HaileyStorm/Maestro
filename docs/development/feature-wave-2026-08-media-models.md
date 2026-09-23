@@ -39,6 +39,13 @@ pipeline and an OpenAI-compatible SGLang-Omni server. Full precision is stated
 to fit under 24GB; CPU offload is roughly 22GB, while layer streaming can reach
 8GB at a substantial speed cost. The current path is non-streaming.
 
+> **2026-09-23 update:** The SGLang-first sequence below is historical design
+> context, not the current Music3 delivery plan. Continuum now uses the native
+> WanGP Music3 handler for Studio and Director, with normal project, terms,
+> queue, audio, and remote-visibility contracts. The isolated SGLang adapter
+> remains an optional experiment. See the current intake reconciliation and
+> `docs/operations/GPU_ACCEPTANCE.md` for the live acceptance gate.
+
 ### Runtime boundary
 
 Implement Music 3 as the first concrete SGLang trial, but keep the engine
@@ -295,7 +302,7 @@ delivery artifact.
 
 Keep one writer per shared cluster and land vertical slices in this order:
 
-1. **Engine contract:** model/purpose-resolved engine configuration, capability
+1. **Engine contract (historical SGLang plan):** model/purpose-resolved engine configuration, capability
    probe, saved provenance, cancellation, and isolated lifecycle. No Music 3 UI
    is merged against a hard-coded server.
 2. **Music 3 runtime slice:** model definition/install manifest, SGLang-Omni

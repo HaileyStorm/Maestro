@@ -1,4 +1,4 @@
-"""Server-owned image recipe license/self-review gates.
+"""Server-owned model recipe license/self-review gates.
 
 This module resolves terms from declared model relationships only. It never
 inspects prompts, input media, outputs, paths, tokens, or user identity.
@@ -23,13 +23,13 @@ from services.host_terms import (
     KREA2_MOODY_MIX_V7_RECIPE_ID,
     KREA2_MOODY_RECIPE_GRAPHS,
     KREA2_REVIEW_TERM,
+    MUSIC3_REVIEW_TERM,
     PONPOKE_FLUX2_KLEIN4B_TERM,
     PONPOKE_FLUX2_KLEIN9B_TERM,
     PORNMASTER_V4_RECIPE_GRAPH,
     PORNMASTER_V4_RECIPE_ID,
     host_term_accepted,
 )
-
 
 PORNMASTER_V4_PONPOKE_RECIPE = PORNMASTER_V4_RECIPE_ID
 PORNMASTER_V4_REQUIRED_TERMS = tuple(
@@ -91,6 +91,21 @@ MODEL_TERM_DOCUMENTS: dict[str, dict[str, Any]] = {
             "to defeat safety filters remain excluded from Maestro's curated "
             "routing. Optional local visual quality checks are never required "
             "and do not decide permissibility."
+        ),
+    },
+    MUSIC3_REVIEW_TERM: {
+        "title": "MiniMax-Music3 Community License and Acceptable Use Policy",
+        "license_url": (
+            "https://huggingface.co/MiniMaxAI/MiniMax-Music3/blob/"
+            "fbdf52fbaaca799592917417eb05f1899f1255ec/LICENSE"
+        ),
+        "review_mode": "manual_self_review",
+        "notice": (
+            "Review the MiniMax-Music3 Community License and Acceptable Use "
+            "Policy before downloading or using this model. Keep its copyright "
+            "notice with copies, show MiniMax-Music3 prominently in commercial "
+            "products, and review the license's revenue and third-party "
+            "service conditions if they apply to your use."
         ),
     },
     PONPOKE_FLUX2_KLEIN4B_TERM: {
@@ -204,6 +219,7 @@ _RECIPE_TERM_ROOTS = {
     ),
     "krea2_raw": KREA2_REVIEW_TERM,
     "krea2_turbo": KREA2_REVIEW_TERM,
+    "minimax_music3": MUSIC3_REVIEW_TERM,
 }
 
 _RELATION_KEYS = (
@@ -507,6 +523,89 @@ def _moody_krea2_manifest_matches(
     )
 
 
+def _music3_native_manifest_matches(model_def: Mapping[str, Any]) -> bool:
+    """Bind the native recipe to the reviewed official and converted sources."""
+    binding = CURRENT_HOST_TERM_BINDINGS.get(MUSIC3_REVIEW_TERM)
+    if not isinstance(binding, Mapping) or binding != {
+        "license_id": "minimax-music3-community-license-2026-08-06",
+        "repository": "MiniMaxAI/MiniMax-Music3",
+        "revision": "fbdf52fbaaca799592917417eb05f1899f1255ec",
+        "license_sha256": "b21d12df2adae59dad3fcf80c1d81492654c662342f497d9a9770198c9317e58",
+        "optimized_repository": "DeepBeepMeep/TTS",
+        "optimized_revision": "d31b4665414200fcab779ced520b01bd9f5e07ba",
+    }:
+        return False
+    try:
+        from models.TTS import minimax_music3_handler as handler
+
+        sources = handler.family_handler.query_model_files(None, "minimax_music3")
+        source_manifest_valid = (
+            handler.OFFICIAL_REPO_ID == binding["repository"]
+            and handler.OFFICIAL_REVISION == binding["revision"]
+            and handler.OPTIMIZED_REPO_ID == binding["optimized_repository"]
+            and handler.OPTIMIZED_REVISION == binding["optimized_revision"]
+            and isinstance(sources, list)
+            and len(sources) == 2
+            and sources[0].get("repoId") == binding["optimized_repository"]
+            and sources[0].get("revision") == binding["optimized_revision"]
+            and sources[0].get("sourceFolderList") == [
+                "MiniMax-Music3", "MiniMaxMusic3-Qwen3",
+            ]
+            and sources[0].get("fileList") == [
+                [
+                    "rvq_depth_decoder_config.json",
+                    "rvq_depth_decoder_bf16.safetensors",
+                    "rvq_depth_decoder_int8_convrot.safetensors",
+                    "condition_encoder_config.json",
+                    "condition_encoder_fp32.safetensors",
+                    "vocoder_config.json",
+                    "vocoder_fp32.safetensors",
+                    "scheduler_config.json",
+                ],
+                ["chat_template.jinja", "tokenizer.json", "tokenizer_config.json"],
+            ]
+            and sources[1].get("repoId") == binding["repository"]
+            and sources[1].get("revision") == binding["revision"]
+            and sources[1].get("sourceFolderList") == [""]
+            and sources[1].get("targetFolderList") == ["MiniMax-Music3"]
+            and sources[1].get("fileList") == [["LICENSE"]]
+            and handler._model_definition().get("text_encoder_URLs")
+            == model_def.get("text_encoder_URLs")
+        )
+    except Exception:  # noqa: BLE001 - uncertain handler sources fail closed
+        return False
+    if not source_manifest_valid:
+        return False
+    optimized = (
+        "https://huggingface.co/DeepBeepMeep/TTS/resolve/"
+        "d31b4665414200fcab779ced520b01bd9f5e07ba/"
+    )
+    return (
+        model_def.get("architecture") == "minimax_music3"
+        and model_def.get("source_repo")
+        == "https://huggingface.co/MiniMaxAI/MiniMax-Music3"
+        and model_def.get("optimized_weights_repo")
+        == "https://huggingface.co/DeepBeepMeep/TTS"
+        and model_def.get("license_url") == MODEL_TERM_DOCUMENTS[
+            MUSIC3_REVIEW_TERM
+        ]["license_url"]
+        and model_def.get("required_host_terms") == [MUSIC3_REVIEW_TERM]
+        and model_def.get("URLs") == [
+            optimized + "MiniMax_Music3_transformer_bf16.safetensors",
+            optimized + "MiniMax_Music3_transformer_int8_convrot.safetensors",
+        ]
+        and model_def.get("text_encoder_URLs") == [
+            optimized + "MiniMaxMusic3-Qwen3/MiniMaxMusic3-Qwen3_bf16.safetensors",
+            optimized + "MiniMaxMusic3-Qwen3/MiniMaxMusic3-Qwen3_int8_convrot.safetensors",
+        ]
+        and sorted(model_def.get("required_model_assets") or []) == sorted([
+            "MiniMax-Music3/LICENSE",
+            *[f"MiniMax-Music3/{name}" for name in sources[0]["fileList"][0]],
+            *[f"MiniMaxMusic3-Qwen3/{name}" for name in sources[0]["fileList"][1]],
+        ])
+    )
+
+
 def model_terms_manifest_valid(
     model_type: str,
     model_defs: Mapping[str, Mapping[str, Any]] | None,
@@ -521,6 +620,11 @@ def model_terms_manifest_valid(
             continue
         seen.add(candidate)
         model_def = definitions.get(candidate)
+        if candidate == "minimax_music3" and (
+            not isinstance(model_def, Mapping)
+            or not _music3_native_manifest_matches(model_def)
+        ):
+            return False
         if candidate == PORNMASTER_V4_PONPOKE_RECIPE and (
             not isinstance(model_def, Mapping)
             or not _pornmaster_v4_manifest_matches(model_def)
@@ -767,15 +871,15 @@ def require_model_terms(
 
 __all__ = [
     "MODEL_TERM_DOCUMENTS",
-    "ModelTermsContractError",
-    "ModelTermsRequiredError",
     "PORNMASTER_V4_PONPOKE_RECIPE",
     "PORNMASTER_V4_REQUIRED_TERMS",
-    "model_terms_manifest_valid",
+    "ModelTermsContractError",
+    "ModelTermsRequiredError",
     "model_availability_policy",
+    "model_terms_manifest_valid",
     "model_terms_status",
     "model_terms_statuses",
+    "require_model_terms",
     "required_model_term",
     "required_model_terms",
-    "require_model_terms",
 ]

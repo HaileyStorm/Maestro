@@ -1988,6 +1988,7 @@ class DirectorRecoveryTests(unittest.TestCase):
     def test_preparation_endpoint_issues_id_before_long_music_request(self):
         captured = {}
         project_access_checks = []
+        admission_checks = []
 
         async def body_json():
             return {
@@ -2016,6 +2017,20 @@ class DirectorRecoveryTests(unittest.TestCase):
                     or f"/projects/{workspace}"
                 )
             ),
+            "_require_remote_visible_models": (
+                lambda _request, models: admission_checks.append(
+                    ("visibility", list(models))
+                )
+            ),
+            "wgp": types.SimpleNamespace(
+                get_model_def=lambda model: (
+                    {"name": "ACE-Step"}
+                    if model == "ace_step_v1_5_xl_sft_lm_4b" else None
+                ),
+            ),
+            "_require_model_recipe_terms": (
+                lambda models: admission_checks.append(("terms", list(models)))
+            ),
             "_register_director_preparation": register,
         }
         _launch_functions({"director_preparation_start"}, namespace)
@@ -2029,6 +2044,10 @@ class DirectorRecoveryTests(unittest.TestCase):
             project_access_checks,
             [("project-a", "project.generate")],
         )
+        self.assertEqual(admission_checks, [
+            ("visibility", ["ace_step_v1_5_xl_sft_lm_4b"]),
+            ("terms", ["ace_step_v1_5_xl_sft_lm_4b"]),
+        ])
         self.assertEqual(
             captured["body"]["image_paths"],
             ["/project-a/reference.png"],
