@@ -198,6 +198,39 @@ change passes 82 runtime/catalog/staging checks. Abrupt process
 termination can still leave private temporary directories for later cleanup;
 no arbitrary prefix-based deletion is authorized by these changes.
 
+Music3 CPU groundwork (2026-09-23): the managed SGLang start command now binds
+the exact served model name, and a loopback-only HTTP transport bounds response
+bytes, rejects redirects and unsupported encodings, and closes its request on
+cancellation. Ten disposable HTTP-server tests and 36 client tests pass. This
+does not provide a production Director caller, staged runtime, project artifact,
+or GPU cancellation proof. The pinned model/license identity is source-verified;
+adapter-only country and external-signature gates still need reconciliation to
+the actual model terms before a first-class generation flow is exposed.
+
+H3/inpaint CPU repairs (2026-09-23): the H3 continuation encoders now have their
+required subprocess import. Prompt mapping loads its sealed manifest from the
+owning project, including when output is staged elsewhere, and uses that same
+project for reference validation. Inpainting probes source geometry before SAM
+pre-scaling; its temporary video stays in a private project directory, preserves
+an existing source-adjacent file, and is removed on success or failure. SAM's
+completed mask is moved to a fresh private project mask directory before that cleanup
+so the queued retake can still read it; a mask returned outside staging or
+through a symlink is rejected, and a permissive destination is not reused.
+The affected CPU checks include real FFmpeg media encoding; no model or GPU
+generation was attempted. Full release checks and live deployment evidence remain
+separate from these CPU results.
+
+The next core WanGP static pass found separate unbound names in native H3
+boundary audio decoding, H3 pre-mux recovery, Multitalk overlap preparation,
+and temporal upsampling. Those paths now bind their inputs before use;
+Classic aligned-pose validation also returns its ordinary UI error instead of
+calling a missing helper. The combined affected H3/inpaint suite passes 74 CPU
+tests, including an extracted H3 recovery branch using the configured video
+container. `F821` has no remaining findings in `launch.py` or `wgp.py`.
+The release gate passes 5,222 backend tests with 17 skips, five JSON-grammar
+checks, 693 UI tests, and the UI type-check/build under the CPU-only test
+environment. This does not establish GPU generation or owner acceptance.
+
 ## Outstanding work and promotion order
 
 1. Complete live GPU acceptance for the repaired Upscale/Revoice workers. The

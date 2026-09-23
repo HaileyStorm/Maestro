@@ -9,10 +9,13 @@ from __future__ import annotations
 
 from pathlib import Path
 import ast
+import contextlib
+import copy
 import hashlib
 import os
 import sys
 import tempfile
+import types
 import unittest
 
 import torch
@@ -621,6 +624,48 @@ class H3AudioBenchmarkIsolationTests(unittest.TestCase):
 
 
 class H3AudioSourceWiringTests(unittest.TestCase):
+    def test_premux_recovery_uses_configured_container_before_model_work(self):
+        tree = ast.parse((APP / "wgp.py").read_text(encoding="utf-8"))
+        worker = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                      and node.name == "_generate_video_impl")
+        recovery = next(node for node in worker.body if isinstance(node, ast.If)
+                        and ast.unparse(node.test)
+                        == "_h3_source_audio_premux_recovery is not None")
+        scenario = ast.FunctionDef(
+            name="run_recovery",
+            args=ast.arguments(posonlyargs=[], args=[], kwonlyargs=[],
+                               kw_defaults=[], defaults=[]),
+            body=[copy.deepcopy(recovery)], decorator_list=[],
+        )
+        module = ast.fix_missing_locations(ast.Module(body=[scenario], type_ignores=[]))
+        observed = []
+
+        def resume(**kwargs):
+            observed.append(kwargs["output_path"])
+            return kwargs["output_path"], None
+
+        namespace = {
+            "os": os,
+            "_h3_source_audio_premux_recovery": {"repeat_index": 0},
+            "durable_output_dir": "/private/stage",
+            "durable_output_prefix": "unit",
+            "h3_audio_roles": types.SimpleNamespace(experimental=True),
+            "after_repeat_output": types.SimpleNamespace(repeat_offset=0),
+            "multi_clip_info": None,
+            "server_config": {"video_container": "mkv", "audio_output_codec": "aac_128"},
+            "audio_source": None,
+            "resume_h3_source_audio_premux": resume,
+            "PostDecodeStageError": RuntimeError,
+            "lock": contextlib.nullcontext(),
+            "gen": {}, "file_list": [], "file_settings_list": [],
+            "custom_settings": {}, "send_cmd": lambda *_args: None,
+            "state": {}, "base_model_type": "minimax_h3",
+        }
+        exec(compile(module, str(APP / "wgp.py"), "exec"), namespace)
+        self.assertTrue(namespace["run_recovery"]())
+        self.assertEqual(observed, ["/private/stage/unit-r0-w1.mkv"])
+        self.assertEqual(namespace["file_list"], observed)
+
     def test_recovered_repeat_consumes_private_identity_before_fresh_repeat(self):
         import inspect
 

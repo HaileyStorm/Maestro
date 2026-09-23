@@ -273,6 +273,55 @@ def _load_handler():
 
 
 class NativeBoundaryPolicyTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg tools required")
+    def test_continuation_helpers_encode_real_cpu_media(self):
+        def video_info(path):
+            probe = subprocess.run([
+                "ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+                "-show_entries", "stream=nb_read_frames,r_frame_rate,width,height",
+                "-of", "json", str(path),
+            ], check=True, capture_output=True, text=True, timeout=30)
+            stream = json.loads(probe.stdout)["streams"][0]
+            numerator, denominator = map(int, stream["r_frame_rate"].split("/"))
+            return (numerator / denominator, stream["width"], stream["height"],
+                    int(stream["nb_read_frames"]))
+
+        namespace = {
+            "os": os, "json": json, "subprocess": subprocess,
+            "wgp": types.SimpleNamespace(get_video_info=video_info),
+            "_H3_REF2VA_HANDOFF_FRAMES": 18,
+            "QueueRecoveryRuntimeError": RuntimeError,
+        }
+        _load_functions(
+            APP / "launch.py",
+            {"_create_h3_ref2va_tail_video", "_create_h3_native_boundary_media"},
+            namespace,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.mp4"
+            subprocess.run([
+                "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                "color=blue:s=64x64:r=24:d=2.5", "-f", "lavfi", "-i",
+                "sine=frequency=440:sample_rate=32000:duration=2.5",
+                "-frames:v", "60", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-ar", "32000", "-ac", "2", "-shortest",
+                str(source),
+            ], check=True, capture_output=True, timeout=60)
+
+            tail = Path(directory) / "tail.mp4"
+            self.assertEqual(namespace["_create_h3_ref2va_tail_video"](
+                str(source), str(tail), frames=18,
+            ), str(tail))
+            self.assertEqual(video_info(tail)[-1], 18)
+
+            boundary = Path(directory) / "boundary.mp4"
+            result = namespace["_create_h3_native_boundary_media"](
+                str(source), str(boundary),
+            )
+            self.assertEqual(video_info(boundary)[-1], 18)
+            self.assertEqual(result["mode"], "native_av_overlap")
+            self.assertEqual(result["audio_sample_rate"], 32000)
+
     def test_full_boundary_semantic_table_and_exact_flavor_memory(self):
         for flavor in sorted(H3_FL2VA_MODELS):
             for boundary in ("continuous", "precut", "cut", "transition"):
@@ -1215,7 +1264,6 @@ class NativeBoundaryDecodeTests(unittest.TestCase):
         namespace = {
             "os": os,
             "np": np,
-            "subprocess": types.SimpleNamespace(run=lambda *args, **kwargs: Completed()),
             "get_video_info": lambda path: (24, 5, 4, 18),
             "get_resampled_video": lambda *args: torch.zeros(
                 (18, 4, 5, 3), dtype=torch.uint8,
@@ -1224,9 +1272,12 @@ class NativeBoundaryDecodeTests(unittest.TestCase):
         loader = _load_functions(
             APP / "wgp.py", {"load_h3_native_boundary_inputs"}, namespace,
         )["load_h3_native_boundary_inputs"]
-        with mock.patch(
-            "services.h3_boundary_policy.verify_boundary_file",
-            return_value="private.mp4",
+        with (
+            mock.patch(
+                "services.h3_boundary_policy.verify_boundary_file",
+                return_value="private.mp4",
+            ),
+            mock.patch("subprocess.run", return_value=Completed()),
         ):
             video, audio = loader({
                 "path": "private.mp4", "size": 1, "sha256": "0" * 64,

@@ -16,6 +16,7 @@ Environment variables:
 import os
 import sys
 import socket
+import subprocess
 
 # --- Bootstrap: CWD must be app/ before holding SERVER_PORT or importing wgp ---
 _app_dir = os.path.dirname(os.path.abspath(__file__))
@@ -10712,6 +10713,24 @@ def _bind_h3_task_prompt_mapping(
         ),
         cleanup_files=cleanup_h3_reference_files,
     )
+
+
+def _load_h3_mapping_manifest_inputs(job: dict) -> tuple[str, list[dict]]:
+    """Read mapping inputs from the sealed project, even for staged outputs."""
+    project_dir = _existing_workspace_dir(job["workspace"])
+    manifest = load_request_manifest(
+        project_dir, job.get("_recovery_manifest_pointer"),
+        expected_job_id=str(job["id"]),
+    )
+    validate_manifest_inputs(
+        manifest,
+        lambda descriptor: _queue_recovery_manifest_validator(
+            descriptor,
+            owner_digest=str(job.get("_recovery_owner_digest") or ""),
+            workspace=str(job["workspace"]), project_dir=project_dir,
+        ),
+    )
+    return project_dir, manifest["inputs"]
 
 
 def _snapshot_h3_recovery_task_params(
@@ -54733,6 +54752,18 @@ async def inpaint_endpoint(request: Request):
 
     from services.inpaint_service import check_sam_status, parse_inpaint_intent, segment_video, unload_sam, ensure_sam_running, shutdown_sam
 
+    # Source geometry is needed before SAM pre-scaling and again when the
+    # retake job is assembled. Probe once before either operation.
+    try:
+        import decord
+        vr = decord.VideoReader(video_path)
+        fps = vr.get_avg_fps()
+        total_frames = len(vr)
+        src_h, src_w = vr[0].shape[:2]
+        del vr
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Cannot read video: {e}")
+
     start_time = float(body.get("start_time", 0))
     end_time = float(body.get("end_time", -1))
     mask_padding = int(body.get("mask_padding", 20))
@@ -54757,7 +54788,7 @@ async def inpaint_endpoint(request: Request):
     # Pre-scale video for SAM if user selected a lower resolution
     # This reduces SAM VRAM/time and produces a correctly-sized mask for LTX
     sam_video_path = video_path
-    _sam_scaled_path = None
+    sam_stage = None
     user_res = body.get("resolution", "")
     if user_res and "x" in user_res:
         try:
@@ -54771,54 +54802,85 @@ async def inpaint_endpoint(request: Request):
                     scaled_h = (int(src_h * scale) // 32) * 32
                     scaled_w = (int(src_w * scale) // 32) * 32
                     import subprocess as _sp
-                    _sam_scaled_path = video_path.rsplit('.', 1)[0] + "_sam_scaled.mp4"
-                    _sp.run([
-                        "ffmpeg", "-y", "-i", video_path,
+                    import tempfile
+                    sam_stage = tempfile.TemporaryDirectory(
+                        prefix=".inpaint-sam-", dir=job_out_dir,
+                    )
+                    sam_scaled_path = os.path.join(sam_stage.name, "scaled.mp4")
+                    scaled = _sp.run([
+                        "ffmpeg", "-n", "-i", video_path,
                         "-vf", f"scale={scaled_w}:{scaled_h}:flags=lanczos",
                         "-c:v", "libx264", "-crf", "18", "-preset", "fast",
-                        "-an", _sam_scaled_path
+                        "-an", sam_scaled_path
                     ], capture_output=True, timeout=120)
-                    if os.path.isfile(_sam_scaled_path):
-                        sam_video_path = _sam_scaled_path
+                    if scaled.returncode == 0 and os.path.isfile(sam_scaled_path):
+                        sam_video_path = sam_scaled_path
                         print(f"[Inpaint] Pre-scaled video for SAM: {src_w}x{src_h} → {scaled_w}x{scaled_h}")
         except Exception as e:
             print(f"[Inpaint] Pre-scale warning (non-fatal): {e}")
+        if sam_video_path == video_path and sam_stage is not None:
+            sam_stage.cleanup()
+            sam_stage = None
 
     # Step 2: SAM segmentation (skip if cached mask provided)
-    if cached_masks_path and os.path.isfile(cached_masks_path):
-        masks_path = cached_masks_path
-        print(f"[Inpaint] Using cached mask: {masks_path}")
-    else:
-        # Start SAM on demand if needed
-        import asyncio
-        sam_ready = await asyncio.to_thread(ensure_sam_running)
-        if not sam_ready:
-            raise HTTPException(status_code=503, detail="SAM service not available. Check installation.")
-        try:
-            seg_result = await asyncio.to_thread(
-                segment_video,
-                video_path=sam_video_path,
-                text=sam_target,
-                start_time=start_time,
-                end_time=end_time,
-                mask_padding=mask_padding,
-            )
-            masks_path = seg_result.get("masks_path")
-            if not masks_path:
-                raise HTTPException(status_code=500, detail="SAM returned no mask data")
-            # Invert mask if requested
-            if body.get("invert_mask") and os.path.isfile(masks_path):
-                import numpy as _np
-                mask = _np.load(masks_path)
-                _np.save(masks_path, ~mask)
-                print(f"[Inpaint] Mask inverted (selecting everything except '{sam_target}')")
-        except RuntimeError as e:
-            raise HTTPException(status_code=503, detail=str(e))
-
-    # Clean up scaled video
-    if _sam_scaled_path and os.path.isfile(_sam_scaled_path):
-        try: os.remove(_sam_scaled_path)
-        except OSError: pass
+    try:
+        if cached_masks_path and os.path.isfile(cached_masks_path):
+            masks_path = cached_masks_path
+            print(f"[Inpaint] Using cached mask: {masks_path}")
+        else:
+            # Start SAM on demand if needed
+            import asyncio
+            sam_ready = await asyncio.to_thread(ensure_sam_running)
+            if not sam_ready:
+                raise HTTPException(status_code=503, detail="SAM service not available. Check installation.")
+            try:
+                seg_result = await asyncio.to_thread(
+                    segment_video,
+                    video_path=sam_video_path,
+                    text=sam_target,
+                    start_time=start_time,
+                    end_time=end_time,
+                    mask_padding=mask_padding,
+                )
+                masks_path = seg_result.get("masks_path")
+                if not masks_path:
+                    raise HTTPException(status_code=500, detail="SAM returned no mask data")
+                if sam_stage is not None:
+                    staged_masks_dir = os.path.join(sam_stage.name, ".masks")
+                    if (os.path.abspath(os.path.dirname(masks_path)) != staged_masks_dir
+                            or os.path.realpath(masks_path) != os.path.abspath(masks_path)):
+                        raise HTTPException(status_code=500, detail="SAM saved the mask outside its staging directory")
+                # Invert mask if requested
+                if body.get("invert_mask") and os.path.isfile(masks_path):
+                    import numpy as _np
+                    mask = _np.load(masks_path)
+                    _np.save(masks_path, ~mask)
+                    print(f"[Inpaint] Mask inverted (selecting everything except '{sam_target}')")
+                if sam_stage is not None:
+                    # SAM writes beside its input video. Preserve the completed
+                    # mask before removing the private pre-scale directory;
+                    # the queued retake must be able to read it later.
+                    from services.atomic_file_publish import publish_file_no_replace
+                    import tempfile
+                    project_masks_dir = tempfile.mkdtemp(
+                        prefix=".inpaint-mask-", dir=job_out_dir,
+                    )
+                    saved_masks_path = os.path.join(
+                        project_masks_dir, f"mask_{uuid.uuid4().hex}.npy",
+                    )
+                    try:
+                        publish_file_no_replace(masks_path, saved_masks_path)
+                    except (OSError, ValueError) as exc:
+                        raise HTTPException(
+                            status_code=500,
+                            detail="The inpaint mask could not be saved in this project",
+                        ) from exc
+                    masks_path = saved_masks_path
+            except RuntimeError as e:
+                raise HTTPException(status_code=503, detail=str(e))
+    finally:
+        if sam_stage is not None:
+            sam_stage.cleanup()
 
     # Step 2b: Shut down SAM completely to free all VRAM (including CUDA context)
     try:
@@ -54828,16 +54890,6 @@ async def inpaint_endpoint(request: Request):
         pass
 
     # Step 3: Build retake params with spatial mask
-    try:
-        import decord
-        vr = decord.VideoReader(video_path)
-        fps = vr.get_avg_fps()
-        total_frames = len(vr)
-        src_h, src_w = vr[0].shape[:2]
-        del vr
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Cannot read video: {e}")
-
     start_frame = max(0, int(start_time * fps))
     end_frame = int(end_time * fps) if end_time > 0 else total_frames
     end_frame = min(end_frame, total_frames)
@@ -59975,16 +60027,12 @@ def _run_generation(
             else:
                 h3_mapping_plan = raw_params.get("_h3_prompt_mapping_source_plan")
             h3_mapping_descriptors = None
+            h3_mapping_project_dir = None
             h3_templates_resolved = h3_mapping_plan is not None
             if h3_mapping_plan is not None:
-                mapping_manifest = load_request_manifest(
-                    out_dir, job.get("_recovery_manifest_pointer"), expected_job_id=str(job_id),
+                h3_mapping_project_dir, h3_mapping_descriptors = (
+                    _load_h3_mapping_manifest_inputs(job)
                 )
-                validate_manifest_inputs(mapping_manifest, lambda descriptor: _queue_recovery_manifest_validator(
-                    descriptor, owner_digest=str(job.get("_recovery_owner_digest") or ""),
-                    workspace=str(job.get("workspace") or ""), project_dir=out_dir,
-                ))
-                h3_mapping_descriptors = mapping_manifest["inputs"]
             if recast_shot_manifest is not None:
                 shot_manifest = recast_shot_manifest
                 shot_workflow = "Recast"
@@ -61331,7 +61379,8 @@ def _run_generation(
                     task, task_sidecar_params = _bind_h3_task_prompt_mapping(
                         job, task, task_sidecar_params,
                         h3_mapping_initial_images.pop(str(task.get("id"))),
-                        h3_mapping_plan, h3_mapping_descriptors, out_dir,
+                        h3_mapping_plan, h3_mapping_descriptors,
+                        h3_mapping_project_dir,
                     )
                     reference_token = task.pop("_h3_reference_files", None)
                     if reference_token is not None:

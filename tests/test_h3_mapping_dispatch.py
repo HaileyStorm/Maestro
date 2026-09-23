@@ -4,6 +4,7 @@ import copy
 import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -11,7 +12,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "app"))
 from services.h3_mapping_dispatch import bind_h3_mapping_task, prepare_h3_single_mapping_source, resolve_h3_mapping_source_plan
 from services.h3_shot_planner import plan_h3_native_shots
-from services.queue_recovery_runtime import QueueRecoveryRuntimeError, recovery_unit_id
+from services.queue_recovery_runtime import (
+    QueueRecoveryRuntimeError,
+    load_request_manifest,
+    recovery_unit_id,
+    validate_manifest_inputs,
+    write_sealed_request_manifest,
+)
 
 SOURCE = "The book opens. <d>[English] Keep <Audio 77> literally.</d>"
 
@@ -31,6 +38,47 @@ def descriptor(field, path, *, digest="a" * 64, dependency=None):
 
 
 class H3MappingDispatchTests(unittest.TestCase):
+    def test_mapping_manifest_uses_sealed_workspace_during_staged_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "project"
+            staged_output = Path(directory) / "staged-output"
+            project.mkdir()
+            staged_output.mkdir()
+            source = project / "reference.png"
+            source.write_bytes(b"pinned input")
+            descriptor_for_test = descriptor(
+                "image_refs:0", str(source), digest="a" * 64,
+            )
+            pointer = write_sealed_request_manifest(
+                project, job_id="mapping-job", params={"model_type": "minimax_h3"},
+                inputs=[descriptor_for_test],
+            )
+            observed = []
+
+            def validate_input(value, *, project_dir, workspace, **_kwargs):
+                observed.append((value, project_dir, workspace))
+                return value == descriptor_for_test and project_dir == str(project)
+
+            helper = function("app/launch.py", "_load_h3_mapping_manifest_inputs", {
+                "_existing_workspace_dir": lambda workspace: str(project),
+                "load_request_manifest": load_request_manifest,
+                "validate_manifest_inputs": validate_manifest_inputs,
+                "_queue_recovery_manifest_validator": validate_input,
+            })
+            job = {
+                "id": "mapping-job", "workspace": "example",
+                "out_dir": str(staged_output),
+                "_recovery_owner_digest": "owner",
+                "_recovery_manifest_pointer": pointer,
+            }
+            self.assertEqual(helper(job), (str(project), [descriptor_for_test]))
+            self.assertEqual(observed, [(descriptor_for_test, str(project), "example")])
+            job["_recovery_manifest_pointer"] = write_sealed_request_manifest(
+                staged_output, job_id="mapping-job", params={}, inputs=[],
+            )
+            with self.assertRaises(QueueRecoveryRuntimeError):
+                helper(job)
+
     def plan(self):
         return plan_h3_native_shots(global_prompt=SOURCE, clip_frame_counts=[124, 124],
                                     fps=24, source_canonicalization="t2va")

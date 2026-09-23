@@ -1921,9 +1921,11 @@ def validate_settings(state, model_type, single_prompt, inputs):
 
     if "V" in video_prompt_type and "O" in video_prompt_type:
         if image_start is None and video_source is None and "L" not in video_prompt_type and not all_letters(video_prompt_type, "IK"):
-            return err("Aligned Pose transfer requires a Start Image or Source Video to continue to be used")    
+            gr.Info("Aligned Pose transfer requires a Start Image or Source Video to continue to be used")
+            return ret()
         if "A" in video_prompt_type and any_letters(video_prompt_type, "YWZ"):
-            return err("Aligned Pose transfer supports only Inpainting process outside the masked area")    
+            gr.Info("Aligned Pose transfer supports only Inpainting process outside the masked area")
+            return ret()
 
     if test_any_sliding_window(model_type) and image_mode == 0:
         if video_length > sliding_window_size:
@@ -3788,7 +3790,6 @@ def get_transformer_dtype(model_type, transformer_dtype_policy):
                 return torch.float16
             else: 
                 return torch.bfloat16
-        return transformer_dtype
     elif transformer_dtype_policy =="fp16":
         return torch.float16
     else:
@@ -9261,6 +9262,8 @@ def seal_multi_clip_segment_before_concat(
 def load_h3_native_boundary_inputs(descriptor):
     """Verify and decode one private H3 AV boundary without a temp file."""
 
+    import subprocess
+
     from services.h3_boundary_policy import (
         H3_NATIVE_AUDIO_SAMPLE_RATE,
         H3_NATIVE_FPS,
@@ -11010,7 +11013,8 @@ def _generate_video_impl(
             raise RuntimeError("H3 pre-mux recovery repeat identity changed")
         recovered_output = os.path.join(
             durable_output_dir,
-            f"{durable_output_prefix}-r{repeat_index}-w1.{container}",
+            f"{durable_output_prefix}-r{repeat_index}-w1."
+            f"{server_config.get('video_container', 'mp4')}",
         )
         recovered_h3_multiclip_component = (
             isinstance(multi_clip_info, dict)
@@ -11801,6 +11805,14 @@ def _generate_video_impl(
 
     reset_control_aligment = "T" in video_prompt_type
 
+    # Audio conditioning needs overlap padding before the final window count
+    # is known. Its reuse width depends only on the already-normalized window
+    # settings; the length-dependent sliding decision stays below.
+    reuse_frames = (
+        min(sliding_window_size - latent_size, sliding_window_overlap)
+        if test_any_sliding_window(model_type) else 0
+    )
+
     # Sliding-window decision moved to after audio/hunyuan processing
     # so that current_video_length adjustments from those paths are
     # reflected in the sliding-window threshold check. The video_source
@@ -12035,11 +12047,9 @@ def _generate_video_impl(
     # audio handler already trimmed under the threshold.
     if test_any_sliding_window(model_type):
         sliding_window = current_video_length > sliding_window_size
-        reuse_frames = min(sliding_window_size - latent_size, sliding_window_overlap)
     else:
         sliding_window = False
         sliding_window_size = current_video_length
-        reuse_frames = 0
 
     def _cleanup_generation_resources():
         """Release preparation/runtime state on success, failure, or abort."""
@@ -12240,6 +12250,7 @@ def _generate_video_impl(
         keep_frames_parsed = [] # aligned to the first control frame of current window (therefore ignore previous reuse_frames)
         pre_video_guide = None # reuse_frames of previous window
         pre_audio_guide, pre_audio_guide_sample_rate = None, 0 # trailing generated audio from previous window, used as clean prefix for next
+        previous_last_frame = None
         image_size = default_image_size #  default frame dimensions for budget until it is change due to a resize
         sample_fit_canvas = fit_canvas
         current_video_length = first_window_video_length
