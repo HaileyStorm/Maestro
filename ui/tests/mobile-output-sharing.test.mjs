@@ -299,6 +299,7 @@ test('metadata and video actions share the mobile target and naming contract', a
     name: 'assembled-scene.mp4',
     type: 'video',
     url: '/media/assembled-scene.mp4',
+    linked_component_count: 3,
   })
   const metadata = {
     params: {
@@ -327,6 +328,24 @@ test('metadata and video actions share the mobile target and naming contract', a
     assert.match(control.props.className, /md:min-h-0/)
     assert.match(control.props.className, /md:min-w-0/)
   }
+})
+
+test('recovered final without public components does not offer rejoin', async t => {
+  const MediaFeedItem = await loadHarness()
+  globalThis.__outputShareStore = createStore()
+  globalThis.__createOutputShare = async () => ({})
+  globalThis.__revokeOutputShare = async () => 1
+  installBrowser(t)
+  const file = output({
+    name: 'recovered-final.mp4',
+    type: 'video',
+    linked_component_count: 0,
+  })
+  const metadata = {
+    params: { multi_clip_info: { group_id: 'group-1', index: 1, total: 2 } },
+  }
+  const { render } = createRuntime(MediaFeedItem, file, { 0: metadata, 1: true })
+  assert.equal(button(render(), 'Rejoin all 2 clips for recovered-final.mp4'), undefined)
 })
 
 test('revocation remains discoverable after reload and reports an idempotent no-op truthfully', async t => {

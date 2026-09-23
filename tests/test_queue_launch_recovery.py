@@ -8810,7 +8810,9 @@ class QueueLaunchWiringTests(unittest.TestCase):
         sample_branch = materialize.index(
             'if snapshot.get("kind") == "sample_campaign_generation":',
         )
-        completed = materialize.index('if status == "completed"', sample_branch)
+        completed = materialize.index(
+            'if status == "completed" and not blocked_reason:', sample_branch,
+        )
         held = materialize.index('"status": "queued"', completed)
         self.assertLess(completed, held)
         self.assertIn('"recovery_state": "terminal"', materialize[completed:held])
@@ -9701,6 +9703,298 @@ class QueueLaunchWiringTests(unittest.TestCase):
         self.assertLess(adoption, cleanup)
         self.assertLess(cleanup, workers)
 
+    def test_completed_h3_late_adoption_settles_before_publication(self):
+        class Registry(dict):
+            def prepare(self, job):
+                return dict(job)
+
+            def publish_prepared(self, job_id, job):
+                self[job_id] = job
+
+        for complete in (True, False):
+            with self.subTest(complete=complete), tempfile.TemporaryDirectory() as tmp:
+                events = []
+                registry = Registry()
+                snapshot = {
+                    "id": "completed-h3", "status": "completed",
+                    "workspace": "project-a", "kind": "generation",
+                }
+                project = {"project-a": (tmp, "opaque-project")}
+                quarantine_ready = False
+
+                def scan(_path, *, workspace):
+                    self.assertEqual(workspace, "project-a")
+                    events.append("late-scan" if quarantine_ready else "early-scan")
+                    if not quarantine_ready:
+                        return {
+                            "adopted_groups": 0, "missing_groups": 0,
+                            "quarantined_groups": 0, "jobs": [],
+                        }
+                    state = "adopted" if complete else "quarantined"
+                    return {
+                        "adopted_groups": int(complete),
+                        "missing_groups": int(not complete),
+                        "quarantined_groups": 0,
+                        "jobs": [{
+                            "job_id": "completed-h3", "state": state,
+                            "declared": 1, "adopted": int(complete),
+                            "missing": int(not complete), "quarantined": 0,
+                            "output_files": ["final.mp4"] if complete else [],
+                        }],
+                    }
+
+                def materialize(_snapshot, _projects):
+                    nonlocal quarantine_ready
+                    adopted = namespace["_queue_recovery_final_adoption_jobs"].get(
+                        ("project-a", "completed-h3"), {}
+                    )
+                    if adopted.get("state") == "adopted":
+                        events.append("receipt-materialized")
+                        return ({
+                            "id": "completed-h3", "workspace": "project-a",
+                            "out_dir": tmp, "status": "completed",
+                            "recovery_state": "terminal", "queue_held": False,
+                            "output_files": ["final.mp4"],
+                            "_recovery_final_adoption": adopted,
+                        }, False)
+                    events.append("cursor-quarantined")
+                    quarantine_ready = True
+                    return ({
+                        "id": "completed-h3", "workspace": "project-a",
+                        "out_dir": tmp, "status": "queued",
+                        "recovery_state": "blocked", "queue_held": True,
+                        "_recovery_reason_code": "final_output_recovery_incomplete",
+                        "message": "Final output recovery is incomplete",
+                    }, False)
+
+                namespace = _isolated_functions(
+                    self.launch,
+                    (
+                        "_queue_recovery_adopt_quarantined_finals",
+                        "_restore_queue_recovery_on_startup",
+                    ),
+                    {
+                        "Mapping": dict, "os": os,
+                        "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+                        "_queue_recovery_workers_started": False,
+                        "_queue_recovery_final_adoption_jobs": {},
+                        "_queue_recovery_final_adoption_startup_summary": {},
+                        "_adopt_quarantined_final_groups": scan,
+                        "_queue_recovery_existing_projects": lambda: project,
+                        "_queue_recovery_restored": types.SimpleNamespace(
+                            jobs={"completed-h3": snapshot}, global_state={},
+                        ),
+                        "_queue_recovery_materialize_job": materialize,
+                        "_queue_recovery_checkpoint": lambda *_args, **_kwargs: None,
+                        "_stamp_requested_generation_residency": lambda *_args, **_kwargs: None,
+                        "_jobs": registry,
+                        "restore_scheduler_state": lambda *_args: None,
+                        "cleanup_orphan_request_manifests": lambda *_args: 0,
+                        "cleanup_orphan_staged_outputs": lambda *_args: 0,
+                        "_queue_recovery_coordinator": types.SimpleNamespace(
+                            compact=lambda: None,
+                        ),
+                    },
+                )
+                self.assertTrue(namespace["_restore_queue_recovery_on_startup"]())
+                self.assertEqual(events[:3], [
+                    "early-scan", "cursor-quarantined", "late-scan",
+                ])
+                self.assertEqual("receipt-materialized" in events, complete)
+                self.assertEqual(registry["completed-h3"]["status"],
+                                 "completed" if complete else "queued")
+                if complete:
+                    self.assertEqual(registry["completed-h3"]["output_files"],
+                                     ["final.mp4"])
+                else:
+                    self.assertEqual(
+                        registry["completed-h3"]["_recovery_reason_code"],
+                        "final_output_recovery_incomplete",
+                    )
+
+    def test_completed_h3_sample_arm_requires_final_receipt(self):
+        namespace = _isolated_functions(
+            self.launch,
+            ("_queue_recovery_materialize_job",),
+            {
+                "hmac": hmac, "math": __import__("math"), "time": time,
+                "H3_OFFLOAD_PLAN_PARAM_KEY": "h3_offload_plan",
+                "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+                "_queue_recovery_final_adoption_jobs": {},
+                "is_registered_h3_family": lambda model: model == "minimax_h3_8.5b_fast",
+                "load_request_manifest": lambda *_args, **_kwargs: {
+                    "params": {"model_type": "minimax_h3_8.5b_fast"},
+                    "inputs": [],
+                },
+                "validate_manifest_inputs": lambda *_args: None,
+                "_queue_recovery_manifest_validator": lambda *_args, **_kwargs: True,
+                "_require_h3_offload_plan_parity": lambda *_args, **_kwargs: None,
+                "_queue_recovery_reconcile_cursor": lambda *_args: None,
+            },
+        )
+        snapshot = {
+            "id": "sample-h3", "kind": "sample_campaign_generation",
+            "status": "completed", "workspace": "project-a",
+            "model_type": "minimax_h3_8.5b_fast",
+            "owner_principal": "owner:v1:" + "a" * 64,
+            "project_instance": "project:v1:" + "b" * 64,
+            "request_manifest": {},
+            "output_files": ["stale-final.mp4"],
+        }
+        projects = {"project-a": ("/project", snapshot["project_instance"])}
+        held, may_start = namespace["_queue_recovery_materialize_job"](
+            snapshot, projects,
+        )
+        self.assertFalse(may_start)
+        self.assertEqual(held["status"], "queued")
+        self.assertTrue(held["queue_held"])
+        self.assertEqual(held["recovery_state"], "blocked")
+        self.assertEqual(held["_recovery_reason_code"],
+                         "final_output_recovery_incomplete")
+
+        missing_top_level_model = dict(snapshot)
+        missing_top_level_model.pop("model_type")
+        held_from_manifest, may_start = namespace[
+            "_queue_recovery_materialize_job"
+        ](missing_top_level_model, projects)
+        self.assertFalse(may_start)
+        self.assertEqual(held_from_manifest["status"], "queued")
+        self.assertEqual(held_from_manifest["_recovery_reason_code"],
+                         "final_output_recovery_incomplete")
+
+        namespace["_queue_recovery_final_adoption_jobs"][(
+            "project-a", "sample-h3",
+        )] = {
+            "state": "adopted", "declared": 1, "adopted": 1,
+            "missing": 0, "quarantined": 0,
+            "output_files": ["verified-final.mp4"],
+        }
+        recovered, may_start = namespace["_queue_recovery_materialize_job"](
+            snapshot, projects,
+        )
+        self.assertFalse(may_start)
+        self.assertEqual(recovered["status"], "completed")
+        self.assertEqual(recovered["recovery_state"], "terminal")
+        self.assertEqual(recovered["output_files"], ["verified-final.mp4"])
+        recovered_from_manifest, may_start = namespace[
+            "_queue_recovery_materialize_job"
+        ](missing_top_level_model, projects)
+        self.assertFalse(may_start)
+        self.assertEqual(recovered_from_manifest["status"], "completed")
+        self.assertEqual(recovered_from_manifest["output_files"],
+                         ["verified-final.mp4"])
+
+    def test_completed_h3_sample_pair_late_adoption_is_atomic(self):
+        class Registry(dict):
+            def prepare(self, job):
+                return dict(job)
+
+            def publish_prepared_many(self, jobs):
+                self.update(jobs)
+
+        for complete in (True, False):
+            with self.subTest(complete=complete), tempfile.TemporaryDirectory() as tmp:
+                events = []
+                registry = Registry()
+                h3 = {
+                    "id": "sample-h3", "kind": "sample_campaign_generation",
+                    "status": "completed", "workspace": "project-a",
+                }
+                peer = {
+                    "id": "sample-peer", "kind": "sample_campaign_generation",
+                    "status": "completed", "workspace": "project-a",
+                }
+                projects = {"project-a": (tmp, "opaque-project")}
+                reconciled = False
+
+                def scan(_path, *, workspace):
+                    self.assertEqual(workspace, "project-a")
+                    events.append("late-scan" if reconciled else "early-scan")
+                    peer_receipt = {
+                        "job_id": "sample-peer", "state": "adopted",
+                        "declared": 1, "adopted": 1,
+                        "missing": 0, "quarantined": 0,
+                        "output_files": ["peer-final.mp4"],
+                    }
+                    return {
+                        "adopted_groups": 1 + int(reconciled and complete),
+                        "missing_groups": 0,
+                        "quarantined_groups": 0,
+                        "jobs": [peer_receipt] + ([{
+                            "job_id": "sample-h3", "state": "adopted",
+                            "declared": 1, "adopted": 1,
+                            "missing": 0, "quarantined": 0,
+                            "output_files": ["verified-final.mp4"],
+                        }] if reconciled and complete else []),
+                    }
+
+                def materialize(snapshot, _projects):
+                    nonlocal reconciled
+                    adopted = namespace["_queue_recovery_final_adoption_jobs"].get(
+                        ("project-a", snapshot["id"]), {}
+                    )
+                    if adopted.get("state") != "adopted":
+                        reconciled = True
+                        events.append("cursor-quarantined")
+                        return ({
+                            **snapshot, "out_dir": tmp, "status": "queued",
+                            "queue_held": True, "recovery_state": "blocked",
+                            "_recovery_reason_code": "final_output_recovery_incomplete",
+                        }, False)
+                    events.append(f"materialized-{snapshot['id']}")
+                    return ({
+                        **snapshot, "out_dir": tmp, "status": "completed",
+                        "queue_held": False, "recovery_state": "terminal",
+                        "output_files": (["verified-final.mp4"]
+                                         if snapshot["id"] == "sample-h3"
+                                         else ["peer-final.mp4"]),
+                    }, False)
+
+                namespace = _isolated_functions(
+                    self.launch,
+                    (
+                        "_queue_recovery_adopt_quarantined_finals",
+                        "_restore_queue_recovery_on_startup",
+                    ),
+                    {
+                        "Mapping": dict, "os": os,
+                        "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+                        "_queue_recovery_workers_started": False,
+                        "_queue_recovery_final_adoption_jobs": {},
+                        "_queue_recovery_final_adoption_startup_summary": {},
+                        "_adopt_quarantined_final_groups": scan,
+                        "_queue_recovery_existing_projects": lambda: projects,
+                        "_queue_recovery_restored": types.SimpleNamespace(
+                            jobs={"sample-h3": h3, "sample-peer": peer},
+                            global_state={},
+                        ),
+                        "_valid_sample_campaign_recovery_groups": (
+                            lambda _snapshots: ((h3, peer),)
+                        ),
+                        "_safe_sample_campaign_restart_snapshot": lambda _snapshot: True,
+                        "_queue_recovery_materialize_job": materialize,
+                        "_queue_recovery_checkpoint": lambda *_args, **_kwargs: None,
+                        "_stamp_requested_generation_residency": lambda *_args, **_kwargs: None,
+                        "_jobs": registry,
+                        "restore_scheduler_state": lambda *_args: None,
+                        "cleanup_orphan_request_manifests": lambda *_args: 0,
+                        "cleanup_orphan_staged_outputs": lambda *_args: 0,
+                        "_queue_recovery_coordinator": types.SimpleNamespace(
+                            compact=lambda: None,
+                        ),
+                    },
+                )
+                self.assertTrue(namespace["_restore_queue_recovery_on_startup"]())
+                self.assertEqual(events[:3], [
+                    "early-scan", "cursor-quarantined", "materialized-sample-peer",
+                ])
+                self.assertIn("late-scan", events)
+                self.assertEqual(set(registry),
+                                 {"sample-h3", "sample-peer"} if complete else set())
+                if complete:
+                    self.assertEqual(registry["sample-h3"]["output_files"],
+                                     ["verified-final.mp4"])
+
     def test_final_adoption_startup_summary_keeps_job_ids_private(self):
         namespace = _isolated_functions(
             self.launch,
@@ -9744,6 +10038,34 @@ class QueueLaunchWiringTests(unittest.TestCase):
             namespace["_queue_recovery_final_adoption_jobs"]
             [("project", "private-job-id")]["adopted"],
             4,
+        )
+        namespace["_queue_recovery_adopt_quarantined_finals"](
+            {"second-project": ("/other/project", "other-digest")},
+            merge_existing=True,
+        )
+        self.assertIn(
+            ("project", "private-job-id"),
+            namespace["_queue_recovery_final_adoption_jobs"],
+        )
+        self.assertIn(
+            ("second-project", "private-job-id"),
+            namespace["_queue_recovery_final_adoption_jobs"],
+        )
+        self.assertEqual(
+            namespace["_queue_recovery_final_adoption_startup_summary"],
+            summary,
+        )
+        def failed_scan(*_args, **_kwargs):
+            raise QueueRecoveryRuntimeError("unavailable")
+
+        namespace["_adopt_quarantined_final_groups"] = failed_scan
+        namespace["_queue_recovery_adopt_quarantined_finals"](
+            {"project": ("/private/project", "opaque-digest")},
+            merge_existing=True,
+        )
+        self.assertIn(
+            ("project", "private-job-id"),
+            namespace["_queue_recovery_final_adoption_jobs"],
         )
 
     def test_public_finality_projection_is_content_free_counts_only(self):

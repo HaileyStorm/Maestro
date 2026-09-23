@@ -12,6 +12,23 @@ import os
 import shutil
 import tempfile
 
+
+def _metadata_json(metadata_dict):
+    """Omit transient image objects from embedded settings metadata.
+
+    Source image bytes, when requested, are stored separately as MP4 cover
+    art. A PIL image used for an in-memory clip boundary is not a reusable
+    source path and must not make the finished video's metadata write fail.
+    """
+    from PIL import Image
+
+    def replace_transient_image(value):
+        if isinstance(value, Image.Image):
+            return
+        raise TypeError(f"Unsupported metadata value: {type(value).__name__}")
+
+    return json.dumps(metadata_dict, default=replace_transient_image)
+
 def _convert_image_to_bytes(img):
     """
     Convert various image formats to bytes suitable for MP4 cover art.
@@ -174,7 +191,7 @@ def save_metadata_to_mp4(file_path, metadata_dict, source_images = None):
     try:
         from mutagen.mp4 import MP4
         file = MP4(file_path)
-        file.tags['©cmt'] = [json.dumps(metadata_dict)]
+        file.tags['©cmt'] = [_metadata_json(metadata_dict)]
         if source_images is not None:
             embed_source_images_metadata_mp4(file, source_images)
         file.save()
@@ -202,7 +219,7 @@ def save_metadata_to_mkv(file_path, metadata_dict):
         # Use FFmpeg to add metadata while preserving ALL streams (including attachments)
         ffmpeg_cmd = [
             'ffmpeg', '-y', '-i', file_path,
-            '-metadata', f'comment={json.dumps(metadata_dict)}',
+            '-metadata', f'comment={_metadata_json(metadata_dict)}',
             '-map', '0',  # Map all streams from input (including attachments)
             '-c', 'copy',  # Copy streams without re-encoding
             temp_path
@@ -509,4 +526,3 @@ def extract_source_images(video_path, output_dir = None):
     except subprocess.CalledProcessError as e:
         print(f"Error extracting source images from {os.path.basename(video_path)}: {e.stderr}")
         return []
-

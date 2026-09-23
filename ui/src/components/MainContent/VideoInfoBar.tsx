@@ -61,6 +61,8 @@ export function VideoInfoBar() {
   const groupId = multiClipInfo?.group_id
   const clipIndex = multiClipInfo?.index
   const clipTotal = multiClipInfo?.total
+  const canRejoinGroup = Boolean(groupId) && Number.isInteger(clipTotal) && (clipTotal ?? 0) >= 2
+    && (selected.artifact_class !== 'final' || selected.linked_component_count >= (clipTotal ?? 0))
 
   // Image thumbnails from upload filenames (may be string or array for multi-clip)
   const rawStart = uploadFilenames?.image_start
@@ -190,7 +192,7 @@ export function VideoInfoBar() {
             >
               <RefreshCw size={14} />
             </button>
-            {groupId && (
+            {canRejoinGroup && (
               <button
                 onClick={handleRejoin}
                 disabled={rejoining}

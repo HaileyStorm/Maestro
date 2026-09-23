@@ -290,6 +290,8 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onVisible, meas
   const groupId = multiClipInfo?.group_id
   const clipIndex = multiClipInfo?.index
   const clipTotal = multiClipInfo?.total
+  const canRejoinGroup = Boolean(groupId) && Number.isInteger(clipTotal) && (clipTotal ?? 0) >= 2
+    && (file.artifact_class !== 'final' || file.linked_component_count >= (clipTotal ?? 0))
 
   const rawStart = uploadFilenames?.image_start
   const rawEnd = uploadFilenames?.image_end
@@ -949,7 +951,7 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onVisible, meas
                   {continueError && <span role="alert" className="text-xs text-red-400">{continueError}</span>}
                 </>
               )}
-              {groupId && (
+              {canRejoinGroup && (
                 <button
                   onClick={handleRejoin}
                   disabled={rejoining}

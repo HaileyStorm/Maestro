@@ -6924,11 +6924,14 @@ _queue_recovery_final_adoption_startup_summary = {
 
 def _queue_recovery_adopt_quarantined_finals(
     projects: Mapping[str, tuple[str, str]],
+    *,
+    merge_existing: bool = False,
 ) -> dict:
     """Adopt complete attested finals before cleanup/indexing, never jobs."""
     global _queue_recovery_final_adoption_jobs
     global _queue_recovery_final_adoption_startup_summary
-    jobs: dict[tuple[str, str], dict] = {}
+    previous_jobs = _queue_recovery_final_adoption_jobs if merge_existing else {}
+    jobs: dict[tuple[str, str], dict] = dict(previous_jobs)
     aggregate = {
         "adopted_groups": 0,
         "missing_groups": 0,
@@ -6944,6 +6947,12 @@ def _queue_recovery_adopt_quarantined_finals(
         except (OSError, ValueError, TypeError, QueueRecoveryRuntimeError):
             aggregate["failed_projects"] += 1
             continue
+        if merge_existing:
+            # A failed rescan must not discard earlier verified receipts for
+            # other jobs in this project. Replace only after a successful read.
+            for key in tuple(jobs):
+                if key[0] == workspace:
+                    del jobs[key]
         for key in ("adopted_groups", "missing_groups", "quarantined_groups"):
             value = summary.get(key)
             if type(value) is int and value >= 0:
@@ -6980,8 +6989,21 @@ def _queue_recovery_adopt_quarantined_finals(
                 "output_files": list(output_files),
             }
     _queue_recovery_final_adoption_jobs = jobs
-    _queue_recovery_final_adoption_startup_summary = aggregate
-    if any(aggregate.values()):
+    if merge_existing:
+        newly_adopted = sum(
+            1 for key, value in jobs.items()
+            if key[0] in projects
+            and value.get("state") == "adopted"
+            and previous_jobs.get(key, {}).get("state") != "adopted"
+        )
+        if newly_adopted:
+            print(
+                "[Maestro] Final recovery after reconciliation: "
+                f"{newly_adopted} newly adopted."
+            )
+    else:
+        _queue_recovery_final_adoption_startup_summary = aggregate
+    if not merge_existing and any(aggregate.values()):
         print(
             "[Maestro] Final recovery: "
             f"{aggregate['adopted_groups']} adopted, "
@@ -7192,15 +7214,15 @@ def _queue_recovery_materialize_job(
         for unit in (snapshot_units if isinstance(snapshot_units, list) else [])
     )
     h3_classifier = globals().get("is_registered_h3_family")
-    verified_h3_final_adoption = bool(
-        verified_final_adoption
-        and (
-            had_h3_unit_evidence
-            or (
-                callable(h3_classifier)
-                and h3_classifier(runtime.get("model_type"))
-            )
+    h3_final_adoption_required = bool(
+        had_h3_unit_evidence
+        or (
+            callable(h3_classifier)
+            and h3_classifier(runtime.get("model_type"))
         )
+    )
+    verified_h3_final_adoption = bool(
+        verified_final_adoption and h3_final_adoption_required
     )
     publication_recovery = globals().get(
         "_project_reference_publication_recovery_requested"
@@ -7245,6 +7267,15 @@ def _queue_recovery_materialize_job(
                         snapshot, manifest_params, manifest.get("inputs") or (),
                     )
                 runtime["params"] = manifest_params
+                if (
+                    callable(h3_classifier)
+                    and h3_classifier(manifest_params.get("model_type"))
+                ):
+                    # Older sample snapshots may omit their top-level model
+                    # identity. The sealed manifest is authoritative before
+                    # the sample completion branch can publish either arm.
+                    h3_final_adoption_required = True
+                    verified_h3_final_adoption = verified_final_adoption
                 if (
                     str(runtime["params"].get("model_type") or "").startswith(
                         "minimax_h3"
@@ -7297,6 +7328,19 @@ def _queue_recovery_materialize_job(
         })
         return runtime, False
     if snapshot.get("kind") == "sample_campaign_generation":
+        if status == "completed" and not blocked_reason and h3_final_adoption_required and not verified_h3_final_adoption:
+            # Sample arms use a paired restore path, so they must enforce the
+            # same final receipt gate before either arm is republished.
+            runtime.update({
+                "status": "queued",
+                "queue_held": True,
+                "resource_state": "queued",
+                "recovery_state": "blocked",
+                "_recovery_reason_code": "final_output_recovery_incomplete",
+                "message": "Final output recovery is incomplete",
+                "error": None,
+            })
+            return runtime, False
         if status == "completed" and not blocked_reason:
             runtime.update({
                 "status": "completed",
@@ -8189,6 +8233,24 @@ def _restore_queue_recovery_on_startup(
             _queue_recovery_materialize_job(snapshot, projects)[0]
             for snapshot in sample_group
         )
+        late_sample_projects = {
+            str(snapshot.get("workspace") or "default")
+            for snapshot, job in zip(sample_group, materialized)
+            if str(snapshot.get("status") or "").casefold() == "completed"
+            and job.get("_recovery_reason_code") == "final_output_recovery_incomplete"
+        }
+        if callable(final_adopter) and late_sample_projects:
+            for workspace in sorted(late_sample_projects):
+                if workspace in projects:
+                    final_adopter(
+                        {workspace: projects[workspace]}, merge_existing=True,
+                    )
+            # Rebuild both arms from the original snapshots after rescanning.
+            # The pair below is published together only if each arm passes.
+            materialized = tuple(
+                _queue_recovery_materialize_job(snapshot, projects)[0]
+                for snapshot in sample_group
+            )
         if any(
             not job.get("out_dir")
             or (
@@ -8230,6 +8292,28 @@ def _restore_queue_recovery_on_startup(
             )
             continue
         job, auto_resume = _queue_recovery_materialize_job(snapshot, projects)
+        if (
+            str(snapshot.get("status") or "").casefold() == "completed"
+            and job.get("_recovery_reason_code") == "final_output_recovery_incomplete"
+        ):
+            # Reconciliation may have quarantined a complete producer group
+            # after the early adoption scan. Give only this project one late
+            # scan before credit settlement, checkpointing, and publication.
+            workspace = str(snapshot.get("workspace") or "default")
+            late_adopter = globals().get(
+                "_queue_recovery_adopt_quarantined_finals"
+            )
+            if workspace in projects and callable(late_adopter):
+                late_adopter(
+                    {workspace: projects[workspace]}, merge_existing=True,
+                )
+                adopted = _queue_recovery_final_adoption_jobs.get(
+                    (workspace, str(snapshot.get("id") or ""))
+                )
+                if isinstance(adopted, dict) and adopted.get("state") == "adopted":
+                    job, auto_resume = _queue_recovery_materialize_job(
+                        snapshot, projects,
+                    )
         credit_hydrate = globals().get("_credit_accounting_hydrate_job")
         if callable(credit_hydrate):
             credit_hydrate(job)
