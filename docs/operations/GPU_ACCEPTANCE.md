@@ -700,6 +700,45 @@ This satisfies only the small runtime prerequisite. The H3 W4A8 row remains
 open for checkpoint-bound generation, playable output, fallback checks, and
 visual/human acceptance. Native Windows runtime execution remains unverified.
 
+### 2026-09-23 signed-in W4A8 live failure and repair attempt
+
+On Linux RTX 5090 with the current `app/env-rtx50` runtime and source
+`141d82f707e3754ba2f5ba661c1587cb4ce96729`, the fresh synthetic
+W4A8 prerequisite passed (finite output, relative MAE 0.0710). The first
+signed-in stable-share Video submission selected W4A8 in Advanced but adaptive
+conditioning still submitted Base FL2VA. It was stopped before generated
+media; this was a UI model-routing defect, not W4A8 execution evidence.
+
+After the local UI correction, a new 608×352, 5.17-second, eight-step Dense
+SDPA/Turbo submission loaded the intended
+`minimax_h3_w4a8_fl2va` checkpoint (Kijai mixed W4A8 asset pinned by
+`app/defaults/minimax_h3_w4a8_fl2va.json`). It failed before denoising step
+0/8. Comfy-Kitchen rejected `w4a8_int8_linear` because MMGP had converted
+the checkpoint's FP32 `weight_s_channel` to BF16; both Triton and eager
+backends require FP32. The failed job was visible in the project queue before
+the coordinated restart.
+Local health and stable-share access remained ready. The failed attempt is
+retained as negative evidence; the parameter-level MMGP dtype repair, its
+small-load regression, and the fresh live retest are recorded below.
+
+The repaired service then completed one fresh signed-in stable-share W4A8
+generation on RTX 5090 (driver 595.84, SM 12.0; Torch 2.10.0+cu130,
+Triton 3.6.0). The submitted sidecar records adaptive FL2VA preference and
+producer model `minimax_h3_w4a8_fl2va`, seed 314159265, 608×352, 124 frames,
+eight Dense SDPA steps, and no LoRAs. The backend loaded the pinned Kijai
+W4A8 checkpoint, completed all eight denoising steps without a checkpoint
+fallback, and recorded a 59-second generation. The Gallery showed the new
+video tile through stable-share and made ranged media requests successfully.
+The MP4 is 5.166667 seconds, HEVC 24 fps with stereo AAC 32 kHz; FFmpeg
+decoded both streams without error. Its SHA-256 is
+`31986669688616241cf6b4084907204d7582b6823613bd54bd7dbfdf99c22ff9`.
+Three inspected frames show the same red robot and yellow triangle through
+the requested turn and wave. Audio is non-silent (mean -25.5 dBFS, peak
+-2.3 dBFS). This is live GPU, browser-Gallery, and agent visual/technical
+media evidence. Browser Play and owner listening/visual acceptance remain
+unverified; the W4A8 row is still open for those judgments, fallback checks,
+and any required parity retest.
+
 ## NVFP4 scale-layout check — 2026-09-07 UTC
 
 The CPU fallback now matches the eager reference for padded physical scale

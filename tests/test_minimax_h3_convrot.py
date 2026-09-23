@@ -213,6 +213,30 @@ class ConvRotAdapterTests(unittest.TestCase):
         self.assertEqual(tuple(model[0].weight_s_rel.shape), (4, 2))
         self.assertEqual(model[0].weight.device.type, "meta")
 
+    def test_mmgp_load_preserves_w4a8_kernel_scale_dtypes(self):
+        try:
+            from mmgp.offload import load_model_data
+        except ModuleNotFoundError as error:
+            self.skipTest(f"MMGP is not installed: {error}")
+
+        state = {
+            "weight": torch.zeros((4, 16), dtype=torch.int8),
+            "weight_s_rel": torch.ones((4, 2), dtype=torch.float8_e4m3fn),
+            "weight_s_channel": torch.ones(4, dtype=torch.float32),
+            "weight_codebook": torch.ones(16, dtype=torch.float32),
+        }
+        layer = W4A8ConvRotLinear(
+            nn.Linear(32, 4, bias=False, device="meta"),
+            {f"layer.{name}": tensor for name, tensor in state.items()},
+            "layer", output_dtype=torch.bfloat16,
+        )
+        load_model_data(layer, state, default_dtype=torch.bfloat16)
+
+        self.assertEqual(layer.weight.dtype, torch.int8)
+        self.assertEqual(layer.weight_s_rel.dtype, torch.float8_e4m3fn)
+        self.assertEqual(layer.weight_s_channel.dtype, torch.float32)
+        self.assertEqual(layer.weight_codebook.dtype, torch.float32)
+
     def test_w4a8_forward_passes_grouped_codebook_contract(self):
         original = nn.Linear(32, 4, bias=False)
         state = {

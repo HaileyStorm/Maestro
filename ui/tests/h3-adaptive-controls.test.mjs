@@ -81,7 +81,9 @@ function loadControls() {
         bundle.onResolve({ filter: /lib\/queueProjection$/ }, () => ({ path: 'queue', namespace: 'adaptive-controls' }))
         bundle.onLoad({ filter: /.*/, namespace: 'adaptive-controls' }, args => {
           if (args.path === 'react') return { contents: `
-            export const useEffect = () => {}
+            export const useEffect = effect => {
+              if (globalThis.__maestroAdaptiveRunEffects) return effect()
+            }
             export const useState = initial => {
               const value = globalThis.__maestroAdaptiveStateValues?.length
                 ? globalThis.__maestroAdaptiveStateValues.shift()
@@ -114,10 +116,14 @@ function loadControls() {
             export const getModelsForFamily = (family, models) => models.filter(model => model.family === family)
           ` }
           if (args.path === 'api') return { contents: `
-            export const fetchH3AccelerationStatus = async () => ({
-              w4a8: { available: true, reason: '' },
-              sage2: { available: true, reason: '' },
-            })
+            export const fetchH3AccelerationStatus = async () => {
+              globalThis.__maestroAdaptiveAccelerationFetches =
+                (globalThis.__maestroAdaptiveAccelerationFetches || 0) + 1
+              return {
+                w4a8: { available: true, reason: '' },
+                sage2: { available: true, reason: '' },
+              }
+            }
             export const verifyManualCheckpoint = async () => ({})
           ` }
           if (args.path === 'tooltip') return { contents: 'export const InfoTooltip = () => null' }
@@ -228,6 +234,27 @@ test('adaptive model groups render both selected checkpoints with stable accessi
   )
   assert.equal(elements.filter(element => textContent(element) === 'Text & frames').length, 1)
   assert.equal(elements.filter(element => textContent(element) === 'References').length, 1)
+})
+
+test('restored W4A8 selection checks runtime availability with the picker closed', async t => {
+  const { ModelSelector } = await loadControls()
+  const previous = globalThis.__maestroAdaptiveControlsStore
+  t.after(() => {
+    globalThis.__maestroAdaptiveControlsStore = previous
+    globalThis.__maestroAdaptiveRunEffects = false
+    delete globalThis.__maestroAdaptiveAccelerationFetches
+  })
+  globalThis.__maestroAdaptiveRunEffects = true
+  globalThis.__maestroAdaptiveAccelerationFetches = 0
+  const store = adaptiveStore()
+  globalThis.__maestroAdaptiveControlsStore = store
+
+  renderTree(ModelSelector())
+  assert.equal(globalThis.__maestroAdaptiveAccelerationFetches, 0)
+
+  store.params.h3_adaptive_fl2va_model = 'minimax_h3_w4a8_fl2va'
+  renderTree(ModelSelector())
+  assert.equal(globalThis.__maestroAdaptiveAccelerationFetches, 1)
 })
 
 test('invalid and missing saved checkpoint identities stay visible for explicit repair', async t => {

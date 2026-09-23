@@ -512,6 +512,51 @@ test('saved Sage2 stays selected but disabled for references and repairs only th
   assert.doesNotMatch(source, /not yet tested/)
 })
 
+test('W4A8 toggle changes the active adaptive FL2VA checkpoint', async () => {
+  const { AdvancedSettings } = await loadAdvancedSettings()
+  const acceleration = {
+    sage2: { available: true, validated: true, reason: 'Available.' },
+    sol_attn: { available: true },
+    w4a8: { available: true, reason: 'Installed.' },
+  }
+  resetRuntime(false, [], [acceleration, null])
+  const store = globalThis.__advancedDrawerStore
+  store.params = {
+    ...store.params,
+    model_type: 'minimax_h3',
+    h3_adaptive_conditioning: true,
+    h3_adaptive_fl2va_model: 'minimax_h3',
+  }
+  store.modelOptions = { architecture: 'minimax_h3' }
+  const adaptive = []
+  const pinned = []
+  store.selectAdaptiveH3Model = (...args) => adaptive.push(args)
+  store.selectModel = model => pinned.push(model)
+
+  const toggle = () => {
+    const label = flattenElements(AdvancedSettings()).find(element => (
+      element.type === 'label'
+      && elementText(element).includes('Kijai W4A8 FL2VA transformer')
+    ))
+    return flattenElements(label).find(element => element.type === 'input' && element.props.type === 'checkbox')
+  }
+  assert.ok(toggle())
+  assert.equal(toggle().props.checked, false)
+  toggle().props.onChange({ target: { checked: true } })
+  assert.deepEqual(adaptive, [['fl2va', 'minimax_h3_w4a8_fl2va']])
+  assert.deepEqual(pinned, [])
+
+  store.params.h3_adaptive_conditioning = false
+  toggle().props.onChange({ target: { checked: true } })
+  assert.deepEqual(pinned, ['minimax_h3_w4a8_fl2va'])
+  store.params.model_type = 'minimax_h3_w4a8_fl2va'
+  assert.equal(toggle().props.checked, true, 'pinned checkpoint is selected')
+  store.params.h3_adaptive_conditioning = true
+  assert.equal(toggle().props.checked, false, 'adaptive Base preference determines the active checkpoint')
+  store.params.h3_adaptive_fl2va_model = 'minimax_h3_w4a8_fl2va'
+  assert.equal(toggle().props.checked, true, 'adaptive W4A8 preference determines the active checkpoint')
+})
+
 test('saved profiles sit at the top of Generate and Advanced reuses them without a second fetch', async () => {
   const [sidebar, advanced] = await Promise.all([
     readFile(sidebarUrl, 'utf8'),

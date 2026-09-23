@@ -98,6 +98,11 @@ class W4A8ConvRotLinear(nn.Module):
         self.weight_codebook = parameter("weight_codebook", required=False)
         self.weight_correction = parameter("weight_correction", required=False)
         self.bias = parameter("bias", required=False)
+        # MMGP otherwise casts these FP32 checkpoint tensors to the BF16
+        # transformer dtype, which Comfy-Kitchen's W4A8 kernels reject.
+        self.weight_s_channel._lock_dtype = torch.float32
+        if self.weight_codebook is not None:
+            self.weight_codebook._lock_dtype = torch.float32
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         try:

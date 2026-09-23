@@ -161,7 +161,9 @@ function CheckpointPicker({
   }, [open, h3SelectedProfile, h3CompatibilitySignature, refreshH3Compatibility])
 
   useEffect(() => {
-    if (!open || !includeW4a8) return
+    // A restored W4A8 selection needs its availability checked even while
+    // the picker stays closed; otherwise its warning says "Checking" forever.
+    if (!includeW4a8 || (!open && selectedType !== 'minimax_h3_w4a8_fl2va')) return
     let current = true
     fetchH3AccelerationStatus(false)
       .then(status => {
@@ -177,7 +179,7 @@ function CheckpointPicker({
         })
       })
     return () => { current = false }
-  }, [includeW4a8, open])
+  }, [includeW4a8, open, selectedType])
 
   const audioSubMode = useStore(s => s.audioSubMode)
 

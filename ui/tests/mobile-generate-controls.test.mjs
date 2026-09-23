@@ -277,7 +277,7 @@ test('model selection, terms, and manual-install actions retain authority and ex
   assert.doesNotMatch(sharedPopupLifecycle, /includeW4a8/)
   assert.match(sharedPopupLifecycle, /document\.addEventListener\('mousedown', handleClick\)/)
   assert.match(sharedPopupLifecycle, /document\.addEventListener\('keydown', handleKeyDown, true\)/)
-  assert.match(models, /if \(!open \|\| !includeW4a8\) return[\s\S]*fetchH3AccelerationStatus/)
+  assert.match(models, /if \(!includeW4a8 \|\| \(!open && selectedType !== 'minimax_h3_w4a8_fl2va'\)\) return[\s\S]*fetchH3AccelerationStatus/)
   assert.match(models, /event\.stopImmediatePropagation\(\)/)
   assert.match(models, /popupRef\.current\?\.querySelector<HTMLElement>/)
   assert.match(models, /window\.requestAnimationFrame\(\(\) => triggerRef\.current\?\.focus\(\)\)/)

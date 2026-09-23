@@ -8,7 +8,7 @@ import { ControlVideoSection } from './ControlVideoSection'
 import { LoraSelector } from '../SettingsDrawer/LoraSelector'
 import { WindowSettings } from './DurationSlider'
 import { GenerationProfiles } from './GenerationProfiles'
-import { h3Sage2Eligibility, h3SemanticRouteRequested } from '../../lib/h3Submission'
+import { defaultAdaptiveFl2vaModel, h3Sage2Eligibility, h3SemanticRouteRequested } from '../../lib/h3Submission'
 import {
   fetchH3AccelerationStatus,
   fetchH3BenchmarkReport,
@@ -189,6 +189,7 @@ export function AdvancedSettings() {
   const durationSeconds = useStore(s => s.durationSeconds)
   const setDurationSeconds = useStore(s => s.setDurationSeconds)
   const selectModel = useStore(s => s.selectModel)
+  const selectAdaptiveH3Model = useStore(s => s.selectAdaptiveH3Model)
   const triggerRef = useRef<HTMLButtonElement>(null)
   const panelRef = useRef<HTMLDivElement>(null)
   const closeRef = useRef<HTMLButtonElement>(null)
@@ -427,10 +428,19 @@ export function AdvancedSettings() {
                         h3Acceleration?.w4a8.available !== true
                         || !['minimax_h3', 'minimax_h3_w4a8_fl2va'].includes(params.model_type)
                       }
-                      checked={params.model_type === 'minimax_h3_w4a8_fl2va'}
-                      onChange={event => void selectModel(
-                        event.target.checked ? 'minimax_h3_w4a8_fl2va' : 'minimax_h3',
-                      )}
+                      checked={(
+                        params.h3_adaptive_conditioning !== false
+                          ? defaultAdaptiveFl2vaModel(params.model_type, params.h3_adaptive_fl2va_model)
+                          : params.model_type
+                      ) === 'minimax_h3_w4a8_fl2va'}
+                      onChange={event => {
+                        const model = event.target.checked ? 'minimax_h3_w4a8_fl2va' : 'minimax_h3'
+                        if (params.h3_adaptive_conditioning !== false) {
+                          void selectAdaptiveH3Model('fl2va', model)
+                        } else {
+                          void selectModel(model)
+                        }
+                      }}
                       className="mt-0.5"
                     />
                     <span>
