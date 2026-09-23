@@ -73,7 +73,8 @@ class H3ProfileTests(unittest.TestCase):
         self.assertEqual(
             [item["id"] for item in definitions],
             [
-                "draft", "fast", "quality", "high", "spectrum_experimental",
+                "draft", "fast", "quality", "high", "turbo_dense_4",
+                "turbo_dense_8", "spectrum_experimental",
                 "lightx2v_experimental", "dasiwa_ref2va_experimental",
                 "dasiwa_ref2va_suspected_experimental",
                 "better_motion_ref2va_experimental", "1080p_delivery",
@@ -97,6 +98,16 @@ class H3ProfileTests(unittest.TestCase):
             (profiles["high"]["attention_engine"], profiles["high"]["num_inference_steps"], profiles["high"]["resolution"]),
             ("sol_attn", 28, "1344x768"),
         )
+        for profile_id, steps in (("turbo_dense_4", 4), ("turbo_dense_8", 8)):
+            self.assertEqual(
+                (
+                    profiles[profile_id]["accelerator"],
+                    profiles[profile_id]["attention_engine"],
+                    profiles[profile_id]["num_inference_steps"],
+                    profiles[profile_id]["resolution"],
+                ),
+                ("turbo", "sdpa", steps, "608x352"),
+            )
         self.assertEqual(
             (
                 profiles["spectrum_experimental"]["accelerator"],
@@ -298,6 +309,8 @@ class H3ProfileTests(unittest.TestCase):
         self.assertIn("not registered", by_id["draft"]["fallback_reason"])
         self.assertEqual(by_id["draft"]["fallback_profile_id"], "quality")
         self.assertEqual(by_id["fast"]["fallback_profile_id"], "quality")
+        self.assertFalse(by_id["turbo_dense_4"]["available"])
+        self.assertFalse(by_id["turbo_dense_8"]["available"])
         self.assertIsNone(by_id["quality"]["fallback_profile_id"])
         self.assertTrue(by_id["quality"]["available"])
 
@@ -515,6 +528,38 @@ class H3ProfileTests(unittest.TestCase):
         self.assertFalse(options[1]["available"])
         self.assertIn("hash mismatch", options[0]["fallback_reason"])
 
+    def test_dense_turbo_profiles_remain_available_when_sage_gate_is_stale(self):
+        checked = []
+
+        def turbo_compatibility(settings):
+            checked.append(settings)
+            return True, None
+
+        options = build_profile_options(
+            {"model_type": "minimax_h3", "reference_shape": {}},
+            model_exists=lambda _model: True,
+            model_downloaded=lambda _model: True,
+            turbo_status={"registered": True, "downloaded": True},
+            turbo_compatibility=turbo_compatibility,
+            sage2_status={
+                "available": True,
+                "validated": False,
+                "validation_reason": "validation record hash mismatch",
+            },
+        )
+        by_id = {item["id"]: item for item in options}
+        self.assertFalse(by_id["draft"]["available"])
+        self.assertFalse(by_id["fast"]["available"])
+        for profile_id, steps in (("turbo_dense_4", 4), ("turbo_dense_8", 8)):
+            option = by_id[profile_id]
+            self.assertTrue(option["available"])
+            self.assertEqual(option["settings"]["num_inference_steps"], steps)
+            self.assertEqual(option["settings"]["custom_settings"], {
+                "h3_attention_engine": "sdpa",
+                "h3_turbo_profile": "h3_turbo_v4",
+            })
+        self.assertEqual(len(checked), 2)
+
     def test_sage_profiles_never_apply_to_unvalidated_h3_checkpoints(self):
         for model_type in (
             "minimax_h3_w4a8_fl2va",
@@ -629,7 +674,7 @@ class H3ProfileTests(unittest.TestCase):
             ),
         )
         self.assertTrue(options[0]["available"])
-        self.assertEqual(seen, ["minimax_h3_w4a8_fl2va", "minimax_h3_w4a8_fl2va"])
+        self.assertEqual(seen, ["minimax_h3_w4a8_fl2va"] * 4)
         self.assertEqual(options[2]["settings"]["model_type"], "minimax_h3_w4a8_fl2va")
 
     def test_pinkcherry_rejects_turbo_and_falls_forward_to_native_quality(self):

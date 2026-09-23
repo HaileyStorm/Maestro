@@ -80,6 +80,30 @@ _PROFILES = (
         "attention_engine": "sol_attn",
     },
     {
+        "id": "turbo_dense_4",
+        "label": "Turbo 4 (Dense)",
+        "description": (
+            "Managed four-step H3 Turbo at 608x352 with Dense SDPA. "
+            "Use when SageAttention2++ has not passed this runtime's validation."
+        ),
+        "accelerator": "turbo",
+        "num_inference_steps": 4,
+        "resolution": "608x352",
+        "attention_engine": "sdpa",
+    },
+    {
+        "id": "turbo_dense_8",
+        "label": "Turbo 8 (Dense)",
+        "description": (
+            "Managed eight-step H3 Turbo at 608x352 with Dense SDPA. "
+            "Use when SageAttention2++ has not passed this runtime's validation."
+        ),
+        "accelerator": "turbo",
+        "num_inference_steps": 8,
+        "resolution": "608x352",
+        "attention_engine": "sdpa",
+    },
+    {
         "id": "spectrum_experimental",
         "label": "Spectrum Experimental",
         "description": (

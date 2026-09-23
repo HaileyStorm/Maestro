@@ -672,12 +672,13 @@ class GalleryApiUiContractTests(unittest.TestCase):
         item = (Path(_ROOT) / "ui" / "src" / "components" / "MainContent" / "MediaFeedItem.tsx").read_text(encoding="utf-8")
         self.assertIn("activatedLoras", item)
         self.assertIn("loras_multipliers", item)
+        self.assertIn("h3LorasForArchitecture(params ?? {}, h3Architecture)", item)
         self.assertIn("Semantic references:", item)
         self.assertIn("uploadFilenames?.image_refs", item)
         for key in ("video_guide2", "video_guide3", "video_source"):
             self.assertIn(f"params?.{key}", item)
             self.assertIn(f"uploadFilenames?.{key}", item)
-        provenance = item[item.index("const activatedLoras"):item.index("const selectionKey")]
+        provenance = item[item.index("let activatedLoras"):item.index("const selectionKey")]
         self.assertNotIn("uploadFilenames?.image_start", provenance)
 
     def test_failed_card_logs_are_inline_and_backend_ids_are_guarded(self):

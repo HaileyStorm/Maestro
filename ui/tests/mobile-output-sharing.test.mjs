@@ -330,6 +330,37 @@ test('metadata and video actions share the mobile target and naming contract', a
   }
 })
 
+test('Gallery LoRA badges follow the effective H3 architecture selection', async t => {
+  const MediaFeedItem = await loadHarness()
+  globalThis.__outputShareStore = createStore()
+  globalThis.__createOutputShare = async () => ({})
+  globalThis.__revokeOutputShare = async () => 1
+  installBrowser(t)
+  const dasiwa = 'dasiwa_ref2va_hybrid_v1_4step.safetensors'
+  const file = output({ name: 'h3-sample.mp4', type: 'video' })
+  const baseParams = {
+    activated_loras: [dasiwa],
+    loras_multipliers: '1.0',
+    h3_fl2va_loras: [],
+    h3_fl2va_loras_multipliers: '',
+    h3_ref2va_loras: [dasiwa],
+    h3_ref2va_loras_multipliers: '1.0',
+  }
+  const base = createRuntime(MediaFeedItem, file, {
+    0: { params: { ...baseParams, model_type: 'minimax_h3' } },
+    1: true,
+  }).render()
+  assert.equal(findElements(base, node => node.props?.title?.includes?.('LoRA ')).length, 0)
+
+  const referenced = createRuntime(MediaFeedItem, file, {
+    0: { params: { ...baseParams, model_type: 'minimax_h3_ref2va' } },
+    1: true,
+  }).render()
+  const badges = findElements(referenced, node => node.props?.title?.includes?.('LoRA '))
+  assert.equal(badges.length, 1)
+  assert.match(nodeText(badges[0]), /dasiwa_ref2va_hybrid_v1_4step/)
+})
+
 test('recovered final without public components does not offer rejoin', async t => {
   const MediaFeedItem = await loadHarness()
   globalThis.__outputShareStore = createStore()

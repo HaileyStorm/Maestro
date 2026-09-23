@@ -3882,6 +3882,24 @@ async function _applyH3ServerProfile(
       delivery_resolution: settings.delivery_resolution || undefined,
       delivery_fit: settings.delivery_fit || undefined,
     }
+    const targetArchitecture = h3ArchitectureForModel(target)
+    if (targetArchitecture) {
+      const oppositeArchitecture = targetArchitecture === 'fl2va' ? 'ref2va' : 'fl2va'
+      const targetList = `h3_${targetArchitecture}_loras` as const
+      const targetWeights = `h3_${targetArchitecture}_loras_multipliers` as const
+      const oppositeList = `h3_${oppositeArchitecture}_loras` as const
+      const oppositeWeights = `h3_${oppositeArchitecture}_loras_multipliers` as const
+      // The profile replaces its own architecture's LoRAs. Preserve the other
+      // picker, but seal an explicit empty list when it has never been set so
+      // a Ref2VA-only adapter cannot leak into a later FL2VA estimate.
+      if (nextParams[oppositeList] == null) {
+        const opposite = h3LorasForArchitecture(state.params, oppositeArchitecture)
+        nextParams[oppositeList] = opposite.loras
+        nextParams[oppositeWeights] = opposite.multipliers
+      }
+      nextParams[targetList] = [...settings.activated_loras]
+      nextParams[targetWeights] = settings.loras_multipliers
+    }
     const mode = state.generationMode
     const savedLoraPerMode = {
       ...state.savedLoraPerMode,

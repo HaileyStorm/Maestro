@@ -1043,3 +1043,64 @@ test('grain controls preserve the complete current per-mode parameter snapshot',
     assert.equal(useStore.getState().savedParamsPerMode.video.filmGrainSaturation, 0.7)
   })
 })
+
+test('a Ref2VA profile keeps FL2VA estimates usable after its reference is removed', async () => {
+  const dasiwa = 'dasiwa_ref2va_hybrid_v1_4step.safetensors'
+  const requests = []
+  await withFreshStore(async ({ useStore }) => {
+    useStore.setState(state => ({
+      generationMode: 'video',
+      modelOptions: modelOptions('minimax_h3_ref2va'),
+      imageRefs: [{ name: 'synthetic-reference.png' }],
+      params: {
+        ...state.params,
+        model_type: 'minimax_h3_ref2va',
+        h3_adaptive_conditioning: true,
+        activated_loras: [],
+        loras_multipliers: '',
+        h3_fl2va_loras: undefined,
+        h3_ref2va_loras: undefined,
+      },
+      h3PerformanceProfiles: [{
+        id: 'dasiwa_ref2va_suspected_experimental',
+        available: true,
+        settings: {
+          model_type: 'minimax_h3_ref2va',
+          num_inference_steps: 4,
+          resolution: '608x352',
+          custom_settings: { h3_attention_engine: 'sdpa' },
+          activated_loras: [dasiwa],
+          loras_multipliers: '1.0',
+          lora_weights: { [dasiwa]: [1] },
+          tea_cache: 0,
+        },
+      }],
+    }))
+    await useStore.getState().applyH3PerformanceProfile('dasiwa_ref2va_suspected_experimental')
+    await settleAsyncWork()
+
+    const applied = useStore.getState().params
+    assert.deepEqual(applied.h3_ref2va_loras, [dasiwa])
+    assert.equal(applied.h3_ref2va_loras_multipliers, '1.0')
+    assert.deepEqual(applied.h3_fl2va_loras, [])
+
+    useStore.setState({ imageRefs: [] })
+    await useStore.getState().refreshH3PerformanceEstimates()
+    assert.equal(useStore.getState().h3EstimateError, null)
+    assert.deepEqual(requests.at(-1).h3_fl2va_loras, [])
+    assert.deepEqual(requests.at(-1).h3_ref2va_loras, [dasiwa])
+  }, {
+    fetchHandler(input, init) {
+      if (String(input) === '/api/v1/h3/estimate') {
+        const request = JSON.parse(init.body)
+        requests.push(request)
+        if (!request.reference_shape.image_count
+          && request.activated_loras.includes(dasiwa)
+          && request.h3_fl2va_loras == null) {
+          return Promise.resolve(Response.json({ detail: 'Incompatible FL2VA LoRA' }, { status: 400 }))
+        }
+      }
+      return baseFetch(input, init)
+    },
+  })
+})

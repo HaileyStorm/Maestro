@@ -355,6 +355,195 @@ download. This accepts one exact native LoRA synthesis path technically;
 owner listening and LoRA quality comparison remain open. The Sound/Vision
 lease was withdrawn after both takes reached terminal success.
 
+### 2026-09-23 fresh signed-in H3 Ref2VA native sample
+
+After the stereo/upscale lease was withdrawn, a coordinated Pinokio restart
+released retained GPU model memory and restored both the current local
+`/health`/`/ready` and stable Cloudflare `/health`/`/ready` to 200. The
+launcher cleared its exact public restart-status generation. A separate
+coherent six-hour `maestro-local` lease
+(`maestro-h3-ref2va-live-01a0a212-20260923`) was validated and monitored
+during the signed-in generation on source revision `980bc06`.
+
+The owner test project submitted the benchmark's deterministic 608x352
+red-circle/yellow-triangle reference PNG (SHA-256
+`820ebc22b7fb2896dd9c0b2485e8e9d42ac567a5b838f3a665fafb1380547cab`)
+and matching synthetic identity-and-motion brief. The private one-segment
+request recorded `minimax_h3_ref2va`, 124 frames at 608x352, 20 steps,
+Dense SDPA, seed `314159265`, one image reference, and no LoRAs or Turbo.
+Job `78ec4edd8082415baf7dc0bd7ab0d364` completed in 81 seconds. Its
+5.166667-second, 24 fps 608x352 HEVC/32 kHz stereo AAC output has SHA-256
+`62d504183deea9bd381c5d12b33823e4dbbf31d2d80e445d3203a6d07231876d`,
+matching the sealed sidecar; audio is finite and non-silent (RMS 0.016,
+peak 0.759). The red circle and yellow triangle are detected in all 124
+decoded frames, and the red object's horizontal centroid moves about 136
+pixels right from first to last. Three sampled frames visually retain the
+reference identity. The signed-in Gallery rose to 25 items, the queue
+returned idle, and stable `/ready` remained 200.
+
+The runtime log identified the loaded Ref2VA checkpoint by basename
+`minimax_h3_ref2va_pruned_fp8_scaled.safetensors`; its 20,958,205,608 bytes
+hash to `f86f2f79ebd2d76eb8eeb46091e83982e6ff51d255747e7b16e92834b392b8e9`.
+The loaded Qwen3-VL-32B NVFP4-AWQ conditioner hashes to
+`35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6`,
+video VAE to `7c1f131492e7eddacaac9069a61b81bdd39de5cc96561e677c5eab1cdce5e522`,
+and audio VAE to `8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48`.
+Two more private signed-in Ref2VA runs used only the managed `h3_turbo_v4`
+asset, Dense SDPA, the same reference/seed/resolution, and no stacked LoRA.
+Turbo8 job `67523e66b8054124a9f32886eab94e8a` completed in 66 seconds;
+its 141-frame, 5.875-second HEVC/stereo AAC output hashes to
+`2e5ac5159c455fec8b34fa5f065769b1dd05593a2c36fcc80e4de15e2203e749`.
+Decoded audio was finite and non-silent (RMS 0.058, peak 0.693). Red and
+yellow reference features were detected in all 141 frames; the red centroid
+moved about 116 pixels right. Turbo4 job
+`c9fc7859599744abb0d552758cb5b5fa` completed in 29 seconds with the
+same 141-frame AV geometry; SHA-256
+`6fc8b85d04f181dddf939338e6ae1cad9740527b0e96103f47f59dd6a00ec510`
+matches its sidecar. Audio was finite and non-silent (RMS 0.068, peak 0.800),
+and both reference-color features appeared in all frames while the red
+centroid moved about 105 pixels right. Sampled frames of both clips visibly
+retained the synthetic character. Turbo4's progress showed eight master
+evaluations for four authored video steps, as designed by its dual-clock
+schedule; that display is not evidence of eight video denoising steps.
+After both jobs, Gallery held 27 items, queue was idle, and stable `/ready`
+returned 200. The duration label correctly showed the aligned 5.88-second
+output, but the browser range input's one-second step reported 5.46 seconds
+for the same selection. The subsequent UI fix uses native 17-frame steps for
+single-pass H3 durations and frame-level steps for long authored timelines.
+After a production UI rebuild and stable-share reload, one keyboard step moved
+the control from 5.17 to 5.88 seconds; the accessible slider value, visible
+label, and expected 141 frames agreed. This checks the control, not a fresh
+generation under the rebuilt UI.
+
+An additional private **Dasiwa on Installed Ref2VA (Unverified)** sample used
+the same reference, prompt, seed, 124-frame 608x352 geometry, four steps, and
+Dense SDPA. Its sealed request contained only
+`dasiwa_ref2va_hybrid_v1_4step.safetensors` at weight 1.0 (local SHA-256
+`d2a9a723d97520232f17b6fec33335f9e94b03b2c67b56f91f16780355479274`),
+with no managed Turbo or other LoRA. Job
+`8c3f86e58e6647eb87ffe8c18084b26b` finished in 59.2 seconds. The
+5.166667-second HEVC/32 kHz stereo AAC artifact hashes to
+`679d950c02df5d9204bcac95186efb4faec8bbce122b8dcbd668fb185fc0f2df`,
+matching its sealed sidecar. The red circle and yellow triangle are detected
+in all 124 frames; sampled frames visibly keep the character, and the red
+centroid moves about 52 pixels right. The decoded audio is finite but
+effectively silent (RMS `0.000002`, peak `0.000108`); this prompt did not
+explicitly request a sound. Gallery rose to 28 items, queue returned idle,
+and stable `/ready` remained 200.
+
+A controlled follow-up added only “Soft electronic footsteps are clearly
+audible throughout.” to that brief. Dasiwa job
+`bcbf780f6cd94a068d2c52d21b87a276` completed in 18.8 seconds with the
+same checkpoint, reference, seed, LoRA, SDPA, four steps, and 124-frame
+geometry. Its private 608x352 HEVC/32 kHz stereo AAC artifact hashes to
+`f87ae2c3b156471a410170a3f8b9b80313689a8c64fbc034884d81765793942e`,
+matching the sealed sidecar. Audio is finite and non-silent (RMS 0.0108,
+peak 0.223; left/right difference RMS 0.0043). Red and yellow reference
+features survive in all 124 decoded frames; the red centroid moves about 66
+pixels right. This shows the installed-base profile can produce non-silent
+stereo audio when prompted, while the first run's silence remains a valid
+observed outcome rather than a demonstrated runtime defect. It supports
+runtime tensor/shape compatibility and coherent synthetic A/V on the
+installed checkpoint, **not** the author's exact-base contract or owner
+audio/visual quality acceptance. Keep this profile explicitly unverified.
+
+Removing the reference after applying Dasiwa exposed a UI-only estimate
+failure: the Ref2VA profile left a legacy shared LoRA selection, and the
+subsequent FL2VA estimate returned HTTP 400 when its separate FL2VA list was
+unset. Applying an H3 profile now seals both architecture lists, preserving
+any explicit opposite selection and using an empty list where appropriate.
+A focused state regression passes, and a signed-in stable-share check applied
+Dasiwa, removed the reference, then selected Quality and High without an
+estimate error. A second issue was visible on the following FL2VA output:
+its request sidecar retained the legacy shared Dasiwa name even though the
+explicit FL2VA list was empty and the worker reported no active LoRAs. The
+Gallery now derives its LoRA badges from the effective H3 architecture list;
+the signed-in stable-share Gallery no longer mislabels that output. The
+legacy field remains in its sealed request for repeat-setting compatibility.
+
+The native and managed Turbo runs accept Ref2VA/SDPA and Turbo4/8 execution
+with synthetic visual identity. The local loose checkpoint has no provenance
+sidecar binding its bytes to the handler's declared source revision, so
+alias/source-revision acceptance remains open, along with broader quality,
+restart/crash recovery, and owner visual or listening acceptance.
+
+### 2026-09-23 fresh signed-in H3 Base FL2VA native sample
+
+The same signed-in owner project submitted the fixed procedural red-robot
+brief through stable Cloudflare with private output, 608x352, 124 frames,
+20 Dense SDPA steps, seed `314159265`, and an explicit empty FL2VA LoRA list.
+Job `8ee5433a1943463d8c9a0f9d142774f1` completed in 74 seconds. The
+worker loaded `minimax_h3_fl2va_pruned_fp8_scaled.safetensors` and logged
+`No LoRAs activated for this generation (model_type=minimax_h3)`; the stale
+legacy shared Dasiwa field in the sidecar did not select an adapter for this
+segment. The loose 20,958,205,608-byte FL2VA checkpoint hashes to
+`12944c1f7791637e7de12208aef04da82bd26b95271b1b47d817364315ade993`;
+its source revision is not bound by a local provenance sidecar. Its private
+HEVC/32 kHz stereo AAC output is 608x352 at 24 fps,
+124 decoded frames and 5.166667 seconds. SHA-256
+`98eb4366cae11a83e8010697ac74875b703159d3762cbb7ceba41fb8864644e6`
+matches the sealed sidecar. Audio samples are finite and non-silent (RMS
+0.0779, peak 0.229; stereo difference RMS 0.0171). Red and yellow features
+were detected in all 124 decoded frames; the red centroid moved about 197
+pixels right. Five sampled frames visibly retain the robot and emblem.
+Gallery reached 30 items, the queue returned idle, and stable `/ready`
+remained 200. This closes one live native Base/SDPA sample.
+
+The same private brief also completed as high native Sol job
+`b33bd3d23c40402bb21bb4251c9c21e5` at 1344x768, 124 frames, 20 steps,
+seed `314159265`, Sol-Attn with tau 1.0, ten dense warm-up steps, two dense
+blocks, and no LoRAs. Its 462-second run produced 5.166667 seconds of
+1344x768/24 fps HEVC with 32 kHz stereo AAC. Output SHA-256
+`71adb24916e1b98bfab9d85dcf7ee3282ee783aceedf39bf0dc5bc7f06d6d0df`
+matches the sidecar. Decoded audio is finite and non-silent (RMS 0.118,
+peak 0.583); red and yellow features appear in all 124 frames. Five sampled
+frames keep the robot and emblem and show a leg-motion cycle. The red
+centroid remains near x=659 and x=654 from first to last frame: the requested
+left-to-right traverse is not visible in frame coordinates, although the
+prompt also asked for a lateral camera move. This is a successful exact Sol
+execution and playable A/V sample, with directional-motion adherence still
+requiring a clearer visual result. Gallery reached 31 items and the queue
+returned idle.
+
+### 2026-09-23 signed-in H3 Base FL2VA Dense Turbo samples
+
+The installed SageAttention2++ validation does not match its source build,
+so Draft and Fast remain unavailable. Two explicit Turbo 4/8 (Dense) profiles
+use the same managed `h3_turbo_v4` asset with Dense SDPA at 608x352. After a
+coordinated Pinokio restart, both profiles appeared on the signed-in stable
+Cloudflare page. The local and stable `/health` and `/ready` endpoints returned
+200, and the launcher cleared its exact restart-status generation. Continuum
+remained running.
+
+The same private procedural brief and seed `314159265` completed as 4-step job
+`5620b05702b24dad92101962535a0d6f` and 8-step job
+`fe8e013537db42f9af97bf5bd3a2bb06`, with empty FL2VA LoRA lists. The
+worker log confirms the managed Turbo LoRA was loaded for the four-step job;
+the sealed requests specify `h3_turbo_v4` and `sdpa` for both.
+The four-step Turbo schedule deliberately uses eight paired transformer/audio
+ticks while advancing video on four of them; the worker's `8/8` progress is
+therefore consistent with the authored four video steps.
+The outputs are
+608x352 HEVC with 124 frames at 24 fps and 5.166667 seconds, plus 32 kHz
+stereo AAC. Their SHA-256 values match the respective sealed sidecars:
+`55085f3360b3aa2db817cc8810cab692f95dd42862f64d775088ef2ce23a5dee`
+and `cea885d5bc29b9e696839b4881456e98e750f56de6e49eb0444ef6bb99c60b0c`.
+Both audio streams are finite and non-silent: RMS 0.0868/0.0902, peak
+0.834/0.806, and stereo-difference RMS 0.0068/0.0043. Red and yellow
+features persist in all 124 decoded frames, and the red centroids move about
+234/230 pixels right. Four-frame contact sheets show a recognizable robot,
+yellow chest emblem, and changing leg positions; the eight-step result has
+simpler detail than the four-step result in this sample. The four-step job
+recorded 110 seconds including a cold load, while the warm eight-step job
+recorded 25 seconds. Gallery reached 33 items, the queue returned idle, and
+stable `/ready` remained healthy. This closes one live Base managed Turbo4/8
+matrix pass, not checkpoint source-revision proof or owner quality acceptance.
+The first Turbo 4 profile application briefly displayed “Could not estimate
+H3 performance” before submission. A duration change returned a successful
+estimate, and a later Turbo 8 → Turbo 4 switch also estimated successfully.
+No persistent admission failure reproduced; the initial estimate response was
+not captured, so its cause remains unproven.
+
 ### 2026-08-27 PinkCherry beta-0.6 runtime receipt
 
 - Source revision: `5a30ce7`; Linux `7.0.0-30-generic`; RTX 5090; NVIDIA

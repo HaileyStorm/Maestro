@@ -7,6 +7,7 @@ import { createOutputShare, deleteOutputComponents, getUploadUrl, fetchOutputMet
 import type { OutputFile, OutputMetadata } from '../../types'
 import { formatGenerationDuration } from '../../lib/format'
 import { modelDisplayName } from '../../lib/modelDisplay'
+import { h3ArchitectureForModel, h3LorasForArchitecture } from '../../lib/h3Submission'
 import {
   hidePrivatePreview as forgetPrivatePreviewReveal,
   privatePreviewIdentity,
@@ -258,12 +259,23 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onVisible, meas
   const resolution = isAudio ? '' : ((params?.resolution as string) || '')
   const seed = params?.seed as number | undefined
   const generationTime = meta?.generation_time
-  const activatedLoras = Array.isArray(params?.activated_loras)
+  const h3Architecture = h3ArchitectureForModel(modelType)
+  let activatedLoras: string[] = Array.isArray(params?.activated_loras)
     ? params.activated_loras.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
     : []
-  const loraMultipliers = typeof params?.loras_multipliers === 'string'
-    ? params.loras_multipliers.split(/\s+/).filter(Boolean)
-    : []
+  let multiplierString = typeof params?.loras_multipliers === 'string' ? params.loras_multipliers : ''
+  if (h3Architecture) {
+    try {
+      const effective = h3LorasForArchitecture(params ?? {}, h3Architecture)
+      activatedLoras = effective.loras
+      multiplierString = effective.multipliers
+    } catch {
+      // A malformed legacy sidecar must not turn a Gallery item into an error.
+      activatedLoras = []
+      multiplierString = ''
+    }
+  }
+  const loraMultipliers = multiplierString.split(/\s+/).filter(Boolean)
   const loraProvenance = activatedLoras.map((value, loraIndex) => ({
     name: value.replace(/\\/g, '/').split('/').pop() || value,
     weight: loraMultipliers[loraIndex]?.split(';')[0] || '1',

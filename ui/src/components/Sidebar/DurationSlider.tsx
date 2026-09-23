@@ -41,10 +41,18 @@ export function DurationSlider() {
   const swDefaults = modelOptions?.sliding_window_defaults || {}
   const durationMin = modelOptions ? modelOptions.frames_minimum / fps : 1
   const durationMax = usesSegments ? 300 : modelOptions?.frames_maximum ? modelOptions.frames_maximum / fps : 300
-  const durationStep = usesSegments ? 1 : Math.max(
+  // A short H3 clip must land on its native temporal grid. One-second range
+  // steps make the thumb report a different duration from the aligned output.
+  // Longer timelines retain frame-level precision for exact authored timing.
+  const nativeDurationStep = Math.max(
     1 / fps,
     (modelOptions?.frame_alignment_modulus || modelOptions?.frames_steps || 1) / fps,
   )
+  const durationStep = usesSegments
+    ? Math.round(duration * fps) <= (modelOptions?.frames_maximum ?? 0)
+      ? nativeDurationStep
+      : 1 / fps
+    : nativeDurationStep
   const windowMin = Math.max(1 / fps, (swDefaults.window_min ?? (usesSegments ? modelOptions?.frames_minimum : Math.round(3 * fps)) ?? 1) / fps)
   const windowMax = Math.max(windowMin, (swDefaults.window_max ?? (usesSegments ? modelOptions?.frames_maximum : Math.round(40 * fps)) ?? Math.round(40 * fps)) / fps)
   const windowStep = Math.max(1 / fps, (swDefaults.window_step ?? (usesSegments ? modelOptions?.frame_alignment_modulus : 1) ?? 1) / fps)
