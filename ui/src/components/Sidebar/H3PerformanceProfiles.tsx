@@ -128,9 +128,9 @@ export function H3PerformanceProfiles() {
     ? undefined
     : profiles.find(profile => profile.id === selected)
   const matchingProfile = (
-    selectedProfile && h3ProfileMatches(selectedProfile, params, loraWeights, spatialUpsampling)
+    selectedProfile?.available && h3ProfileMatches(selectedProfile, params, loraWeights, spatialUpsampling)
       ? selectedProfile
-      : profiles.find(profile => h3ProfileMatches(profile, params, loraWeights, spatialUpsampling))
+      : profiles.find(profile => profile.available && h3ProfileMatches(profile, params, loraWeights, spatialUpsampling))
   )
   const visibleSelection = matchingProfile?.id || 'custom'
   const activeProfile = visibleSelection === 'custom'
