@@ -653,7 +653,8 @@ class LlmRuntimeTests(unittest.TestCase):
         director_pipeline = types.ModuleType("services.director_pipeline")
         director_pipeline._pipelines = {}
         native_execution.acquire()
-        with mock.patch.dict(
+        # Whole-process collection time is unrelated to this lock-order test.
+        with mock.patch("gc.collect", return_value=0), mock.patch.dict(
             sys.modules,
             {"services.director_pipeline": director_pipeline},
         ):
