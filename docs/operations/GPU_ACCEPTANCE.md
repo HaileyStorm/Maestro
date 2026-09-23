@@ -817,7 +817,7 @@ Draft/Fast Sage profiles disabled because the release-bound validation record
 does not match this installed source build. Advanced Settings still permits an
 explicit Sage2 choice for a bounded candidate run.
 
-Through the signed-in stable-share Studio, three subsequent Base FL2VA jobs
+Through the signed-in stable-share Studio, six subsequent Base FL2VA jobs
 used the same synthetic robot brief, seed `314159265`, 124 frames at 24 fps,
 no references or extra LoRAs, and produced Gallery-visible HEVC/AAC outputs:
 
@@ -826,26 +826,51 @@ no references or extra LoRAs, and produced Gallery-visible HEVC/AAC outputs:
 | `base_native_sage2` | 608×352, 20 steps, Sage2, no Turbo | `40b53bd75a844f5185267906ddb5dcb5` | 63 s | `cd36cddb67c59e3f99d59a87387008b8793bfe330f04874985e8990ee4bf9ece` |
 | `base_fast_864_turbo_8_sdpa` | 864×480, 8 steps, Turbo V4, dense SDPA | `ed076e0c2fb3476286b9a1d81c2a6ad3` | 71 s | `ea2fb1458807eec91afd85a1e9fce5b6620f31fa5f603bc61145a1cd93461ec9` |
 | `base_fast_864_turbo_8_sage2` | 864×480, 8 steps, Turbo V4, Sage2 | `2a33dd9fa25c4e0c8276916f604dd1b9` | 38 s | `9af7fcb1a6bb4821637e8ba2d87308698b4a9a316dc53cef418a3ddcaa745c44` |
+| `base_turbo_4_sdpa` | 608×352, 4 steps, Turbo V4, dense SDPA | `3a54ca9b64aa4abd9af3946b3c5926d2` | 48 s | `3711ba3fdd6f174760b8d05068da29d07854acb66a69c42284e6e1fd2d0b6315` |
+| `base_turbo_4_sage2` | 608×352, 4 steps, Turbo V4, Sage2 | `93bdd229fe9f455d87f060dad54df9d4` | 22 s | `5b3ce27501fd50c11026f966dc4e0931fa010f06790a7c92bf94af15d7d8a8f2` |
+| `base_turbo_8_sage2` | 608×352, 8 steps, Turbo V4, Sage2 | `940e3eed18d14d7eacebc8dfcab476dc` | 22 s | `0bf47320fc306bc81c2cbb3dbda179a3360fcc2da740d6291d14d38366ecd974` |
 
 Each sidecar records the stated model, seed, schedule, attention engine, and
-absence of other LoRAs; each output matches its sidecar media hash, decodes all
-124 video frames and its audio stream without error, and lasts 5.166667 s.
-Sampled middle frames show a coherent red walking robot against the requested
-pale blue background in both Turbo outputs. The yellow triangle is visible on
-the robot's side rather than clearly on its chest, so prompt adherence is
-partial. The native sample is also coherent in sampled frames. Audio is
-present and non-silent in all three, but owner listening remains open.
+absence of other LoRAs. The first three outputs match their sidecar media
+hashes, decode all 124 video frames and their audio streams without error,
+and last 5.166667 s. Sampled middle frames show a coherent red walking robot
+against the requested pale blue background in both 864×480 Turbo outputs.
+The yellow triangle is visible on the robot's side rather than clearly on its
+chest, so prompt adherence is partial. The native sample is also coherent in
+sampled frames. Audio is present and non-silent in all three, but owner
+listening remains open.
+
+The later 608×352 samples used the same seed and brief. Their sidecars and
+media hashes also match; the three new files each decode 124 frames with a
+non-silent audio stream. Middle frames of both Sage2 outputs show a coherent
+walking robot with the yellow emblem. Whole-video, audio-quality and owner
+review remain open. Full-frame video SSIM against same-seed dense outputs was
+0.857 at 608×352 Turbo 4, 0.881 at 608×352 Turbo 8 (using the earlier dense
+sample above), and 0.906 for the 864×480 Turbo 8 pair. These measurements
+describe similarity to dense outputs, not aesthetic quality or fidelity to
+the prompt.
 
 After the native job the process reported 1,000 Sage2 calls, zero Sage2
-fallbacks, and zero errors; after the matched Turbo Sage2 job it reported
-1,400 calls with the same zero fallback/error counts. The intervening dense
-job did not increment the Sage2 count. This proves candidate Base FL2VA kernel
-execution on this host, including the Turbo schedule. The 71 s versus 38 s
-sidecar fields do not isolate model load, cache state, or other run conditions,
-so they are not a validated speedup. Do not refresh the release validation
-record or enable curated Sage profiles from these three samples alone. Source,
-runtime, checkpoint and broader quality binding, owner visual/listening
-acceptance, and other H3 checkpoint families remain open.
+fallbacks, and zero errors; after the 864×480 matched Turbo job it reported
+1,400 calls, and after the 608×352 Turbo 4/8 samples 2,200, with the same zero
+fallback/error counts. The intervening dense job did not increment the Sage2
+count. This proves candidate Base FL2VA kernel execution on this host,
+including both Turbo schedules. The sidecar runtime fields do not isolate
+model load, cache state, or other run conditions, so they are not a validated
+speedup. Do not refresh the release validation record or enable curated Sage
+profiles from these samples alone. The current record requires two samples
+each for the 608×352 Turbo 4/8 cases, at least 3,100 kernel calls, explicit
+human visual/audio review, and exact source/runtime/model binding. Those gates
+and other H3 checkpoint families remain open.
+
+With the queue idle, the local-only release control returned 200 and
+`released: ["generation model"]`; system telemetry then reported the H3
+generation model `loaded: false`. Local and stable-share `/health` and `/ready`
+remained 200. The task's lease observer stopped, the exact GPU grant was
+withdrawn and its outbox became `denied`. Continuum and stable Cloudflare
+access stayed running without a resident generation model. This accepts the
+loaded-generation-model unload path on this host, distinct from the earlier
+loaded-LLM unload check and from release during a concurrent generation.
 
 ### 2026-09-23 idle model-release recovery
 
