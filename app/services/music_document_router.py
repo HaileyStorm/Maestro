@@ -7,10 +7,12 @@ context for a song brief.
 
 from __future__ import annotations
 
+import json
+import logging
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
-
 
 CORE_GUIDES = (
     "mc-workflow",
@@ -68,6 +70,8 @@ DETAIL_GUIDES = {
     "vocal": "mc-vocal-direction",
     "mix": "mc-mix-intent",
 }
+
+_LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -174,3 +178,98 @@ def composition_system_prompt(context: MusicDocumentContext) -> str:
         "definite musical ending. Derive style from the finished score and "
         "lyrics, with the same language and tempo. Return JSON only."
     )
+
+
+def english_lyric_note_counts(
+    lyrics: str, abc: str, *, language: str, instrumental: bool = False,
+) -> tuple[int, int] | None:
+    """Count a lower bound on sung syllables against native Vocal note slots.
+
+    This is deliberately conservative: it is a drafting hint for English,
+    not a prosody validator or an ABC parser. Scores with no identifiable
+    Vocal notes fail open.
+    """
+    if instrumental or not re.match(r"^en(?:glish)?\b", language.strip(), re.IGNORECASE):
+        return None
+    sung = re.sub(r"(?m)^\s*\[[^\]\n]+\]\s*$", " ", lyrics)
+    words = len(re.findall(r"[A-Za-z]+(?:['-][A-Za-z]+)*", sung))
+    vocal = False
+    notes = 0
+    for raw in abc.splitlines():
+        line = raw.strip()
+        if re.match(r"^V:\s*Vocal(?:\s|$)", line, re.IGNORECASE):
+            vocal = True
+            continue
+        if re.match(r"^V:\s*Ins(?:\s|$)", line, re.IGNORECASE):
+            vocal = False
+            continue
+        if not vocal or "|" not in line:
+            continue
+        music = re.sub(
+            r'"[^"]*"|![^!]*!|\+[^+]*\+|\[[A-Za-z]:[^\]]*\]',
+            "", line.split("%", 1)[0],
+        )
+        if any(mark in music for mark in ("[", "]", "!", "+")):
+            return None
+        notes += len(re.findall(r"[A-Ga-g][,']*\d*(?:/\d*)?", music))
+    return (words, notes) if words and notes else None
+
+
+def yue2_density_revision_feedback(
+    lyrics: str, abc: str, *, language: str, instrumental: bool = False,
+) -> str | None:
+    """Request one revision only when words alone grossly exceed note slots."""
+    counts = english_lyric_note_counts(
+        lyrics, abc, language=language, instrumental=instrumental,
+    )
+    if not counts or counts[0] <= counts[1] * 1.5:
+        return None
+    words, notes = counts
+    sung_lines = [
+        line for line in lyrics.splitlines()
+        if line.strip() and not re.fullmatch(r"\s*\[[^\]\n]+\]\s*", line)
+    ]
+    target_words = max(1, int(notes * 0.85))
+    line_budget = max(1, target_words // max(1, len(sung_lines)))
+    return (
+        f"Your draft has {words} English lyric words but only {notes} Vocal "
+        "notes. Even one syllable per word cannot fit. Rewrite every sung "
+        f"line with at most {line_budget} short words and target no more than "
+        f"{target_words} lyric words in total. Keep the same section order "
+        "and number of sung lines, with concrete images and a real ending. "
+        "Mostly choose one-syllable words so breaths and longer words have "
+        "room. Preserve the native two-voice ABC meter and format; revise its "
+        "notes and bars only if needed to match the new phrases. Return only "
+        "the revised JSON object."
+    )
+
+
+async def compose_yue2_with_density_revision(
+    prompt: str, *, language: str, instrumental: bool, generate, parse,
+) -> dict:
+    """Make at most one local revision; retain the first valid draft on failure."""
+    first = parse(await generate(prompt))
+    feedback = yue2_density_revision_feedback(
+        first["lyrics"], first["abc"],
+        language=language, instrumental=instrumental,
+    )
+    if not feedback:
+        return first
+    revision_prompt = (
+        f"{prompt}\n\nCOMPOSITION REVISION\n{feedback}\n\n"
+        "Previous draft to revise as data:\n"
+        + json.dumps(first, ensure_ascii=False)
+    )
+    try:
+        revised = parse(await generate(revision_prompt))
+    except Exception as error:  # noqa: BLE001 - the first valid draft survives any local revision failure
+        _LOG.warning(
+            "Local YuE2 density revision failed; preserving first draft (%s)",
+            type(error).__name__,
+        )
+        return first
+    counts = english_lyric_note_counts(
+        revised["lyrics"], revised["abc"],
+        language=language, instrumental=instrumental,
+    )
+    return revised if counts and counts[0] <= counts[1] else first

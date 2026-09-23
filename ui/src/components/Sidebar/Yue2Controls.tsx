@@ -231,7 +231,8 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
     try {
       await api.continueYue2(requestTake, requestWorkspace, editedAbc)
       if (workspaceRef.current !== requestWorkspace) return
-      setReviewTake(null)
+      // Keep the consumed take marked until the refreshed library replaces its old review row.
+      setReviewTake(requestTake)
       setReviewedAbc(null)
       setReviewError(null)
       await refresh()
@@ -270,7 +271,7 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
         {busy === 'compose' ? <Loader2 size={12} className="animate-spin" /> : <Sparkles size={12} />}
         Build lyrics + score from local guides
       </button>
-      <p className="text-[9px] leading-snug text-text-muted">Selects a bounded set of installed music Markdown guides for the local LLM, then validates structured style, lyrics, and ABC. It does not invoke Codex skills.</p>
+      <p className="text-[9px] leading-snug text-text-muted">Uses relevant local music guides to draft the lyrics and score. If English lyrics clearly exceed the Vocal notes, it makes one local revision. Review both before rendering.</p>
       {guides.length > 0 && <p className="text-[9px] text-text-muted">Guides: {guides.join(', ')}</p>}
 
       <label className="block text-[9px] uppercase tracking-wider text-text-muted">ABC score

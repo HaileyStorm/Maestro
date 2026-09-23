@@ -34484,6 +34484,7 @@ async def yue2_compose(request: Request):
     from services import llm_service
     from services.llm_operations import run_blocking_shielded
     from services.music_document_router import (
+        compose_yue2_with_density_revision,
         composition_system_prompt,
         load_music_document_context,
     )
@@ -34517,8 +34518,8 @@ async def yue2_compose(request: Request):
         + (str(body.get("language") or "unspecified"))
         + ("\nInstrumental: yes" if body.get("instrumental") else "\nInstrumental: no")
     )
-    try:
-        raw = await run_blocking_shielded(
+    async def generate_draft(draft_prompt):
+        return await run_blocking_shielded(
             _run_authorized_llm_with_selection,
             request,
             selection,
@@ -34527,7 +34528,7 @@ async def yue2_compose(request: Request):
             body,
             selection,
             llm_service.generate,
-            prompt=prompt,
+            prompt=draft_prompt,
             system_prompt=composition_system_prompt(context),
             max_new_tokens=min(4096, max(768, int(body.get("max_new_tokens", 3072)))),
             temperature=float(body.get("temperature", 0.72)),
@@ -34544,7 +34545,15 @@ async def yue2_compose(request: Request):
                 "additionalProperties": False,
             },
         )
-        result = _parse_yue2_composition(raw)
+
+    try:
+        result = await compose_yue2_with_density_revision(
+            prompt,
+            language=str(body.get("language") or ""),
+            instrumental=bool(body.get("instrumental")),
+            generate=generate_draft,
+            parse=_parse_yue2_composition,
+        )
     except HTTPException:
         raise
     except Exception as error:

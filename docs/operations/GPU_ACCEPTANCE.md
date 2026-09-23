@@ -337,7 +337,7 @@ float WAV measures 87.999 seconds and has SHA-256
 Its mean level is -16.6 dBFS and peak -0.4 dBFS; the final five seconds have
 mean level -22.8 dBFS. The delivery receipt reports no warnings and neither
 ABC nor semantic truncation. The signed-in project library shows the complete
-take with playback and WAV download. This accepts one live native YuE2 audio
+take with an audio player and WAV download. This accepts one live native YuE2 audio
 path technically; lyric intelligibility, musical quality, and owner listening
 remain unaccepted.
 
@@ -350,10 +350,40 @@ planning, so the take does not test score alignment. Its stereo 48 kHz WAV
 measures 213.839 seconds, SHA-256
 `c70beceea3ce6ffeafdbf0908db232c5827dd3d4226d89f22a06b3b318037d75`,
 with mean level -16.0 dBFS and peak -0.6 dBFS. The receipt has no warnings
-or generation-limit flags, and the project library offers playback and WAV
+or generation-limit flags, and the project library shows an audio player and WAV
 download. This accepts one exact native LoRA synthesis path technically;
 owner listening and LoRA quality comparison remain open. The Sound/Vision
 lease was withdrawn after both takes reached terminal success.
+
+After the one-pass local density revision was deployed, a fresh signed-in
+stable-share composer request for a baker opening at dawn produced 46 sung
+English words for 72 Vocal notes across 20 bars at 88 BPM. The native
+two-voice score passed the YuE2 plan-first review, and the same project UI
+continued take `c9ee3ab8ae4643e988a7dcf499bbe97b` to terminal success.
+The downloadable float WAV is stereo 48 kHz, 55.119 seconds, SHA-256
+`c60bfac7f2d4ca2d8ad84e96be2a8175a1702aa9e0d0fab66da9774e08517c31`.
+The delivery receipt reports zero clipped samples, no warnings, and neither
+ABC nor semantic truncation. The last five seconds have mean level
+-24.47 dBFS. This accepts a complete guide-backed composer-to-native-YuE2
+path technically; lyric intelligibility, musical quality, and owner listening
+remain open.
+
+A second signed-in stable-share check used a manually authored eight-bar,
+plan-first YuE2 score after correcting the UI review-marker race. Take
+`e70cc6e3f2b74e24891dc8175eb1386e` passed score review, continued, and
+succeeded with no stale review warning visible during rendering or after
+completion. Its 48 kHz stereo float WAV measures 24.759 seconds and has
+SHA-256 `99f48676d40c3ad76a3f3728986c31a4837fceb11135de9edfd89f419bb9691b`.
+The receipt records no clipping, warnings, or ABC/semantic truncation. This
+is live acceptance of that review UI transition and short native render,
+not owner listening acceptance.
+
+Clicking Play on the short take crashed the Codex in-app browser tab. The
+kernel recorded a ChatGPT-process invalid-opcode trap at that moment; the
+Maestro backend logged no audio request, while local and stable `/ready`
+remained 200. Playback in that browser is not accepted from these checks.
+The saved WAVs and delivery receipts remain intact; reproduce playback in a
+separate browser before closing that part of the acceptance row.
 
 ### 2026-09-23 fresh signed-in H3 Ref2VA native sample
 
