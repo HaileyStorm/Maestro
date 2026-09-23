@@ -73,14 +73,15 @@ import torchaudio
 
 
 def _ffmpeg_demux_audio(video_path: str, out_wav: str, sample_rate: int = 22050) -> bool:
-    """Extract the video's audio to a mono WAV at the given sample rate.
+    """Extract the video's audio to a WAV at the given sample rate.
+    Preserve its channel layout so separated background music stays stereo.
     Returns True on success, False if the video had no audio or ffmpeg failed.
     """
     try:
         result = subprocess.run(
             [
                 "ffmpeg", "-y", "-i", video_path,
-                "-vn", "-ac", "1", "-ar", str(sample_rate),
+                "-vn", "-ar", str(sample_rate),
                 "-acodec", "pcm_s16le",
                 out_wav,
             ],
@@ -310,7 +311,8 @@ def _diarize_audio_for_segments(audio_path: str, num_speakers: Optional[int] = N
 
 def _remix_vocals_with_background(vocals_wav: str, background_wav: str, out_wav: str) -> str:
     """Sum converted vocals with the original separated background (music /
-    SFX), aligning sample rate + channels (mono) + length. Writes and returns
+    SFX), centering vocals in the background's channel layout and aligning
+    sample rate and length. Writes and returns
     out_wav."""
     voc, voc_sr = torchaudio.load(vocals_wav)
     bg, bg_sr = torchaudio.load(background_wav)
@@ -318,8 +320,8 @@ def _remix_vocals_with_background(vocals_wav: str, background_wav: str, out_wav:
         bg = torchaudio.functional.resample(bg, bg_sr, voc_sr)
     if voc.ndim == 2 and voc.shape[0] > 1:
         voc = voc.mean(dim=0, keepdim=True)
-    if bg.ndim == 2 and bg.shape[0] > 1:
-        bg = bg.mean(dim=0, keepdim=True)
+    if voc.shape[0] != bg.shape[0]:
+        voc = voc.expand(bg.shape[0], -1)
     n = max(voc.shape[-1], bg.shape[-1])
     if voc.shape[-1] < n:
         voc = torch.nn.functional.pad(voc, (0, n - voc.shape[-1]))
@@ -483,8 +485,8 @@ def apply_voice_clone_to_file(
                 diffusion_steps=diffusion_steps,
                 cfg_rate=cfg_rate,
             )
-            # Save converted audio (stereo from SeedVC; downmix to mono is fine
-            # for our remux). torchaudio.save accepts (channels, samples).
+            # Keep SeedVC's channel layout here. The remix centers the converted
+            # voice while retaining the separated background's stereo image.
             torchaudio.save(out_wav, converted.cpu().float(), source_sr)
         else:
             # Two-voice mode with diarization. The user has supplied

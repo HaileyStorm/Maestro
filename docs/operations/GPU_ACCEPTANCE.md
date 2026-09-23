@@ -268,6 +268,51 @@ jobs. Those three MP4s kept their pre-restart SHA-256 values and matching
 sidecars. This accepts first-restart durability of these successful outputs,
 but does not simulate a crash during an in-flight tool job.
 
+The stereo follow-up ran under a fresh coherent six-hour Maestro coordinator
+grant (`maestro-seedvc-stereo-live-01a0a212-20260923`) with a bounded lease
+guard. A coordinated Pinokio restart loaded the channel-preserving demux/remix
+change; the new local `/ready` and stable Cloudflare `/ready` both returned 200.
+The same signed-in **Tools → Revoice → Single Voice** inputs then completed as
+job `62735095e68a4387848e72babf6a3e2b`. Its private 5.167-second 608x352
+HEVC/AAC result has SHA-256
+`39f0f3a3b6f2e4b9d2bbf96b706548367ca886035401cf2168c1f0861bdc7345`,
+matching the sidecar. The video stream is byte-identical to the source. Audio
+is now **44.1 kHz stereo** rather than mono: left/right difference RMS is
+0.0568 versus 0.0965 in the 48 kHz stereo source, with 0.874 correlation
+between the decoded channel-difference signals. Output audio differs from the
+source (0.227 RMS sample difference), so this is not a passthrough or duplicate
+channel claim. The Gallery rose to 21 finished items and the queue returned
+idle. This accepts channel-layout and background-spatial preservation for one
+single-voice live path; speaker similarity, two-voice mode, cancellation,
+in-flight crash recovery, and owner listening remain open.
+
+The signed-in stable-share **Tools → Upscale → FlashVSR 3x** request on the same
+5.167-second 608x352 synthetic source completed as job
+`b3c4062d7166436cbc12cd60a7de2aa4`. Its 5.184-second 1824x1056 HEVC
+result retains 48 kHz stereo AAC, and SHA-256
+`27612b984775e2f51952af047e6e1258d936588fa1d481e8d403d60bb869fac4`
+matches the sidecar. A sampled frame retains the teapot and floral detail.
+The Gallery rose to 23 items and the queue returned idle. A separate **4x**
+request completed as job `da8bf23925374809aaf13e048ddcc6c9` in 166
+seconds. Its 5.184-second 2432x1408 HEVC result retains 48 kHz stereo AAC;
+the 18,351,378-byte file's SHA-256
+`37ddb2ffceb77b9c12596d712e4060fa394224e7cf9e3315ad32d076fbfd891c`
+matches the sidecar. Its sampled frame preserves the subject and details.
+The encoded audio streams of the 3x and 4x outputs are identical. Compared
+with the uploaded source after decode and a 21.25 ms offset, each has about
+0.963 normalized mono correlation. The Gallery rose to 24 items, the queue
+returned idle, and stable Cloudflare `/ready` returned 200. These are live
+single-pass 3x and 4x technical completions, not owner detail acceptance or
+the separate two-pass and H3 delivery-profile matrix.
+
+For cancellation, the signed-in UI stopped one FlashVSR2x request during
+Caching and another after it reached Denoising step 2/14. In each case the
+queue returned idle, the Gallery stayed at 22 items, no new upscale artifact
+appeared, and stable `/ready` remained 200. This accepts the visible running
+job Stop path for these two probes. It does not prove an in-flight process
+crash can be adopted or resumed. An attempted Revoice Stop was too late: that
+job completed before the action, so it is not counted as cancellation evidence.
+
 The signed-in stable-share YuE2 composer also ran its local guide-backed
 Gemma 4 31B drafting path. Its initial live request failed because the model
 omitted the native Vocal and Ins score voices. After adding the native ABC
