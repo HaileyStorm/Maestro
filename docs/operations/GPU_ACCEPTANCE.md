@@ -255,6 +255,26 @@ submission and completion technically. Sampled frames expose the same separate
 quality failure as the source run: a person holding a smaller pinwheel replaces
 the tabletop subject in the second shot. Owner visual acceptance remains open.
 
+A separate signed-in Gallery **Regenerate** after the inline H3 timeline fix
+(`b2adc7b`) submitted that same 307-character, 436-frame brief on the fresh
+Pinokio service through stable Cloudflare. Its two same-line bracketed ranges
+were planned separately; the saved second-segment prompt now explicitly says
+to continue the same red four-blade pinwheel on the tabletop with the camera
+arc. The runtime extracted the first clip's last frame for the continuation.
+Job `8aaa877042294a0e9e3ccb9b920182ce` completed both 960x544 HEVC/AAC
+components and an 18.167-second 960x544 H.264/AAC final. First, second, and
+final SHA-256 values are respectively
+`5d469008d09492c1893ceabd48c3ad50e1a427964430cabc0cadfae7980753bd`,
+`a1a0c5fde6135f68ac859a1b5129d2a2ea5b64ad6589e3847997db87cea2ed42`,
+and `a1feb8aeff3c3dae82b8a5451dafa2ac1b43a1d46c243c63e6dc6376cc12d8d0`;
+all match their sidecars. The final's audio is non-silent (mean -24.7 dBFS,
+peak -9.0 dBFS). The signed-in stable Gallery showed the finished final and
+**Rejoin all 2 clips**, with the queue idle. Agent-inspected frames at 2, 8,
+9.5, 12, and 16 seconds retain the red pinwheel on the wooden tabletop; the
+previous person/hand substitution is absent in these samples. This accepts
+this execution and sampled visual-continuity path, not unsampled frames,
+post-generation restart durability, or owner listening/visual acceptance.
+
 A signed-in **Tools → Upscale → FlashVSR 2x** request on the existing 5.167-second
 608x352 H3 teapot clip completed in 70 seconds under the same validated Maestro
 lease. The public result is a 5.184-second 1216x704 HEVC/AAC MP4, SHA-256
