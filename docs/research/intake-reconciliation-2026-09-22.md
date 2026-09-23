@@ -63,7 +63,7 @@ checkpoint was installed.
 
 | Candidate | Retained decision | Actual state / requirement before promotion |
 | --- | --- | --- |
-| MiniMax Music3 | Adapt / isolated experiment | Runtime/stage/SGLang contracts and writer UI exist; `launch.py` virtual catalog reports `execution_allowed: false`. End-to-end generation and Studio/Director publication remain unfinished. Local-only install/benchmark authority does not establish LAN/Cloudflare execution authority. |
+| MiniMax Music3 | Adapt / isolated experiment | Runtime/stage/SGLang contracts and writer UI exist; `launch.py` virtual catalog reports `execution_allowed: false`. End-to-end generation and Studio/Director publication remain unfinished. The 2026-09-23 source refresh confirms model revision `fbdf52fbaaca799592917417eb05f1899f1255ec` and [LICENSE](https://huggingface.co/MiniMaxAI/MiniMax-Music3/blob/fbdf52fbaaca799592917417eb05f1899f1255ec/LICENSE) SHA-256 `b21d12df2adae59dad3fcf80c1d81492654c662342f497d9a9770198c9317e58`; that document has no specific US-country restriction. The managed start command now supplies `--model-name MiniMaxAI/MiniMax-Music3`, matching the exact client identity rather than SGLang’s default pipeline name (39 runtime checks and 82 runtime/catalog/staging checks pass). The old `united_states_approval` field and external HTTPS attestation service are adapter requirements, not demonstrated upstream protocol requirements. Resolve these against existing host terms acceptance and same-owner LAN/Cloudflare parity before executor promotion; keep all inference local. |
 | Music3 Turbo FP8 and MiniMax Music Slider LoRA | Watch | No accepted managed recipe. Need exact artifact, base compatibility, adapter control and audio evidence after the Music3 executor. |
 | YuE2 and installed Sound/Vision LoRAs | Adopt | Bridge-based generation/composition delivered. Native training, dataset preparation, checkpoint auditions and upstream My Music library are separate work. |
 | CharacterSheet / Krea identity LoRAs | Adapt | `character_sheet_workflow.py`, capabilities and profile gates are planning/validation only; profiles explicitly unavailable/non-executable. Ordinary Reference Packs are a different delivered capability. Need exact artifacts, runnable sheet/repair stages and identity acceptance. |
@@ -132,6 +132,9 @@ checkpoint was installed.
 
 ## Upstream assessment and selected ports
 
+Read-only upstream HEAD check on 2026-09-23 still resolves to
+`5efd686ab446d451d927cbc00665e136d8de585e`, matching this assessment.
+
 | Upstream release/cluster | Integration disposition |
 | --- | --- |
 | 1.9.1 llama binary-release pointer (`1d1610d`) | Adapt semantic release → nightly resolution and asset checks; retain Continuum staged install, SONAME repair, cached reuse and CUDA-build policy. |
@@ -175,14 +178,37 @@ The full backend discovery ran 5,183 tests with 17 skips and exposed two existin
 fixture problems: the H3 profile namespace omitted a real helper, and a lease
 exclusion test included unbounded whole-process garbage-collection latency in
 its two-second join. Both fixtures were corrected; their complete modules pass
-17 and 31 tests respectively. The 5,183-test run itself was not repeated after
-these fixture corrections. The separate five JSON-grammar checks also pass.
+17 and 31 tests respectively. At that checkpoint only the affected modules were rerun; the full
+backend result below supersedes that earlier run. The separate five JSON-grammar checks also pass.
+
+Upscale/Revoice follow-on verification (2026-09-23): 16 model-free tool execution
+checks cover exact input ownership/content, legacy recovery refusal, route scope,
+processor reachability, cancellation, crash-result adoption, changed result
+rejection, publication durability failures, and cancellation during recovery adoption.
+The independent correction review found no remaining release blocker. Four exclusive-rename checks,
+21 delivery checks, 10 existing flip checks and 60 lifecycle checks pass. These
+are CPU, synthetic and filesystem evidence, not GPU acceptance. The first full
+backend run completed 5,198 tests with 17 skips and four fixture failures: three
+UI source anchors predated the project-bound poller signature, and a queue-only
+Director fixture depended on free space on the host temporary drive. Corrected
+fixture modules pass 51 tests. The second full backend run passes 5,207 tests
+with 17 skips, plus all five JSON-grammar checks. The final cancellation-adoption
+correction separately passes all 16 tool checks, and the managed Music3 command
+change passes 82 runtime/catalog/staging checks. Abrupt process
+termination can still leave private temporary directories for later cleanup;
+no arbitrary prefix-based deletion is authorized by these changes.
 
 ## Outstanding work and promotion order
 
-1. Finish shared Upscale/Revoice execution repairs (workers reference a removed
-   resolver and lack explicit recovery dispatch). Gallery Extend and manual flip
-   now have CPU/UI/live-flow evidence; retain separate crash/human acceptance.
+1. Complete live GPU acceptance for the repaired Upscale/Revoice workers. The
+   removed resolver, missing recovery dispatch, unsealed source/reference inputs,
+   host-global remote workspace fallback, public working copies, and broad output
+   collection have CPU-tested repairs. Exact manifest inputs and create-only
+   publication now support verified crash-result adoption without processor
+   replay; FlashVSR scratch files stay in private project staging. Actual
+   FlashVSR/SeedVC output quality, cancellation and GPU recovery remain pending
+   the owner's GPU clearance. Gallery Extend and manual flip have CPU/UI/live-flow
+   evidence; flip hard-crash adoption and human acceptance remain distinct.
 2. Implement currently missing Music3 and CharacterSheet executors in coherent
    slices; their static scaffolds must not be advertised as working products.
 3. Adapt upstream Qwen2.1, native YuE2 training/library and Editor as separate

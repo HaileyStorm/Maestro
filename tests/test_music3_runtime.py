@@ -764,6 +764,8 @@ class Music3RuntimeTests(unittest.TestCase):
             "serve",
             "--model-path",
             str(active / "model"),
+            "--model-name",
+            runtime.MUSIC3_MODEL_ID,
             "--host",
             "127.0.0.1",
             "--port",

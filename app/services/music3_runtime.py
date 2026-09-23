@@ -1579,6 +1579,8 @@ def build_music3_start_command(
         "serve",
         "--model-path",
         str(active / "model"),
+        "--model-name",
+        MUSIC3_MODEL_ID,
         "--host",
         "127.0.0.1",
         "--port",
