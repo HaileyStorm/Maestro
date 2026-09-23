@@ -9,6 +9,7 @@ import {
   sameYue2ComposeDraft,
   USE_PREFERRED_YUE2_CHECKPOINT,
   yue2CheckpointSelectionKey,
+  yue2LyricDensityWarning,
 } from './yue2GenerationSettings'
 import type { Yue2CheckpointSelection } from './yue2GenerationSettings'
 
@@ -150,6 +151,10 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
     [checkpointSelections, selectedGroups, selectedLoras],
   )
   const checkpointError = resolvedLoraCheckpoints.find(result => result.error)?.error || null
+  const lyricDensityWarning = useMemo(
+    () => yue2LyricDensityWarning(lyrics, abc, language, instrumental),
+    [lyrics, abc, language, instrumental],
+  )
 
   const compose = async () => {
     if (!description.trim() || busy) return
@@ -271,6 +276,7 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
       <label className="block text-[9px] uppercase tracking-wider text-text-muted">ABC score
         <textarea value={abc} onChange={event => setAbc(event.target.value)} disabled={reviewLoading} placeholder={'X:1\nM:4/4\nV: Vocal\n…\nV: Ins\n…'} className={`${fieldClass} mt-1 min-h-[8rem] resize-y font-mono text-[10px] disabled:cursor-wait disabled:opacity-60`} />
       </label>
+      {lyricDensityWarning && <p role="status" className="rounded bg-amber-500/10 px-2 py-1 text-[10px] text-amber-200">{lyricDensityWarning}</p>}
 
       {(status?.loras?.length || 0) > 0 && (
         <div className="space-y-1.5">
@@ -373,15 +379,34 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
         </button>
       )}
 
-      {activeTrack && (
-        <div className="space-y-1.5 rounded-lg border border-border bg-bg-tertiary/60 p-2 text-[10px]">
-          <div className="flex items-center justify-between gap-2"><span className="truncate text-text-primary">{activeTrack.title}</span><span className="text-text-muted">{activeTrack.status} · {activeTrack.stage}</span></div>
-          {activeTrack.error && <p className="text-red-400">{activeTrack.error}</p>}
-          {activeTrack.warnings?.map(warning => <p key={warning} className="text-amber-300">{warning}</p>)}
-          {activeTrack.status === 'succeeded' && <audio controls preload="metadata" className="w-full" src={api.yue2AudioUrl(activeTrack.id, workspace)} />}
-          {['queued', 'running'].includes(activeTrack.status) && <button type="button" onClick={() => void api.cancelYue2(activeTrack.id, workspace).then(refresh)} className="flex items-center gap-1 text-red-300 hover:text-red-200"><Square size={10} /> Cancel</button>}
+      <section aria-label="YuE2 project library" className="space-y-1.5">
+        <div className="flex items-center justify-between text-[10px]">
+          <h4 className="font-semibold text-text-primary">My Music</h4>
+          <span className="text-text-muted">{projectTracks.length} {projectTracks.length === 1 ? 'take' : 'takes'} in this project</span>
         </div>
-      )}
+        {projectTracks.length === 0 && <p className="text-[10px] text-text-muted">YuE2 takes will appear here.</p>}
+        <div className="max-h-96 space-y-1.5 overflow-y-auto">
+          {projectTracks.map(track => (
+            <article key={track.id} aria-label={`${track.title} · ${track.status}`} className="space-y-1.5 rounded-lg border border-border bg-bg-tertiary/60 p-2 text-[10px]">
+              <div className="flex items-start justify-between gap-2">
+                <span className="min-w-0 truncate font-medium text-text-primary" title={track.title}>{track.title}</span>
+                <span className="shrink-0 text-text-muted">{track.status} · {track.stage}</span>
+              </div>
+              {track.duration > 0 && <p className="text-text-muted">{Math.round(track.duration)}s audio</p>}
+              {track.error && <p className="text-red-400">{track.error}</p>}
+              {(track.truncated?.abc || track.truncated?.semantic) && <p className="text-amber-300">This take reached a generation limit. Check the ending before reusing it.</p>}
+              {track.warnings?.map(warning => <p key={warning} className="text-amber-300">{warning}</p>)}
+              {track.status === 'succeeded' && (
+                <div className="space-y-1">
+                  <audio controls preload="none" className="w-full" src={api.yue2AudioUrl(track.id, workspace)} />
+                  <a href={api.yue2AudioUrl(track.id, workspace, 'wav')} download={`${track.id}.wav`} className="inline-block text-accent-blue hover:underline">Download WAV</a>
+                </div>
+              )}
+              {['queued', 'running'].includes(track.status) && <button type="button" onClick={() => void api.cancelYue2(track.id, workspace).then(refresh).catch(cause => setError(cause instanceof Error ? cause.message : 'YuE2 cancellation failed'))} className="flex items-center gap-1 text-red-300 hover:text-red-200"><Square size={10} /> Cancel</button>}
+            </article>
+          ))}
+        </div>
+      </section>
       {reviewError && <p className="text-[10px] text-red-400">{reviewError}</p>}
       {error && <p className="text-[10px] text-red-400">{error}</p>}
     </section>

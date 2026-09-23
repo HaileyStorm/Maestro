@@ -136,6 +136,15 @@ seconds. This is a live duration mismatch on the pre-deployment `f432921`
 service; it must be diagnosed and retested before duration control is accepted.
 No owner listening judgment is implied.
 
+After deploying the exact-seconds audio control in `2ee121e`, a second
+signed-in ACE-Step v1.5 Turbo LM_4B request selected 30 seconds. Its sealed
+request and published sidecar both record `duration_seconds: 30`; the stereo
+48 kHz PCM WAV measures exactly 30.000 seconds. Its SHA-256 is
+`9ae6f8adc2d72c4fc6bf0f43b1d741db3627266fc717fd9b6b695d56c98e47d2`,
+matching the sidecar. The audio is non-silent (mean -13.5 dBFS, peak 0.0 dBFS).
+This closes the observed duration-submission mismatch for this model and
+request, without implying listening acceptance or other-model coverage.
+
 A fresh MiniMax H3 Base FL2VA **Quality** Studio job then completed on the same
 pre-deployment service, with 23 steps at 960x544. The 5.167-second HEVC/AAC
 file has SHA-256
@@ -160,7 +169,146 @@ and sidecar were initially published; embedded metadata reliability remains
 open. On the next coordinated restart, recovery moved this job's media and
 sidecars into project-local private quarantine and held the queue entry with
 `final_output_recovery_incomplete`. The bytes and hashes were retained, but
-durable Gallery publication and restart recovery are **not yet accepted**.
+first-restart Gallery publication and recovery are **not yet accepted**.
+On a second quiet, coordinated restart, the existing final-adoption path
+verified and restored the final file and sidecar; the signed-in stable-share
+Gallery showed 13 items and the queue was clear. The component clips remain
+in private quarantine, so clip-level reuse, rejoin, and first-restart finality
+remain open; the second restart is a recovery receipt, not a fix for that
+first-restart regression.
+
+A new signed-in H3 Base two-segment request then completed after the MP4
+metadata repair. The 960x544 H.264/AAC final measures 16.167 seconds and has
+SHA-256 `994f9e6d959c3f15d60e188f5f55772d296c68202bce722f52a41bdaf9ac2857`,
+matching its sidecar. Embedded metadata parses; the audio is non-silent (mean
+-19.2 dBFS, peak -1.8 dBFS). Sampled frames retain one red pinwheel across
+the join, though the later blades drift toward extra colors. On its first
+coordinated restart, the final was adopted and the queue cleared, but its
+two source clips were quarantined and the Gallery lost its rejoin action.
+After deploying guarded component-closure adoption and restarting, the final
+and both source clips and sidecars were public with unchanged hashes; the
+signed-in stable-share Gallery showed 15 finished items and **Rejoin all 2
+clips**. The component clip SHA-256 values are
+`8719bde546eee64ed0e6a8e48f9f44b3190cc4e439b3ca21c5dd71af8043d56a`
+and `5a3d1b6d785c1fda6e4157731ae30a0f2798a50237aa1caf2e6250effc371edc`.
+This proves recovery of an existing output under the deployed fix; the next
+request supplies the separate first-restart check. Owner visual acceptance
+still requires separate evidence.
+
+A fresh post-fix H3 Base FL2VA Quality request completed as two authored
+segments and an 18.167-second 960x544 H.264/AAC final. The final SHA-256 is
+`5fdc3f93cc6607c32209ab3510d675b5e58c38fd24594ace0eace29b16f5ab39`;
+the source clip hashes are
+`abd9190949864fea2910a3228dcb71016311eaaa4dbd06766d0d02d66c23e057`
+and `7f237e30385ccc3474fb223c5c988349d6690497e2fd44ade6e270e529fbd6a2`.
+All three match their sidecars. The final has non-silent audio (mean -18.2
+dBFS, peak -2.5 dBFS). On its first coordinated restart, the same files and
+hashes remained public, the signed-in stable-share Gallery showed 17 finished
+items and **Rejoin all 2 clips**, the queue was idle, and stable `/ready`
+returned 200. This accepts first-restart final and component durability for
+this request. Sampled frames exposed a separate quality failure: the second
+shot introduced a person holding a smaller pinwheel instead of preserving
+the tabletop subject. Owner visual acceptance remains open.
+
+Gallery Regenerate on the earlier long-form final submitted an ordinary
+8-second repeat of the final segment's seam prompt. Its output was valid but
+unrelated to the full-video brief. The UI restore path now recovers the
+original full prompt and frame count from long-form metadata when no original
+media references are required; older reference-conditioned outputs instead
+ask for references to be reattached. A signed-in Gallery **Regenerate** after
+this change sealed the original 307-character whole-video brief and 436-frame
+request, then completed two H3 segments and an 18.167-second 960x544 H.264/AAC
+final. The final SHA-256 is
+`f2628ef2b457ea44eda270dd453696e9fab656863636a7a63b9385e2287081e0`;
+component SHA-256 values are
+`8c37499249e482d01cba307daea3b7ba4866317fb803b164a9e668203288c174`
+and `d3b4313be6e157c2620fec99f70fe0658b67d2ec0b5cc1b333a9ae0bbd9cb8f4`.
+All three match their sidecars. The final audio is non-silent (mean -18.2 dBFS,
+peak -2.5 dBFS); the stable-share Gallery shows the final, both related clips,
+and **Rejoin all 2 clips**, with the queue idle. This accepts long-form reroll
+submission and completion technically. Sampled frames expose the same separate
+quality failure as the source run: a person holding a smaller pinwheel replaces
+the tabletop subject in the second shot. Owner visual acceptance remains open.
+
+A signed-in **Tools → Upscale → FlashVSR 2x** request on the existing 5.167-second
+608x352 H3 teapot clip completed in 70 seconds under the same validated Maestro
+lease. The public result is a 5.184-second 1216x704 HEVC/AAC MP4, SHA-256
+`cc98f092b49c45e8474fb9571f80cd1566002d89c46b915ec8bb1bf0252b8b57`,
+matching its sidecar. A sampled frame retains the teapot and floral details at
+twice the source dimensions. Decoded mono audio has 0.9995 approximate
+normalized correlation with the source after a ~32 ms offset, supporting
+preservation through remux/encoding. The signed-in Gallery rose to 19 finished
+items and the queue returned idle. This accepts one live FlashVSR2x output;
+other upscale variants, cancellation, crash adoption, and owner detail
+acceptance remain open.
+
+A signed-in **Tools → Revoice → Single Voice** request used a 5.167-second
+synthetic H3 video with earlier test-song vocals plus a 16-second reference
+voice from another generated take. The UI uploaded both inputs, the worker
+separated vocals, downloaded its first-use SeedVC assets, converted the vocal,
+and remixed it with the background. The terminal result is a private 5.167-second
+608x352 HEVC/AAC MP4, SHA-256
+`14fbc84f518fb8668efb0f9b8f92b62e7d887f16c137a4efa8bd8a99e0515645`,
+matching its sidecar. Its encoded video stream is byte-identical to the input;
+the non-silent mono output audio differs substantially from the original
+(best approximate normalized correlation 0.185 over ±100 ms). The Gallery
+shows the result with its private preview blurred and the queue returned idle.
+This accepts one live SeedVC tool execution and video preservation technically;
+the 48 kHz stereo source became 44.1 kHz mono, so stereo/background fidelity,
+speaker similarity, two-voice mode, cancellation, crash
+adoption, and owner listening remain open. After the first-use downloads the
+root filesystem had about 1 GB free, so additional model installations need
+an explicit storage check before download.
+
+The first coordinated Pinokio **Restart Maestro** after these three requests
+returned a new local ready URL and stable Cloudflare `/health` and `/ready` 200.
+The signed-in project Gallery again listed 20 finished items, including the
+reroll, FlashVSR, and private Revoice results; the queue reported zero active
+jobs. Those three MP4s kept their pre-restart SHA-256 values and matching
+sidecars. This accepts first-restart durability of these successful outputs,
+but does not simulate a crash during an in-flight tool job.
+
+The signed-in stable-share YuE2 composer also ran its local guide-backed
+Gemma 4 31B drafting path. Its initial live request failed because the model
+omitted the native Vocal and Ins score voices. After adding the native ABC
+contract and structured JSON response, the same brief populated style,
+lyrics, and score. The installed YuE2 native parser accepted the 24-bar,
+two-voice score at 88 BPM (nominal 65.45 seconds). The generated lyric draft
+was too dense for its 93 Vocal notes, so musical/prosodic alignment and actual
+YuE2 audio generation are not accepted from this draft. The composer prompt
+now explicitly co-designs lyric syllables and score note slots; a fresh live
+retest is required after that change reaches the running service.
+
+After deployment, the same signed-in local composer returned a structurally
+valid 24-bar, two-voice ABC score with 96 Vocal notes, but paired it with 238
+English lyric words. That is still far too dense for the melody. A conservative
+English word-count warning now flags such a mismatch beside the score while
+leaving the artist free to revise it. A manually tightened 86-word lyric kept
+the six score sections aligned for the first fresh YuE2 synthesis check.
+Under a separate validated Sound/Vision GPU lease, the signed-in stable-share
+UI submitted and completed that native, no-LoRA YuE2 take. The 48 kHz stereo
+float WAV measures 87.999 seconds and has SHA-256
+`4832190159eab365407b96274d1bcfb49698dfd2f90f62375a687f417b8020e8`.
+Its mean level is -16.6 dBFS and peak -0.4 dBFS; the final five seconds have
+mean level -22.8 dBFS. The delivery receipt reports no warnings and neither
+ABC nor semantic truncation. The signed-in project library shows the complete
+take with playback and WAV download. This accepts one live native YuE2 audio
+path technically; lyric intelligibility, musical quality, and owner listening
+remain unaccepted.
+
+A second signed-in take selected the installed DreamPop v2 style LoRA at
+strength 1.0. The request and delivery receipts record the exact checkpoint
+ID `ddee049784269e6b6298ce2d605b1bff` and SHA-256
+`617852d379c66b0407879421a353233d29cda8188cca82973a94c61b512ca03d`;
+the native worker reports 224 adapter modules. This LoRA selects no ABC
+planning, so the take does not test score alignment. Its stereo 48 kHz WAV
+measures 213.839 seconds, SHA-256
+`c70beceea3ce6ffeafdbf0908db232c5827dd3d4226d89f22a06b3b318037d75`,
+with mean level -16.0 dBFS and peak -0.6 dBFS. The receipt has no warnings
+or generation-limit flags, and the project library offers playback and WAV
+download. This accepts one exact native LoRA synthesis path technically;
+owner listening and LoRA quality comparison remain open. The Sound/Vision
+lease was withdrawn after both takes reached terminal success.
 
 ### 2026-08-27 PinkCherry beta-0.6 runtime receipt
 

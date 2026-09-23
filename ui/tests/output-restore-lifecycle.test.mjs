@@ -1265,6 +1265,47 @@ test('H3 estimate matches and fallback suggestions keep restored settings exact 
 })
 
 
+test('published H3 final restores the authored whole-video request instead of its last segment', async () => {
+  await withStore(async ({ useStore }) => {
+    const brief = '[00:00-00:09] A red paper pinwheel. [00:09-00:18] The same pinwheel continues.'
+    const params = baseParams({
+      model_type: 'minimax_h3', prompt: 'OPENING VISUAL CARRY: previous clip', video_length: 226,
+      multi_clip_info: {
+        automatic_h3_longform: true, requested_frames: 436, global_prompt: brief,
+      },
+    })
+    configureGallery(useStore, [{
+      name: 'joined.mp4',
+      meta: sidecar(params, { image_start: ['', ''], image_end: ['', ''] }),
+    }])
+    assert.equal(await useStore.getState().loadSettingsFromOutput(), true)
+    const restored = useStore.getState()
+    assert.equal(restored.params.prompt, brief)
+    assert.equal(restored.params.video_length, 436)
+    assert.equal(restored.params.image_mode, 0)
+    assert.ok(Math.abs(restored.durationSeconds - 436 / 24) < 0.01)
+  })
+})
+
+test('published legacy H3 final with media inputs refuses an incomplete rerun', async () => {
+  await withStore(async ({ alerts, useStore }) => {
+    const params = baseParams({
+      model_type: 'minimax_h3', prompt: 'last segment only', video_length: 226,
+      multi_clip_info: {
+        automatic_h3_longform: true, requested_frames: 436,
+        global_prompt: 'whole video brief',
+      },
+    })
+    configureGallery(useStore, [{
+      name: 'joined-with-reference.mp4',
+      meta: sidecar(params, { image_start: ['reference.png', ''] }),
+    }])
+    assert.equal(await useStore.getState().loadSettingsFromOutput(), false)
+    assert.match(alerts.at(-1), /reattach the references/)
+    assert.equal(useStore.getState().params.prompt, 'current unsaved prompt')
+  })
+})
+
 test('Inpaint output restores and resubmits explicit target, inversion and prompt strength', async () => {
   for (const explicitTarget of ['', 'sky']) {
     for (const invert of [false, true]) {

@@ -45,6 +45,30 @@ export function reviewedAbcForContinuation(original: string, current: string): s
   return current === original ? undefined : current
 }
 
+/** A conservative English word count is a lower bound on sung syllables. */
+export function yue2LyricDensityWarning(
+  lyrics: string, abc: string, language: string, instrumental: boolean,
+): string | null {
+  if (instrumental || !/^en(?:glish)?\b/i.test(language.trim())) return null
+  const words = lyrics.replace(/^\s*\[[^\]]+\]\s*$/gm, ' ')
+    .match(/[A-Za-z]+(?:['-][A-Za-z]+)*/g)?.length || 0
+  if (!words) return null
+
+  let vocal = false
+  let notes = 0
+  for (const rawLine of abc.split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (/^V:\s*Vocal(?:\s|$)/i.test(line)) { vocal = true; continue }
+    if (/^V:\s*Ins(?:\s|$)/i.test(line)) { vocal = false; continue }
+    if (!vocal || !line.includes('|')) continue
+    const music = line.split('%', 1)[0].replace(/"[^"]*"/g, '')
+    // ABC permits adjacent notes such as C8D8E8G8 with no whitespace.
+    notes += music.match(/[A-Ga-g][,']*\d*(?:\/\d*)?/g)?.length || 0
+  }
+  if (!notes || words <= notes * 1.25) return null
+  return `${words} lyric words for ${notes} Vocal notes. The words alone exceed this melody's likely capacity. Shorten the lyrics or add Vocal notes and bars before rendering.`
+}
+
 const DEFAULTS: Yue2GenerationSettings = {
   cot: 'full',
   cfgScale: 1,

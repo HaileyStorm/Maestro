@@ -16902,11 +16902,35 @@ export const useStore = create<AppState>((set, get) => ({
         sourceB: sourceBName,
       }
     }
-    const h3Longform = (
-      p._h3_longform && typeof p._h3_longform === 'object'
-        ? p._h3_longform as Record<string, unknown>
-        : null
-    )
+    // Published H3 finals contain the original Studio brief in
+    // multi_clip_info. Their worker params describe only the last segment;
+    // replaying those directly makes an ordinary short clip with a seam-only
+    // prompt. Older finals can be restored from this compact receipt when no
+    // original media anchors are needed.
+    const clipInfo = p.multi_clip_info && typeof p.multi_clip_info === 'object'
+      ? p.multi_clip_info as Record<string, unknown>
+      : null
+    const legacyH3Final = pendingOutput.artifact_class === 'final'
+      && clipInfo?.automatic_h3_longform === true
+      && !(p._h3_longform && typeof p._h3_longform === 'object')
+    const hasLegacyMediaInputs = Boolean(p.image_start || p.image_end || p.video_guide
+      || p.video_guide2 || p.video_guide3 || p.audio_guide)
+      || Object.values(uploadFilenames || {}).some(value => Array.isArray(value)
+        ? value.some(Boolean) : Boolean(value))
+    const compactLongformRestorable = legacyH3Final
+      && typeof clipInfo?.global_prompt === 'string'
+      && clipInfo.global_prompt.trim().length > 0
+      && typeof clipInfo?.requested_frames === 'number'
+      && Number.isInteger(clipInfo.requested_frames)
+      && Number(clipInfo.requested_frames) > 0
+      && !hasLegacyMediaInputs
+    if (legacyH3Final && !compactLongformRestorable) {
+      window.alert('This older multi-clip output cannot restore its original inputs exactly. Start a new video and reattach the references before generating.')
+      return false
+    }
+    const h3Longform = p._h3_longform && typeof p._h3_longform === 'object'
+      ? p._h3_longform as Record<string, unknown>
+      : compactLongformRestorable ? clipInfo : null
 
     let modelType = (p.model_type as string) || ''
     const requestedH3Checkpoint = String(p._h3_requested_checkpoint || '')

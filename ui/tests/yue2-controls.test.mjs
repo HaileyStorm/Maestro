@@ -16,6 +16,7 @@ const {
   resolveYue2GenerationSettings,
   reviewedAbcForContinuation,
   sameYue2ComposeDraft,
+  yue2LyricDensityWarning,
 } = module
 
 const group = (id, generation = {}, checkpoints = []) => ({
@@ -95,6 +96,21 @@ test('an untouched reviewed score resumes the exact saved YuE2 plan', () => {
   const plan = 'X:1\nV: Vocal\nC4|\nV: Ins\nC,4|'
   assert.equal(reviewedAbcForContinuation(plan, plan), undefined)
   assert.equal(reviewedAbcForContinuation(plan, `${plan}\n% edited`), `${plan}\n% edited`)
+})
+
+test('YuE2 warns when even the English word count overwhelms Vocal note slots', () => {
+  const abc = 'X:1\nV: Vocal clef=treble\n"C" C8 D8 E8 G8|\nV: Ins\nC8 E8 G8 E8|'
+  assert.match(yue2LyricDensityWarning(
+    '[Verse]\nRain on the roof while we repair the bicycle', abc, 'English', false,
+  ), /9 lyric words for 4 Vocal notes/)
+  assert.match(yue2LyricDensityWarning(
+    '[Verse]\nRain on the roof while we repair the bicycle',
+    'X:1\nV: Vocal\n"C" C8D8E8G8|\nV: Ins\nC8E8G8E8|', 'English', false,
+  ), /9 lyric words for 4 Vocal notes/)
+  assert.equal(yue2LyricDensityWarning('[Verse]\nRain falls', abc, 'English', false), null)
+  assert.equal(yue2LyricDensityWarning('[Verse]\n雨が降る', abc, 'Japanese', false), null)
+  assert.equal(yue2LyricDensityWarning('[Verse]\nToo many words for four notes', abc, 'English', true), null)
+  assert.equal(yue2LyricDensityWarning('Many sung words', 'X:1\nK:C', 'English', false), null)
 })
 
 test('YuE2 compose results apply only to the unchanged draft they started from', () => {

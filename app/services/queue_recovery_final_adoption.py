@@ -946,7 +946,9 @@ def _plan_for(
     }
 
 
-def _validate_plan(plan: Mapping[str, Any]) -> None:
+def _validate_plan(
+    plan: Mapping[str, Any], *, allowed_kinds: set[str] | frozenset[str] = _FINAL_KINDS,
+) -> None:
     if (
         set(plan) != {
             "schema_version", "workspace", "job_id", "kind",
@@ -956,7 +958,7 @@ def _validate_plan(plan: Mapping[str, Any]) -> None:
         or _direct_name(plan.get("workspace")) is None
         or type(plan.get("job_id")) is not str
         or _JOB_ID.fullmatch(plan["job_id"]) is None
-        or plan.get("kind") not in _FINAL_KINDS
+        or plan.get("kind") not in allowed_kinds
         or plan.get("publication_mode") not in {"publish", "preexisting_exact"}
         or type(plan.get("output_total")) is not int
         or not 1 <= plan["output_total"] <= 4096
@@ -1062,6 +1064,8 @@ def _recover_pending(
     receipts: Path,
     root: Path,
     quarantine: Path | None,
+    *,
+    allowed_kinds: set[str] | frozenset[str] = _FINAL_KINDS,
 ) -> None:
     plan_paths = sorted(plans.glob("*.json"))
     if len(plan_paths) > 4096:
@@ -1070,7 +1074,7 @@ def _recover_pending(
         if plan_path.is_symlink() or _SHA256.fullmatch(plan_path.stem) is None:
             raise QueueRecoveryRuntimeError("Final-adoption plan directory is unsafe.")
         plan, payload = _load_private_json(plan_path)
-        _validate_plan(plan)
+        _validate_plan(plan, allowed_kinds=allowed_kinds)
         digest = hashlib.sha256(payload).hexdigest()
         if digest != plan_path.stem or payload != _canonical_json(plan):
             raise QueueRecoveryRuntimeError("Final-adoption immutable plan changed.")
@@ -1103,6 +1107,8 @@ def _receipt_jobs(
     plans: Path,
     bindings: Path,
     root: Path,
+    *,
+    allowed_kinds: set[str] | frozenset[str] = _FINAL_KINDS,
 ) -> list[dict[str, Any]]:
     jobs: list[dict[str, Any]] = []
     binding_paths = sorted(bindings.glob("*.json"))
@@ -1135,7 +1141,7 @@ def _receipt_jobs(
         plan, plan_payload = _load_private_json(
             plans / f"{binding['plan_sha256']}.json"
         )
-        _validate_plan(plan)
+        _validate_plan(plan, allowed_kinds=allowed_kinds)
         if (
             hashlib.sha256(plan_payload).hexdigest() != receipt_path.stem
             or plan.get("workspace") != binding["workspace"]
@@ -1173,6 +1179,191 @@ def _receipt_jobs(
     ):
         raise QueueRecoveryRuntimeError("Final-adoption receipt is not job-bound.")
     return jobs
+
+
+def _component_group_for_adopted_final(
+    job: Mapping[str, Any],
+    *,
+    root: Path,
+    plans: Path,
+    bindings: Path,
+    valid_units: Mapping[str, tuple[dict, ...]],
+    workspace: str,
+) -> dict[str, Any] | None:
+    """Bind quarantined clips to every byte-exact published H3 concat."""
+    if job.get("state") != "adopted":
+        return None
+    job_id = str(job.get("job_id") or "")
+    binding, _payload = _load_private_json(
+        bindings / _binding_name(workspace, job_id)
+    )
+    _validate_binding(binding, filename=_binding_name(workspace, job_id))
+    plan, _payload = _load_private_json(
+        plans / f"{binding['plan_sha256']}.json"
+    )
+    _validate_plan(plan)
+    if plan["kind"] != "h3_concat":
+        return None
+    components: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for final in sorted(plan["items"], key=lambda item: item["output_index"]):
+        sidecar_bytes, _info = _read_exact(
+            root / final["dest_sidecar"], maximum_bytes=MAX_MANIFEST_BYTES,
+        )
+        if hashlib.sha256(sidecar_bytes).hexdigest() != final["sidecar_sha256"]:
+            return None
+        try:
+            meta = json.loads(sidecar_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, TypeError):
+            return None
+        if not isinstance(meta, dict):
+            return None
+        dependencies = meta.get("producer_unit_dependencies")
+        settings = meta.get("producer_unit_settings")
+        if (
+            meta.get("job_id") != job_id
+            or meta.get("workspace") != workspace
+            or meta.get("producer_unit_kind") != "h3_concat"
+            or meta.get("producer_unit_id") != final["unit_id"]
+            or meta.get("producer_unit_variant") != final["output_index"]
+            or not isinstance(dependencies, list)
+            or len(dependencies) < 2
+            or not isinstance(settings, dict)
+        ):
+            return None
+        closure = dict(valid_units)
+        closure[final["unit_id"]] = ({
+            "job_id": job_id,
+            "kind": "h3_concat",
+            "dependencies": tuple(dependencies),
+            "settings": settings,
+        },)
+        if not _semantic_dependencies_valid(final["unit_id"], closure):
+            return None
+        for index, unit_id in enumerate(dependencies):
+            unit = valid_units.get(unit_id)
+            if (
+                unit_id in seen
+                or unit is None
+                or len(unit) != 1
+                or unit[0]["kind"] != "h3_segment"
+                or unit[0]["job_id"] != job_id
+                or unit[0]["unit_variant"] != final["output_index"]
+                or unit[0]["unit_index"] != index
+            ):
+                return None
+            seen.add(unit_id)
+            components.append(dict(unit[0], output_index=len(components)))
+    if not components or len(components) > 4096:
+        return None
+    return {
+        "job_id": job_id,
+        "kind": "h3_segment",
+        "output_total": len(components),
+        "items": components,
+    }
+
+
+def _adopt_components_for_receipted_finals(
+    *,
+    root: Path,
+    quarantine: Path | None,
+    recovery: Path,
+    workspace: str,
+    final_jobs: list[dict],
+    final_plans: Path,
+    final_bindings: Path,
+) -> None:
+    """Publish only the complete component closure of an adopted final."""
+    component_adoption = recovery / "component-adoption"
+    if quarantine is None and not component_adoption.exists():
+        return
+    if (
+        not component_adoption.exists()
+        and not any(job.get("state") == "adopted" for job in final_jobs)
+    ):
+        return
+    if not component_adoption.exists() and quarantine is not None:
+        initial_candidates, _rejected = _discover(
+            quarantine, workspace=workspace,
+        )
+        if not any(item["kind"] == "h3_segment" for item in initial_candidates):
+            return
+    adoption, _identity = _ensure_private_directory(component_adoption)
+    plans, _identity = _ensure_private_directory(adoption / "plans")
+    receipts, _identity = _ensure_private_directory(adoption / "receipts")
+    bindings, _identity = _ensure_private_directory(adoption / "bindings")
+    _recover_pending(
+        plans, receipts, root, quarantine,
+        allowed_kinds={"h3_segment"},
+    )
+    # A receipt verifies the published clip bytes on every scan. Missing or
+    # changed clips remain missing; retained evidence never silently replays.
+    _receipt_jobs(
+        receipts, plans, bindings, root,
+        allowed_kinds={"h3_segment"},
+    )
+    if quarantine is None or not any(
+        job.get("state") == "adopted" for job in final_jobs
+    ):
+        return
+    candidates, _rejected = _discover(quarantine, workspace=workspace)
+    valid_units = _valid_units(candidates)
+    for job in final_jobs:
+        group = _component_group_for_adopted_final(
+            job,
+            root=root,
+            plans=final_plans,
+            bindings=final_bindings,
+            valid_units=valid_units,
+            workspace=workspace,
+        )
+        if group is None:
+            continue
+        binding_path = bindings / _binding_name(workspace, group["job_id"])
+        existing_binding = None
+        if binding_path.exists() or binding_path.is_symlink():
+            existing_binding, payload = _load_private_json(binding_path)
+            _validate_binding(existing_binding, filename=binding_path.name)
+            if binding_path.is_symlink() or payload != _canonical_json(existing_binding):
+                raise QueueRecoveryRuntimeError("Component-adoption job binding changed.")
+            if (receipts / f"{existing_binding['plan_sha256']}.json").exists():
+                continue
+        publication_mode = _destination_mode(group, root)
+        plan = _plan_for(
+            group, workspace=workspace, publication_mode=publication_mode,
+        )
+        _validate_plan(plan, allowed_kinds={"h3_segment"})
+        plan_payload = _canonical_json(plan)
+        plan_sha = hashlib.sha256(plan_payload).hexdigest()
+        binding = _binding_for_plan(plan, plan_sha)
+        if existing_binding is not None and existing_binding != binding:
+            continue
+        if existing_binding is None:
+            _create_only(binding_path, _canonical_json(binding))
+        _create_only(plans / f"{plan_sha}.json", plan_payload)
+        if publication_mode == "preexisting_exact":
+            _validate_preexisting_plan(plan, root, quarantine, fsync=True)
+        else:
+            try:
+                for kind in ("sidecar", "media"):
+                    for item in plan["items"]:
+                        _publish_one(
+                            quarantine / item[f"source_{kind}"],
+                            root / item[f"dest_{kind}"],
+                            size=item[f"{kind}_size"],
+                            digest=item[f"{kind}_sha256"],
+                        )
+                        _fsync_directory(root)
+                        _fsync_directory(quarantine)
+            except BaseException:
+                _rollback(plan, root, quarantine)
+                raise
+        _create_only(receipts / f"{plan_sha}.json", _canonical_json({
+            "schema_version": _SCHEMA,
+            "plan_sha256": plan_sha,
+            "state": "completed",
+        }))
 
 
 def adopt_quarantined_final_groups(
@@ -1318,6 +1509,15 @@ def adopt_quarantined_final_groups(
                 _rollback(plan, root, quarantine)
                 raise
         jobs = _receipt_jobs(receipts, plans, bindings, root)
+        _adopt_components_for_receipted_finals(
+            root=root,
+            quarantine=quarantine,
+            recovery=recovery,
+            workspace=workspace,
+            final_jobs=jobs,
+            final_plans=plans,
+            final_bindings=bindings,
+        )
         receipt_ids = {job["job_id"] for job in jobs}
         for group in incomplete + conflicting:
             if group["job_id"] in receipt_ids:

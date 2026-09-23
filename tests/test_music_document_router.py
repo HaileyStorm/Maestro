@@ -35,6 +35,12 @@ class MusicDocumentRouterTests(unittest.TestCase):
         prompt = composition_system_prompt(context)
         self.assertIn("documentation, not executable tools", prompt)
         self.assertIn("must not contain w:", prompt)
+        self.assertIn('V: Vocal clef=treble name="Vocal Melody" snm="Vocal"', prompt)
+        self.assertIn('V: Ins clef=treble name="Ins Melody" snm="Inst."', prompt)
+        self.assertIn("The body must alternate V: Vocal and V: Ins", prompt)
+        self.assertIn("one shared song plan", prompt)
+        self.assertIn("one sung syllable per Vocal note", prompt)
+        self.assertIn("Add enough bars or reduce words", prompt)
 
     def test_long_core_guides_cannot_starve_requested_language_and_style(self):
         brief = 'Japanese city pop with jazz harmony'

@@ -41,8 +41,8 @@ The recent implementation history includes:
 
 | User-visible change | Evidence / limits |
 | --- | --- |
-| YuE2 composition, lyrics, ABC and installed LoRA selection | `086ef7d`, `38f4d3e`; `yue2_bridge.py`, `Yue2Controls.tsx`. Bridge/UI and prompt assembly are delivered through the existing local Sound/Vision service; prior-session YuE2 success was recorded, not rerun here. This is not upstream My Music training integration. |
-| Audio/video generation-path repairs | `086ef7d`: LTX audio runtime, H3 planning failures, YuE2. Earlier authenticated image, short/long video and music outputs were recorded; no new device run in this audit. |
+| YuE2 composition, lyrics, ABC and installed LoRA selection | `086ef7d`, `38f4d3e`; `yue2_bridge.py`, `Yue2Controls.tsx`. Bridge/UI and prompt assembly use the existing local Sound/Vision service. September 23 follow-on live checks completed a native YuE2 take and a DreamPop v2 LoRA take, both visible in the project My Music library; exact technical receipts are in [GPU_ACCEPTANCE.md](../operations/GPU_ACCEPTANCE.md). Native training, dataset preparation, checkpoint auditions, and owner listening are still separate work. |
+| Audio/video generation-path repairs | `086ef7d`: LTX audio runtime, H3 planning failures, YuE2. September 23 follow-on checks completed a fresh H3 two-segment final, a long-form Gallery reroll, FlashVSR2x, and single-voice SeedVC through the signed-in stable share. Their first-restart files and sidecars survived; the H3 second-shot continuity quality failure remains open. See [GPU_ACCEPTANCE.md](../operations/GPU_ACCEPTANCE.md). |
 | Complete reusable technical profiles, update/save-as-new and restoration | Schema `610156e`, update/save-as-new `68744f1`, output restore `96dcf16`, and stale-profile clear `0533d7e`, plus audio-only fixes. Prompts, media and authorization are intentionally separate from technical profiles. |
 | Blend Insert/Overlap, safer source restore and same-job source reattachment | `e673e51`, `75bf89a`, `6a3da85`, `8acfbb9`, `d4dff84`; exact source hashes, project fences, immutable request revisions, duplicate submission guard. |
 | Better Generate/Director mobile controls | `5ae983a`, `40863a3`, `ba2784f`; footer layout, LoRA controls and review actions. |
@@ -65,7 +65,7 @@ checkpoint was installed.
 | --- | --- | --- |
 | MiniMax Music3 | Adopt native WanGP path; retain SGLang as isolated experiment | The upstream-native Music3 handler is registered for Studio and Director's existing audio queue, project output, recovery and same-owner local/LAN/Cloudflare access. The catalog exposes the real model only through the normal visibility whitelist; download and execution require the versioned host review term and exact official/optimized source manifest. The [official LICENSE](https://huggingface.co/MiniMaxAI/MiniMax-Music3/blob/fbdf52fbaaca799592917417eb05f1899f1255ec/LICENSE) is pinned at `fbdf52fbaaca799592917417eb05f1899f1255ec` with SHA-256 `b21d12df2adae59dad3fcf80c1d81492654c662342f497d9a9770198c9317e58`; the optimized WanGP assets are pinned separately at `DeepBeepMeep/TTS@d31b4665414200fcab779ced520b01bd9f5e07ba`. Byte-level lineage from that conversion to the newer official commit is not independently proven, so keep both source identities visible. CPU tests cover source drift, terms admission and catalog parity. No checkpoint has been downloaded, no GPU song has been generated, and quality/cancellation/recovery still need live acceptance. The separate SGLang runtime/client remains unconnected to production, with an adapter-only external signature and country gate; neither is an official license requirement. |
 | Music3 Turbo FP8 and MiniMax Music Slider LoRA | Watch | No accepted managed recipe. Need exact artifact, base compatibility, adapter control and audio evidence after the Music3 executor. |
-| YuE2 and installed Sound/Vision LoRAs | Adopt | Bridge-based generation/composition delivered. Native training, dataset preparation, checkpoint auditions and upstream My Music library are separate work. |
+| YuE2 and installed Sound/Vision LoRAs | Adopt | Bridge-based generation/composition and a project My Music playback/download library are delivered. One native baseline and one exact DreamPop v2 checkpoint passed live technical synthesis. Native training, dataset preparation, checkpoint auditions, and owner listening are separate work. |
 | CharacterSheet / Krea identity LoRAs | Adapt | `character_sheet_workflow.py`, capabilities and profile gates are planning/validation only; profiles explicitly unavailable/non-executable. Ordinary Reference Packs are a different delivered capability. Need exact artifacts, runnable sheet/repair stages and identity acceptance. |
 | H3 Character Sheet Generator / H3 Orbit Sheet / OrbitSheets | Experiment | Separate orbit-sheet candidate, including the historical 73-versus-124-frame fixture; no enabled executor. Do not conflate it with CharacterSheet M2. |
 | Realism People LoRA | Watch | Generic LoRA loading exists; candidate-specific artifact/license/trigger/strength/audio evidence does not. |
@@ -234,24 +234,26 @@ environment. This does not establish GPU generation or owner acceptance.
 
 ## Outstanding work and promotion order
 
-1. Complete live GPU acceptance for the repaired Upscale/Revoice workers. The
+1. Expand live GPU acceptance for the repaired Upscale/Revoice workers. The
    removed resolver, missing recovery dispatch, unsealed source/reference inputs,
    host-global remote workspace fallback, public working copies, and broad output
    collection have CPU-tested repairs. Exact manifest inputs and create-only
    publication now support verified crash-result adoption without processor
-   replay; FlashVSR scratch files stay in private project staging. Actual
-   FlashVSR/SeedVC output quality, cancellation and GPU recovery remain open
-   under the owner's September 23 GPU clearance. Gallery Extend and manual flip have CPU/UI/live-flow
+   replay; FlashVSR scratch files stay in private project staging. One signed-in
+   FlashVSR2x and one single-voice SeedVC output completed and survived their
+   first restart. Other variants, cancellation, in-flight crash recovery,
+   speaker/detail quality, and owner acceptance remain open. Gallery Extend and manual flip have CPU/UI/live-flow
    evidence; flip hard-crash adoption and human acceptance remain distinct.
 2. Complete Music3 native live generation and recovery acceptance after the
    pinned host-term review and asset download. Implement the missing CharacterSheet executor in coherent slices;
    its static scaffold must not be advertised as a working product.
 3. Adapt upstream Qwen2.1, native YuE2 training/library and Editor as separate
    integrations with complete settings/restore/access/recovery coverage.
-4. The owner opened a September 23 GPU window, and an exact multi-hour
-   coordinator grant now covers the current Maestro live checks. Revalidate
-   its authority before and during each selected case; the grant itself does
-   not establish a model's runtime or quality acceptance.
+4. The owner opened a September 23 GPU window. The completed H3/FlashVSR/SeedVC
+   checks used one exact six-hour coordinator grant, then withdrew it after
+   the jobs reached terminal success. Request and validate a fresh multi-hour
+   grant for each further GPU slice; a grant alone does not establish runtime
+   or quality acceptance.
 5. Keep experimental acceleration/LoRA/preview/repair candidates opt-in until
    exact artifact, cancellation, recovery and quality checks pass. Windows and
    owner listening/visual acceptance remain separate targets.

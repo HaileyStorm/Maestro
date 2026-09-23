@@ -34533,6 +34533,16 @@ async def yue2_compose(request: Request):
             temperature=float(body.get("temperature", 0.72)),
             top_p=float(body.get("top_p", 0.9)),
             seed=body.get("seed"),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "style": {"type": "string"},
+                    "lyrics": {"type": "string"},
+                    "abc": {"type": "string"},
+                },
+                "required": ["style", "lyrics", "abc"],
+                "additionalProperties": False,
+            },
         )
         result = _parse_yue2_composition(raw)
     except HTTPException:

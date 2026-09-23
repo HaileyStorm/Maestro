@@ -307,7 +307,7 @@ class QueueFinalAdoptionTests(unittest.TestCase):
         self.assertEqual(summary["quarantined_groups"], 0)
         self.assertTrue((self.project / "job-public-h3-v0-final.mp4").is_file())
 
-    def test_adopts_exact_four_plus_one_and_keeps_components_quarantined(self):
+    def test_adopts_exact_four_plus_one_with_attested_components(self):
         first = self._concat_job("job-four", 4)
         second = self._concat_job("job-one", 1)
         for orphan in range(4):
@@ -345,10 +345,11 @@ class QueueFinalAdoptionTests(unittest.TestCase):
             output = pair[0].name.split("-", 1)[1]
             self.assertTrue((self.project / output).is_file())
             self.assertTrue((self.project / f"{Path(output).stem}.meta.json").is_file())
-        self.assertEqual(
-            len(list(self.quarantine.glob("*"))),
-            34 * 2,
-        )
+        self.assertEqual(len(list(self.quarantine.glob("*"))), 8)
+        for pair in first["components"] + second["components"]:
+            output = pair[0].name.split("-", 1)[1]
+            self.assertTrue((self.project / output).is_file())
+            self.assertTrue((self.project / f"{Path(output).stem}.meta.json").is_file())
         for name, payload in unrelated.items():
             self.assertEqual((self.project / name).read_bytes(), payload)
 
@@ -362,6 +363,61 @@ class QueueFinalAdoptionTests(unittest.TestCase):
         )
         self.assertEqual(replay["adopted_groups"], 2)
         self.assertEqual(before, {path.name: path.read_bytes() for path in receipts})
+
+    def test_adopted_final_receipt_restores_late_quarantined_components(self):
+        fixture = self._concat_job("job-late-clips", 1)
+        first = adopt_quarantined_final_groups(
+            self.project, workspace=self.workspace,
+        )
+        self.assertEqual(first["adopted_groups"], 1)
+        for media, sidecar in fixture["components"]:
+            for source in (media, sidecar):
+                destination = self.project / source.name.split("-", 1)[1]
+                os.replace(destination, source)
+        shutil.rmtree(self.project / ".maestro-recovery" / "component-adoption")
+
+        replay = adopt_quarantined_final_groups(
+            self.project, workspace=self.workspace,
+        )
+        self.assertEqual(replay["adopted_groups"], 1)
+        for media, sidecar in fixture["components"]:
+            for source in (media, sidecar):
+                self.assertFalse(source.exists())
+                self.assertTrue((self.project / source.name.split("-", 1)[1]).is_file())
+
+    def test_component_publication_crash_rolls_back_and_retries(self):
+        fixture = self._concat_job("job-clip-crash", 1)
+        adopt_quarantined_final_groups(self.project, workspace=self.workspace)
+        for media, sidecar in fixture["components"]:
+            for source in (media, sidecar):
+                os.replace(self.project / source.name.split("-", 1)[1], source)
+        shutil.rmtree(self.project / ".maestro-recovery" / "component-adoption")
+        from services import queue_recovery_final_adoption as module
+        publish = module._publish_one
+        interrupted = False
+
+        def crash_once(source, destination, **kwargs):
+            nonlocal interrupted
+            if source.name.endswith("-s0.mp4") and not interrupted:
+                interrupted = True
+                raise RuntimeError("simulated clip publication crash")
+            return publish(source, destination, **kwargs)
+
+        with mock.patch.object(module, "_publish_one", side_effect=crash_once):
+            with self.assertRaisesRegex(RuntimeError, "simulated clip publication crash"):
+                adopt_quarantined_final_groups(
+                    self.project, workspace=self.workspace,
+                )
+        for media, sidecar in fixture["components"]:
+            self.assertTrue(media.exists())
+            self.assertTrue(sidecar.exists())
+        replay = adopt_quarantined_final_groups(
+            self.project, workspace=self.workspace,
+        )
+        self.assertEqual(replay["adopted_groups"], 1)
+        for media, sidecar in fixture["components"]:
+            self.assertTrue((self.project / media.name.split("-", 1)[1]).is_file())
+            self.assertTrue((self.project / sidecar.name.split("-", 1)[1]).is_file())
 
     def test_all_five_preexisting_exact_copies_adopt_without_consuming_sources(self):
         first = self._concat_job("job-copy-four", 4)
