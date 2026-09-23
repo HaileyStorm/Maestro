@@ -266,6 +266,25 @@ non_diegetic_music: N/A"""
                 "h3_style_workflow": workflow,
             })
 
+    def test_inline_authored_ranges_reach_the_second_native_segment(self):
+        from services.h3_shot_planner import plan_h3_native_shots
+
+        plan = plan_h3_native_shots(
+            global_prompt=(
+                "[0-9s] A single red paper pinwheel turns on a wooden tabletop. "
+                "[00:09-00:18] Continue the same red paper pinwheel and "
+                "tabletop as it slows."
+            ),
+            clip_frame_counts=[226, 226],
+            fps=24,
+        )
+
+        self.assertIn("red paper pinwheel", plan["clip_prompts"][1])
+        self.assertIn("tabletop as it slows", plan["clip_prompts"][1])
+        self.assertIn(
+            "CONTINUATION OF AUTHORED ACTION", plan["clip_prompts"][1],
+        )
+
     def test_long_director_scenes_are_split_on_the_h3_grid(self):
         for duration, minimum_segments in ((20.0, 2), (32.0, 3)):
             with self.subTest(duration=duration):

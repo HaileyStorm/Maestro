@@ -56,6 +56,10 @@ _H3_INLINE_SHOT_MARKER_RE = re.compile(
     r"\[\s*(?:shot|scene)\s+\d+[^\]]*\]",
     re.IGNORECASE,
 )
+_H3_INLINE_TIME_RANGE_RE = re.compile(
+    rf"\[\s*({_TIMELINE_TIME})\s*(?:-|–|—|\bto\b)\s*({_TIMELINE_TIME})\s*\]",
+    re.IGNORECASE,
+)
 _H3_DIALOGUE_TOKEN_RE = re.compile(r"<\s*(/?)\s*d\s*>", re.IGNORECASE)
 _H3_DIALOGUE_BLOCK_RE = re.compile(
     r"<d>\s*\[[^\]\r\n]+\]\s+.*?</d>", re.IGNORECASE | re.DOTALL,
@@ -87,11 +91,11 @@ def _restore_h3_dialogue(value, blocks):
 
 
 def _h3_timeline_lines(prompt):
-    """Expand one-line H3 Context-IR shot timelines for existing parsing.
+    """Expand one-line H3 shot and bracketed range timelines for parsing.
 
-    Multiline Studio syntax is returned unchanged. Only a line containing two
-    or more explicit H3 Shot/Scene markers is split, and any leading Context-IR
-    field label remains a separate global line.
+    Multiline Studio syntax is returned unchanged. A line with multiple valid
+    bracketed ranges is split only when its first range starts the line or
+    follows a Shot/Scene label. Dialogue remains opaque to both splitters.
     """
     lines = []
     dialogue_depth = 0
@@ -110,15 +114,45 @@ def _h3_timeline_lines(prompt):
                 dialogue_depth = max(0, dialogue_depth)
             elif dialogue_depth == 0:
                 markers.append(match)
+        shot_lines = []
         if len(markers) < 2:
-            lines.append(raw_line)
-            continue
-        prefix = raw_line[:markers[0].start()].strip()
-        if prefix:
-            lines.append(prefix)
-        for index, marker in enumerate(markers):
-            end = markers[index + 1].start() if index + 1 < len(markers) else len(raw_line)
-            lines.append(raw_line[marker.start():end].strip())
+            shot_lines.append(raw_line)
+        else:
+            prefix = raw_line[:markers[0].start()].strip()
+            if prefix:
+                shot_lines.append(prefix)
+            for index, marker in enumerate(markers):
+                end = markers[index + 1].start() if index + 1 < len(markers) else len(raw_line)
+                shot_lines.append(raw_line[marker.start():end].strip())
+        for shot_line in shot_lines:
+            # Standard closed dialogue blocks were protected above. Leave
+            # malformed or still-open dialogue untouched as well.
+            if dialogue_depth or _H3_DIALOGUE_TOKEN_RE.search(shot_line):
+                lines.append(shot_line)
+                continue
+            ranges = [
+                match for match in _H3_INLINE_TIME_RANGE_RE.finditer(shot_line)
+                if (
+                    (start := _timeline_seconds(match.group(1))) is not None
+                    and (end := _timeline_seconds(match.group(2))) is not None
+                    and end > start
+                )
+            ]
+            if len(ranges) < 2:
+                lines.append(shot_line)
+                continue
+            prefix = shot_line[:ranges[0].start()].strip()
+            if prefix and not re.fullmatch(
+                r"(?:[-*]\s*)?\[\s*(?:shot|scene)\s+\d+[^\]]*\]",
+                prefix,
+                re.IGNORECASE,
+            ):
+                lines.append(shot_line)
+                continue
+            for index, marker in enumerate(ranges):
+                start = 0 if index == 0 else marker.start()
+                end = ranges[index + 1].start() if index + 1 < len(ranges) else len(shot_line)
+                lines.append(shot_line[start:end].strip())
     return lines
 
 

@@ -503,6 +503,36 @@ class GlobalTimelineParserTests(
         )
         self.assertTrue(has_global_timeline(prompt))
 
+    def test_inline_bracketed_ranges_keep_each_authored_beat(self):
+        dialogue = "<d>[English] The sign reads [12-16s] inside the scene.</d>"
+        prompt = (
+            "[0-9s] A red paper pinwheel spins on a wooden tabletop. "
+            f"A person says {dialogue} "
+            "[00:09-00:18] Continue the same pinwheel and tabletop as it slows."
+        )
+        global_lines, events = parse_global_timeline_prompt(prompt)
+
+        self.assertEqual(global_lines, [])
+        self.assertEqual(
+            [(event["start"], event["end"]) for event in events],
+            [(0.0, 9.0), (9.0, 18.0)],
+        )
+        self.assertIn(dialogue, events[0]["text"])
+        self.assertEqual(
+            events[1]["text"],
+            "Continue the same pinwheel and tabletop as it slows.",
+        )
+
+    def test_inline_ranges_after_a_shot_label_preserve_that_label(self):
+        _, events = parse_global_timeline_prompt(
+            "[Shot 1] [0-9s] A red pinwheel spins. "
+            "[9-18s] The same pinwheel slows."
+        )
+
+        self.assertEqual([event["start"] for event in events], [0.0, 9.0])
+        self.assertTrue(events[0]["text"].startswith("[Shot 1]"))
+        self.assertEqual(events[1]["text"], "The same pinwheel slows.")
+
     def test_inline_h3_marker_shaped_dialogue_is_not_split_as_a_shot(self):
         dialogue = "<d>[English] I remember [Scene 1] and [Scene 2]</d>"
         prompt = (
