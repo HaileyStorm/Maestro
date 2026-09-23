@@ -39,6 +39,9 @@ pyannote.audio==3.3.2
 torchcodec==0.10.0
 comfy-kitchen==0.2.26
 
+# Cancellable loopback HTTP transport (Music3 isolated runtime)
+httpx==0.28.1
+
 # UI & interaction
 gradio==5.29.0
 dashscope==1.25.12
