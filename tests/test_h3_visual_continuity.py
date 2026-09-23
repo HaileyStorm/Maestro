@@ -230,6 +230,28 @@ class H3VisualContinuityTests(unittest.TestCase):
         self.assertIn("walking", locks["motion"])
         self.assertIn("pace lifts", locks["energy"])
 
+    def test_explicit_outgoing_screen_direction_survives_authored_cut(self):
+        previous = (
+            "[Shot 1] The traveler walks left to right.\n"
+            "screen direction: exits frame right\n"
+            "facing: screen right\n"
+            "lighting: cool overhead fluorescents"
+        )
+        next_shot = "[Shot 2] A new camera angle follows the same traveler."
+        carried = apply_same_source_visual_carry(
+            [previous, next_shot],
+            clip_boundaries=[{"type": "cut", "continuity_mode": "continuous"}],
+        )
+        self.assertIn("screen direction: exits frame right", carried[1])
+        self.assertIn("subject facing: screen right", carried[1])
+        self.assertIn("[Shot 2]", carried[1])
+        self.assertEqual(strip_opening_visual_carry(carried[1]), next_shot)
+        unlabeled = extract_segment_seam_locks(
+            "[Shot 1] The traveler walks left to right."
+        )
+        self.assertNotIn("screen direction:", unlabeled["camera-world"])
+        self.assertNotIn("subject facing:", unlabeled["camera-world"])
+
     def test_carry_never_strips_shot_markers(self):
         prompts = [
             "[Shot 1] Traveler in the hallway, tracking.",

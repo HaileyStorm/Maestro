@@ -108,7 +108,7 @@ checkpoint was installed.
 | EasyCache / FirstBlockCache | Defer | Historical fast-runtime advice is superseded; no automatic revival from the old note. |
 | Manual per-clip horizontal flip | Adopt, CPU and live flow verified | Source: ignored `docs/development/segment-horizontal-flip-continuity-2026-08-19.md`. Mounted Gallery action plus CPU queue worker preserve the source, copy every audio stream and write provenance on a separate final output. Actual MP4/AAC, WebM/Opus and MOV/PCM tests pass. Signed-in stable Cloudflare action produced a new playable-format MP4 with unchanged 608×352 / 24 fps / 5.166667 s geometry and duration, equal encoded audio hash, unchanged source hash and correct mirrored pixels. Legacy sidecarless inputs can run but remain blocked after restart without existing project ownership evidence. Hard-crash publication recovery and human acceptance remain separate gates. |
 | Suggested geometric flip | Experiment | Needs fixtures and an opt-in proposal; default automatic flip remains rejected. Later automated execution stays deferred. |
-| Facing/screen-direction carry | Adapt | Complementary planner enhancement; existing general continuity is not proof of an explicit facing field. |
+| Facing/screen-direction carry | Adapt, explicit-field slice delivered | Same-source H3 seam locks now carry an authored `screen direction:` or `facing:` line into the next clip's camera-world instruction. Ordinary prose does not create a direction lock; independent non-temporal boundaries and default flip behavior are unchanged. CPU planner checks pass. A first-class structured facing editor and GPU quality acceptance remain open. |
 
 ### Templates, styles, composition and LLMs
 

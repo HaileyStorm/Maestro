@@ -59,7 +59,7 @@ _LABELED_FIELD_RE = re.compile(
     r"(?im)^(?P<key>subject_definitions|overall_soundscape|"
     r"non_diegetic_music|location|setting|environment|lighting|"
     r"visual\s+world|visual\s+continuity|project\s+continuity|"
-    r"pacing)\s*:\s*(?P<value>.+)$"
+    r"screen\s+direction|facing|pacing)\s*:\s*(?P<value>.+)$"
 )
 
 _SUBJECT_RE = re.compile(r"<Subject\s+[1-9]\d*>", re.IGNORECASE)
@@ -186,8 +186,14 @@ def extract_segment_seam_locks(previous_prompt: object) -> dict[str, str]:
             200,
         )
 
+    # Only carry direction when an author supplied a labeled field. Inferring
+    # laterality from a generic motion cue would lock an accidental direction.
     world_bits = [
         part for part in (
+            f"screen direction: {fields['screen_direction']}"
+            if fields.get("screen_direction") else "",
+            f"subject facing: {fields['facing']}"
+            if fields.get("facing") else "",
             fields.get("lighting"),
             fields.get("visual_world"),
             fields.get("visual_continuity"),
