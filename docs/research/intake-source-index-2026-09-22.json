@@ -6,8 +6,8 @@
   "notes": [
     {
       "path": "docs/development/feature-wave-2026-08-media-models.md",
-      "sha256": "7e9d6e759da9c2c2faa6367391c368c391dff9c9e4de96d92e269a825d6b598d",
-      "lines": 349
+      "sha256": "1c73849068f5b4976604e8e3a7fb24deefdedc8404358619ac627858634787bb",
+      "lines": 356
     },
     {
       "path": "docs/development/feature-wave-2026-08.md",
@@ -254,7 +254,7 @@
       "occurrences": [
         {
           "note": "docs/development/feature-wave-2026-08-media-models.md",
-          "line": 339
+          "line": 346
         },
         {
           "note": "docs/research/H3-ecosystem-watch-2026-08-18.md",
@@ -500,7 +500,7 @@
       "occurrences": [
         {
           "note": "docs/development/feature-wave-2026-08-media-models.md",
-          "line": 341
+          "line": 348
         }
       ]
     },
@@ -796,7 +796,7 @@
       "occurrences": [
         {
           "note": "docs/development/feature-wave-2026-08-media-models.md",
-          "line": 335
+          "line": 342
         },
         {
           "note": "docs/research/H3-ecosystem-watch-2026-08-18.md",
@@ -810,7 +810,7 @@
       "occurrences": [
         {
           "note": "docs/development/feature-wave-2026-08-media-models.md",
-          "line": 337
+          "line": 344
         }
       ]
     },
@@ -1178,7 +1178,7 @@
       "occurrences": [
         {
           "note": "docs/development/feature-wave-2026-08-media-models.md",
-          "line": 329
+          "line": 336
         }
       ]
     },
@@ -1188,7 +1188,7 @@
       "occurrences": [
         {
           "note": "docs/development/feature-wave-2026-08-media-models.md",
-          "line": 333
+          "line": 340
         }
       ]
     },
@@ -1362,7 +1362,7 @@
       "occurrences": [
         {
           "note": "docs/development/feature-wave-2026-08-media-models.md",
-          "line": 324
+          "line": 331
         },
         {
           "note": "docs/research/H3-ecosystem-watch-2026-08-18.md",
@@ -1376,7 +1376,7 @@
       "occurrences": [
         {
           "note": "docs/development/feature-wave-2026-08-media-models.md",
-          "line": 327
+          "line": 334
         }
       ]
     },
@@ -1508,7 +1508,7 @@
       "occurrences": [
         {
           "note": "docs/development/feature-wave-2026-08-media-models.md",
-          "line": 331
+          "line": 338
         }
       ]
     },
@@ -1866,7 +1866,7 @@
       "occurrences": [
         {
           "note": "docs/development/feature-wave-2026-08-media-models.md",
-          "line": 349
+          "line": 356
         }
       ]
     },
@@ -1876,7 +1876,7 @@
       "occurrences": [
         {
           "note": "docs/development/feature-wave-2026-08-media-models.md",
-          "line": 343
+          "line": 350
         }
       ]
     },
@@ -2190,7 +2190,7 @@
       "occurrences": [
         {
           "note": "docs/development/feature-wave-2026-08-media-models.md",
-          "line": 347
+          "line": 354
         }
       ]
     },
@@ -2240,7 +2240,7 @@
       "occurrences": [
         {
           "note": "docs/development/feature-wave-2026-08-media-models.md",
-          "line": 345
+          "line": 352
         },
         {
           "note": "docs/development/feature-wave-2026-08.md",
