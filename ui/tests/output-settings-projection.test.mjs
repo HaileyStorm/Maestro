@@ -21,7 +21,7 @@ function storeBundle() {
   bundlePromise ||= build({
     stdin: {
       contents: [
-        "export { useStore } from './src/stores/useStore.ts'",
+        "export { useStore, getModelsForFamily, getDisplayFamily } from './src/stores/useStore.ts'",
         "export { projectGenerationProfileParameters } from './src/lib/generationProfiles.ts'",
       ].join('\n'),
       resolveDir: UI_ROOT,
@@ -434,5 +434,14 @@ test('audio duration control keeps exact short seconds outside the video frame g
       assert.equal(useStore.getState().durationSeconds, seconds)
       assert.equal(useStore.getState().params.video_length, priorVideoLength)
     }
+  })
+})
+
+test('Music3 is selectable in Music and excluded from Speech', async () => {
+  await withFreshStore(async ({ getModelsForFamily, getDisplayFamily }) => {
+    const model = { model_type: 'minimax_music3', family: 'tts' }
+    assert.equal(getDisplayFamily(model), 'tts_music')
+    assert.deepEqual(getModelsForFamily('tts_music', [model]), [model])
+    assert.deepEqual(getModelsForFamily('tts_speech', [model]), [])
   })
 })

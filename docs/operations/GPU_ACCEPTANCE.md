@@ -156,7 +156,11 @@ the same pinwheel, table, and room, with the requested color change in the
 second beat. This accepts one >15-second two-segment path technically and by
 agent visual inspection. During staging, the server logged `Object of type
 Image is not JSON serializable` while embedding MP4 metadata. The final media
-and sidecar were still published; embedded metadata reliability remains open.
+and sidecar were initially published; embedded metadata reliability remains
+open. On the next coordinated restart, recovery moved this job's media and
+sidecars into project-local private quarantine and held the queue entry with
+`final_output_recovery_incomplete`. The bytes and hashes were retained, but
+durable Gallery publication and restart recovery are **not yet accepted**.
 
 ### 2026-08-27 PinkCherry beta-0.6 runtime receipt
 
