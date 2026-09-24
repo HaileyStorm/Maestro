@@ -862,8 +862,8 @@ def upscale_video(
     progress_callback=None,
 ) -> tuple[torch.Tensor | None, dict[str, Any] | None]:
     _report_progress(progress_callback, "Caching")
-    _RUNTIME.load(paths, variant, profile=profile, init_pipe=init_pipe)
     try:
+        _RUNTIME.load(paths, variant, profile=profile, init_pipe=init_pipe)
         shift_correction = bool(
             FLASHVSR_STILL_IMAGE_SHIFT_CORRECTION
             and two_pass
@@ -893,10 +893,9 @@ def upscale_video(
                 _RUNTIME.release()
         return result
     except Exception:
-        if persistent_models:
-            _RUNTIME._unload_mmgp()
-        else:
-            _RUNTIME.release()
+        # A failed load or pass can leave a partial graph even when completed
+        # chunks normally keep their models resident for the next chunk.
+        _RUNTIME.release()
         raise
 
 
