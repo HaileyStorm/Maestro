@@ -1521,6 +1521,7 @@ export interface Yue2LoraGroup {
   preferredStep?: number | null
   generation?: Record<string, unknown>
   checkpoints: Yue2LoraCheckpoint[]
+  trainingJobId?: string
 }
 
 export interface Yue2Status {
@@ -1648,6 +1649,7 @@ export interface Yue2TrainingJob {
   stage: string
   error?: string | null
   cancel_requested: number
+  checkpoints?: Yue2LoraCheckpoint[]
 }
 
 export interface Yue2TrainingRequest {

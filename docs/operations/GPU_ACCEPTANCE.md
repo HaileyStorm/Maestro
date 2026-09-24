@@ -1224,3 +1224,16 @@ already-running service revision; a tested follow-on change sizes 200-step and
 400-step training requests to 20 and 30 minutes respectively. Sound/Vision was
 restarted after two zero-activity checks and returned healthy; a new grant
 under the revised sizing has not yet been exercised.
+
+The follow-on project checkpoint audition path is implemented in Sound/Vision
+and Maestro. It leaves the trained file outside the installed LoRA catalog,
+lists its ID and SHA-256 only for the training project, and validates project,
+job state, adapter layout, and the exact hash at submission and again before
+the generation worker starts. CPU tests cover a foreign project, hash drift,
+mid-resolution replacement, and the worker specification with a mocked grant.
+Sound/Vision's full backend suite passed with 285 tests and one skip; its
+browser suite and both application builds passed. After a zero-activity
+service restart, the live Sound/Vision training API returned the retained
+step-200 checkpoint with the expected SHA-256 and no host path. A real
+checkpoint-audition generation, output assessment by ear, and signed-in
+Maestro UI acceptance remain separate from that CPU and API evidence.

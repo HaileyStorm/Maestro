@@ -29,6 +29,7 @@ const fieldClass = 'w-full rounded-lg border border-border bg-bg-tertiary px-3 p
 
 export function Yue2Controls({ workspace, description, style, lyrics, instrumental, onStyle, onLyrics }: Props) {
   const [status, setStatus] = useState<api.Yue2Status | null>(null)
+  const [trainingJobs, setTrainingJobs] = useState<api.Yue2TrainingJob[]>([])
   const [tracks, setTracks] = useState<api.Yue2Track[]>([])
   const [title, setTitle] = useState('Untitled YuE2 song')
   const [language, setLanguage] = useState('English')
@@ -60,13 +61,15 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
     const requestWorkspace = workspace
     const sequence = ++refreshSequence.current
     try {
-      const [nextStatus, library] = await Promise.all([
+      const [nextStatus, library, training] = await Promise.all([
         api.fetchYue2Status(requestWorkspace),
         api.fetchYue2Library(requestWorkspace),
+        api.fetchYue2Training(requestWorkspace).catch(() => ({ jobs: [] as api.Yue2TrainingJob[] })),
       ])
       if (workspaceRef.current !== requestWorkspace || refreshSequence.current !== sequence) return
       setStatus(nextStatus)
       setTracks(library.tracks.filter(track => track.project === requestWorkspace))
+      setTrainingJobs(training.jobs.filter(job => job.project === requestWorkspace))
       setError(null)
     } catch (cause) {
       if (workspaceRef.current !== requestWorkspace || refreshSequence.current !== sequence) return
@@ -80,6 +83,9 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
     planSequence.current += 1
     setStatus(null)
     setTracks([])
+    setTrainingJobs([])
+    setSelectedLoras({})
+    setCheckpointSelections({})
     setTitle('Untitled YuE2 song')
     setAbc('')
     setDecoderProfile('stock')
@@ -131,19 +137,25 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
   }, [loadPlan, reviewTake, tracks, workspace])
 
   const projectTracks = useMemo(() => tracks.filter(track => track.project === workspace), [tracks, workspace])
+  const loraGroups = useMemo(() => [
+    ...(status?.loras || []),
+    ...trainingJobs.filter(job => job.project === workspace && job.state === 'succeeded' && job.checkpoints?.length)
+      .map(job => ({ id: `training:${job.id}`, name: job.name, kind: job.kind,
+        trigger: job.trigger, trainingJobId: job.id, checkpoints: job.checkpoints || [] })),
+  ], [status?.loras, trainingJobs, workspace])
   const activeTrack = useMemo(
     () => projectTracks.find(track => ['needs-review', 'running', 'queued'].includes(track.status)) || projectTracks[0],
     [projectTracks],
   )
   const selectedGroups = useMemo(
-    () => (status?.loras || []).filter(group => selectedLoras[group.id] !== undefined),
-    [selectedLoras, status?.loras],
+    () => loraGroups.filter(group => selectedLoras[group.id] !== undefined),
+    [selectedLoras, loraGroups],
   )
   const unavailableLoras = useMemo(
     () => status?.available
-      ? unavailableYue2LoraSelections(selectedLoras, status.loras || [])
+      ? unavailableYue2LoraSelections(selectedLoras, loraGroups)
       : [],
-    [selectedLoras, status],
+    [selectedLoras, status, loraGroups],
   )
   const resolvedGeneration = useMemo(() => {
     try {
@@ -217,8 +229,9 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
     }
     setBusy('submit'); setError(null)
     const requestWorkspace = workspace
-    const loras = resolvedLoraCheckpoints.flatMap(({ checkpoint, strength }) => (
-      strength && checkpoint ? [{ id: checkpoint.id, sha256: checkpoint.sha256, strength }] : []
+    const loras = resolvedLoraCheckpoints.flatMap(({ checkpoint, strength, group }) => (
+      strength && checkpoint ? [{ id: checkpoint.id, sha256: checkpoint.sha256, strength,
+        ...(group.trainingJobId ? { trainingJobId: group.trainingJobId } : {}) }] : []
     ))
     const generation = resolvedGeneration.settings
     try {
@@ -317,10 +330,10 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
       {scoreWarning && <p role="status" className="rounded bg-amber-500/10 px-2 py-1 text-[10px] text-amber-200">{scoreWarning}</p>}
       {lyricDensityWarning && <p role="status" className="rounded bg-amber-500/10 px-2 py-1 text-[10px] text-amber-200">{lyricDensityWarning}</p>}
 
-      {(status?.loras?.length || 0) > 0 && (
+      {loraGroups.length > 0 && (
         <div className="space-y-1.5">
-          <p className="text-[9px] uppercase tracking-wider text-text-muted">Native LoRAs</p>
-          {status!.loras.map(group => {
+          <p className="text-[9px] uppercase tracking-wider text-text-muted">YuE2 LoRAs and project checkpoints</p>
+          {loraGroups.map(group => {
             const selected = selectedLoras[group.id] !== undefined
             const checkpoints = Array.isArray(group.checkpoints) ? group.checkpoints : []
             const preferredCheckpoint = preferredYue2Checkpoint(group)
@@ -338,7 +351,7 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
                       else delete next[group.id]
                       return next
                     })} className="accent-accent-blue" />
-                    <span className="truncate">{group.name} · {group.kind}</span>
+                    <span className="truncate">{group.name} · {group.kind}{group.trainingJobId ? ' · private to this project' : ''}</span>
                   </label>
                   {selected && <input aria-label={`${group.name} strength`} type="number" min="0.1" max="2" step="0.05" value={selectedLoras[group.id]} onChange={event => setSelectedLoras(current => ({ ...current, [group.id]: Number(event.target.value) }))} className="w-16 rounded border border-border bg-bg-tertiary px-1 py-0.5 text-[10px] text-text-primary" />}
                 </div>
@@ -473,7 +486,7 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
           ))}
         </div>
       </section>
-      {status?.training && <Yue2Training key={workspace} workspace={workspace} tracks={projectTracks} gpuBlocked={!!status.gpuBlocked} />}
+      {status?.training && <Yue2Training key={workspace} workspace={workspace} tracks={projectTracks} gpuBlocked={!!status.gpuBlocked} onJobs={jobs => { if (workspaceRef.current === workspace) setTrainingJobs(jobs) }} />}
       {reviewError && <p className="text-[10px] text-red-400">{reviewError}</p>}
       {error && <p className="text-[10px] text-red-400">{error}</p>}
     </section>

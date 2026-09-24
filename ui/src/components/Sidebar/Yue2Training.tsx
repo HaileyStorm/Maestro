@@ -3,7 +3,7 @@ import { Loader2, RefreshCw, Square } from 'lucide-react'
 import * as api from '../../api/client'
 import { yue2TrainingAttempts } from './yue2TrainingAttempts'
 
-type Props = { workspace: string; tracks: api.Yue2Track[]; gpuBlocked: boolean }
+type Props = { workspace: string; tracks: api.Yue2Track[]; gpuBlocked: boolean; onJobs?: (jobs: api.Yue2TrainingJob[]) => void }
 const inputClass = 'w-full rounded border border-border bg-bg-tertiary px-2 py-1 text-[10px] text-text-primary focus:border-accent-blue focus:outline-none'
 const jobStateLabel: Record<api.Yue2TrainingJob['state'], string> = {
   queued: 'Queued',
@@ -15,7 +15,7 @@ const jobStateLabel: Record<api.Yue2TrainingJob['state'], string> = {
   cancelled: 'Cancelled',
 }
 
-export function Yue2Training({ workspace, tracks, gpuBlocked }: Props) {
+export function Yue2Training({ workspace, tracks, gpuBlocked, onJobs }: Props) {
   const [jobs, setJobs] = useState<api.Yue2TrainingJob[]>([])
   const [selected, setSelected] = useState<Record<string, boolean>>({})
   const [captions, setCaptions] = useState<Record<string, string>>({})
@@ -43,7 +43,11 @@ export function Yue2Training({ workspace, tracks, gpuBlocked }: Props) {
     const current = ++sequence.current
     try {
       const result = await api.fetchYue2Training(workspace)
-      if (current === sequence.current) setJobs(result.jobs.filter(job => job.project === workspace))
+      if (current === sequence.current) {
+        const projectJobs = result.jobs.filter(job => job.project === workspace)
+        setJobs(projectJobs)
+        onJobs?.(projectJobs)
+      }
     } catch (cause) {
       if (current === sequence.current) setError(cause instanceof Error ? cause.message : 'Training jobs are unavailable.')
     }
@@ -75,7 +79,7 @@ export function Yue2Training({ workspace, tracks, gpuBlocked }: Props) {
       yue2TrainingAttempts.clear(requestWorkspace, attempt.requestId)
       setAttemptVersion(value => value + 1)
       if (workspaceRef.current === requestWorkspace) {
-        setMessage('Training queued. Checkpoints will stay private until you review and install one.')
+        setMessage('Training queued. Finished checkpoints will stay private to this project for audition.')
         setSelected({})
         await refresh()
       }
@@ -84,7 +88,11 @@ export function Yue2Training({ workspace, tracks, gpuBlocked }: Props) {
       try {
         const result = await api.fetchYue2Training(requestWorkspace)
         found = result.jobs.some(job => job.id === attempt.requestId)
-        if (workspaceRef.current === requestWorkspace) setJobs(result.jobs.filter(job => job.project === requestWorkspace))
+        if (workspaceRef.current === requestWorkspace) {
+          const projectJobs = result.jobs.filter(job => job.project === requestWorkspace)
+          setJobs(projectJobs)
+          onJobs?.(projectJobs)
+        }
       } catch { /* A failed status check cannot settle an uncertain submission. */ }
       const rejected = cause instanceof api.Yue2RequestError
         && cause.status >= 400 && cause.status < 500 && ![408, 409, 429].includes(cause.status)
@@ -111,7 +119,7 @@ export function Yue2Training({ workspace, tracks, gpuBlocked }: Props) {
     <details className="rounded-lg border border-border p-2 text-[10px]">
       <summary className="cursor-pointer font-semibold text-text-primary">Train a YuE2 artist or style LoRA</summary>
       <div className="mt-2 space-y-2">
-        <p className="text-text-muted">Choose finished takes from this project, write one style caption for each, then review the saved checkpoints before installing one. Training waits for an available GPU and may take a while.</p>
+        <p className="text-text-muted">Choose finished takes from this project and write one style caption for each. Finished checkpoints can be auditioned in this project without installing them globally. Training waits for an available GPU and may take a while.</p>
         <div className="grid grid-cols-2 gap-2">
           <label className="text-text-muted">Name<input value={name} onChange={event => setName(event.target.value)} maxLength={120} className={`${inputClass} mt-1`} /></label>
           <label className="text-text-muted">Type<select value={kind} onChange={event => setKind(event.target.value as 'artist' | 'style')} className={`${inputClass} mt-1`}><option value="artist">Artist</option><option value="style">Style</option></select></label>
@@ -138,7 +146,7 @@ export function Yue2Training({ workspace, tracks, gpuBlocked }: Props) {
           <div className="flex justify-between gap-2"><span>{job.name} · {job.kind}</span><span>{jobStateLabel[job.state]}</span></div>
           <p className="text-text-muted">Trigger {job.trigger} · {job.sourceTakeIds.length} {job.sourceTakeIds.length === 1 ? 'take' : 'takes'}</p>
           {job.error && <p className="text-red-400">{job.error}</p>}
-          {job.state === 'succeeded' && <p className="text-text-muted">Checkpoints saved for review. They are not installed automatically.</p>}
+          {job.state === 'succeeded' && <p className="text-text-muted">{job.checkpoints?.length || 0} checkpoint{job.checkpoints?.length === 1 ? '' : 's'} saved. Select one under YuE2 LoRAs above to make an audition take. Nothing is installed globally.</p>}
           {['queued', 'preparing', 'waiting-for-resource', 'running'].includes(job.state) && <button type="button" onClick={() => void api.cancelYue2Training(job.id, workspace).then(() => { setMessage(null); setError(null); return refresh() }).catch(cause => setError(cause instanceof Error ? cause.message : 'Cancellation failed.'))} className="flex items-center gap-1 text-red-300"><Square size={10} /> Cancel</button>}
         </div>)}
         {message && <p role="status" className="text-emerald-300">{message}</p>}
