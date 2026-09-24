@@ -98,6 +98,15 @@ from services.model_terms import (
     PORNMASTER_V4_PONPOKE_RECIPE,
     require_model_terms,
 )
+from services.character_sheet_quad import (
+    QUAD_FLUX_LORA_FILENAME,
+    QUAD_FLUX_LORA_REPOSITORY,
+    QUAD_FLUX_LORA_REVISION,
+    QUAD_FLUX_RECIPE_ID,
+    quad_lora_name_matches,
+    require_quad_lora_artifact,
+    require_quad_lora_base,
+)
 from services.model_residency import (
     ModelResidencyError,
     ModelResidencyEvidenceStore,
@@ -3228,6 +3237,19 @@ def resolve_lora_path(model_type, lora_file):
         if os.path.isfile(p):
             return p
     return os.path.join(dirs[0], name)
+
+
+def _require_quad_lora_activation(model_type, activated_loras):
+    """Guard the shared WGP load path, including Classic and direct callers."""
+    quad_names = [name for name in (activated_loras or ()) if quad_lora_name_matches(name)]
+    if not quad_names:
+        return
+    require_quad_lora_base(model_type)
+    require_model_terms(
+        server_config.get("services", {}), QUAD_FLUX_RECIPE_ID, models_def,
+    )
+    for name in quad_names:
+        require_quad_lora_artifact(resolve_lora_path(model_type, name))
 
 attention_modes_installed = get_attention_modes()
 attention_modes_supported = get_supported_attention_modes()
@@ -11474,6 +11496,7 @@ def _generate_video_impl(
         loras_selected += extra_loras_transformers
 
     if len(activated_loras) > 0:
+        _require_quad_lora_activation(model_type, activated_loras)
         print(f"[LoRA] Loading {len(activated_loras)} LoRA(s): {[os.path.basename(l) for l in activated_loras]} | multipliers: {loras_multipliers!r}")
         loras_list_mult_choices_nums, loras_slists, errors =  parse_loras_multipliers(loras_multipliers, len(activated_loras), num_inference_steps, nb_phases = model_def_nb_phases, merge_slist= loras_slists, model_switch_phase= model_switch_phase )
         if len(errors) > 0: raise Exception(f"Error parsing Loras: {errors}")
@@ -17059,10 +17082,36 @@ def download_lora(state, lora_url, progress=gr.Progress(track_tqdm=True),):
         return gr.update()
     model_type = get_state_model_type(state)
     lora_short_name = os.path.basename(lora_url)
-    lora_dir = get_lora_dir(model_type)
-    local_path = os.path.join(lora_dir, lora_short_name)
     try:
-        download_file(lora_url, local_path)
+        is_quad = quad_lora_name_matches(lora_short_name)
+        if is_quad:
+            require_quad_lora_base(model_type)
+            require_model_terms(
+                server_config.get("services", {}), QUAD_FLUX_RECIPE_ID,
+                models_def,
+            )
+            pinned_url = (
+                f"https://huggingface.co/{QUAD_FLUX_LORA_REPOSITORY}/resolve/"
+                f"{QUAD_FLUX_LORA_REVISION}/{QUAD_FLUX_LORA_FILENAME}"
+            )
+            if lora_url != pinned_url:
+                raise ValueError("Use the pinned Quad Character Sheet download URL.")
+        lora_dir = get_lora_dir(model_type)
+        local_path = os.path.join(lora_dir, lora_short_name)
+        if is_quad:
+            fd, temporary_path = tempfile.mkstemp(
+                prefix=".quad-character-sheet-", suffix=".part", dir=lora_dir,
+            )
+            os.close(fd)
+            try:
+                download_file(lora_url, temporary_path)
+                require_quad_lora_artifact(temporary_path)
+                os.replace(temporary_path, local_path)
+            finally:
+                if os.path.exists(temporary_path):
+                    os.remove(temporary_path)
+        else:
+            download_file(lora_url, local_path)
     except Exception as e:
         gr.Info(f"Error downloading Lora {lora_short_name}: {e}")
         return gr.update()

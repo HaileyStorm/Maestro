@@ -146,8 +146,20 @@ The first FLUX LoRA candidate is
 `d05d84e1dfcfffa8b099e562a11b0e26720a982b0dad0f872289ce5945c75d71`.
 The repository labels its license `civitai-model-license`; pin and review the
 exact creator terms and the FLUX.2 Klein 9B base terms before managed download
-or enabling the profile. No LoRA installation or generation is established by
-this source pin.
+or enabling the profile. Maestro's managed generation path now recognizes this
+exact filename only with the FLUX.2 Klein 9B image model. Its download uses
+the pinned repository revision, checks the expected byte count and SHA-256
+before atomic publication, and rehashes an already installed file before use.
+The shared WGP load path applies the same file check to Classic and direct
+callers, including case-only filename aliases; Classic's URL download accepts
+only the pinned source for this name. Managed download requires both the
+creator and FLUX base notices on this host. The CivitAI browser requires the
+creator notice before downloading the exact version or filename and verifies
+its bytes before publication; the separate base notice is required before use.
+Studio, Director, and the CivitAI browser show the creator notice at their
+respective selection or download points. This is artifact support
+for the native image path; the Character Sheet project workflow, profile UI,
+LoRA installation, and live Quad generation remain unverified and unavailable.
 
 The [creator's Civitai model record](https://civitai.com/api/v1/models/2764727)
 was checked on 2026-09-24: version `3128511` lists the same SHA-256, and the

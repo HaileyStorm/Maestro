@@ -1582,6 +1582,7 @@ export type HostTermId =
   | 'ponpoke_flux2_klein_4b_self_review'
   | 'ponpoke_flux2_klein_9b_self_review'
   | 'civitai_2382648_2973304_creator_terms'
+  | 'civitai_2764727_3128511_creator_terms'
 
 export interface HostTermBinding {
   license_id: string
@@ -1633,6 +1634,7 @@ export interface HostTermsStatus {
   ponpoke_flux2_klein_4b_self_review: HostTermStatus
   ponpoke_flux2_klein_9b_self_review: HostTermStatus
   civitai_2382648_2973304_creator_terms: HostTermStatus
+  civitai_2764727_3128511_creator_terms: HostTermStatus
 }
 
 export interface ServicesConfig {

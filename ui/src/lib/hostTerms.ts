@@ -59,6 +59,12 @@ export const HOST_TERM_NOTICES: Record<HostTermId, {
     href: 'https://civitai.com/models/2382648?modelVersionId=2973304',
     linkLabel: 'Review creator terms',
   },
+  civitai_2764727_3128511_creator_terms: {
+    version: 1,
+    text: 'Review Alissonerdx\'s exact Quad Character Sheet LoRA creator terms before downloading or using it. The FLUX.2 Klein 9B base has separate non-commercial terms and requires your own review before distributing, displaying, or transmitting output.',
+    href: 'https://civitai.com/models/2764727?modelVersionId=3128511',
+    linkLabel: 'Review creator terms',
+  },
   civitai_2731187_3209007_creator_terms: {
     version: 1,
     text: "Confirm catlover1937's exact Moody Krea 2 Mix V7 creator terms: credit is required, derivatives are forbidden, and commercial use is limited to RentCivit. The Krea 2 Community License and Acceptable Use Policy also apply. Evaluation may inform separate Krea-base work, but it does not permit Moody derivatives or derivative tooling. You remain responsible for compliance and lawful use; optional local fidelity QA evaluates quality only, is not moderation, does not decide permissibility, and never accepts terms.",

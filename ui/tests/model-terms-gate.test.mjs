@@ -14,6 +14,7 @@ test('model term notices are server-backed, exact, and never browser authority',
   assert.match(notices, /civitai\.com\/models\/2382648\?modelVersionId=2973304/)
   assert.match(notices, /civitai\.com\/models\/2731187\?modelVersionId=3209007/)
   assert.match(notices, /civitai\.com\/models\/2764429\?modelVersionId=3211049/)
+  assert.match(notices, /civitai\.com\/models\/2764727\?modelVersionId=3128511/)
   assert.match(notices, /credit is required/)
   assert.match(notices, /derivatives are allowed/)
   assert.match(notices, /commercial scope is RentCivit only/)
@@ -31,6 +32,30 @@ test('model term notices are server-backed, exact, and never browser authority',
   assert.match(notices, /derivatives are forbidden/)
   assert.match(notices, /does not permit Moody derivatives or derivative tooling/)
   assert.doesNotMatch(notices, /localStorage/)
+})
+
+test('selected Quad LoRA offers creator review and blocks Studio generation until accepted', async () => {
+  const types = await source('../src/types/index.ts')
+  const selector = await source('../src/components/SettingsDrawer/LoraSelector.tsx')
+  const director = await source('../src/components/SettingsDrawer/DirectorLoraSelector.tsx')
+  const button = await source('../src/components/Sidebar/GenerateButton.tsx')
+  const term = 'civitai_2764727_3128511_creator_terms'
+  assert.match(types, new RegExp(term))
+  assert.match(selector, /QuadView_klein9b_v1\.safetensors/)
+  assert.match(selector, /hostTerms\?\.\[QUAD_FLUX_CREATOR_TERM\]\?\.accepted/)
+  assert.match(selector, /acceptHostTerm\(QUAD_FLUX_CREATOR_TERM\)/)
+  assert.match(selector, /toLowerCase\(\) === QUAD_FLUX_LORA\.toLowerCase\(\)/)
+  assert.match(selector, /<QuadLoraTermsNotice modelType=\{modelType\} selectedLoras=\{activatedLoras\} \/>/)
+  assert.match(director, /<QuadLoraTermsNotice modelType=\{modelType\} selectedLoras=\{selections\.map/)
+  assert.match(director, /<QuadLoraTermsNotice modelType=\{modelType\} selectedLoras=\{activatedLoras\} \/>/)
+  assert.match(button, /quadSelected/)
+  assert.match(button, /toLowerCase\(\) === 'quadview_klein9b_v1\.safetensors'/)
+  assert.match(button, new RegExp(`hostTerms\\?\\.${term}\\?\\.accepted !== true`))
+  const browser = await source('../src/components/LoraBrowser/ModelDetail.tsx')
+  assert.match(browser, /String\(model\.id\) === '2764727' && String\(version\?\.id\) === '3128511'/)
+  assert.match(browser, /quadTermsNeeded/)
+  assert.match(browser, /acceptHostTerm\(QUAD_CREATOR_TERM\)/)
+  assert.match(browser, /disabled=\{!file \|\| !!quadTermsNeeded/)
 })
 
 test('PornMaster visibility is a one-time v9 addition with no auto authority', async () => {

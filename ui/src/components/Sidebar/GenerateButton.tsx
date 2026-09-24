@@ -64,7 +64,7 @@ export function GenerateButton() {
   })
   const needsModelTerms = useStore(s => {
     const types = h3ActiveCheckpoints(s.params)
-    return types.some(modelType => {
+    const modelTermsMissing = types.some(modelType => {
       const model = s.models.find(candidate => candidate.model_type === modelType)
       if (
         model?.availability_status === 'location_declaration_required'
@@ -75,6 +75,12 @@ export function GenerateButton() {
         requirement => s.hostTerms?.[requirement.term]?.accepted !== true,
       )
     })
+    const quadSelected = s.params.model_type === 'flux2_klein_9b'
+      && (s.params.activated_loras || []).some(name => (
+        name.split(/[\\/]/).at(-1)?.toLowerCase() === 'quadview_klein9b_v1.safetensors'
+      ))
+    return modelTermsMissing || (quadSelected
+      && s.hostTerms?.civitai_2764727_3128511_creator_terms?.accepted !== true)
   })
   const needsManualCheckpointVerification = useStore(s => {
     const types = h3ActiveCheckpoints(s.params)
@@ -265,7 +271,7 @@ export function GenerateButton() {
         ? 'Choose the country where this computer will actually run MiniMax H3. Maestro does not use IP or VPN location.'
         : 'MiniMax H3 is not licensed in the owner-declared operating country. Separate written MiniMax authorization is required.'
       : needsModelTerms
-      ? 'Read and accept the selected model\'s terms for this Maestro installation.'
+      ? 'Read and accept the selected model or LoRA terms for this Maestro installation.'
       : needsManualCheckpointVerification
       ? 'Download the required model file yourself, then use the model selector to check it on the computer running Maestro. Maestro will not download this file.'
       : needsBlendSources

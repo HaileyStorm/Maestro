@@ -12,6 +12,8 @@ from typing import Any
 from services.host_terms import (
     BFL_FLUX1_REVIEW_TERM,
     BFL_FLUX2_REVIEW_TERM,
+    CHARACTER_SHEET_QUAD_CREATOR_TERM,
+    CHARACTER_SHEET_QUAD_RECIPE_GRAPH,
     CIVITAI_PORNMASTER_V4_CREATOR_TERM,
     CURRENT_HOST_TERM_BINDINGS,
     CURRENT_HOST_TERM_VERSIONS,
@@ -29,6 +31,15 @@ from services.host_terms import (
     PORNMASTER_V4_RECIPE_GRAPH,
     PORNMASTER_V4_RECIPE_ID,
     host_term_accepted,
+)
+from services.character_sheet_quad import (
+    QUAD_FLUX_BASE_MODEL,
+    QUAD_FLUX_LORA_FILENAME,
+    QUAD_FLUX_LORA_REPOSITORY,
+    QUAD_FLUX_LORA_REVISION,
+    QUAD_FLUX_LORA_SHA256,
+    QUAD_FLUX_LORA_SIZE,
+    QUAD_FLUX_RECIPE_ID,
 )
 
 PORNMASTER_V4_PONPOKE_RECIPE = PORNMASTER_V4_RECIPE_ID
@@ -154,6 +165,17 @@ MODEL_TERM_DOCUMENTS: dict[str, dict[str, Any]] = {
             "never accepts terms."
         ),
     },
+    CHARACTER_SHEET_QUAD_CREATOR_TERM: {
+        "title": "Quad Character Sheet LoRA creator terms and self-review",
+        "license_url": CHARACTER_SHEET_QUAD_RECIPE_GRAPH["creator"]["source_url"],
+        "review_mode": "manual_self_review",
+        "notice": (
+            "Review Alissonerdx's exact Quad Character Sheet creator terms "
+            "before downloading or using this LoRA. The FLUX.2 Klein 9B "
+            "base has separate non-commercial terms and requires your own "
+            "review before distributing, displaying, or transmitting output."
+        ),
+    },
     KREA2_MOODY_MIX_V7_CREATOR_TERM: {
         "title": "Moody Krea 2 Mix V7 creator terms and self-review",
         "license_url": KREA2_MOODY_MIX_V7_RECIPE_GRAPH["checkpoint"][
@@ -211,6 +233,10 @@ _RECIPE_TERM_ROOTS = {
         PONPOKE_FLUX2_KLEIN9B_TERM,
     ),
     PORNMASTER_V4_PONPOKE_RECIPE: PORNMASTER_V4_REQUIRED_TERMS,
+    QUAD_FLUX_RECIPE_ID: (
+        CHARACTER_SHEET_QUAD_CREATOR_TERM,
+        BFL_FLUX2_REVIEW_TERM,
+    ),
     KREA2_MOODY_MIX_V7_RECIPE_ID: tuple(
         KREA2_MOODY_MIX_V7_RECIPE_GRAPH["required_host_terms"]
     ),
@@ -239,6 +265,67 @@ def _declared_recipe_terms(model_def: Mapping[str, Any]) -> tuple[str, ...]:
     return tuple(
         value for value in values
         if isinstance(value, str) and value in MODEL_TERM_DOCUMENTS
+    )
+
+
+def _character_sheet_quad_manifest_matches() -> bool:
+    """Bind the virtual LoRA recipe to one source file and the FLUX base."""
+    graph = CHARACTER_SHEET_QUAD_RECIPE_GRAPH
+    creator = CURRENT_HOST_TERM_BINDINGS.get(CHARACTER_SHEET_QUAD_CREATOR_TERM)
+    base = CURRENT_HOST_TERM_BINDINGS.get(BFL_FLUX2_REVIEW_TERM)
+    if not isinstance(creator, Mapping) or not isinstance(base, Mapping):
+        return False
+    if creator.get("recipe_graph") != graph:
+        return False
+    if graph.get("recipe_id") != QUAD_FLUX_RECIPE_ID or graph.get("base_model") != QUAD_FLUX_BASE_MODEL:
+        return False
+    if graph.get("required_host_terms") != [
+        CHARACTER_SHEET_QUAD_CREATOR_TERM, BFL_FLUX2_REVIEW_TERM,
+    ] or graph.get("required_host_term_versions") != {
+        CHARACTER_SHEET_QUAD_CREATOR_TERM: CURRENT_HOST_TERM_VERSIONS.get(CHARACTER_SHEET_QUAD_CREATOR_TERM),
+        BFL_FLUX2_REVIEW_TERM: CURRENT_HOST_TERM_VERSIONS.get(BFL_FLUX2_REVIEW_TERM),
+    }:
+        return False
+    lora = graph.get("lora")
+    if not isinstance(lora, Mapping) or lora != {
+        "repository": QUAD_FLUX_LORA_REPOSITORY,
+        "revision": QUAD_FLUX_LORA_REVISION,
+        "filename": QUAD_FLUX_LORA_FILENAME,
+        "size_bytes": QUAD_FLUX_LORA_SIZE,
+        "sha256": QUAD_FLUX_LORA_SHA256,
+    }:
+        return False
+    source = graph.get("creator")
+    if not isinstance(source, Mapping) or source != {
+        "repository": "civitai/models/2764727",
+        "revision": "3128511",
+        "source_url": "https://civitai.com/models/2764727?modelVersionId=3128511",
+        "creator": "Alissonerdx",
+        "model_id": 2764727,
+        "version_id": 3128511,
+    }:
+        return False
+    if any(creator.get(key) != value for key, value in {
+        "license_id": "civitai-creator-terms-2764727-3128511",
+        "repository": source["repository"],
+        "revision": source["revision"],
+        "source_url": source["source_url"],
+        "creator": source["creator"],
+        "model_id": source["model_id"],
+        "model_version_id": source["version_id"],
+        "filename": lora["filename"],
+        "file_size_bytes": lora["size_bytes"],
+        "file_sha256": lora["sha256"],
+    }.items()):
+        return False
+    return (
+        base.get("license_id") == "flux-non-commercial-license-v2.1"
+        and base.get("repository") == "black-forest-labs/FLUX.2-dev"
+        and base.get("revision") == "0cb56aa"
+        and {
+            "repository": "black-forest-labs/FLUX.2-klein-9B",
+            "revision": "07c5ac6",
+        } in (base.get("covered_repositories") or ())
     )
 
 
@@ -628,6 +715,10 @@ def model_terms_manifest_valid(
         if candidate == PORNMASTER_V4_PONPOKE_RECIPE and (
             not isinstance(model_def, Mapping)
             or not _pornmaster_v4_manifest_matches(model_def)
+        ):
+            return False
+        if candidate == QUAD_FLUX_RECIPE_ID and (
+            model_def is not None or not _character_sheet_quad_manifest_matches()
         ):
             return False
         if candidate in KREA2_MOODY_RECIPE_GRAPHS and (

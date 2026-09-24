@@ -19261,6 +19261,26 @@ async def civitai_download(request: Request):
     if target_dir_name and not _is_safe_path_component(target_dir_name):
         raise HTTPException(status_code=400, detail="Invalid target_dir_name")
 
+    # The exact creator version (or its case-only file alias) requires an
+    # explicit host acceptance before any download thread or disk write.
+    is_quad_lora = kind == "lora" and (
+        (str(model_id) == "2764727" and str(version_id) == "3128511")
+        or quad_lora_name_matches(filename)
+    )
+    if is_quad_lora:
+        from services.host_terms import (
+            CHARACTER_SHEET_QUAD_CREATOR_TERM,
+            host_term_accepted,
+        )
+        if not host_term_accepted(
+            wgp.server_config.get("services", {}),
+            CHARACTER_SHEET_QUAD_CREATOR_TERM,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Review and accept the Quad Character Sheet creator terms before downloading this LoRA.",
+            )
+
     # Resolve target directory.
     if kind == "checkpoint":
         try:
@@ -19336,6 +19356,7 @@ async def civitai_download(request: Request):
         "_kind": kind,
         "_target_architecture": target_architecture,
         "_auto_quantize": auto_quantize,
+        "_quad_lora": is_quad_lora,
     })
     with _civitai_download_lock:
         _civitai_downloads[download_id] = dl
@@ -19490,6 +19511,11 @@ def _run_civitai_download(download_id: str):
                     f"or a model that requires special access. Check Settings → Services → "
                     f"CivitAI API Key."
                 )
+
+        if dl.get("_quad_lora"):
+            if not quad_lora_name_matches(filename):
+                raise RuntimeError("CivitAI did not return the expected Quad Character Sheet LoRA file.")
+            require_quad_lora_artifact(partial_path)
 
         checkpoint_compatibility = None
         if is_checkpoint:
@@ -45082,7 +45108,31 @@ def _normalize_recast_lora_settings(
 # Most entries download that same filename; converted sources can declare an
 # immutable revision, remote path, expected hash/size, and converter. `label`
 # is what the job status shows while host preparation runs.
+from services.character_sheet_quad import (
+    QUAD_FLUX_LORA_FILENAME,
+    QUAD_FLUX_LORA_REPOSITORY,
+    QUAD_FLUX_LORA_REVISION,
+    QUAD_FLUX_LORA_SHA256,
+    QUAD_FLUX_LORA_SIZE,
+    QUAD_FLUX_RECIPE_ID,
+    quad_lora_name_matches,
+    require_quad_lora_artifact,
+    require_quad_lora_base,
+)
+
 _MANAGED_LORAS = {
+    QUAD_FLUX_LORA_FILENAME: {
+        "repo_id": QUAD_FLUX_LORA_REPOSITORY,
+        "revision": QUAD_FLUX_LORA_REVISION,
+        "remote_path": QUAD_FLUX_LORA_FILENAME,
+        "sha256": QUAD_FLUX_LORA_SHA256,
+        "size": QUAD_FLUX_LORA_SIZE,
+        "label": "Quad Character Sheet",
+        "support_url": (
+            f"https://huggingface.co/{QUAD_FLUX_LORA_REPOSITORY}/blob/"
+            f"{QUAD_FLUX_LORA_REVISION}/{QUAD_FLUX_LORA_FILENAME}"
+        ),
+    },
     EDIT_ANYTHING_LORA_FILENAME: {
         "repo_id": "Alissonerdx/LTX-LoRAs",
         "label": "Edit Anything",
@@ -45120,9 +45170,24 @@ def _ensure_managed_loras_present(activated_loras, model_type, progress=None):
     if not activated_loras:
         return []
 
+    has_quad_lora = any(quad_lora_name_matches(name) for name in activated_loras)
+    if has_quad_lora:
+        from services.model_terms import require_model_terms
+
+        require_quad_lora_base(model_type)
+        require_model_terms(
+            wgp.server_config.get("services", {}),
+            QUAD_FLUX_RECIPE_ID,
+            wgp.models_def,
+        )
+
     try:
         target_dir = wgp.get_lora_dir(model_type)
     except Exception:
+        if has_quad_lora:
+            raise RuntimeError(
+                "Could not resolve the FLUX.2 Klein 9B LoRA directory for Quad Character Sheet."
+            )
         # Fall back to the configured loras_root if the model dir can't be
         # resolved (shouldn't happen for the ltx2 models these LoRAs target).
         lora_root = wgp.server_config.get("loras_root", "loras") if hasattr(wgp, "server_config") else "loras"
@@ -45137,7 +45202,11 @@ def _ensure_managed_loras_present(activated_loras, model_type, progress=None):
         with _civitai_download_lock:
             match = None
             for rec in _civitai_downloads.values():
-                if os.path.basename(str(rec.get("filename", ""))) == name:
+                recorded_name = os.path.basename(str(rec.get("filename", "")))
+                if recorded_name == name or (
+                    quad_lora_name_matches(name)
+                    and quad_lora_name_matches(recorded_name)
+                ):
                     if rec.get("status") == "downloading":
                         return dict(rec)
                     match = dict(rec)
@@ -45146,7 +45215,8 @@ def _ensure_managed_loras_present(activated_loras, model_type, progress=None):
     downloaded = []
     for fname in activated_loras:
         base = os.path.basename(str(fname))
-        spec = _MANAGED_LORAS.get(base)
+        is_quad_lora = quad_lora_name_matches(base)
+        spec = _MANAGED_LORAS.get(QUAD_FLUX_LORA_FILENAME if is_quad_lora else base)
         if not spec:
             continue
         save_path = os.path.join(target_dir, base)
@@ -45159,6 +45229,8 @@ def _ensure_managed_loras_present(activated_loras, model_type, progress=None):
         except Exception:
             resolved_path = save_path
         if os.path.isfile(resolved_path):
+            if is_quad_lora:
+                require_quad_lora_artifact(resolved_path)
             continue
 
         # If another part of the app is already fetching this exact file (the
@@ -45190,6 +45262,8 @@ def _ensure_managed_loras_present(activated_loras, model_type, progress=None):
                     pass
 
         if os.path.isfile(save_path):
+            if is_quad_lora:
+                require_quad_lora_artifact(save_path)
             continue
 
         os.makedirs(target_dir, exist_ok=True)

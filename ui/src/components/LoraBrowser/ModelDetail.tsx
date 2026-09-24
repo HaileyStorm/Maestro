@@ -6,6 +6,9 @@ import { fetchLoraDirectories, fetchCheckpointArchitectures } from '../../api/cl
 import type { CheckpointArchitecture } from '../../api/client'
 import type { CivitAIModel, CivitAIModelVersion, CivitAIFile, CivitAIDownload } from '../../types'
 import { formatBytes } from '../../lib/format'
+import { HOST_TERM_NOTICES } from '../../lib/hostTerms'
+
+const QUAD_CREATOR_TERM = 'civitai_2764727_3128511_creator_terms' as const
 
 interface Props {
   model: CivitAIModel
@@ -38,6 +41,22 @@ export function ModelDetail({ model, onBack, kind = 'lora' }: Props) {
   const files = version?.files || []
   const [selectedFileIdx, setSelectedFileIdx] = useState(0)
   const file: CivitAIFile | undefined = files[selectedFileIdx]
+  const quadLora = !isCheckpoint && (
+    (String(model.id) === '2764727' && String(version?.id) === '3128511')
+    || file?.name.toLowerCase() === 'quadview_klein9b_v1.safetensors'
+  )
+  const activeWorkspace = useStore(s => s.activeWorkspace)
+  const hostTerms = useStore(s => s.hostTerms)
+  const hostTermsLoading = useStore(s => s.hostTermsLoading)
+  const hostTermsError = useStore(s => s.hostTermsError)
+  const loadHostTerms = useStore(s => s.loadHostTerms)
+  const acceptHostTerm = useStore(s => s.acceptHostTerm)
+  const quadTermsNeeded = quadLora && hostTerms?.[QUAD_CREATOR_TERM]?.accepted !== true
+  useEffect(() => {
+    if (quadLora && activeWorkspace && !hostTerms && !hostTermsLoading && !hostTermsError) {
+      void loadHostTerms()
+    }
+  }, [quadLora, activeWorkspace, hostTerms, hostTermsLoading, hostTermsError, loadHostTerms])
 
   const images = version?.images || []
   // CivitAI descriptions are user-supplied HTML — sanitize before rendering.
@@ -130,6 +149,7 @@ export function ModelDetail({ model, onBack, kind = 'lora' }: Props) {
 
   const handleDownload = () => {
     if (!file || !version) return
+    if (quadTermsNeeded) return
     if (isCheckpoint && (checkpointArchitectureLoading || checkpointSupportReason || !targetArchitecture)) return
 
     // Extract example prompts from image metadata
@@ -379,6 +399,21 @@ export function ModelDetail({ model, onBack, kind = 'lora' }: Props) {
 
           {/* Download button (with optional API-key advisory above) */}
           <div className="pt-2 space-y-2">
+            {quadTermsNeeded && (
+              <div role="status" className="rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-text-primary">
+                <p>{HOST_TERM_NOTICES[QUAD_CREATOR_TERM].text}</p>
+                <div className="mt-2 flex flex-wrap items-center gap-3">
+                  <a href={HOST_TERM_NOTICES[QUAD_CREATOR_TERM].href} target="_blank" rel="noreferrer" className="text-accent-blue underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Read creator terms</a>
+                  <button type="button" disabled={!activeWorkspace || !hostTerms || hostTermsLoading} onClick={() => { void acceptHostTerm(QUAD_CREATOR_TERM) }} className="rounded border border-amber-400/40 px-2 py-1 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Accept for this Maestro installation</button>
+                </div>
+                {hostTermsError && (
+                  <div className="mt-2 flex items-center gap-2 text-red-300">
+                    <span>{hostTermsError}</span>
+                    <button type="button" onClick={() => { void loadHostTerms() }} className="underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Retry</button>
+                  </div>
+                )}
+              </div>
+            )}
             {activeDownload && activeDownload.status !== 'failed' ? (
               <div className="space-y-2">
                 <div className="flex items-center justify-between text-xs">
@@ -456,7 +491,7 @@ export function ModelDetail({ model, onBack, kind = 'lora' }: Props) {
                 )}
                 <button
                   onClick={handleDownload}
-                  disabled={!file || (isCheckpoint && (checkpointArchitectureLoading || !!checkpointSupportReason || !targetArchitecture))}
+                  disabled={!file || !!quadTermsNeeded || (isCheckpoint && (checkpointArchitectureLoading || !!checkpointSupportReason || !targetArchitecture))}
                   className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-accent-blue text-white text-sm rounded-lg hover:bg-accent-blue-hover transition-colors disabled:opacity-50"
                 >
                   <Download size={14} />

@@ -4,7 +4,7 @@ import { Search, X, Loader2, FolderOpen, Globe, Sparkles, BookOpen } from 'lucid
 import { useStore } from '../../stores/useStore'
 import * as api from '../../api/client'
 import { generateLoraGuide, fetchLoraGuide, fetchLoraDetails } from '../../api/client'
-import { LoraGuideTooltip, LoraAgeChip, LoraSortToggle } from './LoraSelector'
+import { LoraGuideTooltip, LoraAgeChip, LoraSortToggle, QuadLoraTermsNotice } from './LoraSelector'
 import type { LoraDates } from './LoraSelector'
 import { sortLoraNames } from './loraSort'
 import type {
@@ -162,6 +162,7 @@ export function DirectorImageRoleLoraSelector({
 
   return (
     <div className="space-y-2">
+      <QuadLoraTermsNotice modelType={modelType} selectedLoras={selections.map(selection => selection.id)} />
       <p className="text-[9px] leading-relaxed text-text-muted">
         Only LoRAs that work with the selected {role === 'creator' ? 'creator' : 'continuity editor'} model appear here. LoRAs from linked folders can be selected here, but their files must be managed where they are stored. If a LoRA's settings change, remove and add it again before generating.
       </p>
@@ -476,9 +477,12 @@ export function DirectorLoraSelector({ mode, modelType }: {
 
   if (loading) {
     return (
-      <div className="text-xs text-text-muted bg-bg-tertiary border border-border rounded-lg px-3 py-3 text-center flex items-center justify-center gap-2">
-        <Loader2 size={12} className="animate-spin" />
-        Loading LoRAs...
+      <div>
+        <QuadLoraTermsNotice modelType={modelType} selectedLoras={activatedLoras} />
+        <div className="text-xs text-text-muted bg-bg-tertiary border border-border rounded-lg px-3 py-3 text-center flex items-center justify-center gap-2">
+          <Loader2 size={12} className="animate-spin" />
+          Loading LoRAs...
+        </div>
       </div>
     )
   }
@@ -501,6 +505,7 @@ export function DirectorLoraSelector({ mode, modelType }: {
 
   return (
     <div>
+      <QuadLoraTermsNotice modelType={modelType} selectedLoras={activatedLoras} />
       <DirectorProfileLoraPicker mode={mode} modelType={modelType} availableLoras={availableLoras} />
       {needsConfirmation && (
         <div className="mb-2 space-y-1 text-[10px] text-text-secondary">

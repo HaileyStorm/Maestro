@@ -12,6 +12,16 @@ from collections.abc import Mapping, MutableMapping
 from datetime import datetime, timezone
 from typing import Any
 
+from services.character_sheet_quad import (
+    QUAD_FLUX_BASE_MODEL,
+    QUAD_FLUX_LORA_FILENAME,
+    QUAD_FLUX_LORA_REPOSITORY,
+    QUAD_FLUX_LORA_REVISION,
+    QUAD_FLUX_LORA_SHA256,
+    QUAD_FLUX_LORA_SIZE,
+    QUAD_FLUX_RECIPE_ID,
+)
+
 LAWFUL_USE_TERM = "lawful_use"
 REF2VA_TERM = "minimax_h3_ref2va"
 BFL_FLUX1_REVIEW_TERM = "bfl_flux1_self_review"
@@ -29,6 +39,34 @@ PONPOKE_FLUX2_KLEIN9B_TERM = "ponpoke_flux2_klein_9b_self_review"
 CIVITAI_PORNMASTER_V4_CREATOR_TERM = (
     "civitai_2382648_2973304_creator_terms"
 )
+CHARACTER_SHEET_QUAD_CREATOR_TERM = "civitai_2764727_3128511_creator_terms"
+CHARACTER_SHEET_QUAD_RECIPE_GRAPH = {
+    "recipe_id": QUAD_FLUX_RECIPE_ID,
+    "base_model": QUAD_FLUX_BASE_MODEL,
+    "required_host_terms": [
+        CHARACTER_SHEET_QUAD_CREATOR_TERM,
+        BFL_FLUX2_REVIEW_TERM,
+    ],
+    "required_host_term_versions": {
+        CHARACTER_SHEET_QUAD_CREATOR_TERM: 1,
+        BFL_FLUX2_REVIEW_TERM: 1,
+    },
+    "creator": {
+        "repository": "civitai/models/2764727",
+        "revision": "3128511",
+        "source_url": "https://civitai.com/models/2764727?modelVersionId=3128511",
+        "creator": "Alissonerdx",
+        "model_id": 2764727,
+        "version_id": 3128511,
+    },
+    "lora": {
+        "repository": QUAD_FLUX_LORA_REPOSITORY,
+        "revision": QUAD_FLUX_LORA_REVISION,
+        "filename": QUAD_FLUX_LORA_FILENAME,
+        "size_bytes": QUAD_FLUX_LORA_SIZE,
+        "sha256": QUAD_FLUX_LORA_SHA256,
+    },
+}
 PORNMASTER_V4_RECIPE_ID = (
     "flux2_klein_9b_pornmaster_v4_turbo_fp8_ponpoke"
 )
@@ -260,6 +298,7 @@ CURRENT_HOST_TERM_VERSIONS = {
     PONPOKE_FLUX2_KLEIN4B_TERM: 1,
     PONPOKE_FLUX2_KLEIN9B_TERM: 1,
     CIVITAI_PORNMASTER_V4_CREATOR_TERM: 1,
+    CHARACTER_SHEET_QUAD_CREATOR_TERM: 1,
 }
 
 # Immutable, server-owned document identity.  Required image-recipe
@@ -402,6 +441,19 @@ CURRENT_HOST_TERM_BINDINGS = {
         ]["creator_terms"]["underlying_base_license"],
         "recipe_graph": copy.deepcopy(PORNMASTER_V4_RECIPE_GRAPH),
     },
+    CHARACTER_SHEET_QUAD_CREATOR_TERM: {
+        "license_id": "civitai-creator-terms-2764727-3128511",
+        "repository": CHARACTER_SHEET_QUAD_RECIPE_GRAPH["creator"]["repository"],
+        "revision": CHARACTER_SHEET_QUAD_RECIPE_GRAPH["creator"]["revision"],
+        "source_url": CHARACTER_SHEET_QUAD_RECIPE_GRAPH["creator"]["source_url"],
+        "creator": CHARACTER_SHEET_QUAD_RECIPE_GRAPH["creator"]["creator"],
+        "model_id": 2764727,
+        "model_version_id": 3128511,
+        "filename": QUAD_FLUX_LORA_FILENAME,
+        "file_size_bytes": QUAD_FLUX_LORA_SIZE,
+        "file_sha256": QUAD_FLUX_LORA_SHA256,
+        "recipe_graph": copy.deepcopy(CHARACTER_SHEET_QUAD_RECIPE_GRAPH),
+    },
 }
 
 
@@ -530,6 +582,8 @@ def accept_host_term(
 __all__ = [
     "BFL_FLUX1_REVIEW_TERM",
     "BFL_FLUX2_REVIEW_TERM",
+    "CHARACTER_SHEET_QUAD_CREATOR_TERM",
+    "CHARACTER_SHEET_QUAD_RECIPE_GRAPH",
     "CIVITAI_PORNMASTER_V4_CREATOR_TERM",
     "CURRENT_HOST_TERM_BINDINGS",
     "CURRENT_HOST_TERM_VERSIONS",

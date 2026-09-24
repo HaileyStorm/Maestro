@@ -252,7 +252,7 @@ function loadRoleSelector() {
             export const useStore = selector => selector({ setLoraBrowserOpen() {} })
           ` }
           if (args.path === 'lora-selector') return { contents: `
-            export const LoraGuideTooltip = () => null, LoraAgeChip = () => null, LoraSortToggle = () => null
+            export const LoraGuideTooltip = () => null, LoraAgeChip = () => null, LoraSortToggle = () => null, QuadLoraTermsNotice = () => null
           ` }
           return { contents: 'export const sortLoraNames = values => values' }
         })

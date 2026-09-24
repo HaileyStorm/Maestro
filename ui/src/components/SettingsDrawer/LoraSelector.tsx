@@ -6,6 +6,7 @@ import { generateLoraGuide, fetchLoraGuide, fetchLoraDetails, checkLoraUpdates }
 import { formatAge } from '../../lib/format'
 import type { LoraRecommendedWeights, LoraUpdateStatus } from '../../types'
 import { sortLoraNames } from './loraSort'
+import { HOST_TERM_NOTICES } from '../../lib/hostTerms'
 import type { LoraDates, LoraPickerSort } from './loraSort'
 import {
   defaultAdaptiveFl2vaModel,
@@ -21,6 +22,45 @@ import {
 
 const EMPTY_LORAS: string[] = []
 const EMPTY_LORA_WEIGHTS: Record<string, number[]> = Object.create(null)
+const QUAD_FLUX_LORA = 'QuadView_klein9b_v1.safetensors'
+const QUAD_FLUX_CREATOR_TERM = 'civitai_2764727_3128511_creator_terms' as const
+
+export function QuadLoraTermsNotice({ modelType, selectedLoras }: {
+  modelType: string
+  selectedLoras: readonly string[]
+}) {
+  const activeWorkspace = useStore(s => s.activeWorkspace)
+  const hostTerms = useStore(s => s.hostTerms)
+  const hostTermsLoading = useStore(s => s.hostTermsLoading)
+  const hostTermsError = useStore(s => s.hostTermsError)
+  const loadHostTerms = useStore(s => s.loadHostTerms)
+  const acceptHostTerm = useStore(s => s.acceptHostTerm)
+  const selected = modelType === 'flux2_klein_9b' && selectedLoras.some(
+    name => name.split(/[\\/]/).at(-1)?.toLowerCase() === QUAD_FLUX_LORA.toLowerCase(),
+  )
+  useEffect(() => {
+    if (selected && activeWorkspace && !hostTerms && !hostTermsLoading && !hostTermsError) {
+      void loadHostTerms()
+    }
+  }, [selected, activeWorkspace, hostTerms, hostTermsLoading, hostTermsError, loadHostTerms])
+  if (!selected || hostTerms?.[QUAD_FLUX_CREATOR_TERM]?.accepted === true) return null
+  const notice = HOST_TERM_NOTICES[QUAD_FLUX_CREATOR_TERM]
+  return (
+    <div role="status" className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-2 text-[10px] leading-relaxed text-amber-100">
+      <p>{notice.text}</p>
+      <div className="mt-1 flex flex-wrap items-center gap-2">
+        <a href={notice.href} target="_blank" rel="noreferrer" className="text-accent-blue underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Read creator terms</a>
+        <button type="button" disabled={!activeWorkspace || !hostTerms || hostTermsLoading} onClick={() => { void acceptHostTerm(QUAD_FLUX_CREATOR_TERM) }} className="mobile-control-target rounded border border-amber-400/40 px-2 py-1 font-medium text-amber-100 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Accept for this Maestro installation</button>
+      </div>
+      {hostTermsError && (
+        <div className="mt-1 flex items-center gap-2 text-red-300">
+          <span>{hostTermsError}</span>
+          <button type="button" onClick={() => { void loadHostTerms() }} className="underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">Retry</button>
+        </div>
+      )}
+    </div>
+  )
+}
 
 type Architecture = 'fl2va' | 'ref2va'
 type ArchitectureLoraState = {
@@ -762,6 +802,7 @@ export function LoraSelector() {
       <div>
         {loraHeader}
         {compatibilityNotice}
+        <QuadLoraTermsNotice modelType={modelType} selectedLoras={activatedLoras} />
         <div className="text-xs text-text-muted bg-bg-tertiary border border-border rounded-lg px-3 py-4 text-center flex items-center justify-center gap-2">
           <Loader2 size={12} className="animate-spin" />
           Loading LoRAs...
@@ -775,6 +816,7 @@ export function LoraSelector() {
       <div>
         {loraHeader}
         {compatibilityNotice}
+        <QuadLoraTermsNotice modelType={modelType} selectedLoras={activatedLoras} />
         <div className="text-xs text-text-muted bg-bg-tertiary border border-border rounded-lg px-3 py-4 text-center">
           {loraDetailsError || 'No LoRAs found for this model'}
         </div>
@@ -786,6 +828,7 @@ export function LoraSelector() {
     <div>
       {loraHeader}
       {compatibilityNotice}
+      <QuadLoraTermsNotice modelType={modelType} selectedLoras={activatedLoras} />
       {loraDetailsError && (
         <p role="status" className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-2 text-[10px] text-amber-100">
           {loraDetailsError}
