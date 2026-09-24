@@ -33,6 +33,7 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
   const [language, setLanguage] = useState('English')
   const [abc, setAbc] = useState('')
   const [planFirst, setPlanFirst] = useState(true)
+  const [decoderProfile, setDecoderProfile] = useState<'stock' | 'joint-v9'>('stock')
   const [selectedLoras, setSelectedLoras] = useState<Record<string, number>>({})
   const [checkpointSelections, setCheckpointSelections] = useState<Record<string, Yue2CheckpointSelection>>({})
   const [busy, setBusy] = useState<'compose' | 'submit' | 'continue' | null>(null)
@@ -80,6 +81,7 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
     setTracks([])
     setTitle('Untitled YuE2 song')
     setAbc('')
+    setDecoderProfile('stock')
     setBusy(null)
     setError(null)
     setGuides([])
@@ -168,6 +170,18 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
   const scoreFirstLoraWithSuppliedAbc = !!abc.trim() && selectedGroups.some(group =>
     /score-first/i.test(group.name),
   )
+  const reviewingTrack = activeTrack?.status === 'needs-review' ? activeTrack : null
+  const shownDecoderProfile = reviewingTrack
+    ? reviewingTrack.form?.decoderProfile === 'joint-v9' ? 'joint-v9' : 'stock'
+    : decoderProfile
+  const jointV9Available = status?.decoderProfiles?.some(profile => profile.id === 'joint-v9' && profile.available) === true
+  const decoderSelectionError = !reviewingTrack && decoderProfile === 'joint-v9'
+    ? !jointV9Available
+      ? 'Real-audio joint v9 is unavailable. Select the stock decoder or restore the matched files.'
+      : selectedGroups.length > 0
+        ? 'Real-audio joint v9 cannot yet be combined with artist or style LoRAs. Deselect them or use the stock decoder.'
+        : null
+    : null
 
   const compose = async () => {
     if (!description.trim() || busy) return
@@ -193,6 +207,7 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
 
   const submit = async () => {
     if (!style.trim() || !lyrics.trim() || busy) return
+    if (decoderSelectionError) { setError(decoderSelectionError); return }
     if (!resolvedGeneration.settings || checkpointError || unavailableLoras.length) {
       setError(unavailableLoras.length
         ? 'A selected YuE2 LoRA is no longer available. Remove the unavailable selection before generating.'
@@ -212,6 +227,7 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
         form: {
           description, title, lyrics, style, count: 1, project: requestWorkspace,
           cot: generation.cot,
+          decoderProfile,
           abc: generation.cot === 'off' ? '' : abc,
           planFirst: generation.cot === 'off' ? false : planFirst,
           cfg_scale: String(generation.cfgScale),
@@ -396,6 +412,16 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
         </p>
       )}
 
+      <label className="block text-[9px] uppercase tracking-wider text-text-muted">Audio decoder
+        <select value={shownDecoderProfile} disabled={!!reviewingTrack} onChange={event => setDecoderProfile(event.target.value as 'stock' | 'joint-v9')} className={`${fieldClass} mt-1 text-xs disabled:opacity-60`}>
+          <option value="stock">Stock YuE2 decoder</option>
+          <option value="joint-v9" disabled={!jointV9Available && !reviewingTrack}>Real-audio joint v9{jointV9Available ? ' · experimental' : ' · unavailable'}</option>
+        </select>
+      </label>
+      {reviewingTrack && <p className="text-[9px] text-text-muted">This saved take keeps its decoder through score review. Start a new take to choose another decoder.</p>}
+      {shownDecoderProfile === 'joint-v9' && !reviewingTrack && <p className="text-[9px] text-text-muted">Experimental decoder for audio rendering. The stock YuE2 path remains available; compare takes by listening before choosing a favorite.</p>}
+      {decoderSelectionError && <p role="alert" className="text-[10px] text-amber-200">{decoderSelectionError}</p>}
+
       <label className="flex items-center gap-2 text-[10px] text-text-secondary">
         <input type="checkbox" checked={planFirst && resolvedGeneration.settings?.cot !== 'off'} disabled={resolvedGeneration.settings?.cot === 'off'} onChange={event => setPlanFirst(event.target.checked)} className="accent-accent-blue" />
         Pause for ABC review before rendering
@@ -412,7 +438,7 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
           </button>
         )
       ) : (
-        <button type="button" onClick={() => void submit()} disabled={!status?.available || !style.trim() || !lyrics.trim() || !!busy || !resolvedGeneration.settings || !!checkpointError || unavailableLoras.length > 0 || ['queued', 'running'].includes(activeTrack?.status || '')} className="mobile-control-target flex w-full items-center justify-center gap-1.5 rounded-lg bg-cta px-3 text-[10px] font-semibold text-cta-foreground hover:ring-2 hover:ring-accent-blue/40 disabled:opacity-40">
+        <button type="button" onClick={() => void submit()} disabled={!status?.available || !style.trim() || !lyrics.trim() || !!busy || !resolvedGeneration.settings || !!checkpointError || !!decoderSelectionError || unavailableLoras.length > 0 || ['queued', 'running'].includes(activeTrack?.status || '')} className="mobile-control-target flex w-full items-center justify-center gap-1.5 rounded-lg bg-cta px-3 text-[10px] font-semibold text-cta-foreground hover:ring-2 hover:ring-accent-blue/40 disabled:opacity-40">
           {busy === 'submit' ? <Loader2 size={12} className="animate-spin" /> : <Music2 size={12} />} Generate with YuE2
         </button>
       )}
@@ -430,6 +456,7 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
                 <span className="min-w-0 truncate font-medium text-text-primary" title={track.title}>{track.title}</span>
                 <span className="shrink-0 text-text-muted">{track.status} · {track.stage}</span>
               </div>
+              <p className="text-text-muted">Decoder: {track.form?.decoderProfile === 'joint-v9' ? 'Real-audio joint v9' : 'Stock YuE2'}</p>
               {track.duration > 0 && <p className="text-text-muted">{Math.round(track.duration)}s audio</p>}
               {track.error && <p className="text-red-400">{track.error}</p>}
               {(track.truncated?.abc || track.truncated?.semantic) && <p className="text-amber-300">This take reached a generation limit. Check the ending before reusing it.</p>}

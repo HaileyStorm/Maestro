@@ -231,10 +231,20 @@ def public_status(bridge: Yue2Bridge) -> dict[str, Any]:
                 for key in ("id", "name", "kind", "trigger", "preferredStep", "generation", "checkpoints")
             }
         )
+    decoder_profiles = health.get("decoder_profiles", []) if isinstance(health, dict) else []
+    if not isinstance(decoder_profiles, list):
+        decoder_profiles = []
+    joint_v9_available = any(
+        isinstance(profile, dict)
+        and profile.get("id") == "joint-v9"
+        and profile.get("available") is True
+        for profile in decoder_profiles
+    )
     return {
         "available": bool(isinstance(health, dict) and health.get("generation")),
         "model": health.get("model") if isinstance(health, dict) else None,
         "decoder": health.get("decoder") if isinstance(health, dict) else None,
+        "decoderProfiles": [{"id": "joint-v9", "label": "Real-audio joint v9", "available": joint_v9_available}],
         "sampleRate": health.get("sample_rate") if isinstance(health, dict) else None,
         "formats": health.get("formats", []) if isinstance(health, dict) else [],
         "license": health.get("weight_license") if isinstance(health, dict) else None,

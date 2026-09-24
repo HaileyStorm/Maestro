@@ -1159,3 +1159,32 @@ The child exited and the exact coordinator lease is confirmed cancelled.
 Receipts: `.artifacts-temp/astra-mmgp-integration-20260907/`. This closes only
 the synthetic installed DoRA boundary; application/model rows, full-model
 quality, performance, Windows, and running-service adoption remain open.
+
+## 2026-09-24 YuE2 joint-v9 decoder comparison
+
+The installed Sound/Vision service reported the optional `joint-v9` decoder
+available after validating the pinned tokenizer head and NAR adapter, plus the
+configured YuE2-3B model architecture. The signed-in Maestro stable-share UI
+showed the decoder choice with stock as the default. Its native worker merged
+196 NAR LoRA projections and replaced four audio input/output tensors only
+after semantic generation; artist/style LoRA stacking is still excluded.
+
+One local Sound/Vision request, `maestro-joint-v9-probe-20260924-01`, rendered
+take `c5c5a18f57134f9584994fa8c210926e` under a fresh, coherently validated
+20-minute `sound-vision-local` coordinator grant. The grant was withdrawn after
+the take succeeded, and the outbox no longer authorizes work. The control was
+stock take `5df416d7a2d243c0b3cf1f3574750a05` with the same ABC, lyrics,
+style, generation settings, and effective take seed `2577657602294637337`.
+The stock request asked for an automatic seed; the comparison supplied its
+resolved seed explicitly. Title and decoder choice also differed. Score SHA-256 was
+`1591b895678a796a8f0d5b7af05fdedfcfd6e0d06c7abf42bfffea1c05b4dca5`;
+the semantic token files were byte-identical, while latent and WAV files
+differed. The v9 delivery records both pinned asset hashes and the merge count.
+
+Both WAVs have 2,159,936 frames at 48 kHz stereo, or 44.9987 seconds, with no
+reported warning, truncation, or clipped sample. Stock peak/RMS were
+0.864787/0.138130; joint-v9 peak/RMS were 0.983242/0.147431. Their full-waveform
+correlation was 0.949182 and difference RMS 0.046436. These are technical
+measurements, not a preference or fidelity verdict. The score's nominal 17.14
+seconds still does not match the rendered audio length. Human listening and
+duration fidelity remain open before promoting v9 as a quality default.

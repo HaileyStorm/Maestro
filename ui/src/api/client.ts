@@ -1528,6 +1528,7 @@ export interface Yue2Status {
   message?: string
   model?: string
   decoder?: string
+  decoderProfiles?: Array<{ id: string; label: string; available: boolean }>
   sampleRate?: number
   formats?: string[]
   license?: string
@@ -1542,6 +1543,7 @@ export interface Yue2Track {
   subtitle?: string
   project: string
   requestId: string
+  form?: { decoderProfile?: 'stock' | 'joint-v9' }
   status: 'queued' | 'running' | 'needs-review' | 'succeeded' | 'failed' | 'cancelled' | string
   stage: string
   duration: number

@@ -56,7 +56,9 @@ class Yue2BridgeTests(unittest.TestCase):
     def test_public_status_removes_local_folder_paths(self):
         class Bridge:
             def health(self):
-                return {"generation": True, "model": "YuE2-3B", "sample_rate": 48000}
+                return {"generation": True, "model": "YuE2-3B", "sample_rate": 48000,
+                        "decoder_profiles": [{"id": "joint-v9", "available": True,
+                                              "nar_path": "/private/decoder.safetensors"}]}
 
             def loras(self):
                 return {
@@ -66,6 +68,7 @@ class Yue2BridgeTests(unittest.TestCase):
 
         status = yue2_bridge.public_status(Bridge())
         self.assertTrue(status["available"])
+        self.assertTrue(status["decoderProfiles"][0]["available"])
         self.assertNotIn("/private", json.dumps(status))
 
     def test_project_library_and_take_lookup_fail_closed(self):

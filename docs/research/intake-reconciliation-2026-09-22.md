@@ -151,12 +151,16 @@ Read-only upstream HEAD check on 2026-09-23 still resolves to
 | Upstream Classic UI removal / generic fallback / content classification | Do not port behavior that removes existing features, obscures a chosen runtime or violates local content neutrality. |
 
 The [YuE2 real-audio model card](https://huggingface.co/Mothersuperior/yue2-mothersuperior-realaudio-tokenizer-v4)
-documents a matched joint-v9 tokenizer head and NAR decoder LoRA. Those files
-are present on fast storage, but the live Sound/Vision takes above used the
-stock NAR decoder. File presence and the card's measurements do not establish
-worker compatibility or improved listening quality here. Keep the v9 pair as a
-separate adapter/decoder integration and held-out listening candidate, with
-exact asset identity and a GPU lease before activation.
+documents a matched joint-v9 tokenizer head and NAR decoder LoRA. The pinned
+pair is now an opt-in Sound/Vision decoder profile exposed in Maestro, separate
+from artist/style LoRAs and disabled for those combinations. A September 24
+same-score, same-seed live comparison completed under a validated 20-minute
+GPU grant: semantic tokens matched stock, while latents and audio differed.
+Both 48 kHz stereo WAVs lasted 44.9987 seconds with no clipped samples or
+truncation. This proves the native decoder path ran, but neither the card's
+measurements nor one technical pair establishes improved listening quality;
+owner audition and exact score-to-audio duration fidelity remain open. See
+[the technical receipt](../operations/GPU_ACCEPTANCE.md#2026-09-24-yue2-joint-v9-decoder-comparison).
 
 ## Changes made during this audit
 
