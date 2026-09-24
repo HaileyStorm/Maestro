@@ -8,6 +8,10 @@ from app.services.music_document_router import (
     composition_system_prompt,
     english_lyric_note_counts,
     load_music_document_context,
+    native_abc_trailing_sharp_warning,
+    native_abc_voice_bars,
+    normalize_native_abc_whitespace,
+    requested_instrumental_bars,
     select_music_guides,
     yue2_density_revision_feedback,
 )
@@ -61,6 +65,8 @@ class MusicDocumentRouterTests(unittest.TestCase):
         self.assertIn("JSON lyrics field to exactly [Instrumental]", instrumental_prompt)
         self.assertIn("it does not request a singer", instrumental_prompt)
         self.assertIn("V: Vocal clef=treble", instrumental_prompt)
+        self.assertIn("^F8 for F-sharp", instrumental_prompt)
+        self.assertIn("barline and no trailing spaces", instrumental_prompt)
         self.assertNotIn("one sung syllable per Vocal note", instrumental_prompt)
         self.assertNotIn("final chorus or outro develop the story", instrumental_prompt)
 
@@ -125,6 +131,31 @@ class MusicDocumentRouterTests(unittest.TestCase):
             lyrics, abc.replace('C8D8E8G8|', '[CEG]8|'), language='English',
         ))
 
+    def test_explicit_instrumental_bar_target_and_simple_voice_counts(self):
+        self.assertEqual(requested_instrumental_bars('An 8-bar instrumental'), 8)
+        self.assertEqual(requested_instrumental_bars('Exactly 8 bars, please'), 8)
+        self.assertEqual(requested_instrumental_bars('8 bars in total'), 8)
+        self.assertIsNone(requested_instrumental_bars('An 8-bar intro and 8-bar outro'))
+        self.assertIsNone(requested_instrumental_bars('Give it a short intro'))
+        score = (
+            'X:1\nM:4/4\nV: Vocal clef=treble\nV: Ins clef=treble\nK:C\n'
+            '% section\nV: Vocal\n"C" C8D8E8G8| C8D8E8G8|\n'
+            'V: Ins\nC8E8G8E8| C8E8G8E8|\n'
+        )
+        self.assertEqual(native_abc_voice_bars(score), (2, 2))
+        self.assertEqual(native_abc_voice_bars(score.replace(
+            'V: Ins\nC8E8G8E8| C8E8G8E8|', 'V: Ins\nC8E8G8E8|',
+        )), (2, 1))
+        self.assertIsNone(native_abc_voice_bars(score.replace('C8D8E8G8|', 'C8D8E8G8||', 1)))
+        self.assertIsNone(native_abc_voice_bars(score.replace('C8D8E8G8|', 'C8D8E8G8|:', 1)))
+        self.assertIsNotNone(native_abc_trailing_sharp_warning(score.replace('C8D8E8G8', 'C8D8F#8G8', 1)))
+        self.assertIsNone(native_abc_trailing_sharp_warning(score.replace('"C"', '"F#maj7"', 1)))
+        self.assertIsNone(native_abc_trailing_sharp_warning(score.replace('C8D8E8G8', 'C8D8^F8G8', 1)))
+        self.assertEqual(
+            normalize_native_abc_whitespace('X:1  \nV: Vocal\nC8D8E8G8|  \n'),
+            'X:1\nV: Vocal\nC8D8E8G8|\n',
+        )
+
 
 class Yue2DensityRevisionTests(unittest.IsolatedAsyncioTestCase):
     ABC_FOUR = (
@@ -177,6 +208,126 @@ class Yue2DensityRevisionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs('app.services.music_document_router', level='WARNING'):
             result, calls = await self.compose(first, fails=True)
         self.assertEqual(result, first)
+        self.assertEqual(len(calls), 2)
+
+    async def test_instrumental_exact_bar_request_gets_one_bounded_revision(self):
+        first = {'style': 'warm', 'lyrics': '[Instrumental]', 'abc': self.ABC_EIGHT}
+        revised = {'style': 'warm', 'lyrics': '[Instrumental]', 'abc': self.ABC_FOUR}
+        calls = []
+
+        async def generate(prompt):
+            calls.append(prompt)
+            return json.dumps(first if len(calls) == 1 else revised)
+
+        result = await compose_yue2_with_density_revision(
+            'An exactly 1 bar instrumental', language='English', instrumental=True,
+            generate=generate, parse=json.loads,
+        )
+        self.assertEqual(result, revised)
+        self.assertEqual(len(calls), 2)
+        self.assertIn('exactly 1 total bar', calls[1])
+
+        calls.clear()
+        result = await compose_yue2_with_density_revision(
+            'An 8-bar intro and an 8-bar outro', language='English', instrumental=True,
+            generate=generate, parse=json.loads,
+        )
+        self.assertEqual(result, first)
+        self.assertEqual(len(calls), 1)
+
+    async def test_instrumental_revision_must_align_both_voices(self):
+        first = {'style': 'warm', 'lyrics': '[Instrumental]', 'abc': self.ABC_EIGHT}
+        unmatched = {'style': 'warm', 'lyrics': '[Instrumental]', 'abc': (
+            'V: Vocal\nC8D8E8G8|\nV: Ins\nC8E8G8E8|C8E8G8E8|\n'
+        )}
+        calls = []
+
+        async def generate(prompt):
+            calls.append(prompt)
+            return json.dumps(first if len(calls) == 1 else unmatched)
+
+        result = await compose_yue2_with_density_revision(
+            'Exactly 1 bar', language='English', instrumental=True,
+            generate=generate, parse=json.loads,
+        )
+        self.assertEqual(result['abc'], first['abc'])
+        self.assertIn('score has 2 bars per voice', result['scoreWarning'])
+        self.assertEqual(len(calls), 2)
+
+    async def test_unequal_initial_voices_get_revision_and_warning(self):
+        first = {'style': 'warm', 'lyrics': '[Instrumental]', 'abc': (
+            'V: Vocal\nC8D8E8G8|C8D8E8G8|\nV: Ins\nC8E8G8E8|\n'
+        )}
+        calls = []
+
+        async def generate(prompt):
+            calls.append(prompt)
+            return json.dumps(first)
+
+        result = await compose_yue2_with_density_revision(
+            'Exactly 2 bars', language='English', instrumental=True,
+            generate=generate, parse=json.loads,
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertIn('Vocal has 2 and Ins has 1', calls[1])
+        self.assertIn('Vocal has 2 and Ins has 1', result['scoreWarning'])
+
+    async def test_sharp_correction_cannot_unbalance_voices(self):
+        first = {'style': 'bright', 'lyrics': '[Instrumental]', 'abc': (
+            'V: Vocal\nC8D8F#8G8|\nV: Ins\nC8E8G8E8|\n'
+        )}
+        revised = {**first, 'abc': (
+            'V: Vocal\nC8D8^F8G8|C8D8E8G8|\nV: Ins\nC8E8G8E8|\n'
+        )}
+        calls = []
+
+        async def generate(prompt):
+            calls.append(prompt)
+            return json.dumps(first if len(calls) == 1 else revised)
+
+        result = await compose_yue2_with_density_revision(
+            'A short city-pop instrumental', language='English', instrumental=True,
+            generate=generate, parse=json.loads,
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(result['abc'], first['abc'])
+        self.assertIn('trailing #', result['scoreWarning'])
+
+    async def test_instrumental_trailing_sharp_gets_one_bounded_revision(self):
+        first = {'style': 'bright', 'lyrics': '[Instrumental]', 'abc': (
+            'V: Vocal\n"F#maj7" C8D8F#8G8|\nV: Ins\nC8E8G8E8|\n'
+        )}
+        revised = {**first, 'abc': first['abc'].replace('F#8', '^F8')}
+        calls = []
+
+        async def generate(prompt):
+            calls.append(prompt)
+            return json.dumps(first if len(calls) == 1 else revised)
+
+        result = await compose_yue2_with_density_revision(
+            'An exactly 1-bar instrumental', language='English', instrumental=True,
+            generate=generate, parse=json.loads,
+        )
+        self.assertEqual(result, revised)
+        self.assertEqual(len(calls), 2)
+        self.assertIn('rather than F#8', calls[1])
+
+    async def test_instrumental_correction_normalizes_line_ends(self):
+        first = {'style': 'bright', 'lyrics': '[Instrumental]', 'abc': (
+            'V: Vocal\nC8D8F#8G8|  \nV: Ins\nC8E8G8E8|  '
+        )}
+        revised = {**first, 'abc': first['abc'].replace('F#8', '^F8')}
+        calls = []
+
+        async def generate(prompt):
+            calls.append(prompt)
+            return json.dumps(first if len(calls) == 1 else revised)
+
+        result = await compose_yue2_with_density_revision(
+            'A 1-bar instrumental', language='English', instrumental=True,
+            generate=generate, parse=json.loads,
+        )
+        self.assertEqual(result['abc'], 'V: Vocal\nC8D8^F8G8|\nV: Ins\nC8E8G8E8|')
         self.assertEqual(len(calls), 2)
 
 

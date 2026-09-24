@@ -38,6 +38,7 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
   const [busy, setBusy] = useState<'compose' | 'submit' | 'continue' | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [guides, setGuides] = useState<string[]>([])
+  const [scoreWarning, setScoreWarning] = useState<string | null>(null)
   const [reviewTake, setReviewTake] = useState<string | null>(null)
   const [reviewedAbc, setReviewedAbc] = useState<string | null>(null)
   const [reviewLoading, setReviewLoading] = useState(false)
@@ -82,6 +83,7 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
     setBusy(null)
     setError(null)
     setGuides([])
+    setScoreWarning(null)
     setReviewTake(null)
     setReviewedAbc(null)
     setReviewLoading(false)
@@ -109,6 +111,7 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
       if (!plan.reviewable) throw new Error('This YuE2 score is no longer available for review. Refresh its status.')
       if (abcRef.current !== requestAbc) throw new Error('The ABC score changed while its saved plan was loading. Retry score review.')
       setAbc(plan.abc)
+      setScoreWarning(null)
       setReviewedAbc(plan.abc)
     } catch (cause) {
       if (workspaceRef.current !== requestWorkspace || planSequence.current !== sequence) return
@@ -171,7 +174,7 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
     const requestWorkspace = workspace
     const requestDraft = { ...composeDraftRef.current }
     const sequence = ++composeSequence.current
-    setBusy('compose'); setError(null)
+    setBusy('compose'); setError(null); setScoreWarning(null)
     try {
       const result = await api.composeYue2({ workspace: requestWorkspace, description: description.trim(), language, instrumental })
       if (composeSequence.current !== sequence || !sameYue2ComposeDraft(composeDraftRef.current, requestDraft)) return
@@ -179,6 +182,7 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
       onLyrics(instrumental ? '[Instrumental]' : result.lyrics)
       setAbc(result.abc)
       setGuides(result.guides)
+      setScoreWarning(result.scoreWarning ?? null)
     } catch (cause) {
       if (workspaceRef.current !== requestWorkspace || composeSequence.current !== sequence) return
       setError(cause instanceof Error ? cause.message : 'YuE2 composition drafting failed')
@@ -291,8 +295,9 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
       {guides.length > 0 && <p className="text-[9px] text-text-muted">Guides: {guides.join(', ')}</p>}
 
       <label className="block text-[9px] uppercase tracking-wider text-text-muted">ABC score
-        <textarea value={abc} onChange={event => setAbc(event.target.value)} disabled={reviewLoading} placeholder={'X:1\nM:4/4\nV: Vocal\n…\nV: Ins\n…'} className={`${fieldClass} mt-1 min-h-[8rem] resize-y font-mono text-[10px] disabled:cursor-wait disabled:opacity-60`} />
+        <textarea value={abc} onChange={event => { setAbc(event.target.value); setScoreWarning(null) }} disabled={reviewLoading} placeholder={'X:1\nM:4/4\nV: Vocal\n…\nV: Ins\n…'} className={`${fieldClass} mt-1 min-h-[8rem] resize-y font-mono text-[10px] disabled:cursor-wait disabled:opacity-60`} />
       </label>
+      {scoreWarning && <p role="status" className="rounded bg-amber-500/10 px-2 py-1 text-[10px] text-amber-200">{scoreWarning}</p>}
       {lyricDensityWarning && <p role="status" className="rounded bg-amber-500/10 px-2 py-1 text-[10px] text-amber-200">{lyricDensityWarning}</p>}
 
       {(status?.loras?.length || 0) > 0 && (

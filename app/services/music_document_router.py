@@ -203,6 +203,11 @@ def composition_system_prompt(context: MusicDocumentContext, *, instrumental: bo
         "same number of 4/4 bars. With L:1/32, four notes of length 8 fill "
         "one 4/4 bar. Put chord symbols only in Vocal. End each music line "
         "with a single |. Do not use repeat bars or polyphonic brackets. "
+        "ABC accidentals go before a note: ^F8 for F-sharp and _B8 for "
+        "B-flat. A K: key signature also applies to plain notes. Never write "
+        "F#8 or Bb8 as pitch tokens; sharp or flat suffixes belong only in "
+        "quoted chord symbols or K: headers. End each music line with its "
+        "barline and no trailing spaces. "
         "ABC must not contain w: lyric lines. Put any sung words in the JSON lyrics field.\n"
         "X:1\nT:\nM:4/4\nL:1/32\nQ:1/4=88\n"
         "V: Vocal clef=treble name=\"Vocal Melody\" snm=\"Vocal\"\n"
@@ -282,15 +287,125 @@ def yue2_density_revision_feedback(
     )
 
 
+def requested_instrumental_bars(prompt: str) -> int | None:
+    """Recognize only an unambiguous, explicit total-length request."""
+    bar_mentions = re.findall(r"\b\d{1,3}\s*(?:-\s*)?bars?\b", prompt, re.IGNORECASE)
+    if len(bar_mentions) != 1:
+        return None
+    patterns = (
+        r"\b(?:exactly|total(?:\s+of)?)\s+(\d{1,3})\s+bars?\b",
+        r"\b(\d{1,3})\s+bars?\s+(?:in\s+total|total|overall)\b",
+        r"\b(\d{1,3})\s*[- ]\s*bar\s+(?:instrumental|piece|song|track|composition)\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, prompt, re.IGNORECASE)
+        if match:
+            count = int(match.group(1))
+            return count if 1 <= count <= 128 else None
+    return None
+
+
+def native_abc_voice_bars(abc: str) -> tuple[int, int] | None:
+    """Count simple YuE2 Vocal/Ins bars, including unequal voice lengths."""
+    counts = {"vocal": 0, "ins": 0}
+    voice = None
+    for raw in abc.splitlines():
+        line = raw.split("%", 1)[0].strip()
+        declaration = re.match(r"^V:\s*(Vocal|Ins)\b", line, re.IGNORECASE)
+        if declaration:
+            voice = declaration.group(1).lower()
+            continue
+        if re.match(r"^[A-Za-z]:", line) or not line:
+            continue
+        music = re.sub(r'"[^"]*"', "", line)
+        if "|" not in music:
+            continue
+        if voice is None or "|:" in music or ":|" in music or "||" in music:
+            return None
+        counts[voice] += music.count("|")
+    if not counts["vocal"] or not counts["ins"]:
+        return None
+    return counts["vocal"], counts["ins"]
+
+
+def native_abc_trailing_sharp_warning(abc: str) -> str | None:
+    """Catch unambiguous invalid pitch suffixes outside chords and headers."""
+    for raw in abc.splitlines():
+        line = raw.split("%", 1)[0].strip()
+        if re.match(r"^[A-Za-z]:", line):
+            continue
+        music = re.sub(r'"[^"]*"', "", line)
+        if re.search(r"[A-Ga-g]#{1,2}(?=[0-9,',\s|]|$)", music):
+            return (
+                "A pitch uses a trailing #, which native ABC cannot read. "
+                "Put the sharp before the note (F#8 becomes ^F8), or use "
+                "the key signature. Review the score before rendering."
+            )
+    return None
+
+
+def normalize_native_abc_whitespace(abc: str) -> str:
+    """Remove line-end whitespace rejected by the native score parser."""
+    normalized = "\n".join(line.rstrip() for line in abc.splitlines())
+    return normalized + ("\n" if abc.endswith(("\n", "\r")) else "")
+
+
 async def compose_yue2_with_density_revision(
     prompt: str, *, language: str, instrumental: bool, generate, parse,
 ) -> dict:
     """Make at most one local revision; retain the first valid draft on failure."""
     first = parse(await generate(prompt))
-    feedback = yue2_density_revision_feedback(
-        first["lyrics"], first["abc"],
-        language=language, instrumental=instrumental,
-    )
+    first["abc"] = normalize_native_abc_whitespace(first["abc"])
+    requested_bars = requested_instrumental_bars(prompt) if instrumental else None
+    first_bars = native_abc_voice_bars(first["abc"]) if instrumental else None
+    syntax_warning = native_abc_trailing_sharp_warning(first["abc"]) if instrumental else None
+    feedback_parts = []
+    warning_parts = []
+    if requested_bars and first_bars != (requested_bars, requested_bars):
+        bar_word = "bar" if requested_bars == 1 else "bars"
+        observed = (
+            f"Vocal has {first_bars[0]} and Ins has {first_bars[1]}"
+            if first_bars and first_bars[0] != first_bars[1]
+            else f"the score has {first_bars[0]} bars per voice"
+            if first_bars else "the score's bar count could not be verified"
+        )
+        feedback_parts.append(
+            f"The request is for exactly {requested_bars} total {bar_word} in each "
+            f"voice, but {observed}. Revise the complete two-voice ABC score "
+            "to that exact total, keeping both voices aligned and ending musically."
+        )
+        warning_parts.append(
+            f"{observed[0].upper() + observed[1:]}, but both voices must "
+            f"have {requested_bars}. "
+            "Review or edit the score before rendering."
+        )
+    elif instrumental and first_bars and first_bars[0] != first_bars[1]:
+        feedback_parts.append(
+            f"Vocal has {first_bars[0]} bars and Ins has {first_bars[1]}. "
+            "Revise the score so both voices have the same number of bars."
+        )
+        warning_parts.append(
+            f"Vocal has {first_bars[0]} bars and Ins has {first_bars[1]}. "
+            "Align both voices before rendering."
+        )
+    if syntax_warning:
+        feedback_parts.append(
+            "The draft uses a trailing # on a pitch. ABC accidentals must "
+            "precede the note, such as ^F8 rather than F#8. Fix every such "
+            "pitch without changing the intended melody or bar count."
+        )
+        warning_parts.append(syntax_warning)
+    if instrumental and feedback_parts:
+        feedback = (
+            " ".join(feedback_parts)
+            + " Keep lyrics as [Instrumental] and return only the revised JSON object."
+        )
+    else:
+        feedback = yue2_density_revision_feedback(
+            first["lyrics"], first["abc"],
+            language=language, instrumental=instrumental,
+        )
+    first_result = {**first, "scoreWarning": " ".join(warning_parts)} if warning_parts else first
     if not feedback:
         return first
     revision_prompt = (
@@ -300,14 +415,24 @@ async def compose_yue2_with_density_revision(
     )
     try:
         revised = parse(await generate(revision_prompt))
+        revised["abc"] = normalize_native_abc_whitespace(revised["abc"])
     except Exception as error:  # noqa: BLE001 - the first valid draft survives any local revision failure
         _LOG.warning(
-            "Local YuE2 density revision failed; preserving first draft (%s)",
+            "Local YuE2 composition revision failed; preserving first draft (%s)",
             type(error).__name__,
         )
-        return first
+        return first_result
+    if instrumental:
+        revised_bars = native_abc_voice_bars(revised["abc"])
+        if native_abc_trailing_sharp_warning(revised["abc"]):
+            return first_result
+        if not revised_bars or revised_bars[0] != revised_bars[1]:
+            return first_result
+        if requested_bars and revised_bars != (requested_bars, requested_bars):
+            return first_result
+        return revised
     counts = english_lyric_note_counts(
         revised["lyrics"], revised["abc"],
         language=language, instrumental=instrumental,
     )
-    return revised if counts and counts[0] <= counts[1] else first
+    return revised if counts and counts[0] <= counts[1] else first_result

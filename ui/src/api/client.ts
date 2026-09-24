@@ -1576,7 +1576,14 @@ export function composeYue2(params: {
   description: string
   language?: string
   instrumental?: boolean
-}, options?: LlmRequestOptions): Promise<{ style: string; lyrics: string; abc: string; guides: string[]; missingGuides: string[] }> {
+}, options?: LlmRequestOptions): Promise<{
+  style: string
+  lyrics: string
+  abc: string
+  guides: string[]
+  missingGuides: string[]
+  scoreWarning?: string
+}> {
   return withLlmPreparation(
     { workspace: params.workspace, purpose: 'configured' },
     options,

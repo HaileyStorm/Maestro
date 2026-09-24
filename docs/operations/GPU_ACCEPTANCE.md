@@ -508,8 +508,8 @@ local 31B writer and selected only `mc-workflow`, `mc-symbolic-score`,
 `mc-ai-tell-audit`. It returned `[Instrumental]`, a style caption, and a
 two-voice ABC score with SHA-256
 `e3b3910d1813d2c77591bc358c04baac2e48d2d612714e3a48c02b25c078c713`.
-The score had twelve bars despite an eight-bar request, so precise length
-following remains unaccepted. The deployed composer and project review flow
+The score had twelve bars despite an eight-bar request, so that draft did not
+accept precise length following. The deployed composer and project review flow
 worked; this is live drafting evidence, not listening acceptance.
 
 The signed-in user selected the dedicated score-first adapter at strength 1.0
@@ -535,6 +535,38 @@ The UI now warns when a score-first LoRA is selected with supplied ABC and
 offers the two useful paths: clear ABC for adapter-led planning, or deselect
 the adapter to render the supplied score. Musical quality and owner listening
 remain open. Both short coordinator grants were withdrawn after terminal work.
+
+The next signed-in eight-bar instrumental composition did return eight Vocal
+and eight Ins bars, but the installed native score parser rejected `F#8` pitch
+tokens and then the trailing space after its final barline. No audio was
+submitted from that draft. This is a distinct failure from the earlier
+twelve-bar length miss: a plausible-looking score did not meet the native
+ABC dialect. The composer now prompts for prefix accidentals, trims line-end
+whitespace, and uses at most one local correction for invalid sharp suffixes,
+explicit numeric total-bar mismatches, or unequal voice lengths. A correction
+must keep both voices aligned. The revised path needed a fresh signed-in
+native-parser check before it could count as a live repair.
+
+That check passed after the full local gate (5,249 backend tests, 707 UI tests,
+type-check and build) and a coordinated Pinokio restart. The signed-in stable
+share composed a new guide-backed eight-bar instrumental score with the same
+seven `mc-*` guides, `[Instrumental]` lyrics, prefix `^F8` accidentals and no
+line-end whitespace. The installed native parser accepted the exact 482-byte
+score, SHA-256 `1591b895678a796a8f0d5b7af05fdedfcfd6e0d06c7abf42bfffea1c05b4dca5`:
+eight Vocal bars, eight Ins bars, 112 BPM and 17.143 seconds of nominal score
+duration. This accepts score syntax and requested bar count for this one draft.
+
+The same signed-in project submitted that exact score to native YuE2 with no
+LoRA and no additional score-generation step. The take reached complete and
+appeared in My Music with a WAV download. Its 48 kHz stereo file is 44.999
+seconds, SHA-256 `f60dd6473065e8fc17091bd361db8687a7448a520506b967795b784bd252073c`;
+the receipt reports no warnings, no ABC or semantic truncation, zero clipped
+samples and no tail trim. The final 0.2-second RMS is about 0.000038. This
+accepts one composer-to-native-audio execution, not audible quality or exact
+audio duration: the rendered file is much longer than the score's nominal
+17.143 seconds. Both separate 20-minute coordinator grants were withdrawn
+after the local writer unloaded and the native runner exited. Local and stable
+`/health` and `/ready` returned 200 after the restart.
 
 ### 2026-09-23 fresh signed-in H3 Ref2VA native sample
 
