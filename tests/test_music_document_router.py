@@ -24,6 +24,17 @@ class MusicDocumentRouterTests(unittest.TestCase):
         self.assertIn("mc-vocal-direction", guides)
         self.assertIn("mc-style-jazz", guides)
 
+        instrumental = select_music_guides(
+            "An instrumental Japanese city pop piece with a vocal-like lead, jazz harmony",
+            language="Japanese", instrumental=True,
+        )
+        self.assertIn("mc-arrangement-arch", instrumental)
+        self.assertIn("mc-melody", instrumental)
+        self.assertIn("mc-style-citypop-rnb", instrumental)
+        self.assertNotIn("lw-workflow", instrumental)
+        self.assertNotIn("lw-japanese", instrumental)
+        self.assertNotIn("mc-vocal-direction", instrumental)
+
     def test_context_is_bounded_and_reports_missing(self):
         with tempfile.TemporaryDirectory() as folder_name:
             root = Path(folder_name)
@@ -45,6 +56,13 @@ class MusicDocumentRouterTests(unittest.TestCase):
         self.assertIn("one shared song plan", prompt)
         self.assertIn("one sung syllable per Vocal note", prompt)
         self.assertIn("Add enough bars or reduce words", prompt)
+
+        instrumental_prompt = composition_system_prompt(context, instrumental=True)
+        self.assertIn("JSON lyrics field to exactly [Instrumental]", instrumental_prompt)
+        self.assertIn("it does not request a singer", instrumental_prompt)
+        self.assertIn("V: Vocal clef=treble", instrumental_prompt)
+        self.assertNotIn("one sung syllable per Vocal note", instrumental_prompt)
+        self.assertNotIn("final chorus or outro develop the story", instrumental_prompt)
 
     def test_long_core_guides_cannot_starve_requested_language_and_style(self):
         brief = 'Japanese city pop with jazz harmony'

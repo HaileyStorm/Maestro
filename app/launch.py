@@ -34500,6 +34500,7 @@ async def yue2_compose(request: Request):
     workspace = _request_project_workspace(request, body.get("workspace"))
     _require_project_access(request, workspace, permission="project.generate")
     brief = str(body.get("description") or "").strip()
+    instrumental = bool(body.get("instrumental"))
     if not brief:
         raise HTTPException(status_code=400, detail="Describe the song first.")
     if len(brief) > 20_000:
@@ -34507,6 +34508,7 @@ async def yue2_compose(request: Request):
     context = load_music_document_context(
         brief,
         language=str(body.get("language") or ""),
+        instrumental=instrumental,
     )
     if not context.text:
         raise HTTPException(
@@ -34523,7 +34525,7 @@ async def yue2_compose(request: Request):
         brief
         + "\n\nRequested language: "
         + (str(body.get("language") or "unspecified"))
-        + ("\nInstrumental: yes" if body.get("instrumental") else "\nInstrumental: no")
+        + ("\nInstrumental: yes" if instrumental else "\nInstrumental: no")
     )
     async def generate_draft(draft_prompt):
         return await run_blocking_shielded(
@@ -34536,7 +34538,9 @@ async def yue2_compose(request: Request):
             selection,
             llm_service.generate,
             prompt=draft_prompt,
-            system_prompt=composition_system_prompt(context),
+            system_prompt=composition_system_prompt(
+                context, instrumental=instrumental,
+            ),
             max_new_tokens=min(4096, max(768, int(body.get("max_new_tokens", 3072)))),
             temperature=float(body.get("temperature", 0.72)),
             top_p=float(body.get("top_p", 0.9)),
@@ -34557,7 +34561,7 @@ async def yue2_compose(request: Request):
         result = await compose_yue2_with_density_revision(
             prompt,
             language=str(body.get("language") or ""),
-            instrumental=bool(body.get("instrumental")),
+            instrumental=instrumental,
             generate=generate_draft,
             parse=_parse_yue2_composition,
         )
@@ -34569,6 +34573,8 @@ async def yue2_compose(request: Request):
             status_code=500,
             detail=str(error) if isinstance(error, ValueError) else "YuE2 composition drafting failed; check the local Maestro logs.",
         ) from error
+    if instrumental:
+        result["lyrics"] = "[Instrumental]"
     return {
         **result,
         "guides": list(context.selected),

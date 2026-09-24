@@ -423,12 +423,82 @@ The receipt records no clipping, warnings, or ABC/semantic truncation. This
 is live acceptance of that review UI transition and short native render,
 not owner listening acceptance.
 
+### 2026-09-23 YuE2 combined adapters and instrumental ABC
+
+A fresh `sound-vision-local` coordinator grant was validated before each
+submission and observed during both jobs. The signed-in stable-share UI used
+the installed YuE2-3B native worker at Sound/Vision source revision
+`92a73cc7652fcc1f937855e4b765e0a0edd7ff2e`, model revision
+`1a96eca688d6ae5d7f0feb88573fec89920fcd19`, and VAE revision
+`95535e72a97bc0f09b8ada125d26b4009428c0e8`.
+
+The combined-adapter vocal case selected the artist step-950 checkpoint
+`e461611cd0e9d424b1dcb163b7460ba133681e6d55d3d0156a59039615c6235f`
+and DreamPop v2 step-1000 checkpoint
+`617852d379c66b0407879421a353233d29cda8188cca82973a94c61b512ca03d`,
+each at strength 1.0. The native delivery receipt records both AR/NAR adapters,
+448 adapter modules and 392 updated model weights. Its 48 kHz stereo float WAV
+has SHA-256 `b8e971dadfbb06aeaa7d7e9a1635cf54c470e452cc0893fb558e79ff78455851`
+and measures 359.999 seconds; peak amplitude is 0.772 with no clipped samples.
+The semantic stage reached its 9,000-token limit and the delivery receipt marks
+semantic truncation. The project library correctly warns that the ending may
+be incomplete. This proves both adapters executed together and produced audio,
+but does not accept song finality or quality.
+
+The no-LoRA instrumental case supplied a manual eight-bar native two-voice ABC
+score at 100 BPM, with `[Instrumental]` lyrics and no review pause. The worker
+used the external ABC prefix without an ABC-generation step. Its 48 kHz stereo
+float WAV measures 19.879 seconds and has SHA-256
+`1043dc2672080b1e52c0531511b042450fbd28ee125b48782e64ae9b743c714b`.
+Peak amplitude is 0.596 with no clipped samples, no warnings, and neither ABC
+nor semantic truncation. The signed-in project library displayed both new takes
+with players and WAV downloads. This accepts a short instrumental score-to-audio
+path technically; audible absence of vocals, musical quality, and owner
+listening remain separate. The unused lease time was withdrawn and its ledger
+entry is cancelled.
+
 Clicking Play on the short take crashed the Codex in-app browser tab. The
 kernel recorded a ChatGPT-process invalid-opcode trap at that moment; the
 Maestro backend logged no audio request, while local and stable `/ready`
 remained 200. Playback in that browser is not accepted from these checks.
 The saved WAVs and delivery receipts remain intact; reproduce playback in a
 separate browser before closing that part of the acceptance row.
+
+### 2026-09-23 YuE2 score-first instrumental adapter and paired sample
+
+The [dedicated YuE2 instrumental adapter](https://huggingface.co/Mothersuperior/YuE2-instrumental-cot-full-loras)
+was pinned to source revision `947f2f4b28978b2b6c3e316e6a87925c76bf3c4b`.
+Its ComfyUI source checkpoint has SHA-256
+`de6a11d5701df103a191c87dc73115266e2420f3834739319dec5c24d2119f31`.
+A CPU-only, rename-only conversion mapped 224 LoRA tensors from ComfyUI
+`lora_down/up` names to the native `lora_A/B` names. Every tensor was checked
+bitwise equal after conversion, and the native loader recognized 112 AR
+adapter modules. The installed checkpoint has SHA-256
+`e44e108afebcc0bc1158da8c74641b341cf9e88f259c8537bb71bbce916f4c41`.
+The model card specifies CC BY-NC 4.0 and `cot=full`; this optional adapter is
+installed locally, not made an automatic default.
+
+Under a fresh validated 20-minute `sound-vision-local` grant, a signed-in
+Maestro user selected the adapter at strength 1.0, `[Instrumental]`, full
+chain of thought, and automatic score generation with the manual ABC field
+blank. The native worker applied the 112 AR modules and generated a five-section,
+50-bar score. Its 48 kHz stereo float WAV measures 116.079 seconds and has
+SHA-256 `d3b4257748743399ca6c315bbda2ca13c1533010a8c5bdfd6fabf3d2a2c020d3`.
+There were no warnings or score/semantic truncation flags. The peak reaches
+1.0, with a clipped-sample fraction of `0.00002279`; final 0.2-second RMS is
+`0.0000837`.
+
+A same-seed, otherwise matching no-LoRA control submitted to the local native
+service produced a four-section score and a 96.359-second 48 kHz stereo WAV,
+SHA-256 `4df6dbdd4339536ae9309f2f9533cc709c97ec4`. It likewise had no
+warnings or truncation flags. Its peak reaches 1.0, clipped-sample fraction
+is `0.0000003243`, and final 0.2-second RMS is `0.00433`. Both takes appeared
+in the signed-in project My Music library with player and download controls.
+This pair proves that the optional adapter executes and changes the native
+score/audio path; one seed does not establish musical superiority. Audible
+absence of vocals, playback in a separate browser, musical quality, and owner
+listening remain open. The grant was withdrawn after both terminal jobs and
+its ledger entry is cancelled.
 
 ### 2026-09-23 fresh signed-in H3 Ref2VA native sample
 

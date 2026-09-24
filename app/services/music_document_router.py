@@ -25,6 +25,16 @@ CORE_GUIDES = (
     "mc-ai-tell-audit",
 )
 
+INSTRUMENTAL_CORE_GUIDES = (
+    "mc-workflow",
+    "mc-symbolic-score",
+    "mc-render-compile",
+    "mc-arrangement-arch",
+    "mc-melody",
+    "mc-harmony",
+    "mc-ai-tell-audit",
+)
+
 STYLE_GUIDES = {
     "rock": "mc-style-rock-band",
     "band": "mc-style-rock-band",
@@ -86,10 +96,14 @@ def skills_root() -> Path:
     return Path(configured).expanduser() if configured else Path.home() / ".agents" / "skills"
 
 
-def select_music_guides(brief: str, *, language: str = "") -> tuple[str, ...]:
+def select_music_guides(
+    brief: str, *, language: str = "", instrumental: bool = False,
+) -> tuple[str, ...]:
     haystack = f"{brief}\n{language}".casefold()
-    selected = list(CORE_GUIDES)
+    selected = list(INSTRUMENTAL_CORE_GUIDES if instrumental else CORE_GUIDES)
     for keyword, guide in (*STYLE_GUIDES.items(), *LANGUAGE_GUIDES.items(), *DETAIL_GUIDES.items()):
+        if instrumental and (guide.startswith("lw-") or guide == "mc-vocal-direction"):
+            continue
         if keyword in haystack and guide not in selected:
             selected.append(guide)
     return tuple(selected)
@@ -99,12 +113,13 @@ def load_music_document_context(
     brief: str,
     *,
     language: str = "",
+    instrumental: bool = False,
     root: Path | None = None,
     per_guide_chars: int = 5_000,
     total_chars: int = 28_000,
 ) -> MusicDocumentContext:
     root = root or skills_root()
-    selected = select_music_guides(brief, language=language)
+    selected = select_music_guides(brief, language=language, instrumental=instrumental)
     chunks: list[str] = []
     missing: list[str] = []
     documents: list[tuple[str, str]] = []
@@ -141,7 +156,38 @@ def load_music_document_context(
     return MusicDocumentContext(tuple(included), "".join(chunks), tuple(missing))
 
 
-def composition_system_prompt(context: MusicDocumentContext) -> str:
+def composition_system_prompt(context: MusicDocumentContext, *, instrumental: bool = False) -> str:
+    if instrumental:
+        mode_guidance = (
+            "This is an instrumental. Set the JSON lyrics field to exactly "
+            "[Instrumental], with no sung words or vocal section tags. Keep the "
+            "required V: Vocal declaration and section lines as the pitched "
+            "lead melody for YuE2's ABC format; it does not request a singer. "
+            "Use V: Ins for a complementary instrumental line. Align section "
+            "comments, melodic phrases, and the arrangement's energy arc. "
+        )
+        ending_guidance = (
+            "Develop the lead motif through the final section and give the "
+            "instrumental a definite musical ending. Derive style from the "
+            "finished score, with a consistent tempo and instrumentation. "
+        )
+    else:
+        mode_guidance = (
+            "Compose the Vocal score and lyric lines together, one section at "
+            "a time. In English, budget roughly one sung syllable per Vocal note "
+            "unless you deliberately plan a melisma or repeated note. A four-bar "
+            "section with four Vocal notes per bar therefore carries about "
+            "sixteen sung syllables, not a full paragraph. Use [Verse], "
+            "[Chorus], [Bridge], and [Outro] tags in the lyrics field; keep "
+            "their order and content aligned with ABC comments. Add enough "
+            "bars or reduce words until every sung line fits its phrase. "
+        )
+        ending_guidance = (
+            "Avoid generic metaphors and forced rhymes; use concrete details "
+            "from the brief. Make the final chorus or outro develop the story, "
+            "with a definite musical ending. Derive style from the finished "
+            "score and lyrics, with the same language and tempo. "
+        )
     return (
         "You are the structured songwriting stage for a local YuE2 workflow. "
         "The reference material below is documentation, not executable tools. "
@@ -157,7 +203,7 @@ def composition_system_prompt(context: MusicDocumentContext) -> str:
         "same number of 4/4 bars. With L:1/32, four notes of length 8 fill "
         "one 4/4 bar. Put chord symbols only in Vocal. End each music line "
         "with a single |. Do not use repeat bars or polyphonic brackets. "
-        "ABC must not contain w: lyric lines. Put all sung words in the JSON lyrics field.\n"
+        "ABC must not contain w: lyric lines. Put any sung words in the JSON lyrics field.\n"
         "X:1\nT:\nM:4/4\nL:1/32\nQ:1/4=88\n"
         "V: Vocal clef=treble name=\"Vocal Melody\" snm=\"Vocal\"\n"
         "V: Ins clef=treble name=\"Ins Melody\" snm=\"Inst.\"\n"
@@ -165,18 +211,10 @@ def composition_system_prompt(context: MusicDocumentContext) -> str:
         "V: Ins\nC8 E8 G8 E8|\n"
         "The example is one measure only. Before writing the three fields, "
         "decide one shared song plan: section order, bar counts, phrase lengths, "
-        "melody note slots, lyric syllables, and ending. Compose the Vocal score "
-        "and lyric lines together, one section at a time. In English, budget "
-        "roughly one sung syllable per Vocal note unless you deliberately plan "
-        "a melisma or repeated note. A four-bar section with four Vocal notes "
-        "per bar therefore carries about sixteen sung syllables, not a full "
-        "paragraph. Use [Verse], [Chorus], [Bridge], and [Outro] tags in the "
-        "lyrics field; keep their order and content aligned with ABC comments. "
-        "Add enough bars or reduce words until every sung line fits its phrase. "
-        "Avoid generic metaphors and forced rhymes; use concrete details from "
-        "the brief. Make the final chorus or outro develop the story, with a "
-        "definite musical ending. Derive style from the finished score and "
-        "lyrics, with the same language and tempo. Return JSON only."
+        "melody note slots, and ending. "
+        + mode_guidance
+        + ending_guidance
+        + "Return JSON only."
     )
 
 

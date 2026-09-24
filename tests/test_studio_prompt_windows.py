@@ -2325,7 +2325,8 @@ process.stdout.write(JSON.stringify(effectiveSlidingWindowGeometry(10, 5, 5, opt
         ).read_text(encoding="utf-8")
         store = Path(ROOT, "ui", "src", "stores", "useStore.ts").read_text(encoding="utf-8")
         self.assertIn("h3ProfileMatches", component)
-        self.assertIn("profiles.find(profile => h3ProfileMatches(profile", component)
+        self.assertIn("selectedProfile?.available && h3ProfileMatches(selectedProfile", component)
+        self.assertIn("profiles.find(profile => profile.available && h3ProfileMatches(profile", component)
         self.assertIn("function _canonicalH3ProfileCustomSettings", store)
         self.assertIn("h3_sol_dense_steps: 10", store)
 
