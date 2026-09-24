@@ -500,6 +500,42 @@ absence of vocals, playback in a separate browser, musical quality, and owner
 listening remain open. The grant was withdrawn after both terminal jobs and
 its ledger entry is cancelled.
 
+### 2026-09-23 guide-backed instrumental draft and score-to-audio control
+
+After deploying `28a1467`, the signed-in stable-share YuE2 composer loaded the
+local 31B writer and selected only `mc-workflow`, `mc-symbolic-score`,
+`mc-render-compile`, `mc-arrangement-arch`, `mc-melody`, `mc-harmony`, and
+`mc-ai-tell-audit`. It returned `[Instrumental]`, a style caption, and a
+two-voice ABC score with SHA-256
+`e3b3910d1813d2c77591bc358c04baac2e48d2d612714e3a48c02b25c078c713`.
+The score had twelve bars despite an eight-bar request, so precise length
+following remains unaccepted. The deployed composer and project review flow
+worked; this is live drafting evidence, not listening acceptance.
+
+The signed-in user selected the dedicated score-first adapter at strength 1.0
+and submitted that supplied ABC through YuE2's pause/review/continue path.
+The take produced a 48 kHz stereo float WAV of 359.999 seconds, SHA-256
+`9766f505972cec99283b516d6222eba96d2c76c17d61d3c26afd76682009b4f4`.
+Its semantic stage exhausted 9,000 tokens, and the delivery receipt marked
+truncation and an incomplete-ending warning. The peak was 1.0 with a
+clipped-sample fraction of `0.00014754`. This is a technically delivered file,
+but the adapter-plus-supplied-score path did not produce a clean ending.
+
+The same score without a LoRA finished at 36.399 seconds, SHA-256
+`3126e8153663e2db0219742cff149e64e74f9f707387eda444e095c486492907`,
+with no warnings, truncation, or clipped samples. A further no-LoRA control
+using the *same seed* as the adapter take finished at 38.319 seconds, SHA-256
+`fa660b1425779ff986472528a246947d14c427b651cb61f4264da227e6c2a772`,
+with 959 semantic tokens and likewise no warnings, truncation, or clipping.
+The same-seed pair had byte-identical ABC scores, native ABC token arrays,
+and semantic prefix arrays; the adapter was the material model difference.
+The source model card says this score-first LoRA is intended to write its own
+ABC, consistent with its separate successful automatic-score take above.
+The UI now warns when a score-first LoRA is selected with supplied ABC and
+offers the two useful paths: clear ABC for adapter-led planning, or deselect
+the adapter to render the supplied score. Musical quality and owner listening
+remain open. Both short coordinator grants were withdrawn after terminal work.
+
 ### 2026-09-23 fresh signed-in H3 Ref2VA native sample
 
 After the stereo/upscale lease was withdrawn, a coordinated Pinokio restart

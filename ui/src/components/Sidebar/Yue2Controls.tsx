@@ -162,6 +162,9 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
     () => yue2LyricDensityWarning(lyrics, abc, language, instrumental),
     [lyrics, abc, language, instrumental],
   )
+  const scoreFirstLoraWithSuppliedAbc = !!abc.trim() && selectedGroups.some(group =>
+    /score-first/i.test(group.name),
+  )
 
   const compose = async () => {
     if (!description.trim() || busy) return
@@ -271,16 +274,20 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
         <label className="text-[9px] uppercase tracking-wider text-text-muted">Title
           <input value={title} onChange={event => setTitle(event.target.value)} className={`${fieldClass} mt-1 text-xs`} />
         </label>
-        <label className="text-[9px] uppercase tracking-wider text-text-muted">Lyric language
+        <label className="text-[9px] uppercase tracking-wider text-text-muted">{instrumental ? 'Guide language' : 'Lyric language'}
           <input value={language} onChange={event => setLanguage(event.target.value)} className={`${fieldClass} mt-1 text-xs`} />
         </label>
       </div>
 
       <button type="button" onClick={() => void compose()} disabled={!status?.available || !description.trim() || !!busy} className="mobile-control-target flex w-full items-center justify-center gap-1.5 rounded-lg border border-accent-blue/30 bg-accent-blue/10 px-3 text-[10px] font-semibold text-accent-blue hover:bg-accent-blue/20 disabled:opacity-40">
         {busy === 'compose' ? <Loader2 size={12} className="animate-spin" /> : <Sparkles size={12} />}
-        Build lyrics + score from local guides
+        {instrumental ? 'Build instrumental score from local guides' : 'Build lyrics + score from local guides'}
       </button>
-      <p className="text-[9px] leading-snug text-text-muted">Uses relevant local music guides to draft the lyrics and score. If English lyrics clearly exceed the Vocal notes, it makes one local revision. Review both before rendering.</p>
+      <p className="text-[9px] leading-snug text-text-muted">
+        {instrumental
+          ? 'Uses local composition and score guides to draft two-voice ABC. The lead melody does not request singing. Review the score before rendering.'
+          : 'Uses relevant local music guides to draft the lyrics and score. If English lyrics clearly exceed the Vocal notes, it makes one local revision. Review both before rendering.'}
+      </p>
       {guides.length > 0 && <p className="text-[9px] text-text-muted">Guides: {guides.join(', ')}</p>}
 
       <label className="block text-[9px] uppercase tracking-wider text-text-muted">ABC score
@@ -378,6 +385,11 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
       )}
       {resolvedGeneration.error && <p className="text-[10px] text-red-400">{resolvedGeneration.error}</p>}
       {checkpointError && <p className="text-[10px] text-red-400">{checkpointError}</p>}
+      {scoreFirstLoraWithSuppliedAbc && (
+        <p role="status" className="rounded bg-amber-500/10 px-2 py-1 text-[10px] text-amber-200">
+          This score-first LoRA is designed to write its own ABC. With a supplied score, it may run to the length limit. Clear ABC to let it plan a score, or deselect the LoRA to render this score.
+        </p>
+      )}
 
       <label className="flex items-center gap-2 text-[10px] text-text-secondary">
         <input type="checkbox" checked={planFirst && resolvedGeneration.settings?.cot !== 'off'} disabled={resolvedGeneration.settings?.cot === 'off'} onChange={event => setPlanFirst(event.target.checked)} className="accent-accent-blue" />
