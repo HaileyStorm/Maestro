@@ -6,6 +6,9 @@ This audit corrects the September 21 blanket completion claim. Evaluated,
 implemented, executable, tested on a particular device, and accepted by the
 owner are different states. Several adopted historical capabilities remain
 unimplemented. GPU availability is only one of the remaining dependencies.
+The disposition inventory remains the September 22 baseline; delivery notes
+and the promotion order below include verified follow-on work through
+September 24.
 
 Baseline: Continuum `d4dff8442979b6c0559d27b4272462f3c0ade4a7`.
 Upstream reviewed: `Blizaine/Maestro` at
@@ -47,6 +50,7 @@ The recent implementation history includes:
 | Blend Insert/Overlap, safer source restore and same-job source reattachment | `e673e51`, `75bf89a`, `6a3da85`, `8acfbb9`, `d4dff84`; exact source hashes, project fences, immutable request revisions, duplicate submission guard. |
 | Better Generate/Director mobile controls | `5ae983a`, `40863a3`, `ba2784f`; footer layout, LoRA controls and review actions. |
 | H3 durable recovery / final adoption | `e1cec99`, `5c4cd83`; completed outputs can retire corresponding recovery jobs. |
+| Scene Kit kept Character/Location references in Generate | `70c2113`, `8969cee`; the signed-in stable-share UI staged two exact kept output IDs, then produced one FLUX.2 Klein 9B image that visibly followed both fixtures. The second commit repairs private snapshot storage on this installation's existing uploads-volume symlink. See [GPU_ACCEPTANCE.md](../operations/GPU_ACCEPTANCE.md#2026-09-24-scene-kit-to-generate-two-reference-image). This is one live reference path, not CharacterSheet execution or broad model parity. |
 
 Human acceptance of these current changes remains pending: the owner explicitly
 has not tried them. Earlier accepted, revision-bound cases remain valid history. A successful output does not establish quality across every model,
@@ -290,9 +294,13 @@ environment. This does not establish GPU generation or owner acceptance.
    evidence; flip hard-crash adoption and human acceptance remain distinct.
 2. Complete Music3 native live generation and recovery acceptance after the
    pinned host-term review and asset download. Implement the missing CharacterSheet executor in coherent slices;
-   its static scaffold must not be advertised as a working product.
-3. Adapt upstream Qwen2.1, native YuE2 training/library and Editor as separate
-   integrations with complete settings/restore/access/recovery coverage.
+   its static scaffold must not be advertised as a working product. Scene Kit's
+   separate kept-reference handoff now has one live two-image receipt.
+3. Adapt upstream Qwen2.1 and Editor as separate integrations with complete
+   settings/restore/access/recovery coverage. Native YuE2 generation,
+   project-scoped library, training and private-checkpoint audition now have
+   live technical receipts; owner listening, duration fidelity, broader LoRA
+   combinations, crash recovery and Windows checks remain.
 4. The owner opened a September 23 GPU window. The completed H3/FlashVSR/SeedVC
    checks used one exact six-hour coordinator grant, then withdrew it after
    the jobs reached terminal success. A later six-hour grant covered the
