@@ -13,6 +13,7 @@ import {
   yue2LyricDensityWarning,
 } from './yue2GenerationSettings'
 import type { Yue2CheckpointSelection } from './yue2GenerationSettings'
+import { Yue2Training } from './Yue2Training'
 
 type Props = {
   workspace: string
@@ -472,6 +473,7 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
           ))}
         </div>
       </section>
+      {status?.training && <Yue2Training key={workspace} workspace={workspace} tracks={projectTracks} gpuBlocked={!!status.gpuBlocked} />}
       {reviewError && <p className="text-[10px] text-red-400">{reviewError}</p>}
       {error && <p className="text-[10px] text-red-400">{error}</p>}
     </section>

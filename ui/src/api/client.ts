@@ -1534,6 +1534,8 @@ export interface Yue2Status {
   license?: string
   queue?: string
   loraEngine?: string
+  training?: boolean
+  gpuBlocked?: boolean
   loras: Yue2LoraGroup[]
 }
 
@@ -1554,11 +1556,19 @@ export interface Yue2Track {
   audioUrl?: string | null
 }
 
+export class Yue2RequestError extends Error {
+  status: number
+  constructor(status: number, message: string) {
+    super(message)
+    this.status = status
+  }
+}
+
 async function yue2Json<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, { cache: 'no-store', ...init })
   if (!res.ok) {
     const detail = await res.json().catch(() => ({ detail: 'YuE2 request failed' }))
-    throw new Error(detail.detail || 'YuE2 request failed')
+    throw new Yue2RequestError(res.status, detail.detail || 'YuE2 request failed')
   }
   return res.json()
 }
@@ -1623,6 +1633,48 @@ export function cancelYue2(takeId: string, workspace: string): Promise<{ status:
   return yue2Json(`${BASE}/api/v1/yue2/takes/${encodeURIComponent(takeId)}/cancel`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ workspace }),
+  })
+}
+
+export interface Yue2TrainingJob {
+  id: string
+  project: string
+  name: string
+  kind: 'artist' | 'style'
+  trigger: string
+  sourceTakeIds: string[]
+  state: 'queued' | 'preparing' | 'waiting-for-resource' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+  stage: string
+  error?: string | null
+  cancel_requested: number
+}
+
+export interface Yue2TrainingRequest {
+  workspace: string
+  requestId: string
+  name: string
+  kind: 'artist' | 'style'
+  trigger: string
+  steps: number
+  tracks: Array<{ takeId: string; caption: string; lyrics: string }>
+}
+
+export function fetchYue2Training(workspace: string): Promise<{ jobs: Yue2TrainingJob[] }> {
+  const query = new URLSearchParams({ workspace })
+  return yue2Json(`${BASE}/api/v1/yue2/training?${query}`)
+}
+
+export function submitYue2Training(payload: Yue2TrainingRequest): Promise<{ job: Yue2TrainingJob; reused: boolean }> {
+  return yue2Json(`${BASE}/api/v1/yue2/training`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
+export function cancelYue2Training(jobId: string, workspace: string): Promise<{ status: string }> {
+  return yue2Json(`${BASE}/api/v1/yue2/training/${encodeURIComponent(jobId)}/cancel`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ workspace }),
   })
 }

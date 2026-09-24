@@ -189,6 +189,27 @@ class Yue2Bridge:
             timeout=8,
         )
 
+    def training_jobs(self, workspace: str) -> dict[str, Any]:
+        result = self._request(f"/api/training?project={quote(workspace, safe='')}", timeout=8)
+        if not isinstance(result, dict) or not isinstance(result.get("jobs"), list):
+            raise Yue2BridgeError("The YuE2 service returned invalid training jobs.")
+        return {"jobs": [job for job in result["jobs"] if isinstance(job, dict) and job.get("project") == workspace]}
+
+    def require_training_job(self, job_id: str, workspace: str) -> dict[str, Any]:
+        for job in self.training_jobs(workspace)["jobs"]:
+            if job.get("id") == job_id:
+                return job
+        raise Yue2BridgeError("YuE2 training job not found in this project.", status_code=404)
+
+    def submit_training(self, payload: dict[str, Any]):
+        return self._request("/api/training", method="POST", payload=payload, timeout=20)
+
+    def cancel_training(self, job_id: str):
+        return self._request(
+            f"/api/training/{quote(job_id, safe='')}/cancel",
+            method="POST", payload={}, timeout=8,
+        )
+
     def audio_request(self, take_id: str, fmt: str = "mp3") -> Request:
         if fmt not in {"mp3", "wav", "flac"}:
             raise Yue2BridgeError("Unsupported YuE2 audio format.", status_code=404)
@@ -240,8 +261,13 @@ def public_status(bridge: Yue2Bridge) -> dict[str, Any]:
         and profile.get("available") is True
         for profile in decoder_profiles
     )
+    gpu_blocked = bool(isinstance(health, dict) and health.get("gpu_supervision_lost") is True)
     return {
-        "available": bool(isinstance(health, dict) and health.get("generation")),
+        "available": bool(isinstance(health, dict) and health.get("generation") and not gpu_blocked),
+        "message": (
+            "A YuE2 worker could not be confirmed stopped. GPU work is paused; check the local Sound/Vision service."
+            if gpu_blocked else None
+        ),
         "model": health.get("model") if isinstance(health, dict) else None,
         "decoder": health.get("decoder") if isinstance(health, dict) else None,
         "decoderProfiles": [{"id": "joint-v9", "label": "Real-audio joint v9", "available": joint_v9_available}],
@@ -250,5 +276,7 @@ def public_status(bridge: Yue2Bridge) -> dict[str, Any]:
         "license": health.get("weight_license") if isinstance(health, dict) else None,
         "queue": health.get("queue") if isinstance(health, dict) else None,
         "loraEngine": health.get("lora_engine") if isinstance(health, dict) else None,
+        "training": health.get("training") is True if isinstance(health, dict) else False,
+        "gpuBlocked": gpu_blocked,
         "loras": groups,
     }

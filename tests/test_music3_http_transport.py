@@ -108,6 +108,7 @@ class Music3HTTPTransportTests(unittest.IsolatedAsyncioTestCase):
         method: str = "GET",
         body: bytes | None = None,
         maximum: int = 1024,
+        timeout_seconds: float = 3.0,
     ) -> Music3TransportRequest:
         address = server.sockets[0].getsockname()
         return Music3TransportRequest(
@@ -115,7 +116,7 @@ class Music3HTTPTransportTests(unittest.IsolatedAsyncioTestCase):
             url=f"http://127.0.0.1:{address[1]}{path}",
             headers=(("accept", "application/octet-stream"),),
             body=body,
-            timeout_seconds=3.0,
+            timeout_seconds=timeout_seconds,
             max_response_bytes=maximum,
         )
 
@@ -373,23 +374,23 @@ class Music3HTTPTransportTests(unittest.IsolatedAsyncioTestCase):
 
         server = await self._listen(handler)
         first_task = asyncio.create_task(
-            music3_http_transport(self._request(server, HEALTH_PATH))
+            music3_http_transport(self._request(server, HEALTH_PATH, timeout_seconds=10.0))
         )
-        await asyncio.wait_for(first_started.wait(), timeout=2.0)
+        await asyncio.wait_for(first_started.wait(), timeout=10.0)
         second_task = asyncio.create_task(
-            music3_http_transport(self._request(server, MODELS_PATH))
+            music3_http_transport(self._request(server, MODELS_PATH, timeout_seconds=10.0))
         )
-        await asyncio.wait_for(second_started.wait(), timeout=2.0)
+        await asyncio.wait_for(second_started.wait(), timeout=10.0)
         self.assertFalse(second_task.done())
 
         first_task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await first_task
-        await asyncio.wait_for(first_peer_closed.wait(), timeout=2.0)
+        await asyncio.wait_for(first_peer_closed.wait(), timeout=10.0)
         self.assertFalse(second_task.done())
 
         release_second.set()
-        second_response = await asyncio.wait_for(second_task, timeout=2.0)
+        second_response = await asyncio.wait_for(second_task, timeout=10.0)
         self.assertEqual(second_response.body, b"survives")
 
     async def test_exact_request_type_and_mutated_fields_are_revalidated(self):

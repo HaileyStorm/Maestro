@@ -148,6 +148,16 @@ test('YuE2 async results are fenced to the captured workspace and review can be 
   assert.match(source, /Retry score review/)
 })
 
+test('YuE2 training keeps existing jobs visible but blocks new work after supervision loss', async () => {
+  const fs = await import('node:fs/promises')
+  const controls = await fs.readFile(new URL('../src/components/Sidebar/Yue2Controls.tsx', import.meta.url), 'utf8')
+  const training = await fs.readFile(new URL('../src/components/Sidebar/Yue2Training.tsx', import.meta.url), 'utf8')
+  assert.match(controls, /gpuBlocked=\{!!status\.gpuBlocked\}/)
+  assert.match(training, /disabled=\{\(!valid && !pending\) \|\| busy \|\| gpuBlocked\}/)
+  assert.match(training, /gpuBlocked && <p role="alert"/)
+  assert.match(training, /jobs\.map\(job =>/)
+})
+
 test('YuE2 picker submits the selected exact checkpoint pair and blocks stale choices', async () => {
   const source = await import('node:fs/promises').then(fs => fs.readFile(
     new URL('../src/components/Sidebar/Yue2Controls.tsx', import.meta.url),

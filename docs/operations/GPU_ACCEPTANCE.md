@@ -1189,3 +1189,38 @@ correlation was 0.949182 and difference RMS 0.046436. These are technical
 measurements, not a preference or fidelity verdict. The score's nominal 17.14
 seconds still does not match the rendered audio length. Human listening and
 duration fidelity remain open before promoting v9 as a quality default.
+
+## 2026-09-24 YuE2 project training smoke
+
+The signed-in stable-share UI for project `codex-live-matrix-20260921`
+submitted native YuE2 take `99111ae117fd4007be97dfc46eda9ca6` after
+another project's GPU lease ended. The service used a fresh 20-minute
+`sound-vision-local` generation grant and withdrew it on completion. The
+project's My Music library showed the result as complete. Its delivered WAV
+has SHA-256 `0470c9689e676ff7a231c289bbf85d94bd157f77d5f7ee638933559e88923c9f`,
+48 kHz stereo PCM, 69.918667 seconds, no reported clipping, warning, or
+truncation. `ffprobe` independently decoded its header and duration. This is
+technical generation evidence; lyric clarity and musical quality still need
+listening review. An in-app browser tab crashed on an attempted player click,
+so that click did not establish browser playback; another stable-share tab and
+the local/stable health endpoints remained responsive.
+
+The same project then submitted style training job
+`train-6c016d2f-2915-45e7-a6a1-59cf3c43e420` from its finished `YuE2 Live
+Matrix` take, with that take's original style caption and lyrics, an isolated
+trigger, and 200 steps. The fast-storage preflight found one valid audio file
+and no warnings. Sound/Vision obtained a fresh coordinator lease, ran the
+installed YuE2 AI Toolkit and joint-v9 NAR pair, reached 200/200 steps, and
+reported `succeeded` / `checkpoints-ready`. The coordinator showed no active
+reservation after completion. One retained 117,500,928-byte safetensors
+checkpoint has SHA-256
+`4f67170b79ec92f3271ceadfbd1b77115bc4a9c3dea69606979ddf4ea73a5557`
+and passed the service's adapter-header check. It remains private in the
+training workspace, outside the installed LoRA catalog. This is a real
+training-execution and checkpoint-integrity receipt, not proof of a useful
+style, checkpoint audition, cross-project isolation under attack, restart
+recovery, or owner acceptance. The 40-minute lease was requested by the
+already-running service revision; a tested follow-on change sizes 200-step and
+400-step training requests to 20 and 30 minutes respectively. Sound/Vision was
+restarted after two zero-activity checks and returned healthy; a new grant
+under the revised sizing has not yet been exercised.

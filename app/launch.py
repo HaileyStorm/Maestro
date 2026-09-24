@@ -34472,6 +34472,61 @@ async def yue2_cancel(take_id: str, request: Request):
         _raise_yue2_bridge_error(error)
 
 
+@api.get("/api/v1/yue2/training")
+async def yue2_training_jobs(request: Request, workspace: str | None = None):
+    selected = _request_project_workspace(request, workspace)
+    _require_project_access(request, selected, permission="project.open")
+    try:
+        return _yue2_bridge().training_jobs(selected)
+    except Exception as error:
+        _raise_yue2_bridge_error(error)
+
+
+@api.post("/api/v1/yue2/training")
+async def yue2_training_submit(request: Request):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="YuE2 training inputs are invalid.")
+    workspace = _request_project_workspace(request, body.get("workspace"))
+    _require_project_access(request, workspace, permission="project.generate")
+    bridge = _yue2_bridge()
+    tracks = body.get("tracks")
+    if not isinstance(tracks, list) or not 1 <= len(tracks) <= 32:
+        raise HTTPException(status_code=422, detail="Choose 1 to 32 ready YuE2 tracks in this project.")
+    try:
+        ready_ids = {
+            track.get("id") for track in bridge.project_library(workspace)["tracks"]
+            if track.get("status") == "succeeded"
+        }
+        for track in tracks:
+            if not isinstance(track, dict) or not isinstance(track.get("takeId"), str):
+                raise HTTPException(status_code=422, detail="A selected YuE2 track is invalid.")
+            if track["takeId"] not in ready_ids:
+                raise HTTPException(status_code=404, detail="A selected YuE2 track is not ready in this project.")
+        payload = {key: value for key, value in body.items() if key != "workspace"}
+        payload["project"] = workspace
+        return bridge.submit_training(payload)
+    except HTTPException:
+        raise
+    except Exception as error:
+        _raise_yue2_bridge_error(error)
+
+
+@api.post("/api/v1/yue2/training/{job_id}/cancel")
+async def yue2_training_cancel(job_id: str, request: Request):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="YuE2 training project is required.")
+    workspace = _request_project_workspace(request, body.get("workspace"))
+    _require_project_access(request, workspace, permission="project.generate")
+    try:
+        bridge = _yue2_bridge()
+        bridge.require_training_job(job_id, workspace)
+        return bridge.cancel_training(job_id)
+    except Exception as error:
+        _raise_yue2_bridge_error(error)
+
+
 @api.get("/api/v1/yue2/takes/{take_id}/audio.{fmt}")
 async def yue2_audio(take_id: str, fmt: str, request: Request, workspace: str | None = None):
     selected = _request_project_workspace(request, workspace)
