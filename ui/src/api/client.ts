@@ -3528,19 +3528,20 @@ export type ProjectReferenceCharacterSheetProfileStatus =
   | 'later_unavailable'
 
 export interface ProjectReferenceCharacterSheetCapabilities {
-  schema_version: 1
+  schema_version: 2
   capability_id: 'character_sheet'
   server_authored: true
   selection: {
     default_profile_id: 'quad_flux2_klein'
     client_may_enable_profiles: false
+    review_default: 'off'
   }
   workflow: Array<{
     id: 'anchor' | 'local_vlm_review' | 'qwen_image_edit_repair'
     label: string
     order: number
     required: boolean
-    condition?: 'review_finds_failed_roles'
+    condition?: 'failed_roles_selected'
   }>
   profiles: Array<{
     id: ProjectReferenceCharacterSheetProfileId
@@ -4636,17 +4637,17 @@ export async function fetchProjectAssets(project: string): Promise<ProjectAsset[
 
 const CHARACTER_SHEET_WORKFLOW_CONTRACT = [
   {
-    id: 'anchor', label: 'Create the anchor image',
+    id: 'anchor', label: 'Choose a verified FLUX anchor',
     order: 0, required: true, condition: undefined,
   },
   {
-    id: 'local_vlm_review', label: 'Review locally with the VLM',
-    order: 1, required: true, condition: undefined,
+    id: 'local_vlm_review', label: 'Optional local visual review',
+    order: 1, required: false, condition: undefined,
   },
   {
     id: 'qwen_image_edit_repair', label: 'Repair with Qwen Image Edit',
     order: 2, required: false,
-    condition: 'review_finds_failed_roles',
+    condition: 'failed_roles_selected',
   },
 ] as const
 
@@ -4698,7 +4699,7 @@ export function decodeProjectReferenceCharacterSheetCapabilities(
     'workflow', 'profiles',
   ])) return null
   if (
-    value.schema_version !== 1
+    value.schema_version !== 2
     || value.capability_id !== 'character_sheet'
     || value.server_authored !== true
   ) return null
@@ -4706,9 +4707,10 @@ export function decodeProjectReferenceCharacterSheetCapabilities(
   const selection = value.selection
   if (
     !isPlainJsonObject(selection)
-    || !hasExactKeys(selection, ['default_profile_id', 'client_may_enable_profiles'])
+    || !hasExactKeys(selection, ['default_profile_id', 'client_may_enable_profiles', 'review_default'])
     || selection.default_profile_id !== 'quad_flux2_klein'
     || selection.client_may_enable_profiles !== false
+    || selection.review_default !== 'off'
   ) return null
 
   if (!Array.isArray(value.workflow) || value.workflow.length !== CHARACTER_SHEET_WORKFLOW_CONTRACT.length) {

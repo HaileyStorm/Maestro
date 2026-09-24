@@ -47,6 +47,8 @@ class CharacterSheetWorkflowTests(unittest.TestCase):
             "anchor_id": "anchor-private-001",
             "kind": kind,
             "sha256": _sha(label),
+            "source_model_id": "flux2_klein_9b",
+            "source_model_family": "flux",
         }
 
     def _resource_base(self, profile_id: str = DEFAULT_PROFILE_ID):
@@ -127,7 +129,9 @@ class CharacterSheetWorkflowTests(unittest.TestCase):
         )
 
     def _panels(self):
-        roles = ("identity_front", "three_quarter", "profile", "back")
+        roles = (
+            "face_closeup", "front_full_body", "side_full_body", "back_full_body",
+        )
         coordinates = (
             (0, 0, 768, 512),
             (768, 0, 768, 512),
@@ -367,6 +371,7 @@ class CharacterSheetWorkflowTests(unittest.TestCase):
     def test_anchor_is_project_scoped_and_kind_is_authored(self):
         imported = self._plan(anchor=self._anchor(kind="imported"))
         self.assertEqual(imported["anchor"]["kind"], "imported")
+        self.assertEqual(imported["anchor"]["source_model_family"], "flux")
         mismatch = self._anchor()
         mismatch["project_id"] = "another-project"
         with self.assertRaises(CharacterSheetWorkflowError):
@@ -375,6 +380,14 @@ class CharacterSheetWorkflowTests(unittest.TestCase):
         bad_kind["kind"] = "inferred"
         with self.assertRaises(CharacterSheetWorkflowError):
             self._plan(anchor=bad_kind)
+        non_flux = self._anchor()
+        non_flux["source_model_family"] = "krea"
+        with self.assertRaisesRegex(CharacterSheetWorkflowError, "verified FLUX anchor"):
+            self._plan(anchor=non_flux)
+        missing_provenance = self._anchor()
+        del missing_provenance["source_model_id"]
+        with self.assertRaisesRegex(CharacterSheetWorkflowError, "anchor schema"):
+            self._plan(anchor=missing_provenance)
 
     def test_changed_anchor_changes_seal_and_expected_anchor_rejects_replay(self):
         first = self._plan()
@@ -388,12 +401,16 @@ class CharacterSheetWorkflowTests(unittest.TestCase):
         tampered["anchor"]["sha256"] = changed_anchor["sha256"]
         with self.assertRaises(CharacterSheetWorkflowError):
             validate_character_sheet_plan(tampered)
+        changed_model = self._anchor()
+        changed_model["source_model_id"] = "flux2_klein_4b"
+        changed_model_plan = self._plan(anchor=changed_model)
+        self.assertNotEqual(first["plan_seal"], changed_model_plan["plan_seal"])
 
     def test_panel_order_cardinality_and_digest_are_exact(self):
         plan = self._plan()
         self.assertEqual(
             [panel["role"] for panel in plan["panels"]],
-            ["identity_front", "three_quarter", "profile", "back"],
+            ["face_closeup", "front_full_body", "side_full_body", "back_full_body"],
         )
         for candidate in (
             list(reversed(self._panels())),
@@ -415,16 +432,16 @@ class CharacterSheetWorkflowTests(unittest.TestCase):
         before_accepted = {
             panel["role"]: json.dumps(panel, sort_keys=True, separators=(",", ":"))
             for panel in plan["panels"]
-            if panel["role"] != "profile"
+            if panel["role"] != "side_full_body"
         }
         repaired = apply_failed_panel_repairs(
-            plan, failed_roles=["profile"], repaired_panels=[replacement],
+            plan, failed_roles=["side_full_body"], repaired_panels=[replacement],
         )
         self.assertEqual(repaired["anchor"], plan["anchor"])
         self.assertEqual(repaired["resources"], plan["resources"])
         self.assertEqual(repaired["seed"], plan["seed"])
         self.assertEqual(repaired["parent_plan_seal"], plan["plan_seal"])
-        self.assertEqual(repaired["repair_lineage"][0]["failed_roles"], ["profile"])
+        self.assertEqual(repaired["repair_lineage"][0]["failed_roles"], ["side_full_body"])
         self.assertEqual(
             repaired["repair_lineage"][0]["operation"],
             QWEN_IMAGE_EDIT_OPERATION,
@@ -432,11 +449,37 @@ class CharacterSheetWorkflowTests(unittest.TestCase):
         after_accepted = {
             panel["role"]: json.dumps(panel, sort_keys=True, separators=(",", ":"))
             for panel in repaired["panels"]
-            if panel["role"] != "profile"
+            if panel["role"] != "side_full_body"
         }
         self.assertEqual(after_accepted, before_accepted)
         self.assertEqual(repaired["panels"][2]["sha256"], replacement["sha256"])
         self.assertNotEqual(repaired["plan_seal"], plan["plan_seal"])
+
+    def test_review_off_is_sealed_and_user_selected_failed_role_can_be_repaired(self):
+        off_resources = self._resource_base()
+        off_resources["reviewer"] = None
+        off_plan = self._plan(resources=self._authorize(off_resources))
+        self.assertIsNone(off_plan["resources"]["reviewer"])
+        self.assertEqual(off_plan["provenance"]["review_locality"], "off")
+        self.assertEqual(public_character_sheet_plan(off_plan)["review_locality"], "off")
+        self.assertEqual(validate_character_sheet_plan(off_plan), off_plan)
+
+        replacement = copy.deepcopy(off_plan["panels"][2])
+        replacement["sha256"] = _sha("owner-selected-side-repair")
+        repaired = apply_failed_panel_repairs(
+            off_plan,
+            failed_roles=["side_full_body"],
+            repaired_panels=[replacement],
+        )
+        self.assertEqual(repaired["provenance"]["review_locality"], "off")
+        self.assertEqual(
+            public_character_sheet_plan(repaired)["repaired_roles"],
+            ["side_full_body"],
+        )
+
+        on_plan = self._plan()
+        self.assertNotEqual(off_plan["plan_seal"], on_plan["plan_seal"])
+        self.assertEqual(on_plan["provenance"]["review_locality"], "local_vlm")
 
     def test_repair_rejects_extra_unchanged_moved_or_unordered_panels(self):
         plan = self._plan()
@@ -445,26 +488,26 @@ class CharacterSheetWorkflowTests(unittest.TestCase):
         with self.assertRaises(CharacterSheetWorkflowError):
             apply_failed_panel_repairs(
                 plan,
-                failed_roles=["profile"],
+                failed_roles=["side_full_body"],
                 repaired_panels=[replacement, copy.deepcopy(plan["panels"][3])],
             )
         unchanged = copy.deepcopy(plan["panels"][2])
         with self.assertRaises(CharacterSheetWorkflowError):
             apply_failed_panel_repairs(
-                plan, failed_roles=["profile"], repaired_panels=[unchanged],
+                plan, failed_roles=["side_full_body"], repaired_panels=[unchanged],
             )
         moved = copy.deepcopy(replacement)
         moved["x"] += 1
         with self.assertRaises(CharacterSheetWorkflowError):
             apply_failed_panel_repairs(
-                plan, failed_roles=["profile"], repaired_panels=[moved],
+                plan, failed_roles=["side_full_body"], repaired_panels=[moved],
             )
         replacement_back = copy.deepcopy(plan["panels"][3])
         replacement_back["sha256"] = _sha("replacement-back")
         with self.assertRaises(CharacterSheetWorkflowError):
             apply_failed_panel_repairs(
                 plan,
-                failed_roles=["back", "profile"],
+                failed_roles=["back_full_body", "side_full_body"],
                 repaired_panels=[replacement_back, replacement],
             )
 
@@ -473,12 +516,12 @@ class CharacterSheetWorkflowTests(unittest.TestCase):
         profile = copy.deepcopy(plan["panels"][2])
         profile["sha256"] = _sha("profile-repair-one")
         first = apply_failed_panel_repairs(
-            plan, failed_roles=["profile"], repaired_panels=[profile],
+            plan, failed_roles=["side_full_body"], repaired_panels=[profile],
         )
         back = copy.deepcopy(first["panels"][3])
         back["sha256"] = _sha("back-repair-two")
         second = apply_failed_panel_repairs(
-            first, failed_roles=["back"], repaired_panels=[back],
+            first, failed_roles=["back_full_body"], repaired_panels=[back],
         )
         self.assertEqual(len(second["repair_lineage"]), 2)
         self.assertEqual(second["repair_lineage"][1]["attempt"], 2)
@@ -498,7 +541,7 @@ class CharacterSheetWorkflowTests(unittest.TestCase):
         other_profile["sha256"] = profile["sha256"]
         other_first = apply_failed_panel_repairs(
             other_base,
-            failed_roles=["profile"],
+            failed_roles=["side_full_body"],
             repaired_panels=[other_profile],
         )
         spliced = copy.deepcopy(first)
@@ -513,7 +556,7 @@ class CharacterSheetWorkflowTests(unittest.TestCase):
         replacement = copy.deepcopy(plan["panels"][2])
         replacement["sha256"] = _sha("moved-persisted-replacement")
         repaired = apply_failed_panel_repairs(
-            plan, failed_roles=["profile"], repaired_panels=[replacement],
+            plan, failed_roles=["side_full_body"], repaired_panels=[replacement],
         )
         candidate = copy.deepcopy(repaired)
         event = candidate["repair_lineage"][0]

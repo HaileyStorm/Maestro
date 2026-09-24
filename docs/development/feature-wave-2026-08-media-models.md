@@ -140,28 +140,47 @@ panels. The card also documents prompt sensitivity, text errors, imperfect
 cross-view identity, mainly-human training data, and a `ref_boost` fidelity dial
 whose excessive values can damage edits.
 
+The first FLUX LoRA candidate is
+[`QuadView_klein9b_v1.safetensors`](https://huggingface.co/Alissonerdx/CharacterSheet/blob/3dc4295163dacc924d213168d67bf16850fd954f/QuadView_klein9b_v1.safetensors),
+331,379,560 bytes with SHA-256
+`d05d84e1dfcfffa8b099e562a11b0e26720a982b0dad0f872289ce5945c75d71`.
+The repository labels its license `civitai-model-license`; pin and review the
+exact creator terms and the FLUX.2 Klein 9B base terms before managed download
+or enabling the profile. No LoRA installation or generation is established by
+this source pin.
+
 ### Proposed workflow
 
-1. **Anchor:** generate or choose one accepted high-quality character image.
-   The anchor model remains user-selectable; existing Flux, Krea, Qwen, or
-   imported project media can qualify.
+1. **Anchor:** generate or choose one accepted FLUX character image. The
+   server must verify its model provenance and project ownership; an imported
+   image qualifies only when that FLUX provenance can be verified. This
+   incorporates the later owner decision in `docs/operations/USER_TODO.md`.
 2. **Sheet model:** expose a dropdown:
    - `Quad — FLUX.2 Klein` as the conservative default where supported;
    - `Quad — Krea 2` as the stronger Krea alternative;
    - `Dynamic — Krea 2 (experimental)` for the structured concept sheet;
    - later, `Triple — FLUX.2 Klein` for lower-cost turnaround-only work.
+   The [current CharacterSheet card](https://huggingface.co/Alissonerdx/CharacterSheet)
+   defines Quad as a face close-up plus front, side, and back full-body views;
+   Triple is front, side, and back full-body views. A three-quarter panel is
+   not part of either fixed layout.
 3. **Plan:** use the selected local VLM (Qwen3-VL when available) to describe
    invariant identity traits and generate the exact structured prompt required
    by the chosen LoRA. This is creative planning, not moderation.
 4. **Generate:** keep native resolution and model-specific defaults server-owned.
    Initial evidence suggests 1536x1024, about 8 steps for Klein, about 10 steps
    for accelerated Krea variants, and an optional slower Krea Raw profile.
-5. **Review:** run local VLM checks for character identity, view coverage,
-   duplicated/missing panels, layout, and obvious label corruption. Surface the
-   evidence and keep user acceptance authoritative.
-6. **Repair:** pass only failed panels or callouts to an existing Qwen Image Edit
-   model. Preserve accepted panels and the original anchor; never regenerate the
+5. **Review:** offer local VLM checks for character identity, view coverage,
+   duplicated/missing panels, layout, and obvious label corruption. Visual
+   review starts Off and is optional under the later owner decision. Surface
+   its evidence when selected and keep user acceptance authoritative.
+6. **Repair:** pass only failed panels or callouts selected by the user or
+   identified during optional review to an existing Qwen Image Edit model.
+   Preserve accepted panels and the original anchor; never regenerate the
    entire sheet merely because one label failed.
+   The executor must gate editor availability when repair is selected; the
+   current planning-only profile gate still treats it as mandatory and must be
+   adapted before enabling initial sheet generation without repair.
 7. **Publish:** save the accepted sheet as a Reference Studio artifact with
    anchor/model/LoRA hashes, prompt, seed, VLM/editor revisions, per-panel
    repair lineage, terms/license acceptance, and identity references available

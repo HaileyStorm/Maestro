@@ -76,19 +76,20 @@ const typesUrl = new URL('../src/types/index.ts', import.meta.url)
 
 function characterSheetCapabilities() {
   return {
-    schema_version: 1,
+    schema_version: 2,
     capability_id: 'character_sheet',
     server_authored: true,
     selection: {
       default_profile_id: 'quad_flux2_klein',
       client_may_enable_profiles: false,
+      review_default: 'off',
     },
     workflow: [
-      { id: 'anchor', label: 'Create the anchor image', order: 0, required: true },
-      { id: 'local_vlm_review', label: 'Review locally with the VLM', order: 1, required: true },
+      { id: 'anchor', label: 'Choose a verified FLUX anchor', order: 0, required: true },
+      { id: 'local_vlm_review', label: 'Optional local visual review', order: 1, required: false },
       {
         id: 'qwen_image_edit_repair', label: 'Repair with Qwen Image Edit',
-        order: 2, required: false, condition: 'review_finds_failed_roles',
+        order: 2, required: false, condition: 'failed_roles_selected',
       },
     ],
     profiles: [
@@ -1628,6 +1629,7 @@ test('Character Sheet capability decoder rejects drift and private fields withou
   assert.deepEqual(decodeProjectReferenceCharacterSheetCapabilities(exact), exact)
 
   const cases = [
+    value => { value.schema_version = 1 },
     value => { value.profiles[0].available = true },
     value => { value.profiles[0].executable = true },
     value => { value.profiles[0].label = 'AVAILABLE NOW: /private/model/path' },
@@ -1635,7 +1637,9 @@ test('Character Sheet capability decoder rejects drift and private fields withou
     value => { value.profiles.reverse() },
     value => { value.selection.default_profile_id = 'quad_krea2' },
     value => { value.selection.client_may_enable_profiles = true },
+    value => { value.selection.review_default = 'on' },
     value => { value.workflow[0].label = 'Read private project prompt' },
+    value => { value.workflow[1].required = true },
     value => { value.workflow[2].condition = 'always' },
   ]
   for (const mutate of cases) {
@@ -2245,7 +2249,8 @@ test('component source guards lifecycle, accessibility, mobile flow, and sheet-o
   assert.match(source, /Quad Krea and Dynamic Krea are unavailable while legal use is unresolved/)
   assert.match(source, /Dynamic is experimental and will not be selected automatically/)
   assert.match(source, /Triple FLUX is planned for later/)
-  assert.match(source, /review it locally with the VLM, then use Qwen Image Edit only for roles that need repair/)
+  assert.match(source, /use a verified FLUX anchor\. Local visual review will start Off and be optional/)
+  assert.match(source, /Qwen Image Edit will be available for roles that need repair/)
   assert.doesNotMatch(source, />legal_blocked</)
   assert.match(source, /Anatomy \/ Nude/)
   assert.match(source, /underwear \/ underlayers/)

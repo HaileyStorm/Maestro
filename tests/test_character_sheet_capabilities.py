@@ -55,30 +55,33 @@ class CharacterSheetCapabilityTests(unittest.TestCase):
         self.assertFalse(any(profile["available"] for profile in projection["profiles"]))
         self.assertFalse(any(profile["executable"] for profile in projection["profiles"]))
         self.assertFalse(projection["selection"]["client_may_enable_profiles"])
+        self.assertEqual(projection["selection"]["review_default"], "off")
 
     def test_projection_has_exact_required_workflow(self) -> None:
-        workflow = character_sheet_capability_projection()["workflow"]
+        projection = character_sheet_capability_projection()
+        self.assertEqual(projection["schema_version"], 2)
+        workflow = projection["workflow"]
         self.assertEqual(
             workflow,
             [
                 {
                     "id": "anchor",
-                    "label": "Create the anchor image",
+                    "label": "Choose a verified FLUX anchor",
                     "order": 0,
                     "required": True,
                 },
                 {
                     "id": "local_vlm_review",
-                    "label": "Review locally with the VLM",
+                    "label": "Optional local visual review",
                     "order": 1,
-                    "required": True,
+                    "required": False,
                 },
                 {
                     "id": "qwen_image_edit_repair",
                     "label": "Repair with Qwen Image Edit",
                     "order": 2,
                     "required": False,
-                    "condition": "review_finds_failed_roles",
+                    "condition": "failed_roles_selected",
                 },
             ],
         )

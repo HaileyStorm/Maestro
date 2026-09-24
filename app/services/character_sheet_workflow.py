@@ -20,8 +20,8 @@ from types import MappingProxyType
 from typing import Any
 
 
-CONTRACT_SCHEMA_VERSION = 1
-PLANNER_VERSION = "character-sheet-workflow-v1"
+CONTRACT_SCHEMA_VERSION = 2
+PLANNER_VERSION = "character-sheet-workflow-v2"
 DEFAULT_PROFILE_ID = "quad_flux2_klein"
 QWEN_IMAGE_EDIT_OPERATION = "qwen_image_edit"
 AUTHORIZATION_MAX_TTL_SECONDS = 900
@@ -31,10 +31,10 @@ _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _MAX_COORDINATE = 1_000_000
 
 _QUAD_ROLES = (
-    "identity_front",
-    "three_quarter",
-    "profile",
-    "back",
+    "face_closeup",
+    "front_full_body",
+    "side_full_body",
+    "back_full_body",
 )
 _DYNAMIC_ROLES = (
     "hero",
@@ -45,7 +45,7 @@ _DYNAMIC_ROLES = (
     "detail",
     "metadata",
 )
-_TRIPLE_ROLES = ("identity_front", "profile", "back")
+_TRIPLE_ROLES = ("front_full_body", "side_full_body", "back_full_body")
 
 
 PROFILE_DEFINITIONS: Mapping[str, Mapping[str, Any]] = MappingProxyType({
@@ -93,6 +93,7 @@ PROFILE_DEFINITIONS: Mapping[str, Mapping[str, Any]] = MappingProxyType({
 
 _ANCHOR_KEYS = frozenset({
     "schema_version", "project_id", "anchor_id", "kind", "sha256",
+    "source_model_id", "source_model_family",
 })
 _PROJECT_KEYS = frozenset({"project_id"})
 _RESOURCE_KEYS = frozenset({
@@ -251,12 +252,18 @@ def _normalize_anchor(value: Any, *, project_id: str) -> dict[str, Any]:
     kind = value["kind"]
     if type(kind) is not str or kind not in {"generated", "imported"}:
         raise CharacterSheetWorkflowError("Character Sheet anchor kind is invalid.")
+    if type(value["source_model_family"]) is not str or value["source_model_family"] != "flux":
+        raise CharacterSheetWorkflowError("Character Sheet requires a verified FLUX anchor.")
     return {
         "schema_version": CONTRACT_SCHEMA_VERSION,
         "project_id": anchor_project,
         "anchor_id": _identifier(value["anchor_id"], name="anchor.anchor_id"),
         "kind": kind,
         "sha256": _digest(value["sha256"], name="anchor.sha256"),
+        "source_model_id": _identifier(
+            value["source_model_id"], name="anchor.source_model_id",
+        ),
+        "source_model_family": "flux",
     }
 
 
@@ -314,7 +321,10 @@ def _normalize_resource_base(value: Any, *, profile_id: str) -> dict[str, Any]:
             ),
         },
         "planner": _local_resource(value["planner"], name="planner"),
-        "reviewer": _local_resource(value["reviewer"], name="reviewer"),
+        "reviewer": (
+            None if value["reviewer"] is None
+            else _local_resource(value["reviewer"], name="reviewer")
+        ),
         "editor": {
             **_revision_resource(
                 {"id": editor["id"], "revision": editor["revision"]},
@@ -765,7 +775,9 @@ def _unsigned_plan(
         "version": PLANNER_VERSION,
         "generation_sequence": "accepted_anchor_then_sheet_lora",
         "planning_locality": "local_vlm",
-        "review_locality": "local_vlm",
+        "review_locality": (
+            "off" if resources["reviewer"] is None else "local_vlm"
+        ),
         "repair_operation": QWEN_IMAGE_EDIT_OPERATION,
         "resource_manifest_commitment": _seal(
             "character-sheet-resource-manifest-v1", resources,
@@ -1149,7 +1161,7 @@ def public_character_sheet_plan(value: Any) -> dict[str, Any]:
         "repair_attempt_count": len(plan["repair_lineage"]),
         "repaired_roles": list(dict.fromkeys(repaired_roles)),
         "planning_locality": "local_vlm",
-        "review_locality": "local_vlm",
+        "review_locality": plan["provenance"]["review_locality"],
         "private_output": True,
     }
 

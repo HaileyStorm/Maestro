@@ -3244,7 +3244,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                     </p>
                     {characterSheetCapabilities && (
                       <p className="mt-1 text-[8px] leading-relaxed text-text-muted">
-                        Quad Krea and Dynamic Krea are unavailable while legal use is unresolved. Dynamic is experimental and will not be selected automatically. Triple FLUX is planned for later. When enabled, the workflow will create an anchor, review it locally with the VLM, then use Qwen Image Edit only for roles that need repair.
+                        Quad Krea and Dynamic Krea are unavailable while legal use is unresolved. Dynamic is experimental and will not be selected automatically. Triple FLUX is planned for later. When enabled, the workflow will use a verified FLUX anchor. Local visual review will start Off and be optional; Qwen Image Edit will be available for roles that need repair.
                       </p>
                     )}
                   </fieldset>

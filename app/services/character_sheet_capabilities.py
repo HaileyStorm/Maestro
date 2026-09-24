@@ -13,7 +13,7 @@ from typing import Any
 from services.character_sheet_workflow import character_sheet_profile_catalog
 
 
-CAPABILITY_SCHEMA_VERSION = 1
+CAPABILITY_SCHEMA_VERSION = 2
 CAPABILITY_ID = "character_sheet"
 MAX_CAPABILITY_BYTES = 16_384
 MAX_STRING_LENGTH = 128
@@ -73,22 +73,22 @@ _PROFILE_SPECS = (
 _WORKFLOW_STEPS = (
     {
         "id": "anchor",
-        "label": "Create the anchor image",
+        "label": "Choose a verified FLUX anchor",
         "order": 0,
         "required": True,
     },
     {
         "id": "local_vlm_review",
-        "label": "Review locally with the VLM",
+        "label": "Optional local visual review",
         "order": 1,
-        "required": True,
+        "required": False,
     },
     {
         "id": "qwen_image_edit_repair",
         "label": "Repair with Qwen Image Edit",
         "order": 2,
         "required": False,
-        "condition": "review_finds_failed_roles",
+        "condition": "failed_roles_selected",
     },
 )
 
@@ -143,6 +143,7 @@ def character_sheet_capability_projection() -> dict[str, Any]:
         "selection": {
             "default_profile_id": "quad_flux2_klein",
             "client_may_enable_profiles": False,
+            "review_default": "off",
         },
         "workflow": [deepcopy(step) for step in _WORKFLOW_STEPS],
         "profiles": [deepcopy(profile) for profile in _PROFILE_SPECS],
