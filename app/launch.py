@@ -24880,7 +24880,8 @@ def _snapshot_project_asset_refs(
     provenance = []
     path_provenance = []
     staged_paths = []
-    uploads_root = os.path.join(_app_dir, "uploads")
+    configured_uploads_root = os.path.join(_app_dir, "uploads")
+    uploads_root = os.path.realpath(configured_uploads_root)
     recovery_root = os.path.join(uploads_root, ".maestro-recovery")
     staging_directory = None
     try:
@@ -24986,8 +24987,13 @@ def _snapshot_project_asset_refs(
                         detail=f"This model supports at most {maximum} image reference(s)",
                     )
 
-            os.makedirs(uploads_root, exist_ok=True)
-            if os.path.islink(uploads_root) or not os.path.isdir(uploads_root):
+            # Existing installations may place uploads on another volume via
+            # a symlink. Use the same canonical root as queue recovery and
+            # upload access checks, while rejecting a dangling link.
+            if os.path.islink(configured_uploads_root) and not os.path.isdir(configured_uploads_root):
+                raise HTTPException(status_code=503, detail="Private upload storage is unavailable")
+            os.makedirs(configured_uploads_root, exist_ok=True)
+            if not os.path.isdir(uploads_root):
                 raise HTTPException(status_code=503, detail="Private upload storage is unavailable")
             os.makedirs(recovery_root, mode=0o700, exist_ok=True)
             recovery_info = os.lstat(recovery_root)

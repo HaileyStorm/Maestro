@@ -200,6 +200,19 @@ class SceneKitGenerateReferenceTests(unittest.TestCase):
         source = Path(self.store.resolve_output_path("film_1", "main", output[index]["relative_path"]))
         return source.read_bytes()
 
+    def test_existing_upload_volume_symlink_stages_into_canonical_private_root(self):
+        asset = self._asset()
+        upload_volume = self.base / "upload-volume"
+        upload_volume.mkdir()
+        (self.base / "uploads").symlink_to(upload_volume, target_is_directory=True)
+
+        paths, _provenance, _path_provenance = self._snapshot([self._descriptor(asset)])
+
+        self.assertEqual(len(paths), 1)
+        self.assertTrue(Path(paths[0]).is_relative_to(upload_volume))
+        self.assertTrue(can_access_upload(paths[0], SESSION))
+        self.assertEqual(Path(paths[0]).read_bytes(), self._png("front.png").read_bytes())
+
     def test_exact_output_order_and_kept_state_are_required_before_copy(self):
         asset = self._asset(outputs=[
             {"source_path": self._png("front.png"), "label": "Front"},

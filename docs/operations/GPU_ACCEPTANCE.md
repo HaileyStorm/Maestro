@@ -1262,3 +1262,28 @@ retained the succeeded training job, private checkpoint, completed take and
 unchanged WAV hash. Maestro stayed ready through the stable share, and its
 refreshed project view still showed the checkpoint and take. This checks one
 backend restart, not a full machine restart or owner listening acceptance.
+
+## 2026-09-24 Scene Kit to Generate two-reference image
+
+In the signed-in stable-share UI, project `codex-scene-kit-20260924` staged a
+kept Character variant followed by a kept Location variant. The first live
+submission failed before queue admission because the new private snapshot code
+rejected this installation's existing uploads-volume symlink. A focused repair
+canonicalized that upload root, retained the private recovery directory and
+sidecar checks, and added a symlink-layout regression test. After a Pinokio
+restart and fresh local/stable readiness checks, the same UI submitted a
+FLUX.2 Klein 9B image under an exact, continuously monitored `maestro-local`
+GPU grant. The grant was validated immediately before submission.
+
+The durable request for job `1b790811853d4acbb6fb5a096ea6743b` contains
+the exact ordered output IDs `7dfa607bc24d4e1d9bbab6c3fd44b453` (red robot)
+and `f4dd2d1c66324849a253344c9df471e9` (dusk rooftop), each with its
+asset/variant identity, label, project-relative media path and private staged
+copy. Both staged inputs have recovery hashes. The queue advanced through
+running and cleared; Gallery showed one finished 640 × 640 PNG. The file's
+SHA-256, `32912c7ea22d328bca06c20ed24da2cf6ca4bc75fe9055de242750e41b36699b`,
+matches its producer sidecar. Direct visual inspection found the red circular
+robot, white eyes and yellow triangular chest mark on a city rooftop at dusk.
+The first failed pre-queue tile remains visible separately. This accepts one
+two-reference image path on this host and transport, not all models, all
+reference combinations or owner aesthetic approval.
