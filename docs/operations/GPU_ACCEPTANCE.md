@@ -1162,6 +1162,7 @@ quality, performance, Windows, and running-service adoption remain open.
 
 ## 2026-09-24 YuE2 joint-v9 decoder comparison
 
+Sound/Vision source `17249d7` and Maestro source `691932b` bind this check.
 The installed Sound/Vision service reported the optional `joint-v9` decoder
 available after validating the pinned tokenizer head and NAR adapter, plus the
 configured YuE2-3B model architecture. The signed-in Maestro stable-share UI
