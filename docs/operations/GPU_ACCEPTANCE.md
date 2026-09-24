@@ -1235,5 +1235,30 @@ Sound/Vision's full backend suite passed with 285 tests and one skip; its
 browser suite and both application builds passed. After a zero-activity
 service restart, the live Sound/Vision training API returned the retained
 step-200 checkpoint with the expected SHA-256 and no host path. A real
-checkpoint-audition generation, output assessment by ear, and signed-in
-Maestro UI acceptance remain separate from that CPU and API evidence.
+checkpoint-audition generation and signed-in Maestro UI check were separate
+from that CPU and API evidence.
+
+After the coordinated Maestro restart, the signed-in stable-share UI displayed
+the step-200 checkpoint as private to `codex-live-matrix-20260921`, with its
+exact ID and SHA-256. Switching to project `Test` removed that checkpoint
+from the picker; returning to the training project restored it unselected.
+The browser then submitted take `6c4bfc04ba1748a38a59d6f005e1b2cd` with
+only checkpoint `88ba35d0a98ec1f1733ba610bde1a521` at strength 1.0. The
+Sound/Vision worker obtained a fresh 20-minute grant for that take; the
+coherent coordinator check returned `authorized: true` for the exact project,
+agent and workspace before inference. The grant was withdrawn on completion,
+and the coordinator reported no remaining reservation.
+
+The take succeeded and appeared in the same project's My Music library. Its
+delivered 48 kHz stereo float WAV is 51.358667 seconds, 19,721,816 bytes,
+SHA-256 `b6cb45a9d059d7ee96b2c8d68952c4a3621c1a156ea4b12e1e28f53189d04da2`.
+The result records the selected checkpoint's SHA-256, AR and NAR adapters,
+224 adapter modules and 392 model-weight updates. It reports no warning or
+ABC/semantic truncation. This is live checkpoint loading, generation and
+stable-share UI evidence. The two-bar supplied ABC produced much longer audio
+than its nominal score time; duration fidelity and listening quality remain
+open. After two zero-activity checks, the first Sound/Vision service restart
+retained the succeeded training job, private checkpoint, completed take and
+unchanged WAV hash. Maestro stayed ready through the stable share, and its
+refreshed project view still showed the checkpoint and take. This checks one
+backend restart, not a full machine restart or owner listening acceptance.
