@@ -169,6 +169,8 @@ class CharacterSheetWorkflowTests(unittest.TestCase):
         return build_character_sheet_plan(**values)
 
     def test_catalog_has_exact_choices_and_no_invented_executable_profile(self):
+        self.assertEqual(CONTRACT_SCHEMA_VERSION, 3)
+        self.assertEqual(_workflow.PLANNER_VERSION, "character-sheet-workflow-v3")
         catalog = character_sheet_profile_catalog()
         self.assertEqual(
             [item["id"] for item in catalog],
@@ -211,6 +213,42 @@ class CharacterSheetWorkflowTests(unittest.TestCase):
         unavailable["execution_authorization"]["status"] = "blocked"
         with self.assertRaises(CharacterSheetWorkflowError):
             self._plan(resources=unavailable)
+
+    def test_initial_plan_allows_no_editor_but_repair_requires_one(self):
+        without_editor = self._resource_base()
+        without_editor["editor"] = None
+        resources = self._authorize(without_editor)
+        plan = self._plan(resources=resources)
+        self.assertIsNone(plan["resources"]["editor"])
+        self.assertEqual(validate_character_sheet_plan(plan), plan)
+        repaired_panel = {
+            **self._panels()[0],
+            "sha256": _sha("replacement-face"),
+        }
+        with self.assertRaisesRegex(
+            CharacterSheetWorkflowError, "repair requires a local Qwen Image Edit",
+        ):
+            apply_failed_panel_repairs(
+                plan,
+                failed_roles=["face_closeup"],
+                repaired_panels=[repaired_panel],
+            )
+
+        present = self._plan()
+        repaired = apply_failed_panel_repairs(
+            present,
+            failed_roles=["face_closeup"],
+            repaired_panels=[repaired_panel],
+        )
+        tampered = copy.deepcopy(plan)
+        tampered["repair_lineage"] = repaired["repair_lineage"]
+        with self.assertRaisesRegex(
+            CharacterSheetWorkflowError, "repair requires a local Qwen Image Edit",
+        ):
+            validate_character_sheet_plan(tampered)
+        self.assertNotEqual(
+            present["commitments"]["editor"], plan["commitments"]["editor"],
+        )
 
     def test_authorization_is_short_lived_and_bound_to_exact_private_inputs(self):
         authorization = self._resources()

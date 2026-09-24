@@ -2,7 +2,7 @@
 
 This resolver consumes only server-resolved component descriptors.  It does
 not accept a client attestation, inspect creative content, or change the public
-v1 workflow/capability catalog.  Its result is a non-authoritative readiness
+workflow/capability catalog.  Its result is a non-authoritative readiness
 snapshot: a future launch adapter must resolve the server stores again
 immediately before execution.  Returned commitments bind the private facts
 without exposing identifiers, revisions, evidence records, or policy times.
@@ -24,8 +24,8 @@ from services.character_sheet_workflow import PROFILE_DEFINITIONS
 from services.model_terms import model_terms_manifest_valid, model_terms_statuses
 
 
-PROFILE_GATE_SCHEMA_VERSION = 2
-PROFILE_GATE_RESOLVER = "character-sheet-profile-gate-v2"
+PROFILE_GATE_SCHEMA_VERSION = 3
+PROFILE_GATE_RESOLVER = "character-sheet-profile-gate-v3"
 _COMPONENT_KEYS = frozenset({"base_model", "lora", "project", "vlm", "editor"})
 _MODEL_KEYS = frozenset({
     "source", "model_type", "revision", "artifact_ready", "authorization_ready",
@@ -273,6 +273,7 @@ def resolve_character_sheet_profile_gate(
     services: dict[str, object],
     *,
     profile: str | None = None,
+    repair_requested: bool = False,
     components: dict[str, object],
     model_defs: dict[str, Mapping[str, Any]],
 ) -> dict[str, object]:
@@ -280,9 +281,13 @@ def resolve_character_sheet_profile_gate(
 
     A launch adapter must resolve every server store again immediately before
     execution; this function never grants or represents execution authority.
+    An editor may be absent or named without being ready for initial generation;
+    actual failed-role repair requires a fresh ``repair_requested=True`` gate.
     """
     if type(services) is not dict:
         raise CharacterSheetProfileGateError("services must be an exact dictionary.")
+    if type(repair_requested) is not bool:
+        raise CharacterSheetProfileGateError("repair_requested must be a boolean.")
     if type(model_defs) is not dict or not all(type(key) is str for key in model_defs):
         raise CharacterSheetProfileGateError("model_defs must be an exact dictionary.")
     _require_exact_dict(components, _COMPONENT_KEYS, name="components")
@@ -342,8 +347,18 @@ def resolve_character_sheet_profile_gate(
     vlm_gate = _readiness_gate(
         components["vlm"], label="vlm", require_local=True
     )
-    editor_gate = _readiness_gate(
-        components["editor"], label="editor", require_local=True
+    editor_gate = (
+        {
+            "ready": False,
+            "local": False,
+            "commitment": _commit(
+                f"{PROFILE_GATE_RESOLVER}:editor:gate", {"present": False},
+            ),
+        }
+        if components["editor"] is None
+        else _readiness_gate(
+            components["editor"], label="editor", require_local=True
+        )
     )
     owner_gate = _owner_gate(services, applicable=profile_id in _KREA_PROFILES)
     gates = {
@@ -374,10 +389,11 @@ def resolve_character_sheet_profile_gate(
             reasons.append("vlm_not_ready")
         if vlm_gate["local"] is not True:
             reasons.append("vlm_must_be_local")
-        if editor_gate["ready"] is not True:
-            reasons.append("editor_not_ready")
-        if editor_gate["local"] is not True:
-            reasons.append("editor_must_be_local")
+        if repair_requested:
+            if editor_gate["ready"] is not True:
+                reasons.append("editor_not_ready")
+            if editor_gate["local"] is not True:
+                reasons.append("editor_must_be_local")
 
     status = (
         "later_unavailable"
@@ -390,6 +406,7 @@ def resolve_character_sheet_profile_gate(
         "profile": profile_id,
         "profile_status": definition["status"],
         "selection": selection,
+        "repair_requested": repair_requested,
         "experimental": definition["experimental"],
         "status": status,
         "execution_authority": False,

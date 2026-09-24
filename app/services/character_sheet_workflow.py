@@ -20,8 +20,8 @@ from types import MappingProxyType
 from typing import Any
 
 
-CONTRACT_SCHEMA_VERSION = 2
-PLANNER_VERSION = "character-sheet-workflow-v2"
+CONTRACT_SCHEMA_VERSION = 3
+PLANNER_VERSION = "character-sheet-workflow-v3"
 DEFAULT_PROFILE_ID = "quad_flux2_klein"
 QWEN_IMAGE_EDIT_OPERATION = "qwen_image_edit"
 AUTHORIZATION_MAX_TTL_SECONDS = 900
@@ -298,9 +298,9 @@ def _normalize_resource_base(value: Any, *, profile_id: str) -> dict[str, Any]:
     if type(terms) is not dict or set(terms) != _TERMS_KEYS:
         raise CharacterSheetWorkflowError("terms resource schema is invalid.")
     editor = value["editor"]
-    if type(editor) is not dict or set(editor) != _EDITOR_KEYS:
+    if editor is not None and (type(editor) is not dict or set(editor) != _EDITOR_KEYS):
         raise CharacterSheetWorkflowError("editor resource schema is invalid.")
-    if (
+    if editor is not None and (
         editor["local"] is not True
         or type(editor["operation"]) is not str
         or editor["operation"] != QWEN_IMAGE_EDIT_OPERATION
@@ -325,7 +325,7 @@ def _normalize_resource_base(value: Any, *, profile_id: str) -> dict[str, Any]:
             None if value["reviewer"] is None
             else _local_resource(value["reviewer"], name="reviewer")
         ),
-        "editor": {
+        "editor": None if editor is None else {
             **_revision_resource(
                 {"id": editor["id"], "revision": editor["revision"]},
                 name="editor",
@@ -941,6 +941,14 @@ def validate_character_sheet_plan(
             "Character Sheet authorization evidence does not match."
         )
     panels = _normalize_panels(value["panels"], profile_id=profile_id)
+    if (
+        resources["editor"] is None
+        and type(value["repair_lineage"]) is list
+        and value["repair_lineage"]
+    ):
+        raise CharacterSheetWorkflowError(
+            "Character Sheet repair requires a local Qwen Image Edit resource."
+        )
     anchor_commitment = _seal("character-sheet-anchor-v1", anchor)
     resource_commitments = _resource_commitments(resources, seed=seed)
     lineage, initial_panels_commitment = _normalize_lineage(
@@ -1010,6 +1018,10 @@ def apply_failed_panel_repairs(
 ) -> dict[str, Any]:
     """Replace exactly failed panels while preserving every accepted component."""
     clean = validate_character_sheet_plan(plan)
+    if clean["resources"]["editor"] is None:
+        raise CharacterSheetWorkflowError(
+            "Character Sheet repair requires a local Qwen Image Edit resource."
+        )
     roles = tuple(PROFILE_DEFINITIONS[clean["profile"]]["panel_roles"])
     if (
         type(failed_roles) is not list

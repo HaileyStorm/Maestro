@@ -110,7 +110,7 @@ class CharacterSheetProfileGateTests(unittest.TestCase):
         )
         return services
 
-    def _resolve(self, services=None, *, profile=None, components=None):
+    def _resolve(self, services=None, *, profile=None, components=None, repair_requested=False):
         with patch(
             "services.character_sheet_profile_gate.model_terms_statuses",
             side_effect=self._terms,
@@ -118,16 +118,18 @@ class CharacterSheetProfileGateTests(unittest.TestCase):
             return resolve_character_sheet_profile_gate(
                 {} if services is None else services,
                 profile=profile,
+                repair_requested=repair_requested,
                 components=self.components if components is None else components,
                 model_defs=self.model_defs,
             )
 
     def test_omitted_profile_is_allowed_conservative_flux_default(self):
         decision = self._resolve()
-        self.assertEqual(decision["schema_version"], 2)
+        self.assertEqual(decision["schema_version"], 3)
         self.assertEqual(decision["resolver"], PROFILE_GATE_RESOLVER)
         self.assertEqual(decision["profile"], "quad_flux2_klein")
         self.assertEqual(decision["selection"], "default")
+        self.assertFalse(decision["repair_requested"])
         self.assertFalse(decision["experimental"])
         self.assertEqual(decision["status"], "ready_snapshot")
         self.assertEqual(decision["profile_status"], "requires_server_authorization")
@@ -229,9 +231,45 @@ class CharacterSheetProfileGateTests(unittest.TestCase):
             with self.subTest(component=component, field=field):
                 changed = copy.deepcopy(self.components)
                 changed[component][field] = value
-                decision = self._resolve(components=changed)
+                decision = self._resolve(
+                    components=changed,
+                    repair_requested=component == "editor",
+                )
                 self.assertEqual(decision["status"], "blocked")
                 self.assertEqual(decision["reasons"], [reason])
+
+    def test_initial_generation_does_not_require_editor_until_repair_is_selected(self):
+        no_editor = copy.deepcopy(self.components)
+        no_editor["editor"] = None
+        without_editor = self._resolve(components=no_editor)
+        self.assertEqual(without_editor["status"], "ready_snapshot")
+        self.assertFalse(without_editor["gates"]["editor"]["ready"])
+        self.assertEqual(
+            self._resolve(components=no_editor, repair_requested=True)["reasons"],
+            ["editor_not_ready", "editor_must_be_local"],
+        )
+
+        missing_editor = copy.deepcopy(self.components)
+        missing_editor["editor"]["ready"] = False
+        missing_editor["editor"]["local"] = False
+        initial = self._resolve(components=missing_editor)
+        self.assertEqual(initial["status"], "ready_snapshot")
+        self.assertEqual(initial["reasons"], [])
+        self.assertFalse(initial["repair_requested"])
+        self.assertFalse(initial["gates"]["editor"]["ready"])
+
+        repair = self._resolve(components=missing_editor, repair_requested=True)
+        self.assertEqual(repair["status"], "blocked")
+        self.assertEqual(
+            repair["reasons"], ["editor_not_ready", "editor_must_be_local"],
+        )
+        self.assertTrue(repair["repair_requested"])
+        self.assertNotEqual(initial["profile_commitment"], repair["profile_commitment"])
+
+        restored_editor = copy.deepcopy(self.components)
+        allowed_repair = self._resolve(components=restored_editor, repair_requested=True)
+        self.assertEqual(allowed_repair["status"], "ready_snapshot")
+        self.assertEqual(allowed_repair["reasons"], [])
 
     def test_base_and_lora_terms_fail_independently_from_owner_policy(self):
         def terms(_services, model_type, _model_defs):
@@ -520,6 +558,18 @@ class CharacterSheetProfileGateTests(unittest.TestCase):
                         model_defs=model_defs,
                     )
 
+        for invalid_repair_request in (None, 0, 1, "false", _StrSubclass("true")):
+            with self.subTest(repair_requested=repr(invalid_repair_request)):
+                with self.assertRaisesRegex(
+                    CharacterSheetProfileGateError, "repair_requested must be a boolean",
+                ):
+                    resolve_character_sheet_profile_gate(
+                        {},
+                        repair_requested=invalid_repair_request,
+                        components=self.components,
+                        model_defs=self.model_defs,
+                    )
+
         for component, field, invalid in (
             ("base_model", "artifact_ready", 1),
             ("base_model", "model_type", _StrSubclass("base-model")),
@@ -571,12 +621,13 @@ class CharacterSheetProfileGateTests(unittest.TestCase):
             set(first),
             {
                 "schema_version", "resolver", "profile", "selection",
+                "repair_requested",
                 "profile_status", "experimental", "status",
                 "execution_authority", "reasons", "gates", "profile_commitment",
             },
         )
 
-    def test_import_reads_but_does_not_modify_public_v1_workflow_contracts(self):
+    def test_import_reads_but_does_not_modify_public_workflow_contracts(self):
         root = Path(__file__).resolve().parents[1]
         paths = (
             root / "app/services/character_sheet_workflow.py",

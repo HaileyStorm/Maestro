@@ -149,6 +149,15 @@ exact creator terms and the FLUX.2 Klein 9B base terms before managed download
 or enabling the profile. No LoRA installation or generation is established by
 this source pin.
 
+The [creator's Civitai model record](https://civitai.com/api/v1/models/2764727)
+was checked on 2026-09-24: version `3128511` lists the same SHA-256, and the
+creator allows credit-free use and derivatives. Its commercial-use flags do not
+supersede the [FLUX.2 Klein 9B base license](https://huggingface.co/black-forest-labs/FLUX.2-klein-9B/blob/07c5ac6/LICENSE.md),
+which is non-commercial and specifies content filtering or output review before
+distribution, display, or transmission. Maestro's local-content-neutrality rule
+excludes a Maestro content filter. Preserve a manual host-use review boundary;
+do not add prompt scanning or silently enable the LoRA.
+
 ### Proposed workflow
 
 1. **Anchor:** generate or choose one accepted FLUX character image. The
@@ -178,13 +187,15 @@ this source pin.
    identified during optional review to an existing Qwen Image Edit model.
    Preserve accepted panels and the original anchor; never regenerate the
    entire sheet merely because one label failed.
-   The executor must gate editor availability when repair is selected; the
-   current planning-only profile gate still treats it as mandatory and must be
-   adapted before enabling initial sheet generation without repair.
+   The profile gate validates and seals a present editor descriptor, but
+   requires editor readiness only when repair is selected. A future executor
+   must re-resolve that gate before a repair job; initial generation may seal
+   a null editor resource.
 7. **Publish:** save the accepted sheet as a Reference Studio artifact with
-   anchor/model/LoRA hashes, prompt, seed, VLM/editor revisions, per-panel
-   repair lineage, terms/license acceptance, and identity references available
-   to Director, LTX, H3, Recast, and Repaint.
+   anchor/model/LoRA hashes, prompt, seed, VLM revision, terms/license
+   acceptance, and identity references available to Director, LTX, H3,
+   Recast, and Repaint. Include editor revision and per-panel repair lineage
+   when repair is used.
 
 ### Guardrails and tests
 
