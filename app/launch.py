@@ -12145,7 +12145,7 @@ def _require_remote_visible_models(request: Request, model_types) -> None:
     requested = {
         str(model_type).strip()
         for model_type in (model_types or ())
-        if str(model_type).strip()
+        if model_type is not None and str(model_type).strip()
     }
     allowed = _remote_visible_model_ids(request)
     if allowed is None:
@@ -14280,6 +14280,8 @@ def _prepare_generation_sidecar_params(source_params: dict):
                 for item in value
             ]
     sidecar_params = source_params.copy()
+    sidecar_params.pop("_project_asset_ref_provenance", None)
+    sidecar_params.pop("_project_asset_ref_paths", None)
     # Voice references are reusable only after the user attaches them again.
     # Publish their basenames, never the workspace-local paths used by the job.
     sidecar_params.pop("voice_clone_refs", None)
@@ -24618,6 +24620,488 @@ _project_asset_store_lock = threading.Lock()
 _reference_admission_store_instance = None
 _reference_admission_store_lock = threading.Lock()
 _blender_candidate_status_lock = threading.RLock()
+
+_PROJECT_ASSET_REF_PROVENANCE_PARAM = "_project_asset_ref_provenance"
+_PROJECT_ASSET_REF_PATHS_PARAM = "_project_asset_ref_paths"
+_PROJECT_ASSET_REF_MAX_DESCRIPTORS = 32
+_PROJECT_ASSET_REF_MAX_OUTPUTS = 32
+
+
+def _normalize_project_asset_ref_descriptors(value) -> list[dict]:
+    """Accept only bounded identity selectors; client metadata is ignored."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > _PROJECT_ASSET_REF_MAX_DESCRIPTORS:
+        raise HTTPException(
+            status_code=400,
+            detail="project_asset_refs must be a bounded list of asset references",
+        )
+    normalized = []
+    seen = set()
+    total_outputs = 0
+    for item in value:
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail="Invalid project asset reference")
+        asset_id = item.get("asset_id")
+        variant_id = item.get("variant_id")
+        output_ids = item.get("output_ids")
+        if (
+            not isinstance(asset_id, str) or not asset_id
+            or asset_id.strip() != asset_id or len(asset_id) > 128
+            or not isinstance(variant_id, str) or not variant_id
+            or variant_id.strip() != variant_id or len(variant_id) > 128
+            or not isinstance(output_ids, list) or not output_ids
+            or len(output_ids) > _PROJECT_ASSET_REF_MAX_OUTPUTS
+            or any(
+                not isinstance(output_id, str) or not output_id
+                or output_id.strip() != output_id or len(output_id) > 128
+                for output_id in output_ids
+            )
+            or len(set(output_ids)) != len(output_ids)
+        ):
+            raise HTTPException(status_code=400, detail="Invalid project asset reference")
+        identity = (asset_id, variant_id)
+        if identity in seen:
+            raise HTTPException(status_code=400, detail="Duplicate project asset reference")
+        seen.add(identity)
+        total_outputs += len(output_ids)
+        if total_outputs > _PROJECT_ASSET_REF_MAX_OUTPUTS:
+            raise HTTPException(status_code=400, detail="Too many project asset outputs")
+        # Deliberately project only the three identity fields. Client path,
+        # label, type, and other extension fields never become authority.
+        normalized.append({
+            "asset_id": asset_id,
+            "variant_id": variant_id,
+            "output_ids": list(output_ids),
+        })
+    return normalized
+
+
+def _generation_image_ref_count(value) -> int:
+    if isinstance(value, (list, tuple)):
+        return len(value)
+    return int(bool(value))
+
+
+def _project_asset_apply_outputs(variant: dict) -> list[dict]:
+    """Mirror Studio's canonical apply order and primary-output selection."""
+    outputs = [
+        output for output in variant.get("outputs") or []
+        if isinstance(output, dict)
+    ]
+    variant_type = variant.get("variant_type")
+    if variant_type == "reference_pack":
+        indexed = list(enumerate(outputs))
+
+        def order(item):
+            original_index, output = item
+            metadata = output.get("metadata")
+            metadata = metadata if isinstance(metadata, dict) else {}
+            reference_pack = metadata.get("reference_pack")
+            reference_pack = reference_pack if isinstance(reference_pack, dict) else {}
+            selected_index = reference_pack.get("index")
+            if type(selected_index) is not int:
+                selected_index = original_index
+            return selected_index, original_index
+
+        return [output for _, output in sorted(indexed, key=order)]
+    if variant_type == "reference_sheet":
+        sheet = next((
+            output for output in outputs
+            if isinstance(output.get("metadata"), dict)
+            and isinstance(
+                output["metadata"].get("reference_sheet"), dict,
+            )
+            and output["metadata"]["reference_sheet"].get("role") == "sheet"
+        ), None)
+        selected = sheet if sheet is not None else (outputs[0] if outputs else None)
+        return [selected] if selected is not None else []
+    return outputs[:1]
+
+
+def _revalidate_generation_asset_ref_scope(
+    request: Request,
+    workspace: str,
+    project_directory: str,
+    project_identity: str,
+    session_id: str,
+    staged_paths: list[str],
+) -> None:
+    """Recheck authorization and project identity after private byte staging."""
+    try:
+        current_session_id = str(
+            getattr(request.state, "maestro_session_id", "") or "",
+        )
+        if not hmac.compare_digest(current_session_id, session_id):
+            raise HTTPException(status_code=401, detail="Session changed during generation admission")
+        current_directory = _require_project_access(
+            request, workspace, permission="project.generate",
+        )
+        if os.path.normcase(os.path.realpath(current_directory)) != os.path.normcase(
+            os.path.realpath(project_directory)
+        ):
+            raise HTTPException(status_code=409, detail="Project changed during generation admission")
+        current_identity = _queue_recovery_existing_project_identity(
+            current_directory,
+        )
+        if not hmac.compare_digest(current_identity, project_identity):
+            raise HTTPException(status_code=409, detail="Project identity changed during generation admission")
+        _require_upload_content_access(request)
+    except BaseException:
+        _cleanup_project_asset_ref_snapshots(staged_paths, session_id)
+        raise
+
+
+def _cleanup_project_asset_ref_snapshots(paths, session_id: str) -> None:
+    """Remove exact private snapshots created by one failed admission."""
+    from services.output_access import (
+        upload_access_sidecar_path,
+        write_upload_access_sidecar,
+    )
+
+    for path in paths:
+        for candidate in (upload_access_sidecar_path(path), path):
+            try:
+                os.remove(candidate)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                # A failed admission never publishes these names. Leave a
+                # locked artifact private under its session sidecar.
+                if candidate == path:
+                    try:
+                        write_upload_access_sidecar(
+                            path, session_id, private=True,
+                        )
+                    except Exception:
+                        pass
+    recovery_root = os.path.realpath(
+        os.path.join(_app_dir, "uploads", ".maestro-recovery"),
+    )
+    for directory in {os.path.dirname(os.path.abspath(path)) for path in paths}:
+        if (
+            os.path.dirname(directory) != recovery_root
+            or re.fullmatch(
+                r"[0-9a-f]{32,40}-scene-kit-[0-9a-f]{32}",
+                os.path.basename(directory),
+            ) is None
+        ):
+            continue
+        try:
+            os.rmdir(directory)
+        except OSError:
+            pass
+
+
+def _cleanup_terminal_project_asset_snapshots(job: dict) -> bool:
+    """Delete non-retryable terminal copies; retain failed jobs for recovery."""
+    if not isinstance(job, dict) or str(job.get("status") or "").casefold() not in {
+        "completed", "cancelled", "canceled",
+    }:
+        return False
+    params = job.get("params")
+    if not isinstance(params, dict):
+        return False
+    provenance = params.get("_project_asset_ref_paths")
+    if not isinstance(provenance, list):
+        return False
+    job_id = str(job.get("id") or "")
+    recovery_root = os.path.realpath(
+        os.path.join(_app_dir, "uploads", ".maestro-recovery"),
+    )
+    staged_paths = []
+    for asset in provenance:
+        outputs = asset.get("outputs") if isinstance(asset, dict) else None
+        for output in outputs if isinstance(outputs, list) else ():
+            path = output.get("staged_path") if isinstance(output, dict) else None
+            if not isinstance(path, str) or not path or os.path.normpath(path) != path:
+                continue
+            absolute = os.path.abspath(path)
+            directory = os.path.dirname(absolute)
+            try:
+                inside_recovery = (
+                    os.path.commonpath([absolute, recovery_root])
+                    == recovery_root
+                )
+            except ValueError:
+                inside_recovery = False
+            if (
+                inside_recovery
+                and os.path.dirname(directory) == recovery_root
+                and os.path.basename(directory).startswith(f"{job_id}-scene-kit-")
+                and os.path.basename(absolute).startswith("reference-")
+            ):
+                staged_paths.append(absolute)
+    if not staged_paths:
+        return False
+    _cleanup_project_asset_ref_snapshots(
+        staged_paths, str(job.get("session_id") or ""),
+    )
+    return True
+
+
+def _snapshot_project_asset_refs(
+    request: Request,
+    project_id: str,
+    descriptors: list[dict],
+    *,
+    job_id: str,
+    direct_refs,
+    model_def: dict,
+    edit_source_present: bool,
+) -> tuple[list[str], list[dict], list[dict]]:
+    """Copy exact kept project outputs into session-owned immutable uploads."""
+    if not descriptors:
+        return [], [], []
+
+    from pathlib import Path, PurePosixPath
+    from PIL import Image as PILImage
+    from services.output_access import write_upload_access_sidecar
+    from services.win_safe_files import is_safe_direct_basename
+
+    session_id = str(request.state.maestro_session_id or "")
+    if (
+        len(session_id) != 32
+        or any(character not in "0123456789abcdef" for character in session_id)
+    ):
+        raise HTTPException(status_code=401, detail="Session-owned references are unavailable")
+    _require_upload_content_access(request)
+    direct_count = _generation_image_ref_count(direct_refs)
+    reference_limit = model_def.get("reference_image_max_count")
+    image_limit = model_def.get("max_image_refs")
+    limits = []
+    if type(reference_limit) is int and reference_limit > 0:
+        limits.append((direct_count, reference_limit))
+    if type(image_limit) is int and image_limit > 0:
+        limits.append((direct_count + int(edit_source_present), image_limit))
+
+    store = _project_asset_store()
+    validated = []
+    provenance = []
+    path_provenance = []
+    staged_paths = []
+    uploads_root = os.path.join(_app_dir, "uploads")
+    recovery_root = os.path.join(uploads_root, ".maestro-recovery")
+    staging_directory = None
+    try:
+        with store.publication_guard():
+            for descriptor in descriptors:
+                asset_id = descriptor["asset_id"]
+                variant_id = descriptor["variant_id"]
+                asset = _require_project_asset_media_access(
+                    project_id, "main", asset_id, session_id,
+                    variant_id=variant_id,
+                )
+                if str(asset.get("asset_type") or "").casefold() not in {
+                    "character", "location",
+                }:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Only Character and Location assets can be used as generation references",
+                    )
+                variant = next((
+                    item for item in asset.get("variants") or []
+                    if item.get("id") == variant_id
+                ), None)
+                if not isinstance(variant, dict):
+                    raise HTTPException(status_code=404, detail="Reference variant not found")
+                if variant.get("status") != "kept":
+                    raise HTTPException(status_code=409, detail="Reference variant must be kept")
+                outputs = _project_asset_apply_outputs(variant)
+                actual_ids = [
+                    output.get("id") for output in outputs
+                    if isinstance(output, dict)
+                ]
+                if actual_ids != descriptor["output_ids"]:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Project asset output selection is stale or incomplete",
+                    )
+                path_outputs = []
+                for output in outputs:
+                    if not isinstance(output, dict) or not str(
+                        output.get("media_type") or ""
+                    ).casefold().startswith("image/"):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Project asset reference outputs must be images",
+                        )
+                    relative = output.get("relative_path")
+                    pure = PurePosixPath(relative) if isinstance(relative, str) else None
+                    if (
+                        pure is None or pure.is_absolute()
+                        or len(pure.parts) != 4
+                        or pure.parts[:3] != ("media", asset_id, variant_id)
+                        or any(part in {"", ".", ".."} for part in pure.parts)
+                        or not is_safe_direct_basename(pure.name)
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Project asset media path is invalid",
+                        )
+                    workspace_root = Path(store._workspace_dir(project_id, "main"))
+                    lexical = workspace_root.joinpath(*pure.parts)
+                    cursor = workspace_root
+                    for part in pure.parts:
+                        cursor = cursor / part
+                        if cursor.is_symlink():
+                            raise HTTPException(
+                                status_code=409,
+                                detail="Project asset media path is invalid",
+                            )
+                    resolved = Path(store.resolve_output_path(
+                        project_id, "main", relative,
+                    ))
+                    if resolved != lexical.resolve(strict=True) or not resolved.is_file():
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Project asset media is unavailable",
+                        )
+                    validated.append((asset, variant, output, str(resolved)))
+                    path_outputs.append({
+                        "output_id": output["id"],
+                        "relative_path": relative,
+                        "staged_path": "",
+                    })
+                provenance.append({
+                    "asset_id": asset["id"],
+                    "asset_label": asset["name"],
+                    "variant_id": variant["id"],
+                    "variant_label": variant["label"],
+                    "outputs": [{
+                        "output_id": output["id"],
+                        "label": output.get("label") or "",
+                    } for output in outputs],
+                })
+                path_provenance.append({
+                    "asset_id": asset["id"],
+                    "variant_id": variant["id"],
+                    "outputs": path_outputs,
+                })
+
+            for prior_count, maximum in limits:
+                if prior_count + len(validated) > maximum:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"This model supports at most {maximum} image reference(s)",
+                    )
+
+            os.makedirs(uploads_root, exist_ok=True)
+            if os.path.islink(uploads_root) or not os.path.isdir(uploads_root):
+                raise HTTPException(status_code=503, detail="Private upload storage is unavailable")
+            os.makedirs(recovery_root, mode=0o700, exist_ok=True)
+            recovery_info = os.lstat(recovery_root)
+            if (
+                not __import__("stat").S_ISDIR(recovery_info.st_mode)
+                or __import__("stat").S_ISLNK(recovery_info.st_mode)
+            ):
+                raise HTTPException(status_code=503, detail="Private upload storage is unavailable")
+            os.chmod(recovery_root, 0o700)
+            if (
+                not isinstance(job_id, str)
+                or len(job_id) not in {32, 40}
+                or any(character not in "0123456789abcdef" for character in job_id)
+            ):
+                raise HTTPException(status_code=503, detail="Private upload storage is unavailable")
+            staging_directory = os.path.join(
+                recovery_root,
+                f"{job_id}-scene-kit-{uuid.uuid4().hex}",
+            )
+            os.mkdir(staging_directory, mode=0o700)
+            total_bytes = 0
+            max_bytes = int(globals().get("MAX_IMAGE_UPLOAD_BYTES", 500 * 1024 * 1024))
+            path_output_iter = iter(
+                output_record
+                for asset_record in path_provenance
+                for output_record in asset_record["outputs"]
+            )
+            for _asset, _variant, output, source in validated:
+                path_output = next(path_output_iter)
+                suffix = PurePosixPath(output["relative_path"]).suffix.lower()
+                if not suffix or len(suffix) > 12:
+                    raise HTTPException(status_code=409, detail="Project asset image type is invalid")
+                destination = os.path.join(
+                    staging_directory,
+                    f"reference-{len(staged_paths):02d}-{uuid.uuid4().hex}{suffix}",
+                )
+                source_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                source_fd = os.open(source, source_flags)
+                destination_fd = None
+                try:
+                    source_info = os.fstat(source_fd)
+                    if not __import__("stat").S_ISREG(source_info.st_mode):
+                        raise HTTPException(status_code=409, detail="Project asset image is unavailable")
+                    if source_info.st_size < 1 or source_info.st_size > max_bytes:
+                        raise HTTPException(status_code=413, detail="Project asset image exceeds the upload limit")
+                    destination_fd = os.open(
+                        destination,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                    )
+                    staged_paths.append(destination)
+                    with os.fdopen(source_fd, "rb") as input_file, os.fdopen(
+                        destination_fd, "wb",
+                    ) as output_file:
+                        source_fd = destination_fd = None
+                        copied_bytes = 0
+                        while True:
+                            chunk = input_file.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            copied_bytes += len(chunk)
+                            if (
+                                copied_bytes > max_bytes
+                                or total_bytes + copied_bytes > max_bytes
+                            ):
+                                raise HTTPException(
+                                    status_code=413,
+                                    detail="Project asset references exceed the upload limit",
+                                )
+                            output_file.write(chunk)
+                        source_after = os.fstat(input_file.fileno())
+                        if (
+                            copied_bytes != source_info.st_size
+                            or source_after.st_size != source_info.st_size
+                            or source_after.st_mtime_ns != source_info.st_mtime_ns
+                            or source_after.st_ino != source_info.st_ino
+                        ):
+                            raise HTTPException(
+                                status_code=409,
+                                detail="Project asset changed while it was being staged",
+                            )
+                        output_file.flush()
+                        os.fsync(output_file.fileno())
+                    total_bytes += copied_bytes
+                    with PILImage.open(destination) as image:
+                        if image.format is None:
+                            raise HTTPException(status_code=409, detail="Project asset output is not a readable image")
+                        image.verify()
+                    os.chmod(destination, 0o400)
+                    write_upload_access_sidecar(
+                        destination, session_id, private=True,
+                    )
+                    path_output["staged_path"] = destination
+                finally:
+                    if source_fd is not None:
+                        os.close(source_fd)
+                    if destination_fd is not None:
+                        os.close(destination_fd)
+        return staged_paths, provenance, path_provenance
+    except BaseException as error:
+        _cleanup_project_asset_ref_snapshots(staged_paths, session_id)
+        if staging_directory and os.path.isdir(staging_directory):
+            try:
+                os.rmdir(staging_directory)
+            except OSError:
+                pass
+        if isinstance(error, HTTPException):
+            raise
+        if isinstance(error, Exception):
+            raise HTTPException(
+                status_code=409,
+                detail="Project asset media could not be safely staged",
+            ) from None
+        raise
 
 
 def _stage_json_replacement(path: str, payload: dict) -> str:
@@ -42284,6 +42768,11 @@ def _run_generation_preparation(
                     return False
                 continue
             if transitioned:
+                terminal_snapshot_cleanup = globals().get(
+                    "_cleanup_terminal_project_asset_snapshots",
+                )
+                if callable(terminal_snapshot_cleanup):
+                    terminal_snapshot_cleanup(job)
                 emit_event(safe_event)
                 if finality_event is not None:
                     emit_event(finality_event)
@@ -42326,6 +42815,12 @@ def _run_generation_preparation(
         if not isinstance(raw_params, _PreparationMapping):
             raise TypeError("Generation parameters are invalid.") from None
         prepared_params = copy.deepcopy(dict(raw_params))
+        project_asset_provenance = prepared_params.pop(
+            "_project_asset_ref_provenance", None,
+        )
+        project_asset_paths = prepared_params.pop(
+            "_project_asset_ref_paths", None,
+        )
         image_mode = normalized_mode("image_mode", 4)
         prompt_mode = normalized_mode("multi_prompts_gen_type", 3)
         custom_settings = prepared_params.get("custom_settings")
@@ -42476,12 +42971,19 @@ def _run_generation_preparation(
             ]
         public_plan = _public_h3_long_plan(plan, requirements)
         offload_plan = _seal_h3_offload_plan_for_job(prepared_params)
+        manifest_params = copy.deepcopy(prepared_params)
+        if isinstance(project_asset_provenance, list):
+            manifest_params["_project_asset_ref_provenance"] = (
+                project_asset_provenance
+            )
+        if isinstance(project_asset_paths, list):
+            manifest_params["_project_asset_ref_paths"] = project_asset_paths
         manifest_job = dict(job)
-        manifest_job["params"] = prepared_params
+        manifest_job["params"] = manifest_params
         sealed_pointer = write_sealed_request_manifest(
             project_directory,
             job_id=job_id,
-            params=prepared_params,
+            params=manifest_params,
             inputs=_queue_recovery_input_descriptors(
                 manifest_job,
                 str(job.get("_recovery_owner_digest") or ""),
@@ -42504,7 +43006,7 @@ def _run_generation_preparation(
                     "studio_generation_preparation"
                     if waiting else "studio_generation"
                 ),
-                params=prepared_params,
+                params=manifest_params,
                 _recovery_manifest_pointer=dict(sealed_pointer),
                 phase=(
                     "awaiting_plan_terms" if terms_blocked
@@ -43787,6 +44289,16 @@ async def generate(request: Request):
     """Submit a generation job. Returns immediately with a job_id."""
     body = await request.json()
     _reject_client_krea_authority(body)
+    if (
+        "_project_asset_ref_provenance" in body
+        or "_project_asset_ref_paths" in body
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Project asset reference metadata is server-owned",
+        )
+    submitted_project_asset_refs = "project_asset_refs" in body
+    raw_project_asset_refs = body.pop("project_asset_refs", None)
     if _ENHANCED_PROMPT_CARDINALITY_KEY in body:
         raise HTTPException(
             status_code=400,
@@ -43811,7 +44323,16 @@ async def generate(request: Request):
     job_out_dir = _require_project_access(
         request, workspace, permission="project.generate",
     )
+    project_asset_ref_descriptors = (
+        _normalize_project_asset_ref_descriptors(raw_project_asset_refs)
+        if submitted_project_asset_refs else []
+    )
     is_sfx = body.get("sfx_mode")
+    if project_asset_ref_descriptors and is_sfx:
+        raise HTTPException(
+            status_code=400,
+            detail="Project asset image references cannot be used for audio-only generation",
+        )
     _reject_client_director_image_role_internals(body)
     director_role_mode = _director_image_role_wire_mode(body) == "roles"
     if director_role_mode and is_sfx:
@@ -43841,15 +44362,38 @@ async def generate(request: Request):
     if director_role_mode:
         _resolve_director_image_role_request(request, body)
         _apply_director_image_role_generation(body)
+    normal_image_refs = body.get("image_refs")
+    if isinstance(normal_image_refs, str):
+        normal_image_refs = [normal_image_refs] if normal_image_refs else []
+    elif isinstance(normal_image_refs, (list, tuple)):
+        normal_image_refs = list(normal_image_refs)
+    else:
+        normal_image_refs = []
     _krea_principal_role = _request_krea_principal_role(
         request, body.get("model_type"),
     )
     _h3_turbo_validation_reference_bytes = (
         _authorize_h3_turbo_benchmark_request(request, body)
     )
+    if project_asset_ref_descriptors and _h3_turbo_validation_reference_bytes is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Project asset references cannot be used by the H3 benchmark request",
+        )
     _h3_turbo_validation_authorized = (
         _h3_turbo_validation_reference_bytes is not None
     )
+    if project_asset_ref_descriptors:
+        # Presence-only placeholders let existing adaptive planning and H3
+        # estimates see the requested count without resolving or copying
+        # mutable project media before the rest of admission has passed.
+        requested_count = sum(
+            len(item["output_ids"]) for item in project_asset_ref_descriptors
+        )
+        body["image_refs"] = normal_image_refs + [True] * requested_count
+        video_prompt_type = str(body.get("video_prompt_type") or "")
+        if "I" not in video_prompt_type:
+            body["video_prompt_type"] = f"{video_prompt_type}I"
     try:
         _apply_h3_adaptive_checkpoint(body)
     except ValueError as exc:
@@ -44090,6 +44634,50 @@ async def generate(request: Request):
                 getattr(request.state, "maestro_remote", False)
             ),
         )["current"]["estimate"]
+    project_asset_snapshot_paths = []
+    if project_asset_ref_descriptors:
+        try:
+            project_identity = _queue_recovery_project_identity(
+                workspace, job_out_dir,
+            )
+            (
+                pinned_paths,
+                project_asset_provenance,
+                project_asset_paths,
+            ) = _snapshot_project_asset_refs(
+                request,
+                workspace,
+                project_asset_ref_descriptors,
+                job_id=job_id,
+                direct_refs=normal_image_refs,
+                model_def=_generation_model_def,
+                edit_source_present=(
+                    int(body.get("image_mode") or 0) == 2
+                    and bool(body.get("image_start"))
+                ),
+            )
+            project_asset_snapshot_paths = list(pinned_paths)
+            _revalidate_generation_asset_ref_scope(
+                request,
+                workspace,
+                job_out_dir,
+                project_identity,
+                session_id,
+                project_asset_snapshot_paths,
+            )
+        except HTTPException:
+            raise
+        except Exception:
+            _cleanup_project_asset_ref_snapshots(
+                project_asset_snapshot_paths, session_id,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Project asset references could not be staged",
+            ) from None
+        body["image_refs"] = pinned_paths + normal_image_refs
+        body["_project_asset_ref_provenance"] = project_asset_provenance
+        body["_project_asset_ref_paths"] = project_asset_paths
     effective_prepare = durable_generation_preparation and not hold_for_queue
     job = {
         "id": job_id,
@@ -44167,23 +44755,53 @@ async def generate(request: Request):
     # durable before the job becomes observable or its worker can run.
     # A user hold starts the ordinary generation worker so try_start waits
     # on Continuum queue_held; Start Queue only clears that flag.
-    if not hold_for_queue:
-        if durable_generation_preparation:
-            preparation_request = _GenerationPreparationRequest(request)
-            _queue_recovery_register_and_publish(
-                job,
-                worker=lambda queued_job_id: _run_generation_preparation(
-                    queued_job_id,
-                    preparation_request,
-                    enhance=enhance_before_generate,
-                ),
-                recovery_kind="studio_generation_preparation",
-                thread_name=f"studio-generation-preparation-{job_id}",
+    try:
+        if project_asset_snapshot_paths:
+            _revalidate_generation_asset_ref_scope(
+                request,
+                workspace,
+                job_out_dir,
+                project_identity,
+                session_id,
+                project_asset_snapshot_paths,
             )
+        if not hold_for_queue:
+            if durable_generation_preparation:
+                preparation_request = _GenerationPreparationRequest(request)
+                _queue_recovery_register_and_publish(
+                    job,
+                    worker=lambda queued_job_id: _run_generation_preparation(
+                        queued_job_id,
+                        preparation_request,
+                        enhance=enhance_before_generate,
+                    ),
+                    recovery_kind="studio_generation_preparation",
+                    thread_name=f"studio-generation-preparation-{job_id}",
+                )
+            else:
+                _queue_recovery_register_and_publish(job, worker=_run_generation)
         else:
             _queue_recovery_register_and_publish(job, worker=_run_generation)
-    else:
-        _queue_recovery_register_and_publish(job, worker=_run_generation)
+    except BaseException:
+        # Once durable registration may have happened, keep the exact staged
+        # bytes for recovery. If admission failed before either registry
+        # exposed the job, remove only the snapshots created by this request.
+        durable_registration = False
+        coordinator = _queue_recovery_coordinator
+        try:
+            with coordinator._lock:
+                durable_registration = job_id in coordinator._snapshots
+        except Exception:
+            durable_registration = True
+        if (
+            project_asset_snapshot_paths
+            and _jobs.get(job_id) is None
+            and not durable_registration
+        ):
+            _cleanup_project_asset_ref_snapshots(
+                project_asset_snapshot_paths, session_id,
+            )
+        raise
 
     return {
         "job_id": job_id,
@@ -59737,6 +60355,10 @@ def _run_generation(
             # Build task manifest from user params
             raw_params = job["params"].copy()
             raw_params.pop("_h3_offload_plan", None)
+            # Kept in the private request manifest for recovery identity, but
+            # never forward Maestro provenance metadata into WanGP inputs.
+            raw_params.pop("_project_asset_ref_provenance", None)
+            raw_params.pop("_project_asset_ref_paths", None)
             for internal_key in _CREDIT_INTERNAL_PARAMS:
                 raw_params.pop(internal_key, None)
             validation_reference_bytes = job.get(
@@ -64167,6 +64789,11 @@ def _run_generation(
                 active_dir = _workspace_dir()
                 wgp.save_path = active_dir
                 wgp.image_save_path = active_dir
+            terminal_snapshot_cleanup = globals().get(
+                "_cleanup_terminal_project_asset_snapshots",
+            )
+            if callable(terminal_snapshot_cleanup):
+                terminal_snapshot_cleanup(job)
 
 
 def _recast_video_frame_count(video_path):
@@ -66417,6 +67044,12 @@ def _approve_waiting_generation_plan(
         ),
     )
     sealed_params = copy.deepcopy(dict(manifest["params"]))
+    project_asset_provenance = sealed_params.pop(
+        "_project_asset_ref_provenance", None,
+    )
+    project_asset_paths = sealed_params.pop(
+        "_project_asset_ref_paths", None,
+    )
     prepared_source = sealed_params.pop("_maestro_prepared_source", None)
     if not isinstance(prepared_source, dict):
         raise TypeError("sealed enhanced source is unavailable")
@@ -66569,6 +67202,12 @@ def _approve_waiting_generation_plan(
         prepared_params,
         replace=has_overrides,
     )
+    if isinstance(project_asset_provenance, list):
+        prepared_params["_project_asset_ref_provenance"] = (
+            project_asset_provenance
+        )
+    if isinstance(project_asset_paths, list):
+        prepared_params["_project_asset_ref_paths"] = project_asset_paths
     approved_pointer = write_sealed_request_manifest(
         str(job.get("out_dir") or ""),
         job_id=job_id,

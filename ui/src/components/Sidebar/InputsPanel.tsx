@@ -522,6 +522,9 @@ export function InputsPanel() {
   const addImageRef = useStore(s => s.addImageRef)
   const removeImageRef = useStore(s => s.removeImageRef)
   const reorderImageRefs = useStore(s => s.reorderImageRefs)
+  const projectAssetRefs = useStore(s => s.projectAssetRefs)
+  const clearProjectAssetRefs = useStore(s => s.clearProjectAssetRefs)
+  const setSidebarMode = useStore(s => s.setSidebarMode)
   const imageRefType = useStore(s => s.imageRefType)
   const setImageRefType = useStore(s => s.setImageRefType)
   const removeBackgroundRefs = useStore(s => s.removeBackgroundRefs)
@@ -1616,6 +1619,17 @@ export function InputsPanel() {
                   : 'Install required reference model'}
             </button>
           )}
+        </div>
+      )}
+      {projectAssetRefs.length > 0 && (
+        <div role="status" aria-live="polite" className="mb-2 flex items-center justify-between gap-2 rounded-lg border border-accent-blue/35 bg-accent-blue/5 px-2 py-1.5">
+          <span className="min-w-0 text-[10px] text-text-secondary">
+            Scene Kit: {projectAssetRefs.length} selection{projectAssetRefs.length === 1 ? '' : 's'} · {projectAssetRefs.reduce((count, reference) => count + reference.output_ids.length, 0)} outputs staged
+          </span>
+          <span className="flex shrink-0 items-center gap-1">
+            <button type="button" onClick={() => setSidebarMode('reference')} className="rounded px-1.5 py-1 text-[10px] text-accent-blue hover:bg-accent-blue/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue" aria-label="Review staged Scene Kit selections in References">Review in References</button>
+            <button type="button" onClick={clearProjectAssetRefs} className="rounded px-1.5 py-1 text-[10px] text-text-muted hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue" aria-label="Clear staged Scene Kit selections">Clear</button>
+          </span>
         </div>
       )}
       <div className="flex gap-2 overflow-x-auto pb-1">

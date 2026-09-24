@@ -51,7 +51,7 @@ test('LTX audio and decoder contracts remain typed and use the native controls',
 test('submission and output restore repair only the declared LTX values', () => {
   const submit = sliceBetween(
     store,
-    "const params: Record<string, unknown> = {",
+    "const params: api.GenerationSubmissionParams = {",
     '// Default I2V / video-source strength.',
   )
   assert.match(submit, /infer_audio_prompt_from_guide === true/)

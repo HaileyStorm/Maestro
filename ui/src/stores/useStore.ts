@@ -15,7 +15,7 @@ import {
   directorProfileRoleMismatch, directorProfileStateKeys,
   isDirectorProfile, restoreDirectorProfileSettings,
 } from '../lib/directorProfiles'
-import type { GenerateParams, OutputFile, MediaFilter, OutputArtifactScope, AspectRatio, ResolutionPreset, ScailResolutionProfile, GenerationJob, H3SegmentPlan, H3PlanDecision, H3PerformanceEstimate, H3SegmentCountEstimate, H3PerformanceProfile, H3PerformanceProfileId, ModelFamily, ModelDef, GenerationMode, ModelOptions, SystemConfig, SettingsTab, OutputMetadata, MultiClip, ServicesConfig, HostTermId, HostTermsStatus, LlmStatus, LlmModelOption, AudioAnalysisResult, PlannedClip, ClipPlan, DirectorClipImage, DirectorImageGenProgress, DirectorImageRole, DirectorImageRoleLoraSelection, SpeakerMapping, DirectorSkill, DirectorShotImageGuidance, ShortFilmCharacter, ShortFilmPath, CivitAIModel, CivitAIDownload, PipelineListItem, PipelineRepairState, SavedPipelineState, SystemDetectResponse, SystemStats, RecastCharacterMapping, RepaintRegionMapping, AccountAuthResult, AccountContext, AccountProjectMigrationStatus, AccountSession, AccountSummary, ResponsibleUseProjection, SupportAdminProjection, SupportFulfillmentMutationInput, SupportManualContributionInput, SupportPublicProjection, SupportSelfProjection, SupportH3LegalAccessProjection, SupportH3LegalAccessLocationInput } from '../types'
+import type { GenerateParams, ProjectAssetGenerateReference, OutputFile, MediaFilter, OutputArtifactScope, AspectRatio, ResolutionPreset, ScailResolutionProfile, GenerationJob, H3SegmentPlan, H3PlanDecision, H3PerformanceEstimate, H3SegmentCountEstimate, H3PerformanceProfile, H3PerformanceProfileId, ModelFamily, ModelDef, GenerationMode, ModelOptions, SystemConfig, SettingsTab, OutputMetadata, MultiClip, ServicesConfig, HostTermId, HostTermsStatus, LlmStatus, LlmModelOption, AudioAnalysisResult, PlannedClip, ClipPlan, DirectorClipImage, DirectorImageGenProgress, DirectorImageRole, DirectorImageRoleLoraSelection, SpeakerMapping, DirectorSkill, DirectorShotImageGuidance, ShortFilmCharacter, ShortFilmPath, CivitAIModel, CivitAIDownload, PipelineListItem, PipelineRepairState, SavedPipelineState, SystemDetectResponse, SystemStats, RecastCharacterMapping, RepaintRegionMapping, AccountAuthResult, AccountContext, AccountProjectMigrationStatus, AccountSession, AccountSummary, ResponsibleUseProjection, SupportAdminProjection, SupportFulfillmentMutationInput, SupportManualContributionInput, SupportPublicProjection, SupportSelfProjection, SupportH3LegalAccessProjection, SupportH3LegalAccessLocationInput } from '../types'
 import * as api from '../api/client'
 import { applyThemePrefs, getStoredPrefs, type FamilyId, type ThemeMode, type ThemePrefs } from '../lib/theme'
 import { HOST_TERM_NOTICES } from '../lib/hostTerms'
@@ -56,6 +56,11 @@ import {
   stripLegacyH3StylePrefix,
 } from '../lib/h3StyleWorkflows'
 import { h3ShotDeckFromProductionPlan, type ScopedH3ShotDeck } from '../lib/h3ShotDeck'
+import {
+  reconcileProjectAssetGenerateReferences,
+  sameOrderedProjectAssetGenerateReferences,
+  sameProjectAssetGenerateReference,
+} from '../lib/sceneKit'
 
 const CIVIT_DOWNLOAD_POLL_MS = 2000
 const CIVIT_DOWNLOAD_COMPLETED_VISIBLE_MS = 30_000
@@ -3240,6 +3245,18 @@ interface AppState {
   setImageRefType: (type: string) => void
   setRemoveBackgroundRefs: (v: boolean) => void
 
+  // Project-owned Scene Kit references for the next Generate request. These
+  // remain exact server asset IDs; they are not uploaded into imageRefs.
+  projectAssetRefs: ProjectAssetGenerateReference[]
+  projectAssetRefScope: { workspace: string; accountIdentityEpoch: number } | null
+  toggleProjectAssetRef: (reference: ProjectAssetGenerateReference) => void
+  removeProjectAssetRef: (assetId: string, variantId: string) => void
+  clearProjectAssetRefs: () => void
+  reconcileProjectAssetRefs: (
+    workspace: string,
+    available: ProjectAssetGenerateReference[],
+  ) => void
+
   // Post-processing (shared for Studio mode)
   spatialUpsampling: string
   setSpatialUpsampling: (v: string) => void
@@ -5284,6 +5301,8 @@ function _scrubAccountBoundProjectUi(state: AppState): Partial<AppState> {
     continueVideoDuration: 0,
     audioGuideFilename: null,
     imageRefs: [],
+    projectAssetRefs: [],
+    projectAssetRefScope: null,
     clips: [],
     videoSubModeStash: {},
     toolsSourcePath: null,
@@ -7822,6 +7841,77 @@ export const useStore = create<AppState>((set, get) => ({
   setImageRefType: (type) => set({ imageRefType: type }),
   setRemoveBackgroundRefs: (v) => set({ removeBackgroundRefs: v }),
 
+  // Project reference assets stay server-owned. Only their exact IDs cross
+  // the Generate API boundary; normal uploaded image refs retain their own
+  // existing upload path above.
+  projectAssetRefs: [],
+  projectAssetRefScope: null,
+  toggleProjectAssetRef: reference => {
+    const current = get()
+    const workspace = current.activeWorkspace
+    if (!workspace) return
+    const scope = current.projectAssetRefScope
+    const scopeCurrent = scope?.workspace === workspace
+      && scope.accountIdentityEpoch === _accountIdentityEpoch
+    const staged = scopeCurrent ? current.projectAssetRefs : []
+    const index = staged.findIndex(item => (
+      item.asset_id === reference.asset_id && item.variant_id === reference.variant_id
+    ))
+    let next: ProjectAssetGenerateReference[]
+    if (index < 0) {
+      next = [...staged, { ...reference, output_ids: [...reference.output_ids] }]
+    } else if (sameProjectAssetGenerateReference(staged[index], reference)) {
+      next = staged.filter((_, candidateIndex) => candidateIndex !== index)
+    } else {
+      next = staged.map((item, candidateIndex) => candidateIndex === index
+        ? { ...reference, output_ids: [...reference.output_ids] }
+        : item)
+    }
+    set({
+      projectAssetRefs: next,
+      projectAssetRefScope: next.length > 0
+        ? { workspace, accountIdentityEpoch: _accountIdentityEpoch }
+        : null,
+    })
+  },
+  removeProjectAssetRef: (assetId, variantId) => {
+    const current = get()
+    const scope = current.projectAssetRefScope
+    if (!scope
+      || scope.workspace !== current.activeWorkspace
+      || scope.accountIdentityEpoch !== _accountIdentityEpoch) {
+      set({ projectAssetRefs: [], projectAssetRefScope: null })
+      return
+    }
+    const next = current.projectAssetRefs.filter(reference => (
+      reference.asset_id !== assetId || reference.variant_id !== variantId
+    ))
+    set({
+      projectAssetRefs: next,
+      projectAssetRefScope: next.length > 0 ? scope : null,
+    })
+  },
+  clearProjectAssetRefs: () => set({ projectAssetRefs: [], projectAssetRefScope: null }),
+  reconcileProjectAssetRefs: (workspace, available) => {
+    const current = get()
+    if (current.projectAssetRefs.length === 0) return
+    const scope = current.projectAssetRefScope
+    if (!scope
+      || scope.workspace !== workspace
+      || current.activeWorkspace !== workspace
+      || scope.accountIdentityEpoch !== _accountIdentityEpoch) {
+      set({ projectAssetRefs: [], projectAssetRefScope: null })
+      return
+    }
+    const next = reconcileProjectAssetGenerateReferences(current.projectAssetRefs, available)
+    if (next.length !== current.projectAssetRefs.length) {
+      set({
+        projectAssetRefs: next,
+        projectAssetRefScope: next.length > 0 ? scope : null,
+      })
+    }
+  },
+
   // Voice clone postprocessing state — defaults are off / empty so
   // existing generations are unaffected.
   voiceCloneEnabled: false,
@@ -8477,6 +8567,21 @@ export const useStore = create<AppState>((set, get) => ({
     const ownsSubmission = () => _accountIdentityIsCurrent(accountIdentityEpoch)
     let state = get()
     const submissionWorkspace = state.activeWorkspace
+    const projectAssetRefsForSubmission = state.projectAssetRefScope?.workspace === submissionWorkspace
+      && state.projectAssetRefScope.accountIdentityEpoch === accountIdentityEpoch
+      ? state.projectAssetRefs.map(reference => ({
+          asset_id: reference.asset_id,
+          variant_id: reference.variant_id,
+          output_ids: [...reference.output_ids],
+        }))
+      : []
+    const projectAssetRefScopeForSubmission = projectAssetRefsForSubmission.length > 0
+      ? { workspace: submissionWorkspace, accountIdentityEpoch }
+      : null
+    if (state.projectAssetRefs.length > 0 && projectAssetRefsForSubmission.length === 0) {
+      get().clearProjectAssetRefs()
+      state = get()
+    }
     // Model changes update params.model_type immediately and load capabilities
     // asynchronously. Never submit against the previous model's limits or
     // conditioning contract during that short hand-off window.
@@ -9171,13 +9276,19 @@ export const useStore = create<AppState>((set, get) => ({
       return  // Don't fall through to normal generation
     }
 
-    const params: Record<string, unknown> = {
+    const params: api.GenerationSubmissionParams = {
       ...state.params,
       generation_mode: state.generationMode,
       workspace: submissionWorkspace,
       private_output: state.privateOutput,
       explicit_output: state.explicitOutput,
       h3_ref2va_terms_accepted: h3Ref2VATermsAccepted(),
+    }
+    // Project asset refs are an explicit scoped selection, never inherited
+    // from sidecars or converted to transient uploaded image paths.
+    delete params.project_asset_refs
+    if (projectAssetRefsForSubmission.length > 0) {
+      params.project_asset_refs = projectAssetRefsForSubmission
     }
     if (
       state.generationMode === 'video'
@@ -9811,6 +9922,23 @@ export const useStore = create<AppState>((set, get) => ({
 
     try {
       applyH3SegmentCeilingPolicy(params, state.slidingWindowLocked)
+      const liveProjectAssetRefs = get()
+      const stagedProjectAssetRefScopeMatches = projectAssetRefScopeForSubmission === null
+        ? liveProjectAssetRefs.projectAssetRefScope === null
+        : liveProjectAssetRefs.projectAssetRefScope?.workspace === submissionWorkspace
+          && liveProjectAssetRefs.projectAssetRefScope.accountIdentityEpoch === accountIdentityEpoch
+      if (!ownsSubmission() || liveProjectAssetRefs.activeWorkspace !== submissionWorkspace) {
+        _discardStaleGenerationPlaceholder(newJob)
+        return
+      }
+      if (!stagedProjectAssetRefScopeMatches || !sameOrderedProjectAssetGenerateReferences(
+        projectAssetRefsForSubmission,
+        liveProjectAssetRefs.projectAssetRefs,
+      )) {
+        _discardStaleGenerationPlaceholder(newJob)
+        window.alert('Scene Kit references changed while this generation was preparing. Review the current selection in References, then try again.')
+        return
+      }
       const { job_id, status, held, h3_estimate } = await api.submitGeneration(params, holdForQueue)
       if (!ownsSubmission()) {
         _discardStaleGenerationPlaceholder(newJob)
@@ -15974,6 +16102,8 @@ export const useStore = create<AppState>((set, get) => ({
           selectedOutputKeys: [],
           gallerySelectionMode: false,
           ...(projectChanged || previousAccessRevoked ? {
+            projectAssetRefs: [],
+            projectAssetRefScope: null,
             browsingUploads: false,
             presets: [],
             directorProfilesSupported: false,
@@ -16061,6 +16191,10 @@ export const useStore = create<AppState>((set, get) => ({
       set({
         browsingUploads: false,
         activeWorkspace: name,
+        ...(previousWorkspace !== name ? {
+          projectAssetRefs: [],
+          projectAssetRefScope: null,
+        } : {}),
         presets: [],
         directorProfilesSupported: false,
         selectedDirectorProfileId: '',
@@ -16117,6 +16251,8 @@ export const useStore = create<AppState>((set, get) => ({
       set({
         browsingUploads: false,
         activeWorkspace: name,
+        projectAssetRefs: [],
+        projectAssetRefScope: null,
         presets: [],
         directorProfilesSupported: false,
         selectedDirectorProfileId: '',
@@ -16182,6 +16318,10 @@ export const useStore = create<AppState>((set, get) => ({
           unlock_idle_expires_at: null,
         } : workspace),
         ...(lockedActiveWorkspace && state.accessContext?.remote ? { activeWorkspace: '' } : {}),
+        ...(lockedActiveWorkspace ? {
+          projectAssetRefs: [],
+          projectAssetRefScope: null,
+        } : {}),
         jobs: remainingJobs,
         isGenerating: remainingJobs.some(_isActiveGenerationJob),
         ...(clearPendingPlan ? {
@@ -16260,6 +16400,10 @@ export const useStore = create<AppState>((set, get) => ({
         } : workspace),
         ...(lockedActiveWorkspace && state.accessContext?.remote ? { activeWorkspace: '' } : {}),
         ...(lockedActiveWorkspace ? {
+          projectAssetRefs: [],
+          projectAssetRefScope: null,
+        } : {}),
+        ...(lockedActiveWorkspace ? {
           browsingUploads: false,
           presets: [],
           directorProfilesSupported: false,
@@ -16317,6 +16461,8 @@ export const useStore = create<AppState>((set, get) => ({
       set({
         browsingUploads: false,
         activeWorkspace: 'default',
+        projectAssetRefs: [],
+        projectAssetRefScope: null,
         presets: [],
         directorProfilesSupported: false,
         selectedDirectorProfileId: '',

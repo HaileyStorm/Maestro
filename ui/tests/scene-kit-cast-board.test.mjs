@@ -7,10 +7,16 @@ import { build } from 'esbuild'
 
 import {
   groupSceneKitChoices,
+  projectAssetGenerateOutputsAreImages,
+  projectAssetGenerateReferenceFromChoice,
+  reconcileProjectAssetGenerateReferences,
+  sameOrderedProjectAssetGenerateReferences,
+  sameProjectAssetGenerateReference,
   sceneKitChoiceKey,
   sceneKitOutputCount,
   toggleSceneKitChoice,
 } from '../src/lib/sceneKit.ts'
+import { submitGeneration } from '../src/api/client.ts'
 
 const UI_ROOT = fileURLToPath(new URL('..', import.meta.url))
 const asModule = source => `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`
@@ -61,6 +67,84 @@ test('Scene Kit choices keep click order, group by role, and toggle by exact ide
   })
   choices = toggleSceneKitChoice(choices, character)
   assert.deepEqual(choices, [location])
+})
+
+test('Generate project references preserve click order and exact output order', () => {
+  assert.equal(projectAssetGenerateOutputsAreImages(['image/png', 'image/webp']), true)
+  assert.equal(projectAssetGenerateOutputsAreImages([]), false)
+  assert.equal(projectAssetGenerateOutputsAreImages(['image/png', 'video/mp4']), false)
+  const first = projectAssetGenerateReferenceFromChoice(character)
+  const second = projectAssetGenerateReferenceFromChoice(location)
+  assert.deepEqual(first, {
+    asset_id: 'asset-a',
+    variant_id: 'variant-a',
+    output_ids: ['mara-1', 'mara-2', 'mara-3'],
+  })
+  assert.deepEqual([first, second].map(reference => reference.asset_id), ['asset-a', 'asset-b'])
+  assert.equal(sameProjectAssetGenerateReference(first, {
+    ...first,
+    output_ids: ['mara-2', 'mara-1', 'mara-3'],
+  }), false)
+  assert.equal(sameOrderedProjectAssetGenerateReferences([first, second], [first, second]), true)
+  assert.equal(sameOrderedProjectAssetGenerateReferences([first, second], [second, first]), false)
+  assert.equal(sameOrderedProjectAssetGenerateReferences([first], [{
+    ...first,
+    output_ids: ['mara-1', 'mara-3', 'mara-2'],
+  }]), false)
+  assert.deepEqual(
+    reconcileProjectAssetGenerateReferences([first, second], [
+      { ...first, output_ids: ['changed-output'] }, second,
+    ]),
+    [second],
+  )
+})
+
+test('Generate staging is ordered, project-scoped, and invalidated when outputs change', async () => {
+  const { useStore } = await loadStore()
+  const project = 'scene-kit-generate-project'
+  const first = projectAssetGenerateReferenceFromChoice(character)
+  const second = projectAssetGenerateReferenceFromChoice(location)
+  useStore.setState({
+    activeWorkspace: project,
+    projectAssetRefs: [],
+    projectAssetRefScope: null,
+  })
+  useStore.getState().toggleProjectAssetRef(first)
+  useStore.getState().toggleProjectAssetRef(second)
+  assert.deepEqual(useStore.getState().projectAssetRefs, [first, second])
+  assert.equal(useStore.getState().projectAssetRefScope.workspace, project)
+  assert.equal(typeof useStore.getState().projectAssetRefScope.accountIdentityEpoch, 'number')
+  useStore.getState().reconcileProjectAssetRefs(project, [
+    { ...first, output_ids: ['new-output'] }, second,
+  ])
+  assert.deepEqual(useStore.getState().projectAssetRefs, [second])
+  useStore.getState().reconcileProjectAssetRefs(project, [
+    { ...second, output_ids: ['new-location-output'] },
+  ])
+  assert.deepEqual(useStore.getState().projectAssetRefs, [])
+  assert.equal(useStore.getState().projectAssetRefScope, null)
+})
+
+test('Generate sends project reference descriptors separately from uploaded image refs', async () => {
+  const originalFetch = globalThis.fetch
+  const reference = projectAssetGenerateReferenceFromChoice(character)
+  let requestBody
+  globalThis.fetch = async (input, init = {}) => {
+    assert.match(String(input), /\/api\/v1\/generate$/)
+    requestBody = JSON.parse(init.body)
+    return Response.json({ job_id: 'scene-kit-generate-job' })
+  }
+  try {
+    await submitGeneration({
+      model_type: 'video-model',
+      image_refs: ['/uploaded/studio-reference.png'],
+      project_asset_refs: [reference],
+    })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+  assert.deepEqual(requestBody.project_asset_refs, [reference])
+  assert.deepEqual(requestBody.image_refs, ['/uploaded/studio-reference.png'])
 })
 
 test('Director applies a staged reference kit in one aligned state change', async () => {
@@ -137,6 +221,14 @@ test('Cast Board stages every output before one commit and keeps legacy single a
   const source = await readFile(new URL('../src/components/Sidebar/ProjectReferenceLibrary.tsx', import.meta.url), 'utf8')
   assert.match(source, /Scene Kit · Cast Board/)
   assert.match(source, /Add to Scene Kit/)
+  assert.match(source, /Add to Generate/)
+  assert.match(source, /projectAssetGenerateOutputsAreImages/)
+  assert.match(source, /Generate staging supports image outputs only/)
+  assert.match(source, /Generate references/)
+  assert.match(source, /projectAssetGenerateReferenceFromChoice/)
+  assert.match(source, /reconcileProjectAssetRefs\(project, availableProjectAssetRefs\)/)
+  assert.match(source, /assetsSnapshotProject !== project/)
+  assert.match(source, /Remove \$\{label\} from Generate/)
   assert.match(source, /Attach kit to Director/)
   assert.match(source, /const entries: Array<\{ kind: 'character' \| 'location'; file: File; label: string \}> = \[\]/)
   assert.ok(source.indexOf('entries.push({') < source.indexOf('applyReferenceKit(entries,'))
@@ -156,7 +248,13 @@ test('Cast Board stages every output before one commit and keeps legacy single a
 test('project changes clear Director reference files, paths, labels, and the transient board', async () => {
   const store = await readFile(new URL('../src/stores/useStore.ts', import.meta.url), 'utf8')
   const library = await readFile(new URL('../src/components/Sidebar/ProjectReferenceLibrary.tsx', import.meta.url), 'utf8')
+  const inputs = await readFile(new URL('../src/components/Sidebar/InputsPanel.tsx', import.meta.url), 'utf8')
   assert.match(store, /activeWorkspace: name,[\s\S]*directorCharacterRefs: \[\],[\s\S]*directorLocationRefLabels: \[\]/)
   assert.match(store, /projectChanged \|\| previousAccessRevoked[\s\S]*directorReferenceImage: null/)
+  assert.match(store, /projectChanged \|\| previousAccessRevoked[\s\S]*projectAssetRefs: \[\]/)
+  assert.match(store, /projectAssetRefsForSubmission\.length > 0[\s\S]*params\.project_asset_refs = projectAssetRefsForSubmission/)
+  assert.match(store, /stagedProjectAssetRefScopeMatches[\s\S]*sameOrderedProjectAssetGenerateReferences\([\s\S]*Scene Kit references changed while this generation was preparing/)
   assert.match(library, /previousProject\.current = project[\s\S]*setSceneKitChoices\(\[\]\)/)
+  assert.match(inputs, /Scene Kit: \{projectAssetRefs\.length\} selection[\s\S]*Review in References/)
+  assert.match(inputs, /clearProjectAssetRefs/)
 })

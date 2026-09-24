@@ -90,6 +90,7 @@
     "image_start": "media",
     "image_end": "media",
     "image_refs": "media",
+    "project_asset_refs": "media",
     "audio_guide": "media",
     "audio_guide2": "media",
     "audio_guide3": "media",

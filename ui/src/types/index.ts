@@ -540,6 +540,15 @@ export interface H3EstimateResponse {
   profiles: H3PerformanceProfile[]
 }
 
+/** Exact project-owned reference outputs requested for a generation. The
+ * server resolves these IDs against the active project when it accepts the
+ * request; clients must not replace them with uploaded file paths. */
+export interface ProjectAssetGenerateReference {
+  asset_id: string
+  variant_id: string
+  output_ids: string[]
+}
+
 export interface GenerateParams extends H3AdaptiveSelection {
   prompt: string
   /** ACE-Step "Music Caption" — style/genre/instruments/mood (music mode). */
@@ -594,6 +603,7 @@ export interface GenerateParams extends H3AdaptiveSelection {
   video_guide3?: string
   force_fps?: string
   image_refs?: string[]
+  project_asset_refs?: ProjectAssetGenerateReference[]
   frames_positions?: string
   injection_strength?: number
   settings_version?: number

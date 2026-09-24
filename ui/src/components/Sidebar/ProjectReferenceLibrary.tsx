@@ -90,6 +90,9 @@ import { formatManualInstallationBytes, manualInstallationDestination } from '..
 import { requestQueueView } from '../../lib/mainViewNavigation'
 import {
   groupSceneKitChoices,
+  projectAssetGenerateReferenceFromChoice,
+  projectAssetGenerateOutputsAreImages,
+  sameProjectAssetGenerateReference,
   sceneKitChoiceKey,
   sceneKitOutputCount,
   toggleSceneKitChoice,
@@ -955,6 +958,11 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
   const setGuideVideoFps = useStore(s => s.setGuideVideoFps)
   const setGuideVideoFrameCount = useStore(s => s.setGuideVideoFrameCount)
   const addImageRef = useStore(s => s.addImageRef)
+  const projectAssetRefs = useStore(s => s.projectAssetRefs)
+  const toggleProjectAssetRef = useStore(s => s.toggleProjectAssetRef)
+  const removeProjectAssetRef = useStore(s => s.removeProjectAssetRef)
+  const clearProjectAssetRefs = useStore(s => s.clearProjectAssetRefs)
+  const reconcileProjectAssetRefs = useStore(s => s.reconcileProjectAssetRefs)
   const applyReferenceKit = useStore(s => s.directorApplyReferenceKit)
   const directorReferenceCount = useStore(s => (
     Number(Boolean(s.directorReferenceImage || s.directorReferenceImagePath))
@@ -987,6 +995,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
   const openModelVisibility = useStore(s => s.openModelVisibility)
   const open = active
   const [assets, setAssets] = useState<ProjectAsset[]>([])
+  const [assetsSnapshotProject, setAssetsSnapshotProject] = useState('')
   const assetsRef = useRef<ProjectAsset[]>([])
   const [loading, setLoading] = useState(false)
   const [submitting, setSubmitting] = useState(false)
@@ -1441,6 +1450,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
     requestSequence.current += 1
     const resetSections = createSectionState('character', 'standard', 3)
     setAssets([])
+    setAssetsSnapshotProject('')
     setSceneKitChoices([])
     setSceneKitApplying(false)
     setCatalogModels([])
@@ -1506,7 +1516,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
     setActionError('')
   }, [project, sceneKitAccountFingerprint])
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     setSceneKitChoices(current => {
       const next = current.filter(choice => {
         const asset = assets.find(candidate => candidate.id === choice.assetId)
@@ -1523,7 +1533,23 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
       })
       return next.length === current.length ? current : next
     })
-  }, [assets])
+    if (assetsSnapshotProject !== project) return
+    const availableProjectAssetRefs = assets.flatMap(asset => {
+      if (!getDirectorProjectReferenceKind(asset.asset_type)) return []
+      return asset.variants.flatMap(variant => {
+        if (variant.status !== 'kept') return []
+        const outputs = getProjectAssetApplyOutputs(variant)
+        if (!projectAssetGenerateOutputsAreImages(outputs.map(output => output.media_type))) return []
+        const outputIds = outputs.map(output => output.id)
+        return outputIds.length > 0 ? [{
+          asset_id: asset.id,
+          variant_id: variant.id,
+          output_ids: outputIds,
+        }] : []
+      })
+    })
+    reconcileProjectAssetRefs(project, availableProjectAssetRefs)
+  }, [assets, assetsSnapshotProject, project, reconcileProjectAssetRefs])
 
   useLayoutEffect(() => {
     if (!projectExplicitlyLocked) return
@@ -1536,6 +1562,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
     authoringAvailabilityRef.current.clear()
     setAuthoringAvailability({})
     setAssets([])
+    setAssetsSnapshotProject('')
     setSceneKitChoices([])
     setSceneKitApplying(false)
     setCatalogModels([])
@@ -1784,6 +1811,7 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
       const next = await fetchProjectAssets(project)
       if (signal.aborted || sequence !== requestSequence.current) return
       setAssets(next)
+      setAssetsSnapshotProject(project)
       const completedJobIds = new Set(next.flatMap(asset => (
         asset.variants.map(variant => variant.metadata.job?.id).filter((id): id is string => Boolean(id))
       )))
@@ -3820,6 +3848,48 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
 
               <div className="overflow-visible p-4">
                 {loadError && <p role="status" className="mb-3 rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-[10px] text-red-300">{loadError}</p>}
+                {referenceReturnMode === 'studio' && (
+                  <section aria-labelledby="generate-project-references-title" className="mb-4 rounded-xl border border-accent-blue/30 bg-accent-blue/[0.05] p-3">
+                    <div className="flex flex-wrap items-start justify-between gap-2">
+                      <div>
+                        <h3 id="generate-project-references-title" className="text-xs font-semibold text-text-primary">Generate references</h3>
+                        <p className="mt-0.5 text-[9px] text-text-muted">Generate sends these exact project selections by ID. Uploaded image references stay separate.</p>
+                      </div>
+                      <span className="rounded-full bg-bg-primary/60 px-2 py-1 text-[9px] text-text-secondary">
+                        {projectAssetRefs.length} selections · {projectAssetRefs.reduce((count, reference) => count + reference.output_ids.length, 0)} outputs
+                      </span>
+                    </div>
+                    {projectAssetRefs.length > 0 ? (
+                      <ol className="mt-2 space-y-1">
+                        {projectAssetRefs.map((reference, index) => {
+                          const asset = assets.find(candidate => candidate.id === reference.asset_id)
+                          const variant = asset?.variants.find(candidate => candidate.id === reference.variant_id)
+                          const label = `${asset?.name ?? 'Project reference'} · ${variant?.label ?? 'Selected variant'}`
+                          return (
+                            <li key={`${reference.asset_id}:${reference.variant_id}`} className="flex min-w-0 items-center gap-1.5 rounded border border-border bg-bg-secondary/70 px-2 py-1 text-[9px] text-text-secondary">
+                              <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-bg-primary text-[8px] font-bold">{index + 1}</span>
+                              <span className="min-w-0 flex-1 truncate">{label}</span>
+                              <span className="shrink-0 text-text-muted">{reference.output_ids.length}</span>
+                              <button
+                                type="button"
+                                aria-label={`Remove ${label} from Generate`}
+                                onClick={() => removeProjectAssetRef(reference.asset_id, reference.variant_id)}
+                                className="mobile-control-target shrink-0 rounded border border-border p-1 text-text-muted hover:text-text-primary"
+                              ><X size={10} /></button>
+                            </li>
+                          )
+                        })}
+                      </ol>
+                    ) : (
+                      <p className="mt-2 rounded-lg border border-dashed border-border px-3 py-2 text-[9px] text-text-muted">No project references staged. Add a kept Character or Location variant below.</p>
+                    )}
+                    {projectAssetRefs.length > 0 && (
+                      <div className="mt-2 flex justify-end">
+                        <button type="button" onClick={clearProjectAssetRefs} className="mobile-control-target rounded border border-border px-3 text-[9px] text-text-secondary">Clear staged references</button>
+                      </div>
+                    )}
+                  </section>
+                )}
                 {loading && !assets.length ? (
                   <div className="flex h-48 items-center justify-center"><Loader2 size={20} className="animate-spin text-accent-blue" /></div>
                 ) : assets.length === 0 ? (
@@ -3986,11 +4056,22 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                               ?? packMetadata?.review?.requested_model
                             const editing = editVariantId === variant.id
                             const directorReferenceKind = getDirectorProjectReferenceKind(asset.asset_type)
+                            const generateImageOutputs = projectAssetGenerateOutputsAreImages(
+                              applyOutputs.map(output => output.media_type),
+                            )
                             const directorApplyUnsupported = referenceReturnMode === 'director'
                               && directorReferenceKind === null
                               && !applyOutput?.media_type?.startsWith('video/')
                             const sceneKitKey = sceneKitChoiceKey(asset.id, variant.id)
                             const sceneKitSelected = sceneKitChoices.some(choice => choice.key === sceneKitKey)
+                            const projectAssetGenerateReference = projectAssetGenerateReferenceFromChoice({
+                              assetId: asset.id,
+                              variantId: variant.id,
+                              outputIds: applyOutputs.map(output => output.id),
+                            })
+                            const projectAssetGenerateReferenceSelected = projectAssetRefs.some(reference => (
+                              sameProjectAssetGenerateReference(reference, projectAssetGenerateReference)
+                            ))
                             const applyLabel = applyOutput?.media_type?.startsWith('video/')
                               ? 'Use in Generate as an LTX-2.3 control and prompt'
                               : variant.variant_type === 'reference_pack'
@@ -4187,6 +4268,20 @@ export function ProjectReferenceLibrary({ active }: { active: boolean }) {
                                         >
                                           {sceneKitSelected ? <Check size={9} /> : <Plus size={9} />} {sceneKitSelected ? 'Selected for Scene Kit' : 'Add to Scene Kit'}
                                         </button>
+                                      )}
+                                      {directorReferenceKind && generateImageOutputs && (
+                                        <button
+                                          type="button"
+                                          aria-label={`${projectAssetGenerateReferenceSelected ? 'Remove' : 'Add'} ${asset.name} · ${variant.label} ${projectAssetGenerateReferenceSelected ? 'from' : 'to'} Generate`}
+                                          aria-pressed={projectAssetGenerateReferenceSelected}
+                                          onClick={() => toggleProjectAssetRef(projectAssetGenerateReference)}
+                                          className={`mobile-control-target mt-1.5 flex w-full items-center justify-center gap-1 rounded border px-2 text-[9px] ${projectAssetGenerateReferenceSelected ? 'border-accent-green/60 bg-accent-green/10 text-accent-green' : 'border-border text-text-secondary hover:border-accent-blue/50 hover:text-accent-blue'}`}
+                                        >
+                                          {projectAssetGenerateReferenceSelected ? <Check size={9} /> : <Plus size={9} />} {projectAssetGenerateReferenceSelected ? 'Selected for Generate' : 'Add to Generate'}
+                                        </button>
+                                      )}
+                                      {directorReferenceKind && !generateImageOutputs && (
+                                        <p className="mt-1.5 text-[8px] text-text-muted">Generate staging supports image outputs only.</p>
                                       )}
                                       <button type="button" disabled={directorApplyUnsupported || sceneKitApplying} onClick={() => void applyReference(asset, variant)} className="mt-1.5 w-full rounded border border-accent-blue/40 px-1 py-1 text-[9px] text-accent-blue disabled:cursor-not-allowed disabled:border-border disabled:text-text-muted">{directorApplyUnsupported ? 'Use from Generate' : applyLabel}</button>
                                       {directorApplyUnsupported && <p className="mt-1 text-[8px] leading-relaxed text-amber-200">Director currently accepts only Character and Location references. Use this candidate from Generate instead.</p>}

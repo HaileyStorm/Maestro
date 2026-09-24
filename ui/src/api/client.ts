@@ -27,6 +27,7 @@ import type {
   ModelManualInstallation,
   ProjectReferenceManagedLayoutAssistMode,
   ProjectReferencePackPlan,
+  ProjectAssetGenerateReference,
   ProjectReferencePreset,
   ProjectReferenceOperationRouting,
   ProjectReferenceTypeFields,
@@ -1169,8 +1170,12 @@ export async function fetchDefaults(modelType: string): Promise<Record<string, u
 
 // --- Generation ---
 
+export interface GenerationSubmissionParams extends Record<string, unknown> {
+  project_asset_refs?: ProjectAssetGenerateReference[]
+}
+
 export async function submitGeneration(
-  params: Record<string, unknown>,
+  params: GenerationSubmissionParams,
   holdForQueue = false,
 ): Promise<{
   job_id: string
