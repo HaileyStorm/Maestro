@@ -16,6 +16,28 @@ persistent_offloadobj = None
 persistent_model_id = None
 
 
+def release_persistent_models() -> bool:
+    """Drop MMAudio's retained graph after its caller excludes inference."""
+    global persistent_offloadobj, persistent_net, persistent_features_utils
+    global persistent_seq_cfg, persistent_model_id
+
+    owned_offloadobj = persistent_offloadobj
+    if owned_offloadobj is None:
+        return False
+    persistent_offloadobj = None
+    persistent_net = None
+    persistent_features_utils = None
+    persistent_seq_cfg = None
+    persistent_model_id = None
+    try:
+        owned_offloadobj.unload_all()
+    finally:
+        owned_offloadobj.release()
+        del owned_offloadobj
+        gc.collect()
+    return True
+
+
 def _resolve_mmaudio_path(path):
     if path is None:
         return None

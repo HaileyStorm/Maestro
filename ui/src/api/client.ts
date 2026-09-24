@@ -7002,6 +7002,49 @@ export async function releaseModels(): Promise<{ released: string[] }> {
   return res.json()
 }
 
+export interface ResourceReleasePreview {
+  activity_token: string
+  running: number
+  queued: number
+  preparing: number
+  director_running: number
+  loaded: string[]
+  queue_paused: boolean
+  director_queue_paused: boolean
+}
+
+export interface ResourceReleaseRequest {
+  activity_token: string
+  confirm_active: boolean
+  stop_running: boolean
+  /** Exact display labels returned by the preview; omitted or `['all']` means all. */
+  targets?: string[]
+}
+
+export interface ResourceReleaseResult {
+  released: string[]
+  failures: string[]
+  stopped_jobs: number
+  stopped_pipelines: number
+  queue_paused: boolean
+  director_queue_paused: boolean
+}
+
+/** Owner-only, reauthenticated preview of loaded resources and queue activity. */
+export async function fetchResourceReleasePreview(): Promise<ResourceReleasePreview> {
+  return accountRequest<ResourceReleasePreview>('/api/v1/system/resource-release')
+}
+
+/** Release the selected loaded resources after explicit confirmation. */
+export async function releaseResources(
+  request: ResourceReleaseRequest,
+): Promise<ResourceReleaseResult> {
+  return accountRequest<ResourceReleaseResult>('/api/v1/system/resource-release', {
+    method: 'POST',
+    body: JSON.stringify(request),
+  })
+}
+
 /** Apply the recommended settings to wgp_config.json. Used by both
  *  the "Re-detect" button (refreshes after hardware change) and the
  *  auto-tune toggle going from off → on. Server-side this is a single

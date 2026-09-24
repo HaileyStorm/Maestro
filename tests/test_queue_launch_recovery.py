@@ -2827,6 +2827,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "/api/v1/tools/upscale",
                 "/api/v1/tools/revoice",
                 "/api/v1/system/release-model",
+                "/api/v1/system/resource-release",
                 "/api/v1/projects/project-a/assets/generate",
                 "/api/v1/director/preparation",
                 "/api/v1/director/preparation/request-a",
@@ -2887,6 +2888,12 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "POST",
                 "/api/v1/system/release-model",
                 "/api/v1/system/release-model",
+            ),
+            (
+                "owner_resource_release",
+                "POST",
+                "/api/v1/system/resource-release",
+                "/api/v1/system/resource-release",
             ),
             (
                 "delete_workspace",

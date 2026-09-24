@@ -126,6 +126,8 @@ def _load_route_symbols(namespace):
         "serve_project_asset_media",
         "get_project_reference_authoring",
         "get_project_reference_capabilities",
+        "_character_sheet_anchor_key",
+        "_resolve_character_sheet_anchor_for_request",
         "update_project_asset",
         "set_project_asset_variant_status",
         "generate_project_asset_references",
@@ -936,6 +938,40 @@ class ProjectReferenceRouteTests(unittest.TestCase):
         self.assertEqual(response["plan"]["planner_version"], "reference-pack-v2")
         self.assertEqual(response["plan"]["anchor_role"], "canonical_identity")
         self.assertEqual(self.jobs[response["job_id"]]["status"], "completed")
+
+    def test_kept_flux_output_has_server_verified_character_sheet_anchor(self):
+        from services.character_sheet_anchor import resolve_character_sheet_anchor
+
+        self._run(self._body())
+        asset = self._assets()[0]
+        variant = asset["variants"][0]
+        output = variant["outputs"][0]
+        self.store.keep_variant("project", "main", asset["id"], variant["id"])
+
+        resolved = resolve_character_sheet_anchor(
+            self.store,
+            self.ns["_character_sheet_anchor_key"](),
+            project_id="project",
+            workspace_id="main",
+            asset_id=asset["id"],
+            variant_id=variant["id"],
+            output_id=output["id"],
+            is_verified_flux_model=lambda model_id: model_id == "flux2_klein_9b",
+        )
+        self.assertEqual(resolved["anchor"]["source_model_id"], "flux2_klein_9b")
+        self.assertEqual(resolved["anchor"]["project_id"], "project")
+        self.assertEqual(
+            resolved["anchor"]["sha256"],
+            hashlib.sha256(Path(resolved["source_path"]).read_bytes()).hexdigest(),
+        )
+        through_request = self.ns["_resolve_character_sheet_anchor_for_request"](
+            _Request({}),
+            "project",
+            asset["id"],
+            variant["id"],
+            output["id"],
+        )
+        self.assertEqual(through_request["anchor"], resolved["anchor"])
 
     def test_hybrid_generates_anchor_then_local_targeted_edits(self):
         self._run(self._body(

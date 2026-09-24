@@ -3245,6 +3245,8 @@ class AccountCapabilityTests(unittest.TestCase):
 
     def test_remote_owner_route_matrix_denies_before_body_or_side_effects(self):
         route_matrix = (
+            ("GET", "/api/v1/system/resource-release"),
+            ("POST", "/api/v1/system/resource-release"),
             ("GET", "/api/v1/h3/legal-access"),
             ("PUT", "/api/v1/h3/legal-access"),
             ("GET", "/api/v1/krea/owner-policy"),
@@ -3256,6 +3258,8 @@ class AccountCapabilityTests(unittest.TestCase):
             ("POST", "/api/v1/queue/resume"),
         )
         expected_handlers = {
+            ("GET", "/api/v1/system/resource-release"): "owner_resource_release_preview",
+            ("POST", "/api/v1/system/resource-release"): "owner_resource_release",
             ("GET", "/api/v1/h3/legal-access"): "get_h3_legal_access",
             ("PUT", "/api/v1/h3/legal-access"): "update_h3_legal_access",
             ("GET", "/api/v1/krea/owner-policy"): "get_krea_owner_policy",

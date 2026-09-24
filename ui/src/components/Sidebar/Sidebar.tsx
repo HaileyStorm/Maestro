@@ -55,6 +55,11 @@ export function Sidebar() {
   const modelType = useStore(s => s.params.model_type)
   const openLoraBrowser = useStore(s => s.setLoraBrowserOpen)
   const machineControls = useStore(s => s.accessContext?.machine_controls === true)
+  const accountContext = useStore(s => s.accountContext ?? s.accessContext?.accounts ?? null)
+  const ownerAccount = accountContext?.enabled === true
+    && accountContext.authenticated === true
+    && accountContext.account?.role === 'owner'
+  const canClearResources = accountContext?.enabled === true ? ownerAccount : machineControls
   const isMobile = useIsMobile()
   const mobileSidebarRef = useRef<HTMLElement>(null)
   const mobileCloseRef = useRef<HTMLButtonElement>(null)
@@ -419,7 +424,12 @@ export function Sidebar() {
             {!isReference && <GenerationPrivacyControls />}
             {!isReference && (isDirector ? <DirectorChat /> : studioControls)}
             <ProjectReferenceLibrary active={isReference && sidebarOpen} />
-            {machineControls && <HardwareStatusBar />}
+            {(machineControls || canClearResources) && (
+              <HardwareStatusBar
+                canClearResources={canClearResources}
+                showHardwareTelemetry={machineControls}
+              />
+            )}
           </div>
         </aside>
       </>,
@@ -449,7 +459,12 @@ export function Sidebar() {
       {!isReference && <GenerationPrivacyControls />}
       {!isReference && (isDirector ? <DirectorChat /> : studioControls)}
       <ProjectReferenceLibrary active={isReference} />
-      {machineControls && <HardwareStatusBar />}
+      {(machineControls || canClearResources) && (
+        <HardwareStatusBar
+          canClearResources={canClearResources}
+          showHardwareTelemetry={machineControls}
+        />
+      )}
     </aside>
   )
 }

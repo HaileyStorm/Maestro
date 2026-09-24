@@ -923,6 +923,7 @@ _REMOTE_LOCAL_ONLY_PREFIXES = (
     "/api/v1/system/preflight",
     "/api/v1/system-stats",
     "/api/v1/system/release-model",
+    "/api/v1/system/resource-release",
     "/api/v1/model-folders",
     "/api/v1/huggingface",
     "/api/v1/civitai",
@@ -944,6 +945,8 @@ _REMOTE_LOCAL_ONLY_EXACT = frozenset({
     ("PUT", "/api/v1/krea/owner-policy"),
 })
 _REMOTE_OWNER_REAUTH_ALLOWED_EXACT = frozenset({
+    ("GET", "/api/v1/system/resource-release"),
+    ("POST", "/api/v1/system/resource-release"),
     ("PUT", "/api/v1/model-visibility"),
     ("POST", "/api/v1/models/reload"),
     ("POST", "/api/v1/llm/unload"),
@@ -2019,6 +2022,7 @@ def _startup_recovery_sensitive_path(path: str, method: str = "") -> bool:
             "/api/v1/tools/revoice",
             "/api/v1/tools/hflip",
             "/api/v1/system/release-model",
+            "/api/v1/system/resource-release",
             "/api/v1/director/generate-music",
             "/api/v1/director/classify-sections",
             "/api/v1/audio/analyze",
@@ -21855,8 +21859,27 @@ def get_system_stats_live():
     return stats
 
 
+def _require_owner_resource_control(request: Request) -> None:
+    """Keep legacy direct-local ownership and enforce accounts when active."""
+    if _accounts_enabled():
+        _require_account_store(request)
+        _require_account_principal(request)
+        if not _request_has_account_capability(request, "owner.admin"):
+            raise HTTPException(status_code=403, detail="Owner access is required")
+        if not _request_has_recent_account_reauth(request):
+            raise HTTPException(
+                status_code=403,
+                detail="Confirm your password in Account before freeing model memory",
+            )
+    elif bool(getattr(request.state, "maestro_remote", False)) or _request_is_cloudflare_remote(request):
+        raise HTTPException(
+            status_code=403,
+            detail="This machine-wide control is available locally only",
+        )
+
+
 @api.post("/api/v1/system/release-model")
-def system_release_model():
+def system_release_model(request: Request):
     """Manually unload resident models to free VRAM/RAM (issue #12).
 
     Models deliberately stay loaded between generations so a retry with
@@ -21864,6 +21887,7 @@ def system_release_model():
     for users who want the memory back now — wgp reloads transparently
     on the next job. Refuses while anything is generating.
     """
+    _require_owner_resource_control(request)
     # Queued jobs may be held for recovery or waiting on another resource;
     # neither is generating. The locks below serialize an ordinary queued job
     # that starts while this request unloads the resident model.
@@ -21912,6 +21936,361 @@ def system_release_model():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return {"released": released}
+    finally:
+        if native_gpu_acquired:
+            native_gpu_slot.__exit__(None, None, None)
+        _gen_lock.release()
+
+
+_RESOURCE_RELEASE_ACTIVE_STATUSES = frozenset({
+    "queued", "running", "preparing", "waiting_for_plan_approval",
+})
+
+
+def _resource_release_activity() -> dict:
+    """Return content-free owner confirmation state for this process."""
+    from services import director_pipeline as director
+
+    jobs = sorted(
+        (str(job_id), str(job.get("status") or ""))
+        for job_id, job in list(_jobs.items())
+        if isinstance(job, Mapping)
+        and job.get("status") in _RESOURCE_RELEASE_ACTIVE_STATUSES
+    )
+    pipelines = sorted(
+        (str(pid), str(pipeline.get("status") or ""))
+        for pid, pipeline in list(director._pipelines.items())
+        if isinstance(pipeline, Mapping)
+        and pipeline.get("status") in director._ACTIVE_PIPELINE_STATUSES
+    )
+    pipeline_ids = {pid for pid, _ in pipelines}
+    with director._director_queue_lock:
+        queue_state = director._director_queue_state or {}
+        director_queue_base = str(director._director_queue_base or "")
+        director_queue_paused = bool(
+            director_queue_base and queue_state.get("paused", True)
+        )
+        director_queue_worker = getattr(director, "_director_queue_worker", None)
+        director_worker_alive = bool(
+            director_queue_worker is not None and director_queue_worker.is_alive()
+        )
+        director_queue = sorted(
+            (
+                str(entry.get("id") or ""),
+                "pending" if entry.get("status") in {"held", "queued"}
+                else str(entry.get("status") or ""),
+                str(entry.get("pipeline_id") or ""),
+            )
+            for entry in queue_state.get("entries") or []
+            if isinstance(entry, Mapping)
+            and entry.get("status") in {"held", "queued", "running"}
+        )
+    payload = json.dumps(
+        {
+            "jobs": jobs,
+            "pipelines": pipelines,
+            "director_queue": [director_queue_base, director_queue],
+            "director_worker_alive": director_worker_alive,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    token = hmac.new(
+        _session_secret(), b"maestro-resource-release-v1\0" + payload,
+        hashlib.sha256,
+    ).hexdigest()
+    return {
+        "activity_token": token,
+        "running": sum(status == "running" for _, status in jobs),
+        "queued": sum(
+            status in {"queued", "waiting_for_plan_approval"}
+            for _, status in jobs
+        ) + sum(status == "pending" for _, status, _ in director_queue),
+        "preparing": sum(status == "preparing" for _, status in jobs),
+        "director_running": len(pipelines) + sum(
+            status == "running" and pipeline_id not in pipeline_ids
+            for _, status, pipeline_id in director_queue
+        ) + int(director_worker_alive and not director_queue and not pipelines),
+        "queue_paused": bool(queue_control_state().get("paused")),
+        "director_queue_paused": director_queue_paused,
+        "_job_ids": tuple(
+            job_id for job_id, status in jobs
+            if status in {"running", "preparing"}
+        ),
+        "_pipeline_ids": tuple(pid for pid, _ in pipelines),
+        "_director_queue_base": director_queue_base,
+        "_director_queue_paused": director_queue_paused,
+    }
+
+
+def _resource_release_loaded() -> list[str]:
+    """Describe only resident resources that Maestro can actually release."""
+    loaded = []
+    if getattr(wgp, "wan_model", None) is not None or getattr(wgp, "offloadobj", None) is not None:
+        loaded.append("generation model")
+    from services import llm_service
+    if llm_service.is_loaded():
+        loaded.append("Director assistant")
+    if any(getattr(wgp, name, None) is not None for name in (
+        "enhancer_offloadobj", "prompt_enhancer_image_caption_model",
+        "prompt_enhancer_llm_model",
+    )):
+        loaded.append("prompt enhancer")
+    flash_runtime = sys.modules.get("postprocessing.flashvsr.runtime")
+    runtime = getattr(flash_runtime, "_RUNTIME", None)
+    if runtime is not None and any(getattr(runtime, name, None) is not None for name in (
+        "dit", "lq_proj", "tcdecoder", "vae", "offloadobj",
+    )):
+        loaded.append("FlashVSR")
+    mmaudio = sys.modules.get("postprocessing.mmaudio.mmaudio")
+    if mmaudio is not None and getattr(mmaudio, "persistent_offloadobj", None) is not None:
+        loaded.append("MMAudio")
+    analysis = sys.modules.get("services.audio_analysis")
+    if analysis is not None:
+        if getattr(analysis, "_whisper_model", None) is not None:
+            loaded.append("Whisper")
+        if getattr(analysis, "_diarizer_pipe", None) is not None:
+            loaded.append("speaker diarizer")
+    from services.inpaint_service import check_sam_status
+    sam = check_sam_status()
+    if sam.get("status") == "available" and sam.get("model_loaded") is True:
+        loaded.append("SAM")
+    return loaded
+
+
+def _resource_release_stop_running(confirmed: Mapping[str, Any]) -> tuple[int, int]:
+    """Request normal job and Director cancellation after explicit consent."""
+    from services.director_pipeline import _pipelines, stop_pipeline
+
+    stopped_pipelines = 0
+    for pid in confirmed["_pipeline_ids"]:
+        pipeline = _pipelines.get(pid)
+        if isinstance(pipeline, Mapping) and pipeline.get("status") in {
+            "queued", "planning", "running", "paused",
+        }:
+            stopped_pipelines += int(bool(stop_pipeline(pid)))
+    stopped_jobs = 0
+    for job_id in confirmed["_job_ids"]:
+        job = _jobs.get(job_id)
+        if not isinstance(job, dict) or job.get("status") not in {"running", "preparing"}:
+            continue
+        result = request_cancel(
+            job, job_id=str(job_id), active_states=_active_gen_states,
+        )
+        stopped_jobs += int(bool(result.was_running or result.abort_signalled))
+        cpu_tokens = _cpu_text_lane.runtime_tokens(str(job_id))
+        if cpu_tokens is not None:
+            from services import llm_service
+            try:
+                llm_service.abort_local_cpu_runtime(
+                    cpu_tokens.runtime_generation,
+                    cpu_tokens.runtime_attempt_id,
+                    terminate_timeout=5.0,
+                    kill_timeout=5.0,
+                )
+            except Exception as error:
+                print(
+                    "[ResourceRelease] CPU runtime abort remains pending "
+                    f"({type(error).__name__})"
+                )
+            _cpu_text_lane.notify()
+    return stopped_jobs, stopped_pipelines
+
+
+def _resource_release_pause_director_queue(confirmed: Mapping[str, Any]) -> None:
+    """Pause the exact in-process Director queue before stopping its work."""
+    base = confirmed["_director_queue_base"]
+    if not base or confirmed["_director_queue_paused"]:
+        return
+    from services import director_pipeline as director
+    with director._director_queue_lock:
+        if str(director._director_queue_base or "") != base:
+            raise HTTPException(
+                status_code=409,
+                detail="Director queue activity changed. Review the current work again.",
+            )
+        director.pause_director_queue(base)
+
+
+def _resource_release_unload(targets: frozenset[str]) -> tuple[list[str], list[str]]:
+    """Best-effort unload, reporting every component that could not clear."""
+    released: list[str] = []
+    failures: list[str] = []
+
+    def attempt(label: str, action) -> None:
+        try:
+            if action() is not False:
+                released.append(label)
+        except Exception as error:
+            failures.append(label)
+            print(f"[ResourceRelease] {label} unload failed ({type(error).__name__})")
+
+    loaded = set(_resource_release_loaded())
+    selected = loaded if "all" in targets else loaded.intersection(targets)
+    if "generation model" in selected:
+        attempt("generation model", _release_wgp_model_with_native_gpu_exclusion)
+    if "Director assistant" in selected:
+        from services import llm_service
+        attempt("Director assistant", llm_service.unload_model)
+    if "prompt enhancer" in selected:
+        def unload_enhancer():
+            wgp.reset_prompt_enhancer()
+            wgp.reset_prompt_enhancer_if_requested()
+        attempt("prompt enhancer", unload_enhancer)
+    if "FlashVSR" in selected:
+        attempt("FlashVSR", wgp.release_flashvsr_vram)
+    if "MMAudio" in selected:
+        mmaudio = sys.modules.get("postprocessing.mmaudio.mmaudio")
+        attempt("MMAudio", mmaudio.release_persistent_models)
+    analysis = sys.modules.get("services.audio_analysis")
+    if analysis is not None:
+        if "Whisper" in selected:
+            attempt("Whisper", analysis.unload_whisper)
+        if "speaker diarizer" in selected:
+            attempt("speaker diarizer", analysis.unload_diarizer)
+    if "SAM" in selected:
+        from services.inpaint_service import SAM_SERVICE_URL
+        def unload_sam_model():
+            response = requests.post(f"{SAM_SERVICE_URL}/unload", timeout=10)
+            response.raise_for_status()
+        attempt("SAM", unload_sam_model)
+    try:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception as error:
+        failures.append("allocator cache")
+        print(f"[ResourceRelease] allocator cleanup failed ({type(error).__name__})")
+    return released, failures
+
+
+@api.get("/api/v1/system/resource-release")
+def owner_resource_release_preview(request: Request, response: Response):
+    """Show an owner what will be interrupted before clearing model memory."""
+    _set_recovery_no_store(response)
+    _require_owner_resource_control(request)
+    activity = _resource_release_activity()
+    return {
+        **{key: value for key, value in activity.items() if not key.startswith("_")},
+        "loaded": _resource_release_loaded(),
+    }
+
+
+@api.post("/api/v1/system/resource-release")
+async def owner_resource_release(request: Request, response: Response):
+    """Pause queued work, stop confirmed running jobs, then clear residency."""
+    _set_recovery_no_store(response)
+    _require_owner_resource_control(request)
+    body = await request.json()
+    # The generation lock, model teardown and local SAM request may block.
+    # Keep the API event loop available for jobs and queue state to settle.
+    return await asyncio.to_thread(_owner_resource_release_execute, body)
+
+
+def _owner_resource_release_execute(body: Any) -> dict:
+    """Apply one reviewed owner release outside the API event loop."""
+    if not isinstance(body, dict) or not {
+        "activity_token", "confirm_active", "stop_running",
+    }.issubset(body) or set(body) - {
+        "activity_token", "confirm_active", "stop_running", "targets",
+    } or not isinstance(body.get("activity_token"), str) or len(body["activity_token"]) != 64 or (
+        type(body.get("confirm_active")) is not bool
+        or type(body.get("stop_running")) is not bool
+    ):
+        raise HTTPException(status_code=400, detail="Resource request is invalid")
+    targets = body.get("targets", ["all"])
+    available = set(_resource_release_loaded())
+    if (
+        not isinstance(targets, list) or not targets
+        or any(not isinstance(item, str) for item in targets)
+        or len(targets) != len(set(targets))
+        or ("all" in targets and len(targets) != 1)
+    ):
+        raise HTTPException(status_code=400, detail="Resource selection is invalid")
+    activity = _resource_release_activity()
+    if not hmac.compare_digest(body["activity_token"], activity["activity_token"]):
+        raise HTTPException(
+            status_code=409,
+            detail="Queue activity changed. Review the current work and confirm again.",
+        )
+    if set(targets) - (available | {"all"}):
+        raise HTTPException(
+            status_code=409,
+            detail="Loaded resources changed. Review the current selection and confirm again.",
+        )
+    active = sum(activity[key] for key in (
+        "running", "queued", "preparing", "director_running",
+    ))
+    if active and not available:
+        raise HTTPException(
+            status_code=409,
+            detail="No Maestro models are loaded. Wait for current work to finish before clearing cache.",
+        )
+    if active and not body["confirm_active"]:
+        raise HTTPException(status_code=409, detail="Review active work before freeing memory")
+    if (activity["running"] or activity["preparing"] or activity["director_running"]) and not body["stop_running"]:
+        raise HTTPException(
+            status_code=409,
+            detail="Running work must be stopped before model memory can be freed",
+        )
+    if any(
+        isinstance(_jobs.get(job_id), Mapping)
+        and _jobs[job_id].get("kind") == "sample_campaign_generation"
+        for job_id in activity["_job_ids"]
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="A paired sample is active. Wait for it to finish before freeing memory.",
+        )
+    original_paused = activity["queue_paused"]
+    if active and not original_paused:
+        set_queue_paused(True)
+    if active:
+        _resource_release_pause_director_queue(activity)
+        if not hmac.compare_digest(
+            activity["activity_token"],
+            _resource_release_activity()["activity_token"],
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Queue activity changed while pausing. Review the current work again.",
+            )
+    stopped_jobs = stopped_pipelines = 0
+    if body["stop_running"]:
+        stopped_jobs, stopped_pipelines = _resource_release_stop_running(activity)
+    if not _gen_lock.acquire(timeout=30):
+        raise HTTPException(
+            status_code=409,
+            detail="Work is still stopping. The queue is paused; try freeing memory again shortly.",
+        )
+    native_gpu_slot = _WgpNativeGpuExecutionSlot(blocking=False)
+    native_gpu_acquired = False
+    try:
+        native_gpu_acquired = native_gpu_slot.__enter__()
+        if not native_gpu_acquired:
+            raise HTTPException(
+                status_code=409,
+                detail="GPU model work is still active. The queue is paused; try again shortly.",
+            )
+        current = _resource_release_activity()
+        if current["running"] or current["director_running"] or current["preparing"]:
+            raise HTTPException(
+                status_code=409,
+                detail="Work is still stopping. The queue is paused; try again shortly.",
+            )
+        released, failures = _resource_release_unload(frozenset(targets))
+        if not active and not original_paused and not current["queued"]:
+            # An idle owner release should not silently change queue policy.
+            queue_paused = False
+        else:
+            queue_paused = bool(queue_control_state().get("paused"))
+        return {
+            "released": released,
+            "failures": failures,
+            "stopped_jobs": stopped_jobs,
+            "stopped_pipelines": stopped_pipelines,
+            "queue_paused": queue_paused,
+            "director_queue_paused": current["director_queue_paused"],
+        }
     finally:
         if native_gpu_acquired:
             native_gpu_slot.__exit__(None, None, None)
@@ -26833,6 +27212,58 @@ def get_project_reference_capabilities(project: str, request: Request):
     return _project_reference_capabilities()
 
 
+def _character_sheet_anchor_key() -> bytes:
+    """Derive a stable, purpose-specific proof key from the host secret."""
+    return hmac.new(
+        _session_secret(), b"maestro-character-sheet-anchor-proof-v1",
+        hashlib.sha256,
+    ).digest()
+
+
+def _resolve_character_sheet_anchor_for_request(
+    request: Request,
+    project: str,
+    asset_id: str,
+    variant_id: str,
+    output_id: str,
+) -> dict:
+    """Resolve one kept FLUX output from server-owned project media only."""
+    from services.character_sheet_anchor import (
+        CharacterSheetAnchorError,
+        resolve_character_sheet_anchor,
+    )
+
+    project_id, workspace_id = _asset_scope(request, project)
+    _require_project_access(request, project, permission="project.generate")
+    _require_project_asset_media_access(
+        project_id,
+        workspace_id,
+        asset_id,
+        request.state.maestro_session_id,
+        variant_id=variant_id,
+    )
+
+    def is_verified_flux_model(model_id: str) -> bool:
+        return bool(
+            model_id in wgp.models_def
+            and wgp.get_model_family(model_id) == "flux"
+        )
+
+    try:
+        return resolve_character_sheet_anchor(
+            _project_asset_store(),
+            _character_sheet_anchor_key(),
+            project_id=project_id,
+            workspace_id=workspace_id,
+            asset_id=asset_id,
+            variant_id=variant_id,
+            output_id=output_id,
+            is_verified_flux_model=is_verified_flux_model,
+        )
+    except CharacterSheetAnchorError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
 def _project_reference_request_config(
     body, request, *, existing_asset_type=None, commitment_contexts=None,
     managed_character_callouts=None,
@@ -28209,6 +28640,8 @@ def _attach_project_reference_result(
     *, asset_id, result, parent_job, candidate_index, candidate_count,
     parent_variant_id, recommended=False, recommendation_basis=None,
 ):
+    from services.character_sheet_anchor import create_reference_pack_anchor_proof
+
     if is_cancel_requested(parent_job):
         raise RuntimeError("reference_job_cancelled")
     artifacts = list(result.artifacts)
@@ -28273,6 +28706,7 @@ def _attach_project_reference_result(
         )
     ):
         raise RuntimeError("reference_pack_review_seal_invalid")
+    variant_id = f"{parent_job['id']}_pack_{candidate_index + 1}"
     outputs = []
     for artifact in artifacts:
         artifact_metadata = artifact.public_metadata()
@@ -28290,6 +28724,29 @@ def _attach_project_reference_result(
         ).get(artifact.model)
         if isinstance(schedule, dict):
             artifact_metadata["schedule"] = dict(schedule)
+        approved = seal_by_index.get(artifact.index)
+        source_identity = (
+            {
+                "device": approved.device,
+                "inode": approved.inode,
+                "size": approved.size,
+                "sha256": approved.sha256,
+            }
+            if approved is not None
+            else _project_reference_source_identity(str(artifact.path))
+        )
+        anchor_provenance = create_reference_pack_anchor_proof(
+            _character_sheet_anchor_key(),
+            project_id=str(parent_job["workspace"]),
+            workspace_id="main",
+            asset_id=asset_id,
+            variant_id=variant_id,
+            output_index=artifact.index,
+            basename=os.path.basename(str(artifact.path)),
+            source_model_id=artifact.model,
+            source_sha256=source_identity["sha256"],
+            job_id=str(parent_job["id"]),
+        )
         output = {
             "source_path": str(artifact.path),
             "label": (
@@ -28300,22 +28757,14 @@ def _attach_project_reference_result(
             "metadata": {
                 **policy,
                 "initial_blur": bool(result.plan.initial_blur),
-                "reference_pack": artifact_metadata,
+                "reference_pack": {
+                    **artifact_metadata,
+                    "anchor_provenance": anchor_provenance,
+                },
                 "lineage": dict(lineage),
             },
+            "expected_source_identity": source_identity,
         }
-        approved = seal_by_index.get(artifact.index)
-        if approved is not None:
-            output["expected_source_identity"] = {
-                "device": approved.device,
-                "inode": approved.inode,
-                "size": approved.size,
-                "sha256": approved.sha256,
-            }
-        else:
-            output["expected_source_identity"] = (
-                _project_reference_source_identity(str(artifact.path))
-            )
         outputs.append(output)
         _write_project_reference_sidecar(
             str(artifact.path),
@@ -28326,7 +28775,6 @@ def _attach_project_reference_result(
         if is_cancel_requested(parent_job):
             raise RuntimeError("reference_job_cancelled")
 
-    variant_id = f"{parent_job['id']}_pack_{candidate_index + 1}"
     variant_spec = {
         "id": variant_id,
         "variant_type": "reference_pack",

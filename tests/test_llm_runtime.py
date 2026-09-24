@@ -634,6 +634,8 @@ class LlmRuntimeTests(unittest.TestCase):
         release_namespace = {
             "_jobs": {},
             "_gen_lock": threading.Lock(),
+            "Request": object,
+            "_require_owner_resource_control": lambda _request: None,
             "wgp": fake_wgp,
             "HTTPException": HttpError,
             "torch": types.SimpleNamespace(cuda=types.SimpleNamespace(
@@ -658,8 +660,9 @@ class LlmRuntimeTests(unittest.TestCase):
             sys.modules,
             {"services.director_pipeline": director_pipeline},
         ):
+            owner_request = object()
             with self.assertRaises(HttpError) as raised:
-                release_namespace["system_release_model"]()
+                release_namespace["system_release_model"](owner_request)
             self.assertEqual(raised.exception.status_code, 409)
             self.assertEqual(release_calls, [])
             self.assertTrue(
@@ -668,7 +671,7 @@ class LlmRuntimeTests(unittest.TestCase):
             release_namespace["_gen_lock"].release()
             native_execution.release()
             self.assertEqual(
-                release_namespace["system_release_model"](),
+                release_namespace["system_release_model"](owner_request),
                 {"released": ["generation model"]},
             )
             release_namespace["_jobs"] = {
@@ -679,12 +682,12 @@ class LlmRuntimeTests(unittest.TestCase):
                 "waiting": {"status": "queued"},
             }
             self.assertEqual(
-                release_namespace["system_release_model"](),
+                release_namespace["system_release_model"](owner_request),
                 {"released": ["generation model"]},
             )
             release_namespace["_jobs"]["running"] = {"status": "running"}
             with self.assertRaises(HttpError) as raised:
-                release_namespace["system_release_model"]()
+                release_namespace["system_release_model"](owner_request)
             self.assertEqual(raised.exception.status_code, 409)
             release_namespace["_jobs"] = {
                 "waiting": {"status": "queued"},
@@ -710,7 +713,7 @@ class LlmRuntimeTests(unittest.TestCase):
             fake_wgp.release_model = slow_release
             with ThreadPoolExecutor(max_workers=2) as executor:
                 unloading = executor.submit(
-                    release_namespace["system_release_model"],
+                    release_namespace["system_release_model"], owner_request,
                 )
                 try:
                     self.assertTrue(release_entered.wait(timeout=2))
