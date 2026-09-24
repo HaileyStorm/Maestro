@@ -164,6 +164,7 @@ class NVFP4KernelPaddingTests(unittest.TestCase):
         for error in (RuntimeError('kernel failed'), torch.OutOfMemoryError('capacity exhausted')):
             with self.subTest(error=type(error).__name__):
                 weight = Mock()
+                weight.shape = (4, 32)
                 with patch.object(nvfp4, '_nvfp4_can_use_kernel', return_value=True), \
                      patch.object(nvfp4, '_is_fake_tensor', return_value=False), \
                      patch.object(nvfp4, '_nvfp4_linear_cuda', side_effect=error):
@@ -171,6 +172,40 @@ class NVFP4KernelPaddingTests(unittest.TestCase):
                         nvfp4._nvfp4_linear(torch.ones(1, 32), weight)
                 self.assertIs(caught.exception, error)
                 weight.dequantize.assert_not_called()
+
+    def test_known_cublas_shape_error_falls_back_once_per_shape(self):
+        weight = Mock()
+        weight.shape = (4, 32)
+        weight._layout = 'legacy'
+        weight.dequantize.return_value = torch.full((4, 32), 2.0)
+        kernel = Mock(side_effect=RuntimeError('CUBLAS_STATUS_NOT_SUPPORTED'))
+        nvfp4._NVFP4_UNSUPPORTED_SHAPES.clear()
+        try:
+            with patch.object(nvfp4, '_NVFP4_KERNEL_BACKEND', 'lightx2v'), \
+                 patch.object(nvfp4, '_nvfp4_can_use_kernel', return_value=True), \
+                 patch.object(nvfp4, '_is_fake_tensor', return_value=False), \
+                 patch.object(nvfp4, '_nvfp4_linear_cuda', kernel), \
+                 patch.object(nvfp4, '_nvfp4_note_fallback'):
+                for rows in (1, 1, 2):
+                    x = torch.ones(rows, 32)
+                    actual = nvfp4._nvfp4_linear(x, weight)
+                    torch.testing.assert_close(actual, torch.full((rows, 4), 64.0))
+                self.assertEqual(kernel.call_count, 2)
+                self.assertEqual(weight.dequantize.call_count, 3)
+                self.assertEqual(len(nvfp4._NVFP4_UNSUPPORTED_SHAPES), 2)
+        finally:
+            nvfp4._NVFP4_UNSUPPORTED_SHAPES.clear()
+
+    def test_backend_change_clears_unsupported_shape_cache(self):
+        old_backend = nvfp4._NVFP4_BACKEND
+        nvfp4._NVFP4_UNSUPPORTED_SHAPES.add(('old',))
+        with patch.object(nvfp4, '_init_nvfp4_kernel_support'):
+            try:
+                nvfp4.set_nvfp4_backend('comfy')
+                self.assertEqual(nvfp4._NVFP4_BACKEND, 'comfy')
+                self.assertEqual(nvfp4._NVFP4_UNSUPPORTED_SHAPES, set())
+            finally:
+                nvfp4.set_nvfp4_backend(old_backend)
 
 
 if __name__ == '__main__':
