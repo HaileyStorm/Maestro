@@ -10373,6 +10373,38 @@ def _notify_h3_profile_observer(observer, event, model_type, profile=None, load_
         pass
 
 
+def _release_failed_generation_resources():
+    """Drop failed-job residency only after the generation stack has unwound."""
+    try:
+        release_model()
+    except Exception as error:
+        print(f"[Memory] Failed-generation model release: {type(error).__name__}")
+
+    flash_runtime = sys.modules.get("postprocessing.flashvsr.runtime")
+    flash = getattr(flash_runtime, "_RUNTIME", None)
+    if flash is not None and any(
+        getattr(flash, name, None) is not None
+        for name in ("dit", "lq_proj", "tcdecoder", "vae", "offloadobj")
+    ):
+        try:
+            flash_runtime.release_models()
+        except Exception as error:
+            print(f"[Memory] Failed-generation FlashVSR release: {type(error).__name__}")
+
+    mmaudio = sys.modules.get("postprocessing.mmaudio.mmaudio")
+    if mmaudio is not None and getattr(mmaudio, "persistent_offloadobj", None) is not None:
+        try:
+            mmaudio.release_persistent_models()
+        except Exception as error:
+            print(f"[Memory] Failed-generation MMAudio release: {type(error).__name__}")
+    try:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception as error:
+        print(f"[Memory] Failed-generation allocator cleanup: {type(error).__name__}")
+
+
 def generate_video(*args, **kwargs):
     """Outer wrapper so H3 denoise OOM can unwind before a safer retry."""
     from services.h3_oom_relief import (
@@ -10422,6 +10454,11 @@ def generate_video(*args, **kwargs):
         _notify_h3_profile_observer(profile_observer, "reset", model_type)
         try:
             result = _generate_video_impl(*bound_args, **bound_kwargs)
+            if result is False:
+                try:
+                    _release_failed_generation_resources()
+                except Exception as error:
+                    print(f"[Memory] Failed-generation cleanup: {type(error).__name__}")
             if result:
                 try:
                     from services.h3_host_limits import record_denoise_success
@@ -10444,6 +10481,12 @@ def generate_video(*args, **kwargs):
             return result
         except H3OomReliefRetry as retry:
             relief = retry.relief or {}
+            # The exception retains the failed denoise's local tensors until
+            # its traceback frames are cleared, even after empty_cache().
+            try:
+                traceback.clear_frames(retry.__traceback__)
+            except Exception as error:
+                print(f"[Memory] H3 retry traceback cleanup: {type(error).__name__}")
             for key in ("resolution", "num_inference_steps", "override_profile"):
                 if key not in relief:
                     continue
@@ -10469,6 +10512,16 @@ def generate_video(*args, **kwargs):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
+        except BaseException as error:
+            try:
+                traceback.clear_frames(error.__traceback__)
+            except Exception as cleanup_error:
+                print(f"[Memory] Failed-generation traceback cleanup: {type(cleanup_error).__name__}")
+            try:
+                _release_failed_generation_resources()
+            except Exception as cleanup_error:
+                print(f"[Memory] Failed-generation cleanup: {type(cleanup_error).__name__}")
+            raise
 
 
 def _resolve_ltx25_video_vae_request(
