@@ -2,12 +2,12 @@
   "schema_version": 1,
   "date": "2026-09-22",
   "baseline_commit": "d4dff8442979b6c0559d27b4272462f3c0ade4a7",
-  "scope": "Ten tracked development/research notes plus one ignored owner-observation note. 225 unique URL spellings include aliases and supporting evidence, not distinct products. Historical capture and current implementation reconciliation, not refreshed external-page or GPU acceptance.",
+  "scope": "Ten tracked development/research notes plus one ignored owner-observation note. 228 unique URL spellings include aliases and supporting evidence, not distinct products. The September 24 refresh adds three Quad Character Sheet artifact/terms URLs and updates shifted line references; it is not refreshed external-page or GPU acceptance.",
   "notes": [
     {
       "path": "docs/development/feature-wave-2026-08-media-models.md",
-      "sha256": "1c73849068f5b4976604e8e3a7fb24deefdedc8404358619ac627858634787bb",
-      "lines": 356
+      "sha256": "98e7e4791be7d7faa6b2de02710863d5aba871eae60cb5c0128eaefda5050ed2",
+      "lines": 398
     },
     {
       "path": "docs/development/feature-wave-2026-08.md",
@@ -62,7 +62,7 @@
       "source_kind": "owner observation; no URL"
     }
   ],
-  "url_count": 225,
+  "url_count": 228,
   "sources": [
     {
       "id": "source-001",
@@ -254,7 +254,7 @@
       "occurrences": [
         {
           "note": "docs/development/feature-wave-2026-08-media-models.md",
-          "line": 346
+          "line": 388
         },
         {
           "note": "docs/research/H3-ecosystem-watch-2026-08-18.md",
@@ -500,7 +500,7 @@
       "occurrences": [
         {
           "note": "docs/development/feature-wave-2026-08-media-models.md",
-          "line": 348
+          "line": 390
         }
       ]
     },
@@ -796,7 +796,7 @@
       "occurrences": [
         {
           "note": "docs/development/feature-wave-2026-08-media-models.md",
-          "line": 342
+          "line": 384
         },
         {
           "note": "docs/research/H3-ecosystem-watch-2026-08-18.md",
@@ -810,7 +810,7 @@
       "occurrences": [
         {
           "note": "docs/development/feature-wave-2026-08-media-models.md",
-          "line": 344
+          "line": 386
         }
       ]
     },
@@ -1178,7 +1178,11 @@
       "occurrences": [
         {
           "note": "docs/development/feature-wave-2026-08-media-models.md",
-          "line": 336
+          "line": 184
+        },
+        {
+          "note": "docs/development/feature-wave-2026-08-media-models.md",
+          "line": 378
         }
       ]
     },
@@ -1188,7 +1192,7 @@
       "occurrences": [
         {
           "note": "docs/development/feature-wave-2026-08-media-models.md",
-          "line": 340
+          "line": 382
         }
       ]
     },
@@ -1362,7 +1366,7 @@
       "occurrences": [
         {
           "note": "docs/development/feature-wave-2026-08-media-models.md",
-          "line": 331
+          "line": 373
         },
         {
           "note": "docs/research/H3-ecosystem-watch-2026-08-18.md",
@@ -1376,7 +1380,7 @@
       "occurrences": [
         {
           "note": "docs/development/feature-wave-2026-08-media-models.md",
-          "line": 334
+          "line": 376
         }
       ]
     },
@@ -1508,7 +1512,7 @@
       "occurrences": [
         {
           "note": "docs/development/feature-wave-2026-08-media-models.md",
-          "line": 338
+          "line": 380
         }
       ]
     },
@@ -1866,7 +1870,7 @@
       "occurrences": [
         {
           "note": "docs/development/feature-wave-2026-08-media-models.md",
-          "line": 356
+          "line": 398
         }
       ]
     },
@@ -1876,7 +1880,7 @@
       "occurrences": [
         {
           "note": "docs/development/feature-wave-2026-08-media-models.md",
-          "line": 350
+          "line": 392
         }
       ]
     },
@@ -2190,7 +2194,7 @@
       "occurrences": [
         {
           "note": "docs/development/feature-wave-2026-08-media-models.md",
-          "line": 354
+          "line": 396
         }
       ]
     },
@@ -2240,7 +2244,7 @@
       "occurrences": [
         {
           "note": "docs/development/feature-wave-2026-08-media-models.md",
-          "line": 352
+          "line": 394
         },
         {
           "note": "docs/development/feature-wave-2026-08.md",
@@ -2599,6 +2603,36 @@
         {
           "note": "docs/research/H3-ecosystem-watch-2026-08-18.md",
           "line": 30
+        }
+      ]
+    },
+    {
+      "id": "source-226",
+      "url": "https://civitai.com/api/v1/models/2764727",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08-media-models.md",
+          "line": 164
+        }
+      ]
+    },
+    {
+      "id": "source-227",
+      "url": "https://huggingface.co/Alissonerdx/CharacterSheet/blob/3dc4295163dacc924d213168d67bf16850fd954f/QuadView_klein9b_v1.safetensors",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08-media-models.md",
+          "line": 144
+        }
+      ]
+    },
+    {
+      "id": "source-228",
+      "url": "https://huggingface.co/black-forest-labs/FLUX.2-klein-9B/blob/07c5ac6/LICENSE.md",
+      "occurrences": [
+        {
+          "note": "docs/development/feature-wave-2026-08-media-models.md",
+          "line": 167
         }
       ]
     }

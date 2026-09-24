@@ -18,12 +18,14 @@ Upstream adds 74 commits and changes 659 files from that ancestor. This is a
 selective adaptation assessment, not a whole-tree merge or a 2.3.0 parity claim.
 
 The source appendix, [intake-source-index-2026-09-22.json](intake-source-index-2026-09-22.json),
-preserves 225 distinct URL spellings with original note/line references and note
-hashes. These include mirrors, pinned revisions, comments, and licensing
-evidence; they are not 225 separate products. It covers ten tracked notes plus
-one ignored historical owner-observation note. A claim about all captured
-sources is limited to this enumerated corpus. It does not prove no other
-conversation or lost file ever contained a candidate.
+preserves 228 distinct URL spellings with current note/line references and note
+hashes. The September 24 refresh added the exact Quad LoRA artifact, creator
+record, and FLUX base-license URLs after the media-model note gained 42 lines;
+its shifted references were rechecked. These include mirrors, pinned revisions,
+comments, and licensing evidence; they are not 228 separate products. It covers
+ten tracked notes plus one ignored historical owner-observation note. A claim
+about all captured sources is limited to this enumerated corpus. It does not
+prove no other conversation or lost file ever contained a candidate.
 
 The September 6 and September 14 task histories were checked by streaming only
 user messages: no additional URL dump was found there. The September 21 YuE2
