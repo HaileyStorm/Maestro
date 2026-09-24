@@ -1030,6 +1030,30 @@ process exited, while local and stable-share readiness stayed 200. This accepts
 one loaded-LLM release path. A generation model was not resident in these
 requests, so its unload path remains a separate live check.
 
+### 2026-09-24 signed-in owner resource release
+
+After the owner completed recent password confirmation in the stable-share
+browser, the **Free resources** preview was accessible to that owner. It
+initially reported no loaded Maestro resources. Under a fresh, validated
+20-minute `maestro-local` GPU grant, the signed-in browser generated a
+480p FLUX.2 Klein 9B image through the stable-share surface. The finished
+848×480 image appeared in the project Gallery, recorded 54 seconds of
+generation time, and has SHA-256
+`67b591c14371ed2bc50b1f7e936c2ae11a43e759f4a0fa1402de0f2b4412ecfd`.
+Visual inspection found the requested blue mug on a pale tabletop.
+
+With that generation model resident, the owner preview showed one loaded
+`generation model`, zero running jobs, and 10 queued work items across the
+service. The current project's queue view was empty; the owner preview still
+warned that proceeding would pause queued work. After confirmation, a fresh
+owner preview reported no loaded Maestro resources, and the queue view showed
+the main queue paused. This accepts the signed-in remote owner unload path and
+its queued-work warning on the deployed service. It does not exercise release
+during a concurrently running job or prove how much host RAM was reclaimed.
+The exact GPU grant was withdrawn and its outbox became `denied`; direct local
+and stable-share `/ready` checks still returned 200. The owner has not yet
+reviewed the image or the paused work items.
+
 ## NVFP4 scale-layout check — 2026-09-07 UTC
 
 The CPU fallback now matches the eager reference for padded physical scale
