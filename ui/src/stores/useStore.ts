@@ -8475,6 +8475,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
   approveH3Plan: async (decision) => {
     const sequence = ++_h3PlanReviewSequence
+    const accountIdentityEpoch = _accountIdentityEpoch
     const {
       pendingH3PlanJobId: jobId,
       pendingH3PlanWorkspace: workspace,
@@ -8502,7 +8503,13 @@ export const useStore = create<AppState>((set, get) => ({
           duration_redistribution: decision.durationRedistribution ?? 'none',
         } : {}),
       })
-      if (sequence !== _h3PlanReviewSequence || get().activeWorkspace !== workspace || get().pendingH3PlanJobId !== jobId) return
+      if (
+        sequence !== _h3PlanReviewSequence
+        || !_accountIdentityIsCurrent(accountIdentityEpoch)
+        || get().activeWorkspace !== workspace
+        || get().pendingH3PlanJobId !== jobId
+        || get().pendingH3PlanWorkspace !== workspace
+      ) return
       set(s => ({
         pendingH3Plan: null,
         pendingH3PlanEstimate: null,
@@ -8525,7 +8532,53 @@ export const useStore = create<AppState>((set, get) => ({
       get()._pollRecoveredJob(jobId)
       window.dispatchEvent(new CustomEvent('maestro:queue-refresh'))
     } catch (error) {
-      if (sequence !== _h3PlanReviewSequence || get().activeWorkspace !== workspace || get().pendingH3PlanJobId !== jobId) return
+      if (
+        sequence !== _h3PlanReviewSequence
+        || !_accountIdentityIsCurrent(accountIdentityEpoch)
+        || get().activeWorkspace !== workspace
+        || get().pendingH3PlanJobId !== jobId
+        || get().pendingH3PlanWorkspace !== workspace
+      ) return
+      // The deadline may have auto-approved the same job while this request was
+      // in flight. Read its authoritative state before showing a stale review.
+      try {
+        const status = await api.fetchJobStatus(jobId)
+        const current = get().jobs.find(job => job.id === jobId)
+        if (
+          sequence === _h3PlanReviewSequence
+          && _accountIdentityIsCurrent(accountIdentityEpoch)
+          && get().activeWorkspace === workspace
+          && get().pendingH3PlanJobId === jobId
+          && get().pendingH3PlanWorkspace === workspace
+          && current?.workspace === workspace
+          && status.job_id === jobId
+          && status.workspace === workspace
+          && (status.created_at == null || current.createdAt == null || status.created_at === current.createdAt)
+          && status.status !== 'waiting_for_plan_approval'
+        ) {
+          set(s => ({
+            pendingH3Plan: null,
+            pendingH3PlanEstimate: null,
+            pendingH3PlanJobId: null,
+            pendingH3PlanWorkspace: null,
+            h3PlanReviewLoading: false,
+            h3PlanReviewError: null,
+            jobs: s.jobs.map(job => job.id === jobId ? _mergeJobStatus(job, status) : job),
+          }))
+          get()._pollRecoveredJob(jobId)
+          window.dispatchEvent(new CustomEvent('maestro:queue-refresh'))
+          return
+        }
+      } catch {
+        // Keep the original approval error when current status is unavailable.
+      }
+      if (
+        sequence !== _h3PlanReviewSequence
+        || !_accountIdentityIsCurrent(accountIdentityEpoch)
+        || get().activeWorkspace !== workspace
+        || get().pendingH3PlanJobId !== jobId
+        || get().pendingH3PlanWorkspace !== workspace
+      ) return
       set({
         h3PlanReviewLoading: false,
         h3PlanReviewError: error instanceof Error ? error.message : 'The generation plan could not be approved.',

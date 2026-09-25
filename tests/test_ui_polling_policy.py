@@ -245,9 +245,10 @@ class UiPollingStateTests(unittest.TestCase):
         self.assertIn("job.recoveryState === 'retrying'", fast_gate)
 
     def test_all_job_submit_paths_use_the_one_queue_aware_poller(self):
-        # Plan-review hydration plus two recovery refreshes are bounded
-        # one-shots; _pollRecoveredJob remains the sole recurring fetch.
-        self.assertEqual(STORE.count("api.fetchJobStatus("), 4)
+        # Plan-review hydration, a failed approval's deadline reconciliation,
+        # and two recovery refreshes are bounded one-shots. _pollRecoveredJob
+        # remains the sole recurring fetch.
+        self.assertEqual(STORE.count("api.fetchJobStatus("), 5)
         review_start = STORE.index("openH3PlanReview: async")
         review = STORE[
             review_start:STORE.index("closeH3PlanReview: () =>", review_start)
@@ -259,6 +260,13 @@ class UiPollingStateTests(unittest.TestCase):
         self.assertEqual(review.count("api.fetchJobStatus(jobId)"), 1)
         self.assertNotIn("setInterval", review)
         self.assertNotIn("setTimeout", review)
+        approval_start = STORE.index("approveH3Plan: async")
+        approval = STORE[
+            approval_start:STORE.index("cancelH3Plan: async", approval_start)
+        ]
+        self.assertEqual(approval.count("api.fetchJobStatus(jobId)"), 1)
+        self.assertNotIn("setInterval", approval)
+        self.assertNotIn("setTimeout", approval)
         self.assertEqual(recurring.count("api.fetchJobStatus(jobId)"), 1)
         self.assertIn("scheduleNext()", recurring)
         self.assertIn("_recoveryJobPolls.set(jobId, poll)", recurring)
@@ -294,7 +302,7 @@ class UiPollingStateTests(unittest.TestCase):
             callsites,
             {
                 "ui/src/api/client.ts": 1,
-                "ui/src/stores/useStore.ts": 4,
+                "ui/src/stores/useStore.ts": 5,
             },
         )
         references = UI_SOURCES[

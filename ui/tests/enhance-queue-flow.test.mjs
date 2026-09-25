@@ -2626,6 +2626,89 @@ test('plan editor rejects unavailable overrides without mutating Studio model or
   assert.equal(approvals[0].segmentOverrides[0].model_type, 'minimax_h3_pinkcherry_fl2va')
 })
 
+test('plan approval reconciles an automatic deadline winner without hiding a live review error', async t => {
+  const originalFetch = globalThis.fetch
+  const originalWindow = globalThis.window
+  const originalCustomEvent = globalThis.CustomEvent
+  globalThis.window = Object.assign(new EventTarget(), {
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+  })
+  globalThis.CustomEvent ??= class extends Event {
+    constructor(name) { super(name) }
+  }
+  t.after(() => {
+    globalThis.fetch = originalFetch
+    globalThis.window = originalWindow
+    globalThis.CustomEvent = originalCustomEvent
+  })
+
+  const currentPlan = plan()
+  let authoritative = {
+    ...apiJobStatus('deadline-race', 'project one', currentPlan, 1),
+    status: 'queued',
+    phase: 'registered',
+    message: 'Queued',
+    plan_review_required: false,
+  }
+  const requests = []
+  globalThis.fetch = async url => {
+    const path = String(url)
+    requests.push(path)
+    if (path.endsWith('/api/v1/generate/deadline-race/plan/approve')) {
+      return new Response(JSON.stringify({ detail: 'Review deadline passed' }), { status: 409 })
+    }
+    if (path.endsWith('/api/v1/status/deadline-race')) {
+      return jsonResponse(authoritative)
+    }
+    assert.fail(`Unexpected request: ${path}`)
+  }
+
+  const { useStore } = await loadStoreModule()
+  const originalPoll = useStore.getState()._pollRecoveredJob
+  let polls = 0
+  let refreshes = 0
+  globalThis.window.addEventListener('maestro:queue-refresh', () => { refreshes += 1 })
+  const resetReview = () => useStore.setState({
+    activeWorkspace: 'project one',
+    jobs: [{ id: 'deadline-race', createdAt: 1, workspace: 'project one', status: 'waiting_for_plan_approval' }],
+    pendingH3Plan: currentPlan,
+    pendingH3PlanEstimate: null,
+    pendingH3PlanJobId: 'deadline-race',
+    pendingH3PlanWorkspace: 'project one',
+    h3PlanReviewLoading: false,
+    h3PlanReviewError: null,
+    _pollRecoveredJob() { polls += 1 },
+  })
+  t.after(() => { useStore.setState({ _pollRecoveredJob: originalPoll }) })
+
+  resetReview()
+  await useStore.getState().approveH3Plan({ segmentOverrides: [], boundaryOverrides: [] })
+  assert.match(requests[0], /plan\/approve$/)
+  assert.match(requests[1], /status\/deadline-race$/)
+  assert.equal(useStore.getState().pendingH3PlanJobId, null)
+  assert.equal(useStore.getState().h3PlanReviewError, null)
+  assert.equal(useStore.getState().jobs[0].status, 'queued')
+  assert.equal(polls, 1)
+  assert.equal(refreshes, 1)
+
+  authoritative = apiJobStatus('deadline-race', 'project one', currentPlan, 1)
+  resetReview()
+  await useStore.getState().approveH3Plan({ segmentOverrides: [], boundaryOverrides: [] })
+  assert.equal(useStore.getState().pendingH3PlanJobId, 'deadline-race')
+  assert.match(useStore.getState().h3PlanReviewError, /review state changed/i)
+  assert.equal(polls, 1)
+
+  authoritative = { ...authoritative, status: 'queued', workspace: 'project two' }
+  resetReview()
+  await useStore.getState().approveH3Plan({ segmentOverrides: [], boundaryOverrides: [] })
+  assert.equal(useStore.getState().pendingH3PlanJobId, 'deadline-race')
+  assert.match(useStore.getState().h3PlanReviewError, /review state changed/i)
+  assert.equal(polls, 1)
+})
+
 test('one-shot plan hydration and the sole recurring poller fence all late winners', async t => {
   const originalFetch = globalThis.fetch
   const originalWindow = globalThis.window
