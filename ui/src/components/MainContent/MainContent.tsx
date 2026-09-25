@@ -3,11 +3,12 @@ import { Film, Play, Square, FolderOpen, Plus, Check, Loader2, X, BookMarked, Up
 import { TabFilter } from './TabFilter'
 import { ThumbnailGallery } from './ThumbnailGallery'
 import { MediaFeedItem } from './MediaFeedItem'
+import { GalleryViewer } from './GalleryViewer'
 import { ProjectAccessPanel } from './ProjectAccessPanel'
 import { LlmChat } from '../LlmChat'
 import { H3DeliveryRecoveryStatus, OPEN_GALLERY_EVENT } from '../H3DeliveryRecoveryStatus'
 import { useStore } from '../../stores/useStore'
-import type { GenerationJob, ModelDef } from '../../types'
+import type { GenerationJob, ModelDef, OutputFile } from '../../types'
 import * as api from '../../api/client'
 import { modelDisplayName } from '../../lib/modelDisplay'
 import {
@@ -2665,9 +2666,15 @@ export function MainContent() {
   const refreshSampleCampaignQueue = useStore(s => s.refreshSampleCampaignQueue)
   const [shareCopied, setShareCopied] = useState(false)
   const [projectAccessOpen, setProjectAccessOpen] = useState(false)
+  const [viewerSelection, setViewerSelection] = useState<{ identity: string; scopeGeneration: number; trigger: HTMLElement } | null>(null)
+  const closeViewer = useCallback(() => setViewerSelection(null), [])
   const projectShareTriggerRef = useRef<HTMLButtonElement>(null)
   const closeProjectAccess = useCallback(() => setProjectAccessOpen(false), [])
   const [mainView, setMainView] = useState<MainView>('gallery')
+  const changeMainView = useCallback((view: MainView) => {
+    setViewerSelection(null)
+    setMainView(view)
+  }, [])
   const [queueTabSnapshot, setQueueTabSnapshot] = useState<QueueTabSnapshot>({
     state: null,
     jobs: [],
@@ -2732,15 +2739,15 @@ export function MainContent() {
   }, [activeWorkspace])
 
   useEffect(() => {
-    const openGallery = () => setMainView('gallery')
+    const openGallery = () => changeMainView('gallery')
     window.addEventListener(OPEN_GALLERY_EVENT, openGallery)
     return () => window.removeEventListener(OPEN_GALLERY_EVENT, openGallery)
-  }, [])
+  }, [changeMainView])
 
   useEffect(() => {
-    const openQueue = () => setMainView('queue')
+    const openQueue = () => changeMainView('queue')
     return subscribeQueueView(openQueue)
-  }, [])
+  }, [changeMainView])
 
   useEffect(() => {
     const newActiveJob = jobs.some(job => (
@@ -2749,8 +2756,8 @@ export function MainContent() {
       && (job.status === 'preparing' || job.status === 'waiting_for_plan_approval' || job.status === 'queued' || job.status === 'running')
     ))
     for (const job of jobs) if (job.id) seenJobIds.current.add(job.id)
-    if (newActiveJob && openQueueAfterSubmit) setMainView('queue')
-  }, [jobs, openQueueAfterSubmit])
+    if (newActiveJob && openQueueAfterSubmit) changeMainView('queue')
+  }, [jobs, openQueueAfterSubmit, changeMainView])
 
   const refreshQueue = useCallback(async (pollSignal?: AbortSignal) => {
     if (!queuePollingReady) return
@@ -2983,6 +2990,12 @@ export function MainContent() {
     scopeFence.current = { key: galleryScopeKey, generation: scopeFence.current.generation + 1 }
   }
   const scopeGeneration = scopeFence.current.generation
+  const openViewer = useCallback((file: OutputFile, trigger: HTMLElement) => {
+    setViewerSelection({ identity: privatePreviewIdentity(file.workspace, file.name, file.revision), scopeGeneration, trigger })
+  }, [scopeGeneration])
+  const viewerFileExists = viewerSelection && outputs.some(file => (
+    file.type !== 'audio' && privatePreviewIdentity(file.workspace, file.name, file.revision) === viewerSelection.identity
+  ))
   const currentOutputIdentities = useRef(new Set(outputIdentities))
   currentOutputIdentities.current = new Set(outputIdentities)
 
@@ -3300,6 +3313,7 @@ export function MainContent() {
           index={i}
           isActive={activeIndex === i}
           onSelect={handleItemSelect}
+          onOpenViewer={openViewer}
           onVisible={handleItemVisible}
           measurementEpoch={measurementEpoch}
           onMeasured={handleItemMeasured}
@@ -3313,7 +3327,7 @@ export function MainContent() {
       )
     }
     return items
-  }, [startIndex, endIndex, outputs, activeIndex, handleItemSelect, handleItemVisible, measurementEpoch, handleItemMeasured, itemOffsets])
+  }, [startIndex, endIndex, outputs, activeIndex, handleItemSelect, openViewer, handleItemVisible, measurementEpoch, handleItemMeasured, itemOffsets])
 
   return (
     <main className="min-w-0 flex-1 flex flex-col h-full overflow-hidden">
@@ -3332,7 +3346,7 @@ export function MainContent() {
           >
             <MainViewTabs
               activeView={mainView}
-              onSelect={setMainView}
+              onSelect={changeMainView}
               queueTitle={`${queueTooltip}${ownedJobEtaTooltip}`}
               queueStateColor={queueStateColor}
               activeQueueCount={activeQueueCount}
@@ -3570,6 +3584,14 @@ export function MainContent() {
         restoreFocus={projectShareTriggerRef.current}
         onClose={closeProjectAccess}
       />
+      {viewerSelection?.scopeGeneration === scopeGeneration && viewerFileExists && mainView === 'gallery' && (
+        <GalleryViewer
+          files={outputs}
+          initialIdentity={viewerSelection.identity}
+          restoreFocus={viewerSelection.trigger}
+          onClose={closeViewer}
+        />
+      )}
     </main>
   )
 }

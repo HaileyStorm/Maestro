@@ -21,6 +21,7 @@ interface Props {
   index: number
   isActive: boolean
   onSelect: (index: number) => void
+  onOpenViewer: (file: OutputFile, trigger: HTMLElement) => void
   onVisible: (index: number) => void
   measurementEpoch: number
   onMeasured: (identity: string, epoch: number, height: number) => void
@@ -79,7 +80,7 @@ function RetryImage({ url, alt }: { url: string; alt: string }) {
   )
 }
 
-export function MediaFeedItem({ file, index, isActive, onSelect, onVisible, measurementEpoch, onMeasured, style }: Props) {
+export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, onVisible, measurementEpoch, onMeasured, style }: Props) {
   const loadSettingsFromOutput = useStore(s => s.loadSettingsFromOutput)
   const rerollGeneration = useStore(s => s.rerollGeneration)
   const deleteOutput = useStore(s => s.deleteSelectedOutput)
@@ -795,6 +796,15 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onVisible, meas
           >
             <EyeOff size={13} />
           </button>
+        )}
+        {!gallerySelectionMode && file.type !== 'audio' && (
+          <button
+            type="button"
+            onClick={event => { event.stopPropagation(); onOpenViewer(file, event.currentTarget) }}
+            aria-label={`Open ${file.name} in Gallery viewer`}
+            className="absolute bottom-2 right-2 z-10 flex min-h-11 items-center gap-1.5 rounded-full bg-black/70 px-3 text-xs text-white hover:bg-black/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+            title="Open Gallery viewer"
+          >View</button>
         )}
       </div>
 
