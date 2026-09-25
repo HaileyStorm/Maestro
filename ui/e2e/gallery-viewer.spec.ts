@@ -74,6 +74,38 @@ for (const viewport of [
     await expect(viewer.getByRole('img', { name: PUBLIC.name })).toBeVisible()
     await expect(viewer.getByRole('button', { name: 'Next media' })).toBeDisabled()
     await page.screenshot({ path: testInfo.outputPath(`${viewport.name}-viewer-public.png`) })
+    await viewer.getByRole('button', { name: 'Compare' }).click()
+    await expect(viewer.getByRole('group', { name: 'Before and after image comparison' })).toBeVisible()
+    await expect(viewer.getByRole('button', { name: 'Show Before preview' })).toBeVisible()
+    await expect(viewer.locator(`img[src*="${PRIVATE.name}"]`)).toHaveCount(0)
+    await viewer.getByRole('button', { name: 'Show Before preview' }).click()
+    await expect(viewer.getByRole('group', { name: 'Before and after image comparison' }).locator(`img[src*="${PRIVATE.name}"]`)).toHaveCount(1)
+    await page.screenshot({ path: testInfo.outputPath(`${viewport.name}-viewer-comparison.png`) })
+    const comparisonAccessibility = await new AxeBuilder({ page }).include('[role="dialog"][aria-label="Gallery viewer"]').analyze()
+    expect(comparisonAccessibility.violations.filter(violation =>
+      violation.impact === 'critical' || violation.impact === 'serious')).toEqual([])
+    expect(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 1)).toBe(false)
+    const split = viewer.getByRole('slider', { name: 'Comparison split' })
+    await split.press('End')
+    expect(await split.evaluate(element => (element as HTMLInputElement).value)).toBe('100')
+    await split.press('ArrowLeft')
+    expect(await split.evaluate(element => (element as HTMLInputElement).value)).toBe('99')
+    await split.evaluate(element => {
+      for (const [type, x] of [['touchstart', 20], ['touchend', 250]] as const) {
+        const event = new Event(type, { bubbles: true, cancelable: true })
+        Object.defineProperty(event, 'changedTouches', { value: [{ clientX: x, clientY: 200 }] })
+        element.dispatchEvent(event)
+      }
+    })
+    await expect(viewer.getByRole('heading', { name: PUBLIC.name })).toBeVisible()
+    await expect(viewer.getByRole('button', { name: 'Close comparison' })).toBeVisible()
+    await viewer.getByRole('button', { name: 'Blur Before preview' }).click()
+    await expect(viewer.locator(`img[src*="${PRIVATE.name}"]`)).toHaveCount(0)
+    await viewer.getByRole('button', { name: 'Swap' }).click()
+    await expect(viewer.getByRole('button', { name: 'Show After preview' })).toBeVisible()
+    await expect(viewer.locator(`img[src*="${PRIVATE.name}"]`)).toHaveCount(0)
+    await viewer.getByRole('button', { name: 'Close comparison' }).click()
+    await expect(viewer.getByRole('img', { name: PUBLIC.name })).toBeVisible()
     const accessibility = await new AxeBuilder({ page }).include('[role="dialog"][aria-label="Gallery viewer"]').analyze()
     expect(accessibility.violations.filter(violation =>
       violation.impact === 'critical' || violation.impact === 'serious')).toEqual([])
@@ -132,3 +164,41 @@ for (const viewport of [
     expect(zeroSizeRequests).toBeGreaterThan(1)
   })
 }
+
+test('comparison stays closable when its other image disappears', async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem('maestro_welcome_seen_v1', '1'))
+  api!.setAccountScenario('remote-user')
+  let availableOutputs = [PRIVATE, PUBLIC]
+  await page.route(/\/api\/v1\/outputs(?:\?.*)?$/, route => route.fulfill({
+    status: 200, contentType: 'application/json',
+    body: JSON.stringify({ outputs: availableOutputs, total: availableOutputs.length }),
+  }))
+  await page.route('**/api/v1/outputs/*/metadata*', route => route.fulfill({
+    status: 200, contentType: 'application/json',
+    body: JSON.stringify({ params: null, source: 'none' }),
+  }))
+  await page.route('**/api/v1/file/*.png*', route => route.fulfill({
+    status: 200, contentType: 'image/svg+xml', body: PUBLIC_SVG,
+  }))
+  await page.goto('/')
+  await page.getByRole('tab', { name: 'Gallery' }).click()
+  await page.getByRole('button', { name: `Open ${PRIVATE.name} in Gallery viewer` }).click()
+  const viewer = page.getByRole('dialog', { name: 'Gallery viewer' })
+  await viewer.getByRole('button', { name: 'Show preview' }).click()
+  await viewer.getByRole('button', { name: 'Compare' }).click()
+  await expect(viewer.getByRole('group', { name: 'Before and after image comparison' })).toBeVisible()
+
+  availableOutputs = [PRIVATE]
+  await page.evaluate(async () => {
+    const storeModule = '/src/stores/useStore.ts'
+    const { useStore } = await import(/* @vite-ignore */ storeModule)
+    await useStore.getState().loadOutputs()
+  })
+  await expect(viewer).toBeVisible()
+  await expect(viewer.getByText('Choose two different images from this project to compare.')).toBeVisible()
+  await expect(viewer.getByRole('button', { name: 'Close comparison' })).toBeEnabled()
+  await viewer.getByRole('button', { name: 'Close comparison' }).click()
+  await expect(viewer.getByRole('button', { name: 'Compare' })).toBeDisabled()
+  await viewer.getByRole('button', { name: 'Close Gallery viewer' }).click()
+  await expect(page.getByRole('button', { name: `Open ${PRIVATE.name} in Gallery viewer` })).toBeFocused()
+})
