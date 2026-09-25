@@ -6,16 +6,19 @@ timeline contains references and edit decisions, never copies of source files.
 from __future__ import annotations
 
 import copy
+import errno
 import hashlib
 import json
 import math
 import os
 import re
+import stat
 import subprocess
 import tempfile
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -154,6 +157,64 @@ def _atomic_write_json(path: str, payload: Mapping[str, Any]) -> None:
                 os.remove(temporary)
             except OSError:
                 pass
+
+
+@contextmanager
+def _serialized_editor_save(path: str):
+    """Keep revision checks and replacement atomic across server processes."""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    if os.path.islink(directory):
+        raise EditorProjectError("Editor project directory is a link")
+    lock_path = os.path.join(directory, ".editor.lock")
+    descriptor = os.open(
+        lock_path,
+        os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        current = os.lstat(lock_path)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not os.path.samestat(opened, current)
+            or opened.st_nlink != 1
+        ):
+            raise EditorProjectError("Editor project lock is unavailable")
+        if opened.st_size < 1:
+            os.write(descriptor, b"\0")
+            os.fsync(descriptor)
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            while True:
+                try:
+                    msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
+                    break
+                except OSError as error:
+                    # LK_LOCK waits only about ten seconds per call. Keep
+                    # waiting for a valid peer save, as flock does on POSIX.
+                    if error.errno not in {errno.EACCES, errno.EAGAIN}:
+                        raise
+        else:
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        try:
+            if os.path.islink(directory) or not os.path.samestat(
+                os.fstat(descriptor), os.lstat(lock_path)
+            ):
+                raise EditorProjectError("Editor project lock changed")
+            yield
+        finally:
+            if os.name == "nt":
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
 
 
 def create_editor_project(
@@ -728,7 +789,8 @@ def save_editor_project(
 ) -> dict[str, Any]:
     normalized = normalize_editor_project(project, workspace=workspace)
     path = _project_path(save_root, normalized["workspace"], normalized["id"])
-    with _project_lock:
+    with _project_lock, _serialized_editor_save(path):
+        _project_path(save_root, workspace, normalized["id"])
         if os.path.isfile(path):
             if expected_revision is None:
                 raise EditorProjectError("Editor project changed; reload before saving")

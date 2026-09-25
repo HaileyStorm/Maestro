@@ -6,9 +6,11 @@ import os
 import ast
 import asyncio
 import copy
+import errno
 import hashlib
 import hmac
 import json
+import multiprocessing
 import re
 import subprocess
 import sys
@@ -26,6 +28,7 @@ _APP = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "app"))
 if _APP not in sys.path:
     sys.path.insert(0, _APP)
 
+from services import editor_projects as editor_project_service  # noqa: E402
 from services.editor_projects import (  # noqa: E402
     EditorProjectError,
     apply_output_video_trim,
@@ -36,6 +39,16 @@ from services.editor_projects import (  # noqa: E402
     resolve_editor_asset,
     save_editor_project,
 )
+
+
+def _competing_editor_save(root, project, barrier, results, index):
+    candidate = dict(project, name=f"Concurrent edit {index}")
+    barrier.wait(timeout=15)
+    try:
+        saved = save_editor_project(root, "scene", candidate, expected_revision=1)
+        results.put(("saved", saved["revision"], index))
+    except EditorProjectError:
+        results.put(("conflict", None, index))
 
 
 class TestEditorProjectFoundation(unittest.TestCase):
@@ -97,6 +110,67 @@ class TestEditorProjectFoundation(unittest.TestCase):
         self.assertFalse(any(name.endswith(".tmp") for name in os.listdir(
             os.path.join(self.outputs, "scene-a", ".maestro_editor")
         )))
+
+    def test_simultaneous_process_saves_accept_only_one_revision(self):
+        self._workspace("scene")
+        first = save_editor_project(
+            self.outputs, "scene", create_editor_project(workspace="scene"),
+            expected_revision=0,
+        )
+        context = multiprocessing.get_context("spawn" if os.name == "nt" else "fork")
+        barrier = context.Barrier(8)
+        results = context.Queue()
+        processes = [
+            context.Process(
+                target=_competing_editor_save,
+                args=(self.outputs, first, barrier, results, index),
+            )
+            for index in range(8)
+        ]
+        try:
+            for process in processes:
+                process.start()
+            for process in processes:
+                process.join(20)
+            self.assertEqual([process.exitcode for process in processes], [0] * 8)
+            outcomes = [results.get(timeout=2) for _ in processes]
+            winners = [item for item in outcomes if item[0] == "saved"]
+            self.assertEqual(len(winners), 1, outcomes)
+            self.assertEqual([item[0] for item in outcomes].count("conflict"), 7)
+            self.assertEqual(winners[0][1], 2)
+            final = load_editor_project(self.outputs, "scene", first["id"])
+            self.assertEqual((final["revision"], final["name"]), (
+                2, f"Concurrent edit {winners[0][2]}",
+            ))
+        finally:
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+                process.join(2)
+            results.close()
+            results.join_thread()
+
+    def test_windows_lock_retries_temporary_contention(self):
+        self._workspace("scene")
+        operations = []
+        windows_lock = types.SimpleNamespace(LK_LOCK=1, LK_UNLCK=2)
+
+        def locking(_descriptor, operation, _length):
+            operations.append(operation)
+            if operations == [windows_lock.LK_LOCK]:
+                raise OSError(errno.EACCES, "another save holds the lock")
+
+        windows_lock.locking = locking
+        with mock.patch.dict(sys.modules, {"msvcrt": windows_lock}):
+            with mock.patch.object(editor_project_service.os, "name", "nt"):
+                saved = save_editor_project(
+                    self.outputs, "scene", create_editor_project(workspace="scene"),
+                    expected_revision=0,
+                )
+        self.assertEqual(saved["revision"], 1)
+        self.assertEqual(operations, [
+            windows_lock.LK_LOCK, windows_lock.LK_LOCK, windows_lock.LK_UNLCK,
+        ])
 
     def test_project_switch_rejects_stale_document_and_source(self):
         source_a = self._workspace("scene-a")
