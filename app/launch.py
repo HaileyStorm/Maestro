@@ -60972,51 +60972,29 @@ def _run_tool_hflip(job_id: str):
                 out_dir = _existing_workspace_dir(workspace)
                 with _output_lineage_mutation_guard(out_dir):
                     source, metadata = _hflip_source(job)
+                adopted = _resume_processed_tool_output(job)
+                if adopted is not None:
+                    return adopted
                 extension = os.path.splitext(source)[1].lower()
                 if extension in {".mp4", ".m4v"}:
                     container = ".mp4"
                 else:
                     container = extension if extension in {".mov", ".webm"} else ".mkv"
                 filename = f"{os.path.splitext(os.path.basename(source))[0]}_hflip_{job_id}{container}"
-                final_path = os.path.join(out_dir, filename)
-                meta_path = os.path.splitext(final_path)[0] + ".meta.json"
                 with tempfile.TemporaryDirectory(prefix=".hflip-", dir=out_dir) as staging:
                     staged = os.path.join(staging, filename)
                     horizontal_flip(source, staged, abort_check=aborted, timeout=3600)
-                    with _output_lineage_mutation_guard(out_dir):
-                        _hflip_source(job)
-                        if aborted():
-                            return False
-                        if os.path.lexists(final_path) or os.path.lexists(meta_path):
-                            raise ValueError("The flipped output already exists. Refresh the gallery.")
-                        # Preserve the original generation settings for Use settings;
-                        # hflip is transform metadata, not an avatar/edit submode.
-                        source_params = metadata.get("params")
-                        _write_tool_sidecar(
-                            out_dir, filename, source_name=os.path.basename(source),
-                            source_revision=job["params"]["hflip_source_revision"],
-                            tool="hflip", params=source_params if isinstance(source_params, dict) else {},
-                            elapsed=time.time() - start_time, job_id=job_id,
-                        )
-                        media_owned = False
-                        try:
-                            # Atomic create-if-absent; a concurrent file creator
-                            # must never be overwritten after the earlier check.
-                            os.link(staged, final_path)
-                            media_owned = True
-                            # Output identity and terminal state enter the durable
-                            # journal together, so late cancellation cannot leave
-                            # a cancelled job with an unrecorded gallery result.
-                            return finish_job(
-                                job, "completed", output_files=[filename],
-                                progress=100, phase="", message="Done",
-                            )
-                        finally:
-                            if not (job.get("status") == "completed"
-                                    and filename in (job.get("output_files") or [])):
-                                if media_owned:
-                                    os.remove(final_path)
-                                os.remove(meta_path)
+                    if aborted():
+                        return False
+                    # Preserve the source generation settings for Use settings;
+                    # hflip is transform metadata, not an avatar/edit submode.
+                    source_params = metadata.get("params")
+                    return _publish_processed_tool_output(
+                        job, staged, source=source, tool="hflip",
+                        params=source_params if isinstance(source_params, dict) else {},
+                        source_revision=job["params"]["hflip_source_revision"],
+                        elapsed=time.time() - start_time,
+                    )
         except Exception:
             if job.get("status") == "completed":
                 return True
@@ -61055,6 +61033,7 @@ async def tools_hflip(request: Request):
                 "progress": 0, "step": 0, "total_steps": 0,
                 "session_id": request.state.maestro_session_id,
                 "source_remote": bool(_request_remote.get()),
+                "_tool_inputs_authorized_live": True,
                 "phase": "", "message": "Queued (video flip)", "created_at": time.time(),
                 "params": {
                     "hflip_source_name": name, "hflip_source_revision": revision,
@@ -61194,7 +61173,7 @@ def _validated_tool_input_paths(job: dict) -> list[str]:
     """
     try:
         kind = job.get("kind")
-        if kind not in {"tool_upscale", "tool_revoice"}:
+        if kind not in {"tool_upscale", "tool_revoice", "tool_hflip"}:
             raise ValueError("Unsupported tool job")
         project_dir = _existing_workspace_dir(job["workspace"])
         if not hmac.compare_digest(
@@ -61207,19 +61186,21 @@ def _validated_tool_input_paths(job: dict) -> list[str]:
             expected_job_id=job["id"],
         )
         params = job["params"]
-        paths = [params.get("video_path")]
+        paths = [params.get("hflip_source_path") if kind == "tool_hflip" else params.get("video_path")]
         if kind == "tool_revoice":
             refs = params.get("voice_ref_paths")
             if not isinstance(refs, list) or not refs:
                 raise ValueError("Voice references are missing")
             paths.extend(refs)
-        if (manifest.get("params") != params or params.get("_tool_input_paths") != paths
+        if (manifest.get("params") != params
+                or (kind != "tool_hflip" and params.get("_tool_input_paths") != paths)
                 or any(not isinstance(path, str) or not os.path.isabs(path) for path in paths)):
             raise ValueError("Tool input identity changed")
         descriptors = manifest.get("inputs") or []
         for index, path in enumerate(paths):
+            field = f"hflip_source_path:{index}" if kind == "tool_hflip" else f"_tool_input_paths:{index}"
             matches = [d for d in descriptors
-                       if d.get("field") == f"_tool_input_paths:{index}" and d.get("path") == path]
+                       if d.get("field") == field and d.get("path") == path]
             if len(matches) != 1:
                 raise ValueError("Input authorization is missing")
             descriptor = matches[0]
@@ -61234,6 +61215,11 @@ def _validated_tool_input_paths(job: dict) -> list[str]:
                 )
             if not valid:
                 raise ValueError("Input ownership or content changed")
+        if kind == "tool_hflip":
+            if (params.get("hflip_source_name") != os.path.basename(paths[0])
+                    or not isinstance(params.get("hflip_source_revision"), str)):
+                raise ValueError("Gallery selection changed")
+            _hflip_source(job)
         return paths
     except (KeyError, TypeError, ValueError, OSError, QueueRecoveryRuntimeError, QueueRecoveryAdapterError):
         raise _ToolInputChanged("Tool inputs changed or their authorization expired. Select the files again.") from None
@@ -61297,7 +61283,8 @@ def _resume_processed_tool_output(job):
     return None
 
 
-def _publish_processed_tool_output(job, staged_path, *, source, tool, params, elapsed):
+def _publish_processed_tool_output(job, staged_path, *, source, tool, params, elapsed,
+                                   source_revision=None):
     """Seal the result before create-only publication and durable completion."""
     from services.atomic_file_publish import publish_file_no_replace, PublishedFileDurabilityError
 
@@ -61324,7 +61311,8 @@ def _publish_processed_tool_output(job, staged_path, *, source, tool, params, el
         if os.path.lexists(destination) or os.path.lexists(meta_path):
             raise ValueError("The tool output already exists. Refresh the gallery.")
         _write_tool_sidecar(out_dir, filename, source_name=os.path.basename(source),
-                            tool=tool, params=params, elapsed=elapsed, job_id=job["id"], producer=producer)
+                            source_revision=source_revision, tool=tool, params=params,
+                            elapsed=elapsed, job_id=job["id"], producer=producer)
         media_owned = False
         def rollback():
             if not (job.get("status") == "completed" and filename in (job.get("output_files") or [])):

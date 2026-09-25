@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'app'))
 from fastapi import HTTPException
 from services.output_access import stamp_sidecar_policy
+from services.queue_recovery_runtime import recovery_unit_id, sha256_file
 
 TREE = ast.parse((ROOT / 'app/launch.py').read_text())
 
@@ -79,6 +80,7 @@ class FlipRouteTests(unittest.TestCase):
         job, options = self.registered[0]
         self.permission.assert_any_call(unittest.mock.ANY, 'project-a', permission='project.generate')
         self.assertEqual(job['params']['hflip_source_path'], str(self.source))
+        self.assertTrue(job['_tool_inputs_authorized_live'])
         self.assertTrue(job['params']['private_output'])
         self.assertTrue(job['params']['explicit_output'])
         self.assertNotIn('model_type', job['params'])
@@ -121,8 +123,14 @@ class FlipRouteTests(unittest.TestCase):
             'register_abort_state': lambda *args: True, 'unregister_abort_state': Mock(),
             'is_cancel_requested': lambda j: j.get('status') == 'cancelled',
             'stamp_sidecar_policy': stamp_sidecar_policy,
+            '_validated_tool_input_paths': lambda j: [self.ns['_hflip_source'](j)[0]],
+            '_resume_processed_tool_output': lambda _j: None,
+            '_recovery_sha256_file': sha256_file,
+            'recovery_unit_id': recovery_unit_id,
         })
-        load_functions(self.ns, '_run_tool_hflip', '_write_tool_sidecar')
+        job['_recovery_manifest_pointer'] = {}
+        load_functions(self.ns, '_run_tool_hflip', '_write_tool_sidecar',
+                       '_processed_tool_settings', '_publish_processed_tool_output')
         return job
 
     def test_worker_publishes_new_video_with_settings_and_provenance(self):
@@ -195,20 +203,14 @@ class FlipRouteTests(unittest.TestCase):
         for target in ('media', 'metadata'):
             with self.subTest(target=target):
                 job = self.worker_namespace()
-                original_link = os.link
                 from services.atomic_file_publish import publish_file_no_replace
-                def racing_link(src, dst, *args, **kw):
-                    if ('_hflip_' in str(dst) and not str(Path(dst).parent).endswith('.hflip')
-                        and Path(dst).parent == Path(self.root)
-                        and (str(dst).endswith('.meta.json') == (target == 'metadata'))):
-                        Path(dst).write_bytes(b'foreign-winner')
-                    return original_link(src, dst, *args, **kw)
                 def racing_publish(src, dst):
-                    if target == 'metadata':
+                    if ('_hflip_' in str(dst) and Path(dst).parent == Path(self.root)
+                        and str(dst).endswith('.meta.json') == (target == 'metadata')):
                         Path(dst).write_bytes(b'foreign-winner')
                     return publish_file_no_replace(src, dst)
                 def encode(src, dst, **kw): Path(dst).write_bytes(b'flipped')
-                with patch('services.video_transform.horizontal_flip', side_effect=encode), patch('os.link', side_effect=racing_link), patch('services.atomic_file_publish.publish_file_no_replace', side_effect=racing_publish):
+                with patch('services.video_transform.horizontal_flip', side_effect=encode), patch('services.atomic_file_publish.publish_file_no_replace', side_effect=racing_publish):
                     self.assertFalse(self.ns['_run_tool_hflip'](job['id']))
                 winners = list(Path(self.root).glob('*_hflip_*'))
                 self.assertEqual(len(winners), 1)

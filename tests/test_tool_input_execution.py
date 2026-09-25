@@ -52,7 +52,7 @@ class ToolInputExecutionTests(unittest.TestCase):
         self.ns = dict(os=os, json=json, time=time, uuid=uuid, hmac=hmac, Request=object,
             HTTPException=HTTPException, QueueRecoveryRuntimeError=QueueRecoveryRuntimeError,
             QueueRecoveryAdapterError=QueueRecoveryAdapterError, owner_principal_digest=owner_principal_digest,
-            _app_dir=str(self.root), _RECOVERABLE_INPUT_KEYS={'_tool_input_paths'},
+            _app_dir=str(self.root), _RECOVERABLE_INPUT_KEYS={'_tool_input_paths', 'hflip_source_path'},
             recovery_unit_id=recovery_unit_id, _recovery_artifact_descriptor=artifact_descriptor,
             validate_artifact_descriptor=validate_artifact_descriptor,
             _queue_recovery_reconcile_orphan_delivery=lambda *a: None,
@@ -61,6 +61,10 @@ class ToolInputExecutionTests(unittest.TestCase):
             read_upload_access_sidecar=lambda p: json.loads(Path(p+'.access.json').read_text()),
             _existing_workspace_dir=lambda ws: str(self.project),
             _queue_recovery_existing_project_identity=lambda p: 'project-digest',
+            load_media_sidecars=lambda root, names: {
+                name: json.loads((Path(root) / name).with_suffix('.meta.json').read_text())
+                for name in names if (Path(root) / name).with_suffix('.meta.json').is_file()
+            },
             load_request_manifest=lambda root,pointer,**kw: copy.deepcopy(self.manifests[kw['expected_job_id']]),
             _jobs=self.jobs, _gen_lock=threading.Lock(), _active_gen_states={},
             generation_slot=lambda *a: nullcontext(True), _WgpNativeGpuExecutionSlot=lambda *a: nullcontext(),
@@ -77,14 +81,22 @@ class ToolInputExecutionTests(unittest.TestCase):
              '_processed_tool_settings', '_resume_processed_tool_output',
              '_h3_dependency_closed_recovery_units', '_queue_recovery_units', '_queue_recovery_unit_matches', '_queue_recovery_reconcile_cursor',
              '_publish_processed_tool_output', '_write_tool_sidecar', '_queue_recovery_worker',
+             '_output_revision', '_hflip_source', '_run_tool_hflip',
              '_run_tool_upscale', '_run_tool_revoice', 'tools_upscale', 'tools_revoice',
              '_request_project_workspace')
 
     def job(self, kind='tool_revoice', legacy=False):
         if legacy: self.video.with_suffix('.meta.json').unlink()
         paths = [str(self.video)] + ([str(self.voice)] if kind == 'tool_revoice' else [])
-        params = {'video_path': paths[0], '_tool_input_paths': paths}
-        if kind == 'tool_revoice': params['voice_ref_paths'] = paths[1:]
+        if kind == 'tool_hflip':
+            params = {
+                'hflip_source_path': paths[0], 'hflip_source_name': self.video.name,
+                'hflip_source_revision': self.ns['_output_revision'](
+                    paths[0], str(self.project), self.video.name),
+            }
+        else:
+            params = {'video_path': paths[0], '_tool_input_paths': paths}
+            if kind == 'tool_revoice': params['voice_ref_paths'] = paths[1:]
         job = dict(id='a'*32, kind=kind, status='queued', params=params, workspace='project-a',
                    out_dir=str(self.project), _tool_inputs_authorized_live=True,
                    _recovery_owner_digest=self.owner, _recovery_project_digest='project-digest',
@@ -118,6 +130,20 @@ class ToolInputExecutionTests(unittest.TestCase):
         self.assertEqual(self.ns['_validated_tool_input_paths'](job), [str(self.video)])
         job.pop('_tool_inputs_authorized_live')
         with self.assertRaises(ValueError): self.ns['_validated_tool_input_paths'](job)
+
+    def test_hflip_requires_exact_gallery_revision_and_rejects_legacy_restore(self):
+        job = self.job('tool_hflip')
+        self.assertEqual(self.ns['_validated_tool_input_paths'](job), [str(self.video)])
+        sidecar = self.video.with_suffix('.meta.json')
+        original = sidecar.stat().st_mtime_ns
+        os.utime(sidecar, ns=(original + 100_000, original + 100_000))
+        with self.assertRaises(ValueError):
+            self.ns['_validated_tool_input_paths'](job)
+        job = self.job('tool_hflip', legacy=True)
+        self.assertEqual(self.ns['_validated_tool_input_paths'](job), [str(self.video)])
+        job.pop('_tool_inputs_authorized_live')
+        with self.assertRaises(ValueError):
+            self.ns['_validated_tool_input_paths'](job)
 
     def test_live_derived_authority_is_not_persisted_in_recovery(self):
         from services.queue_recovery import QueueRecoveryJournal
@@ -238,6 +264,59 @@ class ToolInputExecutionTests(unittest.TestCase):
             self.assertTrue(self.ns['_run_tool_upscale'](job['id']))
         self.assertEqual(len(self.calls), 1)
         self.assertEqual(job['output_files'], [outputs[0].name])
+
+    def test_hflip_crash_adopts_sealed_result_without_encoding_again(self):
+        class ProcessDeath(BaseException): pass
+        job = self.job('tool_hflip')
+        calls = []
+        def flip(src, dst, **_kw):
+            calls.append(src)
+            Path(dst).write_bytes(b'flipped-with-audio')
+        original_finish = self.ns['finish_job']
+        self.ns['finish_job'] = Mock(side_effect=ProcessDeath())
+        with patch.dict(sys.modules, {'services.video_transform': types.SimpleNamespace(horizontal_flip=flip)}), self.assertRaises(ProcessDeath):
+            self.ns['_run_tool_hflip'](job['id'])
+        outputs = list(self.project.glob('*_hflip_*.mp4'))
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(job['output_files'], [])
+        metadata = json.loads(outputs[0].with_suffix('.meta.json').read_text())
+        self.assertEqual(metadata['tool_source_revision'], job['params']['hflip_source_revision'])
+        self.assertEqual(metadata['producer_media_sha256'], sha256_file(str(outputs[0]))[1])
+        job['status'] = 'queued'
+        self.ns['finish_job'] = original_finish
+        with patch.dict(sys.modules, {'services.video_transform': types.SimpleNamespace(horizontal_flip=flip)}):
+            self.assertTrue(self.ns['_run_tool_hflip'](job['id']))
+        self.assertEqual(calls, [str(self.video)])
+        self.assertEqual(job['output_files'], [outputs[0].name])
+        self.assertEqual(self.video.read_bytes(), b'original')
+
+    def test_hflip_crash_rejects_changed_source_before_adoption(self):
+        class ProcessDeath(BaseException): pass
+        job = self.job('tool_hflip')
+        calls = []
+        def flip(src, dst, **_kw):
+            calls.append(src)
+            Path(dst).write_bytes(b'flipped-with-audio')
+        original_finish = self.ns['finish_job']
+        self.ns['finish_job'] = Mock(side_effect=ProcessDeath())
+        with patch.dict(sys.modules, {'services.video_transform': types.SimpleNamespace(horizontal_flip=flip)}), self.assertRaises(ProcessDeath):
+            self.ns['_run_tool_hflip'](job['id'])
+        output = next(self.project.glob('*_hflip_*.mp4'))
+        sidecar = output.with_suffix('.meta.json')
+        original_media = output.read_bytes()
+        original_metadata = sidecar.read_bytes()
+        source_sidecar = self.video.with_suffix('.meta.json')
+        original_mtime = source_sidecar.stat().st_mtime_ns
+        os.utime(source_sidecar, ns=(original_mtime + 100_000, original_mtime + 100_000))
+        job['status'] = 'queued'
+        self.ns['finish_job'] = original_finish
+        with patch.dict(sys.modules, {'services.video_transform': types.SimpleNamespace(horizontal_flip=flip)}):
+            self.assertFalse(self.ns['_run_tool_hflip'](job['id']))
+        self.assertEqual(calls, [str(self.video)])
+        self.assertEqual(job['status'], 'failed')
+        self.assertEqual(job['output_files'], [])
+        self.assertEqual(output.read_bytes(), original_media)
+        self.assertEqual(sidecar.read_bytes(), original_metadata)
 
     def test_post_rename_durability_failures_remove_only_owned_output(self):
         from services.atomic_file_publish import publish_file_no_replace, PublishedFileDurabilityError
