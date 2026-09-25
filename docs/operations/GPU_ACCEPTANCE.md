@@ -1370,3 +1370,30 @@ quality acceptance. Local and stable Cloudflare `/ready` both returned 200
 afterward; the final Gallery output was checked locally, not through a fresh
 stable-share session. The grant was withdrawn after completion, and its outbox
 returned `denied` while Continuum stayed running.
+
+## 2026-09-25 stable-share public-readiness release
+
+The preceding Pinokio restart exposed a stable-route timing gap: the Worker
+confirmed its updated target while public stable `/health` and `/ready` still
+returned 503 for roughly 30 seconds, yet the restart notice had already been
+cleared. Commit `b5c5081` now requires the public `/direct` route to name the
+current Quick Tunnel and requires public `/health` and `/ready` to pass before
+stable registration. Redirect rollback accepts only the exact current target.
+The checks share a one-minute verification deadline and fall back to the Quick
+Tunnel when stable access does not become ready.
+
+The CPU-only release gate passed 5,362 backend tests (17 skipped), JSON grammar
+checks, 722 UI tests, and the UI type-check/build. The focused stable-share
+suite passed 54 tests; the Worker suite passed 35. One live read-only probe of
+the running Worker and current tunnel passed before deployment. The coordinated
+Pinokio **Restart Maestro** action then stopped the old backend, displayed its
+public maintenance page while stable health/readiness returned 503, and started
+the replacement. Pinokio reported one ready `start.js` and a newly discovered
+local URL. Local and direct Quick Tunnel `/health` and `/ready` returned 200;
+the stable route returned 200 through curl and passed the release client's
+exact public-target/health/ready probe. The launcher selected stable sharing,
+reported the matching restart notice cleared, and a subsequent
+authenticated status read found no active notice. A signed-in stable-share
+browser reopened an existing project Gallery. This is live local and access-
+surface evidence, not a generation, cross-region KV convergence, Windows
+check, or owner visual acceptance.
