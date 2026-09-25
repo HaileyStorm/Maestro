@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { exportEditorProject, openOutputInEditor, saveEditorProject } from '../src/api/client.ts'
+import { exportEditorProject, isBackendJobId, openOutputInEditor, saveEditorProject } from '../src/api/client.ts'
+
+test('Editor export job IDs remain usable in Queue and job logs', () => {
+  assert.equal(isBackendJobId('a1b2c3d4e5f6471889abcdef01234567'), true)
+  assert.equal(isBackendJobId('faceb00c'), true)
+  assert.equal(isBackendJobId('a1b2c3d4e5f6471889abcdef01234567/other'), false)
+})
 
 test('Editor requests keep the project, source revision and autosave revision together', async () => {
   const previous = globalThis.fetch

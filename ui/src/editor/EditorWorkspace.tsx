@@ -136,6 +136,10 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
     setExportError('')
     try {
       await exportEditorProject(source.workspace, project)
+      // The Queue renders cards from /jobs; its /queue poll only updates cards
+      // already in the store. Discover this newly submitted job before sending
+      // the user there, including when the global queue is paused.
+      await useStore.getState().reconnectJobs()
       setExportState(editVersion.current === version ? 'queued' : 'idle')
     } catch (reason) {
       setExportState('idle')

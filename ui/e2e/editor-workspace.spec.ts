@@ -13,6 +13,7 @@ const VIDEO = {
 }
 
 const CONTENT_REVISION = `sha256:${'a'.repeat(64)}`
+const EXPORT_JOB_ID = 'a1b2c3d4e5f6471889abcdef01234567'
 
 function editorProject(revision: number, sourceIn = 0) {
   return {
@@ -100,8 +101,17 @@ for (const viewport of [
       exports.push({ expected_revision: route.request().postDataJSON().expected_revision,
         url: route.request().url() })
       return route.fulfill({ status: 200, contentType: 'application/json',
-        body: JSON.stringify({ job_id: 'synthetic-export', status: 'queued' }) })
+        body: JSON.stringify({ job_id: EXPORT_JOB_ID, status: 'queued' }) })
     })
+    const exportJob = {
+      job_id: EXPORT_JOB_ID, status: 'queued', workspace: VIDEO.workspace,
+      created_at: 1_725_000_500, progress: 0, step: 0, total_steps: 1,
+      phase: 'queued', message: 'Queued (Editor export)', output_files: [],
+      error: null, prompt_preview: '', active_window_prompt: '',
+      model_type: 'editor_export', generation_mode: 'edit',
+      requested_outputs: 1, produced_outputs: 0,
+      queue_wait_reason: 'queue_paused',
+    }
 
     await page.goto('/')
     await page.getByRole('tab', { name: 'Gallery' }).click()
@@ -134,8 +144,18 @@ for (const viewport of [
     expect(saves[1].expected_revision).toBe(2)
     expect(saves[1].source_in).toBeGreaterThan(saves[0].source_in)
     await expect(page.getByRole('status').filter({ hasText: 'Draft saved' })).toBeVisible()
+    await page.route('**/api/v1/jobs', route => route.fulfill({
+      status: 200, contentType: 'application/json',
+      body: JSON.stringify({ jobs: [exportJob] }),
+    }))
+    await page.route(`**/api/v1/status/${EXPORT_JOB_ID}`, route => route.fulfill({
+      status: 200, contentType: 'application/json', body: JSON.stringify(exportJob),
+    }))
     await page.getByRole('button', { name: 'Export MP4' }).click()
     await expect(page.getByRole('status').filter({ hasText: 'Track the export in Queue' })).toBeVisible()
+    await page.getByRole('button', { name: 'Gallery' }).click()
+    await page.getByRole('tab', { name: /Queue/ }).click()
+    await expect(page.getByRole('button', { name: `Copy job id ${EXPORT_JOB_ID}` })).toBeVisible()
     expect(exports).toHaveLength(1)
     expect(exports[0].expected_revision).toBe(3)
     expect(exports[0].url).toContain('/projects/Synthetic%20project/editor/projects/synthetic-cut/exports')

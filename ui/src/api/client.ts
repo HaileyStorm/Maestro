@@ -991,7 +991,7 @@ export interface JobLogEvent {
 }
 
 export function isBackendJobId(jobId: string): boolean {
-  return /^[0-9a-f]{8}$/i.test(jobId)
+  return /^(?:[0-9a-f]{8}|[0-9a-f]{32})$/i.test(jobId)
 }
 
 export async function fetchJobLog(jobId: string, limit = 100): Promise<{ job_id: string; events: JobLogEvent[] }> {
