@@ -155,7 +155,7 @@ const componentModules = new Map([
     export const FolderInput = 'FolderInput'; export const Scissors = 'Scissors';
     export const FastForward = 'FastForward'; export const BookMarked = 'BookMarked';
     export const EyeOff = 'EyeOff'; export const Share2 = 'Share2'; export const Link2Off = 'Link2Off';
-    export const FlipHorizontal = 'FlipHorizontal';
+    export const FlipHorizontal = 'FlipHorizontal'; export const Clapperboard = 'Clapperboard';
   `],
   ['../Recipes/SaveRecipeDialog', `export function SaveRecipeDialog() { return null }`],
   ['../../stores/useStore', `

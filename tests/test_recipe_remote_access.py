@@ -343,7 +343,7 @@ class RecipeUiSourceHarnessTests(unittest.TestCase):
         sidebar = SIDEBAR.read_text(encoding="utf-8")
         overlay = OVERLAY.read_text(encoding="utf-8")
 
-        self.assertIn("!remoteProjectRequired ? <button", app)
+        self.assertIn("!remoteProjectRequired && !editorSource ? <button", app)
         self.assertIn("<RecipesOverlay />", app)
         self.assertNotIn("machineControls && <RecipesOverlay />", app)
         self.assertIn('aria-controls="maestro-mobile-sidebar"', app)

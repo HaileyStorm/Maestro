@@ -68,8 +68,23 @@ if _IS_WINDOWS:
         wintypes.DWORD,     # dwFlagsAndAttributes
         wintypes.HANDLE,    # hTemplateFile
     ]
+    _GetFileInformationByHandleEx = _kernel32.GetFileInformationByHandleEx
+    _GetFileInformationByHandleEx.restype = wintypes.BOOL
+    _GetFileInformationByHandleEx.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+    ]
+
+    class _FileBasicInfo(ctypes.Structure):
+        _fields_ = [
+            ("CreationTime", ctypes.c_longlong),
+            ("LastAccessTime", ctypes.c_longlong),
+            ("LastWriteTime", ctypes.c_longlong),
+            ("ChangeTime", ctypes.c_longlong),
+            ("FileAttributes", wintypes.DWORD),
+        ]
 
     _GENERIC_READ = 0x80000000
+    _FILE_READ_ATTRIBUTES = 0x00000080
     _FILE_SHARE_READ = 0x00000001
     _FILE_SHARE_WRITE = 0x00000002
     _FILE_SHARE_DELETE = 0x00000004
@@ -78,7 +93,28 @@ if _IS_WINDOWS:
     _FILE_FLAG_SEQUENTIAL_SCAN = 0x08000000  # hint for OS prefetcher
     _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
-    def _open_share_delete(path: str):
+    def _windows_change_time_from_handle(handle: int) -> int:
+        info = _FileBasicInfo()
+        if not _GetFileInformationByHandleEx(handle, 0, ctypes.byref(info), ctypes.sizeof(info)):
+            raise OSError(ctypes.get_last_error(), "Could not read file change identity")
+        if info.ChangeTime <= 0:
+            raise OSError("File change identity is unavailable")
+        return int(info.ChangeTime)
+
+    def _windows_change_time(path: str) -> int:
+        handle = _CreateFileW(
+            path, _FILE_READ_ATTRIBUTES,
+            _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+            None, _OPEN_EXISTING, _FILE_ATTRIBUTE_NORMAL, None,
+        )
+        if handle is None or (handle & 0xFFFFFFFF) == 0xFFFFFFFF:
+            raise OSError(ctypes.get_last_error(), "Could not open file identity")
+        try:
+            return _windows_change_time_from_handle(handle)
+        finally:
+            _kernel32.CloseHandle(handle)
+
+    def _open_share_delete(path: str, *, allow_write: bool = True):
         """Open a file for binary read with FILE_SHARE_DELETE.
 
         Returns a Python file object. The OS will allow other processes
@@ -88,7 +124,7 @@ if _IS_WINDOWS:
         handle = _CreateFileW(
             path,
             _GENERIC_READ,
-            _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+            _FILE_SHARE_READ | _FILE_SHARE_DELETE | (_FILE_SHARE_WRITE if allow_write else 0),
             None,
             _OPEN_EXISTING,
             _FILE_ATTRIBUTE_NORMAL | _FILE_FLAG_SEQUENTIAL_SCAN,
@@ -113,7 +149,7 @@ if _IS_WINDOWS:
         return os.fdopen(fd, "rb", buffering=-1)
 
 else:
-    def _open_share_delete(path: str):  # type: ignore[misc]
+    def _open_share_delete(path: str, *, allow_write: bool = True):  # type: ignore[misc]
         # POSIX: regular open already allows concurrent delete.
         return open(path, "rb")
 
@@ -136,6 +172,31 @@ else:
 _CHUNK_SIZE = 64 * 1024  # 64 KB per chunk
 
 
+def file_revision_identity(path: str) -> tuple[int, int, int, int, int, int] | None:
+    """Identity used to bind a validated output to its eventual open handle."""
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return _stat_revision_identity(stat, path=path)
+
+
+def _stat_revision_identity(
+    stat: os.stat_result, *, path: str | None = None, handle=None,
+) -> tuple[int, int, int, int, int, int]:
+    if _IS_WINDOWS:
+        change_time = (
+            _windows_change_time_from_handle(msvcrt.get_osfhandle(handle.fileno()))
+            if handle is not None else _windows_change_time(path)
+        )
+    else:
+        change_time = int(stat.st_ctime_ns)
+    return (
+        int(stat.st_dev), int(stat.st_ino), int(stat.st_size),
+        int(stat.st_mtime_ns), int(stat.st_ctime_ns), change_time,
+    )
+
+
 class ShareDeleteFileResponse(Response):
     """File response that opens with FILE_SHARE_DELETE on Windows so the
     file can be deleted/renamed even while we're streaming it.
@@ -155,9 +216,13 @@ class ShareDeleteFileResponse(Response):
         filename: Optional[str] = None,
         method: Optional[str] = None,
         stat_result: Optional[os.stat_result] = None,
+        expected_file_identity: tuple[int, int, int, int, int, int] | None = None,
+        expected_sidecar: tuple[str, tuple[int, int, int, int, int, int] | None] | None = None,
     ):
         self.path = path
         self.filename = filename
+        self.expected_file_identity = expected_file_identity
+        self.expected_sidecar = expected_sidecar
         self.send_header_only = method is not None and method.upper() == "HEAD"
 
         if media_type is None:
@@ -260,20 +325,43 @@ class ShareDeleteFileResponse(Response):
         # Content-Length → h11 "Too little data for declared Content-Length"
         # error in the connection writer.
         try:
-            f = _open_share_delete(self.path)
+            f = _open_share_delete(self.path, allow_write=self.expected_file_identity is None)
         except FileNotFoundError:
             await self._send_error(send, 404)
             return
         except OSError:
-            await self._send_error(send, 404)
+            await self._send_error(send, 409 if self.expected_file_identity is not None else 404)
             return
 
         try:
             try:
-                size = os.fstat(f.fileno()).st_size
+                opened_stat = os.fstat(f.fileno())
+                size = opened_stat.st_size
             except OSError:
+                if self.expected_file_identity is not None:
+                    await self._send_error(send, 409)
+                    return
                 # Fall back to stat_result if fstat fails (shouldn't happen)
                 size = self.stat_result.st_size if self.stat_result else 0
+            else:
+                if self.expected_file_identity is not None:
+                    try:
+                        opened_identity = _stat_revision_identity(opened_stat, handle=f)
+                    except OSError:
+                        await self._send_error(send, 409)
+                        return
+                    if opened_identity != self.expected_file_identity:
+                        await self._send_error(send, 409)
+                        return
+            if self.expected_sidecar is not None:
+                sidecar_path, sidecar_identity = self.expected_sidecar
+                try:
+                    sidecar_still_current = file_revision_identity(sidecar_path) == sidecar_identity
+                except OSError:
+                    sidecar_still_current = False
+                if not sidecar_still_current:
+                    await self._send_error(send, 409)
+                    return
 
             start, end = 0, size - 1
             status = 200
@@ -313,9 +401,13 @@ class ShareDeleteFileResponse(Response):
                 f.seek(start)
             remaining = length
             while remaining > 0:
-                chunk = f.read(min(self.chunk_size, remaining))
+                read_size = max(self.chunk_size, 1024 * 1024) if self.expected_file_identity else self.chunk_size
+                chunk = f.read(min(read_size, remaining))
                 if not chunk:
                     break
+                if self.expected_file_identity is not None:
+                    if _stat_revision_identity(os.fstat(f.fileno()), handle=f) != self.expected_file_identity:
+                        raise OSError("Output changed while streaming")
                 remaining -= len(chunk)
                 await send({
                     "type": "http.response.body",
@@ -346,7 +438,7 @@ class ShareDeleteFileResponse(Response):
             f.close()
 
     async def _send_error(self, send: Send, status: int) -> None:
-        msg = {404: b"Not Found", 416: b"Range Not Satisfiable"}.get(status, b"Error")
+        msg = {404: b"Not Found", 409: b"Output changed; reopen it from Gallery", 416: b"Range Not Satisfiable"}.get(status, b"Error")
         body = msg
         await send({
             "type": "http.response.start",
@@ -395,6 +487,8 @@ def share_delete_file_response(
     media_type: Optional[str] = None,
     filename: Optional[str] = None,
     method: Optional[str] = None,
+    expected_file_identity: tuple[int, int, int, int, int, int] | None = None,
+    expected_sidecar: tuple[str, tuple[int, int, int, int, int, int] | None] | None = None,
 ) -> Response:
     """Drop-in replacement for FastAPI's FileResponse that uses
     FILE_SHARE_DELETE on Windows.
@@ -404,7 +498,9 @@ def share_delete_file_response(
     thumbnails, etc.
     """
     return ShareDeleteFileResponse(
-        path=path, media_type=media_type, filename=filename, method=method
+        path=path, media_type=media_type, filename=filename, method=method,
+        expected_file_identity=expected_file_identity,
+        expected_sidecar=expected_sidecar,
     )
 
 

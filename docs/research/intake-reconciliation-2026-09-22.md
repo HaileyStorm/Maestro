@@ -8,7 +8,7 @@ owner are different states. Several adopted historical capabilities remain
 unimplemented. GPU availability is only one of the remaining dependencies.
 The disposition inventory remains the September 22 baseline; delivery notes
 and the promotion order below include verified follow-on work through
-September 24.
+September 25.
 
 Baseline: Continuum `d4dff8442979b6c0559d27b4272462f3c0ade4a7`.
 Upstream reviewed: `Blizaine/Maestro` at
@@ -58,6 +58,12 @@ Human acceptance of these current changes remains pending: the owner explicitly
 has not tried them. Earlier accepted, revision-bound cases remain valid history. A successful output does not establish quality across every model,
 LoRA, input combination, platform or recovery path.
 
+The September 25 Editor/hidden Quad/API-key release gate passed 5,336 backend
+tests (17 skipped), the JSON-grammar regression, 718 UI tests, type-check and
+production build, targeted lint, and four Editor desktop/mobile browser cases.
+The Editor signed-in stable-share draft and preview check is recorded below;
+the Quad executor and API-key failure retry have CPU/synthetic evidence only.
+
 ## Historical candidate disposition and actual delivery
 
 The tables summarize the retained decisions at capability level. The original
@@ -72,7 +78,7 @@ checkpoint was installed.
 | MiniMax Music3 | Adopt native WanGP path; retain SGLang as isolated experiment | The upstream-native Music3 handler is registered for Studio and Director's existing audio queue, project output, recovery and same-owner local/LAN/Cloudflare access. The catalog exposes the real model only through the normal visibility whitelist; download and execution require the versioned host review term and exact official/optimized source manifest. The [official LICENSE](https://huggingface.co/MiniMaxAI/MiniMax-Music3/blob/fbdf52fbaaca799592917417eb05f1899f1255ec/LICENSE) is pinned at `fbdf52fbaaca799592917417eb05f1899f1255ec` with SHA-256 `b21d12df2adae59dad3fcf80c1d81492654c662342f497d9a9770198c9317e58`; the optimized WanGP assets are pinned separately at `DeepBeepMeep/TTS@d31b4665414200fcab779ced520b01bd9f5e07ba`. Byte-level lineage from that conversion to the newer official commit is not independently proven, so keep both source identities visible. CPU tests cover source drift, terms admission and catalog parity. No checkpoint has been downloaded, no GPU song has been generated, and quality/cancellation/recovery still need live acceptance. The separate SGLang runtime/client remains unconnected to production, with an adapter-only external signature and country gate; neither is an official license requirement. |
 | Music3 Turbo FP8 and MiniMax Music Slider LoRA | Watch | No accepted managed recipe. Need exact artifact, base compatibility, adapter control and audio evidence after the Music3 executor. |
 | YuE2 and installed Sound/Vision LoRAs | Adopt | Bridge-based generation/composition and a project My Music playback/download library are delivered. Native baseline, DreamPop v2, combined artist+style, manually scored instrumental, optional score-first adapter, and guide-backed instrumental takes have live technical receipts. A refreshed LoRA catalog blocks generation if a previously selected adapter has disappeared, instead of silently dropping it. The dedicated instrumental adapter was pinned and converted without tensor-value changes. It generated a clean automatic score, but with a supplied guide-backed ABC it ran to the 360-second semantic cap; the identical-score and same-seed no-LoRA control ended cleanly in 38 seconds. Its UI now warns about that combination. The adapter remains an explicit selection, with automatic selection on the Instrumental toggle unimplemented. Instrumental composition selects arrangement/score guides instead of lyric-writing or vocal-direction guides, asks for `[Instrumental]` without sung words, and retains YuE2's required two-voice ABC score. An initial guide-backed draft returned twelve bars for an eight-bar request; a later eight-bar draft had invalid native ABC pitch syntax. The revised composer produced an eight-bar-per-voice score accepted by the installed native parser, and its no-LoRA native take completed with no warnings or truncation. The 45-second audio exceeds the score's 17-second nominal duration, so exact audio-length fidelity and owner listening remain open. The combined artist+style take also reached the 360-second semantic limit and needs ending/listening review. The September 24 update adds a project-scoped training UI, durable jobs, source-take staging, coordinator grants, cancellation, and checkpoint quarantine; one live 200-step run produced a valid private checkpoint. A project-bound picker resolves that checkpoint by job, ID and hash at submission and worker start. Signed-in project-switch and actual 51-second audition generation passed under a fresh grant; owner listening and duration fidelity remain open. |
-| CharacterSheet / Krea identity LoRAs | Adapt | `character_sheet_workflow.py`, capabilities and profile gates are planning/validation only; profiles explicitly unavailable/non-executable. Ordinary Reference Packs are a different delivered capability. The corrected contract requires a verified FLUX anchor, gives Quad a face close-up plus front/side/back full-body panels, starts optional visual review Off, and permits user-selected failed-role Qwen Image Edit repair. The September 24 contract update permits an absent local repair editor for initial generation, seals that absence, and rejects selected repair unless a local editor is available. The first Quad FLUX LoRA is pinned to its exact source revision, size and SHA-256. Managed download and native use require creator/base host terms; the CivitAI browser requires creator acceptance before fetching the exact version, hashes it before publication, and native use still requires the base notice. Continuum and Classic rehash installed copies before use, including case-only aliases. Studio, Director, and CivitAI expose the creator notice. That artifact support has CPU checks but no installed LoRA or live Quad generation. The first real `quad_flux2_klein` job still needs server-verified anchor provenance, durable queue/recovery, and atomic project-asset publication. Do not enable it from static readiness alone. Krea, Dynamic Krea, Triple FLUX, and the separate H3 Orbit Sheet experiment remain outside that first slice. |
+| CharacterSheet / Krea identity LoRAs | Adapt | The contract requires a verified FLUX anchor, gives Quad a face close-up plus front/side/back full-body panels, starts optional visual review Off, and permits user-selected failed-role Qwen Image Edit repair. An absent local repair editor is sealed for initial generation; selected repair still requires one. The first Quad FLUX LoRA is pinned to its exact source revision, size and SHA-256. Managed download and native use require creator/base host terms; the CivitAI browser requires creator acceptance before fetching the exact version, hashes it before publication, and native use still requires the base notice. Continuum and Classic rehash installed copies before use, including case-only aliases. The September 25 hidden Quad route now resolves a server-verified FLUX anchor, admits a durable private parent/child job, rechecks model/LoRA/terms at worker start, and atomically publishes four hashed panel candidates with committed-publication recovery. CPU executor, route and adjacent Reference Pack checks pass. Public capabilities remain unavailable, no Quad LoRA is installed, no GPU Quad generation or owner visual review has occurred, and a restart before publication needs resubmission. Do not advertise static readiness as a working product. Krea, Dynamic Krea, Triple FLUX, and the separate H3 Orbit Sheet experiment remain outside that first slice. |
 | H3 Character Sheet Generator / H3 Orbit Sheet / OrbitSheets | Experiment | Separate orbit-sheet candidate, including the historical 73-versus-124-frame fixture; no enabled executor. Do not conflate it with CharacterSheet M2. |
 | Realism People LoRA | Watch | Generic LoRA loading exists; candidate-specific artifact/license/trigger/strength/audio evidence does not. |
 | Looping Sketch Anime LoRA | Defer | Historical license uncertainty and no accepted managed artifact. |
@@ -138,8 +144,11 @@ checkpoint was installed.
 
 ## Upstream assessment and selected ports
 
-Read-only upstream HEAD check on 2026-09-23 still resolves to
-`5efd686ab446d451d927cbc00665e136d8de585e`, matching this assessment.
+The 2.3 assessment below is pinned to
+`5efd686ab446d451d927cbc00665e136d8de585e`. A September 25 fetch found
+one newer upstream commit, `4afe1693e34119ef2d7e710ec8632c22da225055`
+(2.4.0); its separate disposition follows this table. Neither release is a
+whole-tree merge target for Continuum.
 
 | Upstream release/cluster | Integration disposition |
 | --- | --- |
@@ -147,7 +156,7 @@ Read-only upstream HEAD check on 2026-09-23 still resolves to
 | 2.1.3 UTF-8 transport and failed-load recovery (`5b47516`) | Delivered byte-first SSE decoding at both local streaming paths and explicit UTF-8 JSON response decoding in `9d62da5`, retaining Continuum's cancellation, retry, and progress handling. FlashVSR partial-load cleanup is in `5fff121`; failed WGP generation now releases retained model resources after frame unwind in `a32023a`, while the H3 OOM relief retry keeps its resident model. The latter passed 5,306 backend and 715 UI checks on September 24 but awaits the next coordinated service restart and live GPU acceptance. Multilingual streaming still lacks a dedicated live transcript receipt. |
 | 2.2.3 H3 RMSNorm (`f614f61`) | Adapt inference chunking with Continuum's existing 8192-token limit; preserve native normalization, hooks, gradients and settings. GPU memory/throughput acceptance remains pending. |
 | 2.0.1 Gallery Extend handoff (`5734846`) | Adapted and shipped as `81f43e7`: existing Continuum actions open Studio / Video / Extend and attach the selected clip. Workspace-qualified fetches, stale-request cancellation, visible errors and active/stashed preview ownership are covered by 688 UI tests plus lint/build. Signed-in stable Cloudflare flow from Audio to Extend was exercised with an existing 5.2-second clip; no generation submitted. |
-| 2.0 Editor / layered timeline / export | Useful substantial addition; no timeline Editor exists in Continuum yet. Start with a project-scoped **Open in Editor** action from a Gallery video, non-destructive clip import, and autosaved timeline persistence. Server-side project read/write authorization and workspace-switch safety are required even for that first slice. Export, AI round trips, and queue/recovery integration follow separately; upstream cross-folder browsing is not authorization. |
+| 2.0 Editor / layered timeline / export | The first Continuum Editor slice opens a project Gallery video into a non-destructive, single-source trim timeline and autosaves its draft with revision/CAS and current-source checks. Its preview is bound to a content hash and current server-owned privacy flag; the Gallery action also covers videos without generation metadata. CPU route tests and synthetic desktop/mobile browser checks cover project scope, source replacement, sidecarless entry, private reveal, and an edit during an in-flight Back save. After a September 25 coordinated restart, local and stable-share `/health` and `/ready` each returned 200; in the signed-in stable-share UI, a 5.2-second private video opened in Editor, its preview played, and a 5.0-second trim draft survived Gallery exit/reopen. Export, layered editing, AI round trips, and queue/recovery integration remain separate follow-ons; upstream cross-folder browsing is not authorization. Owner acceptance and a live concurrent-write stress test remain open. |
 | 2.0–2.2 H3 character/story/targeted-window repair | Compare with native Reference and H3 authored/durable contracts. Port improvements by behavior; no replacement of current identity or recovery authority. |
 | 2.1 VAE/residency/INT8/NVFP4/VDN/Viggle/audio refinement | Separate runtime/compatibility changes; benchmark each accepted path under a fresh lease. The bounded NVFP4 adaptation in `65866ce` keeps LightX2V as the default, honors an explicit backend selection, and falls back only for recognized unsupported cuBLAS shapes, caching those shapes. OOM and other kernel errors still surface. CPU checks passed, but a live unsupported-shape fallback, image quality, and the other runtime refinements remain unaccepted. Preserve existing manual profiles and working kernels. |
 | 2.2–2.3 YuE2 / My Music / training / instrumental / multi-LoRA | The current bridge exposes a project-filtered My Music library, guide-backed instrumental composition, and native multi-LoRA selection through the installed Sound/Vision service. No-LoRA, single-LoRA, combined-LoRA, manually scored instrumental, adapter-led automatic-score, guide-backed instrumental, and trained private-checkpoint takes have live technical receipts. The combined take reached a generation limit. The guide writer now has a signed-in eight-bar-per-voice draft accepted by the installed native parser and a clean no-LoRA score-to-audio take; an earlier draft missed the requested bar count, and the rendered 45-second audio exceeded the later score's 17-second nominal duration. Exact audio-length fidelity remains open. The dedicated score-first LoRA reached the semantic cap with that supplied score while an identical-score, same-seed no-LoRA control ended cleanly; the UI warns and offers adapter-led score planning or base-model supplied-score rendering. One pair and metadata cannot establish listening quality. The September 24 update below implements project-bound training control with the existing fast-storage AI Toolkit and joint-v9 pair; one 200-step run produced a private checkpoint, and a subsequent signed-in audition generated a 51-second take. Owner listening remains open. |
@@ -155,6 +164,24 @@ Read-only upstream HEAD check on 2026-09-23 still resolves to
 | PWA / Web Push / Tailscale / notification history | Optional architecture work; preserve stable Cloudflare and current access/privacy. No silent remote-service activation. |
 | 30-second H3 single pass | Experimental capability requiring separate geometry/memory/recovery acceptance; existing long-form segmented generation stays. |
 | Upstream Classic UI removal / generic fallback / content classification | Do not port behavior that removes existing features, obscures a chosen runtime or violates local content neutrality. |
+
+### 2026-09-25 upstream 2.4.0 delta
+
+The single new upstream commit changes 173 paths and adds a Gallery viewer,
+H3 planning/repair controls, a separate Singularity model, Qwen Image 2.1
+improvements, and reliability fixes. Its [release notes](https://github.com/Blizaine/Maestro/blob/4afe1693e34119ef2d7e710ec8632c22da225055/docs/RELEASE_NOTES_V2.4.0.md)
+are the source for the following scoped decisions. This is source assessment,
+not installed or live behavior in Continuum.
+
+| 2.4.0 cluster | Continuum disposition and next evidence |
+| --- | --- |
+| Gallery viewer, image comparison, mobile controls and media-to-input menus | **Adapt** after the current project-scoped Editor entry is released. Preserve project/private-output access, current Gallery actions, explicit input destination, and active Studio/Director selection; exercise touch, keyboard, video sound and long-form playback in the signed-in browser. Do not import upstream cross-folder assumptions. |
+| H3 source fidelity, window repair controls and music/performance timing | **Adapt in bounded slices** against Continuum's authored plans and restart/cancellation rules. Keep fidelity warnings and source evidence; treat the optional continue-on-warning setting as a separate default-off decision, not a bypass for invalid or failed generations. Use controlled multi-window fixtures before a GPU quality comparison. |
+| Director performance/dialogue and supplied-audio handling | **Adapt** exact speaker/role and transcript-timing corrections without inventing dialogue, duplicating supplied audio, or replacing local content-neutral execution with a subject-matter gate. |
+| Qwen Image 2.1 LoRA, memory and Director support | **Defer activation with the 2.3 base model** until its pinned research-license host review and exact artifact revisions are settled. Preserve the distinct Qwen 20B model and LoRA library. Once authorized, take the fused-LoRA, memory and Director fixes with CPU and device checks. |
+| H3 Singularity v1.3 Pruned INT8 References | **Benchmark lead**, not a default or replacement for existing H3/Ref2VA choices. Verify exact model/adapter hashes, source terms, memory, cancellation, recovery and quality before catalog promotion. |
+| Face Refiner cleanup, Recast mask memory, API-key save, bundled DramaBox guides | **Adopt focused reliability corrections** after checking each current Continuum path and regression boundary. The API-key field now waits for an authoritative save and masked-value refresh, keeps the entered value plus an inline error on failure, and permits retry without changing provider selection; the UI gate and a failed-save/retry test pass. Face Refiner cleanup, Recast mask memory and DramaBox guide adaptation remain to be assessed or delivered. |
+| Remote LLM vision payloads | **Defer automatic use**. An explicit remote provider and media-sharing privacy decision must precede transmitting project images; local-model and account/project boundaries stay intact. |
 
 The [YuE2 real-audio model card](https://huggingface.co/Mothersuperior/yue2-mothersuperior-realaudio-tokenizer-v4)
 documents a matched joint-v9 tokenizer head and NAR decoder LoRA. The pinned
@@ -295,11 +322,18 @@ environment. This does not establish GPU generation or owner acceptance.
    speaker/detail quality, and owner acceptance remain open. Gallery Extend and manual flip have CPU/UI/live-flow
    evidence; flip hard-crash adoption and human acceptance remain distinct.
 2. Complete Music3 native live generation and recovery acceptance after the
-   pinned host-term review and asset download. Implement the missing CharacterSheet executor in coherent slices; the first Quad LoRA artifact/terms boundary is CPU-tested, but its project job and live run are still missing;
-   its static scaffold must not be advertised as a working product. Scene Kit's
+   pinned host-term review and asset download. The hidden Quad CharacterSheet
+   job and atomic publication path now have CPU checks; install the pinned
+   LoRA only after its applicable host terms, then exercise live generation,
+   cancellation, recovery, quality and public capability admission before
+   presenting it as a working product. Scene Kit's
    separate kept-reference handoff now has one live two-image receipt.
-3. Adapt upstream Qwen2.1 and Editor as separate integrations with complete
-   settings/restore/access/recovery coverage. Native YuE2 generation,
+3. Expand the first Editor trim draft into export, layered editing and AI round
+   trips with scoped queue/recovery and source-safe media handling. Keep Qwen
+   Image 2.1 dormant until exact model/processor/license revisions are pinned
+   and the owner reviews its noncommercial research host-use terms; then adapt
+   its distinct native runtime without auto-enabling it or changing Qwen 20B.
+   Native YuE2 generation,
    project-scoped library, training and private-checkpoint audition now have
    live technical receipts; owner listening, duration fidelity, broader LoRA
    combinations, crash recovery and Windows checks remain.

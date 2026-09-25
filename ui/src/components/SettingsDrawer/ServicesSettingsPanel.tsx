@@ -2,60 +2,7 @@ import { useState } from 'react'
 import { RefreshCw, ShieldAlert, ShieldCheck, Lock } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import { HOST_TERM_NOTICES } from '../../lib/hostTerms'
-
-function ApiKeyField({ label, maskedValue, isSet, onSave }: {
-  label: string
-  maskedValue: string
-  isSet: boolean
-  onSave: (value: string) => void
-}) {
-  const [editing, setEditing] = useState(false)
-  const [value, setValue] = useState('')
-
-  return (
-    <div>
-      <label className="text-[11px] text-text-muted uppercase tracking-wider mb-1.5 block">
-        {label}
-      </label>
-      {editing ? (
-        <div className="flex gap-2">
-          <input
-            type="password"
-            value={value}
-            onChange={e => setValue(e.target.value)}
-            placeholder="Paste API key..."
-            className="flex-1 bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-accent-blue"
-            autoFocus
-          />
-          <button
-            onClick={() => { onSave(value); setEditing(false); setValue('') }}
-            className="px-3 py-2 bg-accent-blue text-white text-xs rounded-lg hover:bg-accent-blue-hover"
-          >
-            Save
-          </button>
-          <button
-            onClick={() => { setEditing(false); setValue('') }}
-            className="px-3 py-2 border border-border text-xs rounded-lg text-text-secondary hover:text-text-primary"
-          >
-            Cancel
-          </button>
-        </div>
-      ) : (
-        <div className="flex gap-2 items-center">
-          <div className="flex-1 bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm text-text-muted font-mono">
-            {isSet ? maskedValue : 'Not set'}
-          </div>
-          <button
-            onClick={() => setEditing(true)}
-            className="px-3 py-2 border border-border text-xs rounded-lg text-text-secondary hover:text-text-primary hover:border-border-light transition-colors"
-          >
-            {isSet ? 'Change' : 'Set'}
-          </button>
-        </div>
-      )}
-    </div>
-  )
-}
+import { ApiKeyField } from '../shared/ApiKeyField'
 
 const PUBLIC_PROVIDERS = new Set(['openai', 'anthropic'])
 
@@ -280,8 +227,9 @@ export function ServicesSettingsPanel() {
                   label="Server API Key"
                   maskedValue={servicesConfig.llm_remote_api_key}
                   isSet={servicesConfig.llm_remote_api_key_set}
-                  onSave={value => {
-                    void updateConfig({ llm_remote_api_key: value }).then(() => loadLlmModels())
+                  onSave={async value => {
+                    await updateConfig({ llm_remote_api_key: value }, { throwOnError: true })
+                    void loadLlmModels()
                   }}
                 />
                 <p className="text-[10px] text-text-muted mt-1">
@@ -628,21 +576,21 @@ export function ServicesSettingsPanel() {
               label="Google AI API Key"
               maskedValue={servicesConfig.google_api_key}
               isSet={servicesConfig.google_api_key_set}
-              onSave={val => updateConfig({ google_api_key: val })}
+              onSave={val => updateConfig({ google_api_key: val }, { throwOnError: true })}
             />
 
             <ApiKeyField
               label="OpenAI API Key"
               maskedValue={servicesConfig.openai_api_key}
               isSet={servicesConfig.openai_api_key_set}
-              onSave={val => updateConfig({ openai_api_key: val })}
+              onSave={val => updateConfig({ openai_api_key: val }, { throwOnError: true })}
             />
 
             <ApiKeyField
               label="Anthropic API Key"
               maskedValue={servicesConfig.anthropic_api_key}
               isSet={servicesConfig.anthropic_api_key_set}
-              onSave={val => updateConfig({ anthropic_api_key: val })}
+              onSave={val => updateConfig({ anthropic_api_key: val }, { throwOnError: true })}
             />
           </>
         )}
@@ -651,7 +599,7 @@ export function ServicesSettingsPanel() {
           label="CivitAI API Key"
           maskedValue={servicesConfig.civitai_api_key}
           isSet={servicesConfig.civitai_api_key_set}
-          onSave={val => updateConfig({ civitai_api_key: val })}
+          onSave={val => updateConfig({ civitai_api_key: val }, { throwOnError: true })}
         />
         <p className="text-[10px] text-text-muted -mt-2">
           Optional. Increases rate limits and enables access to restricted models.

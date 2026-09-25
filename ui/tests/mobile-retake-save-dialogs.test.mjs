@@ -326,7 +326,7 @@ async function loadMediaFeedItemHarness() {
   const iconNames = [
     'Play', 'Pencil', 'RefreshCw', 'FlipHorizontal', 'Copy', 'Trash2', 'Check', 'Combine', 'Loader2',
     'Heart', 'ArrowLeftToLine', 'Download', 'FolderInput', 'Scissors', 'FastForward',
-    'BookMarked', 'EyeOff', 'Share2', 'Link2Off',
+    'BookMarked', 'EyeOff', 'Share2', 'Link2Off', 'Clapperboard',
   ]
   const modules = new Map([
     ['react', `

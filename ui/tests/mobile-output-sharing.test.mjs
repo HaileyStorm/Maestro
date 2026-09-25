@@ -31,7 +31,7 @@ async function loadHarness() {
   const icons = [
     'Play', 'Pencil', 'RefreshCw', 'FlipHorizontal', 'Copy', 'Trash2', 'Check', 'Combine',
     'Loader2', 'Heart', 'ArrowLeftToLine', 'Download', 'FolderInput',
-    'Scissors', 'FastForward', 'BookMarked', 'EyeOff', 'Share2', 'Link2Off',
+    'Scissors', 'FastForward', 'BookMarked', 'EyeOff', 'Share2', 'Link2Off', 'Clapperboard',
   ]
   const modules = new Map([
     ['react', `

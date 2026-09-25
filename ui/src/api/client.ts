@@ -4635,6 +4635,59 @@ export async function fetchProjectAssets(project: string): Promise<ProjectAsset[
   return data.assets || []
 }
 
+export interface EditorProject {
+  id: string
+  name: string
+  workspace: string
+  revision: number
+  canvas: { width: number; height: number; fps: number; background: string }
+  assets: Record<string, {
+    id: string; name: string; type: 'video' | 'audio' | 'image';
+    origin: string; workspace: string; output_id: string; output_revision: string;
+    duration: number; width: number; height: number; fps: number; has_audio: boolean; private: boolean
+  }>
+  tracks: Array<{
+    id: string; name: string; type: 'video' | 'audio' | 'text';
+    items: Array<{ id: string; asset_id: string; start: number; duration: number; source_in: number; speed: number }>
+  }>
+}
+
+function editorRequestError(status: number, fallback: string): ProjectAssetRequestError {
+  const messages: Partial<Record<number, string>> = {
+    401: 'Sign in again to edit this project',
+    403: 'You do not have permission to edit this project',
+    404: 'The source video or saved edit is no longer available',
+    409: 'This edit changed in another tab. Return to Gallery and reopen it',
+    413: 'This edit is too large to save',
+    422: 'This video cannot be opened for editing',
+    423: 'Unlock this project before editing',
+    500: 'Editor could not save the draft right now',
+    503: 'Editor is temporarily unavailable',
+  }
+  const message = messages[status] ?? fallback
+  return new ProjectAssetRequestError(status, `${message} (HTTP ${status})`)
+}
+
+export async function openOutputInEditor(project: string, name: string, revision: string): Promise<EditorProject> {
+  const res = await fetch(`${BASE}/api/v1/projects/${encodeURIComponent(project)}/editor/projects`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ output_name: name, output_revision: revision }),
+  })
+  if (!res.ok) throw editorRequestError(res.status, 'Unable to open this video in Editor')
+  return (await res.json()).project as EditorProject
+}
+
+export async function saveEditorProject(project: string, timeline: EditorProject): Promise<EditorProject> {
+  const res = await fetch(`${BASE}/api/v1/projects/${encodeURIComponent(project)}/editor/projects/${encodeURIComponent(timeline.id)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project: timeline, expected_revision: timeline.revision }),
+  })
+  if (!res.ok) throw editorRequestError(res.status, 'Unable to save this edit')
+  return (await res.json()).project as EditorProject
+}
+
 const CHARACTER_SHEET_WORKFLOW_CONTRACT = [
   {
     id: 'anchor', label: 'Choose a verified FLUX anchor',
@@ -5136,6 +5189,10 @@ export async function fetchOutputs(limit = 0, offset = 0, opts?: { favoritesOnly
 export function getFileUrl(filename: string, workspace?: string): string {
   const query = workspace ? `?workspace=${encodeURIComponent(workspace)}` : ''
   return `${BASE}/api/v1/file/${encodeURIComponent(filename)}${query}`
+}
+
+export function getEditorPreviewUrl(filename: string, workspace: string, contentRevision: string): string {
+  return `${getFileUrl(filename, workspace)}&content_revision=${encodeURIComponent(contentRevision)}`
 }
 
 export interface OutputShareLink {

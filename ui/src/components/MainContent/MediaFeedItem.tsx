@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback, type CSSProperties, type KeyboardEvent } from 'react'
-import { Play, Pencil, RefreshCw, FlipHorizontal, Copy, Trash2, Check, Combine, Loader2, Heart, ArrowLeftToLine, Download, FolderInput, Scissors, FastForward, BookMarked, EyeOff, Share2, Link2Off } from 'lucide-react'
+import { Play, Pencil, RefreshCw, FlipHorizontal, Copy, Trash2, Check, Combine, Loader2, Heart, ArrowLeftToLine, Download, FolderInput, Scissors, FastForward, BookMarked, EyeOff, Share2, Link2Off, Clapperboard } from 'lucide-react'
 import { SaveRecipeDialog } from '../Recipes/SaveRecipeDialog'
 import { currentAccountIdentityEpoch, useStore } from '../../stores/useStore'
 import { prepareGalleryContinuation, retainContinuationPreview } from '../../lib/galleryContinuation'
@@ -91,8 +91,14 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onVisible, meas
   const setContinueVideo = useStore(s => s.setContinueVideo)
   const setParam = useStore(s => s.setParam)
   const openRetakeDialog = useStore(s => s.openRetakeDialog)
+  const openEditor = useStore(s => s.openEditor)
   const generationMode = useStore(s => s.generationMode)
   const workspaces = useStore(s => s.workspaces)
+  const owningWorkspace = workspaces.find(workspace => workspace.name === file.workspace)
+  const canEditProject = Boolean(owningWorkspace) && (
+    owningWorkspace?.project_permissions === undefined
+    || owningWorkspace.project_permissions.includes('project.mutate')
+  )
   const accessContext = useStore(s => s.accessContext)
   // Virtual Uploads view: browse-only. Move/favorite/delete resolve
   // against the active OUTPUT workspace server-side, so they can't act
@@ -879,6 +885,17 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onVisible, meas
           aria-label={`Actions for ${file.name}`}
           onClick={e => e.stopPropagation()}
         >
+          {file.type === 'video' && !browsingUploads && canEditProject && (
+            <button
+              onClick={() => openEditor(file)}
+              type="button"
+              aria-label={`Open ${file.name} in Editor`}
+              className="min-h-11 min-w-11 rounded-lg p-1.5 text-text-secondary transition-colors hover:bg-bg-hover hover:text-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue md:min-h-0 md:min-w-0"
+              title="Open in Editor — make a non-destructive cut"
+            >
+              <Clapperboard size={13} />
+            </button>
+          )}
           {params && (
             <>
               <button

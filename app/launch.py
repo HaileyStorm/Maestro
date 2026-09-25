@@ -5427,6 +5427,18 @@ def _project_reference_validate_committed_variant(
     reference = (
         metadata.get("reference_pack") if isinstance(metadata, dict) else None
     )
+    if (
+        isinstance(reference, dict)
+        and reference.get("character_sheet_profile_id") == "quad_flux2_klein"
+    ):
+        return _character_sheet_quad_validate_committed_variant(
+            store,
+            project_id,
+            workspace_id,
+            variant,
+            job_id=job_id,
+            plan_seal=plan_seal,
+        )
     job_metadata = metadata.get("job") if isinstance(metadata, dict) else None
     variant_policy = (
         metadata.get("policy") if isinstance(metadata, dict) else None
@@ -5596,6 +5608,132 @@ def _project_reference_validate_committed_variant(
             raise ValueError("committed publication output changed")
         outputs.append(relative)
     return outputs
+
+
+def _character_sheet_quad_validate_committed_variant(
+    store,
+    project_id,
+    workspace_id,
+    variant,
+    *,
+    job_id,
+    plan_seal,
+):
+    """Verify role order, stored bytes, anchor receipts, and publication HMAC."""
+    from services.character_sheet_anchor import verify_reference_pack_anchor_proof
+    from services.character_sheet_executor import (
+        PANEL_ROLES,
+        PROFILE_ID,
+        validate_quad_job_identity,
+        verify_quad_publication_proof,
+    )
+    from services.character_sheet_quad import (
+        QUAD_FLUX_BASE_MODEL,
+        QUAD_FLUX_RECIPE_ID,
+    )
+
+    try:
+        metadata = variant.get("metadata")
+        reference = metadata.get("reference_pack")
+        job_metadata = metadata.get("job")
+        provenance = variant.get("provenance")
+        provenance_details = provenance.get("details")
+        outputs = variant.get("outputs")
+        if (
+            variant.get("id") != f"{job_id}_pack_1"
+            or variant.get("variant_type") != "reference_pack"
+            or variant.get("status") != "candidate"
+            or provenance.get("kind") != "generated"
+            or provenance_details.get("service") != "reference_sheets"
+            or provenance_details.get("job_id") != job_id
+            or reference.get("character_sheet_profile_id") != PROFILE_ID
+            or reference.get("generation_model") != QUAD_FLUX_BASE_MODEL
+            or reference.get("recipe_id") != QUAD_FLUX_RECIPE_ID
+            or reference.get("identity_seal") != plan_seal
+            or reference.get("publication_eligible") is not True
+            or reference.get("quality") != {
+                "status": "not_reviewed",
+                "recommended": True,
+                "recommendation_basis": "preliminary_ungraded",
+            }
+            or job_metadata.get("id") != job_id
+            or job_metadata.get("generation_model") != QUAD_FLUX_BASE_MODEL
+            or job_metadata.get("recipe_id") != QUAD_FLUX_RECIPE_ID
+            or not isinstance(outputs, list)
+            or len(outputs) != len(PANEL_ROLES)
+        ):
+            raise ValueError("Character Sheet publication identity changed")
+        parent_job = _jobs.get(job_id)
+        if not isinstance(parent_job, dict):
+            raise ValueError("Character Sheet recovery job is unavailable")
+        identity, _anchor_path = _character_sheet_quad_identity_for_job(
+            parent_job, recheck_runtime=False,
+        )
+        if (
+            identity["identity_seal"] != plan_seal
+            or identity["variant_id"] != variant.get("id")
+            or project_id != identity["project_id"]
+            or workspace_id != identity["workspace_id"]
+        ):
+            raise ValueError("Character Sheet publication scope changed")
+        panel_digests = []
+        relative_paths = []
+        for index, (role, output) in enumerate(zip(PANEL_ROLES, outputs, strict=True)):
+            output_metadata = output.get("metadata")
+            output_reference = output_metadata.get("reference_pack")
+            lineage = output_metadata.get("lineage")
+            relative_path = output.get("relative_path")
+            if (
+                not isinstance(output.get("id"), str)
+                or not isinstance(output.get("filename"), str)
+                or not isinstance(relative_path, str)
+                or output_reference.get("role") != role
+                or output_reference.get("output_index") != index
+                or output_reference.get("model") != QUAD_FLUX_BASE_MODEL
+                or lineage.get("parent_job_id") != job_id
+                or output_metadata.get("private") is not True
+                or output_metadata.get("explicit") is not False
+            ):
+                raise ValueError("Character Sheet output role metadata changed")
+            resolved_path = store.resolve_output_path(
+                project_id, workspace_id, relative_path,
+            )
+            source_identity = _project_reference_source_identity(resolved_path)
+            anchor_proof = output_reference.get("anchor_provenance")
+            binding = {
+                "project_id": project_id,
+                "workspace_id": workspace_id,
+                "asset_id": identity["asset_id"],
+                "variant_id": variant["id"],
+                "output_index": index,
+                "basename": output["filename"],
+                "source_model_id": QUAD_FLUX_BASE_MODEL,
+                "source_sha256": source_identity["sha256"],
+                "job_id": job_id,
+            }
+            if not verify_reference_pack_anchor_proof(
+                _character_sheet_anchor_key(),
+                anchor_proof,
+                expected_binding=binding,
+            ):
+                raise ValueError("Character Sheet output proof changed")
+            panel_digests.append({
+                "role": role,
+                "output_index": index,
+                "sha256": source_identity["sha256"],
+            })
+            relative_paths.append(relative_path)
+        publication_proof = reference.get("publication_proof")
+        if not verify_quad_publication_proof(
+            _character_sheet_quad_key(),
+            publication_proof,
+            identity=identity,
+            panel_digests=panel_digests,
+        ):
+            raise ValueError("Character Sheet published bytes changed")
+        return relative_paths
+    except Exception as error:
+        raise ValueError("committed Character Sheet publication changed") from error
 
 
 def _project_reference_variant_is_recommended(variant: dict) -> bool:
@@ -12306,6 +12444,8 @@ def _job_model_term_ids(job: dict) -> list[str]:
             "editor_model_type",
         ):
             add(reference_pack.get(key))
+        if "character_sheet_identity" in reference_pack:
+            add(reference_pack.get("recipe_id"))
         review = reference_pack.get("review")
         if isinstance(review, dict):
             add(review.get("resolved_model"))
@@ -14879,6 +15019,16 @@ def _require_job_runtime_model_admission(job: dict) -> None:
         job["model_type"] = str(params.get("model_type") or "")
     else:
         _require_job_model_recipe_terms(job)
+    params = job.get("params")
+    reference_pack = (
+        params.get("reference_pack")
+        if isinstance(params, dict) else None
+    )
+    if (
+        isinstance(reference_pack, dict)
+        and "character_sheet_identity" in reference_pack
+    ):
+        _character_sheet_quad_identity_for_job(job, recheck_runtime=True)
     _require_job_krea_actor_admission(job)
 
 
@@ -25982,6 +26132,167 @@ def get_project_reference_authoring(
         raise _project_asset_error(error) from error
 
 
+async def _editor_request_body(request: Request) -> dict:
+    """Read one small Editor mutation without accepting an unbounded timeline."""
+    chunks = []
+    size = 0
+    try:
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > 64 * 1024:
+                raise HTTPException(status_code=413, detail="Editor draft is too large")
+            chunks.append(chunk)
+        body = json.loads(b"".join(chunks))
+    except HTTPException:
+        raise
+    except (ValueError, TypeError, UnicodeError):
+        raise HTTPException(status_code=400, detail="Expected an Editor JSON object") from None
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Expected an Editor JSON object")
+    return body
+
+
+def _editor_save_root() -> str:
+    return os.path.realpath(wgp.server_config.get("save_path", "outputs"))
+
+
+def _editor_require_current_source(request: Request, project: str, asset: dict) -> None:
+    """Refuse a draft whose original video changed or left its project."""
+    if (
+        not isinstance(asset, dict)
+        or asset.get("workspace") != project
+        or asset.get("origin") != "output"
+        or asset.get("type") != "video"
+        or asset.get("output_id") != asset.get("name")
+    ):
+        raise HTTPException(status_code=409, detail="Editor source changed; reopen the video")
+    out_dir, filepath, _ = _require_authorized_output(
+        request, project, str(asset.get("output_id") or ""),
+    )
+    try:
+        current = _output_share_revision(filepath, out_dir, asset["output_id"])
+    except (OSError, ValueError) as error:
+        raise HTTPException(status_code=409, detail="Editor source changed; reopen the video") from error
+    if not hmac.compare_digest(str(asset.get("output_revision") or ""), current):
+        raise HTTPException(status_code=409, detail="Editor source changed; reopen the video")
+
+
+@api.post("/api/v1/projects/{project}/editor/projects")
+async def open_output_editor_project(project: str, request: Request):
+    """Open or create the one non-destructive cut for an exact Gallery output."""
+    from services.editor_projects import (
+        EditorProjectError, create_output_video_timeline,
+        load_editor_project, probe_media, save_editor_project,
+    )
+
+    body = await _editor_request_body(request)
+    name = body.get("output_name")
+    revision = body.get("output_revision")
+    if (
+        not isinstance(name, str) or not isinstance(revision, str)
+        or len(name) > 255 or len(revision) > 128
+    ):
+        raise HTTPException(status_code=400, detail="Select a project video")
+    with _reserve_workspace_operations(project):
+        _require_project_access(
+            request, project, existing_only=True, permission="project.mutate",
+        )
+        out_dir, filepath, _ = _require_authorized_output(request, project, name)
+        if os.path.splitext(name)[1].lower() not in _GALLERY_MEDIA_EXTENSIONS:
+            raise HTTPException(status_code=400, detail="Select a Gallery video")
+        if not hmac.compare_digest(revision, _output_revision(filepath, out_dir, name)):
+            raise HTTPException(status_code=409, detail="Video changed; refresh Gallery")
+        try:
+            initial_content_revision = _output_share_revision(filepath, out_dir, name)
+        except (OSError, ValueError) as error:
+            raise HTTPException(status_code=409, detail="Video changed; refresh Gallery") from error
+        try:
+            media = probe_media(filepath)
+        except (EditorProjectError, OSError, ValueError, subprocess.SubprocessError) as error:
+            raise HTTPException(status_code=422, detail="This video could not be inspected for editing") from error
+        current_out_dir, current_filepath, current_sidecar = _require_authorized_output(
+            request, project, name,
+        )
+        try:
+            current_content_revision = _output_share_revision(current_filepath, current_out_dir, name)
+        except (OSError, ValueError) as error:
+            raise HTTPException(status_code=409, detail="Video changed while opening; refresh Gallery") from error
+        if (current_filepath != filepath
+                or not hmac.compare_digest(initial_content_revision, current_content_revision)):
+            raise HTTPException(status_code=409, detail="Video changed while opening; refresh Gallery")
+        try:
+            media["private"] = public_output_policy(current_sidecar)["private"]
+            timeline = create_output_video_timeline(
+                workspace=project, output_name=name,
+                output_revision=current_content_revision, media=media,
+            )
+        except (EditorProjectError, OSError, ValueError, subprocess.SubprocessError) as error:
+            raise HTTPException(status_code=422, detail="This video could not be inspected for editing") from error
+        try:
+            # ffprobe is outside the persistence lock. Revalidate after it
+            # reads the source so an in-place replacement cannot be opened.
+            _editor_require_current_source(request, project, timeline["assets"]["source-video"])
+            try:
+                saved = load_editor_project(_editor_save_root(), project, timeline["id"])
+            except FileNotFoundError:
+                try:
+                    saved = save_editor_project(
+                        _editor_save_root(), project, timeline, expected_revision=0,
+                    )
+                except EditorProjectError:
+                    # A second tab may have created the same deterministic
+                    # draft while this request was probing the video.
+                    saved = load_editor_project(_editor_save_root(), project, timeline["id"])
+            source = saved.get("assets", {}).get("source-video", {})
+            if any(source.get(key) != timeline["assets"]["source-video"].get(key)
+                   for key in ("output_id", "output_revision", "workspace", "origin", "type")):
+                raise EditorProjectError("Editor source changed")
+        except EditorProjectError as error:
+            raise HTTPException(status_code=409, detail="Editor draft changed; reopen the video") from error
+    return {"project": saved}
+
+
+@api.put("/api/v1/projects/{project}/editor/projects/{editor_id}")
+async def save_output_editor_project(project: str, editor_id: str, request: Request):
+    """Save only cut points with project, source and revision checks."""
+    from services.editor_projects import (
+        EditorProjectError, apply_output_video_trim,
+        load_editor_project, save_editor_project,
+    )
+
+    body = await _editor_request_body(request)
+    proposed = body.get("project")
+    expected = body.get("expected_revision")
+    if not isinstance(proposed, dict) or type(expected) is not int or expected < 1:
+        raise HTTPException(status_code=400, detail="Invalid Editor draft")
+    with _reserve_workspace_operations(project):
+        _require_project_access(
+            request, project, existing_only=True, permission="project.mutate",
+        )
+        try:
+            current = load_editor_project(_editor_save_root(), project, editor_id)
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="Editor draft not found") from None
+        except (EditorProjectError, OSError, ValueError) as error:
+            raise HTTPException(status_code=503, detail="Editor draft is unavailable") from error
+        if current["revision"] != expected:
+            raise HTTPException(status_code=409, detail="Editor draft changed; reload before saving")
+        _editor_require_current_source(request, project, current.get("assets", {}).get("source-video"))
+        try:
+            updated = apply_output_video_trim(current, proposed)
+        except EditorProjectError as error:
+            raise HTTPException(status_code=422, detail="Select a valid source range") from error
+        try:
+            saved = save_editor_project(
+                _editor_save_root(), project, updated, expected_revision=expected,
+            )
+        except EditorProjectError as error:
+            raise HTTPException(status_code=409, detail="Editor draft changed; reload before saving") from error
+        except OSError as error:
+            raise HTTPException(status_code=503, detail="Editor draft could not be saved") from error
+    return {"project": saved}
+
+
 @api.get("/api/v1/projects/{project}/assets")
 def list_project_assets(
     project: str,
@@ -27220,6 +27531,217 @@ def _character_sheet_anchor_key() -> bytes:
     ).digest()
 
 
+def _character_sheet_quad_key() -> bytes:
+    """Derive a private HMAC key for fixed Quad execution and publication."""
+    return hmac.new(
+        _session_secret(), b"maestro-character-sheet-quad-execution-v1",
+        hashlib.sha256,
+    ).digest()
+
+
+def _character_sheet_quad_runtime_snapshot() -> dict:
+    """Recheck the exact Klein model, managed LoRA, and accepted terms."""
+    from services.character_sheet_executor import (
+        build_quad_runtime_snapshot,
+        commitment_digest,
+    )
+    from services.character_sheet_quad import (
+        QUAD_FLUX_BASE_MODEL,
+        QUAD_FLUX_LORA_FILENAME,
+        QUAD_FLUX_LORA_SHA256,
+        QUAD_FLUX_RECIPE_ID,
+        require_quad_lora_artifact,
+    )
+    from services.model_terms import model_terms_statuses, require_model_terms
+
+    model_id = QUAD_FLUX_BASE_MODEL
+    definitions = getattr(wgp, "models_def", {})
+    try:
+        model_def = wgp.get_model_def(model_id)
+        model_family = wgp.get_model_family(model_id)
+    except Exception as error:
+        raise RuntimeError("Quad FLUX model registry is unavailable") from error
+    if (
+        model_id not in definitions
+        or not isinstance(model_def, dict)
+        or model_family != "flux"
+        or not _check_model_downloaded(model_id)
+    ):
+        raise RuntimeError("FLUX.2 Klein 9B model artifacts are unavailable")
+
+    services = wgp.server_config.get("services", {})
+    try:
+        require_model_terms(services, model_id, definitions)
+        require_model_terms(services, QUAD_FLUX_RECIPE_ID, definitions)
+        term_statuses = model_terms_statuses(
+            services, QUAD_FLUX_RECIPE_ID, definitions,
+        )
+        lora_path = wgp.resolve_lora_path(model_id, QUAD_FLUX_LORA_FILENAME)
+        require_quad_lora_artifact(lora_path)
+    except Exception as error:
+        raise RuntimeError("Quad FLUX model terms or LoRA artifact changed") from error
+
+    artifact_groups = []
+    for group_index, group in enumerate(_model_weight_groups(model_id)):
+        selected = None
+        for filename in _variant_group_filenames(group, model_type=model_id):
+            try:
+                local_path = wgp.get_compatible_local_model_filename(
+                    filename, model_id,
+                )
+                local_stat = os.stat(local_path) if local_path else None
+            except Exception:
+                local_stat = None
+            if local_stat is None or not stat.S_ISREG(local_stat.st_mode):
+                continue
+            selected = {
+                "group_index": group_index,
+                "filename": os.path.basename(str(filename)),
+                "device": int(local_stat.st_dev),
+                "inode": int(local_stat.st_ino),
+                "size": int(local_stat.st_size),
+                "mtime_ns": int(local_stat.st_mtime_ns),
+            }
+            break
+        if selected is None:
+            raise RuntimeError("A required FLUX.2 Klein model artifact is unavailable")
+        artifact_groups.append(selected)
+
+    model_contract = {
+        key: model_def.get(key)
+        for key in (
+            "architecture", "URLs", "modules", "text_encoder_URLs",
+            "required_model_assets", "source_repo", "revision",
+        )
+        if key in model_def
+    }
+    model_artifact_commitment = commitment_digest({
+        "model_id": model_id,
+        "model_family": model_family,
+        "registered_contract": model_contract,
+        "resolved_artifact_groups": artifact_groups,
+    })
+    defaults = dict(wgp.get_default_settings(model_id) or {})
+    steps = defaults.get("num_inference_steps", defaults.get("sampling_steps"))
+    if isinstance(steps, bool) or not isinstance(steps, int) or not 1 <= steps <= 200:
+        raise RuntimeError("Quad FLUX generation schedule is unavailable")
+    guidance_key = (
+        "guidance_scale" if "guidance_scale" in defaults
+        else "embedded_guidance_scale"
+        if "embedded_guidance_scale" in defaults else "guidance_scale"
+    )
+    guidance = defaults.get(guidance_key, 1.0)
+    if (
+        isinstance(guidance, bool)
+        or not isinstance(guidance, (int, float))
+        or not math.isfinite(float(guidance))
+        or not 0 <= float(guidance) <= 30
+    ):
+        raise RuntimeError("Quad FLUX generation schedule is unavailable")
+    return build_quad_runtime_snapshot(
+        model_id=model_id,
+        model_family=model_family,
+        model_artifact_commitment=model_artifact_commitment,
+        lora_sha256=QUAD_FLUX_LORA_SHA256,
+        term_statuses=term_statuses,
+        schedule={
+            "model": model_id,
+            "steps": steps,
+            "guidance": float(guidance),
+        },
+    )
+
+
+def _character_sheet_quad_identity_for_job(job: dict, *, recheck_runtime=True):
+    """Validate the sealed Quad request and re-resolve its stored anchor."""
+    from services.character_sheet_anchor import resolve_character_sheet_anchor
+    from services.character_sheet_executor import validate_quad_job_identity
+    from services.character_sheet_quad import (
+        QUAD_FLUX_BASE_MODEL,
+        QUAD_FLUX_LORA_FILENAME,
+        QUAD_FLUX_RECIPE_ID,
+    )
+
+    params = job.get("params") if isinstance(job.get("params"), dict) else {}
+    reference_pack = params.get("reference_pack")
+    identity = (
+        reference_pack.get("character_sheet_identity")
+        if isinstance(reference_pack, dict) else None
+    )
+    try:
+        requested_job_id = str(job.get("id") or "")
+        identity_job_id = (
+            identity.get("job_id") if isinstance(identity, dict) else None
+        )
+        identity_generation_job_id = (
+            identity.get("generation_job_id")
+            if isinstance(identity, dict) else None
+        )
+        if requested_job_id not in {
+            identity_job_id, identity_generation_job_id,
+        }:
+            raise ValueError("Quad job identity scope changed")
+        clean_identity = validate_quad_job_identity(
+            _character_sheet_quad_key(),
+            identity,
+            expected_project_id=str(job.get("workspace") or ""),
+            expected_asset_id=(
+                reference_pack.get("asset_id")
+                if isinstance(reference_pack, dict) else None
+            ),
+            expected_job_id=identity_job_id,
+            current_resources=(
+                _character_sheet_quad_runtime_snapshot()
+                if recheck_runtime else None
+            ),
+        )
+        if (
+            not isinstance(reference_pack, dict)
+            or reference_pack.get("recipe_id") != QUAD_FLUX_RECIPE_ID
+            or reference_pack.get("generation_model") != QUAD_FLUX_BASE_MODEL
+            or params.get("model_type") != QUAD_FLUX_BASE_MODEL
+            or params.get("activated_loras") != [QUAD_FLUX_LORA_FILENAME]
+            or params.get("loras_multipliers") != "1.0"
+            or params.get("seed") != clean_identity["seed"]
+            or params.get("resolution") != "1024x1024"
+            or params.get("num_inference_steps")
+                != clean_identity["resources"]["schedule"]["steps"]
+        ):
+            raise ValueError("Quad generation parameters changed")
+        defaults = dict(wgp.get_default_settings(QUAD_FLUX_BASE_MODEL) or {})
+        guidance_key = (
+            "guidance_scale" if "guidance_scale" in defaults
+            else "embedded_guidance_scale"
+            if "embedded_guidance_scale" in defaults else "guidance_scale"
+        )
+        if params.get(guidance_key) != clean_identity["resources"]["schedule"]["guidance"]:
+            raise ValueError("Quad guidance schedule changed")
+        anchor = resolve_character_sheet_anchor(
+            _project_asset_store(),
+            _character_sheet_anchor_key(),
+            project_id=clean_identity["project_id"],
+            workspace_id=clean_identity["workspace_id"],
+            asset_id=clean_identity["asset_id"],
+            variant_id=clean_identity["anchor_variant_id"],
+            output_id=clean_identity["anchor"]["anchor_id"],
+            is_verified_flux_model=lambda model_id: bool(
+                model_id in wgp.models_def
+                and wgp.get_model_family(model_id) == "flux"
+            ),
+        )
+        if (
+            anchor.get("anchor") != clean_identity["anchor"]
+            or params.get("image_refs") != [anchor.get("source_path")]
+        ):
+            raise ValueError("Quad FLUX anchor changed")
+        return clean_identity, anchor["source_path"]
+    except Exception as error:
+        raise HTTPException(
+            status_code=409,
+            detail="Character Sheet model, terms, LoRA, or anchor changed",
+        ) from error
+
+
 def _resolve_character_sheet_anchor_for_request(
     request: Request,
     project: str,
@@ -27262,6 +27784,255 @@ def _resolve_character_sheet_anchor_for_request(
         )
     except CharacterSheetAnchorError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@api.post("/api/v1/projects/{project}/assets/{asset_id}/character-sheet/quad")
+async def generate_character_sheet_quad(project: str, asset_id: str, request: Request):
+    """Queue one private, fixed Quad FLUX canvas for an existing character."""
+    from services.character_sheet_executor import (
+        PROFILE_ID,
+        build_quad_job_identity,
+    )
+    from services.character_sheet_quad import (
+        QUAD_FLUX_BASE_MODEL,
+        QUAD_FLUX_LORA_FILENAME,
+        QUAD_FLUX_RECIPE_ID,
+    )
+
+    project_id, workspace_id = _asset_scope(request, project)
+    if workspace_id != "main":
+        raise HTTPException(status_code=409, detail="Character Sheets require the main workspace")
+    body = await request.json()
+    if not isinstance(body, dict) or set(body) - {
+        "request_id", "anchor_variant_id", "anchor_output_id", "seed",
+    }:
+        raise HTTPException(status_code=400, detail="Invalid Character Sheet request")
+    try:
+        request_id = normalize_request_id(body.get("request_id"))
+    except ReferenceAdmissionValidationError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    if request_id is None:
+        raise HTTPException(status_code=400, detail="request_id is required")
+    anchor_variant_id = body.get("anchor_variant_id")
+    anchor_output_id = body.get("anchor_output_id")
+    seed = body.get("seed", 0)
+    if (
+        not isinstance(anchor_variant_id, str)
+        or not isinstance(anchor_output_id, str)
+        or type(seed) is not int
+        or not 0 <= seed <= (2**63) - 1
+    ):
+        raise HTTPException(status_code=400, detail="Invalid Character Sheet anchor or seed")
+    session_id = request.state.maestro_session_id
+    job_out_dir = _require_project_access(
+        request, project, permission="project.generate",
+    )
+    try:
+        asset = _require_project_asset_media_access(
+            project_id, workspace_id, asset_id, session_id,
+        )
+        if asset.get("asset_type") != "character":
+            raise HTTPException(status_code=409, detail="Character Sheet requires a character asset")
+        resolved_anchor = _resolve_character_sheet_anchor_for_request(
+            request, project, asset_id, anchor_variant_id, anchor_output_id,
+        )
+        resources = _character_sheet_quad_runtime_snapshot()
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(
+            status_code=409,
+            detail="Quad FLUX model, LoRA, or accepted terms are unavailable",
+        ) from error
+
+    admission_scope = {
+        "owner_principal": owner_principal_digest(_session_secret(), session_id),
+        "project_instance": _queue_recovery_project_identity(project, job_out_dir),
+        "operation": "character_sheet.quad_flux2_klein.v1",
+        "payload": {
+            "profile_id": PROFILE_ID,
+            "asset_id": asset_id,
+            "anchor_variant_id": anchor_variant_id,
+            "anchor_output_id": anchor_output_id,
+            "anchor": resolved_anchor["anchor"],
+            "resources": resources,
+            "seed": seed,
+        },
+    }
+    admission_store = _reference_admission_store()
+    try:
+        admission = admission_store.begin(
+            request_id,
+            **admission_scope,
+            proposed_job_id=uuid.uuid4().hex,
+            proposed_asset_id=asset_id,
+        )
+        if admission.disposition == "pending":
+            deadline = time.monotonic() + min(3.0, admission_store.lease_seconds)
+            while admission.disposition == "pending" and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+                admission = admission_store.inspect(request_id, **admission_scope)
+                if admission is None:
+                    raise ReferenceAdmissionPersistenceError(
+                        "Character Sheet admission reservation disappeared."
+                    )
+        if admission.disposition in {"pending", "failed"}:
+            raise ReferenceAdmissionPersistenceError(
+                "Character Sheet admission is not ready."
+            )
+    except ReferenceAdmissionMismatchError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ReferenceAdmissionValidationError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except (
+        ReferenceAdmissionCapacityError,
+        ReferenceAdmissionCorruptionError,
+        ReferenceAdmissionPersistenceError,
+    ) as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+
+    job_id = admission.job_id
+
+    def response():
+        return {
+            "job_id": job_id,
+            "status": "queued",
+            "asset": {"id": asset_id, "asset_type": "character", "pending": True},
+        }
+
+    if admission.disposition == "replay":
+        return response()
+    existing_job = _jobs.get(job_id)
+    if admission.disposition == "resume" and isinstance(existing_job, dict):
+        if (
+            not _job_owned_by_request(existing_job, request)
+            or existing_job.get("workspace") != project
+            or existing_job.get("logical_job_kind") != "character_sheet_quad_parent"
+        ):
+            raise HTTPException(status_code=503, detail="Character Sheet job recovery is unavailable")
+        admission_store.accept(
+            request_id,
+            **admission_scope,
+            lease_token=admission.lease_token,
+        )
+        return response()
+    if not admission.owns_lease:
+        raise HTTPException(status_code=503, detail="Character Sheet admission is unavailable")
+
+    try:
+        identity = build_quad_job_identity(
+            _character_sheet_quad_key(),
+            project_id=project_id,
+            workspace_id=workspace_id,
+            job_id=job_id,
+            asset_id=asset_id,
+            anchor=resolved_anchor["anchor"],
+            anchor_variant_id=anchor_variant_id,
+            resources=resources,
+            seed=seed,
+        )
+        defaults = dict(wgp.get_default_settings(QUAD_FLUX_BASE_MODEL) or {})
+        schedule = resources["schedule"]
+        guidance_key = (
+            "guidance_scale" if "guidance_scale" in defaults
+            else "embedded_guidance_scale"
+            if "embedded_guidance_scale" in defaults else "guidance_scale"
+        )
+        params = {
+            "model_type": QUAD_FLUX_BASE_MODEL,
+            "prompt": (
+                "Create one clean 2x2 character reference grid guided by the attached "
+                "character image. Panels in reading order: close face portrait, full-body "
+                "front view, full-body side view, full-body back view. Keep the same "
+                "character identity, clothing, colors, and proportions in every panel. "
+                "Use a plain light background, equal panel sizes, and no captions, text, "
+                "borders, or extra figures."
+            ),
+            "negative_prompt": "",
+            "seed": seed,
+            guidance_key: schedule["guidance"],
+            "num_inference_steps": schedule["steps"],
+            "resolution": "1024x1024",
+            "image_mode": 1,
+            "image_prompt_type": "",
+            "video_prompt_type": "KI",
+            "image_refs": [resolved_anchor["source_path"]],
+            "remove_background_images_ref": 0,
+            "image_refs_relative_size": 100,
+            "generation_mode": "image",
+            "repeat_generation": 1,
+            "batch_size": 1,
+            "video_length": 1,
+            "settings_version": 2.57,
+            "private_output": True,
+            "explicit_output": False,
+            "activated_loras": [QUAD_FLUX_LORA_FILENAME],
+            "loras_multipliers": "1.0",
+            "reference_pack": {
+                "profile_id": PROFILE_ID,
+                "recipe_id": QUAD_FLUX_RECIPE_ID,
+                "generation_model": QUAD_FLUX_BASE_MODEL,
+                "asset_id": asset_id,
+                "character_sheet_identity": identity,
+            },
+        }
+        job = {
+            "id": job_id,
+            "status": "queued",
+            "progress": 0,
+            "step": 0,
+            "total_steps": 3,
+            "phase": "Queued",
+            "message": "Queued character sheet",
+            "created_at": time.time(),
+            "params": params,
+            "output_files": [],
+            "error": None,
+            "workspace": project,
+            "out_dir": job_out_dir,
+            "session_id": session_id,
+            "access_policy": {"private": True, "explicit": False},
+            "private": True,
+            "explicit": False,
+            "source_remote": bool(_request_remote.get()),
+            "prompt_preview": "",
+            "model_type": QUAD_FLUX_BASE_MODEL,
+            "generation_mode": "image",
+            "resource_intent": "text",
+            "resource_execution": "standard",
+            "preemption_mode": "none",
+            "resource_state": "queued",
+            "logical_job_kind": "character_sheet_quad_parent",
+            "execution_attempt": 1,
+            "requested_outputs": 4,
+        }
+        _begin_workspace_operation(project_id)
+        try:
+            _queue_recovery_register_and_publish(
+                job,
+                worker=_run_character_sheet_quad,
+                recovery_kind="studio_project_asset_preparation",
+                thread_name=f"character-sheet-quad-{job_id}",
+            )
+        except Exception:
+            _end_workspace_operation(project_id)
+            raise
+        admission_store.accept(
+            request_id,
+            **admission_scope,
+            lease_token=admission.lease_token,
+        )
+    except Exception as error:
+        try:
+            admission_store.fail(
+                request_id,
+                **admission_scope,
+                lease_token=admission.lease_token,
+            )
+        except Exception:
+            pass
+        raise _project_asset_error(error) from error
+    return response()
 
 
 def _project_reference_request_config(
@@ -28098,12 +28869,309 @@ def _project_reference_child_failure_updates(snapshot):
     return updates
 
 
+def _run_character_sheet_quad(job_id):
+    """Generate one fixed Quad canvas, crop it, and atomically attach four roles."""
+    from services.character_sheet_anchor import create_reference_pack_anchor_proof
+    from services.character_sheet_executor import (
+        PANEL_ROLES,
+        PROFILE_ID,
+        create_quad_publication_proof,
+        crop_quad_sheet,
+    )
+    from services.character_sheet_quad import (
+        QUAD_FLUX_BASE_MODEL,
+        QUAD_FLUX_LORA_FILENAME,
+        QUAD_FLUX_RECIPE_ID,
+    )
+    from services import job_lifecycle as _job_lifecycle
+
+    job = _jobs.get(job_id)
+    if not isinstance(job, dict):
+        return
+    generated_path = None
+    staged_paths = []
+    committed = False
+    project_id = str(job.get("workspace") or "")
+    try:
+        if not try_start(
+            job,
+            message="Preparing the character sheet",
+            phase="Preparing",
+            total_steps=3,
+        ):
+            return
+        _require_job_runtime_model_admission(job)
+        identity, _anchor_path = _character_sheet_quad_identity_for_job(job)
+        update_job(
+            job,
+            step=1,
+            total_steps=3,
+            progress=1,
+            phase="Generating the Quad sheet",
+            message="Generating one four-view character sheet",
+        )
+        generated_path = _run_project_reference_image_job(
+            job,
+            dict(job["params"]),
+            role="quad_canvas",
+            phase="Generating the four-view sheet",
+            step=1,
+            total_steps=3,
+            child_id=identity["generation_job_id"],
+            artifact_metadata={
+                "schema_version": 2,
+                "planner_version": "character-sheet-quad-fixed-v1",
+                "role": "quad_canvas",
+                "index": 0,
+                "model": QUAD_FLUX_BASE_MODEL,
+                "provenance": {
+                    "strategy": "local_generation",
+                    "version": "character-sheet-quad-fixed-v1",
+                    "anchor_role": "kept_flux_anchor",
+                },
+                "reason_codes": [],
+            },
+        )
+        if is_cancel_requested(job):
+            raise RuntimeError("reference_job_cancelled")
+        update_job(
+            job,
+            step=2,
+            total_steps=3,
+            progress=75,
+            phase="Cropping four role panels",
+            message="Cropping the fixed 2×2 sheet into four role images",
+        )
+        panels = crop_quad_sheet(
+            _character_sheet_quad_key(),
+            generated_path,
+            job["out_dir"],
+            identity=identity,
+        )
+        staged_paths = [item["path"] for item in panels]
+        panel_digests = [
+            {
+                "role": item["role"],
+                "output_index": item["output_index"],
+                "sha256": item["sha256"],
+            }
+            for item in panels
+        ]
+        publication_proof = create_quad_publication_proof(
+            _character_sheet_quad_key(),
+            identity=identity,
+            panel_digests=panel_digests,
+        )
+        outputs = []
+        policy = {"private": True, "explicit": False}
+        for panel in panels:
+            source_identity = _project_reference_source_identity(panel["path"])
+            if source_identity["sha256"] != panel["sha256"]:
+                raise RuntimeError("character_sheet_panel_changed")
+            anchor_proof = create_reference_pack_anchor_proof(
+                _character_sheet_anchor_key(),
+                project_id=identity["project_id"],
+                workspace_id=identity["workspace_id"],
+                asset_id=identity["asset_id"],
+                variant_id=identity["variant_id"],
+                output_index=panel["output_index"],
+                basename=panel["basename"],
+                source_model_id=QUAD_FLUX_BASE_MODEL,
+                source_sha256=panel["sha256"],
+                job_id=job_id,
+            )
+            outputs.append({
+                "source_path": panel["path"],
+                "label": panel["role"],
+                "expected_source_identity": source_identity,
+                "metadata": {
+                    **policy,
+                    "reference_pack": {
+                        "model": QUAD_FLUX_BASE_MODEL,
+                        "generation_model": QUAD_FLUX_BASE_MODEL,
+                        "role": panel["role"],
+                        "output_index": panel["output_index"],
+                        "anchor_provenance": anchor_proof,
+                    },
+                    "lineage": {"parent_job_id": job_id},
+                },
+            })
+
+        reference_metadata = {
+            "character_sheet_profile_id": PROFILE_ID,
+            "generation_model": QUAD_FLUX_BASE_MODEL,
+            "recipe_id": QUAD_FLUX_RECIPE_ID,
+            "identity_seal": identity["identity_seal"],
+            "publication_eligible": True,
+            "planning_status": "deterministic_quad_layout",
+            "execution_mode": "flux_quad_grid_crop_v1",
+            "panel_roles": list(PANEL_ROLES),
+            "publication_proof": publication_proof,
+            "quality": {
+                "status": "not_reviewed",
+                "recommended": True,
+                "recommendation_basis": "preliminary_ungraded",
+            },
+        }
+        variant_spec = {
+            "id": identity["variant_id"],
+            "variant_type": "reference_pack",
+            "label": "Quad character sheet",
+            "outputs": outputs,
+            "provenance": {
+                "kind": "generated",
+                "details": {
+                    "service": "reference_sheets",
+                    "version": "character-sheet-quad-fixed-v1",
+                    "job_id": job_id,
+                },
+            },
+            "status": "candidate",
+            "metadata": {
+                "reference_pack": reference_metadata,
+                "policy": policy,
+                "job": {
+                    "id": job_id,
+                    "generation_model": QUAD_FLUX_BASE_MODEL,
+                    "recipe_id": QUAD_FLUX_RECIPE_ID,
+                    "candidate_index": 1,
+                    "candidate_count": 1,
+                },
+            },
+        }
+        if is_cancel_requested(job):
+            raise RuntimeError("reference_job_cancelled")
+        store = _project_asset_store()
+        with (
+            _job_lifecycle._queue_condition,
+            _job_lifecycle._lifecycle_lock,
+            store.publication_guard(),
+        ):
+            if is_cancel_requested(job):
+                finish_job(
+                    job,
+                    "failed",
+                    progress=0,
+                    phase="",
+                    message="Character Sheet generation cancelled",
+                    error="Character Sheet generation cancelled",
+                )
+                return
+            checkpoint = globals().get("checkpoint_recovery_job")
+            if not callable(checkpoint) or not checkpoint(
+                job,
+                recovery_state="publication_prepared",
+                recovery_unit={
+                    "kind": "project_reference_publication",
+                    "asset_id": identity["asset_id"],
+                    "workspace_id": identity["workspace_id"],
+                    "variant_ids": [identity["variant_id"]],
+                    "candidate_count": 1,
+                    "plan_seal": identity["identity_seal"],
+                    "mandatory_review": False,
+                },
+                reruns_denoise=False,
+                phase="publishing_character_sheet",
+                message="Four character views prepared for private publication",
+            ):
+                raise RuntimeError("character_sheet_publication_checkpoint_failed")
+            store.add_variants_atomic(
+                identity["project_id"],
+                identity["workspace_id"],
+                identity["asset_id"],
+                [variant_spec],
+            )
+            committed = True
+            asset = store.get_asset(
+                identity["project_id"],
+                identity["workspace_id"],
+                identity["asset_id"],
+            )
+            variant = next(
+                item for item in asset.get("variants") or []
+                if item.get("id") == identity["variant_id"]
+            )
+            relative_paths = _project_reference_validate_committed_variant(
+                store,
+                identity["project_id"],
+                identity["workspace_id"],
+                variant,
+                job_id=job_id,
+                candidate_index=1,
+                candidate_count=1,
+                plan_seal=identity["identity_seal"],
+                mandatory_review=False,
+                explicit_output=False,
+            )
+            finalized = finish_job(
+                job,
+                "completed",
+                progress=100,
+                step=3,
+                total_steps=3,
+                phase="",
+                message="Four character views are ready to review",
+                output_files=relative_paths,
+                error=None,
+                recovery_state="terminal",
+            )
+            if finalized is False:
+                raise RuntimeError("character_sheet_finalization_pending")
+    except Exception:
+        if committed:
+            pending = {
+                "recovery_state": "publication_committed_finalization_pending",
+                "reruns_denoise": False,
+                "phase": "publication_committed",
+                "message": "Character Sheet committed; finalization requires recovery",
+                "error": "Character Sheet finalization requires recovery",
+                "resource_state": "blocked",
+                "queue_held": True,
+            }
+            blocker = globals().get("block_generation_recovery")
+            parked = False
+            if callable(blocker):
+                try:
+                    parked = bool(blocker(job, **pending))
+                except Exception:
+                    parked = False
+            if not parked:
+                try:
+                    _queue_recovery_checkpoint(job, **pending)
+                except Exception:
+                    pass
+        elif job.get("status") not in {"completed", "failed", "cancelled"}:
+            cancelled = is_cancel_requested(job)
+            finish_job(
+                job,
+                "failed",
+                progress=0,
+                phase="",
+                message=(
+                    "Character Sheet generation cancelled"
+                    if cancelled else "Character Sheet generation failed"
+                ),
+                error=(
+                    "Character Sheet generation cancelled"
+                    if cancelled else "Character Sheet generation failed"
+                ),
+            )
+    finally:
+        for path in staged_paths:
+            _cleanup_project_reference_private_source(path, job.get("out_dir"))
+        if generated_path:
+            _cleanup_project_reference_private_source(
+                generated_path, job.get("out_dir"),
+            )
+        _end_workspace_operation(project_id)
+
+
 def _run_project_reference_image_job(
     parent_job, params, *, role, phase, step, total_steps,
-    artifact_metadata=None,
+    artifact_metadata=None, child_id=None,
 ):
     """Run one recoverable local image child and return only its owned output."""
-    child_id = uuid.uuid4().hex[:8]
+    child_id = child_id or uuid.uuid4().hex[:8]
     child = {
         "id": child_id,
         "status": "queued",
@@ -60883,6 +61951,12 @@ def _run_generation(
             # Build task manifest from user params
             raw_params = job["params"].copy()
             raw_params.pop("_h3_offload_plan", None)
+            raw_reference_pack = raw_params.get("reference_pack")
+            if (
+                isinstance(raw_reference_pack, dict)
+                and "character_sheet_identity" in raw_reference_pack
+            ):
+                raw_params.pop("reference_pack", None)
             # Kept in the private request manifest for recovery identity, but
             # never forward Maestro provenance metadata into WanGP inputs.
             raw_params.pop("_project_asset_ref_provenance", None)
@@ -70074,14 +71148,8 @@ def _output_share_revision(
     )
 
     def stat_key(path: str) -> tuple | None:
-        try:
-            value = os.stat(path)
-        except (FileNotFoundError, OSError):
-            return None
-        return (
-            int(value.st_dev), int(value.st_ino), int(value.st_size),
-            int(value.st_mtime_ns), int(value.st_ctime_ns),
-        )
+        from services.win_safe_files import file_revision_identity
+        return file_revision_identity(path)
 
     cache_key = (
         os.path.realpath(filepath), stat_key(filepath),
@@ -70109,6 +71177,8 @@ def _output_share_revision(
         except FileNotFoundError:
             digest.update(b"missing\0")
     revision = f"sha256:{digest.hexdigest()}"
+    if (stat_key(filepath), stat_key(metadata_path)) != (cache_key[1], cache_key[3]):
+        raise OSError("Output changed while reading")
     with _output_share_revision_cache_lock:
         if len(_output_share_revision_cache) >= 256:
             _output_share_revision_cache.clear()
@@ -70361,7 +71431,7 @@ def list_outputs(
 
 
 @api.get("/api/v1/file/{filename:path}")
-def serve_file(request: Request, filename: str, workspace: str = ""):
+def serve_file(request: Request, filename: str, workspace: str = "", content_revision: str = ""):
     """Serve one authorized output from one explicitly scoped project.
 
     Uses share_delete_file_response so that on Windows the file can be
@@ -70371,6 +71441,7 @@ def serve_file(request: Request, filename: str, workspace: str = ""):
     user has to close the entire app to clean up.
     """
     from services.win_safe_files import (
+        file_revision_identity,
         is_safe_direct_basename,
         safe_direct_file_under,
         share_delete_file_response,
@@ -70379,6 +71450,8 @@ def serve_file(request: Request, filename: str, workspace: str = ""):
         raise HTTPException(status_code=400, detail="Invalid output name")
     selected_workspace = _request_project_workspace(request, workspace)
     if selected_workspace == "__uploads__":
+        if content_revision:
+            raise HTTPException(status_code=400, detail="Output revision is not available for uploads")
         _require_upload_content_access(request)
         filepath = safe_direct_file_under(
             os.path.join(os.getcwd(), "uploads"), filename,
@@ -70391,13 +71464,45 @@ def serve_file(request: Request, filename: str, workspace: str = ""):
             return share_delete_file_response(filepath)
         raise HTTPException(status_code=404, detail="File not found")
     try:
-        _, filepath, _ = _require_authorized_output(
+        out_dir, filepath, _ = _require_authorized_output(
             request, selected_workspace, filename,
         )
     except HTTPException as error:
         if error.status_code == 404:
             raise HTTPException(status_code=404, detail="File not found") from error
         raise
+    if content_revision:
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", content_revision):
+            raise HTTPException(status_code=400, detail="Invalid output revision")
+        metadata_path = os.path.join(out_dir, os.path.splitext(filename)[0] + ".meta.json")
+        try:
+            file_identity = file_revision_identity(filepath)
+            sidecar_identity = file_revision_identity(metadata_path)
+        except OSError as error:
+            raise HTTPException(status_code=409, detail="Output changed; reopen it from Gallery") from error
+        if file_identity is None:
+            raise HTTPException(status_code=404, detail="File not found")
+        try:
+            current_revision = _output_share_revision(filepath, out_dir, filename)
+        except FileNotFoundError as error:
+            raise HTTPException(status_code=404, detail="File not found") from error
+        except (OSError, ValueError) as error:
+            raise HTTPException(status_code=409, detail="Output changed; reopen it from Gallery") from error
+        try:
+            identity_still_current = (
+                file_revision_identity(filepath) == file_identity
+                and file_revision_identity(metadata_path) == sidecar_identity
+            )
+        except OSError:
+            identity_still_current = False
+        if not identity_still_current:
+            raise HTTPException(status_code=409, detail="Output changed; reopen it from Gallery")
+        if not hmac.compare_digest(content_revision, current_revision):
+            raise HTTPException(status_code=409, detail="Output changed; reopen it from Gallery")
+        return share_delete_file_response(
+            filepath, expected_file_identity=file_identity,
+            expected_sidecar=(metadata_path, sidecar_identity),
+        )
     return share_delete_file_response(filepath)
 
 

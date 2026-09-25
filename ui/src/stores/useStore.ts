@@ -3565,6 +3565,11 @@ interface AppState {
   storageDashboardOpen: boolean
   setStorageDashboardOpen: (open: boolean) => void
 
+  // A Gallery video opened in the project-scoped, non-destructive Editor.
+  editorSource: OutputFile | null
+  openEditor: (file: OutputFile) => void
+  closeEditor: () => void
+
   // LoRA picker sort order — store-backed (not per-component state) so
   // simultaneously mounted pickers (e.g. Director's Image + Video
   // accordions) stay in sync; persisted to localStorage.
@@ -3614,8 +3619,8 @@ interface AppState {
   servicesConfigLoading: boolean
   servicesConfigError: string | null
   clearServicesConfigError: () => void
-  loadServicesConfig: () => Promise<void>
-  updateServicesConfig: (partial: Partial<ServicesConfig>) => Promise<void>
+  loadServicesConfig: (options?: { throwOnError?: boolean }) => Promise<void>
+  updateServicesConfig: (partial: Partial<ServicesConfig>, options?: { throwOnError?: boolean }) => Promise<void>
   hostTerms: HostTermsStatus | null
   hostTermsLoading: boolean
   hostTermsError: string | null
@@ -12786,7 +12791,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
   privateOutput: false,
   setPrivateOutput: (enabled) => set({ privateOutput: enabled }),
-  loadServicesConfig: async () => {
+  loadServicesConfig: async (options) => {
     set({ servicesConfigLoading: true })
     try {
       const config = await api.fetchServicesConfig()
@@ -12803,13 +12808,14 @@ export const useStore = create<AppState>((set, get) => ({
         servicesConfigLoading: false,
         servicesConfigError: e instanceof Error ? e.message : 'Failed to load services settings',
       })
+      if (options?.throwOnError) throw e
     }
   },
-  updateServicesConfig: async (partial) => {
+  updateServicesConfig: async (partial, options) => {
     set({ servicesConfigError: null })
     try {
       await api.updateServicesConfig(partial)
-      await get().loadServicesConfig()
+      await get().loadServicesConfig(options)
     } catch (e) {
       console.error('Failed to update services config:', e)
       const message = e instanceof Error ? e.message : 'Failed to update services settings'
@@ -12818,6 +12824,7 @@ export const useStore = create<AppState>((set, get) => ({
       // mutation error users need to see.
       await get().loadServicesConfig()
       set({ servicesConfigError: message })
+      if (options?.throwOnError) throw e
     }
   },
   loadHostTerms: async () => {
@@ -16176,7 +16183,7 @@ export const useStore = create<AppState>((set, get) => ({
     if (name === '__uploads__') {
       const activeWorkspace = get().activeWorkspace
       if (activeWorkspace) hidePrivatePreviewsForWorkspace(activeWorkspace)
-      set({ browsingUploads: true, outputs: [], outputsTotal: 0, selectedOutput: 0, selectedOutputMeta: null, selectedOutputKeys: [] })
+      set({ browsingUploads: true, editorSource: null, outputs: [], outputsTotal: 0, selectedOutput: 0, selectedOutputMeta: null, selectedOutputKeys: [] })
       return get().loadOutputs()
     }
     _directorPipelineLifecycleToken = null
@@ -16191,6 +16198,7 @@ export const useStore = create<AppState>((set, get) => ({
       set({
         browsingUploads: false,
         activeWorkspace: name,
+        editorSource: null,
         ...(previousWorkspace !== name ? {
           projectAssetRefs: [],
           projectAssetRefScope: null,
@@ -16251,6 +16259,7 @@ export const useStore = create<AppState>((set, get) => ({
       set({
         browsingUploads: false,
         activeWorkspace: name,
+        editorSource: null,
         projectAssetRefs: [],
         projectAssetRefScope: null,
         presets: [],
@@ -16492,6 +16501,9 @@ export const useStore = create<AppState>((set, get) => ({
 
   storageDashboardOpen: false,
   setStorageDashboardOpen: (open) => set({ storageDashboardOpen: open }),
+  editorSource: null,
+  openEditor: (file) => set({ editorSource: file.type === 'video' ? file : null }),
+  closeEditor: () => set({ editorSource: null }),
 
   loraPickerSort: (() => {
     try { return localStorage.getItem('maestro_lora_picker_sort') === 'newest' ? 'newest' as const : 'name' as const } catch { return 'name' as const }

@@ -1239,7 +1239,6 @@ class LaunchPrivacyContractTests(unittest.TestCase):
 
     def test_routes_are_workspace_scoped_and_bulk_lineage_aware(self):
         source = (APP_ROOT / "launch.py").read_text(encoding="utf-8")
-        self.assertIn("def serve_file(request: Request, filename: str, workspace: str = \"\")", source)
         self.assertNotIn("Search all workspace subdirectories", source)
         self.assertNotIn("can_access_output", source)
         self.assertIn("_require_project_access(", source)

@@ -6,6 +6,7 @@ import { SettingsDrawer } from './components/SettingsDrawer/SettingsDrawer'
 import { LoraBrowser } from './components/LoraBrowser/LoraBrowser'
 import { DirectorDashboard } from './components/DirectorDashboard/DirectorDashboard'
 import { StorageDashboard } from './components/StorageDashboard/StorageDashboard'
+import { EditorWorkspace } from './editor/EditorWorkspace'
 import { RetakeDialog } from './components/RetakeDialog'
 import { OomRecoveryBanner } from './components/OomRecoveryBanner'
 import { DownloadStatusBanner } from './components/DownloadStatusBanner'
@@ -47,6 +48,7 @@ function clearProtectedBootState(recovery: 'account' | 'project'): void {
     selectedOutputMeta: null,
     selectedOutputMetaName: null,
     selectedOutputKeys: [],
+    editorSource: null,
     gallerySelectionMode: false,
     jobs: [],
     sampleCampaignPairs: [],
@@ -114,6 +116,7 @@ function App() {
   const setAccountDrawerOpen = useStore(s => s.setAccountDrawerOpen)
   const workspaces = useStore(s => s.workspaces)
   const activeWorkspace = useStore(s => s.activeWorkspace)
+  const editorSource = useStore(s => s.editorSource)
   const [bootstrapAttempt, setBootstrapAttempt] = useState(0)
   const [bootstrapState, setBootstrapState] = useState<BootstrapState>('loading')
   const [bootstrapError, setBootstrapError] = useState('')
@@ -360,7 +363,7 @@ function App() {
       {/* Mobile header */}
       {isMobile && (
         <header className="grid h-12 shrink-0 grid-cols-[2.75rem_minmax(0,1fr)_5.5rem] items-center border-b border-border bg-bg-secondary px-1 sm:px-2">
-          {!remoteProjectRequired ? <button
+          {!remoteProjectRequired && !editorSource ? <button
             type="button"
             onClick={toggleSidebar}
             className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
@@ -384,8 +387,9 @@ function App() {
         </header>
       )}
 
-      <Sidebar />
-      <MainContent />
+      {editorSource && editorSource.workspace === activeWorkspace && !remoteProjectRequired
+        ? <EditorWorkspace key={`${editorSource.workspace}:${editorSource.name}:${editorSource.revision}`} source={editorSource} />
+        : <><Sidebar /><MainContent /></>}
       {machineControls && <SettingsDrawer />}
       {machineControls && <LoraBrowser />}
       <DirectorDashboard />
