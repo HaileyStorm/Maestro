@@ -48667,43 +48667,61 @@ def _compose_recast_character_masks(
     mapping_masks, colors, overlap_limit=0.35,
     background_color=(255, 255, 255),
 ):
-    """Merge separately tracked people into deterministic SCAIL color slots."""
+    """Merge SCAIL color slots with scratch memory bounded to one frame."""
     import numpy as np
 
     if not mapping_masks or len(mapping_masks) != len(colors):
         raise ValueError("Recast needs one tracked mask per character color.")
-    shape = np.asarray(mapping_masks[0]).shape
+    masks = [np.asarray(mask) for mask in mapping_masks]
+    shape = masks[0].shape
     if len(shape) not in (3, 4):
         raise ValueError(f"Unsupported Recast character-mask shape: {shape}.")
+    if any(mask.shape != shape for mask in masks):
+        raise ValueError("Every Recast character mask must have matching dimensions.")
     region_shape = shape[:-1] if shape[-1] == 3 else shape
+    if len(region_shape) not in (2, 3):
+        raise ValueError(f"Unsupported Recast character-mask shape: {shape}.")
     background = np.asarray(background_color, dtype=np.uint8)
     if background.shape != (3,):
         raise ValueError("Character-mask background must be one RGB color.")
+    palette = [np.asarray(color, dtype=np.uint8) for color in colors]
+    if any(color.shape != (3,) for color in palette):
+        raise ValueError("Each character-mask color must be one RGB color.")
     output = np.empty((*region_shape, 3), dtype=np.uint8)
-    output[...] = background
-    occupied = np.zeros(region_shape, dtype=bool)
+    # Preserve the output shape without allocating full-video region,
+    # overlap, occupancy, and boolean-index coordinate arrays.
+    single_frame = len(region_shape) == 2
+    frame_count = 1 if single_frame else region_shape[0]
+    frame_shape = region_shape if single_frame else region_shape[1:]
+    occupied = np.empty(frame_shape, dtype=bool)
+    areas = [0] * len(masks)
+    overlap_areas = [0] * len(masks)
+    for frame_index in range(frame_count):
+        output_frame = output if single_frame else output[frame_index]
+        output_frame[...] = background
+        occupied.fill(False)
+        for index, (mask, color) in enumerate(zip(masks, palette)):
+            frame = mask if single_frame else mask[frame_index]
+            region = np.any(frame > 30, axis=-1) if shape[-1] == 3 else frame.astype(bool)
+            areas[index] += int(np.count_nonzero(region))
+            overlap_areas[index] += int(np.count_nonzero(region & occupied))
+            # Earlier cards keep priority at an occlusion. copyto broadcasts
+            # the color without building boolean-index coordinate arrays.
+            writable = region & ~occupied
+            np.copyto(output_frame, color, where=writable[..., None])
+            occupied |= region
+
     overlaps = []
-    for index, (raw_mask, color) in enumerate(zip(mapping_masks, colors)):
-        mask = np.asarray(raw_mask)
-        if mask.shape != shape:
-            raise ValueError("Every Recast character mask must have matching dimensions.")
-        region = np.any(mask > 30, axis=-1) if mask.shape[-1] == 3 else mask.astype(bool)
-        area = int(region.sum())
+    for index, (area, overlap_area) in enumerate(zip(areas, overlap_areas)):
         if area <= 0:
             raise ValueError(f"Character mapping {index + 1} matched no pixels.")
-        overlap = np.logical_and(region, occupied)
-        overlap_fraction = float(overlap.sum()) / float(max(1, area))
+        overlap_fraction = float(overlap_area) / float(area)
         overlaps.append(overlap_fraction)
         if overlap_fraction > float(overlap_limit):
             raise ValueError(
                 f"Character mapping {index + 1} overlaps an earlier mapping by "
                 f"{overlap_fraction:.0%}. Use more specific source descriptions."
             )
-        # Earlier cards win the occasional occlusion pixel, making color
-        # assignment stable regardless of SAM's internal object ordering.
-        writable = region & ~occupied
-        output[writable] = np.asarray(color, dtype=np.uint8)
-        occupied |= region
     return output, overlaps
 
 
