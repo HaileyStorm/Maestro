@@ -88,10 +88,12 @@ _DIRECTOR_LEGACY_SECRET_FIELDS = {
     "password",
 }
 _LTX25_MUSIC_VIDEO_SYNC_CONTRACT = (
-    "SOURCE-AUDIO LIP SYNC: Any person visibly singing or rapping "
-    "lip-syncs every vocal syllable to the supplied source soundtrack with "
-    "exact timing, natural mouth shapes, and matching breaths. People who "
-    "are not performing vocals keep their mouths closed."
+    "SOURCE-AUDIO LIP SYNC: Keep the supplied track as the source of sound. "
+    "Synchronize lip movement only for a person this shot explicitly assigns "
+    "to an audible vocal part, and only while that part is present; keep their "
+    "lips relaxed and closed through instrumental gaps. Preserve every other "
+    "subject's assigned action. The soundtrack alone does not require anyone "
+    "to appear on screen."
 )
 _DIRECTOR_VOCAL_PERFORMANCE_RE = re.compile(
     r"\b(?:lip[-\s]?sync(?:s|ing|ed)?|sing(?:s|ing|er|ers)?|"
