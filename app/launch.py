@@ -16734,8 +16734,49 @@ def _public_h3_long_plan(
         int(value) for value in plan.get("_duration_completed_locks") or []
         if type(value) is int and value >= 0
     }
+    clip_count = int(plan.get("clip_count") or 0)
+    source_events = [[] for _ in range(clip_count)]
+    shot_plan = plan.get("shot_plan")
+    ownership = (
+        shot_plan.get("event_ownership")
+        if isinstance(shot_plan, dict) else None
+    )
+    if isinstance(ownership, list):
+        for event in ownership:
+            if not isinstance(event, dict):
+                continue
+            source_index = event.get("source_index")
+            authored_order = event.get("authored_order")
+            owner_index = event.get("owner_segment_index")
+            # Untimed final blocking is a shot instruction, not a source event.
+            if (
+                type(source_index) is not int or source_index < 0
+                or type(authored_order) is not int or authored_order < 0
+                or type(owner_index) is not int
+                or not 0 <= owner_index < clip_count
+                or type(event.get("source_start_frame")) is not int
+            ):
+                continue
+            positions = [owner_index]
+            continuations = event.get("continuation_slices")
+            if isinstance(continuations, list):
+                positions.extend(sorted({
+                    segment_index
+                    for continuation in continuations
+                    if isinstance(continuation, dict)
+                    for segment_index in [continuation.get("segment_index")]
+                    if type(segment_index) is int
+                    and owner_index < segment_index < clip_count
+                }))
+            for position, segment_index in enumerate(positions):
+                source_events[segment_index].append({
+                    "source_index": source_index + 1,
+                    "event_ordinal": authored_order + 1,
+                    "continued_from_previous": position > 0,
+                    "continues_later": position + 1 < len(positions),
+                })
     segments = []
-    for index in range(int(plan.get("clip_count") or 0)):
+    for index in range(clip_count):
         model = models[index] if index < len(models) and isinstance(models[index], dict) else {}
         boundary = boundaries[index - 1] if index > 0 and index - 1 < len(boundaries) else None
         frame_count = int(frames[index]) if index < len(frames) else 0
@@ -16787,6 +16828,8 @@ def _public_h3_long_plan(
             "authored_locked": authored_locked,
             "completed_locked": completed_locked,
             "lock_reason": ", ".join(lock_reasons) if lock_reasons else None,
+            **({"source_events": source_events[index]}
+               if source_events[index] else {}),
         })
     effective_models = []
     for segment in segments:

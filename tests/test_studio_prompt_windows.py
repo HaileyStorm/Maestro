@@ -1725,8 +1725,77 @@ class H3LongStudioPlanningTests(unittest.TestCase):
         self.assertEqual(namespace["errors"], "")
         self.assertEqual(namespace["prompt"], literal_child)
 
+    def test_duration_replay_reprojects_source_events_after_boundary_moves(self):
+        from services.h3_shot_planner import plan_h3_native_shots
+
+        prompt = "[6-12s] An adult courier crosses a hall."
+        original = plan_h3_native_shots(
+            global_prompt=prompt,
+            clip_frame_counts=[144, 144, 144],
+            clip_requested_frames=[144, 144, 144],
+            fps=24,
+        )
+        plan = {
+            "clip_count": 3,
+            "fps": 24,
+            "global_prompt": prompt,
+            "requested_frames": 432,
+            "published_frames": 432,
+            "planned_frames": 432,
+            "clip_frames": [144, 144, 144],
+            "clip_published_frames": [144, 144, 144],
+            "clip_boundaries": original["clip_boundaries"],
+            "segment_frames_maximum": 345,
+            "shot_plan": original,
+        }
+        project = self._load_launch_helpers()["_public_h3_long_plan"]
+        before = project(plan)
+        self.assertEqual(
+            [segment.get("source_events", []) for segment in before["segments"]],
+            [[], [{
+                "source_index": 1, "event_ordinal": 1,
+                "continued_from_previous": False,
+                "continues_later": False,
+            }], []],
+        )
+
+        launch_tree = ast.parse((Path(APP) / "launch.py").read_text())
+        replay_function = next(
+            node for node in launch_tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_replay_h3_duration_shot_plan"
+        )
+        namespace = {"copy": copy}
+        exec(compile(ast.Module(body=[replay_function], type_ignores=[]),
+                     "duration-source-map-replay", "exec"), namespace)
+        replayed = namespace["_replay_h3_duration_shot_plan"](
+            plan, generated=[192, 120, 120], published=[192, 120, 120],
+        )
+        revised = {
+            **plan,
+            "shot_plan": replayed,
+            "clip_frames": [192, 120, 120],
+            "clip_published_frames": [192, 120, 120],
+            "clip_boundaries": replayed["clip_boundaries"],
+        }
+        after = project(revised)
+        self.assertEqual(
+            [segment.get("source_events", []) for segment in after["segments"]],
+            [[{
+                "source_index": 1, "event_ordinal": 1,
+                "continued_from_previous": False,
+                "continues_later": True,
+            }], [{
+                "source_index": 1, "event_ordinal": 1,
+                "continued_from_previous": True,
+                "continues_later": False,
+            }], []],
+        )
+        self.assertNotIn("crosses a hall", repr(after))
+
     def test_30s_cut_alignment_survives_final_frame_tail_reservation(self):
-        prepare = self._load_launch_helpers()["_prepare_h3_long_studio_request"]
+        helpers = self._load_launch_helpers()
+        prepare = helpers["_prepare_h3_long_studio_request"]
         prompt = (
             "subject_definitions:\n<Subject 1>: an adult pilot\n"
             "[Shot 1] <Subject 1> crosses the hangar without a cut.\n"
@@ -1776,6 +1845,31 @@ class H3LongStudioPlanningTests(unittest.TestCase):
                         ),
                         1 + len(event["continuation_slices"]),
                     )
+                public = helpers["_public_h3_long_plan"](plan)
+                expected_by_segment = [[] for _ in range(plan["clip_count"])]
+                for event in events:
+                    if event["source_start_frame"] is None:
+                        continue
+                    expected = {
+                        "source_index": event["source_index"] + 1,
+                        "event_ordinal": event["authored_order"] + 1,
+                    }
+                    positions = [event["owner_segment_index"]] + [
+                        item["segment_index"]
+                        for item in event["continuation_slices"]
+                    ]
+                    for position, segment_index in enumerate(positions):
+                        expected_by_segment[segment_index].append({
+                            **expected,
+                            "continued_from_previous": position > 0,
+                            "continues_later": position + 1 < len(positions),
+                        })
+                self.assertEqual(
+                    [segment.get("source_events", []) for segment in public["segments"]],
+                    expected_by_segment,
+                )
+                self.assertNotIn("crosses the hangar", repr(public))
+                self.assertNotIn("cut to the cockpit", repr(public))
                 semantic = plan["shot_plan"]["semantic_shots"]
                 self.assertEqual(len(semantic), 1)
                 self.assertTrue(

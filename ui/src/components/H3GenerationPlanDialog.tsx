@@ -600,6 +600,11 @@ export function H3GenerationPlanDialog() {
             </section>
           )}
 
+          {plan.segments.some(segment => segment.source_events?.length) && (
+            <p className="mb-2 text-[10px] leading-relaxed text-text-muted">
+              Planned source events show where the saved plan places each beat. The rendered video may differ.
+            </p>
+          )}
           <div className="space-y-2">
             {plan.segments.map((segment, index) => {
               const selectedOption = optionByModel.get(models[index])
@@ -657,6 +662,17 @@ export function H3GenerationPlanDialog() {
                   </div>
                   {models[index] !== 'minimax_h3_ref2va' && (
                     <p className="mt-1 text-[9px] text-text-muted">FL2VA follows this segment’s start, end, and continuity frames. It keeps reference images saved but does not use them for this segment.</p>
+                  )}
+                  {Boolean(segment.source_events?.length) && (
+                    <ul className="mt-2 flex flex-wrap gap-1.5" aria-label={`Planned source events in segment ${segment.index}`}>
+                      {segment.source_events?.map(event => (
+                        <li key={`${event.source_index}-${event.event_ordinal}`} className="rounded border border-border bg-bg-primary/60 px-2 py-1 text-[10px] text-text-secondary">
+                          Source {event.source_index}, event {event.event_ordinal}
+                          {event.continued_from_previous && ' · continued from earlier segment'}
+                          {event.continues_later && ' · continues beyond this segment'}
+                        </li>
+                      ))}
+                    </ul>
                   )}
                   {selectedBlockedReason && (
                     <p className="mt-1 text-[9px] text-red-300">Unavailable: {selectedBlockedReason}</p>

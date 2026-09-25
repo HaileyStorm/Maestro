@@ -702,7 +702,7 @@ def _safe_h3_segment_plan(value: Any) -> dict[str, Any] | None:
         "edge_anchor_locked", "switch_from_previous", "boundary_from_previous",
         "duration_min_published_frames", "duration_max_published_frames",
         "duration_grid_step", "duration_grid_offset", "authored_locked",
-        "completed_locked", "lock_reason",
+        "completed_locked", "lock_reason", "source_events",
     }
 
     def positive_number(child: Any, *, path: str) -> int | float:
@@ -745,6 +745,38 @@ def _safe_h3_segment_plan(value: Any) -> dict[str, Any] | None:
                     safe_segment[key] = positive_integer(child, path=path)
                 elif key == "boundary_from_previous":
                     safe_segment[key] = _safe_h3_boundary(child)
+                elif key == "source_events":
+                    if not isinstance(child, list):
+                        raise QueueRecoveryAdapterError(
+                            "H3 source-event map is invalid."
+                        )
+                    safe_events = []
+                    for source_event in child:
+                        if (
+                            not isinstance(source_event, Mapping)
+                            or set(source_event) != {
+                                "source_index", "event_ordinal",
+                                "continued_from_previous", "continues_later",
+                            }
+                            or type(source_event["continued_from_previous"]) is not bool
+                            or type(source_event["continues_later"]) is not bool
+                        ):
+                            raise QueueRecoveryAdapterError(
+                                "H3 source-event map is invalid."
+                            )
+                        safe_events.append({
+                            "source_index": positive_integer(
+                                source_event["source_index"], path=path
+                            ),
+                            "event_ordinal": positive_integer(
+                                source_event["event_ordinal"], path=path
+                            ),
+                            "continued_from_previous": source_event[
+                                "continued_from_previous"
+                            ],
+                            "continues_later": source_event["continues_later"],
+                        })
+                    safe_segment[key] = safe_events
                 elif key in {
                     "generated_duration_seconds", "published_duration_seconds",
                 }:

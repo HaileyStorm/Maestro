@@ -213,6 +213,12 @@ function plan() {
         model_type: 'minimax_h3',
         model_reason: 'server first',
         edge_anchor_locked: false,
+        source_events: [{
+          source_index: 1,
+          event_ordinal: 1,
+          continued_from_previous: false,
+          continues_later: true,
+        }],
       },
       {
         index: 2,
@@ -222,6 +228,12 @@ function plan() {
         model_reason: 'server second',
         edge_anchor_locked: false,
         boundary_from_previous: { type: 'continuous' },
+        source_events: [{
+          source_index: 1,
+          event_ordinal: 1,
+          continued_from_previous: true,
+          continues_later: false,
+        }],
       },
     ],
   }
@@ -420,6 +432,10 @@ test('rendered H3 plan portals to body, captures its opener, and fences every mo
   assert.equal(renderedDialog.props['aria-modal'], 'true')
   assert.equal(renderedDialog.props['aria-labelledby'], 'h3-plan-dialog-title')
   assert.equal(renderedDialog.props['aria-describedby'], 'h3-plan-dialog-description')
+  const sourceMapText = nodeText(renderedDialog)
+  assert.match(sourceMapText, /Planned source events show where the saved plan places each beat/)
+  assert.match(sourceMapText, /Source 1, event 1 · continues beyond this segment/)
+  assert.match(sourceMapText, /Source 1, event 1 · continued from earlier segment/)
 
   const closeControls = findNodes(tree, node => node.props?.['aria-label'] === 'Close long-video plan review')
   assert.equal(closeControls.length, 2)

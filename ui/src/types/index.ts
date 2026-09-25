@@ -1249,6 +1249,13 @@ export interface H3SegmentPlanItem {
   edge_anchor_locked: boolean
   switch_from_previous: boolean
   boundary_from_previous: H3SegmentBoundary | null
+  /** One-based, content-free ownership from the sealed source plan. */
+  source_events?: Array<{
+    source_index: number
+    event_ordinal: number
+    continued_from_previous: boolean
+    continues_later: boolean
+  }>
   prompt_preview?: string
 }
 

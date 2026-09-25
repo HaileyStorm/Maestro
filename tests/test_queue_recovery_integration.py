@@ -784,6 +784,12 @@ class QueueRecoveryIntegrationTests(unittest.TestCase):
                     "published_frames": 175,
                     "generated_duration_seconds": 175 / 24,
                     "published_duration_seconds": 175 / 24,
+                    "source_events": [{
+                        "source_index": 1,
+                        "event_ordinal": 1,
+                        "continued_from_previous": False,
+                        "continues_later": True,
+                    }],
                     "duration_min_published_frames": 124,
                     "duration_max_published_frames": 345,
                     "duration_grid_step": 1,
@@ -798,6 +804,12 @@ class QueueRecoveryIntegrationTests(unittest.TestCase):
                     "published_frames": 171,
                     "generated_duration_seconds": 175 / 24,
                     "published_duration_seconds": 171 / 24,
+                    "source_events": [{
+                        "source_index": 1,
+                        "event_ordinal": 1,
+                        "continued_from_previous": True,
+                        "continues_later": False,
+                    }],
                     "duration_min_published_frames": 124,
                     "duration_max_published_frames": 345,
                     "duration_grid_step": 1,
@@ -829,6 +841,14 @@ class QueueRecoveryIntegrationTests(unittest.TestCase):
         self.assertTrue(
             restored["h3_segment_plan"]["segments"][1]["completed_locked"]
         )
+        self.assertEqual(
+            restored["h3_segment_plan"]["segments"][0]["source_events"],
+            public_plan["segments"][0]["source_events"],
+        )
+        self.assertEqual(
+            restored["h3_segment_plan"]["segments"][1]["source_events"],
+            public_plan["segments"][1]["source_events"],
+        )
 
     def test_h3_recovery_geometry_rejects_nonfinite_or_boolean_numbers(self):
         base_plan = {
@@ -850,6 +870,19 @@ class QueueRecoveryIntegrationTests(unittest.TestCase):
         invalid_plans.append({
             **base_plan,
             "segments": [{**base_plan["segments"][0], "published_frames": 0}],
+        })
+        invalid_plans.append({
+            **base_plan,
+            "segments": [{
+                **base_plan["segments"][0],
+                "source_events": [{
+                    "source_index": 1,
+                    "event_ordinal": 1,
+                    "continued_from_previous": False,
+                    "continues_later": False,
+                    "text": "PRIVATE_SOURCE_EVENT_SENTINEL",
+                }],
+            }],
         })
         for plan in invalid_plans:
             with self.subTest(plan=plan):
