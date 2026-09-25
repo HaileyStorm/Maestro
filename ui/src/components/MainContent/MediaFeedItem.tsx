@@ -87,7 +87,6 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
   const rejoinClipGroup = useStore(s => s.rejoinClipGroup)
   const flipSelectedClip = useStore(s => s.flipSelectedClip)
   const toggleFavorite = useStore(s => s.toggleFavorite)
-  const setStartImage = useStore(s => s.setStartImage)
   const addImageRef = useStore(s => s.addImageRef)
   const setContinueVideo = useStore(s => s.setContinueVideo)
   const setParam = useStore(s => s.setParam)
@@ -135,6 +134,11 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
   const [copied, setCopied] = useState(false)
   const [rejoining, setRejoining] = useState(false)
   const [sentToInput, setSentToInput] = useState(false)
+  const [sendingToInput, setSendingToInput] = useState(false)
+  const [showInputDestinations, setShowInputDestinations] = useState(false)
+  const [inputError, setInputError] = useState('')
+  const inputRequest = useRef<AbortController | null>(null)
+  const sentToInputTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [showMoveMenu, setShowMoveMenu] = useState(false)
   const [moving, setMoving] = useState(false)
   const [continuing, setContinuing] = useState(false)
@@ -181,6 +185,10 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
   useEffect(() => () => {
     clearTimeout(timeoutRef.current)
   }, [])
+  useEffect(() => () => {
+    inputRequest.current?.abort()
+    if (sentToInputTimer.current !== null) clearTimeout(sentToInputTimer.current)
+  }, [file.name, file.workspace, file.revision])
 
   useEffect(() => {
     const syncReveal = (revealed = privatePreviewWasRevealed(privateRevealKey)) => {
@@ -557,21 +565,59 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
     }
   }
 
-  const handleSendToInput = async () => {
-    if (file.type !== 'image') return
-    try {
-      const res = await fetch(getFileUrl(file.name, file.workspace))
-      const blob = await res.blob()
-      const imageFile = new File([blob], file.name, { type: blob.type || 'image/png' })
-      if (generationMode === 'image') {
-        addImageRef(imageFile)
-      } else {
-        setStartImage(imageFile)
+  const handleSendToInput = async (destination: 'current' | 'image' | 'video-start' = 'current') => {
+    if (file.type !== 'image' || inputRequest.current) return
+    const target = destination === 'current' ? (generationMode === 'image' ? 'image' : 'video-start') : destination
+    const controller = new AbortController()
+    inputRequest.current = controller
+    const accountEpoch = currentAccountIdentityEpoch()
+    const captured = useStore.getState()
+    const contextChanged = (state: ReturnType<typeof useStore.getState>) =>
+      currentAccountIdentityEpoch() !== accountEpoch
+      || state.activeWorkspace !== captured.activeWorkspace
+      || state.generationMode !== captured.generationMode
+      || state.sidebarMode !== captured.sidebarMode
+    let staleContext = false
+    const unsubscribe = useStore.subscribe(state => {
+      if (contextChanged(state)) {
+        staleContext = true
+        controller.abort()
       }
+    })
+    setSendingToInput(true)
+    setInputError('')
+    try {
+      const res = await fetch(getFileUrl(file.name, file.workspace), { signal: controller.signal })
+      if (!res.ok) throw new Error(`Could not read this Gallery image (${res.status}). Try again.`)
+      const blob = await res.blob()
+      if (!blob.type.startsWith('image/')) throw new Error('The Gallery file did not return an image. Try again.')
+      const state = useStore.getState()
+      if (controller.signal.aborted || contextChanged(state)) {
+        throw new Error('The project or input mode changed while the image was loading. Choose the destination again.')
+      }
+      const imageFile = new File([blob], file.name, { type: blob.type })
+      const targetMode = target === 'image' ? 'image' : 'video'
+      unsubscribe()
+      if (state.generationMode !== targetMode) state.setGenerationMode(targetMode)
+      if (useStore.getState().sidebarMode !== 'studio') useStore.getState().setSidebarMode('studio')
+      if (target === 'image') {
+        useStore.getState().addImageRef(imageFile)
+      } else {
+        useStore.getState().setParam('image_mode', 0)
+        useStore.getState().setStartImage(imageFile)
+      }
+      useStore.getState().setSidebarOpen(true)
+      setShowInputDestinations(false)
       setSentToInput(true)
-      setTimeout(() => setSentToInput(false), 2000)
+      if (sentToInputTimer.current !== null) clearTimeout(sentToInputTimer.current)
+      sentToInputTimer.current = setTimeout(() => setSentToInput(false), 2000)
     } catch (e) {
-      console.error('Failed to send image to input:', e)
+      if (staleContext) setInputError('The project or input mode changed while the image was loading. Choose the destination again.')
+      else if (!controller.signal.aborted) setInputError(e instanceof Error ? e.message : 'Could not send this image to Studio.')
+    } finally {
+      unsubscribe()
+      if (inputRequest.current === controller) inputRequest.current = null
+      setSendingToInput(false)
     }
   }
 
@@ -1014,21 +1060,35 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
             </>
           )}
           {file.type === 'image' && (
-            <button
-              onClick={(e) => { e.stopPropagation(); handleSendToInput() }}
-              type="button"
-              aria-label={generationMode === 'image'
-                ? `Use ${file.name} as an input image`
-                : `Use ${file.name} as a start frame`}
-              className={`min-h-11 min-w-11 rounded-lg p-1.5 transition-colors md:min-h-0 md:min-w-0 ${
-                sentToInput
-                  ? 'text-accent-green'
-                  : 'hover:bg-bg-hover text-text-secondary hover:text-accent-blue'
-              }`}
-              title={generationMode === 'image' ? 'Use as input image' : 'Use as start frame'}
-            >
-              {sentToInput ? <Check size={13} /> : <ArrowLeftToLine size={13} />}
-            </button>
+            <>
+              <button
+                onClick={(e) => { e.stopPropagation(); void handleSendToInput() }}
+                disabled={sendingToInput}
+                type="button"
+                aria-label={generationMode === 'image'
+                  ? `Use ${file.name} as an input image`
+                  : `Use ${file.name} as a start frame`}
+                className={`min-h-11 min-w-11 rounded-lg p-1.5 transition-colors disabled:opacity-50 md:min-h-0 md:min-w-0 ${
+                  sentToInput
+                    ? 'text-accent-green'
+                    : 'hover:bg-bg-hover text-text-secondary hover:text-accent-blue'
+                }`}
+                title={generationMode === 'image' ? 'Use as input image' : 'Use as start frame'}
+              >
+                {sendingToInput ? <Loader2 size={13} className="animate-spin" /> : sentToInput ? <Check size={13} /> : <ArrowLeftToLine size={13} />}
+              </button>
+              <button
+                onClick={event => { event.stopPropagation(); setShowInputDestinations(open => !open) }}
+                type="button"
+                aria-expanded={showInputDestinations}
+                aria-controls={`gallery-input-destinations-${index}`}
+                aria-label={`Choose a Studio input for ${file.name}`}
+                className="min-h-11 min-w-11 rounded-lg p-1.5 text-text-secondary hover:bg-bg-hover hover:text-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue md:min-h-0 md:min-w-0"
+                title="Choose a Studio input"
+              >
+                <span aria-hidden="true" className="text-base leading-none">▾</span>
+              </button>
+            </>
           )}
           {file.type === 'video' && (
             <button
@@ -1211,6 +1271,21 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
           )}
         </div>
       </div>
+      {file.type === 'image' && showInputDestinations && (
+        <div
+          id={`gallery-input-destinations-${index}`}
+          role="group"
+          aria-label={`Studio destinations for ${file.name}`}
+          onClick={event => event.stopPropagation()}
+          className="flex flex-wrap gap-2 border-t border-border bg-bg-secondary px-3 py-2"
+        >
+          <button type="button" disabled={sendingToInput} onClick={() => void handleSendToInput('image')} className="min-h-11 rounded-lg border border-border px-3 text-xs text-text-primary hover:bg-bg-hover disabled:opacity-50">Use in Image mode</button>
+          <button type="button" disabled={sendingToInput} onClick={() => void handleSendToInput('video-start')} className="min-h-11 rounded-lg border border-border px-3 text-xs text-text-primary hover:bg-bg-hover disabled:opacity-50">Use as Video start frame</button>
+        </div>
+      )}
+      {file.type === 'image' && inputError && (
+        <p role="alert" className="border-t border-border px-3 py-2 text-xs text-red-400">{inputError}</p>
+      )}
       {showSaveRecipe && (
         <SaveRecipeDialog
           onCancel={closeSaveRecipeDialog}
