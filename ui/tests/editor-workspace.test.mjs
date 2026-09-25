@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { openOutputInEditor, saveEditorProject } from '../src/api/client.ts'
+import { exportEditorProject, openOutputInEditor, saveEditorProject } from '../src/api/client.ts'
 
 test('Editor requests keep the project, source revision and autosave revision together', async () => {
   const previous = globalThis.fetch
@@ -36,6 +36,38 @@ test('Editor save reports stale revisions as a safe, actionable conflict', async
     await assert.rejects(
       saveEditorProject('scene', { id: 'cut', revision: 2 }),
       error => error.status === 409 && error.message.includes('reopen it'),
+    )
+  } finally {
+    globalThis.fetch = previous
+  }
+})
+
+test('Editor export submits only the saved project revision to its project route', async () => {
+  const previous = globalThis.fetch
+  const calls = []
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, init })
+    return { ok: true, json: async () => ({ job_id: 'export-1', status: 'queued' }) }
+  }
+  try {
+    assert.deepEqual(await exportEditorProject('scene a', { id: 'cut #1', revision: 4 }), {
+      job_id: 'export-1', status: 'queued',
+    })
+    assert.match(calls[0].url, /\/projects\/scene%20a\/editor\/projects\/cut%20%231\/exports$/)
+    assert.equal(calls[0].init.method, 'POST')
+    assert.deepEqual(JSON.parse(calls[0].init.body), { expected_revision: 4 })
+  } finally {
+    globalThis.fetch = previous
+  }
+})
+
+test('Editor export reports a changed draft as an actionable conflict', async () => {
+  const previous = globalThis.fetch
+  globalThis.fetch = async () => ({ ok: false, status: 409 })
+  try {
+    await assert.rejects(
+      exportEditorProject('scene', { id: 'cut', revision: 2 }),
+      error => error.status === 409 && error.message.includes('reopen the video'),
     )
   } finally {
     globalThis.fetch = previous

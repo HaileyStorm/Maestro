@@ -2697,7 +2697,7 @@ _CREDIT_INTERNAL_PARAMS = frozenset({
     _CREDIT_BASELINE_PARAM,
     _CREDIT_CLEANUP_PARAM,
 })
-_CREDIT_EXEMPT_JOB_KINDS = frozenset({"tool_upscale", "tool_revoice", "tool_hflip"})
+_CREDIT_EXEMPT_JOB_KINDS = frozenset({"tool_upscale", "tool_revoice", "tool_hflip", "tool_editor_export"})
 _CREDIT_LINEAGE_JOB_KINDS = frozenset({
     "director_pipeline",
     "director_preparation",
@@ -4828,7 +4828,7 @@ _RECOVERABLE_INPUT_KEYS = frozenset({
     "retake_user_end_anchor", "voice_reference", "voice_clone_refs",
     "audio_path", "reference_image_path", "character_ref_paths",
     "location_ref_paths", "image_paths", "_blend_clip_a", "_blend_clip_b",
-    "hflip_source_path", "_tool_input_paths",
+    "hflip_source_path", "editor_source_path", "_tool_input_paths",
 })
 
 
@@ -5071,6 +5071,8 @@ def _queue_recovery_input_descriptors(job: dict, owner_digest: str) -> list[dict
     for field, path in _queue_recovery_file_values(params):
         if field.startswith("hflip_source_path:") and job.get("kind") != "tool_hflip":
             raise QueueRecoveryRuntimeError("Unexpected transform input in this job.")
+        if field.startswith("editor_source_path:") and job.get("kind") != "tool_editor_export":
+            raise QueueRecoveryRuntimeError("Unexpected Editor input in this job.")
         if field.startswith("_tool_input_paths:") and job.get("kind") not in {"tool_upscale", "tool_revoice"}:
             raise QueueRecoveryRuntimeError("Unexpected tool input in this job.")
         resolved = os.path.realpath(path)
@@ -5140,7 +5142,8 @@ def _queue_recovery_input_descriptors(job: dict, owner_digest: str) -> list[dict
             sidecar_path = os.path.join(
                 out_dir, os.path.splitext(os.path.basename(resolved))[0] + ".meta.json",
             )
-            if (field == "hflip_source_path:0" or field.startswith("_tool_input_paths:")) and not os.path.lexists(sidecar_path):
+            if (field in {"hflip_source_path:0", "editor_source_path:0"}
+                    or field.startswith("_tool_input_paths:")) and not os.path.lexists(sidecar_path):
                 # Legacy gallery media remains usable in this session. Without
                 # prior project sidecar evidence, restart recovery stays blocked.
                 descriptor["scope"] = "derived"
@@ -5855,6 +5858,8 @@ def _queue_recovery_worker(job: dict):
         return globals().get("_run_" + kind)
     if kind == "tool_hflip":
         return globals().get("_run_tool_hflip")
+    if kind == "tool_editor_export":
+        return globals().get("_run_tool_editor_export")
     if kind == "studio_blend":
         return globals().get("_run_blend_generation")
     if kind == "studio_outpaint_preparation":
@@ -26291,6 +26296,107 @@ async def save_output_editor_project(project: str, editor_id: str, request: Requ
         except OSError as error:
             raise HTTPException(status_code=503, detail="Editor draft could not be saved") from error
     return {"project": saved}
+
+
+@api.post("/api/v1/projects/{project}/editor/projects/{editor_id}/exports")
+async def export_output_editor_project(project: str, editor_id: str, request: Request):
+    """Queue a source-safe MP4 cut from one saved Editor draft revision."""
+    from services.editor_projects import EditorProjectError, load_editor_project
+
+    body = await _editor_request_body(request)
+    expected = body.get("expected_revision")
+    if type(expected) is not int or expected < 1:
+        raise HTTPException(status_code=400, detail="Save the Editor cut before exporting")
+    with _reserve_workspace_operations(project):
+        _require_project_access(request, project, existing_only=True, permission="project.mutate")
+        out_dir = _require_project_access(
+            request, project, existing_only=True, permission="project.generate",
+        )
+        try:
+            timeline = load_editor_project(_editor_save_root(), project, editor_id)
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="Editor draft not found") from None
+        except (EditorProjectError, OSError, ValueError) as error:
+            raise HTTPException(status_code=503, detail="Editor draft is unavailable") from error
+        if timeline["revision"] != expected:
+            raise HTTPException(status_code=409, detail="Editor draft changed; reload before exporting")
+        asset = timeline.get("assets", {}).get("source-video")
+        if len(timeline.get("assets", {})) != 1 or not isinstance(asset, dict):
+            raise HTTPException(status_code=422, detail="This Editor timeline needs a supported single video cut")
+        tracks = timeline.get("tracks") or []
+        source_tracks = [track for track in tracks if track.get("id") == "video-main"]
+        if (len(source_tracks) != 1 or len(source_tracks[0].get("items") or []) != 1
+                or any(track.get("items") for track in tracks if track is not source_tracks[0])):
+            raise HTTPException(status_code=422, detail="This Editor timeline needs a supported single video cut")
+        clip = source_tracks[0]["items"][0]
+        start = clip.get("source_in")
+        length = clip.get("duration")
+        simple_clip = {key: value for key, value in clip.items() if key not in {"source_in", "duration"}}
+        if (simple_clip != {
+                "id": "source-clip", "asset_id": "source-video", "start": 0.0,
+                "speed": 1.0, "volume": 1.0, "opacity": 1.0,
+                "fade_in": 0.0, "fade_out": 0.0,
+                "transition_in": "none", "transition_out": "none",
+                "take_asset_ids": ["source-video"],
+                "take_states": {"source-video": {"source_in": start, "speed": 1.0}},
+                "transform": {"x": 0.0, "y": 0.0, "scale": 1.0, "rotation": 0.0},
+                "fit": "contain", "muted": False, "disabled": False,
+            }
+                or not isinstance(start, (int, float)) or not isinstance(length, (int, float))
+                or not math.isfinite(start) or not math.isfinite(length)
+                or start < 0 or length < 1 / 240
+                or start + length > asset.get("duration", 0) + 1e-6):
+            raise HTTPException(status_code=422, detail="Select a valid source range before exporting")
+        _editor_require_current_source(request, project, asset)
+        name = asset["output_id"]
+        with _output_lineage_mutation_guard(out_dir):
+            _out_dir, source, sidecar = _require_authorized_output(request, project, name)
+            try:
+                same_source = hmac.compare_digest(
+                    asset["output_revision"], _output_share_revision(source, out_dir, name),
+                )
+            except (OSError, ValueError):
+                same_source = False
+            if not same_source:
+                raise HTTPException(status_code=409, detail="Editor source changed; reopen the video")
+            policy = public_output_policy(sidecar)
+            for existing in _jobs.values():
+                params = existing.get("params") if isinstance(existing.get("params"), dict) else {}
+                if (existing.get("kind") == "tool_editor_export"
+                        and existing.get("workspace") == project
+                        and existing.get("session_id") == request.state.maestro_session_id
+                        and existing.get("status") in {"queued", "running", "held", "registering", "preparing"}
+                        and params.get("editor_project_id") == editor_id
+                        and params.get("editor_revision") == expected):
+                    return {"job_id": existing["id"], "status": existing["status"]}
+            job_id = _new_generation_job_id()
+            job = {
+                "id": job_id, "kind": "tool_editor_export", "status": "queued",
+                "progress": 0, "step": 0, "total_steps": 0,
+                "session_id": request.state.maestro_session_id,
+                "source_remote": bool(_request_remote.get()),
+                "phase": "", "message": "Queued (Editor export)", "created_at": time.time(),
+                "params": {
+                    "editor_source_name": name,
+                    "editor_source_path": source,
+                    "editor_source_revision": asset["output_revision"],
+                    "editor_source_has_audio": bool(asset.get("has_audio")),
+                    "editor_source_fps": float(asset.get("fps") or 0),
+                    "editor_project_id": editor_id,
+                    "editor_revision": expected,
+                    "editor_source_in": float(start),
+                    "editor_duration": float(length),
+                    "private_output": bool(policy["private"]),
+                    "explicit_output": bool(policy["explicit"]),
+                },
+                "output_files": [], "error": None, "workspace": project, "out_dir": out_dir,
+            }
+            _queue_recovery_register_and_publish(
+                job, worker=_run_tool_editor_export,
+                recovery_kind="tool_editor_export",
+                thread_name=f"tool-editor-export-{job_id}",
+            )
+    return {"job_id": job_id, "status": "queued"}
 
 
 @api.get("/api/v1/projects/{project}/assets")
@@ -60717,7 +60823,7 @@ def _inherit_media_access_policy(
 def _write_tool_sidecar(out_dir, filename, *, source_name, tool, params, elapsed, job_id, source_revision=None, producer=None):
     """Publish access-stamped tool metadata; transforms retain source settings."""
     sidecar = {
-        "params": dict(params) if tool == "hflip" else {**params, "edit_sub_mode": tool},
+        "params": dict(params) if tool in {"hflip", "editor_export"} else {**params, "edit_sub_mode": tool},
         "generation_mode": "video",
         "tool": tool,
         "tool_source": source_name,
@@ -60734,6 +60840,19 @@ def _write_tool_sidecar(out_dir, filename, *, source_name, tool, params, elapsed
         sidecar["tool_source_revision"] = source_revision
         sidecar["transform"] = {
             "kind": "horizontal_flip", "video_only": True, "audio": "copied",
+        }
+    elif tool == "editor_export":
+        sidecar["artifact_class"] = "final"
+        sidecar["params"].pop("multi_clip_info", None)
+        sidecar["tool_source_workspace"] = job.get("workspace")
+        sidecar["tool_source_revision"] = source_revision
+        sidecar["transform"] = {
+            "kind": "editor_trim",
+            "editor_project_id": job.get("params", {}).get("editor_project_id"),
+            "editor_revision": job.get("params", {}).get("editor_revision"),
+            "source_in": job.get("params", {}).get("editor_source_in"),
+            "duration": job.get("params", {}).get("editor_duration"),
+            "video": "h264", "audio": "aac",
         }
     if producer:
         sidecar.update(producer)
@@ -60907,6 +61026,115 @@ async def tools_hflip(request: Request):
                 thread_name=f"tool-hflip-{job_id}",
             )
     return {"job_id": job_id, "status": "queued"}
+
+
+def _editor_export_source(job: dict) -> tuple[str, dict]:
+    """Resolve only the exact Gallery video sealed at Editor submission."""
+    from services.win_safe_files import safe_direct_file_under
+
+    params = job["params"]
+    out_dir = _existing_workspace_dir(job["workspace"])
+    name = params["editor_source_name"]
+    source = safe_direct_file_under(out_dir, name)
+    if (not source or not os.path.isfile(source)
+            or source != params["editor_source_path"]
+            or not hmac.compare_digest(
+                _output_share_revision(source, out_dir, name),
+                params["editor_source_revision"],
+            )):
+        raise ValueError("The Editor source changed or was removed. Reopen the video.")
+    metadata = load_media_sidecars(out_dir, {name}).get(name) or {}
+    return source, metadata
+
+
+def _run_tool_editor_export(job_id: str):
+    """Render a CPU cut through ordinary queue cancellation and finality."""
+    import tempfile
+    from services.editor_export import render_single_source_cut
+    from services.editor_projects import probe_media
+
+    job = _jobs[job_id]
+    abort_state = {"abort": False}
+    start_time = time.time()
+    with generation_slot(_gen_lock, job) as acquired:
+        if not acquired:
+            return False
+        try:
+            if not try_start(job, generation_lock=_gen_lock,
+                             message="Exporting Editor cut...", phase="Exporting"):
+                return False
+            if not register_abort_state(job, job_id, _active_gen_states, abort_state):
+                return False
+            def aborted():
+                return bool(abort_state.get("abort")) or is_cancel_requested(job)
+
+            workspace = job["workspace"]
+            with _reserve_workspace_operations(workspace):
+                out_dir = _existing_workspace_dir(workspace)
+                with _output_lineage_mutation_guard(out_dir):
+                    source, metadata = _editor_export_source(job)
+                params = job["params"]
+                filename = f"editor_cut_{job_id}.mp4"
+                final_path = os.path.join(out_dir, filename)
+                meta_path = os.path.splitext(final_path)[0] + ".meta.json"
+                with tempfile.TemporaryDirectory(prefix=".editor-export-", dir=out_dir) as staging:
+                    staged = os.path.join(staging, filename)
+                    render_single_source_cut(
+                        source, staged,
+                        source_in=params["editor_source_in"],
+                        duration=params["editor_duration"],
+                        abort_check=aborted, timeout=3600,
+                    )
+                    rendered = probe_media(staged)
+                    fps = float(params.get("editor_source_fps") or 0)
+                    tolerance = max(0.1, min(0.5, 2 / max(1.0, fps)))
+                    if (rendered["type"] != "video"
+                            or rendered["size"] <= 0
+                            or not rendered["duration"] > 0
+                            or abs(rendered["duration"] - params["editor_duration"]) > tolerance
+                            or (params["editor_source_has_audio"] and not rendered["has_audio"])):
+                        raise ValueError("The Editor cut did not retain the expected video, audio or duration.")
+                    with _output_lineage_mutation_guard(out_dir):
+                        _editor_export_source(job)
+                        if aborted():
+                            return False
+                        if os.path.lexists(final_path) or os.path.lexists(meta_path):
+                            raise ValueError("The Editor output already exists. Refresh Gallery.")
+                        source_params = metadata.get("params")
+                        _write_tool_sidecar(
+                            out_dir, filename,
+                            source_name=os.path.basename(source),
+                            source_revision=params["editor_source_revision"],
+                            tool="editor_export",
+                            params=source_params if isinstance(source_params, dict) else {},
+                            elapsed=time.time() - start_time, job_id=job_id,
+                        )
+                        media_owned = False
+                        try:
+                            os.link(staged, final_path)
+                            media_owned = True
+                            return finish_job(
+                                job, "completed", output_files=[filename],
+                                progress=100, phase="", message="Done",
+                            )
+                        finally:
+                            if not (job.get("status") == "completed"
+                                    and filename in (job.get("output_files") or [])):
+                                if media_owned:
+                                    os.remove(final_path)
+                                os.remove(meta_path)
+        except Exception:
+            if job.get("status") == "completed":
+                return True
+            if not is_cancel_requested(job):
+                finish_job(
+                    job, "failed",
+                    error="The Editor cut could not be exported. Reopen the source and try again.",
+                    message="Editor export failed",
+                )
+            return False
+        finally:
+            unregister_abort_state(job_id, _active_gen_states, abort_state)
 
 
 

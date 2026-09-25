@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { ArrowLeft, Eye, Film, Loader2, Pause, Play, RotateCcw, Save } from 'lucide-react'
-import { getEditorPreviewUrl, openOutputInEditor, projectReferenceSafeErrorMessage, saveEditorProject, type EditorProject } from '../api/client'
+import { ArrowLeft, Download, Eye, Film, Loader2, Pause, Play, RotateCcw, Save } from 'lucide-react'
+import { exportEditorProject, getEditorPreviewUrl, openOutputInEditor, projectReferenceSafeErrorMessage, saveEditorProject, type EditorProject } from '../api/client'
 import { privatePreviewIdentity, privatePreviewWasRevealed, revealPrivatePreview, subscribePrivatePreviewReveal } from '../lib/privatePreview'
 import { useStore } from '../stores/useStore'
 import type { OutputFile } from '../types'
@@ -43,8 +43,11 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
   const [playbackError, setPlaybackError] = useState(false)
   const [loading, setLoading] = useState(true)
   const [playing, setPlaying] = useState(false)
+  const [exportState, setExportState] = useState<'idle' | 'submitting' | 'queued'>('idle')
+  const [exportError, setExportError] = useState('')
   const preview = useRef<HTMLVideoElement>(null)
   const saving = useRef(false)
+  const exporting = useRef(false)
   const editVersion = useRef(0)
   const sourceAsset = project?.assets['source-video']
   const privateIdentity = privatePreviewIdentity(source.workspace, source.name, sourceAsset?.output_revision ?? source.revision)
@@ -111,6 +114,8 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
     editVersion.current += 1
     setSaveState('unsaved')
     setError('')
+    setExportState('idle')
+    setExportError('')
     preview.current?.pause()
     setPlaying(false)
   }
@@ -122,6 +127,25 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
   const percentStart = duration > 0 ? trimStart / duration * 100 : 0
   const percentWidth = duration > 0 ? (trimEnd - trimStart) / duration * 100 : 0
   const canTrim = duration >= 0.1 && Boolean(clip)
+
+  const handleExport = async () => {
+    if (!project || !canTrim || saveState !== 'saved' || saving.current || exporting.current) return
+    exporting.current = true
+    const version = editVersion.current
+    setExportState('submitting')
+    setExportError('')
+    try {
+      await exportEditorProject(source.workspace, project)
+      setExportState(editVersion.current === version ? 'queued' : 'idle')
+    } catch (reason) {
+      setExportState('idle')
+      if (editVersion.current === version) {
+        setExportError(projectReferenceSafeErrorMessage(reason, 'Could not queue this export. Try again.'))
+      }
+    } finally {
+      exporting.current = false
+    }
+  }
 
   const handleBack = async () => {
     if (saving.current || saveState === 'saving') return
@@ -201,7 +225,15 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
                 <div><dt className="text-text-muted">Selected</dt><dd className="tabular-nums">{displayTime(trimEnd - trimStart)}</dd></div>
               </dl>
               <p className="mt-6 border-t border-border pt-5 text-sm leading-relaxed text-text-secondary">Your original video stays intact. This cut is saved as an editable draft in the project.</p>
-              <p className="mt-3 text-xs text-text-muted">Video export will be added in a later Editor update.</p>
+              <button type="button" onClick={() => { void handleExport() }}
+                disabled={!canTrim || saveState !== 'saved' || exportState !== 'idle'}
+                className="mt-5 flex min-h-11 w-full items-center justify-center gap-2 rounded-lg border border-border bg-bg-primary px-4 text-sm font-medium text-text-primary hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50">
+                {exportState === 'submitting' ? <Loader2 size={16} className="animate-spin motion-reduce:animate-none" aria-hidden="true" /> : <Download size={16} aria-hidden="true" />}
+                {exportState === 'submitting' ? 'Queuing export…' : exportState === 'queued' ? 'Export queued' : 'Export MP4'}
+              </button>
+              {exportState === 'queued' && <p className="mt-3 text-xs leading-relaxed text-text-secondary" role="status">Track the export in Queue. The finished MP4 will appear in Gallery.</p>}
+              {exportError && <p className="mt-3 text-sm text-red-400" role="alert">{exportError}</p>}
+              {saveState !== 'saved' && <p className="mt-3 text-xs text-text-muted">The cut must finish saving before export.</p>}
             </aside>
           </div>
 

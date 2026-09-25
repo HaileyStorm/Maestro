@@ -57,6 +57,7 @@ for (const viewport of [
     await skipWelcome(page)
     api!.setAccountScenario('remote-user')
     const saves: Array<{ expected_revision: number; source_in: number }> = []
+    const exports: Array<{ expected_revision: number; url: string }> = []
     const previewRevisions: string[] = []
     let releaseFirstSave!: () => void
     const firstSaveGate = new Promise<void>(resolve => { releaseFirstSave = resolve })
@@ -95,6 +96,12 @@ for (const viewport of [
       await route.fulfill({ status: 200, contentType: 'application/json',
         body: JSON.stringify({ project: editorProject(saves.length + 1, sourceIn) }) })
     })
+    await page.route(/\/api\/v1\/projects\/[^/]+\/editor\/projects\/[^/]+\/exports$/, route => {
+      exports.push({ expected_revision: route.request().postDataJSON().expected_revision,
+        url: route.request().url() })
+      return route.fulfill({ status: 200, contentType: 'application/json',
+        body: JSON.stringify({ job_id: 'synthetic-export', status: 'queued' }) })
+    })
 
     await page.goto('/')
     await page.getByRole('tab', { name: 'Gallery' }).click()
@@ -118,6 +125,7 @@ for (const viewport of [
     await expect(page.getByRole('status').filter({ hasText: 'Unsaved changes' })).toBeVisible()
     await page.getByRole('button', { name: 'Gallery' }).click()
     await expect.poll(() => saves.length).toBe(1)
+    await expect(page.getByRole('button', { name: 'Export MP4' })).toBeDisabled()
     await start.press('ArrowRight')
     releaseFirstSave()
     await expect(page.getByRole('main', { name: 'Video Editor' })).toBeVisible()
@@ -126,5 +134,10 @@ for (const viewport of [
     expect(saves[1].expected_revision).toBe(2)
     expect(saves[1].source_in).toBeGreaterThan(saves[0].source_in)
     await expect(page.getByRole('status').filter({ hasText: 'Draft saved' })).toBeVisible()
+    await page.getByRole('button', { name: 'Export MP4' }).click()
+    await expect(page.getByRole('status').filter({ hasText: 'Track the export in Queue' })).toBeVisible()
+    expect(exports).toHaveLength(1)
+    expect(exports[0].expected_revision).toBe(3)
+    expect(exports[0].url).toContain('/projects/Synthetic%20project/editor/projects/synthetic-cut/exports')
   })
 }
