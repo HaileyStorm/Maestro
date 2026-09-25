@@ -940,7 +940,17 @@ turn and wave are not clearly visible in those samples, so prompt adherence
 remains partial. The signed-in queue returned idle and the joined video
 appeared in Gallery through stable-share. An approval click near the automatic
 plan deadline briefly displayed a stale-review conflict while the server
-auto-approved and completed the job; that confusing UI race remains open.
+auto-approved and completed the job. The UI reconciliation fix in `c2b7a69`
+checks the authoritative job state once after a failed approval. When that same
+project job has already left review, it closes the stale editor, updates the
+queue entry, and resumes the existing queue-aware poller; a genuinely pending
+review keeps its error visible. The full local CI gate passed on September 25:
+5,358 backend tests (17 skipped), JSON grammar, 722 UI tests, type-check, and
+production build. A coordinated Pinokio restart then reached local `/health`
+and `/ready`, the direct Cloudflare tunnel, and stable-share `/health` and
+`/ready`; a signed-in stable-share browser reopened an existing project and
+Gallery output. The precise deadline-click race has not been re-enacted in a
+live browser, so that interaction still needs production acceptance.
 Owner visual and listening acceptance remains open.
 
 ### 2026-09-23 SageAttention2++ candidate kernel check
