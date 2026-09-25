@@ -164,10 +164,15 @@ candidate until this state is reconciled.
 Starting Maestro remains the only runtime action. After Pinokio reports its
 Quick Tunnel, the local helper updates the Worker over the authenticated target
 endpoint, then polls authenticated health for up to about one minute to allow
-Workers KV's eventual propagation at the updating edge. Only after that edge
-reports the exact current target does Maestro display/register the stable URL.
-Any missing, unauthorized, unhealthy, or still-stale Worker falls back to the
-current Quick Tunnel.
+Workers KV's eventual propagation at the updating edge. The helper verifies
+the public `/direct` route points to this launch's exact Quick Tunnel, then probes
+public `/health` and `/ready` through the stable hostname, following only an
+exact redirect to the current Quick Tunnel when redirect rollback is selected.
+These probes share a one-minute verification deadline. Only after the target
+matches and those public probes pass does Maestro
+display/register the stable URL and clear a matching restart notice. A target
+update alone cannot establish public readiness. Any missing, unauthorized,
+unhealthy, or still-stale Worker falls back to the current Quick Tunnel.
 
 Workers KV is globally eventually consistent. A different edge can briefly
 retain the previous launch's target or restart status even after local

@@ -111,6 +111,12 @@ class StableShareRegistrationTests(unittest.TestCase):
                 return _Response({
                     "ok": True, "configured": True, "target": expected_health_target,
                 })
+            if request.full_url == self.stable + "/.well-known/maestro-share/direct":
+                raise HTTPError(request.full_url, 307, "direct", {"Location": self.quick + "/"}, None)
+            if request.full_url == self.stable + "/health":
+                return _Response({"status": "ok"})
+            if request.full_url == self.stable + "/ready":
+                return _RawResponse(b"")
             body = json.loads(request.data.decode("utf-8"))
             return _Response({"status": "ok", "share_url": body["share_url"]})
 
@@ -127,13 +133,21 @@ class StableShareRegistrationTests(unittest.TestCase):
             sleep=lambda _seconds: None,
         )
         self.assertEqual(selected, (self.stable, "stable"))
-        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(calls), 6)
         self.assertEqual(calls[0].get_method(), "PUT")
         self.assertEqual(json.loads(calls[0].data), {"target": self.quick})
         self.assertEqual(calls[1].get_method(), "GET")
         self.assertEqual(calls[0].get_header("Authorization"), f"Bearer {self.secret}")
         self.assertEqual(calls[1].get_header("Authorization"), f"Bearer {self.secret}")
-        registration = calls[2]
+        self.assertEqual(
+            [request.full_url for request in calls[2:5]],
+            [
+                self.stable + "/.well-known/maestro-share/direct",
+                self.stable + "/health", self.stable + "/ready",
+            ],
+        )
+        self.assertTrue(all(request.get_header("Authorization") is None for request in calls[2:]))
+        registration = calls[5]
         self.assertIsNone(registration.get_header("Authorization"))
         self.assertEqual(json.loads(registration.data), {
             "share_url": self.stable,
@@ -152,7 +166,7 @@ class StableShareRegistrationTests(unittest.TestCase):
             sleep=lambda _seconds: None,
         )
 
-        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(calls), 6)
         for request in calls:
             with self.subTest(url=request.full_url):
                 self.assertEqual(
@@ -206,6 +220,12 @@ class StableShareRegistrationTests(unittest.TestCase):
                     if health_reads < 3 else self.quick
                 )
                 return _Response({"ok": True, "configured": True, "target": target})
+            if request.full_url == self.stable + "/.well-known/maestro-share/direct":
+                raise HTTPError(request.full_url, 307, "direct", {"Location": self.quick + "/"}, None)
+            if request.full_url == self.stable + "/health":
+                return _Response({"status": "ok"})
+            if request.full_url == self.stable + "/ready":
+                return _RawResponse(b"")
             body = json.loads(request.data.decode("utf-8"))
             return _Response({"status": "ok", "share_url": body["share_url"]})
 
@@ -238,6 +258,12 @@ class StableShareRegistrationTests(unittest.TestCase):
                 return _Response({
                     "ok": True, "configured": True, "target": self.quick,
                 })
+            if request.full_url == self.stable + "/.well-known/maestro-share/direct":
+                raise HTTPError(request.full_url, 307, "direct", {"Location": self.quick + "/"}, None)
+            if request.full_url == self.stable + "/health":
+                return _Response({"status": "ok"})
+            if request.full_url == self.stable + "/ready":
+                return _RawResponse(b"")
             body = json.loads(request.data.decode("utf-8"))
             return _Response({"status": "ok", "share_url": body["share_url"]})
 
@@ -253,6 +279,161 @@ class StableShareRegistrationTests(unittest.TestCase):
         self.assertEqual(selected, (self.stable, "stable"))
         self.assertEqual(health_reads, 3)
         self.assertEqual(delays, [5.0, 5.0])
+
+    def test_public_503_after_target_update_does_not_advertise_stable_early(self):
+        calls = []
+        public_reads = 0
+
+        def opener(request, timeout):
+            nonlocal public_reads
+            calls.append(request)
+            if request.full_url.endswith("/.well-known/maestro-share/target"):
+                return _Response({"ok": True, "configured": True, "target": self.quick})
+            if request.full_url.endswith("/.well-known/maestro-share/health"):
+                return _Response({"ok": True, "configured": True, "target": self.quick})
+            if request.full_url == self.stable + "/.well-known/maestro-share/direct":
+                raise HTTPError(request.full_url, 307, "direct", {"Location": self.quick + "/"}, None)
+            if request.full_url == self.stable + "/health":
+                public_reads += 1
+                if public_reads < 3:
+                    raise HTTPError(request.full_url, 503, "origin warming", {}, None)
+                return _Response({"status": "ok"})
+            if request.full_url == self.stable + "/ready":
+                return _RawResponse(b"")
+            body = json.loads(request.data.decode("utf-8"))
+            return _Response({"status": "ok", "share_url": body["share_url"]})
+
+        delays = []
+        selected = self.helper.register_share_url(
+            self.local, self.quick,
+            stable_url=self.stable,
+            update_secret=self.secret,
+            open_request=opener,
+            sleep=delays.append,
+        )
+        self.assertEqual(selected, (self.stable, "stable"))
+        self.assertEqual(public_reads, 3)
+        self.assertEqual(delays, [5.0, 5.0])
+        self.assertEqual(calls[-1].full_url, self.local + "/api/v1/access-context/share-url")
+        self.assertTrue(all(
+            request.get_header("Authorization") is None
+            for request in calls if request.full_url in {
+                self.stable + "/health", self.stable + "/ready",
+            }
+        ))
+
+    def test_public_ready_failure_falls_back_to_quick_without_false_stable_claim(self):
+        calls = []
+
+        def opener(request, timeout):
+            calls.append(request)
+            if request.full_url.endswith("/.well-known/maestro-share/target"):
+                return _Response({"ok": True, "configured": True, "target": self.quick})
+            if request.full_url.endswith("/.well-known/maestro-share/health"):
+                return _Response({"ok": True, "configured": True, "target": self.quick})
+            if request.full_url == self.stable + "/.well-known/maestro-share/direct":
+                raise HTTPError(request.full_url, 307, "direct", {"Location": self.quick + "/"}, None)
+            if request.full_url == self.stable + "/health":
+                return _Response({"status": "ok"})
+            if request.full_url == self.stable + "/ready":
+                raise HTTPError(request.full_url, 503, "not ready", {}, None)
+            body = json.loads(request.data.decode("utf-8"))
+            return _Response({"status": "ok", "share_url": body["share_url"]})
+
+        selected = self.helper.register_share_url(
+            self.local, self.quick,
+            stable_url=self.stable,
+            update_secret=self.secret,
+            open_request=opener,
+            sleep=lambda _seconds: None,
+        )
+        self.assertEqual(selected, (self.quick, "quick"))
+        self.assertEqual(json.loads(calls[-1].data), {
+            "share_url": self.quick,
+            "quick_tunnel_url": self.quick,
+            "stable_verified": False,
+        })
+
+    def test_public_verification_respects_bounded_deadline(self):
+        now = [0.0]
+        calls = []
+
+        def opener(request, timeout):
+            calls.append((request.full_url, timeout))
+            if request.full_url.endswith("/.well-known/maestro-share/target"):
+                return _Response({"ok": True, "configured": True, "target": self.quick})
+            if request.full_url.endswith("/.well-known/maestro-share/health"):
+                now[0] += 55.0
+                return _Response({"ok": True, "configured": True, "target": self.quick})
+            if request.full_url.endswith("/.well-known/maestro-share/direct"):
+                now[0] += timeout
+                raise HTTPError(request.full_url, 307, "direct", {
+                    "Location": self.quick + "/",
+                }, None)
+            self.fail(f"Unexpected request beyond deadline: {request.full_url}")
+
+        selected = self.helper._verified_stable_origin(
+            self.quick, self.stable, self.secret,
+            open_request=opener, sleep=lambda _seconds: self.fail("Unexpected sleep"),
+            monotonic=lambda: now[0],
+        )
+        self.assertIsNone(selected)
+        self.assertEqual([timeout for _, timeout in calls], [10, 10.0, 5.0])
+        self.assertEqual(len(calls), 3)
+
+    def test_redirect_rollback_accepts_only_exact_current_quick_tunnel(self):
+        for redirect_target, expected_kind in (
+            (self.quick, "stable"),
+            ("https://stale.trycloudflare.com", "quick"),
+        ):
+            with self.subTest(redirect_target=redirect_target):
+                calls = []
+
+                def opener(request, timeout):
+                    calls.append(request)
+                    if request.full_url.endswith("/.well-known/maestro-share/target"):
+                        return _Response({"ok": True, "configured": True, "target": self.quick})
+                    if request.full_url.endswith("/.well-known/maestro-share/health"):
+                        return _Response({"ok": True, "configured": True, "target": self.quick})
+                    if request.full_url == self.stable + "/.well-known/maestro-share/direct":
+                        raise HTTPError(request.full_url, 307, "direct", {
+                            "Location": redirect_target + "/",
+                        }, None)
+                    if request.full_url in {self.stable + "/health", self.stable + "/ready"}:
+                        path = request.full_url.removeprefix(self.stable)
+                        raise HTTPError(request.full_url, 307, "redirect", {
+                            "Location": redirect_target + path,
+                        }, None)
+                    if request.full_url == self.quick + "/health":
+                        return _Response({"status": "ok"})
+                    if request.full_url == self.quick + "/ready":
+                        return _RawResponse(b"")
+                    body = json.loads(request.data.decode("utf-8"))
+                    return _Response({"status": "ok", "share_url": body["share_url"]})
+
+                selected = self.helper.register_share_url(
+                    self.local, self.quick,
+                    stable_url=self.stable,
+                    update_secret=self.secret,
+                    open_request=opener,
+                    sleep=lambda _seconds: None,
+                )
+                self.assertEqual(selected[1], expected_kind)
+                self.assertEqual(
+                    any(request.full_url == self.quick + "/ready" for request in calls),
+                    expected_kind == "stable",
+                )
+                self.assertFalse(any(
+                    request.full_url.startswith("https://stale.trycloudflare.com/")
+                    for request in calls
+                ))
+                self.assertTrue(all(
+                    request.get_header("Authorization") is None
+                    for request in calls if request.full_url in {
+                        self.stable + "/health", self.stable + "/ready",
+                        self.quick + "/health", self.quick + "/ready",
+                    }
+                ))
 
     def test_backend_replay_does_not_rewrite_or_recheck_worker_target(self):
         calls = []

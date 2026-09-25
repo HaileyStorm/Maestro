@@ -19,10 +19,14 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 _HEALTH_PATH = "/.well-known/maestro-share/health"
 _UPDATE_PATH = "/.well-known/maestro-share/target"
+_PUBLIC_DIRECT_PATH = "/.well-known/maestro-share/direct"
+_PUBLIC_HEALTH_PATH = "/health"
+_PUBLIC_READY_PATH = "/ready"
 _LOCAL_REGISTRATION_PATH = "/api/v1/access-context/share-url"
 _MAX_RESPONSE_BYTES = 16 * 1024
 _REQUEST_USER_AGENT = "Maestro-Stable-Share/1.0"
 _REQUEST_ACCEPT = "application/json"
+_STABLE_VERIFICATION_BUDGET_SECONDS = 60.0
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -114,6 +118,7 @@ def _json_request(
     payload: dict[str, Any] | None,
     headers: dict[str, str],
     open_request: Callable = _default_open,
+    timeout: float = 10,
 ) -> dict[str, Any]:
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     request = Request(
@@ -126,7 +131,7 @@ def _json_request(
             "Accept": _REQUEST_ACCEPT,
         },
     )
-    with open_request(request, timeout=10) as response:
+    with open_request(request, timeout=timeout) as response:
         if response.status != 200:
             raise ValueError("Share service rejected the request")
         return _read_json_response(response)
@@ -141,6 +146,7 @@ def _verified_stable_origin(
     sleep: Callable[[float], None] = time.sleep,
     health_attempts: int = 13,
     health_interval: float = 5.0,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> str | None:
     if not stable_url or not update_secret:
         return None
@@ -163,6 +169,7 @@ def _verified_stable_origin(
         return None
     if not _confirms_target(updated, quick_url):
         return None
+    deadline = monotonic() + _STABLE_VERIFICATION_BUDGET_SECONDS
     for attempt in range(max(1, health_attempts)):
         try:
             healthy = _json_request(
@@ -171,6 +178,7 @@ def _verified_stable_origin(
                 payload=None,
                 headers=authorization,
                 open_request=open_request,
+                timeout=_remaining_timeout(deadline, monotonic),
             )
         except HTTPError as error:
             if error.code not in {429, 500, 502, 503, 504}:
@@ -180,11 +188,93 @@ def _verified_stable_origin(
             healthy = None
         except (ValueError, TypeError, json.JSONDecodeError):
             return None
-        if healthy is not None and _confirms_target(healthy, quick_url):
+        # The authenticated endpoint confirms only the Worker's target record.
+        # Its public route can still return 503 while the new tunnel warms up.
+        if (
+            healthy is not None
+            and _confirms_target(healthy, quick_url)
+            and _public_route_ready(
+                stable, quick_url, open_request=open_request,
+                deadline=deadline, monotonic=monotonic,
+            )
+        ):
             return stable
         if attempt + 1 < max(1, health_attempts):
-            sleep(health_interval)
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                return None
+            sleep(min(health_interval, remaining))
     return None
+
+
+def _remaining_timeout(deadline: float, monotonic: Callable[[], float]) -> float:
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Stable-share verification deadline passed")
+    return min(10.0, remaining)
+
+
+def _open_public_path(
+    stable: str, quick_url: str, path: str, *, open_request: Callable,
+    deadline: float, monotonic: Callable[[], float],
+):
+    """Read the public route, following only its exact configured rollback target."""
+
+    headers = {"User-Agent": _REQUEST_USER_AGENT, "Accept": _REQUEST_ACCEPT}
+    try:
+        return open_request(
+            Request(stable + path, method="GET", headers=headers),
+            timeout=_remaining_timeout(deadline, monotonic),
+        )
+    except HTTPError as error:
+        location = error.headers.get("Location") if error.headers else None
+        status = error.code
+        error.close()
+        if status != 307 or location != quick_url + path:
+            raise
+        return open_request(
+            Request(quick_url + path, method="GET", headers=headers),
+            timeout=_remaining_timeout(deadline, monotonic),
+        )
+
+
+def _public_route_ready(
+    stable: str, quick_url: str, *, open_request: Callable,
+    deadline: float, monotonic: Callable[[], float],
+) -> bool:
+    """Bind the public route to this tunnel and require app health/readiness."""
+
+    try:
+        direct = Request(
+            stable + _PUBLIC_DIRECT_PATH,
+            method="GET",
+            headers={"User-Agent": _REQUEST_USER_AGENT, "Accept": _REQUEST_ACCEPT},
+        )
+        try:
+            with open_request(direct, timeout=_remaining_timeout(deadline, monotonic)):
+                return False
+        except HTTPError as error:
+            location = error.headers.get("Location") if error.headers else None
+            status = error.code
+            error.close()
+            if status != 307 or location != quick_url + "/":
+                return False
+        with _open_public_path(
+            stable, quick_url, _PUBLIC_HEALTH_PATH, open_request=open_request,
+            deadline=deadline, monotonic=monotonic,
+        ) as response:
+            if response.status != 200:
+                return False
+            health = _read_json_response(response)
+        if health.get("status") != "ok":
+            return False
+        with _open_public_path(
+            stable, quick_url, _PUBLIC_READY_PATH, open_request=open_request,
+            deadline=deadline, monotonic=monotonic,
+        ) as response:
+            return response.status == 200
+    except (HTTPError, URLError, OSError, TimeoutError, ValueError, TypeError, json.JSONDecodeError):
+        return False
 
 
 def _confirms_target(response: dict[str, Any], quick_url: str) -> bool:
