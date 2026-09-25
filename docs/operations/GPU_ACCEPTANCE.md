@@ -1311,3 +1311,24 @@ robot, white eyes and yellow triangular chest mark on a city rooftop at dusk.
 The first failed pre-queue tile remains visible separately. This accepts one
 two-reference image path on this host and transport, not all models, all
 reference combinations or owner aesthetic approval.
+
+## 2026-09-24 coordinated Pinokio restart
+
+A live restart check exposed a Pinokio ordering race: `script.restart` and then
+sequential `script.stop` / `script.start` could leave the old server running,
+while the apparent restart action completed or skipped the replacement. The
+launcher now invokes Pinokio's `pterm stop`, then waits for Pinokio to report
+the old script stopped and for its local listener to close before `script.start`.
+The new start verifies local health and readiness,
+registers the stable Cloudflare route, clears the matching public restart
+notice, and stops the parent restart action.
+
+The final live check ran under a coherent, validated `maestro-local` GPU lease.
+The old backend exited before a new one started. Pinokio then showed only
+`start.js` running; local and stable-share `/health` and `/ready` returned 200;
+the queue remained paused with no running or preparing work; and the public
+restart notice was empty. The signed-in owner browser loaded the project
+Gallery through the stable URL after choosing the project again. The lease was
+withdrawn and its final response denied further use. This verifies one local
+Pinokio restart and this stable access route, not restart behavior on other
+Pinokio versions or operating systems.

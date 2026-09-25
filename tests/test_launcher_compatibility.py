@@ -459,9 +459,9 @@ Promise.resolve(build())
         definition = json.loads(completed.stdout)
         self.assertEqual(
             [step["method"] for step in definition["run"]],
-            ["shell.run", "script.restart"],
+            ["shell.run", "shell.run", "script.start"],
         )
-        publish, restart = definition["run"]
+        publish, stop, start = definition["run"]
         command = publish["params"]["message"][0]
         generation_match = re.search(r"--generation ([A-Za-z0-9_-]{16,64})$", command)
         self.assertIsNotNone(generation_match)
@@ -482,9 +482,15 @@ Promise.resolve(build())
             publish["params"]["on"],
             [{"event": "/MAESTRO_RESTART_STATUS_SET restarting/", "kill": True}],
         )
-        self.assertEqual(restart["params"]["uri"], "start.js")
-        self.assertEqual(restart["params"]["params"], {"restart_generation": generation})
-        self.assertNotIn("script.stop", [step["method"] for step in definition["run"]])
+        self.assertEqual(stop["params"]["path"], "app")
+        self.assertEqual(stop["params"]["venv"], "env")
+        self.assertEqual(stop["params"]["message"], "python scripts/pinokio_restart_stop.py")
+        self.assertEqual(stop["params"]["on"], [
+            {"event": "/MAESTRO_OLD_BACKEND_STOPPED/", "kill": True},
+            {"event": "/MAESTRO_OLD_BACKEND_STOP_FAILED/", "break": True},
+        ])
+        self.assertEqual(start["params"]["uri"], "start.js")
+        self.assertEqual(start["params"]["params"], {"restart_generation": generation})
 
     def test_restart_startup_health_readiness_and_generation_clear_ordering(self):
         definition = self._load_start_with_environment(
@@ -536,6 +542,12 @@ Promise.resolve(build())
                 step.get("params", {}).get("message", []),
             )
         )
+        finish_index = next(
+            index for index, step in enumerate(steps)
+            if step.get("method") == "shell.run"
+            and "stop restart.js" in step.get("params", {}).get("message", "")
+            and "restart.js" in step.get("params", {}).get("message", "")
+        )
 
         self.assertEqual(local_url_index, capture_index + 1)
         self.assertFalse(steps[local_url_index]["params"]["backend_ready"])
@@ -547,6 +559,10 @@ Promise.resolve(build())
         self.assertLess(register_index, health_indexes[0])
         self.assertEqual(ready_indexes[0], health_indexes[0] + 1)
         self.assertEqual(clear_index, ready_indexes[0] + 1)
+        self.assertGreater(finish_index, clear_index)
+        self.assertIn("args.restart_generation", steps[finish_index]["when"])
+        self.assertEqual(steps[finish_index]["params"]["path"], ".")
+        self.assertIn('"{{which(\'pterm\')}}"', steps[finish_index]["params"]["message"])
         clear = steps[clear_index]
         self.assertIn("args.restart_generation", clear["when"])
         self.assertIn("[A-Za-z0-9_-]{16,64}", clear["when"])

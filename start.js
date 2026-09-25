@@ -415,6 +415,15 @@ module.exports = async (kernel) => {
         }
       },
       {
+        when: "{{typeof args.restart_generation === 'string' && /^[A-Za-z0-9_-]{16,64}$/.test(args.restart_generation)}}",
+        method: "shell.run",
+        params: {
+          env: runtimeSecretEnv,
+          path: ".",
+          message: '"{{which(\'pterm\')}}" stop restart.js'
+        }
+      },
+      {
         id: "monitor-cloudflare-share",
         when: cloudflareEnabled,
         method: "process.wait",

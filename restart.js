@@ -1,5 +1,5 @@
 const crypto = require("crypto")
-const { shareHelperSecretEnv } = require("./launcher_secret_env")
+const { runtimeSecretEnv, shareHelperSecretEnv } = require("./launcher_secret_env")
 
 module.exports = async () => {
   const generation = crypto.randomBytes(24).toString("hex")
@@ -19,7 +19,22 @@ module.exports = async () => {
         }]
       }
     }, {
-      method: "script.restart",
+      method: "shell.run",
+      params: {
+        env: runtimeSecretEnv,
+        venv: "env",
+        path: "app",
+        message: "python scripts/pinokio_restart_stop.py",
+        on: [{
+          event: "/MAESTRO_OLD_BACKEND_STOPPED/",
+          kill: true
+        }, {
+          event: "/MAESTRO_OLD_BACKEND_STOP_FAILED/",
+          break: true
+        }]
+      }
+    }, {
+      method: "script.start",
       params: {
         uri: "start.js",
         params: {
