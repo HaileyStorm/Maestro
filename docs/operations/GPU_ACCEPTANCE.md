@@ -1332,3 +1332,31 @@ Gallery through the stable URL after choosing the project again. The lease was
 withdrawn and its final response denied further use. This verifies one local
 Pinokio restart and this stable access route, not restart behavior on other
 Pinokio versions or operating systems.
+
+## 2026-09-25 long H3 source-event review and render
+
+The local signed-in owner UI submitted a two-shot, 27.875-second H3 Turbo 4
+video at 608 × 352 while the main queue was paused. The live review displayed
+three planned segments: 192 and 168 published frames following the first
+authored event, then 309 frames following the second event after the authored
+15-second hard cut. The first event was labelled as continuing beyond segment
+1 and from the preceding segment in segment 2; event 2 appeared in segment 3.
+This checked the browser's current-status plan hydration after a stale queue
+card had hidden those labels despite the API already returning them.
+
+Under exact coordinator grant `maestro-h3-live-20260925-1123`, validated just
+before **Start next** and checked every seven seconds, job
+`530476db5d44464f9c8db0592554b005` advanced through all three segments and
+completed. The local Gallery displayed its final MP4; the queue returned idle.
+The 4,121,362-byte file has 669 H.264 frames at 24 fps and 608 × 352, an exact
+27.875-second duration, and 32 kHz stereo AAC. Audio mean and peak levels were
+-21.6 and -3.9 dB. Its SHA-256
+`3de48f2ac2690d00b9f7ebad8df0fea97d6d22676e5ffa00bb6750ba06e63117`
+matches the producer sidecar. Sampled frames at 2, 10, 17, and 25 seconds show
+the same pilot and the hangar-to-cockpit cut; the 25-second frame has moved
+outside the cockpit, so exact visual adherence throughout the second shot is
+not accepted. This is technical output and sampled-frame evidence, not owner
+quality acceptance. Local and stable Cloudflare `/ready` both returned 200
+afterward; the final Gallery output was checked locally, not through a fresh
+stable-share session. The grant was withdrawn after completion, and its outbox
+returned `denied` while Continuum stayed running.

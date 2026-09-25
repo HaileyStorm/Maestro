@@ -2703,9 +2703,22 @@ test('one-shot plan hydration and the sole recurring poller fence all late winne
     h3SegmentPlan: hydratedPlan,
   })
 
+  const cachedStatus = deferred()
+  pending.set('cached', cachedStatus)
   reset([reviewJob('cached', 1, plan())])
-  await useStore.getState().openH3PlanReview('cached')
-  assert.equal(requests.length, 0)
+  const cachedOpen = useStore.getState().openH3PlanReview('cached')
+  assert.deepEqual(requests, ['cached'])
+  const freshPlan = plan()
+  freshPlan.segments[0].source_events = [{
+    source_index: 1,
+    event_ordinal: 1,
+    continued_from_previous: false,
+    continues_later: false,
+  }]
+  cachedStatus.resolve(apiJobStatus('cached', 'project one', freshPlan, 1))
+  await cachedOpen
+  assert.deepEqual(useStore.getState().pendingH3Plan.segments[0].source_events, freshPlan.segments[0].source_events)
+  assert.deepEqual(useStore.getState().jobs[0].h3SegmentPlan.segments[0].source_events, freshPlan.segments[0].source_events)
   assert.equal(useStore.getState().pendingH3PlanJobId, 'cached')
   useStore.getState().closeH3PlanReview()
 
@@ -2714,7 +2727,7 @@ test('one-shot plan hydration and the sole recurring poller fence all late winne
   reset([reviewJob('switching', 2)])
   const switching = useStore.getState().openH3PlanReview('switching')
   await Promise.resolve()
-  assert.deepEqual(requests, ['switching'])
+  assert.deepEqual(requests, ['cached', 'switching'])
   assert.equal(useStore.getState().pendingH3PlanWorkspace, 'project one')
   useStore.setState({ activeWorkspace: 'project two' })
   switched.resolve(apiJobStatus('switching', 'project one', plan(), 2))
@@ -2766,6 +2779,7 @@ test('one-shot plan hydration and the sole recurring poller fence all late winne
   assert.equal(useStore.getState().pendingH3PlanJobId, null)
   assert.equal(useStore.getState().pendingH3Plan, null)
   assert.deepEqual(requests, [
+    'cached',
     'switching',
     'valid-owner',
     'fresh-job',

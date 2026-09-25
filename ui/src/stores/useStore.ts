@@ -8407,7 +8407,9 @@ export const useStore = create<AppState>((set, get) => ({
       h3PlanReviewError: null,
     })
     try {
-      const status = initial.h3SegmentPlan ? null : await api.fetchJobStatus(jobId)
+      // A list card can retain a plan from before the server enriches its review projection.
+      // Open the review from the current job status, including source-event ownership.
+      const status = await api.fetchJobStatus(jobId)
       const current = get().jobs.find(job => job.id === jobId)
       if (
         sequence !== _h3PlanReviewSequence
@@ -8421,7 +8423,7 @@ export const useStore = create<AppState>((set, get) => ({
         || !current
         || current.workspace !== workspace
         || current.status !== 'waiting_for_plan_approval'
-        || (status != null && (
+        || (
           status.job_id !== jobId
           || status.workspace !== workspace
           || (
@@ -8430,24 +8432,22 @@ export const useStore = create<AppState>((set, get) => ({
             && current.createdAt !== initial.createdAt
             && status.created_at !== current.createdAt
           )
-        ))
+        )
       ) {
         get().closeH3PlanReview()
         return
       }
-      const plan = status?.h3_segment_plan || current.h3SegmentPlan || null
-      if (!plan || (status && status.status !== 'waiting_for_plan_approval')) {
+      const plan = status.h3_segment_plan
+      if (!plan || status.status !== 'waiting_for_plan_approval') {
         throw new Error('The queued plan is not ready for review.')
       }
       set(s => ({
         pendingH3Plan: plan,
-        pendingH3PlanEstimate: status?.h3_estimate || current.h3Estimate || null,
+        pendingH3PlanEstimate: status.h3_estimate || current.h3Estimate || null,
         pendingH3PlanJobId: jobId,
         pendingH3PlanWorkspace: workspace,
         h3PlanReviewLoading: false,
-        jobs: status
-          ? s.jobs.map(job => job.id === jobId ? _mergeJobStatus(job, status) : job)
-          : s.jobs,
+        jobs: s.jobs.map(job => job.id === jobId ? _mergeJobStatus(job, status) : job),
       }))
     } catch (error) {
       if (
