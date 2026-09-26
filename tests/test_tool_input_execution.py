@@ -181,6 +181,7 @@ class ToolInputExecutionTests(unittest.TestCase):
         self.ns['_chunked_flashvsr_upscale'] = processor
         def revoice(path, voices, **kw):
             self.calls.append((path,voices)); self.assertTrue(Path(path).parent.name.startswith('.tool-'))
+            self.assertFalse(kw['cancel_check']())
             self.assertEqual(list(self.project.glob('*_revoice_*')), [])
             Path(path).write_bytes(b'processed'); return True
         return {

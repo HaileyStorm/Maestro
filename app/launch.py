@@ -61772,6 +61772,7 @@ def _run_tool_revoice(job_id: str):
                         final_path, voice_refs, mode=mode,
                         diffusion_steps=int(params.get("diffusion_steps", 25)),
                         cfg_rate=float(params.get("cfg_rate", 0.5)),
+                        cancel_check=lambda: is_cancel_requested(job),
                     )
                     if is_cancel_requested(job):
                         try:
@@ -66595,15 +66596,19 @@ def _run_generation(
                                 return False
                             print(f"  [Voice Clone] mode={pp_voice_clone_mode} refs={len(pp_voice_clone_refs)} on {fname}")
                             from postprocessing.voice_clone import apply_voice_clone_to_file
-                            apply_voice_clone_to_file(
+                            voice_cloned = apply_voice_clone_to_file(
                                 video_path=video_path,
                                 voice_ref_paths=pp_voice_clone_refs,
                                 mode=pp_voice_clone_mode,
+                                cancel_check=lambda: is_cancel_requested(job),
                             )
-                            print(f"  [Voice Clone] Done: {fname}")
+                            if voice_cloned:
+                                print(f"  [Voice Clone] Done: {fname}")
                         except Exception as vc_err:
                             print(f"  [Voice Clone] Warning: failed on {fname}: {vc_err}")
                             traceback.print_exc()
+                        if is_cancel_requested(job):
+                            return False
 
                 # Post-generation dynamic audio normalization (smooths speaker volume transitions)
                 if success and raw_params.get("tts_dynaudnorm"):
