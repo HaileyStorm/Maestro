@@ -324,8 +324,13 @@ environment. This does not establish GPU generation or owner acceptance.
    publication now support verified crash-result adoption without processor
    replay; FlashVSR scratch files stay in private project staging. One signed-in
    FlashVSR2x and one single-voice SeedVC output completed and survived their
-   first restart. Other variants, cancellation, in-flight crash recovery,
-   speaker/detail quality, and owner acceptance remain open. Gallery Extend and manual flip have CPU/UI/live-flow
+   first restart. A later signed-in 17-second FlashVSR2x was interrupted
+   in flight, held for owner reauthentication, resumed as the same job, and
+   published once; the Gallery result survived a further restart. The UI now
+   rediscovers held jobs immediately after project selection. See
+   [GPU_ACCEPTANCE.md](../operations/GPU_ACCEPTANCE.md). Revoice cancellation and crash recovery,
+   the result-adoption crash window, other variants, speaker/detail quality,
+   and owner acceptance remain open. Gallery Extend and manual flip have CPU/UI/live-flow
    evidence; flip crash-window adoption has CPU simulation evidence, while a
    process-kill/restart check and human acceptance remain distinct.
 2. Complete Music3 native live generation and recovery acceptance after the

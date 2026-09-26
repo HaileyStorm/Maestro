@@ -1411,3 +1411,42 @@ authenticated status read found no active notice. A signed-in stable-share
 browser reopened an existing project Gallery. This is live local and access-
 surface evidence, not a generation, cross-region KV convergence, Windows
 check, or owner visual acceptance.
+
+## 2026-09-26 FlashVSR in-flight crash recovery
+
+An authorized signed-in owner submitted FlashVSR 2x for a 17.167-second H3
+three-clip final in the `h3-draft-tests` project under an exact coordinator
+grant. The backend was interrupted during the running tool job. After the
+coordinated Pinokio restart, the durable queue held that job for remote owner
+reauthentication, with no processor replay and no published upscale. A UI bug
+initially hid the held card: after project selection, the client refreshed
+workspaces but did not reconnect server jobs until a page reload. The client
+now reconnects jobs after the selected project is loaded. Its real-store
+regression test covers a remote restart with `/jobs` unavailable until the
+owner selects the project. In the signed-in stable-share UI, selecting
+`h3-draft-tests` exposed the same held job without a page reload; **Open
+project and resume** advanced it with recovery attempt 1.
+
+Under a fresh coherent 20-minute grant
+`maestro-flashvsr-recovery-01a0a212-20260926b`, the resumed job
+`36b7e467a0344366b17cfb483a5835bb` completed once. Its one published
+MP4 is 26,659,016 bytes with SHA-256
+`ca01f23ec9496c1163dc23ec15f767c5363a188002af9d0e6931071718a02295`,
+matching the producer sidecar. It decodes as 17.184 seconds, 412 HEVC frames
+at 24 fps and 1216 × 704, with 32 kHz stereo AAC. Source and output audio
+decode to the same 549,888 stereo samples; normalized correlation is 0.9996
+after a 1,024-sample codec offset. The signed-in Gallery rose from 32 to 33
+items and showed this result first; the queue was clear. A clean coordinated
+Pinokio restart compacted the completed job out of the active recovery journal
+and the result remained first in the Gallery after project selection. Pinokio
+reported a ready `start.js`; stable Cloudflare root, `/health`, and `/ready`
+returned 200, and the Worker's direct route returned 307. The restart notice
+was cleared, the model unloaded with the restart, and the grant was withdrawn
+with a terminal denied response.
+
+This accepts one FlashVSR in-flight interruption, same-job owner resume,
+single-result publication, audio preservation, first post-completion restart,
+and stable-share Gallery visibility. It does not establish automatic
+unattended resume, Revoice crash recovery, the separate result-adoption crash
+window, other tools or upscale variants, visual detail quality, or owner
+playback acceptance.

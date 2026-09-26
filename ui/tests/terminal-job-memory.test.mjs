@@ -112,7 +112,14 @@ test('real store hydrates failures after account bootstrap and scrubs on identit
       if (workspaceResponse) return workspaceResponse()
       body = { workspaces, active }
     }
-    else if (url.endsWith('/jobs')) body = { jobs: statuses }
+    else if (url.endsWith('/workspaces/active')) {
+      active = JSON.parse(init.body).name
+      body = { status: 'ok', active }
+    }
+    else if (url.endsWith('/jobs')) {
+      if (remote && !active) return Response.json({ detail: 'Select a project' }, { status: 423 })
+      body = { jobs: statuses }
+    }
     else if (url.endsWith('/account/nonce')) body = { nonce: 'test', purpose: JSON.parse(init.body).purpose }
     else if (url.endsWith('/account/logout')) {
       context = accountContext(null)
@@ -246,6 +253,30 @@ test('real store hydrates failures after account bootstrap and scrubs on identit
     assert.equal(accountStore.getState().activeWorkspace, '')
     assert.equal(accountStore.getState().jobs[0].id, failedJob.id)
     assert.equal(memory.loadTerminalJobs('account:a').length, 1)
+  })
+  await t.test('selecting a project after restart rediscovers its held job without reloading', async () => {
+    memory.clearTerminalJobs()
+    context = accountContext('a')
+    remote = true
+    active = ''
+    workspaces = [{ name: 'project-a', project_permissions: ['project.read'] }]
+    statuses = [{
+      job_id: 'held-after-crash', status: 'queued', workspace: 'project-a',
+      progress: 0, step: 0, total_steps: 0, phase: '',
+      message: 'Unlock this project to resume', output_files: [], error: null,
+      queue_held: true, recovery_state: 'blocked_remote_reauth',
+      recovery_actions: ['resume'],
+    }]
+    const store = await freshStore()
+    store.setState({ loadOutputs: async () => true, _pollRecoveredJob: () => {} })
+    await store.getState().loadAccessContext(false)
+    await store.getState().loadWorkspaces()
+    await store.getState().reconnectJobs()
+    assert.deepEqual(store.getState().jobs, [], 'the server hides jobs before project selection')
+    assert.equal(await store.getState().switchWorkspace('project-a'), true)
+    assert.equal(store.getState().jobs[0]?.id, 'held-after-crash')
+    assert.equal(store.getState().jobs[0]?.recoveryState, 'blocked_remote_reauth')
+    statuses = []
   })
   await t.test('only the newest workspace response may publish or erase pending recovery', async () => {
     context = accountContext('a')

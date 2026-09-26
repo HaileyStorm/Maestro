@@ -16289,7 +16289,13 @@ export const useStore = create<AppState>((set, get) => ({
       })
       void get().loadPresets()
       const loaded = await get().loadOutputs()
-      void get().loadWorkspaces()
+      await get().loadWorkspaces()
+      // A restart can clear the remote active project before the browser
+      // reconnects its jobs. Once this project is selected again, discover
+      // held recovery cards from the server instead of waiting for a reload.
+      if (get().activeWorkspace === name && !get().browsingUploads) {
+        await get().reconnectJobs()
+      }
       return loaded && get().activeWorkspace === name && !get().browsingUploads
     } catch (e) {
       console.error('Failed to switch workspace:', e)
