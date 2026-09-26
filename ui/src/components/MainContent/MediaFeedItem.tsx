@@ -157,6 +157,8 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
     setFlipError('')
   }, [file.name, file.workspace, file.revision])
   const privateRevealKey = privatePreviewIdentity(file.workspace, file.name, file.revision)
+  const [videoDecodeFailure, setVideoDecodeFailure] = useState('')
+  const videoPreviewUnavailable = videoDecodeFailure === privateRevealKey
   const [revealedPrivateKey, setRevealedPrivateKey] = useState(() =>
     file.private && privatePreviewWasRevealed(privateRevealKey) ? privateRevealKey : '',
   )
@@ -799,6 +801,10 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
           <div className="flex h-full w-full items-center justify-center bg-bg-active text-text-muted">
             <EyeOff size={24} aria-hidden="true" />
           </div>
+        ) : file.type === 'video' && videoPreviewUnavailable ? (
+          <div role="status" className="max-w-xs px-4 text-center text-xs text-text-muted">
+            This browser cannot display this video preview. Open View for details or download the original.
+          </div>
         ) : file.type === 'video' ? (
           <video
             ref={setVideoElement}
@@ -809,6 +815,12 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
             loop
             className="w-full h-full object-contain"
             muted={!isActive}
+            onLoadedMetadata={event => {
+              if (!event.currentTarget.videoWidth || !event.currentTarget.videoHeight) {
+                setVideoDecodeFailure(privateRevealKey)
+              }
+            }}
+            onError={() => setVideoDecodeFailure(privateRevealKey)}
           />
         ) : file.type === 'audio' ? (
           <div className="flex flex-col items-center gap-4">

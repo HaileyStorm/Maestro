@@ -182,7 +182,7 @@ export function GalleryViewer({ files, initialIdentity, restoreFocus, onClose }:
   const [selectedIdentity, setSelectedIdentity] = useState(initialIdentity)
   const [compareMode, setCompareMode] = useState(false)
   const [revealVersion, setRevealVersion] = useState(0)
-  const [mediaStatus, setMediaStatus] = useState<{ identity: string; state: 'ready' | 'error' } | null>(null)
+  const [mediaStatus, setMediaStatus] = useState<{ identity: string; state: 'ready' | 'error' | 'unsupported-video' } | null>(null)
   const dialogRef = useRef<HTMLDivElement>(null)
   const closeRef = useRef<HTMLButtonElement>(null)
   const touchStart = useRef<{ x: number; y: number } | null>(null)
@@ -296,15 +296,23 @@ export function GalleryViewer({ files, initialIdentity, restoreFocus, onClose }:
                 className="flex min-h-11 items-center gap-2 rounded-full border border-white/30 px-5 text-sm hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
               ><Eye size={16} /> Show preview</button>
             </div>
+          ) : currentStatus === 'unsupported-video' ? (
+            <div role="alert" className="flex max-w-sm flex-col items-center gap-3 text-center text-sm text-white/75">
+              <p>This video was saved, but this browser cannot display its picture. Download the original to play it in a compatible app. For future videos, choose an H.264 output codec in System settings.</p>
+              <a href={file.url} download={file.name} className="rounded-full border border-white/30 px-5 py-3 text-white hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white">Download original video</a>
+            </div>
           ) : currentStatus === 'error' ? (
-            <div role="alert" className="max-w-xs text-center text-sm text-white/75">This media could not be loaded. Try opening it from the Gallery again.</div>
+            <div role="alert" className="flex max-w-xs flex-col items-center gap-3 text-center text-sm text-white/75">
+              <p>This media could not be loaded. Try opening it from the Gallery again.</p>
+              {file.type === 'video' && <a href={file.url} download={file.name} className="rounded-full border border-white/30 px-5 py-3 text-white hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white">Download original video</a>}
+            </div>
           ) : (
             <>
               {currentStatus === 'loading' && (
                 <div role="status" className="absolute flex items-center gap-2 text-sm text-white/70"><Loader2 size={17} className="animate-spin motion-reduce:animate-none" />Loading media...</div>
               )}
               {file.type === 'video' ? (
-                <video key={fileIdentity} src={file.url} controls playsInline preload="metadata" className={`h-full w-full object-contain ${currentStatus === 'loading' ? 'opacity-0' : ''}`} onLoadedMetadata={() => setMediaStatus({ identity: fileIdentity, state: 'ready' })} onError={() => setMediaStatus({ identity: fileIdentity, state: 'error' })} />
+                <video key={fileIdentity} src={file.url} controls playsInline preload="metadata" className={`h-full w-full object-contain ${currentStatus === 'loading' ? 'opacity-0' : ''}`} onLoadedMetadata={event => setMediaStatus({ identity: fileIdentity, state: event.currentTarget.videoWidth > 0 && event.currentTarget.videoHeight > 0 ? 'ready' : 'unsupported-video' })} onError={() => setMediaStatus({ identity: fileIdentity, state: 'error' })} />
               ) : (
                 <ViewerImage key={fileIdentity} file={file} status={currentStatus} onReady={() => setMediaStatus({ identity: fileIdentity, state: 'ready' })} onFailure={() => setMediaStatus({ identity: fileIdentity, state: 'error' })} />
               )}
