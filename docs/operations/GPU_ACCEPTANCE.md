@@ -1565,7 +1565,7 @@ client-side fault: Bridge submission did not add its accepted job to the UI
 store before opening Queue. The client now reconnects accepted jobs before
 navigation; a focused UI regression covers the pending state and keeps a
 post-accept refresh error distinct from failed submission. Immediate Queue
-visibility with this client fix has not yet been tested in a new live run.
+visibility was subsequently tested in the third run below.
 The complete CPU-masked local CI gate passed: 5,398 backend tests (17 skipped),
 732 UI tests, JSON grammar checks, and the production type-check/build.
 
@@ -1586,3 +1586,26 @@ Cloudflare readiness, and cleared the exact public restart-status generation.
 The Continuum user service was active again, and the coordinator withdrawal
 invalidated the grant. The owner resource control's live unload path remains
 unverified in this session.
+
+## 2026-09-26 native H3 Bridge immediate Queue acceptance
+
+After the client fix was pushed and deployed through a coordinated restart, a
+third signed-in stable-share Bridge was submitted under a fresh, continuously
+validated 20-minute coordinator grant. Without reloading the browser, Queue
+showed the accepted job first as "being added", then "running" with denoising
+progress, then clear at terminal completion. The selected project's Gallery
+increased to 49 items and showed the new private Bridge final. Reloading after
+a further coordinated restart preserved that final and its preview blur.
+
+FFprobe found a 13.667-second, 328-frame, 1344 × 768 H.264 video at 24 fps
+with AAC. The final producer receipt's media size and SHA-256 matched the file,
+and a complete FFmpeg decode exited without errors. The browser run establishes
+submission-to-Queue visibility and final Gallery persistence, not full video
+playback, continuity quality, soundtrack quality, or owner acceptance.
+
+The coordinated restart cleared its exact public status generation after
+local and stable-share readiness returned. The Continuum user service was
+active, the stable direct route pointed to the current Quick Tunnel, and the
+model was no longer loaded. The coordinator grant was withdrawn; coherent
+validation then rejected further GPU work. The owner Free resources control
+still requires a new password confirmation for its separate live unload test.
