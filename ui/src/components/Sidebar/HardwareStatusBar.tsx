@@ -114,7 +114,9 @@ function ResourceReleaseControl({
   const [confirmationNotice, setConfirmationNotice] = useState<string | null>(null)
   const [waitForActiveWork, setWaitForActiveWork] = useState(false)
   const [status, setStatus] = useState<string | null>(null)
+  const [accountAction, setAccountAction] = useState(false)
   const statusTimer = useRef<number | undefined>(undefined)
+  const setAccountDrawerOpen = useStore(state => state.setAccountDrawerOpen)
 
   useEffect(() => () => window.clearTimeout(statusTimer.current), [])
 
@@ -133,13 +135,25 @@ function ResourceReleaseControl({
 
   const setStatusBriefly = (message: string) => {
     setStatus(message)
+    setAccountAction(false)
     window.clearTimeout(statusTimer.current)
     statusTimer.current = window.setTimeout(() => setStatus(null), 8000)
+  }
+
+  const setStatusForError = (error: unknown) => {
+    if (error instanceof AccountApiError && (error.status === 401 || error.status === 403)) {
+      window.clearTimeout(statusTimer.current)
+      setStatus(resourceReleaseError(error))
+      setAccountAction(true)
+    } else {
+      setStatusBriefly(resourceReleaseError(error))
+    }
   }
 
   const openPreview = async () => {
     setOpening(true)
     setStatus(null)
+    setAccountAction(false)
     setConfirmationNotice(null)
     setWaitForActiveWork(false)
     try {
@@ -148,7 +162,7 @@ function ResourceReleaseControl({
       setSelection('all')
       setConfirmOpen(true)
     } catch (error) {
-      setStatusBriefly(resourceReleaseError(error))
+      setStatusForError(error)
     } finally {
       setOpening(false)
     }
@@ -212,10 +226,16 @@ function ResourceReleaseControl({
         } catch (previewError) {
           setConfirmOpen(false)
           setPreview(null)
-          setStatusBriefly(resourceReleaseError(previewError))
+          setStatusForError(previewError)
         }
       } else {
-        setConfirmationNotice(resourceReleaseError(error))
+        if (error instanceof AccountApiError && (error.status === 401 || error.status === 403)) {
+          setConfirmOpen(false)
+          setPreview(null)
+          setStatusForError(error)
+        } else {
+          setConfirmationNotice(resourceReleaseError(error))
+        }
       }
     } finally {
       setSubmitting(false)
@@ -344,6 +364,19 @@ function ResourceReleaseControl({
       {status && !confirmOpen && (
         <div className={`px-1.5 py-1 text-[10px] text-text-muted break-words ${compact ? 'absolute bottom-full right-0 z-50 mb-2 w-72 max-w-[calc(100vw-2rem)] rounded border border-border bg-bg-primary shadow-lg' : ''}`} role="status" aria-live="polite">
           {status}
+          {accountAction && (
+            <button
+              type="button"
+              onClick={() => {
+                setAccountDrawerOpen(true)
+                setStatus(null)
+                setAccountAction(false)
+              }}
+              className="mt-1 block rounded px-1.5 py-1 font-medium text-accent-blue hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue"
+            >
+              Open Account
+            </button>
+          )}
         </div>
       )}
     </div>
