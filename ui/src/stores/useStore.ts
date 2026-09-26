@@ -3454,6 +3454,7 @@ interface AppState {
   accountProjectMigration: AccountProjectMigrationStatus | null
   accountProjectMigrationLoading: boolean
   accountDrawerOpen: boolean
+  accountDrawerRequestedTab: 'support' | 'account'
   accountSessions: AccountSession[]
   accountUsers: AccountSummary[]
   accountDetailsLoading: boolean
@@ -3468,7 +3469,7 @@ interface AppState {
   supportAdminAccountId: string | null
   supportAdmin: SupportAdminProjection | null
   supportDetailsLoading: boolean
-  setAccountDrawerOpen: (open: boolean) => void
+  setAccountDrawerOpen: (open: boolean, requestedTab?: 'support' | 'account') => void
   loadAccountContext: (refreshProjectsOnIdentityChange?: boolean) => Promise<AccountContext | null>
   loadAccountProjectMigration: () => Promise<AccountProjectMigrationStatus | null>
   migrateAccountProjects: () => Promise<AccountProjectMigrationStatus | null>
@@ -11668,6 +11669,7 @@ export const useStore = create<AppState>((set, get) => ({
   accountProjectMigration: null,
   accountProjectMigrationLoading: false,
   accountDrawerOpen: false,
+  accountDrawerRequestedTab: 'support',
   accountSessions: [],
   accountUsers: [],
   accountDetailsLoading: false,
@@ -11682,12 +11684,13 @@ export const useStore = create<AppState>((set, get) => ({
   supportAdminAccountId: null,
   supportAdmin: null,
   supportDetailsLoading: false,
-  setAccountDrawerOpen: (open) => {
+  setAccountDrawerOpen: (open, requestedTab = 'support') => {
     if (!open) _supportAdminRequestSequence += 1
     set(open
-      ? { accountDrawerOpen: true }
+      ? { accountDrawerOpen: true, accountDrawerRequestedTab: requestedTab }
       : {
           accountDrawerOpen: false,
+          accountDrawerRequestedTab: 'support',
           supportAdminAccountId: null,
           supportAdmin: null,
           supportDetailsLoading: false,

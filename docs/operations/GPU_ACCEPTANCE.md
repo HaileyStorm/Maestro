@@ -1064,6 +1064,20 @@ The exact GPU grant was withdrawn and its outbox became `denied`; direct local
 and stable-share `/ready` checks still returned 200. The owner has not yet
 reviewed the image or the paused work items.
 
+### 2026-09-26 resource-control reauthentication path
+
+The signed-in stable-share owner session could still generate, but its earlier
+password confirmation had expired. Opening **Free resources** returned the
+expected 403 from the owner resource preview. The UI now keeps that reason
+visible and offers **Open Account**; a signed-in browser check confirmed that
+the button opens the Account tab directly at **Confirm your password**, with
+resource clearing named among the actions that require confirmation. No
+password was entered in this check, so the post-reauth release action was not
+repeated. After the H3 live checks, a coordinated Pinokio restart unloaded the
+resident generation model. System telemetry reported `loaded: false`, local
+and stable-share `/health` and `/ready` returned 200, and the exact GPU grant
+was withdrawn. Maestro remained online.
+
 ## NVFP4 scale-layout check — 2026-09-07 UTC
 
 The CPU fallback now matches the eager reference for padded physical scale

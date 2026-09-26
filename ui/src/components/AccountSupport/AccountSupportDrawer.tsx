@@ -348,6 +348,7 @@ export function AccountSupportDrawer({
   const oneTimeCodesIdentityRef = useRef<string | null>(null)
   const open = useStore(state => state.accountDrawerOpen)
   const setOpen = useStore(state => state.setAccountDrawerOpen)
+  const requestedTab = useStore(state => state.accountDrawerRequestedTab)
   const context = useStore(state => state.accountContext)
   const accessContext = useStore(state => state.accessContext)
   const contextLoading = useStore(state => state.accountContextLoading)
@@ -471,6 +472,13 @@ export function AccountSupportDrawer({
   useEffect(() => {
     if (required && open && activeTab !== 'account') setActiveTab('account')
   }, [activeTab, open, required])
+
+  useEffect(() => {
+    if (open && requestedTab === 'account' && context?.enabled === true) {
+      lifecycleRef.current.opened()
+      setActiveTab('account')
+    }
+  }, [open, requestedTab, context?.enabled])
 
   useEffect(() => {
     if (!publicRegistrationAvailable && entryMode === 'register') {
@@ -1053,7 +1061,7 @@ export function AccountSupportDrawer({
                   }}
                 >
                   <h3 className="text-xs font-semibold text-text-primary">Confirm your password</h3>
-                  <p className="mt-1 text-[10px] text-text-muted">Confirm before changing passwords or recovery codes, signing out other account sessions, or managing users.</p>
+                  <p className="mt-1 text-[10px] text-text-muted">Confirm before freeing Maestro resources, changing passwords or recovery codes, signing out other account sessions, or managing users.</p>
                   <div className="mt-3">
                     <Field label="Current password" value={reauthPassword} onChange={setReauthPassword} type="password" autoComplete="current-password" required />
                   </div>

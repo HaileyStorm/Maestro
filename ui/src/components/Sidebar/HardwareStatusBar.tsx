@@ -368,7 +368,7 @@ function ResourceReleaseControl({
             <button
               type="button"
               onClick={() => {
-                setAccountDrawerOpen(true)
+                setAccountDrawerOpen(true, 'account')
                 setStatus(null)
                 setAccountAction(false)
               }}
