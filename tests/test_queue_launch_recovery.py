@@ -5258,6 +5258,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
         self.assertEqual(worker_calls, [])
 
     def test_completed_h3_requires_exact_adopted_finals_before_terminal_state(self):
+        manifest_params = {"value": {}}
         finality = {
             ("project-a", "job-completed"): {
                 "state": "adopted",
@@ -5272,14 +5273,16 @@ class QueueLaunchWiringTests(unittest.TestCase):
             self.launch,
             ("_queue_recovery_materialize_job",),
             {
+                "os": os,
                 "hmac": hmac,
                 "math": __import__("math"),
                 "time": time,
                 "_PLAN_REVIEW_TIMEOUT_SECONDS": 16.0,
+                "H3_OFFLOAD_PLAN_PARAM_KEY": H3_OFFLOAD_PLAN_PARAM_KEY,
                 "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
                 "_queue_recovery_final_adoption_jobs": finality,
                 "load_request_manifest": lambda *_args, **_kwargs: {
-                    "params": {}, "inputs": [],
+                    "params": dict(manifest_params["value"]), "inputs": [],
                 },
                 "validate_manifest_inputs": lambda *_args: None,
                 "_queue_recovery_manifest_validator": lambda *_args, **_kwargs: True,
@@ -5291,6 +5294,12 @@ class QueueLaunchWiringTests(unittest.TestCase):
                     job.get("model_type") or ""
                 ).startswith("minimax_h3"),
                 "_queue_recovery_worker": lambda _job: None,
+                "_h3_final_output_integrity": lambda *_args, **_kwargs: {
+                    "validation": "valid",
+                },
+                "h3_integrity_is_pending": lambda *_args: False,
+                "h3_integrity_pending_path": lambda *_args: "unused",
+                "_h3_incomplete_recovery_prefix": lambda _job: None,
                 "_queue_recovery_reconcile_cursor": lambda job, _path: job.update({
                     "output_files": [],
                 }),
@@ -5303,6 +5312,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
             "owner_principal": "owner:v1:" + "a" * 64,
             "project_instance": "project:v1:" + "b" * 64,
             "request_manifest": {},
+            "h3_segment_plan": {"published_frames": 124, "fps": 24},
             "recovery_cursor": {
                 "completed_units": [{"kind": "h3_segment"}],
             },
@@ -5372,12 +5382,109 @@ class QueueLaunchWiringTests(unittest.TestCase):
         self.assertIsNone(adopted_queued["failed_child_reason"])
         self.assertNotIn("_recovery_reason_code", adopted_queued)
 
+        expectations = []
+        def verify_expected(_project, _outputs, **expected):
+            expectations.append(expected)
+            return {"validation": "valid"}
+        namespace["_h3_final_output_integrity"] = verify_expected
+        namespace["_queue_recovery_materialize_job"](
+            queued_snapshot, projects,
+        )
+        self.assertEqual(expectations, [{
+            "expected_frames": 124, "expected_fps": 24,
+        }])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = Path(temporary) / ".pending"
+            marker.write_text("pending", encoding="utf-8")
+            namespace["h3_integrity_is_pending"] = lambda *_args: marker.exists()
+            namespace["h3_integrity_pending_path"] = lambda *_args: str(marker)
+            recovered, may_start = namespace[
+                "_queue_recovery_materialize_job"
+            ](queued_snapshot, projects)
+            self.assertFalse(may_start)
+            self.assertEqual(recovered["status"], "completed")
+            self.assertFalse(marker.exists())
+        namespace["h3_integrity_is_pending"] = lambda *_args: False
+
+        no_plan, may_start = namespace[
+            "_queue_recovery_materialize_job"
+        ]({**queued_snapshot, "h3_segment_plan": None}, projects)
+        self.assertFalse(may_start)
+        self.assertEqual(no_plan["status"], "queued")
+        self.assertEqual(
+            no_plan["_recovery_reason_code"], "h3_output_integrity_failed",
+        )
+
+        namespace["_h3_final_output_integrity"] = lambda *_args, **_kwargs: {
+            "validation": "invalid",
+        }
+        unverified, may_start = namespace[
+            "_queue_recovery_materialize_job"
+        ](queued_snapshot, projects)
+        self.assertFalse(may_start)
+        self.assertEqual(unverified["status"], "queued")
+        self.assertTrue(unverified["queue_held"])
+        self.assertEqual(unverified["output_files"], [])
+        self.assertEqual(
+            unverified["_recovery_reason_code"],
+            "h3_output_integrity_failed",
+        )
+        def failing_probe(*_args, **_kwargs):
+            raise RuntimeError("probe failed")
+        namespace["_h3_final_output_integrity"] = failing_probe
+        probe_error, may_start = namespace[
+            "_queue_recovery_materialize_job"
+        ](queued_snapshot, projects)
+        self.assertFalse(may_start)
+        self.assertEqual(probe_error["status"], "queued")
+        self.assertEqual(probe_error["output_files"], [])
+        namespace["_h3_final_output_integrity"] = lambda *_args, **_kwargs: {
+            "validation": "invalid",
+        }
+        sample_unverified, may_start = namespace[
+            "_queue_recovery_materialize_job"
+        ]({
+            **queued_snapshot,
+            "kind": "sample_campaign_generation",
+            "recovery_state": "sample_campaign_held",
+        }, projects)
+        self.assertFalse(may_start)
+        self.assertEqual(sample_unverified["status"], "queued")
+        self.assertTrue(sample_unverified["queue_held"])
+        self.assertEqual(
+            sample_unverified["recovery_state"], "sample_campaign_held",
+        )
+        self.assertEqual(sample_unverified["output_files"], [])
+        namespace["_h3_final_output_integrity"] = lambda *_args, **_kwargs: {
+            "validation": "valid",
+        }
+
+        manifest_params["value"] = {"model_type": "minimax_h3"}
+        rejected_failure, may_start = namespace[
+            "_queue_recovery_materialize_job"
+        ]({
+            **queued_snapshot,
+            "status": "failed",
+            "failure_details": {"code": "h3_output_integrity_failed"},
+        }, projects)
+        self.assertFalse(may_start)
+        self.assertEqual(rejected_failure["status"], "failed")
+        self.assertEqual(rejected_failure["output_files"], [])
+        manifest_params["value"] = {}
+
+        namespace["_h3_final_output_integrity"] = lambda *_args, **_kwargs: {
+            "validation": "invalid",
+        }
         cancelled_queued, may_start = namespace[
             "_queue_recovery_materialize_job"
         ]({**queued_snapshot, "cancel_requested": True}, projects)
         self.assertFalse(may_start)
         self.assertEqual(cancelled_queued["status"], "cancelled")
         self.assertEqual(cancelled_queued["recovery_state"], "cancelled")
+        namespace["_h3_final_output_integrity"] = lambda *_args, **_kwargs: {
+            "validation": "valid",
+        }
 
         ordinary_queued = {
             **queued_snapshot,
@@ -9587,12 +9694,16 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 ("_publish_h3_delivery_outputs",),
                 {
                     "os": os, "json": json, "time": time,
+                    "logging": __import__("logging"),
                     "_sample_campaign_transition_lock": transition,
                     "_SAMPLE_CAMPAIGN_JOB_KIND": "sample_campaign_generation",
                     "update_job": publisher,
                     "is_cancel_requested": lambda _job: False,
                     "_atomic_write_json": atomic_json,
                     "stamp_sidecar_policy": stamp_sidecar_policy,
+                    "_h3_final_output_integrity": lambda *_args: {
+                        "validation": "valid", "reports": [],
+                    },
                 },
             )
             result = []
@@ -9689,13 +9800,80 @@ class QueueLaunchWiringTests(unittest.TestCase):
         )
         publish = worker.index("published_outputs = record_job_outputs(")
         sidecar = worker.index("_write_output_sidecars(new_files", publish)
-        gate = worker.index("name in published_outputs", publish)
+        gate = worker.index("job.get(\"artifact_files\") or []", publish)
         self.assertLess(gate, sidecar)
+        self.assertIn("if _defer_h3_final_publication(job)", worker[publish:sidecar])
         lock = worker.rfind("with _sample_campaign_transition_lock:", 0, publish)
         self.assertGreater(lock, 0)
         self.assertLess(lock, publish)
         self.assertGreaterEqual(worker.count("sample_safe_unit_current(abort_state)"), 7)
         self.assertNotIn("\n                        _queue_recovery_checkpoint_unit(", worker)
+
+    def test_h3_failed_variant_keeps_earlier_verified_finals(self):
+        namespace = _isolated_functions(
+            self.launch,
+            ("_h3_verified_published_outputs",),
+            {"h3_integrity_is_pending": lambda _root, name: name == "pending.mp4"},
+        )
+        outputs = namespace["_h3_verified_published_outputs"](
+            {"output_files": [
+                "earlier-valid.mp4", "current-valid.mp4", "rejected.mp4",
+                "pending.mp4",
+            ]},
+            "/unused", ["rejected.mp4"],
+        )
+        self.assertEqual(outputs, ["earlier-valid.mp4", "current-valid.mp4"])
+        worker = ast.get_source_segment(
+            self.launch_source, _function(self.launch, "_run_generation"),
+        )
+        completion = worker.index("published = finish_job(")
+        self.assertIn(
+            "_h3_verified_published_outputs(", worker[completion:completion + 400],
+        )
+
+    def test_h3_pending_marker_write_failure_quarantines_fresh_media(self):
+        sidecar_writer = _function(self.launch, "_write_output_sidecars")
+        module = ast.Module(body=[sidecar_writer], type_ignores=[])
+        ast.fix_missing_locations(module)
+
+        class StageFailure(RuntimeError):
+            def __init__(self, message, **_details):
+                super().__init__(message)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            media = root / "fresh.mp4"
+            media.write_bytes(b"media")
+            namespace = {
+                "os": os, "json": json, "time": time, "uuid": uuid,
+                "job": {
+                    "params": {"generation_mode": "video"},
+                    "access_policy": {"private": True},
+                    "workspace": "default",
+                },
+                "job_id": "h3-test", "start_time": time.time(),
+                "out_dir": str(root), "clip_output_files": {},
+                "producer_artifact_roles": {"fresh.mp4": "final"},
+                "pp_film_grain_intensity": 0,
+                "pp_spatial_upsampling": None,
+                "pp_delivery_resolution": None,
+                "requested_model": "h3", "_H3_LONG_STUDIO_MODELS": {"h3"},
+                "GENERATED_MEDIA_EXTENSIONS": {".mp4"},
+                "_RECOVERY_ARTIFACT_ROLES": {"final", "component", "window", "temporary"},
+                "_prepare_generation_sidecar_params": lambda params: ([], dict(params)),
+                "_strip_director_image_role_internals": lambda _params: None,
+                "_extract_output_seed": lambda _name: None,
+                "stamp_sidecar_policy": stamp_sidecar_policy,
+                "h3_integrity_pending_path": lambda _root, _name: str(root / ".pending"),
+                "_atomic_write_json": mock.Mock(side_effect=OSError("marker write failed")),
+                "_GenerationStageFailure": StageFailure,
+            }
+            exec(compile(module, "isolated-h3-sidecar", "exec"), namespace)
+            with self.assertRaises(StageFailure):
+                namespace["_write_output_sidecars"](["fresh.mp4"])
+            self.assertFalse(media.exists())
+            self.assertFalse((root / "fresh.meta.json").exists())
+            self.assertEqual(len(list(root.glob(".private-sidecar-failed-*-fresh.mp4"))), 1)
 
     def test_final_adoption_runs_before_cleanup_index_and_workers(self):
         restore = ast.get_source_segment(

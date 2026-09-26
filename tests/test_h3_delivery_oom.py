@@ -7,6 +7,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -355,6 +356,7 @@ class H3DeliveryTransactionTests(unittest.TestCase):
             return True
 
         namespace = {
+            "logging": logging,
             "wgp": SimpleNamespace(server_config={"vram_safety_coefficient": 0.8}),
             "is_cancel_requested": cancel,
             "update_job": update,
@@ -365,6 +367,9 @@ class H3DeliveryTransactionTests(unittest.TestCase):
             "_apply_delivery_fit_to_file": fit,
             "_persist_h3_delivery_oom_info": Mock(return_value=True),
             "_persist_h3_delivery_failure_details": Mock(return_value=True),
+            "_h3_final_output_integrity": Mock(return_value={
+                "validation": "valid", "reports": [],
+            }),
         }
         symbols = _load_launch_symbols(
             "_H3DeliveryFailure",
@@ -614,6 +619,30 @@ class H3DeliveryTransactionTests(unittest.TestCase):
         self.assertTrue(retained["private"])
         self.assertEqual(retained["workspace"], "project-a")
         self.assertEqual(retained["artifact_class"], "temporary")
+
+    def test_invalid_delivered_media_rolls_back_before_final_publication(self):
+        symbols, _ = self._symbols(Mock(), Mock())
+        integrity = Mock(return_value={"validation": "invalid", "reports": []})
+        symbols["_h3_final_output_integrity"] = integrity
+        self.job["h3_segment_plan"] = {"published_frames": 124, "fps": 24}
+        self.job["params"] = {"delivery_resolution": "1920x1080"}
+        staged = symbols["_stage_h3_delivery_native_outputs"](
+            self.job, self.out_dir, self.files,
+        )
+        symbols["_reset_h3_delivery_work"](staged)
+        with self.assertRaises(symbols["_H3DeliveryFailure"]) as caught:
+            symbols["_publish_h3_delivery_outputs"](self.job, staged)
+        self.assertEqual(caught.exception.code, "h3_output_integrity_failed")
+        integrity.assert_called_once_with(
+            self.out_dir, self.files, expected_frames=124, expected_fps=24.0,
+            expected_resolution=(1920, 1080),
+        )
+        self.assertEqual(self.job["output_files"], [])
+        self.assertFalse(any(Path(self.out_dir, name).exists() for name in self.files))
+        for item in staged:
+            sidecar = json.loads(Path(item["source_meta"]).read_text(encoding="utf-8"))
+            self.assertTrue(sidecar["private"])
+            self.assertEqual(sidecar["artifact_class"], "temporary")
 
     def test_cancel_after_lifecycle_update_retracts_and_rolls_back_final(self):
         def upscale(

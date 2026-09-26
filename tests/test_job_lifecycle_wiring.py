@@ -445,6 +445,7 @@ class TestJobLifecycleWiring(unittest.TestCase):
                     "task_sidecar_params": {},
                     "producer_artifact_roles": {}, "recovery_staging_dir": None,
                     "h3_delivery_request": delivery, "sample_worker": False,
+                    "_defer_h3_final_publication": lambda _job: False,
                     "abort_state": None, "_active_gen_states": {},
                     "_sample_campaign_transition_lock": threading.RLock(),
                     "sample_safe_unit_current": lambda _state: True,

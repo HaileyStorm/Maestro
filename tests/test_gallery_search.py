@@ -15,6 +15,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -32,9 +33,12 @@ try:
         SearchIndex,
         artifact_matches_scope,
         classify_gallery_artifacts,
+        h3_integrity_is_pending,
+        h3_integrity_pending_path,
         linked_component_names,
         load_media_sidecars,
     )
+    from services.queue_recovery_runtime import quarantine_artifact  # noqa: E402
     from services.win_safe_files import (  # noqa: E402
         is_safe_direct_basename,
         is_safe_workspace_name,
@@ -85,6 +89,44 @@ def _write_sidecar(workspace: str, media_name: str, **updates) -> str:
 
 
 class GallerySearchTests(unittest.TestCase):
+    def test_locked_h3_invalid_media_keeps_its_sidecar_and_pending_marker(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            name = "invalid.mp4"
+            _touch_media(workspace, name)
+            sidecar = _write_sidecar(workspace, name)
+            marker = h3_integrity_pending_path(workspace, name)
+            Path(marker).write_text('{"pending":true}', encoding="utf-8")
+            with patch(
+                "services.queue_recovery_runtime.os.replace",
+                side_effect=PermissionError("viewer lock"),
+            ):
+                quarantine_artifact(workspace, {"basename": name})
+            self.assertTrue(Path(workspace, name).exists())
+            self.assertTrue(Path(sidecar).exists())
+            self.assertTrue(h3_integrity_is_pending(workspace, name))
+            self.assertEqual(SearchIndex().search("copper", workspace), set())
+
+    def test_h3_pending_marker_withholds_final_without_rewriting_sealed_sidecar(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            name = "joined.mp4"
+            _touch_media(workspace, name)
+            sidecar = _write_sidecar(
+                workspace, name,
+                producer_unit_kind="h3_concat",
+                artifact_class="final",
+                producer_artifact_class="final",
+            )
+            original = Path(sidecar).read_bytes()
+            index = SearchIndex()
+            self.assertEqual(index.search("copper", workspace), {name})
+            marker = h3_integrity_pending_path(workspace, name)
+            Path(marker).write_text('{"pending":true}', encoding="utf-8")
+            self.assertTrue(h3_integrity_is_pending(workspace, name))
+            self.assertEqual(index.search("copper", workspace), set())
+            self.assertEqual(Path(sidecar).read_bytes(), original)
+            os.remove(marker)
+            self.assertEqual(index.search("copper", workspace), {name})
+
     def test_sidecar_maps_to_exact_extension_when_stems_collide(self):
         with tempfile.TemporaryDirectory() as workspace:
             _touch_media(workspace, "same.png")
@@ -363,6 +405,25 @@ class ArtifactClassificationTests(unittest.TestCase):
             {name for name, role in classes.items() if role == "final"},
             {"delivery.mp4"},
         )
+
+    def test_failed_h3_integrity_never_appears_as_gallery_final(self):
+        classes = classify_gallery_artifacts([{
+            "name": "failed-join.mp4",
+            "meta": {
+                "producer_unit_kind": "h3_concat",
+                "producer_artifact_class": "final",
+                "artifact_class": "final",
+                "output_integrity_failed": True,
+            },
+        }, {
+            "name": "failed-without-unit.mp4",
+            "meta": {
+                "artifact_class": "final",
+                "output_integrity_failed": True,
+            },
+        }])
+        self.assertEqual(classes["failed-join.mp4"], "temporary")
+        self.assertEqual(classes["failed-without-unit.mp4"], "temporary")
 
     def test_director_rejoin_is_a_modern_final_not_a_component(self):
         classes = classify_gallery_artifacts([
@@ -749,11 +810,13 @@ class GalleryApiUiContractTests(unittest.TestCase):
             launch.index('@api.get("/api/v1/file/{filename:path}")')
         ]
         authorization = route.index("_require_project_access(")
+        integrity_filter = route.index("h3_integrity_is_pending(out_dir, entry[0])")
         artifact_filter = route.index("artifact_matches_scope")
         media_filter = route.index("normalized_media_type")
         total = route.index("total = len(files)")
         pagination = route.index("files = files[offset:offset + limit]")
-        self.assertLess(authorization, artifact_filter)
+        self.assertLess(authorization, integrity_filter)
+        self.assertLess(integrity_filter, artifact_filter)
         self.assertLess(artifact_filter, media_filter)
         self.assertLess(media_filter, total)
         self.assertLess(total, pagination)

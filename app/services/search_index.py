@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
+import hashlib
 import json
 import math
 import os
@@ -26,6 +27,22 @@ GALLERY_MEDIA_EXTENSIONS = {
     ".wav", ".mp3", ".flac", ".ogg",
 }
 ARTIFACT_CLASSES = {"final", "component", "window", "temporary"}
+
+
+def h3_integrity_pending_path(workspace_dir: str, media_name: str) -> str:
+    """Private marker that withholds a media basename without resealing its sidecar."""
+    if (
+        not isinstance(media_name, str)
+        or not media_name
+        or os.path.basename(media_name) != media_name
+    ):
+        raise ValueError("Invalid H3 output basename")
+    digest = hashlib.sha256(media_name.encode("utf-8")).hexdigest()
+    return os.path.join(workspace_dir, f".h3-integrity-pending-{digest}.pending")
+
+
+def h3_integrity_is_pending(workspace_dir: str, media_name: str) -> bool:
+    return os.path.lexists(h3_integrity_pending_path(workspace_dir, media_name))
 _STRUCTURED_SEARCH_KEYS = {"model", "lora", "seed", "reference", "after", "before"}
 _REFERENCE_PARAM_KEYS = {
     "image_start", "image_end", "image_refs", "image_guide", "video_guide",
@@ -150,6 +167,8 @@ _RECOVERY_FIXED_ROLES = {
 
 def _modern_producer_role(meta: Mapping[str, object]) -> Optional[str]:
     """Resolve modern recovery roles without trusting a media filename."""
+    if meta.get("output_integrity_failed") is True:
+        return "temporary"
     kind = meta.get("producer_unit_kind")
     if not isinstance(kind, str) or not kind:
         return None
@@ -521,6 +540,7 @@ class SearchIndex:
         for name in names:
             if not (
                 name.endswith(".meta.json")
+                or (name.startswith(".h3-integrity-pending-") and name.endswith(".pending"))
                 or os.path.splitext(name)[1].lower() in GALLERY_MEDIA_EXTENSIONS
             ):
                 continue
@@ -540,6 +560,8 @@ class SearchIndex:
         state.documents.clear()
         sidecars = load_media_sidecars(workspace)
         for media_name, meta in sidecars.items():
+            if h3_integrity_is_pending(workspace, media_name):
+                continue
             media_created_at = 0.0
             media_path = os.path.join(workspace, media_name)
             if _direct_file(workspace, media_name):

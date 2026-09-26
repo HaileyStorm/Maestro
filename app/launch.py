@@ -7368,8 +7368,14 @@ def _queue_recovery_materialize_job(
             and h3_classifier(runtime.get("model_type"))
         )
     )
+    failure_details = snapshot.get("failure_details")
+    integrity_failed_snapshot = bool(
+        isinstance(failure_details, dict)
+        and failure_details.get("code") == "h3_output_integrity_failed"
+    )
     verified_h3_final_adoption = bool(
         verified_final_adoption and h3_final_adoption_required
+        and not integrity_failed_snapshot
     )
     publication_recovery = globals().get(
         "_project_reference_publication_recovery_requested"
@@ -7381,9 +7387,58 @@ def _queue_recovery_materialize_job(
     blocked_reason = "Recovery project is missing or was recreated"
     blocked_code = "project_missing_or_recreated"
     manifest = None
+    integrity_recovery_failed = False
     if current is not None and hmac.compare_digest(current[1], expected_project):
         runtime["out_dir"] = current[0]
-        if project_reference_finalization or verified_h3_final_adoption:
+        if (
+            verified_h3_final_adoption
+            and not snapshot.get("cancel_requested")
+            and str(snapshot.get("status") or "").casefold()
+            not in {"completed", "failed", "cancelled", "canceled"}
+        ):
+            verifier = globals().get("_h3_final_output_integrity")
+            duration_plan = snapshot.get("h3_segment_plan")
+            duration_plan = (
+                duration_plan if isinstance(duration_plan, dict) else {}
+            )
+            expected_frames = duration_plan.get("published_frames")
+            expected_fps = duration_plan.get("fps")
+            integrity = {"validation": "unverified"}
+            if (
+                callable(verifier)
+                and type(expected_frames) is int and expected_frames > 0
+                and type(expected_fps) in {int, float} and expected_fps > 0
+            ):
+                try:
+                    integrity = verifier(
+                        current[0], adopted_outputs,
+                        expected_frames=expected_frames,
+                        expected_fps=expected_fps,
+                    )
+                except Exception:
+                    pass
+            if integrity.get("validation") != "valid":
+                verified_h3_final_adoption = False
+                integrity_recovery_failed = True
+            else:
+                pending = globals().get("h3_integrity_is_pending")
+                marker_path = globals().get("h3_integrity_pending_path")
+                if not callable(pending) or not callable(marker_path):
+                    verified_h3_final_adoption = False
+                    integrity_recovery_failed = True
+                else:
+                    try:
+                        for name in adopted_outputs:
+                            if pending(current[0], name):
+                                os.remove(marker_path(current[0], name))
+                    except OSError:
+                        verified_h3_final_adoption = False
+                        integrity_recovery_failed = True
+        if (
+            project_reference_finalization
+            or verified_h3_final_adoption
+            or integrity_recovery_failed
+        ):
             # Completion-only recovery is authorized entirely by the sealed,
             # content-free recovery unit/receipt and committed asset evidence.
             # It must never reload private request inputs or rerun generation.
@@ -7422,7 +7477,11 @@ def _queue_recovery_materialize_job(
                     # identity. The sealed manifest is authoritative before
                     # the sample completion branch can publish either arm.
                     h3_final_adoption_required = True
-                    verified_h3_final_adoption = verified_final_adoption
+                    verified_h3_final_adoption = bool(
+                        verified_final_adoption
+                        and not integrity_failed_snapshot
+                        and not integrity_recovery_failed
+                    )
                 if (
                     str(runtime["params"].get("model_type") or "").startswith(
                         "minimax_h3"
@@ -7454,6 +7513,23 @@ def _queue_recovery_materialize_job(
         runtime["artifact_files"] = artifacts
 
     status = str(snapshot.get("status") or "queued").casefold()
+    if integrity_recovery_failed and not blocked_reason:
+        runtime.update({
+            "status": "queued",
+            "queue_held": True,
+            "resource_state": "queued",
+            "recovery_state": (
+                "sample_campaign_held"
+                if snapshot.get("kind") == "sample_campaign_generation"
+                else "blocked"
+            ),
+            "reruns_denoise": False,
+            "output_files": [],
+            "_recovery_reason_code": "h3_output_integrity_failed",
+            "message": "Final video verification failed; review the output before retrying",
+            "error": None,
+        })
+        return runtime, False
     if (
         snapshot.get("kind") == "prompt_enhancement"
         and status not in {"completed", "failed", "cancelled", "canceled"}
@@ -59055,6 +59131,41 @@ def _publish_h3_delivery_outputs(
             published_items.append(item)
         if is_cancel_requested(job):
             raise InterruptedError("H3 delivery cancelled")
+        expectations = {}
+        duration_plan = job.get("h3_segment_plan")
+        if isinstance(duration_plan, dict):
+            frames = duration_plan.get("published_frames")
+            fps = duration_plan.get("fps")
+            if type(frames) is int and frames > 0:
+                expectations["expected_frames"] = frames
+            if type(fps) in {int, float} and fps > 0:
+                expectations["expected_fps"] = float(fps)
+        resolution = (
+            requested_target if recovery_action == "retry_delivery"
+            else "" if recovery_action == "accept_native"
+            else str((job.get("params") or {}).get("delivery_resolution") or "")
+        )
+        if resolution:
+            try:
+                width, height = (int(value) for value in resolution.lower().split("x", 1))
+                expectations["expected_resolution"] = (width, height)
+            except (TypeError, ValueError):
+                pass
+        integrity = _h3_final_output_integrity(
+            os.path.dirname(staged[0]["source_path"]), final_names,
+            **expectations,
+        )
+        logging.getLogger(__name__).info(
+            "H3 delivery output integrity: %s",
+            json.dumps(integrity, sort_keys=True),
+        )
+        if integrity["validation"] != "valid":
+            raise _H3DeliveryFailure(
+                "The final H3 video could not be verified. "
+                "Check the output file or retry the delivery.",
+                stage="publication",
+                code="h3_output_integrity_failed",
+            )
         # Keep the exact-attempt lifecycle publication and final sidecar
         # promotion in the same transition transaction as preemption.
         with _sample_campaign_transition_lock:
@@ -59292,6 +59403,8 @@ def _process_h3_delivery_from_protected_native(
             publication_commit_fn=publication_commit_fn,
         )
     except InterruptedError:
+        raise
+    except _H3DeliveryFailure:
         raise
     except Exception as error:
         raise _H3DeliveryFailure(
@@ -60144,6 +60257,8 @@ def _retry_h3_delivery_postprocess_only(
                 pass
         if is_cancel_requested(job):
             raise InterruptedError("H3 delivery recovery cancelled") from error
+        if isinstance(error, _H3DeliveryFailure):
+            raise
         oom_info = delivery_oom_info(
             error,
             float(wgp.server_config.get("vram_safety_coefficient", 0.80)),
@@ -60361,6 +60476,66 @@ def _verified_h3_concat_output_names(
             if name in candidates and name not in verified:
                 verified.append(name)
     return verified
+
+
+def _h3_final_output_integrity(
+    project_dir: str,
+    final_names,
+    *,
+    expected_frames: int | None = None,
+    expected_fps: float | None = None,
+    expected_resolution: tuple[int, int] | None = None,
+    probe=None,
+) -> dict:
+    """Check explicit H3 Finals without returning private filenames or media."""
+    if probe is None:
+        from services.h3_output_integrity import probe_h3_output
+        probe = probe_h3_output
+    reports = []
+    for name in final_names or ():
+        if (
+            not isinstance(name, str)
+            or not name
+            or os.path.basename(name) != name
+            or os.path.splitext(name)[1].lower()
+            not in {".mp4", ".webm", ".mkv", ".mov"}
+        ):
+            reports.append({"validation": "invalid", "checks": {"final_name": False}})
+            continue
+        expectations = {}
+        if expected_frames is not None:
+            expectations["expected_frames"] = expected_frames
+        if expected_fps is not None:
+            expectations["expected_fps"] = expected_fps
+        if expected_resolution is not None:
+            expectations["expected_resolution"] = expected_resolution
+        reports.append(probe(
+            os.path.join(project_dir, name),
+            require_audio=True,
+            sample_signal=True,
+            **expectations,
+        ))
+    return {
+        "validation": (
+            "valid"
+            if reports and all(report.get("validation") == "valid" for report in reports)
+            else "invalid"
+        ),
+        "final_count": len(reports),
+        "reports": reports,
+    }
+
+
+def _h3_verified_published_outputs(
+    job: dict, project_dir: str, rejected_names,
+) -> list[str]:
+    """Retain earlier verified variants while excluding unverified Finals."""
+    rejected = set(rejected_names)
+    return [
+        name for name in job.get("output_files") or []
+        if name not in rejected
+        and not h3_integrity_is_pending(project_dir, name)
+    ]
 
 
 def _job_failure_positions(job: dict) -> tuple[dict | None, dict | None, dict | None]:
@@ -61903,6 +62078,18 @@ def _run_generation(
     import inspect
 
     job = _jobs[job_id]
+    h3_delivery_request = False
+    h3_integrity_passed = False
+
+    def _defer_h3_final_publication(target: Mapping[str, Any]) -> bool:
+        params = target.get("params")
+        return bool(
+            not h3_delivery_request
+            and not h3_integrity_passed
+            and isinstance(params, dict)
+            and str(params.get("model_type") or "") in _H3_LONG_STUDIO_MODELS
+        )
+
     if _queue_recovery_delivery_pending(job) is None:
         try:
             _require_h3_legal_execution(_h3_job_model_types(job))
@@ -61942,6 +62129,8 @@ def _run_generation(
         **updates: Any,
     ) -> bool:
         attempt = _sample_attempt(target, expected_execution_attempt)
+        if _defer_h3_final_publication(target) and "output_files" in updates:
+            updates["output_files"] = []
         if target.get("kind") != _SAMPLE_CAMPAIGN_JOB_KIND:
             return _lifecycle_update_job(
                 target, expected_execution_attempt=attempt, **updates,
@@ -61965,6 +62154,8 @@ def _run_generation(
         expected_execution_attempt: int | None = None,
     ) -> list[str]:
         attempt = _sample_attempt(target, expected_execution_attempt)
+        if _defer_h3_final_publication(target):
+            final_output_files = []
         if target.get("kind") != _SAMPLE_CAMPAIGN_JOB_KIND:
             return _lifecycle_record_job_outputs(
                 target,
@@ -63552,6 +63743,18 @@ def _run_generation(
                             pass
                     temp_meta = f"{meta_path}.{uuid.uuid4().hex[:8]}.tmp"
                     try:
+                        if (
+                            requested_model in _H3_LONG_STUDIO_MODELS
+                            and not native_source
+                            and file_sidecar.get("producer_artifact_class")
+                                not in {"component", "window", "temporary"}
+                        ):
+                            # Keep the sealed sidecar byte-exact for crash
+                            # adoption while the final media is checked.
+                            _atomic_write_json(
+                                h3_integrity_pending_path(out_dir, fname),
+                                {"pending": True},
+                            )
                         with open(temp_meta, "w", encoding="utf-8") as f:
                             json.dump(file_sidecar, f, indent=2)
                             f.flush()
@@ -64367,7 +64570,12 @@ def _run_generation(
                                     )
                                     return False
                             elif not all(
-                                name in published for name in new_artifacts
+                                name in (
+                                    job.get("artifact_files") or []
+                                    if _defer_h3_final_publication(job)
+                                    else published
+                                )
+                                for name in new_artifacts
                             ):
                                 return False
                             repeat_published_artifacts.update(new_artifacts)
@@ -65740,6 +65948,7 @@ def _run_generation(
             # Publish any files that finished before an abort. Director waits
             # for this worker to settle and persists these partial outputs.
             new_files = []
+            verified_h3_final_files = []
             if os.path.isdir(out_dir):
                 new_files = collect_job_outputs(
                     gen,
@@ -65793,7 +66002,11 @@ def _run_generation(
                         sample_worker
                         and not defer_output_publication
                         and not all(
-                            name in published_outputs for name in new_files
+                            name in (
+                                job.get("artifact_files") or []
+                                if _defer_h3_final_publication(job)
+                                else published_outputs
+                            ) for name in new_files
                         )
                     ):
                         return False
@@ -65815,7 +66028,12 @@ def _run_generation(
                     update_job(job, output_files=verified_h3_final_files)
 
             if cancelled or is_cancel_requested(job):
-                return False
+                if (
+                    requested_model not in _H3_LONG_STUDIO_MODELS
+                    or defer_output_publication
+                    or h3_delivery_request
+                ):
+                    return False
 
             if os.path.isdir(out_dir):
                 # Post-generation outpaint cleanup: combines two operations
@@ -66429,6 +66647,144 @@ def _run_generation(
                 if not defer_output_publication and not h3_delivery_request:
                     _write_output_sidecars(new_files)
 
+            h3_integrity_failed = False
+            if not defer_output_publication and requested_model in _H3_LONG_STUDIO_MODELS and not h3_delivery_request:
+                h3_expected = {}
+                if isinstance(h3_longform, dict):
+                    frames = h3_longform.get("published_frames")
+                    fps = h3_longform.get("fps")
+                    if type(frames) is int and frames > 0:
+                        h3_expected["expected_frames"] = frames
+                    if type(fps) in {int, float} and fps > 0:
+                        h3_expected["expected_fps"] = float(fps)
+                h3_final_names = []
+                for name in new_files:
+                    if (
+                        not isinstance(name, str)
+                        or os.path.basename(name) != name
+                        or os.path.splitext(name)[1].lower()
+                            not in {".mp4", ".webm", ".mkv", ".mov"}
+                    ):
+                        continue
+                    if (
+                        name in verified_h3_final_files
+                        or producer_artifact_roles.get(name) == "final"
+                        or h3_integrity_is_pending(out_dir, name)
+                    ) and name not in h3_final_names:
+                        h3_final_names.append(name)
+                try:
+                    integrity = _h3_final_output_integrity(
+                        out_dir, h3_final_names, **h3_expected,
+                    )
+                except Exception:
+                    integrity = {"validation": "unverified", "reports": []}
+                logging.getLogger(__name__).info(
+                    "H3 final output integrity: %s",
+                    json.dumps(integrity, sort_keys=True),
+                )
+                reports = integrity.get("reports") or []
+                checked = list(zip(h3_final_names, reports))
+                valid_names = [
+                    name for name, report in checked
+                    if isinstance(report, dict)
+                    and report.get("validation") == "valid"
+                ]
+                rejected_names = [
+                    name for name in h3_final_names if name not in valid_names
+                ]
+                with _sample_campaign_transition_lock:
+                    if not sample_safe_unit_current(abort_state):
+                        return False
+                    promoted_names = []
+                    for name in valid_names:
+                        try:
+                            marker = h3_integrity_pending_path(out_dir, name)
+                            os.remove(marker)
+                            promoted_names.append(name)
+                        except Exception:
+                            rejected_names.append(name)
+                            logging.getLogger(__name__).warning(
+                                "H3 verified output sidecar could not be promoted",
+                            )
+                    for name in rejected_names:
+                        media_path = os.path.join(out_dir, name)
+                        sidecar_name = os.path.splitext(name)[0] + ".meta.json"
+                        sidecar_path = os.path.join(out_dir, sidecar_name)
+                        try:
+                            _quarantine_recovery_artifact(
+                                out_dir, {"basename": name},
+                            )
+                        except Exception:
+                            logging.getLogger(__name__).warning(
+                                "H3 invalid output quarantine could not finish",
+                            )
+                        if os.path.isfile(media_path):
+                            try:
+                                try:
+                                    with open(sidecar_path, "r", encoding="utf-8") as handle:
+                                        sidecar = json.load(handle)
+                                except (OSError, ValueError, TypeError):
+                                    sidecar = {"artifact_class": "temporary"}
+                                sidecar["output_integrity_failed"] = True
+                                provisional_policy = dict(job.get("access_policy") or {})
+                                provisional_policy["private"] = True
+                                stamp_sidecar_policy(
+                                    sidecar, provisional_policy,
+                                    workspace=job.get("workspace") or "default",
+                                )
+                                _atomic_write_json(sidecar_path, sidecar)
+                            except Exception:
+                                logging.getLogger(__name__).warning(
+                                    "H3 invalid output sidecar could not be marked",
+                                )
+                        else:
+                            try:
+                                _quarantine_recovery_artifact(
+                                    out_dir, {"sidecar_basename": sidecar_name},
+                                )
+                            except Exception:
+                                pass
+                            try:
+                                os.remove(h3_integrity_pending_path(out_dir, name))
+                            except OSError:
+                                pass
+                    h3_integrity_passed = True
+                    if promoted_names:
+                        published = record_job_outputs(
+                            job, promoted_names,
+                            final_output_files=promoted_names,
+                        )
+                        if not all(name in published for name in promoted_names):
+                            for name in promoted_names:
+                                try:
+                                    _atomic_write_json(
+                                        h3_integrity_pending_path(out_dir, name),
+                                        {"pending": True},
+                                    )
+                                except Exception:
+                                    pass
+                            return False
+                    h3_integrity_failed = bool(
+                        rejected_names or (success and not promoted_names)
+                    )
+                    if h3_integrity_failed:
+                        if first_failure_details is None:
+                            failure = _safe_failure_updates(
+                                _GenerationStageFailure(
+                                    "The final H3 video could not be verified. "
+                                    "Check the output file or retry the generation.",
+                                    stage="publication",
+                                    code="h3_output_integrity_failed",
+                                ),
+                                job,
+                            )
+                            first_task_error = failure["error"]
+                            first_failure_details = failure["failure_details"]
+                        success = False
+
+            if cancelled or is_cancel_requested(job):
+                return False
+
             if success and not finalize:
                 deferred_updates = {}
                 if defer_output_publication:
@@ -66496,9 +66852,18 @@ def _run_generation(
                 ):
                     return False
 
+            if h3_integrity_failed and job.get("_h3_delivery_publication"):
+                _rollback_h3_delivery_publication(
+                    job, update_job_fn=update_job,
+                )
             published = finish_job(
                 job,
                 "completed" if success else "failed",
+                **({
+                    "output_files": _h3_verified_published_outputs(
+                        job, out_dir, rejected_names,
+                    ),
+                } if h3_integrity_passed else {}),
                 progress=100 if success else 0,
                 step=0,
                 total_steps=0,
@@ -71373,6 +71738,8 @@ from services.search_index import (
     artifact_lineage,
     artifact_matches_scope,
     classify_gallery_artifacts,
+    h3_integrity_is_pending,
+    h3_integrity_pending_path,
     linked_component_names,
     load_media_sidecars,
 )
@@ -71563,6 +71930,7 @@ def list_outputs(
                 ))
                 and sidecar_cache.get(entry[0]) is None
             )
+            and not h3_integrity_is_pending(out_dir, entry[0])
         ]
         media_names = {entry[0] for entry in raw_entries}
         sidecar_cache = {
