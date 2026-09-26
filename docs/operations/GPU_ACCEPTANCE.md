@@ -1447,6 +1447,40 @@ with a terminal denied response.
 This accepts one FlashVSR in-flight interruption, same-job owner resume,
 single-result publication, audio preservation, first post-completion restart,
 and stable-share Gallery visibility. It does not establish automatic
-unattended resume, Revoice crash recovery, the separate result-adoption crash
-window, other tools or upscale variants, visual detail quality, or owner
+unattended resume, the separate result-adoption crash window, other tools or
+upscale variants, visual detail quality, or owner
 playback acceptance.
+
+## 2026-09-26 Revoice in-flight crash recovery
+
+An authorized signed-in owner submitted **Tools → Revoice → Single Voice** for
+an existing 5.167-second project video and a 30-second project WAV reference
+under an exact 20-minute GPU coordinator grant. The backend was interrupted
+while job `c4659c1c415448599cd7d3251bf6cc94` was running Voice Conversion.
+After the coordinated Pinokio restart, the durable queue held the same job as
+`blocked_remote_reauth` at recovery attempt 0, without processor replay or a
+published result. Selecting `codex-live-matrix-20260921` in the signed-in
+stable-share UI exposed the held card without a page reload. **Open project and
+resume** restarted that job under the revalidated grant; the SeedVC processor
+completed its two 25-step passes and the queue returned idle.
+
+Exactly one new MP4 was published for that job. It is 1,720,088 bytes with
+SHA-256 `2512859b01a5596167cf4315accb5fea9d62b24f652d81f85ff979416783038f`,
+matching its producer sidecar. Source and result both decode as 5.167 seconds,
+124 HEVC frames at 608 × 352, and 44.1 kHz stereo AAC. Decoded video frames
+are identical. Decoded audio has the same 164,955 samples but changed RMS
+(0.1956 to 0.2168) and low maximum normalized correlation (0.1034), showing
+that voice conversion changed the soundtrack. The signed-in Gallery rose from
+43 to 44 items and displayed the new result first. A clean coordinated
+Pinokio restart retained that Gallery entry and cleared the active queue.
+Pinokio reported a ready `start.js`; stable Cloudflare root, `/health`, and
+`/ready` returned 200 and the Worker's direct route returned 307. The model
+was unloaded by restart and the GPU grant was withdrawn with a terminal denied
+response.
+
+This accepts one Revoice in-flight interruption, same-job owner resume,
+single-result publication, unchanged video frames, changed audio, first
+post-completion restart, and stable-share Gallery visibility. It does not
+establish automatic unattended resume, speaker similarity or audio quality,
+two-voice mode, cancellation, the separate result-adoption crash window, or
+owner listening acceptance.

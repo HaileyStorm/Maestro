@@ -327,8 +327,11 @@ environment. This does not establish GPU generation or owner acceptance.
    first restart. A later signed-in 17-second FlashVSR2x was interrupted
    in flight, held for owner reauthentication, resumed as the same job, and
    published once; the Gallery result survived a further restart. The UI now
-   rediscovers held jobs immediately after project selection. See
-   [GPU_ACCEPTANCE.md](../operations/GPU_ACCEPTANCE.md). Revoice cancellation and crash recovery,
+   rediscovers held jobs immediately after project selection. A signed-in
+   single-voice Revoice job was also interrupted in flight, held for owner
+   reauthentication, resumed under a revalidated grant as the same job, and
+   published one changed-audio MP4 that survived a further restart. See
+   [GPU_ACCEPTANCE.md](../operations/GPU_ACCEPTANCE.md). Revoice cancellation,
    the result-adoption crash window, other variants, speaker/detail quality,
    and owner acceptance remain open. Gallery Extend and manual flip have CPU/UI/live-flow
    evidence; flip crash-window adoption has CPU simulation evidence, while a
