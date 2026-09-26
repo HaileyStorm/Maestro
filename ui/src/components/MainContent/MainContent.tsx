@@ -2502,7 +2502,12 @@ function GalleryBulkToolbar() {
             workspace={activeWorkspace}
             clips={bridgeCandidates}
             isCurrentSelection={isCurrentBridgeSelection}
-            onQueued={() => {
+            onQueued={async () => {
+              if (!isCurrentBridgeSelection()) return
+              // Bridge is submitted outside the ordinary Generate store path.
+              // Reconnect its accepted job before opening Queue, which renders
+              // only jobs known to the store even when /queue already lists it.
+              await useStore.getState().reconnectJobs()
               if (!isCurrentBridgeSelection()) return
               requestQueueView()
               window.dispatchEvent(new CustomEvent(QUEUE_REFRESH_EVENT))

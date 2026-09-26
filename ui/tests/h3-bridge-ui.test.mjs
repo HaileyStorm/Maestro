@@ -306,6 +306,73 @@ test('a changed selection does not redirect the user after a delayed queue respo
   }
 })
 
+test('an accepted Bridge stays pending until Queue reconnect finishes', async () => {
+  const { H3BridgePanel } = await loadBridgeModule()
+  const clips = [output('earlier.mp4'), output('later.mp4')]
+  const originalFetch = globalThis.fetch
+  let finishReconnect
+  let reconnectStarted = false
+  globalThis.__h3BridgeHookStates = []
+  globalThis.fetch = async () => Response.json({ job_id: 'bridge-job', status: 'running' })
+  try {
+    let tree = openPanel(H3BridgePanel, {
+      workspace: 'project-a', clips, isCurrentSelection: () => true,
+      onQueued: () => {
+        reconnectStarted = true
+        return new Promise(resolve => { finishReconnect = resolve })
+      },
+    })
+    chooseClipsAndFill(tree)
+    const props = {
+      workspace: 'project-a', clips, isCurrentSelection: () => true,
+      onQueued: () => {
+        reconnectStarted = true
+        return new Promise(resolve => { finishReconnect = resolve })
+      },
+    }
+    tree = renderPanel(H3BridgePanel, props)
+    const submitted = flatten(tree).find(element => element.type === 'form').props.onSubmit({ preventDefault() {} })
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(reconnectStarted, true)
+    tree = renderPanel(H3BridgePanel, props)
+    assert.equal(flatten(tree).find(element => elementText(element) === 'Adding to Queue…')?.props.disabled, true)
+    finishReconnect()
+    await submitted
+    tree = renderPanel(H3BridgePanel, props)
+    assert.equal(flatten(tree).find(element => elementText(element) === 'Create bridge')?.props.disabled, false)
+  } finally {
+    globalThis.fetch = originalFetch
+    delete globalThis.__h3BridgeHookStates
+    delete globalThis.__h3BridgeHookIndex
+  }
+})
+
+test('a Queue refresh failure does not present an accepted Bridge as a failed submission', async () => {
+  const { H3BridgePanel } = await loadBridgeModule()
+  const clips = [output('earlier.mp4'), output('later.mp4')]
+  const originalFetch = globalThis.fetch
+  globalThis.__h3BridgeHookStates = []
+  globalThis.fetch = async () => Response.json({ job_id: 'bridge-job', status: 'running' })
+  try {
+    const props = {
+      workspace: 'project-a', clips, isCurrentSelection: () => true,
+      onQueued: async () => { throw new Error('refresh failed') },
+    }
+    let tree = openPanel(H3BridgePanel, props)
+    chooseClipsAndFill(tree)
+    tree = renderPanel(H3BridgePanel, props)
+    await flatten(tree).find(element => element.type === 'form').props.onSubmit({ preventDefault() {} })
+    tree = renderPanel(H3BridgePanel, props)
+    const message = elementText(tree)
+    assert.match(message, /Bridge was accepted, but Queue could not refresh/)
+    assert.match(message, /before submitting another bridge/)
+  } finally {
+    globalThis.fetch = originalFetch
+    delete globalThis.__h3BridgeHookStates
+    delete globalThis.__h3BridgeHookIndex
+  }
+})
+
 test('a stale source revision gives a useful error and leaves the Queue alone', async () => {
   const { H3BridgePanel } = await loadBridgeModule()
   const clips = [output('earlier.mp4'), output('later.mp4')]

@@ -40,7 +40,7 @@ interface Props {
   workspace: string
   clips: readonly [OutputFile, OutputFile]
   isCurrentSelection: () => boolean
-  onQueued: () => void
+  onQueued: () => Promise<void>
 }
 
 export function H3BridgePanel({ workspace, clips, isCurrentSelection, onQueued }: Props) {
@@ -81,10 +81,18 @@ export function H3BridgePanel({ workspace, clips, isCurrentSelection, onQueued }
         generated_frames: generatedFrames,
         reroll_index: Number(rerollIndex),
       })
-      if (isCurrentSelection()) onQueued()
     } catch (reason) {
       if (isCurrentSelection()) {
         setError(reason instanceof Error ? reason.message : 'H3 Bridge could not be queued. Try again from this project.')
+      }
+      if (isCurrentSelection()) setPending(false)
+      return
+    }
+    try {
+      if (isCurrentSelection()) await onQueued()
+    } catch {
+      if (isCurrentSelection()) {
+        setError('Bridge was accepted, but Queue could not refresh. Check Queue or reload before submitting another bridge.')
       }
     } finally {
       if (isCurrentSelection()) setPending(false)

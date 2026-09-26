@@ -1553,3 +1553,36 @@ process; local and stable-share `/health` and `/ready` returned 200. The
 stable direct-fallback endpoint redirected to the new Quick Tunnel, whose
 `/health` also returned 200. The restart-status generation cleared only after
 local health and recovery readiness.
+
+## 2026-09-26 native H3 Bridge Queue retest
+
+A second signed-in stable-share Bridge used a separate validated 20-minute
+coordinator grant after the project-output staging fix was deployed. The
+backend accepted the request and reported one running job to the remote
+`/api/v1/queue` response, but the open Queue view still said it was clear.
+Reloading the same browser restored the running card. This isolated a second,
+client-side fault: Bridge submission did not add its accepted job to the UI
+store before opening Queue. The client now reconnects accepted jobs before
+navigation; a focused UI regression covers the pending state and keeps a
+post-accept refresh error distinct from failed submission. Immediate Queue
+visibility with this client fix has not yet been tested in a new live run.
+The complete CPU-masked local CI gate passed: 5,398 backend tests (17 skipped),
+732 UI tests, JSON grammar checks, and the production type-check/build.
+
+The worker completed and the signed-in Gallery showed the second private
+Bridge final. FFprobe reported a 13.667-second, 328-frame, 1344 × 768 H.264
+video at 24 fps with AAC. Its 63 visible bridge frames join the 124- and
+141-frame source clips. The final's SHA-256 matched its producer receipt, and
+a complete FFmpeg decode exited without errors. This is technical output and
+Gallery evidence, not a full playback, soundtrack-quality, or owner review.
+Three sampled frames retained the red circle and yellow triangle, while the
+background changed from pale blue near the first join to dark navy through
+the bridge and second clip; those samples do not establish smooth continuity.
+
+After completion, the owner resource control required a new password
+confirmation, so it could not be used from the current browser session. A
+coordinated Pinokio restart released the model, restored local and stable
+Cloudflare readiness, and cleared the exact public restart-status generation.
+The Continuum user service was active again, and the coordinator withdrawal
+invalidated the grant. The owner resource control's live unload path remains
+unverified in this session.
