@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import ipaddress
 import os
 from pathlib import Path
 import sys
@@ -45,6 +46,17 @@ def load_launch_functions(namespace: dict, *names: str) -> None:
     for node in nodes:
         node.decorator_list = []
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "launch.py", "exec"), namespace)
+
+
+def load_launch_class(namespace: dict, name: str) -> None:
+    import ast
+
+    tree = ast.parse((ROOT / "app/launch.py").read_text(encoding="utf-8"))
+    node = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == name
+    )
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "launch.py", "exec"), namespace)
 
 
 def load_nested_launch_function(namespace: dict, outer_name: str, nested_name: str) -> None:
@@ -395,15 +407,48 @@ class H3GalleryStillGuideServiceTests(unittest.TestCase):
 
 
 class FakePreparationRequest:
-    def __init__(self, source, body):
+    def __init__(self, source, body, *, admission_account_session=False):
         self.state = types.SimpleNamespace(
             maestro_session_id=source.state.maestro_session_id,
             maestro_remote=source.state.maestro_remote,
+            maestro_account_session_id=(
+                source.state.maestro_account_session_id
+                if admission_account_session else ""
+            ),
         )
         self._body = copy.deepcopy(body)
 
     async def json(self):
         return copy.deepcopy(self._body)
+
+
+class H3GuideAdmissionRequestTests(unittest.TestCase):
+    def test_immediate_admission_keeps_account_marker_but_worker_drops_it(self):
+        namespace = {
+            "Request": object,
+            "copy": copy,
+            "ipaddress": ipaddress,
+        }
+        load_launch_class(namespace, "_GenerationPreparationRequest")
+        source = types.SimpleNamespace(
+            headers={"x-forwarded-proto": "https"},
+            base_url="https://maestro.example/",
+            client=types.SimpleNamespace(host="127.0.0.1"),
+            state=types.SimpleNamespace(
+                maestro_session_id="c" * 32,
+                maestro_remote=True,
+                maestro_account_principal={"id": "a" * 32, "role": "owner"},
+                maestro_account_session_id="b" * 32,
+            ),
+        )
+        preparation = namespace["_GenerationPreparationRequest"]
+        admitted = preparation(
+            source, {"workspace": "project-a"},
+            admission_account_session=True,
+        )
+        self.assertEqual(admitted.state.maestro_account_session_id, "b" * 32)
+        self.assertEqual(admitted.state.maestro_account_principal["role"], "owner")
+        self.assertEqual(preparation(source).state.maestro_account_session_id, "")
 
 
 class H3GalleryStillGuideRouteTests(unittest.TestCase):
@@ -413,11 +458,17 @@ class H3GalleryStillGuideRouteTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.source = StillSourceFixture(self.root)
         self.queued: list[dict] = []
+        self.admission_markers: list[str] = []
+        self.preparation_request = None
         self.probe_threads: list[int] = []
         self.revision_value = "revision-1"
         self.token = object()
 
         async def generate(preparation_request):
+            self.preparation_request = preparation_request
+            self.admission_markers.append(
+                preparation_request.state.maestro_account_session_id
+            )
             self.queued.append(await preparation_request.json())
             self.assertIs(
                 preparation_request.state._maestro_h3_gallery_still_guide_token,
@@ -530,6 +581,7 @@ class H3GalleryStillGuideRouteTests(unittest.TestCase):
             json=read,
             state=types.SimpleNamespace(
                 maestro_session_id="owner-session", maestro_remote=True,
+                maestro_account_session_id="s" * 32,
             ),
         )
 
@@ -544,6 +596,8 @@ class H3GalleryStillGuideRouteTests(unittest.TestCase):
         with patch("services.h3_gallery_still_guide.probe_gallery_still", side_effect=probe):
             response = asyncio.run(self.ns["h3_gallery_still_guide_endpoint"](self.request()))
         self.assertEqual(response["job_id"], "job-guide")
+        self.assertEqual(self.admission_markers, ["s" * 32])
+        self.assertEqual(self.preparation_request.state.maestro_account_session_id, "")
         self.assertEqual(response["h3_guide_execution"]["frame_index"], 62)
         self.assertEqual(response["h3_guide_execution"]["guide_count"], 1)
         self.assertEqual(len(self.probe_threads), 2)

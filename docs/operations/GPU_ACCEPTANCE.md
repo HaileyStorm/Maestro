@@ -1609,3 +1609,37 @@ active, the stable direct route pointed to the current Quick Tunnel, and the
 model was no longer loaded. The coordinator grant was withdrawn; coherent
 validation then rejected further GPU work. The owner Free resources control
 still requires a new password confirmation for its separate live unload test.
+
+## 2026-09-26 H3 Gallery-still Guide technical acceptance
+
+After a signed-in stable-share Guide submission exposed an account-session
+admission fault, the request-bound wrapper retained the authenticated marker
+only through immediate admission and cleared it before detached preparation.
+The corrected route was deployed through Pinokio's coordinated restart. A new
+signed-in submission under a fresh, continuously validated 20-minute GPU grant
+appeared immediately in Queue, progressed through 28 denoising steps and video
+and audio decoding, and cleared without a failed item. The selected project's
+Gallery gained one final. The grant was withdrawn after terminal completion;
+Maestro remained running. Local and stable-share `/health` and `/ready` returned
+200, the stable direct route pointed to the current Quick Tunnel, and the
+restart-status generation was cleared.
+
+The single-still H3 Base FL2VA result is 124 frames at 24 fps, 1344 × 768,
+5.166667 seconds, HEVC with 32 kHz stereo AAC. The source still's SHA-256 is
+`e70c767867b83405fb1bc3ec8f34cdd3e1ba1a96b9dfc72acbd2cab672d4f59c`;
+the generated media's SHA-256 is
+`f9057c928992261de6d214985d11055a992f4bb0d6f6367bed64526ec7c29fdd`,
+matching its producer sidecar. A full FFmpeg decode returned no errors. Audio
+measured -17.1 dBFS mean and -4.4 dBFS maximum. Sampled first, guided middle,
+and final frames showed coherent subject geometry; the middle frame retained
+the source still's distinctive marking and framing. This is one technical and
+sampled-frame acceptance case, not a general quality or owner review.
+
+The in-app browser's Gallery viewer did not display the HEVC picture: playback
+advanced to the end with zero decoded video dimensions and a black frame. An
+existing H.264 output in the same viewer displayed video and nonzero dimensions.
+The generated file itself decodes correctly, but browser playback for this
+configured HEVC output is unresolved. Do not count the Gallery card or FFmpeg
+decode as browser playback acceptance. The full CPU-masked local CI gate for
+the admission fix passed 5,415 backend tests (17 skipped), 743 UI tests, JSON
+grammar, source compilation, and production build.

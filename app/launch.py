@@ -43925,7 +43925,10 @@ async def h3_evaluation_preflight(request: Request):
 class _GenerationPreparationRequest:
     """Minimal immutable request authority retained by one preparation worker."""
 
-    def __init__(self, request: Request, body: dict | None = None):
+    def __init__(
+        self, request: Request, body: dict | None = None, *,
+        admission_account_session: bool = False,
+    ):
         from collections import namedtuple
         import re as _re
         from types import SimpleNamespace
@@ -43949,6 +43952,15 @@ class _GenerationPreparationRequest:
             if principal_id and principal_role in ACCOUNT_ROLES
             else None
         )
+        account_session_id = str(getattr(
+            request.state, "maestro_account_session_id", "",
+        ) or "")
+        if not (
+            admission_account_session
+            and bounded_principal
+            and _re.fullmatch(r"[0-9a-f]{32}", account_session_id)
+        ):
+            account_session_id = ""
 
         source_headers = getattr(request, "headers", {}) or {}
         self.headers = {
@@ -43983,6 +43995,9 @@ class _GenerationPreparationRequest:
             # defaults. Usernames, reauthentication state, and capabilities
             # are deliberately absent from this detached worker request.
             maestro_account_principal=bounded_principal,
+            # Only an immediate, request-bound admission may reuse the
+            # authenticated marker. Detached preparation workers omit it.
+            maestro_account_session_id=account_session_id,
             maestro_llm_progress_callback=None,
             # Local LLM/H3 exclusion is provided by llm_service's lease.
             # Preparation must never occupy the generation scheduler lock.
@@ -46578,11 +46593,16 @@ async def h3_gallery_still_guide_endpoint(request: Request):
     )
     params["private_output"] = effective_private
     params["explicit_output"] = effective_explicit
-    preparation_request = _GenerationPreparationRequest(request, params)
+    preparation_request = _GenerationPreparationRequest(
+        request, params, admission_account_session=True,
+    )
     preparation_request.state._maestro_h3_gallery_still_guide_token = (
         _H3_GALLERY_STILL_GUIDE_REQUEST_TOKEN
     )
-    result = await generate(preparation_request)
+    try:
+        result = await generate(preparation_request)
+    finally:
+        preparation_request.state.maestro_account_session_id = ""
     if not isinstance(result, dict):
         raise HTTPException(status_code=503, detail="H3 Guide could not be queued")
     return {
