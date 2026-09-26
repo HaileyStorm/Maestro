@@ -86,6 +86,11 @@ MINIMAX_H3_KEYFRAME_NOISE_AUG = 0.999
 # The seeded posterior sample of the keyframe VAE encode. Fixed at 42 independently of the request seed.
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
 
+# The server may opt into the pinned two-clip Ref2VA AddGuide layout. Keep
+# this exact descriptor private to the runtime; the Studio does not expose it.
+_H3_BRIDGE_GUIDE_VALUE = ((1, 0, 22), (2, -22, 22))
+H3_BRIDGE_GUIDE_FRAMES = 22
+
 # Rotary-time constants. One latent frame spans `5/3 * frames_per_latent` rotary units, where the pattern
 # `(1, 4, 4, 4, 4)` mirrors the VAE's 17-pixel-frames-to-5-latent-frames grouping; the spatial axes are normalized
 # by the square root of the latent area and scaled by 32.
@@ -268,6 +273,130 @@ def prepare_keyframe_image(image, height: int, width: int, stretch: bool):
     top = max(0, (resized_size[1] - height) // 2)
     resized = image.resize(resized_size, Image.Resampling.LANCZOS)
     return resized.crop((left, top, left + width, top + height))
+
+
+class H3BridgeGuideError(ValueError):
+    """A native Ref2VA AddGuide request is outside its fixed contract."""
+
+
+def validate_h3_bridge_guides_setting(custom_settings) -> bool:
+    """Validate the single server-authored Ref2VA AddGuide descriptor."""
+    if not isinstance(custom_settings, dict) or "_h3_bridge_guides" not in custom_settings:
+        return False
+
+    value = custom_settings["_h3_bridge_guides"]
+    expected_keys = {"slot", "frame_idx", "frames"}
+    if type(value) is not list or len(value) != len(_H3_BRIDGE_GUIDE_VALUE):
+        raise H3BridgeGuideError(
+            "MiniMax H3 bridge guides require the exact two-slot AddGuide setting."
+        )
+    for descriptor, expected in zip(value, _H3_BRIDGE_GUIDE_VALUE):
+        if type(descriptor) is not dict or set(descriptor) != expected_keys:
+            raise H3BridgeGuideError(
+                "MiniMax H3 bridge guide descriptors must contain only slot, frame_idx, and frames."
+            )
+        actual = tuple(descriptor[key] for key in ("slot", "frame_idx", "frames"))
+        if any(type(item) is not int for item in actual) or actual != expected:
+            raise H3BridgeGuideError(
+                "MiniMax H3 bridge guides only support slots 1/2 at frame indices 0/-22 for 22 frames."
+            )
+    return True
+
+
+def validate_h3_bridge_guides_request(
+    custom_settings,
+    *,
+    reference_mode: bool,
+    selected_video_slots,
+    audio_prompt_type: str,
+) -> bool:
+    """Fail closed unless both selected Ref2VA clips match the AddGuide contract."""
+    if not validate_h3_bridge_guides_setting(custom_settings):
+        return False
+    if reference_mode is not True:
+        raise H3BridgeGuideError(
+            "MiniMax H3 AddGuide clips require the Ref2VA checkpoint."
+        )
+    if audio_prompt_type is None:
+        audio_prompt_type = ""
+    if not isinstance(audio_prompt_type, str):
+        raise H3BridgeGuideError("MiniMax H3 bridge guide audio mode must be text.")
+    if "K" in audio_prompt_type:
+        raise H3BridgeGuideError(
+            "MiniMax H3 bridge guides cannot use reference-video soundtrack mode."
+        )
+    try:
+        selected_video_slots = tuple(selected_video_slots)
+        selected_slots = tuple(slot for slot, _value in selected_video_slots)
+        selected_values = tuple(value for _slot, value in selected_video_slots)
+    except (TypeError, ValueError) as error:
+        raise H3BridgeGuideError(
+            "MiniMax H3 bridge guides require selected videos in physical slots 1 and 2."
+        ) from error
+    if selected_slots != (1, 2) or any(value is None for value in selected_values):
+        raise H3BridgeGuideError(
+            "MiniMax H3 bridge guides require exactly the selected video tensors in slots 1 and 2."
+        )
+    return True
+
+
+def prepare_h3_bridge_video_inputs(selected_video_slots, height: int, width: int):
+    """Return no semantic videos and the two fixed 22-frame canvas guide clips."""
+    try:
+        selected_video_slots = tuple(selected_video_slots)
+        selected_slots = tuple(slot for slot, _value in selected_video_slots)
+    except (TypeError, ValueError) as error:
+        raise H3BridgeGuideError(
+            "MiniMax H3 bridge guides require selected videos in physical slots 1 and 2."
+        ) from error
+    if selected_slots != (1, 2):
+        raise H3BridgeGuideError(
+            "MiniMax H3 bridge guides require exactly the selected video tensors in slots 1 and 2."
+        )
+    if height < 1 or width < 1:
+        raise H3BridgeGuideError("MiniMax H3 bridge guide canvas dimensions must be positive.")
+
+    guide_clips = []
+    for slot, source in selected_video_slots:
+        if not isinstance(source, torch.Tensor) or source.ndim != 4 or source.shape[0] != 3:
+            raise H3BridgeGuideError(
+                "MiniMax H3 bridge guides require preprocessed CTHW RGB video tensors."
+            )
+        if source.shape[1] < H3_BRIDGE_GUIDE_FRAMES:
+            raise H3BridgeGuideError(
+                "MiniMax H3 bridge guide videos must each contain at least 22 preprocessed frames."
+            )
+
+        clip = (
+            source[:, -H3_BRIDGE_GUIDE_FRAMES:]
+            if slot == 1
+            else source[:, :H3_BRIDGE_GUIDE_FRAMES]
+        )
+        clip = clip.detach().to(device="cpu", dtype=torch.float32)
+        prepared_frames = []
+        for frame in clip.unbind(dim=1):
+            pixels = (
+                frame.clamp(-1.0, 1.0)
+                .add(1.0)
+                .mul(127.5)
+                .round()
+                .to(torch.uint8)
+                .permute(1, 2, 0)
+                .numpy()
+            )
+            image = prepare_keyframe_image(
+                Image.fromarray(pixels),
+                height,
+                width,
+                stretch=False,
+            )
+            prepared = torch.from_numpy(np.array(image, dtype=np.uint8, copy=True))
+            prepared = prepared.permute(2, 0, 1).float().div_(127.5).sub_(1.0)
+            prepared_frames.append(prepared)
+        guide_clips.append(torch.stack(prepared_frames, dim=1).contiguous())
+
+    # AddGuide clips are conditioning anchors, not Ref2VA semantic references.
+    return (), tuple(guide_clips)
 
 
 def patchify_video_latents(latents: torch.Tensor, patch_size: tuple[int, int, int]) -> torch.Tensor:
@@ -796,6 +925,12 @@ def build_ref2va_packed_sequence(
     rows_per_target_frame = target_frame_grid.shape[0]
     for entry in keyframe_anchors:
         anchor, condition_frames, frame_index = _unpack_keyframe_anchor(entry)
+        if condition_frames < 1:
+            raise ValueError("MiniMax H3 keyframe condition length must be positive")
+        if anchor in {"first", "last"} and condition_frames > num_latent_frames:
+            raise ValueError(
+                "MiniMax H3 first/last keyframe conditions cannot exceed target latent frames"
+            )
         rows = slice(
             condition_cursor,
             condition_cursor + condition_frames * rows_per_target_frame,
@@ -816,11 +951,7 @@ def build_ref2va_packed_sequence(
         elif anchor == "first":
             condition[:, :, 0] = target_times[:condition_frames, None]
         elif anchor == "last":
-            condition[:, :, 0] = (
-                target_origin
-                + _temporal_position_span(num_latent_frames, video_time_scale)
-                - _ROPE_FRAME_RESCALE * float(video_time_scale)
-            )
+            condition[:, :, 0] = target_times[-condition_frames:, None]
         elif anchor == "frame" and frame_index is not None:
             condition[:, :, 0] = (
                 target_origin

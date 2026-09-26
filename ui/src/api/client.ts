@@ -1174,6 +1174,105 @@ export interface GenerationSubmissionParams extends Record<string, unknown> {
   project_asset_refs?: ProjectAssetGenerateReference[]
 }
 
+export interface H3BridgeClipARequest {
+  name: string
+  revision: string
+  end_frame?: number
+}
+
+export interface H3BridgeClipBRequest {
+  name: string
+  revision: string
+  start_frame?: number
+}
+
+export interface H3BridgeRequest {
+  workspace: string
+  model_type: 'minimax_h3_ref2va'
+  clip_a: H3BridgeClipARequest
+  clip_b: H3BridgeClipBRequest
+  prompt: string
+  generated_frames: number
+  reroll_index?: number
+  settings?: {
+    seed?: number
+    num_inference_steps?: number
+    guidance_scale?: number
+    resolution?: string
+    activated_loras?: string[]
+    loras_multipliers?: number[]
+    tea_cache?: number
+    custom_settings?: Record<string, unknown>
+    override_profile?: string | null
+  }
+}
+
+export interface H3BridgeSubmission {
+  job_id: string
+  status: string
+}
+
+export async function submitH3Bridge(params: H3BridgeRequest): Promise<H3BridgeSubmission> {
+  const res = await fetch(`${BASE}/api/v1/h3/bridge`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  })
+  if (!res.ok) {
+    const payload = await res.json().catch(() => ({})) as { detail?: unknown; error?: unknown }
+    const detail = typeof payload.detail === 'string'
+      ? payload.detail
+      : typeof payload.error === 'string'
+        ? payload.error
+        : ''
+    if ([400, 413, 422].includes(res.status)) {
+      if (/media file exceeds the 8 GiB size limit/i.test(detail)) {
+        throw new Error('Each source video must be 8 GiB or smaller. Choose smaller videos, refresh Gallery, and try again.')
+      }
+      if (/source media exceeds the 30-minute duration limit/i.test(detail)) {
+        throw new Error('Each source video must be 30 minutes or shorter. Choose shorter videos, refresh Gallery, and try again.')
+      }
+      if (/source dimensions exceed 4096 pixels per side or 12 megapixels|source resolution exceeds the CPU assembly limit/i.test(detail)) {
+        throw new Error('Each source video must be no larger than 4096 pixels per side and 12 megapixels. Choose lower-resolution videos, then retry.')
+      }
+      if (/source duration is unavailable or ambiguous/i.test(detail)) {
+        throw new Error('H3 Bridge could not verify a source video’s duration. Choose a video with readable duration metadata, then retry.')
+      }
+      const sourceCannotBeUsed = /could not be read|source is unavailable|nonempty regular file|media probe (?:failed|timed out)|video frame timestamps (?:could not be read|are invalid)|at least 56 source frames.*at 24 fps/i.test(detail)
+      if (sourceCannotBeUsed) {
+        throw new Error('Each selected video must be readable and contain at least 56 normalized frames at 24 fps (about 2.3 seconds). Refresh Gallery or choose longer videos, then retry.')
+      }
+      if (res.status === 413) {
+        throw new Error('A selected video exceeds the size H3 Bridge can process. Choose smaller videos, refresh Gallery, and try again.')
+      }
+      if (res.status === 422) {
+        throw new Error('H3 Bridge could not use the selected video media. Choose supported videos and retry.')
+      }
+      throw new Error('H3 Bridge could not use the selected videos or request. Refresh Gallery, check your choices, and try again.')
+    }
+    if (res.status === 404) {
+      if (!detail || detail === 'Not Found') {
+        throw new Error('H3 Bridge is unavailable in this version of Maestro. Update and restart Maestro, then try again.')
+      }
+      if (/(?:output|file|video|clip_[ab]).*(?:not found|unavailable)|(?:not found|unavailable).*(?:output|file|video|clip_[ab])/i.test(detail)) {
+        throw new Error('A selected video is no longer available. Refresh Gallery, select two current videos, and try again.')
+      }
+      throw new Error('H3 Bridge or a selected video is unavailable. Refresh Gallery and retry; if Bridge remains unavailable, update and restart Maestro.')
+    }
+    if (res.status === 401 || res.status === 403) throw new Error('You do not have permission to generate in this project.')
+    if (res.status === 409) throw new Error('One of the selected videos changed. Refresh Gallery, select them again, and retry.')
+    if (res.status === 423) throw new Error('Unlock this project before creating a bridge.')
+    if (res.status === 451) throw new Error('MiniMax H3 is unavailable under the current license. Accepting model terms alone does not grant access; the required written MiniMax license must be in place.')
+    if (res.status === 503) throw new Error('MiniMax H3 is not ready on this installation. Check that the local model and required access terms are available, then retry.')
+    throw new Error('H3 Bridge could not be queued. Try again from this project.')
+  }
+  const result = await res.json() as Partial<H3BridgeSubmission>
+  if (typeof result.job_id !== 'string' || typeof result.status !== 'string') {
+    throw new Error('H3 Bridge returned an invalid queue response. Refresh the Queue before trying again.')
+  }
+  return { job_id: result.job_id, status: result.status }
+}
+
 export async function submitGeneration(
   params: GenerationSubmissionParams,
   holdForQueue = false,

@@ -33,6 +33,7 @@ from .checkpoint import (
 )
 from .conditioner import MiniMaxH3Conditioner, MiniMaxH3Qwen3VL, build_h3_processor, load_h3_qwen_config
 from .packing import (
+    H3_BRIDGE_GUIDE_FRAMES,
     MINIMAX_H3_AUDIO_CHANNELS,
     MINIMAX_H3_AUDIO_LATENTS_PER_SECOND,
     MINIMAX_H3_FPS,
@@ -51,9 +52,11 @@ from .packing import (
     build_row_timesteps,
     keyframe_condition_noise,
     patchify_video_latents,
+    prepare_h3_bridge_video_inputs,
     prepare_keyframe_image,
     unpack_audio_tokens,
     unpatchify_video_tokens,
+    validate_h3_bridge_guides_request,
     video_latent_num_frames,
 )
 from .scheduler import MiniMaxH3Scheduler
@@ -1149,6 +1152,19 @@ class MiniMaxH3Model:
         native_boundary_enabled = (
             custom_settings.get("h3_native_boundary_conditioning") is True
         )
+        bridge_guides_enabled = "_h3_bridge_guides" in custom_settings
+        if bridge_guides_enabled:
+            from services.h3_reference_inputs import selected_h3_video_slots
+
+            selected_bridge_slots = selected_h3_video_slots(
+                video_prompt_type, (input_frames, input_frames2, input_frames3),
+            )
+            validate_h3_bridge_guides_request(
+                custom_settings,
+                reference_mode=bool(getattr(self, "reference_mode", False)),
+                selected_video_slots=selected_bridge_slots,
+                audio_prompt_type=audio_prompt_type,
+            )
         progress_status = _kwargs.get("set_progress_status")
 
         def report_phase(label: str) -> None:
@@ -1188,14 +1204,16 @@ class MiniMaxH3Model:
                 return len(value) > 0
             return True
 
-        spectrum_semantic_inputs = spectrum_input_present(
-            input_ref_images
-        ) or any(
-            spectrum_input_present(item)
-            for item in (
+        spectrum_inputs = (
+            (input_waveform, audio_guide, audio_guide2, audio_guide3)
+            if bridge_guides_enabled
+            else (
                 input_frames, input_frames2, input_frames3,
                 input_waveform, audio_guide, audio_guide2, audio_guide3,
             )
+        )
+        spectrum_semantic_inputs = spectrum_input_present(input_ref_images) or any(
+            spectrum_input_present(item) for item in spectrum_inputs
         )
         spectrum_config = validate_spectrum_request(
             selected_model_type=str(
@@ -1244,7 +1262,7 @@ class MiniMaxH3Model:
         experimental_source_audio = source_audio_requested(custom_settings)
         declared_semantic_references = (
             bool(input_ref_images)
-            or "V" in (video_prompt_type or "")
+            or ("V" in (video_prompt_type or "") and not bridge_guides_enabled)
             or (
                 not experimental_source_audio
                 and any(letter in (audio_prompt_type or "") for letter in "ABCK")
@@ -1376,9 +1394,20 @@ class MiniMaxH3Model:
             image_refs = [input_ref_images]
         from services.h3_reference_inputs import selected_h3_video_slots
 
-        video_refs = [value for _slot, value in selected_h3_video_slots(
+        selected_video_slots = selected_h3_video_slots(
             video_prompt_type, (input_frames, input_frames2, input_frames3),
-        )]
+        )
+        bridge_guide_clips = ()
+        if bridge_guides_enabled:
+            normalized_bridge_slots = tuple(
+                (slot, _as_video_tensor(value))
+                for slot, value in selected_video_slots
+            )
+            video_refs, bridge_guide_clips = prepare_h3_bridge_video_inputs(
+                normalized_bridge_slots, height, width,
+            )
+        else:
+            video_refs = [value for _slot, value in selected_video_slots]
 
         loaded_audio_guides = [
             self._load_waveform(path)
@@ -1618,6 +1647,54 @@ class MiniMaxH3Model:
         )
         if self._interrupt:
             return None
+        bridge_anchors = ()
+        if bridge_guide_clips:
+            report_phase("Encoding H3 AddGuide clips")
+            expected_guide_latents = video_latent_num_frames(H3_BRIDGE_GUIDE_FRAMES)
+            bridge_latents = []
+            for clip in bridge_guide_clips:
+                if tuple(clip.shape) != (3, H3_BRIDGE_GUIDE_FRAMES, height, width):
+                    raise RuntimeError(
+                        "MiniMax H3 AddGuide clip did not match the validated 22-frame canvas."
+                    )
+                latent = self._encode_reference_video(clip, keep_all_latents=True)
+                if (
+                    latent.shape[0] != 1
+                    or latent.shape[2] != expected_guide_latents
+                    or tuple(latent.shape[-2:]) != (latent_height, latent_width)
+                ):
+                    raise RuntimeError(
+                        "MiniMax H3 AddGuide VAE encoding must produce exactly 7 target-sized latent frames."
+                    )
+                bridge_latents.append(latent)
+                if self._interrupt:
+                    return None
+            bridge_rows = torch.cat(
+                [patchify_video_latents(latent, self.patch_size) for latent in bridge_latents]
+            ).to(self.device)
+            bridge_noise = keyframe_condition_noise(
+                tuple(
+                    (latent.shape[2], latent_height, latent_width)
+                    for latent in bridge_latents
+                ),
+                self.patch_size,
+                24,
+                generator=generator,
+                device=self.device,
+            )
+            bridge_rows = self.scheduler.scale_noise(
+                bridge_rows, MINIMAX_H3_KEYFRAME_NOISE_AUG, bridge_noise,
+            )
+            condition_rows = (
+                bridge_rows
+                if condition_rows is None
+                else torch.cat([condition_rows, bridge_rows])
+            )
+            bridge_anchors = tuple(
+                (anchor, int(latent.shape[2]))
+                for anchor, latent in zip(("first", "last"), bridge_latents)
+            )
+            anchors = anchors + bridge_anchors
         if boundary_video_rows is not None:
             condition_rows = (
                 boundary_video_rows

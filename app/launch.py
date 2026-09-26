@@ -4829,6 +4829,7 @@ _RECOVERABLE_INPUT_KEYS = frozenset({
     "audio_path", "reference_image_path", "character_ref_paths",
     "location_ref_paths", "image_paths", "_blend_clip_a", "_blend_clip_b",
     "hflip_source_path", "editor_source_path", "_tool_input_paths",
+    "_h3_bridge_clip_a", "_h3_bridge_clip_b",
 })
 
 
@@ -5862,6 +5863,8 @@ def _queue_recovery_worker(job: dict):
         return globals().get("_run_tool_editor_export")
     if kind == "studio_blend":
         return globals().get("_run_blend_generation")
+    if kind == "studio_h3_bridge":
+        return globals().get("_run_h3_bridge_generation")
     if kind == "studio_outpaint_preparation":
         return globals().get("_prepare_and_run_outpaint")
     if kind == "studio_project_asset_preparation":
@@ -15378,6 +15381,13 @@ def _reject_client_h3_internal_state(body: dict) -> None:
         str(key) for key in body
         if isinstance(key, str) and key.startswith("_h3_")
     )
+    custom_settings = body.get("custom_settings")
+    if isinstance(custom_settings, dict):
+        internal.extend(
+            f"custom_settings.{key}"
+            for key in custom_settings
+            if isinstance(key, str) and key.startswith("_h3_")
+        )
     clip_info = body.get("multi_clip_info")
     if isinstance(clip_info, dict) and "prompt_mapping" in clip_info:
         internal.append("multi_clip_info.prompt_mapping")
@@ -56072,6 +56082,178 @@ async def outpaint_endpoint(request: Request):
     }
 
 
+@api.post("/api/v1/h3/bridge")
+async def h3_bridge_endpoint(request: Request):
+    """Queue a native Ref2VA transition between two project video cuts."""
+    from services.h3_bridge_media import (
+        H3BridgeMediaError, probe_source, validate_bridge_source_dimensions,
+    )
+    from services.h3_bridge_plan import H3BridgePlanError, plan_h3_bridge
+
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Bridge request must be an object")
+    workspace = _request_project_workspace(request, body.get("workspace"))
+    out_dir = _require_project_access(
+        request, workspace, permission="project.generate",
+    )
+    model_type = body.get("model_type", "minimax_h3_ref2va")
+    if model_type != "minimax_h3_ref2va":
+        raise HTTPException(
+            status_code=400,
+            detail="H3 Bridge requires the MiniMax H3 Ref2VA model",
+        )
+    _require_remote_visible_models(request, [model_type])
+    _require_h3_legal_execution([model_type])
+    _require_model_recipe_terms([model_type])
+
+    sources = []
+    for label in ("clip_a", "clip_b"):
+        selected = body.get(label)
+        allowed_clip_keys = {
+            "name", "revision", "end_frame" if label == "clip_a" else "start_frame",
+        }
+        if not isinstance(selected, dict) or set(selected) - allowed_clip_keys:
+            raise HTTPException(status_code=400, detail=f"{label} selection is invalid")
+        name = selected.get("name")
+        revision = selected.get("revision")
+        if not isinstance(name, str) or not isinstance(revision, str) or not revision:
+            raise HTTPException(status_code=400, detail=f"{label} needs a current Gallery selection")
+        source_dir, path, _sidecar = _require_authorized_output(
+            request, workspace, name,
+        )
+        if source_dir != out_dir or os.path.splitext(name)[1].lower() not in {
+            ".mp4", ".webm", ".mkv", ".mov",
+        }:
+            raise HTTPException(status_code=400, detail=f"{label} must be a project video")
+        if not hmac.compare_digest(revision, _output_revision(path, source_dir, name)):
+            raise HTTPException(status_code=409, detail=f"{label} changed; select it again")
+        try:
+            # Media hashing and CFR timestamp inspection can take seconds for
+            # an authorized Gallery clip. Keep that work off the API loop.
+            probe = await asyncio.to_thread(probe_source, path)
+        except H3BridgeMediaError as error:
+            raise HTTPException(status_code=400, detail=f"{label}: {error}") from error
+        except Exception as error:
+            raise HTTPException(status_code=400, detail=f"{label} could not be read") from error
+        if not hmac.compare_digest(revision, _output_revision(path, source_dir, name)):
+            raise HTTPException(status_code=409, detail=f"{label} changed; select it again")
+        sources.append((selected, name, path, probe, probe.sha256))
+
+    (a, a_name, a_path, a_probe, a_digest), (b, b_name, b_path, b_probe, b_digest) = sources
+    try:
+        validate_bridge_source_dimensions(a_probe, b_probe)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    a_end = a.get("end_frame", a_probe.frames_24fps)
+    b_start = b.get("start_frame", 0)
+    if (
+        type(a_end) is not int or type(b_start) is not int
+        or not 56 <= a_end <= a_probe.frames_24fps
+        or not 0 <= b_start <= b_probe.frames_24fps - 56
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Bridge cuts need at least 56 source frames of motion at 24 fps",
+        )
+    generated_frames = body.get("generated_frames", 124)
+    prompt = body.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise HTTPException(status_code=400, detail="Describe the transition to generate")
+    try:
+        plan = plan_h3_bridge(
+            {"sha256": a_digest, "start_frame": a_end - 56,
+             "end_frame_exclusive": a_end},
+            {"sha256": b_digest, "start_frame": b_start,
+             "end_frame_exclusive": b_start + 56},
+            generated_frames=generated_frames,
+            hidden_head_frames=22,
+            hidden_tail_frames=22,
+            reroll_index=body.get("reroll_index", 0),
+        )
+    except H3BridgePlanError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+    defaults = wgp.get_default_settings(model_type) or {}
+    if not isinstance(defaults, dict):
+        raise HTTPException(status_code=503, detail="H3 Bridge model settings are unavailable")
+    settings = body.get("settings", {})
+    allowed_settings = {
+        "seed", "num_inference_steps", "guidance_scale", "resolution",
+        "activated_loras", "loras_multipliers", "tea_cache",
+        "custom_settings", "override_profile",
+    }
+    if not isinstance(settings, dict) or set(settings) - allowed_settings:
+        raise HTTPException(status_code=400, detail="H3 Bridge settings are invalid")
+    _reject_client_h3_internal_state(settings)
+    params = copy.deepcopy(defaults)
+    default_custom = params.get("custom_settings")
+    requested_custom = settings.get("custom_settings", {})
+    if not isinstance(default_custom, dict) or not isinstance(requested_custom, dict):
+        raise HTTPException(status_code=400, detail="H3 Bridge custom settings are invalid")
+    params.update({key: value for key, value in settings.items() if key != "custom_settings"})
+    custom = {**default_custom, **requested_custom}
+    params["custom_settings"] = {
+        **custom,
+        "_h3_bridge_guides": [
+            {"slot": 1, "frame_idx": 0, "frames": 22},
+            {"slot": 2, "frame_idx": -22, "frames": 22},
+        ],
+    }
+    params.update({
+        "model_type": model_type,
+        "prompt": prompt.strip(),
+        "generation_mode": "video",
+        "image_mode": 0,
+        "image_prompt_type": "",
+        "video_prompt_type": "V+-",
+        "audio_prompt_type": "",
+        "video_length": generated_frames,
+        "sliding_window_size": 345,
+        "video_guide": a_path,
+        "video_guide2": b_path,
+        "_h3_bridge_clip_a": a_path,
+        "_h3_bridge_clip_b": b_path,
+        "_h3_bridge_source_names": [a_name, b_name],
+        "_h3_bridge_source_revisions": [a["revision"], b["revision"]],
+        "_h3_bridge_plan": plan,
+        "_defer_output_publication": True,
+    })
+    session_id = request.state.maestro_session_id
+    inherited = _inherit_media_access_policy([a_path, b_path], workspace, session_id)
+    for policy_key in ("private_output", "explicit_output"):
+        if body.get(policy_key) is not None and type(body[policy_key]) is not bool:
+            raise HTTPException(status_code=400, detail=f"{policy_key} must be a boolean")
+    policy = _http_output_policy_from_request(
+        {
+            "private_output": bool(inherited["private"] or body.get("private_output")),
+            "explicit_output": bool(inherited["explicit"] or body.get("explicit_output")),
+        },
+        owner_session_id=session_id,
+    )
+    job_id = _new_generation_job_id()
+    job = {
+        "id": job_id, "status": "queued", "progress": 0,
+        "step": 0, "total_steps": 0, "phase": "",
+        "message": "Queued (H3 Bridge)", "created_at": time.time(),
+        "params": params, "output_files": [], "error": None,
+        "workspace": workspace, "out_dir": out_dir,
+        "session_id": session_id,
+        "source_remote": bool(getattr(request.state, "maestro_remote", False)),
+        "access_policy": policy,
+        "private": policy["private"], "explicit": policy["explicit"],
+        "model_type": model_type, "generation_mode": "video",
+        "prompt_preview": prompt.strip()[:500],
+    }
+    _queue_recovery_register_and_publish(
+        job,
+        worker=_run_h3_bridge_generation,
+        recovery_kind="studio_h3_bridge",
+        thread_name=f"studio-h3-bridge-{job_id}",
+    )
+    return {"job_id": job_id, "status": "queued"}
+
+
 @api.post("/api/v1/blend")
 async def blend_endpoint(request: Request):
     """Blend two clips with an AI-generated transition.
@@ -56615,6 +56797,293 @@ async def blend_endpoint(request: Request):
         import shutil
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise
+
+
+def _run_h3_bridge_generation(job_id: str):
+    """Regenerate the conditioned interval, then publish one A-Bridge-B file."""
+    import tempfile
+    from services.atomic_file_publish import (
+        PublishedFileDurabilityError, publish_file_no_replace,
+    )
+    from services.h3_bridge_media import prepare_guides, assemble_bridge
+    from services.h3_bridge_plan import validate_h3_bridge_plan
+    from services.win_safe_files import safe_direct_file_under
+
+    job = _jobs[job_id]
+    params = job.get("params") or {}
+    out_dir = job.get("out_dir") or ""
+    bridge_state = {"abort": False}
+    final_path = None
+    final_sidecar_path = None
+    final_staging = None
+    owned_new_sidecar = False
+    owned_new_media = False
+    published = False
+    started_at = time.time()
+    try:
+        plan = validate_h3_bridge_plan(params.get("_h3_bridge_plan"))
+        names = params.get("_h3_bridge_source_names")
+        revisions = params.get("_h3_bridge_source_revisions")
+        if (
+            not isinstance(names, list) or len(names) != 2
+            or not isinstance(revisions, list) or len(revisions) != 2
+        ):
+            raise ValueError("Bridge source bindings are incomplete")
+        final_name = f"{job_id}_h3_bridge.mp4"
+        final_path = os.path.join(out_dir, final_name)
+        final_sidecar_path = os.path.join(
+            out_dir, f"{job_id}_h3_bridge.meta.json",
+        )
+        # The sidecar precedes the exclusive media rename. A crash after that
+        # rename leaves a complete, content-bound Final that can be adopted
+        # without running H3 again; any half-published pair fails closed.
+        with _reserve_workspace_operations(job["workspace"]):
+            current_out_dir = _existing_workspace_dir(job["workspace"])
+            if os.path.realpath(current_out_dir) != os.path.realpath(out_dir):
+                raise ValueError("Bridge project changed during recovery")
+            with _output_lineage_mutation_guard(out_dir):
+                media_exists = os.path.lexists(final_path)
+                meta_exists = os.path.lexists(final_sidecar_path)
+                if media_exists != meta_exists:
+                    raise ValueError("Bridge publication is incomplete; review its saved output")
+                if media_exists:
+                    safe_final = safe_direct_file_under(out_dir, final_name)
+                    safe_meta = safe_direct_file_under(
+                        out_dir, os.path.basename(final_sidecar_path),
+                    )
+                    if (
+                        not safe_final or not safe_meta
+                        or os.path.realpath(safe_final) != os.path.realpath(final_path)
+                        or not os.path.isfile(safe_final)
+                        or not os.path.isfile(safe_meta)
+                    ):
+                        raise ValueError("Saved Bridge output is invalid")
+                    with open(safe_meta, "r", encoding="utf-8") as handle:
+                        existing_meta = json.load(handle)
+                    bridge_meta = existing_meta.get("h3_bridge")
+                    media_size, media_digest = _recovery_sha256_file(safe_final)
+                    if (
+                        existing_meta.get("job_id") != job_id
+                        or existing_meta.get("workspace") != job["workspace"]
+                        or existing_meta.get("output_filename") != final_name
+                        or existing_meta.get("artifact_class") != "final"
+                        or not isinstance(bridge_meta, dict)
+                        or bridge_meta.get("plan_sha256") != plan["plan_sha256"]
+                        or bridge_meta.get("source_names") != names
+                        or existing_meta.get("producer_media_size") != media_size
+                        or existing_meta.get("producer_media_sha256") != media_digest
+                        or existing_meta.get("private") != job.get("private")
+                        or existing_meta.get("explicit") != job.get("explicit")
+                    ):
+                        raise ValueError("Saved Bridge output does not match its job")
+                    published = bool(finish_job(
+                        job, "completed", output_files=[final_name], progress=100,
+                        step=0, total_steps=0, phase="", message="Done",
+                    ))
+        if media_exists:
+            if published:
+                record_job_outputs(job, [final_name], final_output_files=[final_name])
+            return
+        source_paths = []
+        for index, (name, revision) in enumerate(zip(names, revisions)):
+            if not isinstance(name, str) or not isinstance(revision, str):
+                raise ValueError("Bridge source bindings are invalid")
+            current = safe_direct_file_under(out_dir, name)
+            expected = params.get("_h3_bridge_clip_a" if index == 0 else "_h3_bridge_clip_b")
+            if (
+                not current or not os.path.isfile(current)
+                or os.path.normcase(os.path.realpath(current))
+                    != os.path.normcase(os.path.realpath(str(expected or "")))
+                or not hmac.compare_digest(
+                    revision, _output_revision(current, out_dir, name),
+                )
+            ):
+                raise ValueError("Bridge source changed; choose it again")
+            source_paths.append(current)
+        a_path, b_path = source_paths
+        if is_cancel_requested(job):
+            return
+        with tempfile.TemporaryDirectory(prefix=f"h3-bridge-{job_id}-") as temp_dir:
+            guides = prepare_guides(
+                a_path, b_path, plan, temp_dir,
+                cancel_check=lambda: is_cancel_requested(job),
+            )
+            if is_cancel_requested(job):
+                return
+            params["video_guide"] = str(guides[0])
+            params["video_guide2"] = str(guides[1])
+            generated_dir = os.path.join(temp_dir, "generated")
+            os.makedirs(generated_dir, exist_ok=True)
+            job["out_dir"] = generated_dir
+            if not _run_generation(job_id, finalize=False):
+                return
+            job["out_dir"] = out_dir
+            if not register_abort_state(
+                job, job_id, _active_gen_states, bridge_state,
+            ):
+                return
+            if not update_job(
+                job, progress=99, phase="Assembling H3 Bridge",
+                message="Joining the source clips and generated transition...",
+            ):
+                return
+            transition_names = [
+                name for name in job.get("_internal_output_files") or []
+                if isinstance(name, str)
+                and os.path.basename(name) == name
+                and os.path.splitext(name)[1].lower() == ".mp4"
+            ]
+            if len(transition_names) != 1:
+                raise ValueError("Bridge generation did not produce one verified video")
+            transition_name = transition_names[0]
+            transition_path = safe_direct_file_under(generated_dir, transition_name)
+            if not transition_path or not os.path.isfile(transition_path):
+                raise ValueError("Generated Bridge transition is unavailable")
+            if is_cancel_requested(job):
+                return
+            # Exclusive rename publication requires the stage and project
+            # destination to be on the same filesystem. Keep it hidden from
+            # the direct-file Gallery until its sidecar and bytes are ready.
+            final_staging = tempfile.TemporaryDirectory(
+                prefix=f".h3-bridge-final-{job_id}-", dir=out_dir,
+            )
+            staging_path = os.path.join(final_staging.name, final_name)
+            summary = assemble_bridge(
+                a_path, b_path, transition_path, plan, staging_path,
+                cancel_check=lambda: is_cancel_requested(job),
+            )
+            if is_cancel_requested(job):
+                return
+            media_size, media_digest = _recovery_sha256_file(staging_path)
+            _transition_size, transition_digest = _recovery_sha256_file(
+                transition_path,
+            )
+            producer_settings = {
+                "plan_sha256": plan["plan_sha256"],
+                "transition_sha256": transition_digest,
+            }
+            final_params = copy.deepcopy(params)
+            for key in (
+                "_h3_bridge_clip_a", "_h3_bridge_clip_b",
+                "_h3_bridge_source_names", "_h3_bridge_source_revisions",
+                "_h3_bridge_plan", "_defer_output_publication",
+                "video_guide", "video_guide2",
+            ):
+                final_params.pop(key, None)
+            custom = final_params.get("custom_settings")
+            if isinstance(custom, dict):
+                custom = dict(custom)
+                custom.pop("_h3_bridge_guides", None)
+                final_params["custom_settings"] = custom
+            final_params["video_guide"] = names[0]
+            final_params["video_guide2"] = names[1]
+            final_params["h3_bridge_plan_sha256"] = plan["plan_sha256"]
+            final_meta = {
+                "params": final_params,
+                "upload_filenames": {
+                    "video_guide": names[0], "video_guide2": names[1],
+                },
+                "generation_mode": "h3_bridge",
+                "job_id": job_id,
+                "generation_time": round(time.time() - started_at),
+                "created_at": time.time(),
+                "output_filename": final_name,
+                "h3_bridge": {
+                    "plan_sha256": plan["plan_sha256"],
+                    "plan": plan,
+                    "source_names": list(names),
+                    "source_hashes": [
+                        plan["sources"]["a_tail"]["sha256"],
+                        plan["sources"]["b_head"]["sha256"],
+                    ],
+                    "assembly": summary,
+                },
+                "producer_unit_id": recovery_unit_id(
+                    job_id, "h3_bridge", settings=producer_settings,
+                ),
+                "producer_unit_kind": "h3_bridge",
+                "producer_unit_variant": 0,
+                "producer_unit_index": 0,
+                "producer_unit_dependencies": [],
+                "producer_unit_settings": producer_settings,
+                "producer_unit_artifact_names": [final_name],
+                "producer_media_size": media_size,
+                "producer_media_sha256": media_digest,
+                "producer_artifact_class": "final",
+                "artifact_class": "final",
+            }
+            stamp_sidecar_policy(
+                final_meta,
+                dict(job.get("access_policy") or {}),
+                workspace=job.get("workspace") or "default",
+            )
+            with _reserve_workspace_operations(job["workspace"]):
+                current_out_dir = _existing_workspace_dir(job["workspace"])
+                if os.path.realpath(current_out_dir) != os.path.realpath(out_dir):
+                    raise ValueError("Bridge project changed during assembly")
+                with _output_lineage_mutation_guard(out_dir):
+                    for index, (name, revision) in enumerate(zip(names, revisions)):
+                        source = safe_direct_file_under(out_dir, name)
+                        if (
+                            not source or not os.path.isfile(source)
+                            or not hmac.compare_digest(
+                                revision, _output_revision(source, out_dir, name),
+                            )
+                        ):
+                            raise ValueError("Bridge source changed during assembly")
+                        _size, digest = _recovery_sha256_file(source)
+                        expected_digest = plan["sources"][
+                            "a_tail" if index == 0 else "b_head"
+                        ]["sha256"]
+                        if not hmac.compare_digest(f"sha256:{digest}", expected_digest):
+                            raise ValueError("Bridge source changed during assembly")
+                    if is_cancel_requested(job):
+                        return
+                    if os.path.lexists(final_path) or os.path.lexists(final_sidecar_path):
+                        raise ValueError("Bridge output name is already in use")
+                    _atomic_write_json(final_sidecar_path, final_meta)
+                    owned_new_sidecar = True
+                    try:
+                        publish_file_no_replace(staging_path, final_path)
+                        owned_new_media = True
+                    except PublishedFileDurabilityError:
+                        owned_new_media = True
+                        raise
+                    if is_cancel_requested(job):
+                        return
+                    published = bool(finish_job(
+                        job, "completed", output_files=[final_name], progress=100,
+                        step=0, total_steps=0, phase="", message="Done",
+                    ))
+            if published:
+                record_job_outputs(job, [final_name], final_output_files=[final_name])
+    except InterruptedError:
+        return
+    except Exception:
+        logging.getLogger(__name__).exception("H3 Bridge failed")
+        if not is_cancel_requested(job):
+            finish_job(
+                job, "failed", error="H3 Bridge could not be completed",
+                message="H3 Bridge failed; check the selected clips and retry",
+            )
+    finally:
+        job["out_dir"] = out_dir
+        job.pop("_internal_output_files", None)
+        job.pop("_internal_clip_output_files", None)
+        job.pop("_internal_join_output_file", None)
+        if not published:
+            for path, owned in (
+                (final_path, owned_new_media),
+                (final_sidecar_path, owned_new_sidecar),
+            ):
+                if owned and path and os.path.isfile(path):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+        if final_staging is not None:
+            final_staging.cleanup()
+        unregister_abort_state(job_id, _active_gen_states, bridge_state)
 
 
 def _run_blend_generation(job_id: str):
@@ -62420,6 +62889,13 @@ def _run_generation(
             # Build task manifest from user params
             raw_params = job["params"].copy()
             raw_params.pop("_h3_offload_plan", None)
+            if job.get("kind") == "studio_h3_bridge":
+                for bridge_key in (
+                    "_h3_bridge_clip_a", "_h3_bridge_clip_b",
+                    "_h3_bridge_source_names", "_h3_bridge_source_revisions",
+                    "_h3_bridge_plan",
+                ):
+                    raw_params.pop(bridge_key, None)
             raw_reference_pack = raw_params.get("reference_pack")
             if (
                 isinstance(raw_reference_pack, dict)
@@ -63569,6 +64045,22 @@ def _run_generation(
                 upload_filenames, sidecar_params = (
                     _prepare_generation_sidecar_params(source_params)
                 )
+                if job.get("kind") == "studio_h3_bridge":
+                    bridge_names = job["params"].get("_h3_bridge_source_names")
+                    for key in (
+                        "_h3_bridge_clip_a", "_h3_bridge_clip_b",
+                        "_h3_bridge_source_names", "_h3_bridge_source_revisions",
+                        "video_guide", "video_guide2",
+                    ):
+                        sidecar_params.pop(key, None)
+                    bridge_custom = sidecar_params.get("custom_settings")
+                    if isinstance(bridge_custom, dict):
+                        bridge_custom = dict(bridge_custom)
+                        bridge_custom.pop("_h3_bridge_guides", None)
+                        sidecar_params["custom_settings"] = bridge_custom
+                    if isinstance(bridge_names, list) and len(bridge_names) == 2:
+                        upload_filenames["video_guide"] = bridge_names[0]
+                        upload_filenames["video_guide2"] = bridge_names[1]
                 # Native boundary descriptors are private, retry-scoped
                 # recovery inputs. Persist only the separately sealed producer
                 # continuation evidence, never staging paths or stale requests.

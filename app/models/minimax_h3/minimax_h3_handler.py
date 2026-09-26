@@ -597,11 +597,29 @@ class family_handler:
         audio_prompt_type = inputs.get("audio_prompt_type") or ""
         video_prompt_type = inputs.get("video_prompt_type") or ""
         image_refs = inputs.get("image_refs") or []
+        bridge_guides_enabled = False
+        selected_video_slots = None
         try:
+            if "_h3_bridge_guides" in custom_for_audio:
+                selected_video_slots = selected_h3_video_slots(
+                    video_prompt_type,
+                    tuple(inputs.get(key) for key in ("video_guide", "video_guide2", "video_guide3")),
+                )
+                from .packing import validate_h3_bridge_guides_request
+
+                try:
+                    bridge_guides_enabled = validate_h3_bridge_guides_request(
+                        custom_for_audio,
+                        reference_mode=_is_reference_mode(base_model_type),
+                        selected_video_slots=selected_video_slots,
+                        audio_prompt_type=audio_prompt_type,
+                    )
+                except ValueError as error:
+                    return str(error)
             experimental_source_audio = source_audio_requested(custom_for_audio)
             semantic_references = (
                 bool(image_refs)
-                or "V" in video_prompt_type
+                or ("V" in video_prompt_type and not bridge_guides_enabled)
                 or (
                     not experimental_source_audio
                     and any(letter in audio_prompt_type for letter in "ABCK")
@@ -647,11 +665,14 @@ class family_handler:
                 if _is_reference_mode(base_model_type)
                 else sum(inputs.get(key) is not None for key in ("image_start", "image_end"))
             )
-            selected_video_slots = selected_h3_video_slots(
-                video_prompt_type,
-                tuple(inputs.get(key) for key in ("video_guide", "video_guide2", "video_guide3")),
+            if selected_video_slots is None:
+                selected_video_slots = selected_h3_video_slots(
+                    video_prompt_type,
+                    tuple(inputs.get(key) for key in ("video_guide", "video_guide2", "video_guide3")),
+                )
+            video_count_for_ordinals = (
+                0 if bridge_guides_enabled else len(selected_video_slots)
             )
-            video_count_for_ordinals = len(selected_video_slots)
             legacy_audio_count = (
                 video_count_for_ordinals
                 if "K" in audio_prompt_type

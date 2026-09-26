@@ -35,7 +35,7 @@ def _runtime_video_refs(params):
     module = ast.parse(MAIN.read_text())
     assignment = next(node for node in ast.walk(module)
                       if isinstance(node, ast.Assign) and any(
-                          isinstance(target, ast.Name) and target.id == 'video_refs'
+                          isinstance(target, ast.Name) and target.id == 'selected_video_slots'
                           for target in node.targets
                       ) and 'selected_h3_video_slots' in ast.unparse(node.value))
     namespace = {'video_prompt_type': params.get('video_prompt_type', ''),
@@ -44,7 +44,7 @@ def _runtime_video_refs(params):
                  'input_frames3': params.get('video_guide3'),
                  'selected_h3_video_slots': selected_h3_video_slots}
     exec(compile(ast.Module(body=[assignment], type_ignores=[]), 'runtime-video-selection', 'exec'), namespace)
-    return namespace['video_refs']
+    return [value for _slot, value in namespace['selected_video_slots']]
 
 
 class H3ReferenceHandoffTests(unittest.TestCase):

@@ -5,9 +5,10 @@ import { ThumbnailGallery } from './ThumbnailGallery'
 import { MediaFeedItem } from './MediaFeedItem'
 import { GalleryViewer } from './GalleryViewer'
 import { ProjectAccessPanel } from './ProjectAccessPanel'
+import { H3BridgePanel, resolveH3BridgeSelection } from './H3BridgePanel'
 import { LlmChat } from '../LlmChat'
 import { H3DeliveryRecoveryStatus, OPEN_GALLERY_EVENT } from '../H3DeliveryRecoveryStatus'
-import { useStore } from '../../stores/useStore'
+import * as storeApi from '../../stores/useStore'
 import type { GenerationJob, ModelDef, OutputFile } from '../../types'
 import * as api from '../../api/client'
 import { modelDisplayName } from '../../lib/modelDisplay'
@@ -19,7 +20,7 @@ import {
 } from '../../lib/privatePreview'
 import { boundedBackoffDelay, POLL_INTERVAL_MS, useVisibilityPolling } from '../../lib/useVisibilityPolling'
 import { copyTextToClipboard } from '../../lib/clipboard'
-import { subscribeQueueView } from '../../lib/mainViewNavigation'
+import { requestQueueView, subscribeQueueView } from '../../lib/mainViewNavigation'
 import { isActiveLogicalQueueJob, projectLogicalQueue } from '../../lib/queueProjection'
 import { formatApproximateDuration, formatMediaDuration } from '../../lib/format'
 import { BLEND_MEDIA_ACCEPT, isBlendMediaFile } from '../Sidebar/blendMediaTypes'
@@ -28,6 +29,8 @@ const QUEUE_REFRESH_EVENT = 'maestro:queue-refresh'
 const REQUEST_WORKSPACE_UNLOCK_EVENT = 'maestro:request-workspace-unlock'
 const RESOURCE_WAIT_TITLE = 'This generation is still in the queue. It will start when enough GPU resources are available, without interrupting a generation already running.'
 const CPU_RESTART_WARNING = 'This text task is running on the CPU, so it may be slower. Maestro will restart it with GPU acceleration only if starting over is expected to finish sooner.'
+const useStore = storeApi.useStore
+const currentAccountIdentityEpoch = () => storeApi.currentAccountIdentityEpoch?.() ?? 0
 
 type ProjectPermission =
   | 'project.open'
@@ -2442,6 +2445,20 @@ function GalleryBulkToolbar() {
   const accountProjectAccessActive = api.isAccountProjectAccessActive(accessContext, accountProjectMigration)
   const workspaceByName = new Map(workspaces.map(workspace => [workspace.name, workspace]))
   const selectedOutputs = outputs.filter(output => selected.includes(`${output.workspace}\0${output.name}`))
+  const activeProject = workspaceByName.get(activeWorkspace)
+  const canGenerateBridge = workspaceAllowsPermission(activeProject, 'project.generate')
+    && (accountProjectAccessActive || activeProject?.unlocked !== false)
+  const bridgeCandidates = resolveH3BridgeSelection(outputs, selected, activeWorkspace, canGenerateBridge)
+  const bridgeSelectionIdentity = JSON.stringify(
+    (bridgeCandidates || []).map(output => output.workspace + '\0' + output.name).sort(),
+  )
+  const bridgeAccountEpoch = currentAccountIdentityEpoch()
+  const isCurrentBridgeSelection = () => {
+    const state = useStore.getState()
+    return currentAccountIdentityEpoch() === bridgeAccountEpoch
+      && state.activeWorkspace === activeWorkspace
+      && JSON.stringify([...state.selectedOutputKeys].sort()) === bridgeSelectionIdentity
+  }
   const canMutateSelection = selected.length > 0
     && selectedOutputs.length === selected.length
     && selectedOutputs.every(output => workspaceAllowsPermission(
@@ -2479,6 +2496,19 @@ function GalleryBulkToolbar() {
           Select loaded
         </button>
         <button onClick={clear} disabled={busy} className="rounded-md border border-border px-2 py-1 text-[10px] text-text-secondary hover:text-text-primary">Clear</button>
+        {bridgeCandidates && (
+          <H3BridgePanel
+            key={String(bridgeAccountEpoch) + ':' + bridgeSelectionIdentity}
+            workspace={activeWorkspace}
+            clips={bridgeCandidates}
+            isCurrentSelection={isCurrentBridgeSelection}
+            onQueued={() => {
+              if (!isCurrentBridgeSelection()) return
+              requestQueueView()
+              window.dispatchEvent(new CustomEvent(QUEUE_REFRESH_EVENT))
+            }}
+          />
+        )}
         <div className="mx-1 hidden h-5 w-px bg-border sm:block" />
         {canMutateSelection && <>
           <select
