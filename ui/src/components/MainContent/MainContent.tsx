@@ -6,6 +6,7 @@ import { MediaFeedItem } from './MediaFeedItem'
 import { GalleryViewer } from './GalleryViewer'
 import { ProjectAccessPanel } from './ProjectAccessPanel'
 import { H3BridgePanel, resolveH3BridgeSelection } from './H3BridgePanel'
+import { H3GuidePanel, resolveH3GuideSelection } from './H3GuidePanel'
 import { LlmChat } from '../LlmChat'
 import { H3DeliveryRecoveryStatus, OPEN_GALLERY_EVENT } from '../H3DeliveryRecoveryStatus'
 import * as storeApi from '../../stores/useStore'
@@ -2428,6 +2429,9 @@ function QueuePanel({
 function GalleryBulkToolbar() {
   const selected = useStore(s => s.selectedOutputKeys)
   const outputs = useStore(s => s.filteredOutputs())
+  const models = useStore(s => s.models)
+  const enabledModels = useStore(s => s.enabledModels)
+  const modelsLoaded = useStore(s => s.modelsLoaded)
   const workspaces = useStore(s => s.workspaces) ?? []
   const activeWorkspace = useStore(s => s.activeWorkspace)
   const accessContext = useStore(s => s.accessContext)
@@ -2449,15 +2453,33 @@ function GalleryBulkToolbar() {
   const canGenerateBridge = workspaceAllowsPermission(activeProject, 'project.generate')
     && (accountProjectAccessActive || activeProject?.unlocked !== false)
   const bridgeCandidates = resolveH3BridgeSelection(outputs, selected, activeWorkspace, canGenerateBridge)
+  const guideStill = resolveH3GuideSelection(outputs, selected, activeWorkspace, canGenerateBridge)
   const bridgeSelectionIdentity = JSON.stringify(
     (bridgeCandidates || []).map(output => output.workspace + '\0' + output.name).sort(),
   )
+  const guideSelectionKey = guideStill
+    ? `${guideStill.workspace}\0${guideStill.name}`
+    : ''
+  const guideSelectionIdentity = guideStill
+    ? `${guideSelectionKey}\0${guideStill.revision}`
+    : ''
   const bridgeAccountEpoch = currentAccountIdentityEpoch()
   const isCurrentBridgeSelection = () => {
     const state = useStore.getState()
     return currentAccountIdentityEpoch() === bridgeAccountEpoch
       && state.activeWorkspace === activeWorkspace
       && JSON.stringify([...state.selectedOutputKeys].sort()) === bridgeSelectionIdentity
+  }
+  const guideAccountEpoch = currentAccountIdentityEpoch()
+  const isCurrentGuideSelection = () => {
+    const state = useStore.getState()
+    return currentAccountIdentityEpoch() === guideAccountEpoch
+      && state.activeWorkspace === activeWorkspace
+      && state.selectedOutputKeys.length === 1
+      && state.selectedOutputKeys[0] === guideSelectionKey
+      && state.filteredOutputs().some(output => (
+        `${output.workspace}\0${output.name}\0${output.revision}` === guideSelectionIdentity
+      ))
   }
   const canMutateSelection = selected.length > 0
     && selectedOutputs.length === selected.length
@@ -2509,6 +2531,26 @@ function GalleryBulkToolbar() {
               // only jobs known to the store even when /queue already lists it.
               await useStore.getState().reconnectJobs()
               if (!isCurrentBridgeSelection()) return
+              requestQueueView()
+              window.dispatchEvent(new CustomEvent(QUEUE_REFRESH_EVENT))
+            }}
+          />
+        )}
+        {guideStill && (
+          <H3GuidePanel
+            key={String(guideAccountEpoch) + ':' + guideSelectionIdentity}
+            workspace={activeWorkspace}
+            still={guideStill}
+            models={models}
+            enabledModels={enabledModels}
+            modelsLoaded={modelsLoaded}
+            isCurrentSelection={isCurrentGuideSelection}
+            onQueued={async () => {
+              if (!isCurrentGuideSelection()) return
+              // Reconnect the accepted guide job before opening Queue so its
+              // normal generation status is visible without a page reload.
+              await useStore.getState().reconnectJobs()
+              if (!isCurrentGuideSelection()) return
               requestQueueView()
               window.dispatchEvent(new CustomEvent(QUEUE_REFRESH_EVENT))
             }}

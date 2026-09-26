@@ -386,6 +386,88 @@ test('gallery actions select their card and immediately start that card operatio
   })
 })
 
+test('Gallery still guide outputs cannot restore or reroll as ordinary video settings', async () => {
+  const guideMetadata = {
+    ...sidecar(baseParams({
+      model_type: 'minimax_h3',
+      prompt: 'guided output prompt',
+      image_mode: 1,
+      image_start: 'source-still.png',
+    })),
+    h3_guide_execution: {
+      capability: 'gallery_still_fl2va',
+      frame_index: 62,
+      target_frames: 124,
+      guide_count: 1,
+      audio_guides: 0,
+      video_guides: 0,
+    },
+  }
+
+  await withStore(async ({ alerts, requests, useStore }) => {
+    const guidedOutput = { name: 'guided-output.mp4', meta: guideMetadata }
+    configureGallery(useStore, [guidedOutput])
+    let generationCalls = 0
+    useStore.setState({ startGeneration: async () => { generationCalls += 1 } })
+    const initialParams = useStore.getState().params
+
+    assert.equal(await useStore.getState().loadSettingsFromOutput(), false)
+    assert.strictEqual(useStore.getState().params, initialParams)
+    assert.match(alerts.at(-1), /Select the source still in Gallery.*Use still as guide/i)
+    assert.deepEqual(requests, [], 'cached guide metadata is rejected before network or hydration work')
+
+    await useStore.getState().rerollGeneration()
+    assert.equal(generationCalls, 0)
+    assert.strictEqual(useStore.getState().params, initialParams)
+    assert.deepEqual(requests, [])
+  })
+
+  await withStore(async ({ alerts, metadata, requests, useStore }) => {
+    const embeddedGuideMetadata = {
+      source: 'embedded',
+      params: baseParams({
+        model_type: 'minimax_h3',
+        prompt: 'embedded guided output prompt',
+        image_mode: 1,
+        image_start: 'source-still.png',
+        custom_settings: { _h3_timeline_still_guide: { frame_index: 62 } },
+      }),
+      upload_filenames: {},
+    }
+    assert.equal(Object.hasOwn(embeddedGuideMetadata, 'h3_guide_execution'), false)
+    const guidedOutput = { name: 'guide-embedded-metadata-refresh.mp4', meta: null }
+    metadata.set(guidedOutput.name, embeddedGuideMetadata)
+    configureGallery(useStore, [guidedOutput])
+    const initialParams = useStore.getState().params
+
+    assert.equal(await useStore.getState().loadSettingsFromOutput(), false)
+    assert.strictEqual(useStore.getState().params, initialParams)
+    assert.match(alerts.at(-1), /Select the source still in Gallery.*Use still as guide/i)
+    assert.ok(
+      requests.some(({ url }) => url.startsWith(`/api/v1/outputs/${encodeURIComponent(guidedOutput.name)}/metadata`)),
+      'sidecarless metadata is refreshed before the embedded marker guard runs',
+    )
+    assert.equal(
+      requests.some(({ url }) => url.startsWith('/api/v1/model-options/') || url.startsWith('/api/v1/file/')),
+      false,
+      'embedded guide metadata is rejected before model-option or image hydration requests',
+    )
+  })
+})
+
+test('Gallery still guide controls hide generic settings, recipe, and reroll actions', async () => {
+  const [card, infoBar] = await Promise.all([
+    source('../src/components/MainContent/MediaFeedItem.tsx'),
+    source('../src/components/MainContent/VideoInfoBar.tsx'),
+  ])
+  assert.ok(card.includes('isH3GalleryStillGuideOutput(meta)'), 'the card checks the server guide capability')
+  assert.ok(card.includes('H3_GALLERY_STILL_GUIDE_RESTORE_MESSAGE'), 'the card provides actionable guidance')
+  assert.ok(card.includes('{!isGalleryStillGuideOutput && ('), 'the card gates its recipe/load/reroll controls')
+  assert.ok(infoBar.includes('isH3GalleryStillGuideOutput(meta)'), 'the info bar checks the server guide capability')
+  assert.ok(infoBar.includes('H3_GALLERY_STILL_GUIDE_RESTORE_MESSAGE'), 'the info bar provides actionable guidance')
+  assert.ok(infoBar.includes('{!isGalleryStillGuideOutput && ('), 'the info bar gates load/reroll controls')
+})
+
 test('selecting another output immediately restores that card across generation modes', async () => {
   await withStore(async ({ metadata, requests, useStore }) => {
     const audio = {

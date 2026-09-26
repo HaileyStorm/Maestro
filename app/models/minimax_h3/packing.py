@@ -36,14 +36,13 @@ without it: `MiniMaxH3Transformer3DModel` then needs no attention mask, which ke
 backends available.
 """
 
+import os
 from dataclasses import dataclass
 
 import numpy as np
 import torch
-from PIL import Image
-
 from diffusers.utils.torch_utils import randn_tensor
-
+from PIL import Image
 
 # Per-row modality tags. They index the transformer's AdaLN table, so the values are a checkpoint contract.
 MINIMAX_H3_VIDEO_TAG = 0
@@ -215,6 +214,158 @@ def align_num_frames(num_frames: int) -> int:
     return num_frames
 
 
+def _has_h3_guide_input(value) -> bool:
+    """Return whether a guide slot contains a value without reading media."""
+    if value is None:
+        return False
+    if isinstance(value, torch.Tensor):
+        return value.numel() > 0
+    if isinstance(value, (list, tuple, dict, set)):
+        return bool(value)
+    return True
+
+
+def _is_single_h3_still_shape(image) -> bool:
+    """Recognize one CHW still or a one-frame CTHW still without copying it."""
+    if isinstance(image, Image.Image):
+        return image.width > 0 and image.height > 0
+    if isinstance(image, torch.Tensor):
+        shape = tuple(image.shape)
+        if len(shape) == 3:
+            return shape[0] in (3, 4) and shape[1] > 0 and shape[2] > 0
+        if len(shape) == 4:
+            return (
+                shape[0] in (3, 4)
+                and shape[1] == 1
+                and shape[2] > 0
+                and shape[3] > 0
+            )
+        return False
+    try:
+        shape = tuple(np.asarray(image).shape)
+    except (TypeError, ValueError):
+        return False
+    if len(shape) == 2:
+        return shape[0] > 0 and shape[1] > 0
+    if len(shape) == 3:
+        return shape[0] > 0 and shape[1] > 0 and shape[2] in (1, 3, 4)
+    return False
+
+
+def validate_h3_timeline_still_guide_request(
+    custom_settings,
+    *,
+    frame_num: int | None,
+    image_start,
+    image_end=None,
+    reference_mode: bool = False,
+    native_boundary: bool = False,
+    image_refs=None,
+    video_guides=(),
+    video_prompt_type: str = "",
+    audio_guides=(),
+    audio_prompt_type: str = "",
+    audio_inputs=(),
+    input_video=None,
+    prefix_frames_count=0,
+    validate_image_shape: bool = True,
+) -> tuple[str, int, int] | None:
+    """Validate the private FL2VA still-at-frame adapter and return its packer anchor.
+
+    The private setting changes only where ``image_start`` is placed in the target
+    video timeline. It never converts semantic references, endpoint images, or
+    boundary continuation into timeline guides.
+    """
+    setting_name = "_h3_timeline_still_guide"
+    if not isinstance(custom_settings, dict) or setting_name not in custom_settings:
+        return None
+
+    guide = custom_settings[setting_name]
+    if not isinstance(guide, dict) or set(guide) != {"frame_index"}:
+        raise ValueError(
+            "MiniMax H3 timeline still guide must contain only an integer frame_index."
+        )
+    frame_index = guide.get("frame_index")
+    if type(frame_index) is not int:
+        raise ValueError(
+            "MiniMax H3 timeline still guide frame_index must be an integer."
+        )
+    if reference_mode:
+        raise ValueError("MiniMax H3 timeline still guides require an FL2VA checkpoint.")
+    if _has_h3_guide_input(image_end):
+        raise ValueError(
+            "MiniMax H3 timeline still guides cannot be combined with an ending image."
+        )
+    if native_boundary or custom_settings.get("h3_native_boundary_conditioning") is True:
+        raise ValueError(
+            "MiniMax H3 timeline still guides cannot be combined with boundary conditioning."
+        )
+    if "_h3_bridge_guides" in custom_settings:
+        raise ValueError(
+            "MiniMax H3 timeline still guides cannot be combined with Bridge guides."
+        )
+    if _has_h3_guide_input(input_video) or prefix_frames_count not in (None, 0, False):
+        raise ValueError(
+            "MiniMax H3 timeline still guides cannot be combined with boundary video input."
+        )
+    if _has_h3_guide_input(image_refs):
+        raise ValueError(
+            "MiniMax H3 timeline still guides accept only image_start as the visual guide."
+        )
+    if any(_has_h3_guide_input(value) for value in video_guides) or "V" in str(
+        video_prompt_type or ""
+    ).upper():
+        raise ValueError(
+            "MiniMax H3 timeline still guides cannot be combined with video references."
+        )
+    source_audio_mode = str(
+        custom_settings.get("h3_source_audio_mode") or "native"
+    ).strip().lower()
+    if (
+        any(_has_h3_guide_input(value) for value in audio_guides)
+        or str(audio_prompt_type or "").strip()
+        or any(_has_h3_guide_input(value) for value in audio_inputs)
+        or source_audio_mode != "native"
+    ):
+        raise ValueError(
+            "MiniMax H3 timeline still guides cannot be combined with audio guidance or source audio."
+        )
+    if not _has_h3_guide_input(image_start):
+        raise ValueError("MiniMax H3 timeline still guide requires image_start.")
+    if validate_image_shape:
+        if not _is_single_h3_still_shape(image_start):
+            raise ValueError(
+                "MiniMax H3 timeline still guide image_start must be one CHW RGB/RGBA still "
+                "or a one-frame CTHW tensor."
+            )
+    elif not isinstance(image_start, (str, os.PathLike)) and not _is_single_h3_still_shape(
+        image_start
+    ):
+        raise ValueError(
+            "MiniMax H3 timeline still guide image_start must be one CHW RGB/RGBA still "
+            "or a one-frame CTHW tensor."
+        )
+
+    if frame_num is not None:
+        if isinstance(frame_num, bool) or not isinstance(frame_num, (int, np.integer)):
+            raise ValueError("MiniMax H3 timeline still guide requires an integer target frame count.")
+        frame_num = int(frame_num)
+        if frame_num < 1 or align_num_frames(frame_num) != frame_num:
+            raise ValueError(
+                "MiniMax H3 timeline still guide target frame count must be aligned to the 17n+5 grid."
+            )
+        if not 0 < frame_index < frame_num - 1:
+            raise ValueError(
+                "MiniMax H3 timeline still guide frame_index must select an interior target frame."
+            )
+    elif frame_index < 1:
+        raise ValueError(
+            "MiniMax H3 timeline still guide frame_index must select an interior target frame."
+        )
+
+    return "frame", 1, frame_index
+
+
 def video_latent_num_frames(num_frames: int) -> int:
     r"""
     The number of latent frames the video VAE produces for a `17 * n + 5` frame count.
@@ -273,6 +424,11 @@ def prepare_keyframe_image(image, height: int, width: int, stretch: bool):
     top = max(0, (resized_size[1] - height) // 2)
     resized = image.resize(resized_size, Image.Resampling.LANCZOS)
     return resized.crop((left, top, left + width, top + height))
+
+
+def prepare_h3_timeline_still_guide_image(image, height: int, width: int):
+    """Prepare an interior AddGuide still with the upstream center cover-crop."""
+    return prepare_keyframe_image(image, height, width, stretch=False)
 
 
 class H3BridgeGuideError(ValueError):

@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback, type CSSProperties, type Keyb
 import { Play, Pencil, RefreshCw, FlipHorizontal, Copy, Trash2, Check, Combine, Loader2, Heart, ArrowLeftToLine, Download, FolderInput, Scissors, FastForward, BookMarked, EyeOff, Share2, Link2Off, Clapperboard } from 'lucide-react'
 import { SaveRecipeDialog } from '../Recipes/SaveRecipeDialog'
 import { currentAccountIdentityEpoch, useStore } from '../../stores/useStore'
+import { H3_GALLERY_STILL_GUIDE_RESTORE_MESSAGE, isH3GalleryStillGuideOutput } from '../../lib/h3GalleryStillGuide'
 import { prepareGalleryContinuation, retainContinuationPreview } from '../../lib/galleryContinuation'
 import { createOutputShare, deleteOutputComponents, getUploadUrl, fetchOutputMetadata, getFileUrl, moveOutput, revokeOutputShare, uploadImage } from '../../api/client'
 import type { OutputFile, OutputMetadata } from '../../types'
@@ -265,6 +266,7 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
   }, [isActive, privateBlurred, releaseVideoSource])
 
   const params = meta?.params as Record<string, unknown> | null
+  const isGalleryStillGuideOutput = isH3GalleryStillGuideOutput(meta)
   const uploadFilenames = meta?.upload_filenames
 
   const prompt = (params?._tts_original_prompt as string) || (params?.prompt as string) || ''
@@ -941,6 +943,15 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
           aria-label={`Actions for ${file.name}`}
           onClick={e => e.stopPropagation()}
         >
+          {isGalleryStillGuideOutput && (
+            <span
+              role="note"
+              className="max-w-56 px-1 text-[9px] leading-tight text-text-muted"
+              title={H3_GALLERY_STILL_GUIDE_RESTORE_MESSAGE}
+            >
+              Select the source still in Gallery, then choose “Use still as guide” again.
+            </span>
+          )}
           {file.type === 'video' && !browsingUploads && canEditProject && (
             <button
               onClick={() => openEditor(file)}
@@ -954,40 +965,44 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
           )}
           {params && (
             <>
-              <button
-                ref={saveRecipeTriggerRef}
-                onClick={(e) => {
-                  e.stopPropagation()
-                  saveRecipeEpochRef.current += 1
-                  setShowSaveRecipe(true)
-                }}
-                type="button"
-                aria-haspopup="dialog"
-                aria-expanded={showSaveRecipe}
-                aria-label="Save as Recipe — reuse this look with one click"
-                className="min-h-11 min-w-11 rounded-lg p-1.5 text-text-secondary transition-colors hover:bg-bg-hover hover:text-accent-blue md:min-h-0 md:min-w-0"
-                title="Save as Recipe — reuse this look with one click"
-              >
-                <BookMarked size={13} />
-              </button>
-              <button
-                onClick={handleLoadSettings}
-                type="button"
-                aria-label={`Load generation settings from ${file.name}`}
-                className="min-h-11 min-w-11 rounded-lg p-1.5 text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary md:min-h-0 md:min-w-0"
-                title="Load settings"
-              >
-                <Pencil size={13} />
-              </button>
-              <button
-                onClick={handleReroll}
-                type="button"
-                aria-label={`Regenerate ${file.name} with the same settings`}
-                className="min-h-11 min-w-11 rounded-lg p-1.5 text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary md:min-h-0 md:min-w-0"
-                title="Re-generate with same settings"
-              >
-                <RefreshCw size={13} />
-              </button>
+              {!isGalleryStillGuideOutput && (
+                <>
+                  <button
+                    ref={saveRecipeTriggerRef}
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      saveRecipeEpochRef.current += 1
+                      setShowSaveRecipe(true)
+                    }}
+                    type="button"
+                    aria-haspopup="dialog"
+                    aria-expanded={showSaveRecipe}
+                    aria-label="Save as Recipe — reuse this look with one click"
+                    className="min-h-11 min-w-11 rounded-lg p-1.5 text-text-secondary transition-colors hover:bg-bg-hover hover:text-accent-blue md:min-h-0 md:min-w-0"
+                    title="Save as Recipe — reuse this look with one click"
+                  >
+                    <BookMarked size={13} />
+                  </button>
+                  <button
+                    onClick={handleLoadSettings}
+                    type="button"
+                    aria-label={`Load generation settings from ${file.name}`}
+                    className="min-h-11 min-w-11 rounded-lg p-1.5 text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary md:min-h-0 md:min-w-0"
+                    title="Load settings"
+                  >
+                    <Pencil size={13} />
+                  </button>
+                  <button
+                    onClick={handleReroll}
+                    type="button"
+                    aria-label={`Regenerate ${file.name} with the same settings`}
+                    className="min-h-11 min-w-11 rounded-lg p-1.5 text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary md:min-h-0 md:min-w-0"
+                    title="Re-generate with same settings"
+                  >
+                    <RefreshCw size={13} />
+                  </button>
+                </>
+              )}
               {file.type === 'video' && (
                 <>
                   <button

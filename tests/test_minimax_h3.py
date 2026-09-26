@@ -47,6 +47,47 @@ def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def _load_wgp_timeline_still_guide_helper():
+    tree = ast.parse(_read(_WGP_PATH), filename=str(_WGP_PATH))
+    selected = []
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "_is_h3_timeline_still_guide_request":
+            selected.append(node)
+        elif isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name)
+            and target.id == "_H3_TIMELINE_STILL_GUIDE_MODELS"
+            for target in node.targets
+        ):
+            selected.append(node)
+    namespace = {}
+    module = ast.Module(body=selected, type_ignores=[])
+    exec(
+        compile(ast.fix_missing_locations(module), str(_WGP_PATH), "exec"),
+        namespace,
+    )
+    return namespace["_is_h3_timeline_still_guide_request"]
+
+
+def _load_wgp_first_window_prefix_helper(torch):
+    tree = ast.parse(_read(_WGP_PATH), filename=str(_WGP_PATH))
+    selected = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_restore_h3_first_window_prefix"
+    )
+    namespace = {
+        "torch": torch,
+        "_video_tensor_to_uint8_chunk_inplace": lambda value: value,
+    }
+    module = ast.Module(body=[selected], type_ignores=[])
+    exec(
+        compile(ast.fix_missing_locations(module), str(_WGP_PATH), "exec"),
+        namespace,
+    )
+    return namespace["_restore_h3_first_window_prefix"]
+
+
 class _HTTPException(Exception):
     def __init__(self, *, status_code: int, detail):
         super().__init__(detail)
@@ -266,6 +307,7 @@ def _load_handler_class():
     namespace = {
         "os": os,
         "torch": types.SimpleNamespace(bfloat16="bfloat16"),
+        "__package__": "models.minimax_h3",
     }
     module = ast.Module(body=selected, type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), str(_HANDLER_PATH), "exec"), namespace)
@@ -522,6 +564,10 @@ class TestMiniMaxH3Definition(unittest.TestCase):
         )
         self.assertNotIn("768p", model_def["resolution_preset_order"])
         self.assertTrue(model_def["supports_auto_aspect"])
+        self.assertIn(
+            "_h3_timeline_still_guide",
+            model_def["runtime_custom_settings"],
+        )
         self.assertEqual(
             model_def["auto_resolution_fallbacks"]["auto_1080p"],
             "1920x1088",
@@ -1553,6 +1599,306 @@ class TestMiniMaxH3ConditionerCheckpoint(unittest.TestCase):
         for state_dict, message in invalid_cases:
             with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
                 preprocess_conditioner_state_dict(state_dict)
+
+
+class TestMiniMaxH3TimelineStillGuide(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(_APP))
+        import torch
+        from models.minimax_h3.minimax_h3_main import MiniMaxH3Model
+        from models.minimax_h3.packing import (
+            audio_latent_num_frames,
+            build_packed_sequence,
+            prepare_h3_timeline_still_guide_image,
+            validate_h3_timeline_still_guide_request,
+            video_latent_num_frames,
+        )
+        from PIL import Image
+
+        cls.torch = torch
+        cls.Image = Image
+        cls.model_type = MiniMaxH3Model
+        cls.audio_latent_num_frames = staticmethod(audio_latent_num_frames)
+        cls.build_packed_sequence = staticmethod(build_packed_sequence)
+        cls.prepare_timeline_image = staticmethod(prepare_h3_timeline_still_guide_image)
+        cls.validate_guide = staticmethod(validate_h3_timeline_still_guide_request)
+        cls.video_latent_num_frames = staticmethod(video_latent_num_frames)
+        cls.handler = _load_handler_class()
+        cls.wgp_guide_request = staticmethod(
+            _load_wgp_timeline_still_guide_helper()
+        )
+        cls.restore_first_window_prefix = staticmethod(
+            _load_wgp_first_window_prefix_helper(torch)
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if sys.path and sys.path[0] == str(_APP):
+            sys.path.pop(0)
+
+    def _guide_settings(self, frame_index=47):
+        return {"_h3_timeline_still_guide": {"frame_index": frame_index}}
+
+    def _validate(self, **overrides):
+        values = {
+            "custom_settings": self._guide_settings(),
+            "frame_num": 124,
+            "image_start": self.torch.zeros((3, 1, 8, 8)),
+        }
+        values.update(overrides)
+        return self.validate_guide(**values)
+
+    def test_interior_guide_uses_absolute_pixel_frame_rope_time(self):
+        anchor = self._validate()
+        self.assertEqual(anchor, ("frame", 1, 47))
+        self.assertNotEqual(anchor[2] % 17, 0)
+
+        text_tags = self.torch.ones((4,), dtype=self.torch.long)
+        layout = self.build_packed_sequence(
+            text_tags,
+            self.video_latent_num_frames(124),
+            2,
+            2,
+            self.audio_latent_num_frames(124),
+            (1, 1, 1),
+            keyframe_anchors=(anchor,),
+        )
+        first_condition_row = int(layout.video_indices[0])
+        expected_time = 4 + 47 * (5.0 / 3.0)
+        self.assertAlmostEqual(
+            float(layout.position_ids[first_condition_row, 0]),
+            expected_time,
+        )
+
+    def test_rejects_unsupported_modes_shapes_and_frame_geometry(self):
+        invalid = (
+            ({"reference_mode": True}, "FL2VA"),
+            ({"image_end": self.torch.zeros((3, 8, 8))}, "ending image"),
+            ({"native_boundary": True}, "boundary conditioning"),
+            ({"image_refs": ["reference.png"]}, "only image_start"),
+            ({"video_guides": (self.torch.zeros((3, 5, 8, 8)),)}, "video references"),
+            ({"audio_guides": ("voice.wav",)}, "audio guidance or source audio"),
+            ({"audio_prompt_type": "A"}, "audio guidance or source audio"),
+            ({"audio_inputs": ("soundtrack.wav",)}, "audio guidance or source audio"),
+            (
+                {
+                    "custom_settings": {
+                        **self._guide_settings(),
+                        "h3_source_audio_mode": "lock_source",
+                    }
+                },
+                "audio guidance or source audio",
+            ),
+            ({"frame_num": 125}, "aligned to the 17n\\+5 grid"),
+            ({"custom_settings": self._guide_settings(123)}, "interior target frame"),
+            ({"custom_settings": self._guide_settings(0)}, "interior target frame"),
+            ({"custom_settings": self._guide_settings(True)}, "must be an integer"),
+            (
+                {
+                    "custom_settings": {
+                        "_h3_timeline_still_guide": {
+                            "frame_index": 47,
+                            "unexpected": True,
+                        }
+                    }
+                },
+                "only an integer frame_index",
+            ),
+            ({"image_start": self.torch.zeros((3, 2, 8, 8))}, "one CHW RGB/RGBA still"),
+            (
+                {
+                    "custom_settings": {
+                        **self._guide_settings(),
+                        "_h3_bridge_guides": [],
+                    }
+                },
+                "Bridge guides",
+            ),
+        )
+        for overrides, message in invalid:
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                self._validate(**overrides)
+
+    def test_unmarked_request_keeps_existing_audio_inputs(self):
+        self.assertIsNone(
+            self.validate_guide(
+                {"h3_source_audio_mode": "lock_source"},
+                frame_num=124,
+                image_start=None,
+                audio_guides=("voice.wav",),
+                audio_prompt_type="A",
+                audio_inputs=("soundtrack.wav",),
+            )
+        )
+
+    def test_wgp_private_guide_skips_only_the_start_prefix_path(self):
+        settings = self._guide_settings()
+        for model_type in (
+            "minimax_h3",
+            "minimax_h3_pinkcherry_fl2va",
+            "minimax_h3_w4a8_fl2va",
+        ):
+            self.assertTrue(
+                self.wgp_guide_request(
+                    settings,
+                    model_type=model_type,
+                    base_model_type="minimax_h3",
+                )
+            )
+        self.assertFalse(
+            self.wgp_guide_request(
+                {}, model_type="wan", base_model_type="wan",
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "FL2VA checkpoint"):
+            self.wgp_guide_request(
+                settings,
+                model_type="minimax_h3_ref2va",
+                base_model_type="minimax_h3_ref2va",
+            )
+        with self.assertRaisesRegex(ValueError, "source video"):
+            self.wgp_guide_request(
+                settings,
+                model_type="minimax_h3",
+                base_model_type="minimax_h3",
+                video_source="source.mp4",
+            )
+        with self.assertRaisesRegex(ValueError, "fake start-image"):
+            self.wgp_guide_request(
+                settings,
+                model_type="minimax_h3",
+                base_model_type="minimax_h3",
+                fake_start_image=True,
+            )
+
+        source = _read(_WGP_PATH)
+        generate_video = next(
+            node
+            for node in ast.parse(source, filename=str(_WGP_PATH)).body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_generate_video_impl"
+        )
+        generate_source = ast.get_source_segment(source, generate_video) or ""
+        self.assertRegex(
+            generate_source,
+            r"(?s)if h3_timeline_still_guide_requested:\s*"
+            r"if sample_fit_canvas is not None.*?else:\s*"
+            r"pre_video_guide\s*=\s*prefix_video\s*=\s*image_start_tensor\.unsqueeze\(1\)",
+        )
+        self.assertRegex(
+            generate_source,
+            r"(?s)prefix_frames_count\s*=\s*\(\s*0\s*"
+            r"if h3_timeline_still_guide_requested\s*else\s*",
+        )
+        self.assertRegex(
+            generate_source,
+            r"(?s)input_video_for_model\s*=\s*\(\s*None\s*"
+            r"if\s*\(\s*h3_timeline_still_guide_requested\s*"
+            r"or fake_start_image.*?else pre_video_guide\s*\)",
+        )
+        self.assertRegex(
+            generate_source,
+            r"(?s)and not h3_timeline_still_guide_requested\s*\)\s*:\s*"
+            r"sample = _restore_h3_first_window_prefix\(",
+        )
+        self.assertIn("prefix_video = pre_video_frame = None", generate_source)
+        self.assertIn("pre_video_frame=pre_video_frame", generate_source)
+        self.assertRegex(
+            generate_source,
+            r"frame_num=align_model_frame_count\(current_video_length,\s*"
+            r"model_def, for_generation=True\)",
+        )
+
+        sample = self.torch.zeros((1, 124, 3, 2, 2), dtype=self.torch.uint8)
+        assembled = self.restore_first_window_prefix(sample, None, 0)
+        self.assertIs(assembled, sample)
+        self.assertEqual(assembled.shape[1], 124)
+
+        ordinary_start = self.torch.full(
+            (1, 1, 3, 2, 2), 255, dtype=self.torch.uint8,
+        )
+        generated = self.torch.zeros((1, 124, 3, 2, 2), dtype=self.torch.uint8)
+        ordinary = self.restore_first_window_prefix(generated, ordinary_start, 1)
+        self.assertTrue(self.torch.equal(ordinary, generated))
+        self.assertEqual(ordinary.shape[1], 124)
+
+    def test_interior_still_uses_addguide_center_cover_crop(self):
+        source = self.Image.new("RGB", (8, 4))
+        for x in range(8):
+            color = (255, 0, 0) if x < 2 else (0, 255, 0) if x < 6 else (0, 0, 255)
+            for y in range(4):
+                source.putpixel((x, y), color)
+
+        cropped = self.prepare_timeline_image(source, 4, 4)
+        self.assertEqual(cropped.size, (4, 4))
+        self.assertEqual(cropped.getpixel((0, 2)), (0, 255, 0))
+        self.assertEqual(cropped.getpixel((3, 2)), (0, 255, 0))
+
+    def test_model_checks_the_private_adapter_before_runtime_work(self):
+        model = object.__new__(self.model_type)
+        model.reference_mode = False
+        with self.assertRaisesRegex(ValueError, "interior target frame"):
+            model.generate(
+                "still guide",
+                image_start=self.torch.zeros((3, 8, 8)),
+                frame_num=124,
+                custom_settings=self._guide_settings(123),
+            )
+        with self.assertRaisesRegex(ValueError, "accept only image_start"):
+            model.generate(
+                "still guide",
+                image_start=self.torch.zeros((3, 8, 8)),
+                input_ref_images=[self.torch.zeros((3, 8, 8))],
+                frame_num=124,
+                custom_settings=self._guide_settings(),
+            )
+        with self.assertRaisesRegex(ValueError, "audio guidance or source audio"):
+            model.generate(
+                "still guide",
+                image_start=self.torch.zeros((3, 8, 8)),
+                audio_guide="voice.wav",
+                frame_num=124,
+                custom_settings=self._guide_settings(),
+            )
+
+    def test_handler_allows_only_nested_adapter_and_rejects_ref2va_early(self):
+        payload = {
+            "custom_settings": self._guide_settings(),
+            "image_start": "authorized-still.png",
+            "video_length": 124,
+        }
+        error = self.handler.validate_generative_settings(
+            "minimax_h3_ref2va", {}, payload,
+        )
+        self.assertIn("require an FL2VA", error)
+
+        payload["video_length"] = 125
+        error = self.handler.validate_generative_settings(
+            "minimax_h3", {}, payload,
+        )
+        self.assertIn("aligned to the 17n+5 grid", error)
+
+        payload["video_length"] = 124
+        payload["image_refs"] = ["reference.png"]
+        error = self.handler.validate_generative_settings(
+            "minimax_h3", {}, payload,
+        )
+        self.assertIn("accept only image_start", error)
+        payload.pop("image_refs")
+
+        payload["audio_guide"] = "voice.wav"
+        error = self.handler.validate_generative_settings(
+            "minimax_h3", {}, payload,
+        )
+        self.assertIn("audio guidance or source audio", error)
+        payload.pop("audio_guide")
+
+        payload["_h3_timeline_still_guide"] = {"frame_index": 47}
+        error = self.handler.validate_generative_settings(
+            "minimax_h3", {}, payload,
+        )
+        self.assertIn("supplied in custom_settings", error)
 
 
 def _gpu_runtime_available():

@@ -15368,7 +15368,11 @@ def _apply_fresh_h3_role_defaults(body: dict, request: Request) -> str | None:
     return profile_id
 
 
-def _reject_client_h3_internal_state(body: dict) -> None:
+def _reject_client_h3_internal_state(
+    body: dict,
+    *,
+    allow_gallery_still_guide: bool = False,
+) -> None:
     """Reject executable H3 worker state supplied by an HTTP client.
 
     Public H3 controls intentionally use ``h3_*`` names.  Leading-underscore
@@ -15377,16 +15381,34 @@ def _reject_client_h3_internal_state(body: dict) -> None:
     cannot see.  Server and Director jobs retain those fields because they
     enter the worker directly rather than crossing this HTTP boundary.
     """
+    allowed_top_level = (
+        {
+            "_h3_timeline_still_guide_source",
+            "_h3_timeline_still_guide_plan",
+        }
+        if allow_gallery_still_guide else set()
+    )
     internal = sorted(
         str(key) for key in body
-        if isinstance(key, str) and key.startswith("_h3_")
+        if (
+            isinstance(key, str)
+            and key.startswith("_h3_")
+            and key not in allowed_top_level
+        )
     )
     custom_settings = body.get("custom_settings")
     if isinstance(custom_settings, dict):
         internal.extend(
             f"custom_settings.{key}"
             for key in custom_settings
-            if isinstance(key, str) and key.startswith("_h3_")
+            if (
+                isinstance(key, str)
+                and key.startswith("_h3_")
+                and not (
+                    allow_gallery_still_guide
+                    and key == "_h3_timeline_still_guide"
+                )
+            )
         )
     clip_info = body.get("multi_clip_info")
     if isinstance(clip_info, dict) and "prompt_mapping" in clip_info:
@@ -44597,6 +44619,31 @@ def _run_generation_preparation(
         raw_params = job.get("params")
         if not isinstance(raw_params, _PreparationMapping):
             raise TypeError("Generation parameters are invalid.") from None
+        raw_custom = raw_params.get("custom_settings")
+        has_gallery_still_guide = (
+            isinstance(raw_custom, _PreparationMapping)
+            and "_h3_timeline_still_guide" in raw_custom
+        ) or any(
+            key in raw_params
+            for key in (
+                "_h3_timeline_still_guide_source",
+                "_h3_timeline_still_guide_plan",
+            )
+        )
+        if has_gallery_still_guide:
+            try:
+                validate_guide = globals().get(
+                    "_validate_h3_gallery_still_guide_job",
+                )
+                if not callable(validate_guide):
+                    raise RuntimeError("H3 Guide source validation is unavailable")
+                validate_guide(job)
+            except Exception as error:
+                terminalize_failure(
+                    error,
+                    "The selected Gallery still changed; select it again and submit a new guide.",
+                )
+                return
         prepared_params = copy.deepcopy(dict(raw_params))
         project_asset_provenance = prepared_params.pop(
             "_project_asset_ref_provenance", None,
@@ -44728,6 +44775,32 @@ def _run_generation_preparation(
         )
         if not waiting:
             _require_h3_generation_terms(prepared_params, plan)
+        prepared_custom = prepared_params.get("custom_settings")
+        has_prepared_gallery_guide = (
+            isinstance(prepared_custom, _PreparationMapping)
+            and "_h3_timeline_still_guide" in prepared_custom
+        ) or any(
+            key in prepared_params
+            for key in (
+                "_h3_timeline_still_guide_source",
+                "_h3_timeline_still_guide_plan",
+            )
+        )
+        if has_prepared_gallery_guide:
+            try:
+                validate_guide = globals().get(
+                    "_validate_h3_gallery_still_guide_job",
+                )
+                if not callable(validate_guide):
+                    raise RuntimeError("H3 Guide source validation is unavailable")
+                validate_guide({
+                    **job,
+                    "params": prepared_params,
+                })
+            except Exception as error:
+                raise QueueRecoveryRuntimeError(
+                    "The selected Gallery still changed during generation planning."
+                ) from error
         if waiting:
             # Approval derives only from this private immutable enhanced
             # source, never from public geometry and never by repeating LLM.
@@ -46067,10 +46140,483 @@ async def release_sample_campaign_arm(request: Request):
     return result.public_payload()
 
 
+_H3_GALLERY_STILL_GUIDE_REQUEST_TOKEN = object()
+_H3_GALLERY_STILL_GUIDE_SETTINGS = frozenset({
+    "video_length", "resolution", "num_inference_steps", "guidance_scale",
+    "seed", "activated_loras", "loras_multipliers", "tea_cache",
+    "override_profile",
+})
+
+
+def _validate_h3_gallery_still_guide_job(job: Mapping[str, Any]) -> dict | None:
+    """Recheck the exact authorized still before preparation, execution, or replay."""
+    from services.h3_gallery_still_guide import (
+        H3_GALLERY_STILL_GUIDE_CUSTOM_KEY,
+        H3_GALLERY_STILL_GUIDE_PLAN_KEY,
+        H3_GALLERY_STILL_GUIDE_SOURCE_KEY,
+        validate_gallery_still_guide_job,
+    )
+    params = job.get("params") if isinstance(job, Mapping) else None
+    if not isinstance(params, Mapping):
+        return None
+    custom = params.get("custom_settings")
+    has_private_setting = (
+        isinstance(custom, Mapping)
+        and H3_GALLERY_STILL_GUIDE_CUSTOM_KEY in custom
+    )
+    has_binding = (
+        H3_GALLERY_STILL_GUIDE_SOURCE_KEY in params
+        or H3_GALLERY_STILL_GUIDE_PLAN_KEY in params
+    )
+    if not has_private_setting and not has_binding:
+        return None
+    from services.search_index import (
+        classify_gallery_artifacts,
+        h3_integrity_is_pending,
+        load_media_sidecars,
+    )
+    from services.win_safe_files import safe_direct_file_under
+    return validate_gallery_still_guide_job(
+        params,
+        workspace=str(job.get("workspace") or ""),
+        out_dir=str(job.get("out_dir") or ""),
+        safe_direct_file_under=safe_direct_file_under,
+        output_revision=_output_revision,
+        load_sidecars=load_media_sidecars,
+        classify_artifacts=classify_gallery_artifacts,
+        integrity_pending=h3_integrity_is_pending,
+        job_private=job.get("private") is True,
+        job_explicit=job.get("explicit") is True,
+    )
+
+
+def _withhold_failed_h3_gallery_still_outputs(
+    file_names,
+    *,
+    out_dir: str,
+    before_names,
+    media_paths=None,
+) -> None:
+    """Keep fresh Guide media out of Gallery when its source goes stale.
+
+    This runs before sidecars are written, so leaving a rendered file at its
+    public basename would make it look like a legacy final.  Only basenames
+    absent from the worker's initial directory snapshot belong to this
+    publication attempt; older outputs are never quarantined here.
+    """
+    from services.search_index import h3_integrity_pending_path
+    from services.win_safe_files import safe_delete, safe_direct_file_under
+
+    try:
+        before = set(before_names or ())
+    except Exception:
+        before = set()
+
+    for name in file_names or ():
+        if (
+            not isinstance(name, str)
+            or name in before
+            or os.path.basename(name) != name
+            or name in {"", ".", ".."}
+            or os.path.splitext(name)[1].lower() not in GENERATED_MEDIA_EXTENSIONS
+        ):
+            continue
+
+        output_root = os.path.realpath(out_dir)
+        output_path = safe_direct_file_under(out_dir, name)
+        output_exists = bool(output_path and os.path.isfile(output_path))
+        output_entry = os.path.abspath(os.path.join(output_root, name))
+        output_present = (
+            os.path.dirname(output_entry) == output_root
+            and os.path.lexists(output_entry)
+        )
+        marker_path = h3_integrity_pending_path(out_dir, name)
+        marker_direct = safe_direct_file_under(
+            out_dir, os.path.basename(marker_path),
+        )
+        marker_preexisting = bool(
+            marker_direct and os.path.lexists(marker_direct)
+        )
+        marker_created = False
+        if output_present and marker_direct and not marker_preexisting:
+            try:
+                _atomic_write_json(marker_direct, {"pending": True})
+                marker_created = True
+            except Exception:
+                # Quarantine/delete below is the primary finality guard.  A
+                # marker is an additional fail-closed guard if the media is
+                # locked and cannot be moved.
+                pass
+
+        if output_exists:
+            try:
+                _quarantine_recovery_artifact(out_dir, {"basename": name})
+            except Exception:
+                pass
+            if os.path.lexists(output_path):
+                try:
+                    safe_delete(output_path, retries=1, retry_delay=0)
+                except Exception:
+                    pass
+
+        # Recovery renders may still be in the private staging directory when
+        # this callback rejects publication.  Accept only the exact direct
+        # child path supplied by the worker's staging map.
+        staged_path = (
+            media_paths.get(name)
+            if isinstance(media_paths, Mapping) else None
+        )
+        if isinstance(staged_path, str):
+            try:
+                from services.queue_recovery_runtime import (
+                    ensure_recovery_staging_directory,
+                )
+
+                staging_dir = ensure_recovery_staging_directory(out_dir)
+                staged_name = os.path.basename(staged_path)
+                staged_direct = safe_direct_file_under(staging_dir, staged_name)
+                if (
+                    staged_direct
+                    and os.path.abspath(staged_path) == staged_direct
+                    and os.path.isfile(staged_direct)
+                ):
+                    try:
+                        safe_delete(staged_direct, retries=1, retry_delay=0)
+                    except Exception:
+                        pass
+                    if os.path.lexists(staged_direct):
+                        quarantine_name = (
+                            f".stale-guide-{uuid.uuid4().hex}-{staged_name}"
+                        )
+                        quarantine_path = safe_direct_file_under(
+                            staging_dir, quarantine_name,
+                        )
+                        if quarantine_path and not os.path.lexists(quarantine_path):
+                            try:
+                                os.replace(staged_direct, quarantine_path)
+                            except OSError:
+                                pass
+            except Exception:
+                pass
+
+        # If quarantine and deletion both failed, retain the durable marker so
+        # the Gallery list and authorized-output checks suppress the basename.
+        output_still_present = bool(
+            output_present and os.path.lexists(output_entry)
+        )
+        if output_still_present and marker_direct and not marker_preexisting:
+            try:
+                if not os.path.lexists(marker_direct):
+                    _atomic_write_json(marker_direct, {"pending": True})
+                    marker_created = True
+            except Exception:
+                pass
+        elif marker_created and marker_direct:
+            try:
+                os.remove(marker_direct)
+            except OSError:
+                # A leftover marker is fail-closed; it can only hide this
+                # basename from Gallery until its next successful publication.
+                pass
+
+
+@api.post("/api/v1/h3/gallery-still-guide")
+async def h3_gallery_still_guide_endpoint(request: Request):
+    """Queue one project-authorized Gallery still at one interior H3 frame."""
+    from services.h3_gallery_still_guide import (
+        H3_GALLERY_STILL_GUIDE_CUSTOM_KEY,
+        H3_GALLERY_STILL_GUIDE_EXTENSIONS,
+        H3_GALLERY_STILL_GUIDE_PLAN_KEY,
+        H3_GALLERY_STILL_GUIDE_SOURCE_KEY,
+        H3GalleryStillGuideError,
+        build_gallery_still_guide_plan,
+        make_gallery_still_guide_source,
+        probe_gallery_still,
+    )
+
+    try:
+        submitted = await request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=400, detail="H3 Guide request must be an object",
+        ) from None
+    required = {
+        "workspace", "name", "revision", "frame_index", "model_type",
+        "prompt", "settings",
+    }
+    allowed = required | {"private_output", "explicit_output"}
+    if not isinstance(submitted, dict) or not required <= set(submitted) or set(submitted) - allowed:
+        raise HTTPException(
+            status_code=400, detail="H3 Guide request fields are invalid",
+        )
+    for policy_key in ("private_output", "explicit_output"):
+        if policy_key in submitted and type(submitted[policy_key]) is not bool:
+            raise HTTPException(
+                status_code=400, detail=f"{policy_key} must be a boolean",
+            )
+    workspace_value = submitted.get("workspace")
+    name = submitted.get("name")
+    revision = submitted.get("revision")
+    frame_index = submitted.get("frame_index")
+    model_type = submitted.get("model_type")
+    prompt = submitted.get("prompt")
+    settings = submitted.get("settings")
+    if (
+        not isinstance(workspace_value, str)
+        or not workspace_value
+        or not isinstance(name, str)
+        or not name
+        or len(name) > 255
+        or not isinstance(revision, str)
+        or not revision
+        or len(revision) > 256
+        or type(frame_index) is not int
+        or not isinstance(prompt, str)
+        or not prompt.strip()
+        or len(prompt) > 16_384
+        or not isinstance(settings, dict)
+        or set(settings) - _H3_GALLERY_STILL_GUIDE_SETTINGS
+        or "video_length" not in settings
+        or type(settings.get("video_length")) is not int
+    ):
+        raise HTTPException(
+            status_code=400, detail="H3 Guide request fields are invalid",
+        )
+    if model_type != _H3_BASE_FL2VA_MODEL:
+        raise HTTPException(
+            status_code=400,
+            detail="H3 Guide currently supports the installed MiniMax H3 FL2VA model only",
+        )
+
+    workspace = _request_project_workspace(request, workspace_value)
+    out_dir = _require_project_access(
+        request, workspace, permission="project.generate",
+    )
+    if wgp.get_model_def(model_type) is None:
+        raise HTTPException(status_code=400, detail="H3 Guide model is unavailable")
+    _require_remote_visible_models(request, [model_type])
+    _require_h3_legal_execution([model_type])
+    _require_model_recipe_terms([model_type])
+
+    if os.path.splitext(name)[1].lower() not in H3_GALLERY_STILL_GUIDE_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Select a PNG, JPEG, or WebP still from this project's Gallery",
+        )
+    source_dir, source_path, _authorized_sidecar = _require_authorized_output(
+        request, workspace, name,
+    )
+    if os.path.realpath(source_dir) != os.path.realpath(out_dir):
+        raise HTTPException(status_code=404, detail="Gallery still is unavailable")
+    if h3_integrity_is_pending(source_dir, name):
+        raise HTTPException(
+            status_code=409,
+            detail="Selected Gallery still is still being finalized; refresh Gallery and retry",
+        )
+    sidecar = load_media_sidecars(source_dir, {name}).get(name)
+    if (
+        not isinstance(sidecar, dict)
+        or sidecar.get("workspace") != workspace
+        or type(sidecar.get("private", False)) is not bool
+        or type(sidecar.get("explicit", False)) is not bool
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Selected Gallery still is no longer available; refresh Gallery and select it again",
+        )
+    try:
+        source_stat = os.stat(source_path, follow_symlinks=False)
+        artifact_class = classify_gallery_artifacts([{
+            "name": name,
+            "meta": sidecar,
+            "size": source_stat.st_size,
+            "created_at": source_stat.st_mtime,
+        }]).get(name)
+    except OSError:
+        artifact_class = None
+    if artifact_class != "final":
+        raise HTTPException(
+            status_code=400,
+            detail="Select a final still from this project's Gallery",
+        )
+    if revision != _output_revision(source_path, source_dir, name):
+        raise HTTPException(
+            status_code=409,
+            detail="Selected Gallery still changed; refresh Gallery and select it again",
+        )
+
+    try:
+        # Decode and hash at most one bounded still away from the API loop.
+        probe = await asyncio.to_thread(probe_gallery_still, source_path)
+    except H3GalleryStillGuideError as error:
+        raise HTTPException(
+            status_code=400,
+            detail="Selected Gallery item is not a supported readable still",
+        ) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=400,
+            detail="Selected Gallery item could not be read as a still",
+        ) from error
+    try:
+        # Re-probe exact bytes after decoding to close same-size/timestamp
+        # replacement races before the durable request manifest is written.
+        verified_probe = await asyncio.to_thread(probe_gallery_still, source_path)
+    except Exception as error:
+        raise HTTPException(
+            status_code=409,
+            detail="Selected Gallery still changed; refresh Gallery and select it again",
+        ) from error
+    if (
+        probe != verified_probe
+        or revision != _output_revision(source_path, source_dir, name)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Selected Gallery still changed; refresh Gallery and select it again",
+        )
+
+    model_def = wgp.get_model_def(model_type) or {}
+    requested_frames = settings["video_length"]
+    if not 124 <= requested_frames <= 345:
+        raise HTTPException(
+            status_code=400,
+            detail="video_length must be one H3 clip from 124 through 345 frames",
+        )
+    try:
+        target_frames = int(wgp.align_model_frame_count(requested_frames, model_def))
+    except (TypeError, ValueError, OverflowError) as error:
+        raise HTTPException(status_code=400, detail="video_length is invalid") from error
+    if (
+        not 124 <= target_frames <= 345
+        or not 0 < frame_index < target_frames - 1
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="frame_index must be an interior frame of the aligned H3 target",
+        )
+    try:
+        guide_plan = build_gallery_still_guide_plan(
+            sha256=probe.sha256,
+            frame_index=frame_index,
+            target_frames=target_frames,
+        )
+        guide_source = make_gallery_still_guide_source(
+            workspace=workspace,
+            name=name,
+            revision=revision,
+            probe=probe,
+            frame_index=frame_index,
+            target_frames=target_frames,
+            plan=guide_plan,
+            source_private=sidecar.get("private", False),
+            source_explicit=sidecar.get("explicit", False),
+        )
+    except H3GalleryStillGuideError as error:
+        raise HTTPException(status_code=400, detail="H3 Guide input is invalid") from error
+
+    defaults = wgp.get_default_settings(model_type) or {}
+    if not isinstance(defaults, dict):
+        raise HTTPException(
+            status_code=503, detail="H3 Guide model settings are unavailable",
+        )
+    custom_defaults = defaults.get("custom_settings") or {}
+    if not isinstance(custom_defaults, dict):
+        raise HTTPException(
+            status_code=503, detail="H3 Guide model settings are unavailable",
+        )
+    params = copy.deepcopy(defaults)
+    params.update(copy.deepcopy(settings))
+    for key in _GENERATION_MEDIA_INPUTS:
+        if key != "image_start":
+            params[key] = [] if key == "image_refs" else None
+    params.update({
+        "workspace": workspace,
+        "model_type": model_type,
+        "prompt": prompt,
+        "generation_mode": "video",
+        "image_mode": 0,
+        "image_prompt_type": "S",
+        "video_prompt_type": "",
+        "audio_prompt_type": "",
+        "input_waveform": None,
+        "audio_path": None,
+        "image_start": source_path,
+        "video_length": target_frames,
+        "sliding_window_size": target_frames,
+        "multi_prompts_gen_type": 0,
+        "h3_adaptive_conditioning": False,
+        "voice_clone_enabled": False,
+        "voice_clone_refs": [],
+        "h3_native_boundary_conditioning": False,
+        H3_GALLERY_STILL_GUIDE_SOURCE_KEY: guide_source,
+        H3_GALLERY_STILL_GUIDE_PLAN_KEY: guide_plan,
+    })
+    safe_custom = {
+        key: copy.deepcopy(value)
+        for key, value in custom_defaults.items()
+        if not (isinstance(key, str) and key.startswith("_h3_"))
+    }
+    safe_custom["h3_source_audio_mode"] = "native"
+    safe_custom["h3_native_boundary_conditioning"] = False
+    safe_custom[H3_GALLERY_STILL_GUIDE_CUSTOM_KEY] = {
+        "frame_index": frame_index,
+    }
+    params["custom_settings"] = safe_custom
+
+    session_id = str(request.state.maestro_session_id)
+    inherited = _inherit_media_access_policy([source_path], workspace, session_id)
+    effective_private = bool(
+        sidecar.get("private", False)
+        or inherited.get("private", False)
+        or submitted.get("private_output", False)
+    )
+    effective_explicit = bool(
+        sidecar.get("explicit", False)
+        or inherited.get("explicit", False)
+        or submitted.get("explicit_output", False)
+    )
+    params["private_output"] = effective_private
+    params["explicit_output"] = effective_explicit
+    preparation_request = _GenerationPreparationRequest(request, params)
+    preparation_request.state._maestro_h3_gallery_still_guide_token = (
+        _H3_GALLERY_STILL_GUIDE_REQUEST_TOKEN
+    )
+    result = await generate(preparation_request)
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=503, detail="H3 Guide could not be queued")
+    return {
+        **result,
+        "h3_guide_execution": {
+            "capability": "gallery_still_fl2va",
+            "frame_index": frame_index,
+            "target_frames": target_frames,
+            "guide_count": 1,
+            "audio_guides": 0,
+            "video_guides": 0,
+        },
+    }
+
+
 @api.post("/api/v1/generate")
 async def generate(request: Request):
     """Submit a generation job. Returns immediately with a job_id."""
     body = await request.json()
+    preparation_request_type = globals().get("_GenerationPreparationRequest")
+    gallery_guide_token = globals().get(
+        "_H3_GALLERY_STILL_GUIDE_REQUEST_TOKEN",
+    )
+    request_state = getattr(request, "state", None)
+    trusted_h3_gallery_still_guide = bool(
+        isinstance(preparation_request_type, type)
+        and isinstance(request, preparation_request_type)
+        and gallery_guide_token is not None
+        and getattr(
+            request_state,
+            "_maestro_h3_gallery_still_guide_token",
+            None,
+        ) is gallery_guide_token
+    )
     _reject_client_krea_authority(body)
     if (
         "_project_asset_ref_provenance" in body
@@ -46139,7 +46685,12 @@ async def generate(request: Request):
         if not is_sfx:
             _require_h3_legal_execution([body["model_type"]])
             _require_model_recipe_terms([body["model_type"]])
-    _reject_client_h3_internal_state(body)
+    if trusted_h3_gallery_still_guide:
+        _reject_client_h3_internal_state(
+            body, allow_gallery_still_guide=True,
+        )
+    else:
+        _reject_client_h3_internal_state(body)
     _reject_client_h3_turbo_validation_controls(body)
     _authorize_generation_media_inputs(request, body, workspace)
     if director_role_mode:
@@ -62740,6 +63291,44 @@ def _run_generation(
     abort_state = None
     h3_reference_file_tokens = []
 
+    guide_params = job.get("params") if isinstance(job, dict) else None
+    guide_custom = (
+        guide_params.get("custom_settings")
+        if isinstance(guide_params, dict) else None
+    )
+    has_gallery_still_guide = (
+        isinstance(guide_custom, dict)
+        and "_h3_timeline_still_guide" in guide_custom
+    ) or (
+        isinstance(guide_params, dict)
+        and any(
+            key in guide_params
+            for key in (
+                "_h3_timeline_still_guide_source",
+                "_h3_timeline_still_guide_plan",
+            )
+        )
+    )
+    if has_gallery_still_guide:
+        try:
+            validate_guide = globals().get(
+                "_validate_h3_gallery_still_guide_job",
+            )
+            if not callable(validate_guide):
+                raise RuntimeError("H3 Guide source validation is unavailable")
+            validate_guide(job)
+        except Exception:
+            finish_job(
+                job,
+                "failed",
+                error=(
+                    "The selected Gallery still changed; select it again and "
+                    "submit a new guide."
+                ),
+                message="Selected Gallery still changed",
+            )
+            return False
+
     try:
         _credit_prepare_admission(job)
     except (CreditRuntimeError, EntitlementError, ValueError):
@@ -62898,6 +63487,8 @@ def _run_generation(
                     "_h3_bridge_plan",
                 ):
                     raw_params.pop(bridge_key, None)
+            raw_params.pop("_h3_timeline_still_guide_source", None)
+            raw_params.pop("_h3_timeline_still_guide_plan", None)
             raw_reference_pack = raw_params.get("reference_pack")
             if (
                 isinstance(raw_reference_pack, dict)
@@ -63959,6 +64550,25 @@ def _run_generation(
                         )
                     )
 
+            if (
+                isinstance(job.get("params"), dict)
+                and "_h3_timeline_still_guide_source" in job["params"]
+            ):
+                try:
+                    # Rehash immediately before WGP parses/decodes its media
+                    # inputs, after model admission and task construction.
+                    _validate_h3_gallery_still_guide_job(job)
+                except Exception:
+                    finish_job(
+                        job,
+                        "failed",
+                        error=(
+                            "The selected Gallery still changed; select it "
+                            "again and submit a new guide."
+                        ),
+                        message="Selected Gallery still changed",
+                    )
+                    return False
             queue, error = wgp._parse_task_manifest(manifest, state, os.getcwd())
 
             if error:
@@ -64039,6 +64649,36 @@ def _run_generation(
                 """
                 if not file_names:
                     return
+                guide_source = (
+                    (job.get("params") or {}).get(
+                        "_h3_timeline_still_guide_source"
+                    )
+                    if isinstance(job.get("params"), dict) else None
+                )
+                if isinstance(guide_source, dict):
+                    try:
+                        _validate_h3_gallery_still_guide_job(job)
+                    except Exception:
+                        # A changed source must not leave sidecarless media at
+                        # its public basename, where Gallery treats it as a
+                        # legacy final. Cover every fresh file in this batch,
+                        # including the file whose publication began first.
+                        try:
+                            _withhold_failed_h3_gallery_still_outputs(
+                                file_names,
+                                out_dir=out_dir,
+                                before_names=before,
+                                media_paths=media_paths,
+                            )
+                        except Exception:
+                            logging.getLogger(__name__).warning(
+                                "Could not fully withhold stale H3 Guide output",
+                            )
+                        raise _GenerationStageFailure(
+                            "The selected Gallery still changed; select it again and submit a new guide.",
+                            stage="publication",
+                            code="publication_failed",
+                        ) from None
                 source_params = (
                     task_params
                     if isinstance(task_params, dict)
@@ -64047,6 +64687,17 @@ def _run_generation(
                 upload_filenames, sidecar_params = (
                     _prepare_generation_sidecar_params(source_params)
                 )
+                if isinstance(guide_source, dict):
+                    for key in (
+                        "_h3_timeline_still_guide_source",
+                        "_h3_timeline_still_guide_plan",
+                    ):
+                        sidecar_params.pop(key, None)
+                    guide_custom = sidecar_params.get("custom_settings")
+                    if isinstance(guide_custom, dict):
+                        guide_custom = dict(guide_custom)
+                        guide_custom.pop("_h3_timeline_still_guide", None)
+                        sidecar_params["custom_settings"] = guide_custom
                 if job.get("kind") == "studio_h3_bridge":
                     bridge_names = job["params"].get("_h3_bridge_source_names")
                     for key in (
@@ -64093,6 +64744,15 @@ def _run_generation(
                     "generation_time": round(time.time() - start_time),
                     "created_at": time.time(),
                 }
+                if isinstance(guide_source, dict):
+                    sidecar["h3_guide_execution"] = {
+                        "capability": "gallery_still_fl2va",
+                        "frame_index": guide_source.get("frame_index"),
+                        "target_frames": guide_source.get("target_frames"),
+                        "guide_count": 1,
+                        "audio_guides": 0,
+                        "video_guides": 0,
+                    }
                 sidecar_policy = dict(job.get("access_policy") or {})
                 if native_source:
                     sidecar_policy["private"] = True

@@ -10566,6 +10566,65 @@ def _apply_ltx25_video_vae_request(
     return bool(reload_needed or variant_changed)
 
 
+_H3_TIMELINE_STILL_GUIDE_MODELS = frozenset({
+    "minimax_h3",
+    "minimax_h3_pinkcherry_fl2va",
+    "minimax_h3_w4a8_fl2va",
+})
+
+
+def _is_h3_timeline_still_guide_request(
+    custom_settings,
+    *,
+    model_type,
+    base_model_type,
+    video_source=None,
+    fake_start_image=False,
+):
+    """Validate WGP's private interior-still prefix bypass request."""
+    setting_name = "_h3_timeline_still_guide"
+    if not isinstance(custom_settings, dict) or setting_name not in custom_settings:
+        return False
+    if (
+        str(model_type or "") not in _H3_TIMELINE_STILL_GUIDE_MODELS
+        or str(base_model_type or "") != "minimax_h3"
+    ):
+        raise ValueError(
+            "MiniMax H3 timeline still guides require an FL2VA checkpoint."
+        )
+    if video_source is not None:
+        raise ValueError(
+            "MiniMax H3 timeline still guides cannot be combined with a source video."
+        )
+    if fake_start_image:
+        raise ValueError(
+            "MiniMax H3 timeline still guides cannot be combined with fake start-image conditioning."
+        )
+    return True
+
+
+def _restore_h3_first_window_prefix(sample, prefix_video, overlap_frames):
+    """Restore the ordinary start/source prefix without changing H3 guides."""
+    if prefix_video is None:
+        return sample
+    if prefix_video.dtype != sample.dtype:
+        if sample.dtype == torch.uint8:
+            prefix_video = _video_tensor_to_uint8_chunk_inplace(prefix_video)
+        elif prefix_video.dtype == torch.uint8:
+            prefix_video = prefix_video.float().div_(127.5).sub_(1.0)
+    if prefix_video.shape[1] > 1:
+        # Drop the overlapping source frames before restoring its prefix.
+        return torch.cat(
+            [prefix_video, sample[:, overlap_frames:]],
+            dim=1,
+        )
+    # A single start image is fully overlapped by generation.
+    return torch.cat(
+        [prefix_video[:, :-overlap_frames], sample],
+        dim=1,
+    )
+
+
 def _generate_video_impl(
     task,
     send_cmd,
@@ -11021,6 +11080,15 @@ def _generate_video_impl(
     if model_def.get("no_background_removal", False): remove_background_images_ref = 0
     
     base_model_type = get_base_model_type(model_type)
+    h3_timeline_still_guide_requested = _is_h3_timeline_still_guide_request(
+        custom_settings,
+        model_type=model_type,
+        base_model_type=base_model_type,
+        video_source=video_source,
+        fake_start_image=(
+            model_def.get("fake_start_image", False) and image_start is not None
+        ),
+    )
     model_handler = get_model_handler(base_model_type)
     block_size = model_handler.get_vae_block_size(base_model_type) if hasattr(model_handler, "get_vae_block_size") else 16
     h3_audio_roles = None
@@ -11830,6 +11898,10 @@ def _generate_video_impl(
         else:
             mp4_files = glob.glob(os.path.join(save_path, "*.mp4"))
             video_source = max(mp4_files, key=os.path.getmtime) if mp4_files else None                            
+    if h3_timeline_still_guide_requested and video_source is not None:
+        raise ValueError(
+            "MiniMax H3 timeline still guides cannot be combined with a source video."
+        )
     fps = 1 if is_image else get_computed_fps(force_fps, base_model_type , video_guide, video_source )
     control_audio_tracks = source_audio_tracks = source_audio_metadata = []
     if any_letters(audio_prompt_type, "R") and video_guide is not None and MMAudio_setting == 0 and not any_letters(audio_prompt_type, "ABXK"):
@@ -12512,7 +12584,12 @@ def _generate_video_impl(
                     image_start_tensor, new_height, new_width = calculate_dimensions_and_resize_image(image_start, height, width, sample_fit_canvas, fit_crop, block_size = block_size)
                     if fit_crop: refresh_preview["image_start"] = image_start_tensor
                     image_start_tensor = convert_image_to_tensor(image_start_tensor)
-                    pre_video_guide =  prefix_video = image_start_tensor.unsqueeze(1)
+                    if h3_timeline_still_guide_requested:
+                        if sample_fit_canvas is not None and not fake_start_image:
+                            image_size = image_start_tensor.shape[-2:]
+                            sample_fit_canvas = None
+                    else:
+                        pre_video_guide =  prefix_video = image_start_tensor.unsqueeze(1)
                 else:
                     prefix_video  = preprocess_video(width=width, height=height,video_in=video_source, max_frames= parsed_keep_frames_video_source , start_frame = 0, fit_canvas= sample_fit_canvas, fit_crop = fit_crop, target_fps = fps, block_size = block_size )
                     prefix_video  = prefix_video.permute(3, 0, 1, 2)
@@ -12521,18 +12598,19 @@ def _generate_video_impl(
 
                     new_height, new_width = prefix_video.shape[-2:]
                     pre_video_guide =  prefix_video[:, -reuse_frames:].float().div_(127.5).sub_(1.) # c, f, h, w
-                pre_video_frame = convert_tensor_to_image(prefix_video[:, -1])
-                source_video_overlap_frames_count = pre_video_guide.shape[1]
-                source_video_frames_count = prefix_video.shape[1]
-                # SCAIL-2's fake start image is an identity reference, not
-                # an output-frame anchor.  Keep fit_canvas available so the
-                # control video establishes the generated canvas/aspect.
-                if sample_fit_canvas != None and not fake_start_image:
-                    image_size  = pre_video_guide.shape[-2:]
-                    sample_fit_canvas = None
-                guide_start_frame =  prefix_video.shape[1]
-                if fake_start_image:
-                    source_video_overlap_frames_count = source_video_frames_count = guide_start_frame = 0
+                if prefix_video is not None:
+                    pre_video_frame = convert_tensor_to_image(prefix_video[:, -1])
+                    source_video_overlap_frames_count = pre_video_guide.shape[1]
+                    source_video_frames_count = prefix_video.shape[1]
+                    # SCAIL-2's fake start image is an identity reference, not
+                    # an output-frame anchor.  Keep fit_canvas available so the
+                    # control video establishes the generated canvas/aspect.
+                    if sample_fit_canvas != None and not fake_start_image:
+                        image_size  = pre_video_guide.shape[-2:]
+                        sample_fit_canvas = None
+                    guide_start_frame =  prefix_video.shape[1]
+                    if fake_start_image:
+                        source_video_overlap_frames_count = source_video_frames_count = guide_start_frame = 0
             if image_end is not None:
                 image_end_list=  image_end if isinstance(image_end, list) else [image_end]
                 if len(image_end_list) >= window_no:
@@ -12986,8 +13064,21 @@ def _generate_video_impl(
                 # here can overwrite height/width inside the model and make
                 # its latent disagree with those tensors.  Later windows do
                 # need their generated history as input_video.
-                input_video_for_model = None if fake_start_image and window_no == 1 else pre_video_guide
-                prefix_frames_count = source_video_overlap_frames_count if window_no <= 1 else reuse_frames
+                input_video_for_model = (
+                    None
+                    if (
+                        h3_timeline_still_guide_requested
+                        or fake_start_image and window_no == 1
+                    )
+                    else pre_video_guide
+                )
+                prefix_frames_count = (
+                    0
+                    if h3_timeline_still_guide_requested
+                    else source_video_overlap_frames_count
+                    if window_no <= 1
+                    else reuse_frames
+                )
                 if h3_native_boundary_video is not None:
                     if window_no != 1:
                         raise ValueError(
@@ -13471,18 +13562,16 @@ def _generate_video_impl(
                 # a different canvas.
                 if fake_start_image and window_no == 1:
                     prefix_video = None
-                elif prefix_video != None and window_no == 1 :
-                    if prefix_video.dtype != sample.dtype:
-                        if sample.dtype == torch.uint8:
-                            prefix_video = _video_tensor_to_uint8_chunk_inplace(prefix_video)
-                        elif prefix_video.dtype == torch.uint8:
-                            prefix_video = prefix_video.float().div_(127.5).sub_(1.0)
-                    if prefix_video.shape[1] > 1:
-                        # remove sliding window overlapped frames at the beginning of the generation
-                        sample = torch.cat([ prefix_video, sample[: , source_video_overlap_frames_count:]], dim = 1)
-                    else:
-                        # remove source video overlapped frames at the beginning of the generation if there is only a start frame
-                        sample = torch.cat([ prefix_video[:, :-source_video_overlap_frames_count], sample], dim = 1)
+                elif (
+                    prefix_video is not None
+                    and window_no == 1
+                    and not h3_timeline_still_guide_requested
+                ):
+                    sample = _restore_h3_first_window_prefix(
+                        sample,
+                        prefix_video,
+                        source_video_overlap_frames_count,
+                    )
                     prefix_video = None
                     guide_start_frame -= source_video_overlap_frames_count 
                     if generated_audio is not None:

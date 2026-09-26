@@ -6,7 +6,6 @@ import os
 
 import torch
 
-
 _MODEL_TYPE = "minimax_h3"
 _REF2VA_MODEL_TYPE = "minimax_h3_ref2va"
 _BETA3_MODEL_TYPE = "minimax_h3_10eros_beta3"
@@ -476,6 +475,7 @@ class family_handler:
                 "h3_source_audio_mode",
                 "h3_primary_audio_ordinal",
                 "h3_audio_remix_strength",
+                "_h3_timeline_still_guide",
             ],
             "h3_native_boundary_conditioning": native_boundary_enabled,
             "minimax_h3_native_boundary_image_prompt_types_allowed": (
@@ -582,6 +582,60 @@ class family_handler:
             _beta3_artifact_for_model_def(_BETA3_MODEL_TYPE, model_def)
             return _BETA3_UNWIRED_MESSAGE
         custom_settings = inputs.get("custom_settings")
+        custom_for_timeline = (
+            custom_settings if isinstance(custom_settings, dict) else {}
+        )
+        if "_h3_timeline_still_guide" in inputs:
+            return (
+                "MiniMax H3 timeline still guide must be supplied in custom_settings."
+            )
+        frame_num = inputs.get("frame_num")
+        if frame_num is None:
+            frame_num = inputs.get("video_length")
+        if "_h3_timeline_still_guide" in custom_for_timeline:
+            # Ordinary H3 handler imports should not load the heavyweight
+            # packing stack. It is only needed for the private still adapter.
+            from .packing import validate_h3_timeline_still_guide_request
+
+            try:
+                validate_h3_timeline_still_guide_request(
+                    custom_for_timeline,
+                    frame_num=frame_num,
+                    image_start=inputs.get("image_start"),
+                    image_end=inputs.get("image_end"),
+                    reference_mode=_is_reference_mode(base_model_type),
+                    native_boundary=(
+                        custom_for_timeline.get("h3_native_boundary_conditioning") is True
+                        or inputs.get("h3_native_boundary_conditioning") is True
+                    ),
+                    image_refs=inputs.get("image_refs"),
+                    video_guides=tuple(
+                        inputs.get(key)
+                        for key in ("video_guide", "video_guide2", "video_guide3")
+                    ),
+                    video_prompt_type=inputs.get("video_prompt_type") or "",
+                    audio_guides=tuple(
+                        inputs.get(key)
+                        for key in (
+                            "audio_guide",
+                            "audio_guide2",
+                            "audio_guide3",
+                            "audio_guide4",
+                            "audio_guide5",
+                            "audio_guide6",
+                        )
+                    ),
+                    audio_prompt_type=inputs.get("audio_prompt_type") or "",
+                    audio_inputs=(
+                        inputs.get("input_waveform"),
+                        inputs.get("audio_source"),
+                    ),
+                    input_video=inputs.get("input_video"),
+                    prefix_frames_count=inputs.get("prefix_frames_count", 0),
+                    validate_image_shape=False,
+                )
+            except ValueError as error:
+                return str(error)
         from services.h3_audio import (
             H3AudioCompatibilityError,
             H3MediaMapError,

@@ -1276,6 +1276,107 @@ export async function submitH3Bridge(params: H3BridgeRequest): Promise<H3BridgeS
   return { job_id: result.job_id, status: result.status }
 }
 
+export type H3GalleryStillGuideModel = 'minimax_h3'
+
+export interface H3GalleryStillGuideRequest {
+  workspace: string
+  name: string
+  revision: string
+  frame_index: number
+  model_type: H3GalleryStillGuideModel
+  prompt: string
+  settings: {
+    video_length: number
+    resolution?: string
+    num_inference_steps?: number
+    guidance_scale?: number
+    seed?: number
+    activated_loras?: string[]
+    loras_multipliers?: number[]
+    tea_cache?: number
+    override_profile?: string | null
+  }
+  private_output?: boolean
+  explicit_output?: boolean
+}
+
+export interface H3GalleryStillGuideSubmission {
+  job_id: string
+  status: string
+  held?: boolean
+  h3_estimate?: import('../types').H3PerformanceEstimate | null
+}
+
+export async function submitH3GalleryStillGuide(
+  params: H3GalleryStillGuideRequest,
+): Promise<H3GalleryStillGuideSubmission> {
+  const res = await fetch(`${BASE}/api/v1/h3/gallery-still-guide`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  })
+  if (!res.ok) {
+    const payload = await res.json().catch(() => ({})) as { detail?: unknown; error?: unknown }
+    const detail = typeof payload.detail === 'string'
+      ? payload.detail
+      : typeof payload.error === 'string'
+        ? payload.error
+        : ''
+    if (res.status === 400) {
+      if (/frame_index|interior frame/i.test(detail)) {
+        const maxFrame = Number.isSafeInteger(params.settings.video_length)
+          ? params.settings.video_length - 2
+          : null
+        throw new Error(maxFrame === null
+          ? 'Choose an exact interior frame index. Frame 0 and the final frame cannot be guide positions.'
+          : `Choose an exact 0-based interior frame from 1 to ${maxFrame}.`)
+      }
+      if (/model_type|unsupported model|compatible model/i.test(detail)) {
+        throw new Error('Choose an enabled FL2VA model from the model list, then try again.')
+      }
+      if (/video_length|17n\s*\+\s*5|frame grid|multi-clip/i.test(detail)) {
+        throw new Error('Choose one target clip length from the available frame-count options.')
+      }
+      throw new Error(detail
+        ? `H3 Guide could not use that request: ${detail}`
+        : 'H3 Guide could not use that request. Check the model, frame, and clip length, then try again.')
+    }
+    if (res.status === 401 || res.status === 403) throw new Error('You do not have permission to generate in this project.')
+    if (res.status === 409) {
+      if (/pending|already active|in progress/i.test(detail)) {
+        throw new Error('A guide request is already active for this project. Check Queue before starting another.')
+      }
+      throw new Error('The selected Gallery image changed. Refresh Gallery, select the current image, and try again.')
+    }
+    if (res.status === 423) throw new Error('Unlock this project before creating a guided clip.')
+    if (res.status === 404) {
+      if (/(?:output|image|file).*(?:not found|unavailable)|(?:not found|unavailable).*(?:output|image|file)/i.test(detail)) {
+        throw new Error('The selected Gallery image is no longer available. Refresh Gallery and select a current image.')
+      }
+      if (!detail || detail === 'Not Found') {
+        throw new Error('H3 Guide is not available in the running Maestro server. Update and restart Maestro, then refresh this page.')
+      }
+      throw new Error(`H3 Guide could not find the selected image: ${detail}`)
+    }
+    if (res.status === 405) throw new Error('H3 Guide is not available in the running Maestro server. Update and restart Maestro, then refresh this page.')
+    if (res.status === 451) throw new Error('The selected FL2VA model is unavailable under its current license. Check model access in Settings, then retry.')
+    if (res.status === 503) throw new Error('The selected FL2VA model is not ready on this installation. Finish its setup or check model access, then retry.')
+    throw new Error(detail
+      ? `H3 Guide could not be queued: ${detail}`
+      : 'H3 Guide could not be queued. Try again from this project.')
+  }
+  const result = await res.json() as Partial<H3GalleryStillGuideSubmission>
+  if (typeof result.job_id !== 'string' || typeof result.status !== 'string') {
+    throw new Error('H3 Guide returned an invalid queue response. Refresh the Queue before trying again.')
+  }
+  return {
+    job_id: result.job_id,
+    status: result.status,
+    held: result.held,
+    h3_estimate: result.h3_estimate,
+  }
+}
+
 export async function submitGeneration(
   params: GenerationSubmissionParams,
   holdForQueue = false,

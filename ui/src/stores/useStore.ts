@@ -1,4 +1,5 @@
 import { supportsPromptPreparation } from '../lib/promptEnhancement'
+import { H3_GALLERY_STILL_GUIDE_RESTORE_MESSAGE, isH3GalleryStillGuideOutput } from '../lib/h3GalleryStillGuide'
 import { create } from 'zustand'
 import {
   captureGenerationModeUiSettings,
@@ -16971,6 +16972,13 @@ export const useStore = create<AppState>((set, get) => ({
     const pendingOutput = submitted.filteredOutputs()[submitted.selectedOutput]
     const pendingName = pendingOutput?.name
     if (!pendingName) return false
+    const cachedMetadata = submitted.selectedOutputMetaName === pendingName
+      ? submitted.selectedOutputMeta
+      : null
+    if (isH3GalleryStillGuideOutput(cachedMetadata)) {
+      window.alert(H3_GALLERY_STILL_GUIDE_RESTORE_MESSAGE)
+      return false
+    }
     // A pending fresh-model hydration must never land after a sidecar restore
     // and replace the settings needed to reproduce that output.
     ++_h3ProfileApplySeq
@@ -17052,6 +17060,10 @@ export const useStore = create<AppState>((set, get) => ({
           ? get().selectedOutputMeta
           : null
       }
+    }
+    if (isH3GalleryStillGuideOutput(selectedOutputMeta)) {
+      window.alert(H3_GALLERY_STILL_GUIDE_RESTORE_MESSAGE)
+      return false
     }
     if (!selectedOutputMeta?.params) {
       return false

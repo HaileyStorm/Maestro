@@ -405,11 +405,31 @@ class TestScail2ControlVideoFraming(unittest.TestCase):
         )
 
     def test_fake_identity_start_is_not_passed_as_first_window_history(self):
-        source = _read(_WGP_PATH)
-        self.assertIn(
-            "input_video_for_model = None if fake_start_image and window_no == 1 else pre_video_guide",
-            source,
-        )
+        tree = ast.parse(_read(_WGP_PATH), filename=_WGP_PATH)
+        assignments = [
+            node.value for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "input_video_for_model"
+                for target in node.targets
+            )
+            and isinstance(node.value, ast.IfExp)
+        ]
+        self.assertEqual(len(assignments), 1)
+        expression = compile(ast.Expression(assignments[0]), _WGP_PATH, "eval")
+
+        def input_history(*, fake_start_image, window_no, guide):
+            return eval(expression, {"__builtins__": {}}, {
+                "fake_start_image": fake_start_image,
+                "window_no": window_no,
+                "h3_timeline_still_guide_requested": guide,
+                "pre_video_guide": "generated history",
+            })
+
+        self.assertIsNone(input_history(fake_start_image=True, window_no=1, guide=False))
+        self.assertEqual(input_history(fake_start_image=True, window_no=2, guide=False), "generated history")
+        self.assertEqual(input_history(fake_start_image=False, window_no=1, guide=False), "generated history")
+        self.assertIsNone(input_history(fake_start_image=False, window_no=1, guide=True))
 
     def test_fake_identity_start_is_not_concatenated_into_output(self):
         source = _read(_WGP_PATH)

@@ -53,10 +53,12 @@ from .packing import (
     keyframe_condition_noise,
     patchify_video_latents,
     prepare_h3_bridge_video_inputs,
+    prepare_h3_timeline_still_guide_image,
     prepare_keyframe_image,
     unpack_audio_tokens,
     unpatchify_video_tokens,
     validate_h3_bridge_guides_request,
+    validate_h3_timeline_still_guide_request,
     video_latent_num_frames,
 )
 from .scheduler import MiniMaxH3Scheduler
@@ -1149,8 +1151,37 @@ class MiniMaxH3Model:
         custom_settings = _kwargs.get("custom_settings")
         if not isinstance(custom_settings, dict):
             custom_settings = {}
+        if "_h3_timeline_still_guide" in _kwargs:
+            raise ValueError(
+                "MiniMax H3 timeline still guide must be supplied in custom_settings."
+            )
         native_boundary_enabled = (
             custom_settings.get("h3_native_boundary_conditioning") is True
+        )
+        timeline_still_anchor = validate_h3_timeline_still_guide_request(
+            custom_settings,
+            frame_num=frame_num,
+            image_start=image_start,
+            image_end=image_end,
+            reference_mode=bool(getattr(self, "reference_mode", False)),
+            native_boundary=native_boundary_enabled
+            or _kwargs.get("h3_native_boundary_conditioning") is True,
+            image_refs=input_ref_images,
+            video_guides=(input_frames, input_frames2, input_frames3),
+            video_prompt_type=video_prompt_type,
+            audio_guides=(
+                audio_guide,
+                audio_guide2,
+                audio_guide3,
+                *(
+                    _kwargs.get(key)
+                    for key in ("audio_guide4", "audio_guide5", "audio_guide6")
+                ),
+            ),
+            audio_prompt_type=audio_prompt_type,
+            audio_inputs=(input_waveform, _kwargs.get("audio_source")),
+            input_video=_kwargs.get("input_video"),
+            prefix_frames_count=_kwargs.get("prefix_frames_count", 0),
         )
         bridge_guides_enabled = "_h3_bridge_guides" in custom_settings
         if bridge_guides_enabled:
@@ -1517,14 +1548,26 @@ class MiniMaxH3Model:
             if item is not None
         ]
         user_anchors = tuple(
-            anchor
+            (
+                timeline_still_anchor
+                if timeline_still_anchor is not None and anchor == "first"
+                else anchor
+            )
             for anchor, item in (("first", image_start), ("last", image_end))
             if item is not None
         )
-        user_keyframes = [
-            prepare_keyframe_image(image, height, width, stretch=index == 0)
-            for index, image in enumerate(user_keyframes)
-        ]
+        if timeline_still_anchor is not None:
+            user_keyframes = [
+                prepare_h3_timeline_still_guide_image(
+                    image, height, width,
+                )
+                for image in user_keyframes
+            ]
+        else:
+            user_keyframes = [
+                prepare_keyframe_image(image, height, width, stretch=index == 0)
+                for index, image in enumerate(user_keyframes)
+            ]
 
         boundary_history = None
         boundary_waveform = None

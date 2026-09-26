@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef } from 'react'
 import { Pencil, RefreshCw, Copy, Trash2, Check, Combine, Loader2, Sparkles, Mic } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
+import { H3_GALLERY_STILL_GUIDE_RESTORE_MESSAGE, isH3GalleryStillGuideOutput } from '../../lib/h3GalleryStillGuide'
 import { getUploadUrl } from '../../api/client'
 import { formatGenerationDuration } from '../../lib/format'
 import { modelDisplayName } from '../../lib/modelDisplay'
@@ -29,6 +30,7 @@ export function VideoInfoBar() {
   const [upscaling, setUpscaling] = useState(false)
 
   const selected = outputs[selectedOutput]
+  const isGalleryStillGuideOutput = isH3GalleryStillGuideOutput(meta)
   useEffect(() => {
     confirmRef.current = null
     setConfirmDelete(false)
@@ -168,6 +170,11 @@ export function VideoInfoBar() {
                 {prompt}
               </div>
             )}
+            {isGalleryStillGuideOutput && (
+              <div className="mt-0.5 text-[11px] leading-snug text-text-muted" role="note">
+                {H3_GALLERY_STILL_GUIDE_RESTORE_MESSAGE}
+              </div>
+            )}
           </>
         ) : (
           <div className="text-[11px] text-text-muted">{selected.name}</div>
@@ -178,20 +185,24 @@ export function VideoInfoBar() {
       <div className="flex items-center gap-0.5 shrink-0">
         {params && (
           <>
-            <button
-              onClick={loadSettingsFromOutput}
-              className="p-1.5 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-colors"
-              title="Load settings"
-            >
-              <Pencil size={14} />
-            </button>
-            <button
-              onClick={rerollGeneration}
-              className="p-1.5 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-colors"
-              title="Re-generate with same settings"
-            >
-              <RefreshCw size={14} />
-            </button>
+            {!isGalleryStillGuideOutput && (
+              <>
+                <button
+                  onClick={loadSettingsFromOutput}
+                  className="p-1.5 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-colors"
+                  title="Load settings"
+                >
+                  <Pencil size={14} />
+                </button>
+                <button
+                  onClick={rerollGeneration}
+                  className="p-1.5 rounded-lg hover:bg-bg-hover text-text-secondary hover:text-text-primary transition-colors"
+                  title="Re-generate with same settings"
+                >
+                  <RefreshCw size={14} />
+                </button>
+              </>
+            )}
             {canRejoinGroup && (
               <button
                 onClick={handleRejoin}
