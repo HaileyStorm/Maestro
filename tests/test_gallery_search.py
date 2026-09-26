@@ -406,6 +406,23 @@ class ArtifactClassificationTests(unittest.TestCase):
             {"delivery.mp4"},
         )
 
+    def test_h3_bridge_requires_complete_final_receipt_for_gallery(self):
+        complete = {
+            "producer_unit_kind": "h3_bridge",
+            "artifact_class": "final",
+            "producer_artifact_class": "final",
+            "producer_media_size": 5047463,
+            "producer_media_sha256": "a" * 64,
+        }
+        classes = classify_gallery_artifacts([
+            {"name": "bridge.mp4", "meta": complete},
+            {"name": "incomplete.mp4", "meta": {
+                **complete, "producer_media_sha256": "",
+            }},
+        ])
+        self.assertEqual(classes["bridge.mp4"], "final")
+        self.assertEqual(classes["incomplete.mp4"], "component")
+
     def test_failed_h3_integrity_never_appears_as_gallery_final(self):
         classes = classify_gallery_artifacts([{
             "name": "failed-join.mp4",

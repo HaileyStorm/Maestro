@@ -56812,6 +56812,7 @@ def _run_h3_bridge_generation(job_id: str):
     job = _jobs[job_id]
     params = job.get("params") or {}
     out_dir = job.get("out_dir") or ""
+    job["_h3_bridge_project_out_dir"] = out_dir
     bridge_state = {"abort": False}
     final_path = None
     final_sidecar_path = None
@@ -57068,6 +57069,7 @@ def _run_h3_bridge_generation(job_id: str):
             )
     finally:
         job["out_dir"] = out_dir
+        job.pop("_h3_bridge_project_out_dir", None)
         job.pop("_internal_output_files", None)
         job.pop("_internal_clip_output_files", None)
         job.pop("_internal_join_output_file", None)
@@ -68584,8 +68586,16 @@ def _recovered_job_remote_project_accessible(
             )
             if not access.protected or not access.unlocked:
                 return False
+        # Bridge inference writes a private transition into temporary storage.
+        # Keep remote queue/status access bound to its original project while
+        # the worker temporarily points out_dir at that staging directory.
+        job_project_dir = (
+            job.get("_h3_bridge_project_out_dir")
+            if job.get("kind") == "studio_h3_bridge"
+            else None
+        ) or job.get("out_dir")
         if os.path.normcase(os.path.realpath(project_dir)) != os.path.normcase(
-            os.path.realpath(str(job.get("out_dir") or "")),
+            os.path.realpath(str(job_project_dir or "")),
         ):
             return False
         recovered_project = str(job.get("_recovery_project_digest") or "")

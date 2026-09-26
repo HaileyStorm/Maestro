@@ -8,7 +8,7 @@ owner are different states. Several adopted historical capabilities remain
 unimplemented. GPU availability is only one of the remaining dependencies.
 The disposition inventory remains the September 22 baseline; delivery notes
 and the promotion order below include verified follow-on work through
-September 25.
+September 26.
 
 Baseline: Continuum `d4dff8442979b6c0559d27b4272462f3c0ade4a7`.
 Upstream reviewed: `Blizaine/Maestro` at
@@ -109,8 +109,8 @@ checkpoint was installed.
 | --- | --- | --- |
 | FL2VA versus Ref2VA / LongMedia audio roles | Adopt / extract | Distinct native modes, reference binding and audio-role contracts exist. Controlled comparisons and quality remain separate from source correctness. |
 | Multishot, Extender, Context Loop and continuation suites | Adapt | Native segment planners/continuity/recovery exist. Candidate-specific native continuation/Bridge/Guide executors remain separate; no graph import. |
-| Javawock H3 Bridge workflow | Adopt native planned slice | Source recipe retained in the August 25 record; native `h3_bridge_plan.py` is a plan, not an executor. |
-| H3 Bridge, Guide, Control and Regenerate 2K | Adapt / experiment | `h3_bridge_plan.py`, `h3_guide_plan.py`, `h3_control_plan.py`, `h3_native_continuation.py`, `h3_regenerate_2k.py` define sealed plans/admission but no enabled executor. |
+| Javawock H3 Bridge workflow | Adopt native executable slice | Native project-bound Gallery selection now binds two source revisions and sealed frame ranges, generates a Ref2VA AddGuide interval, and assembles an A + bridge + B final without importing the source graph. A signed-in stable-share submission completed a 345-frame H.264/AAC result with 80 new transition frames under an exact GPU grant; see [GPU acceptance](../operations/GPU_ACCEPTANCE.md). Sampled seam frames retained the subject. Full playback, soundtrack quality, and owner acceptance remain open. |
+| H3 Bridge, Guide, Control and Regenerate 2K | Adapt / experiment | Bridge has an executor and Gallery action; `h3_guide_plan.py`, `h3_control_plan.py`, `h3_native_continuation.py`, and `h3_regenerate_2k.py` still define sealed plans/admission without enabled dedicated executors. Treat each as a separate decision and acceptance path. |
 | Comfy #15375 masks / Fun ControlNet Union / LanPaint / H3 inpainting Space | Adapt / experiment | Generic SAM/LTX Inpaint is not H3 audiovisual latent-mask execution. Need native mask/interval/untouched-region semantics. Do not import hosted subject-matter guards. |
 | Comfy #15808 marker parity | Adopt | `_ensure_h3_marker_tokens` in `models/minimax_h3/conditioner.py` with marker tests in `test_minimax_h3.py`. |
 | H3 FaceRefine / temporal face repair | Adapt | Generic repair primitives exist; dedicated H3 temporal crop/track/regenerate/composite path is unfinished. |
@@ -152,9 +152,10 @@ checkpoint was installed.
 
 The 2.3 assessment below is pinned to
 `5efd686ab446d451d927cbc00665e136d8de585e`. A September 25 fetch found
-one newer upstream commit, `4afe1693e34119ef2d7e710ec8632c22da225055`
-(2.4.0); its separate disposition follows this table. Neither release is a
-whole-tree merge target for Continuum.
+the 2.4.0 commit `4afe1693e34119ef2d7e710ec8632c22da225055`.
+The September 26 fetch reached `d98af351` after the 2.4.1 release commit
+`960cf9d` and a Linux DLSS test fix. Their separate dispositions follow.
+Neither release is a whole-tree merge target for Continuum.
 
 | Upstream release/cluster | Integration disposition |
 | --- | --- |
@@ -188,6 +189,21 @@ not installed or live behavior in Continuum.
 | H3 Singularity v1.3 Pruned INT8 References | **Benchmark lead**, not a default or replacement for existing H3/Ref2VA choices. Verify exact model/adapter hashes, source terms, memory, cancellation, recovery and quality before catalog promotion. |
 | Face Refiner cleanup, Recast mask memory, API-key save, bundled DramaBox guides | **Adopt the applicable corrections, defer Face Refiner cleanup with its absent feature.** The API-key field now waits for an authoritative save and masked-value refresh, keeps the entered value plus an inline error on failure, and permits retry without changing provider selection; the UI gate and a failed-save/retry test pass. Recast mask composition now holds scratch arrays to one frame while preserving global overlap checks and earlier-card priority. In the same 1,000-frame CPU fixture, traced scratch above the 9.2 MB output fell from about 49 MB to 39 KB; four focused tests pass. This does not establish live Recast GPU output. The two upstream DramaBox markdown guides are now bundled, load without missing-guide warnings, and are textually identical to Continuum's existing fallbacks. Upstream Face Refiner's retry/atexit cleanup lives in `app/services/face_refiner.py`, a service absent from Continuum; reassess that cleanup when a native temporal face-refinement executor is justified, rather than adding an unused service. |
 | Remote LLM vision payloads | **Defer automatic use**. An explicit remote provider and media-sharing privacy decision must precede transmitting project images; local-model and account/project boundaries stay intact. |
+
+### 2026-09-26 upstream 2.4.1 delta
+
+The fetch reached `d98af351` (release `960cf9d` plus a Linux DLSS test fix).
+The [upstream release notes](https://github.com/Blizaine/Maestro/blob/960cf9d/docs/RELEASE_NOTES_V2.4.1.md)
+and changed source were assessed against Continuum's existing project, model,
+queue and recovery boundaries. None of these clusters is accepted merely by
+fetching upstream.
+
+| 2.4.1 cluster | Continuum disposition and next evidence |
+| --- | --- |
+| Qwen Image 2.1 control, inpaint/outpaint, native 2K, Turbo adapters, cache and text-to-image defaults | **Adapt after the base-model gate.** The local baseline has no accepted Qwen 2.1 runtime; its pinned source and non-commercial host-use review still precede download or activation. Preserve saved settings and current image paths. Port the unset-inpaint text-to-image fix when the handler exists, then verify masks, source geometry, 2K memory and Turbo results under separate CPU/device checks. |
+| H3 INT8 video VAE auto-selection and Comfy Kitchen kernels | **Benchmark lead.** Keep explicit VAE and attention choices authoritative. Compare the exact asset and kernel pins against the installed RTX 50 runtime, then test quality, memory, recovery and fallback under a fresh coordinator grant before changing any default. Published upstream speed figures are not local measurements. |
+| Experimental Windows 10 DLSS backend | **Defer host deployment.** This is a Linux installation; keep existing finishing and Windows 11 behavior. Assess the separate installer and Windows-only device acceptance on a compatible host, without enabling it through ordinary updates. The following Linux DLSS test-only commit is not a runtime feature to import. |
+| Gallery chronology, Media Info, finishing history and upload deletion | **Adapt in bounded slices.** Compare folder-qualified ordering and overlapping refresh handling with Continuum's project Gallery; add useful measured media facts and truthful finishing provenance where absent. Deletion must preserve active-job input and project authorization checks. Do not trade away existing private-preview gating, Editor/Bridge actions or recoverable output flows for upstream parity. |
 
 The [YuE2 real-audio model card](https://huggingface.co/Mothersuperior/yue2-mothersuperior-realaudio-tokenizer-v4)
 documents a matched joint-v9 tokenizer head and NAR decoder LoRA. The pinned

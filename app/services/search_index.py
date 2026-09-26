@@ -174,6 +174,20 @@ def _modern_producer_role(meta: Mapping[str, object]) -> Optional[str]:
         return None
     if meta.get("delivery_native_source") is True and meta.get("artifact_class") == "temporary":
         return "temporary"
+    if kind == "h3_bridge":
+        # The Bridge worker writes these receipts only after assembling and
+        # hashing its complete A + transition + B result. An incomplete or
+        # older sidecar must not acquire final status from the kind alone.
+        if (
+            meta.get("artifact_class") == "final"
+            and meta.get("producer_artifact_class") == "final"
+            and type(meta.get("producer_media_size")) is int
+            and meta["producer_media_size"] > 0
+            and isinstance(meta.get("producer_media_sha256"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", meta["producer_media_sha256"])
+        ):
+            return "final"
+        return "component"
     fixed = _RECOVERY_FIXED_ROLES.get(kind)
     if fixed is not None:
         return fixed

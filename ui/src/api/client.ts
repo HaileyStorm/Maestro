@@ -1250,7 +1250,10 @@ export async function submitH3Bridge(params: H3BridgeRequest): Promise<H3BridgeS
       }
       throw new Error('H3 Bridge could not use the selected videos or request. Refresh Gallery, check your choices, and try again.')
     }
-    if (res.status === 404) {
+    if (res.status === 404 || res.status === 405) {
+      if (res.status === 405) {
+        throw new Error('H3 Bridge is unavailable in the running Maestro server. Restart Maestro and refresh this page, then try again.')
+      }
       if (!detail || detail === 'Not Found') {
         throw new Error('H3 Bridge is unavailable in this version of Maestro. Update and restart Maestro, then try again.')
       }

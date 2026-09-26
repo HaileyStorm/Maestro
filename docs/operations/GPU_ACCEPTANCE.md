@@ -1509,3 +1509,47 @@ SeedVC conversion call to return; preemption *inside* either call and two-voice
 cancellation are not established. The deployed change passed 5,375 backend
 tests (17 skipped), 723 UI tests, and the UI type-check/build. These checks do
 not establish voice similarity or owner listening quality.
+
+## 2026-09-26 native H3 Bridge first full run
+
+A signed-in owner selected two existing project videos in the stable-share
+Gallery and submitted a native H3 Ref2VA Bridge under a fresh, continuously
+validated 20-minute GPU coordinator grant. The first submission returned HTTP
+405 because the browser had loaded the new UI while an older Python process
+was still serving requests. Pinokio stopped that process and started the
+current `start.js`; the new backend exposed `POST /api/v1/h3/bridge`, and the
+same browser request was accepted. The model completed one 28-step interval,
+then the Bridge worker assembled and published one project-private final.
+
+FFprobe found a 14.375-second, 345-frame, 1344 × 768 H.264 video at 24 fps
+with 48 kHz stereo AAC. Its source lengths were 124 and 141 frames, with 80
+new bridge frames between them. The producer sidecar's media digest matched
+the published bytes, and a complete FFmpeg decode returned without errors.
+Sampled frames on both sides of each splice retained the red geometric
+subject and pale-blue setting. This is a technical and sampled-frame check,
+not full playback, soundtrack quality or owner acceptance.
+
+Two live UI faults were found during that run. While the worker pointed the
+job's output directory at private transition staging, the remote Queue's
+project check hid the running job and showed an empty queue. The source now
+retains its project directory separately during staging, with a scoped
+visibility regression. After completion, the default Gallery hid the new
+file as a component because its new producer kind was not recognized as a
+final. Gallery classification now requires Bridge's complete final receipt;
+an incomplete Bridge sidecar remains a component. Both focused test suites
+pass. After deployment, the signed-in stable-share Gallery showed 47 items
+in the selected project, including this Bridge final, and its private viewer
+opened with the preview still blurred. That establishes live Gallery
+visibility and preview privacy. In-flight Queue visibility has a focused
+regression but still needs a fresh browser run during private staging.
+
+The model was unloaded through a Pinokio stop/start after publication. The
+fresh local `/ready` returned 200; the stable Cloudflare route briefly returned
+503 during target rotation, then `/health` and `/ready` returned 200 and its
+direct route redirected to the current Quick Tunnel. The coordinator grant
+was withdrawn and coherent lease validation then denied further GPU work. A
+later coordinated restart loaded the Queue and Gallery fixes in a new Python
+process; local and stable-share `/health` and `/ready` returned 200. The
+stable direct-fallback endpoint redirected to the new Quick Tunnel, whose
+`/health` also returned 200. The restart-status generation cleared only after
+local health and recovery readiness.

@@ -261,6 +261,7 @@ class H3BridgeWorkerTests(unittest.TestCase):
 
     def _generate(self, job_id, **_kwargs):
         self.generated = True
+        self.assertEqual(self.job["_h3_bridge_project_out_dir"], str(self.root))
         path = Path(self.job["out_dir"]) / "generated.mp4"
         path.write_bytes(b"generated-transition")
         self.job["_internal_output_files"] = ["generated.mp4"]
@@ -300,6 +301,7 @@ class H3BridgeWorkerTests(unittest.TestCase):
         self.assertNotIn("h3-bridge-", json.dumps(sidecar))
         self.assertFalse((self.root / "generated.mp4").exists())
         self.assertEqual(self.job["out_dir"], str(self.root))
+        self.assertNotIn("_h3_bridge_project_out_dir", self.job)
 
     def test_source_change_during_assembly_prevents_final_publication(self):
         def mutate(*args, **kwargs):
@@ -336,6 +338,36 @@ class H3BridgeWorkerTests(unittest.TestCase):
         self.assertFalse(self.generated)
         self.assertEqual(self.job["status"], "failed")
         self.assertTrue(final.is_file())
+
+
+class H3BridgeQueueVisibilityTests(unittest.TestCase):
+    def test_remote_owner_can_follow_staged_bridge_only_in_active_project(self):
+        with tempfile.TemporaryDirectory() as root:
+            job = {
+                "kind": "studio_h3_bridge", "workspace": "project-a",
+                "out_dir": str(Path(root) / "private-staging"),
+                "_h3_bridge_project_out_dir": root,
+            }
+            active = {"owner-session": "project-a"}
+            namespace = {
+                "os": os, "hmac": hmac, "HTTPException": HTTPException,
+                "QueueRecoveryAdapterError": ValueError,
+                "_existing_workspace_dir": lambda _workspace: root,
+                "_require_account_project_permission": lambda *_args: object(),
+                "_remote_active_projects_lock": threading.RLock(),
+                "_remote_active_projects": active,
+            }
+            load_launch_functions(namespace, "_recovered_job_remote_project_accessible")
+            request = types.SimpleNamespace(state=types.SimpleNamespace(
+                maestro_session_id="owner-session", maestro_remote=True,
+            ))
+            visible = namespace["_recovered_job_remote_project_accessible"]
+            self.assertTrue(visible(job, request))
+            active["owner-session"] = "other-project"
+            self.assertFalse(visible(job, request))
+            active["owner-session"] = "project-a"
+            job["kind"] = "studio_generation"
+            self.assertFalse(visible(job, request))
 
 
 if __name__ == "__main__":

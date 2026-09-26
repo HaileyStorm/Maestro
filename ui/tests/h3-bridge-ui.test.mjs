@@ -200,6 +200,7 @@ test('bridge submission errors give useful guidance for media limits, missing so
     { status: 422, body: { detail: 'source dimensions exceed 4096 pixels per side or 12 megapixels' }, message: sourceDimensionsMessage },
     { status: 404, body: { detail: 'Output not found: earlier.mp4' }, message: 'A selected video is no longer available. Refresh Gallery, select two current videos, and try again.' },
     { status: 404, body: { detail: 'Not Found' }, message: 'H3 Bridge is unavailable in this version of Maestro. Update and restart Maestro, then try again.' },
+    { status: 405, body: { detail: 'Method Not Allowed' }, message: 'H3 Bridge is unavailable in the running Maestro server. Restart Maestro and refresh this page, then try again.' },
     { status: 404, body: { detail: 'Model not found' }, message: 'H3 Bridge or a selected video is unavailable. Refresh Gallery and retry; if Bridge remains unavailable, update and restart Maestro.' },
     { status: 451, body: {}, message: 'MiniMax H3 is unavailable under the current license. Accepting model terms alone does not grant access; the required written MiniMax license must be in place.' },
     { status: 503, body: {}, message: 'MiniMax H3 is not ready on this installation. Check that the local model and required access terms are available, then retry.' },

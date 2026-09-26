@@ -137,6 +137,7 @@ Multiple isolated output directories with a quick switcher in the sidebar. Usefu
 - **Reference** is a persistent sidebar peer to Generate and Director. Its create/manage workspace stays mounted while inactive so authored state survives navigation; Queue leaves Reference only after the submission and job reconnect are durably confirmed. Locked projects disable entry, and a newly locked active project returns to the prior workspace after clearing private Reference state.
 - Reference makes reusable character, setting, item, and style cards, generates multiple candidates, and lets you keep/reject/delete variants before using them in Director or Generate semantic-reference workflows. The catalog includes explicit Moody Krea 2 quick-select cards when a recipe is enabled and present; disabled, missing, and manual-install states remain visible and are never auto-enabled or auto-selected.
 - Gallery selection supports bulk move, privacy, and deletion. Finals are shown by default; All, Components, Windows, and Temporary views expose intermediate artifacts when needed. Deleting a final can atomically include its linked parts.
+- **Bridge two videos** in the Gallery: select two project videos, choose which comes first, describe the motion between them, and choose the added duration. MiniMax H3 Ref2VA generates the conditioned interval; the finished video joins the complete selected cuts with that interval and inherits their project access and privacy. Source revisions are checked again before publication, so a changed clip fails instead of silently bridging different media.
 - **Flip horizontally** in a video's Gallery actions creates a separate flipped copy on the CPU. It preserves the original and copies every audio stream unchanged. Keep the original to undo the choice, or delete only the flipped copy. The queued operation supports cancellation and retains source/provenance and privacy metadata.
 - Read-only single-output share links work for local owners and through the same Cloudflare URL, and are revoked when the output is moved, changed, deleted, or its project is removed.
 
@@ -762,6 +763,20 @@ The response contains `job_id`; poll `GET /api/v1/status/{job_id}` for the new
 output filename. A stale selection returns 409 at submission; a later source
 change fails the job rather than flipping a different revision. No model or GPU is used. MP4/M4V, MOV, and WebM keep a compatible
 container; other video containers produce Matroska so audio can remain copied.
+
+To generate a native H3 bridge, select two videos in one project and submit
+their exact Gallery `name` and `revision` values. The example generates 124
+frames, of which 80 (about 3.3 seconds at 24 fps) are added between the cuts:
+
+```bash
+curl -fsS -b cookies.txt -H "Origin: $BASE" -H 'Content-Type: application/json' \
+  -d '{"workspace":"my-project","model_type":"minimax_h3_ref2va","clip_a":{"name":"first.mp4","revision":"<first revision>"},"clip_b":{"name":"next.mp4","revision":"<next revision>"},"prompt":"A continuous camera move connects the two shots","generated_frames":124}' \
+  "$BASE/api/v1/h3/bridge"
+```
+
+The response contains a `job_id` for the project Queue. Each source must have
+at least 56 frames after normalization to 24 fps. The result is a separate
+MP4; the source videos remain available.
 
 Python and JavaScript clients use the same JSON bodies with their normal cookie-aware HTTP client (`requests.Session` or `fetch(..., {credentials: 'include'})`). Blender preview sampling is `POST /api/v1/blender/render` with `frames` containing 2–32 integers; previews are stamped with project/privacy metadata and registered as project reference candidates by default.
 
