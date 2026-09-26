@@ -1484,3 +1484,28 @@ post-completion restart, and stable-share Gallery visibility. It does not
 establish automatic unattended resume, speaker similarity or audio quality,
 two-voice mode, cancellation, the separate result-adoption crash window, or
 owner listening acceptance.
+
+## 2026-09-26 Revoice running cancellation
+
+Two attempted stops of short single-voice Revoice jobs missed the running
+window; both completed and published results. They are excluded from the
+cancellation result. After deploying `d327921`, a signed-in stable-share
+request used an 18.167-second source, one voice reference, and 100 SeedVC
+diffusion steps under an exact monitored 20-minute GPU grant. Job
+`f27a383d848d40cb8280cb42441a85a3` reached running **Voice Conversion**;
+Stop returned HTTP 200 with `cancelled` and `was_running: true` while vocal
+separation was loading. The separation call finished, then the new cancellation
+checkpoint stopped the worker before SeedVC asset/model loading or conversion.
+The terminal status reported `output_files: []` and `produced_outputs: 0`;
+there was no published result for this job, and the queue returned to zero
+active jobs. The Gallery remained at 46 finished items. A clean Pinokio restart
+retained those 46 items and an empty queue. Stable Cloudflare root, `/health`,
+and `/ready` returned 200; the Worker's direct route returned 307. The
+separation model was unloaded by restart and the grant was withdrawn.
+
+This accepts cancellation at a Revoice stage boundary and no publication after
+Stop. Cancellation still waits for any already-running vocal-separation or
+SeedVC conversion call to return; preemption *inside* either call and two-voice
+cancellation are not established. The deployed change passed 5,375 backend
+tests (17 skipped), 723 UI tests, and the UI type-check/build. These checks do
+not establish voice similarity or owner listening quality.

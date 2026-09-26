@@ -330,12 +330,16 @@ environment. This does not establish GPU generation or owner acceptance.
    rediscovers held jobs immediately after project selection. A signed-in
    single-voice Revoice job was also interrupted in flight, held for owner
    reauthentication, resumed under a revalidated grant as the same job, and
-   published one changed-audio MP4 that survived a further restart. See
-   [GPU_ACCEPTANCE.md](../operations/GPU_ACCEPTANCE.md). Revoice cancellation,
-   the result-adoption crash window, other variants, speaker/detail quality,
-   and owner acceptance remain open. Gallery Extend and manual flip have CPU/UI/live-flow
-   evidence; flip crash-window adoption has CPU simulation evidence, while a
-   process-kill/restart check and human acceptance remain distinct.
+   published one changed-audio MP4 that survived a further restart. A later
+   running single-voice Revoice job was cancelled during vocal separation;
+   it stopped before SeedVC loading, published no result, and left the queue
+   idle through a clean restart. See
+   [GPU_ACCEPTANCE.md](../operations/GPU_ACCEPTANCE.md). In-call cancellation
+   preemption, the result-adoption crash window, other variants,
+   speaker/detail quality, and owner acceptance remain open. Gallery Extend
+   and manual flip have CPU/UI/live-flow evidence; flip crash-window adoption
+   has CPU simulation evidence, while a process-kill/restart check and human
+   acceptance remain distinct.
 2. Complete Music3 native live generation and recovery acceptance after the
    pinned host-term review and asset download. The hidden Quad CharacterSheet
    job and atomic publication path now have CPU checks; install the pinned
