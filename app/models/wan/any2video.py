@@ -50,6 +50,7 @@ from shared.utils.text_encoder_cache import TextEncoderCache
 from shared.utils.self_refiner import PnPHandler, create_self_refiner_handler
 from mmgp import safetensors2
 from shared.utils import files_locator as fl
+from services.video_prompt_flags import decode_video_prompt_type
 from .scail2 import (
     get_scail2_seed_generator,
     prepare_scail2_conditioning,
@@ -804,7 +805,11 @@ class WanAny2V:
             if track.ndim == 4: track = track.squeeze(0)
             if track.max() <= 1:
                 track = np.round(track * [width, height]).astype(np.int64)
-            control_video_pos= 0 if "T" in video_prompt_type else window_start_frame_no
+            control_video_pos= (
+                0
+                if decode_video_prompt_type(video_prompt_type).timeline_aligned
+                else window_start_frame_no
+            )
             track = torch.from_numpy(track[control_video_pos:control_video_pos+frame_num]).to(self.device)
             track_feats, track_pos = create_pos_feature_map(track, None, [4, 8, 8], height, width, 16, device=y.device)
             track_feats = None #track_feats.permute(3, 0, 1, 2)

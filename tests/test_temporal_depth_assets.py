@@ -1,10 +1,12 @@
 """Model-free regressions for LTX temporal-depth preprocessor provisioning."""
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import os
 from pathlib import Path
+import sys
 import tempfile
 import types
 import unittest
@@ -22,8 +24,6 @@ _VENDOR_ROOT = _APP / "preprocessing" / "video_depth_anything"
 
 
 def _load_service():
-    import sys
-
     app_path = str(_APP)
     if app_path not in sys.path:
         sys.path.insert(0, app_path)
@@ -58,6 +58,72 @@ def _load_service():
     ):
         spec.loader.exec_module(module)
     return module
+
+
+def _load_flags():
+    app_path = str(_APP)
+    if app_path not in sys.path:
+        sys.path.insert(0, app_path)
+    return importlib.import_module("services.video_prompt_flags")
+
+
+def _load_ast_function(path, name, *, class_name=None, namespace=None):
+    """Load one actual function body without importing its heavy module."""
+
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    if class_name is None:
+        candidates = [
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == name
+        ]
+    else:
+        class_node = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == class_name
+        )
+        candidates = [
+            node for node in class_node.body
+            if isinstance(node, ast.FunctionDef) and node.name == name
+        ]
+    if len(candidates) != 1:
+        raise AssertionError(f"Expected one {name} function in {path}")
+    function_node = ast.fix_missing_locations(candidates[0])
+    # A method's staticmethod decorator belongs to its class descriptor; the
+    # extracted function body is called directly in this model-free harness.
+    function_node.decorator_list = []
+    scope = dict(namespace or {})
+    exec(compile(ast.Module(body=[function_node], type_ignores=[]), str(path), "exec"), scope)
+    return scope[name]
+
+
+def _load_wgp_handlers(*names, namespace=None):
+    """Execute selected actual WGP handlers without importing model runtime."""
+
+    scope = dict(namespace or {})
+    for name in names:
+        scope[name] = _load_ast_function(
+            _WGP_PATH,
+            name,
+            namespace=scope,
+        )
+    return scope
+
+
+def _evaluate_assignment_rhs(path, target_name, namespace):
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    assignments = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == target_name
+            for target in node.targets
+        )
+    ]
+    if len(assignments) != 1:
+        raise AssertionError(f"Expected one assignment to {target_name} in {path}")
+    expression = ast.Expression(body=assignments[0].value)
+    return eval(compile(ast.fix_missing_locations(expression), str(path), "eval"), namespace)
 
 
 class _FakeResponse:
@@ -103,14 +169,55 @@ class TestTemporalDepthAssetRegistry(unittest.TestCase):
 
     def test_temporal_depth_detection_handles_ui_and_named_values(self):
         uses = self.module.uses_temporal_depth
-        for value in ("TVG", "PTVG", "TEVG", "depth_temporal"):
+        for value in (
+            "TVG", "PTVG", "TEVG", "TVGT", "PTVGT", "TEVGT",
+            "depth_temporal", "depth_temporalT",
+        ):
             with self.subTest(value=value):
                 self.assertTrue(uses({"video_prompt_type": value}))
         self.assertTrue(uses({"video_prompt_type": ["P", "T", "V", "G"]}))
-        for value in ("", "PVG", "DVG", None):
+        self.assertTrue(uses({"video_prompt_type": ["P", "T", "V", "G", "T"]}))
+        for value in ("", "PVG", "DVG", "T", "VGT", "PVGT", "DVGT", None):
             with self.subTest(value=value):
                 self.assertFalse(uses({"video_prompt_type": value}))
         self.assertFalse(uses(None))
+
+    def test_video_prompt_decoder_separates_alignment_from_depth(self):
+        decode = self.module.decode_video_prompt_type
+        for value, control_flags, aligned, temporal_depth in (
+            ("T", "", True, False),
+            ("PVGT", "PVG", True, False),
+            ("DVGT", "DVG", True, False),
+            ("PTVG", "PTVG", False, True),
+            ("PTVGT", "PTVG", True, True),
+            ("TEVGT", "TEVG", True, True),
+            ("depth_temporalT", "depth_temporal", True, True),
+        ):
+            with self.subTest(value=value):
+                decoded = decode(value)
+                self.assertEqual(decoded.control_flags, control_flags)
+                self.assertEqual(decoded.timeline_aligned, aligned)
+                self.assertEqual(decoded.uses_temporal_depth, temporal_depth)
+
+        # An unordered legacy input still receives conservative depth
+        # provisioning because its items cannot identify a trailing marker.
+        unordered = decode({"P", "V", "G", "T"})
+        self.assertFalse(unordered.timeline_aligned)
+        self.assertTrue(unordered.uses_temporal_depth)
+
+    def test_classic_alignment_transitions_preserve_internal_depth_flags(self):
+        flags = _load_flags()
+        set_alignment = flags.set_video_prompt_type_alignment
+        decode = flags.decode_video_prompt_type
+        aligned = set_alignment("PTVG", "T")
+        self.assertEqual(aligned, "PTVGT")
+        self.assertTrue(decode(aligned).timeline_aligned)
+        self.assertTrue(decode(aligned).uses_temporal_depth)
+
+        unaligned = set_alignment(aligned, "")
+        self.assertEqual(unaligned, "PTVG")
+        self.assertFalse(decode(unaligned).timeline_aligned)
+        self.assertTrue(decode(unaligned).uses_temporal_depth)
 
     def test_invalid_variant_fails_before_network_access(self):
         with self.assertRaisesRegex(RuntimeError, "Unsupported.*variant"):
@@ -261,6 +368,192 @@ class TestTemporalDepthWiring(unittest.TestCase):
         self.assertNotIn(
             'fl.locate_file(f"depth/video_depth_anything_', segment,
         )
+
+    def test_wgp_uses_decoded_alignment_for_runtime_and_classic_controls(self):
+        wgp = _WGP_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            "reset_control_aligment = video_prompt_type_flags.timeline_aligned",
+            wgp,
+        )
+        self.assertIn(
+            "filter_letters(video_prompt_type_flags.control_flags, video_guide_processes)",
+            wgp,
+        )
+        alignment = wgp[
+            wgp.index("def refresh_video_prompt_type_alignment("):
+            wgp.index("def refresh_video_prompt_type_video_guide(")
+        ]
+        self.assertIn("set_video_prompt_type_alignment(", alignment)
+        self.assertIn("update_video_prompt_type_flags(", wgp)
+        self.assertIn(
+            "decode_video_prompt_type(video_video_prompt_type).control_flags",
+            wgp,
+        )
+        self.assertIn(
+            "decode_video_prompt_type(video_prompt_type_value).timeline_aligned",
+            wgp,
+        )
+
+    def test_actual_classic_handlers_keep_depth_internal_and_alignment_trailing(self):
+        flags = _load_flags()
+        decode = flags.decode_video_prompt_type
+        model_defs = {"current": {}}
+        gr = types.SimpleNamespace(update=lambda **kwargs: kwargs)
+        namespace = {
+            "decode_video_prompt_type": decode,
+            "set_video_prompt_type_alignment": flags.set_video_prompt_type_alignment,
+            "update_video_prompt_type_flags": flags.update_video_prompt_type_flags,
+            "video_guide_processes": "OPEDTSLCMU",
+            "all_guide_processes": "OPEDTSLCMUVGBH",
+            "process_map_video_guide": {
+                "O": "pose_align", "P": "pose", "E": "canny",
+                "D": "depth", "T": "depth_temporal", "S": "scribble",
+                "L": "flow", "C": "gray", "M": "inpaint", "U": "identity",
+            },
+            "get_current_model_settings": lambda state: state["settings"],
+            "get_state_model_type": lambda _state: "test",
+            "get_model_settings": lambda state, _model_type: state["settings"],
+            "get_model_def": lambda _model_type: model_defs["current"],
+            "switch_image_guide_editor": lambda *args: ("mask-guide", "guide", "mask"),
+            "injected_frames_positions_visible": lambda _flags: False,
+            "input_video_strength_visible": lambda *_args: False,
+            "time": types.SimpleNamespace(time=lambda: 1.0),
+            "gr": gr,
+        }
+        handlers = _load_wgp_handlers(
+            "refresh_video_prompt_type_alignment",
+            "update_video_prompt_type",
+            "switch_image_mode",
+            "refresh_video_prompt_type_image_refs",
+            "refresh_video_prompt_type_video_guide",
+            "refresh_video_prompt_type_video_mask",
+            "refresh_video_prompt_type_video_custom_dropbox",
+            "refresh_video_prompt_type_video_custom_checkbox",
+            namespace=namespace,
+        )
+
+        settings = {"video_prompt_type": "VG"}
+        handlers["update_video_prompt_type"](
+            {"settings": settings}, process_type=["depth_temporal"],
+        )
+        self.assertEqual(settings["video_prompt_type"], "TVG")
+        self.assertTrue(decode(settings["video_prompt_type"]).uses_temporal_depth)
+        self.assertFalse(decode(settings["video_prompt_type"]).timeline_aligned)
+
+        settings["video_prompt_type"] = "PTVGT"
+        handlers["update_video_prompt_type"](
+            {"settings": settings}, any_video_guide=True, process_type=["raw"],
+        )
+        self.assertEqual(settings["video_prompt_type"], "VGT")
+        self.assertTrue(decode(settings["video_prompt_type"]).timeline_aligned)
+        self.assertFalse(decode(settings["video_prompt_type"]).uses_temporal_depth)
+
+        align = handlers["refresh_video_prompt_type_alignment"]
+        aligned = align(None, "PTVG", "T")
+        self.assertEqual(aligned, "PTVGT")
+        unaligned = align(None, aligned, "")
+        self.assertEqual(unaligned, "PTVG")
+        self.assertTrue(decode(unaligned).uses_temporal_depth)
+
+        image_ref_result = handlers["refresh_video_prompt_type_image_refs"](
+            None, "PVGT", "I", 0, "",
+        )
+        self.assertEqual(image_ref_result[0], "PVGIT")
+        self.assertTrue(decode(image_ref_result[0]).timeline_aligned)
+        self.assertFalse(decode(image_ref_result[0]).uses_temporal_depth)
+
+        model_defs["current"] = {
+            "inpaint_support": True,
+            "inpaint_video_prompt_type": "VAG",
+            "image_video_prompt_type": "KI",
+        }
+        image_mode_state = {
+            "image_mode_tab": 1,
+            "settings": {"video_prompt_type": "PTVGT"},
+        }
+        handlers["switch_image_mode"](image_mode_state)
+        switched = image_mode_state["settings"]["video_prompt_type"]
+        self.assertEqual(switched, "KIT")
+        self.assertTrue(decode(switched).timeline_aligned)
+        self.assertFalse(decode(switched).uses_temporal_depth)
+
+        refresh_guide = handlers["refresh_video_prompt_type_video_guide"]
+        guide_args = (None, "", "PTVGT", "V", 0, None, None, None, "")
+        raw_guide_result = refresh_guide(*guide_args)
+        self.assertEqual(raw_guide_result[0], "VT")
+        self.assertTrue(decode(raw_guide_result[0]).timeline_aligned)
+        self.assertFalse(decode(raw_guide_result[0]).uses_temporal_depth)
+        depth_guide_result = refresh_guide(
+            None, "", "PVGT", "TVG", 0, None, None, None, "",
+        )
+        self.assertEqual(depth_guide_result[0], "TVGT")
+        self.assertTrue(decode(depth_guide_result[0]).timeline_aligned)
+        self.assertTrue(decode(depth_guide_result[0]).uses_temporal_depth)
+
+        mask_result = handlers["refresh_video_prompt_type_video_mask"](
+            None, "PTVGT", "A", 0, None, None, None,
+        )
+        self.assertEqual(mask_result[0], "PTVGAT")
+        self.assertTrue(decode(mask_result[0]).timeline_aligned)
+        self.assertTrue(decode(mask_result[0]).uses_temporal_depth)
+
+        model_defs["current"] = {
+            "custom_video_selection": {
+                "letters_filter": "X",
+                "choices": [("Off", ""), ("On", "X")],
+            },
+        }
+        custom_drop = handlers["refresh_video_prompt_type_video_custom_dropbox"](
+            None, "PVGT", "X",
+        )
+        custom_check = handlers["refresh_video_prompt_type_video_custom_checkbox"](
+            None, "PVGT", True,
+        )
+        for result in (custom_drop, custom_check):
+            self.assertEqual(result, "PVGXT")
+            self.assertTrue(decode(result).timeline_aligned)
+            self.assertFalse(decode(result).uses_temporal_depth)
+
+    def test_recam_legacy_settings_migration_preserves_alignment_marker(self):
+        service = _load_service()
+        fix_settings = _load_ast_function(
+            _ROOT / "app" / "models" / "wan" / "wan_handler.py",
+            "fix_settings",
+            class_name="family_handler",
+            namespace={
+                "test_oneframe_overlap": lambda _base_model_type: False,
+                "test_class_i2v": lambda _base_model_type: False,
+                "test_svi2pro": lambda _base_model_type: False,
+            },
+        )
+        ui_defaults = {"video_prompt_type": "PT"}
+        fix_settings("recam_1.3B", 2.30, {}, ui_defaults)
+        self.assertEqual(ui_defaults["video_prompt_type"], "PUVT")
+        decoded = service.decode_video_prompt_type(ui_defaults["video_prompt_type"])
+        self.assertTrue(decoded.timeline_aligned)
+        self.assertFalse(decoded.uses_temporal_depth)
+
+    def test_wanmove_control_start_uses_alignment_not_temporal_depth(self):
+        decode = _load_flags().decode_video_prompt_type
+        source = _ROOT / "app" / "models" / "wan" / "any2video.py"
+        for value, expected in (
+            ("PVGT", 0),
+            ("PTVG", 23),
+            ("PTVGT", 0),
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    _evaluate_assignment_rhs(
+                        source,
+                        "control_video_pos",
+                        {
+                            "decode_video_prompt_type": decode,
+                            "video_prompt_type": value,
+                            "window_start_frame_no": 23,
+                        },
+                    ),
+                    expected,
+                )
 
     def test_h3_lora_affine_preflight_runs_before_managed_lora_download(self):
         launch = _LAUNCH_PATH.read_text(encoding="utf-8")

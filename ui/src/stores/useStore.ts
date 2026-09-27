@@ -9846,11 +9846,9 @@ export const useStore = create<AppState>((set, get) => ({
       if (params.input_video_strength == null) params.input_video_strength = _defaultIVS
       // Temporal alignment: the UI scopes EVERYTHING to the new content —
       // durationSeconds is the extend length, and ControlVideoSection's
-      // injected-frame positions are computed against that timeline. The
-      // backend, however, defaults to interpreting frames_positions (and
-      // control video / control audio alignment) against the FULL timeline
-      // including the source clip (wgp.py: reset_control_aligment = "T" in
-      // video_prompt_type; alignment_shift = source frames only when "T").
+      // injected-frame positions are computed against that timeline. WGP
+      // decodes only a trailing "T" through video_prompt_flags as timeline
+      // alignment, then offsets positions by the source-frame count.
       // Without "T", a frame injected at "end of the new 20s" of a 10s clip
       // lands at the 20s mark of the 30s output — 10s early; on longer
       // sources the position can fall entirely INSIDE the source span and
@@ -9868,14 +9866,20 @@ export const useStore = create<AppState>((set, get) => ({
         params.video_prompt_type = vptExtend + 'T'
       }
       // Compensate for the overlap frames the backend adds (video_length +
-      // overlap - 1). Without this, a 20s request with a 20s window produces
-      // 2 windows because the overlap pushes total frames past one window.
-      const swDefaults = state.modelOptions?.sliding_window_defaults as Record<string, number> | undefined
-      const overlap = swDefaults?.overlap_default ?? 9
-      const overlapFrames = Math.max(0, overlap - 1)
-      const currentFrames = (params.video_length as number) || 0
-      if (currentFrames > overlapFrames) {
-        params.video_length = currentFrames - overlapFrames
+      // overlap - 1) only when the selected model supports sliding windows.
+      // Model options own this capability when present. If fetching options
+      // failed, retain the legacy fallback for unknown models while recognizing
+      // known H3 model IDs as non-sliding.
+      const supportsSlidingWindow = state.modelOptions?.sliding_window
+        ?? !H3_STUDIO_MODELS.has(String(params.model_type || ''))
+      if (supportsSlidingWindow) {
+        const swDefaults = state.modelOptions?.sliding_window_defaults as Record<string, number> | undefined
+        const overlap = swDefaults?.overlap_default ?? 9
+        const overlapFrames = Math.max(0, overlap - 1)
+        const currentFrames = (params.video_length as number) || 0
+        if (currentFrames > overlapFrames) {
+          params.video_length = currentFrames - overlapFrames
+        }
       }
     }
 

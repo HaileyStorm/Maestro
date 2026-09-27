@@ -114,6 +114,11 @@ from services.model_residency import (
     build_residency_key,
     choose_profile_action,
 )
+from services.video_prompt_flags import (
+    decode_video_prompt_type,
+    set_video_prompt_type_alignment,
+    update_video_prompt_type_flags,
+)
 
 # import torch._dynamo as dynamo
 # dynamo.config.recompile_limit = 2000   # default is 256
@@ -3975,8 +3980,16 @@ def fix_settings(model_type, ui_defaults, min_settings_version = 0):
             video_prompt_type = del_in_sequence(video_prompt_type, "IK")
         else:
             first_choice = image_ref_choices_list[0][1]
-            if "I" in first_choice and not "I" in video_prompt_type: video_prompt_type += "I"
-            if len(image_ref_choices_list)==1 and "K" in first_choice and not "K" in video_prompt_type: video_prompt_type += "K"
+            if "I" in first_choice and not "I" in video_prompt_type:
+                video_prompt_type = update_video_prompt_type_flags(
+                    video_prompt_type,
+                    add_flags="I",
+                )
+            if len(image_ref_choices_list)==1 and "K" in first_choice and not "K" in video_prompt_type:
+                video_prompt_type = update_video_prompt_type_flags(
+                    video_prompt_type,
+                    add_flags="K",
+                )
         ui_defaults["video_prompt_type"] = video_prompt_type
 
     model_handler = get_model_handler(base_model_type)
@@ -7331,9 +7344,9 @@ def resolve_media_creation_date(file_name, configs=None):
 def update_video_prompt_type(state, any_video_guide = False, any_video_mask = False, any_background_image_ref = False, process_type = None, default_update = ""):
     letters = default_update
     settings = get_current_model_settings(state)
-    video_prompt_type = settings["video_prompt_type"]
+    remove_flags = ""
     if process_type  is not None:
-        video_prompt_type = del_in_sequence(video_prompt_type, video_guide_processes)
+        remove_flags += video_guide_processes
         for one_process_type in process_type: 
             for k,v in process_map_video_guide.items():
                 if v== one_process_type:
@@ -7347,7 +7360,7 @@ def update_video_prompt_type(state, any_video_guide = False, any_video_mask = Fa
     if any_video_guide: letters += "V"
     if any_video_mask: letters += "A"
     if any_background_image_ref: 
-        video_prompt_type = del_in_sequence(video_prompt_type, "F")
+        remove_flags += "F"
         letters += "KI"
     validated_letters = ""
     for letter in letters:
@@ -7363,8 +7376,11 @@ def update_video_prompt_type(state, any_video_guide = False, any_video_mask = Fa
             if any(letter in choice for label, choice in guide_custom_choices["choices"] ):
                 validated_letters += letter
                 continue
-    video_prompt_type = add_to_sequence(video_prompt_type, letters)
-    settings["video_prompt_type"] = video_prompt_type 
+    settings["video_prompt_type"] = update_video_prompt_type_flags(
+        settings["video_prompt_type"],
+        remove_flags=remove_flags,
+        add_flags=letters,
+    )
 
 
 def select_video(state, current_gallery_tab, input_file_list, file_selected, audio_files_paths, audio_file_selected, source, event_data: gr.EventData):
@@ -7725,7 +7741,10 @@ def select_video(state, current_gallery_tab, input_file_list, file_selected, aud
             control_net_weight = ""
             if len(control_net_weight_name):
                 video_control_net_weight = configs.get("control_net_weight", 1)
-                if len(filter_letters(video_video_prompt_type, video_guide_processes))> 1:
+                if len(filter_letters(
+                    decode_video_prompt_type(video_video_prompt_type).control_flags,
+                    video_guide_processes,
+                )) > 1:
                     video_control_net_weight2 = configs.get("control_net_weight2", 1)
                     control_net_weight = f"{control_net_weight_name} #1={video_control_net_weight}, {control_net_weight_name} #2={video_control_net_weight2}"
                 else:
@@ -11058,7 +11077,10 @@ def _generate_video_impl(
 
     set_video_prompt_type = model_def.get("set_video_prompt_type", None)
     if set_video_prompt_type is not None:
-        video_prompt_type = add_to_sequence(video_prompt_type, set_video_prompt_type)
+        video_prompt_type = update_video_prompt_type_flags(
+            video_prompt_type,
+            add_flags=set_video_prompt_type,
+        )
     if is_image:
         if not model_def.get("custom_video_length", False):
             if min_frames_if_references >= 1000:
@@ -11951,7 +11973,8 @@ def _generate_video_impl(
         )
         temp_filenames_list.append(audio_guide)
 
-    reset_control_aligment = "T" in video_prompt_type
+    video_prompt_type_flags = decode_video_prompt_type(video_prompt_type)
+    reset_control_aligment = video_prompt_type_flags.timeline_aligned
 
     # Audio conditioning needs overlap padding before the final window count
     # is known. Its reuse width depends only on the already-normalized window
@@ -12829,7 +12852,7 @@ def _generate_video_impl(
                     # Generic Video Preprocessing
                     process_outside_mask = process_map_outside_mask.get(filter_letters(video_prompt_type, "YWX"), None)
                     preprocess_type, preprocess_type2 =  "raw", None 
-                    for process_num, process_letter in enumerate( filter_letters(video_prompt_type, video_guide_processes)):
+                    for process_num, process_letter in enumerate( filter_letters(video_prompt_type_flags.control_flags, video_guide_processes)):
                         if process_num == 0:
                             preprocess_type = process_map_video_guide.get(process_letter, "raw")
                         else:
@@ -16288,14 +16311,20 @@ def switch_image_mode(state):
             model_cache[2] = video_prompt_type
             video_prompt_type = model_cache.get(1, None)
             if video_prompt_type is None:
-                video_prompt_type = del_in_sequence(old_video_prompt_type, video_prompt_inpaint_mode + all_guide_processes)  
-                video_prompt_type = add_to_sequence(video_prompt_type, video_prompt_image_mode)
+                video_prompt_type = update_video_prompt_type_flags(
+                    old_video_prompt_type,
+                    remove_flags=video_prompt_inpaint_mode + all_guide_processes,
+                    add_flags=video_prompt_image_mode,
+                )
         elif image_mode == 2:
             model_cache[1] = video_prompt_type
             video_prompt_type = model_cache.get(2, None)
             if video_prompt_type is None:
-                video_prompt_type = del_in_sequence(old_video_prompt_type, video_prompt_image_mode + all_guide_processes)
-                video_prompt_type = add_to_sequence(video_prompt_type, video_prompt_inpaint_mode)  
+                video_prompt_type = update_video_prompt_type_flags(
+                    old_video_prompt_type,
+                    remove_flags=video_prompt_image_mode + all_guide_processes,
+                    add_flags=video_prompt_inpaint_mode,
+                )
         ui_defaults["video_prompt_type"] = video_prompt_type 
         
     return  str(time.time())
@@ -16727,10 +16756,14 @@ def refresh_video_prompt_type_image_refs(state, video_prompt_type, video_prompt_
     model_def = get_model_def(model_type)
     image_ref_choices = model_def.get("image_ref_choices", None)
     if image_ref_choices is not None:
-        video_prompt_type = del_in_sequence(video_prompt_type, image_ref_choices["letters_filter"])
+        remove_flags = image_ref_choices["letters_filter"]
     else:
-        video_prompt_type = del_in_sequence(video_prompt_type, "KFI")
-    video_prompt_type = add_to_sequence(video_prompt_type, video_prompt_type_image_refs)
+        remove_flags = "KFI"
+    video_prompt_type = update_video_prompt_type_flags(
+        video_prompt_type,
+        remove_flags=remove_flags,
+        add_flags=video_prompt_type_image_refs,
+    )
     visible = "I" in video_prompt_type
     any_outpainting= image_mode in model_def.get("video_guide_outpainting", [])
     rm_bg_visible= visible and not model_def.get("no_background_removal", False) 
@@ -16779,8 +16812,11 @@ def switch_image_guide_editor(image_mode, old_video_prompt_type , video_prompt_t
 
 def refresh_video_prompt_type_video_mask(state, video_prompt_type, video_prompt_type_video_mask, image_mode, old_image_mask_guide_value, old_image_guide_value, old_image_mask_value ):
     old_video_prompt_type = video_prompt_type
-    video_prompt_type = del_in_sequence(video_prompt_type, "XYZWNA")
-    video_prompt_type = add_to_sequence(video_prompt_type, video_prompt_type_video_mask)
+    video_prompt_type = update_video_prompt_type_flags(
+        video_prompt_type,
+        remove_flags="XYZWNA",
+        add_flags=video_prompt_type_video_mask,
+    )
     visible= "A" in video_prompt_type     
     model_type = get_state_model_type(state)
     model_def = get_model_def(model_type)
@@ -16790,9 +16826,10 @@ def refresh_video_prompt_type_video_mask(state, video_prompt_type, video_prompt_
     return video_prompt_type, gr.update(visible= visible and not image_outputs), image_mask_guide, image_guide, image_mask, gr.update(visible= visible ) , gr.update(visible= visible and (mask_strength_always_enabled or "G" in video_prompt_type )  )
 
 def refresh_video_prompt_type_alignment(state, video_prompt_type, video_prompt_type_video_guide):
-    video_prompt_type = del_in_sequence(video_prompt_type, "T")
-    video_prompt_type = add_to_sequence(video_prompt_type, video_prompt_type_video_guide)
-    return video_prompt_type
+    return set_video_prompt_type_alignment(
+        video_prompt_type,
+        video_prompt_type_video_guide,
+    )
 
 
 def refresh_video_prompt_type_video_guide(state, filter_type, video_prompt_type, video_prompt_type_video_guide,  image_mode, old_image_mask_guide_value, old_image_guide_value, old_image_mask_value, image_prompt_type ):
@@ -16804,8 +16841,11 @@ def refresh_video_prompt_type_video_guide(state, filter_type, video_prompt_type,
         letter_filter = guide_custom_choices.get("letters_filter","")
     else:
         letter_filter = all_guide_processes
-    video_prompt_type = del_in_sequence(video_prompt_type, letter_filter)
-    video_prompt_type = add_to_sequence(video_prompt_type, video_prompt_type_video_guide)
+    video_prompt_type = update_video_prompt_type_flags(
+        video_prompt_type,
+        remove_flags=letter_filter,
+        add_flags=video_prompt_type_video_guide,
+    )
     visible = "V" in video_prompt_type
     any_outpainting= image_mode in model_def.get("video_guide_outpainting", [])
     mask_visible = visible and "A" in video_prompt_type and not "U" in video_prompt_type
@@ -16835,9 +16875,11 @@ def refresh_video_prompt_type_video_custom_dropbox(state, video_prompt_type, vid
     custom_video_selection = model_def.get("custom_video_selection", None)
     if custom_video_selection is None: return gr.update()
     letters_filter = custom_video_selection.get("letters_filter", "")
-    video_prompt_type = del_in_sequence(video_prompt_type, letters_filter)
-    video_prompt_type = add_to_sequence(video_prompt_type, video_prompt_type_video_custom_dropbox)
-    return video_prompt_type
+    return update_video_prompt_type_flags(
+        video_prompt_type,
+        remove_flags=letters_filter,
+        add_flags=video_prompt_type_video_custom_dropbox,
+    )
 
 def refresh_video_prompt_type_video_custom_checkbox(state, video_prompt_type, video_prompt_type_video_custom_checkbox):
     model_type = get_state_model_type(state)
@@ -16845,10 +16887,16 @@ def refresh_video_prompt_type_video_custom_checkbox(state, video_prompt_type, vi
     custom_video_selection = model_def.get("custom_video_selection", None)
     if custom_video_selection is None: return gr.update()
     letters_filter = custom_video_selection.get("letters_filter", "")
-    video_prompt_type = del_in_sequence(video_prompt_type, letters_filter)
-    if video_prompt_type_video_custom_checkbox:
-        video_prompt_type = add_to_sequence(video_prompt_type, custom_video_selection["choices"][1][1])
-    return video_prompt_type
+    add_flags = (
+        custom_video_selection["choices"][1][1]
+        if video_prompt_type_video_custom_checkbox
+        else ""
+    )
+    return update_video_prompt_type_flags(
+        video_prompt_type,
+        remove_flags=letters_filter,
+        add_flags=add_flags,
+    )
 
 
 def refresh_preview(state):
@@ -18406,7 +18454,11 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
                                 ("Aligned to the beginning of the Source Video", ""),
                                 ("Aligned to the beginning of the First Window of the new Video Sample", "T"),
                             ],
-                            value=filter_letters(video_prompt_type_value, "T"),
+                            value=(
+                                "T"
+                                if decode_video_prompt_type(video_prompt_type_value).timeline_aligned
+                                else ""
+                            ),
                             label="Control Video / Control Audio / Positioned Frames Temporal Alignment when any Video to continue",
                             visible = any_control_image or any_control_video or any_audio_guide or any_audio_guide2 or any_custom_guide 
                         )

@@ -1776,3 +1776,56 @@ bounded fidelity experiment must retain the same score, seed and settings,
 change only an explicit conditioning variable, and compare measured duration
 and musical endings separately; no silent trimming or time scaling is accepted
 as score-following evidence.
+
+## 2026-09-27 H3 Extend preflight failure and cancellation
+
+Under a fresh validated 20-minute Maestro grant, the signed-in stable-share
+Gallery submitted Extend from the existing 5.167-second synthetic Guide clip,
+using H3 Base FL2VA, Turbo 4 Dense, 608 × 352, one private output and 5.167
+seconds of requested new content. The source SHA-256 was
+`f9057c928992261de6d214985d11055a992f4bb0d6f6367bed64526ec7c29fdd`.
+The request unexpectedly began downloading Video Depth Anything Large during
+preprocessing even though no Temporal Depth control was selected. The UI Stop
+action cancelled the attempt before any observed denoising; the queue returned
+idle, the Gallery remained at 51 items and no output for this job was published.
+The source retained its original hash.
+
+The completed 1,538,392,012-byte depth checkpoint is retained. Its SHA-256,
+`43df27c6b396042ba34ff7b798ab279f64d204d2e86d7a373968f8fa36d0e6fa`,
+matches the pinned asset. This unwanted download is a failed preflight result,
+not acceptance of Temporal Depth or H3 Extend. Source inspection found that
+the trailing `T` used to align controls to new content was also interpreted as
+the internal `T` selecting Temporal Depth, in both provisioning and runtime
+preprocessing. Repair and fresh runtime verification remain required.
+
+Separate source inspection found an H3 continuation gap: ordinary Extend
+passes source video to a model path that consumes it only for the gated native
+boundary experiment, while output assembly can treat the whole source as an
+overlap. The supported automatic long-form last-frame handoff does not by
+itself establish ordinary Extend support. No experimental boundary setting was
+enabled and no successful continuation is claimed from this cancelled request.
+
+After cancellation, the supported direct-local unload completed after acquiring
+the generation resource lock, and system status reported no loaded generation
+model. The five-second lease observer was stopped, the exact grant withdrawn,
+and its outbox reported `denied` with no lease. This cleanup does not verify
+the remote owner Free resources action, which still needs recent password
+confirmation.
+
+### Alignment and duration repair deployed
+
+The shared flag decoder now treats one trailing `T` as timeline alignment and
+an earlier `T` as Temporal Depth. Studio Extend subtracts sliding overlap only
+for models that support it; known H3 models retain their requested new-content
+duration when model options are unavailable. Focused checks passed (18 backend
+and five UI tests), followed by independent review with no remaining finding.
+The final source bytes passed the full local CI gate: publication guard,
+syntax, 5,441 backend tests (17 skipped), 748 UI tests, type-check and build.
+
+Pinokio's coordinated Restart Maestro action loaded the repair. The newly
+discovered direct-local and stable-share routes each returned HTTP 200 for
+`/health`, `/ready`, account context and workspaces; the restart-status readback
+was empty. A fresh Chrome visit reached Maestro's sign-in screen. Owner browser
+acceptance still needs sign-in, and no new GPU generation has tested H3 Extend.
+The tests establish flag and duration behavior, not successful source-prefix
+continuation or absence of a depth download in a live generation.

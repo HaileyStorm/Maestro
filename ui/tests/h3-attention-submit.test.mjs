@@ -329,6 +329,109 @@ test('available Sage Base submission preserves the selected engine and creates o
   })
 })
 
+test('Extend request frames respect sliding capability and the known H3 fallback', async () => {
+  const source = '/uploads/extend-source.mp4'
+  const cases = [
+    {
+      name: 'sliding model keeps the legacy missing-overlap fallback',
+      modelType: 'test_sliding_video',
+      slidingWindow: true,
+      source,
+      imageMode: 3,
+      requestedFrames: 97,
+      expectedFrames: 89,
+    },
+    {
+      name: 'non-sliding H3 keeps a requested duration over 15 seconds',
+      modelType: 'minimax_h3',
+      slidingWindow: false,
+      source,
+      imageMode: 3,
+      requestedFrames: 385,
+      expectedFrames: 385,
+    },
+    {
+      name: 'missing options still recognize H3 as non-sliding',
+      modelType: 'minimax_h3',
+      slidingWindow: null,
+      source,
+      imageMode: 3,
+      requestedFrames: 385,
+      expectedFrames: 385,
+    },
+    {
+      name: 'missing options retain historical compensation for an unknown model',
+      modelType: 'test_sliding_video',
+      slidingWindow: null,
+      source,
+      imageMode: 3,
+      requestedFrames: 97,
+      expectedFrames: 89,
+    },
+    {
+      name: 'ordinary video submission keeps its requested duration',
+      modelType: 'test_sliding_video',
+      slidingWindow: true,
+      source: '',
+      imageMode: 0,
+      requestedFrames: 97,
+      expectedFrames: 97,
+    },
+  ]
+
+  for (const scenario of cases) {
+    await withFreshStore(async ({ requests, useStore }) => {
+      useStore.setState(state => {
+        const slidingModel = scenario.modelType === 'test_sliding_video'
+          ? {
+            model_type: scenario.modelType,
+            name: 'Test sliding video model',
+            family: 'video',
+            architecture: 'test_sliding_video',
+            availability_status: 'available',
+            execution_allowed: true,
+            is_i2v: true,
+            is_t2v: true,
+            guidance_max_phases: 2,
+            fps: 24,
+          }
+          : null
+        return {
+          continueVideoPath: scenario.source,
+          ...(scenario.slidingWindow == null
+            ? { modelOptions: null }
+            : {
+              modelOptions: {
+                ...state.modelOptions,
+                model_type: scenario.modelType,
+                architecture: scenario.modelType,
+                sliding_window: scenario.slidingWindow,
+              },
+            }),
+          ...(slidingModel ? {
+            models: [...state.models, slidingModel],
+            selectedModelPerMode: { ...state.selectedModelPerMode, video: scenario.modelType },
+          } : {}),
+          params: {
+            ...state.params,
+            model_type: scenario.modelType,
+            image_mode: scenario.imageMode,
+            video_length: scenario.requestedFrames,
+          },
+        }
+      })
+
+      await useStore.getState().startGeneration('queue')
+
+      const generateRequest = requests.find(request => request.url === '/api/v1/generate')
+      assert.ok(generateRequest, scenario.name)
+      const body = JSON.parse(generateRequest.body)
+      assert.equal(body.video_length, scenario.expectedFrames, scenario.name)
+      if (scenario.source) assert.equal(body.video_source, source, scenario.name)
+    })
+  }
+})
+
 test('a late Sage status response cannot submit after the selected request changes', async () => {
   const cases = [
     {

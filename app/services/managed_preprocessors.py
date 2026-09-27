@@ -17,6 +17,7 @@ from typing import Any
 import requests
 
 from shared.utils import files_locator as fl
+from services.video_prompt_flags import decode_video_prompt_type
 
 
 ProgressCallback = Callable[[str], Any]
@@ -114,11 +115,7 @@ def uses_temporal_depth(params: dict | None) -> bool:
 
     if not isinstance(params, dict):
         return False
-    value = params.get("video_prompt_type")
-    if isinstance(value, (list, tuple, set)):
-        value = "".join(str(item or "") for item in value)
-    value = str(value or "")
-    return "T" in value or "depth_temporal" in value.casefold()
+    return decode_video_prompt_type(params.get("video_prompt_type")).uses_temporal_depth
 
 
 def _checkpoint_spec(variant: str | None) -> tuple[str, dict]:

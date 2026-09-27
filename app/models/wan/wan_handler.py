@@ -982,7 +982,12 @@ class family_handler():
             if base_model_type in ["recam_1.3B"]:
                 video_prompt_type = ui_defaults.get("video_prompt_type", "")
                 if not "V" in video_prompt_type:
-                    video_prompt_type += "UV"
+                    from services.video_prompt_flags import update_video_prompt_type_flags
+
+                    video_prompt_type = update_video_prompt_type_flags(
+                        video_prompt_type,
+                        add_flags="UV",
+                    )
                     ui_defaults["video_prompt_type"] = video_prompt_type 
                     ui_defaults["image_prompt_type"] = ""
 
