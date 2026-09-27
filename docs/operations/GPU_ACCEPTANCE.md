@@ -1667,3 +1667,72 @@ Before deployment, the CPU-masked full local gate passed 5,430 backend tests
 production build. A coordinated Pinokio restart then cleared its public status
 generation. Current direct and stable-share `/health` and `/ready` returned 200,
 and the stable direct fallback redirected to this launch's Quick Tunnel.
+
+## 2026-09-27 successor long-form playback and retained-artifact check
+
+The combined-revision `scripts/run_local_ci.py --gate all` run completed on
+the handoff source revision `568f90d`: 5,435 backend tests passed with 17 skips
+(including the five JSON-grammar tests now included in discovery), all 747 UI
+tests passed, and publication-boundary checks, Python compilation, TypeScript
+checking and the production build passed. GPU-related environment variables
+were masked. These are CPU/static checks, separate from the live evidence below.
+
+The successor resumed from `568f90d` and rediscovered the running Pinokio
+service. Direct and stable-share `/health` and `/ready` returned 200. The
+configured `/.well-known/maestro-share/direct` fallback returned 307 to the
+current Quick Tunnel. No restart or GPU workload was needed for this check.
+
+The 18.167-second inline-timeline-fix output recorded above still exists with
+both component clips after the intervening service restarts. All three media
+hashes match their sidecars and the earlier receipt. The final SHA-256 remains
+`a1feb8aeff3c3dae82b8a5451dafa2ac1b43a1d46c243c63e6dc6376cc12d8d0`.
+FFprobe reports 436 H.264 frames at 24 fps and 960 × 544, with stereo 32 kHz
+AAC audio. Video duration is 18.166667 seconds and audio duration is 18.167
+seconds. A complete CPU decode returned zero. Audio mean/peak levels remain
+-24.7/-9.0 dBFS. FFmpeg reported no black interval with `d=0.1:pix_th=0.1` and
+no frozen interval with `n=-50dB:d=2`; these measurements remain advisory.
+An agent-inspected one-frame-per-second contact sheet retains the red pinwheel,
+stand and tabletop across both segments. This does not inspect every frame or
+establish acceptable motion, sound or creative quality.
+
+In the signed-in stable-share Gallery viewer, the final loaded at 960 × 544
+and played through to `currentTime=duration=18.167`, `ended=true`, with no media
+error. This supplies one long-form browser-playback receipt and a current
+post-restart artifact check, not a new generation, controlled crash/recovery
+test, audible-sound observation, cross-browser guarantee or owner acceptance.
+After the card's lazy metadata load completed, the signed-in Gallery also
+exposed Load settings, Regenerate and Rejoin all 2 clips for that final.
+Their presence is verified; none of those mutating actions was submitted.
+
+The signed-in owner Free resources control still requires recent password
+confirmation. Its error remains visible and Open Account reaches Confirm your
+password. No password was supplied and no release was attempted in this check;
+the combined reauthentication-plus-resident-resource release remains open.
+
+## 2026-09-27 local multilingual Chat transport
+
+Under a fresh validated 20-minute `maestro-local` grant, the signed-in
+stable-share Chat submitted one synthetic three-line round-trip request to
+the already-selected Gemma 4 31B Heretic ARA Q4_K_M model. Live LLM status
+identified `MoonRide/gemma-4-31B-it-heretic-ara-GGUF`, provider `local`, device
+and backend `cuda`. The asynchronous Chat worker used its progress-enabled
+local generation path. The completed browser response preserved these lines
+exactly, including the accent marks, em dash, Arabic and four-byte emoji:
+
+```text
+雪山と星空
+Crème brûlée — déjà vu
+مرحبا بالعالم 🌍
+```
+
+This is one live multilingual local-Chat transport receipt. It does not prove
+every network chunk boundary, other providers, vision, general language
+quality or model throughput. The retained earlier conversation was not cleared.
+
+The five-second coherent lease observer remained authorized throughout the
+workload. After the response completed, the supported direct-local LLM unload
+control returned success and live status reported both `loaded=false` and
+`loading=false`. The observer then exited, the exact grant was withdrawn, and
+the outbox became `denied` with no lease. Direct health and stable-share health
+and readiness remained 200 without restarting Maestro. This local cleanup is
+not acceptance of the separately gated remote owner Free resources action.

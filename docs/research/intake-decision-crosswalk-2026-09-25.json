@@ -1366,7 +1366,7 @@
       },
       "current_reconciliation": {
         "status": "recorded",
-        "disposition": "Adopt contract, not shell script; ordinary delivery checks remain incomplete",
+        "disposition": "Adapt structural output verification, not the source shell script; the CPU publication gate and ordinary live H3 outputs are verified. Signal metrics remain advisory; exact native audio-format fidelity, Director assembly, and owner playback/quality acceptance remain open.",
         "anchors": [
           {
             "path": "docs/research/intake-reconciliation-2026-09-22.md",
@@ -7329,7 +7329,7 @@
       "source_ids": [
         "source-092"
       ],
-      "issue": "The current decision adopts the output-verification contract, not the source shell script; ordinary-delivery media-integrity checks remain incomplete."
+      "issue": "The source shell script was not adopted. Ordinary H3 final-publication structural checks are implemented, and the deployed probe passed on two signed-in stable-share outputs. Dark/static/silent signal samples remain advisory; exact native audio-format fidelity, Director assembly, and owner playback/quality acceptance remain open."
     },
     {
       "source_ids": [
