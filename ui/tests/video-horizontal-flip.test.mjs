@@ -32,10 +32,34 @@ test('hflip client submits an exact workspace, filename, and revision', async ()
   })
 })
 
+test('browser-copy client submits only the selected project video identity', async () => {
+  const { submitToolBrowserCopy } = await import('../src/api/client.ts')
+  const calls = []
+  const previousFetch = globalThis.fetch
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, init })
+    return { ok: true, json: async () => ({ job_id: 'copy-job', status: 'queued' }) }
+  }
+  try {
+    assert.deepEqual(
+      await submitToolBrowserCopy({ workspace: 'project-a', name: 'clip.mp4', revision: 'rev-7' }),
+      { job_id: 'copy-job', status: 'queued' },
+    )
+  } finally {
+    globalThis.fetch = previousFetch
+  }
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].url, '/api/v1/tools/browser-copy')
+  assert.equal(calls[0].init.method, 'POST')
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    workspace: 'project-a', name: 'clip.mp4', revision: 'rev-7',
+  })
+})
+
 async function loadFlipAction() {
   const source = await readFile(new URL('../src/stores/useStore.ts', import.meta.url), 'utf8')
   const start = source.indexOf('  flipSelectedClip: async (output) => {')
-  const end = source.indexOf('  sendClipToTools:', start)
+  const end = source.indexOf('  createBrowserCopy:', start)
   assert.ok(start >= 0 && end > start, 'flip action must stay in a bounded store region')
   const method = source.slice(start, end)
     .replace(/^  flipSelectedClip: async \(output\) => \{/, `export async function flipSelectedClip(output, context) {
@@ -48,6 +72,24 @@ async function loadFlipAction() {
     .replace(/\n  \},\s*$/, '\n}')
   const result = await transform(method, { loader: 'ts', format: 'esm', target: 'es2022' })
   return import(asDataModule(result.code)).then(module => module.flipSelectedClip)
+}
+
+async function loadBrowserCopyAction() {
+  const source = await readFile(new URL('../src/stores/useStore.ts', import.meta.url), 'utf8')
+  const start = source.indexOf('  createBrowserCopy: async (output) => {')
+  const end = source.indexOf('  sendClipToTools:', start)
+  assert.ok(start >= 0 && end > start, 'browser-copy action must stay in a bounded store region')
+  const method = source.slice(start, end)
+    .replace(/^  createBrowserCopy: async \(output\) => \{/, `export async function createBrowserCopy(output, context) {
+      const { api, get, set, accountIdentityEpochValue, accountIdentityIsCurrent,
+        discardStaleGenerationPlaceholder, isActiveGenerationJob } = context
+      const _accountIdentityEpoch = accountIdentityEpochValue
+      const _accountIdentityIsCurrent = accountIdentityIsCurrent
+      const _discardStaleGenerationPlaceholder = discardStaleGenerationPlaceholder
+      const _isActiveGenerationJob = isActiveGenerationJob`)
+    .replace(/\n  \},\s*$/, '\n}')
+  const result = await transform(method, { loader: 'ts', format: 'esm', target: 'es2022' })
+  return import(asDataModule(result.code)).then(module => module.createBrowserCopy)
 }
 
 function makeActionContext({ submit, workspace = 'project-a', epoch = 1 } = {}) {
@@ -64,6 +106,10 @@ function makeActionContext({ submit, workspace = 'project-a', epoch = 1 } = {}) 
       submitToolHflip: async params => {
         submitted.push(params)
         return submit ? submit(params) : { job_id: 'flip-job', status: 'queued' }
+      },
+      submitToolBrowserCopy: async params => {
+        submitted.push(params)
+        return submit ? submit(params) : { job_id: 'copy-job', status: 'queued' }
       },
     },
     get: () => state,
@@ -122,6 +168,177 @@ test('late hflip responses cannot retain a placeholder after project or account 
   resolveAccountSubmit({ job_id: 'late-account-job', status: 'queued' })
   await accountPending
   assert.equal(accountFixture.state.jobs.length, 0)
+})
+
+test('browser-copy action queues and polls the exact project output', async () => {
+  const createBrowserCopy = await loadBrowserCopyAction()
+  const fixture = makeActionContext()
+  globalThis.window = { dispatchEvent() {} }
+  globalThis.CustomEvent = class CustomEvent { constructor(type) { this.type = type } }
+  assert.equal(await createBrowserCopy({ workspace: 'project-a', name: 'clip.mp4', revision: 'rev-7' }, fixture.context), 'copy-job')
+  assert.deepEqual(fixture.submitted, [{ workspace: 'project-a', name: 'clip.mp4', revision: 'rev-7' }])
+  assert.equal(fixture.state.jobs[0].id, 'copy-job')
+  assert.equal(fixture.state.jobs[0].status, 'queued')
+  assert.deepEqual(fixture.pollCalls, [['copy-job', 'project-a']])
+
+  const existing = makeActionContext({ submit: async () => ({ job_id: 'copy-already-running', status: 'running' }) })
+  assert.equal(await createBrowserCopy({ workspace: 'project-a', name: 'clip.mp4', revision: 'rev-7' }, existing.context), 'copy-already-running')
+  assert.equal(existing.state.jobs[0].status, 'running')
+  assert.deepEqual(existing.pollCalls, [['copy-already-running', 'project-a']])
+})
+
+test('browser-copy action drops stale account/project replies and refuses a wrong selection', async () => {
+  const createBrowserCopy = await loadBrowserCopyAction()
+  const wrongProject = makeActionContext({ workspace: 'project-b' })
+  await assert.rejects(
+    createBrowserCopy({ workspace: 'project-a', name: 'clip.mp4', revision: 'rev-7' }, wrongProject.context),
+    /current project/,
+  )
+  assert.equal(wrongProject.submitted.length, 0)
+
+  let resolveSubmit
+  const fixture = makeActionContext({ submit: () => new Promise(resolve => { resolveSubmit = resolve }) })
+  const pending = createBrowserCopy({ workspace: 'project-a', name: 'clip.mp4', revision: 'rev-7' }, fixture.context)
+  fixture.setWorkspace('project-b')
+  resolveSubmit({ job_id: 'late-copy', status: 'queued' })
+  assert.equal(await pending, null)
+  assert.equal(fixture.state.jobs.length, 0)
+
+  let resolveAccountSubmit
+  const accountFixture = makeActionContext({ submit: () => new Promise(resolve => { resolveAccountSubmit = resolve }) })
+  const accountPending = createBrowserCopy({ workspace: 'project-a', name: 'clip.mp4', revision: 'rev-7' }, accountFixture.context)
+  accountFixture.setEpoch(2)
+  resolveAccountSubmit({ job_id: 'late-account-copy', status: 'queued' })
+  assert.equal(await accountPending, null)
+  assert.equal(accountFixture.state.jobs.length, 0)
+})
+
+test('Gallery viewer offers a browser copy only after a revealed video fails to decode', async () => {
+  const modules = new Map([
+    ['react', `
+      export function useState(initial) {
+        const index = globalThis.__copyViewerHook++
+        if (!(index in globalThis.__copyViewerState)) globalThis.__copyViewerState[index] = typeof initial === 'function' ? initial() : initial
+        return [globalThis.__copyViewerState[index], value => {
+          globalThis.__copyViewerState[index] = typeof value === 'function' ? value(globalThis.__copyViewerState[index]) : value
+        }]
+      }
+      export function useRef(initial) { return { current: initial } }
+      export function useEffect() {}
+      export function useMemo(factory) { return factory() }
+      export function useCallback(callback) { return callback }
+    `],
+    ['react/jsx-runtime', `
+      export function jsx(type, props) { return { type, props: props || {} } }
+      export const jsxs = jsx
+      export const Fragment = Symbol('Fragment')
+    `],
+    ['react-dom', 'export function createPortal(children) { return children }'],
+    ['lucide-react', `
+      export const ArrowLeftRight='ArrowLeftRight', ChevronLeft='ChevronLeft', ChevronRight='ChevronRight';
+      export const Columns2='Columns2', Eye='Eye', EyeOff='EyeOff', Film='Film', Loader2='Loader2', X='X';
+    `],
+    ['../../stores/useStore', 'export function useStore(select) { return select(globalThis.__copyViewerStore) }'],
+    ['../../lib/modalFocus', `
+      export function installModalFocus() { return () => {} }
+      export function closeModalIfTop(_doc, _dialog, onClose) { onClose() }
+    `],
+    ['../../lib/privatePreview', `
+      export function privatePreviewIdentity(workspace, name, revision) { return workspace + ':' + name + ':' + revision }
+      export function privatePreviewWasRevealed() { return globalThis.__copyViewerRevealed }
+      export function revealPrivatePreview() { globalThis.__copyViewerRevealed = true }
+      export function hidePrivatePreview() { globalThis.__copyViewerRevealed = false }
+      export function subscribePrivatePreviewChanges() { return () => {} }
+    `],
+  ])
+  const result = await build({
+    absWorkingDir: new URL('../', import.meta.url).pathname,
+    entryPoints: [new URL('../src/components/MainContent/GalleryViewer.tsx', import.meta.url).pathname],
+    bundle: true, format: 'cjs', platform: 'node', jsx: 'automatic', write: false, logLevel: 'silent',
+    plugins: [{ name: 'browser-copy-viewer-mocks', setup(bundle) {
+      bundle.onResolve({ filter: /.*/ }, args => modules.has(args.path)
+        ? { path: args.path, namespace: 'copy-viewer-test' } : undefined)
+      bundle.onLoad({ filter: /.*/, namespace: 'copy-viewer-test' }, args => ({
+        contents: modules.get(args.path), loader: 'js',
+      }))
+    } }],
+  })
+  const compiled = { exports: {} }
+  new Function('require', 'module', 'exports', result.outputFiles[0].text)(
+    (await import('node:module')).createRequire(import.meta.url), compiled, compiled.exports,
+  )
+  const Viewer = compiled.exports.GalleryViewer
+  const file = {
+    workspace: 'project-a', name: 'clip.mp4', revision: 'rev-7',
+    url: '/api/v1/file/clip.mp4?workspace=project-a', type: 'video', private: true,
+  }
+  const calls = []
+  globalThis.__copyViewerStore = { jobs: [], createBrowserCopy: async selected => {
+    calls.push(selected)
+    globalThis.__copyViewerStore.jobs = [{ id: 'copy-job', status: 'queued' }]
+    return 'copy-job'
+  } }
+  globalThis.MediaError = { MEDIA_ERR_DECODE: 3, MEDIA_ERR_SRC_NOT_SUPPORTED: 4 }
+  globalThis.document = { body: {}, getElementById: () => null }
+  globalThis.__copyViewerState = []
+  globalThis.__copyViewerRevealed = false
+  let viewerFiles = [file]
+  const renderViewer = () => {
+    globalThis.__copyViewerHook = 0
+    return Viewer({ files: viewerFiles, initialIdentity: 'project-a:clip.mp4:rev-7', restoreFocus: null, onClose() {} })
+  }
+  const allNodes = (node, found = []) => {
+    if (!node || typeof node !== 'object') return found
+    found.push(node)
+    const children = node.props?.children
+    for (const child of Array.isArray(children) ? children : [children]) allNodes(child, found)
+    return found
+  }
+  assert.equal(allNodes(renderViewer()).some(node => node.props?.children === 'Create H.264 browser copy'), false)
+  globalThis.__copyViewerRevealed = true
+  const video = allNodes(renderViewer()).find(node => node.type === 'video')
+  assert.ok(video)
+  video.props.onLoadedMetadata({ currentTarget: { videoWidth: 0, videoHeight: 0 } })
+  const fallback = allNodes(renderViewer())
+  const copyButton = fallback.find(node => node.type === 'button' && node.props?.children === 'Create H.264 browser copy')
+  assert.ok(copyButton)
+  assert.equal(fallback.some(node => node.type === 'a' && node.props?.download === 'clip.mp4'), true)
+  await copyButton.props.onClick()
+  assert.deepEqual(calls, [file])
+  const queued = allNodes(renderViewer())
+  const queuedButton = queued.find(node => node.type === 'button' && node.props?.children === 'Browser copy queued')
+  assert.equal(queuedButton.props.disabled, true)
+  assert.equal(queued.some(node => node.props?.role === 'status' && String(node.props?.children).includes('copy is in Queue')), true)
+
+  globalThis.__copyViewerStore.jobs = [{ id: 'copy-job', status: 'failed', error: 'The copy failed.' }]
+  const failed = allNodes(renderViewer())
+  const retryButton = failed.find(node => node.type === 'button' && node.props?.children === 'Retry H.264 browser copy')
+  assert.equal(retryButton.props.disabled, false)
+  assert.equal(failed.some(node => node.props?.role === 'alert' && node.props?.children === 'The copy failed.'), true)
+
+  globalThis.__copyViewerStore.jobs = []
+  viewerFiles = [file, { ...file, name: 'clip_browser_copy_copy-job.mp4', revision: 'rev-8' }]
+  const completed = allNodes(renderViewer())
+  assert.equal(completed.some(node => node.type === 'button' && node.props?.children === 'Browser copy ready'), true)
+  assert.equal(completed.some(node => node.props?.role === 'status' && String(node.props?.children).includes('ready in Gallery')), true)
+
+  viewerFiles = [file]
+  const missing = allNodes(renderViewer())
+  assert.equal(missing.some(node => node.type === 'button' && node.props?.children === 'Retry H.264 browser copy'), true)
+  assert.equal(missing.some(node => node.props?.role === 'status' && String(node.props?.children).includes('no longer in Queue')), true)
+
+  globalThis.__copyViewerState = []
+  globalThis.__copyViewerStore.jobs = []
+  const unsupported = allNodes(renderViewer()).find(node => node.type === 'video')
+  unsupported.props.onError({ currentTarget: { error: { code: 4 } } })
+  assert.equal(allNodes(renderViewer()).some(node => node.type === 'button' && node.props?.children === 'Create H.264 browser copy'), true)
+
+  globalThis.__copyViewerState = []
+  const networkError = allNodes(renderViewer()).find(node => node.type === 'video')
+  networkError.props.onError({ currentTarget: { error: { code: 2 } } })
+  const genericFailure = allNodes(renderViewer())
+  assert.equal(genericFailure.some(node => node.type === 'button' && node.props?.children === 'Create H.264 browser copy'), false)
+  assert.equal(genericFailure.some(node => node.props?.children === 'This media could not be loaded. Try opening it from the Gallery again.'), true)
 })
 
 const componentModules = new Map([

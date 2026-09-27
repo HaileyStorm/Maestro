@@ -75,7 +75,10 @@ class ToolJobIdentityTests(unittest.TestCase):
             new_unique_job_id(AlwaysOccupied())
 
     def test_tool_kinds_require_recovery_registration(self):
-        self.assertEqual(TOOL_JOB_KINDS, {"tool_upscale", "tool_revoice", "tool_hflip", "tool_editor_export"})
+        self.assertEqual(TOOL_JOB_KINDS, {
+            "tool_upscale", "tool_revoice", "tool_hflip", "tool_editor_export",
+            "tool_browser_copy",
+        })
         self.assertTrue(tool_job_requires_recovery_registration(
             {"kind": "tool_upscale"},
         ))
@@ -84,6 +87,9 @@ class ToolJobIdentityTests(unittest.TestCase):
         ))
         self.assertTrue(tool_job_requires_recovery_registration(
             {"kind": "tool_editor_export"},
+        ))
+        self.assertTrue(tool_job_requires_recovery_registration(
+            {"kind": "tool_browser_copy"},
         ))
         self.assertFalse(tool_job_requires_recovery_registration(
             {"kind": "studio_generation"},

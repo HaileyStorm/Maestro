@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type TouchEvent } fr
 import { createPortal } from 'react-dom'
 import { ArrowLeftRight, ChevronLeft, ChevronRight, Columns2, Eye, EyeOff, Film, Loader2, X } from 'lucide-react'
 import type { OutputFile } from '../../types'
+import { useStore } from '../../stores/useStore'
 import { closeModalIfTop, installModalFocus } from '../../lib/modalFocus'
 import {
   hidePrivatePreview,
@@ -183,6 +184,9 @@ export function GalleryViewer({ files, initialIdentity, restoreFocus, onClose }:
   const [compareMode, setCompareMode] = useState(false)
   const [revealVersion, setRevealVersion] = useState(0)
   const [mediaStatus, setMediaStatus] = useState<{ identity: string; state: 'ready' | 'error' | 'unsupported-video' } | null>(null)
+  const [copyRequest, setCopyRequest] = useState<{ identity: string; state: 'submitting' | 'queued' | 'error'; jobId?: string; message?: string } | null>(null)
+  const createBrowserCopy = useStore(state => state.createBrowserCopy)
+  const copyJob = useStore(state => state.jobs.find(job => job.id === copyRequest?.jobId))
   const dialogRef = useRef<HTMLDivElement>(null)
   const closeRef = useRef<HTMLButtonElement>(null)
   const touchStart = useRef<{ x: number; y: number } | null>(null)
@@ -193,6 +197,12 @@ export function GalleryViewer({ files, initialIdentity, restoreFocus, onClose }:
   const file = media[selectedIndex]
   const fileIdentity = file && identity(file)
   const currentStatus = mediaStatus?.identity === fileIdentity ? mediaStatus.state : 'loading'
+  const currentCopyRequest = copyRequest?.identity === fileIdentity ? copyRequest : null
+  const copyOutputVisible = Boolean(currentCopyRequest?.jobId && file && files.some(item =>
+    item.workspace === file.workspace && item.name.endsWith(`_browser_copy_${currentCopyRequest.jobId}.mp4`)))
+  const copyFailed = currentCopyRequest?.state === 'queued' && (copyJob?.status === 'failed' || copyJob?.status === 'cancelled')
+  const copyCompleted = currentCopyRequest?.state === 'queued' && (copyJob?.status === 'completed' || copyOutputVisible)
+  const copyUntracked = currentCopyRequest?.state === 'queued' && !copyJob && !copyOutputVisible
   const images = media.filter(item => item.type === 'image')
   const comparisonOpen = compareMode && file?.type === 'image'
   void revealVersion
@@ -297,9 +307,35 @@ export function GalleryViewer({ files, initialIdentity, restoreFocus, onClose }:
               ><Eye size={16} /> Show preview</button>
             </div>
           ) : currentStatus === 'unsupported-video' ? (
-            <div role="alert" className="flex max-w-sm flex-col items-center gap-3 text-center text-sm text-white/75">
-              <p>This video was saved, but this browser cannot display its picture. Download the original to play it in a compatible app. For future videos, choose an H.264 output codec in System settings.</p>
+            <div className="flex max-w-sm flex-col items-center gap-3 text-center text-sm text-white/75">
+              <p role="alert">This video was saved, but this browser cannot display its picture. Create a separate H.264 copy to watch it here, or download the original to play in a compatible app.</p>
+              <button
+                type="button"
+                disabled={!file.revision || currentCopyRequest?.state === 'submitting' || (currentCopyRequest?.state === 'queued' && !copyFailed && !copyUntracked)}
+                aria-busy={currentCopyRequest?.state === 'submitting'}
+                onClick={async () => {
+                  setCopyRequest({ identity: fileIdentity, state: 'submitting' })
+                  try {
+                    const jobId = await createBrowserCopy(file)
+                    setCopyRequest(jobId ? { identity: fileIdentity, state: 'queued', jobId } : null)
+                  } catch (error) {
+                    setCopyRequest({
+                      identity: fileIdentity,
+                      state: 'error',
+                      message: error instanceof Error ? error.message : 'The browser copy could not be queued.',
+                    })
+                  }
+                }}
+                className="min-h-11 rounded-full border border-white/30 px-5 py-3 text-white hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white disabled:opacity-50"
+              >{currentCopyRequest?.state === 'submitting' ? 'Queuing browser copy...' : copyCompleted ? 'Browser copy ready' : copyFailed || copyUntracked ? 'Retry H.264 browser copy' : currentCopyRequest?.state === 'queued' ? 'Browser copy queued' : 'Create H.264 browser copy'}</button>
+              {currentCopyRequest?.state === 'queued' && !copyFailed && !copyCompleted && !copyUntracked && <p role="status">The copy is in Queue and will appear in Gallery when ready. The original is unchanged.</p>}
+              {copyCompleted && <p role="status">The copy is ready in Gallery. The original is unchanged.</p>}
+              {copyFailed && <p role="alert">{copyJob?.status === 'cancelled' ? 'The copy was cancelled. You can retry it.' : copyJob?.error || 'The copy failed. You can retry it.'}</p>}
+              {copyUntracked && <p role="status">The copy is no longer in Queue. Refresh Gallery to check the result before retrying.</p>}
+              {currentCopyRequest?.state === 'error' && <p role="alert">{currentCopyRequest.message}</p>}
+              {!file.revision && <p>The source needs a current Gallery revision. Refresh Gallery and reopen this video.</p>}
               <a href={file.url} download={file.name} className="rounded-full border border-white/30 px-5 py-3 text-white hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white">Download original video</a>
+              <p>Future videos can use H.264 directly from System settings. A browser copy uses additional disk space.</p>
             </div>
           ) : currentStatus === 'error' ? (
             <div role="alert" className="flex max-w-xs flex-col items-center gap-3 text-center text-sm text-white/75">
@@ -312,7 +348,7 @@ export function GalleryViewer({ files, initialIdentity, restoreFocus, onClose }:
                 <div role="status" className="absolute flex items-center gap-2 text-sm text-white/70"><Loader2 size={17} className="animate-spin motion-reduce:animate-none" />Loading media...</div>
               )}
               {file.type === 'video' ? (
-                <video key={fileIdentity} src={file.url} controls playsInline preload="metadata" className={`h-full w-full object-contain ${currentStatus === 'loading' ? 'opacity-0' : ''}`} onLoadedMetadata={event => setMediaStatus({ identity: fileIdentity, state: event.currentTarget.videoWidth > 0 && event.currentTarget.videoHeight > 0 ? 'ready' : 'unsupported-video' })} onError={() => setMediaStatus({ identity: fileIdentity, state: 'error' })} />
+                <video key={fileIdentity} src={file.url} controls playsInline preload="metadata" className={`h-full w-full object-contain ${currentStatus === 'loading' ? 'opacity-0' : ''}`} onLoadedMetadata={event => setMediaStatus({ identity: fileIdentity, state: event.currentTarget.videoWidth > 0 && event.currentTarget.videoHeight > 0 ? 'ready' : 'unsupported-video' })} onError={event => setMediaStatus({ identity: fileIdentity, state: event.currentTarget.error?.code === MediaError.MEDIA_ERR_DECODE || event.currentTarget.error?.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED ? 'unsupported-video' : 'error' })} />
               ) : (
                 <ViewerImage key={fileIdentity} file={file} status={currentStatus} onReady={() => setMediaStatus({ identity: fileIdentity, state: 'ready' })} onFailure={() => setMediaStatus({ identity: fileIdentity, state: 'error' })} />
               )}

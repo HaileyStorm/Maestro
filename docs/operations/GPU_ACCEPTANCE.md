@@ -1643,3 +1643,27 @@ configured HEVC output is unresolved. Do not count the Gallery card or FFmpeg
 decode as browser playback acceptance. The full CPU-masked local CI gate for
 the admission fix passed 5,415 backend tests (17 skipped), 743 UI tests, JSON
 grammar, source compilation, and production build.
+
+## 2026-09-27 browser-compatible copy of the H3 Guide result
+
+An opt-in Gallery action now creates a separate H.264/yuv420p/AAC MP4 when the
+selected browser cannot decode a video. The signed-in stable-share browser
+submitted the action for the HEVC H3 Guide result above. The durable CPU tool
+job completed, and the new file appeared in the same project's Gallery while
+the original remained present and unchanged. FFprobe measured 1344 × 768,
+5.166667 seconds, H.264 video and AAC audio. The copy is 635,905 bytes; its
+producer sidecar records that size and SHA-256
+`7a566b639756ecdd523844ed833ac9af1b03cd08f3c6be3e03a0768eab0292bb`.
+The original remained 3,012,474 bytes with its prior modification timestamp.
+
+In the in-app browser, the copy loaded with 1344 × 768 decoded video dimensions,
+played without a media error, and visibly showed the red robot and tabletop in
+the Gallery viewer. This resolves browser playback for this selected output by
+creating a separate copy; it does not establish HEVC support in the browser,
+quality equivalence, audible sound, or owner acceptance. No GPU work ran.
+
+Before deployment, the CPU-masked full local gate passed 5,430 backend tests
+(17 skipped), five JSON-grammar checks, 747 UI tests, source compilation and
+production build. A coordinated Pinokio restart then cleared its public status
+generation. Current direct and stable-share `/health` and `/ready` returned 200,
+and the stable direct fallback redirected to this launch's Quick Tunnel.

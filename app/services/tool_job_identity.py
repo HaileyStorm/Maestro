@@ -8,7 +8,13 @@ from typing import Any
 
 
 JOB_ID_HEX_LENGTH = 32
-TOOL_JOB_KINDS = frozenset({"tool_upscale", "tool_revoice", "tool_hflip", "tool_editor_export"})
+TOOL_JOB_KINDS = frozenset({
+    "tool_upscale",
+    "tool_revoice",
+    "tool_hflip",
+    "tool_editor_export",
+    "tool_browser_copy",
+})
 _UNIQUE_ID_ATTEMPTS = 32
 
 

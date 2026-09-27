@@ -3303,6 +3303,8 @@ interface AppState {
   quickUpscaleClip: (name: string, url: string | null) => Promise<void>
   /** Gallery one-click: queue a CPU horizontal flip for an exact output revision. */
   flipSelectedClip: (output: Pick<OutputFile, 'workspace' | 'name' | 'revision'>) => Promise<void>
+  /** Gallery viewer: queue a separate H.264/AAC copy for an exact output revision. */
+  createBrowserCopy: (output: Pick<OutputFile, 'workspace' | 'name' | 'revision'>) => Promise<string | null>
   /** Gallery one-click: load a clip into the Tools panel for a tool that needs
    *  setup before running (e.g. revoice needs voice references), and switch to it. */
   sendClipToTools: (name: string, url: string | null, tool: 'upscale' | 'revoice') => void
@@ -8082,6 +8084,51 @@ export const useStore = create<AppState>((set, get) => ({
         isGenerating: st.jobs.some(j => j !== newJob && _isActiveGenerationJob(j)),
       }))
       console.error('Tool hflip failed:', message)
+      throw error instanceof Error ? error : new Error(message)
+    }
+  },
+  createBrowserCopy: async (output) => {
+    const accountIdentityEpoch = _accountIdentityEpoch
+    const { workspace, name, revision } = output
+    if (!workspace || !name || !revision || get().activeWorkspace !== workspace) {
+      throw new Error('This video is no longer selected in the current project. Reopen it from Gallery.')
+    }
+
+    const newJob: GenerationJob = {
+      id: '', status: 'queued', progress: 0, step: 0, totalSteps: 0,
+      phase: '', message: 'Submitting browser copy...', outputFiles: [], error: null,
+      workspace,
+    }
+    set(st => ({ isGenerating: true, jobs: [newJob, ...st.jobs] }))
+
+    try {
+      const result = await api.submitToolBrowserCopy({ workspace, name, revision })
+      if (!_accountIdentityIsCurrent(accountIdentityEpoch) || get().activeWorkspace !== workspace) {
+        _discardStaleGenerationPlaceholder(newJob)
+        return null
+      }
+      const acceptedStatus = result.status === 'running' || result.status === 'preparing'
+        ? result.status : 'queued'
+      set(st => ({
+        jobs: st.jobs.map(job => job === newJob
+          ? { ...job, id: result.job_id, status: acceptedStatus, message: 'Browser copy accepted' }
+          : job),
+      }))
+      get()._pollRecoveredJob(result.job_id, workspace)
+      window.dispatchEvent(new CustomEvent('maestro:queue-refresh'))
+      return result.job_id
+    } catch (error) {
+      if (!_accountIdentityIsCurrent(accountIdentityEpoch) || get().activeWorkspace !== workspace) {
+        _discardStaleGenerationPlaceholder(newJob)
+        return null
+      }
+      const message = error instanceof Error ? error.message : 'Browser copy could not be queued'
+      set(st => ({
+        jobs: st.jobs.map(job => job === newJob
+          ? { ...job, id: job.id || `tool-browser-copy-fail-${Date.now()}`, status: 'failed', message, error: message }
+          : job),
+        isGenerating: st.jobs.some(job => job !== newJob && _isActiveGenerationJob(job)),
+      }))
       throw error instanceof Error ? error : new Error(message)
     }
   },

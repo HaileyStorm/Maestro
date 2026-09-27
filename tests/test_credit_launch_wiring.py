@@ -165,7 +165,7 @@ class CreditLaunchWiringTests(unittest.TestCase):
                 }
             ),
             "_CREDIT_EXEMPT_JOB_KINDS": frozenset({
-                "tool_upscale", "tool_revoice",
+                "tool_upscale", "tool_revoice", "tool_browser_copy",
             }),
             "_credit_admission_evaluations": {},
             "_credit_mark_accounting_health": lambda _healthy: None,
@@ -2130,7 +2130,7 @@ class CreditLaunchWiringTests(unittest.TestCase):
     def test_standalone_gpu_tools_are_explicitly_exempt(self):
         namespace = {
             "_CREDIT_EXEMPT_JOB_KINDS": frozenset({
-                "tool_upscale", "tool_revoice",
+                "tool_upscale", "tool_revoice", "tool_browser_copy",
             }),
         }
         _functions({"_credit_job_exempt"}, namespace)
@@ -2140,12 +2140,16 @@ class CreditLaunchWiringTests(unittest.TestCase):
         self.assertTrue(namespace["_credit_job_exempt"]({
             "kind": "tool_revoice",
         }))
+        self.assertTrue(namespace["_credit_job_exempt"]({
+            "kind": "tool_browser_copy",
+        }))
         self.assertFalse(namespace["_credit_job_exempt"]({
             "kind": "studio_generation",
         }))
         for function_name, kind in (
             ("tools_upscale", "tool_upscale"),
             ("tools_revoice", "tool_revoice"),
+            ("tools_browser_copy", "tool_browser_copy"),
         ):
             function = next(
                 node for node in TREE.body

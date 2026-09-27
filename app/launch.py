@@ -2021,6 +2021,7 @@ def _startup_recovery_sensitive_path(path: str, method: str = "") -> bool:
             "/api/v1/tools/upscale",
             "/api/v1/tools/revoice",
             "/api/v1/tools/hflip",
+            "/api/v1/tools/browser-copy",
             "/api/v1/system/release-model",
             "/api/v1/system/resource-release",
             "/api/v1/director/generate-music",
@@ -2697,7 +2698,10 @@ _CREDIT_INTERNAL_PARAMS = frozenset({
     _CREDIT_BASELINE_PARAM,
     _CREDIT_CLEANUP_PARAM,
 })
-_CREDIT_EXEMPT_JOB_KINDS = frozenset({"tool_upscale", "tool_revoice", "tool_hflip", "tool_editor_export"})
+_CREDIT_EXEMPT_JOB_KINDS = frozenset({
+    "tool_upscale", "tool_revoice", "tool_hflip", "tool_editor_export",
+    "tool_browser_copy",
+})
 _CREDIT_LINEAGE_JOB_KINDS = frozenset({
     "director_pipeline",
     "director_preparation",
@@ -4828,7 +4832,8 @@ _RECOVERABLE_INPUT_KEYS = frozenset({
     "retake_user_end_anchor", "voice_reference", "voice_clone_refs",
     "audio_path", "reference_image_path", "character_ref_paths",
     "location_ref_paths", "image_paths", "_blend_clip_a", "_blend_clip_b",
-    "hflip_source_path", "editor_source_path", "_tool_input_paths",
+    "hflip_source_path", "editor_source_path", "browser_copy_source_path",
+    "_tool_input_paths",
     "_h3_bridge_clip_a", "_h3_bridge_clip_b",
 })
 
@@ -5074,6 +5079,8 @@ def _queue_recovery_input_descriptors(job: dict, owner_digest: str) -> list[dict
             raise QueueRecoveryRuntimeError("Unexpected transform input in this job.")
         if field.startswith("editor_source_path:") and job.get("kind") != "tool_editor_export":
             raise QueueRecoveryRuntimeError("Unexpected Editor input in this job.")
+        if field.startswith("browser_copy_source_path:") and job.get("kind") != "tool_browser_copy":
+            raise QueueRecoveryRuntimeError("Unexpected browser-copy input in this job.")
         if field.startswith("_tool_input_paths:") and job.get("kind") not in {"tool_upscale", "tool_revoice"}:
             raise QueueRecoveryRuntimeError("Unexpected tool input in this job.")
         resolved = os.path.realpath(path)
@@ -5143,7 +5150,10 @@ def _queue_recovery_input_descriptors(job: dict, owner_digest: str) -> list[dict
             sidecar_path = os.path.join(
                 out_dir, os.path.splitext(os.path.basename(resolved))[0] + ".meta.json",
             )
-            if (field in {"hflip_source_path:0", "editor_source_path:0"}
+            if (field in {
+                    "hflip_source_path:0", "editor_source_path:0",
+                    "browser_copy_source_path:0",
+                }
                     or field.startswith("_tool_input_paths:")) and not os.path.lexists(sidecar_path):
                 # Legacy gallery media remains usable in this session. Without
                 # prior project sidecar evidence, restart recovery stays blocked.
@@ -5861,6 +5871,8 @@ def _queue_recovery_worker(job: dict):
         return globals().get("_run_tool_hflip")
     if kind == "tool_editor_export":
         return globals().get("_run_tool_editor_export")
+    if kind == "tool_browser_copy":
+        return globals().get("_run_tool_browser_copy")
     if kind == "studio_blend":
         return globals().get("_run_blend_generation")
     if kind == "studio_h3_bridge":
@@ -62083,7 +62095,7 @@ def _inherit_media_access_policy(
 def _write_tool_sidecar(out_dir, filename, *, source_name, tool, params, elapsed, job_id, source_revision=None, producer=None):
     """Publish access-stamped tool metadata; transforms retain source settings."""
     sidecar = {
-        "params": dict(params) if tool in {"hflip", "editor_export"} else {**params, "edit_sub_mode": tool},
+        "params": dict(params) if tool in {"hflip", "editor_export", "browser_copy"} else {**params, "edit_sub_mode": tool},
         "generation_mode": "video",
         "tool": tool,
         "tool_source": source_name,
@@ -62113,6 +62125,17 @@ def _write_tool_sidecar(out_dir, filename, *, source_name, tool, params, elapsed
             "source_in": job.get("params", {}).get("editor_source_in"),
             "duration": job.get("params", {}).get("editor_duration"),
             "video": "h264", "audio": "aac",
+        }
+    elif tool == "browser_copy":
+        sidecar["artifact_class"] = "final"
+        sidecar["params"].pop("multi_clip_info", None)
+        sidecar["tool_source_workspace"] = job.get("workspace")
+        sidecar["tool_source_revision"] = source_revision
+        sidecar["transform"] = {
+            "kind": "browser_compatible_copy",
+            "video": "h264",
+            "pixel_format": "yuv420p",
+            "audio": "aac when present",
         }
     if producer:
         sidecar.update(producer)
@@ -62160,6 +62183,34 @@ def _hflip_source(job: dict) -> tuple[str, dict]:
         or _output_revision(source, out_dir, name) != params["hflip_source_revision"]
     ):
         raise ValueError("The source clip changed or was removed. Select it again.")
+    metadata = load_media_sidecars(out_dir, {name}).get(name) or {}
+    return source, metadata
+
+
+def _browser_copy_source(job: dict) -> tuple[str, dict]:
+    """Resolve only the exact Gallery video sealed at browser-copy submission."""
+    from services.win_safe_files import safe_direct_file_under
+
+    params = job["params"]
+    out_dir = _existing_workspace_dir(job["workspace"])
+    captured_out_dir = str(job.get("out_dir") or "")
+    if (
+        not captured_out_dir
+        or os.path.normcase(os.path.realpath(out_dir))
+        != os.path.normcase(os.path.realpath(captured_out_dir))
+    ):
+        raise ValueError("The selected project changed or was removed.")
+    name = params["browser_copy_source_name"]
+    source = safe_direct_file_under(out_dir, name)
+    revision = params.get("browser_copy_source_revision")
+    if (
+        not source
+        or not os.path.isfile(source)
+        or source != params["browser_copy_source_path"]
+        or not isinstance(revision, str)
+        or not hmac.compare_digest(_output_revision(source, out_dir, name), revision)
+    ):
+        raise ValueError("The selected video changed or was removed. Refresh Gallery.")
     metadata = load_media_sidecars(out_dir, {name}).get(name) or {}
     return source, metadata
 
@@ -62265,6 +62316,283 @@ async def tools_hflip(request: Request):
                 thread_name=f"tool-hflip-{job_id}",
             )
     return {"job_id": job_id, "status": "queued"}
+
+
+def _run_tool_browser_copy(job_id: str):
+    """Create a browser-compatible CPU copy through normal queue finality."""
+    import tempfile
+
+    from services.video_transform import (
+        BROWSER_COPY_TIMEOUT_SECONDS,
+        browser_compatible_copy,
+    )
+
+    job = _jobs[job_id]
+    abort_state = {"abort": False}
+    start_time = time.time()
+    with generation_slot(_gen_lock, job) as acquired:
+        if not acquired:
+            return False
+        try:
+            if not try_start(
+                job,
+                generation_lock=_gen_lock,
+                message="Preparing browser-compatible copy...",
+                phase="Preparing copy",
+            ):
+                return False
+            if not register_abort_state(job, job_id, _active_gen_states, abort_state):
+                return False
+
+            def aborted():
+                return bool(abort_state.get("abort")) or is_cancel_requested(job)
+
+            workspace = job["workspace"]
+            with _reserve_workspace_operations(workspace):
+                out_dir = _existing_workspace_dir(workspace)
+                with _output_lineage_mutation_guard(out_dir):
+                    source, metadata = _browser_copy_source(job)
+                adopted = _resume_processed_tool_output(job)
+                if adopted is not None:
+                    return adopted
+                with tempfile.TemporaryDirectory(
+                    prefix=".browser-copy-",
+                    dir=out_dir,
+                ) as staging:
+                    staged = os.path.join(staging, "browser-copy.mp4")
+                    browser_compatible_copy(
+                        source,
+                        staged,
+                        abort_check=aborted,
+                        timeout=BROWSER_COPY_TIMEOUT_SECONDS,
+                    )
+                    if aborted():
+                        return False
+                    source_params = metadata.get("params")
+                    return _publish_processed_tool_output(
+                        job,
+                        staged,
+                        source=source,
+                        tool="browser_copy",
+                        params=source_params if isinstance(source_params, dict) else {},
+                        source_revision=job["params"]["browser_copy_source_revision"],
+                        elapsed=time.time() - start_time,
+                    )
+        except Exception:  # noqa: BLE001 - encoder errors must stay redacted in job state.
+            if job.get("status") == "completed":
+                return True
+            if not is_cancel_requested(job):
+                finish_job(
+                    job,
+                    "failed",
+                    error="The browser-compatible copy could not be created. Refresh the source clip and try again.",
+                    message="Browser-compatible copy failed",
+                )
+            return False
+        finally:
+            unregister_abort_state(job_id, _active_gen_states, abort_state)
+
+
+# Route-only state: map access/mutation occurs synchronously on the ASGI event
+# loop before each waiter yields, so duplicate requests cannot race creation.
+_BROWSER_COPY_PREFLIGHTS: dict[tuple[str, str, str, str, str], dict] = {}
+
+
+def _browser_copy_preflight_acquire(key, source, out_dir, validate_browser_copy):
+    """Join one ffprobe preflight per exact source revision and owner session."""
+
+    entry = _BROWSER_COPY_PREFLIGHTS.get(key)
+    if entry is not None and entry["waiters"] == 0 and entry["task"].done():
+        if _BROWSER_COPY_PREFLIGHTS.get(key) is entry:
+            _BROWSER_COPY_PREFLIGHTS.pop(key, None)
+        entry = None
+    if entry is None:
+        task = asyncio.create_task(
+            asyncio.to_thread(validate_browser_copy, source, out_dir),
+        )
+        entry = {"task": task, "waiters": 0}
+        _BROWSER_COPY_PREFLIGHTS[key] = entry
+
+        def discard_finished(done_task):
+            if not done_task.cancelled():
+                done_task.exception()
+            if (
+                entry["waiters"] == 0
+                and _BROWSER_COPY_PREFLIGHTS.get(key) is entry
+            ):
+                _BROWSER_COPY_PREFLIGHTS.pop(key, None)
+
+        task.add_done_callback(discard_finished)
+    entry["waiters"] += 1
+    return entry
+
+
+def _browser_copy_preflight_release(key, entry):
+    """Drop one waiter and remove the shared result when nobody needs it."""
+
+    entry["waiters"] = max(0, entry["waiters"] - 1)
+    if (
+        entry["waiters"] == 0
+        and entry["task"].done()
+        and _BROWSER_COPY_PREFLIGHTS.get(key) is entry
+    ):
+        _BROWSER_COPY_PREFLIGHTS.pop(key, None)
+
+
+@api.post("/api/v1/tools/browser-copy")
+async def tools_browser_copy(request: Request):
+    """Create a new browser-compatible Gallery video without changing source."""
+    from services.video_transform import (
+        BrowserCopyError,
+        BrowserCopyLimitError,
+        BrowserCopySpaceError,
+        validate_browser_copy,
+    )
+
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="A video selection is required")
+    if not isinstance(body.get("workspace"), str) or not body["workspace"]:
+        raise HTTPException(status_code=400, detail="workspace is required")
+    workspace = _request_project_workspace(request, body["workspace"])
+    name, revision = body.get("name"), body.get("revision")
+    if not isinstance(name, str) or not isinstance(revision, str) or not revision:
+        raise HTTPException(status_code=400, detail="Select a current video from Gallery")
+    if os.path.splitext(name)[1].lower() not in {
+        ".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v",
+    }:
+        raise HTTPException(status_code=400, detail="Select a video to copy")
+
+    def find_active_job(out_dir: str, source: str) -> dict | None:
+        for existing in _jobs.values():
+            params = existing.get("params") if isinstance(existing.get("params"), dict) else {}
+            if (
+                existing.get("kind") == "tool_browser_copy"
+                and existing.get("workspace") == workspace
+                and existing.get("session_id") == request.state.maestro_session_id
+                and os.path.normcase(os.path.realpath(str(existing.get("out_dir") or "")))
+                == os.path.normcase(os.path.realpath(out_dir))
+                and existing.get("status") in {
+                    "queued", "running", "held", "registering", "preparing",
+                }
+                and params.get("browser_copy_source_name") == name
+                and params.get("browser_copy_source_path") == source
+                and isinstance(params.get("browser_copy_source_revision"), str)
+                and hmac.compare_digest(params["browser_copy_source_revision"], revision)
+            ):
+                return existing
+        return None
+
+    with _reserve_workspace_operations(workspace):
+        out_dir = _require_project_access(
+            request, workspace, permission="project.generate",
+        )
+        with _output_lineage_mutation_guard(out_dir):
+            selected_out_dir, source, sidecar = _require_authorized_output(
+                request, workspace, name,
+            )
+            if (
+                os.path.normcase(os.path.realpath(selected_out_dir))
+                != os.path.normcase(os.path.realpath(out_dir))
+            ):
+                raise HTTPException(status_code=409, detail="The selected project changed. Refresh Gallery.")
+            if not hmac.compare_digest(_output_revision(source, out_dir, name), revision):
+                raise HTTPException(status_code=409, detail="The source clip changed. Refresh Gallery.")
+
+            existing = find_active_job(out_dir, source)
+            if existing is not None:
+                return {"job_id": existing["id"], "status": existing["status"]}
+
+    session_id = request.state.maestro_session_id
+    preflight_key = (
+        workspace,
+        os.path.normcase(os.path.realpath(out_dir)),
+        session_id,
+        os.path.normcase(os.path.realpath(source)),
+        revision,
+    )
+    preflight = _browser_copy_preflight_acquire(
+        preflight_key,
+        source,
+        out_dir,
+        validate_browser_copy,
+    )
+    try:
+        # The shared ffprobe task runs outside the synchronous locks. Shield it
+        # so cancellation of one HTTP waiter does not cancel every duplicate.
+        try:
+            await asyncio.shield(preflight["task"])
+        except BrowserCopyLimitError as error:
+            raise HTTPException(status_code=413, detail=str(error)) from None
+        except BrowserCopySpaceError as error:
+            raise HTTPException(status_code=507, detail=str(error)) from None
+        except BrowserCopyError:
+            raise HTTPException(
+                status_code=422,
+                detail="The selected video could not be prepared for browser-compatible copy.",
+            ) from None
+
+        # The exact Gallery item may change while ffprobe runs; reauthorize it
+        # under the mutation guards before creating the durable job.
+        with _reserve_workspace_operations(workspace):
+            current_out_dir = _require_project_access(
+                request, workspace, permission="project.generate",
+            )
+            with _output_lineage_mutation_guard(current_out_dir):
+                selected_out_dir, current_source, sidecar = _require_authorized_output(
+                    request, workspace, name,
+                )
+                if (
+                    os.path.normcase(os.path.realpath(current_out_dir))
+                    != os.path.normcase(os.path.realpath(out_dir))
+                    or os.path.normcase(os.path.realpath(selected_out_dir))
+                    != os.path.normcase(os.path.realpath(current_out_dir))
+                    or current_source != source
+                    or not hmac.compare_digest(
+                        _output_revision(current_source, current_out_dir, name), revision,
+                    )
+                ):
+                    raise HTTPException(status_code=409, detail="The source clip changed. Refresh Gallery.")
+                existing = find_active_job(current_out_dir, current_source)
+                if existing is not None:
+                    return {"job_id": existing["id"], "status": existing["status"]}
+
+                policy = sidecar if isinstance(sidecar, dict) else {}
+                job_id = _new_generation_job_id()
+                job = {
+                    "id": job_id,
+                    "kind": "tool_browser_copy",
+                    "status": "queued",
+                    "progress": 0,
+                    "step": 0,
+                    "total_steps": 0,
+                    "session_id": session_id,
+                    "source_remote": bool(_request_remote.get()),
+                    "_tool_inputs_authorized_live": True,
+                    "phase": "",
+                    "message": "Queued (browser-compatible copy)",
+                    "created_at": time.time(),
+                    "params": {
+                        "browser_copy_source_name": name,
+                        "browser_copy_source_revision": revision,
+                        "browser_copy_source_path": source,
+                        "private_output": bool(policy.get("private", False)),
+                        "explicit_output": bool(policy.get("explicit", False)),
+                    },
+                    "output_files": [],
+                    "error": None,
+                    "workspace": workspace,
+                    "out_dir": current_out_dir,
+                }
+                _queue_recovery_register_and_publish(
+                    job,
+                    worker=_run_tool_browser_copy,
+                    recovery_kind="tool_browser_copy",
+                    thread_name=f"tool-browser-copy-{job_id}",
+                )
+                return {"job_id": job_id, "status": "queued"}
+    finally:
+        _browser_copy_preflight_release(preflight_key, preflight)
 
 
 def _editor_export_source(job: dict) -> tuple[str, dict]:
@@ -62390,7 +62718,9 @@ def _validated_tool_input_paths(job: dict) -> list[str]:
     """
     try:
         kind = job.get("kind")
-        if kind not in {"tool_upscale", "tool_revoice", "tool_hflip"}:
+        if kind not in {
+            "tool_upscale", "tool_revoice", "tool_hflip", "tool_browser_copy",
+        }:
             raise ValueError("Unsupported tool job")
         project_dir = _existing_workspace_dir(job["workspace"])
         if not hmac.compare_digest(
@@ -62403,19 +62733,28 @@ def _validated_tool_input_paths(job: dict) -> list[str]:
             expected_job_id=job["id"],
         )
         params = job["params"]
-        paths = [params.get("hflip_source_path") if kind == "tool_hflip" else params.get("video_path")]
+        source_field = (
+            "hflip_source_path" if kind == "tool_hflip"
+            else "browser_copy_source_path" if kind == "tool_browser_copy"
+            else None
+        )
+        paths = [params.get(source_field or "video_path")]
         if kind == "tool_revoice":
             refs = params.get("voice_ref_paths")
             if not isinstance(refs, list) or not refs:
                 raise ValueError("Voice references are missing")
             paths.extend(refs)
         if (manifest.get("params") != params
-                or (kind != "tool_hflip" and params.get("_tool_input_paths") != paths)
+                or (source_field is None and params.get("_tool_input_paths") != paths)
                 or any(not isinstance(path, str) or not os.path.isabs(path) for path in paths)):
             raise ValueError("Tool input identity changed")
         descriptors = manifest.get("inputs") or []
         for index, path in enumerate(paths):
-            field = f"hflip_source_path:{index}" if kind == "tool_hflip" else f"_tool_input_paths:{index}"
+            field = (
+                f"{source_field}:{index}"
+                if source_field is not None
+                else f"_tool_input_paths:{index}"
+            )
             matches = [d for d in descriptors
                        if d.get("field") == field and d.get("path") == path]
             if len(matches) != 1:
@@ -62432,11 +62771,15 @@ def _validated_tool_input_paths(job: dict) -> list[str]:
                 )
             if not valid:
                 raise ValueError("Input ownership or content changed")
-        if kind == "tool_hflip":
-            if (params.get("hflip_source_name") != os.path.basename(paths[0])
-                    or not isinstance(params.get("hflip_source_revision"), str)):
+        if source_field is not None:
+            prefix = "hflip" if kind == "tool_hflip" else "browser_copy"
+            if (params.get(f"{prefix}_source_name") != os.path.basename(paths[0])
+                    or not isinstance(params.get(f"{prefix}_source_revision"), str)):
                 raise ValueError("Gallery selection changed")
-            _hflip_source(job)
+            if kind == "tool_hflip":
+                _hflip_source(job)
+            else:
+                _browser_copy_source(job)
         return paths
     except (KeyError, TypeError, ValueError, OSError, QueueRecoveryRuntimeError, QueueRecoveryAdapterError):
         raise _ToolInputChanged("Tool inputs changed or their authorization expired. Select the files again.") from None

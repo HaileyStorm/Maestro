@@ -2004,6 +2004,23 @@ export async function submitToolHflip(params: {
   return res.json()
 }
 
+export async function submitToolBrowserCopy(params: {
+  workspace: string
+  name: string
+  revision: string
+}): Promise<{ job_id: string; status: string }> {
+  const res = await fetch(`${BASE}/api/v1/tools/browser-copy`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Browser copy could not be queued' }))
+    throw new Error(err.detail || 'Browser copy could not be queued')
+  }
+  return res.json()
+}
+
 export async function submitToolRevoice(params: {
   video_path: string
   voice_ref_paths: string[]
