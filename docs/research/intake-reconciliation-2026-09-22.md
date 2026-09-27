@@ -227,8 +227,19 @@ claim. Commit `7a1250c` was pushed and deployed through Pinokio Restart
 Maestro. The direct, host-local LAN, Quick Tunnel and stable-share access
 surfaces each returned 200 for `/health`, `/ready`, account context and
 workspaces; Pinokio reported the exact restart notice cleared. Chrome loaded
-the stable-share owner sign-in page. Finishing history, upload deletion,
-signed-in Media Info and owner acceptance remain separate work.
+the stable-share owner sign-in page. Signed-in Media Info and owner acceptance
+remain separate work.
+
+The first finishing-history slice shows one recorded Tools upscale/media-flow
+event in a collapsed Gallery card section, using the authorized sidecar's
+successful tool field, recognized method, source basename, recorded time and
+job time where each exists. Private cards hide the section until reveal.
+Embedded metadata and generation requests without a completed tool record
+cannot produce this section. Focused private-reveal and missing-record checks,
+all 750 UI tests, the TypeScript/Vite build and the repository guard gate pass.
+Measured before/after geometry and frame rate, post-generation finishing
+success records, a full processing chain, upload deletion, signed-in viewing
+and owner acceptance remain separate work.
 
 The [YuE2 real-audio model card](https://huggingface.co/Mothersuperior/yue2-mothersuperior-realaudio-tokenizer-v4)
 documents a matched joint-v9 tokenizer head and NAR decoder LoRA. The pinned

@@ -1560,6 +1560,8 @@ export interface ModelFolderCandidate {
 export interface OutputMetadata {
   source: 'sidecar' | 'embedded' | 'none'
   params: Record<string, unknown> | null
+  tool?: string
+  tool_source?: string
   private?: boolean
   explicit?: boolean
   upload_filenames?: Record<string, string | string[]>

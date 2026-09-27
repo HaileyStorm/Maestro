@@ -29,6 +29,37 @@ interface Props {
   style?: CSSProperties
 }
 
+function finishingMethodLabel(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const match = /^(flashvsr2pass|flashvsr|lanczos|dlss5\*)(\d+(?:\.\d+)?)$/i.exec(value.trim())
+  if (!match) return null
+  const name = {
+    flashvsr2pass: 'FlashVSR two-pass',
+    flashvsr: 'FlashVSR',
+    lanczos: 'Lanczos',
+    'dlss5*': 'DLSS 5 Neural Rendering',
+  }[match[1]!.toLowerCase()]
+  return `${name} ${match[2]}×`
+}
+
+function finishedToolDetails(metadata: OutputMetadata | null) {
+  if (metadata?.source !== 'sidecar' || !['upscale', 'media_flow'].includes(metadata.tool || '')) return null
+  const params = metadata.params
+  const sourceName = typeof metadata.tool_source === 'string'
+    ? metadata.tool_source.replace(/\\/g, '/').split('/').filter(Boolean).pop()
+    : undefined
+  const recordedAt = typeof metadata.created_at === 'number' && Number.isFinite(metadata.created_at) && metadata.created_at > 0
+    ? new Date(metadata.created_at * 1000) : null
+  return {
+    result: metadata.tool === 'upscale' ? 'Upscaled video' : 'Finished media',
+    method: finishingMethodLabel(params?.method ?? params?.spatial_upsampling),
+    sourceName,
+    recordedAt: recordedAt && Number.isFinite(recordedAt.getTime()) ? recordedAt.toLocaleString() : null,
+    jobTime: typeof metadata.generation_time === 'number' && Number.isFinite(metadata.generation_time) && metadata.generation_time >= 0
+      ? formatGenerationDuration(metadata.generation_time) : null,
+  }
+}
+
 /** Image component that retries loading if the file isn't fully written yet.
  *
  * Backstops the backend's atomic image-write guarantee in two ways:
@@ -268,6 +299,7 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
   }, [isActive, privateBlurred, releaseVideoSource])
 
   const params = meta?.params as Record<string, unknown> | null
+  const finishing = finishedToolDetails(meta)
   const isGalleryStillGuideOutput = isH3GalleryStillGuideOutput(meta)
   const uploadFilenames = meta?.upload_filenames
 
@@ -1298,6 +1330,18 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
           )}
         </div>
       </div>
+      {!privateBlurred && finishing && (
+        <details className="border-t border-border bg-bg-secondary px-3 py-2 text-xs text-text-secondary" onClick={event => event.stopPropagation()}>
+          <summary className="cursor-pointer select-none font-medium text-text-primary">Finishing details</summary>
+          <dl className="mt-2 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-[11px]">
+            <dt className="text-text-muted">Result</dt><dd>{finishing.result}</dd>
+            {finishing.method && <><dt className="text-text-muted">Method</dt><dd>{finishing.method}</dd></>}
+            {finishing.sourceName && <><dt className="text-text-muted">Source</dt><dd className="min-w-0 break-all">{finishing.sourceName}</dd></>}
+            {finishing.recordedAt && <><dt className="text-text-muted">Recorded at</dt><dd>{finishing.recordedAt}</dd></>}
+            {finishing.jobTime && <><dt className="text-text-muted">Recorded job time</dt><dd>{finishing.jobTime}</dd></>}
+          </dl>
+        </details>
+      )}
       {file.type === 'image' && showInputDestinations && (
         <div
           id={`gallery-input-destinations-${index}`}

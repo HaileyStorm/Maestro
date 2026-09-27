@@ -252,7 +252,11 @@ async function loadMediaFeedItemHarness() {
   const modules = new Map([
     ['react', `
       export function useState(initial) {
-        return [typeof initial === 'function' ? initial() : initial, () => {}]
+        const index = globalThis.__mediaFeedStateIndex || 0
+        globalThis.__mediaFeedStateIndex = index + 1
+        return [index === 0 && globalThis.__mediaFeedTestMeta !== undefined
+          ? globalThis.__mediaFeedTestMeta
+          : typeof initial === 'function' ? initial() : initial, () => {}]
       }
       export function useEffect() {}
       export function useRef(initial) { return { current: initial } }
@@ -777,25 +781,30 @@ test('private audio and retry images acquire no media URL before reveal', async 
   t.after(() => {
     delete globalThis.__mediaFeedRevealed
     delete globalThis.__mediaFeedStore
+    delete globalThis.__mediaFeedTestMeta
+    delete globalThis.__mediaFeedStateIndex
   })
 
   const MediaFeedItem = await loadMediaFeedItemHarness()
-  const render = file => materialize(MediaFeedItem({
-    file: {
-      favorite: false,
-      linked_component_count: 0,
-      artifact_class: 'final',
-      revision: 'r1',
-      workspace: 'private-media',
-      private: true,
-      ...file,
-    },
-    index: 0,
-    isActive: true,
-    onVisible: noop,
-    measurementEpoch: 0,
-    onMeasured: noop,
-  }))
+  const render = file => {
+    globalThis.__mediaFeedStateIndex = 0
+    return materialize(MediaFeedItem({
+      file: {
+        favorite: false,
+        linked_component_count: 0,
+        artifact_class: 'final',
+        revision: 'r1',
+        workspace: 'private-media',
+        private: true,
+        ...file,
+      },
+      index: 0,
+      isActive: true,
+      onVisible: noop,
+      measurementEpoch: 0,
+      onMeasured: noop,
+    }))
+  }
   const mediaSources = tree => findElements(tree, element => (
     element.type === 'img' || element.type === 'audio' || element.type === 'video'
   )).map(element => element.props?.src).filter(Boolean)
@@ -809,6 +818,30 @@ test('private audio and retry images acquire no media URL before reveal', async 
   globalThis.__mediaFeedRevealed.add(privatePreviewIdentity('private-media', audio.name, 'r1'))
   assert.deepEqual(mediaSources(render(image)), ['/private.png'])
   assert.deepEqual(mediaSources(render(audio)), ['/private.wav'])
+
+  const processedVideo = { name: 'upscaled.mp4', type: 'video', url: '/upscaled.mp4' }
+  globalThis.__mediaFeedTestMeta = {
+    source: 'sidecar', tool: 'upscale', tool_source: '/private/source.mp4',
+    params: { method: 'lanczos2' }, generation_time: 13, created_at: 1700000000,
+  }
+  assert.equal(JSON.stringify(render(processedVideo)).includes('Finishing details'), false)
+  globalThis.__mediaFeedRevealed.add(privatePreviewIdentity('private-media', processedVideo.name, 'r1'))
+  const processed = JSON.stringify(render(processedVideo))
+  assert.match(processed, /Finishing details/)
+  assert.match(processed, /Lanczos 2×/)
+  assert.match(processed, /source\.mp4/)
+  assert.equal(processed.includes('/private/source.mp4'), false)
+  assert.match(processed, /Recorded at/)
+  assert.match(processed, /Recorded job time/)
+
+  globalThis.__mediaFeedTestMeta = {
+    source: 'sidecar', params: { spatial_upsampling: 'lanczos2' },
+  }
+  assert.equal(JSON.stringify(render(processedVideo)).includes('Finishing details'), false)
+  globalThis.__mediaFeedTestMeta = {
+    source: 'embedded', tool: 'upscale', params: { method: 'lanczos2' },
+  }
+  assert.equal(JSON.stringify(render(processedVideo)).includes('Finishing details'), false)
 })
 
 test('private image and video thumbnails acquire sources only while revealed', async t => {
