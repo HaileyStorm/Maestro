@@ -699,6 +699,25 @@ class QueueLaunchWiringTests(unittest.TestCase):
         params["image_refs"][0] = object()
         self.assertEqual(frozen["image_refs"], ["authorized-reference.png"])
         json.dumps(frozen)
+        prefix_params = {
+            "image_start": "/private/recovery/temporary-last.png",
+            "video_source": "/private/uploads/source.mp4",
+            "keep_frames_video_source": 50,
+            "multi_clip_info": {
+                "automatic_h3_longform": True,
+                "index": 0,
+                "source_prefix": {
+                    "path": "/private/uploads/source.mp4",
+                    "sha256": "a" * 64,
+                },
+            },
+        }
+        prefix_frozen = snapshot(prefix_params, prefix_params["multi_clip_info"])
+        self.assertIsNone(prefix_frozen["image_start"])
+        self.assertNotIn("video_source", prefix_frozen)
+        self.assertNotIn("keep_frames_video_source", prefix_frozen)
+        self.assertNotIn("path", prefix_frozen["multi_clip_info"]["source_prefix"])
+        self.assertEqual(prefix_params["image_start"], "/private/recovery/temporary-last.png")
         with self.assertRaisesRegex(
             QueueRecoveryRuntimeError, "not serializable",
         ):
@@ -3914,6 +3933,295 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "native_boundary_conditioning": False,
                 "semantic_physical_contract_version": 3,
             })
+
+    def test_h3_source_prefix_binds_one_segment_to_concat_identity(self):
+        namespace = _isolated_functions(
+            self.launch,
+            (
+                "_h3_source_prefix_identity",
+                "_h3_segment_recovery_settings",
+                "_h3_dependency_closed_recovery_units",
+            ),
+            {
+                "copy": copy, "math": __import__("math"), "re": re,
+                "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+            },
+        )
+        prefix = {
+            "version": 1, "input_field": "video_source:0",
+            "source_native_frames": 125, "retained_frames": 120,
+            "output_fps": 24.0, "fit": "contain",
+            "conditioning": "last_frame",
+            "audio_policy": "preserve_source_then_generated",
+            "sha256": hashlib.sha256(b"source").hexdigest(),
+            "size": 6, "path": "/private/upload.mp4",
+        }
+        settings = namespace["_h3_segment_recovery_settings"]({
+            "index": 0, "generated_frames": 124,
+            "published_frames": 124, "trim_tail_frames": 0,
+            "source_prefix": prefix,
+        })
+        self.assertNotIn("path", settings["source_prefix"])
+        segment = {
+            "kind": "h3_segment", "unit_id": "segment",
+            "dependencies": [], "settings": settings,
+            "artifacts": [{"sha256": "a" * 64}],
+        }
+        concat = {
+            "kind": "h3_concat", "unit_id": "concat",
+            "dependencies": ["segment"],
+            "settings": {
+                "component_hashes": ["a" * 64],
+                "clip_start_frames": [0],
+                "clip_tail_frames": [0],
+                "source_prefix": settings["source_prefix"],
+            },
+        }
+        closed = namespace["_h3_dependency_closed_recovery_units"]
+        self.assertEqual(
+            [item["unit_id"] for item in closed([segment, concat])],
+            ["segment", "concat"],
+        )
+        changed = copy.deepcopy(concat)
+        changed["settings"]["source_prefix"]["sha256"] = "0" * 64
+        self.assertEqual(
+            [item["unit_id"] for item in closed([segment, changed])],
+            ["segment"],
+        )
+        with self.assertRaisesRegex(
+            QueueRecoveryRuntimeError, "identity",
+        ):
+            namespace["_h3_source_prefix_identity"]({
+                **prefix, "sha256": "bad",
+            })
+
+    def test_h3_extend_plans_one_generated_segment_without_video_anchor_leak(self):
+        class WgpStub:
+            def get_model_def(self, model_type):
+                return {
+                    "fps": 24, "frames_minimum": 90,
+                    "frames_maximum": 294, "frames_steps": 17,
+                    "latent_size": 17,
+                    "minimax_h3_reference_mode": (
+                        model_type == "minimax_h3_ref2va"
+                    ),
+                }
+
+            def align_model_frame_count(self, frames, _definition):
+                return min(
+                    294, max(90, ((int(frames) - 5 + 16) // 17) * 17 + 5),
+                )
+
+            def get_video_info(self, _path):
+                return 25, 64, 64, 120  # metadata estimate, not decoded count
+
+            def get_exact_video_frame_count(self, _path):
+                return 125
+
+        namespace = _isolated_functions(
+            self.launch,
+            (
+                "_h3_source_prefix_frame_counts",
+                "_prepare_h3_long_studio_request",
+                "_plan_h3_adaptive_models",
+                "_validate_h3_segment_plan",
+                "_public_h3_boundary",
+                "_public_h3_long_plan",
+            ),
+            {
+                "os": os, "math": __import__("math"),
+                "wgp": WgpStub(),
+                "_H3_LONG_STUDIO_MODELS": {
+                    "minimax_h3", "minimax_h3_ref2va",
+                },
+                "_H3_FL2VA_MODELS": {"minimax_h3"},
+                "_H3_REF2VA_MODEL": "minimax_h3_ref2va",
+                "_h3_preferred_fl2va_model": lambda _body: "minimax_h3",
+                "_MULTI_CLIP_SEPARATOR": "\n",
+                "_stamp_h3_duration_contract": lambda _body, _plan: None,
+            },
+        )
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as source:
+            body = {
+                "model_type": "minimax_h3",
+                "video_length": 124,
+                "video_source": source.name,
+                "image_prompt_type": "V",
+                "prompt": "The vehicle drives onward.",
+            }
+            plan = namespace["_prepare_h3_long_studio_request"](body)
+            self.assertEqual(plan["clip_count"], 1)
+            self.assertEqual(plan["segment_models"][0]["model_type"], "minimax_h3")
+            self.assertEqual(plan["source_prefix"]["retained_frames"], 120)
+            self.assertEqual(body["image_start"], [None])
+            self.assertEqual(body["video_source"], source.name)
+            public = namespace["_public_h3_long_plan"](plan)
+            self.assertEqual(public["source_prefix"]["final_output_frames"], 244)
+            self.assertNotIn(source.name, json.dumps(public))
+
+            capped = {
+                "model_type": "minimax_h3", "video_length": 124,
+                "video_source": source.name,
+                "keep_frames_video_source": 50,
+                "prompt": "The vehicle drives onward.",
+            }
+            capped_plan = namespace["_prepare_h3_long_studio_request"](capped)
+            self.assertEqual(
+                capped_plan["source_prefix"]["source_native_frames"], 125,
+            )
+            self.assertEqual(capped_plan["source_prefix"]["retained_frames"], 50)
+            end_trim = {
+                "model_type": "minimax_h3",
+                "video_length": 124,
+                "video_source": source.name,
+                "prompt": "The vehicle drives onward.",
+                "keep_frames_video_source": -10,
+            }
+            trimmed_plan = namespace["_prepare_h3_long_studio_request"](end_trim)
+            self.assertEqual(
+                trimmed_plan["source_prefix"]["source_native_frames"], 125,
+            )
+            self.assertEqual(trimmed_plan["source_prefix"]["retained_frames"], 110)
+            for subject in (
+                "An explicit adult scene continues.",
+                "A violent battle continues.",
+                "A controversial protest continues.",
+            ):
+                sensitive = {
+                    "model_type": "minimax_h3",
+                    "video_length": 124,
+                    "video_source": source.name,
+                    "image_prompt_type": "V",
+                    "prompt": subject,
+                }
+                sensitive_plan = namespace["_prepare_h3_long_studio_request"](
+                    sensitive,
+                )
+                self.assertEqual(
+                    sensitive_plan["source_prefix"], plan["source_prefix"],
+                )
+                self.assertEqual(
+                    sensitive_plan["segment_models"], plan["segment_models"],
+                )
+
+    def test_h3_source_still_uses_sealed_normalized_prefix_and_propagates_cancel(self):
+        from PIL import Image
+
+        observed = []
+
+        class WgpStub:
+            @staticmethod
+            def get_video_info(_path):
+                return 24, 8, 8, 3
+
+            @staticmethod
+            def get_exact_video_frame_count(path):
+                return 4 if Path(path).read_bytes() == b"new-sealed-source" else 3
+
+            @staticmethod
+            def snapshot_h3_source_prefix(
+                source_prefix, output_path, *, abort_callback,
+            ):
+                if abort_callback is not None and abort_callback():
+                    raise InterruptedError("Extend source preparation cancelled.")
+                source_bytes = Path(source_prefix["path"]).read_bytes()
+                if hashlib.sha256(source_bytes).hexdigest() != source_prefix["sha256"]:
+                    raise RuntimeError("Source changed after seal")
+                Path(output_path).write_bytes(source_bytes)
+                return output_path
+
+            @staticmethod
+            def extract_h3_source_prefix_last_frame(
+                source_path, output_path, *, source_native_frames,
+                retained_frames, output_fps, abort_callback,
+            ):
+                observed.append((
+                    source_path, source_native_frames, retained_frames,
+                    output_fps,
+                ))
+                if abort_callback is not None and abort_callback():
+                    raise InterruptedError("Extend source preparation cancelled.")
+                Image.new("RGB", (8, 8), (80, 80, 80)).save(output_path)
+
+        namespace = _isolated_functions(
+            self.launch,
+            (
+                "_h3_source_prefix_identity",
+                "_h3_source_prefix_frame_counts",
+                "_prepare_h3_source_prefix",
+            ),
+            {
+                "os": os, "math": __import__("math"), "re": re,
+                "wgp": WgpStub(),
+                "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+                "ensure_recovery_staging_directory": (
+                    ensure_recovery_staging_directory
+                ),
+            },
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "project"
+            project.mkdir()
+            source = project / "source.mp4"
+            source.write_bytes(b"sealed-source")
+            descriptor = {
+                "field": "video_source:0", "path": str(source),
+                "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                "size": source.stat().st_size,
+            }
+            namespace["_load_h3_mapping_manifest_inputs"] = (
+                lambda _job: (str(project), [descriptor])
+            )
+            plan = {
+                "source_prefix": {
+                    "version": 1, "input_field": "video_source:0",
+                    "source_native_frames": 3, "retained_frames": 3,
+                    "output_fps": 24, "fit": "contain",
+                    "conditioning": "last_frame",
+                    "audio_policy": "preserve_source_then_generated",
+                }
+            }
+            prefix, still = namespace["_prepare_h3_source_prefix"](
+                {"id": "job-source", "params": {
+                    "video_source": str(source),
+                }},
+                plan,
+            )
+            self.assertEqual(observed, [(prefix["path"], 3, 3, 24)])
+            self.assertNotEqual(prefix["path"], str(source))
+            self.assertEqual(Path(prefix["path"]).read_bytes(), source.read_bytes())
+            self.assertEqual(Image.open(still).convert("RGB").getpixel((0, 0)), (80, 80, 80))
+            self.assertEqual(prefix["sha256"], descriptor["sha256"])
+            checks = iter((False, False, True))
+            with self.assertRaisesRegex(InterruptedError, "cancelled"):
+                namespace["_prepare_h3_source_prefix"](
+                    {"id": "job-source", "params": {
+                        "video_source": str(source),
+                    }},
+                    plan,
+                    abort_callback=lambda: next(checks),
+                )
+            with self.assertRaisesRegex(
+                QueueRecoveryRuntimeError, "identity changed",
+            ):
+                namespace["_prepare_h3_source_prefix"](
+                    {"id": "job-source", "params": {
+                        "video_source": str(project / "different.mp4"),
+                    }},
+                    plan,
+                )
+            source.write_bytes(b"new-sealed-source")
+            descriptor["sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
+            descriptor["size"] = source.stat().st_size
+            with self.assertRaisesRegex(
+                QueueRecoveryRuntimeError, "changed after planning",
+            ):
+                namespace["_prepare_h3_source_prefix"](
+                    {"id": "job-source", "params": {
+                        "video_source": str(source),
+                    }},
+                    plan,
+                )
 
     def test_recovered_v2_h3_worker_preserves_replan_contract_to_parser(self):
         """Exercise restored task materialization through the pre-model boundary."""

@@ -343,6 +343,22 @@ export function H3GenerationPlanDialog() {
   if (!plan || !planJobId || !planWorkspace) return null
   const planFps = plan.fps || 24
   const planPublishedFrames = plan.published_frames || plan.requested_frames
+  const sourcePrefix = plan.source_prefix
+  const sourcePrefixSummary = sourcePrefix?.conditioning === 'last_frame'
+    && Number.isSafeInteger(sourcePrefix.source_frames)
+    && sourcePrefix.source_frames >= 0
+    && Number.isFinite(sourcePrefix.source_duration_seconds)
+    && sourcePrefix.source_duration_seconds >= 0
+    && Number.isSafeInteger(sourcePrefix.added_frames)
+    && sourcePrefix.added_frames >= 0
+    && Number.isFinite(sourcePrefix.added_duration_seconds)
+    && sourcePrefix.added_duration_seconds >= 0
+    && Number.isSafeInteger(sourcePrefix.final_output_frames)
+    && sourcePrefix.final_output_frames >= 0
+    && Number.isFinite(sourcePrefix.final_output_duration_seconds)
+    && sourcePrefix.final_output_duration_seconds >= 0
+    ? sourcePrefix
+    : null
   const planLoadSeconds = planEstimate?.model_load_state === 'resident'
     ? 0
     : Number(planEstimate?.model_load_seconds || 0)
@@ -415,10 +431,15 @@ export function H3GenerationPlanDialog() {
           <div className="min-w-0 flex-1">
             <h2 id="h3-plan-dialog-title" className="text-sm font-semibold text-text-primary">Review long-video plan</h2>
             <p id="h3-plan-dialog-description" className="mt-0.5 text-[11px] text-text-muted">
-              {plan.clip_count} segment{plan.clip_count === 1 ? '' : 's'} · {formatMediaDuration(planPublishedFrames / planFps)} final video
-              {plan.planned_frames !== planPublishedFrames && ` · ${formatMediaDuration(plan.planned_frames / planFps)} generated`}
+              {plan.clip_count} segment{plan.clip_count === 1 ? '' : 's'} · {formatMediaDuration(sourcePrefixSummary?.final_output_duration_seconds ?? planPublishedFrames / planFps)} final video
+              {!sourcePrefixSummary && plan.planned_frames !== planPublishedFrames && ` · ${formatMediaDuration(plan.planned_frames / planFps)} generated`}
               {' '}· {switchCount} model change{switchCount === 1 ? '' : 's'}
             </p>
+            {sourcePrefixSummary && (
+              <p className="mt-1 text-[10px] leading-relaxed text-text-secondary">
+                Source video: {formatMediaDuration(sourcePrefixSummary.source_duration_seconds)} ({sourcePrefixSummary.source_frames} frames) · Added: {formatMediaDuration(sourcePrefixSummary.added_duration_seconds)} ({sourcePrefixSummary.added_frames} frames) · Total: {formatMediaDuration(sourcePrefixSummary.final_output_duration_seconds)} ({sourcePrefixSummary.final_output_frames} frames)
+              </p>
+            )}
             {planEstimate && (
               <p className="mt-0.5 text-[10px] text-text-muted" title={`Confidence: ${planEstimate.confidence}. ${planEstimate.uncertainty_reasons.join('; ')}`}>
                 Planned time {formatPlanEstimateTime(planEstimate.seconds + planLoadSeconds)}
@@ -439,6 +460,11 @@ export function H3GenerationPlanDialog() {
         </div>
 
         <div className="min-h-0 overflow-y-auto overscroll-contain flex-1 p-4 [-webkit-overflow-scrolling:touch]">
+          {sourcePrefixSummary && (
+            <div role="note" aria-label="Source video extension details" className="mb-3 rounded-lg border border-accent-blue/30 bg-accent-blue/5 p-2.5 text-[10px] leading-relaxed text-text-secondary">
+              Continuum re-encodes and keeps the source clip at the start. The first added segment uses only its last retained frame as a fixed visual anchor. Source motion and audio do not guide generated segments. {sourcePrefixSummary.source_audio_preserved && sourcePrefixSummary.generated_audio_preserved && 'When present, source audio is preserved, and generated audio follows it.'}
+            </div>
+          )}
           <div className="mb-3 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-2.5 text-[10px] text-text-secondary">
             <AlertTriangle size={14} className="mt-0.5 shrink-0 text-amber-400" />
             <span>Choose FL2VA when exact start or end frames matter. Choose Ref2VA when reference images and recent motion matter. If you supplied a final frame, the last segment must use FL2VA. FL2VA keeps your references saved but does not use them.</span>

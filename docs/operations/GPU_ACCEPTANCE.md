@@ -1829,3 +1829,26 @@ was empty. A fresh Chrome visit reached Maestro's sign-in screen. Owner browser
 acceptance still needs sign-in, and no new GPU generation has tested H3 Extend.
 The tests establish flag and duration behavior, not successful source-prefix
 continuation or absence of a depth download in a live generation.
+
+### H3 Extend source-prefix implementation: CPU evidence
+
+The follow-up implementation plans H3 Extend as a retained source prefix plus
+one or more newly generated H3 segments. The first FL2VA segment receives a
+still from the final frame of the normalized retained prefix; generated H3
+children do not receive the full `video_source`. The source is a sealed request
+input, and its versioned hash, size, frame cap, FPS and audio policy bind the
+first segment and final concat recovery identities. One generated segment now
+still requires source-plus-segment assembly. The plan shows source, added and
+total duration separately, and H3 Extend no longer offers a source-strength
+slider that its model path cannot honor.
+
+Disposable CPU ffmpeg tests cover audible and silent source prefixes, one and
+two generated segments, differing source and output FPS, explicit source frame
+caps, source mutation, missing generated audio, cancellation, exact output
+frame counts, audio underflow bounded to one sample and trailing AAC padding
+bounded to one access unit. Focused queue-recovery
+tests cover the sealed source binding, single-segment adoption and failed
+identity checks. These are synthetic media and static/runtime-unit checks;
+they do not establish a successful H3 GPU continuation, browser acceptance,
+audible quality, or preservation of source bytes through re-encoding. The
+cancelled live attempt and its negative evidence above remain unchanged.

@@ -1055,6 +1055,9 @@ class NativeBoundaryRecoveryTests(unittest.TestCase):
                 os.path.join(out_dir, output_basename),
             ),
             "_write_output_sidecars": lambda *args, **kwargs: None,
+            "_snapshot_h3_recovery_task_params": (
+                lambda params, clip_info: params
+            ),
             "_queue_recovery_checkpoint_unit": lambda *args, **kwargs: {
                 "unit_id": "concat-unit",
             },
@@ -1064,6 +1067,11 @@ class NativeBoundaryRecoveryTests(unittest.TestCase):
             APP / "launch.py", "_replay_h3_concat_from_verified_segments",
             namespace,
         )
+        with self.assertRaisesRegex(RuntimeError, "source prefix changed"):
+            replay(
+                variant=0, total_segments=2,
+                clip_info={"source_prefix": {"version": 1}},
+            )
         replay(
             variant=0, total_segments=2,
             clip_info={"audio_start_sec": 0, "preserve_generated_audio": True},

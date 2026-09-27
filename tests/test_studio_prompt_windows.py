@@ -2052,7 +2052,11 @@ class H3LongStudioPlanningTests(unittest.TestCase):
         self.assertIn('abort_callback=lambda: bool(gen.get("abort", False))', wgp)
         self.assertIn("Unable to concatenate generated segments", wgp)
         self.assertIn(
-            "audio_source\n                            if preserve_generated_audio",
+            'None\n                            if source_prefix is not None',
+            wgp,
+        )
+        self.assertIn(
+            "audio_source\n                                if preserve_generated_audio",
             wgp,
         )
 

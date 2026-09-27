@@ -1297,6 +1297,19 @@ export interface H3DurationPlan {
   residual_published_frames: number
 }
 
+/** Server-authored retained source geometry and audio behavior for H3 Extend. */
+export interface H3SourcePrefixPlan {
+  source_frames: number
+  source_duration_seconds: number
+  added_frames: number
+  added_duration_seconds: number
+  final_output_frames: number
+  final_output_duration_seconds: number
+  conditioning: 'last_frame'
+  source_audio_preserved: boolean
+  generated_audio_preserved: boolean
+}
+
 export interface H3SegmentPlan {
   kind: 'h3_segments'
   clip_count: number
@@ -1307,6 +1320,7 @@ export interface H3SegmentPlan {
   adaptive_conditioning: boolean
   checkpoint_switches: number
   segments: H3SegmentPlanItem[]
+  source_prefix?: H3SourcePrefixPlan
   duration_plan?: H3DurationPlan
 }
 

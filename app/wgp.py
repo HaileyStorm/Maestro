@@ -9262,6 +9262,31 @@ def _trim_video_tail(clip_path, trim_frames, fps):
             os.remove(tmp_path)
 
 
+def _redact_h3_source_prefix_path_for_metadata(configs):
+    """Keep the sealed source path private in saved generation metadata."""
+    if not isinstance(configs, dict):
+        return configs
+    multi_clip_info = configs.get("multi_clip_info")
+    if not isinstance(multi_clip_info, dict):
+        return configs
+    source_prefix = multi_clip_info.get("source_prefix")
+    if not isinstance(source_prefix, dict) or "path" not in source_prefix:
+        return configs
+    metadata_multi_clip_info = copy.deepcopy(multi_clip_info)
+    metadata_multi_clip_info["source_prefix"]["path"] = "[redacted]"
+    configs["multi_clip_info"] = metadata_multi_clip_info
+    return configs
+
+
+def _multi_clip_image_start_metadata(group, total, source_prefix=None):
+    """Omit source-derived first-frame staging paths from final metadata."""
+    return [
+        None if source_prefix is not None and index == 0
+        else group[index]["image_start"]
+        for index in range(total)
+    ]
+
+
 def seal_multi_clip_segment_before_concat(
     clip_path, multi_clip_info, after_segment_output,
 ):
@@ -9368,10 +9393,588 @@ def load_h3_native_boundary_inputs(descriptor):
     return video, audio.reshape(expected_samples, 2).copy()
 
 
+def get_exact_video_frame_count(path):
+    """Count decoded video frames with a bounded CPU ffprobe pass."""
+    import os
+    import subprocess
+
+    if not isinstance(path, str) or not path or not os.path.isfile(path):
+        raise PostDecodeStageError(
+            "The source video is unavailable for frame counting",
+            stage="source_prefix", code="source_prefix_frame_count_invalid",
+        )
+    ffmpeg_bin = os.environ.get("FFMPEG_BINARY", "ffmpeg")
+    ffprobe_bin = ffmpeg_bin.replace("ffmpeg", "ffprobe")
+    try:
+        result = subprocess.run(
+            [
+                ffprobe_bin, "-v", "error", "-count_frames",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=nb_read_frames",
+                "-of", "default=nokey=1:noprint_wrappers=1",
+                os.path.abspath(path).replace("\\", "/"),
+            ],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode != 0:
+            raise ValueError("ffprobe failed")
+        count = int(result.stdout.strip())
+        if count <= 0:
+            raise ValueError("ffprobe returned no video frames")
+        return count
+    except (OSError, subprocess.SubprocessError, TypeError, ValueError) as error:
+        raise PostDecodeStageError(
+            "The exact source video frame count could not be read",
+            stage="source_prefix", code="source_prefix_frame_count_invalid",
+        ) from error
+
+
+def _h3_source_prefix_media_info(source_prefix, generated_paths, ffprobe_bin):
+    """Validate a sealed H3 source prefix against the generated clip media."""
+    import json
+    import math
+    import os
+    import subprocess
+    from fractions import Fraction
+
+    required_fields = {
+        "version", "input_field", "path", "sha256", "size",
+        "source_native_frames", "retained_frames", "output_fps", "fit",
+        "conditioning", "audio_policy",
+    }
+
+    def invalid(code="concat_source_prefix_invalid"):
+        raise PostDecodeStageError(
+            "The source prefix metadata is invalid",
+            stage="concat", code=code,
+        )
+
+    if not isinstance(source_prefix, dict) or set(source_prefix) != required_fields:
+        invalid()
+    if (
+        type(source_prefix.get("version")) is not int
+        or source_prefix["version"] != 1
+        or source_prefix.get("input_field") != "video_source:0"
+        or source_prefix.get("fit") != "contain"
+        or source_prefix.get("conditioning") != "last_frame"
+        or source_prefix.get("audio_policy") != "preserve_source_then_generated"
+    ):
+        invalid()
+
+    source_path = source_prefix.get("path")
+    digest = source_prefix.get("sha256")
+    size = source_prefix.get("size")
+    source_native_frames = source_prefix.get("source_native_frames")
+    retained_frames = source_prefix.get("retained_frames")
+    output_fps = source_prefix.get("output_fps")
+    if (
+        not isinstance(source_path, str)
+        or not source_path
+        or not os.path.isabs(source_path)
+        or type(size) is not int
+        or size <= 0
+        or type(source_native_frames) is not int
+        or source_native_frames <= 0
+        or type(retained_frames) is not int
+        or retained_frames <= 0
+        or isinstance(output_fps, bool)
+        or not isinstance(output_fps, (int, float))
+        or not math.isfinite(float(output_fps))
+        or float(output_fps) <= 0
+        or not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        invalid()
+    try:
+        source_stat = os.stat(source_path)
+    except OSError:
+        invalid("concat_source_prefix_changed")
+    if not os.path.isfile(source_path) or source_stat.st_size != size:
+        invalid("concat_source_prefix_changed")
+    if not generated_paths:
+        invalid()
+
+    def probe(path):
+        try:
+            result = subprocess.run(
+                [
+                    ffprobe_bin, "-v", "error", "-count_frames",
+                    "-show_streams", "-of", "json", path.replace("\\", "/"),
+                ],
+                capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode != 0:
+                invalid()
+            payload = json.loads(result.stdout)
+            streams = payload.get("streams")
+            if not isinstance(streams, list):
+                invalid()
+            videos = [stream for stream in streams if stream.get("codec_type") == "video"]
+            audios = [stream for stream in streams if stream.get("codec_type") == "audio"]
+            if not videos:
+                invalid()
+            video = videos[0]
+            count = video.get("nb_read_frames") or video.get("nb_frames")
+            rate = video.get("avg_frame_rate")
+            if not rate or str(rate).strip() in {"0/0", "N/A"}:
+                rate = video.get("r_frame_rate")
+            try:
+                frames = int(count)
+                fps = float(Fraction(str(rate)))
+                width = int(video.get("width") or 0)
+                height = int(video.get("height") or 0)
+            except (TypeError, ValueError, ZeroDivisionError):
+                invalid()
+            if frames <= 0 or not math.isfinite(fps) or fps <= 0:
+                invalid()
+            return {
+                "frames": frames,
+                "fps": fps,
+                "width": width,
+                "height": height,
+                "audios": audios,
+            }
+        except PostDecodeStageError:
+            raise
+        except (OSError, subprocess.SubprocessError, TypeError, ValueError, json.JSONDecodeError):
+            invalid()
+
+    source = probe(source_path)
+    if source["frames"] != source_native_frames:
+        invalid("concat_source_prefix_changed")
+
+    generated = [probe(path) for path in generated_paths]
+    first = generated[0]
+    if (
+        first["width"] <= 0
+        or first["height"] <= 0
+        or first["width"] % 2
+        or first["height"] % 2
+    ):
+        invalid()
+    if any(
+        not math.isclose(item["fps"], float(output_fps), rel_tol=1e-7, abs_tol=1e-7)
+        for item in generated
+    ):
+        invalid()
+    if any(not item["audios"] for item in generated):
+        raise PostDecodeStageError(
+            "A generated segment has no embedded audio",
+            stage="audio_mux", code="concat_generated_audio_missing",
+        )
+    try:
+        generated_audio_rate = int(generated[0]["audios"][0].get("sample_rate") or 0)
+        generated_audio_channels = int(generated[0]["audios"][0].get("channels") or 0)
+    except (TypeError, ValueError):
+        invalid()
+    if generated_audio_rate <= 0 or generated_audio_channels not in {1, 2}:
+        invalid()
+
+    return {
+        "path": source_path,
+        "source_has_audio": bool(source["audios"]),
+        "source_native_frames": source_native_frames,
+        "source_fps": source["fps"],
+        "retained_frames": retained_frames,
+        "output_fps": float(output_fps),
+        "width": first["width"],
+        "height": first["height"],
+        "generated_frame_counts": [item["frames"] for item in generated],
+        "generated_audio_rate": generated_audio_rate,
+        "generated_audio_layout": "mono" if generated_audio_channels == 1 else "stereo",
+    }
+
+
+def _snapshot_h3_source_prefix(source_prefix, private_dir, abort_callback):
+    """Copy the exact sealed bytes to a private temporary input for ffmpeg."""
+    import hashlib
+    import os
+    import tempfile
+
+    source_path = source_prefix["path"]
+    descriptor, snapshot_path = tempfile.mkstemp(
+        prefix="h3-source-prefix-", suffix=".media", dir=private_dir,
+    )
+    copied_size = 0
+    digest = hashlib.sha256()
+    try:
+        with os.fdopen(descriptor, "wb") as target, open(source_path, "rb") as source:
+            while True:
+                if abort_callback is not None and abort_callback():
+                    return None
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                copied_size += len(chunk)
+                digest.update(chunk)
+                target.write(chunk)
+        if (
+            copied_size != source_prefix["size"]
+            or digest.hexdigest() != source_prefix["sha256"]
+        ):
+            raise PostDecodeStageError(
+                "The source prefix changed after it was sealed",
+                stage="concat", code="concat_source_prefix_changed",
+            )
+        return snapshot_path
+    except PostDecodeStageError:
+        raise
+    except OSError as error:
+        raise PostDecodeStageError(
+            "The source prefix could not be read",
+            stage="concat", code="concat_source_prefix_changed",
+        ) from error
+
+
+def snapshot_h3_source_prefix(
+    source_prefix, output_path, *, abort_callback=None,
+):
+    """Atomically copy and verify a sealed source prefix into job staging."""
+    import hashlib
+    import os
+    import tempfile
+
+    if not isinstance(source_prefix, dict):
+        raise PostDecodeStageError(
+            "The source-prefix descriptor is invalid",
+            stage="source_prefix", code="source_prefix_snapshot_invalid",
+        )
+    source_path = source_prefix.get("path")
+    expected_size = source_prefix.get("size")
+    expected_sha256 = source_prefix.get("sha256")
+    if (
+        not isinstance(source_path, str)
+        or not source_path
+        or not os.path.isabs(source_path)
+        or not isinstance(output_path, str)
+        or not output_path
+        or type(expected_size) is not int
+        or expected_size <= 0
+        or not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_sha256)
+    ):
+        raise PostDecodeStageError(
+            "The source-prefix descriptor is invalid",
+            stage="source_prefix", code="source_prefix_snapshot_invalid",
+        )
+    source_path = os.path.abspath(source_path)
+    output_path = os.path.abspath(output_path)
+    if (
+        not os.path.isfile(source_path)
+        or os.path.realpath(source_path) == os.path.realpath(output_path)
+    ):
+        raise PostDecodeStageError(
+            "The sealed source-prefix file is unavailable",
+            stage="source_prefix", code="concat_source_prefix_changed",
+        )
+    output_dir = os.path.dirname(output_path)
+    if not os.path.isdir(output_dir):
+        raise PostDecodeStageError(
+            "The source-prefix staging directory is unavailable",
+            stage="source_prefix", code="source_prefix_snapshot_invalid",
+        )
+
+    def check_abort():
+        if abort_callback is None:
+            return False
+        try:
+            return bool(abort_callback())
+        except Exception as error:
+            raise PostDecodeStageError(
+                "The source-prefix snapshot was interrupted",
+                stage="source_prefix", code="source_prefix_snapshot_abort_check_failed",
+            ) from error
+
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix=".h3-source-prefix-snapshot-", suffix=".tmp", dir=output_dir,
+    )
+    try:
+        copied_size = 0
+        digest = hashlib.sha256()
+        with os.fdopen(descriptor, "wb") as target, open(source_path, "rb") as source:
+            while True:
+                if check_abort():
+                    raise InterruptedError("H3 source-prefix snapshot was cancelled")
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                target.write(chunk)
+                digest.update(chunk)
+                copied_size += len(chunk)
+            target.flush()
+            os.fsync(target.fileno())
+        if (
+            copied_size != expected_size
+            or digest.hexdigest() != expected_sha256
+        ):
+            raise PostDecodeStageError(
+                "The source-prefix bytes no longer match their sealed descriptor",
+                stage="source_prefix", code="concat_source_prefix_changed",
+            )
+        if check_abort():
+            raise InterruptedError("H3 source-prefix snapshot was cancelled")
+        os.replace(temporary_path, output_path)
+        temporary_path = None
+        return output_path
+    except (InterruptedError, PostDecodeStageError):
+        raise
+    except OSError as error:
+        raise PostDecodeStageError(
+            "The sealed source-prefix file could not be staged",
+            stage="source_prefix", code="source_prefix_snapshot_failed",
+        ) from error
+    finally:
+        if temporary_path is not None:
+            try:
+                if os.path.isfile(temporary_path):
+                    os.remove(temporary_path)
+            except OSError:
+                pass
+
+
+def _h3_source_prefix_temporal_filter_parts(
+    source_native_frames, retained_frames, output_fps,
+):
+    """Return shared source-cap/FPS and retained-output temporal filters."""
+    if (
+        type(source_native_frames) is not int
+        or source_native_frames <= 0
+        or type(retained_frames) is not int
+        or retained_frames <= 0
+        or isinstance(output_fps, bool)
+        or not isinstance(output_fps, (int, float))
+        or not math.isfinite(float(output_fps))
+        or float(output_fps) <= 0
+    ):
+        raise ValueError("invalid H3 source-prefix temporal settings")
+    prefix_duration = retained_frames / float(output_fps)
+    before_geometry = (
+        f"trim=end_frame={source_native_frames},"
+        "setpts=PTS-STARTPTS,"
+        f"fps={float(output_fps):.12g}"
+    )
+    after_geometry = (
+        f"tpad=stop_mode=clone:stop_duration={prefix_duration:.9f},"
+        f"trim=end_frame={retained_frames},"
+        "setpts=PTS-STARTPTS"
+    )
+    return before_geometry, after_geometry
+
+
+def extract_h3_source_prefix_last_frame(
+    source_path, output_path, *, source_native_frames, retained_frames,
+    output_fps, abort_callback=None,
+):
+    """Extract the last frame of the normalized source prefix as a PNG."""
+    import math
+    import os
+    import subprocess
+    import tempfile
+    import time
+
+    if (
+        not isinstance(source_path, str)
+        or not source_path
+        or not isinstance(output_path, str)
+        or not output_path
+    ):
+        raise PostDecodeStageError(
+            "The source-prefix frame input or output path is invalid",
+            stage="source_prefix", code="source_prefix_frame_extract_invalid",
+        )
+    source_path = os.path.abspath(source_path)
+    output_path = os.path.abspath(output_path)
+    if (
+        not os.path.isfile(source_path)
+        or os.path.realpath(source_path) == os.path.realpath(output_path)
+    ):
+        raise PostDecodeStageError(
+            "The source-prefix frame input or output path is invalid",
+            stage="source_prefix", code="source_prefix_frame_extract_invalid",
+        )
+    try:
+        before_geometry, after_geometry = _h3_source_prefix_temporal_filter_parts(
+            source_native_frames, retained_frames, output_fps,
+        )
+    except (TypeError, ValueError, OverflowError) as error:
+        raise PostDecodeStageError(
+            "The source-prefix frame settings are invalid",
+            stage="source_prefix", code="source_prefix_frame_extract_invalid",
+        ) from error
+
+    def check_abort():
+        if abort_callback is None:
+            return False
+        try:
+            return bool(abort_callback())
+        except Exception as error:
+            raise PostDecodeStageError(
+                "The source-prefix frame extraction was interrupted",
+                stage="source_prefix", code="source_prefix_frame_extract_abort_check_failed",
+            ) from error
+
+    if check_abort():
+        raise InterruptedError("H3 source-prefix frame extraction was cancelled")
+
+    output_dir = os.path.dirname(output_path)
+    if not os.path.isdir(output_dir):
+        raise PostDecodeStageError(
+            "The source-prefix frame output directory is unavailable",
+            stage="source_prefix", code="source_prefix_frame_extract_invalid",
+        )
+
+    descriptor, private_output_path = tempfile.mkstemp(
+        prefix=".h3-source-prefix-frame-", suffix=".png", dir=output_dir,
+    )
+    os.close(descriptor)
+    ffmpeg_bin = os.environ.get("FFMPEG_BINARY", "ffmpeg")
+    frame_filter = (
+        f"{before_geometry},{after_geometry},"
+        f"trim=start_frame={retained_frames - 1}:end_frame={retained_frames},"
+        "setpts=PTS-STARTPTS"
+    )
+    command = [
+        ffmpeg_bin, "-v", "error", "-nostdin", "-y", "-i",
+        source_path.replace("\\", "/"),
+        "-map", "0:v:0", "-vf", frame_filter,
+        "-vsync", "0", "-frames:v", "1", "-update", "1",
+        "-c:v", "png", private_output_path.replace("\\", "/"),
+    ]
+    process = None
+
+    def stop_process():
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+
+    try:
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        deadline = time.monotonic() + 600.0
+        while True:
+            try:
+                _stdout, stderr = process.communicate(timeout=0.25)
+                break
+            except subprocess.TimeoutExpired:
+                if check_abort():
+                    stop_process()
+                    raise InterruptedError(
+                        "H3 source-prefix frame extraction was cancelled"
+                    )
+                if time.monotonic() >= deadline:
+                    stop_process()
+                    raise PostDecodeStageError(
+                        "Source-prefix frame extraction timed out",
+                        stage="source_prefix", code="source_prefix_frame_extract_timeout",
+                    )
+        if process.returncode != 0:
+            raise PostDecodeStageError(
+                "The final normalized source-prefix frame could not be extracted",
+                stage="source_prefix", code="source_prefix_frame_extract_failed",
+            )
+        if check_abort():
+            raise InterruptedError("H3 source-prefix frame extraction was cancelled")
+        with open(private_output_path, "rb") as frame_file:
+            if frame_file.read(8) != b"\x89PNG\r\n\x1a\n":
+                raise PostDecodeStageError(
+                    "The extracted source-prefix frame is empty or invalid",
+                    stage="source_prefix", code="source_prefix_frame_extract_failed",
+                )
+        os.replace(private_output_path, output_path)
+        return output_path
+    except (InterruptedError, PostDecodeStageError):
+        stop_process()
+        raise
+    except Exception as error:
+        stop_process()
+        raise PostDecodeStageError(
+            "The final normalized source-prefix frame could not be extracted",
+            stage="source_prefix", code="source_prefix_frame_extract_failed",
+        ) from error
+    finally:
+        try:
+            if os.path.isfile(private_output_path):
+                os.remove(private_output_path)
+        except OSError:
+            pass
+
+
+def _verify_h3_source_prefix_output(
+    output_path, expected_frames, output_fps, width, height, ffprobe_bin,
+):
+    """Check exact prefix-mode video length and matching audio presentation."""
+    import json
+    import math
+    import subprocess
+    from fractions import Fraction
+
+    try:
+        result = subprocess.run(
+            [
+                ffprobe_bin, "-v", "error", "-count_frames", "-show_streams",
+                "-of", "json", output_path.replace("\\", "/"),
+            ],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode != 0:
+            return False
+        streams = json.loads(result.stdout).get("streams") or []
+        videos = [stream for stream in streams if stream.get("codec_type") == "video"]
+        audios = [stream for stream in streams if stream.get("codec_type") == "audio"]
+        if not videos or not audios:
+            return False
+        video = videos[0]
+        actual_frames = int(video.get("nb_read_frames") or video.get("nb_frames") or 0)
+        actual_fps = float(Fraction(str(video.get("r_frame_rate") or "0/1")))
+        actual_width = int(video.get("width") or 0)
+        actual_height = int(video.get("height") or 0)
+        audio = audios[0]
+        audio_rate = int(audio.get("sample_rate") or 0)
+        audio_duration = audio.get("duration")
+        if audio_duration is None and audio.get("duration_ts") and audio.get("time_base"):
+            audio_duration = (
+                int(audio["duration_ts"])
+                * float(Fraction(str(audio["time_base"])))
+            )
+        audio_duration = float(audio_duration)
+        expected_duration = expected_frames / output_fps
+    except (
+        OSError, subprocess.SubprocessError, TypeError, ValueError,
+        ZeroDivisionError, KeyError, json.JSONDecodeError,
+    ):
+        return False
+
+    if (
+        actual_frames != expected_frames
+        or not math.isclose(actual_fps, output_fps, rel_tol=1e-7, abs_tol=1e-7)
+        or actual_width != width
+        or actual_height != height
+        or audio_rate <= 0
+        or not math.isfinite(audio_duration)
+    ):
+        return False
+    # Reject a short AAC presentation beyond one sample. The MP4 muxer may
+    # expose up to one padded AAC access unit at the tail, so bound only that
+    # overrun while keeping the video frame count independently exact.
+    delta = audio_duration - expected_duration
+    return (
+        delta >= -(1 / audio_rate) - 1e-6
+        and delta <= (1024 / audio_rate) + 1e-6
+    )
+
+
 def concatenate_multi_clip_videos(
     clip_paths, output_path, audio_path=None, audio_start_sec=0.0,
     abort_callback=None, pad_audio=False, audio_duration_sec=None,
-    clip_start_frames=None,
+    clip_start_frames=None, source_prefix=None,
 ):
     """Concatenate video clips into one video, optionally adding a full audio track.
 
@@ -9389,9 +9992,13 @@ def concatenate_multi_clip_videos(
     import json
     import math
     import time
+    import tempfile
+    import shutil
     output_path = os.path.abspath(output_path)
     output_path_ffmpeg = output_path.replace("\\", "/")
     ffmpeg_bin = os.environ.get("FFMPEG_BINARY", "ffmpeg")
+    ffprobe_bin = ffmpeg_bin.replace("ffmpeg", "ffprobe")
+    source_prefix_mode = source_prefix is not None
 
     requested_count = len(clip_paths)
     if requested_count == 0:
@@ -9425,12 +10032,26 @@ def concatenate_multi_clip_videos(
             stage="concat", code="concat_input_incomplete",
         )
 
+    source_prefix_info = None
+    if source_prefix_mode:
+        source_prefix_info = _h3_source_prefix_media_info(
+            source_prefix, valid_paths, ffprobe_bin,
+        )
+        # The external soundtrack argument is intentionally ignored for this
+        # contract: source audio (or silence) leads into each generated clip's
+        # native embedded audio.
+        audio_path = None
+        audio_start_sec = 0.0
+        pad_audio = False
+        valid_paths.insert(0, source_prefix_info["path"])
+
     n = len(valid_paths)
     if clip_start_frames is None:
-        clip_start_frames = [0] * n
+        clip_start_frames = [0] * (requested_count if source_prefix_mode else n)
+    expected_start_count = requested_count if source_prefix_mode else n
     if (
         not isinstance(clip_start_frames, (list, tuple))
-        or len(clip_start_frames) != n
+        or len(clip_start_frames) != expected_start_count
     ):
         raise PostDecodeStageError(
             "Segment overlap trim metadata is invalid",
@@ -9443,6 +10064,8 @@ def concatenate_multi_clip_videos(
             "Segment overlap trim metadata is invalid",
             stage="concat", code="concat_overlap_invalid",
         ) from None
+    if source_prefix_mode:
+        clip_start_frames = [0, *clip_start_frames]
 
     try:
         audio_start_sec = float(audio_start_sec or 0)
@@ -9471,9 +10094,10 @@ def concatenate_multi_clip_videos(
 
     # Check if clips have embedded audio (e.g., LTX-2.3 generated video+audio)
     clips_have_audio = False
-    if not audio_path:
+    if source_prefix_mode:
+        clips_have_audio = True
+    elif not audio_path:
         try:
-            ffprobe_bin = ffmpeg_bin.replace("ffmpeg", "ffprobe")
             probe_result = subprocess.run(
                 [ffprobe_bin, "-i", valid_paths[0].replace("\\", "/"),
                  "-show_streams", "-select_streams", "a", "-loglevel", "error"],
@@ -9492,7 +10116,7 @@ def concatenate_multi_clip_videos(
 
     use_clip_audio = clips_have_audio and not audio_path
     detected_audio_sample_rate = None
-    if use_clip_audio:
+    if use_clip_audio and not source_prefix_mode:
         try:
             audio_probe = subprocess.run(
                 [
@@ -9520,52 +10144,66 @@ def concatenate_multi_clip_videos(
     # overlaid audio track to progressively desync.
     detected_fps = None
     exact_output_frames = None
-    try:
-        ffprobe_bin = ffmpeg_bin.replace("ffmpeg", "ffprobe")
-        fps_probe = subprocess.run(
-            [ffprobe_bin, "-i", valid_paths[0].replace("\\", "/"),
-             "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate",
-             "-of", "csv=p=0", "-loglevel", "error"],
-            capture_output=True, text=True, timeout=10,
+    if source_prefix_mode:
+        detected_fps = source_prefix_info["output_fps"]
+        frame_counts = source_prefix_info["generated_frame_counts"]
+        generated_starts = clip_start_frames[1:]
+        valid_frame_counts = (
+            len(frame_counts) == requested_count
+            and all(count > start for count, start in zip(frame_counts, generated_starts))
         )
-        fps_str = fps_probe.stdout.strip()
-        if "/" in fps_str:
-            num, den = fps_str.split("/")
-            detected_fps = float(num) / float(den)
-        elif fps_str:
-            detected_fps = float(fps_str)
-        if detected_fps and detected_fps > 0:
-            print(f"[Multi-Clip] Detected clip fps: {detected_fps}")
-    except Exception:
-        pass
-
-    frame_counts = []
-    if detected_fps and detected_fps > 0:
+    else:
         try:
-            for path in valid_paths:
-                count_probe = subprocess.run(
-                    [
-                        ffprobe_bin, "-v", "error", "-count_frames",
-                        "-select_streams", "v:0", "-show_entries",
-                        "stream=nb_read_frames,nb_frames", "-of", "json",
-                        path.replace("\\", "/"),
-                    ],
-                    capture_output=True, text=True, timeout=30,
-                )
-                streams = json.loads(count_probe.stdout).get("streams") or []
-                stream = streams[0]
-                frame_counts.append(int(
-                    stream.get("nb_read_frames") or stream.get("nb_frames")
-                ))
-        except (IndexError, TypeError, ValueError, json.JSONDecodeError):
-            frame_counts = []
-    valid_frame_counts = (
-        len(frame_counts) == n
-        and all(
-            count > start
-            for count, start in zip(frame_counts, clip_start_frames)
+            fps_probe = subprocess.run(
+                [ffprobe_bin, "-i", valid_paths[0].replace("\\", "/"),
+                 "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate",
+                 "-of", "csv=p=0", "-loglevel", "error"],
+                capture_output=True, text=True, timeout=10,
+            )
+            fps_str = fps_probe.stdout.strip()
+            if "/" in fps_str:
+                num, den = fps_str.split("/")
+                detected_fps = float(num) / float(den)
+            elif fps_str:
+                detected_fps = float(fps_str)
+            if detected_fps and detected_fps > 0:
+                print(f"[Multi-Clip] Detected clip fps: {detected_fps}")
+        except Exception:
+            pass
+
+        frame_counts = []
+        if detected_fps and detected_fps > 0:
+            try:
+                for path in valid_paths:
+                    count_probe = subprocess.run(
+                        [
+                            ffprobe_bin, "-v", "error", "-count_frames",
+                            "-select_streams", "v:0", "-show_entries",
+                            "stream=nb_read_frames,nb_frames", "-of", "json",
+                            path.replace("\\", "/"),
+                        ],
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    streams = json.loads(count_probe.stdout).get("streams") or []
+                    stream = streams[0]
+                    frame_counts.append(int(
+                        stream.get("nb_read_frames") or stream.get("nb_frames")
+                    ))
+            except (IndexError, TypeError, ValueError, json.JSONDecodeError):
+                frame_counts = []
+    if not source_prefix_mode:
+        valid_frame_counts = (
+            len(frame_counts) == n
+            and all(
+                count > start
+                for count, start in zip(frame_counts, clip_start_frames)
+            )
         )
-    )
+    if source_prefix_mode and not valid_frame_counts:
+        raise PostDecodeStageError(
+            "Source-prefix output frame counts could not be established",
+            stage="concat", code="concat_source_prefix_invalid",
+        )
     if any(clip_start_frames):
         if not detected_fps or detected_fps <= 0:
             raise PostDecodeStageError(
@@ -9578,10 +10216,16 @@ def concatenate_multi_clip_videos(
                 stage="concat", code="concat_overlap_invalid",
             )
     if valid_frame_counts:
-        exact_output_frames = sum(
-            count - start
-            for count, start in zip(frame_counts, clip_start_frames)
-        )
+        if source_prefix_mode:
+            exact_output_frames = source_prefix_info["retained_frames"] + sum(
+                count - start
+                for count, start in zip(frame_counts, clip_start_frames[1:])
+            )
+        else:
+            exact_output_frames = sum(
+                count - start
+                for count, start in zip(frame_counts, clip_start_frames)
+            )
 
     # Build ffmpeg command with concat filter
     cmd = [ffmpeg_bin, "-y"]
@@ -9594,7 +10238,48 @@ def concatenate_multi_clip_videos(
     video_labels = []
     audio_labels = []
     trim_filters = []
+    if source_prefix_mode:
+        prefix_duration = (
+            source_prefix_info["retained_frames"] / detected_fps
+        )
+        width = source_prefix_info["width"]
+        height = source_prefix_info["height"]
+        prefix_before_geometry, prefix_after_geometry = (
+            _h3_source_prefix_temporal_filter_parts(
+                source_prefix_info["source_native_frames"],
+                source_prefix_info["retained_frames"],
+                detected_fps,
+            )
+        )
+        trim_filters.append(
+            f"[0:v:0]{prefix_before_geometry},"
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease:flags=lanczos,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+            f"setsar=1,{prefix_after_geometry}[source_prefix_video]"
+        )
+        audio_rate = source_prefix_info["generated_audio_rate"]
+        audio_layout = source_prefix_info["generated_audio_layout"]
+        if source_prefix_info["source_has_audio"]:
+            trim_filters.append(
+                "[0:a:0]"
+                "asetpts=PTS-STARTPTS,"
+                f"aresample={audio_rate},"
+                f"aformat=sample_rates={audio_rate}:channel_layouts={audio_layout},"
+                "apad,"
+                f"atrim=duration={prefix_duration:.9f},"
+                "asetpts=PTS-STARTPTS[source_prefix_audio]"
+            )
+        else:
+            trim_filters.append(
+                f"anullsrc=r={audio_rate}:cl={audio_layout},"
+                f"atrim=duration={prefix_duration:.9f},"
+                "asetpts=PTS-STARTPTS[source_prefix_audio]"
+            )
+        video_labels.append("[source_prefix_video]")
+        audio_labels.append("[source_prefix_audio]")
     for index, start_frame in enumerate(clip_start_frames):
+        if source_prefix_mode and index == 0:
+            continue
         if start_frame:
             trim_filters.append(
                 f"[{index}:v]trim=start_frame={start_frame},setpts=PTS-STARTPTS[v{index}]"
@@ -9700,13 +10385,16 @@ def concatenate_multi_clip_videos(
     # keeping it aligned with the overlaid audio track.
     if detected_fps and detected_fps > 0:
         cmd += ["-r", str(detected_fps), "-vsync", "cfr"]
-    if exact_output_frames is not None:
+    if exact_output_frames is not None and not source_prefix_mode:
         cmd += ["-frames:v", str(exact_output_frames)]
 
     cmd += ["-c:v", "libx264", "-crf", "18", "-preset", "fast",
             "-pix_fmt", "yuv420p", output_path_ffmpeg]
 
-    print(f"[Multi-Clip] Running: {' '.join(cmd[:6])} ... [{n} inputs] ... {' '.join(cmd[-8:])}")
+    if source_prefix_mode:
+        print("[Multi-Clip] Normalizing sealed source prefix and joining generated clips")
+    else:
+        print(f"[Multi-Clip] Running: {' '.join(cmd[:6])} ... [{n} inputs] ... {' '.join(cmd[-8:])}")
 
     def _remove_partial_output():
         try:
@@ -9719,7 +10407,23 @@ def concatenate_multi_clip_videos(
             )
 
     process = None
+    private_source_dir = None
+    private_source_path = None
     try:
+        if source_prefix_mode:
+            if abort_callback is not None and abort_callback():
+                _remove_partial_output()
+                return False
+            private_source_dir = tempfile.mkdtemp(prefix="maestro-h3-source-prefix-")
+            private_source_path = _snapshot_h3_source_prefix(
+                source_prefix, private_source_dir, abort_callback,
+            )
+            if private_source_path is None:
+                _remove_partial_output()
+                return False
+            source_input = cmd.index("-i") + 1
+            cmd[source_input] = private_source_path.replace("\\", "/")
+
         if abort_callback is None:
             completed = subprocess.run(
                 cmd,
@@ -9760,6 +10464,10 @@ def concatenate_multi_clip_videos(
 
         if returncode != 0:
             err = stderr or ""
+            if source_prefix_mode:
+                err = err.replace(source_prefix_info["path"], "[source prefix]")
+                if private_source_path:
+                    err = err.replace(private_source_path, "[source prefix]")
             error_lines = [l for l in err.split('\n')
                            if any(k in l.lower() for k in ['error', 'fail', 'invalid',
                                                             'no such', 'not found',
@@ -9780,6 +10488,20 @@ def concatenate_multi_clip_videos(
         # Verify output file has content; an ffmpeg zero-byte success is not a
         # usable artifact and must not survive without ownership metadata.
         if os.path.isfile(output_path) and os.path.getsize(output_path) > 0:
+            if source_prefix_mode:
+                if abort_callback is not None and abort_callback():
+                    _remove_partial_output()
+                    return False
+                if not _verify_h3_source_prefix_output(
+                    output_path, exact_output_frames, detected_fps,
+                    source_prefix_info["width"], source_prefix_info["height"],
+                    ffprobe_bin,
+                ):
+                    _remove_partial_output()
+                    raise PostDecodeStageError(
+                        "Source-prefix output failed exact video-frame or bounded audio-presentation validation",
+                        stage="concat", code="concat_source_prefix_output_invalid",
+                    )
             size_mb = os.path.getsize(output_path) / (1024 * 1024)
             print(f"[Multi-Clip] Output: {size_mb:.1f} MB")
             return True
@@ -9805,13 +10527,25 @@ def concatenate_multi_clip_videos(
     except PostDecodeStageError:
         raise
     except Exception as e:
-        print(f"[Multi-Clip] Concatenation failed: {e}")
+        if source_prefix_mode:
+            print("[Multi-Clip] Source-prefix concatenation failed")
+        else:
+            print(f"[Multi-Clip] Concatenation failed: {e}")
         _remove_partial_output()
         raise PostDecodeStageError(
             "ffmpeg concatenation raised an exception",
             stage=failure_stage,
             code=f"{failure_code_prefix}_exception",
         ) from e
+    finally:
+        if private_source_dir is not None:
+            try:
+                shutil.rmtree(private_source_dir)
+            except OSError as cleanup_error:
+                print(
+                    "[Multi-Clip] Warning: could not remove private source-prefix temporary files: "
+                    f"{type(cleanup_error).__name__}"
+                )
 
 _AUDIO_TRANSCODE_CACHE = {}
 
@@ -14034,6 +14768,7 @@ def _generate_video_impl(
                     })
                 embedded_images = {img_name: inputs[img_name] for img_name in image_names_list } if server_config.get("embed_source_images", False) else None
                 configs = prepare_inputs_dict("metadata", inputs, model_type)
+                configs = _redact_h3_source_prefix_path_for_metadata(configs)
                 if sliding_window: configs["window_no"] = window_no
                 configs["prompt"] = "\n".join(original_prompts)
                 if prompt_enhancer_image_caption_model != None and prompt_enhancer !=None and len(prompt_enhancer)>0 and enhancer_mode != 1:
@@ -14393,7 +15128,10 @@ def _generate_video_impl(
                     # A one-shot Director timeline is already the finished
                     # video. Registering a one-item "group" created a second,
                     # byte-equivalent _multiclip file for no useful purpose.
-                    and int(multi_clip_info.get("total", 0) or 0) > 1
+                    and (
+                        int(multi_clip_info.get("total", 0) or 0) > 1
+                        or multi_clip_info.get("source_prefix") is not None
+                    )
                     and not multi_clip_info.get("defer_concat", False)
                 ):
                     clip_path = video_path[0] if isinstance(video_path, list) else video_path
@@ -14426,10 +15164,15 @@ def _generate_video_impl(
                         preserve_generated_audio = bool(
                             multi_clip_info.get("preserve_generated_audio")
                         )
+                        source_prefix = multi_clip_info.get("source_prefix")
                         concat_audio = (
-                            audio_source
-                            if preserve_generated_audio
-                            else (original_audio_guide or audio_source)
+                            None
+                            if source_prefix is not None
+                            else (
+                                audio_source
+                                if preserve_generated_audio
+                                else (original_audio_guide or audio_source)
+                            )
                         )
                         concat_ext = os.path.splitext(clip_path)[1]
                         concat_name = (
@@ -14451,6 +15194,7 @@ def _generate_video_impl(
                                 group[i]["discard_prefix_frames"]
                                 for i in range(multi_clip_info["total"])
                             ],
+                            source_prefix=source_prefix,
                         )
                         if concat_succeeded:
                             print(f"[Multi-Clip] Concatenated video saved: {concat_path}")
@@ -14472,21 +15216,25 @@ def _generate_video_impl(
                                     for i in range(multi_clip_info["total"])
                                 )
                             )
-                            concat_configs["image_start"] = [
-                                group[i]["image_start"]
-                                for i in range(multi_clip_info["total"])
-                            ]
+                            concat_configs["image_start"] = (
+                                _multi_clip_image_start_metadata(
+                                    group, multi_clip_info["total"], source_prefix,
+                                )
+                            )
                             concat_configs["multi_prompts_gen_type"] = 3
                             concat_configs["video_length"] = sum(
                                 int(group[i].get("published_frames") or 0)
                                 for i in range(multi_clip_info["total"])
+                            ) + int(
+                                (source_prefix or {}).get("retained_frames", 0)
+                                or 0
                             )
                             concat_configs["sliding_window_size"] = (
                                 0
                                 if multi_clip_info.get("automatic_h3_longform")
                                 else video_length
                             )
-                            if preserve_generated_audio:
+                            if source_prefix is not None or preserve_generated_audio:
                                 concat_configs.pop("audio_guide", None)
                             elif original_audio_guide:
                                 concat_configs["audio_guide"] = original_audio_guide

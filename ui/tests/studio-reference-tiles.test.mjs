@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { transform } from 'esbuild'
 
 const inputs = readFileSync(new URL('../src/components/Sidebar/InputsPanel.tsx', import.meta.url), 'utf8')
+const continueVideoSection = readFileSync(new URL('../src/components/Sidebar/ContinueVideoSection.tsx', import.meta.url), 'utf8')
 const applyLib = readFileSync(new URL('../src/lib/studioSemanticReferences.ts', import.meta.url), 'utf8')
 const library = readFileSync(new URL('../src/components/Sidebar/ProjectReferenceLibrary.tsx', import.meta.url), 'utf8')
 const attachmentLib = readFileSync(new URL('../src/lib/generateAttachmentOptions.ts', import.meta.url), 'utf8')
@@ -43,6 +44,55 @@ test('Generate attachment helper keeps honest labels and disable-to-end order', 
   assert.match(attachmentLib, /Project reference/)
   assert.match(attachmentLib, /function orderGenerateAttachmentOptions/)
   assert.match(attachmentLib, /function filterProjectReferenceChoices/)
+})
+
+test('H3 Extend uses a fixed last-frame anchor while other models keep the source-strength slider', async () => {
+  const start = inputs.indexOf('      {/* Option strip — extend source: source video strength */}')
+  const end = inputs.indexOf('      {/* Option strip — soundtrack: audio strength + processing flags */}', start)
+  assert.ok(start >= 0 && end > start)
+  assert.match(inputs, /const h3Extend = isExtend && h3StudioWorkflow/)
+  const result = await transform(`
+    const Fragment = 'fragment'
+    function node(type, props, ...children) { return { type, props: props || {}, children } }
+    function Strip(props) { return node('strip', props) }
+    function Row(props) { return node('row', props) }
+    export function render({selected, continueVideo, h3Extend, inputVideoStrength, setParam}) {
+      return <>${inputs.slice(start, end)}</>
+    }
+  `, { loader: 'tsx', format: 'esm', jsxFactory: 'node', jsxFragment: 'Fragment' })
+  const { render } = await import(`data:text/javascript;base64,${Buffer.from(result.code).toString('base64')}`)
+  const walk = value => Array.isArray(value)
+    ? value.flatMap(walk)
+    : value && typeof value === 'object'
+      ? [value, ...walk(value.props?.children), ...walk(value.children)]
+      : []
+  const treeText = value => Array.isArray(value)
+    ? value.map(treeText).join('')
+    : value && typeof value === 'object'
+      ? `${treeText(value.props?.children)}${treeText(value.children)}`
+      : value == null ? '' : String(value)
+  const renderStrip = h3Extend => render({
+    selected: 'extend',
+    continueVideo: { filename: 'source.mp4' },
+    h3Extend,
+    inputVideoStrength: 0.75,
+    setParam() {},
+  })
+
+  const h3Tree = renderStrip(true)
+  assert.equal(walk(h3Tree).filter(value => value.type === 'input' && value.props.type === 'range').length, 0)
+  assert.match(treeText(h3Tree), /last retained frame as a fixed anchor/)
+  assert.match(treeText(h3Tree), /source motion and audio do not guide generation/)
+
+  const otherTree = renderStrip(false)
+  const range = walk(otherTree).find(value => value.type === 'input' && value.props.type === 'range')
+  assert.ok(range)
+  assert.equal(range.props.step, 0.05)
+  assert.match(treeText(otherTree), /1\.0 = seamless continuation/)
+
+  assert.match(continueVideoSection, /continueVideo && !isH3Extend/)
+  assert.match(continueVideoSection, /The source clip is re-encoded and kept first/)
+  assert.match(continueVideoSection, /New content will be appended after the source video/)
 })
 
 void fileURLToPath

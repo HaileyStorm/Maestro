@@ -3,14 +3,28 @@ import { X, Film } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
 import * as api from '../../api/client'
 
+const H3_EXTEND_MODELS = new Set([
+  'minimax_h3',
+  'minimax_h3_pinkcherry_fl2va',
+  'minimax_h3_w4a8_fl2va',
+  'minimax_h3_ref2va',
+])
+
 export function ContinueVideoSection() {
   const continueVideo = useStore(s => s.continueVideo)
   const continueVideoUrl = useStore(s => s.continueVideoUrl)
   const continueVideoDuration = useStore(s => s.continueVideoDuration)
   const setContinueVideo = useStore(s => s.setContinueVideo)
   const clearContinueVideo = useStore(s => s.clearContinueVideo)
+  const params = useStore(s => s.params)
+  const modelOptions = useStore(s => s.modelOptions)
   const inputVideoStrength = useStore(s => s.params.input_video_strength ?? 1.0)
   const setParam = useStore(s => s.setParam)
+  const isH3Extend = Number(params.image_mode) === 3 && (
+    H3_EXTEND_MODELS.has(String(params.model_type))
+    || modelOptions?.architecture === 'minimax_h3'
+    || modelOptions?.architecture === 'minimax_h3_ref2va'
+  )
 
   const [error, setError] = useState<string | null>(null)
   const [uploading, setUploading] = useState(false)
@@ -105,7 +119,7 @@ export function ContinueVideoSection() {
       {error && <p className="text-[10px] text-red-400">{error}</p>}
 
       {/* Source video strength slider */}
-      {continueVideo && (
+      {continueVideo && !isH3Extend && (
         <div>
           <div className="flex items-center justify-between mb-1">
             <label className="text-[10px] text-text-muted">Source Video Strength</label>
@@ -126,7 +140,9 @@ export function ContinueVideoSection() {
 
       {continueVideo && (
         <p className="text-[10px] text-text-muted text-center">
-          New content will be appended after the source video
+          {isH3Extend
+            ? 'The source clip is re-encoded and kept first. The first added segment uses its last retained frame as a fixed anchor; source motion and audio do not guide generation. When present, source audio is preserved, and generated audio follows it.'
+            : 'New content will be appended after the source video'}
         </p>
       )}
     </div>

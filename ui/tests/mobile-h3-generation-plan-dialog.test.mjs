@@ -283,6 +283,26 @@ function planWithDuration() {
   }
 }
 
+function planWithSourcePrefix() {
+  const current = plan()
+  return {
+    ...current,
+    clip_count: 1,
+    segments: current.segments.slice(0, 1),
+    source_prefix: {
+      source_frames: 108,
+      source_duration_seconds: 4.5,
+      added_frames: 72,
+      added_duration_seconds: 3,
+      final_output_frames: 180,
+      final_output_duration_seconds: 7.5,
+      conditioning: 'last_frame',
+      source_audio_preserved: true,
+      generated_audio_preserved: true,
+    },
+  }
+}
+
 function resetHarness(document, store, refs, nowMs = 1_000_000) {
   globalThis.document = document
   globalThis.HTMLElement = FakeElement
@@ -436,6 +456,7 @@ test('rendered H3 plan portals to body, captures its opener, and fences every mo
   assert.match(sourceMapText, /Planned source events show where the saved plan places each beat/)
   assert.match(sourceMapText, /Source 1, event 1 · continues beyond this segment/)
   assert.match(sourceMapText, /Source 1, event 1 · continued from earlier segment/)
+  assert.doesNotMatch(sourceMapText, /Source video: \d/)
 
   const closeControls = findNodes(tree, node => node.props?.['aria-label'] === 'Close long-video plan review')
   assert.equal(closeControls.length, 2)
@@ -543,6 +564,50 @@ test('loading and expired review states cannot dismiss or resubmit stale plan wo
   assert.equal(cancels, 0)
   assert.match(nodeText(tree), /Approving the saved plan unchanged/)
   assert.equal(findNodes(tree, node => node.props?.role === 'alert').length, 1)
+})
+
+test('H3 Extend review shows source, added, and total durations with fixed last-frame guidance', async t => {
+  const Dialog = await loadDialog()
+  const document = new FakeDocument()
+  const dialog = new FakeElement(document, 'rendered H3 dialog')
+  const closeButton = new FakeElement(document, 'rendered H3 close')
+  document.appRoot = new FakeElement(document, 'app root')
+  document.activeElement = new FakeElement(document, 'opener')
+  const store = {
+    pendingH3Plan: planWithSourcePrefix(),
+    pendingH3PlanEstimate: null,
+    pendingH3PlanJobId: 'review-job',
+    pendingH3PlanWorkspace: 'project one',
+    jobs: [{ id: 'review-job', status: 'waiting_for_plan_approval', planReviewDeadline: 2_000 }],
+    h3PlanReviewLoading: false,
+    h3PlanReviewError: null,
+    models: [],
+    activeWorkspace: 'project one',
+    hostTerms: { minimax_h3_ref2va: { accepted: true } },
+    hostTermsLoading: false,
+    hostTermsError: null,
+    loadHostTerms() {},
+    acceptHostTerm() {},
+    closeH3PlanReview() {},
+    approveH3Plan() {},
+    cancelH3Plan() {},
+  }
+  resetHarness(document, store, { dialog, close: closeButton })
+  t.after(() => {
+    delete globalThis.document
+    delete globalThis.window
+    delete globalThis.HTMLElement
+  })
+
+  const tree = render(Dialog)
+  const sourceDetails = findNodes(tree, node => node.props?.['aria-label'] === 'Source video extension details')[0]
+  assert.ok(sourceDetails)
+  const dialogText = nodeText(tree)
+  assert.match(dialogText, /Source video: 4\.5s \(108 frames\) · Added: 3s \(72 frames\) · Total: 7\.5s \(180 frames\)/)
+  assert.match(nodeText(sourceDetails), /re-encodes and keeps the source clip at the start/)
+  assert.match(nodeText(sourceDetails), /first added segment uses only its last retained frame as a fixed visual anchor/)
+  assert.match(nodeText(sourceDetails), /Source motion and audio do not guide generated segments/)
+  assert.match(nodeText(sourceDetails), /When present, source audio is preserved, and generated audio follows it/)
 })
 
 test('duration controls preserve server authority, locks, revision, and exact approval intent', async t => {

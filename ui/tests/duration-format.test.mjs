@@ -82,7 +82,7 @@ test('Generate duration surfaces share the canonical display formatters', async 
   assert.match(slider, /formatMediaDuration\(duration\)/)
   assert.match(slider, /formatMediaDuration\(windowSize\)/)
   assert.match(profiles, /formatApproximateDuration\(seconds, ''\)/)
-  assert.match(plan, /formatMediaDuration\(planPublishedFrames \/ planFps\)/)
+  assert.match(plan, /formatMediaDuration\(sourcePrefixSummary\?\.final_output_duration_seconds \?\? planPublishedFrames \/ planFps\)/)
   assert.match(plan, /formatApproximateDuration\(seconds, 'calculating…'\)/)
   assert.match(queue, /formatApproximateDuration\(job\.etaSeconds\)/)
   assert.match(queue, /formatMediaDuration\(publishedSeconds\)/)

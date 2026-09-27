@@ -168,6 +168,56 @@ class QueueFinalAdoptionTests(unittest.TestCase):
             ))
         return {"components": components, "finals": finals}
 
+    def _single_source_prefix_job(
+        self, job_id: str, *, concat_prefix: dict | None = None,
+    ) -> dict:
+        prefix = {
+            "version": 1,
+            "input_field": "video_source:0",
+            "source_native_frames": 125,
+            "retained_frames": 120,
+            "output_fps": 24,
+            "fit": "contain",
+            "conditioning": "last_frame",
+            "audio_policy": "preserve_source_then_generated",
+            "sha256": hashlib.sha256(b"source").hexdigest(),
+            "size": 6,
+        }
+        component_name = f"{job_id}-generated.mp4"
+        component_data = b"generated-segment"
+        segment_settings = {
+            "discard_prefix_frames": 0,
+            "trim_tail_frames": 0,
+            "source_prefix": prefix,
+        }
+        segment = self._base_meta(
+            job_id=job_id, kind="h3_segment", variant=0, index=0,
+            output_index=0, output_total=1, dependencies=[],
+            settings=segment_settings, artifacts=[component_name],
+        )
+        segment["private"] = False
+        self._quarantined_pair(component_name, component_data, segment)
+        final_name = f"{job_id}-final.mp4"
+        final = self._base_meta(
+            job_id=job_id, kind="h3_concat", variant=0, index=0,
+            output_index=0, output_total=1,
+            dependencies=[segment["producer_unit_id"]],
+            settings={
+                "clip_start_frames": [0],
+                "clip_tail_frames": [0],
+                "component_hashes": [
+                    hashlib.sha256(component_data).hexdigest(),
+                ],
+                "source_prefix": (
+                    prefix if concat_prefix is None else concat_prefix
+                ),
+            },
+            artifacts=[final_name],
+        )
+        final["private"] = False
+        self._quarantined_pair(final_name, b"source-plus-generated", final)
+        return {"component": component_name, "final": final_name}
+
     def _delivery_job(self, job_id: str, total: int) -> dict:
         dependencies = []
         components = []
@@ -306,6 +356,35 @@ class QueueFinalAdoptionTests(unittest.TestCase):
         self.assertEqual(summary["adopted_groups"], 1)
         self.assertEqual(summary["quarantined_groups"], 0)
         self.assertTrue((self.project / "job-public-h3-v0-final.mp4").is_file())
+
+    def test_adopts_one_generated_segment_only_with_bound_source_prefix(self):
+        good = self._single_source_prefix_job("job-source-one")
+        summary = adopt_quarantined_final_groups(
+            self.project, workspace=self.workspace,
+        )
+        self.assertEqual(summary["adopted_groups"], 1)
+        self.assertTrue((self.project / good["final"]).is_file())
+        self.assertTrue((self.project / good["component"]).is_file())
+
+    def test_rejects_one_segment_when_concat_prefix_differs(self):
+        self._single_source_prefix_job(
+            "job-source-mismatch",
+            concat_prefix={
+                "version": 1, "input_field": "video_source:0",
+                "source_native_frames": 125, "retained_frames": 120,
+                "output_fps": 24, "fit": "contain",
+                "conditioning": "last_frame",
+                "audio_policy": "preserve_source_then_generated",
+                "sha256": "0" * 64, "size": 6,
+            },
+        )
+        summary = adopt_quarantined_final_groups(
+            self.project, workspace=self.workspace,
+        )
+        self.assertEqual(summary["adopted_groups"], 0)
+        self.assertFalse(
+            (self.project / "job-source-mismatch-final.mp4").exists()
+        )
 
     def test_adopts_exact_four_plus_one_with_attested_components(self):
         first = self._concat_job("job-four", 4)

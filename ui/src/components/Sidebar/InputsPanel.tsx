@@ -540,6 +540,7 @@ export function InputsPanel() {
     || modelOptions?.architecture === 'minimax_h3'
     || modelOptions?.architecture === 'minimax_h3_ref2va'
   )
+  const h3Extend = isExtend && h3StudioWorkflow
   const h3AdaptiveConditioning = params.h3_adaptive_conditioning !== false
   const dedicatedRef2VAMode = (
     params.model_type === 'minimax_h3_ref2va'
@@ -2008,10 +2009,18 @@ export function InputsPanel() {
       {/* Option strip — extend source: source video strength */}
       {selected === 'extend' && continueVideo && (
         <Strip>
-          <Row label="Source video strength" value={inputVideoStrength.toFixed(2)} />
-          <input type="range" min={0} max={1} step={0.05} value={inputVideoStrength}
-            onChange={e => setParam('input_video_strength', parseFloat(e.target.value))} className="w-full h-1 accent-accent-blue" />
-          <p className="text-[9px] text-text-muted">1.0 = seamless continuation; lower gives more creative freedom. New content is appended after the source.</p>
+          {h3Extend ? (
+            <p className="text-[9px] leading-relaxed text-text-muted">
+              The source clip is re-encoded and kept first. The first added segment uses its last retained frame as a fixed anchor; source motion and audio do not guide generation. When present, source audio is preserved, and generated audio follows it.
+            </p>
+          ) : (
+            <>
+              <Row label="Source video strength" value={inputVideoStrength.toFixed(2)} />
+              <input type="range" min={0} max={1} step={0.05} value={inputVideoStrength}
+                onChange={e => setParam('input_video_strength', parseFloat(e.target.value))} className="w-full h-1 accent-accent-blue" />
+              <p className="text-[9px] text-text-muted">1.0 = seamless continuation; lower gives more creative freedom. New content is appended after the source.</p>
+            </>
+          )}
         </Strip>
       )}
 

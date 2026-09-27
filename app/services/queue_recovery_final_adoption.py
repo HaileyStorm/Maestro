@@ -11,6 +11,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -35,6 +36,30 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _FINAL_KINDS = {"h3_concat", "h3_delivery", "ordinary_repeat"}
 _UNIT_KINDS = _FINAL_KINDS | {"h3_segment"}
 _thread_lock = threading.RLock()
+
+
+def _valid_h3_source_prefix_identity(value: object) -> bool:
+    """Permit a one-segment final only with a complete sealed source policy."""
+    if not isinstance(value, dict):
+        return False
+    return bool(
+        type(value.get("version")) is int and value["version"] == 1
+        and value.get("input_field") == "video_source:0"
+        and type(value.get("source_native_frames")) is int
+        and value["source_native_frames"] > 0
+        and type(value.get("retained_frames")) is int
+        and value["retained_frames"] > 0
+        and type(value.get("output_fps")) in {int, float}
+        and math.isfinite(value["output_fps"])
+        and value["output_fps"] > 0
+        and value.get("fit") == "contain"
+        and value.get("conditioning") == "last_frame"
+        and value.get("audio_policy") == "preserve_source_then_generated"
+        and type(value.get("sha256")) is str
+        and _SHA256.fullmatch(value["sha256"]) is not None
+        and type(value.get("size")) is int and value["size"] > 0
+        and "path" not in value
+    )
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -607,6 +632,22 @@ def _semantic_dependencies_valid(
             settings.get("component_hashes") == actual_hashes
             and settings.get("clip_start_frames") == start_trims
             and settings.get("clip_tail_frames") == tail_trims
+        )
+        first_settings = (
+            valid_units[dependencies[0]][0]["settings"]
+            if dependencies else None
+        )
+        expected_prefix = (
+            first_settings.get("source_prefix")
+            if isinstance(first_settings, dict) else None
+        )
+        result = bool(
+            result
+            and settings.get("source_prefix") == expected_prefix
+            and (
+                expected_prefix is None
+                or _valid_h3_source_prefix_identity(expected_prefix)
+            )
         )
         _memo[unit_id] = result
         return result
@@ -1227,7 +1268,14 @@ def _component_group_for_adopted_final(
             or meta.get("producer_unit_id") != final["unit_id"]
             or meta.get("producer_unit_variant") != final["output_index"]
             or not isinstance(dependencies, list)
-            or len(dependencies) < 2
+            or not dependencies
+            or (
+                len(dependencies) == 1
+                and not _valid_h3_source_prefix_identity(
+                    settings.get("source_prefix")
+                    if isinstance(settings, dict) else None
+                )
+            )
             or not isinstance(settings, dict)
         ):
             return None

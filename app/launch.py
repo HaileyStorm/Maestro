@@ -9688,6 +9688,21 @@ def _h3_dependency_closed_recovery_units(verified: list[dict]) -> list[dict]:
                     )
                 ):
                     continue
+                first_settings = (
+                    accepted_by_id[dependencies[0]].get("settings")
+                    if dependencies else None
+                )
+                expected_prefix = (
+                    first_settings.get("source_prefix")
+                    if isinstance(first_settings, dict) else None
+                )
+                if settings.get("source_prefix") != expected_prefix:
+                    continue
+                if expected_prefix is not None:
+                    try:
+                        _h3_source_prefix_identity(expected_prefix)
+                    except QueueRecoveryRuntimeError:
+                        continue
             dependency_closed.append(unit)
             accepted_by_id[str(unit.get("unit_id") or "")] = unit
             admitted.append(unit)
@@ -10092,6 +10107,10 @@ def _h3_segment_recovery_settings(clip_info: dict) -> dict:
         "published_frames": published,
         "trim_tail_frames": tail,
     }
+    if int(clip_info.get("index", -1)) == 0 and clip_info.get("source_prefix"):
+        result["source_prefix"] = _h3_source_prefix_identity(
+            clip_info["source_prefix"],
+        )
     peak_identity = clip_info.get("peak_recovery_identity")
     if isinstance(peak_identity, dict):
         # This identity is versioned and present only on newly replanned
@@ -10166,6 +10185,163 @@ def _h3_segment_recovery_settings(clip_info: dict) -> dict:
             raise QueueRecoveryRuntimeError("H3 mapping receipt disagrees with segment geometry or checkpoint.")
         result["prompt_mapping"] = receipt
     return result
+
+
+def _h3_source_prefix_identity(prefix: dict) -> dict:
+    """Keep source bytes and assembly policy in recovery IDs, never its path."""
+    if not isinstance(prefix, dict):
+        raise QueueRecoveryRuntimeError("H3 source prefix metadata is invalid.")
+    try:
+        identity = {
+            key: prefix[key]
+            for key in (
+                "version", "input_field", "source_native_frames",
+                "retained_frames", "output_fps", "fit", "conditioning",
+                "audio_policy", "sha256", "size",
+            )
+        }
+        valid = (
+            type(identity["version"]) is int and identity["version"] == 1
+            and identity["input_field"] == "video_source:0"
+            and type(identity["source_native_frames"]) is int
+            and identity["source_native_frames"] > 0
+            and type(identity["retained_frames"]) is int
+            and identity["retained_frames"] > 0
+            and type(identity["output_fps"]) in {int, float}
+            and math.isfinite(identity["output_fps"])
+            and identity["output_fps"] > 0
+            and identity["fit"] == "contain"
+            and identity["conditioning"] == "last_frame"
+            and identity["audio_policy"] == "preserve_source_then_generated"
+            and type(identity["sha256"]) is str
+            and re.fullmatch(r"[0-9a-f]{64}", identity["sha256"])
+            and type(identity["size"]) is int and identity["size"] > 0
+        )
+    except (KeyError, TypeError, ValueError):
+        valid = False
+    if not valid:
+        raise QueueRecoveryRuntimeError("H3 source prefix identity is invalid.")
+    return identity
+
+
+def _h3_source_prefix_frame_counts(
+    source_path: str, source_limit, output_fps: float,
+) -> dict:
+    """Measure the sealed source and apply Studio's output-frame trim units."""
+    try:
+        source_fps, _width, _height, _estimated_frames = wgp.get_video_info(
+            source_path,
+        )
+        source_fps = float(source_fps)
+        source_frames = int(wgp.get_exact_video_frame_count(source_path))
+    except (TypeError, ValueError, OSError, RuntimeError) as exc:
+        raise ValueError(
+            "The Extend source video could not be measured."
+        ) from exc
+    if (
+        not math.isfinite(source_fps) or source_fps <= 0
+        or source_frames <= 0
+        or not math.isfinite(output_fps) or output_fps <= 0
+    ):
+        raise ValueError("The Extend source video has no usable frames.")
+    total_prefix_frames = max(
+        1, int(round(source_frames * output_fps / source_fps)),
+    )
+    retained_frames = total_prefix_frames
+    if source_limit not in (None, ""):
+        try:
+            requested_limit = int(source_limit)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "The Extend source frame limit must be an integer."
+            ) from exc
+        if requested_limit == 0:
+            raise ValueError("The Extend source frame limit cannot be zero.")
+        retained_frames = (
+            min(total_prefix_frames, requested_limit)
+            if requested_limit > 0
+            else total_prefix_frames + requested_limit
+        )
+        if retained_frames <= 0:
+            raise ValueError(
+                "The Extend source frame limit removes the whole video."
+            )
+    return {
+        "source_native_frames": source_frames,
+        "retained_frames": retained_frames,
+    }
+
+
+def _prepare_h3_source_prefix(
+    job: dict, plan: dict, *, abort_callback=None,
+) -> tuple[dict, str]:
+    """Rebuild the first FL2VA still from the sealed source after validation."""
+    source_plan = plan.get("source_prefix")
+    if not isinstance(source_plan, dict):
+        raise QueueRecoveryRuntimeError("H3 source prefix plan is missing.")
+    project_dir, descriptors = _load_h3_mapping_manifest_inputs(job)
+    matches = [
+        item for item in descriptors
+        if isinstance(item, dict) and item.get("field") == "video_source:0"
+    ]
+    if len(matches) != 1:
+        raise QueueRecoveryRuntimeError("H3 source input is not sealed.")
+    descriptor = matches[0]
+    source_path = str(descriptor.get("path") or "")
+    params = job.get("params") if isinstance(job.get("params"), dict) else {}
+    if (
+        not source_path
+        or os.path.realpath(source_path)
+            != os.path.realpath(str(params.get("video_source") or ""))
+    ):
+        raise QueueRecoveryRuntimeError("H3 source input identity changed.")
+    prefix = {
+        **source_plan,
+        "path": source_path,
+        "sha256": str(descriptor.get("sha256") or ""),
+        "size": descriptor.get("size"),
+    }
+    _h3_source_prefix_identity(prefix)
+    if abort_callback is not None and abort_callback():
+        raise InterruptedError("Extend source preparation cancelled.")
+    staging = ensure_recovery_staging_directory(project_dir)
+    snapshot = os.path.join(
+        staging,
+        f"unit-{job['id']}-h3-source-{prefix['sha256'][:16]}.media",
+    )
+    output = os.path.join(
+        staging,
+        f"unit-{job['id']}-h3-source-{prefix['sha256'][:16]}-last.png",
+    )
+    try:
+        wgp.snapshot_h3_source_prefix(
+            prefix, snapshot, abort_callback=abort_callback,
+        )
+        measured = _h3_source_prefix_frame_counts(
+            snapshot, params.get("keep_frames_video_source"),
+            float(prefix["output_fps"]),
+        )
+        if any(prefix[key] != value for key, value in measured.items()):
+            raise QueueRecoveryRuntimeError(
+                "The Extend source changed after planning."
+            )
+        prefix["path"] = snapshot
+        wgp.extract_h3_source_prefix_last_frame(
+            snapshot, output,
+            source_native_frames=prefix["source_native_frames"],
+            retained_frames=prefix["retained_frames"],
+            output_fps=prefix["output_fps"],
+            abort_callback=abort_callback,
+        )
+    except InterruptedError:
+        raise
+    except QueueRecoveryRuntimeError:
+        raise
+    except (OSError, IndexError, ValueError, RuntimeError) as exc:
+        raise QueueRecoveryRuntimeError(
+            "The Extend source's last frame could not be prepared."
+        ) from exc
+    return prefix, output
 
 
 def _h3_execution_shots_for_dispatch(
@@ -11073,6 +11249,18 @@ def _snapshot_h3_recovery_task_params(
         raise QueueRecoveryRuntimeError(
             "H3 task metadata snapshot is invalid."
         )
+    copied_clip_info = snapshot.get("multi_clip_info")
+    if isinstance(copied_clip_info, dict):
+        copied_prefix = copied_clip_info.get("source_prefix")
+        if isinstance(copied_prefix, dict):
+            copied_prefix.pop("path", None)
+            # This still is recreated from the sealed source for each run and
+            # is removed with private recovery staging. Do not publish a dead
+            # local path in segment/final settings metadata.
+            if copied_clip_info.get("index") == 0:
+                snapshot["image_start"] = None
+            snapshot.pop("video_source", None)
+            snapshot.pop("keep_frames_video_source", None)
     return snapshot
 
 
@@ -16551,6 +16739,36 @@ def _prepare_h3_long_studio_request(body: dict) -> dict | None:
     if maximum_frames <= 0:
         return None
 
+    source_prefix = None
+    source_video = body.get("video_source")
+    if source_video:
+        if not isinstance(source_video, str) or not os.path.isfile(source_video):
+            raise ValueError("The Extend source video is unavailable.")
+        if body.get("image_start"):
+            raise ValueError(
+                "H3 Extend uses the source video's last frame as its start. "
+                "Remove the separate start frame."
+            )
+        if body.get("h3_native_boundary_conditioning") is True:
+            raise ValueError(
+                "H3 Extend cannot use experimental native boundary conditioning."
+            )
+        # Studio's source cap is measured after resampling to the model FPS.
+        # Bind the full native source and cap only normalized output frames.
+        # This avoids estimating a native cutoff from average FPS for VFR media.
+        source_counts = _h3_source_prefix_frame_counts(
+            source_video, body.get("keep_frames_video_source"), fps,
+        )
+        source_prefix = {
+            "version": 1,
+            "input_field": "video_source:0",
+            **source_counts,
+            "output_fps": fps,
+            "fit": "contain",
+            "conditioning": "last_frame",
+            "audio_policy": "preserve_source_then_generated",
+        }
+
     if body.get("h3_adaptive_conditioning", True) is not False:
         fl2va_def = wgp.get_model_def("minimax_h3") or {}
         minimum_frames = max(
@@ -16593,7 +16811,7 @@ def _prepare_h3_long_studio_request(body: dict) -> dict | None:
         minimum_frames,
         min(maximum_frames, segment_maximum),
     )
-    if requested_frames <= segment_maximum:
+    if requested_frames <= segment_maximum and source_prefix is None:
         return None
 
     reference_mode = bool(model_def.get("minimax_h3_reference_mode"))
@@ -16607,6 +16825,9 @@ def _prepare_h3_long_studio_request(body: dict) -> dict | None:
         return value or None
 
     first_anchor = edge_anchor(body.get("image_start"))
+    planning_first_anchor = first_anchor or (
+        "__h3_source_last_frame__" if source_prefix else None
+    )
     last_anchor = edge_anchor(body.get("image_end"), last=True)
     # FL2VA's end anchor requires its native tail to be discarded. Generate
     # that tail inside the last legal H3 clip, then trim the aggregate exactly
@@ -16675,7 +16896,7 @@ def _prepare_h3_long_studio_request(body: dict) -> dict | None:
         source_family = "ref2va" if str(body.get("_h3_requested_checkpoint") or model_type) == _H3_REF2VA_MODEL else "base"
     provisional_models = _plan_h3_adaptive_models(
         body, clip_count=len(clip_frames), clip_boundaries=clip_boundaries,
-        first_anchor=first_anchor, last_anchor=last_anchor,
+        first_anchor=planning_first_anchor, last_anchor=last_anchor,
     )
     template_mapping_source = bool(global_prompt.strip()) and body.get("h3_adaptive_conditioning", True) is not False and source_family != "ref2va" and any(
         item.get("model_type") == _H3_REF2VA_MODEL for item in provisional_models
@@ -16702,14 +16923,14 @@ def _prepare_h3_long_studio_request(body: dict) -> dict | None:
         body,
         clip_count=len(clip_frames),
         clip_boundaries=clip_boundaries,
-        first_anchor=first_anchor,
+        first_anchor=planning_first_anchor,
         last_anchor=last_anchor,
     )
     _validate_h3_segment_plan(
         body,
         clip_frames=clip_frames,
         segment_models=segment_models,
-        first_anchor=first_anchor,
+        first_anchor=planning_first_anchor,
         last_anchor=last_anchor,
     )
 
@@ -16773,11 +16994,12 @@ def _prepare_h3_long_studio_request(body: dict) -> dict | None:
             "h3_adaptive_conditioning", True,
         ) is not False,
         "segment_models": segment_models,
-        "preserve_generated_audio": reference_mode or native_boundaries,
+        "preserve_generated_audio": reference_mode or native_boundaries or bool(source_prefix),
         "native_boundary_conditioning": native_boundaries,
         "global_prompt": global_prompt,
         "original_image_start": first_anchor,
         "original_image_end": last_anchor,
+        **({"source_prefix": source_prefix} if source_prefix else {}),
     }
     duration_contract_disabled = (
         body.pop("_h3_duration_contract_disabled", False) is True
@@ -16820,7 +17042,13 @@ def _public_h3_long_plan(
     plan: dict | None,
     requirements: dict | None = None,
 ) -> dict | None:
-    if not isinstance(plan, dict) or int(plan.get("clip_count") or 0) <= 1:
+    if (
+        not isinstance(plan, dict)
+        or (
+            int(plan.get("clip_count") or 0) <= 1
+            and not plan.get("source_prefix")
+        )
+    ):
         return None
     frames = list(plan.get("clip_frames") or [])
     stored_published_frames = plan.get("clip_published_frames")
@@ -16929,7 +17157,10 @@ def _public_h3_long_plan(
             "model_type": model.get("model_type"),
             "model_reason": model.get("reason"),
             "edge_anchor_locked": bool(
-                (index == 0 and plan.get("original_image_start"))
+                (index == 0 and (
+                    plan.get("original_image_start")
+                    or plan.get("source_prefix")
+                ))
                 or (
                     index == int(plan.get("clip_count") or 0) - 1
                     and plan.get("original_image_end")
@@ -16973,6 +17204,23 @@ def _public_h3_long_plan(
         "effective_models": effective_models,
         "segments": segments,
     }
+    source_prefix = plan.get("source_prefix")
+    if isinstance(source_prefix, dict):
+        source_frames = int(source_prefix.get("retained_frames") or 0)
+        generated_frames = int(public["published_frames"])
+        public["source_prefix"] = {
+            "conditioning": "last_frame",
+            "source_frames": source_frames,
+            "source_duration_seconds": source_frames / fps,
+            "added_frames": generated_frames,
+            "added_duration_seconds": generated_frames / fps,
+            "final_output_frames": source_frames + generated_frames,
+            "final_output_duration_seconds": (
+                source_frames + generated_frames
+            ) / fps,
+            "source_audio_preserved": True,
+            "generated_audio_preserved": True,
+        }
     target_published = int(
         plan.get("_duration_target_published_frames")
         or plan.get("published_frames")
@@ -42280,7 +42528,12 @@ async def preview_generation_plan(request: Request):
         if isinstance(estimate_payload, dict) else None
     )
     return {
-        "requires_review": bool(plan and int(plan.get("clip_count") or 0) > 1),
+        "requires_review": bool(
+            plan and (
+                int(plan.get("clip_count") or 0) > 1
+                or plan.get("source_prefix")
+            )
+        ),
         "plan": _public_h3_long_plan(plan, requirements),
         "effective_model_type": str(body.get("model_type") or ""),
         "requirements": requirements,
@@ -64234,6 +64487,28 @@ def _run_generation(
             h3_longform = raw_params.pop("_h3_longform", None)
             if not isinstance(h3_longform, dict):
                 h3_longform = None
+            h3_source_prefix = None
+            h3_source_start = None
+            if h3_longform and h3_longform.get("source_prefix"):
+                try:
+                    h3_source_prefix, h3_source_start = (
+                        _prepare_h3_source_prefix(
+                            job, h3_longform,
+                            abort_callback=lambda: is_cancel_requested(job),
+                        )
+                    )
+                except InterruptedError:
+                    finish_job(
+                        job, "cancelled",
+                        message="Extend source preparation cancelled.",
+                    )
+                    return False
+                except (QueueRecoveryRuntimeError, OSError, ValueError) as exc:
+                    finish_job(
+                        job, "failed", error=str(exc),
+                        message="The Extend source could not be prepared.",
+                    )
+                    return False
             if isinstance(h3_longform, dict) and "prompt_mapping_version" in h3_longform:
                 from services.h3_mapping_dispatch import resolve_h3_mapping_source_plan
                 h3_mapping_plan = resolve_h3_mapping_source_plan(h3_longform)
@@ -64452,6 +64727,19 @@ def _run_generation(
                         clip_params["_h3_conditioning_reason"] = str(
                             segment_plan.get("reason") or "adaptive conditioning"
                         )
+                    if h3_source_prefix:
+                        # The source is an immutable, sealed assembly input.
+                        # H3 receives only its last retained frame as the
+                        # first FL2VA anchor, never WGP's video-source overlap.
+                        clip_params.pop("video_source", None)
+                        clip_params.pop("keep_frames_video_source", None)
+                        clip_params["image_mode"] = 0
+                        clip_params["input_video_strength"] = 1.0
+                        prompt_type = str(
+                            clip_params.get("video_prompt_type") or ""
+                        )
+                        if prompt_type.endswith("T"):
+                            clip_params["video_prompt_type"] = prompt_type[:-1]
                     native_h3_boundaries = bool(
                         h3_longform
                         and h3_longform.get("native_boundary_conditioning")
@@ -64529,6 +64817,12 @@ def _run_generation(
                                 clip_params.pop(semantic_key, None)
                             clip_params["video_prompt_type"] = ""
                             clip_params["audio_prompt_type"] = ""
+                    if h3_source_prefix and i == 0:
+                        if segment_model not in _H3_FL2VA_MODELS:
+                            raise ValueError(
+                                "H3 Extend's first segment must use FL2VA."
+                            )
+                        clip_params["image_start"] = h3_source_start
                     # Set per-clip image_prompt_type based on which images are present
                     has_start = bool(clip_params.get("image_start"))
                     has_end = bool(clip_end)
@@ -64702,6 +64996,9 @@ def _run_generation(
                             "boundary_overlap_discard_frames": int(
                                 segment_plan.get("discard_frames") or 0
                             ),
+                            **({
+                                "source_prefix": copy.deepcopy(h3_source_prefix)
+                            } if h3_source_prefix else {}),
                         })
                         peak_identities = h3_longform.get(
                             "peak_recovery_identities"
@@ -65383,8 +65680,13 @@ def _run_generation(
 
             def _replay_h3_concat_from_verified_segments(
                 *, variant: int, total_segments: int, clip_info: dict,
+                h3_source_prefix: dict | None = None,
             ) -> dict:
                 """Rerun concat only; no denoising path is reachable here."""
+                if clip_info.get("source_prefix") != h3_source_prefix:
+                    raise QueueRecoveryRuntimeError(
+                        "Recovered H3 source prefix changed."
+                    )
                 component_names = []
                 component_hashes = []
                 dependencies = []
@@ -65460,6 +65762,22 @@ def _run_generation(
                         _h3_true_peak_policy_identity()
                     ),
                 }
+                if h3_source_prefix:
+                    identity = _h3_source_prefix_identity(h3_source_prefix)
+                    first_segment = _queue_recovery_unit_matches(
+                        job, kind="h3_segment", variant=variant,
+                        index=0, project_dir=out_dir,
+                    )
+                    if (
+                        first_segment is None
+                        or (first_segment.get("settings") or {}).get(
+                            "source_prefix"
+                        ) != identity
+                    ):
+                        raise QueueRecoveryRuntimeError(
+                            "Recovered H3 source prefix is not sealed."
+                        )
+                    settings["source_prefix"] = identity
                 unit_id = recovery_unit_id(
                     job_id,
                     "h3_concat",
@@ -65470,14 +65788,15 @@ def _run_generation(
                 extension = os.path.splitext(component_names[-1])[1] or ".mp4"
                 output_name = f"recovered_{job_id}_v{variant + 1}_multiclip{extension}"
                 preserve_audio = bool(clip_info.get("preserve_generated_audio"))
-                concat_audio = (
-                    raw_params.get("audio_source")
-                    if preserve_audio
-                    else (
+                if h3_source_prefix:
+                    concat_audio = None
+                elif preserve_audio:
+                    concat_audio = raw_params.get("audio_source")
+                else:
+                    concat_audio = (
                         raw_params.get("audio_guide")
                         or raw_params.get("audio_source")
                     )
-                )
 
                 concat_safety_evidence = {}
 
@@ -65489,6 +65808,7 @@ def _run_generation(
                         audio_start_sec=clip_info.get("audio_start_sec", 0),
                         clip_start_frames=clip_start_frames,
                         abort_callback=lambda: is_cancel_requested(job),
+                        source_prefix=h3_source_prefix,
                     )
                     if assembled is not True:
                         return assembled
@@ -65531,11 +65851,14 @@ def _run_generation(
                                 "variant": variant,
                             },
                         },
-                        task_params={
-                            **raw_params,
-                            "multi_clip_info": dict(clip_info),
-                            "h3_audio_true_peak": concat_safety_stats,
-                        },
+                        task_params=_snapshot_h3_recovery_task_params(
+                            {
+                                **raw_params,
+                                "multi_clip_info": dict(clip_info),
+                                "h3_audio_true_peak": concat_safety_stats,
+                            },
+                            clip_info,
+                        ),
                     )
                     unit = _queue_recovery_checkpoint_unit(
                         job,
@@ -65603,7 +65926,13 @@ def _run_generation(
                     )
                 return [str(predecessor["unit_id"])], evidence
 
-            is_multiclip = total_tasks > 1 and any(t.get('params', {}).get('multi_clip_info') for t in queue)
+            is_multiclip = bool(
+                (total_tasks > 1 or h3_source_prefix)
+                and any(
+                    t.get("params", {}).get("multi_clip_info")
+                    for t in queue
+                )
+            )
             automatic_h3_longform = any(
                 isinstance((task.get("params") or {}).get("multi_clip_info"), dict)
                 and (task.get("params") or {})["multi_clip_info"].get(
@@ -65750,6 +66079,7 @@ def _run_generation(
                             variant=recovery_variant,
                             total_segments=recovery_total,
                             clip_info=recovery_clip_info,
+                            h3_source_prefix=h3_source_prefix,
                         )
                     # Concat recovery above is deliberately standalone: a
                     # completed final native segment never re-enters denoising.
@@ -67310,6 +67640,31 @@ def _run_generation(
                                     _h3_true_peak_policy_identity()
                                 ),
                             }
+                            if h3_source_prefix:
+                                identity = _h3_source_prefix_identity(
+                                    h3_source_prefix,
+                                )
+                                if (
+                                    clip_info.get("source_prefix")
+                                    != h3_source_prefix
+                                ):
+                                    raise QueueRecoveryRuntimeError(
+                                        "H3 source prefix changed before publication."
+                                    )
+                                first_segment = _queue_recovery_unit_matches(
+                                    job, kind="h3_segment", variant=h3_variant,
+                                    index=0, project_dir=out_dir,
+                                )
+                                if (
+                                    first_segment is None
+                                    or (first_segment.get("settings") or {}).get(
+                                        "source_prefix"
+                                    ) != identity
+                                ):
+                                    raise QueueRecoveryRuntimeError(
+                                        "H3 source prefix is not sealed."
+                                    )
+                                concat_settings["source_prefix"] = identity
                             concat_safety_stats = gen.get(
                                 "h3_audio_true_peak"
                             )
