@@ -4,6 +4,7 @@ import { ArrowLeftRight, ChevronLeft, ChevronRight, Columns2, Eye, EyeOff, Film,
 import type { OutputFile } from '../../types'
 import { useStore } from '../../stores/useStore'
 import { closeModalIfTop, installModalFocus } from '../../lib/modalFocus'
+import { formatBytes, formatMediaDuration } from '../../lib/format'
 import {
   hidePrivatePreview,
   privatePreviewIdentity,
@@ -27,7 +28,7 @@ function ViewerImage({ file, alt, status, onReady, onFailure }: {
   file: OutputFile
   alt?: string
   status: 'loading' | 'ready' | 'error'
-  onReady: () => void
+  onReady: (width: number, height: number) => void
   onFailure: () => void
 }) {
   const [attempt, setAttempt] = useState(0)
@@ -59,7 +60,7 @@ function ViewerImage({ file, alt, status, onReady, onFailure }: {
       onLoad={event => {
         const image = event.currentTarget
         if (image.naturalWidth === 0 || image.naturalHeight === 0) retry()
-        else onReady()
+        else onReady(image.naturalWidth, image.naturalHeight)
       }}
       onError={retry}
     />
@@ -183,7 +184,13 @@ export function GalleryViewer({ files, initialIdentity, restoreFocus, onClose }:
   const [selectedIdentity, setSelectedIdentity] = useState(initialIdentity)
   const [compareMode, setCompareMode] = useState(false)
   const [revealVersion, setRevealVersion] = useState(0)
-  const [mediaStatus, setMediaStatus] = useState<{ identity: string; state: 'ready' | 'error' | 'unsupported-video' } | null>(null)
+  const [mediaStatus, setMediaStatus] = useState<{
+    identity: string
+    state: 'ready' | 'error' | 'unsupported-video'
+    width?: number
+    height?: number
+    duration?: number
+  } | null>(null)
   const [copyRequest, setCopyRequest] = useState<{ identity: string; state: 'submitting' | 'queued' | 'error'; jobId?: string; message?: string } | null>(null)
   const createBrowserCopy = useStore(state => state.createBrowserCopy)
   const copyJob = useStore(state => state.jobs.find(job => job.id === copyRequest?.jobId))
@@ -197,6 +204,7 @@ export function GalleryViewer({ files, initialIdentity, restoreFocus, onClose }:
   const file = media[selectedIndex]
   const fileIdentity = file && identity(file)
   const currentStatus = mediaStatus?.identity === fileIdentity ? mediaStatus.state : 'loading'
+  const currentMeasurement = currentStatus === 'ready' ? mediaStatus : null
   const currentCopyRequest = copyRequest?.identity === fileIdentity ? copyRequest : null
   const copyOutputVisible = Boolean(currentCopyRequest?.jobId && file && files.some(item =>
     item.workspace === file.workspace && item.name.endsWith(`_browser_copy_${currentCopyRequest.jobId}.mp4`)))
@@ -207,6 +215,13 @@ export function GalleryViewer({ files, initialIdentity, restoreFocus, onClose }:
   const comparisonOpen = compareMode && file?.type === 'image'
   void revealVersion
   const privateHidden = Boolean(file?.private && fileIdentity && !privatePreviewWasRevealed(fileIdentity))
+  const mediaFacts = [
+    currentMeasurement?.width && currentMeasurement.height
+      ? `${currentMeasurement.width} × ${currentMeasurement.height}` : null,
+    file?.type === 'video' && typeof currentMeasurement?.duration === 'number' && Number.isFinite(currentMeasurement.duration)
+      ? formatMediaDuration(currentMeasurement.duration) : null,
+    file && Number.isFinite(file.size) && file.size >= 0 ? formatBytes(file.size) : null,
+  ].filter((value): value is string => Boolean(value))
 
   const close = useCallback(() => {
     closeModalIfTop(document, dialogRef.current, onClose)
@@ -280,6 +295,11 @@ export function GalleryViewer({ files, initialIdentity, restoreFocus, onClose }:
           <div className="min-w-0 flex-1">
             <p className="truncate text-[11px] text-white/55">{file.workspace} · {selectedIndex + 1} of {media.length}</p>
             <h2 className="truncate text-sm font-medium" title={file.name}>{file.name}</h2>
+            {!privateHidden && mediaFacts.length > 0 && (
+              <p className="truncate text-[11px] text-white/55">
+                Media info: {mediaFacts.join(' · ')}
+              </p>
+            )}
           </div>
           {file.type === 'image' && (
             <button type="button" onClick={() => setCompareMode(mode => !mode)} disabled={!comparisonOpen && images.length < 2} aria-pressed={comparisonOpen} title={!comparisonOpen && images.length < 2 ? 'This project needs two Gallery images to compare' : undefined} className="flex min-h-11 items-center gap-2 rounded-full px-3 text-xs text-white disabled:opacity-40 hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"><Columns2 size={17} />{comparisonOpen ? 'Close comparison' : 'Compare'}</button>
@@ -348,9 +368,9 @@ export function GalleryViewer({ files, initialIdentity, restoreFocus, onClose }:
                 <div role="status" className="absolute flex items-center gap-2 text-sm text-white/70"><Loader2 size={17} className="animate-spin motion-reduce:animate-none" />Loading media...</div>
               )}
               {file.type === 'video' ? (
-                <video key={fileIdentity} src={file.url} controls playsInline preload="metadata" className={`h-full w-full object-contain ${currentStatus === 'loading' ? 'opacity-0' : ''}`} onLoadedMetadata={event => setMediaStatus({ identity: fileIdentity, state: event.currentTarget.videoWidth > 0 && event.currentTarget.videoHeight > 0 ? 'ready' : 'unsupported-video' })} onError={event => setMediaStatus({ identity: fileIdentity, state: event.currentTarget.error?.code === MediaError.MEDIA_ERR_DECODE || event.currentTarget.error?.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED ? 'unsupported-video' : 'error' })} />
+                <video key={fileIdentity} src={file.url} controls playsInline preload="metadata" className={`h-full w-full object-contain ${currentStatus === 'loading' ? 'opacity-0' : ''}`} onLoadedMetadata={event => setMediaStatus({ identity: fileIdentity, state: event.currentTarget.videoWidth > 0 && event.currentTarget.videoHeight > 0 ? 'ready' : 'unsupported-video', width: event.currentTarget.videoWidth, height: event.currentTarget.videoHeight, duration: event.currentTarget.duration })} onError={event => setMediaStatus({ identity: fileIdentity, state: event.currentTarget.error?.code === MediaError.MEDIA_ERR_DECODE || event.currentTarget.error?.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED ? 'unsupported-video' : 'error' })} />
               ) : (
-                <ViewerImage key={fileIdentity} file={file} status={currentStatus} onReady={() => setMediaStatus({ identity: fileIdentity, state: 'ready' })} onFailure={() => setMediaStatus({ identity: fileIdentity, state: 'error' })} />
+                <ViewerImage key={fileIdentity} file={file} status={currentStatus} onReady={(width, height) => setMediaStatus({ identity: fileIdentity, state: 'ready', width, height })} onFailure={() => setMediaStatus({ identity: fileIdentity, state: 'error' })} />
               )}
             </>
           )}

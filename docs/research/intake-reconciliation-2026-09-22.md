@@ -212,8 +212,18 @@ results. The full local gate passed 5,464 backend tests (17 skipped), the UI
 suite, type-check and build. After the coordinated Pinokio restart, direct,
 host-local LAN, Quick Tunnel and stable-share `/health`, `/ready`, account
 context and workspaces returned 200. Chrome reloaded to owner sign-in. This
-accepts deployment and unauthenticated browser hydration; measured Media Info,
-finishing history, upload deletion, signed-in Gallery ordering and owner
+accepts deployment and unauthenticated browser hydration; signed-in Gallery
+ordering and owner acceptance remain separate work.
+
+The September 27 Media Info slice adds the selected Gallery item's listed file
+size, image natural dimensions, and browser-decoded video dimensions and
+duration to the viewer after its private preview is revealed. Unsupported
+video shows only the listed size; it does not claim a successful media probe.
+Measurements are tied to the selected file revision and disappear on selection
+change. Focused image/video, private-reveal, and selection checks pass; the UI
+gate passed 750 tests, type-check and build, and the publication/syntax guard
+passed. This is UI measurement, not sealed-file metadata or a live playback
+claim. Finishing history, upload deletion, signed-in Media Info and owner
 acceptance remain separate work.
 
 The [YuE2 real-audio model card](https://huggingface.co/Mothersuperior/yue2-mothersuperior-realaudio-tokenizer-v4)

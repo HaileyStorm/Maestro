@@ -270,7 +270,7 @@ test('Gallery viewer offers a browser copy only after a revealed video fails to 
   const Viewer = compiled.exports.GalleryViewer
   const file = {
     workspace: 'project-a', name: 'clip.mp4', revision: 'rev-7',
-    url: '/api/v1/file/clip.mp4?workspace=project-a', type: 'video', private: true,
+    url: '/api/v1/file/clip.mp4?workspace=project-a', type: 'video', private: true, size: 2048,
   }
   const calls = []
   globalThis.__copyViewerStore = { jobs: [], createBrowserCopy: async selected => {
@@ -283,9 +283,10 @@ test('Gallery viewer offers a browser copy only after a revealed video fails to 
   globalThis.__copyViewerState = []
   globalThis.__copyViewerRevealed = false
   let viewerFiles = [file]
+  let initialIdentity = 'project-a:clip.mp4:rev-7'
   const renderViewer = () => {
     globalThis.__copyViewerHook = 0
-    return Viewer({ files: viewerFiles, initialIdentity: 'project-a:clip.mp4:rev-7', restoreFocus: null, onClose() {} })
+    return Viewer({ files: viewerFiles, initialIdentity, restoreFocus: null, onClose() {} })
   }
   const allNodes = (node, found = []) => {
     if (!node || typeof node !== 'object') return found
@@ -294,10 +295,23 @@ test('Gallery viewer offers a browser copy only after a revealed video fails to 
     for (const child of Array.isArray(children) ? children : [children]) allNodes(child, found)
     return found
   }
+  const mediaInfo = () => allNodes(renderViewer()).find(node => node.type === 'p' && String(node.props?.children).includes('Media info:'))
   assert.equal(allNodes(renderViewer()).some(node => node.props?.children === 'Create H.264 browser copy'), false)
+  assert.equal(mediaInfo(), undefined)
   globalThis.__copyViewerRevealed = true
   const video = allNodes(renderViewer()).find(node => node.type === 'video')
   assert.ok(video)
+  assert.equal(String(mediaInfo()?.props.children).includes('2 KB'), true)
+  video.props.onLoadedMetadata({ currentTarget: { videoWidth: 640, videoHeight: 360, duration: 5.17 } })
+  const measured = mediaInfo()
+  assert.match(String(measured?.props.children), /640 × 360.*5.17s.*2 KB/)
+  viewerFiles = [file, { ...file, name: 'other.mp4', revision: 'rev-8', size: 4096 }]
+  allNodes(renderViewer()).find(node => node.props?.['aria-label'] === 'Next media').props.onClick()
+  const nextInfo = mediaInfo()
+  assert.equal(String(nextInfo?.props.children).includes('640 × 360'), false)
+  assert.equal(String(nextInfo?.props.children).includes('4 KB'), true)
+  allNodes(renderViewer()).find(node => node.props?.['aria-label'] === 'Previous media').props.onClick()
+  viewerFiles = [file]
   video.props.onLoadedMetadata({ currentTarget: { videoWidth: 0, videoHeight: 0 } })
   const fallback = allNodes(renderViewer())
   const copyButton = fallback.find(node => node.type === 'button' && node.props?.children === 'Create H.264 browser copy')
@@ -339,6 +353,16 @@ test('Gallery viewer offers a browser copy only after a revealed video fails to 
   const genericFailure = allNodes(renderViewer())
   assert.equal(genericFailure.some(node => node.type === 'button' && node.props?.children === 'Create H.264 browser copy'), false)
   assert.equal(genericFailure.some(node => node.props?.children === 'This media could not be loaded. Try opening it from the Gallery again.'), true)
+
+  globalThis.__copyViewerState = []
+  viewerFiles = [{ ...file, name: 'still.png', revision: 'rev-9', type: 'image', size: 1024 }]
+  initialIdentity = 'project-a:still.png:rev-9'
+  const imageView = allNodes(renderViewer()).find(node => typeof node.type === 'function')
+  assert.ok(imageView)
+  const image = imageView.type(imageView.props)
+  image.props.onLoad({ currentTarget: { naturalWidth: 1024, naturalHeight: 768 } })
+  const imageInfo = mediaInfo()
+  assert.match(String(imageInfo?.props.children), /1024 × 768.*1 KB/)
 })
 
 const componentModules = new Map([
