@@ -223,8 +223,12 @@ Measurements are tied to the selected file revision and disappear on selection
 change. Focused image/video, private-reveal, and selection checks pass; the UI
 gate passed 750 tests, type-check and build, and the publication/syntax guard
 passed. This is UI measurement, not sealed-file metadata or a live playback
-claim. Finishing history, upload deletion, signed-in Media Info and owner
-acceptance remain separate work.
+claim. Commit `7a1250c` was pushed and deployed through Pinokio Restart
+Maestro. The direct, host-local LAN, Quick Tunnel and stable-share access
+surfaces each returned 200 for `/health`, `/ready`, account context and
+workspaces; Pinokio reported the exact restart notice cleared. Chrome loaded
+the stable-share owner sign-in page. Finishing history, upload deletion,
+signed-in Media Info and owner acceptance remain separate work.
 
 The [YuE2 real-audio model card](https://huggingface.co/Mothersuperior/yue2-mothersuperior-realaudio-tokenizer-v4)
 documents a matched joint-v9 tokenizer head and NAR decoder LoRA. The pinned
