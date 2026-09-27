@@ -205,6 +205,14 @@ fetching upstream.
 | Experimental Windows 10 DLSS backend | **Defer host deployment.** This is a Linux installation; keep existing finishing and Windows 11 behavior. Assess the separate installer and Windows-only device acceptance on a compatible host, without enabling it through ordinary updates. The following Linux DLSS test-only commit is not a runtime feature to import. |
 | Gallery chronology, Media Info, finishing history and upload deletion | **Adapt in bounded slices.** Compare folder-qualified ordering and overlapping refresh handling with Continuum's project Gallery; add useful measured media facts and truthful finishing provenance where absent. Deletion must preserve active-job input and project authorization checks. Do not trade away existing private-preview gating, Editor/Bridge actions or recoverable output flows for upstream parity. |
 
+The September 27 chronology slice makes equal-mtime Gallery outputs sort by
+name after newest-first modification time, including the multi-clip filter.
+The endpoint regression reverses filesystem enumeration and checks paginated
+results. The full local gate passed 5,464 backend tests (17 skipped), the UI
+suite, type-check and build. This is CPU and build evidence; measured Media
+Info, finishing history, upload deletion, and signed-in browser acceptance
+remain separate work.
+
 The [YuE2 real-audio model card](https://huggingface.co/Mothersuperior/yue2-mothersuperior-realaudio-tokenizer-v4)
 documents a matched joint-v9 tokenizer head and NAR decoder LoRA. The pinned
 pair is now an opt-in Sound/Vision decoder profile exposed in Maestro, separate

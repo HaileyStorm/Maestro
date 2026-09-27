@@ -73778,8 +73778,8 @@ def list_outputs(
             continue
         raw_entries.append((name, filepath, ext, os.path.getmtime(filepath)))
 
-    # Sort by creation time (newest first) before any filtering
-    raw_entries.sort(key=lambda e: e[3], reverse=True)
+    # Keep same-mtime outputs in a stable order across directory enumerations.
+    raw_entries.sort(key=lambda e: (-e[3], e[0]))
 
     # First pass: read sidecar JSON ONCE per file and cache the bits we need
     # downstream (clip group info, generation_mode, edit_sub_mode). Files
@@ -73930,7 +73930,7 @@ def list_outputs(
                 sw_finals.append(f)
 
         combined = multiclips + sw_finals
-        combined.sort(key=lambda f: f["created_at"], reverse=True)
+        combined.sort(key=lambda f: (-f["created_at"], f["name"]))
         files = combined
     if search:
         from services.search_index import get_search_index

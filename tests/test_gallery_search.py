@@ -15,6 +15,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from urllib.parse import quote
 from unittest.mock import patch
 
 
@@ -536,6 +537,65 @@ class ArtifactClassificationTests(unittest.TestCase):
 
 
 class GalleryApiUiContractTests(unittest.TestCase):
+    def test_same_mtime_outputs_keep_their_order_across_refresh_and_pagination(self):
+        launch_path = Path(_APP_DIR) / "launch.py"
+        tree = ast.parse(launch_path.read_text(encoding="utf-8"), filename=str(launch_path))
+        node = next(
+            item for item in tree.body
+            if isinstance(item, ast.FunctionDef) and item.name == "list_outputs"
+        )
+        listing = copy.deepcopy(node)
+        listing.decorator_list = []
+        module = ast.Module(body=[listing], type_ignores=[])
+        ast.fix_missing_locations(module)
+
+        with tempfile.TemporaryDirectory() as workspace:
+            names = ("multiclip-zeta.mp4", "old.mp4", "multiclip-alpha.mp4")
+            for name in names:
+                _touch_media(workspace, name)
+                timestamp = 1_700_000_000 if name == "old.mp4" else 1_700_000_100
+                os.utime(os.path.join(workspace, name), (timestamp, timestamp))
+
+            namespace = {
+                "os": os,
+                "quote": quote,
+                "Request": object,
+                "ArtifactScope": ArtifactScope,
+                "_GALLERY_MEDIA_EXTENSIONS": {".mp4"},
+                "_request_project_workspace": lambda _request, _name: "gallery-test",
+                "_require_project_access": lambda *_args, **_kwargs: workspace,
+                "_load_favorites": lambda _name: set(),
+                "load_media_sidecars": lambda _dir, _names: {},
+                "h3_integrity_is_pending": lambda _dir, _name: False,
+                "classify_gallery_artifacts": lambda entries: {
+                    entry["name"]: "final" for entry in entries
+                },
+                "linked_component_names": lambda *_args: [],
+                "artifact_matches_scope": artifact_matches_scope,
+                "_output_revision": lambda *_args, **_kwargs: "test-revision",
+                "public_output_policy": lambda _meta: {"private": False, "explicit": False},
+            }
+            exec(compile(module, str(launch_path), "exec"), namespace)
+            list_outputs = namespace["list_outputs"]
+            request = types.SimpleNamespace()
+            expected = ["multiclip-alpha.mp4", "multiclip-zeta.mp4", "old.mp4"]
+            for enumeration in (names, tuple(reversed(names))):
+                with patch.object(os, "listdir", return_value=list(enumeration)):
+                    response = list_outputs(request, workspace="gallery-test")
+                    page = list_outputs(
+                        request, workspace="gallery-test", limit=1, offset=1,
+                    )
+                    multiclip = list_outputs(
+                        request, workspace="gallery-test", multiclip_only=True,
+                    )
+                self.assertEqual([item["name"] for item in response["outputs"]], expected)
+                self.assertEqual(response["total"], 3)
+                self.assertEqual([item["name"] for item in page["outputs"]], [expected[1]])
+                self.assertEqual(page["total"], 3)
+                self.assertEqual(
+                    [item["name"] for item in multiclip["outputs"]], expected[:2],
+                )
+
     def test_virtual_upload_gallery_never_enters_project_favorites_storage(self):
         launch_path = Path(_APP_DIR) / "launch.py"
         source = launch_path.read_text(encoding="utf-8")
