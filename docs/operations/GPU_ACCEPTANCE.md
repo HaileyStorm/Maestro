@@ -1852,3 +1852,15 @@ identity checks. These are synthetic media and static/runtime-unit checks;
 they do not establish a successful H3 GPU continuation, browser acceptance,
 audible quality, or preservation of source bytes through re-encoding. The
 cancelled live attempt and its negative evidence above remain unchanged.
+
+The source-prefix implementation was pushed as `a9c7746d`. On those source
+bytes, the full local gate passed: publication guard, Python syntax, 5,463
+backend tests (17 skipped), 750 UI tests, TypeScript type-check and Vite build.
+The CPU ffmpeg continuation suite passed all 17 cases. A coordinated Pinokio
+restart loaded the commit and discovered a new ready URL. Direct-local,
+host-local LAN, Quick Tunnel and stable-share checks returned HTTP 200 for
+`/health`, `/ready`, account context and workspaces with normal clients; the
+public restart notice was cleared. Chrome rendered the owner sign-in screen
+after reload. This verifies deployment and unauthenticated browser hydration,
+not a signed-in H3 submission, GPU output, remote-client LAN parity or owner
+acceptance. No new GPU grant or H3 job was used for this rollout.
