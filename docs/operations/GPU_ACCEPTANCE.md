@@ -1736,3 +1736,43 @@ control returned success and live status reported both `loaded=false` and
 the outbox became `denied` with no lease. Direct health and stable-share health
 and readiness remained 200 without restarting Maestro. This local cleanup is
 not acceptance of the separately gated remote owner Free resources action.
+
+## 2026-09-27 YuE2 playback and duration diagnosis
+
+The signed-in stable-share My Music library retained all 16 project takes.
+The eight-bar stock take recorded above played through its MP3 preview to
+`currentTime=duration=44.998667`, `ended=true`, with no media error. The
+previously crashing 69.918667-second take also played through its MP3 preview
+to that exact duration and `ended=true`, with no media error. The in-app
+browser remained responsive. These are two current browser-preview receipts,
+not native WAV playback, audible-output observations, musical-quality approval
+or cross-browser acceptance. No generation, model load or GPU request ran.
+
+A bounded read of the retained eight-bar stock attempt confirms that its
+request ABC and saved plan score both have SHA-256
+`1591b895678a796a8f0d5b7af05fdedfcfd6e0d06c7abf42bfffea1c05b4dca5`.
+The native score parser reports eight measures, 32 quarter notes and 112 BPM:
+17.142857 seconds nominally. Its semantic settings are minimum 200 and maximum
+9,000 tokens. The retained semantic array contains 1,125 codec frames and the
+latent array is 1,125 × 64. The receipt counts 1,126 output tokens including
+EOS, marks semantic truncation false, and records no audio tail trim.
+
+The VAE's normal output geometry is `1920 * codec_frames - 64` samples.
+For this attempt, that is exactly 2,159,936 samples at 48 kHz, or 44.998667
+seconds, matching the audio receipt. The supplied ABC is tokenized as a
+conditioning prefix; the native request has no target-duration field and
+semantic generation ends at EOS or its token ceiling. This evidence locates
+this take's duration discrepancy in semantic generation, consistently with
+soft score conditioning, rather than a lost score, token-limit cutoff, or
+decoder sample-rate conversion. It does not establish why the model chose
+that ending or whether another prompt, seed or adapter would follow timing.
+
+Exact score-duration fidelity remains open. The existing result exposes audio
+duration, semantic counts and truncation, but does not persist nominal score
+seconds. A tighter ceiling would risk an incomplete ending and would not prove
+the score was followed. The stock/joint-v9 comparison above already rules out
+that decoder choice as the cause of this pair's identical length. The next
+bounded fidelity experiment must retain the same score, seed and settings,
+change only an explicit conditioning variable, and compare measured duration
+and musical endings separately; no silent trimming or time scaling is accepted
+as score-following evidence.

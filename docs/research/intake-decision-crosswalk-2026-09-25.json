@@ -506,13 +506,13 @@
         ]
       },
       "current_reconciliation": {
-        "status": "partial",
-        "disposition": "Adjacent probes only; alleged compressor not established",
+        "status": "recorded",
+        "disposition": "Watch; no managed integration until a concrete reference-compressor source, artifact and license are established",
         "anchors": [
           {
             "path": "docs/research/intake-reconciliation-2026-09-22.md",
-            "line": 118,
-            "label": "Ref2VA size match/max, IA/face-mask tricks"
+            "line": 420,
+            "label": "Ref2VA reference-file compressor rumor"
           }
         ]
       },
@@ -767,13 +767,13 @@
         ]
       },
       "current_reconciliation": {
-        "status": "partial",
-        "disposition": "Music3 lane adopted; combined MV workflow remains watch",
+        "status": "recorded",
+        "disposition": "Watch the combined music-video workflow; preserve the separately adopted native Music3 lane and treat 30-versus-24 fps as a benchmark lead",
         "anchors": [
           {
             "path": "docs/research/intake-reconciliation-2026-09-22.md",
-            "line": 78,
-            "label": "MiniMax Music3"
+            "line": 421,
+            "label": "Music3 plus LTX local music-video workflow"
           }
         ]
       }
@@ -7293,8 +7293,8 @@
     "indexed_occurrence_pointers": 301,
     "mapped_occurrence_pointers": 301,
     "candidate_cluster_count": 124,
-    "clusters_with_recorded_current_anchor": 122,
-    "clusters_with_partial_current_anchor": 2,
+    "clusters_with_recorded_current_anchor": 124,
+    "clusters_with_partial_current_anchor": 0,
     "clusters_without_current_anchor": 0,
     "clusters_with_recorded_historical_decision": 121,
     "clusters_with_source_listing_only_historical_status": 2,
