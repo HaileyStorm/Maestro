@@ -241,6 +241,15 @@ Measured before/after geometry and frame rate, post-generation finishing
 success records, a full processing chain, upload deletion, signed-in viewing
 and owner acceptance remain separate work.
 
+Commit `a640f99` was pushed and deployed through Pinokio Restart Maestro on
+2026-09-27. Pinokio reported only `start.js` running, ready at its newly
+discovered local port, with no last error, and the exact public restart notice
+cleared. The direct, LAN, Quick Tunnel and stable-share access surfaces each
+returned 200 for `/health`, `/ready`, account context and workspaces. Chrome
+loaded the stable-share owner sign-in page after restart. This is service and
+unauthenticated browser evidence; the finishing section itself has not been
+accepted in a signed-in browser or with a real processed output.
+
 The [YuE2 real-audio model card](https://huggingface.co/Mothersuperior/yue2-mothersuperior-realaudio-tokenizer-v4)
 documents a matched joint-v9 tokenizer head and NAR decoder LoRA. The pinned
 pair is now an opt-in Sound/Vision decoder profile exposed in Maestro, separate
