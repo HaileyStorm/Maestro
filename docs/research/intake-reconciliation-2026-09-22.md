@@ -268,6 +268,15 @@ after those mocks were updated, all 750 UI tests, TypeScript/Vite build and the
 repository guard gate passed. An independent review's output-size, staged-byte
 identity and cancellation findings were resolved with focused regressions.
 
+Commit `f530359` was pushed and deployed through Pinokio Restart Maestro on
+2026-09-27. Pinokio reported only `start.js` running, ready at the newly
+discovered local port, with no last error and the exact restart notice cleared.
+The direct, LAN, Quick Tunnel and stable-share access surfaces each returned
+200 for `/health`, `/ready`, account context and workspaces. Chrome loaded the
+stable-share owner sign-in page. This verifies service reachability and
+unauthenticated UI hydration; a signed-in Gallery comparison and real Tools
+Upscale output remain unverified.
+
 Generic Gallery upload deletion remains deferred. Uploads are session-owned
 and the virtual Uploads workspace is browse-only; project-output deletion
 does not supply upload authority. The existing `.trash_*` path is transient
