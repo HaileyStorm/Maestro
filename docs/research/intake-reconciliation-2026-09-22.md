@@ -209,9 +209,12 @@ The September 27 chronology slice makes equal-mtime Gallery outputs sort by
 name after newest-first modification time, including the multi-clip filter.
 The endpoint regression reverses filesystem enumeration and checks paginated
 results. The full local gate passed 5,464 backend tests (17 skipped), the UI
-suite, type-check and build. This is CPU and build evidence; measured Media
-Info, finishing history, upload deletion, and signed-in browser acceptance
-remain separate work.
+suite, type-check and build. After the coordinated Pinokio restart, direct,
+host-local LAN, Quick Tunnel and stable-share `/health`, `/ready`, account
+context and workspaces returned 200. Chrome reloaded to owner sign-in. This
+accepts deployment and unauthenticated browser hydration; measured Media Info,
+finishing history, upload deletion, signed-in Gallery ordering and owner
+acceptance remain separate work.
 
 The [YuE2 real-audio model card](https://huggingface.co/Mothersuperior/yue2-mothersuperior-realaudio-tokenizer-v4)
 documents a matched joint-v9 tokenizer head and NAR decoder LoRA. The pinned
