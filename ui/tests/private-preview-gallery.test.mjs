@@ -823,6 +823,11 @@ test('private audio and retry images acquire no media URL before reveal', async 
   globalThis.__mediaFeedTestMeta = {
     source: 'sidecar', tool: 'upscale', tool_source: '/private/source.mp4',
     params: { method: 'lanczos2' }, generation_time: 13, created_at: 1700000000,
+    processing: {
+      version: 1,
+      input: { width: 64, height: 48, fps: 24, duration_seconds: 1, has_audio: true },
+      output: { width: 128, height: 96, fps: 48, duration_seconds: 1, has_audio: false },
+    },
   }
   assert.equal(JSON.stringify(render(processedVideo)).includes('Finishing details'), false)
   globalThis.__mediaFeedRevealed.add(privatePreviewIdentity('private-media', processedVideo.name, 'r1'))
@@ -833,6 +838,16 @@ test('private audio and retry images acquire no media URL before reveal', async 
   assert.equal(processed.includes('/private/source.mp4'), false)
   assert.match(processed, /Recorded at/)
   assert.match(processed, /Recorded job time/)
+  assert.match(processed, /Measured source/)
+  assert.match(processed, /64×48 · 24 fps · 1s · audio track/)
+  assert.match(processed, /Measured output/)
+  assert.match(processed, /128×96 · 48 fps · 1s · no audio track/)
+
+  globalThis.__mediaFeedTestMeta = {
+    source: 'sidecar', tool: 'upscale', params: { method: 'lanczos2' },
+    processing: { input: { width: 999, height: 999 } },
+  }
+  assert.equal(JSON.stringify(render(processedVideo)).includes('Measured source'), false)
 
   globalThis.__mediaFeedTestMeta = {
     source: 'sidecar', params: { spatial_upsampling: 'lanczos2' },

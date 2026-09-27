@@ -102,8 +102,10 @@ def _fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
-def sha256_file(path: os.PathLike[str] | str) -> tuple[int, str]:
+def sha256_file(path: os.PathLike[str] | str, *, abort_check: Callable[[], bool] | None = None) -> tuple[int, str]:
     """Hash one regular single-link file through a no-follow descriptor."""
+    if abort_check and abort_check():
+        raise QueueRecoveryRuntimeError("Recovery evidence hash cancelled.")
     requested = Path(os.path.abspath(os.fspath(path)))
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
@@ -116,6 +118,8 @@ def sha256_file(path: os.PathLike[str] | str) -> tuple[int, str]:
         if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
             raise QueueRecoveryRuntimeError("Recovery evidence is not a safe regular file.")
         while True:
+            if abort_check and abort_check():
+                raise QueueRecoveryRuntimeError("Recovery evidence hash cancelled.")
             chunk = os.read(descriptor, 1024 * 1024)
             if not chunk:
                 break
@@ -130,6 +134,8 @@ def sha256_file(path: os.PathLike[str] | str) -> tuple[int, str]:
             or (current.st_dev, current.st_ino) != (refreshed.st_dev, refreshed.st_ino)
         ):
             raise QueueRecoveryRuntimeError("Recovery evidence changed while it was hashed.")
+        if abort_check and abort_check():
+            raise QueueRecoveryRuntimeError("Recovery evidence hash cancelled.")
         return int(refreshed.st_size), digest.hexdigest()
     except OSError:
         raise QueueRecoveryRuntimeError("Recovery evidence could not be read safely.") from None

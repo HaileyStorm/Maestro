@@ -420,7 +420,8 @@ const componentModules = new Map([
     export async function revokeOutputShare() { return 0 }
     export async function uploadImage() { return { path: '', url: '' } }
   `],
-  ['../../lib/format', `export function formatGenerationDuration(value) { return String(value) }`],
+  ['../../lib/format', `export function formatGenerationDuration(value) { return String(value) }
+export function formatMediaDuration(value) { return String(value) }`],
   ['../../lib/modelDisplay', `export function modelDisplayName(value) { return value }`],
   ['../../lib/privatePreview', `
     export function hidePrivatePreview() {}

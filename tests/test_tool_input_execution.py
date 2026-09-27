@@ -226,6 +226,104 @@ class ToolInputExecutionTests(unittest.TestCase):
                             tool='upscale',params={},elapsed=1)
         self.assertEqual(list(self.project.glob('*_upscale_*')), [])
 
+    def test_upscale_sidecar_records_only_measured_video_facts(self):
+        job = self.job('tool_upscale')
+        staged = self.project / 'staged.mp4'; staged.write_bytes(b'processed')
+        input_facts = {'size_bytes': len(b'original'), 'width': 64, 'height': 48,
+                       'fps': 24, 'duration_seconds': 1, 'has_audio': True}
+        output_facts = {'size_bytes': len(b'processed'), 'width': 128, 'height': 96,
+                        'fps': 24, 'duration_seconds': 1, 'has_audio': True}
+        paths = []
+        def probe(path, **_kwargs):
+            paths.append(path)
+            return output_facts if path == str(staged) else input_facts
+        with patch.dict(sys.modules, {'services.media_info': types.SimpleNamespace(probe_video_facts=probe)}):
+            self.assertTrue(self.ns['_publish_processed_tool_output'](
+                job, str(staged), source=str(self.video), tool='upscale',
+                params={'method': 'lanczos2', 'prompt': 'private creative text'}, elapsed=1))
+        metadata = json.loads((self.project / job['output_files'][0]).with_suffix('.meta.json').read_text())
+        self.assertEqual(metadata['processing'], {
+            'version': 1, 'input': input_facts, 'output': output_facts,
+        })
+        self.assertEqual(paths, [str(staged), str(self.video)])
+        self.assertTrue(metadata['private'])
+        self.assertNotIn('prompt', json.dumps(metadata['processing']))
+        self.assertNotIn(str(self.project), json.dumps(metadata['processing']))
+
+    def test_optional_upscale_probe_failure_preserves_completed_output(self):
+        job = self.job('tool_upscale')
+        staged = self.project / 'staged.mp4'; staged.write_bytes(b'processed')
+        def probe(path, **_kwargs):
+            return {'size_bytes': len(b'processed'), 'width': 128, 'height': 96} if path == str(staged) else None
+        with patch.dict(sys.modules, {'services.media_info': types.SimpleNamespace(probe_video_facts=probe)}):
+            self.assertTrue(self.ns['_publish_processed_tool_output'](
+                job, str(staged), source=str(self.video), tool='upscale', params={}, elapsed=1))
+        metadata = json.loads((self.project / job['output_files'][0]).with_suffix('.meta.json').read_text())
+        self.assertNotIn('processing', metadata)
+        self.assertEqual(job['status'], 'completed')
+
+    def test_cancelled_upscale_skips_optional_probes_and_publication(self):
+        job = self.job('tool_upscale')
+        staged = self.project / 'staged.mp4'; staged.write_bytes(b'processed')
+        paths = []
+        def probe(path, **_kwargs):
+            paths.append(path)
+            job['status'] = 'cancelled'
+            return {'size_bytes': len(b'processed'), 'width': 128, 'height': 96}
+        with patch.dict(sys.modules, {'services.media_info': types.SimpleNamespace(probe_video_facts=probe)}):
+            job['status'] = 'cancelled'
+            self.assertFalse(self.ns['_publish_processed_tool_output'](
+                job, str(staged), source=str(self.video), tool='upscale', params={}, elapsed=1))
+            self.assertEqual(paths, [])
+            job['status'] = 'queued'
+            self.assertFalse(self.ns['_publish_processed_tool_output'](
+                job, str(staged), source=str(self.video), tool='upscale', params={}, elapsed=1))
+        self.assertEqual(paths, [str(staged)])
+        self.assertEqual(list(self.project.glob('*_upscale_*')), [])
+
+    def test_same_size_staged_change_during_probe_is_not_published(self):
+        job = self.job('tool_upscale')
+        staged = self.project / 'staged.mp4'; staged.write_bytes(b'processed')
+        def probe(path, **_kwargs):
+            if path == str(staged):
+                staged.write_bytes(b'changed!!')
+                return {'size_bytes': len(b'processed'), 'width': 128, 'height': 96}
+            return {'size_bytes': len(b'original'), 'width': 64, 'height': 48}
+        with patch.dict(sys.modules, {'services.media_info': types.SimpleNamespace(probe_video_facts=probe)}):
+            with self.assertRaisesRegex(ValueError, 'output changed'):
+                self.ns['_publish_processed_tool_output'](
+                    job, str(staged), source=str(self.video), tool='upscale', params={}, elapsed=1)
+        self.assertEqual(list(self.project.glob('*_upscale_*')), [])
+
+    def test_cancel_during_staged_verification_hash_publishes_nothing(self):
+        job = self.job('tool_upscale')
+        staged = self.project / 'staged.mp4'; staged.write_bytes(b'x' * (2 * 1024 * 1024))
+        original_hash = self.ns['_recovery_sha256_file']
+        staged_hashes = 0
+        def cancelling_hash(path, **kwargs):
+            nonlocal staged_hashes
+            if path != str(staged):
+                return original_hash(path, **kwargs)
+            staged_hashes += 1
+            if staged_hashes != 2:
+                return original_hash(path, **kwargs)
+            checks = 0
+            def abort_during_read():
+                nonlocal checks
+                checks += 1
+                if checks >= 3:
+                    job['status'] = 'cancelled'
+                return kwargs['abort_check']()
+            return original_hash(path, abort_check=abort_during_read)
+        self.ns['_recovery_sha256_file'] = cancelling_hash
+        with patch.dict(sys.modules, {'services.media_info': types.SimpleNamespace(
+            probe_video_facts=lambda path, **_kwargs: None,
+        )}):
+            self.assertFalse(self.ns['_publish_processed_tool_output'](
+                job, str(staged), source=str(self.video), tool='upscale', params={}, elapsed=1))
+        self.assertEqual(staged_hashes, 2)
+        self.assertEqual(list(self.project.glob('*_upscale_*')), [])
+
     def test_gpu_failure_keeps_safe_oom_diagnostics_without_paths(self):
         job = self.job('tool_upscale')
         modules = self.configure_worker()

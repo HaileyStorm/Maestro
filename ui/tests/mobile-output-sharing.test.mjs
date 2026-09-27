@@ -66,7 +66,7 @@ async function loadHarness() {
       export const moveOutput = async () => {}
       export const uploadImage = async () => ({ path: '' })
     `],
-    ['../../lib/format', 'export function formatGenerationDuration(value) { return String(value) }'],
+    ['../../lib/format', 'export function formatGenerationDuration(value) { return String(value) }\nexport function formatMediaDuration(value) { return String(value) }'],
     ['../../lib/modelDisplay', 'export function modelDisplayName() { return "" }'],
     ['../../lib/privatePreview', `
       export function privatePreviewIdentity(workspace, name, revision = '') {

@@ -5,8 +5,8 @@ import { currentAccountIdentityEpoch, useStore } from '../../stores/useStore'
 import { H3_GALLERY_STILL_GUIDE_RESTORE_MESSAGE, isH3GalleryStillGuideOutput } from '../../lib/h3GalleryStillGuide'
 import { prepareGalleryContinuation, retainContinuationPreview } from '../../lib/galleryContinuation'
 import { createOutputShare, deleteOutputComponents, getUploadUrl, fetchOutputMetadata, getFileUrl, moveOutput, revokeOutputShare, uploadImage } from '../../api/client'
-import type { OutputFile, OutputMetadata } from '../../types'
-import { formatGenerationDuration } from '../../lib/format'
+import type { MeasuredVideoFacts, OutputFile, OutputMetadata } from '../../types'
+import { formatGenerationDuration, formatMediaDuration } from '../../lib/format'
 import { modelDisplayName } from '../../lib/modelDisplay'
 import { h3ArchitectureForModel, h3LorasForArchitecture } from '../../lib/h3Submission'
 import {
@@ -42,6 +42,22 @@ function finishingMethodLabel(value: unknown): string | null {
   return `${name} ${match[2]}×`
 }
 
+function measuredVideoSummary(value: MeasuredVideoFacts | undefined): string | null {
+  if (!value || typeof value !== 'object') return null
+  const positive = (number: unknown): number | null =>
+    typeof number === 'number' && Number.isFinite(number) && number > 0 ? number : null
+  const width = positive(value.width)
+  const height = positive(value.height)
+  const fps = positive(value.fps)
+  const duration = positive(value.duration_seconds)
+  const parts: string[] = []
+  if (width && height && Number.isInteger(width) && Number.isInteger(height)) parts.push(`${width}×${height}`)
+  if (fps) parts.push(`${Number(fps.toFixed(2))} fps`)
+  if (duration) parts.push(formatMediaDuration(duration))
+  if (typeof value.has_audio === 'boolean') parts.push(value.has_audio ? 'audio track' : 'no audio track')
+  return parts.length ? parts.join(' · ') : null
+}
+
 function finishedToolDetails(metadata: OutputMetadata | null) {
   if (metadata?.source !== 'sidecar' || !['upscale', 'media_flow'].includes(metadata.tool || '')) return null
   const params = metadata.params
@@ -50,6 +66,7 @@ function finishedToolDetails(metadata: OutputMetadata | null) {
     : undefined
   const recordedAt = typeof metadata.created_at === 'number' && Number.isFinite(metadata.created_at) && metadata.created_at > 0
     ? new Date(metadata.created_at * 1000) : null
+  const processing = metadata.processing?.version === 1 ? metadata.processing : null
   return {
     result: metadata.tool === 'upscale' ? 'Upscaled video' : 'Finished media',
     method: finishingMethodLabel(params?.method ?? params?.spatial_upsampling),
@@ -57,6 +74,8 @@ function finishedToolDetails(metadata: OutputMetadata | null) {
     recordedAt: recordedAt && Number.isFinite(recordedAt.getTime()) ? recordedAt.toLocaleString() : null,
     jobTime: typeof metadata.generation_time === 'number' && Number.isFinite(metadata.generation_time) && metadata.generation_time >= 0
       ? formatGenerationDuration(metadata.generation_time) : null,
+    measuredSource: measuredVideoSummary(processing?.input),
+    measuredOutput: measuredVideoSummary(processing?.output),
   }
 }
 
@@ -1337,6 +1356,8 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
             <dt className="text-text-muted">Result</dt><dd>{finishing.result}</dd>
             {finishing.method && <><dt className="text-text-muted">Method</dt><dd>{finishing.method}</dd></>}
             {finishing.sourceName && <><dt className="text-text-muted">Source</dt><dd className="min-w-0 break-all">{finishing.sourceName}</dd></>}
+            {finishing.measuredSource && <><dt className="text-text-muted">Measured source</dt><dd>{finishing.measuredSource}</dd></>}
+            {finishing.measuredOutput && <><dt className="text-text-muted">Measured output</dt><dd>{finishing.measuredOutput}</dd></>}
             {finishing.recordedAt && <><dt className="text-text-muted">Recorded at</dt><dd>{finishing.recordedAt}</dd></>}
             {finishing.jobTime && <><dt className="text-text-muted">Recorded job time</dt><dd>{finishing.jobTime}</dd></>}
           </dl>

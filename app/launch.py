@@ -63101,9 +63101,20 @@ def _publish_processed_tool_output(job, staged_path, *, source, tool, params, el
     """Seal the result before create-only publication and durable completion."""
     from services.atomic_file_publish import publish_file_no_replace, PublishedFileDurabilityError
 
+    if is_cancel_requested(job):
+        return False
     size, digest = _recovery_sha256_file(staged_path)
     if size <= 0:
         raise ValueError("The tool produced no output video.")
+    measured_output = None
+    if tool == "upscale":
+        try:
+            from services.media_info import probe_video_facts
+            measured_output = probe_video_facts(staged_path, cancel_check=lambda: is_cancel_requested(job))
+        except Exception:
+            pass  # Optional history must not discard a successfully processed video.
+    if is_cancel_requested(job):
+        return False
     out_dir = _existing_workspace_dir(job["workspace"])
     filename = f"{os.path.splitext(os.path.basename(source))[0]}_{tool}_{job['id']}{os.path.splitext(staged_path)[1]}"
     destination = os.path.join(out_dir, filename)
@@ -63118,9 +63129,35 @@ def _publish_processed_tool_output(job, staged_path, *, source, tool, params, el
         "producer_artifact_class": "final", "artifact_class": "final",
     }
     with _output_lineage_mutation_guard(out_dir):
-        _validated_tool_input_paths(job)
+        validated_paths = _validated_tool_input_paths(job)
         if is_cancel_requested(job):
             return False
+        if measured_output and measured_output.get("size_bytes") == size:
+            try:
+                measured_input = probe_video_facts(validated_paths[0], cancel_check=lambda: is_cancel_requested(job))
+            except Exception:
+                measured_input = None
+            if is_cancel_requested(job):
+                return False
+            _validated_tool_input_paths(job)
+            if measured_input:
+                producer["processing"] = {
+                    "version": 1, "input": measured_input, "output": measured_output,
+                }
+        if is_cancel_requested(job):
+            return False
+        if tool == "upscale":
+            try:
+                current_size, current_digest = _recovery_sha256_file(
+                    staged_path, abort_check=lambda: is_cancel_requested(job))
+            except QueueRecoveryRuntimeError:
+                if is_cancel_requested(job):
+                    return False
+                raise
+            if current_size != size or not hmac.compare_digest(current_digest, digest):
+                raise ValueError("The tool output changed before publication.")
+            if is_cancel_requested(job):
+                return False
         if os.path.lexists(destination) or os.path.lexists(meta_path):
             raise ValueError("The tool output already exists. Refresh the gallery.")
         _write_tool_sidecar(out_dir, filename, source_name=os.path.basename(source),

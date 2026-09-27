@@ -1562,6 +1562,11 @@ export interface OutputMetadata {
   params: Record<string, unknown> | null
   tool?: string
   tool_source?: string
+  processing?: {
+    version?: number
+    input?: MeasuredVideoFacts
+    output?: MeasuredVideoFacts
+  }
   private?: boolean
   explicit?: boolean
   upload_filenames?: Record<string, string | string[]>
@@ -1580,6 +1585,17 @@ export interface OutputMetadata {
   job_id?: string
   generation_time?: number
   created_at?: number
+}
+
+export interface MeasuredVideoFacts {
+  size_bytes?: number
+  width?: number
+  height?: number
+  fps?: number
+  duration_seconds?: number
+  has_audio?: boolean
+  audio_channels?: number
+  audio_sample_rate?: number
 }
 
 export interface MultiClip {

@@ -250,6 +250,31 @@ loaded the stable-share owner sign-in page after restart. This is service and
 unauthenticated browser evidence; the finishing section itself has not been
 accepted in a signed-in browser or with a real processed output.
 
+The next bounded finishing slice records measured source/output video headers
+for a newly completed Tools Upscale job. The publisher probes its own staged
+output and the exact authorized source, revalidates that source, and checks the
+staged bytes again with cancellation-aware hashing. It then includes numeric
+geometry, frame rate, duration and audio facts in the existing atomic,
+privacy-stamped sidecar only when both probes succeed. A failed optional probe
+leaves the completed video publishable without a measured comparison. The
+Gallery card shows these recorded facts under the same private-reveal gate.
+This does not reconstruct legacy measurements, prove requested generation
+finishing succeeded, or add a local media-flow worker. Post-generation
+finishing records, full processing chains, signed-in viewing and owner
+acceptance remain open.
+The full backend gate passed 5,472 tests with 17 skips. Its first UI pass found
+two test harness format-module mocks missing the existing duration formatter;
+after those mocks were updated, all 750 UI tests, TypeScript/Vite build and the
+repository guard gate passed. An independent review's output-size, staged-byte
+identity and cancellation findings were resolved with focused regressions.
+
+Generic Gallery upload deletion remains deferred. Uploads are session-owned
+and the virtual Uploads workspace is browse-only; project-output deletion
+does not supply upload authority. The existing `.trash_*` path is transient
+rollback staging and later cleanup, not a user-restorable trash. An upload
+delete action needs exact session authorization, active and recoverable job
+input fencing, and an explicit recovery contract before adoption.
+
 The [YuE2 real-audio model card](https://huggingface.co/Mothersuperior/yue2-mothersuperior-realaudio-tokenizer-v4)
 documents a matched joint-v9 tokenizer head and NAR decoder LoRA. The pinned
 pair is now an opt-in Sound/Vision decoder profile exposed in Maestro, separate
