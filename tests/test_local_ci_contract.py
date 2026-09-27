@@ -53,7 +53,7 @@ class LocalWrapperTests(unittest.TestCase):
         h3 = self.wrapper.commands_for_gate("h3-upstream", python=python)
 
         self.assertEqual(len(guard), 2)
-        self.assertEqual(len(backend), 4)
+        self.assertEqual(len(backend), 3)
         self.assertEqual(len(ui), 2)
         self.assertEqual(all_commands, backend + ui)
         self.assertEqual(
@@ -64,6 +64,13 @@ class LocalWrapperTests(unittest.TestCase):
         self.assertEqual(ui[0].argv, ("npm", "test"))
         self.assertEqual(ui[1].argv, ("npm", "run", "build"))
         self.assertIn("test_*.py", backend[2].argv)
+        self.assertFalse(
+            any(
+                "test_call_llm_json_grammar.py" in argument
+                for command in backend
+                for argument in command.argv
+            )
+        )
 
     def test_child_environment_hides_gpu_runtimes(self):
         with mock.patch.dict(

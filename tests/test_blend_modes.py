@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import io
 import json
 import os
 import subprocess
@@ -11,6 +12,7 @@ import sys
 import tempfile
 import unittest
 import uuid
+from contextlib import redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -835,28 +837,46 @@ class TestBlendWorkerAssembly(unittest.TestCase):
         self.assertNotIn("transition.meta.json", job["_test_remaining_files"])
 
     def test_missing_transition_sidecar_fails_without_public_final(self):
-        job, statuses, _commands, _filters, _sidecars = self._run_worker(
-            "insert", omit_sidecar=True,
-        )
+        diagnostics = io.StringIO()
+        with redirect_stderr(diagnostics):
+            job, statuses, _commands, _filters, _sidecars = self._run_worker(
+                "insert", omit_sidecar=True,
+            )
         self.assertEqual(statuses[-1], "failed")
         self.assertFalse(any(name.endswith("_blend.mp4") for name in job["_test_remaining_files"]))
         self.assertNotIn("transition.mp4", job["_test_remaining_files"])
+        self.assertIn(
+            "Generated Blend transition metadata was not found",
+            diagnostics.getvalue(),
+        )
 
     def test_mismatched_transition_sidecar_fails_without_public_final(self):
-        job, statuses, _commands, _filters, _sidecars = self._run_worker(
-            "insert", mismatched_sidecar=True,
-        )
+        diagnostics = io.StringIO()
+        with redirect_stderr(diagnostics):
+            job, statuses, _commands, _filters, _sidecars = self._run_worker(
+                "insert", mismatched_sidecar=True,
+            )
         self.assertEqual(statuses[-1], "failed")
         self.assertFalse(any(name.endswith("_blend.mp4") for name in job["_test_remaining_files"]))
         self.assertNotIn("transition.mp4", job["_test_remaining_files"])
+        self.assertIn(
+            "Generated Blend transition metadata does not match its job",
+            diagnostics.getvalue(),
+        )
 
     def test_mismatched_transition_policy_fails_without_public_final(self):
-        job, statuses, _commands, _filters, _sidecars = self._run_worker(
-            "insert", mismatched_policy=True,
-        )
+        diagnostics = io.StringIO()
+        with redirect_stderr(diagnostics):
+            job, statuses, _commands, _filters, _sidecars = self._run_worker(
+                "insert", mismatched_policy=True,
+            )
         self.assertEqual(statuses[-1], "failed")
         self.assertFalse(any(name.endswith("_blend.mp4") for name in job["_test_remaining_files"]))
         self.assertNotIn("transition.mp4", job["_test_remaining_files"])
+        self.assertIn(
+            "Generated Blend transition metadata does not match its job",
+            diagnostics.getvalue(),
+        )
 
     def test_overlap_keeps_trimmed_source_inputs(self):
         _job, statuses, commands, _filters, _sidecars = self._run_worker("overlap")
@@ -944,14 +964,23 @@ class TestBlendWorkerAssembly(unittest.TestCase):
                 def VideoReader(self, _path):
                     raise RuntimeError("synthetic decode failure")
 
-            with patch.dict(sys.modules, {"decord": BrokenDecord()}), patch.object(
-                subprocess, "run", side_effect=lambda command, **_kwargs: commands.append(list(command))
+            diagnostics = io.StringIO()
+            with redirect_stderr(diagnostics), patch.dict(
+                sys.modules, {"decord": BrokenDecord()},
+            ), patch.object(
+                subprocess,
+                "run",
+                side_effect=lambda command, **_kwargs: commands.append(list(command))
                 or SimpleNamespace(returncode=0, stdout="", stderr=""),
             ):
                 worker("probe")
         self.assertEqual(statuses[-1], "failed")
         self.assertFalse(any(command and command[0] == "ffmpeg" for command in commands))
         self.assertIn("source media", jobs["probe"]["error"])
+        self.assertIn(
+            "Blend source media could not be read",
+            diagnostics.getvalue(),
+        )
 
     def test_final_sidecar_rebinds_output_and_prunes_temp_references(self):
         job, statuses, commands, _filters, sidecars = self._run_worker(

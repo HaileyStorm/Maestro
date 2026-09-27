@@ -11,6 +11,7 @@ Contract under test (no llama-server involved — stub generate fns):
 """
 import os
 import sys
+import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app"))
 
@@ -39,78 +40,65 @@ def _planner_with(responses):
     return _Planner(llm_generate=fake_gen, llm_generate_streaming=fake_gen), calls
 
 
-def test_schema_on_first_attempt_when_thinking_off():
-    planner, calls = _planner_with([VALID])
-    out = planner._call_llm_json("u", "s", thinking_budget=0, json_schema=SCHEMA)
-    assert out == [{"scene_goal": "x"}]
-    assert len(calls) == 1
-    assert calls[0]["json_schema"] == SCHEMA
-    assert calls[0]["enable_thinking"] is False
+class TestJsonGrammarGating(unittest.TestCase):
+    def test_schema_on_first_attempt_when_thinking_off(self):
+        planner, calls = _planner_with([VALID])
+        out = planner._call_llm_json("u", "s", thinking_budget=0, json_schema=SCHEMA)
+        self.assertEqual(out, [{"scene_goal": "x"}])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["json_schema"], SCHEMA)
+        self.assertIs(calls[0]["enable_thinking"], False)
 
+    def test_thinking_on_first_attempt_unconstrained_retry_constrained(self):
+        planner, calls = _planner_with(["not json at all ((", VALID])
+        out = planner._call_llm_json("u", "s", thinking_budget=4096, json_schema=SCHEMA)
+        self.assertEqual(out, [{"scene_goal": "x"}])
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("json_schema", calls[0])
+        self.assertEqual(calls[1]["json_schema"], SCHEMA)
+        self.assertIs(calls[1]["enable_thinking"], False)
+        self.assertEqual(calls[1]["thinking_budget"], 0)
 
-def test_thinking_on_first_attempt_unconstrained_retry_constrained():
-    planner, calls = _planner_with(["not json at all ((", VALID])
-    out = planner._call_llm_json("u", "s", thinking_budget=4096, json_schema=SCHEMA)
-    assert out == [{"scene_goal": "x"}]
-    assert len(calls) == 2
-    assert "json_schema" not in calls[0]          # thinking-on path untouched
-    assert calls[1]["json_schema"] == SCHEMA      # retry is grammar-locked
-    assert calls[1]["enable_thinking"] is False
-    assert calls[1]["thinking_budget"] == 0
+    def test_retry_gets_generic_grammar_without_schema(self):
+        planner, calls = _planner_with(["garbage ((", VALID])
+        out = planner._call_llm_json("u", "s", thinking_budget=4096)
+        self.assertEqual(out, [{"scene_goal": "x"}])
+        self.assertEqual(calls[1]["json_schema"], _GENERIC_ARRAY_SCHEMA)
 
+    def test_degrades_when_gen_fn_rejects_schema(self):
+        calls = []
+        responses = [VALID]
 
-def test_retry_gets_generic_grammar_without_schema():
-    planner, calls = _planner_with(["garbage ((", VALID])
-    out = planner._call_llm_json("u", "s", thinking_budget=4096)
-    assert out == [{"scene_goal": "x"}]
-    assert calls[1]["json_schema"] == _GENERIC_ARRAY_SCHEMA
+        def legacy_gen(**kwargs):
+            if "json_schema" in kwargs:
+                raise TypeError("unexpected keyword argument 'json_schema'")
+            calls.append(kwargs)
+            return responses.pop(0)
 
+        planner = _Planner(llm_generate=legacy_gen, llm_generate_streaming=legacy_gen)
+        out = planner._call_llm_json("u", "s", thinking_budget=0, json_schema=SCHEMA)
+        self.assertEqual(out, [{"scene_goal": "x"}])
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("json_schema", calls[0])
 
-def test_degrades_when_gen_fn_rejects_schema():
-    calls = []
-    responses = [VALID]
+    def test_degraded_retry_matches_historical_call(self):
+        responses = ["garbage ((", VALID]
+        calls = []
 
-    def legacy_gen(**kwargs):
-        if "json_schema" in kwargs:
-            raise TypeError("unexpected keyword argument 'json_schema'")
-        calls.append(kwargs)
-        return responses.pop(0)
+        def legacy_gen(**kwargs):
+            if "json_schema" in kwargs:
+                raise TypeError("unexpected keyword argument 'json_schema'")
+            calls.append(kwargs)
+            return responses.pop(0)
 
-    planner = _Planner(llm_generate=legacy_gen, llm_generate_streaming=legacy_gen)
-    out = planner._call_llm_json("u", "s", thinking_budget=0, json_schema=SCHEMA)
-    assert out == [{"scene_goal": "x"}]
-    assert len(calls) == 1
-    assert "json_schema" not in calls[0]          # constrained call degraded cleanly
-
-
-def test_degraded_retry_matches_historical_call():
-    responses = ["garbage ((", VALID]
-    calls = []
-
-    def legacy_gen(**kwargs):
-        if "json_schema" in kwargs:
-            raise TypeError("unexpected keyword argument 'json_schema'")
-        calls.append(kwargs)
-        return responses.pop(0)
-
-    planner = _Planner(llm_generate=legacy_gen, llm_generate_streaming=legacy_gen)
-    out = planner._call_llm_json("u", "s", thinking_budget=4096)
-    assert out == [{"scene_goal": "x"}]
-    # degraded retry restores the historical thinking budget and drops
-    # the grammar-only kwargs entirely
-    assert len(calls) == 2
-    assert calls[1]["thinking_budget"] == 2048
-    assert "enable_thinking" not in calls[1]
+        planner = _Planner(llm_generate=legacy_gen, llm_generate_streaming=legacy_gen)
+        out = planner._call_llm_json("u", "s", thinking_budget=4096)
+        self.assertEqual(out, [{"scene_goal": "x"}])
+        # The degraded retry restores the historical call without grammar kwargs.
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["thinking_budget"], 2048)
+        self.assertNotIn("enable_thinking", calls[1])
 
 
 if __name__ == "__main__":
-    failed = 0
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            try:
-                fn()
-                print(f"PASS {name}")
-            except AssertionError as e:
-                failed += 1
-                print(f"FAIL {name}: {e}")
-    sys.exit(1 if failed else 0)
+    unittest.main()

@@ -83,11 +83,6 @@ def commands_for_gate(gate: str, *, python: Path | None = None) -> tuple[GateCom
             ),
             REPO_ROOT,
         ),
-        GateCommand(
-            "JSON grammar regression",
-            (str(python), "tests/test_call_llm_json_grammar.py"),
-            REPO_ROOT,
-        ),
     )
     ui = (
         GateCommand("UI tests", ("npm", "test"), UI_ROOT),

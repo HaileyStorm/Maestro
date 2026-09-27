@@ -123,7 +123,6 @@ Its CI-equivalent commands are:
 app/env/bin/python scripts/verify_clean_repo.py
 app/env/bin/python -m compileall -q -x '(^|/)(env|node_modules)/' app/services app/launch.py scripts
 app/env/bin/python -m unittest discover -s tests -p "test_*.py"
-app/env/bin/python tests/test_call_llm_json_grammar.py
 (cd ui && npm test && npm run build)
 ```
 
