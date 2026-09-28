@@ -79,6 +79,32 @@ function finishedToolDetails(metadata: OutputMetadata | null) {
   }
 }
 
+function recordedGenerationFinishing(metadata: OutputMetadata | null) {
+  if (metadata?.source !== 'sidecar' || metadata.postprocessing?.version !== 1) return []
+  const steps = metadata.postprocessing.steps
+  if (!Array.isArray(steps)) return []
+  const labels = new Map([
+    ['upscale', 'Upscale'],
+    ['delivery_fit', 'Delivery fit'],
+    ['film_grain', 'Film grain'],
+    ['voice_clone', 'Voice replacement'],
+    ['audio_normalization', 'Audio level smoothing'],
+  ])
+  const outcomes = new Map([
+    ['applied', 'Applied'],
+    ['not_applied', 'Not applied'],
+    ['unconfirmed', 'Outcome unconfirmed'],
+  ])
+  return steps.slice(0, 5).flatMap(record => {
+    if (!record || typeof record !== 'object') return []
+    const label = labels.get(record.step ?? '')
+    const outcome = outcomes.get(record.outcome ?? '')
+    if (!label || !outcome) return []
+    const method = record.step === 'upscale' ? finishingMethodLabel(record.method) : null
+    return [{ label: method ?? label, outcome }]
+  })
+}
+
 /** Image component that retries loading if the file isn't fully written yet.
  *
  * Backstops the backend's atomic image-write guarantee in two ways:
@@ -319,6 +345,7 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
 
   const params = meta?.params as Record<string, unknown> | null
   const finishing = finishedToolDetails(meta)
+  const generationFinishing = recordedGenerationFinishing(meta)
   const isGalleryStillGuideOutput = isH3GalleryStillGuideOutput(meta)
   const uploadFilenames = meta?.upload_filenames
 
@@ -1349,10 +1376,10 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
           )}
         </div>
       </div>
-      {!privateBlurred && finishing && (
+      {!privateBlurred && (finishing || generationFinishing.length > 0) && (
         <details className="border-t border-border bg-bg-secondary px-3 py-2 text-xs text-text-secondary" onClick={event => event.stopPropagation()}>
           <summary className="cursor-pointer select-none font-medium text-text-primary">Finishing details</summary>
-          <dl className="mt-2 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-[11px]">
+          {finishing && <dl className="mt-2 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-[11px]">
             <dt className="text-text-muted">Result</dt><dd>{finishing.result}</dd>
             {finishing.method && <><dt className="text-text-muted">Method</dt><dd>{finishing.method}</dd></>}
             {finishing.sourceName && <><dt className="text-text-muted">Source</dt><dd className="min-w-0 break-all">{finishing.sourceName}</dd></>}
@@ -1360,7 +1387,12 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
             {finishing.measuredOutput && <><dt className="text-text-muted">Measured output</dt><dd>{finishing.measuredOutput}</dd></>}
             {finishing.recordedAt && <><dt className="text-text-muted">Recorded at</dt><dd>{finishing.recordedAt}</dd></>}
             {finishing.jobTime && <><dt className="text-text-muted">Recorded job time</dt><dd>{finishing.jobTime}</dd></>}
-          </dl>
+          </dl>}
+          {generationFinishing.length > 0 && <ol className="mt-2 space-y-1 text-[11px]">
+            {generationFinishing.map((step, index) => <li key={`${step.label}-${index}`} className="flex justify-between gap-3">
+              <span>{step.label}</span><span className="text-text-muted">{step.outcome}</span>
+            </li>)}
+          </ol>}
         </details>
       )}
       {file.type === 'image' && showInputDestinations && (

@@ -417,6 +417,16 @@ class H3DeliveryTransactionTests(unittest.TestCase):
                 Path(self.out_dir, filename).read_bytes(),
                 f"native-{index}".encode() + b"-upscaled-fit",
             )
+            meta = json.loads(Path(
+                self.out_dir, Path(filename).stem + ".meta.json",
+            ).read_text(encoding="utf-8"))
+            self.assertEqual(meta["postprocessing"], {
+                "version": 1,
+                "steps": [
+                    {"step": "upscale", "outcome": "applied", "method": "flashvsr3"},
+                    {"step": "delivery_fit", "outcome": "applied"},
+                ],
+            })
         self.assertFalse(any(name.startswith(".maestro-delivery-") for name in os.listdir(self.out_dir)))
 
     def test_second_oom_is_path_redacted_and_retains_private_owned_native(self):
@@ -701,6 +711,7 @@ class H3DeliveryTransactionTests(unittest.TestCase):
             self.assertEqual(meta["params"]["requested_delivery_resolution"], "3840x2160")
             self.assertEqual(meta["params"]["delivery_resolution"], "")
             self.assertEqual(meta["params"]["spatial_upsampling"], "")
+            self.assertNotIn("postprocessing", meta)
             self.assertEqual(meta["delivery_recovery"]["producer_job_id"], "job-1")
             self.assertEqual(
                 meta["delivery_recovery"]["recovery_job_id"], "recovery-child",
@@ -713,6 +724,11 @@ class H3DeliveryTransactionTests(unittest.TestCase):
         )
         symbols["_reset_h3_delivery_work"](staged)
         symbols["_publish_h3_delivery_outputs"](self.job, staged)
+        for filename in self.files:
+            meta = json.loads(Path(
+                self.out_dir, Path(filename).stem + ".meta.json",
+            ).read_text(encoding="utf-8"))
+            self.assertNotIn("postprocessing", meta)
         expected = [Path(item["rollback_meta"]).read_bytes() for item in staged]
         self.job["cancel_requested"] = True
         symbols["_rollback_h3_delivery_publication"](self.job)
@@ -750,14 +766,10 @@ class H3DeliveryTransactionTests(unittest.TestCase):
         staged = symbols["_stage_h3_delivery_native_outputs"](
             self.job, self.out_dir, self.files,
         )
-        publish = Mock(return_value=self.files)
         retry_symbols = _load_launch_symbols(
             "_H3DeliveryFailure",
             "_retry_h3_delivery_postprocess_only",
-            namespace={
-                **symbols,
-                "_publish_h3_delivery_outputs": publish,
-            },
+            namespace=symbols,
         )
         recovery = {
             "spatial_upsampling": "flashvsr3",
@@ -772,7 +784,15 @@ class H3DeliveryTransactionTests(unittest.TestCase):
         self.assertEqual(release.call_count, 1)
         self.assertEqual(upscale.call_count, 2)
         self.assertEqual(fit.call_count, 2)
-        self.assertEqual(publish.call_count, 1)
+        for filename in self.files:
+            meta = json.loads(Path(
+                self.out_dir, Path(filename).stem + ".meta.json",
+            ).read_text(encoding="utf-8"))
+            self.assertEqual(meta["delivery_recovery"]["action"], "retry_delivery")
+            self.assertEqual(meta["postprocessing"]["steps"], [
+                {"step": "upscale", "outcome": "applied", "method": "flashvsr3"},
+                {"step": "delivery_fit", "outcome": "applied"},
+            ])
         self.assertFalse(hasattr(symbols["wgp"], "generate_video"))
 
 class H3DeliverySelectionAndPrivacyTests(unittest.TestCase):

@@ -296,6 +296,20 @@ stable-share owner sign-in page. This verifies service reachability and
 unauthenticated UI hydration; a signed-in Gallery comparison and real Tools
 Upscale output remain unverified.
 
+The September 27 generation finishing slice adds versioned, per-output
+sidecar records only after a post-generation pass returns or reports a
+definite no-op. It records upscale, film grain, voice replacement and audio
+level smoothing as applied, not applied, or outcome unconfirmed. H3's separate
+transaction records applied upscale and exact delivery fit only after both
+passes complete and final publication succeeds; accepting protected native
+media does not claim either pass. Gallery shows the recorded steps in its
+collapsed finishing section after private reveal, validates the closed step
+and outcome vocabulary, and ignores request settings or embedded metadata as
+evidence. This is a new-output record, not a historical backfill or a complete
+processing-chain ledger. Optional passes after H3 delivery publication are
+not yet part of its transactional record. CPU and synthetic UI checks do not
+establish a live generation, signed-in Gallery viewing or owner acceptance.
+
 Generic Gallery upload deletion remains deferred. Uploads are session-owned
 and the virtual Uploads workspace is browse-only; project-output deletion
 does not supply upload authority. The existing `.trash_*` path is transient

@@ -60324,6 +60324,7 @@ def _publish_h3_delivery_outputs(
     job: dict,
     staged: list[dict],
     *,
+    completed_delivery: dict | None = None,
     recovery_action: str = "",
     requested_target: str = "",
     update_job_fn=None,
@@ -60359,6 +60360,29 @@ def _publish_h3_delivery_outputs(
         })
         if final:
             sidecar.pop("delivery_native_source", None)
+            # Only callers that finished both delivery passes supply this
+            # receipt. Native acceptance and direct publication must not
+            # infer applied work from the requested settings.
+            if recovery_action == "accept_native":
+                sidecar.pop("postprocessing", None)
+            elif isinstance(completed_delivery, dict):
+                method = str(completed_delivery.get("spatial_upsampling") or "")
+                upscale_step = {"step": "upscale", "outcome": "applied"}
+                if (
+                    0 < len(method) <= 40
+                    and all(
+                        character.isalnum() or character in "_.-"
+                        for character in method
+                    )
+                ):
+                    upscale_step["method"] = method
+                sidecar["postprocessing"] = {
+                    "version": 1,
+                    "steps": [
+                        upscale_step,
+                        {"step": "delivery_fit", "outcome": "applied"},
+                    ],
+                }
             durable = (
                 sidecar.get("delivery_recovery")
                 if isinstance(sidecar.get("delivery_recovery"), dict) else {}
@@ -60706,6 +60730,7 @@ def _process_h3_delivery_from_protected_native(
         return _publish_h3_delivery_outputs(
             job,
             staged,
+            completed_delivery={"spatial_upsampling": spatial_upsampling},
             update_job_fn=update_job_fn,
             publication_commit_fn=publication_commit_fn,
         )
@@ -60853,6 +60878,7 @@ def _deliver_h3_outputs_transactionally(
             return _publish_h3_delivery_outputs(
                 job,
                 staged,
+                completed_delivery={"spatial_upsampling": spatial_upsampling},
                 update_job_fn=update_job_fn,
                 publication_commit_fn=publication_commit_fn,
             )
@@ -61551,6 +61577,9 @@ def _retry_h3_delivery_postprocess_only(
         return _publish_h3_delivery_outputs(
             job,
             staged,
+            completed_delivery={
+                "spatial_upsampling": str(recovery.get("spatial_upsampling") or ""),
+            },
             recovery_action="retry_delivery",
             requested_target=str(recovery.get("delivery_resolution") or ""),
         )
@@ -65318,6 +65347,27 @@ def _run_generation(
             clip_output_files: dict[int, str] = {}
             join_output_file = None
             producer_artifact_roles: dict[str, str] = {}
+            postprocessing_outcomes: dict[str, list[dict[str, str]]] = {}
+
+            def _record_postprocessing_outcome(
+                filename: str, step: str, outcome: str, *, method: str = "",
+            ) -> None:
+                """Record only an observed pass result for this job's output."""
+                if step not in {
+                    "upscale", "film_grain", "voice_clone", "audio_normalization",
+                }:
+                    return
+                if outcome not in {"applied", "not_applied", "unconfirmed"}:
+                    return
+                event = {"step": step, "outcome": outcome}
+                if step == "upscale" and isinstance(method, str) and re.fullmatch(
+                    r"(?:flashvsr2pass|flashvsr|lanczos|dlss5\*)\d+(?:\.\d+)?",
+                    method, re.IGNORECASE,
+                ):
+                    event["method"] = method
+                steps = postprocessing_outcomes.setdefault(filename, [])
+                steps[:] = [previous for previous in steps if previous["step"] != step]
+                steps.append(event)
 
             def _record_eta_inactive_time(inactive_started: float) -> None:
                 """Exclude scheduler holds from live runtime ETA samples."""
@@ -65485,6 +65535,12 @@ def _run_generation(
                     else:
                         file_sidecar.pop("director_clip_index", None)
                     file_sidecar["output_filename"] = fname
+                    recorded_steps = postprocessing_outcomes.get(fname)
+                    if recorded_steps and not native_source:
+                        file_sidecar["postprocessing"] = {
+                            "version": 1,
+                            "steps": [dict(step) for step in recorded_steps],
+                        }
                     producer_role = producer_artifact_roles.get(fname)
                     if producer_role:
                         # This role comes from the task's registered output
@@ -68450,9 +68506,17 @@ def _run_generation(
                                 _apply_spatial_upsampling_to_file(
                                     video_path, pp_spatial_upsampling, job=job,
                                 )
+                                _record_postprocessing_outcome(
+                                    fname, "upscale", "applied",
+                                    method=pp_spatial_upsampling,
+                                )
                                 print(f"  [Upscale] Done: {fname}")
                             except Exception as up_err:
-                                print(f"  [Upscale] Warning: failed on {fname} (keeping original): {up_err}")
+                                _record_postprocessing_outcome(
+                                    fname, "upscale", "unconfirmed",
+                                    method=pp_spatial_upsampling,
+                                )
+                                print(f"  [Upscale] Warning: outcome unconfirmed for {fname}: {up_err}")
                                 traceback.print_exc()
 
                 # Post-generation film grain pass (applied to output files, not during inference)
@@ -68475,8 +68539,14 @@ def _run_generation(
                                 return False
                             print(f"  [Film Grain] Applying to {fname} (intensity={pp_film_grain_intensity}, saturation={pp_film_grain_saturation})")
                             _apply_film_grain_to_file(video_path, pp_film_grain_intensity, pp_film_grain_saturation)
+                            _record_postprocessing_outcome(
+                                fname, "film_grain", "applied",
+                            )
                             print(f"  [Film Grain] Done: {fname}")
                         except Exception as fg_err:
+                            _record_postprocessing_outcome(
+                                fname, "film_grain", "unconfirmed",
+                            )
                             print(f"  [Film Grain] Warning: failed on {fname}: {fg_err}")
                             traceback.print_exc()
 
@@ -68512,8 +68582,18 @@ def _run_generation(
                                 cancel_check=lambda: is_cancel_requested(job),
                             )
                             if voice_cloned:
+                                _record_postprocessing_outcome(
+                                    fname, "voice_clone", "applied",
+                                )
                                 print(f"  [Voice Clone] Done: {fname}")
+                            else:
+                                _record_postprocessing_outcome(
+                                    fname, "voice_clone", "not_applied",
+                                )
                         except Exception as vc_err:
+                            _record_postprocessing_outcome(
+                                fname, "voice_clone", "unconfirmed",
+                            )
                             print(f"  [Voice Clone] Warning: failed on {fname}: {vc_err}")
                             traceback.print_exc()
                         if is_cancel_requested(job):
@@ -68547,12 +68627,21 @@ def _run_generation(
                             )
                             if result.returncode == 0 and os.path.isfile(tmp_path):
                                 os.replace(tmp_path, audio_path)
+                                _record_postprocessing_outcome(
+                                    fname, "audio_normalization", "applied",
+                                )
                                 print(f"  [DynAudNorm] Done: {fname}")
                             else:
+                                _record_postprocessing_outcome(
+                                    fname, "audio_normalization", "not_applied",
+                                )
                                 print(f"  [DynAudNorm] ffmpeg failed: {result.stderr[:200]}")
                                 if os.path.isfile(tmp_path):
                                     os.remove(tmp_path)
                         except Exception as dan_err:
+                            _record_postprocessing_outcome(
+                                fname, "audio_normalization", "unconfirmed",
+                            )
                             print(f"  [DynAudNorm] Warning: failed on {fname}: {dan_err}")
 
                 # Refresh sidecars after post-processing/renames. Internal

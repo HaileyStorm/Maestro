@@ -853,10 +853,42 @@ test('private audio and retry images acquire no media URL before reveal', async 
     source: 'sidecar', params: { spatial_upsampling: 'lanczos2' },
   }
   assert.equal(JSON.stringify(render(processedVideo)).includes('Finishing details'), false)
+  const generatedVideo = { name: 'generated.mp4', type: 'video', url: '/generated.mp4' }
+  globalThis.__mediaFeedTestMeta = {
+    source: 'sidecar', params: { spatial_upsampling: 'flashvsr2' },
+    postprocessing: { version: 1, steps: [
+      { step: 'upscale', outcome: 'applied', method: 'flashvsr2' },
+      { step: 'delivery_fit', outcome: 'applied' },
+      { step: 'film_grain', outcome: 'unconfirmed' },
+      { step: 'voice_clone', outcome: 'not_applied' },
+      { step: 'invalid', outcome: 'applied', method: '/private/source' },
+    ] },
+  }
+  assert.equal(JSON.stringify(render(generatedVideo)).includes('Finishing details'), false)
+  globalThis.__mediaFeedRevealed.add(privatePreviewIdentity('private-media', generatedVideo.name, 'r1'))
+  const generated = JSON.stringify(render(generatedVideo))
+  assert.match(generated, /Finishing details/)
+  assert.match(generated, /FlashVSR 2×/)
+  assert.match(generated, /Delivery fit/)
+  assert.match(generated, /Film grain/)
+  assert.match(generated, /Outcome unconfirmed/)
+  assert.match(generated, /Voice replacement/)
+  assert.match(generated, /Not applied/)
+  assert.equal(generated.includes('/private/source'), false)
+
+  globalThis.__mediaFeedTestMeta = {
+    source: 'sidecar', params: {}, postprocessing: { version: 1, steps: [
+      { step: '__proto__', outcome: 'applied' },
+      { step: 'upscale', outcome: 'constructor' },
+    ] },
+  }
+  assert.equal(JSON.stringify(render(generatedVideo)).includes('Finishing details'), false)
+
   globalThis.__mediaFeedTestMeta = {
     source: 'embedded', tool: 'upscale', params: { method: 'lanczos2' },
+    postprocessing: { version: 1, steps: [{ step: 'upscale', outcome: 'applied' }] },
   }
-  assert.equal(JSON.stringify(render(processedVideo)).includes('Finishing details'), false)
+  assert.equal(JSON.stringify(render(generatedVideo)).includes('Finishing details'), false)
 })
 
 test('private image and video thumbnails acquire sources only while revealed', async t => {

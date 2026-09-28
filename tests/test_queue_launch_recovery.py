@@ -10162,6 +10162,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "job_id": "h3-test", "start_time": time.time(),
                 "out_dir": str(root), "clip_output_files": {},
                 "producer_artifact_roles": {"fresh.mp4": "final"},
+                "postprocessing_outcomes": {},
                 "pp_film_grain_intensity": 0,
                 "pp_spatial_upsampling": None,
                 "pp_delivery_resolution": None,
@@ -10182,6 +10183,64 @@ class QueueLaunchWiringTests(unittest.TestCase):
             self.assertFalse(media.exists())
             self.assertFalse((root / "fresh.meta.json").exists())
             self.assertEqual(len(list(root.glob(".private-sidecar-failed-*-fresh.mp4"))), 1)
+
+    def test_generation_sidecar_records_only_observed_finishing_outcomes(self):
+        module = ast.Module(body=[
+            _function(self.launch, "_record_postprocessing_outcome"),
+            _function(self.launch, "_write_output_sidecars"),
+        ], type_ignores=[])
+        ast.fix_missing_locations(module)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            media = root / "fresh.mp4"
+            media.write_bytes(b"media")
+            namespace = {
+                "os": os, "json": json, "time": time, "uuid": uuid, "re": re,
+                "job": {
+                    "params": {"generation_mode": "video", "spatial_upsampling": "flashvsr2"},
+                    "access_policy": {"private": True}, "workspace": "default",
+                },
+                "job_id": "finishing-test", "start_time": time.time(),
+                "out_dir": str(root), "clip_output_files": {},
+                "producer_artifact_roles": {"fresh.mp4": "final"},
+                "postprocessing_outcomes": {},
+                "pp_film_grain_intensity": 0,
+                "pp_spatial_upsampling": None, "pp_delivery_resolution": None,
+                "requested_model": "other", "_H3_LONG_STUDIO_MODELS": {"h3"},
+                "GENERATED_MEDIA_EXTENSIONS": {".mp4"},
+                "_RECOVERY_ARTIFACT_ROLES": {"final", "component", "window", "temporary"},
+                "_prepare_generation_sidecar_params": lambda params: ({}, dict(params)),
+                "_strip_director_image_role_internals": lambda _params: None,
+                "_extract_output_seed": lambda _name: None,
+                "stamp_sidecar_policy": stamp_sidecar_policy,
+            }
+            exec(compile(module, "isolated-generation-finishing", "exec"), namespace)
+            write_sidecar = namespace["_write_output_sidecars"]
+            record = namespace["_record_postprocessing_outcome"]
+            media_paths = {"fresh.mp4": str(media)}
+
+            write_sidecar(["fresh.mp4"], media_paths=media_paths)
+            sidecar_path = root / "fresh.meta.json"
+            self.assertNotIn("postprocessing", json.loads(sidecar_path.read_text()))
+
+            record("fresh.mp4", "upscale", "applied", method="flashvsr2")
+            record("fresh.mp4", "voice_clone", "not_applied")
+            record("fresh.mp4", "film_grain", "unconfirmed")
+            record("fresh.mp4", "unsupported", "applied", method="/private/source")
+            record("fresh.mp4", "voice_clone", "unsupported")
+            write_sidecar(["fresh.mp4"], media_paths=media_paths)
+            sidecar = json.loads(sidecar_path.read_text())
+            self.assertTrue(sidecar["private"])
+            self.assertEqual(sidecar["postprocessing"], {
+                "version": 1,
+                "steps": [
+                    {"step": "upscale", "outcome": "applied", "method": "flashvsr2"},
+                    {"step": "voice_clone", "outcome": "not_applied"},
+                    {"step": "film_grain", "outcome": "unconfirmed"},
+                ],
+            })
+            self.assertNotIn("/private/source", sidecar_path.read_text())
 
     def test_final_adoption_runs_before_cleanup_index_and_workers(self):
         restore = ast.get_source_segment(

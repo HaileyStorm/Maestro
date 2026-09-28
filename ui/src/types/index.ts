@@ -1567,6 +1567,14 @@ export interface OutputMetadata {
     input?: MeasuredVideoFacts
     output?: MeasuredVideoFacts
   }
+  postprocessing?: {
+    version?: number
+    steps?: Array<{
+      step?: string
+      outcome?: string
+      method?: string
+    }>
+  }
   private?: boolean
   explicit?: boolean
   upload_filenames?: Record<string, string | string[]>
