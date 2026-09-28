@@ -1,9 +1,11 @@
+import asyncio
 import ast
 import os
 import sys
 import tempfile
 import types
 import unittest
+import uuid
 from pathlib import Path
 
 
@@ -14,6 +16,7 @@ if str(APP_ROOT) not in sys.path:
 
 from services.output_access import (  # noqa: E402
     can_access_upload,
+    public_output_policy,
     write_upload_access_sidecar,
 )
 
@@ -39,6 +42,33 @@ class _HTTPException(Exception):
 
 
 class AuthorizedMediaResolverTests(unittest.TestCase):
+    @staticmethod
+    def _load_upload_route():
+        source = LAUNCH_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        node = next(
+            item for item in ast.walk(tree)
+            if isinstance(item, ast.AsyncFunctionDef)
+            and item.name == "upload_image"
+        )
+        node.decorator_list = []
+        module = ast.Module(body=[node], type_ignores=[])
+        ast.fix_missing_locations(module)
+        namespace = {
+            "Request": object,
+            "UploadFile": object,
+            "File": lambda _value: None,
+            "HTTPException": _HTTPException,
+            "MAX_IMAGE_UPLOAD_BYTES": 1024,
+            "_require_upload_content_access": lambda _request: None,
+            "write_upload_access_sidecar": write_upload_access_sidecar,
+            "public_output_policy": public_output_policy,
+            "os": os,
+            "uuid": uuid,
+        }
+        exec(compile(module, str(LAUNCH_PATH), "exec"), namespace)
+        return namespace["upload_image"]
+
     def _load_resolver(self, output_root: str):
         source = LAUNCH_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source)
@@ -191,6 +221,47 @@ class AuthorizedMediaResolverTests(unittest.TestCase):
                             raised.exception.detail,
                             f"Unauthorized media: {field}",
                         )
+            finally:
+                os.chdir(previous)
+
+    def test_local_upload_under_volume_symlink_returns_authorizable_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = root / "app"
+            volume = root / "volume"
+            outputs = root / "outputs"
+            app.mkdir()
+            volume.mkdir()
+            outputs.mkdir()
+            (app / "uploads").symlink_to(volume, target_is_directory=True)
+            previous = os.getcwd()
+            os.chdir(app)
+            try:
+                owner = "a" * 32
+                foreign = "b" * 32
+                request = self._request(owner)
+                request.headers = {}
+
+                class UploadedFile:
+                    filename = "source.png"
+
+                    async def read(self):
+                        return b"synthetic-source"
+
+                result = asyncio.run(
+                    self._load_upload_route()(request, UploadedFile())
+                )
+                canonical = str(volume / result["filename"])
+                alias = str(app / "uploads" / result["filename"])
+                self.assertEqual(result["path"], canonical)
+                resolver = self._load_resolver(str(outputs))
+                self.assertEqual(
+                    resolver(request, result["path"], "default"), canonical,
+                )
+                self.assertIsNone(
+                    resolver(self._request(foreign), result["path"], "default")
+                )
+                self.assertIsNone(resolver(request, alias, "default"))
             finally:
                 os.chdir(previous)
 

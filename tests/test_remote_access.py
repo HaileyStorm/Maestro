@@ -2069,11 +2069,14 @@ class LaunchSecurityContractTests(unittest.TestCase):
         self.assertNotIn("owner", active_projects)
 
     def test_remote_uploads_are_forced_private_and_paths_are_redacted(self):
-        for name in ("upload_audio", "upload_image"):
+        for name, local_path in (
+            ("upload_audio", "else filepath"),
+            ("upload_image", "else os.path.realpath(filepath)"),
+        ):
             source = self._function_source(name)
             self.assertIn("maestro_remote", source)
             self.assertIn("private = True", source)
-            self.assertIn("else filepath", source)
+            self.assertIn(local_path, source)
 
     def test_first_time_remote_user_can_create_a_password_protected_project(self):
         selector = (

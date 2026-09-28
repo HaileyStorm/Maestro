@@ -75846,7 +75846,7 @@ async def upload_image(
         "path": (
             unique_name
             if bool(getattr(request.state, "maestro_remote", False))
-            else filepath
+            else os.path.realpath(filepath)
         ),
         "url": f"/api/v1/uploads/{unique_name}",
         **public_output_policy(access),
