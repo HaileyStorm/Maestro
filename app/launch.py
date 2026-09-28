@@ -63178,7 +63178,13 @@ def _publish_processed_tool_output(job, staged_path, *, source, tool, params, el
 
     if is_cancel_requested(job):
         return False
-    size, digest = _recovery_sha256_file(staged_path)
+    try:
+        size, digest = _recovery_sha256_file(
+            staged_path, abort_check=lambda: is_cancel_requested(job))
+    except QueueRecoveryRuntimeError:
+        if is_cancel_requested(job):
+            return False
+        raise
     if size <= 0:
         raise ValueError("The tool produced no output video.")
     measured_output = None

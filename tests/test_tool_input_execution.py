@@ -324,6 +324,34 @@ class ToolInputExecutionTests(unittest.TestCase):
         self.assertEqual(staged_hashes, 2)
         self.assertEqual(list(self.project.glob('*_upscale_*')), [])
 
+    def test_cancel_during_initial_staged_hash_stops_read_and_publishes_nothing(self):
+        job = self.job('tool_upscale')
+        staged = self.project / 'staged.mp4'; staged.write_bytes(b'x' * (2 * 1024 * 1024))
+        original_hash = self.ns['_recovery_sha256_file']
+        staged_hashes = 0
+
+        def cancelling_hash(path, **kwargs):
+            nonlocal staged_hashes
+            if path != str(staged):
+                return original_hash(path, **kwargs)
+            staged_hashes += 1
+            checks = 0
+
+            def abort_during_read():
+                nonlocal checks
+                checks += 1
+                if checks >= 3:
+                    job['status'] = 'cancelled'
+                return kwargs['abort_check']()
+
+            return original_hash(path, abort_check=abort_during_read)
+
+        self.ns['_recovery_sha256_file'] = cancelling_hash
+        self.assertFalse(self.ns['_publish_processed_tool_output'](
+            job, str(staged), source=str(self.video), tool='upscale', params={}, elapsed=1))
+        self.assertEqual(staged_hashes, 1)
+        self.assertEqual(list(self.project.glob('*_upscale_*')), [])
+
     def test_gpu_failure_keeps_safe_oom_diagnostics_without_paths(self):
         job = self.job('tool_upscale')
         modules = self.configure_worker()
