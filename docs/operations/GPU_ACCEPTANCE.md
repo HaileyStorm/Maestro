@@ -1893,6 +1893,28 @@ Do not count the candidate as durable Gallery delivery or release acceptance
 until recovery state and current listing are reconciled. The earlier cancelled
 depth-preflight result remains separate.
 
+### 2026-09-28 CPU media readback of the quarantined Extend candidate
+
+The source video still matches its sealed request SHA-256, the generated H3
+segment matches its recovery descriptor, and the quarantined final video matches
+the concat checkpoint. The source has 124 frames at 24 FPS with audio; the final
+has 248 frames at 24 FPS, 608 × 352, with audio and a 10.334-second container
+duration. No file was moved or rewritten for this readback.
+
+With FFmpeg 6.1.1, the production source normalization (124-frame trim, 24 FPS,
+Lanczos fit and black pad to 608 × 352) compared against final frames 0–123 at
+SSIM 0.994414. The generated segment compared against final frames 124–247 at
+SSIM 0.994184. Decoded mono 32 kHz PCM over the central 128,000 samples of each
+half had correlation 0.999863 for source audio and 0.999969 for generated audio;
+the best lag in a ±2,048-sample search was zero for both. This supports the
+intended ordered source-plus-segment assembly and audio content in each half.
+It does not establish source-byte identity after re-encoding, perceptual
+quality, browser playback after restart, or human acceptance. The mismatched
+sidecar still keeps the final pair quarantined. After the coordinated restart,
+the executable H3 job is held under the general
+`h3_legal_access_required` restart reason; that label alone does not prove the
+owner lacks a license. Durable Gallery delivery remains unverified.
+
 ## 2026-09-27 YuE2 score-duration style comparison
 
 The stock YuE2 take `5df416d7a2d243c0b3cf1f3574750a05` above rendered
