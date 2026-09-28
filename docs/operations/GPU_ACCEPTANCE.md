@@ -1927,6 +1927,33 @@ attempt count unchanged. This is a live recovery-state correction, not a
 repaired sidecar or durable Gallery delivery. No new GPU generation, browser
 acceptance, or human quality review was performed for this change.
 
+### 2026-09-28 CPU final adoption of the held Extend output
+
+Commit `8cf2f13` added an operator-only reseal path for the held output. It
+requires the unchanged sealed video, project and request identity, completed
+segment, H3 frame and audio attestations, and matching producer graph. The
+sidecar's earlier sealed descriptor remains in journal history. A disposable
+replay using copies of the actual artifacts closed the segment dependency,
+created one adoption receipt, and verified the final descriptor without
+changing production files. The full local gate passed at this code revision:
+5,491 backend tests (17 skipped), 750 UI tests, TypeScript check, and build.
+
+With the Pinokio service stopped, the live read-only preflight confirmed queue
+sequence 29 and the one changed sidecar. The guarded CPU action committed the
+reseal at sequence 30, staged byte-exact copies of the completed segment pair,
+and left the job held for startup adoption. On the subsequent Pinokio Start,
+the durable queue recorded the job as completed and unheld with one output,
+`reruns_denoise=false`, and one retained reseal-history entry. Its final media
+and sidecar match the revised descriptor, the output is linked in the job, and
+the final-adoption receipt is complete. Direct `/health` and `/ready` and
+stable-share `/health` passed; the public maintenance notice was cleared.
+
+An unauthenticated Gallery listing request returned 404, so current Gallery
+visibility and browser playback are unverified. No model generation or GPU
+work was run for this repair. The earlier browser playback of the candidate
+does not establish playback after this adoption, and human quality acceptance
+remains pending.
+
 ## 2026-09-27 YuE2 score-duration style comparison
 
 The stock YuE2 take `5df416d7a2d243c0b3cf1f3574750a05` above rendered
