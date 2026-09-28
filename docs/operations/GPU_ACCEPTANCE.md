@@ -1880,10 +1880,18 @@ backend tests (17 skipped), 750 UI tests, TypeScript type-check and build.
 
 A subsequent storage readback found the candidate and its metadata in the
 recovery quarantine, with the same media hash and frame count, while its
-published output path was absent. The reason for that move is not yet
-established. Preserve the candidate and do not count this as durable Gallery
-delivery or release acceptance until recovery state and current listing are
-reconciled. The earlier cancelled depth-preflight result remains separate.
+published output path was absent. The queue snapshot held the job for
+`final_output_recovery_incomplete`: the H3 concat checkpoint sealed a
+6,074-byte sidecar, but the quarantined sidecar was 6,148 bytes with a
+different hash. Source inspection found that the general output-sidecar
+refresh can rewrite an already checkpointed H3 sidecar before final integrity
+checks. The video bytes still match the checkpoint. A targeted repair now
+preserves the exact sidecar when the completed H3 unit still verifies and no
+finishing step changed its media; the existing quarantined pair remains
+untouched. This is CPU and source evidence, not a successful new live run.
+Do not count the candidate as durable Gallery delivery or release acceptance
+until recovery state and current listing are reconciled. The earlier cancelled
+depth-preflight result remains separate.
 
 ## 2026-09-27 YuE2 score-duration style comparison
 

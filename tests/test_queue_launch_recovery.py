@@ -10217,6 +10217,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "h3_integrity_pending_path": lambda _root, _name: str(root / ".pending"),
                 "_atomic_write_json": mock.Mock(side_effect=OSError("marker write failed")),
                 "_GenerationStageFailure": StageFailure,
+                "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
             }
             exec(compile(module, "isolated-h3-sidecar", "exec"), namespace)
             with self.assertRaises(StageFailure):
@@ -10224,6 +10225,116 @@ class QueueLaunchWiringTests(unittest.TestCase):
             self.assertFalse(media.exists())
             self.assertFalse((root / "fresh.meta.json").exists())
             self.assertEqual(len(list(root.glob(".private-sidecar-failed-*-fresh.mp4"))), 1)
+
+    def test_h3_noop_sidecar_refresh_preserves_completed_recovery_unit(self):
+        writer = _function(self.launch, "_write_output_sidecars")
+        module = ast.fix_missing_locations(ast.Module(body=[writer], type_ignores=[]))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            name = "final.mp4"
+            (root / name).write_bytes(b"completed H3 media")
+            unit_id = recovery_unit_id("h3-sidecar-test", "h3_concat")
+            meta = {
+                "artifact_class": "final",
+                "created_at": 1,
+                "job_id": "h3-sidecar-test",
+                "output_filename": name,
+                "params": {"generation_mode": "video"},
+                "producer_artifact_class": "final",
+                "producer_unit_id": unit_id,
+                "producer_unit_kind": "h3_concat",
+                "producer_unit_variant": 0,
+                "producer_unit_index": 0,
+            }
+            sidecar = root / "final.meta.json"
+            sidecar.write_text(
+                json.dumps(meta, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            original = sidecar.read_bytes()
+            descriptor = artifact_descriptor(
+                root, basename=name, sidecar_basename=sidecar.name,
+                producer_unit_id=unit_id,
+            )
+            unit = {"unit_id": unit_id, "artifacts": [descriptor]}
+            def match(_job, *, kind, variant, index, project_dir,
+                      quarantine_invalid):
+                self.assertEqual((kind, variant, index), ("h3_concat", 0, 0))
+                self.assertFalse(quarantine_invalid)
+                self.assertEqual(project_dir, str(root))
+                return unit if validate_artifact_descriptor(
+                    root, descriptor, producer_unit_id=unit_id,
+                ) else None
+
+            namespace = {
+                "os": os, "json": json, "time": time, "uuid": uuid,
+                "job": {"params": {"generation_mode": "video"},
+                        "access_policy": {"private": True}, "workspace": "default"},
+                "job_id": "h3-sidecar-test", "start_time": time.time(),
+                "out_dir": str(root), "clip_output_files": {},
+                "producer_artifact_roles": {name: "final"},
+                "postprocessing_outcomes": {
+                    name: [{"step": "voice_clone", "outcome": "not_applied"}],
+                },
+                "pp_film_grain_intensity": 0, "pp_spatial_upsampling": None,
+                "pp_delivery_resolution": None,
+                "requested_model": "h3", "_H3_LONG_STUDIO_MODELS": {"h3"},
+                "GENERATED_MEDIA_EXTENSIONS": {".mp4"},
+                "_RECOVERY_ARTIFACT_ROLES": {"final", "component", "window", "temporary"},
+                "_prepare_generation_sidecar_params": lambda params: ({}, dict(params)),
+                "_strip_director_image_role_internals": lambda _params: None,
+                "_extract_output_seed": lambda _name: None,
+                "stamp_sidecar_policy": stamp_sidecar_policy,
+                "_queue_recovery_unit_matches": match,
+                "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+            }
+            exec(compile(module, "isolated-h3-sidecar-refresh", "exec"), namespace)
+            with mock.patch(
+                "services.search_index.load_media_sidecars",
+                side_effect=lambda _root: {name: json.loads(sidecar.read_text())},
+            ):
+                namespace["_write_output_sidecars"]([name])
+            self.assertEqual(sidecar.read_bytes(), original)
+            self.assertTrue(validate_artifact_descriptor(
+                root, descriptor, producer_unit_id=unit_id,
+            ))
+
+    def test_non_object_existing_sidecar_does_not_abort_refresh(self):
+        writer = _function(self.launch, "_write_output_sidecars")
+        module = ast.fix_missing_locations(ast.Module(body=[writer], type_ignores=[]))
+        for original in ("[]", "null"):
+            with self.subTest(original=original), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "fresh.mp4").write_bytes(b"media")
+                sidecar = root / "fresh.meta.json"
+                sidecar.write_text(original, encoding="utf-8")
+                namespace = {
+                    "os": os, "json": json, "time": time, "uuid": uuid,
+                    "job": {"params": {"generation_mode": "video"},
+                            "access_policy": {"private": True}, "workspace": "default"},
+                    "job_id": "sidecar-shape-test", "start_time": time.time(),
+                    "out_dir": str(root), "clip_output_files": {},
+                    "producer_artifact_roles": {"fresh.mp4": "final"},
+                    "postprocessing_outcomes": {},
+                    "pp_film_grain_intensity": 0, "pp_spatial_upsampling": None,
+                    "pp_delivery_resolution": None,
+                    "requested_model": "other", "_H3_LONG_STUDIO_MODELS": {"h3"},
+                    "GENERATED_MEDIA_EXTENSIONS": {".mp4"},
+                    "_RECOVERY_ARTIFACT_ROLES": {"final", "component", "window", "temporary"},
+                    "_prepare_generation_sidecar_params": lambda params: ({}, dict(params)),
+                    "_strip_director_image_role_internals": lambda _params: None,
+                    "_extract_output_seed": lambda _name: None,
+                    "stamp_sidecar_policy": stamp_sidecar_policy,
+                    "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+                }
+                exec(compile(module, "isolated-sidecar-shape", "exec"), namespace)
+                with mock.patch(
+                    "services.search_index.load_media_sidecars", return_value={},
+                ):
+                    namespace["_write_output_sidecars"](["fresh.mp4"])
+                saved = json.loads(sidecar.read_text(encoding="utf-8"))
+                self.assertIsInstance(saved, dict)
+                self.assertTrue(saved["private"])
 
     def test_generation_sidecar_records_only_observed_finishing_outcomes(self):
         module = ast.Module(body=[
@@ -10255,6 +10366,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "_strip_director_image_role_internals": lambda _params: None,
                 "_extract_output_seed": lambda _name: None,
                 "stamp_sidecar_policy": stamp_sidecar_policy,
+                "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
             }
             exec(compile(module, "isolated-generation-finishing", "exec"), namespace)
             write_sidecar = namespace["_write_output_sidecars"]

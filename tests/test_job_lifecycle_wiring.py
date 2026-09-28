@@ -484,6 +484,7 @@ class TestJobLifecycleWiring(unittest.TestCase):
                         "producer_artifact_class": "final", "artifact_class": "window"}
                 ns = {"job_sidecars": {"native.mp4": meta}, "out_dir": directory,
                       "os": os, "json": json, "_RECOVERY_ARTIFACT_ROLES": {"final", "window"},
+                      "sealed_h3_sidecar_unchanged": lambda _name: False,
                       "_queue_recovery_expected_artifact_role": lambda _kind, value: value["producer_artifact_class"]}
                 exec(compile(ast.fix_missing_locations(ast.Module(body=[refresh], type_ignores=[])), "launch.py", "exec"), ns)
                 with open(os.path.join(directory, "native.meta.json"), encoding="utf-8") as handle:

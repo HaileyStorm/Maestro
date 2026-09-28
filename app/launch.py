@@ -65417,6 +65417,52 @@ def _run_generation(
                 """
                 if not file_names:
                     return
+                def sealed_h3_sidecar_unchanged(name):
+                    """A completed recovery unit owns its byte-exact sidecar."""
+                    if not isinstance(name, str) or os.path.basename(name) != name:
+                        return False
+                    # An observed no-op leaves the media seal intact. A
+                    # changed or uncertain result still takes the finishing
+                    # path and must pass final integrity before publication.
+                    outcomes = postprocessing_outcomes.get(name) or []
+                    if any(
+                        not isinstance(step, dict)
+                        or step.get("outcome") != "not_applied"
+                        for step in outcomes
+                    ):
+                        return False
+                    meta_path = os.path.join(
+                        out_dir, os.path.splitext(name)[0] + ".meta.json",
+                    )
+                    try:
+                        with open(meta_path, "r", encoding="utf-8") as handle:
+                            meta = json.load(handle)
+                        if not isinstance(meta, dict):
+                            return False
+                        kind = meta.get("producer_unit_kind")
+                        variant = meta.get("producer_unit_variant")
+                        index = meta.get("producer_unit_index")
+                        if (
+                            kind not in {"h3_segment", "h3_concat"}
+                            or type(variant) is not int
+                            or type(index) is not int
+                        ):
+                            return False
+                        unit = _queue_recovery_unit_matches(
+                            job, kind=kind, variant=variant, index=index,
+                            project_dir=out_dir, quarantine_invalid=False,
+                        )
+                        return bool(
+                            unit
+                            and unit.get("unit_id") == meta.get("producer_unit_id")
+                            and any(
+                                artifact.get("basename") == name
+                                for artifact in unit.get("artifacts") or []
+                                if isinstance(artifact, dict)
+                            )
+                        )
+                    except (OSError, ValueError, TypeError, QueueRecoveryRuntimeError):
+                        return False
                 guide_source = (
                     (job.get("params") or {}).get(
                         "_h3_timeline_still_guide_source"
@@ -65539,6 +65585,11 @@ def _run_generation(
                 for fname in file_names:
                     ext = os.path.splitext(fname)[1].lower()
                     if ext not in GENERATED_MEDIA_EXTENSIONS:
+                        continue
+                    if (
+                        not isinstance(recovery_units, dict)
+                        or fname not in recovery_units
+                    ) and sealed_h3_sidecar_unchanged(fname):
                         continue
                     file_sidecar = dict(sidecar)
                     file_sidecar["params"] = sidecar_params.copy()
@@ -65748,6 +65799,8 @@ def _run_generation(
                         if meta.get("job_id") == job_id
                     }
                     for name, meta in job_sidecars.items():
+                        if sealed_h3_sidecar_unchanged(name):
+                            continue
                         # The gallery classifier intentionally uses filename
                         # hints for display of legacy leftovers. Those hints
                         # are not producer authority and must never be copied
