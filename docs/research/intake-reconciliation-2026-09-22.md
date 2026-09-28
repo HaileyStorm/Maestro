@@ -240,6 +240,15 @@ view keeps its unversioned URL. Focused viewer checks, all 750 UI tests,
 type-check/build and the guard gate pass.
 Signed-in viewing of a replaced file remains unverified.
 
+Commit `81fdede` passed the combined local gate (5,473 backend tests, 17
+skipped; 750 UI tests; TypeScript/Vite build and guard), was pushed, and was
+deployed through Pinokio Restart Maestro on 2026-09-28 UTC. Pinokio reported
+only `start.js` running at the newly discovered port, with no last error and
+the exact restart notice cleared. Direct, LAN, Quick Tunnel and stable-share
+access each returned 200 for `/health`, `/ready`, account context and
+workspaces. Chrome loaded the stable-share owner sign-in page. This is service
+and unauthenticated browser evidence, not a signed-in stale-preview check.
+
 The first finishing-history slice shows one recorded Tools upscale/media-flow
 event in a collapsed Gallery card section, using the authorized sidecar's
 successful tool field, recognized method, source basename, recorded time and
