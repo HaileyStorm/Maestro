@@ -1864,3 +1864,45 @@ public restart notice was cleared. Chrome rendered the owner sign-in screen
 after reload. This verifies deployment and unauthenticated browser hydration,
 not a signed-in H3 submission, GPU output, remote-client LAN parity or owner
 acceptance. No new GPU grant or H3 job was used for this rollout.
+
+### H3 Extend live output and later artifact readback
+
+After the source-prefix implementation, a signed-in local run generated an H3
+Extend candidate from the 5.167-second synthetic Guide clip. The assembled
+candidate has 248 frames at 24 FPS, 608 × 352, and a 10.334-second container
+duration. Its SHA-256 is
+`99990da30f9c0e5827b1338bd43ef8cea800b84743d0d7074a576ecc050ed222`.
+The Gallery viewer loaded it and browser playback reached the final frames;
+this is browser and technical evidence, not human quality acceptance. The
+validated generation grant was withdrawn. The later source changes
+`09b8466` and `534dac3` passed the full local gate at that revision: 5,476
+backend tests (17 skipped), 750 UI tests, TypeScript type-check and build.
+
+A subsequent storage readback found the candidate and its metadata in the
+recovery quarantine, with the same media hash and frame count, while its
+published output path was absent. The reason for that move is not yet
+established. Preserve the candidate and do not count this as durable Gallery
+delivery or release acceptance until recovery state and current listing are
+reconciled. The earlier cancelled depth-preflight result remains separate.
+
+## 2026-09-27 YuE2 score-duration style comparison
+
+The stock YuE2 take `5df416d7a2d243c0b3cf1f3574750a05` above rendered
+44.998667 seconds from an eight-bar score nominally 17.142857 seconds at
+112 BPM. A controlled local comparison, take
+`476c68079c7b434aa19c00463f1c31e8`, reused the exact ABC SHA-256
+`1591b895678a796a8f0d5b7af05fdedfcfd6e0d06c7abf42bfffea1c05b4dca5`,
+lyrics, sampler, stock decoder and effective seed `2577657602294637337`.
+Only the model-facing style added an explicit instruction to resolve and stop
+after eight bars, about 17 seconds; the title changed to identify the take.
+The exact `sound-vision-local` grant was validated before execution and
+withdrawn afterward.
+
+The comparison completed without reported truncation, warning or clipped
+samples, but rendered **60.278667 seconds** at 48 kHz stereo, farther from the
+score length than the stock take. The WAV SHA-256 is
+`c607a93a3c751617ebfbdea0aa37b8d85080979a00f00a01e28ef41ac365239a`.
+This one-take result does not support using a style instruction as a duration
+control. Its ending and musical fidelity still need listening review. No
+trimming, time scaling or score-following claim is inferred from the completed
+file.
