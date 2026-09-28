@@ -1910,10 +1910,22 @@ the best lag in a ±2,048-sample search was zero for both. This supports the
 intended ordered source-plus-segment assembly and audio content in each half.
 It does not establish source-byte identity after re-encoding, perceptual
 quality, browser playback after restart, or human acceptance. The mismatched
-sidecar still keeps the final pair quarantined. After the coordinated restart,
-the executable H3 job is held under the general
-`h3_legal_access_required` restart reason; that label alone does not prove the
-owner lacks a license. Durable Gallery delivery remains unverified.
+sidecar still keeps the final pair quarantined. The previous coordinated
+restart replaced the job's `final_output_recovery_incomplete` reason with the
+general `h3_legal_access_required` reason; that label did not prove the owner
+lacked a license.
+
+Commit `77d1a0d` preserves the finality hold when the prior queue reason or
+the exact job's final-adoption record shows an unresolved final. The full local
+gate passed at that revision: 5,478 backend tests (17 skipped), 750 UI tests,
+TypeScript check, and build. A Pinokio restart moved the live service from
+port 42003 to 42004. Direct `/health` and `/ready` and stable-share `/health`
+returned 200; the public restart notice was empty. The durable queue then
+recorded this job as queued and blocked with
+`final_output_recovery_incomplete`, `reruns_denoise=false`, and its prior
+attempt count unchanged. This is a live recovery-state correction, not a
+repaired sidecar or durable Gallery delivery. No new GPU generation, browser
+acceptance, or human quality review was performed for this change.
 
 ## 2026-09-27 YuE2 score-duration style comparison
 
