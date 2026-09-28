@@ -5875,6 +5875,66 @@ class QueueLaunchWiringTests(unittest.TestCase):
             incomplete["message"], "Final output recovery is incomplete",
         )
 
+        # A queued H3 job can already carry this exact finality hold when the
+        # next process starts. Startup must not turn it into a legal-access
+        # resume action while the final artifact is still quarantined.
+        held_snapshot = {
+            **snapshot,
+            "status": "queued",
+            "model_type": "minimax_h3",
+            "queue_held": True,
+            "recovery_state": "blocked",
+            "recovery_attempt": 2,
+            "_recovery_reason_code": "final_output_recovery_incomplete",
+        }
+        held_final, may_start = namespace[
+            "_queue_recovery_materialize_job"
+        ](held_snapshot, projects)
+        self.assertFalse(may_start)
+        self.assertEqual(held_final["status"], "queued")
+        self.assertTrue(held_final["queue_held"])
+        self.assertFalse(held_final["reruns_denoise"])
+        self.assertEqual(held_final["recovery_attempt"], 2)
+        self.assertEqual(
+            held_final["_recovery_reason_code"],
+            "final_output_recovery_incomplete",
+        )
+
+        # An older startup may already have overwritten the reason. The
+        # final-adoption quarantine must still restore the finality hold.
+        previously_overwritten = {
+            **held_snapshot,
+            "_recovery_reason_code": "h3_legal_access_required",
+        }
+        restored_finality, may_start = namespace[
+            "_queue_recovery_materialize_job"
+        ](previously_overwritten, projects)
+        self.assertFalse(may_start)
+        self.assertEqual(restored_finality["status"], "queued")
+        self.assertTrue(restored_finality["queue_held"])
+        self.assertFalse(restored_finality["reruns_denoise"])
+        self.assertEqual(
+            restored_finality["_recovery_reason_code"],
+            "final_output_recovery_incomplete",
+        )
+
+        def missing_manifest(*_args, **_kwargs):
+            raise QueueRecoveryRuntimeError("Recovery manifest is unavailable")
+
+        namespace["load_request_manifest"] = missing_manifest
+        held_without_manifest, may_start = namespace[
+            "_queue_recovery_materialize_job"
+        ](held_snapshot, projects)
+        self.assertFalse(may_start)
+        self.assertEqual(held_without_manifest["status"], "queued")
+        self.assertTrue(held_without_manifest["queue_held"])
+        self.assertEqual(held_without_manifest["recovery_state"], "blocked")
+        self.assertFalse(held_without_manifest["reruns_denoise"])
+        self.assertEqual(
+            held_without_manifest["_recovery_reason_code"],
+            "final_output_recovery_incomplete",
+        )
+
     def test_completed_final_only_and_cursor_loss_h3_never_hide_missing_finals(self):
         manifest_params = {"value": {}}
         namespace = _isolated_functions(

@@ -7788,6 +7788,31 @@ def _queue_recovery_materialize_job(
             )
         except (TypeError, ValueError):
             legal_attempt = 0
+        if (
+            (
+                snapshot.get("_recovery_reason_code")
+                    == "final_output_recovery_incomplete"
+                or (
+                    isinstance(final_adoption, dict)
+                    and final_adoption.get("state") in {"missing", "quarantined"}
+                )
+            )
+            and not verified_h3_final_adoption
+        ):
+            # A finality hold or quarantined final is stronger evidence than
+            # the generic H3 startup hold, even after an earlier restart lost
+            # the finality reason. Never offer a generation rerun for it.
+            runtime.update({
+                "status": "queued",
+                "queue_held": True,
+                "recovery_state": "blocked",
+                "recovery_attempt": legal_attempt,
+                "reruns_denoise": False,
+                "_recovery_reason_code": "final_output_recovery_incomplete",
+                "message": "Final output recovery is incomplete",
+                "error": None,
+            })
+            return runtime, False
         runtime.update({
             "status": "queued",
             "queue_held": True,
