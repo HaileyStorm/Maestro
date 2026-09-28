@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import tempfile
 import threading
 from typing import Any, Callable, Iterator, Mapping
 
@@ -25,6 +26,7 @@ from services.queue_recovery_runtime import (
     QueueRecoveryRuntimeError,
     recovery_unit_id,
     sha256_file,
+    validate_artifact_descriptor,
 )
 
 
@@ -467,6 +469,7 @@ def _candidate(
         "dependencies": tuple(dependencies),
         "dest_media": output,
         "dest_sidecar": expected_sidecar,
+        "explicit": meta.get("explicit"),
         "job_id": job_id,
         "kind": kind,
         "media_sha256": media_sha,
@@ -478,6 +481,8 @@ def _candidate(
         "sidecar_size": int(sidecar_info.st_size),
         "source_media": media_name,
         "source_sidecar": sidecar_name,
+        "private": meta.get("private"),
+        "continuation": continuation,
         "unit_id": unit_id,
         "unit_index": index,
         "unit_variant": variant,
@@ -515,6 +520,358 @@ def _discover(quarantine: Path, *, workspace: str) -> tuple[list[dict], int]:
         else:
             candidates.append(candidate)
     return candidates, rejected
+
+
+def _staging_unit(
+    unit: Mapping[str, Any],
+    *,
+    job_id: str,
+    kind: str,
+) -> dict[str, Any]:
+    """Validate the caller-sealed identity fields needed for one H3 unit."""
+    if not isinstance(unit, Mapping) or unit.get("state") != "completed" or unit.get("kind") != kind:
+        raise QueueRecoveryRuntimeError("H3 final-adoption unit is invalid.")
+    variant, index = unit.get("variant"), unit.get("index")
+    dependencies = unit.get("dependencies")
+    settings = unit.get("settings", {})
+    if (
+        type(variant) is not int or variant < 0
+        or type(index) is not int or index < 0
+        or not isinstance(dependencies, list)
+        or any(
+            type(value) is not str or _UNIT_ID.fullmatch(value) is None
+            for value in dependencies
+        )
+        or not isinstance(settings, Mapping)
+    ):
+        raise QueueRecoveryRuntimeError("H3 final-adoption unit is invalid.")
+    try:
+        expected_id = recovery_unit_id(
+            job_id, kind, variant=variant, index=index,
+            dependencies=dependencies, settings=settings,
+        )
+    except QueueRecoveryRuntimeError:
+        raise QueueRecoveryRuntimeError("H3 final-adoption unit is invalid.") from None
+    unit_id = unit.get("unit_id")
+    artifacts = unit.get("artifacts")
+    if (
+        type(unit_id) is not str or _UNIT_ID.fullmatch(unit_id) is None
+        or unit_id != expected_id or not isinstance(artifacts, list)
+        or len(artifacts) != 1 or not isinstance(artifacts[0], Mapping)
+    ):
+        raise QueueRecoveryRuntimeError("H3 final-adoption unit is invalid.")
+    descriptor = dict(artifacts[0])
+    basename = _direct_name(descriptor.get("basename"))
+    sidecar_basename = _direct_name(descriptor.get("sidecar_basename"))
+    if (
+        basename is None or sidecar_basename is None
+        or sidecar_basename != os.path.splitext(basename)[0] + ".meta.json"
+        or descriptor.get("producer_unit_id") != unit_id
+        or type(descriptor.get("size")) is not int or descriptor["size"] < 1
+        or type(descriptor.get("sha256")) is not str
+        or _SHA256.fullmatch(descriptor["sha256"]) is None
+        or type(descriptor.get("sidecar_size")) is not int or descriptor["sidecar_size"] < 1
+        or type(descriptor.get("sidecar_sha256")) is not str
+        or _SHA256.fullmatch(descriptor["sidecar_sha256"]) is None
+    ):
+        raise QueueRecoveryRuntimeError("H3 final-adoption artifact is invalid.")
+    return {
+        "artifacts": [descriptor],
+        "dependencies": list(dependencies),
+        "index": index,
+        "kind": kind,
+        "settings": dict(settings),
+        "unit_id": unit_id,
+        "variant": variant,
+        "continuation": unit.get("continuation"),
+    }
+
+
+def _staging_job_policy(
+    job: Mapping[str, Any], *, workspace: str,
+) -> tuple[str, bool, bool]:
+    if not isinstance(job, Mapping):
+        raise QueueRecoveryRuntimeError("H3 final-adoption job is invalid.")
+    job_id = job.get("id")
+    private = job.get("private")
+    explicit = job.get("explicit")
+    if (
+        type(job_id) is not str or _JOB_ID.fullmatch(job_id) is None
+        or job.get("workspace") != workspace
+        or type(private) is not bool or type(explicit) is not bool
+    ):
+        raise QueueRecoveryRuntimeError("H3 final-adoption job is invalid.")
+    policy = job.get("access_policy")
+    if policy is not None and (
+        not isinstance(policy, Mapping)
+        or policy.get("private") is not private or policy.get("explicit") is not explicit
+    ):
+        raise QueueRecoveryRuntimeError("H3 final-adoption job policy is invalid.")
+    return job_id, private, explicit
+
+
+def _staging_candidate_matches_unit(
+    candidate: Mapping[str, Any],
+    unit: Mapping[str, Any],
+    *,
+    job_id: str,
+    private: bool,
+    explicit: bool,
+) -> bool:
+    descriptor = unit["artifacts"][0]
+    return (
+        candidate.get("job_id") == job_id
+        and candidate.get("unit_id") == unit["unit_id"]
+        and candidate.get("kind") == unit["kind"]
+        and candidate.get("unit_variant") == unit["variant"]
+        and candidate.get("unit_index") == unit["index"]
+        and candidate.get("dependencies") == tuple(unit["dependencies"])
+        and candidate.get("settings") == unit["settings"]
+        and candidate.get("artifact_names") == (descriptor["basename"],)
+        and candidate.get("dest_media") == descriptor["basename"]
+        and candidate.get("media_size") == descriptor.get("size")
+        and candidate.get("media_sha256") == descriptor.get("sha256")
+        and candidate.get("output_index") == unit["variant"]
+        and candidate.get("private") is private
+        and candidate.get("explicit") is explicit
+        and candidate.get("continuation") == unit.get("continuation")
+    )
+
+
+def _h3_staging_names(
+    workspace: str,
+    job_id: str,
+    unit: Mapping[str, Any],
+) -> tuple[str, str]:
+    descriptor = unit["artifacts"][0]
+    seed = {
+        "job_id": job_id,
+        "media_sha256": descriptor["sha256"],
+        "segment_unit_id": unit["unit_id"],
+        "sidecar_sha256": descriptor["sidecar_sha256"],
+        "workspace": workspace,
+    }
+    token = hashlib.sha256(_canonical_json(seed)).hexdigest()[:32]
+    return (
+        f"{token}-{descriptor['basename']}",
+        f"{token}-{descriptor['sidecar_basename']}",
+    )
+
+
+def _check_h3_staging_name_budget(quarantine: Path, names: tuple[str, str]) -> int:
+    try:
+        name_max = int(os.pathconf(quarantine, "PC_NAME_MAX"))
+    except (AttributeError, OSError, TypeError, ValueError):
+        # Keep the preflight conservative on platforms without pathconf.
+        name_max = 255
+    if name_max <= 0:
+        name_max = 255
+    if any(len(os.fsencode(name)) > name_max for name in names):
+        raise QueueRecoveryRuntimeError(
+            "H3 segment names exceed the quarantine filesystem limit."
+        )
+    return name_max
+
+
+def validate_h3_segment_staging_name_budget(
+    project_directory: os.PathLike[str] | str,
+    *,
+    workspace: str,
+    job: Mapping[str, Any],
+    segment_unit: Mapping[str, Any],
+) -> int:
+    """Read-only preflight for the exact quarantine names used by H3 staging."""
+    if _direct_name(workspace) is None:
+        raise QueueRecoveryRuntimeError("H3 final-adoption workspace is invalid.")
+    root = _safe_root(project_directory)
+    job_id, _private, _explicit = _staging_job_policy(job, workspace=workspace)
+    segment = _staging_unit(segment_unit, job_id=job_id, kind="h3_segment")
+    recovery = root / MANIFEST_DIRECTORY
+    _existing_private_directory(recovery)
+    quarantine, quarantine_identity = _existing_private_directory(recovery / "quarantine")
+    _verify_directory(quarantine, quarantine_identity)
+    return _check_h3_staging_name_budget(
+        quarantine,
+        _h3_staging_names(workspace, job_id, segment),
+    )
+
+
+def _stage_file_matches(
+    path: Path,
+    *,
+    expected_size: int,
+    expected_sha256: str,
+    source_identity: tuple[int, int] | None = None,
+    file_identity: tuple[int, int] | None = None,
+) -> bool:
+    try:
+        info = os.lstat(path)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or info.st_nlink != 1
+            or (os.name != "nt" and stat.S_IMODE(info.st_mode) != 0o600)
+            or (
+                source_identity is not None
+                and (info.st_dev, info.st_ino) == source_identity
+            )
+            or (
+                file_identity is not None
+                and (info.st_dev, info.st_ino) != file_identity
+            )
+        ):
+            return False
+        actual_size, actual_sha256 = sha256_file(path)
+        after = os.lstat(path)
+    except (OSError, QueueRecoveryRuntimeError):
+        return False
+    return bool(
+        actual_size == expected_size
+        and actual_sha256 == expected_sha256
+        and (info.st_dev, info.st_ino, info.st_mtime_ns)
+        == (after.st_dev, after.st_ino, after.st_mtime_ns)
+    )
+
+
+def _unlink_staged_if_owned(
+    path: Path,
+    identity: tuple[int, int],
+    *,
+    expected_size: int,
+    expected_sha256: str,
+) -> None:
+    """Remove only a byte-exact single-link entry created by this call."""
+    try:
+        if _stage_file_matches(
+            path,
+            expected_size=expected_size,
+            expected_sha256=expected_sha256,
+            file_identity=identity,
+        ):
+            os.unlink(path)
+    except (OSError, QueueRecoveryRuntimeError):
+        return
+
+
+def _copy_stage_file(
+    source: Path,
+    quarantine: Path,
+    destination_name: str,
+    *,
+    expected_size: int,
+    expected_sha256: str,
+    quarantine_identity: tuple[int, int],
+) -> tuple[int, int]:
+    """Copy one no-follow source to a private temp, then publish create-only."""
+    source_fd = temp_fd = -1
+    temp_path: Path | None = None
+    published_identity: tuple[int, int] | None = None
+    destination = quarantine / destination_name
+    try:
+        _verify_directory(quarantine, quarantine_identity)
+        source_fd = os.open(
+            source,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        source_before = os.fstat(source_fd)
+        if (
+            not stat.S_ISREG(source_before.st_mode)
+            or source_before.st_nlink != 1
+            or source_before.st_size != expected_size
+        ):
+            raise QueueRecoveryRuntimeError("H3 segment source changed.")
+        temp_fd, temporary = tempfile.mkstemp(
+            prefix=f".{destination_name}.", suffix=".tmp", dir=quarantine,
+        )
+        temp_path = Path(temporary)
+        os.fchmod(temp_fd, 0o600)
+        temp_info = os.fstat(temp_fd)
+        digest = hashlib.sha256()
+        copied = 0
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            copied += len(chunk)
+            if copied > expected_size:
+                raise QueueRecoveryRuntimeError("H3 segment source changed.")
+            digest.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(temp_fd, view)
+                if written <= 0:
+                    raise OSError
+                view = view[written:]
+        source_after = os.fstat(source_fd)
+        current_source = os.lstat(source)
+        if (
+            copied != expected_size
+            or digest.hexdigest() != expected_sha256
+            or (source_before.st_dev, source_before.st_ino, source_before.st_size,
+                source_before.st_mtime_ns)
+            != (source_after.st_dev, source_after.st_ino, source_after.st_size,
+                source_after.st_mtime_ns)
+            or source_after.st_nlink != 1
+            or (current_source.st_dev, current_source.st_ino)
+            != (source_after.st_dev, source_after.st_ino)
+        ):
+            raise QueueRecoveryRuntimeError("H3 segment source changed.")
+        os.fsync(temp_fd)
+        os.close(temp_fd)
+        temp_fd = -1
+        _verify_directory(quarantine, quarantine_identity)
+        published_identity = (temp_info.st_dev, temp_info.st_ino)
+        os.link(temp_path, destination, follow_symlinks=False)
+        published = os.lstat(destination)
+        if (published.st_dev, published.st_ino) != published_identity:
+            raise QueueRecoveryRuntimeError("H3 segment copy could not be verified.")
+        os.unlink(temp_path)
+        temp_path = None
+        _fsync_directory(quarantine)
+        if not _stage_file_matches(
+            destination,
+            expected_size=expected_size,
+            expected_sha256=expected_sha256,
+            source_identity=(source_before.st_dev, source_before.st_ino),
+            file_identity=published_identity,
+        ):
+            raise QueueRecoveryRuntimeError("H3 segment copy could not be verified.")
+        return published_identity
+    except (QueueRecoveryRuntimeError, OSError) as error:
+        if temp_path is not None:
+            try:
+                os.unlink(temp_path)
+                temp_path = None
+            except OSError:
+                pass
+        if published_identity is not None:
+            _unlink_staged_if_owned(
+                destination,
+                published_identity,
+                expected_size=expected_size,
+                expected_sha256=expected_sha256,
+            )
+            try:
+                _fsync_directory(quarantine)
+            except OSError:
+                pass
+        if isinstance(error, QueueRecoveryRuntimeError):
+            raise
+        raise QueueRecoveryRuntimeError(
+            "H3 segment copy could not be published safely."
+        ) from None
+    finally:
+        if source_fd >= 0:
+            os.close(source_fd)
+        if temp_fd >= 0:
+            os.close(temp_fd)
+        if temp_path is not None:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
 
 def _valid_units(candidates: list[dict]) -> dict[str, tuple[dict, ...]]:
@@ -653,6 +1010,190 @@ def _semantic_dependencies_valid(
         return result
     _memo[unit_id] = True
     return True
+
+
+def stage_quarantined_h3_segment_for_final_adoption(
+    project_directory: os.PathLike[str] | str,
+    *,
+    workspace: str,
+    job: Mapping[str, Any],
+    segment_unit: Mapping[str, Any],
+    final_unit: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Copy one sealed H3 segment pair into private quarantine for a concat."""
+    if _direct_name(workspace) is None:
+        raise QueueRecoveryRuntimeError("H3 final-adoption workspace is invalid.")
+    root = _safe_root(project_directory)
+    job_id, private, explicit = _staging_job_policy(job, workspace=workspace)
+    segment = _staging_unit(segment_unit, job_id=job_id, kind="h3_segment")
+    final = _staging_unit(final_unit, job_id=job_id, kind="h3_concat")
+    if (
+        segment["unit_id"] not in final["dependencies"]
+        or segment["variant"] != final["variant"]
+        or final["dependencies"].index(segment["unit_id"]) != segment["index"]
+        or len(set(final["dependencies"])) != len(final["dependencies"])
+    ):
+        raise QueueRecoveryRuntimeError("H3 final-adoption dependency graph is invalid.")
+
+    from services.h3_audio_safety import DEFAULT_TARGET_DBTP, POLICY_VERSION
+    peak_policy = {
+        "policy_version": POLICY_VERSION,
+        "target_dbtp": DEFAULT_TARGET_DBTP,
+    }
+    attestation = final_unit.get("attestation")
+    true_peak = (
+        attestation.get("h3_audio_true_peak")
+        if isinstance(attestation, Mapping) else None
+    )
+    if (
+        final["settings"].get("h3_audio_true_peak_policy") != peak_policy
+        or not isinstance(true_peak, Mapping)
+        or true_peak.get("policy_version") != POLICY_VERSION
+        or true_peak.get("target_dbtp") != DEFAULT_TARGET_DBTP
+        or true_peak.get("verified") is not True
+    ):
+        raise QueueRecoveryRuntimeError("H3 final true-peak attestation is invalid.")
+    descriptor = segment["artifacts"][0]
+    if not validate_artifact_descriptor(root, descriptor, producer_unit_id=segment["unit_id"]):
+        raise QueueRecoveryRuntimeError("H3 segment does not match its sealed descriptor.")
+
+    recovery = root / MANIFEST_DIRECTORY
+    _existing_private_directory(recovery)
+    quarantine, quarantine_identity = _existing_private_directory(recovery / "quarantine")
+    adoption, adoption_identity = _ensure_private_directory(recovery / "final-adoption")
+    with _serialized(adoption / "adoption.lock"):
+        _verify_directory(adoption, adoption_identity)
+        _verify_directory(quarantine, quarantine_identity)
+        initial_candidates, _rejected = _discover(quarantine, workspace=workspace)
+        final_candidates = _valid_units(initial_candidates).get(final["unit_id"])
+        if (
+            final_candidates is None
+            or len(final_candidates) != 1
+            or not _staging_candidate_matches_unit(final_candidates[0], final,
+                job_id=job_id, private=private, explicit=explicit)
+        ):
+            raise QueueRecoveryRuntimeError(
+                "Quarantined H3 final does not match its sealed unit."
+            )
+        final_candidate_before = dict(final_candidates[0])
+        final_descriptor = final["artifacts"][0]
+        staged_media_name, staged_sidecar_name = _h3_staging_names(
+            workspace, job_id, segment,
+        )
+        _check_h3_staging_name_budget(
+            quarantine, (staged_media_name, staged_sidecar_name),
+        )
+        staged_media = quarantine / staged_media_name
+        staged_sidecar_path = quarantine / staged_sidecar_name
+        source_media = root / descriptor["basename"]
+        source_sidecar = root / descriptor["sidecar_basename"]
+        media_exists = os.path.lexists(staged_media)
+        sidecar_exists = os.path.lexists(staged_sidecar_path)
+        if media_exists or sidecar_exists:
+            try:
+                source_media_info, source_sidecar_info = (
+                    os.lstat(source_media), os.lstat(source_sidecar),
+                )
+            except OSError:
+                raise QueueRecoveryRuntimeError("H3 segment source changed.") from None
+            if media_exists and not _stage_file_matches(
+                staged_media, expected_size=descriptor["size"],
+                expected_sha256=descriptor["sha256"],
+                source_identity=(source_media_info.st_dev, source_media_info.st_ino),
+            ):
+                raise QueueRecoveryRuntimeError("H3 segment quarantine name is occupied.")
+            if sidecar_exists and not _stage_file_matches(
+                staged_sidecar_path, expected_size=descriptor["sidecar_size"],
+                expected_sha256=descriptor["sidecar_sha256"],
+                source_identity=(source_sidecar_info.st_dev, source_sidecar_info.st_ino),
+            ):
+                raise QueueRecoveryRuntimeError("H3 segment quarantine name is occupied.")
+        idempotent = media_exists and sidecar_exists
+        created: list[tuple[Path, tuple[int, int], int, str]] = []
+        try:
+            for exists, source, destination_name, size_key, digest_key in (
+                (media_exists, source_media, staged_media_name, "size", "sha256"),
+                (
+                    sidecar_exists,
+                    source_sidecar,
+                    staged_sidecar_name,
+                    "sidecar_size",
+                    "sidecar_sha256",
+                ),
+            ):
+                if exists:
+                    continue
+                identity = _copy_stage_file(
+                    source,
+                    quarantine,
+                    destination_name,
+                    expected_size=descriptor[size_key],
+                    expected_sha256=descriptor[digest_key],
+                    quarantine_identity=quarantine_identity,
+                )
+                created.append((
+                    quarantine / destination_name,
+                    identity,
+                    descriptor[size_key],
+                    descriptor[digest_key],
+                ))
+            _verify_directory(quarantine, quarantine_identity)
+            staged_candidates, _rejected = _discover(quarantine, workspace=workspace)
+            staged_units = _valid_units(staged_candidates)
+            staged_segment = staged_units.get(segment["unit_id"])
+            staged_final = staged_units.get(final["unit_id"])
+            if (
+                staged_segment is None
+                or len(staged_segment) != 1
+                or not _staging_candidate_matches_unit(staged_segment[0], segment,
+                    job_id=job_id, private=private, explicit=explicit)
+                or staged_segment[0]["source_media"] != staged_media_name
+                or staged_segment[0]["source_sidecar"] != staged_sidecar_name
+                or staged_final is None
+                or len(staged_final) != 1
+                or staged_final[0]["sidecar_sha256"]
+                != final_candidate_before["sidecar_sha256"]
+                or staged_final[0]["media_sha256"]
+                != final_candidate_before["media_sha256"]
+                or not _semantic_dependencies_valid(final["unit_id"], staged_units)
+            ):
+                raise QueueRecoveryRuntimeError(
+                    "H3 final dependency graph is not closed by the staged segment."
+                )
+        except BaseException:
+            for path, identity, size, digest in reversed(created):
+                _unlink_staged_if_owned(
+                    path,
+                    identity,
+                    expected_size=size,
+                    expected_sha256=digest,
+                )
+            if created:
+                try:
+                    _fsync_directory(quarantine)
+                except OSError:
+                    pass
+            raise
+
+        _verify_directory(quarantine, quarantine_identity)
+        return {
+            "schema_version": _SCHEMA,
+            "workspace": workspace,
+            "job_id": job_id,
+            "segment_unit_id": segment["unit_id"],
+            "segment_media_basename": staged_media_name,
+            "segment_sidecar_basename": staged_sidecar_name,
+            "segment_media_sha256": descriptor["sha256"],
+            "segment_sidecar_sha256": descriptor["sidecar_sha256"],
+            "final_unit_id": final["unit_id"],
+            "final_media_sha256": final_candidate_before["media_sha256"],
+            "final_sidecar_sha256": final_candidate_before["sidecar_sha256"],
+            "final_sidecar_seal_match": (
+                final_candidate_before["sidecar_sha256"]
+                == final_descriptor["sidecar_sha256"]
+            ),
+            "idempotent": idempotent,
+        }
 
 
 def _complete_groups(candidates: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -1592,4 +2133,8 @@ def adopt_quarantined_final_groups(
         }
 
 
-__all__ = ["adopt_quarantined_final_groups"]
+__all__ = [
+    "adopt_quarantined_final_groups",
+    "stage_quarantined_h3_segment_for_final_adoption",
+    "validate_h3_segment_staging_name_budget",
+]

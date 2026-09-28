@@ -14,11 +14,16 @@ import uuid
 
 from services.queue_recovery_final_adoption import (
     adopt_quarantined_final_groups,
+    stage_quarantined_h3_segment_for_final_adoption,
+    validate_h3_segment_staging_name_budget,
+    _h3_staging_names,
 )
 from services.queue_recovery_runtime import (
     QueueRecoveryRuntimeError,
+    artifact_descriptor,
     recovery_unit_id,
 )
+from services.h3_audio_safety import DEFAULT_TARGET_DBTP, POLICY_VERSION
 
 
 class QueueFinalAdoptionTests(unittest.TestCase):
@@ -218,6 +223,168 @@ class QueueFinalAdoptionTests(unittest.TestCase):
         self._quarantined_pair(final_name, b"source-plus-generated", final)
         return {"component": component_name, "final": final_name}
 
+    def _h3_final_adoption_fixture(
+        self,
+        *,
+        job_id: str = "job-stage-h3",
+        final_payload: bytes = b"sealed-final-media",
+        quarantined_final_payload: bytes | None = None,
+        segment_name: str | None = None,
+    ) -> dict:
+        prefix = {
+            "version": 1,
+            "input_field": "video_source:0",
+            "source_native_frames": 125,
+            "retained_frames": 120,
+            "output_fps": 24,
+            "fit": "contain",
+            "conditioning": "last_frame",
+            "audio_policy": "preserve_source_then_generated",
+            "sha256": hashlib.sha256(b"source").hexdigest(),
+            "size": 6,
+        }
+        job = {
+            "id": job_id,
+            "workspace": self.workspace,
+            "private": True,
+            "explicit": False,
+            "access_policy": {"private": True, "explicit": False},
+        }
+        segment_name = segment_name or f"{job_id}-generated.mp4"
+        segment_payload = b"source-prefix-generated-segment"
+        segment_settings = {
+            "discard_prefix_frames": 0,
+            "trim_tail_frames": 0,
+            "source_prefix": prefix,
+        }
+        segment_meta = self._base_meta(
+            job_id=job_id,
+            kind="h3_segment",
+            variant=0,
+            index=0,
+            output_index=0,
+            output_total=1,
+            dependencies=[],
+            settings=segment_settings,
+            artifacts=[segment_name],
+        )
+        segment_meta["explicit"] = False
+        segment_media = self.project / segment_name
+        segment_sidecar = self.project / f"{Path(segment_name).stem}.meta.json"
+        segment_media.write_bytes(segment_payload)
+        segment_meta.update({
+            "output_filename": segment_name,
+            "producer_media_sha256": hashlib.sha256(segment_payload).hexdigest(),
+            "producer_media_size": len(segment_payload),
+        })
+        segment_sidecar.write_text(
+            json.dumps(segment_meta, sort_keys=True), encoding="utf-8",
+        )
+        segment_descriptor = artifact_descriptor(
+            self.project,
+            basename=segment_name,
+            sidecar_basename=segment_sidecar.name,
+            producer_unit_id=segment_meta["producer_unit_id"],
+        )
+        segment_unit = {
+            "artifacts": [segment_descriptor],
+            "dependencies": [],
+            "index": 0,
+            "kind": "h3_segment",
+            "settings": segment_settings,
+            "state": "completed",
+            "unit_id": segment_meta["producer_unit_id"],
+            "variant": 0,
+        }
+
+        final_settings = {
+            "clip_start_frames": [0],
+            "clip_tail_frames": [0],
+            "component_hashes": [hashlib.sha256(segment_payload).hexdigest()],
+            "h3_audio_true_peak_policy": {
+                "policy_version": POLICY_VERSION,
+                "target_dbtp": DEFAULT_TARGET_DBTP,
+            },
+            "source_prefix": prefix,
+        }
+        final_name = f"{job_id}-final.mp4"
+        final_meta = self._base_meta(
+            job_id=job_id,
+            kind="h3_concat",
+            variant=0,
+            index=0,
+            output_index=0,
+            output_total=1,
+            dependencies=[segment_unit["unit_id"]],
+            settings=final_settings,
+            artifacts=[final_name],
+        )
+        final_meta["explicit"] = False
+        final_sidecar = self.project / f"{Path(final_name).stem}.meta.json"
+        final_media = self.project / final_name
+        final_media.write_bytes(final_payload)
+        final_meta.update({
+            "output_filename": final_name,
+            "producer_media_sha256": hashlib.sha256(final_payload).hexdigest(),
+            "producer_media_size": len(final_payload),
+        })
+        final_sidecar.write_text(json.dumps(final_meta, sort_keys=True), encoding="utf-8")
+        final_descriptor = artifact_descriptor(
+            self.project,
+            basename=final_name,
+            sidecar_basename=final_sidecar.name,
+            producer_unit_id=final_meta["producer_unit_id"],
+        )
+        final_unit = {
+            "artifacts": [final_descriptor],
+            "attestation": {
+                "h3_audio_true_peak": {
+                    "policy_version": POLICY_VERSION,
+                    "target_dbtp": DEFAULT_TARGET_DBTP,
+                    "verified": True,
+                },
+            },
+            "dependencies": [segment_unit["unit_id"]],
+            "index": 0,
+            "kind": "h3_concat",
+            "settings": final_settings,
+            "state": "completed",
+            "unit_id": final_meta["producer_unit_id"],
+            "variant": 0,
+        }
+        final_media.unlink()
+        final_sidecar.unlink()
+        quarantined_meta = dict(final_meta)
+        quarantined_meta["later_re_attestation_marker"] = "updated"
+        quarantined = self._quarantined_pair(
+            final_name,
+            final_payload if quarantined_final_payload is None
+            else quarantined_final_payload,
+            quarantined_meta,
+        )
+        return {
+            "final_descriptor": final_descriptor,
+            "final_meta": final_meta,
+            "final_unit": final_unit,
+            "job": job,
+            "job_id": job_id,
+            "quarantined_final": quarantined,
+            "segment_descriptor": segment_descriptor,
+            "segment_meta": segment_meta,
+            "segment_name": segment_name,
+            "segment_payload": segment_payload,
+            "segment_unit": segment_unit,
+        }
+
+    def _stage_fixture(self, fixture: dict) -> dict:
+        return stage_quarantined_h3_segment_for_final_adoption(
+            self.project,
+            workspace=self.workspace,
+            job=fixture["job"],
+            segment_unit=fixture["segment_unit"],
+            final_unit=fixture["final_unit"],
+        )
+
     def _delivery_job(self, job_id: str, total: int) -> dict:
         dependencies = []
         components = []
@@ -298,6 +465,175 @@ class QueueFinalAdoptionTests(unittest.TestCase):
             shutil.copyfile(source_sidecar, destination_sidecar)
             copied.append((destination_media, destination_sidecar))
         return copied
+
+    def test_stages_sealed_h3_segment_as_an_idempotent_independent_pair(self):
+        fixture = self._h3_final_adoption_fixture()
+        result = self._stage_fixture(fixture)
+
+        staged_media = self.quarantine / result["segment_media_basename"]
+        staged_sidecar = self.quarantine / result["segment_sidecar_basename"]
+        source_media = self.project / fixture["segment_name"]
+        source_sidecar = self.project / fixture["segment_descriptor"]["sidecar_basename"]
+        self.assertFalse(result["idempotent"])
+        self.assertEqual(staged_media.read_bytes(), fixture["segment_payload"])
+        self.assertEqual(staged_sidecar.read_bytes(), source_sidecar.read_bytes())
+        for staged, source in ((staged_media, source_media), (staged_sidecar, source_sidecar)):
+            info = os.lstat(staged)
+            self.assertEqual(info.st_nlink, 1)
+            self.assertEqual(info.st_mode & 0o777, 0o600)
+            self.assertNotEqual(
+                (info.st_dev, info.st_ino),
+                (os.stat(source).st_dev, os.stat(source).st_ino),
+            )
+        actual_sidecar_sha = hashlib.sha256(
+            fixture["quarantined_final"][1].read_bytes()
+        ).hexdigest()
+        self.assertEqual(result["final_sidecar_sha256"], actual_sidecar_sha)
+        self.assertFalse(result["final_sidecar_seal_match"])
+        self.assertEqual(
+            result["final_media_sha256"], fixture["final_descriptor"]["sha256"],
+        )
+
+        repeated = self._stage_fixture(fixture)
+        self.assertTrue(repeated["idempotent"])
+        self.assertEqual(
+            repeated["segment_media_basename"], result["segment_media_basename"],
+        )
+        self.assertEqual(
+            repeated["segment_sidecar_basename"], result["segment_sidecar_basename"],
+        )
+
+    def test_rejects_quarantined_final_with_wrong_media_digest(self):
+        fixture = self._h3_final_adoption_fixture(
+            quarantined_final_payload=b"not-the-sealed-final",
+        )
+        with self.assertRaises(QueueRecoveryRuntimeError):
+            self._stage_fixture(fixture)
+        staged_media, staged_sidecar = _h3_staging_names(
+            self.workspace, fixture["job_id"], fixture["segment_unit"],
+        )
+        self.assertFalse((self.quarantine / staged_media).exists())
+        self.assertFalse((self.quarantine / staged_sidecar).exists())
+
+    def test_rejects_quarantined_final_with_wrong_producer_graph(self):
+        fixture = self._h3_final_adoption_fixture()
+        final_sidecar = fixture["quarantined_final"][1]
+        meta = json.loads(final_sidecar.read_text(encoding="utf-8"))
+        dependencies = ["unit:v1:" + "f" * 64]
+        settings = dict(meta["producer_unit_settings"])
+        settings["component_hashes"] = ["0" * 64]
+        meta["producer_unit_dependencies"] = dependencies
+        meta["producer_unit_settings"] = settings
+        meta["producer_unit_id"] = recovery_unit_id(
+            fixture["job_id"], "h3_concat", variant=0, index=0,
+            dependencies=dependencies, settings=settings,
+        )
+        final_sidecar.write_text(json.dumps(meta, sort_keys=True), encoding="utf-8")
+
+        with self.assertRaises(QueueRecoveryRuntimeError):
+            self._stage_fixture(fixture)
+        staged_media, staged_sidecar = _h3_staging_names(
+            self.workspace, fixture["job_id"], fixture["segment_unit"],
+        )
+        self.assertFalse((self.quarantine / staged_media).exists())
+        self.assertFalse((self.quarantine / staged_sidecar).exists())
+
+    def test_rejects_changed_root_segment_before_staging(self):
+        fixture = self._h3_final_adoption_fixture()
+        (self.project / fixture["segment_name"]).write_bytes(b"changed-segment")
+        with self.assertRaises(QueueRecoveryRuntimeError):
+            self._stage_fixture(fixture)
+        staged_media, staged_sidecar = _h3_staging_names(
+            self.workspace, fixture["job_id"], fixture["segment_unit"],
+        )
+        self.assertFalse((self.quarantine / staged_media).exists())
+        self.assertFalse((self.quarantine / staged_sidecar).exists())
+
+    def test_long_segment_name_is_rejected_by_read_only_preflight(self):
+        fixture = self._h3_final_adoption_fixture(
+            job_id="job-stage-long-name",
+            segment_name=("s" * 230) + ".mp4",
+        )
+        staged_media, staged_sidecar = _h3_staging_names(
+            self.workspace, fixture["job_id"], fixture["segment_unit"],
+        )
+        name_max = (
+            int(os.pathconf(self.quarantine, "PC_NAME_MAX"))
+            if hasattr(os, "pathconf") else 255
+        )
+        self.assertGreater(
+            max(len(os.fsencode(staged_media)), len(os.fsencode(staged_sidecar))),
+            name_max,
+        )
+        with self.assertRaisesRegex(
+            QueueRecoveryRuntimeError,
+            "H3 segment names exceed the quarantine filesystem limit",
+        ):
+            validate_h3_segment_staging_name_budget(
+                self.project,
+                workspace=self.workspace,
+                job=fixture["job"],
+                segment_unit=fixture["segment_unit"],
+            )
+        with self.assertRaisesRegex(
+            QueueRecoveryRuntimeError,
+            "H3 segment names exceed the quarantine filesystem limit",
+        ):
+            self._stage_fixture(fixture)
+        quarantine_names = {path.name for path in self.quarantine.iterdir()}
+        self.assertNotIn(staged_media, quarantine_names)
+        self.assertNotIn(staged_sidecar, quarantine_names)
+
+    def test_collision_partial_publish_and_crash_resume_are_safe(self):
+        resume = self._h3_final_adoption_fixture(job_id="job-stage-resume")
+        resume_media, resume_sidecar = _h3_staging_names(
+            self.workspace, resume["job_id"], resume["segment_unit"],
+        )
+        partial_media = self.quarantine / resume_media
+        partial_media.write_bytes(resume["segment_payload"])
+        os.chmod(partial_media, 0o600)
+        resumed = self._stage_fixture(resume)
+        self.assertFalse(resumed["idempotent"])
+        self.assertEqual((self.quarantine / resume_sidecar).read_bytes(), (
+            self.project / resume["segment_descriptor"]["sidecar_basename"]
+        ).read_bytes())
+
+        collision = self._h3_final_adoption_fixture(job_id="job-stage-collision")
+        collision_media, collision_sidecar = _h3_staging_names(
+            self.workspace, collision["job_id"], collision["segment_unit"],
+        )
+        occupied = self.quarantine / collision_media
+        occupied.write_bytes(b"foreign collision")
+        os.chmod(occupied, 0o600)
+        with self.assertRaises(QueueRecoveryRuntimeError):
+            self._stage_fixture(collision)
+        self.assertEqual(occupied.read_bytes(), b"foreign collision")
+        self.assertFalse((self.quarantine / collision_sidecar).exists())
+
+        partial = self._h3_final_adoption_fixture(job_id="job-stage-partial")
+        partial_media, partial_sidecar = _h3_staging_names(
+            self.workspace, partial["job_id"], partial["segment_unit"],
+        )
+        real_link = os.link
+        link_calls = 0
+
+        def fail_second_link(source, destination, *args, **kwargs):
+            nonlocal link_calls
+            link_calls += 1
+            if link_calls == 2:
+                raise OSError("synthetic partial publish")
+            return real_link(source, destination, *args, **kwargs)
+
+        with mock.patch(
+            "services.queue_recovery_final_adoption.os.link",
+            side_effect=fail_second_link,
+        ):
+            with self.assertRaises(QueueRecoveryRuntimeError):
+                self._stage_fixture(partial)
+        self.assertEqual(link_calls, 2)
+        self.assertFalse((self.quarantine / partial_media).exists())
+        self.assertFalse((self.quarantine / partial_sidecar).exists())
+        self.assertEqual(list(self.quarantine.glob(".*.tmp")), [])
 
     def test_adopts_complete_ordinary_repeat_without_h3_concat_fields(self):
         output = "unit-ordinary-final-t0-r0-w1.mp4"
