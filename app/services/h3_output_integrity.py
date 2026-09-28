@@ -19,6 +19,94 @@ import subprocess
 from typing import Any, Callable
 
 
+def expected_h3_final_frames(
+    generated_frames: int,
+    *,
+    planned_source_prefix: dict | None = None,
+    public_source_prefix: dict | None = None,
+    recovery_cursor: dict | None = None,
+    recovery_final_unit: dict | None = None,
+    require_recovery_evidence: bool = False,
+) -> int:
+    """Count the retained Extend source as well as generated H3 frames."""
+    if type(generated_frames) is not int or generated_frames <= 0:
+        raise ValueError("H3 generated frame count is invalid")
+
+    def retained_frames(prefix: Any) -> int:
+        if (
+            not isinstance(prefix, dict)
+            or type(prefix.get("version")) is not int
+            or prefix["version"] != 1
+            or prefix.get("input_field") != "video_source:0"
+            or type(prefix.get("retained_frames")) is not int
+            or prefix["retained_frames"] <= 0
+            or type(prefix.get("source_native_frames")) is not int
+            or prefix["source_native_frames"] <= 0
+            or _number(prefix.get("output_fps")) <= 0
+            or prefix.get("fit") != "contain"
+            or prefix.get("conditioning") != "last_frame"
+            or prefix.get("audio_policy") != "preserve_source_then_generated"
+        ):
+            raise ValueError("H3 source prefix frame count is invalid")
+        return prefix["retained_frames"]
+
+    counts = []
+    if planned_source_prefix is not None:
+        counts.append(retained_frames(planned_source_prefix))
+    if public_source_prefix is not None:
+        if (
+            not isinstance(public_source_prefix, dict)
+            or type(public_source_prefix.get("source_frames")) is not int
+            or public_source_prefix["source_frames"] <= 0
+            or type(public_source_prefix.get("added_frames")) is not int
+            or public_source_prefix["added_frames"] != generated_frames
+            or type(public_source_prefix.get("final_output_frames")) is not int
+            or public_source_prefix["final_output_frames"]
+                != public_source_prefix["source_frames"] + generated_frames
+        ):
+            raise ValueError("H3 public source prefix frame count is invalid")
+        counts.append(public_source_prefix["source_frames"])
+    cursor_prefix = None
+    if recovery_cursor is not None:
+        if not isinstance(recovery_cursor, dict):
+            raise ValueError("H3 recovery cursor is invalid")
+        units = recovery_cursor.get("completed_units")
+        if units is not None and not isinstance(units, list):
+            raise ValueError("H3 completed units are invalid")
+        for unit in units or []:
+            if (
+                isinstance(unit, dict)
+                and unit.get("kind") == "h3_segment"
+                and unit.get("index") == 0
+            ):
+                settings = unit.get("settings")
+                if isinstance(settings, dict) and settings.get("source_prefix") is not None:
+                    count = retained_frames(settings["source_prefix"])
+                    if cursor_prefix is not None and cursor_prefix != count:
+                        raise ValueError("H3 source prefix frame counts disagree")
+                    cursor_prefix = count
+                    counts.append(count)
+    final_prefix = None
+    if recovery_final_unit is not None:
+        if not isinstance(recovery_final_unit, dict):
+            raise ValueError("H3 final recovery unit is invalid")
+        if recovery_final_unit.get("kind") == "h3_concat":
+            settings = recovery_final_unit.get("settings")
+            final_prefix = (
+                settings.get("source_prefix") if isinstance(settings, dict) else None
+            )
+            if final_prefix is not None:
+                counts.append(retained_frames(final_prefix))
+    if require_recovery_evidence and (
+        (final_prefix is None) != (cursor_prefix is None)
+        or (public_source_prefix is not None and cursor_prefix is None)
+    ):
+        raise ValueError("H3 Extend recovery prefix evidence is incomplete")
+    if len(set(counts)) > 1:
+        raise ValueError("H3 source prefix frame counts disagree")
+    return generated_frames + (counts[0] if counts else 0)
+
+
 def _rate(value: Any) -> float:
     try:
         parts = str(value or "").split("/", 1)

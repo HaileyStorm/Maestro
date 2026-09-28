@@ -7418,6 +7418,18 @@ def _queue_recovery_materialize_job(
             )
             expected_frames = duration_plan.get("published_frames")
             expected_fps = duration_plan.get("fps")
+            if type(expected_frames) is int and expected_frames > 0:
+                try:
+                    from services.h3_output_integrity import expected_h3_final_frames
+                    expected_frames = expected_h3_final_frames(
+                        expected_frames,
+                        public_source_prefix=duration_plan.get("source_prefix"),
+                        recovery_cursor=snapshot.get("recovery_cursor"),
+                        recovery_final_unit=snapshot.get("recovery_unit"),
+                        require_recovery_evidence=True,
+                    )
+                except ValueError:
+                    expected_frames = None
             integrity = {"validation": "unverified"}
             if (
                 callable(verifier)
@@ -60468,7 +60480,16 @@ def _publish_h3_delivery_outputs(
             frames = duration_plan.get("published_frames")
             fps = duration_plan.get("fps")
             if type(frames) is int and frames > 0:
-                expectations["expected_frames"] = frames
+                from services.h3_output_integrity import expected_h3_final_frames
+                longform = (job.get("params") or {}).get("_h3_longform")
+                expectations["expected_frames"] = expected_h3_final_frames(
+                    frames,
+                    planned_source_prefix=(
+                        longform.get("source_prefix")
+                        if isinstance(longform, dict) else None
+                    ),
+                    recovery_cursor=job.get("recovery_cursor"),
+                )
             if type(fps) in {int, float} and fps > 0:
                 expectations["expected_fps"] = float(fps)
         resolution = (
@@ -68653,13 +68674,6 @@ def _run_generation(
             h3_integrity_failed = False
             if not defer_output_publication and requested_model in _H3_LONG_STUDIO_MODELS and not h3_delivery_request:
                 h3_expected = {}
-                if isinstance(h3_longform, dict):
-                    frames = h3_longform.get("published_frames")
-                    fps = h3_longform.get("fps")
-                    if type(frames) is int and frames > 0:
-                        h3_expected["expected_frames"] = frames
-                    if type(fps) in {int, float} and fps > 0:
-                        h3_expected["expected_fps"] = float(fps)
                 h3_final_names = []
                 for name in new_files:
                     if (
@@ -68676,6 +68690,18 @@ def _run_generation(
                     ) and name not in h3_final_names:
                         h3_final_names.append(name)
                 try:
+                    if isinstance(h3_longform, dict):
+                        frames = h3_longform.get("published_frames")
+                        fps = h3_longform.get("fps")
+                        if type(frames) is int and frames > 0:
+                            from services.h3_output_integrity import expected_h3_final_frames
+                            h3_expected["expected_frames"] = expected_h3_final_frames(
+                                frames,
+                                planned_source_prefix=h3_longform.get("source_prefix"),
+                                recovery_cursor=job.get("recovery_cursor"),
+                            )
+                        if type(fps) in {int, float} and fps > 0:
+                            h3_expected["expected_fps"] = float(fps)
                     integrity = _h3_final_output_integrity(
                         out_dir, h3_final_names, **h3_expected,
                     )

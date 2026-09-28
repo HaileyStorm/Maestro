@@ -5702,6 +5702,47 @@ class QueueLaunchWiringTests(unittest.TestCase):
             "expected_frames": 124, "expected_fps": 24,
         }])
 
+        prefix = {
+            "version": 1,
+            "input_field": "video_source:0",
+            "source_native_frames": 124,
+            "retained_frames": 124,
+            "output_fps": 24.0,
+            "fit": "contain",
+            "conditioning": "last_frame",
+            "audio_policy": "preserve_source_then_generated",
+        }
+        extended_snapshot = {
+            **queued_snapshot,
+            "recovery_cursor": {"completed_units": [{
+                "kind": "h3_segment", "index": 0,
+                "settings": {"source_prefix": prefix},
+            }]},
+            "recovery_unit": {
+                "kind": "h3_concat", "settings": {"source_prefix": prefix},
+            },
+        }
+        namespace["_queue_recovery_materialize_job"](
+            extended_snapshot, projects,
+        )
+        self.assertEqual(expectations[-1], {
+            "expected_frames": 248, "expected_fps": 24,
+        })
+        expectations.clear()
+        incomplete_extend = {
+            **extended_snapshot,
+            "recovery_cursor": {"completed_units": [{
+                "kind": "h3_segment", "index": 0, "settings": {},
+            }]},
+        }
+        held, may_start = namespace["_queue_recovery_materialize_job"](
+            incomplete_extend, projects,
+        )
+        self.assertFalse(may_start)
+        self.assertEqual(held["status"], "queued")
+        self.assertEqual(held["_recovery_reason_code"], "h3_output_integrity_failed")
+        self.assertEqual(expectations, [])
+
         with tempfile.TemporaryDirectory() as temporary:
             marker = Path(temporary) / ".pending"
             marker.write_text("pending", encoding="utf-8")

@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
-from services.h3_output_integrity import probe_h3_output
+from services.h3_output_integrity import expected_h3_final_frames, probe_h3_output
 
 
 def _production_final_checker():
@@ -42,6 +42,82 @@ def _probe_payload(*, audio=True, width=608, frames=124):
 
 
 class H3OutputIntegrityTests(unittest.TestCase):
+    def test_extend_final_counts_retained_source_and_generated_frames(self):
+        prefix = {
+            "version": 1,
+            "input_field": "video_source:0",
+            "source_native_frames": 124,
+            "retained_frames": 124,
+            "output_fps": 24.0,
+            "fit": "contain",
+            "conditioning": "last_frame",
+            "audio_policy": "preserve_source_then_generated",
+        }
+        cursor = {"completed_units": [{
+            "kind": "h3_segment", "index": 0,
+            "settings": {"source_prefix": {**prefix, "sha256": "a" * 64, "size": 100}},
+        }]}
+        final_unit = {
+            "kind": "h3_concat",
+            "settings": {"source_prefix": {**prefix, "sha256": "a" * 64, "size": 100}},
+        }
+        public_prefix = {
+            "source_frames": 124, "added_frames": 124,
+            "final_output_frames": 248,
+        }
+        self.assertEqual(expected_h3_final_frames(124), 124)
+        self.assertEqual(
+            expected_h3_final_frames(
+                124, planned_source_prefix=prefix,
+                public_source_prefix=public_prefix,
+                recovery_cursor=cursor, recovery_final_unit=final_unit,
+                require_recovery_evidence=True,
+            ),
+            248,
+        )
+        self.assertEqual(
+            expected_h3_final_frames(124, recovery_cursor=cursor), 248,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "extended.mp4"
+            artifact.write_bytes(b"synthetic container bytes")
+            report = probe_h3_output(
+                artifact, expected_frames=248, expected_fps=24,
+                require_audio=True,
+                run=lambda *_a, **_k: SimpleNamespace(
+                    stdout=_probe_payload(frames=248),
+                ),
+                which=lambda command: command,
+            )
+            self.assertEqual(report["validation"], "valid")
+        with self.assertRaises(ValueError):
+            expected_h3_final_frames(
+                124, planned_source_prefix={**prefix, "retained_frames": 123},
+                recovery_cursor=cursor,
+            )
+        with self.assertRaises(ValueError):
+            expected_h3_final_frames(
+                124, planned_source_prefix={**prefix, "retained_frames": True},
+            )
+        with self.assertRaises(ValueError):
+            expected_h3_final_frames(
+                124, recovery_cursor={"completed_units": []},
+                recovery_final_unit=final_unit,
+                require_recovery_evidence=True,
+            )
+        with self.assertRaises(ValueError):
+            expected_h3_final_frames(
+                124, recovery_cursor=cursor,
+                recovery_final_unit={"kind": "h3_concat", "settings": {}},
+                require_recovery_evidence=True,
+            )
+        with self.assertRaises(ValueError):
+            expected_h3_final_frames(
+                124, public_source_prefix=public_prefix,
+                recovery_cursor={"completed_units": []},
+                require_recovery_evidence=True,
+            )
+
     def test_verified_geometry_frame_grid_audio_and_hash_have_no_path(self):
         with tempfile.TemporaryDirectory() as directory:
             artifact = Path(directory) / "private-output.mp4"
