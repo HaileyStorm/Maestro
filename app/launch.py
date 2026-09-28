@@ -11631,17 +11631,24 @@ def _queue_recovery_reconcile_orphan_delivery(
         try:
             with open(entry.path, "r", encoding="utf-8") as handle:
                 meta = json.load(handle)
+            if not isinstance(meta, dict):
+                continue
             durable = meta.get("delivery_recovery")
-            unit_id = str((durable or {}).get("queue_recovery_unit_id") or "")
-            settings = (durable or {}).get("queue_recovery_settings")
-            dependencies = (durable or {}).get("queue_recovery_dependencies")
-            original = str((durable or {}).get("original_filename") or "")
+            if not isinstance(durable, dict):
+                continue
+            unit_id = str(durable.get("queue_recovery_unit_id") or "")
+            settings = durable.get("queue_recovery_settings")
+            dependencies = durable.get("queue_recovery_dependencies")
+            original = str(durable.get("original_filename") or "")
             if (
-                not isinstance(meta, dict)
-                or not isinstance(durable, dict)
-                or str(durable.get("source_job_id") or "") != str(job.get("id") or "")
+                str(durable.get("source_job_id") or "") != str(job.get("id") or "")
                 or not isinstance(settings, dict)
                 or not isinstance(dependencies, list)
+                or not isinstance(settings.get("native_hashes"), list)
+                or any(
+                    not isinstance(value, str)
+                    for value in settings["native_hashes"]
+                )
                 or os.path.basename(original) != original
                 or original.startswith(".")
             ):

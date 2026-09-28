@@ -7399,6 +7399,17 @@ class QueueLaunchWiringTests(unittest.TestCase):
             self.assertIsNotNone(pending)
             self.assertEqual(pending["unit_id"], unit_id)
             self.assertEqual(pending["artifacts"][0]["sha256"], native_sha)
+            malformed = project / ".maestro-delivery-malformed.native.meta.json"
+            for contents in ("[]", "null", '{"delivery_recovery": []}',
+                             '{"delivery_recovery": null}'):
+                with self.subTest(contents=contents):
+                    malformed.write_text(contents, encoding="utf-8")
+                    recovered = namespace[
+                        "_queue_recovery_reconcile_orphan_delivery"
+                    ](job, str(project))
+                    self.assertIsNotNone(recovered)
+                    self.assertEqual(recovered["unit_id"], unit_id)
+            malformed.unlink()
             raw = json.loads(meta_path.read_text(encoding="utf-8"))
             raw["delivery_recovery"].pop("owner_session_id")
             meta_path.write_text(json.dumps(raw), encoding="utf-8")
