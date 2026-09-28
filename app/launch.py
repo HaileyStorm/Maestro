@@ -58864,7 +58864,10 @@ async def inpaint_endpoint(request: Request):
     return {"job_id": job_id, "status": "queued", "target": intent["target"], "prompt": intent["prompt"]}
 
 
-def _apply_film_grain_to_file(video_path: str, intensity: float, saturation: float):
+def _apply_film_grain_to_file(
+    video_path: str, intensity: float, saturation: float,
+    *, cancel_check: Callable[[], bool] | None = None,
+):
     """Apply film grain to an already-saved video file (post-generation).
 
     Reads frames with decord, applies grain on GPU if available, re-encodes
@@ -58888,7 +58891,8 @@ def _apply_film_grain_to_file(video_path: str, intensity: float, saturation: flo
         return _apply_film_grain_to_file_impl(video_path, intensity, saturation,
                                               torch=torch, decord=decord,
                                               add_film_grain=add_film_grain,
-                                              save_video=save_video)
+                                              save_video=save_video,
+                                              cancel_check=cancel_check)
     finally:
         # Always restore decord's default bridge so downstream readers
         # (retake, director renderers, etc.) get decord.NDArray results.
@@ -58899,17 +58903,25 @@ def _apply_film_grain_to_file(video_path: str, intensity: float, saturation: flo
 
 
 def _apply_film_grain_to_file_impl(video_path: str, intensity: float, saturation: float,
-                                   *, torch, decord, add_film_grain, save_video):
+                                   *, torch, decord, add_film_grain, save_video,
+                                   cancel_check: Callable[[], bool] | None = None):
     """Body of _apply_film_grain_to_file. Extracted so the bridge-restore
     finally above can wrap the entire body cleanly without re-indenting
     the existing implementation."""
 
+    def check_cancel():
+        if cancel_check is not None and cancel_check():
+            raise InterruptedError("Film grain cancelled")
+
+    check_cancel()
     reader = decord.VideoReader(video_path)
     fps = round(reader.get_avg_fps())
     # Read all frames as uint8 tensor [F, H, W, C]
     frames = reader.get_batch(range(len(reader)))
+    del reader  # Release the source handle before replacing it on Windows.
     # Rearrange to [C, F, H, W] as expected by add_film_grain
     frames = frames.permute(3, 0, 1, 2)
+    check_cancel()
     # Free GPU memory from the generation model before using it for film grain
     if torch.cuda.is_available():
         import gc
@@ -58928,64 +58940,71 @@ def _apply_film_grain_to_file_impl(video_path: str, intensity: float, saturation
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         frames = add_film_grain(frames, intensity, saturation)
+    check_cancel()
     # Check if source has audio track to preserve it
-    has_audio = False
     audio_tmp = None
+    codec_type = wgp.server_config.get("video_output_codec", "libx264_8")
+    container = wgp.server_config.get("video_container", "mp4")
+    tmp_path = video_path + ".grain_tmp." + container
+    muxed_path = video_path + ".muxed." + container
     try:
         import subprocess
         probe = subprocess.run(
             ['ffprobe', '-v', 'quiet', '-select_streams', 'a', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', video_path],
             capture_output=True, text=True, timeout=10
         )
+        if probe.returncode != 0:
+            raise RuntimeError("Film grain audio probe failed")
         has_audio = 'audio' in probe.stdout
+        check_cancel()
         if has_audio:
             import tempfile
-            audio_tmp = tempfile.mktemp(suffix='.aac')
-            subprocess.run(
+            descriptor, audio_tmp = tempfile.mkstemp(suffix='.aac')
+            os.close(descriptor)
+            demux = subprocess.run(
                 ['ffmpeg', '-y', '-i', video_path, '-vn', '-acodec', 'copy', audio_tmp],
                 capture_output=True, timeout=60
             )
-    except Exception:
-        has_audio = False
-    # Save back — save_video expects [B, C, F, H, W] for the uint8 fast path
-    codec_type = wgp.server_config.get("video_output_codec", "libx264_8")
-    container = wgp.server_config.get("video_container", "mp4")
-    tmp_path = video_path + ".grain_tmp." + container
-    # frames is [C, F, H, W] uint8 — save_video has a uint8 fast path (no normalize needed)
-    save_video(tensor=frames.unsqueeze(0), save_file=tmp_path, fps=fps, nrow=1,
-               normalize=False, codec_type=codec_type, container=container)
-    def _replace_with_retry(src, dst, max_retries=5):
-        """Replace file with retry loop for Windows file locking."""
-        import gc
-        for attempt in range(max_retries):
-            try:
-                os.replace(src, dst)
-                return
-            except (PermissionError, OSError) as e:
-                if attempt < max_retries - 1:
-                    gc.collect()
-                    time.sleep(1)
-                else:
-                    raise
-
-    # Mux audio back if present
-    if has_audio and audio_tmp and os.path.exists(audio_tmp):
-        try:
-            import subprocess
-            muxed_path = video_path + ".muxed." + container
-            subprocess.run(
+            if demux.returncode != 0 or os.path.getsize(audio_tmp) == 0:
+                raise RuntimeError("Film grain audio extraction failed")
+            check_cancel()
+        # Save back — save_video expects [B, C, F, H, W] for the uint8 fast path.
+        save_video(tensor=frames.unsqueeze(0), save_file=tmp_path, fps=fps, nrow=1,
+                   normalize=False, codec_type=codec_type, container=container)
+        if not os.path.isfile(tmp_path) or os.path.getsize(tmp_path) == 0:
+            raise RuntimeError("Film grain video encoding failed")
+        check_cancel()
+        if has_audio:
+            mux = subprocess.run(
                 ['ffmpeg', '-y', '-i', tmp_path, '-i', audio_tmp, '-c:v', 'copy', '-c:a', 'aac', '-shortest', muxed_path],
                 capture_output=True, timeout=120
             )
-            _replace_with_retry(muxed_path, video_path)
-            os.remove(tmp_path)
-        except Exception:
-            _replace_with_retry(tmp_path, video_path)
-        finally:
-            if os.path.exists(audio_tmp):
-                os.remove(audio_tmp)
-    else:
-        _replace_with_retry(tmp_path, video_path)
+            if mux.returncode != 0 or not os.path.isfile(muxed_path) or os.path.getsize(muxed_path) == 0:
+                raise RuntimeError("Film grain audio remux failed")
+            check_cancel()
+
+        def replace_with_retry(source, max_retries=5):
+            """Replace only the complete output, retrying Windows file locks."""
+            import gc
+            for attempt in range(max_retries):
+                check_cancel()
+                try:
+                    os.replace(source, video_path)
+                    return
+                except (PermissionError, OSError):
+                    if attempt >= max_retries - 1:
+                        raise
+                    gc.collect()
+                    time.sleep(1)
+
+        replace_with_retry(muxed_path if has_audio else tmp_path)
+    finally:
+        for temporary in (audio_tmp, tmp_path, muxed_path):
+            if temporary and os.path.exists(temporary):
+                try:
+                    os.remove(temporary)
+                except OSError:
+                    pass
 
 
 # ── Per-job VRAM coefficient adjustment ────────────────────────────
@@ -68650,14 +68669,20 @@ def _run_generation(
                             ):
                                 return False
                             print(f"  [Film Grain] Applying to {fname} (intensity={pp_film_grain_intensity}, saturation={pp_film_grain_saturation})")
-                            _apply_film_grain_to_file(video_path, pp_film_grain_intensity, pp_film_grain_saturation)
+                            _apply_film_grain_to_file(
+                                video_path, pp_film_grain_intensity,
+                                pp_film_grain_saturation,
+                                cancel_check=lambda: is_cancel_requested(job),
+                            )
                             _record_postprocessing_outcome(
                                 fname, "film_grain", "applied",
                             )
                             print(f"  [Film Grain] Done: {fname}")
+                        except InterruptedError:
+                            return False
                         except Exception as fg_err:
                             _record_postprocessing_outcome(
-                                fname, "film_grain", "unconfirmed",
+                                fname, "film_grain", "not_applied",
                             )
                             print(f"  [Film Grain] Warning: failed on {fname}: {fg_err}")
                             traceback.print_exc()

@@ -385,50 +385,111 @@ class QueueFinalAdoptionTests(unittest.TestCase):
             final_unit=fixture["final_unit"],
         )
 
-    def _delivery_job(self, job_id: str, total: int) -> dict:
+    def _delivery_job(
+        self, job_id: str, total: int, *, wrong_native_hash: bool = False,
+        reversed_native_hashes: bool = False,
+        parent_kind: str = "h3_concat", missing_native_hashes: bool = False,
+        multiartifact_parent: bool = False, duplicate_native_hash: bool = False,
+    ) -> dict:
         dependencies = []
         components = []
-        previous_hash = ""
-        previous_continuation_sha = ""
-        for segment in range(2):
+        native_hashes = []
+        multiartifact_outputs = []
+        for segment in range(total):
             output = f"{job_id}-component-{segment}.mp4"
             settings = {
                 "discard_prefix_frames": 0,
                 "segment": segment,
                 "trim_tail_frames": 0,
             }
-            if dependencies:
-                settings.update({
-                    "predecessor_artifact_hashes": [previous_hash],
-                    "predecessor_continuation_sha256": previous_continuation_sha,
-                })
             meta = self._base_meta(
                 job_id=job_id,
                 kind="h3_segment",
-                variant=0,
-                index=segment,
-                output_index=0,
+                variant=segment,
+                index=0,
+                output_index=segment,
                 output_total=total,
-                dependencies=list(dependencies[-1:]),
+                dependencies=[],
                 settings=settings,
                 artifacts=[output],
             )
-            previous_continuation_sha = hashlib.sha256(
+            continuation_sha = hashlib.sha256(
                 f"continuation:{job_id}:{segment}".encode()
             ).hexdigest()
             meta["producer_unit_continuation"] = {
                 "basename": f"{job_id}-s{segment}-continuation.png",
                 "dependency": meta["producer_unit_id"],
                 "mode": "last_frame",
-                "sha256": previous_continuation_sha,
+                "sha256": continuation_sha,
                 "size": 123,
                 "storage": "recovery_staging",
             }
             components.append(self._quarantined_pair(output, output.encode(), meta))
-            dependencies.append(meta["producer_unit_id"])
-            previous_hash = hashlib.sha256(output.encode()).hexdigest()
+            component_hash = hashlib.sha256(output.encode()).hexdigest()
+            segment_unit_id = meta["producer_unit_id"]
+            if parent_kind == "h3_segment":
+                dependencies.append(segment_unit_id)
+                native_hashes.append(component_hash)
+                continue
+            native_output = f"{job_id}-native-{segment}.mp4"
+            if multiartifact_parent:
+                multiartifact_outputs.append(native_output)
+                native_hashes.append(hashlib.sha256(native_output.encode()).hexdigest())
+                continue
+            parent_dependencies = (
+                [segment_unit_id] if parent_kind == "h3_concat" else []
+            )
+            parent_settings = (
+                {
+                    "clip_start_frames": [0],
+                    "clip_tail_frames": [0],
+                    "component_hashes": [component_hash],
+                }
+                if parent_kind == "h3_concat" else {}
+            )
+            parent_meta = self._base_meta(
+                job_id=job_id,
+                kind=parent_kind,
+                variant=segment if parent_kind == "h3_concat" else 0,
+                index=0 if parent_kind == "h3_concat" else segment,
+                output_index=segment,
+                output_total=total,
+                dependencies=parent_dependencies,
+                settings=parent_settings,
+                artifacts=[native_output],
+            )
+            components.append(self._quarantined_pair(
+                native_output, native_output.encode(), parent_meta,
+            ))
+            dependencies.append(parent_meta["producer_unit_id"])
+            native_hashes.append(hashlib.sha256(native_output.encode()).hexdigest())
+        if multiartifact_parent:
+            for output_index, native_output in enumerate(multiartifact_outputs):
+                parent_meta = self._base_meta(
+                    job_id=job_id,
+                    kind="ordinary_repeat",
+                    variant=0,
+                    index=0,
+                    output_index=output_index,
+                    output_total=total,
+                    dependencies=[],
+                    settings={},
+                    artifacts=multiartifact_outputs,
+                )
+                components.append(self._quarantined_pair(
+                    native_output, native_output.encode(), parent_meta,
+                ))
+                dependencies.append(parent_meta["producer_unit_id"])
         names = [f"{job_id}-delivery-{index}.mp4" for index in range(total)]
+        if wrong_native_hash:
+            native_hashes[-1] = hashlib.sha256(b"different native").hexdigest()
+        if reversed_native_hashes:
+            native_hashes.reverse()
+        if duplicate_native_hash:
+            native_hashes[-1] = native_hashes[0]
         settings = {"delivery": True}
+        if not missing_native_hashes:
+            settings["native_hashes"] = native_hashes
         unit_id = recovery_unit_id(
             job_id,
             "h3_delivery",
@@ -1284,6 +1345,70 @@ class QueueFinalAdoptionTests(unittest.TestCase):
         self.assertEqual(summary["adopted_groups"], 1)
         self.assertEqual(summary["jobs"][0]["adopted"], 3)
         self.assertEqual(len(list(self.project.glob("job-delivery-delivery-*.mp4"))), 3)
+
+    def test_delivery_group_rejects_native_hash_not_sealed_by_parent(self):
+        self._delivery_job("job-delivery-parent-mismatch", 2, wrong_native_hash=True)
+        summary = adopt_quarantined_final_groups(
+            self.project,
+            workspace=self.workspace,
+        )
+        self.assertEqual(summary["adopted_groups"], 0)
+        self.assertFalse(list(self.project.glob("job-delivery-parent-mismatch-delivery-*.mp4")))
+
+    def test_delivery_group_rejects_reordered_native_hashes(self):
+        self._delivery_job("job-delivery-parent-order", 2, reversed_native_hashes=True)
+        summary = adopt_quarantined_final_groups(
+            self.project,
+            workspace=self.workspace,
+        )
+        self.assertEqual(summary["adopted_groups"], 0)
+
+    def test_delivery_group_rejects_component_parent(self):
+        self._delivery_job("job-delivery-component", 2, parent_kind="h3_segment")
+        summary = adopt_quarantined_final_groups(
+            self.project,
+            workspace=self.workspace,
+        )
+        self.assertEqual(summary["adopted_groups"], 0)
+
+    def test_delivery_group_accepts_ordinary_final_parent(self):
+        self._delivery_job("job-delivery-ordinary", 2, parent_kind="ordinary_repeat")
+        summary = adopt_quarantined_final_groups(
+            self.project,
+            workspace=self.workspace,
+        )
+        self.assertEqual(summary["adopted_groups"], 1)
+
+    def test_delivery_group_requires_native_hashes(self):
+        self._delivery_job("job-delivery-unbound", 2, missing_native_hashes=True)
+        summary = adopt_quarantined_final_groups(
+            self.project,
+            workspace=self.workspace,
+        )
+        self.assertEqual(summary["adopted_groups"], 0)
+
+    def test_delivery_group_consumes_each_multiartifact_parent_hash_once(self):
+        self._delivery_job(
+            "job-delivery-multi-parent", 2,
+            parent_kind="ordinary_repeat", multiartifact_parent=True,
+        )
+        summary = adopt_quarantined_final_groups(
+            self.project,
+            workspace=self.workspace,
+        )
+        self.assertEqual(summary["adopted_groups"], 1)
+
+    def test_delivery_group_rejects_reused_multiartifact_parent_hash(self):
+        self._delivery_job(
+            "job-delivery-reused-parent", 2,
+            parent_kind="ordinary_repeat", multiartifact_parent=True,
+            duplicate_native_hash=True,
+        )
+        summary = adopt_quarantined_final_groups(
+            self.project,
+            workspace=self.workspace,
+        )
+        self.assertEqual(summary["adopted_groups"], 0)
 
     def test_private_directory_and_workspace_are_fail_closed(self):
         self._concat_job("job-private", 1)

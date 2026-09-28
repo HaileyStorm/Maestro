@@ -8,6 +8,7 @@ existing gallery entry.  It never creates or completes a runtime job.
 """
 from __future__ import annotations
 
+from collections import Counter
 from contextlib import contextmanager
 import hashlib
 import json
@@ -1006,6 +1007,30 @@ def _semantic_dependencies_valid(
                 or _valid_h3_source_prefix_identity(expected_prefix)
             )
         )
+        _memo[unit_id] = result
+        return result
+    if item["kind"] == "h3_delivery":
+        native_hashes = settings.get("native_hashes")
+        result = isinstance(native_hashes, list) and len(native_hashes) == len(dependencies)
+        remaining: dict[str, Counter[str]] = {}
+        if result:
+            for dependency, native_hash in zip(dependencies, native_hashes):
+                parent = valid_units[dependency]
+                if (
+                    not isinstance(native_hash, str)
+                    or _SHA256.fullmatch(native_hash) is None
+                    or parent[0]["kind"] not in {"h3_concat", "ordinary_repeat"}
+                ):
+                    result = False
+                    break
+                available = remaining.setdefault(
+                    dependency,
+                    Counter(candidate["media_sha256"] for candidate in parent),
+                )
+                if available[native_hash] <= 0:
+                    result = False
+                    break
+                available[native_hash] -= 1
         _memo[unit_id] = result
         return result
     _memo[unit_id] = True
