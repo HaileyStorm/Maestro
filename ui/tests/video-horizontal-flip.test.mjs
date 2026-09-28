@@ -269,7 +269,7 @@ test('Gallery viewer offers a browser copy only after a revealed video fails to 
   )
   const Viewer = compiled.exports.GalleryViewer
   const file = {
-    workspace: 'project-a', name: 'clip.mp4', revision: 'rev-7',
+    workspace: 'project-a', name: 'clip.mp4', revision: 'a-7.0-0',
     url: '/api/v1/file/clip.mp4?workspace=project-a', type: 'video', private: true, size: 2048,
   }
   const calls = []
@@ -283,7 +283,7 @@ test('Gallery viewer offers a browser copy only after a revealed video fails to 
   globalThis.__copyViewerState = []
   globalThis.__copyViewerRevealed = false
   let viewerFiles = [file]
-  let initialIdentity = 'project-a:clip.mp4:rev-7'
+  let initialIdentity = 'project-a:clip.mp4:a-7.0-0'
   const renderViewer = () => {
     globalThis.__copyViewerHook = 0
     return Viewer({ files: viewerFiles, initialIdentity, restoreFocus: null, onClose() {} })
@@ -301,11 +301,12 @@ test('Gallery viewer offers a browser copy only after a revealed video fails to 
   globalThis.__copyViewerRevealed = true
   const video = allNodes(renderViewer()).find(node => node.type === 'video')
   assert.ok(video)
+  assert.equal(video.props.src, '/api/v1/file/clip.mp4?workspace=project-a&listing_revision=a-7.0-0')
   assert.equal(String(mediaInfo()?.props.children).includes('2 KB'), true)
   video.props.onLoadedMetadata({ currentTarget: { videoWidth: 640, videoHeight: 360, duration: 5.17 } })
   const measured = mediaInfo()
   assert.match(String(measured?.props.children), /640 × 360.*5.17s.*2 KB/)
-  viewerFiles = [file, { ...file, name: 'other.mp4', revision: 'rev-8', size: 4096 }]
+  viewerFiles = [file, { ...file, name: 'other.mp4', revision: 'a-8.0-0', size: 4096 }]
   allNodes(renderViewer()).find(node => node.props?.['aria-label'] === 'Next media').props.onClick()
   const nextInfo = mediaInfo()
   assert.equal(String(nextInfo?.props.children).includes('640 × 360'), false)
@@ -316,7 +317,8 @@ test('Gallery viewer offers a browser copy only after a revealed video fails to 
   const fallback = allNodes(renderViewer())
   const copyButton = fallback.find(node => node.type === 'button' && node.props?.children === 'Create H.264 browser copy')
   assert.ok(copyButton)
-  assert.equal(fallback.some(node => node.type === 'a' && node.props?.download === 'clip.mp4'), true)
+  assert.equal(fallback.some(node => node.type === 'a' && node.props?.download === 'clip.mp4'
+    && node.props?.href === video.props.src), true)
   await copyButton.props.onClick()
   assert.deepEqual(calls, [file])
   const queued = allNodes(renderViewer())
@@ -331,7 +333,7 @@ test('Gallery viewer offers a browser copy only after a revealed video fails to 
   assert.equal(failed.some(node => node.props?.role === 'alert' && node.props?.children === 'The copy failed.'), true)
 
   globalThis.__copyViewerStore.jobs = []
-  viewerFiles = [file, { ...file, name: 'clip_browser_copy_copy-job.mp4', revision: 'rev-8' }]
+  viewerFiles = [file, { ...file, name: 'clip_browser_copy_copy-job.mp4', revision: 'a-8.0-0' }]
   const completed = allNodes(renderViewer())
   assert.equal(completed.some(node => node.type === 'button' && node.props?.children === 'Browser copy ready'), true)
   assert.equal(completed.some(node => node.props?.role === 'status' && String(node.props?.children).includes('ready in Gallery')), true)
@@ -355,14 +357,24 @@ test('Gallery viewer offers a browser copy only after a revealed video fails to 
   assert.equal(genericFailure.some(node => node.props?.children === 'This media could not be loaded. Try opening it from the Gallery again.'), true)
 
   globalThis.__copyViewerState = []
-  viewerFiles = [{ ...file, name: 'still.png', revision: 'rev-9', type: 'image', size: 1024 }]
-  initialIdentity = 'project-a:still.png:rev-9'
+  viewerFiles = [{ ...file, name: 'still.png', revision: 'a-9.0-0', type: 'image',
+    url: '/api/v1/file/still.png?workspace=project-a', size: 1024 }]
+  initialIdentity = 'project-a:still.png:a-9.0-0'
   const imageView = allNodes(renderViewer()).find(node => typeof node.type === 'function')
   assert.ok(imageView)
   const image = imageView.type(imageView.props)
+  assert.equal(image.props.src, '/api/v1/file/still.png?workspace=project-a&listing_revision=a-9.0-0')
   image.props.onLoad({ currentTarget: { naturalWidth: 1024, naturalHeight: 768 } })
   const imageInfo = mediaInfo()
   assert.match(String(imageInfo?.props.children), /1024 × 768.*1 KB/)
+
+  globalThis.__copyViewerState = []
+  viewerFiles = [{ ...file, workspace: '__uploads__', name: 'upload.png',
+    revision: 'upload-r1', type: 'image', url: '/api/v1/file/upload.png?workspace=__uploads__' }]
+  initialIdentity = '__uploads__:upload.png:upload-r1'
+  const uploadView = allNodes(renderViewer()).find(node => typeof node.type === 'function')
+  assert.equal(uploadView.type(uploadView.props).props.src,
+    '/api/v1/file/upload.png?workspace=__uploads__')
 })
 
 const componentModules = new Map([

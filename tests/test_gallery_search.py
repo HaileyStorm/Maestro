@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import ast
 import copy
+import hmac
 import json
 import os
+import re
 import sys
 import tempfile
 import types
@@ -537,6 +539,74 @@ class ArtifactClassificationTests(unittest.TestCase):
 
 
 class GalleryApiUiContractTests(unittest.TestCase):
+    def test_gallery_listing_revision_refuses_replaced_media_without_changing_share_revision(self):
+        launch_path = Path(_APP_DIR) / "launch.py"
+        tree = ast.parse(launch_path.read_text(encoding="utf-8"), filename=str(launch_path))
+        nodes = []
+        for name in ("_output_revision", "serve_file"):
+            node = next(item for item in tree.body if isinstance(item, ast.FunctionDef) and item.name == name)
+            selected = copy.deepcopy(node)
+            selected.decorator_list = []
+            nodes.append(selected)
+        module = ast.Module(body=nodes, type_ignores=[])
+        ast.fix_missing_locations(module)
+
+        class FakeHTTPException(Exception):
+            def __init__(self, *, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+
+        with tempfile.TemporaryDirectory() as workspace:
+            name = "video.mp4"
+            media = os.path.join(workspace, name)
+            _touch_media(workspace, name)
+            sidecar = _write_sidecar(workspace, name)
+            strong_revision = "sha256:" + "a" * 64
+            namespace = {
+                "os": os,
+                "re": re,
+                "hmac": hmac,
+                "Request": object,
+                "HTTPException": FakeHTTPException,
+                "_request_project_workspace": lambda _request, selected: selected,
+                "_require_authorized_output": lambda *_args: (workspace, media, None),
+                "_output_share_revision": lambda *_args: strong_revision,
+            }
+            exec(compile(module, str(launch_path), "exec"), namespace)
+            serve_file = namespace["serve_file"]
+            revision = namespace["_output_revision"]
+            request = types.SimpleNamespace()
+            first_revision = revision(media, workspace, name)
+            with patch("services.win_safe_files.share_delete_file_response") as send:
+                serve_file(request, name, workspace="project-a", listing_revision=first_revision)
+                self.assertIsNotNone(send.call_args.kwargs["expected_file_identity"])
+                self.assertEqual(send.call_args.kwargs["expected_sidecar"][0], sidecar)
+
+                Path(media).write_bytes(b"replacement with different size")
+                with self.assertRaises(FakeHTTPException) as stale:
+                    serve_file(request, name, workspace="project-a", listing_revision=first_revision)
+                self.assertEqual(stale.exception.status_code, 409)
+                second_revision = revision(media, workspace, name)
+                self.assertNotEqual(first_revision, second_revision)
+                serve_file(request, name, workspace="project-a", listing_revision=second_revision)
+
+                Path(sidecar).write_text('{"updated":true}', encoding="utf-8")
+                with self.assertRaises(FakeHTTPException) as stale_sidecar:
+                    serve_file(request, name, workspace="project-a", listing_revision=second_revision)
+                self.assertEqual(stale_sidecar.exception.status_code, 409)
+
+                serve_file(request, name, workspace="project-a", content_revision=strong_revision)
+                with self.assertRaises(FakeHTTPException) as malformed:
+                    serve_file(request, name, workspace="project-a", listing_revision="sha256:wrong")
+                self.assertEqual(malformed.exception.status_code, 400)
+                with self.assertRaises(FakeHTTPException) as mixed:
+                    serve_file(request, name, workspace="project-a", content_revision=strong_revision,
+                               listing_revision=first_revision)
+                self.assertEqual(mixed.exception.status_code, 400)
+                with self.assertRaises(FakeHTTPException) as upload:
+                    serve_file(request, name, workspace="__uploads__", listing_revision=first_revision)
+                self.assertEqual(upload.exception.status_code, 400)
+
     def test_same_mtime_outputs_keep_their_order_across_refresh_and_pagination(self):
         launch_path = Path(_APP_DIR) / "launch.py"
         tree = ast.parse(launch_path.read_text(encoding="utf-8"), filename=str(launch_path))

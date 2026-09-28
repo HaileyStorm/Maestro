@@ -230,6 +230,16 @@ workspaces; Pinokio reported the exact restart notice cleared. Chrome loaded
 the stable-share owner sign-in page. Signed-in Media Info and owner acceptance
 remain separate work.
 
+The viewer's project-output image, video, comparison, thumbnail and download
+URLs now carry the file revision from the Gallery listing. If that output is
+ordinarily replaced in place, a separate listing-revision check refuses the
+stale preview instead of showing new media beside old listing facts. This
+mtime/size token is not a cryptographic content identity; the stronger
+`content_revision` share contract stays separate. The session-owned Uploads
+view keeps its unversioned URL. Focused viewer checks, all 750 UI tests,
+type-check/build and the guard gate pass.
+Signed-in viewing of a replaced file remains unverified.
+
 The first finishing-history slice shows one recorded Tools upscale/media-flow
 event in a collapsed Gallery card section, using the authorized sidecar's
 successful tool field, recognized method, source basename, recorded time and

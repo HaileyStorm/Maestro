@@ -24,6 +24,12 @@ function identity(file: OutputFile): string {
   return privatePreviewIdentity(file.workspace, file.name, file.revision)
 }
 
+function mediaUrl(file: OutputFile): string {
+  if (file.workspace === '__uploads__' || !file.revision) return file.url
+  const separator = file.url.includes('?') ? '&' : '?'
+  return `${file.url}${separator}listing_revision=${encodeURIComponent(file.revision)}`
+}
+
 function ViewerImage({ file, alt, status, onReady, onFailure }: {
   file: OutputFile
   alt?: string
@@ -50,7 +56,8 @@ function ViewerImage({ file, alt, status, onReady, onFailure }: {
       setAttempt(attempt + 1)
     }, 400 * (attempt + 1))
   }
-  const src = attempt === 0 ? file.url : `${file.url}${file.url.includes('?') ? '&' : '?'}viewer_retry=${attempt}`
+  const url = mediaUrl(file)
+  const src = attempt === 0 ? url : `${url}${url.includes('?') ? '&' : '?'}viewer_retry=${attempt}`
   return (
     <img
       key={src}
@@ -203,6 +210,7 @@ export function GalleryViewer({ files, initialIdentity, restoreFocus, onClose }:
     : media.findIndex(file => identity(file) === initialIdentity)
   const file = media[selectedIndex]
   const fileIdentity = file && identity(file)
+  const fileUrl = file && mediaUrl(file)
   const currentStatus = mediaStatus?.identity === fileIdentity ? mediaStatus.state : 'loading'
   const currentMeasurement = currentStatus === 'ready' ? mediaStatus : null
   const currentCopyRequest = copyRequest?.identity === fileIdentity ? copyRequest : null
@@ -354,13 +362,13 @@ export function GalleryViewer({ files, initialIdentity, restoreFocus, onClose }:
               {copyUntracked && <p role="status">The copy is no longer in Queue. Refresh Gallery to check the result before retrying.</p>}
               {currentCopyRequest?.state === 'error' && <p role="alert">{currentCopyRequest.message}</p>}
               {!file.revision && <p>The source needs a current Gallery revision. Refresh Gallery and reopen this video.</p>}
-              <a href={file.url} download={file.name} className="rounded-full border border-white/30 px-5 py-3 text-white hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white">Download original video</a>
+              <a href={fileUrl} download={file.name} className="rounded-full border border-white/30 px-5 py-3 text-white hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white">Download original video</a>
               <p>Future videos can use H.264 directly from System settings. A browser copy uses additional disk space.</p>
             </div>
           ) : currentStatus === 'error' ? (
             <div role="alert" className="flex max-w-xs flex-col items-center gap-3 text-center text-sm text-white/75">
               <p>This media could not be loaded. Try opening it from the Gallery again.</p>
-              {file.type === 'video' && <a href={file.url} download={file.name} className="rounded-full border border-white/30 px-5 py-3 text-white hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white">Download original video</a>}
+              {file.type === 'video' && <a href={fileUrl} download={file.name} className="rounded-full border border-white/30 px-5 py-3 text-white hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white">Download original video</a>}
             </div>
           ) : (
             <>
@@ -368,7 +376,7 @@ export function GalleryViewer({ files, initialIdentity, restoreFocus, onClose }:
                 <div role="status" className="absolute flex items-center gap-2 text-sm text-white/70"><Loader2 size={17} className="animate-spin motion-reduce:animate-none" />Loading media...</div>
               )}
               {file.type === 'video' ? (
-                <video key={fileIdentity} src={file.url} controls playsInline preload="metadata" className={`h-full w-full object-contain ${currentStatus === 'loading' ? 'opacity-0' : ''}`} onLoadedMetadata={event => setMediaStatus({ identity: fileIdentity, state: event.currentTarget.videoWidth > 0 && event.currentTarget.videoHeight > 0 ? 'ready' : 'unsupported-video', width: event.currentTarget.videoWidth, height: event.currentTarget.videoHeight, duration: event.currentTarget.duration })} onError={event => setMediaStatus({ identity: fileIdentity, state: event.currentTarget.error?.code === MediaError.MEDIA_ERR_DECODE || event.currentTarget.error?.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED ? 'unsupported-video' : 'error' })} />
+                <video key={fileIdentity} src={fileUrl} controls playsInline preload="metadata" className={`h-full w-full object-contain ${currentStatus === 'loading' ? 'opacity-0' : ''}`} onLoadedMetadata={event => setMediaStatus({ identity: fileIdentity, state: event.currentTarget.videoWidth > 0 && event.currentTarget.videoHeight > 0 ? 'ready' : 'unsupported-video', width: event.currentTarget.videoWidth, height: event.currentTarget.videoHeight, duration: event.currentTarget.duration })} onError={event => setMediaStatus({ identity: fileIdentity, state: event.currentTarget.error?.code === MediaError.MEDIA_ERR_DECODE || event.currentTarget.error?.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED ? 'unsupported-video' : 'error' })} />
               ) : (
                 <ViewerImage key={fileIdentity} file={file} status={currentStatus} onReady={(width, height) => setMediaStatus({ identity: fileIdentity, state: 'ready', width, height })} onFailure={() => setMediaStatus({ identity: fileIdentity, state: 'error' })} />
               )}
@@ -411,7 +419,7 @@ export function GalleryViewer({ files, initialIdentity, restoreFocus, onClose }:
                     onClick={() => selectIndex(index)}
                     className={`flex h-16 w-20 items-center justify-center overflow-hidden rounded-lg border bg-white/5 text-white/55 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white ${index === selectedIndex ? 'border-white' : 'border-white/15 hover:border-white/50'}`}
                   >
-                    {hidden ? <EyeOff size={18} /> : item.type === 'image' ? <img src={item.url} alt="" loading="lazy" className="h-full w-full object-cover" /> : <Film size={18} />}
+                    {hidden ? <EyeOff size={18} /> : item.type === 'image' ? <img src={mediaUrl(item)} alt="" loading="lazy" className="h-full w-full object-cover" /> : <Film size={18} />}
                   </button>
                 </div>
               )

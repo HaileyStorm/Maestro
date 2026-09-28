@@ -73998,7 +73998,7 @@ def list_outputs(
 
 
 @api.get("/api/v1/file/{filename:path}")
-def serve_file(request: Request, filename: str, workspace: str = "", content_revision: str = ""):
+def serve_file(request: Request, filename: str, workspace: str = "", content_revision: str = "", listing_revision: str = ""):
     """Serve one authorized output from one explicitly scoped project.
 
     Uses share_delete_file_response so that on Windows the file can be
@@ -74017,7 +74017,7 @@ def serve_file(request: Request, filename: str, workspace: str = "", content_rev
         raise HTTPException(status_code=400, detail="Invalid output name")
     selected_workspace = _request_project_workspace(request, workspace)
     if selected_workspace == "__uploads__":
-        if content_revision:
+        if content_revision or listing_revision:
             raise HTTPException(status_code=400, detail="Output revision is not available for uploads")
         _require_upload_content_access(request)
         filepath = safe_direct_file_under(
@@ -74038,9 +74038,16 @@ def serve_file(request: Request, filename: str, workspace: str = "", content_rev
         if error.status_code == 404:
             raise HTTPException(status_code=404, detail="File not found") from error
         raise
-    if content_revision:
-        if not re.fullmatch(r"sha256:[0-9a-f]{64}", content_revision):
-            raise HTTPException(status_code=400, detail="Invalid output revision")
+    if content_revision or listing_revision:
+        if content_revision and listing_revision:
+            raise HTTPException(status_code=400, detail="Choose one output revision")
+        if content_revision:
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", content_revision):
+                raise HTTPException(status_code=400, detail="Invalid output revision")
+        elif len(listing_revision) > 128 or not re.fullmatch(
+            r"[0-9a-f]+-[0-9a-f]+\.[0-9a-f]+-[0-9a-f]+", listing_revision,
+        ):
+            raise HTTPException(status_code=400, detail="Invalid Gallery revision")
         metadata_path = os.path.join(out_dir, os.path.splitext(filename)[0] + ".meta.json")
         try:
             file_identity = file_revision_identity(filepath)
@@ -74050,7 +74057,10 @@ def serve_file(request: Request, filename: str, workspace: str = "", content_rev
         if file_identity is None:
             raise HTTPException(status_code=404, detail="File not found")
         try:
-            current_revision = _output_share_revision(filepath, out_dir, filename)
+            current_revision = (
+                _output_share_revision(filepath, out_dir, filename)
+                if content_revision else _output_revision(filepath, out_dir, filename)
+            )
         except FileNotFoundError as error:
             raise HTTPException(status_code=404, detail="File not found") from error
         except (OSError, ValueError) as error:
@@ -74064,7 +74074,7 @@ def serve_file(request: Request, filename: str, workspace: str = "", content_rev
             identity_still_current = False
         if not identity_still_current:
             raise HTTPException(status_code=409, detail="Output changed; reopen it from Gallery")
-        if not hmac.compare_digest(content_revision, current_revision):
+        if not hmac.compare_digest(content_revision or listing_revision, current_revision):
             raise HTTPException(status_code=409, detail="Output changed; reopen it from Gallery")
         return share_delete_file_response(
             filepath, expected_file_identity=file_identity,
