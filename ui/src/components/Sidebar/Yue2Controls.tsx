@@ -471,7 +471,12 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
                 <span className="shrink-0 text-text-muted">{track.status} · {track.stage}</span>
               </div>
               <p className="text-text-muted">Decoder: {track.form?.decoderProfile === 'joint-v9' ? 'Real-audio joint v9' : 'Stock YuE2'}</p>
-              {track.duration > 0 && <p className="text-text-muted">{Math.round(track.duration)}s audio</p>}
+              {track.nominal_score_seconds != null && track.nominal_score_seconds > 0 ? (
+                <p className="text-text-muted" title="Score timing uses its bars, meter, and tempo. YuE2 may render a different length.">
+                  Score timing ~{Math.round(track.nominal_score_seconds)}s
+                  {track.duration > 0 ? ` · Audio ${Math.round(track.duration)}s` : ''}
+                </p>
+              ) : track.duration > 0 && <p className="text-text-muted">{Math.round(track.duration)}s audio</p>}
               {track.error && <p className="text-red-400">{track.error}</p>}
               {(track.truncated?.abc || track.truncated?.semantic) && <p className="text-amber-300">This take reached a generation limit. Check the ending before reusing it.</p>}
               {track.warnings?.map(warning => <p key={warning} className="text-amber-300">{warning}</p>)}

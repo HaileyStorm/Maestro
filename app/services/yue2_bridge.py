@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
+
+from .music_document_router import native_abc_voice_bars
 
 
 class Yue2BridgeError(RuntimeError):
@@ -22,6 +25,28 @@ class Yue2BridgeError(RuntimeError):
     def __init__(self, message: str, *, status_code: int = 503):
         super().__init__(message)
         self.status_code = status_code
+
+
+def nominal_score_seconds(abc: object) -> float | None:
+    """Estimate simple native ABC score timing, not the model's audio length."""
+    if not isinstance(abc, str) or not abc or len(abc) > 100_000:
+        return None
+    bars = native_abc_voice_bars(abc)
+    if not bars or bars[0] != bars[1]:
+        return None
+    lines = [line.strip() for line in abc.splitlines()]
+    meter_lines = [line for line in lines if line.startswith("M:")]
+    tempo_lines = [line for line in lines if line.startswith("Q:")]
+    if len(meter_lines) != 1 or len(tempo_lines) != 1 or "[Q:" in abc or "[M:" in abc:
+        return None
+    meter = re.fullmatch(r"M:\s*(\d{1,2})/(\d{1,2})", meter_lines[0])
+    tempo = re.fullmatch(r"Q:\s*1/4\s*=\s*(\d{1,3})", tempo_lines[0])
+    if not meter or not tempo:
+        return None
+    beats, denominator, bpm = int(meter[1]), int(meter[2]), int(tempo[1])
+    if not (1 <= beats <= 32 and denominator in {2, 4, 8, 16} and 20 <= bpm <= 400):
+        return None
+    return bars[0] * beats * 4 / denominator * 60 / bpm
 
 
 def _read_env_file(path: Path) -> dict[str, str]:
@@ -153,11 +178,18 @@ class Yue2Bridge:
         library = self.library()
         if not isinstance(library, dict) or not isinstance(library.get("tracks"), list):
             raise Yue2BridgeError("The YuE2 service returned an invalid library.")
+        tracks = []
+        for track in library["tracks"]:
+            if not isinstance(track, dict) or track.get("project") != workspace:
+                continue
+            public_track = dict(track)
+            form = track.get("form")
+            seconds = nominal_score_seconds(form.get("abc")) if isinstance(form, dict) else None
+            if seconds is not None:
+                public_track["nominal_score_seconds"] = seconds
+            tracks.append(public_track)
         return {
-            "tracks": [
-                track for track in library["tracks"]
-                if isinstance(track, dict) and track.get("project") == workspace
-            ]
+            "tracks": tracks
         }
 
     def require_take(self, take_id: str, workspace: str) -> dict[str, Any]:

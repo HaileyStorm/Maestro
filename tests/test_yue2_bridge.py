@@ -165,6 +165,24 @@ class Yue2BridgeTests(unittest.TestCase):
             bridge.require_take("foreign", "alpha")
         self.assertEqual(caught.exception.status_code, 404)
 
+    def test_project_library_exposes_nominal_score_timing_separately_from_audio(self):
+        abc = (
+            "X:1\nM:4/4\nL:1/32\nQ:1/4=112\nK:C\n"
+            "V: Vocal\n" + "C8D8E8F8|" * 8 + "\n"
+            "V: Ins\n" + "C8D8E8F8|" * 8 + "\n"
+        )
+        bridge = yue2_bridge.Yue2Bridge(token_file=Path("/unused"))
+        bridge.library = lambda: {"tracks": [
+            {"id": "owned", "project": "alpha", "form": {"abc": abc}, "duration": 44.999},
+            {"id": "foreign", "project": "beta", "form": {"abc": abc}},
+            {"id": "unknown", "project": "alpha", "form": {"abc": abc.replace("Q:1/4=112", "Q:variable")}},
+        ]}
+        tracks = bridge.project_library("alpha")["tracks"]
+        self.assertEqual([track["id"] for track in tracks], ["owned", "unknown"])
+        self.assertAlmostEqual(tracks[0]["nominal_score_seconds"], 17.142857, places=5)
+        self.assertEqual(tracks[0]["duration"], 44.999)
+        self.assertNotIn("nominal_score_seconds", tracks[1])
+
     def test_training_jobs_are_project_filtered_and_cancel_requires_match(self):
         bridge = yue2_bridge.Yue2Bridge(token_file=Path("/unused"))
         calls = []

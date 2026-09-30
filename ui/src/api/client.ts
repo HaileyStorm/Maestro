@@ -1758,6 +1758,8 @@ export interface Yue2Track {
   status: 'queued' | 'running' | 'needs-review' | 'succeeded' | 'failed' | 'cancelled' | string
   stage: string
   duration: number
+  /** Structural timing from a simple ABC score; generated audio may differ. */
+  nominal_score_seconds?: number
   elapsed: number
   error?: string | null
   warnings?: string[]
