@@ -70792,6 +70792,10 @@ def _job_eta_values(job: dict) -> tuple[int | None, int | None]:
         started_at = float(job.get("started_at") or 0)
     except (TypeError, ValueError):
         progress = started_at = 0
+    if progress >= 100:
+        # This scalar measures generation, while delivery and publication may
+        # still be running. Neither the seed nor its step rate can time them.
+        return None, None
     try:
         inactive = max(0.0, float(job.get("_eta_inactive_seconds") or 0))
     except (TypeError, ValueError):
@@ -70880,9 +70884,15 @@ def _job_eta_values(job: dict) -> tuple[int | None, int | None]:
 def _public_progress_telemetry(job: dict) -> dict:
     """Return additive phase semantics without changing legacy scalars."""
     running = str(job.get("status") or "") == "running"
+    try:
+        generation_complete = float(
+            job.get("overall_progress", job.get("progress", 0)) or 0
+        ) >= 100
+    except (TypeError, ValueError):
+        generation_complete = False
     return {
         "progress_indeterminate": bool(
-            running and job.get("progress_indeterminate", False)
+            running and (job.get("progress_indeterminate", False) or generation_complete)
         ),
     }
 

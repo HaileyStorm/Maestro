@@ -76,6 +76,26 @@ class GenerationTelemetryTests(unittest.TestCase):
         # Only ten active seconds elapsed: ten remain overall and in phase.
         self.assertEqual(eta_values(running), (10, 10))
 
+    def test_completed_generation_does_not_claim_delivery_is_done(self):
+        clock = SimpleNamespace(time=lambda: 160.0)
+        eta_values = _load_function(
+            "app/launch.py", "_job_eta_values", {"time": clock},
+        )
+        public_progress = _load_function(
+            "app/launch.py", "_public_progress_telemetry",
+        )
+        finishing = {
+            "status": "running",
+            "phase": "Upscaling",
+            "started_at": 100.0,
+            "overall_progress": 100,
+            "progress": 100,
+            "h3_estimate": {"seconds": 507, "model_load_seconds": 150},
+        }
+        self.assertEqual(eta_values(finishing), (None, None))
+        self.assertTrue(public_progress(finishing)["progress_indeterminate"])
+        self.assertFalse(public_progress({**finishing, "status": "completed"})["progress_indeterminate"])
+
     def test_cold_load_does_not_inflate_early_h3_eta(self):
         clock = SimpleNamespace(time=lambda: 610.0)
         eta_values = _load_function(
@@ -244,7 +264,7 @@ class GenerationTelemetryTests(unittest.TestCase):
         self.assertIn("progress_indeterminate?: boolean", client)
         self.assertIn("progressIndeterminate: status.status === 'running'", store)
         self.assertIn("hasExactCurrentSteps\n        ? (currentStep / currentTotalSteps)", main)
-        self.assertIn("Overall ETA ${formatApproximateDuration(job.etaSeconds)}", main)
+        self.assertIn("Overall ETA ${formatApproximateDuration(finishingOutput ? null : job.etaSeconds)}", main)
         self.assertIn("Current segment ETA ${formatApproximateDuration(job.subtaskEtaSeconds)}", main)
         self.assertIn("Estimated time ${formatApproximateDuration(queuedH3Runtime)} after start", main)
         self.assertIn("Planned time ${formatApproximateDuration(queuedH3Runtime)} after start", main)
@@ -328,7 +348,7 @@ class GenerationTelemetryTests(unittest.TestCase):
             "Planned time ${formatApproximateDuration(queuedH3Runtime)} after start",
             eta_render,
         )
-        self.assertIn("Overall ETA ${formatApproximateDuration(job.etaSeconds)}", eta_render)
+        self.assertIn("Overall ETA ${formatApproximateDuration(finishingOutput ? null : job.etaSeconds)}", eta_render)
         self.assertIn("const exactTextEta = resourceDescriptor?.intent === 'text'", status_mapper)
         self.assertIn(
             "exactTextEta ? status.eta_seconds ?? null : previous?.etaSeconds ?? estimatedTotal",

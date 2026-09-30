@@ -1405,6 +1405,8 @@ function _jobStatusDetails(
   const resourceDescriptor = _normalizeResourceDescriptor(status.resource_descriptor, status.status)
   const resetDiscardedProgress = _resourceProgressMustReset(resourceDescriptor, previous)
   const exactTextEta = resourceDescriptor?.intent === 'text'
+  const finishingOutput = status.status === 'running'
+    && (status.overall_progress ?? status.progress * 100) >= 100
   return {
     createdAt: status.created_at,
     promptPreview: status.status === 'preparing' || status.status === 'waiting_for_plan_approval'
@@ -1466,7 +1468,7 @@ function _jobStatusDetails(
     currentSegmentReason: status.current_segment_reason,
     currentSegmentBoundary: status.current_segment_boundary,
     ...(submittedEstimate ? { h3Estimate: submittedEstimate } : {}),
-    etaSeconds: resetDiscardedProgress
+    etaSeconds: resetDiscardedProgress || finishingOutput
       ? null
       : status.status === 'running'
         ? (exactTextEta ? status.eta_seconds ?? null : status.eta_seconds ?? previous?.etaSeconds ?? estimatedTotal)

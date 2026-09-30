@@ -1071,7 +1071,7 @@ test('running recovery never presents itself as merely queued', async t => {
   assert.doesNotMatch(elementText(tree), /Recovery Queued/)
 })
 
-test('running H3 delivery does not claim generation was interrupted', async t => {
+test('running H3 delivery shows finishing work instead of completion or interruption', async t => {
   const previousStore = globalThis.__resourceWaitStore
   globalThis.__resourceWaitStore = {
     accessContext: { machine_controls: false },
@@ -1089,6 +1089,7 @@ test('running H3 delivery does not claim generation was interrupted', async t =>
         recoveryState,
         recoveryInterrupted: recoveryState === 'interrupted',
         progress: 1,
+        etaSeconds: 507,
         step: 32,
         totalSteps: 32,
         phase: 'Upscaling',
@@ -1100,10 +1101,46 @@ test('running H3 delivery does not claim generation was interrupted', async t =>
       onDismiss() {},
     })
     const text = elementText(tree)
-    assert.match(text, /Generating\.\.\./)
+    assert.match(text, /Finishing output\.\.\./)
     assert.match(text, /Upscaling/)
+    assert.match(text, /Overall ETA unknown/)
+    assert.doesNotMatch(text, /8m 27s/)
     assert.doesNotMatch(text, /Generation (Interrupted|Restored)/)
+    assert.equal(flattenElements(tree).some(element => element.props?.style?.width === '100%'), false)
   }
+  const multiSegment = JobPlaceholder({
+    job: {
+      id: 'h3-delivery-multi-segment',
+      status: 'running',
+      modelType: 'minimax_h3',
+      progress: 1,
+      overallProgress: 100,
+      windowCurrent: 2,
+      windowTotal: 2,
+      windowStep: 32,
+      windowTotalSteps: 32,
+      phase: 'Delivery fit',
+      outputFiles: [],
+    },
+    onStop() {},
+    onDismiss() {},
+  })
+  assert.match(elementText(multiSegment), /Finishing output/)
+  assert.doesNotMatch(elementText(multiSegment), /Current segment/)
+  assert.equal(flattenElements(multiSegment).some(element => element.props?.style?.width === '100%'), false)
+})
+
+test('finishing output clears a stale generation ETA from status mapping', async () => {
+  const { _jobStatusDetails } = await loadStoreMappers()
+  const previous = { etaSeconds: 507, h3Estimate: { seconds: 507 } }
+  const finishing = _jobStatusDetails({
+    status: 'running',
+    overall_progress: 100,
+    progress: 1,
+    eta_seconds: null,
+  }, previous)
+  assert.equal(finishing.etaSeconds, null)
+  assert.equal(finishing.overallProgress, 100)
 })
 
 test('blocked recovery omits an invented zero-of-zero attempt count', async t => {

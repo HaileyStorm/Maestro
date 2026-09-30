@@ -466,6 +466,11 @@ function h3QueuedRuntime(job: GenerationJob): number | null {
   return h3EstimatedRuntime(job)
 }
 
+function isFinishingOutput(job: GenerationJob): boolean {
+  return job.status === 'running'
+    && (job.overallProgress ?? job.progress * 100) >= 100
+}
+
 function estimateRuntime(estimate: GenerationJob['estimateAfterResume']): number | null {
   if (!estimate) return null
   const total = Number(estimate.seconds || 0) + Number(estimate.model_load_seconds || 0)
@@ -1349,6 +1354,7 @@ function JobPlaceholder({
         : (job.windowProgress ?? progressPct)))
     : progressPct
   const currentProgressIndeterminate = job.progressIndeterminate === true || !hasExactCurrentSteps
+  const finishingOutput = isFinishingOutput(job)
   const queuedH3Runtime = (job.status === 'queued' || job.status === 'waiting_for_plan_approval') && job.modelType?.startsWith('minimax_h3')
     ? h3QueuedRuntime(job)
     : null
@@ -1477,7 +1483,7 @@ function JobPlaceholder({
                           ? job.phase === 'planning_generation' ? 'Planning generation' : 'Enhancing prompt'
                           : job.status === 'waiting_for_plan_approval'
                             ? 'Plan ready for review'
-                            : job.status === 'queued' ? 'Queued...' : 'Generating...'}
+                        : job.status === 'queued' ? 'Queued...' : finishingOutput ? 'Finishing output...' : 'Generating...'}
             </p>
             {api.isBackendJobId(job.id) && (
               <div className="mt-1.5 flex justify-center">
@@ -1546,8 +1552,8 @@ function JobPlaceholder({
                   ? job.h3SegmentPlan?.segments.length
                     ? `Planned time ${formatApproximateDuration(queuedH3Runtime)} after start`
                     : `Estimated time ${formatApproximateDuration(queuedH3Runtime)} after start`
-                  : `Overall ETA ${formatApproximateDuration(job.etaSeconds)}`}
-                {job.status === 'running' && hasWindows && job.modelType?.startsWith('minimax_h3')
+                  : `Overall ETA ${formatApproximateDuration(finishingOutput ? null : job.etaSeconds)}`}
+                {job.status === 'running' && !finishingOutput && hasWindows && job.modelType?.startsWith('minimax_h3')
                     ? ` · Current segment ETA ${formatApproximateDuration(job.subtaskEtaSeconds)}`
                     : ''}
               </p>
@@ -1633,23 +1639,29 @@ function JobPlaceholder({
             {hasWindows && !isFailed && !recoveryBlocked && (
               <div className="mt-2 space-y-1.5 text-left">
                 <div className="flex items-center justify-between text-[10px] text-text-secondary">
-                  <span>Overall</span>
-                  <span>{progressUnit} {job.windowCurrent || 1}/{job.windowTotal}</span>
+                  <span>{finishingOutput ? 'Finishing output' : 'Overall'}</span>
+                  {!finishingOutput && <span>{progressUnit} {job.windowCurrent || 1}/{job.windowTotal}</span>}
                 </div>
                 <div className="w-full bg-bg-active rounded-full h-1.5 overflow-hidden">
-                  <div className="h-full bg-accent-blue rounded-full transition-all duration-300" style={{ width: `${overallPct}%` }} />
-                </div>
-                <div className="flex items-center justify-between text-[10px] text-text-secondary">
-                  <span>Current {progressUnit.toLowerCase()}</span>
-                  <span>{hasExactCurrentSteps ? `Step ${currentStep}/${currentTotalSteps}` : 'Preparing'}</span>
-                </div>
-                <div className="w-full bg-bg-active rounded-full h-1.5 overflow-hidden">
-                  {currentProgressIndeterminate ? (
-                    <div className="h-full w-full animate-pulse rounded-full bg-accent-green/60" />
+                  {finishingOutput ? (
+                    <div className="h-full w-full animate-pulse rounded-full bg-accent-blue/60" />
                   ) : (
-                    <div className="h-full bg-accent-green rounded-full transition-all duration-300" style={{ width: `${windowPct}%` }} />
+                    <div className="h-full bg-accent-blue rounded-full transition-all duration-300" style={{ width: `${overallPct}%` }} />
                   )}
                 </div>
+                {!finishingOutput && <>
+                  <div className="flex items-center justify-between text-[10px] text-text-secondary">
+                    <span>Current {progressUnit.toLowerCase()}</span>
+                    <span>{hasExactCurrentSteps ? `Step ${currentStep}/${currentTotalSteps}` : 'Preparing'}</span>
+                  </div>
+                  <div className="w-full bg-bg-active rounded-full h-1.5 overflow-hidden">
+                    {currentProgressIndeterminate ? (
+                      <div className="h-full w-full animate-pulse rounded-full bg-accent-green/60" />
+                    ) : (
+                      <div className="h-full bg-accent-green rounded-full transition-all duration-300" style={{ width: `${windowPct}%` }} />
+                    )}
+                  </div>
+                </>}
               </div>
             )}
             {hasSteps && !hasWindows && !isFailed && !recoveryBlocked && (
@@ -1785,13 +1797,13 @@ function JobPlaceholder({
           {/* Progress bar — hidden when failed */}
           {!isFailed && !hasWindows && !recoveryBlocked && (
             <div className="w-full bg-bg-active rounded-full h-1.5 overflow-hidden">
-              {progressPct > 0 ? (
+              {finishingOutput || progressPct <= 0 ? (
+                <div className="h-full bg-accent-green/60 rounded-full animate-pulse w-full" />
+              ) : (
                 <div
                   className="h-full bg-accent-green rounded-full transition-all duration-300"
                   style={{ width: `${progressPct}%` }}
                 />
-              ) : (
-                <div className="h-full bg-accent-green/60 rounded-full animate-pulse w-full" />
               )}
             </div>
           )}
@@ -2344,8 +2356,8 @@ function QueuePanel({
                     <>
                       <span title={resourceWaitTitle}>{queueRowLabel}{waitDetail ? ` · ${waitDetail}` : ''} · Priority {info.priority} · Outputs {info.produced_outputs}/{info.requested_outputs}</span>
                       <span className="text-[9px] text-text-secondary">
-                        ETA {formatApproximateDuration(info.eta_seconds)}
-                        {info.subtask_eta_seconds != null ? ` · current task ${formatApproximateDuration(info.subtask_eta_seconds)}` : ''}
+                        ETA {formatApproximateDuration(isFinishingOutput(job) ? null : info.eta_seconds)}
+                        {!isFinishingOutput(job) && info.subtask_eta_seconds != null ? ` · current task ${formatApproximateDuration(info.subtask_eta_seconds)}` : ''}
                       </span>
                       {residencyMessage && (
                         <span
@@ -3004,8 +3016,9 @@ export function MainContent() {
     .map(job => logicalQueue.schedulerTargetByPublicJobId.get(job.id))
     .find(target => target?.queueJob?.status === 'running' || target?.schedulerJob?.status === 'running')
   const currentJob = currentTarget?.schedulerJob ?? currentTarget?.publicJob
-  const currentEtaSeconds = currentTarget?.queueJob?.eta_seconds ?? currentJob?.etaSeconds
-  const currentSubtaskEtaSeconds = currentTarget?.queueJob?.subtask_eta_seconds ?? currentJob?.subtaskEtaSeconds
+  const currentFinishingOutput = currentJob ? isFinishingOutput(currentJob) : false
+  const currentEtaSeconds = currentFinishingOutput ? null : currentTarget?.queueJob?.eta_seconds ?? currentJob?.etaSeconds
+  const currentSubtaskEtaSeconds = currentFinishingOutput ? null : currentTarget?.queueJob?.subtask_eta_seconds ?? currentJob?.subtaskEtaSeconds
   const queueSummary = logicalQueue.summary
   const queueStateLabel = queueSummary.running > 0
     ? (ordinaryQueueState?.pause_after_current ? 'running · pause next' : 'running')
@@ -3039,7 +3052,7 @@ export function MainContent() {
     ? `Queue: ${activeQueueCount} active · ${queueSummaryLabel(queueSummary)}${enhanceQueueActive ? ' · Prompt Enhance active' : ''}${ordinaryQueueState.paused ? ' · paused' : ordinaryQueueState.pause_after_current ? ' · pauses after current output' : ''}`
     : 'Queue status loading'
   const ownedJobEtaTooltip = currentJob
-    ? ` · Your job: overall ETA ${formatApproximateDuration(currentEtaSeconds)}${currentSubtaskEtaSeconds != null ? ` · current task ${formatApproximateDuration(currentSubtaskEtaSeconds)}` : ''}`
+    ? ` · Your job: ${currentFinishingOutput ? 'finishing output · ' : ''}overall ETA ${formatApproximateDuration(currentEtaSeconds)}${currentSubtaskEtaSeconds != null ? ` · current task ${formatApproximateDuration(currentSubtaskEtaSeconds)}` : ''}`
     : ''
 
   const feedRef = useRef<HTMLDivElement>(null)
@@ -3433,7 +3446,7 @@ export function MainContent() {
               queueStateLabel={queueStateLabel}
               queueDetails={currentJob ? (
                 <span className="hidden text-[9px] xl:inline">
-                  · {Math.round(currentJob.overallProgress ?? currentJob.progress * 100)}% · ETA {formatApproximateDuration(currentEtaSeconds)}
+                  · {currentFinishingOutput ? 'Finishing output' : `${Math.round(currentJob.overallProgress ?? currentJob.progress * 100)}%`} · ETA {formatApproximateDuration(currentEtaSeconds)}
                   {currentSubtaskEtaSeconds != null ? ` · task ${formatApproximateDuration(currentSubtaskEtaSeconds)}` : ''}
                 </span>
               ) : undefined}
