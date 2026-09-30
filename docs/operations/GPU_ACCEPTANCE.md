@@ -1954,6 +1954,52 @@ work was run for this repair. The earlier browser playback of the candidate
 does not establish playback after this adoption, and human quality acceptance
 remains pending.
 
+### 2026-09-29 live H3 Extend and 1080p delivery
+
+On deployed `21586d6`, a signed-in owner browser submitted one private H3 Base
+Extend from the existing 124-frame, 5.167-second synthetic source. The sealed
+request bound the source SHA-256
+`f9057c928992261de6d214985d11055a992f4bb0d6f6367bed64526ec7c29fdd`
+and requested 124 new frames at 24 FPS. The 1080p Delivery profile used
+1344×768 native generation, 32 Sol-Attn steps, FlashVSR 1.5x and an exact
+1920×1080 center crop/downsample. Job
+`68f8e18d8db24bd1bc989b2e04274c43` completed in 965.16 seconds from
+submission. The local GPU grant was coherently validated before submission and
+every five seconds during work; the exact grant was withdrawn afterward and
+its outbox became denied. The queue returned to idle and the UI reported no
+loaded model.
+
+The completed, unheld queue snapshot at sequence 43 names one delivered output
+with `reruns_denoise=false`. The final H.264/AAC file has 248 frames at
+1920×1080 and a 10.336-second container duration; both its streams decoded
+without FFmpeg errors. Its SHA-256,
+`357d2f528c2073894209f170fd69a612ff90f71c11d7967da9de339447a6fe89`,
+matches the final sidecar. The sidecar records applied `flashvsr1.5` and
+`delivery_fit` steps. The 1344×768 native concat parent remains in place with
+the sealed SHA-256
+`4849e09106428fdb9be4059d79a9125dd246181f3339d3652b912a77fc1d88ca`;
+its sidecar is byte-identical to the copy retained in the delivery record.
+Downscaling the delivered first 124 frames to the native size and comparing
+them with the parent first 124 frames gave SSIM All 0.981488. Both halves of
+the final audio had nonzero signal. The signed-in Gallery gained one item,
+showed the exact 1920×1080, 10.34-second media information, and played the
+output through its final frame. This is one technical and browser acceptance
+sample, not human quality judgment, remote-client acceptance, or proof of
+restart recovery for this output.
+
+Two UI findings remain separate from the successful output. During delivery,
+the queue card said “Generation Interrupted — Completed Parts Saved” while its
+state stayed running and eventually completed. Advanced Settings showed “None”
+for Spatial Upsampling while the selected profile and submitted request
+correctly used FlashVSR 1.5x.
+
+Source corrections now avoid the interrupted/restored label during an active
+job and add the missing 1.5x dropdown option. After a local UI build and browser
+reload, selecting the 1080p Delivery profile displayed “FlashVSR 1.5x” as the
+selected Advanced value. The queue-label correction passed a focused UI test;
+no second GPU run has exercised that label in the browser. The actual 965-second
+run also exceeded the profile's roughly 600-second estimate.
+
 ## 2026-09-27 YuE2 score-duration style comparison
 
 The stock YuE2 take `5df416d7a2d243c0b3cf1f3574750a05` above rendered

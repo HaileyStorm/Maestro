@@ -1355,10 +1355,13 @@ function JobPlaceholder({
   const phase = stripTimeSuffix(job.phase || job.message)
   const recoveryState = job.recoveryState
   const recoveryBlocked = job.recoveryBlocked === true
+  const showRestoredNotice = job.status !== 'running' && recoveryState === 'restored'
+  const showInterruptedNotice = job.status !== 'running' && (
+    recoveryState === 'interrupted' || job.recoveryInterrupted === true
+  )
   const recoveryNotice = recoveryBlocked
-    || job.recoveryInterrupted === true
-    || recoveryState === 'interrupted'
-    || recoveryState === 'restored'
+    || showInterruptedNotice
+    || showRestoredNotice
     || recoveryState === 'retrying'
   const isFailed = (job.status === 'failed' || job.status === 'cancelled') && !recoveryNotice
   const isDeliveryOom = job.status === 'failed' && job.oomInfo?.stage === 'h3_delivery'
@@ -1462,9 +1465,9 @@ function JobPlaceholder({
                       : 'Generation Failed')
                 : recoveryBlocked
                   ? 'Recovery Needed'
-                  : recoveryState === 'restored'
+                  : showRestoredNotice
                     ? 'Generation Restored'
-                    : recoveryState === 'interrupted' || job.recoveryInterrupted
+                    : showInterruptedNotice
                       ? 'Generation Interrupted — Completed Parts Saved'
                       : recoveryState === 'retrying'
                         ? job.status === 'running' ? 'Recovery Running' : 'Recovery Queued'

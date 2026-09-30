@@ -19,6 +19,7 @@ const vaeOptions = [
 // perform_spatial_upsampling(); the model auto-downloads (~GB) on first use.
 // "Two Pass" = higher quality, ~2x slower.
 const flashvsrOptions = [
+  { value: 'flashvsr1.5', label: 'FlashVSR 1.5x' },
   { value: 'flashvsr2', label: 'FlashVSR 2x' },
   { value: 'flashvsr3', label: 'FlashVSR 3x' },
   { value: 'flashvsr4', label: 'FlashVSR 4x' },

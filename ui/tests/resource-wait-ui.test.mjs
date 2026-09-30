@@ -1071,6 +1071,41 @@ test('running recovery never presents itself as merely queued', async t => {
   assert.doesNotMatch(elementText(tree), /Recovery Queued/)
 })
 
+test('running H3 delivery does not claim generation was interrupted', async t => {
+  const previousStore = globalThis.__resourceWaitStore
+  globalThis.__resourceWaitStore = {
+    accessContext: { machine_controls: false },
+    hostTerms: { minimax_h3_ref2va: { accepted: true } },
+  }
+  t.after(() => { globalThis.__resourceWaitStore = previousStore })
+
+  const { JobPlaceholder } = await loadJobPlaceholder()
+  for (const recoveryState of ['restored', 'interrupted']) {
+    const tree = JobPlaceholder({
+      job: {
+        id: `h3-delivery-${recoveryState}`,
+        status: 'running',
+        modelType: 'minimax_h3',
+        recoveryState,
+        recoveryInterrupted: recoveryState === 'interrupted',
+        progress: 1,
+        step: 32,
+        totalSteps: 32,
+        phase: 'Upscaling',
+        message: 'Protected native output is ready for delivery',
+        outputFiles: [],
+        error: null,
+      },
+      onStop() {},
+      onDismiss() {},
+    })
+    const text = elementText(tree)
+    assert.match(text, /Generating\.\.\./)
+    assert.match(text, /Upscaling/)
+    assert.doesNotMatch(text, /Generation (Interrupted|Restored)/)
+  }
+})
+
 test('blocked recovery omits an invented zero-of-zero attempt count', async t => {
   const previousStore = globalThis.__resourceWaitStore
   globalThis.__resourceWaitStore = {
