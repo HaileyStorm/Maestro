@@ -3995,6 +3995,96 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 **prefix, "sha256": "bad",
             })
 
+    def test_h3_delivery_dependency_closure_requires_exact_parent_hash(self):
+        namespace = _isolated_functions(
+            self.launch,
+            ("_h3_dependency_closed_recovery_units",),
+            {"re": re},
+        )
+        parent_hash = "a" * 64
+        parent = {
+            "kind": "h3_concat", "unit_id": "concat",
+            "dependencies": [],
+            "settings": {
+                "component_hashes": [], "clip_start_frames": [],
+                "clip_tail_frames": [], "source_prefix": None,
+            },
+            "artifacts": [{"sha256": parent_hash}],
+        }
+        delivery = {
+            "kind": "h3_delivery", "unit_id": "delivery",
+            "dependencies": ["concat"],
+            "settings": {"native_hashes": [parent_hash]},
+            "artifacts": [{"sha256": "b" * 64}],
+        }
+        closed = namespace["_h3_dependency_closed_recovery_units"]
+        self.assertEqual(
+            [unit["unit_id"] for unit in closed([parent, delivery])],
+            ["concat", "delivery"],
+        )
+        changed_hash = copy.deepcopy(delivery)
+        changed_hash["settings"]["native_hashes"] = ["c" * 64]
+        self.assertEqual(
+            [unit["unit_id"] for unit in closed([parent, changed_hash])],
+            ["concat"],
+        )
+        self.assertEqual(closed([delivery]), [])
+        no_parent = copy.deepcopy(delivery)
+        no_parent["dependencies"] = []
+        no_parent["settings"]["native_hashes"] = []
+        self.assertEqual(closed([no_parent]), [])
+
+    def test_pending_copy_on_write_delivery_does_not_expose_native_parent(self):
+        with tempfile.TemporaryDirectory() as project_dir:
+            parent = {
+                "kind": "h3_concat", "state": "completed",
+                "unit_id": "concat", "dependencies": [],
+                "artifacts": [{
+                    "basename": "native.mp4",
+                    "sidecar_basename": "native.meta.json",
+                }],
+            }
+            namespace = _isolated_functions(
+                self.launch, ("_queue_recovery_reconcile_cursor",),
+                {
+                    "os": os,
+                    "_queue_recovery_units": lambda job: list(
+                        job["recovery_cursor"]["completed_units"]
+                    ),
+                    "_queue_recovery_unit_matches": (
+                        lambda *_args, **_kwargs: parent
+                    ),
+                    "_h3_dependency_closed_recovery_units": lambda units: units,
+                    "_queue_recovery_reconcile_orphan_delivery": (
+                        lambda *_args: None
+                    ),
+                },
+            )
+            pending = {
+                "publication_schema": 2,
+                "state": "protected_native",
+                "unit_id": "delivery",
+            }
+            job = {
+                "id": "job", "output_files": ["native.mp4"],
+                "recovery_cursor": {
+                    "completed_units": [parent], "delivery_pending": pending,
+                },
+            }
+            namespace["_queue_recovery_reconcile_cursor"](
+                job, project_dir,
+            )
+            self.assertEqual(job["output_files"], [])
+            self.assertIn("native.mp4", job["artifact_files"])
+            self.assertEqual(
+                job["recovery_cursor"]["delivery_pending"], pending,
+            )
+            job["recovery_cursor"].pop("delivery_pending")
+            namespace["_queue_recovery_reconcile_cursor"](
+                job, project_dir,
+            )
+            self.assertEqual(job["output_files"], ["native.mp4"])
+
     def test_h3_extend_plans_one_generated_segment_without_video_anchor_leak(self):
         class WgpStub:
             def get_model_def(self, model_type):
@@ -4359,6 +4449,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "_snapshot_h3_recovery_task_params",
                 "_attach_voice_clone_sidecar_request",
                 "_expand_h3_longform_outputs",
+                "_h3_copy_on_write_delivery_eligible",
                 "_run_generation",
             ),
             {
@@ -10296,6 +10387,53 @@ class QueueLaunchWiringTests(unittest.TestCase):
             self.assertFalse(media.exists())
             self.assertFalse((root / "fresh.meta.json").exists())
             self.assertEqual(len(list(root.glob(".private-sidecar-failed-*-fresh.mp4"))), 1)
+
+    def test_copy_on_write_parent_keeps_final_role_private_while_pending(self):
+        writer = _function(self.launch, "_write_output_sidecars")
+        module = ast.fix_missing_locations(ast.Module(body=[writer], type_ignores=[]))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "native.mp4").write_bytes(b"native H3 media")
+            namespace = {
+                "os": os, "json": json, "time": time, "uuid": uuid,
+                "job": {
+                    "params": {"generation_mode": "video"},
+                    "access_policy": {"private": False},
+                    "workspace": "default",
+                },
+                "job_id": "h3-test", "start_time": time.time(),
+                "out_dir": str(root), "clip_output_files": {},
+                "producer_artifact_roles": {"native.mp4": "final"},
+                "postprocessing_outcomes": {},
+                "pp_film_grain_intensity": 0,
+                "pp_spatial_upsampling": None,
+                "pp_delivery_resolution": "3840x2160",
+                "pp_delivery_fit": "center_crop",
+                "requested_model": "h3", "_H3_LONG_STUDIO_MODELS": {"h3"},
+                "GENERATED_MEDIA_EXTENSIONS": {".mp4"},
+                "_RECOVERY_ARTIFACT_ROLES": {
+                    "final", "component", "window", "temporary",
+                },
+                "_prepare_generation_sidecar_params": lambda params: ([], dict(params)),
+                "_strip_director_image_role_internals": lambda _params: None,
+                "_extract_output_seed": lambda _name: None,
+                "stamp_sidecar_policy": stamp_sidecar_policy,
+                "h3_integrity_pending_path": lambda _root, _name: str(root / ".pending"),
+                "_queue_recovery_expected_artifact_role": lambda _kind, _meta: None,
+                "_atomic_write_json": lambda path, value: Path(path).write_text(
+                    json.dumps(value), encoding="utf-8",
+                ),
+                "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+            }
+            exec(compile(module, "isolated-h3-cow-parent", "exec"), namespace)
+            namespace["_write_output_sidecars"](
+                ["native.mp4"], private_native_parent=True,
+            )
+            sidecar = json.loads((root / "native.meta.json").read_text())
+            self.assertTrue(sidecar["private"])
+            self.assertEqual(sidecar["artifact_class"], "final")
+            self.assertFalse(sidecar.get("delivery_native_source", False))
+            self.assertTrue((root / ".pending").exists())
 
     def test_h3_noop_sidecar_refresh_preserves_completed_recovery_unit(self):
         writer = _function(self.launch, "_write_output_sidecars")

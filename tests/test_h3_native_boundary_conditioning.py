@@ -1032,6 +1032,8 @@ class NativeBoundaryRecoveryTests(unittest.TestCase):
             "out_dir": "/project",
             "raw_params": {},
             "h3_delivery_request": False,
+            "h3_delivery_native_source": False,
+            "h3_copy_on_write_delivery": False,
             "producer_artifact_roles": {},
             "gen": {"file_list": []},
             "wgp": Wgp,

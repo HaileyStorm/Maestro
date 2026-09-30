@@ -444,7 +444,10 @@ class TestJobLifecycleWiring(unittest.TestCase):
                     "repeat_mapping_settings": {}, "mapping_receipt": None,
                     "task_sidecar_params": {},
                     "producer_artifact_roles": {}, "recovery_staging_dir": None,
-                    "h3_delivery_request": delivery, "sample_worker": False,
+                    "h3_delivery_request": delivery,
+                    "h3_copy_on_write_delivery": False,
+                    "h3_delivery_native_source": delivery,
+                    "sample_worker": False,
                     "_defer_h3_final_publication": lambda _job: False,
                     "abort_state": None, "_active_gen_states": {},
                     "_sample_campaign_transition_lock": threading.RLock(),
@@ -1885,7 +1888,9 @@ class TestJobLifecycleWiring(unittest.TestCase):
               "_write_output_sidecars": lambda *_args, **_kwargs: events.append("sidecar"),
               "_queue_recovery_promote_staged_outputs": lambda *_args: events.append("promote"),
               "_queue_recovery_checkpoint_unit": lambda *_args, **_kwargs: events.append("checkpoint") or {"unit_id": "unit"},
-              "h3_delivery_request": False, "task_sidecar_params": {}, "gen": {}, "clip_output_files": {}}
+              "h3_delivery_request": False, "h3_copy_on_write_delivery": False,
+              "h3_delivery_native_source": False, "task_sidecar_params": {},
+              "gen": {}, "clip_output_files": {}}
         exec(compile(ast.fix_missing_locations(ast.Module(body=[callback], type_ignores=[])), "launch.py", "exec"), ns)
         for wrong in (dict(expected, index=1), dict(expected, index=-1), dict(expected, index=True),
                       dict(expected, total=3), dict(expected, output_index=1), dict(expected, group_id="other")):

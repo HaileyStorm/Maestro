@@ -9740,6 +9740,40 @@ def _h3_dependency_closed_recovery_units(verified: list[dict]) -> list[dict]:
                         _h3_source_prefix_identity(expected_prefix)
                     except QueueRecoveryRuntimeError:
                         continue
+            elif kind == "h3_delivery":
+                native_hashes = settings.get("native_hashes")
+                if (
+                    not dependencies
+                    or not isinstance(native_hashes, list)
+                    or len(native_hashes) != len(dependencies)
+                ):
+                    continue
+                remaining: dict[str, list[str]] = {}
+                valid_parent_hashes = True
+                for dependency, native_hash in zip(dependencies, native_hashes):
+                    predecessor = accepted_by_id[dependency]
+                    if (
+                        predecessor.get("kind")
+                            not in {"h3_concat", "ordinary_repeat"}
+                        or not isinstance(native_hash, str)
+                        or re.fullmatch(r"[0-9a-f]{64}", native_hash) is None
+                    ):
+                        valid_parent_hashes = False
+                        break
+                    available = remaining.setdefault(
+                        dependency,
+                        [
+                            str(artifact.get("sha256") or "")
+                            for artifact in predecessor.get("artifacts") or []
+                            if isinstance(artifact, dict)
+                        ],
+                    )
+                    if native_hash not in available:
+                        valid_parent_hashes = False
+                        break
+                    available.remove(native_hash)
+                if not valid_parent_hashes:
+                    continue
             dependency_closed.append(unit)
             accepted_by_id[str(unit.get("unit_id") or "")] = unit
             admitted.append(unit)
@@ -10070,10 +10104,25 @@ def _queue_recovery_reconcile_cursor(job: dict, project_dir: str) -> None:
             unit for unit in verified_h3_units
             if unit.get("kind") == "h3_delivery"
         ]
-        final_units = delivery_units or [
-            unit for unit in verified_h3_units
-            if unit.get("kind") == "h3_concat"
-        ]
+        pending_delivery = cursor.get("delivery_pending")
+        if (
+            isinstance(pending_delivery, dict)
+            and pending_delivery.get("publication_schema") == 2
+            and pending_delivery.get("state") in {
+                "staging_native", "protected_native",
+            }
+        ):
+            # The sealed parent remains on disk during copy-on-write delivery.
+            # It is lineage, not a finished substitute for the requested child.
+            final_units = [
+                unit for unit in delivery_units
+                if unit.get("unit_id") == pending_delivery.get("unit_id")
+            ]
+        else:
+            final_units = delivery_units or [
+                unit for unit in verified_h3_units
+                if unit.get("kind") == "h3_concat"
+            ]
         verified_finals = []
         for unit in final_units:
             for artifact in unit.get("artifacts") or []:
@@ -11636,6 +11685,10 @@ def _queue_recovery_reconcile_orphan_delivery(
             durable = meta.get("delivery_recovery")
             if not isinstance(durable, dict):
                 continue
+            # Copy-on-write delivery has a durable intent with its distinct
+            # destination. A hidden copy alone cannot reconstruct that intent.
+            if durable.get("schema_version") == 2:
+                continue
             unit_id = str(durable.get("queue_recovery_unit_id") or "")
             settings = durable.get("queue_recovery_settings")
             dependencies = durable.get("queue_recovery_dependencies")
@@ -11835,15 +11888,23 @@ def _queue_recovery_delivery_plan(
     spatial_upsampling: str,
     delivery_resolution: str,
     delivery_fit: str,
+    copy_on_write: bool = False,
 ) -> dict:
     """Bind delivery to ordered verified native hashes and producer units."""
+    if copy_on_write and not file_names:
+        raise QueueRecoveryRuntimeError("H3 delivery needs a sealed parent output.")
     native_hashes = []
     dependencies = []
     sources = []
+    resealed_legacy_source = False
     for file_name in file_names:
         matching = None
         for unit in _queue_recovery_units(job):
             if unit.get("state") != "completed":
+                continue
+            if copy_on_write and unit.get("kind") not in {
+                "h3_concat", "ordinary_repeat",
+            }:
                 continue
             for artifact in unit.get("artifacts") or []:
                 if not (
@@ -11884,6 +11945,7 @@ def _queue_recovery_delivery_plan(
                     ):
                         continue
                     source_artifact = refreshed
+                    resealed_legacy_source = True
                 matching = (source_unit, source_artifact)
                 break
             if matching is not None:
@@ -11902,6 +11964,13 @@ def _queue_recovery_delivery_plan(
         "native_hashes": native_hashes,
         "spatial_upsampling": spatial_upsampling,
     }
+    use_copy_on_write = copy_on_write and not resealed_legacy_source
+    if copy_on_write and not use_copy_on_write:
+        raise QueueRecoveryRuntimeError(
+            "Copy-on-write delivery requires an unchanged sealed parent."
+        )
+    if use_copy_on_write:
+        settings["publication_schema"] = 2
     unit_id = recovery_unit_id(
         str(job.get("id") or ""),
         "h3_delivery",
@@ -11913,7 +11982,8 @@ def _queue_recovery_delivery_plan(
         stem, extension = os.path.splitext(file_name)
         prefix = (
             f".maestro-delivery-{job.get('id', 'job')}-"
-            f"{unit_id[-12:]}-{item_index}-{stem}"
+            f"{unit_id[-12:]}-{item_index}"
+            f"{'' if use_copy_on_write else '-' + stem}"
         )
         staging.append({
             "native_basename": prefix + ".native" + extension,
@@ -11921,9 +11991,16 @@ def _queue_recovery_delivery_plan(
             "original_basename": file_name,
             "source": sources[item_index],
             "work_basename": prefix + ".work" + extension,
+            **({
+                "final_basename": (
+                    f"h3-delivery-{unit_id.rsplit(':', 1)[-1]}-{item_index}"
+                    f"{extension}"
+                ),
+            } if use_copy_on_write else {}),
         })
     return {
         "dependencies": dependencies,
+        "publication_schema": 2 if use_copy_on_write else 1,
         "staging": staging,
         "settings": settings,
         "unit_id": unit_id,
@@ -11934,6 +12011,7 @@ def _queue_recovery_checkpoint_delivery_intent(job: dict, plan: dict) -> dict:
     """Persist planned native names and source hashes before the first rename."""
     pending = {
         "dependencies": list(plan.get("dependencies") or []),
+        "publication_schema": plan.get("publication_schema", 1),
         "settings": dict(plan.get("settings") or {}),
         "staging": [dict(item) for item in plan.get("staging") or []],
         "state": "staging_native",
@@ -11972,11 +12050,16 @@ def _queue_recovery_checkpoint_delivery_pending(
     pending = {
         "artifacts": artifacts,
         "dependencies": list(plan["dependencies"]),
+        "publication_schema": plan.get("publication_schema", 1),
         "settings": dict(plan["settings"]),
         "state": "protected_native",
         "unit_id": str(plan["unit_id"]),
         "work_basenames": [item["work_basename"] for item in staged],
     }
+    if plan.get("publication_schema") == 2:
+        pending["sources"] = [
+            dict(item["source"]) for item in plan["staging"]
+        ]
     cursor = dict(job.get("recovery_cursor") or {})
     cursor["delivery_pending"] = pending
     _queue_recovery_checkpoint(
@@ -11989,6 +12072,60 @@ def _queue_recovery_checkpoint_delivery_pending(
     return pending
 
 
+def _queue_recovery_validate_delivery_parents(
+    project_dir: str,
+    pending: dict,
+    final_names: list[str],
+) -> list[dict]:
+    """Bind every copy-on-write parent to the delivery unit's ordered inputs."""
+    sources = pending.get("sources")
+    dependencies = pending.get("dependencies")
+    settings = pending.get("settings")
+    native_hashes = (
+        settings.get("native_hashes") if isinstance(settings, dict) else None
+    )
+    if (
+        not isinstance(sources, list)
+        or not isinstance(dependencies, list)
+        or not isinstance(native_hashes, list)
+        or not sources
+        or len(sources) != len(dependencies)
+        or len(sources) != len(native_hashes)
+        or len(sources) != len(final_names)
+    ):
+        raise QueueRecoveryRuntimeError(
+            "Protected delivery parent evidence is incomplete."
+        )
+    unit_id = str(pending.get("unit_id") or "")
+    for index, (source, dependency, native_hash, final_name) in enumerate(
+        zip(sources, dependencies, native_hashes, final_names)
+    ):
+        parent_name = source.get("basename") if isinstance(source, dict) else None
+        producer_unit = (
+            source.get("producer_unit_id") if isinstance(source, dict) else None
+        )
+        expected_final = (
+            f"h3-delivery-{unit_id.rsplit(':', 1)[-1]}-{index}"
+            f"{os.path.splitext(parent_name)[1]}"
+            if isinstance(parent_name, str) else ""
+        )
+        if (
+            not isinstance(dependency, str)
+            or not isinstance(native_hash, str)
+            or not isinstance(producer_unit, str)
+            or producer_unit != dependency
+            or source.get("sha256") != native_hash
+            or final_name != expected_final
+            or source.get("sidecar_basename")
+                != os.path.splitext(parent_name)[0] + ".meta.json"
+            or not validate_artifact_descriptor(
+                project_dir, source, producer_unit_id=producer_unit,
+            )
+        ):
+            raise QueueRecoveryRuntimeError("Sealed delivery parent changed.")
+    return sources
+
+
 def _queue_recovery_restore_delivery_staged(
     job: dict,
     project_dir: str,
@@ -11996,10 +12133,25 @@ def _queue_recovery_restore_delivery_staged(
 ) -> list[dict]:
     artifacts = pending.get("artifacts") or []
     work_names = pending.get("work_basenames") or []
+    copy_on_write = pending.get("publication_schema") == 2
+    sources = pending.get("sources") if copy_on_write else None
     if len(artifacts) != len(work_names):
         raise QueueRecoveryRuntimeError("Protected delivery evidence is incomplete.")
+    if copy_on_write and (
+        not isinstance(sources, list) or len(sources) != len(artifacts)
+    ):
+        raise QueueRecoveryRuntimeError("Protected delivery parent evidence is incomplete.")
+    if copy_on_write:
+        sources = _queue_recovery_validate_delivery_parents(
+            project_dir, pending,
+            [
+                str(descriptor.get("original_basename") or "")
+                if isinstance(descriptor, dict) else ""
+                for descriptor in artifacts
+            ],
+        )
     staged = []
-    for descriptor, work_name in zip(artifacts, work_names):
+    for item_index, (descriptor, work_name) in enumerate(zip(artifacts, work_names)):
         if not validate_protected_artifact_descriptor(
             project_dir,
             descriptor,
@@ -12015,19 +12167,263 @@ def _queue_recovery_restore_delivery_staged(
         ):
             raise QueueRecoveryRuntimeError("Protected delivery identity is invalid.")
         stem = os.path.splitext(original)[0]
+        parent_name = None
+        if copy_on_write:
+            source = sources[item_index]
+            parent_name = source.get("basename") if isinstance(source, dict) else None
+            if not isinstance(parent_name, str):
+                raise QueueRecoveryRuntimeError("Sealed delivery parent changed.")
+            extension = os.path.splitext(parent_name)[1]
+            prefix = (
+                f".maestro-delivery-{job.get('id', 'job')}-"
+                f"{str(pending.get('unit_id') or '')[-12:]}-{item_index}"
+            )
+            if (
+                descriptor.get("basename") != prefix + ".native" + extension
+                or descriptor.get("sidecar_basename")
+                    != prefix + ".native.meta.json"
+                or work_name != prefix + ".work" + extension
+            ):
+                raise QueueRecoveryRuntimeError(
+                    "Protected delivery staging identity changed."
+                )
         staged.append({
             "file_name": original,
+            **({"copy_on_write": True} if copy_on_write else {}),
+            **({"parent_basename": parent_name} if copy_on_write else {}),
             "source_path": os.path.join(project_dir, original),
             "source_meta": os.path.join(project_dir, stem + ".meta.json"),
             "native_path": os.path.join(project_dir, descriptor["basename"]),
             "native_meta": os.path.join(project_dir, descriptor["sidecar_basename"]),
             "work_path": os.path.join(project_dir, work_name),
             "work_basename": work_name,
-            "rollback_meta": os.path.join(project_dir, work_name + ".rollback.meta.json"),
+            "rollback_meta": os.path.join(
+                project_dir,
+                os.path.splitext(work_name)[0] + ".rollback.meta.json",
+            ),
             "recovery_descriptor": dict(descriptor),
         })
     job["_h3_delivery_native"] = staged
     return staged
+
+
+def _queue_recovery_completed_delivery_sidecar(
+    sidecar: dict,
+    *,
+    pending: dict,
+    file_names: list[str],
+    media_size: int,
+    media_sha256: str,
+) -> dict:
+    """Build the byte-exact final seal used by publication and checkpoint."""
+    sealed = dict(sidecar)
+    sealed.update({
+        "producer_artifact_class": "final",
+        "artifact_class": "final",
+        "producer_unit_artifact_names": sorted(file_names),
+        "producer_unit_id": str(pending.get("unit_id") or ""),
+        "producer_unit_kind": "h3_delivery",
+        "producer_unit_variant": 0,
+        "producer_unit_index": 0,
+        "producer_unit_dependencies": list(pending.get("dependencies") or []),
+        "producer_unit_settings": dict(pending.get("settings") or {}),
+        "producer_media_sha256": media_sha256,
+        "producer_media_size": media_size,
+    })
+    return sealed
+
+
+def _queue_recovery_checkpoint_delivery_publication(
+    job: dict,
+    records: list[dict],
+) -> dict:
+    """Persist exact child bytes before the first public-name mutation."""
+    pending = _queue_recovery_delivery_pending(job)
+    if (
+        not isinstance(pending, dict)
+        or pending.get("state") != "protected_native"
+        or pending.get("publication_schema") != 2
+        or not records
+        or len(records) != len(pending.get("artifacts") or [])
+    ):
+        raise QueueRecoveryRuntimeError("Copy-on-write delivery intent is incomplete.")
+    updated = dict(pending)
+    updated["publication"] = {"schema_version": 1, "items": records}
+    cursor = dict(job.get("recovery_cursor") or {})
+    cursor["delivery_pending"] = updated
+    if _queue_recovery_checkpoint(
+        job, recovery_cursor=cursor, recovery_state="interrupted",
+        reruns_denoise=False,
+        message="Publishing verified H3 delivery output",
+    ) is not True:
+        raise QueueRecoveryRuntimeError("Copy-on-write delivery intent was not saved.")
+    return updated
+
+
+def _queue_recovery_reconcile_delivery_publication(
+    job: dict,
+    staged: list[dict],
+    *,
+    tolerate_foreign_collision: bool = False,
+) -> None:
+    """Retract only exact child bytes named by a durable publication intent."""
+    pending = _queue_recovery_delivery_pending(job)
+    publication = pending.get("publication") if isinstance(pending, dict) else None
+    records = publication.get("items") if isinstance(publication, dict) else None
+    if (
+        pending is None
+        or pending.get("publication_schema") != 2
+        or not isinstance(publication, dict)
+        or publication.get("schema_version") != 1
+        or not isinstance(records, list)
+        or len(records) != len(staged)
+        or not isinstance(pending.get("sources"), list)
+        or len(pending["sources"]) != len(staged)
+    ):
+        raise QueueRecoveryRuntimeError("Copy-on-write publication evidence is missing.")
+    def file_identity(path):
+        info = os.stat(path, follow_symlinks=False)
+        return (
+            info.st_dev, info.st_ino, info.st_nlink,
+            info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+        )
+
+    checked = []
+    collision = False
+    for index, (item, record) in enumerate(zip(staged, records)):
+        if (
+            not isinstance(record, dict)
+            or item.get("copy_on_write") is not True
+            or record.get("basename") != item.get("file_name")
+            or any(
+                not isinstance(record.get(key), str)
+                or re.fullmatch(r"[0-9a-f]{64}", record[key]) is None
+                for key in (
+                    "media_sha256", "private_sidecar_sha256",
+                    "final_sidecar_sha256", "sealed_sidecar_sha256",
+                )
+            )
+            or type(record.get("media_size")) is not int
+            or record["media_size"] < 1
+        ):
+            raise QueueRecoveryRuntimeError("Copy-on-write publication identity changed.")
+        media_path = item["source_path"]
+        sidecar_path = item["source_meta"]
+        media_exists = os.path.lexists(media_path)
+        sidecar_exists = os.path.lexists(sidecar_path)
+        sidecar_hash = None
+        sidecar_identity = None
+        if sidecar_exists:
+            if os.path.islink(sidecar_path) or not os.path.isfile(sidecar_path):
+                raise QueueRecoveryRuntimeError("Delivery publication sidecar changed.")
+            sidecar_identity = file_identity(sidecar_path)
+            _, sidecar_hash = _recovery_sha256_file(sidecar_path)
+            if sidecar_hash not in {
+                record["private_sidecar_sha256"],
+                record["final_sidecar_sha256"],
+                record["sealed_sidecar_sha256"],
+            }:
+                raise QueueRecoveryRuntimeError("Delivery publication sidecar changed.")
+            try:
+                with open(sidecar_path, "r", encoding="utf-8") as handle:
+                    sidecar = json.load(handle)
+            except (OSError, UnicodeError, ValueError, TypeError) as error:
+                raise QueueRecoveryRuntimeError(
+                    "Delivery publication sidecar changed."
+                ) from error
+            durable = (
+                sidecar.get("delivery_recovery")
+                if isinstance(sidecar, dict) else None
+            )
+            parent = pending["sources"][index]
+            if (
+                not isinstance(parent, dict)
+                or not isinstance(durable, dict)
+                or durable.get("schema_version") != 2
+                or durable.get("queue_recovery_unit_id") != pending.get("unit_id")
+                or durable.get("queue_recovery_dependencies")
+                    != pending.get("dependencies")
+                or durable.get("queue_recovery_settings")
+                    != pending.get("settings")
+                or durable.get("original_filename") != parent.get("basename")
+                or sidecar.get("output_filename") != record["basename"]
+                or sidecar.get("job_id") != str(job.get("id") or "")
+                or sidecar.get("workspace")
+                    != str(job.get("workspace") or "default")
+            ):
+                raise QueueRecoveryRuntimeError("Delivery publication identity changed.")
+        media_owned = False
+        media_identity = None
+        if media_exists:
+            if os.path.islink(media_path) or not os.path.isfile(media_path):
+                collision = True
+            else:
+                media_identity = file_identity(media_path)
+                media_owned = _recovery_sha256_file(media_path) == (
+                    record["media_size"], record["media_sha256"],
+                ) and sidecar_exists
+                if not media_owned:
+                    collision = True
+        checked.append((
+            item, record, sidecar_hash, sidecar_identity,
+            media_owned, media_identity,
+        ))
+
+    for (
+        item, record, sidecar_hash, _sidecar_identity,
+        media_owned, _media_identity,
+    ) in checked:
+        if sidecar_hash in {
+            record["final_sidecar_sha256"],
+            record["sealed_sidecar_sha256"],
+        } and media_owned:
+            rollback_path = item["rollback_meta"]
+            if (
+                not os.path.isfile(rollback_path)
+                or os.path.islink(rollback_path)
+                or _recovery_sha256_file(rollback_path)[1]
+                    != record["private_sidecar_sha256"]
+            ):
+                raise QueueRecoveryRuntimeError(
+                    "Private delivery rollback sidecar is unavailable."
+                )
+
+    for (
+        item, record, sidecar_hash, sidecar_identity,
+        media_owned, media_identity,
+    ) in checked:
+        media_path = item["source_path"]
+        sidecar_path = item["source_meta"]
+        if sidecar_identity is not None and file_identity(
+            sidecar_path,
+        ) != sidecar_identity:
+            raise QueueRecoveryRuntimeError("Delivery publication sidecar changed.")
+        if media_owned and file_identity(media_path) != media_identity:
+            raise QueueRecoveryRuntimeError("Delivery publication media changed.")
+        if sidecar_hash in {
+            record["final_sidecar_sha256"],
+            record["sealed_sidecar_sha256"],
+        } and media_owned:
+            rollback_path = item["rollback_meta"]
+            if _recovery_sha256_file(rollback_path)[1] != record[
+                "private_sidecar_sha256"
+            ]:
+                raise QueueRecoveryRuntimeError("Private delivery rollback changed.")
+            os.replace(rollback_path, sidecar_path)
+        if media_owned:
+            os.remove(media_path)
+        if sidecar_hash is not None:
+            os.remove(sidecar_path)
+        rollback_path = item["rollback_meta"]
+        if (
+            os.path.isfile(rollback_path)
+            and not os.path.islink(rollback_path)
+            and _recovery_sha256_file(rollback_path)[1]
+                == record["private_sidecar_sha256"]
+        ):
+            os.remove(rollback_path)
+    if collision and not tolerate_foreign_collision:
+        raise QueueRecoveryRuntimeError("H3 delivery destination already exists.")
 
 
 def _queue_recovery_checkpoint_delivery_completed(
@@ -12038,6 +12434,10 @@ def _queue_recovery_checkpoint_delivery_completed(
 ) -> dict | None:
     """Seal final delivery sidecars, then journal the completed delivery unit."""
     unit_id = str(pending.get("unit_id") or "")
+    if pending.get("publication_schema") == 2:
+        _queue_recovery_validate_delivery_parents(
+            project_dir, pending, file_names,
+        )
     for file_name in file_names:
         media_path = os.path.join(project_dir, file_name)
         meta_path = os.path.join(
@@ -12053,21 +12453,10 @@ def _queue_recovery_checkpoint_delivery_completed(
             ) from error
         if not isinstance(sidecar, dict):
             raise QueueRecoveryRuntimeError("Completed delivery sidecar is invalid.")
-        sidecar.update({
-            "producer_artifact_class": "final",
-            "artifact_class": "final",
-            "producer_unit_artifact_names": sorted(file_names),
-            "producer_unit_id": unit_id,
-            "producer_unit_kind": "h3_delivery",
-            "producer_unit_variant": 0,
-            "producer_unit_index": 0,
-            "producer_unit_dependencies": list(
-                pending.get("dependencies") or []
-            ),
-            "producer_unit_settings": dict(pending.get("settings") or {}),
-            "producer_media_sha256": media_sha256,
-            "producer_media_size": media_size,
-        })
+        sidecar = _queue_recovery_completed_delivery_sidecar(
+            sidecar, pending=pending, file_names=file_names,
+            media_size=media_size, media_sha256=media_sha256,
+        )
         _atomic_write_json(meta_path, sidecar)
     unit = _queue_recovery_checkpoint_unit(
         job,
@@ -60099,6 +60488,24 @@ def _atomic_write_json(path: str, value: dict) -> None:
                 pass
 
 
+def _atomic_create_json(path: str, value: dict) -> None:
+    """Durably create a sidecar without replacing an existing name."""
+    from services.atomic_file_publish import publish_file_no_replace
+
+    temporary = f"{path}.{uuid.uuid4().hex[:8]}.tmp"
+    try:
+        with open(temporary, "x", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        publish_file_no_replace(temporary, path)
+    finally:
+        try:
+            os.remove(temporary)
+        except FileNotFoundError:
+            pass
+
+
 def _atomic_write_bytes(path: str, value: bytes) -> None:
     temporary = f"{path}.{uuid.uuid4().hex[:8]}.tmp"
     try:
@@ -60123,6 +60530,177 @@ def _atomic_write_bytes(path: str, value: bytes) -> None:
             pass
 
 
+def _stage_h3_delivery_native_outputs_v2(
+    job: dict, out_dir: str, file_names: list[str], delivery_plan: dict,
+) -> list[dict]:
+    """Keep each sealed parent in place while protecting a delivery work copy."""
+    import shutil
+    from services.atomic_file_publish import publish_file_no_replace
+
+    planned = delivery_plan.get("staging")
+    if (
+        not isinstance(planned, list)
+        or not file_names
+        or len(planned) != len(file_names)
+        or len(set(file_names)) != len(file_names)
+        or not isinstance(delivery_plan.get("dependencies"), list)
+        or not isinstance(delivery_plan.get("settings"), dict)
+        or not isinstance(delivery_plan["settings"].get("native_hashes"), list)
+        or len(delivery_plan["dependencies"]) != len(file_names)
+        or len(delivery_plan["settings"]["native_hashes"]) != len(file_names)
+    ):
+        raise RuntimeError("Durable H3 delivery sources are incomplete")
+    staged = []
+    final_names = set()
+    for item_index, (file_name, entry) in enumerate(zip(file_names, planned)):
+        if not isinstance(entry, dict) or entry.get("original_basename") != file_name:
+            raise RuntimeError("Durable H3 delivery source order changed")
+        final_name = entry.get("final_basename")
+        private_name = entry.get("native_basename")
+        private_meta_name = entry.get("native_sidecar_basename")
+        work_name = entry.get("work_basename")
+        names = (file_name, final_name, private_name, private_meta_name, work_name)
+        expected_final = (
+            f"h3-delivery-{str(delivery_plan.get('unit_id') or '').rsplit(':', 1)[-1]}-"
+            f"{item_index}{os.path.splitext(file_name)[1]}"
+        )
+        if any(
+            not isinstance(name, str) or os.path.basename(name) != name
+            or not name or len(name.encode("utf-8")) > 240
+            for name in names
+        ) or final_name in final_names or final_name != expected_final:
+            raise RuntimeError("Durable H3 delivery names are invalid")
+        if not private_name.startswith(".maestro-delivery-") or not work_name.startswith(".maestro-delivery-"):
+            raise RuntimeError("Durable H3 delivery staging names are invalid")
+        final_names.add(final_name)
+        source = entry.get("source")
+        unit_id = source.get("producer_unit_id") if isinstance(source, dict) else None
+        if (
+            not isinstance(unit_id, str)
+            or unit_id != delivery_plan["dependencies"][item_index]
+            or source.get("sha256")
+                != delivery_plan["settings"]["native_hashes"][item_index]
+            or source.get("basename") != file_name
+            or not validate_artifact_descriptor(
+                out_dir, source, producer_unit_id=unit_id,
+            )
+        ):
+            raise RuntimeError("Sealed H3 delivery parent changed")
+        source_path = os.path.join(out_dir, file_name)
+        source_meta = os.path.join(out_dir, os.path.splitext(file_name)[0] + ".meta.json")
+        if source.get("sidecar_basename") != os.path.basename(source_meta):
+            raise RuntimeError("Sealed H3 delivery parent sidecar changed")
+        final_path = os.path.join(out_dir, final_name)
+        final_meta = os.path.join(out_dir, os.path.splitext(final_name)[0] + ".meta.json")
+        if os.path.lexists(final_path) or os.path.lexists(final_meta):
+            raise RuntimeError("H3 delivery destination already exists")
+        native_path = os.path.join(out_dir, private_name)
+        native_meta = os.path.join(out_dir, private_meta_name)
+        work_path = os.path.join(out_dir, work_name)
+        with open(source_meta, "rb") as handle:
+            original_meta_bytes = handle.read()
+        try:
+            original_sidecar = json.loads(original_meta_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, TypeError):
+            raise RuntimeError("Sealed H3 delivery parent sidecar is invalid") from None
+        if not isinstance(original_sidecar, dict):
+            raise RuntimeError("Sealed H3 delivery parent sidecar is invalid")
+        if os.path.lexists(native_path):
+            if os.path.islink(native_path) or _recovery_sha256_file(native_path) != (
+                source.get("size"), source.get("sha256")
+            ):
+                raise RuntimeError("Protected H3 delivery copy changed")
+        else:
+            temporary = native_path + f".{uuid.uuid4().hex}.copying"
+            try:
+                with open(source_path, "rb") as reader, open(temporary, "xb") as writer:
+                    shutil.copyfileobj(reader, writer, length=1024 * 1024)
+                    writer.flush()
+                    os.fsync(writer.fileno())
+                if _recovery_sha256_file(temporary) != (
+                    source.get("size"), source.get("sha256")
+                ):
+                    raise RuntimeError("Sealed H3 delivery parent changed during copy")
+                publish_file_no_replace(temporary, native_path)
+            finally:
+                try:
+                    os.remove(temporary)
+                except FileNotFoundError:
+                    pass
+        if not validate_artifact_descriptor(
+            out_dir, source, producer_unit_id=unit_id,
+        ):
+            raise RuntimeError("Sealed H3 delivery parent changed during staging")
+        if os.path.lexists(native_meta):
+            if os.path.islink(native_meta):
+                raise RuntimeError("Protected H3 delivery metadata changed")
+            with open(native_meta, "rb") as handle:
+                current_bytes = handle.read()
+            try:
+                current = json.loads(current_bytes.decode("utf-8"))
+                recovery = current.get("delivery_recovery")
+                saved = (
+                    base64.b64decode(recovery["original_sidecar_b64"], validate=True)
+                    if isinstance(recovery, dict) else current_bytes
+                )
+            except (UnicodeDecodeError, ValueError, TypeError, KeyError):
+                raise RuntimeError("Protected H3 delivery metadata is incomplete") from None
+            if saved != original_meta_bytes:
+                raise RuntimeError("Protected H3 delivery parent metadata changed")
+        owner = str(job.get("session_id") or "")
+        private_sidecar = dict(original_sidecar)
+        stamp_sidecar_policy(
+            private_sidecar,
+            {"private": True, "explicit": bool(original_sidecar.get("explicit")),
+             "owner_session_id": owner or None},
+            workspace=str(job.get("workspace") or "default"),
+        )
+        private_sidecar.update({
+            "output_filename": private_name,
+            "producer_artifact_class": "temporary",
+            "artifact_class": "temporary",
+            "delivery_native_source": True,
+            "delivery_recovery": {
+                "schema_version": 2,
+                "source_job_id": str(job.get("id") or ""),
+                "original_filename": file_name,
+                "requested_target": str((job.get("params") or {}).get("delivery_resolution") or ""),
+                "delivery_fit": str((job.get("params") or {}).get("delivery_fit") or ""),
+                "spatial_upsampling": str((job.get("params") or {}).get("spatial_upsampling") or ""),
+                "producer_job_id": str(original_sidecar.get("job_id") or job.get("id") or ""),
+                "producer_artifact_class": str(original_sidecar.get("producer_artifact_class") or "final"),
+                "artifact_lineage": original_sidecar.get("artifact_lineage"),
+                "source_remote": bool(job.get("source_remote", False)),
+                "owner_session_id": owner,
+                "original_sidecar_b64": base64.b64encode(original_meta_bytes).decode("ascii"),
+                "final_private": bool((job.get("access_policy") or {}).get("private")),
+                "final_explicit": bool((job.get("access_policy") or {}).get("explicit")),
+                "manual_retry_count": 0,
+                "manual_retry_limit": 2,
+                "restart_supported": True,
+                "queue_recovery_unit_id": str(delivery_plan.get("unit_id") or ""),
+                "queue_recovery_dependencies": list(delivery_plan.get("dependencies") or []),
+                "queue_recovery_settings": dict(delivery_plan.get("settings") or {}),
+            },
+        })
+        _atomic_write_json(native_meta, private_sidecar)
+        staged.append({
+            "file_name": final_name,
+            "copy_on_write": True,
+            "parent_basename": file_name,
+            "source_path": final_path,
+            "source_meta": final_meta,
+            "native_path": native_path,
+            "native_meta": native_meta,
+            "work_path": work_path,
+            "rollback_meta": os.path.splitext(work_path)[0] + ".rollback.meta.json",
+            "original_meta_bytes": original_meta_bytes,
+            "work_basename": work_name,
+        })
+    job["_h3_delivery_native"] = staged
+    return staged
+
+
 def _stage_h3_delivery_native_outputs(
     job: dict,
     out_dir: str,
@@ -60130,6 +60708,10 @@ def _stage_h3_delivery_native_outputs(
     delivery_plan: dict | None = None,
 ) -> list[dict]:
     """Move authoritative native finals into hidden owner-private staging."""
+    if isinstance(delivery_plan, dict) and delivery_plan.get("publication_schema") == 2:
+        return _stage_h3_delivery_native_outputs_v2(
+            job, out_dir, file_names, delivery_plan,
+        )
     token = uuid.uuid4().hex[:10]
     owner = str(job.get("session_id") or "")
     planned_by_original = {
@@ -60395,9 +60977,16 @@ def _publish_h3_delivery_outputs(
 ) -> list[str]:
     """Commit sidecars-before-media and roll back every partial publication."""
     import shutil
+    import tempfile
+    from services.atomic_file_publish import publish_file_no_replace
 
     final_names = [item["file_name"] for item in staged]
     published_items = []
+    copy_on_write = any(item.get("copy_on_write") is True for item in staged)
+    if copy_on_write and not all(
+        item.get("copy_on_write") is True for item in staged
+    ):
+        raise QueueRecoveryRuntimeError("Mixed H3 delivery publication is invalid.")
     publisher = update_job if update_job_fn is None else update_job_fn
     final_policy = dict(job.get("access_policy") or {})
     owner = str(job.get("session_id") or "")
@@ -60506,22 +61095,106 @@ def _publish_h3_delivery_outputs(
             sidecar["delivery_native_source"] = True
         return sidecar
 
+    cow_sidecars = {}
+    if copy_on_write:
+        if recovery_action:
+            raise QueueRecoveryRuntimeError(
+                "Copy-on-write recovery action requires a separate publication intent."
+            )
+        pending = _queue_recovery_delivery_pending(job)
+        if not isinstance(pending, dict):
+            raise QueueRecoveryRuntimeError("Copy-on-write delivery intent is missing.")
+        if pending.get("publication") and any(
+            os.path.lexists(item["source_path"])
+            or os.path.lexists(item["source_meta"])
+            for item in staged
+        ):
+            raise QueueRecoveryRuntimeError(
+                "Previous H3 delivery publication needs recovery."
+            )
+        _queue_recovery_validate_delivery_parents(
+            os.path.dirname(staged[0]["source_path"]), pending, final_names,
+        )
+        if any(
+            os.path.lexists(item["source_path"])
+            or os.path.lexists(item["source_meta"])
+            for item in staged
+        ):
+            raise FileExistsError("H3 delivery destination already exists.")
+        records = []
+        for item in staged:
+            media_size, media_sha256 = _recovery_sha256_file(item["work_path"])
+            private_sidecar = _publication_sidecar(item, final=False)
+            final_sidecar = _publication_sidecar(item, final=True)
+            sealed_sidecar = _queue_recovery_completed_delivery_sidecar(
+                final_sidecar, pending=pending, file_names=final_names,
+                media_size=media_size, media_sha256=media_sha256,
+            )
+            def sidecar_sha256(value):
+                return hashlib.sha256(
+                    json.dumps(value, indent=2).encode("utf-8")
+                ).hexdigest()
+            records.append({
+                "basename": item["file_name"],
+                "media_size": media_size,
+                "media_sha256": media_sha256,
+                "private_sidecar_sha256": sidecar_sha256(private_sidecar),
+                "final_sidecar_sha256": sidecar_sha256(final_sidecar),
+                "sealed_sidecar_sha256": sidecar_sha256(sealed_sidecar),
+            })
+            cow_sidecars[item["file_name"]] = (
+                private_sidecar, final_sidecar,
+            )
+        _queue_recovery_checkpoint_delivery_publication(job, records)
+
     try:
         # A basename may appear only behind an owner-private temporary
         # sidecar. Final access policy is promoted after every media file has
         # landed and cancellation has been checked again.
-        for item in staged:
-            _atomic_write_json(
-                item["source_meta"],
-                _publication_sidecar(item, final=False),
+        for item_index, item in enumerate(staged):
+            sidecar = (
+                cow_sidecars[item["file_name"]][0]
+                if copy_on_write else _publication_sidecar(item, final=False)
             )
-            shutil.copy2(item["source_meta"], item["rollback_meta"])
+            if item.get("copy_on_write") is True:
+                _atomic_create_json(item["source_meta"], sidecar)
+                temporary_handle, temporary_backup = tempfile.mkstemp(
+                    prefix=".maestro-delivery-rollback-",
+                    dir=os.path.dirname(item["rollback_meta"]),
+                )
+                try:
+                    with os.fdopen(temporary_handle, "wb") as writer, open(
+                        item["source_meta"], "rb",
+                    ) as reader:
+                        shutil.copyfileobj(reader, writer, length=1024 * 1024)
+                        writer.flush()
+                        os.fsync(writer.fileno())
+                    if _recovery_sha256_file(temporary_backup)[1] != records[
+                        item_index
+                    ]["private_sidecar_sha256"]:
+                        raise QueueRecoveryRuntimeError(
+                            "Private delivery rollback sidecar changed."
+                        )
+                    publish_file_no_replace(
+                        temporary_backup, item["rollback_meta"],
+                    )
+                finally:
+                    try:
+                        os.remove(temporary_backup)
+                    except FileNotFoundError:
+                        pass
+            else:
+                _atomic_write_json(item["source_meta"], sidecar)
+                shutil.copy2(item["source_meta"], item["rollback_meta"])
         if is_cancel_requested(job):
             raise InterruptedError("H3 delivery cancelled")
         for item in staged:
             if is_cancel_requested(job):
                 raise InterruptedError("H3 delivery cancelled")
-            os.replace(item["work_path"], item["source_path"])
+            if item.get("copy_on_write") is True:
+                publish_file_no_replace(item["work_path"], item["source_path"])
+            else:
+                os.replace(item["work_path"], item["source_path"])
             published_items.append(item)
         if is_cancel_requested(job):
             raise InterruptedError("H3 delivery cancelled")
@@ -60594,7 +61267,8 @@ def _publish_h3_delivery_outputs(
                     raise InterruptedError("H3 delivery cancelled")
                 _atomic_write_json(
                     item["source_meta"],
-                    _publication_sidecar(item, final=True),
+                    cow_sidecars[item["file_name"]][1]
+                    if copy_on_write else _publication_sidecar(item, final=True),
                 )
             if (
                 callable(publication_commit_fn)
@@ -60623,34 +61297,39 @@ def _publish_h3_delivery_outputs(
         # Prefer a recoverable hidden rename over deletion. If a viewer has the
         # file locked and even the rename fails, keep the basename behind an
         # owner-private temporary sidecar; never leave fail-open media.
-        for item in published_items:
-            try:
-                os.replace(item["source_path"], item["work_path"])
-            except OSError:
-                pass
-        for item in staged:
-            try:
-                os.replace(item["rollback_meta"], item["source_meta"])
-            except OSError as rollback_error:
-                # A second filesystem fault must never be suppressed merely
-                # because some sidecar exists. Prove that any retained policy
-                # is still the owner-private temporary policy; otherwise make
-                # the security failure explicit for the safe outer wrapper.
+        if copy_on_write:
+            _queue_recovery_reconcile_delivery_publication(
+                job, staged, tolerate_foreign_collision=True,
+            )
+        else:
+            for item in published_items:
                 try:
-                    with open(item["source_meta"], "r", encoding="utf-8") as handle:
-                        retained = json.load(handle)
-                    retained_is_private = (
-                        retained.get("private") is True
-                        and retained.get("artifact_class") == "temporary"
-                        and str(retained.get("workspace") or "")
-                            == str(job.get("workspace") or "default")
-                    )
-                except Exception:
-                    retained_is_private = False
-                if not retained_is_private:
-                    raise RuntimeError(
-                        "Unable to retain private H3 delivery rollback policy",
-                    ) from rollback_error
+                    os.replace(item["source_path"], item["work_path"])
+                except OSError:
+                    pass
+            for item in staged:
+                try:
+                    os.replace(item["rollback_meta"], item["source_meta"])
+                except OSError as rollback_error:
+                    # A second filesystem fault must never be suppressed merely
+                    # because some sidecar exists. Prove that any retained policy
+                    # is still the owner-private temporary policy; otherwise make
+                    # the security failure explicit for the safe outer wrapper.
+                    try:
+                        with open(item["source_meta"], "r", encoding="utf-8") as handle:
+                            retained = json.load(handle)
+                        retained_is_private = (
+                            retained.get("private") is True
+                            and retained.get("artifact_class") == "temporary"
+                            and str(retained.get("workspace") or "")
+                                == str(job.get("workspace") or "default")
+                        )
+                    except Exception:
+                        retained_is_private = False
+                    if not retained_is_private:
+                        raise RuntimeError(
+                            "Unable to retain private H3 delivery rollback policy",
+                        ) from rollback_error
         raise
 
     # Native bytes and byte-exact temporary sidecars stay protected until the
@@ -60672,6 +61351,14 @@ def _rollback_h3_delivery_publication(job: dict, *, update_job_fn=None) -> None:
             # Restore the marker and leave both lifecycle and filesystem bytes
             # untouched for retry/finality recovery.
             job["_h3_delivery_publication"] = publication
+            return
+        if any(
+            item.get("copy_on_write") is True
+            for item in publication.get("staged") or []
+        ):
+            _queue_recovery_reconcile_delivery_publication(
+                job, publication["staged"],
+            )
             return
         for item in publication.get("staged") or []:
             if os.path.isfile(item["source_path"]):
@@ -60818,6 +61505,23 @@ def _process_h3_delivery_from_protected_native(
         ) from error
 
 
+def _h3_copy_on_write_delivery_eligible(
+    delivery_requested: bool,
+    *,
+    director_final_video_postprocess: bool,
+    film_grain_intensity: float,
+    voice_clone_enabled: bool,
+    voice_clone_refs: list,
+) -> bool:
+    """Use protected child publication only when no later pass changes it."""
+    return bool(
+        delivery_requested
+        and not director_final_video_postprocess
+        and film_grain_intensity <= 0
+        and not (voice_clone_enabled and voice_clone_refs)
+    )
+
+
 def _deliver_h3_outputs_transactionally(
     job: dict,
     out_dir: str,
@@ -60827,6 +61531,7 @@ def _deliver_h3_outputs_transactionally(
     delivery_fit: str,
     update_job_fn=None,
     publication_commit_fn=None,
+    copy_on_write: bool = False,
 ) -> list[str]:
     """Deliver all H3 finals from protected native bytes with one OOM retry."""
     from services.oom_detect import delivery_oom_info, is_oom
@@ -60855,6 +61560,7 @@ def _deliver_h3_outputs_transactionally(
                 spatial_upsampling=spatial_upsampling,
                 delivery_resolution=delivery_resolution,
                 delivery_fit=delivery_fit,
+                copy_on_write=copy_on_write,
             )
             intent_checkpoint(job, delivery_plan)
             staged = _stage_h3_delivery_native_outputs(
@@ -61044,6 +61750,7 @@ def _resume_pending_h3_delivery_only(
     if pending.get("state") == "staging_native":
         plan = {
             "dependencies": dependencies,
+            "publication_schema": pending.get("publication_schema", 1),
             "settings": settings,
             "staging": [dict(item) for item in pending.get("staging") or []],
             "unit_id": expected,
@@ -61109,6 +61816,11 @@ def _resume_pending_h3_delivery_only(
             job, update_job_fn=update_job_fn,
         )
         return False
+    if pending.get("publication_schema") == 2 and pending.get("publication"):
+        publisher = update_job if update_job_fn is None else update_job_fn
+        if not publisher(job, output_files=[]):
+            raise InterruptedError("H3 delivery preempted")
+        _queue_recovery_reconcile_delivery_publication(job, staged)
     job["_h3_delivery_recovery"] = {
         "nonce": uuid.uuid4().hex,
         "staged": staged,
@@ -64612,6 +65324,18 @@ def _run_generation(
             pp_voice_clone_enabled = bool(raw_params.pop("voice_clone_enabled", False))
             pp_voice_clone_refs = raw_params.pop("voice_clone_refs", None) or []
             pp_voice_clone_mode = raw_params.pop("voice_clone_mode", "single")
+            h3_copy_on_write_delivery = _h3_copy_on_write_delivery_eligible(
+                h3_delivery_request,
+                director_final_video_postprocess=(
+                    director_final_video_postprocess
+                ),
+                film_grain_intensity=pp_film_grain_intensity,
+                voice_clone_enabled=pp_voice_clone_enabled,
+                voice_clone_refs=pp_voice_clone_refs,
+            )
+            h3_delivery_native_source = bool(
+                h3_delivery_request and not h3_copy_on_write_delivery
+            )
 
             defer_output_publication = bool(
                 raw_params.pop("_defer_output_publication", False)
@@ -65463,6 +66187,7 @@ def _run_generation(
             def _write_output_sidecars(
                 file_names, *, native_source=False, recovery_units=None,
                 media_paths=None, task_params=None,
+                private_native_parent=False,
             ):
                 """Stamp every produced media file, including abort leftovers.
 
@@ -65625,7 +66350,10 @@ def _run_generation(
                         "video_guides": 0,
                     }
                 sidecar_policy = dict(job.get("access_policy") or {})
-                if native_source:
+                # A copy-on-write parent keeps its final producer seal for
+                # recovery, but remains private until its delivery child is
+                # verified and published.
+                if native_source or private_native_parent:
                     sidecar_policy["private"] = True
                 stamp_sidecar_policy(
                     sidecar,
@@ -66064,7 +66792,8 @@ def _run_generation(
                         raise InterruptedError("H3 concat preempted")
                     _write_output_sidecars(
                         [output_name],
-                        native_source=h3_delivery_request,
+                        native_source=h3_delivery_native_source,
+                        private_native_parent=h3_copy_on_write_delivery,
                         recovery_units={
                             output_name: {
                                 "dependencies": list(dependencies),
@@ -66574,7 +67303,8 @@ def _run_generation(
                                 return False
                             _write_output_sidecars(
                                 new_artifacts,
-                                native_source=h3_delivery_request,
+                                native_source=h3_delivery_native_source,
+                                private_native_parent=h3_copy_on_write_delivery,
                                 recovery_units=recovery_units,
                                 task_params=task_sidecar_params if mapping_receipt is not None else None,
                                 media_paths={
@@ -66819,7 +67549,8 @@ def _run_generation(
                             raise InterruptedError("H3 segment preempted")
                         _write_output_sidecars(
                             [name],
-                            native_source=h3_delivery_request,
+                            native_source=h3_delivery_native_source,
+                            private_native_parent=h3_copy_on_write_delivery,
                             recovery_units={
                                 name: {
                                     "continuation": None,
@@ -67516,7 +68247,8 @@ def _run_generation(
                                 return False
                             _write_output_sidecars(
                                 failed_segment_names,
-                                native_source=h3_delivery_request,
+                                native_source=h3_delivery_native_source,
+                                private_native_parent=h3_copy_on_write_delivery,
                                 recovery_units=failed_units,
                                 media_paths={
                                     name: task_staged_media[name]
@@ -67767,7 +68499,8 @@ def _run_generation(
                                     return False
                                 _write_output_sidecars(
                                     segment_names,
-                                    native_source=h3_delivery_request,
+                                    native_source=h3_delivery_native_source,
+                                    private_native_parent=h3_copy_on_write_delivery,
                                     recovery_units=segment_units,
                                     media_paths={
                                         name: task_staged_media[name]
@@ -67931,7 +68664,8 @@ def _run_generation(
                                     return False
                                 _write_output_sidecars(
                                     concat_names,
-                                    native_source=h3_delivery_request,
+                                    native_source=h3_delivery_native_source,
+                                    private_native_parent=h3_copy_on_write_delivery,
                                     recovery_units=concat_units,
                                     media_paths={
                                         name: task_staged_media[name]
@@ -68109,7 +68843,11 @@ def _run_generation(
                         return False
                     if not defer_output_publication:
                         if h3_delivery_request:
-                            _write_output_sidecars(new_files, native_source=True)
+                            _write_output_sidecars(
+                                new_files,
+                                native_source=h3_delivery_native_source,
+                                private_native_parent=h3_copy_on_write_delivery,
+                            )
                         else:
                             _write_output_sidecars(new_files)
 
@@ -68598,6 +69336,7 @@ def _run_generation(
                                 publication_commit_fn=(
                                     commit_h3_delivery_publication
                                 ),
+                                copy_on_write=h3_copy_on_write_delivery,
                             )
                             if director_postprocess_files is not None:
                                 director_postprocess_files = list(delivered_files)

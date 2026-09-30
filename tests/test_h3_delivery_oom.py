@@ -9,6 +9,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -35,9 +36,11 @@ from services.output_access import stamp_sidecar_policy  # noqa: E402
 from services.queue_recovery_runtime import (  # noqa: E402
     QueueRecoveryRuntimeError,
     artifact_descriptor,
+    protected_artifact_descriptor,
     recovery_unit_id,
     sha256_file,
     validate_artifact_descriptor,
+    validate_protected_artifact_descriptor,
 )
 
 
@@ -185,6 +188,48 @@ class H3DeliveryTransactionTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_copy_on_write_eligibility_excludes_later_video_passes(self):
+        eligible = _load_launch_symbols(
+            "_h3_copy_on_write_delivery_eligible",
+        )["_h3_copy_on_write_delivery_eligible"]
+        base = {
+            "director_final_video_postprocess": False,
+            "film_grain_intensity": 0,
+            "voice_clone_enabled": False,
+            "voice_clone_refs": [],
+        }
+        self.assertTrue(eligible(True, **base))
+        self.assertFalse(eligible(False, **base))
+        for change in (
+            {"director_final_video_postprocess": True},
+            {"film_grain_intensity": 0.25},
+            {"voice_clone_enabled": True, "voice_clone_refs": ["reference.wav"]},
+        ):
+            with self.subTest(change=change):
+                self.assertFalse(eligible(True, **{**base, **change}))
+        self.assertTrue(eligible(
+            True, **{**base, "voice_clone_enabled": True},
+        ))
+
+    def test_transaction_forwards_copy_on_write_to_durable_plan(self):
+        planner = Mock(side_effect=RuntimeError("stop before staging"))
+        symbols = _load_launch_symbols(
+            "_H3DeliveryFailure",
+            "_deliver_h3_outputs_transactionally",
+            namespace={
+                "_queue_recovery_delivery_plan": planner,
+                "_queue_recovery_checkpoint_delivery_intent": Mock(),
+                "_queue_recovery_checkpoint_delivery_pending": Mock(),
+            },
+        )
+        with self.assertRaises(symbols["_H3DeliveryFailure"]):
+            symbols["_deliver_h3_outputs_transactionally"](
+                self.job, self.out_dir, [self.files[0]],
+                "flashvsr3", "3840x2160", "center_crop",
+                copy_on_write=True,
+            )
+        self.assertTrue(planner.call_args.kwargs["copy_on_write"])
 
     def test_live_shaped_native_policy_restamp_reseals_without_accepting_media_change(self):
         filename = self.files[0]
@@ -344,6 +389,523 @@ class H3DeliveryTransactionTests(unittest.TestCase):
         self.assertTrue(Path(staged[0]["native_path"]).is_file())
         self.assertTrue(Path(staged[0]["native_meta"]).is_file())
         self.assertFalse(Path(self.out_dir, filename).exists())
+
+    def test_copy_on_write_delivery_staging_preserves_sealed_parent(self):
+        filename = self.files[0]
+        unit_id = recovery_unit_id("job-1", "ordinary_repeat", index=0)
+        media_path = Path(self.out_dir, filename)
+        sidecar_path = Path(self.out_dir, Path(filename).stem + ".meta.json")
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        size, digest = sha256_file(media_path)
+        sidecar.update({
+            "job_id": "job-1",
+            "producer_unit_id": unit_id,
+            "producer_unit_kind": "ordinary_repeat",
+            "producer_unit_variant": 0,
+            "producer_unit_index": 0,
+            "producer_unit_dependencies": [],
+            "producer_media_size": size,
+            "producer_media_sha256": digest,
+        })
+        sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+        artifact = artifact_descriptor(
+            self.out_dir, basename=filename,
+            sidecar_basename=sidecar_path.name, producer_unit_id=unit_id,
+        )
+        self.job["recovery_cursor"] = {"completed_units": [{
+            "artifacts": [artifact], "dependencies": [], "index": 0,
+            "kind": "ordinary_repeat", "state": "completed",
+            "unit_id": unit_id, "variant": 0,
+        }]}
+        original_media = media_path.read_bytes()
+        original_sidecar = sidecar_path.read_bytes()
+        def checkpoint(job, **updates):
+            job.update(updates)
+            return True
+
+        symbols = _load_launch_symbols(
+            "_atomic_write_json",
+            "_atomic_create_json",
+            "_stage_h3_delivery_native_outputs_v2",
+            "_stage_h3_delivery_native_outputs",
+            "_queue_recovery_delivery_plan",
+            "_queue_recovery_checkpoint_delivery_intent",
+            "_queue_recovery_checkpoint_delivery_pending",
+            "_queue_recovery_validate_delivery_parents",
+            "_queue_recovery_completed_delivery_sidecar",
+            "_queue_recovery_checkpoint_delivery_publication",
+            "_queue_recovery_reconcile_delivery_publication",
+            "_queue_recovery_delivery_pending",
+            "_queue_recovery_checkpoint_delivery_completed",
+            "_queue_recovery_restore_delivery_staged",
+            "_publish_h3_delivery_outputs",
+            "_finalize_h3_delivery_publication",
+            namespace={
+                "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+                "_queue_recovery_units": lambda job: list(job["recovery_cursor"]["completed_units"]),
+                "_recovery_sha256_file": sha256_file,
+                "_recovery_artifact_descriptor": artifact_descriptor,
+                "hashlib": hashlib, "hmac": hmac, "re": re,
+                "recovery_unit_id": recovery_unit_id,
+                "validate_artifact_descriptor": validate_artifact_descriptor,
+                "_protected_recovery_artifact_descriptor": protected_artifact_descriptor,
+                "validate_protected_artifact_descriptor": validate_protected_artifact_descriptor,
+                "_queue_recovery_checkpoint": checkpoint,
+                "_queue_recovery_checkpoint_unit": lambda _job, **_kwargs: {"unit_id": plan["unit_id"]},
+                "_h3_final_output_integrity": lambda *_args, **_kwargs: {"validation": "valid"},
+                "_sample_campaign_transition_lock": threading.RLock(),
+                "_SAMPLE_CAMPAIGN_JOB_KIND": "sample_campaign_generation",
+                "is_cancel_requested": lambda _job: False,
+                "logging": logging,
+            },
+        )
+        plan = symbols["_queue_recovery_delivery_plan"](
+            self.job, self.out_dir, [filename],
+            spatial_upsampling="flashvsr3",
+            delivery_resolution="3840x2160", delivery_fit="center_crop",
+            copy_on_write=True,
+        )
+        self.assertEqual(plan["publication_schema"], 2)
+        final_name = plan["staging"][0]["final_basename"]
+        self.assertNotEqual(final_name, filename)
+        changed_plan = json.loads(json.dumps(plan))
+        changed_plan["staging"][0]["final_basename"] = "h3-delivery-wrong.mp4"
+        with self.assertRaisesRegex(RuntimeError, "names are invalid"):
+            symbols["_stage_h3_delivery_native_outputs"](
+                self.job, self.out_dir, [filename], changed_plan,
+            )
+        self.assertEqual(media_path.read_bytes(), original_media)
+        self.assertEqual(sidecar_path.read_bytes(), original_sidecar)
+        intent = symbols["_queue_recovery_checkpoint_delivery_intent"](
+            self.job, plan,
+        )
+        self.assertEqual(intent["state"], "staging_native")
+        self.assertEqual(intent["publication_schema"], 2)
+        staged = symbols["_stage_h3_delivery_native_outputs"](
+            self.job, self.out_dir, [filename], plan,
+        )
+        self.assertEqual(staged[0]["file_name"], final_name)
+        self.assertEqual(media_path.read_bytes(), original_media)
+        self.assertEqual(sidecar_path.read_bytes(), original_sidecar)
+        self.assertTrue(validate_artifact_descriptor(
+            self.out_dir, artifact, producer_unit_id=unit_id,
+        ))
+        self.assertEqual(Path(staged[0]["native_path"]).read_bytes(), original_media)
+        self.assertFalse(Path(staged[0]["source_path"]).exists())
+        repeated = symbols["_stage_h3_delivery_native_outputs"](
+            self.job, self.out_dir, [filename], plan,
+        )
+        self.assertEqual(repeated[0]["native_path"], staged[0]["native_path"])
+        self.assertEqual(media_path.read_bytes(), original_media)
+        self.assertEqual(sidecar_path.read_bytes(), original_sidecar)
+        pending = symbols["_queue_recovery_checkpoint_delivery_pending"](
+            self.job, self.out_dir, repeated, plan,
+        )
+        self.assertEqual(pending["publication_schema"], 2)
+        self.assertEqual(pending["sources"], [artifact])
+        restored = symbols["_queue_recovery_restore_delivery_staged"](
+            self.job, self.out_dir, pending,
+        )
+        self.assertEqual(restored[0]["file_name"], final_name)
+        self.assertEqual(restored[0]["parent_basename"], filename)
+        wrong_work = {
+            **pending,
+            "work_basenames": [".maestro-delivery-other.work.mp4"],
+        }
+        with self.assertRaisesRegex(
+            QueueRecoveryRuntimeError, "staging identity changed",
+        ):
+            symbols["_queue_recovery_restore_delivery_staged"](
+                self.job, self.out_dir, wrong_work,
+            )
+        other_name = "different-parent.mp4"
+        other_unit = recovery_unit_id("job-1", "ordinary_repeat", index=1)
+        other_path = Path(self.out_dir, other_name)
+        other_path.write_bytes(b"different-parent-media")
+        other_size, other_digest = sha256_file(other_path)
+        other_meta = dict(sidecar)
+        other_meta.update({
+            "output_filename": other_name,
+            "producer_unit_id": other_unit,
+            "producer_unit_index": 1,
+            "producer_media_size": other_size,
+            "producer_media_sha256": other_digest,
+        })
+        other_sidecar = Path(self.out_dir, "different-parent.meta.json")
+        other_sidecar.write_text(json.dumps(other_meta), encoding="utf-8")
+        other_artifact = artifact_descriptor(
+            self.out_dir, basename=other_name,
+            sidecar_basename=other_sidecar.name,
+            producer_unit_id=other_unit,
+        )
+        substituted = {**pending, "sources": [other_artifact]}
+        with self.assertRaisesRegex(
+            QueueRecoveryRuntimeError, "Sealed delivery parent changed",
+        ):
+            symbols["_queue_recovery_restore_delivery_staged"](
+                self.job, self.out_dir, substituted,
+            )
+        with self.assertRaisesRegex(
+            QueueRecoveryRuntimeError, "Sealed delivery parent changed",
+        ):
+            symbols["_queue_recovery_checkpoint_delivery_completed"](
+                self.job, self.out_dir, [final_name], substituted,
+            )
+        sidecar_path.write_bytes(original_sidecar + b" ")
+        with self.assertRaisesRegex(
+            QueueRecoveryRuntimeError, "Sealed delivery parent changed",
+        ):
+            symbols["_queue_recovery_restore_delivery_staged"](
+                self.job, self.out_dir, pending,
+            )
+        sidecar_path.write_bytes(original_sidecar)
+        self.assertTrue(validate_artifact_descriptor(
+            self.out_dir, artifact, producer_unit_id=unit_id,
+        ))
+        Path(restored[0]["work_path"]).write_bytes(original_media + b"-delivered")
+        publisher = lambda job, **updates: bool(job.update(updates) or True)
+        foreign_final = Path(self.out_dir, final_name)
+        foreign_final.write_bytes(b"foreign-output")
+        with self.assertRaises(FileExistsError):
+            symbols["_publish_h3_delivery_outputs"](
+                self.job, restored,
+                completed_delivery={"spatial_upsampling": "flashvsr3"},
+                update_job_fn=publisher,
+            )
+        self.assertEqual(foreign_final.read_bytes(), b"foreign-output")
+        self.assertEqual(media_path.read_bytes(), original_media)
+        self.assertFalse(Path(restored[0]["source_meta"]).exists())
+        foreign_final.unlink()
+        with tempfile.TemporaryDirectory() as external_root:
+            sentinel = Path(external_root, "sentinel.txt")
+            sentinel.write_bytes(b"outside-unchanged")
+            rollback_link = Path(restored[0]["rollback_meta"])
+            try:
+                rollback_link.symlink_to(sentinel)
+            except OSError:
+                self.skipTest("Symlinks are unavailable on this platform")
+            with self.assertRaises(FileExistsError):
+                symbols["_publish_h3_delivery_outputs"](
+                    self.job, restored,
+                    completed_delivery={"spatial_upsampling": "flashvsr3"},
+                    update_job_fn=publisher,
+                )
+            self.assertEqual(sentinel.read_bytes(), b"outside-unchanged")
+            self.assertTrue(rollback_link.is_symlink())
+            self.assertFalse(Path(restored[0]["source_meta"]).exists())
+            rollback_link.unlink()
+        delivered = symbols["_publish_h3_delivery_outputs"](
+            self.job, restored,
+            completed_delivery={"spatial_upsampling": "flashvsr3"},
+            update_job_fn=publisher,
+            publication_commit_fn=lambda names: bool(
+                symbols["_queue_recovery_checkpoint_delivery_completed"](
+                    self.job, self.out_dir, names, pending,
+                )
+            ),
+        )
+        self.assertEqual(delivered, [final_name])
+        self.assertEqual(Path(self.out_dir, final_name).read_bytes(), original_media + b"-delivered")
+        self.assertEqual(media_path.read_bytes(), original_media)
+        self.assertEqual(sidecar_path.read_bytes(), original_sidecar)
+        self.assertTrue(validate_artifact_descriptor(
+            self.out_dir, artifact, producer_unit_id=unit_id,
+        ))
+        symbols["_finalize_h3_delivery_publication"](self.job)
+        self.assertFalse(Path(restored[0]["native_path"]).exists())
+        self.assertTrue(validate_artifact_descriptor(
+            self.out_dir, artifact, producer_unit_id=unit_id,
+        ))
+
+    def test_copy_on_write_restart_retracts_only_exact_partial_publication(self):
+        from services.atomic_file_publish import (
+            PublishedFileDurabilityError,
+            publish_file_no_replace,
+        )
+
+        def fixture(root, *, count=1):
+            filenames = []
+            parents = []
+            parent_paths = []
+            parent_sidecars = []
+            units = []
+            for index in range(count):
+                filename = f"sealed-parent-{index}.mp4"
+                filenames.append(filename)
+                media_path = Path(root, filename)
+                media_path.write_bytes(f"sealed-native-{index}".encode())
+                parent_size, parent_hash = sha256_file(media_path)
+                parent_unit = recovery_unit_id(
+                    "job-1", "ordinary_repeat", index=index,
+                )
+                parent_meta = Path(root, f"sealed-parent-{index}.meta.json")
+                sidecar = _sidecar(filename)
+                sidecar.update({
+                    "job_id": "job-1",
+                    "producer_unit_id": parent_unit,
+                    "producer_unit_kind": "ordinary_repeat",
+                    "producer_unit_variant": 0,
+                    "producer_unit_index": index,
+                    "producer_unit_dependencies": [],
+                    "producer_media_size": parent_size,
+                    "producer_media_sha256": parent_hash,
+                })
+                parent_meta.write_text(json.dumps(sidecar), encoding="utf-8")
+                parent = artifact_descriptor(
+                    root, basename=filename,
+                    sidecar_basename=parent_meta.name,
+                    producer_unit_id=parent_unit,
+                )
+                parents.append(parent)
+                parent_paths.append(media_path)
+                parent_sidecars.append(parent_meta)
+                units.append({
+                    "artifacts": [parent], "dependencies": [], "index": index,
+                    "kind": "ordinary_repeat", "state": "completed",
+                    "unit_id": parent_unit, "variant": 0,
+                })
+            job = {
+                **self.job,
+                "out_dir": root,
+                "recovery_cursor": {"completed_units": units},
+            }
+            def checkpoint(current, **updates):
+                current.update(updates)
+                return True
+
+            symbols = _load_launch_symbols(
+                "_atomic_write_json", "_atomic_create_json",
+                "_stage_h3_delivery_native_outputs_v2",
+                "_stage_h3_delivery_native_outputs",
+                "_queue_recovery_delivery_plan",
+                "_queue_recovery_checkpoint_delivery_intent",
+                "_queue_recovery_checkpoint_delivery_pending",
+                "_queue_recovery_validate_delivery_parents",
+                "_queue_recovery_completed_delivery_sidecar",
+                "_queue_recovery_checkpoint_delivery_publication",
+                "_queue_recovery_reconcile_delivery_publication",
+                "_queue_recovery_restore_delivery_staged",
+                "_queue_recovery_delivery_pending",
+                "_publish_h3_delivery_outputs",
+                "_resume_pending_h3_delivery_only",
+                namespace={
+                    "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+                    "_queue_recovery_units": lambda current: list(
+                        current["recovery_cursor"]["completed_units"]
+                    ),
+                    "_recovery_sha256_file": sha256_file,
+                    "_protected_recovery_artifact_descriptor": protected_artifact_descriptor,
+                    "validate_protected_artifact_descriptor": validate_protected_artifact_descriptor,
+                    "validate_artifact_descriptor": validate_artifact_descriptor,
+                    "_queue_recovery_checkpoint": checkpoint,
+                    "_queue_recovery_unit_matches": lambda *_args, **_kwargs: None,
+                    "_h3_final_output_integrity": lambda *_args, **_kwargs: {
+                        "validation": "valid",
+                    },
+                    "_release_h3_delivery_vram": lambda: [],
+                    "_sample_campaign_transition_lock": threading.RLock(),
+                    "_SAMPLE_CAMPAIGN_JOB_KIND": "sample_campaign_generation",
+                    "is_cancel_requested": lambda _job: False,
+                    "logging": logging, "hashlib": hashlib, "hmac": hmac,
+                    "re": re, "recovery_unit_id": recovery_unit_id,
+                },
+            )
+            plan = symbols["_queue_recovery_delivery_plan"](
+                job, root, filenames, spatial_upsampling="flashvsr3",
+                delivery_resolution="3840x2160", delivery_fit="center_crop",
+                copy_on_write=True,
+            )
+            symbols["_queue_recovery_checkpoint_delivery_intent"](job, plan)
+            staged = symbols["_stage_h3_delivery_native_outputs"](
+                job, root, filenames, plan,
+            )
+            symbols["_queue_recovery_checkpoint_delivery_pending"](
+                job, root, staged, plan,
+            )
+            for index, item in enumerate(staged):
+                Path(item["work_path"]).write_bytes(
+                    f"delivered-child-{index}".encode()
+                )
+            return (
+                job, symbols, staged, parents[0],
+                parent_paths[0], parent_sidecars[0],
+            )
+
+        for crash_at in (
+            "private_sidecar", "media_rename", "final_sidecar",
+            "sealed_sidecar", "durability_failure",
+        ):
+            with self.subTest(crash_at=crash_at), tempfile.TemporaryDirectory() as root:
+                job, symbols, staged, parent, media_path, parent_meta = fixture(root)
+                parent_bytes = media_path.read_bytes()
+                parent_meta_bytes = parent_meta.read_bytes()
+                item = staged[0]
+                final_media = Path(item["source_path"])
+                final_meta = Path(item["source_meta"])
+                publisher = lambda current, **updates: bool(current.update(updates) or True)
+                commit_fn = None
+                if crash_at == "private_sidecar":
+                    original_create = symbols["_atomic_create_json"]
+                    def interrupted_create(path, value):
+                        original_create(path, value)
+                        raise KeyboardInterrupt("simulated restart")
+                    symbols["_atomic_create_json"] = interrupted_create
+                    publish_context = patch(
+                        "services.atomic_file_publish.publish_file_no_replace",
+                        publish_file_no_replace,
+                    )
+                elif crash_at == "media_rename":
+                    def interrupted_publish(source, destination):
+                        publish_file_no_replace(source, destination)
+                        if destination == item["source_path"]:
+                            raise KeyboardInterrupt("simulated restart")
+                    publish_context = patch(
+                        "services.atomic_file_publish.publish_file_no_replace",
+                        interrupted_publish,
+                    )
+                elif crash_at == "durability_failure":
+                    def failed_directory_sync(source, destination):
+                        publish_file_no_replace(source, destination)
+                        if destination == item["source_path"]:
+                            raise PublishedFileDurabilityError(
+                                5, "simulated directory sync failure",
+                            )
+                    publish_context = patch(
+                        "services.atomic_file_publish.publish_file_no_replace",
+                        failed_directory_sync,
+                    )
+                elif crash_at == "final_sidecar":
+                    original_write = symbols["_atomic_write_json"]
+                    def interrupted_final(path, value):
+                        original_write(path, value)
+                        if path == item["source_meta"]:
+                            raise KeyboardInterrupt("simulated restart")
+                    symbols["_atomic_write_json"] = interrupted_final
+                    publish_context = patch(
+                        "services.atomic_file_publish.publish_file_no_replace",
+                        publish_file_no_replace,
+                    )
+                else:
+                    def interrupted_seal(names):
+                        pending = job["recovery_cursor"]["delivery_pending"]
+                        sidecar = json.loads(final_meta.read_text(encoding="utf-8"))
+                        size, digest = sha256_file(final_media)
+                        sealed = symbols["_queue_recovery_completed_delivery_sidecar"](
+                            sidecar, pending=pending, file_names=names,
+                            media_size=size, media_sha256=digest,
+                        )
+                        symbols["_atomic_write_json"](str(final_meta), sealed)
+                        raise KeyboardInterrupt("simulated restart")
+                    commit_fn = interrupted_seal
+                    publish_context = patch(
+                        "services.atomic_file_publish.publish_file_no_replace",
+                        publish_file_no_replace,
+                    )
+                expected_error = (
+                    PublishedFileDurabilityError
+                    if crash_at == "durability_failure" else KeyboardInterrupt
+                )
+                with publish_context, self.assertRaises(expected_error):
+                    symbols["_publish_h3_delivery_outputs"](
+                        job, staged,
+                        completed_delivery={"spatial_upsampling": "flashvsr3"},
+                        update_job_fn=publisher,
+                        publication_commit_fn=commit_fn,
+                    )
+                self.assertIn("publication", job["recovery_cursor"]["delivery_pending"])
+                self.assertEqual(
+                    final_meta.is_file(), crash_at != "durability_failure",
+                )
+                self.assertEqual(media_path.read_bytes(), parent_bytes)
+                self.assertEqual(parent_meta.read_bytes(), parent_meta_bytes)
+                if crash_at == "durability_failure":
+                    self.assertFalse(final_media.exists())
+                    continue
+                restarted = json.loads(json.dumps({
+                    key: value for key, value in job.items()
+                    if not key.startswith("_h3_delivery")
+                }))
+                saw_clean_destination = []
+                def process_after_reconcile(*_args, **_kwargs):
+                    saw_clean_destination.append(
+                        not final_media.exists() and not final_meta.exists()
+                    )
+                    raise KeyboardInterrupt("stopped before GPU work")
+                symbols["_process_h3_delivery_from_protected_native"] = (
+                    process_after_reconcile
+                )
+                if crash_at == "private_sidecar":
+                    final_media.write_bytes(b"foreign-media")
+                    with self.assertRaisesRegex(
+                        QueueRecoveryRuntimeError,
+                        "destination already exists",
+                    ):
+                        symbols["_resume_pending_h3_delivery_only"](
+                            restarted, update_job_fn=publisher,
+                        )
+                    self.assertEqual(final_media.read_bytes(), b"foreign-media")
+                    self.assertFalse(final_meta.exists())
+                    final_media.unlink()
+                with self.assertRaisesRegex(
+                    KeyboardInterrupt, "stopped before GPU work",
+                ):
+                    symbols["_resume_pending_h3_delivery_only"](
+                        restarted, update_job_fn=publisher,
+                    )
+                self.assertEqual(saw_clean_destination, [True])
+                self.assertFalse(final_media.exists())
+                self.assertFalse(final_meta.exists())
+                self.assertEqual(media_path.read_bytes(), parent_bytes)
+                self.assertEqual(parent_meta.read_bytes(), parent_meta_bytes)
+                self.assertTrue(validate_artifact_descriptor(
+                    root, parent, producer_unit_id=parent["producer_unit_id"],
+                ))
+
+        with tempfile.TemporaryDirectory() as root:
+            job, symbols, staged, _parent, _media_path, _parent_meta = fixture(
+                root, count=2,
+            )
+            def update(current, **updates):
+                current.update(updates)
+                return True
+
+            def stop_after_both_sidecars(_names):
+                raise KeyboardInterrupt("simulated restart")
+
+            with self.assertRaises(KeyboardInterrupt):
+                symbols["_publish_h3_delivery_outputs"](
+                    job, staged,
+                    completed_delivery={"spatial_upsampling": "flashvsr3"},
+                    update_job_fn=update,
+                    publication_commit_fn=stop_after_both_sidecars,
+                )
+            final_paths = [
+                (Path(item["source_path"]), Path(item["source_meta"]))
+                for item in staged
+            ]
+            before = [(media.read_bytes(), meta.read_bytes())
+                      for media, meta in final_paths]
+            Path(staged[1]["rollback_meta"]).unlink()
+            restarted = json.loads(json.dumps({
+                key: value for key, value in job.items()
+                if not key.startswith("_h3_delivery")
+            }))
+            restored = symbols["_queue_recovery_restore_delivery_staged"](
+                restarted, root,
+                restarted["recovery_cursor"]["delivery_pending"],
+            )
+            with self.assertRaisesRegex(
+                QueueRecoveryRuntimeError,
+                "Private delivery rollback sidecar is unavailable",
+            ):
+                symbols["_queue_recovery_reconcile_delivery_publication"](
+                    restarted, restored,
+                )
+            self.assertEqual(
+                [(media.read_bytes(), meta.read_bytes())
+                 for media, meta in final_paths],
+                before,
+            )
 
     def _symbols(self, upscale, fit, *, cancelled=None):
         release = Mock(return_value=["released_h3", "cleared_cuda_cache"])

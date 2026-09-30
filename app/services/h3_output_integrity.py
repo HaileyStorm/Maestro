@@ -67,13 +67,15 @@ def expected_h3_final_frames(
             raise ValueError("H3 public source prefix frame count is invalid")
         counts.append(public_source_prefix["source_frames"])
     cursor_prefix = None
+    cursor_units = []
     if recovery_cursor is not None:
         if not isinstance(recovery_cursor, dict):
             raise ValueError("H3 recovery cursor is invalid")
         units = recovery_cursor.get("completed_units")
         if units is not None and not isinstance(units, list):
             raise ValueError("H3 completed units are invalid")
-        for unit in units or []:
+        cursor_units = units or []
+        for unit in cursor_units:
             if (
                 isinstance(unit, dict)
                 and unit.get("kind") == "h3_segment"
@@ -97,6 +99,63 @@ def expected_h3_final_frames(
             )
             if final_prefix is not None:
                 counts.append(retained_frames(final_prefix))
+        elif recovery_final_unit.get("kind") == "h3_delivery":
+            settings = recovery_final_unit.get("settings")
+            if isinstance(settings, dict) and settings.get("publication_schema") == 2:
+                dependencies = recovery_final_unit.get("dependencies")
+                native_hashes = settings.get("native_hashes")
+                if (
+                    not isinstance(dependencies, list)
+                    or not isinstance(native_hashes, list)
+                    or not dependencies
+                    or len(dependencies) != len(native_hashes)
+                ):
+                    raise ValueError("H3 delivery parent frame evidence is invalid")
+                for dependency, native_hash in zip(dependencies, native_hashes):
+                    if (
+                        not isinstance(dependency, str)
+                        or not dependency
+                        or not isinstance(native_hash, str)
+                        or len(native_hash) != 64
+                        or any(
+                            character not in "0123456789abcdef"
+                            for character in native_hash
+                        )
+                    ):
+                        raise ValueError("H3 delivery parent frame evidence is invalid")
+                    parents = [
+                        unit for unit in cursor_units
+                        if isinstance(unit, dict)
+                        and unit.get("unit_id") == dependency
+                        and unit.get("kind") in {"h3_concat", "ordinary_repeat"}
+                    ]
+                    artifacts = (
+                        parents[0].get("artifacts")
+                        if len(parents) == 1 else None
+                    )
+                    matches = (
+                        [
+                            artifact for artifact in artifacts
+                            if isinstance(artifact, dict)
+                            and artifact.get("sha256") == native_hash
+                        ]
+                        if isinstance(artifacts, list) else []
+                    )
+                    if len(matches) != 1:
+                        raise ValueError("H3 delivery parent changed")
+                    if parents[0].get("kind") != "h3_concat":
+                        continue
+                    parent_settings = parents[0].get("settings")
+                    parent_prefix = (
+                        parent_settings.get("source_prefix")
+                        if isinstance(parent_settings, dict) else None
+                    )
+                    if parent_prefix is not None:
+                        count = retained_frames(parent_prefix)
+                        if final_prefix is not None and final_prefix != count:
+                            raise ValueError("H3 source prefix frame counts disagree")
+                        final_prefix = count
+                        counts.append(count)
     if require_recovery_evidence and (
         (final_prefix is None) != (cursor_prefix is None)
         or (public_source_prefix is not None and cursor_prefix is None)

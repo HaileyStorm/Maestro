@@ -78,6 +78,134 @@ class H3OutputIntegrityTests(unittest.TestCase):
         self.assertEqual(
             expected_h3_final_frames(124, recovery_cursor=cursor), 248,
         )
+        concat_parent = {
+            "unit_id": "concat-parent", "kind": "h3_concat",
+            "settings": {"source_prefix": prefix},
+            "artifacts": [{"sha256": "b" * 64}],
+        }
+        delivery_final = {
+            "kind": "h3_delivery", "dependencies": ["concat-parent"],
+            "settings": {
+                "publication_schema": 2,
+                "native_hashes": ["b" * 64],
+            },
+        }
+        delivery_cursor = {
+            "completed_units": [*cursor["completed_units"], concat_parent],
+        }
+        self.assertEqual(
+            expected_h3_final_frames(
+                124, public_source_prefix=public_prefix,
+                recovery_cursor=delivery_cursor,
+                recovery_final_unit=delivery_final,
+                require_recovery_evidence=True,
+            ),
+            248,
+        )
+        multi_output_cursor = {
+            "completed_units": [
+                *cursor["completed_units"],
+                {
+                    **concat_parent,
+                    "artifacts": [
+                        {"sha256": "e" * 64},
+                        {"sha256": "b" * 64},
+                    ],
+                },
+            ],
+        }
+        self.assertEqual(
+            expected_h3_final_frames(
+                124, public_source_prefix=public_prefix,
+                recovery_cursor=multi_output_cursor,
+                recovery_final_unit=delivery_final,
+                require_recovery_evidence=True,
+            ),
+            248,
+        )
+        with self.assertRaises(ValueError):
+            expected_h3_final_frames(
+                124, public_source_prefix=public_prefix,
+                recovery_cursor=cursor,
+                recovery_final_unit=delivery_final,
+                require_recovery_evidence=True,
+            )
+        two_parent_final = {
+            **delivery_final,
+            "dependencies": ["concat-parent", "repeat-parent"],
+            "settings": {
+                "publication_schema": 2,
+                "native_hashes": ["b" * 64, "d" * 64],
+            },
+        }
+        with self.assertRaises(ValueError):
+            expected_h3_final_frames(
+                124, public_source_prefix=public_prefix,
+                recovery_cursor=delivery_cursor,
+                recovery_final_unit=two_parent_final,
+                require_recovery_evidence=True,
+            )
+        two_parent_cursor = {
+            "completed_units": [
+                *delivery_cursor["completed_units"],
+                {
+                    "unit_id": "repeat-parent", "kind": "ordinary_repeat",
+                    "artifacts": [{"sha256": "d" * 64}],
+                },
+            ],
+        }
+        self.assertEqual(
+            expected_h3_final_frames(
+                124, public_source_prefix=public_prefix,
+                recovery_cursor=two_parent_cursor,
+                recovery_final_unit=two_parent_final,
+                require_recovery_evidence=True,
+            ),
+            248,
+        )
+        with self.assertRaises(ValueError):
+            expected_h3_final_frames(
+                124, public_source_prefix=public_prefix,
+                recovery_cursor=delivery_cursor,
+                recovery_final_unit={
+                    **delivery_final,
+                    "settings": {
+                        "publication_schema": 2,
+                        "native_hashes": ["c" * 64],
+                    },
+                },
+                require_recovery_evidence=True,
+            )
+        with self.assertRaises(ValueError):
+            expected_h3_final_frames(
+                124, public_source_prefix=public_prefix,
+                recovery_cursor={
+                    "completed_units": [
+                        *cursor["completed_units"],
+                        {**concat_parent, "artifacts": [{"sha256": None}]},
+                    ],
+                },
+                recovery_final_unit={
+                    **delivery_final,
+                    "settings": {
+                        "publication_schema": 2,
+                        "native_hashes": [None],
+                    },
+                },
+                require_recovery_evidence=True,
+            )
+        with self.assertRaises(ValueError):
+            expected_h3_final_frames(
+                124, public_source_prefix=public_prefix,
+                recovery_cursor={
+                    "completed_units": [
+                        *cursor["completed_units"],
+                        {**concat_parent, "artifacts": 7},
+                    ],
+                },
+                recovery_final_unit=delivery_final,
+                require_recovery_evidence=True,
+            )
         with tempfile.TemporaryDirectory() as directory:
             artifact = Path(directory) / "extended.mp4"
             artifact.write_bytes(b"synthetic container bytes")
