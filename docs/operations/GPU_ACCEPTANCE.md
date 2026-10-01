@@ -2115,3 +2115,20 @@ timeline and both interior guides, and use a fresh validated GPU lease. Without
 retained pre-encoding output or latents, the existing result cannot localize
 the darkness to denoising versus learned VAE decoding. Private probe inputs,
 script, hashes and results are retained in the opening-diagnosis artifact.
+
+### Reusable Guide seed after app recovery
+
+The original pair and its separate browser copy retain the same actual seed in
+embedded generation metadata. The Guide form now offers an optional seed so a
+comparison can reuse it. Blank input preserves the existing model default;
+`-1` requests randomness, and explicit nonnegative integers must fit JavaScript's
+exact integer range. Invalid input disables submission before the API call.
+The existing Guide settings contract already accepts a seed.
+
+All 12 focused Guide UI checks, scoped ESLint, and the production TypeScript/Vite
+build passed. In the live local browser, a fractional seed showed the validation
+message and kept submission disabled; the recovered exact seed enabled the
+prepared two-still draft at frames 31 and 90 of a 124-frame clip. The draft adds
+only full-brightness/no-fade wording to the original prompt. No new generation
+or quality improvement is established by preparing it. The same GPU request
+remains queued, and no redundant full-suite run was made.

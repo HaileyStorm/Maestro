@@ -99,6 +99,7 @@ export function H3GuidePanel({
   const [pending, setPending] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [secondFrameIndexValue, setSecondFrameIndexValue] = useState('')
+  const [seedValue, setSeedValue] = useState('')
 
   const compatibleModels = resolveH3GuideModels(models, enabledModels, modelsLoaded)
   const selectedModel = compatibleModels.find(model => model.model_type === modelType)
@@ -108,11 +109,15 @@ export function H3GuidePanel({
   const secondFrameIndex = isInteriorH3GuideFrame(secondFrameIndexValue, targetFrameCount)
     ? Number(secondFrameIndexValue) : null
   const validSecondFrame = !secondStill || (secondFrameIndex !== null && secondFrameIndex !== frameIndex)
+  const validSeed = seedValue === '' || (
+    /^(?:-1|\d+)$/.test(seedValue) && Number.isSafeInteger(Number(seedValue))
+  )
   const canSubmit = Boolean(
     selectedModel
     && prompt.trim()
     && validFrame
     && validSecondFrame
+    && validSeed
     && !pending,
   )
 
@@ -136,7 +141,10 @@ export function H3GuidePanel({
         } : {}),
         model_type: selectedModel.model_type as typeof H3_GUIDE_MODEL_ORDER[number],
         prompt,
-        settings: { video_length: targetFrameCount },
+        settings: {
+          video_length: targetFrameCount,
+          ...(seedValue !== '' ? { seed: Number(seedValue) } : {}),
+        },
         private_output: still.private || Boolean(secondStill?.private),
         explicit_output: still.explicit || Boolean(secondStill?.explicit),
       })
@@ -229,6 +237,26 @@ export function H3GuidePanel({
               </select>
             </label>
           </div>
+          <label className="mt-3 flex flex-col gap-1 text-xs text-text-secondary">
+            <span>Seed (optional)</span>
+            <input
+              aria-label="Seed (optional)"
+              type="number"
+              min={-1}
+              max={Number.MAX_SAFE_INTEGER}
+              step={1}
+              value={seedValue}
+              onChange={event => setSeedValue(event.target.value)}
+              placeholder="Leave blank for model default"
+              disabled={pending}
+              className="min-h-11 rounded-md border border-border bg-bg-tertiary px-2 text-text-primary placeholder:text-text-muted"
+            />
+          </label>
+          <p className="mt-1 text-[11px] text-text-muted" aria-live="polite">
+            {validSeed
+              ? 'Reuse a whole-number seed to compare settings. Use -1 for a random seed.'
+              : 'Enter -1 or a whole number from 0 to 9007199254740991, or leave this blank.'}
+          </p>
           <label className="mt-3 flex flex-col gap-1 text-xs text-text-secondary">
             <span>Guide frame index (0-based)</span>
             <input

@@ -259,6 +259,46 @@ test('the panel requires an explicit frame and submits exact image revision, FL2
   }
 })
 
+test('Guide seed is optional, preserves exact reusable values, and rejects invalid values before submission', async () => {
+  const { H3GuidePanel } = await loadGuideModule()
+  const originalFetch = globalThis.fetch
+  const requests = []
+  globalThis.__h3GuideHookStates = []
+  globalThis.fetch = async (_url, options) => {
+    requests.push(JSON.parse(options.body))
+    return Response.json({ job_id: 'guide-job', status: 'queued' })
+  }
+  try {
+    const props = panelProps({ secondStill: output('second.png') })
+    let tree = openPanel(H3GuidePanel, props)
+    fillGuide(tree, { frame: '31', length: '124' })
+    findLabel(tree, 'Second guide frame index, 0-based').props.onChange({ target: { value: '90' } })
+    for (const seed of ['935314058', '0', '-1', '9007199254740991', '']) {
+      findLabel(tree, 'Seed (optional)').props.onChange({ target: { value: seed } })
+      tree = renderPanel(H3GuidePanel, props)
+      await flatten(tree).find(element => element.type === 'form').props.onSubmit({ preventDefault() {} })
+      const request = requests.at(-1)
+      assert.deepEqual(request.settings, { video_length: 124, ...(seed !== '' ? { seed: Number(seed) } : {}) })
+      assert.equal(request.frame_index, 31)
+      assert.equal(request.second_still.frame_index, 90)
+      tree = renderPanel(H3GuidePanel, props)
+    }
+    assert.equal(requests.length, 5)
+    for (const seed of ['-2', '1.5', '1e3', 'NaN', 'Infinity', '9007199254740992', ' ']) {
+      findLabel(tree, 'Seed (optional)').props.onChange({ target: { value: seed } })
+      tree = renderPanel(H3GuidePanel, props)
+      assert.equal(flatten(tree).find(element => element.type === 'button' && elementText(element) === 'Create guided clip').props.disabled, true)
+      assert.match(elementText(tree), /Enter -1 or a whole number/)
+      await flatten(tree).find(element => element.type === 'form').props.onSubmit({ preventDefault() {} })
+      assert.equal(requests.length, 5)
+    }
+  } finally {
+    globalThis.fetch = originalFetch
+    delete globalThis.__h3GuideHookStates
+    delete globalThis.__h3GuideHookIndex
+  }
+})
+
 test('the panel does not submit edge or fractional frame indices', async () => {
   const { H3GuidePanel } = await loadGuideModule()
   const originalFetch = globalThis.fetch
