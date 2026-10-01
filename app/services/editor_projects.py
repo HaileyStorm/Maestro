@@ -346,26 +346,119 @@ def apply_output_video_trim(
     ):
         raise EditorProjectError("Editor project belongs to a different workspace")
     try:
-        asset = current["assets"]["source-video"]
-        source_track = next(
-            track for track in proposed["tracks"] if track.get("id") == "video-main"
-        )
-        source_clip = source_track["items"][0]
-        start = float(source_clip["source_in"])
-        length = float(source_clip["duration"])
-        duration = float(asset["duration"])
+        originals = editor_sequence_clips(current)
+        proposed_items = next(track for track in proposed["tracks"] if track.get("id") == "video-main")["items"]
+        if len(proposed_items) != len(originals):
+            raise ValueError("clip count changed")
+        by_id = {clip["id"]: (asset, clip) for asset, clip in originals}
+        updated = copy.deepcopy(dict(current))
+        track = next(track for track in updated["tracks"] if track["id"] == "video-main")
+        items = []
+        position = 0.0
+        used = set()
+        for incoming in proposed_items:
+            # Retain the original single-cut API's id-less trim payload.
+            clip_id = incoming.get("id", originals[0][1]["id"] if len(originals) == 1 else None)
+            if clip_id in used or clip_id not in by_id:
+                raise ValueError("clip identity changed")
+            used.add(clip_id)
+            asset, original = by_id[clip_id]
+            start, length = incoming["source_in"], incoming["duration"]
+            if (type(start) not in (int, float) or type(length) not in (int, float)
+                    or not math.isfinite(start) or not math.isfinite(length)
+                    or start < 0 or length < 1 / 240
+                    or start + length > asset["duration"] + 1e-6):
+                raise ValueError("invalid range")
+            clip = copy.deepcopy(original)
+            clip.update(source_in=float(start), duration=float(length), start=position)
+            clip["take_states"][clip["asset_id"]]["source_in"] = float(start)
+            items.append(clip)
+            position += float(length)
+        if position > 86400:
+            raise ValueError("sequence too long")
+        track["items"] = items
     except (KeyError, IndexError, StopIteration, TypeError, ValueError):
         raise EditorProjectError("Select a valid source range") from None
-    if (
-        not all(math.isfinite(value) for value in (start, length, duration))
-        or start < 0 or length < 1 / 240
-        or start + length > duration + 1e-6
-    ):
-        raise EditorProjectError("Select a valid source range")
+    return updated
+
+
+def editor_sequence_clips(project: Mapping[str, Any]) -> list[tuple[dict, dict]]:
+    """Validate the closed sequential-video capability, without dropping layers."""
+    try:
+        tracks = project["tracks"]
+        main = [track for track in tracks if track["id"] == "video-main"]
+        if len(main) != 1 or main[0].get("type") != "video":
+            raise ValueError()
+        if any(track.get("items") for track in tracks if track is not main[0]):
+            raise ValueError()
+        if main[0].get("muted") or main[0].get("locked"):
+            raise ValueError()
+        clips = main[0]["items"]
+        assets = project["assets"]
+        if not 1 <= len(clips) <= 8 or len(assets) != len(clips):
+            raise ValueError()
+        result, ids, asset_ids = [], set(), set()
+        position = 0.0
+        for clip in clips:
+            asset_id, clip_id = clip["asset_id"], clip["id"]
+            asset = assets[asset_id]
+            start, length = clip["source_in"], clip["duration"]
+            expected = {
+                "id": clip_id, "asset_id": asset_id, "start": position,
+                "source_in": start, "duration": length,
+                "speed": 1.0, "volume": 1.0, "opacity": 1.0,
+                "fade_in": 0.0, "fade_out": 0.0,
+                "transition_in": "none", "transition_out": "none",
+                "take_asset_ids": [asset_id],
+                "take_states": {asset_id: {"source_in": start, "speed": 1.0}},
+                "transform": {"x": 0.0, "y": 0.0, "scale": 1.0, "rotation": 0.0},
+                "fit": "contain", "muted": False, "disabled": False,
+            }
+            if (clip != expected or clip_id in ids or asset_id in asset_ids
+                    or asset.get("type") != "video" or asset.get("origin") != "output"
+                    or asset.get("workspace") != project["workspace"]
+                    or type(start) not in (int, float) or type(length) not in (int, float)
+                    or not math.isfinite(start) or not math.isfinite(length)
+                    or start < 0 or length < 1 / 240
+                    or start + length > asset["duration"] + 1e-6):
+                raise ValueError()
+            ids.add(clip_id); asset_ids.add(asset_id)
+            position += length
+            result.append((asset, clip))
+        if position > 86400:
+            raise ValueError()
+        return result
+    except (KeyError, TypeError, ValueError):
+        raise EditorProjectError("This Editor timeline needs supported sequential video cuts") from None
+
+
+def append_output_video_clip(current: Mapping[str, Any], *, output_name: str,
+                             output_revision: str, media: Mapping[str, Any]) -> dict[str, Any]:
+    clips = editor_sequence_clips(current)
+    if len(clips) >= 8:
+        raise EditorProjectError("An Editor sequence supports up to eight clips")
+    if any(asset["output_id"] == output_name for asset, _ in clips):
+        raise EditorProjectError("This video is already in the sequence")
+    candidate = create_output_video_timeline(
+        workspace=current["workspace"], output_name=output_name,
+        output_revision=output_revision, media=media,
+    )
     updated = copy.deepcopy(dict(current))
-    track = next(track for track in updated["tracks"] if track["id"] == "video-main")
-    track["items"][0]["source_in"] = start
-    track["items"][0]["duration"] = length
+    # H.264/yuv420p needs even dimensions. Keep the first-source canvas,
+    # rounding an odd edge up one pixel when it becomes a sequence.
+    for dimension in ("width", "height"):
+        updated["canvas"][dimension] += updated["canvas"][dimension] % 2
+    token = uuid.uuid4().hex[:16]
+    asset_id = f"source-video-{token}"
+    asset = candidate["assets"]["source-video"]
+    asset["id"] = asset_id
+    updated["assets"][asset_id] = asset
+    clip = candidate["tracks"][0]["items"][0]
+    clip.update(id=f"source-clip-{token}", asset_id=asset_id,
+                start=sum(item["duration"] for _, item in clips),
+                take_asset_ids=[asset_id], take_states={asset_id: {"source_in": 0.0, "speed": 1.0}})
+    next(track for track in updated["tracks"] if track["id"] == "video-main")["items"].append(clip)
+    editor_sequence_clips(updated)
     return updated
 
 

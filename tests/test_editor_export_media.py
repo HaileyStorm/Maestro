@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import array
 import json
 from pathlib import Path
 import shutil
@@ -14,7 +15,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "app"))
-from services.editor_export import render_single_source_cut  # noqa: E402
+from services.editor_export import render_single_source_cut, render_video_sequence  # noqa: E402
 
 
 FFMPEG = shutil.which("ffmpeg")
@@ -80,6 +81,53 @@ class EditorExportMediaTests(unittest.TestCase):
         destination = self.root / "silent.mp4"
         render_single_source_cut(source, destination, source_in=1.0, duration=0.5, timeout=30)
         self.assertEqual([stream["codec_type"] for stream in self.probe(destination)["streams"]], ["video"])
+
+    def test_sequence_joins_mixed_canvas_fps_and_audio_at_exact_frames(self):
+        sources = []
+        for name, color, size, fps, audio in (("red", "red", "128x72", 24, True), ("blue", "blue", "72x128", 30, False)):
+            source = self.root / f"{name}.mp4"
+            command = [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                       "-f", "lavfi", "-i", f"color={color}:s={size}:r={fps}:d=2"]
+            if audio:
+                command += ["-f", "lavfi", "-i", "sine=frequency=440:duration=2", "-c:a", "aac"]
+            command += ["-c:v", "libx264", "-threads", "2", "-preset", "ultrafast", str(source)]
+            self.run_media(command)
+            sources.append(source)
+        hashes = [hashlib.sha256(path.read_bytes()).hexdigest() for path in sources]
+        clips = [{"path": str(path), "source_in": 0.25, "duration": 0.55, "has_audio": index == 0}
+                 for index, path in enumerate(sources)]
+        destination = self.root / "sequence.mp4"
+        render_video_sequence(clips, destination, width=128, height=72, fps=24, timeout=30)
+        media = self.probe(destination)
+        self.assertEqual([(stream["codec_type"], stream["codec_name"]) for stream in media["streams"]], [("video", "h264"), ("audio", "aac")])
+        self.assertAlmostEqual(float(media["streams"][0]["duration"]), 26 / 24, delta=0.001)
+        pixels = self.run_media([FFMPEG, "-v", "error", "-i", str(destination), "-map", "0:v", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"])
+        stride = 128 * 72 * 3
+        self.assertEqual(len(pixels), stride * 26)
+        center = (36 * 128 + 64) * 3
+        for frame in (0, 12):
+            red, _, blue = pixels[frame * stride + center:frame * stride + center + 3]
+            self.assertGreater(red, 200)
+            self.assertLess(blue, 30)
+        for frame in (13, 25):
+            red, _, blue = pixels[frame * stride + center:frame * stride + center + 3]
+            self.assertLess(red, 30)
+            self.assertGreater(blue, 200)
+        # Portrait source is fitted, preserving black letterbox outside the image.
+        self.assertLess(max(pixels[13 * stride:13 * stride + 3]), 10)
+        samples = array.array("f", self.run_media([FFMPEG, "-v", "error", "-i", str(destination), "-map", "0:a", "-ac", "1", "-ar", "48000", "-f", "f32le", "-"]))
+        self.assertGreater(max(abs(value) for value in samples[4800:19200]), 0.03)
+        self.assertLess(max(abs(value) for value in samples[33600:43200]), 0.001)
+        self.assertEqual([hashlib.sha256(path.read_bytes()).hexdigest() for path in sources], hashes)
+        def cancelled(command, **_options):
+            Path(command[-1]).write_bytes(b"partial")
+            return 0
+        with self.assertRaises(InterruptedError):
+            render_video_sequence(clips, self.root / "cancelled.mp4", width=128, height=72, fps=24, runner=cancelled, abort_check=lambda: True)
+        self.assertFalse((self.root / "cancelled.mp4").exists())
+        with self.assertRaises(FileExistsError):
+            render_video_sequence(clips, destination, width=128, height=72, fps=24)
+        self.assertFalse(list(self.root.glob(".editor-sequence-*")))
 
     def test_failed_or_cancelled_render_never_replaces_an_output(self):
         source = self.make_source(audio_tracks=0)

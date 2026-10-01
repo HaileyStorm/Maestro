@@ -32,6 +32,8 @@ from services import editor_projects as editor_project_service  # noqa: E402
 from services.editor_projects import (  # noqa: E402
     EditorProjectError,
     apply_output_video_trim,
+    append_output_video_clip,
+    editor_sequence_clips,
     create_editor_project,
     create_output_video_timeline,
     list_editor_projects,
@@ -92,6 +94,40 @@ class TestEditorProjectFoundation(unittest.TestCase):
             apply_output_video_trim(first, dict(proposed, tracks=[{
                 "id": "video-main", "items": [{"source_in": 19.0, "duration": 4.0}],
             }]))
+
+    def test_sequence_reorder_trim_keeps_server_assets_and_rejects_identity_changes(self):
+        self._workspace("scene")
+        media = {"type": "video", "duration": 3.0, "width": 127, "height": 71, "fps": 24}
+        first = create_output_video_timeline(workspace="scene", output_name="first.mp4", output_revision="first", media=media)
+        sequence = append_output_video_clip(first, output_name="second.mp4", output_revision="second", media=media)
+        self.assertEqual((sequence["canvas"]["width"], sequence["canvas"]["height"]), (128, 72))
+        proposed = copy.deepcopy(sequence)
+        proposed["tracks"][0]["items"].reverse()
+        proposed["tracks"][0]["items"][0].update(source_in=0.5, duration=1.25, start=999, asset_id="forged")
+        updated = apply_output_video_trim(sequence, proposed)
+        pairs = editor_sequence_clips(updated)
+        self.assertEqual([asset["output_id"] for asset, _ in pairs], ["second.mp4", "first.mp4"])
+        self.assertEqual([clip["start"] for _, clip in pairs], [0, 1.25])
+        self.assertEqual(updated["assets"], sequence["assets"])
+        saved = save_editor_project(self.outputs, "scene", updated, expected_revision=0)
+        self.assertEqual(len(editor_sequence_clips(load_editor_project(self.outputs, "scene", saved["id"]))), 2)
+        for mode in ("duplicate", "missing", "unknown"):
+            invalid = copy.deepcopy(proposed)
+            items = invalid["tracks"][0]["items"]
+            if mode == "duplicate":
+                items[1]["id"] = items[0]["id"]
+            elif mode == "missing":
+                items.pop()
+            else:
+                items[0]["id"] = "unknown"
+            with self.subTest(mode=mode), self.assertRaises(EditorProjectError):
+                apply_output_video_trim(sequence, invalid)
+        with self.assertRaisesRegex(EditorProjectError, "already"):
+            append_output_video_clip(sequence, output_name="second.mp4", output_revision="second", media=media)
+        for index in range(6):
+            sequence = append_output_video_clip(sequence, output_name=f"more-{index}.mp4", output_revision="revision", media=media)
+        with self.assertRaisesRegex(EditorProjectError, "eight"):
+            append_output_video_clip(sequence, output_name="overflow.mp4", output_revision="revision", media=media)
 
     def test_round_trip_and_stale_autosave_cannot_overwrite_newer_edit(self):
         self._workspace("scene-a")

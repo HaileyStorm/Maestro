@@ -4911,6 +4911,19 @@ export async function saveEditorProject(project: string, timeline: EditorProject
   return (await res.json()).project as EditorProject
 }
 
+export async function appendEditorClip(project: string, timeline: EditorProject, name: string, revision: string): Promise<EditorProject> {
+  const res = await fetch(`${BASE}/api/v1/projects/${encodeURIComponent(project)}/editor/projects/${encodeURIComponent(timeline.id)}/clips`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ expected_revision: timeline.revision, output_name: name, output_revision: revision }),
+  })
+  if (!res.ok) {
+    if (res.status === 422) throw new ProjectAssetRequestError(422, 'Choose another video from this project. A sequence can contain up to 8 clips (HTTP 422)')
+    throw editorRequestError(res.status, 'Unable to add this video to the sequence')
+  }
+  return (await res.json()).project as EditorProject
+}
+
 export async function exportEditorProject(project: string, timeline: EditorProject): Promise<{ job_id: string; status: string }> {
   const res = await fetch(`${BASE}/api/v1/projects/${encodeURIComponent(project)}/editor/projects/${encodeURIComponent(timeline.id)}/exports`, {
     method: 'POST',
@@ -4923,7 +4936,7 @@ export async function exportEditorProject(project: string, timeline: EditorProje
       403: 'You do not have permission to export from this project',
       404: 'This Editor draft is no longer available',
       409: 'The draft or source changed. Return to Gallery and reopen the video',
-      422: 'Only a single source video cut can be exported right now',
+      422: 'This sequence cannot be exported. Check that it contains 1–8 valid video clips',
       423: 'Unlock this project before exporting',
       503: 'Editor export is temporarily unavailable',
     }
