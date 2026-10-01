@@ -2090,3 +2090,28 @@ Private job receipts, hashes, frame samples and browser proof remain in the
 untracked two-still acceptance artifact. Investigate the black opening frames
 before visual qualification; human acceptance, broader Guide media, Control and
 native continuation remain separate gates.
+
+### Opening-frame diagnosis after app recovery
+
+CPU inspection of the retained pair shows a fade over approximately the first
+24 frames, rather than three isolated black frames followed by a fully lit
+scene. Mean RGB at a 64 × 36 analysis scale rises from 0 at frame 0 to 7.80 at
+frame 3, 80.86 at frame 11, and 200.66 at frame 24. The prior one-still sample
+is bright from frame 0, but its prompt and conditioning differ, so it is not a
+controlled comparison of the pair extension.
+
+Two model-free probes narrowed the investigation. The actual VAE temporal
+assembly, supplied with a constant bright stub decoder, produced all 124 frames
+at the same brightness. The production CPU HEVC writer, supplied with a bright
+uint8 chunk, preserved the first 32 inspected frames without a black opening.
+A bounded independent source review also found no opening pad or fade in the
+condition-row slicing, assembly, or fixed brightness conversion. These checks
+do not execute the learned VAE or denoising model and do not establish a cause.
+
+No source fix, frame removal, anchor shift, new generation, or full-suite rerun
+is claimed by this diagnosis. The next native quality comparison should state
+full brightness from frame 0 and no fade explicitly, preserve the 124-frame
+timeline and both interior guides, and use a fresh validated GPU lease. Without
+retained pre-encoding output or latents, the existing result cannot localize
+the darkness to denoising versus learned VAE decoding. Private probe inputs,
+script, hashes and results are retained in the opening-diagnosis artifact.
