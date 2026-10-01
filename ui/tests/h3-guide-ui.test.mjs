@@ -15,7 +15,7 @@ function loadGuideModule() {
   if (guideModulePromise) return guideModulePromise
   guideModulePromise = build({
     stdin: {
-      contents: "export { H3GuidePanel, H3_GUIDE_TARGET_FRAMES, isInteriorH3GuideFrame, resolveH3GuideModels, resolveH3GuideSelection } from './src/components/MainContent/H3GuidePanel.tsx'; export { submitH3GalleryStillGuide } from './src/api/client'",
+      contents: "export { H3GuidePanel, H3_GUIDE_TARGET_FRAMES, isInteriorH3GuideFrame, resolveH3GuideModels, resolveH3GuideSelection, resolveH3GuideSelections } from './src/components/MainContent/H3GuidePanel.tsx'; export { submitH3GalleryStillGuide } from './src/api/client'",
       resolveDir: UI_ROOT,
       loader: 'js',
     },
@@ -124,7 +124,7 @@ function renderPanel(Component, props) {
 function openPanel(Component, props) {
   const firstRender = renderPanel(Component, props)
   const openButton = flatten(firstRender).find(element => (
-    element.type === 'button' && elementText(element) === 'Use still as guide'
+    element.type === 'button' && /^Use stills? as guides?$/.test(elementText(element))
   ))
   assert.ok(openButton)
   openButton.props.onClick()
@@ -216,7 +216,7 @@ test('the panel requires an explicit frame and submits exact image revision, FL2
     assert.equal(flatten(tree).find(element => element.type === 'button' && elementText(element) === 'Create guided clip').props.disabled, true)
     assert.match(elementText(tree), /one Gallery still as a visual guide for one interior frame/)
     assert.match(elementText(tree), /base FL2VA model only; PinkCherry and W4A8 variants are not included/)
-    assert.match(elementText(tree), /does not use guide video, audio, or multiple guide images/)
+    assert.match(elementText(tree), /does not use guide video or audio/)
     fillGuide(tree)
     const modelSelector = findLabel(tree, 'FL2VA model')
     assert.equal(flatten(modelSelector).filter(element => element.type === 'option').length, 1)
@@ -389,5 +389,62 @@ test('Gallery integration reconnects accepted guide jobs before opening Queue', 
   assert.match(integration, /await useStore\.getState\(\)\.reconnectJobs\(\)/)
   assert.match(integration, /requestQueueView\(\)/)
   assert.match(integration, /QUEUE_REFRESH_EVENT/)
-  assert.match(source, /resolveH3GuideSelection\(outputs, selected, activeWorkspace, canGenerateBridge\)/)
+  assert.match(source, /resolveH3GuideSelections\(outputs, selected, activeWorkspace, canGenerateBridge\)/)
+})
+
+test('two-guide selection preserves source order and rejects mixed, duplicate or stale selections', async () => {
+  const { resolveH3GuideSelections } = await loadGuideModule()
+  const first = output('first.png')
+  const second = output('second.png')
+  assert.deepEqual(resolveH3GuideSelections([first, second], [key(second), key(first)], 'project-a', true), [second, first])
+  assert.equal(resolveH3GuideSelections([first, second], [key(first), key(first)], 'project-a', true), null)
+  assert.equal(resolveH3GuideSelections([first, second], [key(first), key(second)], 'project-a', false), null)
+  assert.equal(resolveH3GuideSelections([first, { ...second, revision: '' }], [key(first), key(second)], 'project-a', true), null)
+  assert.equal(resolveH3GuideSelections([first, { ...second, type: 'video' }], [key(first), key(second)], 'project-a', true), null)
+  assert.equal(resolveH3GuideSelections([first, second], [key(first), key(second), 'missing'], 'project-a', true), null)
+})
+
+test('two-guide panel requires distinct positions, binds both revisions and inherits second privacy', async () => {
+  const { H3GuidePanel } = await loadGuideModule()
+  const originalFetch = globalThis.fetch
+  const requests = []
+  let current = true
+  globalThis.__h3GuideHookStates = []
+  globalThis.fetch = async (url, options) => {
+    requests.push(JSON.parse(options.body))
+    return Response.json({ job_id: 'pair-job', status: 'queued' })
+  }
+  try {
+    const props = panelProps({
+      still: output('first.png'),
+      secondStill: output('second.png', { private: true, explicit: true }),
+      isCurrentSelection: () => current,
+    })
+    let tree = openPanel(H3GuidePanel, props)
+    assert.match(elementText(tree), /Guide two frames with H3/)
+    assert.match(elementText(tree), /second.png/)
+    fillGuide(tree)
+    let secondField = findLabel(tree, 'Second guide frame index, 0-based')
+    assert.equal(secondField.props.value, '')
+    secondField.props.onChange({ target: { value: '62' } })
+    tree = renderPanel(H3GuidePanel, props)
+    assert.match(elementText(tree), /Choose two different guide frame indices/)
+    assert.equal(flatten(tree).find(element => elementText(element) === 'Create guided clip').props.disabled, true)
+    findLabel(tree, 'Second guide frame index, 0-based').props.onChange({ target: { value: '31' } })
+    tree = renderPanel(H3GuidePanel, props)
+    await flatten(tree).find(element => element.type === 'form').props.onSubmit({ preventDefault() {} })
+    assert.equal(requests.length, 1)
+    assert.equal(requests[0].frame_index, 62)
+    assert.deepEqual(requests[0].second_still, { name: 'second.png', revision: 'revision-second.png', frame_index: 31 })
+    assert.equal(requests[0].private_output, true)
+    assert.equal(requests[0].explicit_output, true)
+    current = false
+    tree = renderPanel(H3GuidePanel, props)
+    await flatten(tree).find(element => element.type === 'form').props.onSubmit({ preventDefault() {} })
+    assert.equal(requests.length, 1)
+  } finally {
+    globalThis.fetch = originalFetch
+    delete globalThis.__h3GuideHookStates
+    delete globalThis.__h3GuideHookIndex
+  }
 })

@@ -1,4 +1,4 @@
-"""Bounded validation for one project Gallery still used by H3 AddGuide."""
+"""Bounded source and replay validation for one or two Gallery H3 still guides."""
 
 from __future__ import annotations
 
@@ -234,6 +234,54 @@ def make_gallery_still_guide_source(
     }
 
 
+def build_gallery_still_guide_pair_plan(
+    *, sha256: str, frame_index: int, second_sha256: str,
+    second_frame_index: int, target_frames: int,
+) -> dict[str, Any]:
+    """Seal two stills in Picture order at distinct interior target frames."""
+    for digest, index in ((sha256, frame_index), (second_sha256, second_frame_index)):
+        build_gallery_still_guide_plan(
+            sha256=digest, frame_index=index, target_frames=target_frames,
+        )
+    if frame_index == second_frame_index:
+        raise H3GalleryStillGuideError("Guide frames must be distinct")
+    try:
+        return plan_h3_guide_inputs(
+            target_frames,
+            [{"frame_idx": index, "visual": {"sha256": digest, "count": 1}, "audio": None}
+             for digest, index in ((sha256, frame_index), (second_sha256, second_frame_index))],
+            conditioning_family="fl2va_timeline",
+        )
+    except (H3GuidePlanError, TypeError, ValueError) as error:
+        raise H3GalleryStillGuideError("Guide plan is invalid") from error
+
+
+def make_gallery_still_guide_pair_source(
+    first: Mapping[str, Any], second: Mapping[str, Any],
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind both independently authorized source records to their joint plan."""
+    if (
+        not isinstance(first, Mapping) or set(first) != _SOURCE_FIELDS
+        or not isinstance(second, Mapping) or set(second) != _SOURCE_FIELDS
+        or first["workspace"] != second["workspace"]
+        or first["name"] == second["name"]
+        or first["target_frames"] != second["target_frames"]
+    ):
+        raise H3GalleryStillGuideError("Guide sources are inconsistent")
+    expected = build_gallery_still_guide_pair_plan(
+        sha256=first["sha256"], frame_index=first["frame_index"],
+        second_sha256=second["sha256"], second_frame_index=second["frame_index"],
+        target_frames=first["target_frames"],
+    )
+    if validate_h3_guide_plan(dict(plan)) != expected:
+        raise H3GalleryStillGuideError("Guide plan does not match both selected stills")
+    return {
+        **dict(first), "plan_sha256": expected["plan_sha256"],
+        "second_source": {**dict(second), "plan_sha256": expected["plan_sha256"]},
+    }
+
+
 def validate_gallery_still_guide_job(
     params: Mapping[str, Any],
     *,
@@ -251,6 +299,14 @@ def validate_gallery_still_guide_job(
     if not isinstance(params, Mapping):
         raise H3GalleryStillGuideError("Guide request is invalid")
     source = params.get(H3_GALLERY_STILL_GUIDE_SOURCE_KEY)
+    if isinstance(source, Mapping) and "second_source" in source:
+        return _validate_gallery_still_guide_pair_job(
+            params, workspace=workspace, out_dir=out_dir,
+            safe_direct_file_under=safe_direct_file_under,
+            output_revision=output_revision, load_sidecars=load_sidecars,
+            classify_artifacts=classify_artifacts, integrity_pending=integrity_pending,
+            job_private=job_private, job_explicit=job_explicit,
+        )
     plan = params.get(H3_GALLERY_STILL_GUIDE_PLAN_KEY)
     custom = params.get("custom_settings")
     private_setting = (
@@ -306,6 +362,7 @@ def validate_gallery_still_guide_job(
         or str((custom.get("h3_source_audio_mode") if isinstance(custom, Mapping) else "native") or "native").strip().lower() != "native"
         or params.get("h3_native_boundary_conditioning") is True
         or (isinstance(custom, Mapping) and custom.get("h3_native_boundary_conditioning") is True)
+        or params.get("trim_tail_frames", 0) != 0
         or params.get("multi_prompts_gen_type") == 3
         or params.get("multi_clip_info") not in (None, "", [])
         or params.get("_h3_longform") not in (None, "", {})
@@ -386,6 +443,70 @@ def validate_gallery_still_guide_job(
     }
 
 
+def _validate_gallery_still_guide_pair_job(
+    params: Mapping[str, Any], **validation: Any,
+) -> dict[str, Any]:
+    """Revalidate both sources with the existing exact one-still replay gate."""
+    source = params[H3_GALLERY_STILL_GUIDE_SOURCE_KEY]
+    if set(source) != _SOURCE_FIELDS | {"second_source"}:
+        raise H3GalleryStillGuideError("Guide request binding is invalid")
+    first = {key: value for key, value in source.items() if key != "second_source"}
+    second = source["second_source"]
+    custom = params.get("custom_settings")
+    setting = custom.get(H3_GALLERY_STILL_GUIDE_CUSTOM_KEY) if isinstance(custom, Mapping) else None
+    if (
+        not isinstance(second, Mapping) or set(second) != _SOURCE_FIELDS
+        or type(setting) is not dict or set(setting) != {"frame_index", "end_frame_index"}
+        or type(setting["frame_index"]) is not int
+        or type(setting["end_frame_index"]) is not int
+        or setting["frame_index"] != first["frame_index"]
+        or setting["end_frame_index"] != second["frame_index"]
+        or first["workspace"] != second["workspace"]
+        or first["name"] == second["name"]
+        or first["target_frames"] != second["target_frames"]
+        or not isinstance(params.get("image_end"), (str, os.PathLike))
+    ):
+        raise H3GalleryStillGuideError("Guide request does not bind two distinct stills")
+    expected = build_gallery_still_guide_pair_plan(
+        sha256=first["sha256"], frame_index=first["frame_index"],
+        second_sha256=second["sha256"], second_frame_index=second["frame_index"],
+        target_frames=first["target_frames"],
+    )
+    try:
+        plan = validate_h3_guide_plan(params.get(H3_GALLERY_STILL_GUIDE_PLAN_KEY))
+    except (H3GuidePlanError, TypeError, ValueError) as error:
+        raise H3GalleryStillGuideError("Guide plan is invalid") from error
+    if (
+        plan != expected
+        or first["plan_sha256"] != plan["plan_sha256"]
+        or second["plan_sha256"] != plan["plan_sha256"]
+    ):
+        raise H3GalleryStillGuideError("Guide plan does not match both selected stills")
+    results = []
+    for item, path in ((first, params.get("image_start")), (second, params["image_end"])):
+        single_plan = build_gallery_still_guide_plan(
+            sha256=item["sha256"], frame_index=item["frame_index"],
+            target_frames=item["target_frames"],
+        )
+        single_params = {
+            **dict(params), "image_start": path, "image_end": None,
+            H3_GALLERY_STILL_GUIDE_SOURCE_KEY: {
+                **dict(item), "plan_sha256": single_plan["plan_sha256"],
+            },
+            H3_GALLERY_STILL_GUIDE_PLAN_KEY: single_plan,
+            "custom_settings": {
+                **dict(custom),
+                H3_GALLERY_STILL_GUIDE_CUSTOM_KEY: {"frame_index": item["frame_index"]},
+            },
+        }
+        results.append(validate_gallery_still_guide_job(single_params, **validation))
+    return {
+        **results[0], "plan_sha256": plan["plan_sha256"], "guide_count": 2,
+        "frame_indices": [item["frame_index"] for item in results],
+        "sources": results,
+    }
+
+
 __all__ = [
     "GalleryStillProbe",
     "H3_GALLERY_STILL_GUIDE_CUSTOM_KEY",
@@ -394,6 +515,8 @@ __all__ = [
     "H3_GALLERY_STILL_GUIDE_SOURCE_KEY",
     "H3GalleryStillGuideError",
     "build_gallery_still_guide_plan",
+    "build_gallery_still_guide_pair_plan",
+    "make_gallery_still_guide_pair_source",
     "make_gallery_still_guide_source",
     "probe_gallery_still",
     "validate_gallery_still_guide_job",

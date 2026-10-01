@@ -26,6 +26,8 @@ from services.h3_gallery_still_guide import (
     H3_GALLERY_STILL_GUIDE_SOURCE_KEY,
     H3GalleryStillGuideError,
     build_gallery_still_guide_plan,
+    build_gallery_still_guide_pair_plan,
+    make_gallery_still_guide_pair_source,
     make_gallery_still_guide_source,
     probe_gallery_still,
     validate_gallery_still_guide_job,
@@ -80,9 +82,9 @@ def load_nested_launch_function(namespace: dict, outer_name: str, nested_name: s
 
 
 class StillSourceFixture:
-    def __init__(self, root: Path, *, private: bool = True, explicit: bool = True):
+    def __init__(self, root: Path, *, private: bool = True, explicit: bool = True, name: str = "guide.png"):
         self.root = root
-        self.path = root / "guide.png"
+        self.path = root / name
         self.save_image((210, 30, 50))
         self.sidecar = {
             "workspace": "project-a",
@@ -91,7 +93,7 @@ class StillSourceFixture:
             "private": private,
             "explicit": explicit,
         }
-        (root / "guide.meta.json").write_text(
+        (root / (self.path.stem + ".meta.json")).write_text(
             __import__("json").dumps(self.sidecar), encoding="utf-8",
         )
 
@@ -149,6 +151,134 @@ class StillSourceFixture:
             H3_GALLERY_STILL_GUIDE_SOURCE_KEY: source,
             H3_GALLERY_STILL_GUIDE_PLAN_KEY: plan,
         }
+
+
+class H3GalleryStillGuidePairServiceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.first = StillSourceFixture(self.root, private=False, explicit=False)
+        self.second = StillSourceFixture(self.root, name="second.png")
+        self.second.save_image((0, 200, 30))
+
+    def params(self):
+        params = self.first.params()
+        first = params[H3_GALLERY_STILL_GUIDE_SOURCE_KEY]
+        probe = probe_gallery_still(str(self.second.path))
+        single = build_gallery_still_guide_plan(sha256=probe.sha256, frame_index=90, target_frames=124)
+        second = make_gallery_still_guide_source(
+            workspace="project-a", name="second.png", revision="revision-1",
+            probe=probe, frame_index=90, target_frames=124, plan=single,
+            source_private=True, source_explicit=True,
+        )
+        joint = build_gallery_still_guide_pair_plan(
+            sha256=first["sha256"], frame_index=62,
+            second_sha256=second["sha256"], second_frame_index=90, target_frames=124,
+        )
+        params[H3_GALLERY_STILL_GUIDE_SOURCE_KEY] = make_gallery_still_guide_pair_source(first, second, joint)
+        params[H3_GALLERY_STILL_GUIDE_PLAN_KEY] = joint
+        params["image_end"] = str(self.second.path)
+        params["custom_settings"][H3_GALLERY_STILL_GUIDE_CUSTOM_KEY] = {"frame_index":62,"end_frame_index":90}
+        return params
+
+    def test_binds_both_stills_in_picture_order_without_mutating_request(self):
+        params = self.params()
+        before = copy.deepcopy(params)
+        result = self.first.validate(params)
+        self.assertEqual(result["guide_count"], 2)
+        self.assertEqual(result["frame_indices"], [62,90])
+        self.assertEqual([s["name"] for s in result["sources"]], ["guide.png","second.png"])
+        self.assertEqual(params, before)
+
+    def test_worker_manifest_keeps_second_still_and_full_target_without_endpoint_trim(self):
+        import ast
+
+        params = self.params()
+        # Recovery can carry an old endpoint trim; the worker must override it.
+        params["trim_tail_frames"] = 17
+        fake_wgp = types.SimpleNamespace(
+            task_id=1, get_model_min_frames_and_step=lambda _model: (124, 17, 345),
+        )
+        namespace = {"wgp": fake_wgp, "raw_params": params}
+        load_launch_functions(namespace, "_apply_generation_end_image_trim")
+        tree = ast.parse((ROOT / "app/launch.py").read_text())
+        worker = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_run_generation")
+        # Execute the actual single-clip worker manifest branch, with no model
+        # or worker loop loaded. This exercises the slot/trim handoff to WGP.
+        branch = next(node.orelse for node in ast.walk(worker) if isinstance(node, ast.If) and any(
+            isinstance(item, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "manifest" for target in item.targets)
+            and isinstance(item.value, ast.List) for item in node.orelse
+        ))
+        exec(compile(ast.Module(body=branch, type_ignores=[]), "launch.py", "exec"), namespace)
+        prepared = namespace["manifest"][0]["params"]
+        self.assertEqual(prepared["trim_tail_frames"], 0)
+        self.assertEqual(prepared["video_length"], 124)
+        self.assertEqual(prepared["image_end"], str(self.second.path))
+        self.assertEqual(self.first.validate(prepared)["frame_indices"], [62, 90])
+        ordinary = {"model_type": "minimax_h3", "video_length": 124, "image_end": str(self.second.path)}
+        namespace["_apply_generation_end_image_trim"](ordinary)
+        self.assertEqual(ordinary["trim_tail_frames"], 17)
+        # Unvalidated replay cannot publish a shortened timeline as this plan.
+        prepared["trim_tail_frames"] = 17
+        with self.assertRaises(H3GalleryStillGuideError):
+            self.first.validate(prepared)
+
+    def test_rejects_changed_second_image_bytes_despite_same_revision_callback(self):
+        params = self.params()
+        self.second.save_image((0,0,200))
+        with self.assertRaises(H3GalleryStillGuideError):
+            self.first.validate(params)
+
+    def test_rejects_second_source_path_substitution(self):
+        params = self.params()
+        params["image_end"] = params["image_start"]
+        with self.assertRaises(H3GalleryStillGuideError):
+            self.first.validate(params)
+
+    def test_requires_private_and_explicit_flags_from_second_source(self):
+        for flags in ({"job_private":False}, {"job_explicit":False}):
+            with self.subTest(flags=flags), self.assertRaises(H3GalleryStillGuideError):
+                self.first.validate(self.params(), **flags)
+
+    def test_rejects_second_project_binding_drift(self):
+        params = self.params()
+        sidecar = dict(self.second.sidecar, workspace="project-b")
+        (self.root/"second.meta.json").write_text(__import__("json").dumps(sidecar))
+        with self.assertRaises(H3GalleryStillGuideError):
+            self.first.validate(params)
+
+    def test_rejects_duplicate_or_noninteger_or_endpoint_frames(self):
+        first = self.params()[H3_GALLERY_STILL_GUIDE_SOURCE_KEY]
+        for frame in (62,0,123,True,90.0):
+            with self.subTest(frame=frame), self.assertRaises(H3GalleryStillGuideError):
+                build_gallery_still_guide_pair_plan(
+                    sha256=first["sha256"], frame_index=62,
+                    second_sha256=first["second_source"]["sha256"],
+                    second_frame_index=frame, target_frames=124,
+                )
+
+    def test_rejects_reordered_joint_plan_or_custom_frame_drift(self):
+        params = self.params()
+        source = params[H3_GALLERY_STILL_GUIDE_SOURCE_KEY]
+        params[H3_GALLERY_STILL_GUIDE_PLAN_KEY] = build_gallery_still_guide_pair_plan(
+            sha256=source["second_source"]["sha256"], frame_index=90,
+            second_sha256=source["sha256"], second_frame_index=62, target_frames=124,
+        )
+        with self.assertRaises(H3GalleryStillGuideError): self.first.validate(params)
+        params = self.params()
+        params["custom_settings"][H3_GALLERY_STILL_GUIDE_CUSTOM_KEY]["end_frame_index"] = 89
+        with self.assertRaises(H3GalleryStillGuideError): self.first.validate(params)
+
+    def test_rejects_unbound_additional_media_and_second_revision_drift(self):
+        for field in ("audio_guide","video_guide","image_refs"):
+            params = self.params()
+            params[field] = ["unbound.png"] if field == "image_refs" else "unbound.mp4"
+            with self.subTest(field=field), self.assertRaises(H3GalleryStillGuideError):
+                self.first.validate(params)
+        params = self.params()
+        self.first.revision = lambda path, root, name: "revision-2" if name == "second.png" else "revision-1"
+        with self.assertRaises(H3GalleryStillGuideError): self.first.validate(params)
 
 
 class H3GalleryStillGuideServiceTests(unittest.TestCase):
@@ -553,12 +683,85 @@ class H3GalleryStillGuideRouteTests(unittest.TestCase):
             "_GenerationPreparationRequest": FakePreparationRequest,
             "generate": generate,
         }
-        load_launch_functions(self.ns, "h3_gallery_still_guide_endpoint")
+        load_launch_functions(self.ns, "_resolve_h3_gallery_still_guide_source", "h3_gallery_still_guide_endpoint")
 
     def _authorized_output(self, _request, workspace, name):
         if workspace != "project-a" or name != self.source.path.name:
             raise HTTPException(404, "Output file not found")
         return str(self.root), str(self.source.path), self.source.sidecar
+
+    def pair_request(self, **changes):
+        self.source = StillSourceFixture(self.root, private=False, explicit=False)
+        self.second = StillSourceFixture(self.root, name="second.png")
+        self.authorized_names = []
+
+        def authorize(_request, workspace, name):
+            self.authorized_names.append(name)
+            source = next((item for item in (self.source, self.second) if item.path.name == name), None)
+            if workspace != "project-a" or source is None:
+                raise HTTPException(404, "Output file not found")
+            return str(self.root), str(source.path), source.sidecar
+
+        self.ns["_require_authorized_output"] = authorize
+        self.ns["load_media_sidecars"] = load_media_sidecars
+        self.ns["_inherit_media_access_policy"] = lambda *_args: {"private": False, "explicit": False}
+        return self.request(second_still={
+            "name": self.second.path.name, "revision": "revision-1", "frame_index": 90,
+        }, **changes)
+
+    def test_pair_route_authorizes_both_sources_and_preserves_second_privacy(self):
+        response = asyncio.run(self.ns["h3_gallery_still_guide_endpoint"](self.pair_request()))
+        self.assertEqual(self.authorized_names, ["guide.png", "second.png"])
+        self.assertEqual(response["h3_guide_execution"]["guide_count"], 2)
+        self.assertEqual(response["h3_guide_execution"]["frame_indices"], [62, 90])
+        params = self.queued[0]
+        self.assertEqual(params["image_start"], str(self.source.path))
+        self.assertEqual(params["image_end"], str(self.second.path))
+        # WGP's input cleaning retains the second image only in SE mode.
+        self.assertEqual(params["image_prompt_type"], "SE")
+        self.assertTrue(params["private_output"])
+        self.assertTrue(params["explicit_output"])
+        self.assertEqual(params["custom_settings"][H3_GALLERY_STILL_GUIDE_CUSTOM_KEY], {
+            "frame_index": 62, "end_frame_index": 90,
+        })
+        receipt = self.source.validate(params)
+        self.assertEqual(receipt["frame_indices"], [62, 90])
+        self.assertEqual(self.preparation_request.state.maestro_account_session_id, "")
+        self.assertEqual(self.admission_markers, ["s" * 32])
+
+    def test_pair_route_rejects_invalid_and_stale_second_source_before_queue(self):
+        request = self.pair_request()
+        self.ns["_output_revision"] = lambda _path, _root, name: "changed" if name == "second.png" else "revision-1"
+        with self.assertRaises(HTTPException) as error:
+            asyncio.run(self.ns["h3_gallery_still_guide_endpoint"](request))
+        self.assertEqual(error.exception.status_code, 409)
+        self.assertEqual(self.queued, [])
+
+        for second in (
+            None, {"name": "second.png", "revision": "revision-1", "frame_index": True},
+            {"name": "second.png", "revision": "revision-1", "frame_index": 62},
+            {"name": "guide.png", "revision": "revision-1", "frame_index": 90},
+            {"name": "second.png", "revision": "revision-1", "frame_index": 123},
+            {"name": "second.png", "revision": "revision-1", "frame_index": 90, "path": "foreign"},
+        ):
+            self.ns["_output_revision"] = lambda *_args: "revision-1"
+            with self.subTest(second=second), self.assertRaises(HTTPException) as error:
+                asyncio.run(self.ns["h3_gallery_still_guide_endpoint"](self.request(second_still=second)))
+            self.assertEqual(error.exception.status_code, 400)
+        self.assertEqual(self.queued, [])
+
+    def test_pair_route_preserves_authorized_creative_prompts(self):
+        for prompt in (
+            "Two consenting adult lovers in an intimate bedroom scene.",
+            "A battlefield aftermath with blood and destroyed vehicles.",
+            "A controversial political satire in a city square.",
+        ):
+            with self.subTest(prompt=prompt):
+                response = asyncio.run(self.ns["h3_gallery_still_guide_endpoint"](self.pair_request(prompt=prompt)))
+                self.assertEqual(response["job_id"], "job-guide")
+                self.assertEqual(self.queued[-1]["prompt"], prompt)
+                self.assertEqual(self.queued[-1]["image_end"], str(self.second.path))
+                self.assertEqual(self.source.validate(self.queued[-1])["guide_count"], 2)
 
     def request(self, **changes):
         body = {

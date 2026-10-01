@@ -6,7 +6,7 @@ import { MediaFeedItem } from './MediaFeedItem'
 import { GalleryViewer } from './GalleryViewer'
 import { ProjectAccessPanel } from './ProjectAccessPanel'
 import { H3BridgePanel, resolveH3BridgeSelection } from './H3BridgePanel'
-import { H3GuidePanel, resolveH3GuideSelection } from './H3GuidePanel'
+import { H3GuidePanel, resolveH3GuideSelections } from './H3GuidePanel'
 import { LlmChat } from '../LlmChat'
 import { H3DeliveryRecoveryStatus, OPEN_GALLERY_EVENT } from '../H3DeliveryRecoveryStatus'
 import * as storeApi from '../../stores/useStore'
@@ -2468,16 +2468,15 @@ function GalleryBulkToolbar() {
   const canGenerateBridge = workspaceAllowsPermission(activeProject, 'project.generate')
     && (accountProjectAccessActive || activeProject?.unlocked !== false)
   const bridgeCandidates = resolveH3BridgeSelection(outputs, selected, activeWorkspace, canGenerateBridge)
-  const guideStill = resolveH3GuideSelection(outputs, selected, activeWorkspace, canGenerateBridge)
+  const guideStills = resolveH3GuideSelections(outputs, selected, activeWorkspace, canGenerateBridge)
+  const guideStill = guideStills?.[0]
   const bridgeSelectionIdentity = JSON.stringify(
     (bridgeCandidates || []).map(output => output.workspace + '\0' + output.name).sort(),
   )
-  const guideSelectionKey = guideStill
-    ? `${guideStill.workspace}\0${guideStill.name}`
-    : ''
-  const guideSelectionIdentity = guideStill
-    ? `${guideSelectionKey}\0${guideStill.revision}`
-    : ''
+  const guideSelectionKeys = (guideStills || []).map(still => `${still.workspace}\0${still.name}`)
+  const guideSelectionIdentity = JSON.stringify(
+    (guideStills || []).map(still => `${still.workspace}\0${still.name}\0${still.revision}`),
+  )
   const bridgeAccountEpoch = currentAccountIdentityEpoch()
   const isCurrentBridgeSelection = () => {
     const state = useStore.getState()
@@ -2490,11 +2489,10 @@ function GalleryBulkToolbar() {
     const state = useStore.getState()
     return currentAccountIdentityEpoch() === guideAccountEpoch
       && state.activeWorkspace === activeWorkspace
-      && state.selectedOutputKeys.length === 1
-      && state.selectedOutputKeys[0] === guideSelectionKey
-      && state.filteredOutputs().some(output => (
-        `${output.workspace}\0${output.name}\0${output.revision}` === guideSelectionIdentity
-      ))
+      && JSON.stringify(state.selectedOutputKeys) === JSON.stringify(guideSelectionKeys)
+      && (guideStills || []).every(still => state.filteredOutputs().some(output => (
+        output.workspace === still.workspace && output.name === still.name && output.revision === still.revision
+      )))
   }
   const canMutateSelection = selected.length > 0
     && selectedOutputs.length === selected.length
@@ -2556,6 +2554,7 @@ function GalleryBulkToolbar() {
             key={String(guideAccountEpoch) + ':' + guideSelectionIdentity}
             workspace={activeWorkspace}
             still={guideStill}
+            secondStill={guideStills?.[1]}
             models={models}
             enabledModels={enabledModels}
             modelsLoaded={modelsLoaded}

@@ -47033,84 +47033,11 @@ def _withhold_failed_h3_gallery_still_outputs(
                 pass
 
 
-@api.post("/api/v1/h3/gallery-still-guide")
-async def h3_gallery_still_guide_endpoint(request: Request):
-    """Queue one project-authorized Gallery still at one interior H3 frame."""
+async def _resolve_h3_gallery_still_guide_source(request, workspace, out_dir, name, revision):
+    """Authorize and twice probe one Gallery still before sealing the request."""
     from services.h3_gallery_still_guide import (
-        H3_GALLERY_STILL_GUIDE_CUSTOM_KEY,
-        H3_GALLERY_STILL_GUIDE_EXTENSIONS,
-        H3_GALLERY_STILL_GUIDE_PLAN_KEY,
-        H3_GALLERY_STILL_GUIDE_SOURCE_KEY,
-        H3GalleryStillGuideError,
-        build_gallery_still_guide_plan,
-        make_gallery_still_guide_source,
-        probe_gallery_still,
+        H3_GALLERY_STILL_GUIDE_EXTENSIONS, H3GalleryStillGuideError, probe_gallery_still,
     )
-
-    try:
-        submitted = await request.json()
-    except Exception:
-        raise HTTPException(
-            status_code=400, detail="H3 Guide request must be an object",
-        ) from None
-    required = {
-        "workspace", "name", "revision", "frame_index", "model_type",
-        "prompt", "settings",
-    }
-    allowed = required | {"private_output", "explicit_output"}
-    if not isinstance(submitted, dict) or not required <= set(submitted) or set(submitted) - allowed:
-        raise HTTPException(
-            status_code=400, detail="H3 Guide request fields are invalid",
-        )
-    for policy_key in ("private_output", "explicit_output"):
-        if policy_key in submitted and type(submitted[policy_key]) is not bool:
-            raise HTTPException(
-                status_code=400, detail=f"{policy_key} must be a boolean",
-            )
-    workspace_value = submitted.get("workspace")
-    name = submitted.get("name")
-    revision = submitted.get("revision")
-    frame_index = submitted.get("frame_index")
-    model_type = submitted.get("model_type")
-    prompt = submitted.get("prompt")
-    settings = submitted.get("settings")
-    if (
-        not isinstance(workspace_value, str)
-        or not workspace_value
-        or not isinstance(name, str)
-        or not name
-        or len(name) > 255
-        or not isinstance(revision, str)
-        or not revision
-        or len(revision) > 256
-        or type(frame_index) is not int
-        or not isinstance(prompt, str)
-        or not prompt.strip()
-        or len(prompt) > 16_384
-        or not isinstance(settings, dict)
-        or set(settings) - _H3_GALLERY_STILL_GUIDE_SETTINGS
-        or "video_length" not in settings
-        or type(settings.get("video_length")) is not int
-    ):
-        raise HTTPException(
-            status_code=400, detail="H3 Guide request fields are invalid",
-        )
-    if model_type != _H3_BASE_FL2VA_MODEL:
-        raise HTTPException(
-            status_code=400,
-            detail="H3 Guide currently supports the installed MiniMax H3 FL2VA model only",
-        )
-
-    workspace = _request_project_workspace(request, workspace_value)
-    out_dir = _require_project_access(
-        request, workspace, permission="project.generate",
-    )
-    if wgp.get_model_def(model_type) is None:
-        raise HTTPException(status_code=400, detail="H3 Guide model is unavailable")
-    _require_remote_visible_models(request, [model_type])
-    _require_h3_legal_execution([model_type])
-    _require_model_recipe_terms([model_type])
-
     if os.path.splitext(name)[1].lower() not in H3_GALLERY_STILL_GUIDE_EXTENSIONS:
         raise HTTPException(
             status_code=400,
@@ -47189,6 +47116,109 @@ async def h3_gallery_still_guide_endpoint(request: Request):
             detail="Selected Gallery still changed; refresh Gallery and select it again",
         )
 
+    return source_path, sidecar, probe
+
+
+@api.post("/api/v1/h3/gallery-still-guide")
+async def h3_gallery_still_guide_endpoint(request: Request):
+    """Queue one or two project-authorized stills at distinct interior H3 frames."""
+    from services.h3_gallery_still_guide import (
+        H3_GALLERY_STILL_GUIDE_CUSTOM_KEY,
+        H3_GALLERY_STILL_GUIDE_PLAN_KEY,
+        H3_GALLERY_STILL_GUIDE_SOURCE_KEY,
+        H3GalleryStillGuideError,
+        build_gallery_still_guide_plan,
+        build_gallery_still_guide_pair_plan,
+        make_gallery_still_guide_pair_source,
+        make_gallery_still_guide_source,
+    )
+
+    try:
+        submitted = await request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=400, detail="H3 Guide request must be an object",
+        ) from None
+    required = {
+        "workspace", "name", "revision", "frame_index", "model_type",
+        "prompt", "settings",
+    }
+    allowed = required | {"private_output", "explicit_output", "second_still"}
+    if not isinstance(submitted, dict) or not required <= set(submitted) or set(submitted) - allowed:
+        raise HTTPException(
+            status_code=400, detail="H3 Guide request fields are invalid",
+        )
+    for policy_key in ("private_output", "explicit_output"):
+        if policy_key in submitted and type(submitted[policy_key]) is not bool:
+            raise HTTPException(
+                status_code=400, detail=f"{policy_key} must be a boolean",
+            )
+    workspace_value = submitted.get("workspace")
+    name = submitted.get("name")
+    revision = submitted.get("revision")
+    frame_index = submitted.get("frame_index")
+    model_type = submitted.get("model_type")
+    prompt = submitted.get("prompt")
+    settings = submitted.get("settings")
+    if (
+        not isinstance(workspace_value, str)
+        or not workspace_value
+        or not isinstance(name, str)
+        or not name
+        or len(name) > 255
+        or not isinstance(revision, str)
+        or not revision
+        or len(revision) > 256
+        or type(frame_index) is not int
+        or not isinstance(prompt, str)
+        or not prompt.strip()
+        or len(prompt) > 16_384
+        or not isinstance(settings, dict)
+        or set(settings) - _H3_GALLERY_STILL_GUIDE_SETTINGS
+        or "video_length" not in settings
+        or type(settings.get("video_length")) is not int
+    ):
+        raise HTTPException(
+            status_code=400, detail="H3 Guide request fields are invalid",
+        )
+    second_still = submitted.get("second_still")
+    if "second_still" in submitted and (
+        not isinstance(second_still, dict)
+        or set(second_still) != {"name", "revision", "frame_index"}
+        or not isinstance(second_still.get("name"), str)
+        or not 0 < len(second_still["name"]) <= 255
+        or not isinstance(second_still.get("revision"), str)
+        or not 0 < len(second_still["revision"]) <= 256
+        or type(second_still.get("frame_index")) is not int
+        or second_still["name"] == name
+        or second_still["frame_index"] == frame_index
+    ):
+        raise HTTPException(status_code=400, detail="Choose two different Gallery stills and distinct interior frame indices")
+    if model_type != _H3_BASE_FL2VA_MODEL:
+        raise HTTPException(
+            status_code=400,
+            detail="H3 Guide currently supports the installed MiniMax H3 FL2VA model only",
+        )
+
+    workspace = _request_project_workspace(request, workspace_value)
+    out_dir = _require_project_access(
+        request, workspace, permission="project.generate",
+    )
+    if wgp.get_model_def(model_type) is None:
+        raise HTTPException(status_code=400, detail="H3 Guide model is unavailable")
+    _require_remote_visible_models(request, [model_type])
+    _require_h3_legal_execution([model_type])
+    _require_model_recipe_terms([model_type])
+
+    source_path, sidecar, probe = await _resolve_h3_gallery_still_guide_source(
+        request, workspace, out_dir, name, revision,
+    )
+    second_path = second_sidecar = second_probe = None
+    if second_still is not None:
+        second_path, second_sidecar, second_probe = await _resolve_h3_gallery_still_guide_source(
+            request, workspace, out_dir, second_still["name"], second_still["revision"],
+        )
+
     model_def = wgp.get_model_def(model_type) or {}
     requested_frames = settings["video_length"]
     if not 124 <= requested_frames <= 345:
@@ -47225,6 +47255,24 @@ async def h3_gallery_still_guide_endpoint(request: Request):
             source_private=sidecar.get("private", False),
             source_explicit=sidecar.get("explicit", False),
         )
+        if second_still is not None:
+            second_plan = build_gallery_still_guide_plan(
+                sha256=second_probe.sha256, frame_index=second_still["frame_index"],
+                target_frames=target_frames,
+            )
+            second_source = make_gallery_still_guide_source(
+                workspace=workspace, name=second_still["name"], revision=second_still["revision"],
+                probe=second_probe, frame_index=second_still["frame_index"],
+                target_frames=target_frames, plan=second_plan,
+                source_private=second_sidecar.get("private", False),
+                source_explicit=second_sidecar.get("explicit", False),
+            )
+            guide_plan = build_gallery_still_guide_pair_plan(
+                sha256=probe.sha256, frame_index=frame_index,
+                second_sha256=second_probe.sha256, second_frame_index=second_still["frame_index"],
+                target_frames=target_frames,
+            )
+            guide_source = make_gallery_still_guide_pair_source(guide_source, second_source, guide_plan)
     except H3GalleryStillGuideError as error:
         raise HTTPException(status_code=400, detail="H3 Guide input is invalid") from error
 
@@ -47249,12 +47297,14 @@ async def h3_gallery_still_guide_endpoint(request: Request):
         "prompt": prompt,
         "generation_mode": "video",
         "image_mode": 0,
-        "image_prompt_type": "S",
+        "trim_tail_frames": 0,
+        "image_prompt_type": "SE" if second_still is not None else "S",
         "video_prompt_type": "",
         "audio_prompt_type": "",
         "input_waveform": None,
         "audio_path": None,
         "image_start": source_path,
+        "image_end": second_path,
         "video_length": target_frames,
         "sliding_window_size": target_frames,
         "multi_prompts_gen_type": 0,
@@ -47275,17 +47325,22 @@ async def h3_gallery_still_guide_endpoint(request: Request):
     safe_custom[H3_GALLERY_STILL_GUIDE_CUSTOM_KEY] = {
         "frame_index": frame_index,
     }
+    if second_still is not None:
+        safe_custom[H3_GALLERY_STILL_GUIDE_CUSTOM_KEY]["end_frame_index"] = second_still["frame_index"]
     params["custom_settings"] = safe_custom
 
     session_id = str(request.state.maestro_session_id)
-    inherited = _inherit_media_access_policy([source_path], workspace, session_id)
+    source_paths = [source_path] + ([second_path] if second_path is not None else [])
+    inherited = _inherit_media_access_policy(source_paths, workspace, session_id)
     effective_private = bool(
         sidecar.get("private", False)
+        or (second_sidecar or {}).get("private", False)
         or inherited.get("private", False)
         or submitted.get("private_output", False)
     )
     effective_explicit = bool(
         sidecar.get("explicit", False)
+        or (second_sidecar or {}).get("explicit", False)
         or inherited.get("explicit", False)
         or submitted.get("explicit_output", False)
     )
@@ -47309,7 +47364,8 @@ async def h3_gallery_still_guide_endpoint(request: Request):
             "capability": "gallery_still_fl2va",
             "frame_index": frame_index,
             "target_frames": target_frames,
-            "guide_count": 1,
+            "guide_count": 2 if second_still is not None else 1,
+            "frame_indices": [frame_index] + ([second_still["frame_index"]] if second_still is not None else []),
             "audio_guides": 0,
             "video_guides": 0,
         },
@@ -64559,6 +64615,23 @@ def _generation_tasks_succeeded(
     )
 
 
+def _apply_generation_end_image_trim(raw_params: dict) -> None:
+    """Apply endpoint trimming without shortening interior timeline Guide clips."""
+    custom = raw_params.get("custom_settings")
+    if isinstance(custom, dict) and "_h3_timeline_still_guide" in custom:
+        # Source/plan validation still runs before execution. The second Guide
+        # is transported in image_end but is not an endpoint image.
+        raw_params["trim_tail_frames"] = 0
+        return
+    has_end_image = raw_params.get("image_end") not in (None, "", [])
+    if has_end_image and raw_params.get("video_length"):
+        try:
+            _, frame_step, _ = wgp.get_model_min_frames_and_step(raw_params.get("model_type", ""))
+        except Exception:
+            frame_step = 8
+        raw_params["trim_tail_frames"] = frame_step
+
+
 def _run_generation(
     job_id: str,
     *,
@@ -66027,16 +66100,7 @@ def _run_generation(
                     )
             else:
                 wgp.task_id += 1
-                # SE trim: if end image is set, mark tail frames for trimming
-                # (removes distorted frames from end-frame conditioning)
-                has_end_image = raw_params.get("image_end") not in (None, "", [])
-                if has_end_image and raw_params.get("video_length"):
-                    model_type = raw_params.get("model_type", "")
-                    try:
-                        _, fs, _ = wgp.get_model_min_frames_and_step(model_type)
-                    except Exception:
-                        fs = 8  # LTX-2 default
-                    raw_params["trim_tail_frames"] = fs
+                _apply_generation_end_image_trim(raw_params)
 
                 manifest = [{
                     "id": wgp.task_id,
@@ -66345,7 +66409,11 @@ def _run_generation(
                         "capability": "gallery_still_fl2va",
                         "frame_index": guide_source.get("frame_index"),
                         "target_frames": guide_source.get("target_frames"),
-                        "guide_count": 1,
+                        "guide_count": 2 if isinstance(guide_source.get("second_source"), dict) else 1,
+                        "frame_indices": [guide_source.get("frame_index")] + (
+                            [guide_source["second_source"].get("frame_index")]
+                            if isinstance(guide_source.get("second_source"), dict) else []
+                        ),
                         "audio_guides": 0,
                         "video_guides": 0,
                     }

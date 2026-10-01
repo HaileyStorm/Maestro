@@ -272,18 +272,20 @@ def validate_h3_timeline_still_guide_request(
 ) -> tuple[str, int, int] | None:
     """Validate the private FL2VA still-at-frame adapter and return its packer anchor.
 
-    The private setting changes only where ``image_start`` is placed in the target
-    video timeline. It never converts semantic references, endpoint images, or
-    boundary continuation into timeline guides.
+    The private setting places one or two stills at exact interior target frames.
+    A second still requires an explicit end_frame_index; ordinary endpoint,
+    reference and boundary requests keep their own semantics.
     """
     setting_name = "_h3_timeline_still_guide"
     if not isinstance(custom_settings, dict) or setting_name not in custom_settings:
         return None
 
     guide = custom_settings[setting_name]
-    if not isinstance(guide, dict) or set(guide) != {"frame_index"}:
+    if not isinstance(guide, dict) or set(guide) not in (
+        {"frame_index"}, {"frame_index", "end_frame_index"},
+    ):
         raise ValueError(
-            "MiniMax H3 timeline still guide must contain only an integer frame_index."
+            "MiniMax H3 timeline still guide requires frame_index and optional end_frame_index."
         )
     frame_index = guide.get("frame_index")
     if type(frame_index) is not int:
@@ -292,7 +294,13 @@ def validate_h3_timeline_still_guide_request(
         )
     if reference_mode:
         raise ValueError("MiniMax H3 timeline still guides require an FL2VA checkpoint.")
-    if _has_h3_guide_input(image_end):
+    paired = "end_frame_index" in guide
+    end_frame_index = guide.get("end_frame_index")
+    if paired and (type(end_frame_index) is not int or end_frame_index == frame_index):
+        raise ValueError("MiniMax H3 timeline still guides require two distinct integer frame indices.")
+    if paired and not _has_h3_guide_input(image_end):
+        raise ValueError("MiniMax H3 second timeline still guide requires image_end.")
+    if not paired and _has_h3_guide_input(image_end):
         raise ValueError(
             "MiniMax H3 timeline still guides cannot be combined with an ending image."
         )
@@ -332,19 +340,15 @@ def validate_h3_timeline_still_guide_request(
         )
     if not _has_h3_guide_input(image_start):
         raise ValueError("MiniMax H3 timeline still guide requires image_start.")
-    if validate_image_shape:
-        if not _is_single_h3_still_shape(image_start):
+    images = [("image_start", image_start)]
+    if paired:
+        images.append(("image_end", image_end))
+    for name, image in images:
+        if not (not validate_image_shape and isinstance(image, (str, os.PathLike))) and not _is_single_h3_still_shape(image):
             raise ValueError(
-                "MiniMax H3 timeline still guide image_start must be one CHW RGB/RGBA still "
+                f"MiniMax H3 timeline still guide {name} must be one CHW RGB/RGBA still "
                 "or a one-frame CTHW tensor."
             )
-    elif not isinstance(image_start, (str, os.PathLike)) and not _is_single_h3_still_shape(
-        image_start
-    ):
-        raise ValueError(
-            "MiniMax H3 timeline still guide image_start must be one CHW RGB/RGBA still "
-            "or a one-frame CTHW tensor."
-        )
 
     if frame_num is not None:
         if isinstance(frame_num, bool) or not isinstance(frame_num, (int, np.integer)):
@@ -354,16 +358,24 @@ def validate_h3_timeline_still_guide_request(
             raise ValueError(
                 "MiniMax H3 timeline still guide target frame count must be aligned to the 17n+5 grid."
             )
-        if not 0 < frame_index < frame_num - 1:
+        if any(not 0 < index < frame_num - 1 for index in ([frame_index, end_frame_index] if paired else [frame_index])):
             raise ValueError(
                 "MiniMax H3 timeline still guide frame_index must select an interior target frame."
             )
-    elif frame_index < 1:
+    elif any(index < 1 for index in ([frame_index, end_frame_index] if paired else [frame_index])):
         raise ValueError(
             "MiniMax H3 timeline still guide frame_index must select an interior target frame."
         )
 
     return "frame", 1, frame_index
+
+
+def h3_timeline_still_guide_keyframe_anchors(custom_settings, first_anchor):
+    """Build ordered packer anchors after the request has passed validation."""
+    guide = custom_settings["_h3_timeline_still_guide"]
+    if "end_frame_index" in guide:
+        return first_anchor, ("frame", 1, guide["end_frame_index"])
+    return (first_anchor,)
 
 
 def video_latent_num_frames(num_frames: int) -> int:

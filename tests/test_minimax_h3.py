@@ -68,6 +68,23 @@ def _load_wgp_timeline_still_guide_helper():
     return namespace["_is_h3_timeline_still_guide_request"]
 
 
+def _load_wgp_timeline_guide_resize_helper():
+    functions = []
+    for path, name in (
+        (_APP / "shared" / "utils" / "utils.py", "calculate_new_dimensions"),
+        (_WGP_PATH, "_resize_h3_timeline_still_guide_image"),
+    ):
+        tree = ast.parse(_read(path), filename=str(path))
+        functions.append(next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == name
+        ))
+    namespace = {}
+    module = ast.Module(body=functions, type_ignores=[])
+    exec(compile(ast.fix_missing_locations(module), str(_WGP_PATH), "exec"), namespace)
+    return namespace["_resize_h3_timeline_still_guide_image"]
+
+
 def _load_wgp_first_window_prefix_helper(torch):
     tree = ast.parse(_read(_WGP_PATH), filename=str(_WGP_PATH))
     selected = next(
@@ -1610,6 +1627,7 @@ class TestMiniMaxH3TimelineStillGuide(unittest.TestCase):
         from models.minimax_h3.packing import (
             audio_latent_num_frames,
             build_packed_sequence,
+            h3_timeline_still_guide_keyframe_anchors,
             prepare_h3_timeline_still_guide_image,
             validate_h3_timeline_still_guide_request,
             video_latent_num_frames,
@@ -1621,6 +1639,7 @@ class TestMiniMaxH3TimelineStillGuide(unittest.TestCase):
         cls.model_type = MiniMaxH3Model
         cls.audio_latent_num_frames = staticmethod(audio_latent_num_frames)
         cls.build_packed_sequence = staticmethod(build_packed_sequence)
+        cls.guide_anchors = staticmethod(h3_timeline_still_guide_keyframe_anchors)
         cls.prepare_timeline_image = staticmethod(prepare_h3_timeline_still_guide_image)
         cls.validate_guide = staticmethod(validate_h3_timeline_still_guide_request)
         cls.video_latent_num_frames = staticmethod(video_latent_num_frames)
@@ -1630,6 +1649,9 @@ class TestMiniMaxH3TimelineStillGuide(unittest.TestCase):
         )
         cls.restore_first_window_prefix = staticmethod(
             _load_wgp_first_window_prefix_helper(torch)
+        )
+        cls.resize_timeline_guide = staticmethod(
+            _load_wgp_timeline_guide_resize_helper()
         )
 
     @classmethod
@@ -1703,7 +1725,7 @@ class TestMiniMaxH3TimelineStillGuide(unittest.TestCase):
                         }
                     }
                 },
-                "only an integer frame_index",
+                "requires frame_index and optional end_frame_index",
             ),
             ({"image_start": self.torch.zeros((3, 2, 8, 8))}, "one CHW RGB/RGBA still"),
             (
@@ -1719,6 +1741,39 @@ class TestMiniMaxH3TimelineStillGuide(unittest.TestCase):
         for overrides, message in invalid:
             with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
                 self._validate(**overrides)
+
+    def test_two_stills_keep_picture_order_and_exact_independent_rope_times(self):
+        # Reverse chronological positions must retain Picture/source order.
+        settings = {"_h3_timeline_still_guide": {"frame_index": 89, "end_frame_index": 31}}
+        anchor = self._validate(custom_settings=settings, image_end=self.torch.ones((3, 8, 8)))
+        anchors = self.guide_anchors(settings, anchor)
+        self.assertEqual(anchors, (("frame", 1, 89), ("frame", 1, 31)))
+        layout = self.build_packed_sequence(
+            self.torch.ones((4,), dtype=self.torch.long),
+            self.video_latent_num_frames(124), 2, 2,
+            self.audio_latent_num_frames(124), (1, 1, 1),
+            keyframe_anchors=anchors,
+        )
+        rows = layout.video_indices[:8]
+        for offset, index in ((0, 89), (4, 31)):
+            for row in rows[offset:offset + 4]:
+                self.assertAlmostEqual(float(layout.position_ids[int(row), 0]), 4 + index * 5 / 3)
+        self.assertIn("user_anchors = h3_timeline_still_guide_keyframe_anchors(", _MAIN_PATH.read_text())
+
+    def test_second_still_requires_distinct_interior_index_and_one_frame_shape(self):
+        for index in (True, 1.5, 0, 123, 47):
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                self._validate(
+                    custom_settings={"_h3_timeline_still_guide": {"frame_index": 47, "end_frame_index": index}},
+                    image_end=self.torch.ones((3, 8, 8)),
+                )
+        settings = {"_h3_timeline_still_guide": {"frame_index": 47, "end_frame_index": 90}}
+        for image in (None, self.torch.ones((3, 2, 8, 8))):
+            with self.subTest(image_shape=getattr(image, 'shape', None)), self.assertRaises(ValueError):
+                self._validate(custom_settings=settings, image_end=image)
+        self.assertEqual(self._validate(
+            custom_settings=settings, image_start="first.png", image_end="second.png", validate_image_shape=False,
+        ), ("frame", 1, 47))
 
     def test_unmarked_request_keeps_existing_audio_inputs(self):
         self.assertIsNone(
@@ -1822,6 +1877,40 @@ class TestMiniMaxH3TimelineStillGuide(unittest.TestCase):
         ordinary = self.restore_first_window_prefix(generated, ordinary_start, 1)
         self.assertTrue(self.torch.equal(ordinary, generated))
         self.assertEqual(ordinary.shape[1], 124)
+
+    def test_wgp_guide_preprocessing_crops_original_mixed_aspect_stills(self):
+        # A generic fixed-canvas resize retains the red margins by stretching
+        # them. AddGuide must crop those margins before tensor conversion.
+        for size in ((12, 4), (4, 12)):
+            source = self.Image.new("RGB", size, (255, 0, 0))
+            if size[0] > size[1]:
+                source.paste((0, 255, 0), (4, 0, 8, 4))
+            else:
+                source.paste((0, 255, 0), (0, 4, 4, 8))
+            for fit, fit_crop in ((None, False), (2, False), (0, True)):
+                with self.subTest(size=size, fit=fit, fit_crop=fit_crop):
+                    image, height, width = self.resize_timeline_guide(
+                        source, 4, 4, fit, fit_crop, block_size=1,
+                    )
+                    self.assertEqual((height, width), (4, 4))
+                    self.assertEqual(image.size, (4, 4))
+                    self.assertEqual(set(image.getdata()), {(0, 255, 0)})
+                    self.assertEqual(source.getpixel((0, 0)), (255, 0, 0))
+
+    def test_wgp_guide_preprocessing_preserves_existing_canvas_selection(self):
+        source = self.Image.new("RGB", (120, 40), (0, 255, 0))
+        for fit in (0, 1):
+            with self.subTest(fit=fit):
+                image, height, width = self.resize_timeline_guide(
+                    source, 64, 64, fit, False, block_size=32,
+                )
+                expected = (32, 96) if fit == 0 else (32, 64)
+                self.assertEqual((height, width), expected)
+                self.assertEqual(image.size, tuple(reversed(expected)))
+        generate_source = _read(_WGP_PATH)
+        self.assertIn("if h3_timeline_still_guide_requested\n                else calculate_dimensions_and_resize_image", generate_source)
+        self.assertIn("image_start_tensor, new_height, new_width = resize_keyframe_image(image_start,", generate_source)
+        self.assertIn("image_end_tensor, _, _ = resize_keyframe_image(image_end_list[window_no-1],", generate_source)
 
     def test_interior_still_uses_addguide_center_cover_crop(self):
         source = self.Image.new("RGB", (8, 4))

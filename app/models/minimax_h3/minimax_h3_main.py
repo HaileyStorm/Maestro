@@ -50,6 +50,7 @@ from .packing import (
     build_packed_sequence,
     build_ref2va_packed_sequence,
     build_row_timesteps,
+    h3_timeline_still_guide_keyframe_anchors,
     keyframe_condition_noise,
     patchify_video_latents,
     prepare_h3_bridge_video_inputs,
@@ -1548,15 +1549,14 @@ class MiniMaxH3Model:
             if item is not None
         ]
         user_anchors = tuple(
-            (
-                timeline_still_anchor
-                if timeline_still_anchor is not None and anchor == "first"
-                else anchor
-            )
+            anchor
             for anchor, item in (("first", image_start), ("last", image_end))
             if item is not None
         )
         if timeline_still_anchor is not None:
+            user_anchors = h3_timeline_still_guide_keyframe_anchors(
+                custom_settings, timeline_still_anchor,
+            )
             user_keyframes = [
                 prepare_h3_timeline_still_guide_image(
                     image, height, width,

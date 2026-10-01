@@ -11356,6 +11356,27 @@ def _is_h3_timeline_still_guide_request(
     return True
 
 
+def _resize_h3_timeline_still_guide_image(
+    image, canvas_height, canvas_width, fit_into_canvas, fit_crop, block_size=16,
+):
+    """Choose WGP's canvas, then cover-crop the original H3 Guide still."""
+    from models.minimax_h3.packing import prepare_h3_timeline_still_guide_image
+
+    if fit_crop:
+        new_height, new_width = canvas_height, canvas_width
+    else:
+        image_width, image_height = image.size
+        new_height, new_width = calculate_new_dimensions(
+            canvas_height, canvas_width, image_height, image_width,
+            fit_into_canvas, block_size=block_size,
+        )
+    return (
+        prepare_h3_timeline_still_guide_image(image, new_height, new_width),
+        new_height,
+        new_width,
+    )
+
+
 def _restore_h3_first_window_prefix(sample, prefix_video, overlap_frames):
     """Restore the ordinary start/source prefix without changing H3 guides."""
     if prefix_video is None:
@@ -11845,6 +11866,10 @@ def _generate_video_impl(
             model_def.get("fake_start_image", False) and image_start is not None
         ),
     )
+    if h3_timeline_still_guide_requested:
+        # Interior Guide slots must keep the full requested timeline.
+        trim_tail_frames = 0
+
     model_handler = get_model_handler(base_model_type)
     block_size = model_handler.get_vae_block_size(base_model_type) if hasattr(model_handler, "get_vae_block_size") else 16
     h3_audio_roles = None
@@ -13336,9 +13361,14 @@ def _generate_video_impl(
             if hasattr(model_handler, "custom_prompt_preprocess"):
                 prompt = model_handler.custom_prompt_preprocess(**locals())
             image_start_tensor = image_end_tensor = None
+            resize_keyframe_image = (
+                _resize_h3_timeline_still_guide_image
+                if h3_timeline_still_guide_requested
+                else calculate_dimensions_and_resize_image
+            )
             if window_no == 1 and (video_source is not None or image_start is not None):
                 if image_start is not None:
-                    image_start_tensor, new_height, new_width = calculate_dimensions_and_resize_image(image_start, height, width, sample_fit_canvas, fit_crop, block_size = block_size)
+                    image_start_tensor, new_height, new_width = resize_keyframe_image(image_start, height, width, sample_fit_canvas, fit_crop, block_size = block_size)
                     if fit_crop: refresh_preview["image_start"] = image_start_tensor
                     image_start_tensor = convert_image_to_tensor(image_start_tensor)
                     if h3_timeline_still_guide_requested:
@@ -13372,7 +13402,7 @@ def _generate_video_impl(
                 image_end_list=  image_end if isinstance(image_end, list) else [image_end]
                 if len(image_end_list) >= window_no:
                     new_height, new_width = image_size                    
-                    image_end_tensor, _, _ = calculate_dimensions_and_resize_image(image_end_list[window_no-1], new_height, new_width, sample_fit_canvas, fit_crop, block_size = block_size)
+                    image_end_tensor, _, _ = resize_keyframe_image(image_end_list[window_no-1], new_height, new_width, sample_fit_canvas, fit_crop, block_size = block_size)
                     # image_end_tensor =image_end_list[window_no-1].resize((new_width, new_height), resample=Image.Resampling.LANCZOS) 
                     refresh_preview["image_end"] = image_end_tensor 
                     image_end_tensor = convert_image_to_tensor(image_end_tensor)

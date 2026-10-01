@@ -2021,3 +2021,36 @@ This one-take result does not support using a style instruction as a duration
 control. Its ending and musical fidelity still need listening review. No
 trimming, time scaling or score-following claim is inferred from the completed
 file.
+
+
+## 2026-10-01 two-still H3 Guide source checkpoint
+
+The Gallery Guide action now accepts one or two current stills from the same
+project. The two-still route independently authorizes and probes both sources,
+seals their revisions, hashes and exact interior frame positions in one ordered
+plan, and inherits private/explicit flags from either source. Replay and
+publication reuse the source checks for both images. Picture order is preserved
+even when the requested frame positions are in reverse chronological order.
+The selected stills are center-cropped from their original aspect to the output
+canvas. Ordinary endpoint and reference generation keep their existing behavior.
+
+Independent review caught the worker's endpoint tail trim being applied to the
+second interior guide. The route and worker now set Guide trimming to zero;
+replay rejects a shortened Guide plan, and WGP preserves the full Guide timeline.
+A CPU test executes the actual single-clip worker manifest branch, retaining the
+second image and all 124 target frames while ordinary endpoint input still gets
+its established 17-frame trim. Native packed-sequence tests prove independent,
+unsnapped rotary frame positions; these tests do not load or run the model.
+
+Focused source/native/API/UI checks and the UI type-check/build pass. Adult,
+violent and controversial authorized prompts traverse the same route unchanged.
+The retained full backend run completed 5,513 tests with 17 skipped and one
+failure from an obsolete ETA text assertion. That assertion was corrected and
+its affected check passed; this is not a new successful full-CI result. No
+redundant full-suite rerun was made for this slice.
+
+This checkpoint establishes source and CPU behavior only. Two-still native
+generation, rendered browser playback, media fidelity and owner acceptance are
+pending. The earlier single-still live result and HEVC browser failure above
+remain separate evidence. Control weights, video/audio Guide inputs and native
+continuation are not implemented by this extension.
