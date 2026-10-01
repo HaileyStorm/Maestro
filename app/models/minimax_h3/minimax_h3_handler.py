@@ -598,11 +598,19 @@ class family_handler:
             from .packing import validate_h3_timeline_still_guide_request
 
             try:
+                # WanGP validates its cleaned end-image list before the worker
+                # selects the one still for this clip. Keep native shape checks
+                # strict and unwrap only that singleton transport here.
+                timeline_image_end = inputs.get("image_end")
+                if isinstance(timeline_image_end, (list, tuple)):
+                    if len(timeline_image_end) != 1:
+                        return "MiniMax H3 timeline still guide requires exactly one second still."
+                    timeline_image_end = timeline_image_end[0]
                 validate_h3_timeline_still_guide_request(
                     custom_for_timeline,
                     frame_num=frame_num,
                     image_start=inputs.get("image_start"),
-                    image_end=inputs.get("image_end"),
+                    image_end=timeline_image_end,
                     reference_mode=_is_reference_mode(base_model_type),
                     native_boundary=(
                         custom_for_timeline.get("h3_native_boundary_conditioning") is True

@@ -1951,6 +1951,19 @@ class TestMiniMaxH3TimelineStillGuide(unittest.TestCase):
                 custom_settings=self._guide_settings(),
             )
 
+    def test_handler_accepts_wgp_singleton_second_still_transport(self):
+        payload = {
+            "custom_settings": {"_h3_timeline_still_guide": {
+                "frame_index": 31, "end_frame_index": 90,
+            }},
+            "image_start": self.Image.new("RGB", (8, 8)),
+            "image_end": [self.Image.new("RGB", (8, 8))],
+            "video_length": 124,
+        }
+        self.assertIsNone(self.handler.validate_generative_settings("minimax_h3", {}, payload))
+        payload["image_end"].append(self.Image.new("RGB", (8, 8)))
+        self.assertIn("exactly one second still", self.handler.validate_generative_settings("minimax_h3", {}, payload))
+
     def test_handler_allows_only_nested_adapter_and_rejects_ref2va_early(self):
         payload = {
             "custom_settings": self._guide_settings(),
