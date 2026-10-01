@@ -2074,6 +2074,36 @@ class QueueLaunchWiringTests(unittest.TestCase):
         unrelated = asyncio.run(exercise("/health", 404))
         self.assertEqual(unrelated.headers, {})
 
+    def test_restarted_ui_html_revalidates_bundles_including_304(self):
+        import httpx
+        from starlette.applications import Starlette
+        from starlette.staticfiles import StaticFiles
+        namespace = _isolated_functions(
+            self.launch,
+            ("_recovery_response_requires_no_store", "_stamp_recovery_no_store_response",
+             "_call_next_with_recovery_no_store"),
+            {"Request": object, "Response": object},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "index.html").write_text('<script src="/bundle-new.js"></script>')
+            Path(directory, "bundle-new.js").write_text("window.currentBuild = true")
+            app = Starlette()
+            app.middleware("http")(namespace["_call_next_with_recovery_no_store"])
+            app.mount("/", StaticFiles(directory=directory, html=True))
+
+            async def exercise():
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                    html = await client.get("/")
+                    self.assertEqual(html.headers["cache-control"], "no-cache")
+                    self.assertIn("bundle-new.js", html.text)
+                    unchanged = await client.get("/", headers={"If-None-Match": html.headers["etag"]})
+                    self.assertEqual(unchanged.status_code, 304)
+                    self.assertEqual(unchanged.headers["cache-control"], "no-cache")
+                    asset = await client.get("/bundle-new.js")
+                    self.assertEqual(asset.status_code, 200)
+                    self.assertNotIn("cache-control", asset.headers)
+            asyncio.run(exercise())
+
     def test_startup_recovery_is_registered_before_other_worker_startup(self):
         recovery = self.launch_source.index(
             'def _start_queue_recovery_before_background_workers'

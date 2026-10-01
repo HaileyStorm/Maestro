@@ -1490,6 +1490,14 @@ def _stamp_recovery_no_store_response(request: Request, response: Response):
     if _recovery_response_requires_no_store(str(request.url.path)):
         response.headers["Cache-Control"] = "private, no-store"
         response.headers["Pragma"] = "no-cache"
+    elif (
+        str(request.url.path) == "/"
+        or str(request.url.path).endswith(".html")
+        or response.headers.get("content-type", "").split(";", 1)[0] == "text/html"
+    ):
+        # A restart can reuse a prior port. Revalidate the HTML entry point
+        # (including 304s) so its hashed bundle references match this build.
+        response.headers["Cache-Control"] = "no-cache"
     return response
 
 
