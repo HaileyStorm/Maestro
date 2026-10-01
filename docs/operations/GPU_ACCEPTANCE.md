@@ -2054,3 +2054,39 @@ generation, rendered browser playback, media fidelity and owner acceptance are
 pending. The earlier single-still live result and HEVC browser failure above
 remain separate evidence. Control weights, video/audio Guide inputs and native
 continuation are not implemented by this extension.
+
+## 2026-10-01 two-still H3 Guide native checkpoint
+
+One browser-submitted Base FL2VA run completed with two existing Gallery stills
+at interior frames 31 and 90. The initial attempt stopped before model loading
+because WanGP supplied its cleaned second still as a singleton list. Commit
+`68f2a9c` unwraps only that transport at the handler boundary and rejects
+multiple second stills; all 12 focused timeline Guide tests passed on CPU.
+
+The corrected run completed in 683 seconds and published 124 frames at 24 FPS,
+1344 × 768, with native audio. Its producer sidecar records both guide indices,
+two stills, no video/audio guide inputs, and zero endpoint trimming. Full CPU
+FFmpeg decoding exited successfully. Frame inspection shows the first still's
+red robot at frame 31 and the second still's marble/triangle scene at frame 90;
+the final frame is retained. These observations establish one executable pair,
+not general fidelity or owner acceptance.
+
+Two negative results remain explicit. The first three frames are black
+(`blackdetect`: 0–0.125 seconds); no frame removal or anchor shift was applied.
+The original HEVC file cannot play in the tested browser. Maestro's existing
+CPU H.264 browser-copy action produced a separate 124-frame file, and the real
+browser player reached its 5.167-second end without a media error. Both original
+video and sidecar hashes remained unchanged. Original HEVC playback remains
+unsupported; the separate copy establishes browser playback only.
+
+H3 was released by a coordinated restart after the queue became idle, and the
+exact GPU request was withdrawn. Local and stable health/readiness were checked
+again. The restarted frontend also receives HTML revalidation headers from
+`0e8195e`, repairing an observed stale-bundle load when a prior port was reused.
+Its two focused HTTP checks cover HTML 200/304 responses and preserve asset and
+private-response behavior. No redundant full-suite run was made.
+
+Private job receipts, hashes, frame samples and browser proof remain in the
+untracked two-still acceptance artifact. Investigate the black opening frames
+before visual qualification; human acceptance, broader Guide media, Control and
+native continuation remain separate gates.
