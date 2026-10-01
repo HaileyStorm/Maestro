@@ -2132,3 +2132,57 @@ prepared two-still draft at frames 31 and 90 of a 124-frame clip. The draft adds
 only full-brightness/no-fade wording to the original prompt. No new generation
 or quality improvement is established by preparing it. The same GPU request
 remains queued, and no redundant full-suite run was made.
+
+### 2026-10-01 same-seed opening-quality comparison: negative result
+
+The prepared two-still comparison completed through the signed-in local Gallery
+Guide and real queue on `d919a42`, RTX 5090, driver 595.84, Python 3.11.14 and
+Torch 2.10.0+cu130. The exact coordinator grant was validated for the entire
+planned operation and checked every five seconds through completion and unload.
+Generation took 626 seconds. The published HEVC/AAC MP4 contains all 124 frames
+at 24 fps, 1344 × 768, lasting 5.166667 seconds. Its SHA-256 is
+`fdd6a2a63a3a4b68376dc93d20c18e1312cb57b98383612955e3beaa2409093e`, matching
+the producer sidecar.
+
+Both outputs embed actual seed `935314058` and use 28 steps, the same model,
+canvas, attention/profile values, source stills and interior guide indices
+31/90. The relevant H3 model, runtime and encoder source files have no changes
+since the retained baseline. The intentional change was adding explicit
+continuous-brightness/no-fade wording to the original prompt. The newer sidecar
+also retains the selected seed; the old sidecar omitted it, while its embedded
+media metadata retains the same actual seed.
+
+This did **not** fix the opening. At the existing 64 × 36 RGB analysis scale,
+the original frame 0/3/12/24 means are 0/7.80/92.65/200.66; the comparison is
+0/6.62/107.43/201.32. Both visually fade in over roughly the first second.
+Under a conservative every-channel-at-most-1 definition after scaling, the
+original has two near-black leading frames and the comparison has three.
+These threshold counts do not replace the broader visible fade diagnosis.
+
+The comparison also introduces a dark ending: mean RGB at frame 123 falls from
+213.27 in the original to 6.88 in the comparison. Both guided interior objects
+remain recognizable, but the prompt-only remedy is rejected. A decoded-frame
+contact sheet includes the opening, both guide indices and final frame. No
+frame removal, retiming, anchor shift, production model fix, full-suite rerun,
+or human quality acceptance is claimed. This single-seed result cannot identify
+whether the learned denoiser or VAE introduced the fades.
+
+The local browser reports that it cannot decode this native HEVC preview;
+the file was fully decoded with CPU FFmpeg for analysis. This is generated
+media and agent visual evidence, not browser playback acceptance for HEVC.
+The separately delivered Editor H.264 export did play to completion in-browser.
+
+After the queue became idle, the resource panel required fresh owner password
+confirmation. Authentication was preserved; the authorized coordinated Pinokio
+restart unloaded the model. The fresh browser then reported no generation model
+loaded. Local and stable health/readiness returned 200, public restart status
+was cleared, the observer stopped cleanly, and the exact lease was withdrawn.
+Post-withdraw validation no longer authorizes GPU work.
+
+Opening-quality qualification remains open. The next diagnostic needs retained
+learned-model intermediate/pre-encode evidence under a fresh exact lease to
+localize the fade. Another uninstrumented repeat is not justified by this
+negative result. Private receipts retain exact outputs, source identities,
+lease binding, frame measurements and helper scripts; originals and negative
+history remain intact. Music3 and other deferred acceptance gates remain as
+previously recorded; the broad sprint Goal stays active.
