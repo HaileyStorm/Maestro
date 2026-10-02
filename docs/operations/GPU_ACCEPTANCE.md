@@ -2410,3 +2410,39 @@ Retry rejected the request before enqueue or attempt increment. No new GPU
 inference or recovered final is established. The queued GPU request was withdrawn
 without a grant, and its CPU watcher was stopped with exit 143. A later native
 retry requires a new coherent grant and the explicit experimental host gate.
+
+### Retained native boundary retry completed (2026-10-02 UTC)
+
+A fresh coherent checkout-bound grant authorized the owner-triggered retry of
+the previously failed native boundary request. The experimental host gate was
+enabled only for this bounded check. The authenticated Queue admitted exactly
+one recovery attempt and displayed segment 2 of 2; generation completed and
+the queue cleared. No replacement plan or full first-segment rerun was used.
+
+The sealed request SHA-256 stayed
+`ebd8faf7e12e444de98e233aec3c553c0643030c63ca22b526d8432290cf0d4c`.
+The completed first segment stayed byte-identical at 748,162 bytes, SHA-256
+`1b7357d6a53cd41fe1342979f4998f1b75382c5848dff3c2b9c1ef0863b3277b`.
+The recovered final SHA-256 is
+`51d6a4794ca179abc1962ae3ad53a3ff99ac45cd7b567b8e2a4c80d56d3fb0e6`.
+CPU probing counted 350 video frames at 608×352 and 14.583333 seconds, with
+H.264 video and 32 kHz stereo AAC. Full audio/video decoding exited zero. The
+authenticated local Gallery viewer loaded the original final with ready state
+4 and no media error; native playback reached its 14.583333-second end.
+Private receipts, media probes and browser proof are retained with the exact
+retry artifact. This closes this request's retained-prefix runtime recovery
+gap. It does not establish perceptual improvement, cumulative latent append,
+or human listening/quality acceptance; the earlier comparison's negative
+quality measurements remain authoritative and the path remains experimental.
+
+A separate small Queue copy correction distinguishes queued, admitted and
+released GPU resource states in the badge tooltip, and uses a neutral queued
+badge. The existing affected UI module passed 29 checks; TypeScript and the
+production Vite build passed. No full suite was repeated.
+
+The temporary host flag was removed by restoring the exact pre-check
+environment bytes. Coordinated Pinokio restart returned local and stable-share
+health/readiness 200, cleared the public restart status, preserved the recovered
+Gallery final and empty queue, and showed no generation model loaded. The
+five-second coherent authority observer continued through restoration and then
+exited zero; the exact grant was withdrawn after unloading.

@@ -373,10 +373,16 @@ function describeResourceExecution(
             : 'Generation using the GPU'
     return {
       label,
-      title: descriptor.state === 'blocked'
-        ? 'This generation is waiting for enough compatible GPU resources.'
-        : 'This generation is using the GPU.',
-      tone: descriptor.state === 'blocked' || descriptor.state === 'released' ? 'neutral' : 'accelerated',
+      title: descriptor.state === 'queued'
+        ? 'This generation is queued and is not using the GPU.'
+        : descriptor.state === 'admitted'
+          ? 'GPU resources have been assigned. This generation is starting.'
+          : descriptor.state === 'blocked'
+            ? 'This generation is waiting for enough compatible GPU resources.'
+            : descriptor.state === 'released'
+              ? 'This generation is no longer using the GPU.'
+              : 'This generation is using the GPU.',
+      tone: descriptor.state === 'queued' || descriptor.state === 'blocked' || descriptor.state === 'released' ? 'neutral' : 'accelerated',
     }
   }
 
