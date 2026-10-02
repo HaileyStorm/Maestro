@@ -108,3 +108,22 @@ TypeScript, scoped ESLint, production build, source compilation and publication
 guard passed. One independent review found an audio test selector regression;
 it was corrected. The full suite was not rerun under the owner's frequency
 preference. Live release and human acceptance are recorded separately below.
+
+
+### Multiple-row live release
+
+The coordinated Pinokio restart loaded the new backend and production build.
+Local and stable-share health/readiness passed using a browser User-Agent; the
+stable edge rejected Python's default User-Agent with HTTP 403. The launcher's
+exact restart notice was cleared and authenticated status returned empty.
+
+A live four-second source cut accepted two distinct Gallery stills, saved with
+intervals 1–3 seconds at top and 2–4 seconds at bottom. An out-of-cut interval
+blocked export until corrected. The completed private composite contains both
+ordered, redacted image plans and is H.264/AAC, 608 × 352, 24 fps, four seconds
+and 96 video frames. Full decoding passed. Audio retains its length through
+the existing AAC re-encoding path; decoded bytes differ from the source AAC,
+so this live result does not claim byte-identical source audio. The focused
+controlled media checks above isolate whether image composition changes audio.
+Both image rows reopened with their independent intervals intact. Human
+creative approval remains open.

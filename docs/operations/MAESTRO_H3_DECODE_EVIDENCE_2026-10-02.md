@@ -119,9 +119,34 @@ single-tile, horizontal, vertical, corner and three-way layouts. Inputs remain
 unchanged; a separate disabled-tiling case also passes. Independent review
 found no source-level blocker. Compilation and scoped diff checks passed.
 
-This fixes the proven spatial assembly mismatch. Learned GPU parity and peak
-memory remain unverified for the repair. A fresh decoder-only request is queued
-for corrected streaming versus buffered assembly, followed by float32-weight /
-float16-autocast sensitivity using the same existing compact weights. That
-upcast cannot restore precision lost during checkpoint creation. No temporal
-or opening-fade improvement is claimed by the CPU result.
+This fixes the proven spatial assembly mismatch. The subsequent learned GPU
+comparison below verifies parity on the retained sample. Peak memory remains
+unmeasured. No temporal or opening-fade improvement is claimed by the repair.
+
+## Learned spatial parity and precision sensitivity
+
+A fresh, coherently validated local lease admitted a supervised decoder-only
+replay. The child completed all three variants and exited; its exact request
+was withdrawn and the durable response no longer authorized GPU work.
+
+Corrected streaming and buffered spatial stitching produced identical raw
+pixels across all 124 frames: maximum absolute and frame-mean absolute
+differences were both zero. Corrected RGB means also reproduced the previous
+buffered reference exactly. This verifies the spatial assembly repair for this
+retained tensor, checkpoint and runtime, without another denoising run.
+
+Upcasting the same compact checkpoint to float32 weights under float16
+autocast changed pixels slightly: maximum absolute raw difference 0.0087890625
+and maximum per-frame mean absolute difference 0.0003278540. It retained the
+opening fade. Corrected opening RGB means on the 0–255 scale were 0.02043,
+0.38606, 1.66318 and 9.71831 for frames 0–3; upcast means were 0.02132,
+0.38608, 1.66351 and 9.71676. Upcasting cannot restore precision already lost
+when the checkpoint was made, so this does not establish full-precision
+checkpoint parity or uniquely attribute the fade.
+
+Private replay records retain all frame metrics, latent/checkpoint digests and
+executed source identity. Temporal decode, denoiser behavior, independent
+pretrained-stack parity, peak-memory measurement and human quality acceptance
+remain separate. The next diagnostic should compare temporal decode behavior
+or a separately authorized verified checkpoint against these same retained
+latents before spending another generation.
