@@ -2309,3 +2309,59 @@ hash is unchanged, and the coordinated public restart notice is clear.
 This closes the retained baseline's completed-output recovery gap. It does not
 claim a successful experimental pair, browser playback, or human media quality
 acceptance. A new paired qualification still requires a fresh exact GPU grant.
+
+### Matched native AV boundary run and audio-device repair (2026-10-02 UTC)
+
+A fresh exact checkout-bound grant authorized the experimental arm. The sealed
+request matches the retained ordinary baseline's global and per-segment prompts,
+reference-image digest, seed 314159265, Dense SDPA, 20 steps, 608×352 canvas,
+and two 175-frame published segments. The experimental path also preserves its
+generated audio. The opening segment uses ordinary frame conditioning; only the
+second segment uses the decoded AV boundary history.
+
+The first new attempt completed its opening segment, then exposed a device
+mismatch while encoding boundary audio. The encoder caches reference latents on
+CPU, but implicit normalization-statistic factories followed the worker's CUDA
+default. Both statistics now explicitly use the encoded latent's device. Five
+focused audio checks passed, including normalization under a non-CPU default
+without a GPU workload. The existing independent reviewer found no residual
+CPU-contract issue. No full suite was rerun.
+
+Restart retained that failed request and its completed prefix. Its recovery
+remains held because matching 20-step capacity calibration is absent. That gate
+was preserved. A fresh matched attempt after the repair completed both segments
+and final assembly. The second segment records native conditioning and 17
+history frames discarded from the published join. This proves the existing
+18-decoded-frame AV boundary path ran; it is not cumulative latent append.
+
+Both final files pass full CPU video/audio decoding and contain 350 frames at
+24 fps (14.583333 seconds), H.264 video, and stereo 32 kHz AAC audio. The new
+experimental final SHA-256 is
+`d158fa81d1ce46093b33911a5b9d18f4eec42e9e486b482d98a90c56877b5402`.
+The retained ordinary final digest is unchanged.
+
+At the frame-175 join, mean absolute adjacent RGB difference after 64×36
+sampling is 2.746528 ordinary and
+3.208623 experimental, on the 0–255 scale.
+The measured adjacent audio-sample jump is
+1.418422e-08 ordinary and
+0.00058821874 experimental. These single-run
+measurements show no improvement on those seam metrics. They are not perceptual
+quality thresholds or human acceptance. The generated contact sheet, complete
+stream reports, neighbor-frame measurements, and negative attempt history are
+retained privately with the comparison record. Keep this path experimental.
+
+The original host environment was restored byte for byte, followed by a
+coordinated Pinokio restart. Fresh local and stable-share health and readiness
+probes returned 200; public restart status was cleared. Authenticated Studio
+reported no generation model loaded. The exact GPU request was withdrawn, and
+the coherent post-withdrawal validator rejected further use. The five-second
+authority observer covered generation and restoration; its process returned
+143 after stopping, so this is not a clean-exit receipt.
+
+The successful original final also loaded and played in the authenticated local
+Gallery viewer at 608×352 and 14.583333 seconds. Playback advanced beyond ten
+seconds with ready state 4 and no media error. A browser screenshot is retained
+with the private comparison evidence. This establishes browser playback, not
+human listening or perceptual acceptance. The failed-prefix recovery remains
+held for matching capacity calibration.

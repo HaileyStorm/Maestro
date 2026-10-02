@@ -1264,6 +1264,32 @@ class NativeBoundaryRecoveryTests(unittest.TestCase):
 
 
 class NativeBoundaryDecodeTests(unittest.TestCase):
+    def test_reference_audio_normalization_ignores_worker_default_device(self):
+        encode_audio = _load_nested_function(
+            APP / "models/minimax_h3/minimax_h3_main.py",
+            "_encode_reference_audio",
+            {"torch": torch, "AUDIO_LATENTS_MEAN": (1.0, 2.0),
+             "AUDIO_LATENTS_STD": (2.0, 4.0)},
+        )
+        waveform = torch.zeros((2, 8), device="cpu")
+        latent = torch.tensor([[[3.0, 5.0], [6.0, 10.0]]],
+                              dtype=torch.float16, device="cpu")
+        audio_vae = types.SimpleNamespace(encode=mock.Mock(return_value=
+            types.SimpleNamespace(latent_dist=types.SimpleNamespace(
+                mode=lambda: latent,
+            )),
+        ))
+        model = types.SimpleNamespace(device=torch.device("cpu"), audio_vae=audio_vae)
+        # Meta exercises a non-CPU factory default without creating CUDA work.
+        with torch.device("meta"):
+            normalized = encode_audio(model, waveform)
+        self.assertEqual(normalized.device.type, "cpu")
+        self.assertEqual(normalized.dtype, torch.float32)
+        torch.testing.assert_close(normalized, torch.tensor(
+            [[[1.0, 2.0], [1.0, 2.0]]], device="cpu",
+        ))
+        self.assertEqual(audio_vae.encode.call_args.args[0].device.type, "cpu")
+
     def test_generated_h3_stereo_is_preserved_by_final_mux(self):
         from shared.utils import audio_video
 

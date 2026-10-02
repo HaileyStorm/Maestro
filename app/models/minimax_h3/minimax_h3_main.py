@@ -994,8 +994,9 @@ class MiniMaxH3Model:
     def _encode_reference_audio(self, waveform: torch.Tensor) -> torch.Tensor:
         posterior = self.audio_vae.encode(waveform[:, None].to(self.device)).latent_dist
         encoded = posterior.mode().float().cpu()
-        mean = torch.tensor(AUDIO_LATENTS_MEAN, dtype=torch.float32).view(1, -1, 1)
-        std = torch.tensor(AUDIO_LATENTS_STD, dtype=torch.float32).view(1, -1, 1)
+        # The worker's default device can be CUDA; cached reference latents are CPU.
+        mean = torch.tensor(AUDIO_LATENTS_MEAN, dtype=torch.float32, device=encoded.device).view(1, -1, 1)
+        std = torch.tensor(AUDIO_LATENTS_STD, dtype=torch.float32, device=encoded.device).view(1, -1, 1)
         return (encoded - mean) / std
 
     def _prepare_references(
