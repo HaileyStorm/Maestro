@@ -754,9 +754,9 @@ class AutoencoderKLMiniMaxH3(ModelMixin, ConfigMixin, AttentionMixin, Autoencode
         )
 
         # Decode one tile at a time instead of materializing every decoded
-        # tile together. Besides lowering the VAE peak, retaining the already
-        # blended bottom/right tails preserves both-axis contributions at
-        # corners and when three spatial tiles overlap.
+        # tile together. Retain each original tile's bottom/right edges before
+        # blending: the buffered reference reads unmodified neighbours. Using
+        # blended edges changes corners and regions with three-way overlap.
         ratio = self.spatial_compression_ratio
         canvas = None
         row_tails: list[torch.Tensor] = []
@@ -776,6 +776,14 @@ class AutoencoderKLMiniMaxH3(ModelMixin, ConfigMixin, AttentionMixin, Autoencode
                 tile = self.decoder(hidden_states)
                 del hidden_states
 
+                if i < len(y_indices) - 1:
+                    new_tails.append(tile[..., -y_overlaps[i] :, :].clone())
+                next_left_tail = (
+                    tile[..., :, -x_overlaps[j] :].clone()
+                    if j < len(x_indices) - 1
+                    else None
+                )
+
                 if i > 0:
                     tile = self._blend(
                         row_tails[j],
@@ -791,13 +799,6 @@ class AutoencoderKLMiniMaxH3(ModelMixin, ConfigMixin, AttentionMixin, Autoencode
                         dim=-1,
                     )
 
-                if i < len(y_indices) - 1:
-                    new_tails.append(tile[..., -y_overlaps[i] :, :].clone())
-                next_left_tail = (
-                    tile[..., :, -x_overlaps[j] :].clone()
-                    if j < len(x_indices) - 1
-                    else None
-                )
                 left_tail = next_left_tail
 
                 if i < len(y_indices) - 1:

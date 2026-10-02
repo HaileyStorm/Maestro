@@ -104,3 +104,24 @@ Next, inspect localized spatial differences using the retained data and design
 a bounded temporal-decoder comparison before spending another generation.
 Any further GPU work requires fresh coherent authority. Keep denoiser,
 temporal decoder, spatial stitching, codec and human judgments separate.
+
+## Spatial parity repair after the diagnostic
+
+The measured pixel difference led to a concrete source mismatch: streamed
+assembly retained already-blended bottom/right edges. Buffered `_stitch_tiles`
+reads the original decoded neighbours. The streamed path now clones those
+original edges before blending, retaining its bounded tile memory strategy.
+
+A context-dependent CPU decoder reproduced the difference at corners and
+three-way overlaps in float16 and float32 before the repair. After the repair,
+all ten dtype/layout combinations match the buffered path exactly, including
+single-tile, horizontal, vertical, corner and three-way layouts. Inputs remain
+unchanged; a separate disabled-tiling case also passes. Independent review
+found no source-level blocker. Compilation and scoped diff checks passed.
+
+This fixes the proven spatial assembly mismatch. Learned GPU parity and peak
+memory remain unverified for the repair. A fresh decoder-only request is queued
+for corrected streaming versus buffered assembly, followed by float32-weight /
+float16-autocast sensitivity using the same existing compact weights. That
+upcast cannot restore precision lost during checkpoint creation. No temporal
+or opening-fade improvement is claimed by the CPU result.
