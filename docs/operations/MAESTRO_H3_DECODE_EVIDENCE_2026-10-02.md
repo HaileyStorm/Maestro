@@ -150,3 +150,59 @@ pretrained-stack parity, peak-memory measurement and human quality acceptance
 remain separate. The next diagnostic should compare temporal decode behavior
 or a separately authorized verified checkpoint against these same retained
 latents before spending another generation.
+
+
+## First-chunk temporal isolation
+
+The native temporal assembly matches the pinned
+[Diffusers implementation](https://github.com/huggingface/diffusers/blob/578c9b2c6636ab2424a0e56186268b83623656b2/src/diffusers/models/autoencoders/autoencoder_kl_minimax_h3.py#L730).
+The opening uses latent indices 0–6, yields 28 raw frames, and trims three
+leading frames. Raw frames 3–19 form the first 17 output frames, before any
+inter-chunk overlap blend. One bounded read-only review confirmed this mapping.
+
+A fresh exact lease admitted a supervised three-variant clip decode using the
+retained tensor and same compact checkpoint. The actual first chunk reproduced
+all 17 accepted opening RGB means exactly: maximum mean error zero. The fade
+therefore exists before temporal overlap assembly; these retained metrics do
+not establish full-pixel equality with the earlier full decode.
+
+Two synthetic controls repeated one latent plane seven times. Repeating latent
+0 kept mean RGB near black (0.0789–0.0922 on sampled raw frames 3–19). Repeating
+latent 10 produced bright frames (sampled means 156.0456–201.6577). Identical
+planes still vary by output frame because the decoder uses temporal positions
+and full self-attention. These controls demonstrate input-sensitive behavior;
+they cannot uniquely assign cause to the incoming denoised latents or learned
+VAE. They are not repaired videos or creative acceptance evidence.
+
+All three variants completed; the supervised child exited, its model was
+unloaded, and withdrawal was confirmed by the durable coordinator response.
+Private records retain 28 raw-frame metrics per variant, all 37 input latent
+statistics, source/checkpoint digests, and a reproducible PNG/SVG plot. No new
+generation, downloads, production defaults, model prompt, timing or source
+media was changed. The following known-bright round trip tests the installed encode/decode path
+without another denoising generation.
+
+
+## Known bright stationary-video round trip
+
+A distinct fresh lease admitted one deterministic VAE encode/decode round trip
+of the existing bright robot still, resized to the matched 1344 × 768 canvas
+and repeated for 22 frames. The encoder uses its normal 17-frame chunks and
+trailing pad/drop geometry; posterior mode yields seven latent frames, and
+normal decode returns exactly 22 frames. No denoiser, prompt encoder or model
+transformer runs in this control. Input media is pinned by SHA-256.
+
+Input mean RGB was 203.6659 on the 0–255 scale. Decoded means stayed between
+203.1189 and 203.2955 across all 22 frames; frame 0 was 203.2646. The installed
+compact VAE can reconstruct this bright stationary input from its first output
+frame without the captured fade. That contradicts a universal forced fade in
+this encode/decode path. It does not prove all-video quality, official
+full-precision parity, or uniquely diagnose how the generated opening latents
+acquired their dark content.
+
+The supervised child completed and exited, its owned model/tensors unloaded,
+and its exact lease withdrawal was confirmed. The retained plot now includes
+this round trip alongside the captured opening and repeated-latent controls.
+The next source/runtime comparison belongs to generated latent conditioning
+and denoising, while preserving existing prompts, creative content, source
+media, timing, defaults and separate human acceptance.
