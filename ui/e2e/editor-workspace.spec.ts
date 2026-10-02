@@ -188,3 +188,87 @@ for (const viewport of [
     expect(exports[0].url).toContain('/projects/Synthetic%20project/editor/projects/synthetic-cut/exports')
   })
 }
+
+for (const viewport of [{ name: 'desktop', width: 1440, height: 900 }, { name: 'mobile', width: 390, height: 844 }]) {
+  test(`${viewport.name} timed Gallery audio import saves, reopens and guards export`, async ({ page }, testInfo) => {
+    await page.setViewportSize(viewport)
+    await skipWelcome(page)
+    api!.setAccountScenario('remote-user')
+    await page.route('**/editor-fonts/DejaVuSans.ttf', route => route.fulfill({
+      path: new URL('../public/editor-fonts/DejaVuSans.ttf', import.meta.url).pathname, contentType: 'font/ttf',
+    }))
+    const sound = { ...VIDEO, name: 'evening.wav', type: 'audio', mode: 'audio', revision: 'audio-gallery-v1', url: '/api/v1/file/evening.wav' }
+    const base = editorProject(1)
+    let saved = { ...base, assets: { ...base.assets } as Record<string, typeof base.assets['source-video']>, tracks: [
+      ...base.tracks, { id: 'audio-main', name: 'Audio', type: 'audio', items: [] as Array<typeof base.tracks[0]['items'][0] & { volume?: number; muted?: boolean }> },
+    ] }
+    const imports: unknown[] = []
+    const exports: unknown[] = []
+    const previewPins: string[] = []
+    await page.route(/\/api\/v1\/outputs(?:\?.*)?$/, route => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ outputs: [VIDEO, sound], total: 2 }) }))
+    await page.route('**/api/v1/outputs/*/metadata*', route => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ params: null, source: 'none' }) }))
+    await page.route('**/api/v1/file/sidecarless-clip.mp4*', route => route.fulfill({ status: 404, body: 'Synthetic video unavailable' }))
+    await page.route('**/api/v1/file/evening.wav*', route => {
+      const pin = new URL(route.request().url()).searchParams.get('content_revision')
+      if (pin) previewPins.push(pin)
+      const wave = Buffer.alloc(44 + 48000 * 2)
+      wave.write('RIFF'); wave.writeUInt32LE(wave.length - 8, 4); wave.write('WAVEfmt ', 8); wave.writeUInt32LE(16, 16)
+      wave.writeUInt16LE(1, 20); wave.writeUInt16LE(1, 22); wave.writeUInt32LE(48000, 24); wave.writeUInt32LE(96000, 28)
+      wave.writeUInt16LE(2, 32); wave.writeUInt16LE(16, 34); wave.write('data', 36); wave.writeUInt32LE(wave.length - 44, 40)
+      return route.fulfill({ contentType: 'audio/wav', body: wave })
+    })
+    await page.route(/\/api\/v1\/projects\/[^/]+\/editor\/projects(?:\/[^/?]+)?(?:\?.*)?$/, route => {
+      if (route.request().method() === 'PUT') saved = { ...route.request().postDataJSON().project, revision: saved.revision + 1 }
+      return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ project: saved }) })
+    })
+    await page.route('**/editor/projects/*/audio', route => {
+      imports.push(route.request().postDataJSON())
+      saved = { ...saved, revision: saved.revision + 1, assets: { ...saved.assets, 'source-audio': {
+        ...base.assets['source-video'], id: 'source-audio', name: sound.name, type: 'audio', output_id: sound.name,
+        output_revision: `sha256:${'b'.repeat(64)}`, duration: 8, width: 0, height: 0, fps: 0,
+      } }, tracks: saved.tracks.map(track => track.id === 'audio-main' ? { ...track, items: [{ id: 'audio-layer', asset_id: 'source-audio', source_in: 0, start: 0, duration: 8, speed: 1, volume: 1, muted: false }] } : track) }
+      return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ project: saved }) })
+    })
+    await page.route('**/editor/projects/*/exports', route => { exports.push(route.request().postDataJSON()); return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ job_id: EXPORT_JOB_ID, status: 'queued' }) }) })
+    await page.goto('/')
+    await page.getByRole('tab', { name: 'Gallery' }).click()
+    await page.getByRole('button', { name: `Open ${VIDEO.name} in Editor` }).click()
+    const panel = page.getByRole('region', { name: 'Audio layer' })
+    await expect(panel).toBeVisible()
+    await panel.getByRole('combobox').selectOption(sound.name)
+    await panel.getByRole('button', { name: 'Add audio', exact: true }).click()
+    await expect(panel.getByRole('button', { name: 'Reveal private audio' })).toBeVisible()
+    expect(imports).toEqual([{ expected_revision: 1, output_name: sound.name, output_revision: sound.revision }])
+    expect(previewPins).toEqual([])
+    await panel.getByLabel('Audio source start (seconds)', { exact: true }).fill('2')
+    await panel.getByLabel('Audio source end (seconds)', { exact: true }).fill('5')
+    await panel.getByLabel('Audio timeline start (seconds)', { exact: true }).fill('3')
+    await panel.getByRole('slider', { name: /Audio volume/ }).focus()
+    await panel.getByRole('slider', { name: /Audio volume/ }).press('Home')
+    for (let index = 0; index < 25; index++) await panel.getByRole('slider', { name: /Audio volume/ }).press('ArrowRight')
+    await panel.getByRole('checkbox', { name: 'Mute audio layer' }).check()
+    await expect(page.getByRole('status').filter({ hasText: 'Draft saved' })).toBeVisible()
+    await page.getByRole('button', { name: 'Gallery', exact: true }).click()
+    await page.getByRole('button', { name: `Open ${VIDEO.name} in Editor` }).click()
+    await expect(panel.getByLabel('Audio source start (seconds)', { exact: true })).toHaveValue('2')
+    await expect(panel.getByRole('checkbox', { name: 'Mute audio layer' })).toBeChecked()
+    await panel.getByRole('button', { name: 'Reveal private audio' }).click()
+    await expect.poll(() => previewPins.length).toBeGreaterThan(0)
+    expect(previewPins.every(pin => pin === `sha256:${'b'.repeat(64)}`)).toBe(true)
+    await expect(panel.getByRole('button', { name: 'Audition audio' })).toBeDisabled()
+    await panel.getByLabel('Audio timeline start (seconds)', { exact: true }).fill('9')
+    await expect(page.getByText('Audio ends after this cut.', { exact: false })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Export MP4' })).toBeDisabled()
+    await panel.getByLabel('Audio timeline start (seconds)', { exact: true }).fill('3')
+    await panel.getByRole('checkbox', { name: 'Mute audio layer' }).uncheck()
+    await expect(page.getByRole('status').filter({ hasText: 'Draft saved' })).toBeVisible()
+    expect(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 1)).toBe(false)
+    const accessibility = await new AxeBuilder({ page }).include('main[aria-label="Video Editor"]').analyze()
+    expect(accessibility.violations.filter(v => v.impact === 'critical' || v.impact === 'serious')).toEqual([])
+    await panel.screenshot({ path: testInfo.outputPath(`${viewport.name}-audio-layer.png`) })
+    await page.getByRole('button', { name: 'Export MP4' }).click()
+    await expect.poll(() => exports.length).toBe(1)
+    await panel.getByRole('button', { name: 'Remove audio layer' }).click()
+    await expect(panel.getByRole('combobox')).toBeFocused()
+  })
+}

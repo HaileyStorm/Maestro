@@ -54,6 +54,51 @@ def _competing_editor_save(root, project, barrier, results, index):
 
 
 class TestEditorProjectFoundation(unittest.TestCase):
+    def test_audio_layer_round_trip_trim_offset_gain_mute_and_closed_identity(self):
+        from services.editor_projects import add_output_audio_layer, editor_audio_layer
+        self._workspace("audio")
+        current = create_output_video_timeline(workspace="audio", output_name="source.mp4", output_revision="video",
+            media={"type": "video", "duration": 4, "width": 128, "height": 72, "fps": 24})
+        current = add_output_audio_layer(current, output_name="score.wav", output_revision="audio",
+            media={"type": "audio", "duration": 8, "has_audio": True})
+        current = save_editor_project(self.outputs, "audio", current, expected_revision=0)
+        proposed = copy.deepcopy(current)
+        proposed["assets"]["source-audio"]["output_id"] = "foreign.wav"
+        item = proposed["tracks"][1]["items"][0]
+        item.update(source_in=2, duration=1.5, start=1, volume=0.25, muted=True)
+        updated = apply_output_video_trim(current, proposed)
+        self.assertEqual(updated["assets"], current["assets"])
+        self.assertEqual(editor_audio_layer(updated, require_fit=True), {
+            "id": "audio-layer", "asset_id": "source-audio", "source_in": 2,
+            "start": 1, "duration": 1.5, "volume": 0.25, "muted": True})
+        saved = save_editor_project(self.outputs, "audio", updated, expected_revision=1)
+        self.assertEqual(editor_audio_layer(load_editor_project(self.outputs, "audio", saved["id"])), editor_audio_layer(updated))
+        self.assertEqual(len(editor_sequence_clips(saved)), 1)
+        for change in ({"volume": 1.01}, {"volume": True}, {"duration": float("nan")}, {"source_in": 7},
+                       {"start": -1}, {"muted": 1}, {"asset_id": "source-video"}, {"fade_in": 0.2}):
+            broken = copy.deepcopy(saved); broken["tracks"][1]["items"][0].update(change)
+            with self.subTest(change=change), self.assertRaises(EditorProjectError):
+                apply_output_video_trim(saved, broken)
+        late = copy.deepcopy(saved); late["tracks"][1]["items"][0]["start"] = 3
+        late = apply_output_video_trim(saved, late)
+        self.assertIsNotNone(editor_audio_layer(late))
+        with self.assertRaises(EditorProjectError): editor_audio_layer(late, require_fit=True)
+        with self.assertRaises(EditorProjectError):
+            add_output_audio_layer(saved, output_name="second.wav", output_revision="second", media={"type": "audio", "duration": 1, "has_audio": True})
+        removed = copy.deepcopy(saved); removed["tracks"][1]["items"] = []
+        removed = apply_output_video_trim(saved, removed)
+        self.assertIsNone(editor_audio_layer(removed)); self.assertNotIn("source-audio", removed["assets"])
+        self.assertEqual(len(editor_sequence_clips(removed)), 1)
+
+    def test_audio_probe_uses_stream_duration_when_container_duration_absent(self):
+        path = os.path.join(self.temp.name, "sound.wav")
+        Path(path).write_bytes(b"audio")
+        with mock.patch("services.editor_projects.subprocess.run", return_value=types.SimpleNamespace(returncode=0,
+                stdout=json.dumps({"streams": [{"codec_type": "audio", "duration": "2.5", "channels": 2, "sample_rate": "48000"}]}))):
+            media = editor_project_service.probe_media(path)
+        self.assertEqual(media["duration"], 2.5)
+        self.assertEqual(media["type"], "audio")
+
     def test_titles_overlap_round_trip_and_keep_absolute_times_through_trim(self):
         from services.editor_projects import editor_text_layers
         self._workspace("titles")

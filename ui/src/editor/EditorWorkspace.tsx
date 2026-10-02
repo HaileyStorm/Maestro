@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ArrowLeft, ArrowRight, Download, Eye, Film, Loader2, Pause, Play, Plus, RotateCcw, Save, Trash2 } from 'lucide-react'
-import { appendEditorClip, exportEditorProject, getEditorPreviewUrl, openOutputInEditor, projectReferenceSafeErrorMessage, saveEditorProject, type EditorProject } from '../api/client'
+import { addEditorAudio, appendEditorClip, exportEditorProject, getEditorPreviewUrl, openOutputInEditor, projectReferenceSafeErrorMessage, saveEditorProject, type EditorProject } from '../api/client'
 import { privatePreviewIdentity, privatePreviewWasRevealed, revealPrivatePreview, subscribePrivatePreviewReveal } from '../lib/privatePreview'
 import { useStore } from '../stores/useStore'
 import type { OutputFile } from '../types'
@@ -116,6 +116,119 @@ function availableVideos(project: EditorProject, outputs: OutputFile[]): OutputF
     && Boolean(output.revision) && !imported.has(output.name))
 }
 
+function audioLayer(project: EditorProject) {
+  return project.tracks.find(track => track.id === 'audio-main')?.items[0]
+}
+
+function availableAudio(project: EditorProject, outputs: OutputFile[]) {
+  return outputs.filter(output => output.workspace === project.workspace && output.type === 'audio' && Boolean(output.revision))
+}
+
+function changeAudio(project: EditorProject, change: Partial<NonNullable<ReturnType<typeof audioLayer>>> | null): EditorProject {
+  return { ...project, tracks: project.tracks.map(track => track.id === 'audio-main'
+    ? { ...track, items: change === null ? [] : track.items.map(item => ({ ...item, ...change, id: item.id, asset_id: item.asset_id })) } : track) }
+}
+
+const audioInputClass = 'min-h-11 w-full min-w-0 rounded-lg border border-border bg-bg-primary px-3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50'
+const audioButtonClass = 'flex min-h-11 items-center justify-center gap-2 rounded-lg border border-border px-3 text-sm hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50'
+
+function AudioLayerPanel({ project, outputs, busy, error, stopKey, videoPlaying, onAudition, onImport, onChange }: {
+  project: EditorProject; outputs: OutputFile[]; busy: boolean; error: string; stopKey?: string; videoPlaying: boolean;
+  onAudition: () => void; onImport: (name: string) => void; onChange: (project: EditorProject) => void
+}) {
+  const layer = audioLayer(project)
+  const asset = project.assets[layer?.asset_id ?? '']
+  const choices = availableAudio(project, outputs)
+  const [name, setName] = useState('')
+  const [playing, setPlaying] = useState(false)
+  const [mediaErrorIdentity, setMediaErrorIdentity] = useState('')
+  const [revealedIdentity, setRevealedIdentity] = useState('')
+  const audio = useRef<HTMLAudioElement>(null)
+  const picker = useRef<HTMLSelectElement>(null)
+  const identity = privatePreviewIdentity(project.workspace, asset?.output_id ?? '', asset?.output_revision ?? '')
+  const revealed = asset?.private === false || revealedIdentity === identity || privatePreviewWasRevealed(identity)
+  useEffect(() => subscribePrivatePreviewReveal(identity, value => { if (value) setRevealedIdentity(identity) }), [identity])
+  const mediaError = mediaErrorIdentity === identity
+  useEffect(() => {
+    const element = audio.current
+    element?.pause()
+    if (element) element.volume = layer?.volume ?? 1
+    return () => element?.pause()
+  }, [project, stopKey, revealed, layer?.volume])
+  useEffect(() => { if (videoPlaying || busy) audio.current?.pause() }, [videoPlaying, busy])
+
+  const update = (change: Parameters<typeof changeAudio>[1]) => onChange(changeAudio(project, change))
+  const audition = () => {
+    const element = audio.current
+    if (!element || !layer) return
+    if (!element.paused) { element.pause(); return }
+    onAudition()
+    element.currentTime = layer.source_in
+    element.volume = layer.volume ?? 1
+    void element.play().catch(() => { if (audio.current === element) setMediaErrorIdentity(identity) })
+  }
+  return <section className="rounded-xl border border-border bg-bg-secondary p-4 md:p-6" aria-label="Audio layer">
+    <h2 className="mb-3 text-sm font-semibold">Audio layer <span className="ml-2 font-normal text-text-secondary">{layer ? '1/1' : '0/1'}</span></h2>
+    <p className="mb-5 text-xs leading-relaxed text-text-secondary">Add one audio file from this project’s Gallery. It mixes with the source sound during its chosen interval, without looping or extending the video. Lower the volume if the mix distorts. Video preview plays source sound; audition below plays only this audio layer.</p>
+    {!layer || !asset ? <div className="rounded-lg border border-dashed border-border p-4">
+      <div className="flex flex-wrap items-end gap-3">
+        <label className="block min-w-0 flex-1 text-sm"><span className="mb-2 block">Audio from this project’s Gallery</span>
+          <select ref={picker} value={choices.some(item => item.name === name) ? name : ''} disabled={busy || choices.length === 0}
+            onChange={event => setName(event.target.value)} className={audioInputClass}>
+            <option value="">Choose audio…</option>{choices.map(output => <option key={output.name} value={output.name}>{output.name}</option>)}
+          </select>
+        </label>
+        <button type="button" disabled={busy || !choices.some(item => item.name === name)} onClick={() => onImport(name)} className={audioButtonClass}><Plus size={15} aria-hidden="true" /> Add audio</button>
+      </div>
+      <p className="mt-3 text-xs text-text-secondary">{choices.length === 0 ? 'No loaded Gallery audio is available. Return to Gallery, show Audio and load audio from this project, then reopen this edit.' : 'Pending edits save before the selected audio is added.'}</p>
+    </div> : <div className="grid min-w-0 gap-5 md:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]">
+      <div className="min-w-0 space-y-3">
+        <div className="rounded-lg border border-accent-blue bg-accent-blue/15 p-3">
+          <p className="truncate text-sm font-medium" title={asset.name}>{asset.name}</p>
+          <p className="mt-2 text-xs tabular-nums text-text-secondary">Source {displayTime(asset.duration)} · Timeline {displayTime(layer.start)}–{displayTime(layer.start + layer.duration)}</p>
+          <p className="mt-1 text-xs text-text-secondary">{layer.muted ? 'Muted' : `${Math.round((layer.volume ?? 1) * 100)}% volume`}</p>
+        </div>
+        <div className="relative h-8 overflow-hidden rounded bg-bg-primary" aria-hidden="true"><div className="absolute inset-y-1 rounded border border-accent-blue bg-accent-blue/25"
+          style={{ left: `${Math.min(100, layer.start / Math.max(0.01, renderedDuration(project)) * 100)}%`, width: `${Math.max(0, Math.min(layer.duration, renderedDuration(project) - layer.start)) / Math.max(0.01, renderedDuration(project)) * 100}%` }} /></div>
+        {!revealed ? <button type="button" className={audioButtonClass} disabled={busy} onClick={() => { revealPrivatePreview(identity); setRevealedIdentity(identity) }}><Eye size={15} aria-hidden="true" /> Reveal private audio</button> : <>
+          <audio key={identity} ref={audio} src={getEditorPreviewUrl(asset.output_id, project.workspace, asset.output_revision)} preload="metadata"
+            onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={() => setPlaying(false)} onError={() => setMediaErrorIdentity(identity)}
+            onTimeUpdate={event => { if (event.currentTarget.currentTime >= layer.source_in + layer.duration) event.currentTarget.pause() }} />
+          <button type="button" disabled={busy || mediaError || layer.muted || layer.volume === 0} onClick={audition} className={audioButtonClass}>
+            {playing ? <Pause size={15} aria-hidden="true" /> : <Play size={15} aria-hidden="true" />}{playing ? 'Pause audio' : 'Audition audio'}</button>
+          {mediaError && <p role="alert" className="text-sm text-red-400">This browser could not play the pinned audio. Return to Gallery and reopen the edit, or export and play the MP4.</p>}
+        </>}
+        <button type="button" disabled={busy} onClick={() => { audio.current?.pause(); update(null); window.requestAnimationFrame(() => picker.current?.focus()) }} className={audioButtonClass}><Trash2 size={15} aria-hidden="true" /> Remove audio layer</button>
+      </div>
+      <div className="min-w-0 space-y-4">
+        <div className="grid gap-3 sm:grid-cols-2">
+          <label className="block text-sm"><span className="mb-2 block">Audio source start (seconds)</span>
+            <input type="number" min={0} max={asset.duration - 1 / 240} step={0.1} value={layer.source_in} disabled={busy} className={audioInputClass}
+              onChange={event => { const value = Number(event.target.value); if (Number.isFinite(value) && value >= 0 && value <= asset.duration - 1 / 240) update({ source_in: value, duration: Math.min(layer.duration, asset.duration - value) }) }} />
+          </label>
+          <label className="block text-sm"><span className="mb-2 block">Audio source end (seconds)</span>
+            <input type="number" min={layer.source_in + 1 / 240} max={asset.duration} step={0.1} value={Number((layer.source_in + layer.duration).toFixed(6))} disabled={busy} className={audioInputClass}
+              onChange={event => { const value = Number(event.target.value); if (Number.isFinite(value) && value >= layer.source_in + 1 / 240 && value <= asset.duration) update({ duration: value - layer.source_in }) }} />
+          </label>
+        </div>
+        <label className="block text-sm"><span className="mb-2 block">Audio timeline start (seconds)</span>
+          <input aria-label="Audio timeline start (seconds)" aria-describedby="audio-timeline-help" type="number" min={0} max={86400 - layer.duration} step={0.1} value={layer.start} disabled={busy} className={audioInputClass}
+            onChange={event => { const value = Number(event.target.value); if (Number.isFinite(value) && value >= 0 && value + layer.duration <= 86400) update({ start: value }) }} />
+          <span id="audio-timeline-help" className="mt-1 block text-xs text-text-secondary">Where the trimmed audio begins in the sequence. This time stays fixed when video clips move.</span>
+        </label>
+        <label className="block text-sm"><span className="mb-2 flex justify-between"><span>Audio volume</span><span>{Math.round((layer.volume ?? 1) * 100)}%</span></span>
+          <input type="range" min={0} max={100} step={1} value={(layer.volume ?? 1) * 100} disabled={busy} onChange={event => update({ volume: Number(event.target.value) / 100 })}
+            className="min-h-11 w-full rounded accent-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue" />
+        </label>
+        <label className="flex min-h-11 items-center gap-3 text-sm"><input type="checkbox" checked={layer.muted ?? false} disabled={busy} onChange={event => update({ muted: event.target.checked })}
+          className="h-5 w-5 rounded accent-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue" />Mute audio layer</label>
+      </div>
+    </div>}
+    {busy && <p role="status" className="mt-3 text-xs text-text-secondary">Wait for the current Editor operation to finish.</p>}
+    {error && <p role="alert" className="mt-3 text-sm text-red-400">{error}</p>}
+  </section>
+}
+
 export function EditorWorkspace({ source }: { source: OutputFile }) {
   const closeEditor = useStore(state => state.closeEditor)
   const outputs = useStore(state => state.outputs)
@@ -132,6 +245,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
   const [appendName, setAppendName] = useState('')
   const [appendPending, setAppendPending] = useState(false)
   const [appendError, setAppendError] = useState('')
+  const [importKind, setImportKind] = useState<'video' | 'audio'>('video')
   const [saveState, setSaveState] = useState<SaveState>('saved')
   const [savePending, setSavePending] = useState(false)
   const [error, setError] = useState('')
@@ -319,12 +433,14 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
     updateDraft(moveClip(projectRef.current, clip.id, direction))
   }
 
-  const handleAppend = async () => {
+  const handleAppend = async (kind: 'video' | 'audio' = 'video', requestedName = appendName) => {
     const epoch = scope.current
     if (!projectRef.current || !isCurrent(epoch) || appending.current || exporting.current || saveState === 'error') return
-    const output = availableVideos(projectRef.current, useStore.getState().outputs).find(item => item.name === appendName)
-    if (!output || sequenceClips(projectRef.current).length >= 8) return
+    const choices = kind === 'audio' ? availableAudio : availableVideos
+    const output = choices(projectRef.current, useStore.getState().outputs).find(item => item.name === requestedName)
+    if (!output || (kind === 'video' && sequenceClips(projectRef.current).length >= 8) || (kind === 'audio' && audioLayer(projectRef.current))) return
     appending.current = true
+    setImportKind(kind)
     setAppendPending(true)
     setAppendError('')
     preview.current?.pause()
@@ -339,24 +455,24 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
       if (!isCurrent(epoch) || !projectRef.current) return
       // Gallery may refresh while a save is pending. Pin exactly the selected
       // current output, and require another selection if its identity changed.
-      const currentOutput = availableVideos(projectRef.current, useStore.getState().outputs)
+      const currentOutput = choices(projectRef.current, useStore.getState().outputs)
         .find(item => item.name === output.name && item.revision === output.revision)
       if (!currentOutput) {
-        setAppendError('This Gallery video changed. Choose it again before adding it.')
+        setAppendError(`This Gallery ${kind} changed. Choose it again before adding it.`)
         setAppendName('')
         return
       }
-      const appended = await appendEditorClip(source.workspace, projectRef.current, output.name, output.revision)
+      const appended = await (kind === 'audio' ? addEditorAudio : appendEditorClip)(source.workspace, projectRef.current, output.name, output.revision)
       if (!isCurrent(epoch)) return
       projectRef.current = appended
       setProject(appended)
-      selectClip(sequenceClips(appended).at(-1)?.id ?? '')
+      if (kind === 'video') selectClip(sequenceClips(appended).at(-1)?.id ?? '')
       setSaveState('saved')
       setAppendName('')
       setExportState('idle')
       setExportError('')
     } catch (reason) {
-      if (isCurrent(epoch)) setAppendError(projectReferenceSafeErrorMessage(reason, 'This video could not be added. Try again.'))
+      if (isCurrent(epoch)) setAppendError(projectReferenceSafeErrorMessage(reason, `This ${kind} could not be added. Try again.`))
     } finally {
       if (isCurrent(epoch)) {
         appending.current = false
@@ -372,6 +488,8 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
   const percentWidth = duration > 0 ? (trimEnd - trimStart) / duration * 100 : 0
   const canTrim = duration >= 0.1 && Boolean(clip) && !appendPending && exportState !== 'submitting'
   const sequenceDuration = project ? renderedDuration(project) : 0
+  const bed = project ? audioLayer(project) : undefined
+  const audioOutOfRange = Boolean(bed && bed.start + bed.duration > sequenceDuration + 1e-6)
   const titlesOutOfRange = titles.some(item => item.start + item.duration > sequenceDuration + 1e-6)
   const titleFps = clips.length > 1 ? project?.canvas.fps ?? 30 : sourceAsset?.fps || project?.canvas.fps || 30
   const titlesTooShort = titles.some(item => item.duration < 1 / titleFps - 1e-9)
@@ -382,7 +500,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
 
   const handleExport = async () => {
     const epoch = scope.current
-    if (!project || !canTrim || titlesOutOfRange || titlesTooShort || saveState !== 'saved' || saving.current || exporting.current || appending.current || !isCurrent(epoch)) return
+    if (!project || !canTrim || titlesOutOfRange || titlesTooShort || audioOutOfRange || saveState !== 'saved' || saving.current || exporting.current || appending.current || !isCurrent(epoch)) return
     exporting.current = true
     const version = editVersion.current
     setExportState('submitting')
@@ -512,13 +630,14 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
                 : 'Your original videos stay intact. Clips play one after another, in timeline order. The sequence is saved as an editable draft in the project.'}</p>
               {clips.length > 1 && <p className="mt-3 text-xs leading-relaxed text-text-secondary">Export uses the sequence canvas set from the first video ({project.canvas.width} × {project.canvas.height}, {project.canvas.fps} fps). Odd source dimensions are rounded up to an even canvas. Other shapes receive black bars. Each clip uses its first audio track; clips without audio use silence.</p>}
               <button type="button" onClick={() => { void handleExport() }}
-                disabled={!canTrim || titlesOutOfRange || titlesTooShort || saveState !== 'saved' || exportState !== 'idle' || appendPending}
+                disabled={!canTrim || titlesOutOfRange || titlesTooShort || audioOutOfRange || saveState !== 'saved' || exportState !== 'idle' || appendPending}
                 className="mt-5 flex min-h-11 w-full items-center justify-center gap-2 rounded-lg border border-border bg-bg-primary px-4 text-sm font-medium text-text-primary hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50">
                 {exportState === 'submitting' ? <Loader2 size={16} className="animate-spin motion-reduce:animate-none" aria-hidden="true" /> : <Download size={16} aria-hidden="true" />}
                 {exportState === 'submitting' ? 'Queuing export…' : exportState === 'queued' ? 'Export queued' : 'Export MP4'}
               </button>
               {exportState === 'queued' && <p className="mt-3 text-xs leading-relaxed text-text-secondary" role="status">Track the export in Queue. The finished MP4 will appear in Gallery.</p>}
               {exportError && <p className="mt-3 text-sm text-red-400" role="alert">{exportError}</p>}
+              {audioOutOfRange && <p className="mt-3 text-sm text-red-400" role="alert">Audio ends after this cut. Shorten the audio layer or move its timeline start before export.</p>}
               {titlesOutOfRange && <p className="mt-3 text-sm text-red-400" role="alert">Text ends after this cut. Shorten or remove those text layers before export.</p>}
               {titlesTooShort && <p className="mt-3 text-sm text-red-400" role="alert">Text must last at least one video frame ({(1 / titleFps).toFixed(3)} seconds). Move its start or end before export.</p>}
               {saveState !== 'saved' && <p className="mt-3 text-xs text-text-muted">The {clips.length === 1 ? 'cut' : 'sequence'} must finish saving before export.</p>}
@@ -562,15 +681,15 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
                 <button type="button" disabled={busy || savePending || saveState === 'error' || clips.length >= 8 || !candidates.some(item => item.name === appendName)}
                   onClick={() => { void handleAppend() }}
                   className="flex min-h-11 items-center justify-center gap-2 rounded-lg border border-border bg-bg-primary px-4 text-sm hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50">
-                  {appendPending ? <Loader2 size={15} className="animate-spin motion-reduce:animate-none" aria-hidden="true" /> : <Plus size={15} aria-hidden="true" />}
-                  {appendPending ? 'Adding clip…' : 'Add clip'}
+                  {appendPending && importKind === 'video' ? <Loader2 size={15} className="animate-spin motion-reduce:animate-none" aria-hidden="true" /> : <Plus size={15} aria-hidden="true" />}
+                  {appendPending && importKind === 'video' ? 'Adding clip…' : 'Add clip'}
                 </button>
               </div>
               <p className="mt-2 text-xs text-text-muted">{clips.length >= 8 ? 'This sequence has reached its 8-clip limit.'
                 : candidates.length === 0 ? 'No other loaded Gallery videos are available. Return to Gallery to load more videos from this project.'
                 : 'The selected video is added after the last clip. Pending edits save before it is added.'}</p>
-              {appendPending && <p className="mt-2 text-xs text-text-secondary" role="status">Saving pending edits and adding the selected video…</p>}
-              {appendError && <p className="mt-3 text-sm text-red-400" role="alert">{appendError}</p>}
+              {appendPending && importKind === 'video' && <p className="mt-2 text-xs text-text-secondary" role="status">Saving pending edits and adding the selected video…</p>}
+              {appendError && importKind === 'video' && <p className="mt-3 text-sm text-red-400" role="alert">{appendError}</p>}
             </div>
             <h3 className="mb-3 text-sm font-medium">Trim clip {selectedIndex + 1}</h3>
             <div className="relative mb-6 h-16 overflow-hidden rounded-lg bg-bg-primary" aria-hidden="true">
@@ -598,6 +717,10 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
               if (window.confirm('Leave Editor and discard the unsaved changes?')) closeEditor()
             }} className="mt-3 min-h-11 rounded-lg px-3 text-sm text-text-secondary underline hover:text-text-primary">Leave without saving</button>}
           </section>
+          <AudioLayerPanel key={project.id} project={project} outputs={outputs} busy={busy || saveState === 'error'} error={importKind === 'audio' ? appendError : ''}
+            stopKey={clip?.id} videoPlaying={playing} onAudition={() => { preview.current?.pause(); setPlaying(false) }}
+            onImport={name => { void handleAppend('audio', name) }}
+            onChange={next => { if (!appending.current && !exporting.current && isCurrent(scope.current)) updateDraft(next) }} />
           <section className="rounded-xl border border-border bg-bg-secondary p-4 md:p-6" aria-label="Text layers">
             <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
               <h2 className="text-sm font-semibold">Text layers <span className="ml-2 font-normal text-text-secondary">{titles.length}/8</span></h2>

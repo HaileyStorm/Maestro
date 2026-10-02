@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import array
 import json
+import math
 from pathlib import Path
 import shutil
 import subprocess
@@ -24,6 +25,70 @@ FFPROBE = shutil.which("ffprobe")
 
 @unittest.skipUnless(FFMPEG and FFPROBE, "ffmpeg and ffprobe are required")
 class EditorExportMediaTests(unittest.TestCase):
+    def test_audio_layer_timing_trim_gain_mute_silence_sequence_and_all_streams(self):
+        source = self.make_source()
+        bed = self.root / "bed.wav"
+        self.run_media([FFMPEG, "-v", "error", "-f", "lavfi", "-i", "sine=frequency=880:duration=1:sample_rate=48000",
+            "-f", "lavfi", "-i", "sine=frequency=960:duration=1:sample_rate=48000", "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1[a]",
+            "-map", "[a]", "-c:a", "pcm_s16le", str(bed)])
+        hashes = [hashlib.sha256(p.read_bytes()).hexdigest() for p in (source, bed)]
+        plan = {"path": str(bed), "source_in": 1.25, "duration": 0.5, "start": 0.5, "volume": 1.0, "muted": False}
+        def samples(path, index=0):
+            return array.array("f", self.run_media([FFMPEG, "-v", "error", "-i", str(path), "-map", f"0:a:{index}", "-ac", "1", "-ar", "48000", "-f", "f32le", "-"]))
+        def amplitude(values, frequency, start=0.65, end=0.85):
+            part = values[round(start * 48000):round(end * 48000)]
+            real = sum(value * math.cos(2 * math.pi * frequency * index / 48000) for index, value in enumerate(part))
+            imag = sum(value * math.sin(2 * math.pi * frequency * index / 48000) for index, value in enumerate(part))
+            return 2 * math.hypot(real, imag) / len(part)
+        amplitudes = []
+        baseline = self.root / "baseline.mp4"
+        render_single_source_cut(source, baseline, source_in=0.25, duration=1.5, timeout=30)
+        for index, (gain, muted) in enumerate(((1, False), (0.5, False), (0, False), (1, True))):
+            output = self.root / f"mixed-{index}.mp4"
+            render_single_source_cut(source, output, source_in=0.25, duration=1.5, audio_layer={**plan, "volume": gain, "muted": muted}, timeout=30)
+            media = self.probe(output)
+            self.assertEqual([item["codec_type"] for item in media["streams"]], ["video", "audio", "audio"])
+            self.assertAlmostEqual(float(media["streams"][0]["duration"]), 1.5, delta=0.001)
+            for stream, source_frequency in enumerate((440, 660)):
+                values = samples(output, stream)
+                base = samples(baseline, stream)
+                self.assertAlmostEqual(amplitude(values, source_frequency) / amplitude(base, source_frequency), 1, delta=0.05)
+                self.assertLess(amplitude(values, 960, 0.1, 0.3), 0.002)
+                self.assertLess(amplitude(values, 960, 1.15, 1.35), 0.002)
+                self.assertLess(amplitude(values, 880), 0.002)  # trim chose the second tone
+                if stream == 0: amplitudes.append(amplitude(values, 960))
+                if gain == 0 or muted: self.assertEqual(values, base)
+        self.assertGreater(amplitudes[0], 0.1)
+        self.assertAlmostEqual(amplitudes[1] / amplitudes[0], 0.5, delta=0.05)
+        self.assertLess(max(amplitudes[2:]), 0.002)
+        for kind in ("silent", "sequence"):
+            output = self.root / f"{kind}.mp4"
+            if kind == "silent":
+                silent = self.root / "silent-source.mp4"
+                self.run_media([FFMPEG, "-v", "error", "-f", "lavfi", "-i", "color=black:s=128x72:r=24:d=1.5", "-c:v", "libx264", "-threads", "2", str(silent)])
+                render_single_source_cut(silent, output, source_in=0, duration=1.5, audio_layer=plan, timeout=30)
+            else:
+                render_video_sequence([{"path": source, "source_in": 0, "duration": 0.75, "has_audio": True}] * 2,
+                    output, width=128, height=72, fps=24, audio_layer=plan,
+                    text_layers=[{"id": "title", "text": "Across join", "start": 0.5, "duration": 0.5, "position": "top"}], timeout=30)
+            self.assertEqual(len(self.probe(output)["streams"]), 2)
+            self.assertGreater(amplitude(samples(output), 960), 0.03)
+            self.assertAlmostEqual(float(self.probe(output)["streams"][0]["duration"]), 1.5, delta=0.001)
+        self.assertEqual([hashlib.sha256(p.read_bytes()).hexdigest() for p in (source, bed)], hashes)
+        self.assertFalse(list(self.root.glob(".editor-cut-*")))
+
+    def test_audio_mix_keeps_multichannel_layout(self):
+        source = self.root / "surround.mkv"
+        bed = self.root / "mono.wav"
+        self.run_media([FFMPEG, "-v", "error", "-f", "lavfi", "-i", "color=black:s=128x72:r=24:d=0.5",
+            "-f", "lavfi", "-i", "anullsrc=r=48000:cl=5.1", "-t", "0.5", "-c:v", "libx264", "-threads", "2", "-c:a", "pcm_s16le", str(source)])
+        self.run_media([FFMPEG, "-v", "error", "-f", "lavfi", "-i", "sine=frequency=960:sample_rate=48000:duration=0.5", str(bed)])
+        output = self.root / "surround.mp4"
+        render_single_source_cut(source, output, source_in=0, duration=0.5,
+            audio_layer={"path": str(bed), "source_in": 0, "duration": 0.5, "start": 0, "volume": 0.5, "muted": False}, timeout=30)
+        streams = json.loads(self.run_media([FFPROBE, "-v", "error", "-select_streams", "a", "-show_entries", "stream=channels,channel_layout", "-of", "json", str(output)]))["streams"]
+        self.assertEqual(streams, [{"channels": 6, "channel_layout": "5.1"}])
+
     def test_title_positions_stacking_and_narrow_canvas_fit(self):
         from services.editor_export import _title_filters
         from PIL import Image

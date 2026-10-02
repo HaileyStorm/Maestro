@@ -16,7 +16,9 @@ frame-rounded exported length; preview plays the selected clip, not the full joi
 
 Preview and CPU export use the bundled DejaVu Sans font. White text and a
 translucent black rectangle fit the canvas width. Font, color, free positioning,
-animation, extra audio/image layers and overlapping video are not yet editable.
+animation, image layers and overlapping video are not yet editable. One timed
+Gallery audio layer is supported; see
+[the audio contract](MAESTRO_EDITOR_AUDIO_LAYER_2026-10-02.md).
 Long lines shrink; at the minimum font size they compress horizontally to avoid
 clipping on very small canvases. A blank title produces no visible overlay but
 still uses the saved even-sized export canvas.

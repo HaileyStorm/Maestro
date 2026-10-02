@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import math
 import os
+import json
+import re
+import subprocess
 from pathlib import Path
 import tempfile
 from typing import Callable
@@ -82,6 +85,61 @@ def _seconds(value: object, *, allow_zero: bool = False) -> str:
     return f"{number:.9f}".rstrip("0").rstrip(".")
 
 
+def _audio_mix_filters(layer: dict | None, *, duration: float, first_input: int,
+                       bases: list[str], layouts: list[str]) -> tuple[list[str], list[str], list[str]]:
+    """Add a sample-timed finite bed without attenuating or losing source streams."""
+    if layer is None:
+        return [], [], []
+    start = _seconds(layer["start"], allow_zero=True)
+    source_in = _seconds(layer["source_in"], allow_zero=True)
+    length = _seconds(layer["duration"])
+    gain = layer["volume"]
+    if (type(layer["muted"]) is not bool or type(gain) not in (int, float)
+            or not math.isfinite(gain) or not 0 <= gain <= 1
+            or float(start) + float(length) > duration + 1e-6):
+        raise ValueError("Editor audio interval or volume is invalid")
+    path = Path(os.path.abspath(os.fspath(layer["path"])))
+    if not path.is_file() or path.is_symlink():
+        raise FileNotFoundError("Editor audio source is unavailable")
+    if layer["muted"] or gain == 0:
+        return [], [], []
+    if not bases:
+        bases, layouts = ["bed_silence"], ["stereo"]
+        filters = [f"anullsrc=r=48000:cl=stereo,atrim=duration={_seconds(duration)}[bed_silence]"]
+    else:
+        filters = []
+    if len(bases) != len(layouts) or any(not re.fullmatch(r"[A-Za-z0-9._()+-]{1,64}", layout) for layout in layouts):
+        raise ValueError("Editor source audio layout is unavailable")
+    inputs = ["-ss", source_in, "-t", length, "-i", str(path)]
+    samples = round(float(start) * 48000)
+    total_samples = round(duration * 48000)
+    filters.append(f"[{first_input}:a:0]asetpts=PTS-STARTPTS,aresample=48000,"
+                   f"atrim=duration={length},volume={gain},adelay={samples}S:all=1,"
+                   f"apad,atrim=end_sample={total_samples},asplit={len(bases)}"
+                   + "".join(f"[bed{index}]" for index in range(len(bases))))
+    maps = []
+    for index, (base, layout) in enumerate(zip(bases, layouts)):
+        filters.append(f"[{base}]asetpts=PTS-STARTPTS,aresample=48000,"
+                       f"aformat=sample_fmts=fltp:channel_layouts={layout},apad,"
+                       f"atrim=end_sample={total_samples}[original{index}]")
+        filters.append(f"[bed{index}]aformat=sample_fmts=fltp:channel_layouts={layout}[bed_layout{index}]")
+        filters.append(f"[original{index}][bed_layout{index}]amix=inputs=2:duration=first:"
+                       f"dropout_transition=0:normalize=0[mixed{index}]")
+        maps += ["-map", f"[mixed{index}]"]
+    return inputs, filters, maps
+
+
+def _source_audio_layouts(source: Path) -> list[str]:
+    result = subprocess.run([os.environ.get("FFPROBE_BINARY") or "ffprobe", "-v", "error",
+                             "-select_streams", "a", "-show_entries", "stream=channel_layout,channels",
+                             "-of", "json", str(source)], capture_output=True, text=True, timeout=60, check=True)
+    streams = json.loads(result.stdout)["streams"]
+    # Some PCM containers omit the speaker mask. Retain their channel count
+    # using FFmpeg's standard default, as the existing AAC export does.
+    return [item.get("channel_layout") or (f"{item['channels']}c" if type(item.get("channels")) is int
+            and 1 <= item["channels"] <= 64 else "") for item in streams]
+
+
 def render_single_source_cut(
     source: str | os.PathLike[str],
     destination: str | os.PathLike[str],
@@ -90,6 +148,7 @@ def render_single_source_cut(
     duration: float,
     text_layers: list[dict] | None = None,
     canvas: dict | None = None,
+    audio_layer: dict | None = None,
     abort_check: Callable[[], object] | None = None,
     timeout: float = 3600,
     runner: Callable[..., int] | None = None,
@@ -146,13 +205,24 @@ def render_single_source_cut(
                                     f"pad={canvas['width']}:{canvas['height']}:(ow-iw)/2:(oh-ih)/2,setsar=1[cut]",
                                     *title_filters]), "-map", f"[{label}]"]
                          if text_layers else ["-map", "0:v:0", "-vf", "setpts=PTS-STARTPTS"])
+        layouts = _source_audio_layouts(source_path) if audio_layer and not audio_layer["muted"] and audio_layer["volume"] > 0 else []
+        bed_inputs, bed_filters, audio_options = _audio_mix_filters(
+            audio_layer, duration=float(length), first_input=1 + len(title_inputs) // 2,
+            bases=[f"0:a:{index}" for index in range(len(layouts))], layouts=layouts,
+        )
+        if bed_filters:
+            if text_layers:
+                video_options[3] += ";" + ";".join(bed_filters)
+            else:
+                video_options += ["-filter_complex_threads", "2", "-filter_complex", ";".join(bed_filters)]
+        else:
+            audio_options = ["-map", "0:a?", "-af", "asetpts=PTS-STARTPTS"]
         command = [
             os.environ.get("FFMPEG_BINARY") or "ffmpeg",
             "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-            "-ss", start, "-i", str(source_path), *title_inputs, "-t", length,
-            *video_options, "-map", "0:a?",
+            "-ss", start, "-i", str(source_path), *title_inputs, *bed_inputs, "-t", length,
+            *video_options, *audio_options,
             "-map_metadata", "-1", "-map_chapters", "-1",
-            "-af", "asetpts=PTS-STARTPTS",
             "-fps_mode", "passthrough", "-threads", "2",
             "-c:v", "libx264", "-preset", "medium", "-crf", "18",
             "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
@@ -184,6 +254,7 @@ def render_video_sequence(
     clips: list[dict], destination: str | os.PathLike[str], *,
     width: int, height: int, fps: float,
     text_layers: list[dict] | None = None,
+    audio_layer: dict | None = None,
     abort_check: Callable[[], object] | None = None,
     timeout: float = 3600, runner: Callable[..., int] | None = None,
 ) -> str:
@@ -255,8 +326,14 @@ def render_video_sequence(
         )
         command += title_inputs
         filters += title_filters
+        bed_inputs, bed_filters, audio_maps = _audio_mix_filters(
+            audio_layer, duration=total_frames / fps, first_input=len(clips) + len(title_inputs) // 2,
+            bases=["a"], layouts=["stereo"],
+        )
+        command += bed_inputs
+        filters += bed_filters
         command += ["-filter_complex_threads", "2", "-filter_complex", ";".join(filters),
-                    "-map", f"[{label}]", "-map", "[a]", "-map_metadata", "-1", "-map_chapters", "-1",
+                    "-map", f"[{label}]", *(audio_maps or ["-map", "[a]"]), "-map_metadata", "-1", "-map_chapters", "-1",
                     "-threads", "2", "-c:v", "libx264", "-preset", "medium", "-crf", "18",
                     "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
                     "-movflags", "+faststart", str(temporary)]

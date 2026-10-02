@@ -4841,7 +4841,7 @@ _RECOVERABLE_INPUT_KEYS = frozenset({
     "retake_user_end_anchor", "voice_reference", "voice_clone_refs",
     "audio_path", "reference_image_path", "character_ref_paths",
     "location_ref_paths", "image_paths", "_blend_clip_a", "_blend_clip_b",
-    "hflip_source_path", "editor_source_path", "browser_copy_source_path",
+    "hflip_source_path", "editor_source_path", "editor_audio_path", "browser_copy_source_path",
     "_tool_input_paths",
     "_h3_bridge_clip_a", "_h3_bridge_clip_b",
 })
@@ -5086,7 +5086,7 @@ def _queue_recovery_input_descriptors(job: dict, owner_digest: str) -> list[dict
     for field, path in _queue_recovery_file_values(params):
         if field.startswith("hflip_source_path:") and job.get("kind") != "tool_hflip":
             raise QueueRecoveryRuntimeError("Unexpected transform input in this job.")
-        if field.startswith("editor_source_path:") and job.get("kind") != "tool_editor_export":
+        if field.startswith(("editor_source_path:", "editor_audio_path:")) and job.get("kind") != "tool_editor_export":
             raise QueueRecoveryRuntimeError("Unexpected Editor input in this job.")
         if field.startswith("browser_copy_source_path:") and job.get("kind") != "tool_browser_copy":
             raise QueueRecoveryRuntimeError("Unexpected browser-copy input in this job.")
@@ -5160,7 +5160,7 @@ def _queue_recovery_input_descriptors(job: dict, owner_digest: str) -> list[dict
                 out_dir, os.path.splitext(os.path.basename(resolved))[0] + ".meta.json",
             )
             if (field in {"hflip_source_path:0", "browser_copy_source_path:0"}
-                    or field.startswith(("_tool_input_paths:", "editor_source_path:"))) and not os.path.lexists(sidecar_path):
+                    or field.startswith(("_tool_input_paths:", "editor_source_path:", "editor_audio_path:"))) and not os.path.lexists(sidecar_path):
                 # Legacy gallery media remains usable in this session. Without
                 # prior project sidecar evidence, restart recovery stays blocked.
                 descriptor["scope"] = "derived"
@@ -27304,7 +27304,7 @@ def _editor_require_current_source(request: Request, project: str, asset: dict) 
         not isinstance(asset, dict)
         or asset.get("workspace") != project
         or asset.get("origin") != "output"
-        or asset.get("type") != "video"
+        or asset.get("type") not in {"video", "audio"}
         or asset.get("output_id") != asset.get("name")
     ):
         raise HTTPException(status_code=409, detail="Editor source changed; reopen the video")
@@ -27477,7 +27477,7 @@ async def append_output_editor_clip(project: str, editor_id: str, request: Reque
         except (EditorProjectError, OSError, ValueError, subprocess.SubprocessError) as error:
             raise HTTPException(status_code=422, detail="This video could not be inspected for editing") from error
         with _output_lineage_mutation_guard(out_dir):
-            for asset, _ in clips:
+            for asset in current["assets"].values():
                 _editor_require_current_source(request, project, asset)
             current_dir, current_path, sidecar = _require_authorized_output(request, project, name)
             try:
@@ -27494,6 +27494,68 @@ async def append_output_editor_clip(project: str, editor_id: str, request: Reque
                 saved = save_editor_project(_editor_save_root(), project, updated, expected_revision=expected)
             except EditorProjectError as error:
                 raise HTTPException(status_code=409, detail="Editor draft changed; reload before adding a clip") from error
+            except OSError as error:
+                raise HTTPException(status_code=503, detail="Editor draft could not be saved") from error
+    return {"project": saved}
+
+
+@api.post("/api/v1/projects/{project}/editor/projects/{editor_id}/audio")
+async def add_output_editor_audio(project: str, editor_id: str, request: Request):
+    """Add one current Gallery audio file, retaining server-owned source identity."""
+    from services.editor_projects import (
+        EditorProjectError, add_output_audio_layer, editor_audio_layer,
+        load_editor_project, probe_media, save_editor_project,
+    )
+    body = await _editor_request_body(request)
+    expected, name, revision = body.get("expected_revision"), body.get("output_name"), body.get("output_revision")
+    if (set(body) != {"expected_revision", "output_name", "output_revision"}
+            or type(expected) is not int or expected < 1
+            or not isinstance(name, str) or not 0 < len(name) <= 255
+            or not isinstance(revision, str) or not 0 < len(revision) <= 128):
+        raise HTTPException(status_code=400, detail="Choose a current Gallery audio file")
+    with _reserve_workspace_operations(project):
+        _require_project_access(request, project, existing_only=True, permission="project.mutate")
+        try:
+            current = load_editor_project(_editor_save_root(), project, editor_id)
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="Editor draft not found") from None
+        except (EditorProjectError, OSError, ValueError) as error:
+            raise HTTPException(status_code=503, detail="Editor draft is unavailable") from error
+        if current["revision"] != expected:
+            raise HTTPException(status_code=409, detail="Editor draft changed; reload before adding audio")
+        try:
+            if editor_audio_layer(current):
+                raise EditorProjectError("Remove the current audio layer before adding another")
+        except EditorProjectError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        out_dir, filepath, _ = _require_authorized_output(request, project, name)
+        try:
+            if not hmac.compare_digest(revision, _output_revision(filepath, out_dir, name)):
+                raise HTTPException(status_code=409, detail="Audio changed; refresh Gallery")
+            content_revision = _output_share_revision(filepath, out_dir, name)
+            media = probe_media(filepath)
+        except HTTPException:
+            raise
+        except (EditorProjectError, OSError, ValueError, subprocess.SubprocessError) as error:
+            raise HTTPException(status_code=422, detail="This audio could not be inspected for editing") from error
+        with _output_lineage_mutation_guard(out_dir):
+            for asset in current["assets"].values():
+                _editor_require_current_source(request, project, asset)
+            current_dir, current_path, sidecar = _require_authorized_output(request, project, name)
+            try:
+                if (current_path != filepath or current_dir != out_dir
+                        or not hmac.compare_digest(content_revision, _output_share_revision(current_path, current_dir, name))):
+                    raise HTTPException(status_code=409, detail="Audio changed while adding; refresh Gallery")
+                media["private"] = public_output_policy(sidecar)["private"]
+                updated = add_output_audio_layer(current, output_name=name, output_revision=content_revision, media=media)
+            except HTTPException:
+                raise
+            except (EditorProjectError, OSError, ValueError) as error:
+                raise HTTPException(status_code=422, detail="Choose an available project audio file") from error
+            try:
+                saved = save_editor_project(_editor_save_root(), project, updated, expected_revision=expected)
+            except EditorProjectError as error:
+                raise HTTPException(status_code=409, detail="Editor draft changed; reload before adding audio") from error
             except OSError as error:
                 raise HTTPException(status_code=503, detail="Editor draft could not be saved") from error
     return {"project": saved}
@@ -27521,10 +27583,11 @@ async def export_output_editor_project(project: str, editor_id: str, request: Re
             raise HTTPException(status_code=503, detail="Editor draft is unavailable") from error
         if timeline["revision"] != expected:
             raise HTTPException(status_code=409, detail="Editor draft changed; reload before exporting")
-        from services.editor_projects import editor_sequence_clips, editor_text_layers
+        from services.editor_projects import editor_sequence_clips, editor_text_layers, editor_audio_layer
         try:
             clips = editor_sequence_clips(timeline)
             text_layers = editor_text_layers(timeline, require_fit=True)
+            audio_layer = editor_audio_layer(timeline, require_fit=True)
         except EditorProjectError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         with _output_lineage_mutation_guard(out_dir):
@@ -27548,6 +27611,15 @@ async def export_output_editor_project(project: str, editor_id: str, request: Re
                     "source_in": float(clip["source_in"]), "duration": float(clip["duration"]),
                     "private": bool(policy["private"]), "explicit": bool(policy["explicit"]),
                 })
+            bed = None
+            if audio_layer:
+                asset = timeline["assets"][audio_layer["asset_id"]]
+                _editor_require_current_source(request, project, asset)
+                _, bed_path, bed_sidecar = _require_authorized_output(request, project, asset["output_id"])
+                bed_policy = public_output_policy(bed_sidecar)
+                bed = {**audio_layer, "name": asset["output_id"], "path": bed_path,
+                       "revision": asset["output_revision"], "private": bool(bed_policy["private"]),
+                       "explicit": bool(bed_policy["explicit"])}
             first = sources[0]
             name, source = first["name"], first["path"]
             canvas = timeline["canvas"]
@@ -27574,7 +27646,7 @@ async def export_output_editor_project(project: str, editor_id: str, request: Re
                     "editor_source_name": name,
                     "editor_source_path": [item["path"] for item in sources] if multiple else source,
                     "editor_source_revision": first["revision"],
-                    "editor_source_has_audio": any(item["has_audio"] for item in sources) or multiple,
+                    "editor_source_has_audio": any(item["has_audio"] for item in sources) or multiple or bool(bed and not bed["muted"] and bed["volume"] > 0),
                     "editor_source_fps": float(canvas["fps"] if multiple else first["fps"]),
                     "editor_project_id": editor_id,
                     "editor_revision": expected,
@@ -27582,8 +27654,9 @@ async def export_output_editor_project(project: str, editor_id: str, request: Re
                     "editor_duration": duration,
                     **({"editor_sources": sources, "editor_canvas": copy.deepcopy(canvas)} if multiple else {}),
                     **({"editor_text_layers": text_layers, "editor_canvas": copy.deepcopy(canvas)} if text_layers else {}),
-                    "private_output": any(item["private"] for item in sources),
-                    "explicit_output": any(item["explicit"] for item in sources),
+                    **({"editor_audio_layer": bed, "editor_audio_path": bed["path"]} if bed else {}),
+                    "private_output": any(item["private"] for item in sources) or bool(bed and bed["private"]),
+                    "explicit_output": any(item["explicit"] for item in sources) or bool(bed and bed["explicit"]),
                 },
                 "output_files": [], "error": None, "workspace": project, "out_dir": out_dir,
             }
@@ -63660,6 +63733,12 @@ def _write_tool_sidecar(out_dir, filename, *, source_name, tool, params, elapsed
             sidecar["params"] = None
             sidecar["transform"]["text_layers"] = copy.deepcopy(job["params"]["editor_text_layers"])
             sidecar["transform"]["canvas"] = copy.deepcopy(job["params"]["editor_canvas"])
+        if job.get("params", {}).get("editor_audio_layer"):
+            sidecar["params"] = None
+            bed = job["params"]["editor_audio_layer"]
+            sidecar["transform"]["audio_layer"] = {key: bed[key] for key in (
+                "name", "revision", "source_in", "start", "duration", "volume", "muted")}
+            sidecar["transform"]["audio_mix"] = "added to each retained stream; no looping or video extension"
     elif tool == "browser_copy":
         sidecar["artifact_class"] = "final"
         sidecar["params"].pop("multi_clip_info", None)
@@ -64144,6 +64223,11 @@ def _editor_export_source(job: dict) -> tuple[str, dict]:
     else:
         entries = [{"name": params["editor_source_name"], "path": params["editor_source_path"],
                     "revision": params["editor_source_revision"]}]
+    bed = params.get("editor_audio_layer")
+    if bed is not None:
+        if not isinstance(bed, dict) or bed.get("path") != params.get("editor_audio_path"):
+            raise ValueError("The Editor audio source changed.")
+        entries = [*entries, bed]
     resolved = []
     for entry in entries:
         name = entry["name"]
@@ -64196,7 +64280,7 @@ def _run_tool_editor_export(job_id: str):
                         render_video_sequence(
                             params["editor_sources"], staged,
                             width=canvas["width"], height=canvas["height"], fps=canvas["fps"],
-                            text_layers=params.get("editor_text_layers"),
+                            text_layers=params.get("editor_text_layers"), audio_layer=params.get("editor_audio_layer"),
                             abort_check=aborted, timeout=3600,
                         )
                     else:
@@ -64204,6 +64288,7 @@ def _run_tool_editor_export(job_id: str):
                             source, staged, source_in=params["editor_source_in"],
                             duration=params["editor_duration"], abort_check=aborted, timeout=3600,
                             text_layers=params.get("editor_text_layers"), canvas=params.get("editor_canvas"),
+                            audio_layer=params.get("editor_audio_layer"),
                         )
                     rendered = probe_media(staged)
                     if params.get("editor_sources") is not None:

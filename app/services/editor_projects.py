@@ -391,6 +391,106 @@ def apply_output_video_trim(
         titles = next(track for track in updated["tracks"] if track["id"] == "titles-main")
         plan = editor_text_layers({**updated, "tracks": [incoming_titles[0]]})
         titles["items"] = [_editor_title_item(item) for item in plan]
+    incoming_audio = [track for track in proposed["tracks"] if track.get("id") == "audio-main"]
+    if incoming_audio:
+        original_bed = editor_audio_layer(current)
+        candidate = editor_audio_layer({**updated, "tracks": incoming_audio})
+        if candidate and (not original_bed or any(candidate[key] != original_bed[key] for key in ("id", "asset_id"))):
+            raise EditorProjectError("Add audio from this project's Gallery")
+        audio = next(track for track in updated["tracks"] if track["id"] == "audio-main")
+        audio["items"] = [_editor_audio_item(candidate)] if candidate else []
+        if original_bed and not candidate:
+            del updated["assets"][original_bed["asset_id"]]
+    return updated
+
+
+def _editor_audio_item(plan: Mapping[str, Any]) -> dict[str, Any]:
+    asset_id = plan["asset_id"]
+    return {
+        **dict(plan), "speed": 1.0, "opacity": 1.0,
+        "fade_in": 0.0, "fade_out": 0.0, "transition_in": "none", "transition_out": "none",
+        "take_asset_ids": [asset_id],
+        "take_states": {asset_id: {"source_in": plan["source_in"], "speed": 1.0}},
+        "transform": {"x": 0.0, "y": 0.0, "scale": 1.0, "rotation": 0.0},
+        "fit": "contain", "disabled": False,
+    }
+
+
+def editor_audio_layer(project: Mapping[str, Any], *, require_fit: bool = False) -> dict | None:
+    """One bounded audio layer; paths and source identity are server-owned."""
+    try:
+        tracks = [track for track in project["tracks"] if track.get("id") == "audio-main"]
+        if not tracks:
+            return None
+        if len(tracks) != 1:
+            raise ValueError()
+        track = tracks[0]
+        if (track.get("type") != "audio" or track.get("muted") or track.get("locked")
+                or track.get("volume", 1.0) != 1.0 or track.get("z_index", 0) != 0):
+            raise ValueError()
+        items = track["items"]
+        if not isinstance(items, list) or len(items) > 1:
+            raise ValueError()
+        if not items:
+            return None
+        item = items[0]
+        plan = {key: item[key] for key in ("id", "asset_id", "start", "source_in", "duration", "volume", "muted")}
+        asset = project["assets"][plan["asset_id"]]
+        if (not isinstance(plan["id"], str) or not _PROJECT_ID_RE.fullmatch(plan["id"])
+                or asset.get("type") != "audio" or asset.get("origin") != "output"
+                or asset.get("workspace") != project["workspace"] or not asset.get("has_audio")
+                or type(plan["muted"]) is not bool):
+            raise ValueError()
+        for key in ("start", "source_in", "duration", "volume"):
+            if type(plan[key]) not in (int, float) or not math.isfinite(plan[key]):
+                raise ValueError()
+        if (plan["start"] < 0 or plan["source_in"] < 0 or plan["duration"] < 1 / 240
+                or not 0 <= plan["volume"] <= 1
+                or plan["source_in"] + plan["duration"] > asset["duration"] + 1e-6
+                or plan["start"] + plan["duration"] > 86400):
+            raise ValueError()
+        canonical = _editor_audio_item(plan)
+        # Saved take state follows source trim; incoming edits may carry its old cache.
+        if any(key not in canonical or (key != "take_states" and value != canonical[key]) for key, value in item.items()):
+            raise ValueError()
+        if require_fit:
+            clips = next(track["items"] for track in project["tracks"] if track["id"] == "video-main")
+            fps = project["canvas"]["fps"]
+            end = sum(max(1, round(clip["duration"] * fps)) for clip in clips) / fps if len(clips) > 1 else clips[0]["duration"]
+            if plan["start"] + plan["duration"] > end + 1e-6:
+                raise ValueError()
+        return plan
+    except (KeyError, StopIteration, TypeError, ValueError):
+        raise EditorProjectError("Use one Gallery audio layer with a valid source trim, timeline start and volume from 0 to 100%. Its interval must end within the exported cut.") from None
+
+
+def add_output_audio_layer(current: Mapping[str, Any], *, output_name: str,
+                           output_revision: str, media: Mapping[str, Any]) -> dict[str, Any]:
+    clips = editor_sequence_clips(current)
+    if editor_audio_layer(current):
+        raise EditorProjectError("Remove the current audio layer before adding another")
+    if (not isinstance(output_name, str) or not output_name or output_name.startswith(".")
+            or os.path.basename(output_name) != output_name or "\\" in output_name
+            or not re.fullmatch(r"[A-Za-z0-9:._-]{1,128}", output_revision)
+            or media.get("type") != "audio" or not media.get("has_audio")):
+        raise EditorProjectError("Select an available project audio file")
+    duration = _finite_number(media.get("duration"), 0)
+    if not 1 / 240 <= duration <= 86400:
+        raise EditorProjectError("Audio duration is unavailable for editing")
+    updated = copy.deepcopy(dict(current))
+    asset_id = "source-audio"
+    updated["assets"][asset_id] = {
+        "id": asset_id, "name": output_name, "type": "audio", "origin": "output",
+        "workspace": current["workspace"], "output_id": output_name, "output_revision": output_revision,
+        "private": bool(media.get("private", True)), "duration": duration,
+        "width": 0, "height": 0, "fps": 0.0, "has_audio": True,
+    }
+    fps = current["canvas"]["fps"]
+    end = sum(max(1, round(clip["duration"] * fps)) for _, clip in clips) / fps if len(clips) > 1 else clips[0][1]["duration"]
+    plan = {"id": "audio-layer", "asset_id": asset_id, "source_in": 0.0, "start": 0.0,
+            "duration": min(duration, end), "volume": 1.0, "muted": False}
+    next(track for track in updated["tracks"] if track["id"] == "audio-main")["items"] = [_editor_audio_item(plan)]
+    editor_sequence_clips(updated)
     return updated
 
 
@@ -461,14 +561,15 @@ def editor_sequence_clips(project: Mapping[str, Any]) -> list[tuple[dict, dict]]
         main = [track for track in tracks if track["id"] == "video-main"]
         if len(main) != 1 or main[0].get("type") != "video":
             raise ValueError()
-        if any(track.get("items") for track in tracks if track is not main[0] and track.get("id") != "titles-main"):
+        if any(track.get("items") for track in tracks if track is not main[0] and track.get("id") not in {"titles-main", "audio-main"}):
             raise ValueError()
         editor_text_layers(project)
+        bed = editor_audio_layer(project)
         if main[0].get("muted") or main[0].get("locked"):
             raise ValueError()
         clips = main[0]["items"]
         assets = project["assets"]
-        if not 1 <= len(clips) <= 8 or len(assets) != len(clips):
+        if not 1 <= len(clips) <= 8 or len(assets) != len(clips) + bool(bed):
             raise ValueError()
         result, ids, asset_ids = [], set(), set()
         position = 0.0
@@ -1108,8 +1209,8 @@ def probe_media(path: str, *, ffprobe: str = "ffprobe") -> dict[str, Any]:
     else:
         media_type = "video" if video else "audio"
     duration = _finite_number((payload.get("format") or {}).get("duration"), 0.0)
-    if duration <= 0 and video:
-        duration = _finite_number(video.get("duration"), 0.0)
+    if duration <= 0:
+        duration = _finite_number((video or audio or {}).get("duration"), 0.0)
     rate = str((video or {}).get("avg_frame_rate") or "0/1")
     try:
         numerator, denominator = rate.split("/", 1)

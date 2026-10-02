@@ -3,7 +3,7 @@ import test, { after } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { createServer } from 'vite'
 
-import { appendEditorClip, exportEditorProject, isBackendJobId, openOutputInEditor, saveEditorProject } from '../src/api/client.ts'
+import { addEditorAudio, appendEditorClip, exportEditorProject, isBackendJobId, openOutputInEditor, saveEditorProject } from '../src/api/client.ts'
 
 // Expose the component's actual draft transformations only in this test loader.
 // Production exports remain the component, and no duplicate implementation is tested.
@@ -16,12 +16,12 @@ const server = await createServer({
     name: 'editor-test-transforms',
     transform(code, id) {
       if (id.endsWith('/src/editor/EditorWorkspace.tsx')) {
-        return `${code}\nexport { changeTrim, moveClip, availableVideos, addText, changeText, textLayers, renderedDuration };`
+        return `${code}\nexport { changeTrim, moveClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio };`
       }
     },
   }],
 })
-const { changeTrim, moveClip, availableVideos, addText, changeText, textLayers, renderedDuration } = await server.ssrLoadModule('/src/editor/EditorWorkspace.tsx')
+const { changeTrim, moveClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio } = await server.ssrLoadModule('/src/editor/EditorWorkspace.tsx')
 after(() => server.close())
 
 function sequenceProject() {
@@ -223,4 +223,33 @@ test('Editor export reports a changed draft as an actionable conflict', async ()
   } finally {
     globalThis.fetch = previous
   }
+})
+
+
+test('audio edits retain identity, video/title lanes and absolute time through reorder', () => {
+  const project = sequenceProject()
+  project.tracks.push({ id: 'audio-main', type: 'audio', name: 'Audio', items: [{ id: 'bed', asset_id: 'sound', source_in: 1, start: 2, duration: 3, speed: 1, volume: 1, muted: false }] })
+  const changed = changeAudio(project, { source_in: 4, start: 1, duration: 2, volume: 0.25, muted: true, asset_id: 'foreign', id: 'forged' })
+  assert.equal(audioLayer(changed).asset_id, 'sound')
+  assert.equal(audioLayer(changed).id, 'bed')
+  assert.equal(changed.tracks[0], project.tracks[0])
+  assert.equal(changed.assets, project.assets)
+  assert.deepEqual(audioLayer(moveClip(changed, 'clip-c', -1)), audioLayer(changed))
+  assert.equal(audioLayer(changeAudio(changed, null)), undefined)
+})
+
+test('audio choices and import pin the current same-project Gallery revision', async () => {
+  const project = sequenceProject()
+  const outputs = [{ name: 'fiction.wav', workspace: 'scene', type: 'audio', revision: 'current', private: true, explicit: true },
+    { name: 'other.wav', workspace: 'elsewhere', type: 'audio', revision: 'other' },
+    { name: 'unsealed.wav', workspace: 'scene', type: 'audio' }, { name: 'video.mp4', workspace: 'scene', type: 'video', revision: 'video' }]
+  assert.deepEqual(availableAudio(project, outputs), [outputs[0]])
+  const previous = globalThis.fetch
+  const calls = []
+  globalThis.fetch = async (url, init) => { calls.push({ url, init }); return { ok: true, json: async () => ({ project }) } }
+  try {
+    assert.equal(await addEditorAudio('scene', project, outputs[0].name, 'current'), project)
+    assert.match(calls[0].url, /\/editor\/projects\/first-source-draft\/audio$/)
+    assert.deepEqual(JSON.parse(calls[0].init.body), { expected_revision: 5, output_name: 'fiction.wav', output_revision: 'current' })
+  } finally { globalThis.fetch = previous }
 })

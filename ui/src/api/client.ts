@@ -4872,7 +4872,7 @@ export interface EditorProject {
   tracks: Array<{
     id: string; name: string; type: 'video' | 'audio' | 'text';
     items: Array<{ id: string; asset_id?: string; start: number; duration: number; source_in: number; speed: number;
-      text?: string; position?: 'top' | 'center' | 'bottom' }>
+      text?: string; position?: 'top' | 'center' | 'bottom'; volume?: number; muted?: boolean }>
   }>
 }
 
@@ -4883,7 +4883,7 @@ function editorRequestError(status: number, fallback: string): ProjectAssetReque
     404: 'The source video or saved edit is no longer available',
     409: 'This edit changed in another tab. Return to Gallery and reopen it',
     413: 'This edit is too large to save',
-    422: 'Check the video ranges and text layers. Use up to eight titles, three lines and 160 characters each, lasting at least one video frame and ending within the cut',
+    422: 'Check the video, text and audio ranges. Titles must last at least one frame. The audio source trim and volume must be valid, and all layers must end within the cut for export',
     423: 'Unlock this project before editing',
     500: 'Editor could not save the draft right now',
     503: 'Editor is temporarily unavailable',
@@ -4925,6 +4925,18 @@ export async function appendEditorClip(project: string, timeline: EditorProject,
   return (await res.json()).project as EditorProject
 }
 
+export async function addEditorAudio(project: string, timeline: EditorProject, name: string, revision: string): Promise<EditorProject> {
+  const res = await fetch(`${BASE}/api/v1/projects/${encodeURIComponent(project)}/editor/projects/${encodeURIComponent(timeline.id)}/audio`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ expected_revision: timeline.revision, output_name: name, output_revision: revision }),
+  })
+  if (!res.ok) {
+    if (res.status === 422) throw new ProjectAssetRequestError(422, 'Choose an audio file from this project. Remove the current audio layer before adding another (HTTP 422)')
+    throw editorRequestError(res.status, 'Unable to add this audio layer')
+  }
+  return (await res.json()).project as EditorProject
+}
+
 export async function exportEditorProject(project: string, timeline: EditorProject): Promise<{ job_id: string; status: string }> {
   const res = await fetch(`${BASE}/api/v1/projects/${encodeURIComponent(project)}/editor/projects/${encodeURIComponent(timeline.id)}/exports`, {
     method: 'POST',
@@ -4937,7 +4949,7 @@ export async function exportEditorProject(project: string, timeline: EditorProje
       403: 'You do not have permission to export from this project',
       404: 'This Editor draft is no longer available',
       409: 'The draft or source changed. Return to Gallery and reopen the video',
-      422: 'This sequence cannot be exported. Check that it contains 1–8 valid video clips',
+      422: 'Check the video cuts and layer times. Text must last at least one frame, and text and audio must end within the exported cut',
       423: 'Unlock this project before exporting',
       503: 'Editor export is temporarily unavailable',
     }
