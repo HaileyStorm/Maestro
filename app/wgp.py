@@ -11190,24 +11190,40 @@ def generate_video(*args, **kwargs):
 
     model_type = _bound_value("model_type")
     profile_observer = _bound_value("_h3_profile_observer")
-    if is_h3_model(model_type):
-        current_profile = _bound_value("override_profile", -1)
-        if current_profile in (None, -1):
-            current_profile = get_default_profile(
-                get_output_type_for_model(model_type),
+    cumulative_dispatch = _bound_value("_h3_cumulative_dispatch")
+    cumulative_started = False
+    try:
+        if cumulative_dispatch is not None:
+            from services.h3_cumulative_dispatch import begin_h3_cumulative_dispatch
+            begin_h3_cumulative_dispatch(cumulative_dispatch, {
+                name: _bound_value(name, parameter.default)
+                for name, parameter in inspect.signature(_generate_video_impl).parameters.items()
+            })
+            cumulative_started = True
+        if is_h3_model(model_type):
+            current_profile = _bound_value("override_profile", -1)
+            if current_profile in (None, -1):
+                current_profile = get_default_profile(
+                    get_output_type_for_model(model_type),
+                )
+            _set_bound(
+                "override_profile",
+                apply_h3_baseline_offload_profile(
+                    current_profile,
+                    model_type,
+                    _bound_value("resolution"),
+                ),
             )
-        _set_bound(
-            "override_profile",
-            apply_h3_baseline_offload_profile(
-                current_profile,
-                model_type,
-                _bound_value("resolution"),
-            ),
-        )
+    except BaseException:
+        if cumulative_started:
+            cumulative_dispatch.discard()
+        raise
     while True:
-        _notify_h3_profile_observer(profile_observer, "reset", model_type)
         try:
+            _notify_h3_profile_observer(profile_observer, "reset", model_type)
             result = _generate_video_impl(*bound_args, **bound_kwargs)
+            if cumulative_dispatch is not None:
+                cumulative_dispatch.finish(result)
             if result is False:
                 try:
                     _release_failed_generation_resources()
@@ -11234,6 +11250,19 @@ def generate_video(*args, **kwargs):
                     pass
             return result
         except H3OomReliefRetry as retry:
+            if cumulative_dispatch is not None:
+                # A retained-state retry needs an explicit recovery decision;
+                # do not mutate its canvas/steps or consume another window.
+                cumulative_dispatch.discard()
+                try:
+                    traceback.clear_frames(retry.__traceback__)
+                except Exception as cleanup_error:  # noqa: BLE001 - preserve the original sampler failure
+                    print(f"[Memory] H3 retained-state traceback cleanup: {type(cleanup_error).__name__}")
+                try:
+                    _release_failed_generation_resources()
+                except Exception as cleanup_error:  # noqa: BLE001 - preserve the original sampler failure
+                    print(f"[Memory] H3 retained-state cleanup: {type(cleanup_error).__name__}")
+                raise
             relief = retry.relief or {}
             # The exception retains the failed denoise's local tensors until
             # its traceback frames are cleared, even after empty_cache().
@@ -11267,6 +11296,8 @@ def generate_video(*args, **kwargs):
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
         except BaseException as error:
+            if cumulative_dispatch is not None:
+                cumulative_dispatch.discard()
             try:
                 traceback.clear_frames(error.__traceback__)
             except Exception as cleanup_error:
@@ -11613,6 +11644,8 @@ def _generate_video_impl(
     # Ephemeral API-owned observation callback, never saved in task settings.
     _h3_profile_observer=None,
     _h3_decode_observer=None,
+    # Private single-output retained AV transport. Never saved in settings.
+    _h3_cumulative_dispatch=None,
 ):
 
     # API scheduling needs a model-safe boundary between independent outputs.
@@ -14110,6 +14143,12 @@ def _generate_video_impl(
                         "multi_clip_info": multi_clip_info,
                         "_h3_decode_observer": _h3_decode_observer,
                     }),
+                    **({} if _h3_cumulative_dispatch is None else
+                       _h3_cumulative_dispatch.model_kwargs(
+                           base_model_type=base_model_type,
+                           frame_num=align_model_frame_count(current_video_length, model_def, for_generation=True),
+                           repeat_no=repeat_no, window_no=window_no,
+                       )),
                     # Motion suffix: only passed when the loaded suffix video
                     # is available. Other model handlers (Wan / Flux / Qwen /
                     # Hunyuan) don't accept these kwargs, so we omit them
@@ -14265,6 +14304,8 @@ def _generate_video_impl(
             _retake_stitch_info = None
             output_audio_sampling_rate= audio_sampling_rate
             if samples != None:
+                if _h3_cumulative_dispatch is not None:
+                    _h3_cumulative_dispatch.capture(samples)
                 if isinstance(samples, dict):
                     overlapped_latents = samples.get("latent_slice", None)
                     BGRA_frames = samples.get("BGRA_frames", None)
@@ -14487,8 +14528,14 @@ def _generate_video_impl(
                     # of the duration users see or restore from metadata.
                     inputs["video_length"] = published_video_length
                 if overridden_inputs is not None: inputs.update(overridden_inputs)
+                if _h3_cumulative_dispatch is not None:
+                    # The encoded file is the complete cumulative publication,
+                    # not just this invocation's shorter sampling window.
+                    inputs["video_length"] = _h3_cumulative_dispatch.published_frames
+                    inputs["duration_seconds"] = _h3_cumulative_dispatch.published_frames / 24.0
                 inputs.pop("_h3_profile_observer", None)
                 inputs.pop("_h3_decode_observer", None)
+                inputs.pop("_h3_cumulative_dispatch", None)
                 durable_file_stem = None
                 if durable_output_dir is not None:
                     durable_repeat = (
@@ -14797,6 +14844,7 @@ def _generate_video_impl(
                 inputs.pop("mode")
                 inputs.pop("after_repeat_output", None)
                 inputs.pop("after_segment_output", None)
+                inputs.pop("_h3_cumulative_dispatch", None)
                 inputs["model_type"] = model_type
                 inputs["model_filename"] = get_model_filename(model_type, transformer_quantization, transformer_dtype_policy)
                 if is_image:

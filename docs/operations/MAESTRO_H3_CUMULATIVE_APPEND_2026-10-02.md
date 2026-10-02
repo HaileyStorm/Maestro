@@ -180,8 +180,8 @@ generated media were used. Public UI, WGP and queue routing remain unchanged.
 
 Next integration anchors from the bounded read-only queue map:
 
-- Capture private AV handoff before `wgp.py` unwraps dictionary samples to `x`.
-  Keep tensors and opaque tokens out of queue JSON.
+- WGP transport is implemented below. Supply its private dispatch from the
+  authorized long-form caller; keep tensors and opaque tokens out of queue JSON.
 - Seal AV with segment completion in the long-form callback; preserve the
   descriptor through every recovery-unit checkpoint/enrichment path.
 - Include the AV payload hash in predecessor dependency evidence; verify/load
@@ -190,6 +190,81 @@ Next integration anchors from the bounded read-only queue map:
   identity before calling restore. Keep bad/missing AV state explicit.
 - Exercise queue crash/cancel/cleanup with fakes, then run a separate bounded
   live continuation only under fresh GPU authority.
+
+## Private WGP transport milestone
+
+`H3CumulativeDispatch` is a single-use, server-owned runtime object passed as
+`_h3_cumulative_dispatch` directly to `wgp.generate_video`. It carries the exact
+sampling frame count and optional prior handoff/planner step. Construction does
+not authorize a model workload. The ordinary WGP path does not import this
+transport when the argument is absent. JSON objects are rejected, the private
+experimental gate remains required, and Python serialization is rejected.
+Do not put this object into task params or journal state.
+
+The outer WGP wrapper validates a single native FL2VA video output. The actual
+model call forwards private capture/previous/step kwargs; the returned retained
+AV state is captured before WGP unwraps dictionary samples to `x`. Output
+geometry must match the complete generated/published chain and exact 32 kHz
+stereo sample clock. Media settings record complete published frames and seconds,
+not the shorter sampling window. The private object is removed before filename
+formatting, embedded metadata and saved settings.
+
+The dispatcher exposes a successor handoff only after WGP returns success.
+Cancellation, failed encoding/publication, missing/malformed sampler state and
+exceptions discard its candidate; previous input references are released at the
+terminal boundary. A private cumulative OOM discards the candidate, clears the
+failed traceback and performs best-effort resource cleanup, preserving the
+original exception. It cannot use ordinary automatic OOM relief to silently
+change canvas/steps or retry another window. The caller must restore a sealed
+checkpoint and make an explicit retry decision if a model token was invalidated
+by completed sampling followed by failed publication.
+
+The path rejects repeat/batch expansion, ordinary source-prefix restoration,
+audio offsets, frame-rate changes, postprocessing and incompatible reference
+inputs. Multi-clip metadata must defer concatenation and carry no source prefix
+or trim: a cumulative output already includes retained frames, so ordinary
+concatenation would duplicate them. An unexpected second repeat/window fails
+before another sampling invocation. These private restrictions are not a public
+capability change. Creative text follows the same path; only prompt invocation
+cardinality is checked.
+
+Ten CPU tests execute the AST-extracted real WGP outer wrapper with the real
+native sampler and fake components. They cover capture, a 56-frame append window
+producing a complete 175-frame output, exact retained AV prefix, final publication
+trim, ordinary output parity, failed output/encoder exception, OOM without
+implicit retry, single-use/private-object gate, serialization rejection,
+concatenation/prefix/repeat/postprocessing rejection and unchanged sensitive
+creative prompt routing. The transport-node test also executes the actual model kwargs,
+capture, metadata timing and private-field stripping nodes from WGP source.
+Independent review found pre-sampling validation/profile/observer failures
+could retain prior tensors outside the cleanup boundary. Valid dispatch begin
+now discards on failure, profile setup is protected, and observer reset is inside
+the protected loop. A regression verifies all three fail before sampling and
+release prior state. The correction review confirms that lifecycle finding is
+closed. Public/queue injection and actual loaded-bundle verification remain
+pending.
+This is CPU sampler/transport evidence, not an end-to-end WGP encode or device
+run. The initial nine passed with 26 adjacent OOM-relief/planning-failure checks (35 total),
+then ten passed after final lifetime/metadata and review corrections. The
+request-guard test passed once more after explicit tail-trim/retake and integer
+repeat/batch guards were added; adjacent evidence is reused. New service/tests pass Ruff lint/format and syntax/diff checks. WGP has
+its same 445 pre-existing Ruff diagnostics with no new finding.
+
+The bounded map identified actual loaded-bundle inputs for the next resolver:
+transformer/conditioner aliases resolved by WGP, constructor-selected transformer
+and both VAE paths, conditioner config and seven processor files. Configurable
+checkpoint roots may be linked, so bind exact resolved files rather than just
+relative names or pinned upstream repositories. Include code defaults, selected
+dtype/QKV layout, scheduler shifts and normalization constants. The standard
+asset manifest does not provide hashes for the complete standard bundle. No
+weight files were read or hashed during this map.
+
+Remaining: the authorized long-form caller must inject this object without
+serializing it, choose cumulative output replacement rather than ordinary
+component concatenation, seal AV receipts with completed media dependencies,
+and restore against the verified actually loaded bundle. No public UI or queue
+activation, model weights, CUDA, generated media, restart or full-suite run was
+used for this milestone.
 
 ## Recovery and ownership
 
@@ -207,7 +282,10 @@ and verified origin parity. The recovery claim
 `maestro-h3-cumulative-recovery-20261002` covers only this note, the native model,
 the new serialization service and its focused test file. The controller owns
 implementation; the existing native read-only agent supplied the queue map and
-independent review. Release this exact recovery claim after serial Git closure. Foreign `AGENTS.md`,
+independent review. The exact recovery claim was released after commit `0ece65e` and verified
+origin parity. The next exact claim `maestro-h3-cumulative-dispatch-20261002`
+covers only WGP, its new private transport service/tests and this note; release
+it after serial Git closure. Foreign `AGENTS.md`,
 storage-janitor work and private
 artifacts remain preserved. Historical SQLite Beads remains on its mutation
 hold despite the activation audit's Dolt metadata. No Beads lifecycle command,
