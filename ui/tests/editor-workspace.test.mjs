@@ -16,12 +16,12 @@ const server = await createServer({
     name: 'editor-test-transforms',
     transform(code, id) {
       if (id.endsWith('/src/editor/EditorWorkspace.tsx')) {
-        return `${code}\nexport { changeTrim, moveClip, removeClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio, imageLayer, changeImage, availableImages, imageLayout };`
+        return `${code}\nexport { changeTrim, moveClip, removeClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio, imageLayers, changeImage, availableImages, imageLayout };`
       }
     },
   }],
 })
-const { changeTrim, moveClip, removeClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio, imageLayer, changeImage, availableImages, imageLayout } = await server.ssrLoadModule('/src/editor/EditorWorkspace.tsx')
+const { changeTrim, moveClip, removeClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio, imageLayers, changeImage, availableImages, imageLayout } = await server.ssrLoadModule('/src/editor/EditorWorkspace.tsx')
 after(() => server.close())
 
 function sequenceProject() {
@@ -277,11 +277,11 @@ test('audio choices and import pin the current same-project Gallery revision', a
 test('image appearance and interval retain source identity, absolute timing and other lanes', () => {
   const project = sequenceProject()
   project.tracks.push({ id: 'images-main', type: 'video', items: [{ id: 'overlay', asset_id: 'still', start: 2, duration: 3, source_in: 0, speed: 1, size: 0.25, opacity: 1, position: 'center' }] })
-  const changed = changeImage(project, { start: 1, duration: 2, opacity: 0.5, size: 1, position: 'bottom', id: 'forged', asset_id: 'foreign' })
-  assert.equal(imageLayer(changed).asset_id, 'still'); assert.equal(imageLayer(changed).id, 'overlay')
+  const changed = changeImage(project, 'overlay', { start: 1, duration: 2, opacity: 0.5, size: 1, position: 'bottom', id: 'forged', asset_id: 'foreign' })
+  assert.equal(imageLayers(changed)[0].asset_id, 'still'); assert.equal(imageLayers(changed)[0].id, 'overlay')
   assert.equal(changed.tracks[0], project.tracks[0]); assert.equal(changed.assets, project.assets)
-  assert.deepEqual(imageLayer(moveClip(changed, 'clip-c', -1)), imageLayer(changed))
-  assert.equal(imageLayer(changeImage(changed, null)), undefined)
+  assert.deepEqual(imageLayers(moveClip(changed, 'clip-c', -1)), imageLayers(changed))
+  assert.deepEqual(imageLayers(changeImage(changed, 'overlay', null)), [])
   assert.deepEqual(availableImages(project, [{ name: 'yes.png', workspace: 'scene', type: 'image', revision: 'pin' }, { name: 'other.png', workspace: 'other', type: 'image', revision: 'pin' }, { name: 'missing.png', workspace: 'scene', type: 'image' }]).map(item => item.name), ['yes.png'])
   for (const position of ['top', 'center', 'bottom']) {
     const layout = imageLayout(128, 72, 16, 8, 1, position)
@@ -298,4 +298,19 @@ test('image import pins Gallery identity and CAS without accepting a client path
     assert.match(calls[0].url, /scene%20a\/editor\/projects\/cut%20%231\/image$/)
     assert.deepEqual(JSON.parse(calls[0].init.body), { expected_revision: 5, output_name: 'logo.png', output_revision: 'pin' })
   } finally { globalThis.fetch = previous }
+})
+
+
+test('image row edit and removal retain ordered overlapping neighbors', () => {
+  const project = sequenceProject()
+  project.tracks.push({ id: 'images-main', items: [
+    { id: 'a', asset_id: 'still-a', start: 0, duration: 3 },
+    { id: 'b', asset_id: 'still-b', start: 1, duration: 3 },
+  ] })
+  const changed = changeImage(project, 'b', { opacity: 0, id: 'forged', asset_id: 'foreign' })
+  assert.equal(imageLayers(changed)[0], imageLayers(project)[0])
+  assert.deepEqual(imageLayers(changed).map(item => item.id), ['a', 'b'])
+  assert.equal(imageLayers(changed)[1].asset_id, 'still-b')
+  assert.deepEqual(imageLayers(changeImage(changed, 'a', null)), [imageLayers(changed)[1]])
+  assert.deepEqual(imageLayers(moveClip(changed, 'clip-c', -1)), imageLayers(changed))
 })

@@ -19,10 +19,8 @@ from typing import Callable
 from shared.utils.media_encoder import run_encoder
 
 
-def _image_filters(layer: dict | None, directory: Path, *, width: int, height: int,
-                   duration: float, fps: float, first_input: int, base: str) -> tuple[list[str], list[str], str]:
-    if layer is None:
-        return [], [], base
+def _image_filter(layer: dict, directory: Path, *, width: int, height: int,
+                   duration: float, fps: float, first_input: int, base: str, index: int) -> tuple[list[str], list[str], str]:
     from services.editor_projects import inspect_editor_still
     from PIL import Image, ImageOps
     start = _seconds(layer["start"], allow_zero=True)
@@ -46,15 +44,33 @@ def _image_filters(layer: dict | None, directory: Path, *, width: int, height: i
     ratio = min(width * 0.9 * size / image.width, height * 0.88 * size / image.height)
     image = image.resize((max(1, round(image.width * ratio)), max(1, round(image.height * ratio))), Image.Resampling.LANCZOS)
     image.putalpha(image.getchannel("A").point([round(alpha * opacity) for alpha in range(256)]))
-    staged = directory / "image-layer.png"
+    staged = directory / f"image-layer-{index}.png"
     image.save(staged)
     x = (width - image.width) // 2
     margin = round(height * 0.06)
     y = {"top": margin, "center": (height - image.height) // 2, "bottom": height - margin - image.height}[layer["position"]]
     end = _seconds(float(start) + float(length))
     return ["-i", str(staged)], [f"[{base}][{first_input}:v]overlay=x={x}:y={y}:"
-        f"eof_action=repeat:enable='gte(t,{start})*lt(t,{end})'[image_v]"], "image_v"
+        f"eof_action=repeat:enable='gte(t,{start})*lt(t,{end})'[image_v_{index}]"], f"image_v_{index}"
 
+
+def editor_image_plans(value: list[dict] | dict | None) -> list[dict]:
+    """Canonical ordered rows, including sealed jobs from the single-image release."""
+    plans = [value] if isinstance(value, dict) else (value if value is not None else [])
+    if not isinstance(plans, list) or len(plans) > 8 or any(not isinstance(item, dict) for item in plans):
+        raise ValueError("Editor supports up to eight image layers")
+    return plans
+
+def _image_filters(layers: list[dict] | dict | None, directory: Path, *, width: int, height: int,
+                   duration: float, fps: float, first_input: int, base: str) -> tuple[list[str], list[str], str]:
+    plans = editor_image_plans(layers)
+    inputs, filters, label = [], [], base
+    for index, item in enumerate(plans):
+        added, composed, label = _image_filter(item, directory, width=width, height=height,
+            duration=duration, fps=fps, first_input=first_input + index, base=label, index=index)
+        inputs.extend(added)
+        filters.extend(composed)
+    return inputs, filters, label
 
 def _title_filters(layers: list[dict] | None, directory: Path, *, width: int, height: int,
                    duration: float, fps: float, first_input: int, base: str) -> tuple[list[str], list[str], str]:
@@ -184,7 +200,7 @@ def render_single_source_cut(
     source_in: float,
     duration: float,
     text_layers: list[dict] | None = None,
-    image_layer: dict | None = None,
+    image_layer: list[dict] | dict | None = None,
     canvas: dict | None = None,
     audio_layer: dict | None = None,
     abort_check: Callable[[], object] | None = None,
@@ -306,7 +322,7 @@ def render_video_sequence(
     clips: list[dict], destination: str | os.PathLike[str], *,
     width: int, height: int, fps: float,
     text_layers: list[dict] | None = None,
-    image_layer: dict | None = None,
+    image_layer: list[dict] | dict | None = None,
     audio_layer: dict | None = None,
     abort_check: Callable[[], object] | None = None,
     timeout: float = 3600, runner: Callable[..., int] | None = None,

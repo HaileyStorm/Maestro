@@ -417,16 +417,18 @@ def apply_output_video_trim(
             del updated["assets"][original_bed["asset_id"]]
     incoming_images = [track for track in proposed["tracks"] if track.get("id") == "images-main"]
     if incoming_images:
-        original = editor_image_layer(current)
-        candidate = editor_image_layer({**updated, "tracks": incoming_images})
-        if candidate and (not original or any(candidate[key] != original[key] for key in ("id", "asset_id"))):
-            raise EditorProjectError("Add an image from this project's Gallery")
+        original = {item["id"]: item for item in editor_image_layers(current)}
+        candidates = editor_image_layers({**updated, "tracks": incoming_images})
+        if any(item["id"] not in original or item["asset_id"] != original[item["id"]]["asset_id"] for item in candidates):
+            raise EditorProjectError("Add images from this project's Gallery")
         track = next((track for track in updated["tracks"] if track["id"] == "images-main"), None)
         if track is None:
-            raise EditorProjectError("Add an image from this project's Gallery")
-        track["items"] = [_editor_image_item(candidate)] if candidate else []
-        if original and not candidate:
-            del updated["assets"][original["asset_id"]]
+            raise EditorProjectError("Add images from this project's Gallery")
+        track["items"] = [_editor_image_item(item) for item in candidates]
+        retained = {item["asset_id"] for item in candidates}
+        for item in original.values():
+            if item["asset_id"] not in retained:
+                del updated["assets"][item["asset_id"]]
     return updated
 
 
@@ -546,11 +548,11 @@ def _editor_image_item(plan: Mapping[str, Any]) -> dict:
             "transform": {"x": 0.0, "y": 0.0, "scale": 1.0, "rotation": 0.0}}
 
 
-def editor_image_layer(project: Mapping[str, Any], *, require_fit: bool = False) -> dict | None:
+def editor_image_layers(project: Mapping[str, Any], *, require_fit: bool = False) -> list[dict]:
     try:
         tracks = [track for track in project["tracks"] if track.get("id") == "images-main"]
         if not tracks:
-            return None
+            return []
         if len(tracks) != 1:
             raise ValueError()
         track = tracks[0]
@@ -558,65 +560,79 @@ def editor_image_layer(project: Mapping[str, Any], *, require_fit: bool = False)
                 or track.get("volume", 1.0) != 1.0 or track.get("z_index", 5) != 5):
             raise ValueError()
         items = track["items"]
-        if not isinstance(items, list) or len(items) > 1:
+        if not isinstance(items, list) or len(items) > 8:
             raise ValueError()
         if not items:
-            return None
-        item = items[0]
-        plan = {key: item[key] for key in ("id", "asset_id", "start", "duration", "size", "opacity", "position")}
-        asset = project["assets"][plan["asset_id"]]
-        if (not isinstance(plan["id"], str) or not _PROJECT_ID_RE.fullmatch(plan["id"])
-                or asset.get("type") != "image" or asset.get("origin") != "output"
-                or asset.get("workspace") != project["workspace"] or asset.get("has_audio")
-                or not 1 <= asset["width"] <= 16384 or not 1 <= asset["height"] <= 16384
-                or asset["width"] * asset["height"] > 32000000
-                or plan["position"] not in {"top", "center", "bottom"}):
-            raise ValueError()
-        if any(type(plan[k]) not in (int, float) or not math.isfinite(plan[k]) for k in ("start", "duration", "size", "opacity")):
-            raise ValueError()
-        if (plan["start"] < 0 or plan["duration"] < 1 / 240 or plan["start"] + plan["duration"] > 86400
-                or not 0.1 <= plan["size"] <= 1 or not 0 <= plan["opacity"] <= 1):
-            raise ValueError()
-        canonical = _editor_image_item(plan)
-        if any(key not in canonical or value != canonical[key] for key, value in item.items()):
-            raise ValueError()
-        if require_fit:
-            clips = next(track["items"] for track in project["tracks"] if track["id"] == "video-main")
-            fps = project["canvas"]["fps"] if len(clips) > 1 else (project["assets"][clips[0]["asset_id"]].get("fps") or project["canvas"]["fps"])
-            end = sum(max(1, round(clip["duration"] * fps)) for clip in clips) / fps if len(clips) > 1 else clips[0]["duration"]
-            if plan["start"] + plan["duration"] > end + 1e-6 or plan["duration"] < 1 / max(1, fps) - 1e-9:
+            return []
+        result, ids, asset_ids = [], set(), set()
+        for item in items:
+            plan = {key: item[key] for key in ("id", "asset_id", "start", "duration", "size", "opacity", "position")}
+            asset = project["assets"][plan["asset_id"]]
+            if (not isinstance(plan["id"], str) or not _PROJECT_ID_RE.fullmatch(plan["id"])
+                    or asset.get("type") != "image" or asset.get("origin") != "output"
+                    or asset.get("workspace") != project["workspace"] or asset.get("has_audio")
+                    or not 1 <= asset["width"] <= 16384 or not 1 <= asset["height"] <= 16384
+                    or asset["width"] * asset["height"] > 32000000
+                    or plan["position"] not in {"top", "center", "bottom"}):
                 raise ValueError()
-        return plan
+            if any(type(plan[k]) not in (int, float) or not math.isfinite(plan[k]) for k in ("start", "duration", "size", "opacity")):
+                raise ValueError()
+            if (plan["start"] < 0 or plan["duration"] < 1 / 240 or plan["start"] + plan["duration"] > 86400
+                    or not 0.1 <= plan["size"] <= 1 or not 0 <= plan["opacity"] <= 1):
+                raise ValueError()
+            canonical = _editor_image_item(plan)
+            if any(key not in canonical or value != canonical[key] for key, value in item.items()):
+                raise ValueError()
+            if require_fit:
+                clips = next(track["items"] for track in project["tracks"] if track["id"] == "video-main")
+                fps = project["canvas"]["fps"] if len(clips) > 1 else (project["assets"][clips[0]["asset_id"]].get("fps") or project["canvas"]["fps"])
+                end = sum(max(1, round(clip["duration"] * fps)) for clip in clips) / fps if len(clips) > 1 else clips[0]["duration"]
+                if plan["start"] + plan["duration"] > end + 1e-6 or plan["duration"] < 1 / max(1, fps) - 1e-9:
+                    raise ValueError()
+            if plan["id"] in ids or plan["asset_id"] in asset_ids:
+                raise ValueError()
+            ids.add(plan["id"])
+            asset_ids.add(plan["asset_id"])
+            result.append(plan)
+        return result
     except (KeyError, StopIteration, TypeError, ValueError):
-        raise EditorProjectError("Use one Gallery still image, size 10–100%, opacity 0–100% and top, center or bottom placement. It must last at least one frame and end within the exported cut.") from None
+        raise EditorProjectError("Use up to eight Gallery still images, size 10–100%, opacity 0–100% and top, center or bottom placement. Each image must last at least one frame and end within the exported cut.") from None
+
+
+def editor_image_layer(project: Mapping[str, Any], *, require_fit: bool = False) -> dict | None:
+    """Compatibility reader for single-image callers; never drops extra rows."""
+    plans = editor_image_layers(project, require_fit=require_fit)
+    if len(plans) > 1:
+        raise EditorProjectError("Read all image layers for this Editor draft")
+    return plans[0] if plans else None
 
 
 def add_output_image_layer(current: Mapping[str, Any], *, output_name: str,
                            output_revision: str, media: Mapping[str, Any]) -> dict:
     clips = editor_sequence_clips(current)
-    if editor_image_layer(current):
-        raise EditorProjectError("Remove the current image layer before adding another")
+    if len(editor_image_layers(current)) >= 8:
+        raise EditorProjectError("Use up to eight image layers")
     if (not isinstance(output_name, str) or not output_name or output_name.startswith(".")
             or os.path.basename(output_name) != output_name or "\\" in output_name
             or not re.fullmatch(r"[A-Za-z0-9:._-]{1,128}", output_revision)
             or media.get("type") != "image" or media.get("has_audio")):
         raise EditorProjectError("Select an available project still image")
     updated = copy.deepcopy(dict(current))
-    asset_id = "source-image"
+    asset_id = "source-image" if "source-image" not in updated["assets"] else f"source-image-{uuid.uuid4().hex}"
     updated["assets"][asset_id] = {"id": asset_id, "name": output_name, "type": "image", "origin": "output",
         "workspace": current["workspace"], "output_id": output_name, "output_revision": output_revision,
         "private": bool(media.get("private", True)), "duration": 0.0, "fps": 0.0, "has_audio": False,
         "width": media.get("width"), "height": media.get("height")}
     fps = current["canvas"]["fps"]
     end = sum(max(1, round(clip["duration"] * fps)) for _, clip in clips) / fps if len(clips) > 1 else clips[0][1]["duration"]
-    plan = {"id": "image-layer", "asset_id": asset_id, "start": 0.0, "duration": end,
+    plan = {"id": "image-layer" if asset_id == "source-image" else f"image-{uuid.uuid4().hex}", "asset_id": asset_id, "start": 0.0, "duration": end,
             "size": 0.25, "opacity": 1.0, "position": "center"}
     track = next((track for track in updated["tracks"] if track["id"] == "images-main"), None)
     if track is None:
         track = {"id": "images-main", "name": "Image layer", "type": "video", "z_index": 5,
                  "muted": False, "locked": False, "volume": 1.0, "items": []}
         updated["tracks"].append(track)
-    track["items"] = [_editor_image_item(plan)]
+    track["items"].append(_editor_image_item(plan))
     editor_sequence_clips(updated)
     return updated
 
@@ -692,12 +708,12 @@ def editor_sequence_clips(project: Mapping[str, Any]) -> list[tuple[dict, dict]]
             raise ValueError()
         editor_text_layers(project)
         bed = editor_audio_layer(project)
-        image = editor_image_layer(project)
+        images = editor_image_layers(project)
         if main[0].get("muted") or main[0].get("locked"):
             raise ValueError()
         clips = main[0]["items"]
         assets = project["assets"]
-        if not 1 <= len(clips) <= 8 or len(assets) != len(clips) + bool(bed) + bool(image):
+        if not 1 <= len(clips) <= 8 or len(assets) != len(clips) + bool(bed) + len(images):
             raise ValueError()
         result, ids, asset_ids = [], set(), set()
         position = 0.0

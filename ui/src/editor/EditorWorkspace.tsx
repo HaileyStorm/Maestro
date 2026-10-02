@@ -239,17 +239,18 @@ function AudioLayerPanel({ project, outputs, busy, error, stopKey, videoPlaying,
   </section>
 }
 
-function imageLayer(project: EditorProject) {
-  return project.tracks.find(track => track.id === 'images-main')?.items[0]
+function imageLayers(project: EditorProject) {
+  return project.tracks.find(track => track.id === 'images-main')?.items ?? []
 }
 
 function availableImages(project: EditorProject, outputs: OutputFile[]) {
   return outputs.filter(output => output.workspace === project.workspace && output.type === 'image' && Boolean(output.revision))
 }
 
-function changeImage(project: EditorProject, change: Partial<NonNullable<ReturnType<typeof imageLayer>>> | null): EditorProject {
+function changeImage(project: EditorProject, id: string, change: Partial<EditorProject['tracks'][number]['items'][number]> | null): EditorProject {
   return { ...project, tracks: project.tracks.map(track => track.id === 'images-main'
-    ? { ...track, items: change && track.items[0] ? [{ ...track.items[0], ...change, id: track.items[0].id, asset_id: track.items[0].asset_id }] : [] } : track) }
+    ? { ...track, items: change === null ? track.items.filter(item => item.id !== id)
+      : track.items.map(item => item.id === id ? { ...item, ...change, id: item.id, asset_id: item.asset_id } : item) } : track) }
 }
 
 function imageLayout(width: number, height: number, assetWidth: number, assetHeight: number, size: number, position: 'top' | 'center' | 'bottom') {
@@ -259,31 +260,39 @@ function imageLayout(width: number, height: number, assetWidth: number, assetHei
   return { x: Math.floor((width - w) / 2) / width * 100, y: y / height * 100, width: w / width * 100, height: h / height * 100 }
 }
 
-function ImageLayerPanel({ project, outputs, busy, error, revealed, mediaError, onReveal, onImport, onChange }: {
-  project: EditorProject; outputs: OutputFile[]; busy: boolean; error: string; revealed: boolean; mediaError: boolean;
-  onReveal: () => void; onImport: (name: string) => void; onChange: (project: EditorProject) => void
+function ImageLayerPanel({ project, outputs, busy, error, layer, revealed, mediaError, onSelect, onReveal, onImport, onChange }: {
+  project: EditorProject; outputs: OutputFile[]; busy: boolean; error: string; layer?: EditorProject['tracks'][number]['items'][number]; revealed: boolean; mediaError: boolean;
+  onSelect: (id: string) => void; onReveal: () => void; onImport: (name: string) => void; onChange: (project: EditorProject) => void
 }) {
-  const layer = imageLayer(project)
+  const layers = imageLayers(project)
   const asset = layer && project.assets[layer.asset_id ?? '']
   const [name, setName] = useState('')
   const select = useRef<HTMLSelectElement>(null)
-  const update = (change: Partial<NonNullable<typeof layer>>) => onChange(changeImage(project, change))
+  const update = (change: Partial<NonNullable<typeof layer>>) => layer && onChange(changeImage(project, layer.id, change))
   return <section className="rounded-xl border border-border bg-bg-secondary p-4 md:p-6" aria-label="Image layer">
-    <h2 className="mb-3 text-sm font-semibold">Image layer <span className="ml-2 font-normal text-text-secondary">{layer ? '1/1' : '0/1'}</span></h2>
-    <p className="mb-5 text-xs leading-relaxed text-text-secondary">Add one static PNG, JPEG or WebP from this project’s Gallery. It appears above video and below titles, retaining its shape and transparency. Sequence times stay fixed when clips move. Size fits inside the canvas; the image does not extend the video.</p>
-    {!layer ? <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-end">
+    <h2 className="mb-3 text-sm font-semibold">Image layer <span className="ml-2 font-normal text-text-secondary">{layers.length}/8</span></h2>
+    <p className="mb-5 text-xs leading-relaxed text-text-secondary">Add up to eight static PNG, JPEG or WebP images from this project’s Gallery. It appears above video and below titles, retaining its shape and transparency. Later rows appear on top. Sequence times stay fixed when clips move. Size fits inside the canvas; the image does not extend the video.</p>
+    <div className="mb-5 flex min-w-0 flex-col gap-3 sm:flex-row sm:items-end">
       <label className="block min-w-0 flex-1 text-sm"><span className="mb-2 block">Image from this project’s Gallery</span>
-        <select ref={select} value={name} disabled={busy} onChange={event => setName(event.target.value)} className={audioInputClass}>
+        <select ref={select} value={name} disabled={busy || layers.length >= 8} onChange={event => setName(event.target.value)} className={audioInputClass}>
           <option value="">Choose image…</option>{availableImages(project, outputs).map(output => <option key={output.name} value={output.name}>{output.name}</option>)}
         </select>
       </label>
-      <button type="button" disabled={busy || !availableImages(project, outputs).some(item => item.name === name)} onClick={() => onImport(name)} className={audioButtonClass}><Plus size={15} aria-hidden="true" />Add image</button>
-    </div> : <div className="grid min-w-0 gap-5 md:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]">
+      <button type="button" disabled={busy || layers.length >= 8 || !availableImages(project, outputs).some(item => item.name === name)} onClick={() => onImport(name)} className={audioButtonClass}><Plus size={15} aria-hidden="true" />Add image</button>
+    </div>
+    <ol className="mb-5 grid min-w-0 gap-2 sm:grid-cols-2" aria-label="Image layer order">
+      {layers.map((item, index) => <li key={item.id}><button type="button" aria-pressed={item.id === layer?.id} disabled={busy} onClick={() => onSelect(item.id)}
+        className={`min-h-16 w-full rounded-lg border p-3 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50 ${item.id === layer?.id ? 'border-accent-blue bg-accent-blue/15' : 'border-border bg-bg-primary hover:bg-bg-hover'}`}>
+        <span className="block truncate text-sm">Image {index + 1} · {project.assets[item.asset_id ?? '']?.name}</span>
+        <span className="mt-1 block text-xs tabular-nums text-text-secondary">{displayTime(item.start)}–{displayTime(item.start + item.duration)}</span>
+      </button></li>)}
+    </ol>
+    {layer && <div className="grid min-w-0 gap-5 md:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]">
       <div className="min-w-0 rounded-lg border border-accent-blue bg-accent-blue/10 p-4">
         <p className="break-all text-sm">{asset?.name}</p><p className="mt-2 text-xs text-text-secondary">{asset?.width} × {asset?.height} · Still image</p>
         {asset?.private !== false && <button type="button" disabled={busy} onClick={onReveal} className={`${audioButtonClass} mt-4 w-full`}><Eye size={15} aria-hidden="true" />{revealed ? 'Private image revealed' : 'Show private image'}</button>}
         <p className="mt-3 text-xs text-text-secondary">{revealed ? 'Shown in the video preview during its interval.' : 'Private preview is hidden until you reveal it.'}</p>
-        <button type="button" disabled={busy} onClick={() => { onChange(changeImage(project, null)); requestAnimationFrame(() => select.current?.focus()) }} className={`${audioButtonClass} mt-4 w-full`}><Trash2 size={15} aria-hidden="true" />Remove image</button>
+        <button type="button" disabled={busy} onClick={() => { onChange(changeImage(project, layer.id, null)); requestAnimationFrame(() => select.current?.focus()) }} className={`${audioButtonClass} mt-4 w-full`}><Trash2 size={15} aria-hidden="true" />Remove image</button>
       </div>
       <div className="grid min-w-0 gap-4 sm:grid-cols-2">
         <label className="block text-sm"><span className="mb-2 block">Image start (seconds)</span><input type="number" min={0} max={86400 - layer.duration} step={0.05} value={layer.start} disabled={busy} className={audioInputClass}
@@ -341,13 +350,24 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
   const clips = project ? sequenceClips(project) : []
   const clip = clips.find(item => item.id === activeClipId) ?? clips[0]
   const sourceAsset = clip && project?.assets[clip.asset_id ?? '']
-  const overlay = project ? imageLayer(project) : undefined
+  const overlays = project ? imageLayers(project) : []
+  const [activeImageId, setActiveImageId] = useState('')
+  const overlay = overlays.find(item => item.id === activeImageId) ?? overlays[0]
   const imageAsset = overlay && project?.assets[overlay.asset_id ?? '']
   const imageIdentity = privatePreviewIdentity(source.workspace, imageAsset?.output_id ?? '', imageAsset?.output_revision ?? '')
-  const [imageRevealIdentity, setImageRevealIdentity] = useState('')
-  const [imageErrorIdentity, setImageErrorIdentity] = useState('')
-  const imageRevealed = imageAsset?.private === false || imageRevealIdentity === imageIdentity || privatePreviewWasRevealed(imageIdentity)
-  const imagePreviewError = imageErrorIdentity === imageIdentity
+  const [, refreshImageReveals] = useState(0)
+  const [imageErrors, setImageErrors] = useState<Record<string, boolean>>({})
+  const imageRevealed = imageAsset?.private === false || privatePreviewWasRevealed(imageIdentity)
+  const imagePreviewError = Boolean(imageErrors[imageIdentity])
+  const imageIdentities = JSON.stringify(overlays.map(item => {
+    const asset = project?.assets[item.asset_id ?? '']
+    return privatePreviewIdentity(source.workspace, asset?.output_id ?? '', asset?.output_revision ?? '')
+  }))
+  useEffect(() => {
+    const unsubscribe = (JSON.parse(imageIdentities) as string[]).map(identity =>
+      subscribePrivatePreviewReveal(identity, () => refreshImageReveals(value => value + 1)))
+    return () => unsubscribe.forEach(stop => stop())
+  }, [imageIdentities])
   const titles = project ? textLayers(project) : []
   const selectedTitle = titles.find(item => item.id === activeTextId) ?? titles[0]
   const clipIndex = clips.findIndex(item => item.id === clip?.id)
@@ -531,7 +551,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
     if (!projectRef.current || !isCurrent(epoch) || appending.current || exporting.current || saveState === 'error') return
     const choices = kind === 'audio' ? availableAudio : kind === 'image' ? availableImages : availableVideos
     const output = choices(projectRef.current, useStore.getState().outputs).find(item => item.name === requestedName)
-    if (!output || (kind === 'video' && sequenceClips(projectRef.current).length >= 8) || (kind === 'audio' && audioLayer(projectRef.current)) || (kind === 'image' && imageLayer(projectRef.current))) return
+    if (!output || (kind === 'video' && sequenceClips(projectRef.current).length >= 8) || (kind === 'audio' && audioLayer(projectRef.current)) || (kind === 'image' && imageLayers(projectRef.current).length >= 8)) return
     appending.current = true
     setImportKind(kind)
     setAppendPending(true)
@@ -560,6 +580,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
       projectRef.current = appended
       setProject(appended)
       if (kind === 'video') selectClip(sequenceClips(appended).at(-1)?.id ?? '')
+      if (kind === 'image') setActiveImageId(imageLayers(appended).at(-1)?.id ?? '')
       setSaveState('saved')
       setAppendName('')
       setExportState('idle')
@@ -586,7 +607,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
   const titlesOutOfRange = titles.some(item => item.start + item.duration > sequenceDuration + 1e-6)
   const titleFps = clips.length > 1 ? project?.canvas.fps ?? 30 : sourceAsset?.fps || project?.canvas.fps || 30
   const titlesTooShort = titles.some(item => item.duration < 1 / titleFps - 1e-9)
-  const imageInvalidRange = Boolean(overlay && (overlay.start + overlay.duration > sequenceDuration + 1e-6 || overlay.duration < 1 / titleFps - 1e-9))
+  const imageInvalidRange = overlays.some(item => item.start + item.duration > sequenceDuration + 1e-6 || item.duration < 1 / titleFps - 1e-9)
   const selectedIndex = clips.findIndex(item => item.id === clip?.id)
   const candidates = project ? availableVideos(project, outputs) : []
   const busy = appendPending || exportState === 'submitting'
@@ -677,12 +698,17 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
                     onSeeked={event => setPreviewTime(Math.max(0, event.currentTarget.currentTime - trimStart))}
                     onTimeUpdate={event => { setPreviewTime(Math.max(0, event.currentTarget.currentTime - trimStart)); if (event.currentTarget.currentTime >= trimEnd) event.currentTarget.pause() }}
                     onError={() => setPlaybackError(true)} className="h-full w-full object-contain" />
-                  {overlay && imageAsset && imageRevealed && !imagePreviewError && titleTime >= overlay.start && titleTime < overlay.start + overlay.duration && (() => {
-                    const rect = imageLayout(project.canvas.width, project.canvas.height, imageAsset.width, imageAsset.height, overlay.size ?? 0.25, overlay.position ?? 'center')
-                    return <img key={imageIdentity} alt="" aria-hidden="true" data-testid="image-layer-preview" src={getEditorPreviewUrl(imageAsset.output_id, project.workspace, imageAsset.output_revision)}
-                      onError={() => setImageErrorIdentity(imageIdentity)} className="pointer-events-none absolute object-contain"
-                      style={{ left: `${rect.x}%`, top: `${rect.y}%`, width: `${rect.width}%`, height: `${rect.height}%`, opacity: overlay.opacity ?? 1 }} />
-                  })()}
+                  {overlays.map(item => {
+                    const asset = project.assets[item.asset_id ?? '']
+                    if (!asset) return null
+                    const identity = privatePreviewIdentity(project.workspace, asset.output_id, asset.output_revision)
+                    if ((asset.private !== false && !privatePreviewWasRevealed(identity)) || imageErrors[identity]
+                      || titleTime < item.start || titleTime >= item.start + item.duration) return null
+                    const rect = imageLayout(project.canvas.width, project.canvas.height, asset.width, asset.height, item.size ?? 0.25, item.position ?? 'center')
+                    return <img key={item.id} alt="" aria-hidden="true" data-testid="image-layer-preview" src={getEditorPreviewUrl(asset.output_id, project.workspace, asset.output_revision)}
+                      onError={() => setImageErrors(previous => ({ ...previous, [identity]: true }))} className="pointer-events-none absolute object-contain"
+                      style={{ left: `${rect.x}%`, top: `${rect.y}%`, width: `${rect.width}%`, height: `${rect.height}%`, opacity: item.opacity ?? 1 }} />
+                  })}
                   {fontReady && <svg className="pointer-events-none absolute inset-0 h-full w-full" viewBox={`0 0 ${project.canvas.width} ${project.canvas.height}`} aria-hidden="true" data-testid="text-layer-preview">
                     {titles.filter(item => item.text.trim() && titleTime >= item.start && titleTime < item.start + item.duration).map(item => {
                       const layout = titleLayout(item.text, project.canvas.width, project.canvas.height, item.position)
@@ -824,10 +850,10 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
             stopKey={clip?.id} videoPlaying={playing} onAudition={() => { preview.current?.pause(); setPlaying(false) }}
             onImport={name => { void handleAppend('audio', name) }}
             onChange={next => { if (!appending.current && !exporting.current && isCurrent(scope.current)) updateDraft(next) }} />
-          <ImageLayerPanel key={project.id} project={project} outputs={outputs} busy={busy || saveState === 'error'} error={importKind === 'image' ? appendError : ''} revealed={imageRevealed} mediaError={imagePreviewError}
-            onReveal={() => { revealPrivatePreview(imageIdentity); setImageRevealIdentity(imageIdentity) }} onImport={name => { void handleAppend('image', name) }}
+          <ImageLayerPanel key={project.id} project={project} outputs={outputs} busy={busy || saveState === 'error'} error={importKind === 'image' ? appendError : ''} layer={overlay} onSelect={setActiveImageId} revealed={imageRevealed} mediaError={imagePreviewError}
+            onReveal={() => { revealPrivatePreview(imageIdentity) }} onImport={name => { void handleAppend('image', name) }}
             onChange={next => { if (!appending.current && !exporting.current && isCurrent(scope.current)) updateDraft(next) }} />
-          {imageInvalidRange && <p role="alert" className="text-sm text-red-400">The image must last at least one video frame and end within the exported cut. Adjust its interval before exporting.</p>}
+          {imageInvalidRange && <p role="alert" className="text-sm text-red-400">Each image must last at least one video frame and end within the exported cut. Adjust the image intervals before exporting.</p>}
           <section className="rounded-xl border border-border bg-bg-secondary p-4 md:p-6" aria-label="Text layers">
             <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
               <h2 className="text-sm font-semibold">Text layers <span className="ml-2 font-normal text-text-secondary">{titles.length}/8</span></h2>

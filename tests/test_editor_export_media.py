@@ -53,7 +53,7 @@ class EditorExportMediaTests(unittest.TestCase):
             self.assertEqual(sound(destination), sound(original))
         for pos in ("top", "center", "bottom"):
             _image_filters({**plan, "position": pos}, self.root, width=128, height=72, duration=1, fps=24, first_input=1, base="v")
-            with Image.open(self.root / "image-layer.png") as decoded:
+            with Image.open(self.root / "image-layer-0.png") as decoded:
                 self.assertEqual(decoded.size, (58, 29)); self.assertEqual(decoded.getpixel((30, 15))[3], 128)
                 self.assertLess(decoded.getpixel((0, 0))[3], 128)
         sequence = self.root / "image-sequence.mp4"
@@ -67,6 +67,62 @@ class EditorExportMediaTests(unittest.TestCase):
             render_single_source_cut(source, self.root / "cancel-image.mp4", source_in=0, duration=1, image_layer=plan, canvas=canvas, abort_check=lambda: True, timeout=30)
         self.assertFalse((self.root / "cancel-image.mp4").exists())
         self.assertFalse(list(self.root.glob('.editor-titles-*')))
+
+    def test_ordered_overlapping_images_keep_alpha_intervals_and_audio(self):
+        from PIL import Image
+        source = self.make_source()
+        plans = []
+        for index, color in enumerate(((255, 0, 0, 255), (0, 255, 0, 128))):
+            path = self.root / f"still-{index}.png"
+            Image.new("RGBA", (16, 8), color).save(path)
+            plans.append({"path": str(path), "width": 16, "height": 8, "start": index * 0.25,
+                "duration": 0.5, "size": 0.5, "opacity": 1, "position": "center"})
+        original = self.root / "original.mp4"
+        render_single_source_cut(source, original, source_in=0, duration=1, timeout=30)
+        output = self.root / "overlapping.mp4"
+        render_single_source_cut(source, output, source_in=0, duration=1, image_layer=plans,
+            canvas={"width":128,"height":72,"fps":24}, timeout=30)
+        def center(at):
+            raw = self.run_media([FFMPEG,"-v","error","-ss",str(at),"-i",str(output),"-frames:v","1","-pix_fmt","rgb24","-f","rawvideo","-"])
+            return tuple(raw[(36*128+64)*3:(36*128+64)*3+3])
+        red, overlap, green = center(0.125), center(0.375), center(0.625)
+        self.assertGreater(red[0], 220); self.assertLess(red[1], 20)
+        self.assertGreater(overlap[0], 100); self.assertGreater(overlap[1], 100)
+        self.assertLess(overlap[0], 160); self.assertLess(overlap[1], 160)
+        self.assertGreater(green[1], green[0] + 90)
+        for stream in range(len(self.probe(original)["streams"]) - 1):
+            def sound(path): return self.run_media([FFMPEG,"-v","error","-i",str(path),"-map",f"0:a:{stream}","-f","s16le","-"])
+            self.assertEqual(sound(output), sound(original))
+
+    def test_multiple_images_titles_and_audio_bed_across_sequence_join(self):
+        from PIL import Image
+        source = self.make_source()
+        plans = []
+        for index, color in enumerate(("red", "green")):
+            path = self.root / f"joined-{index}.png"
+            Image.new("RGBA", (16, 8), color).save(path)
+            plans.append({"path": str(path), "width":16, "height":8, "start":0.25, "duration":0.5,
+                "size":0.5, "opacity":1, "position":"center"})
+        bed = self.root / "join-bed.wav"
+        self.run_media([FFMPEG,"-v","error","-f","lavfi","-i","sine=frequency=960:sample_rate=48000:duration=1",str(bed)])
+        clips = [{"path":str(source),"source_in":0,"duration":0.5,"has_audio":True},
+                 {"path":str(source),"source_in":1,"duration":0.5,"has_audio":True}]
+        output = self.root / "all-layers.mp4"
+        render_video_sequence(clips, output, width=128,height=72,fps=24,image_layer=plans,
+            text_layers=[{"id":"title","text":"TOP","start":0.25,"duration":0.5,"position":"center"}],
+            audio_layer={"path":str(bed),"source_in":0,"start":0,"duration":1,"volume":0.5,"muted":False},timeout=30)
+        streams = self.probe(output)["streams"]
+        self.assertEqual([item["codec_type"] for item in streams], ["video", "audio"])
+        self.assertAlmostEqual(float(streams[0]["duration"]), 1, delta=0.001)
+        for at in (0.375,0.625):
+            raw = self.run_media([FFMPEG,"-v","error","-ss",str(at),"-i",str(output),"-frames:v","1","-pix_fmt","rgb24","-f","rawvideo","-"])
+            pixels = [tuple(raw[i:i+3]) for y in range(31,42) for x in range(57,71) for i in [(y*128+x)*3]]
+            self.assertTrue(any(min(pixel) > 170 for pixel in pixels), "Title must remain above both overlapping stills")
+        import array
+        pcm = array.array("h",self.run_media([FFMPEG,"-v","error","-i",str(output),"-map","0:a:0","-ac","1","-ar","48000","-f","s16le","-"]))
+        real = sum(v/32768*math.cos(2*math.pi*960*i/48000) for i,v in enumerate(pcm))
+        imag = sum(v/32768*math.sin(2*math.pi*960*i/48000) for i,v in enumerate(pcm))
+        self.assertGreater(2*math.hypot(real,imag)/len(pcm),0.04)
 
     def test_audio_layer_timing_trim_gain_mute_silence_sequence_and_all_streams(self):
         source = self.make_source()

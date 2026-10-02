@@ -89,6 +89,37 @@ class TestEditorProjectFoundation(unittest.TestCase):
         self.assertIsNone(editor_image_layer(removed)); self.assertNotIn("source-image", removed["assets"])
         self.assertEqual(len(editor_sequence_clips(removed)), 1)
 
+    def test_eight_image_rows_overlap_identity_roundtrip_and_independent_removal(self):
+        from services.editor_projects import add_output_image_layer, editor_image_layers
+        self._workspace("images")
+        current = create_output_video_timeline(workspace="images", output_name="source.mp4", output_revision="video",
+            media={"type": "video", "duration": 4, "width": 128, "height": 72, "fps": 24})
+        for _ in range(8):
+            current = add_output_image_layer(current, output_name="same.png", output_revision="image",
+                media={"type": "image", "width": 32, "height": 16})
+        layers = editor_image_layers(current, require_fit=True)
+        self.assertEqual(len({item["id"] for item in layers}), 8)
+        self.assertEqual(len({item["asset_id"] for item in layers}), 8)
+        with self.assertRaises(EditorProjectError):
+            add_output_image_layer(current, output_name="ninth.png", output_revision="image", media={"type": "image", "width": 32, "height": 16})
+        proposed = copy.deepcopy(current)
+        rows = next(track for track in proposed["tracks"] if track["id"] == "images-main")["items"]
+        rows.reverse()
+        rows[0].update(start=1, duration=2, opacity=0)
+        removed = rows.pop(3)
+        updated = apply_output_video_trim(current, proposed)
+        self.assertNotIn(removed["asset_id"], updated["assets"])
+        self.assertEqual(len(editor_sequence_clips(updated)), 1)
+        saved = save_editor_project(self.outputs, "images", updated, expected_revision=0)
+        self.assertEqual(editor_image_layers(load_editor_project(self.outputs, "images", saved["id"])), editor_image_layers(updated))
+        for key, value in (("id", "forged"), ("asset_id", layers[0]["asset_id"])):
+            forged = copy.deepcopy(saved)
+            next(track for track in forged["tracks"] if track["id"] == "images-main")["items"][1][key] = value
+            with self.assertRaises(EditorProjectError): apply_output_video_trim(saved, forged)
+        late = copy.deepcopy(saved)
+        next(track for track in late["tracks"] if track["id"] == "images-main")["items"][-1]["start"] = 4
+        with self.assertRaises(EditorProjectError): editor_image_layers(late, require_fit=True)
+
     def test_still_decoder_rejects_animation_and_container_and_applies_orientation(self):
         from services.editor_projects import inspect_editor_still
         from PIL import Image

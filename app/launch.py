@@ -27565,7 +27565,7 @@ async def add_output_editor_audio(project: str, editor_id: str, request: Request
 async def add_output_editor_image(project: str, editor_id: str, request: Request):
     """Add one current Gallery image file, retaining server-owned source identity."""
     from services.editor_projects import (
-        EditorProjectError, add_output_image_layer, editor_image_layer,
+        EditorProjectError, add_output_image_layer, editor_image_layers,
         load_editor_project, inspect_editor_still, save_editor_project,
     )
     body = await _editor_request_body(request)
@@ -27586,8 +27586,8 @@ async def add_output_editor_image(project: str, editor_id: str, request: Request
         if current["revision"] != expected:
             raise HTTPException(status_code=409, detail="Editor draft changed; reload before adding image")
         try:
-            if editor_image_layer(current):
-                raise EditorProjectError("Remove the current image layer before adding another")
+            if len(editor_image_layers(current)) >= 8:
+                raise EditorProjectError("Use up to eight image layers")
         except EditorProjectError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         out_dir, filepath, _ = _require_authorized_output(request, project, name)
@@ -27645,12 +27645,12 @@ async def export_output_editor_project(project: str, editor_id: str, request: Re
             raise HTTPException(status_code=503, detail="Editor draft is unavailable") from error
         if timeline["revision"] != expected:
             raise HTTPException(status_code=409, detail="Editor draft changed; reload before exporting")
-        from services.editor_projects import editor_sequence_clips, editor_text_layers, editor_audio_layer, editor_image_layer
+        from services.editor_projects import editor_sequence_clips, editor_text_layers, editor_audio_layer, editor_image_layers
         try:
             clips = editor_sequence_clips(timeline)
             text_layers = editor_text_layers(timeline, require_fit=True)
             audio_layer = editor_audio_layer(timeline, require_fit=True)
-            image_layer = editor_image_layer(timeline, require_fit=True)
+            image_layers = editor_image_layers(timeline, require_fit=True)
         except EditorProjectError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         with _output_lineage_mutation_guard(out_dir):
@@ -27683,15 +27683,15 @@ async def export_output_editor_project(project: str, editor_id: str, request: Re
                 bed = {**audio_layer, "name": asset["output_id"], "path": bed_path,
                        "revision": asset["output_revision"], "private": bool(bed_policy["private"]),
                        "explicit": bool(bed_policy["explicit"])}
-            image = None
-            if image_layer:
+            images = []
+            for image_layer in image_layers:
                 asset = timeline["assets"][image_layer["asset_id"]]
                 _editor_require_current_source(request, project, asset)
                 _, image_path, image_sidecar = _require_authorized_output(request, project, asset["output_id"])
                 image_policy = public_output_policy(image_sidecar)
-                image = {**image_layer, "name": asset["output_id"], "path": image_path,
+                images.append({**image_layer, "name": asset["output_id"], "path": image_path,
                          "width": asset["width"], "height": asset["height"], "revision": asset["output_revision"],
-                         "private": bool(image_policy["private"]), "explicit": bool(image_policy["explicit"])}
+                         "private": bool(image_policy["private"]), "explicit": bool(image_policy["explicit"])})
             first = sources[0]
             name, source = first["name"], first["path"]
             canvas = timeline["canvas"]
@@ -27730,9 +27730,9 @@ async def export_output_editor_project(project: str, editor_id: str, request: Re
                     **({"editor_canvas": copy.deepcopy(canvas)} if fit_canvas else {}),
                     **({"editor_text_layers": text_layers, "editor_canvas": copy.deepcopy(canvas)} if text_layers else {}),
                     **({"editor_audio_layer": bed, "editor_audio_path": bed["path"]} if bed else {}),
-                    **({"editor_image_layer": image, "editor_image_path": image["path"], "editor_canvas": copy.deepcopy(canvas)} if image else {}),
-                    "private_output": any(item["private"] for item in sources) or bool(bed and bed["private"]) or bool(image and image["private"]),
-                    "explicit_output": any(item["explicit"] for item in sources) or bool(bed and bed["explicit"]) or bool(image and image["explicit"]),
+                    **({"editor_image_layer": images, "editor_image_path": [item["path"] for item in images], "editor_canvas": copy.deepcopy(canvas)} if images else {}),
+                    "private_output": any(item["private"] for item in sources) or bool(bed and bed["private"]) or any(item["private"] for item in images),
+                    "explicit_output": any(item["explicit"] for item in sources) or bool(bed and bed["explicit"]) or any(item["explicit"] for item in images),
                 },
                 "output_files": [], "error": None, "workspace": project, "out_dir": out_dir,
             }
@@ -63819,12 +63819,17 @@ def _write_tool_sidecar(out_dir, filename, *, source_name, tool, params, elapsed
                 "name", "revision", "source_in", "start", "duration", "volume", "muted")}
             sidecar["transform"]["audio_mix"] = "added to each retained stream; no looping or video extension"
         if job.get("params", {}).get("editor_image_layer"):
+            from services.editor_export import editor_image_plans
             sidecar["params"] = None
-            image = job["params"]["editor_image_layer"]
-            sidecar["transform"]["image_layer"] = {key: image[key] for key in (
+            images = editor_image_plans(job["params"]["editor_image_layer"])
+            plans = [{key: image[key] for key in (
                 "name", "revision", "start", "duration", "size", "opacity", "position", "width", "height")}
+                for image in images]
+            sidecar["transform"]["image_layers"] = plans
+            if len(plans) == 1:
+                sidecar["transform"]["image_layer"] = plans[0]
             sidecar["transform"]["canvas"] = copy.deepcopy(job["params"]["editor_canvas"])
-            sidecar["transform"]["image_composition"] = "static image above video and below titles; aspect and alpha retained"
+            sidecar["transform"]["image_composition"] = "static images in row order above video and below titles; aspect and alpha retained"
     elif tool == "browser_copy":
         sidecar["artifact_class"] = "final"
         sidecar["params"].pop("multi_clip_info", None)
@@ -64314,11 +64319,15 @@ def _editor_export_source(job: dict) -> tuple[str, dict]:
         if not isinstance(bed, dict) or bed.get("path") != params.get("editor_audio_path"):
             raise ValueError("The Editor audio source changed.")
         entries = [*entries, bed]
-    image = params.get("editor_image_layer")
-    if image is not None:
-        if not isinstance(image, dict) or image.get("path") != params.get("editor_image_path"):
-            raise ValueError("The Editor image source changed.")
-        entries = [*entries, image]
+    from services.editor_export import editor_image_plans
+    value = params.get("editor_image_layer")
+    images = editor_image_plans(value)
+    if images:
+        paths = [image.get("path") for image in images]
+        bound = params.get("editor_image_path")
+        if paths != ([bound] if isinstance(value, dict) else bound):
+            raise ValueError("The Editor image sources changed.")
+        entries = [*entries, *images]
     resolved = []
     for entry in entries:
         name = entry["name"]

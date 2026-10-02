@@ -2,14 +2,15 @@
 
 ## Delivered behavior
 
-Add one static PNG, JPEG or WebP from the current project's loaded Gallery to
+Add up to eight independently timed static PNG, JPEG or WebP images from the current project's loaded Gallery to
 an existing video edit. Choose its absolute sequence start/end, size from
 10–100%, opacity from 0–100%, and top, center or bottom placement. Removing
 it changes the draft only. Original video, audio and image files stay intact.
 If no image is listed, return to Gallery, show Images, load the desired image,
 then show All or Videos and reopen the edit.
 
-The image sits above video and below titles. It keeps its aspect ratio, EXIF
+Images sit above video and below titles. Later rows appear on top; select a row
+to edit or remove it. Repeated imports have independent server-owned identities. It keeps its aspect ratio, EXIF
 orientation and alpha. Size is fitted within a box of 90% of canvas width and
 88% of canvas height, scaled by the chosen percentage; top/bottom use a 6%
 vertical margin. The interval is half open: start is included, end excluded.
@@ -23,8 +24,8 @@ Preview shows the selected clip and its current image/title overlays; audio
 preview behavior remains [documented separately](MAESTRO_EDITOR_AUDIO_LAYER_2026-10-02.md).
 Animated WebP/APNG and other containers are rejected. Export an animation as a
 still first. Supported images are bounded to 32 megapixels and 16384 pixels per
-side. Multiple images, arbitrary drag/rotation, overlapping video and live
-mixed audio remain later Editor work.
+side. Arbitrary drag/rotation, overlapping video and live mixed audio remain
+later Editor work.
 
 ## Source and export contract
 
@@ -80,3 +81,30 @@ overflow. The retained mobile render is from the synthetic browser fixture:
 live mobile screenshot capture returned a partial viewport. Browser zoom,
 human creative approval, Windows acceptance and broad VFR behavior remain
 unverified. No GPU/model inference is required for this feature.
+
+
+## Multiple image rows
+
+The ordered image lane now retains up to eight rows. Saving edits/removes each
+existing row by its server-owned identity, preserves overlap and order, and
+removes only its corresponding asset. Every interval must fit the export;
+selecting a valid row cannot hide an invalid neighboring row.
+
+Every imported image participates in privacy, source revision checks, indexed
+recovery inputs, dispatch and publication rechecks, including zero-opacity
+rows. Preview reveal stays per source identity. CPU composition uses unique
+staging files and ordered inputs before titles and the audio bed. Existing
+single-image queued jobs retain their scalar input binding through a bounded
+adapter; new jobs carry ordered lists under the existing recovery keys.
+
+Focused evidence: 27 project checks, 26 route/recovery/finality checks, 13 real
+CPU media checks, 19 UI helper/API checks and four synthetic browser runs across
+desktop/mobile layouts in Firefox and Chromium. The media packet covers overlap,
+alpha, join boundaries, titles above both stills, an audio bed and unchanged
+single-cut decoded audio. Browser checks cover independent private requests,
+keyboard row selection, preserved neighboring edits, all-row export guards,
+remove focus, overflow and no serious/critical accessibility findings.
+TypeScript, scoped ESLint, production build, source compilation and publication
+guard passed. One independent review found an audio test selector regression;
+it was corrected. The full suite was not rerun under the owner's frequency
+preference. Live release and human acceptance are recorded separately below.
