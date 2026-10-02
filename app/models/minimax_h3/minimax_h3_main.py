@@ -12,6 +12,7 @@ import math
 import os
 import time
 from contextlib import nullcontext
+from fractions import Fraction
 
 import numpy as np
 import torch
@@ -749,6 +750,7 @@ class MiniMaxH3Model:
         self.scheduler = None
         self.audio_scheduler = None
         self._ref2va_handoff_cache = None
+        self._h3_cumulative_token = None
         self._last_spectrum_stats = None
         self.__interrupt = False
 
@@ -836,6 +838,7 @@ class MiniMaxH3Model:
                 except Exception:
                     pass
         self._ref2va_handoff_cache = None
+        self._h3_cumulative_token = None
         self._last_spectrum_stats = None
         self.transformer = None
         self.conditioner = None
@@ -1157,6 +1160,79 @@ class MiniMaxH3Model:
         custom_settings = _kwargs.get("custom_settings")
         if not isinstance(custom_settings, dict):
             custom_settings = {}
+        cumulative_requested = any(
+            key in _kwargs for key in (
+                "_h3_cumulative_capture", "_h3_cumulative_previous", "_h3_cumulative_step",
+            )
+        )
+        cumulative_previous = cumulative_step = cumulative_context = None
+        cumulative_token = None
+        if not cumulative_requested:
+            # An intervening ordinary request may reconfigure managed weights.
+            self._h3_cumulative_token = None
+        if cumulative_requested:
+            from services.h3_cumulative_latents import (
+                H3CumulativeLatents,
+                append_h3_cumulative_window,
+                extract_h3_cumulative_context,
+            )
+            from services.h3_native_continuation import H3NativeContinuationStep
+
+            if (
+                os.environ.get("MAESTRO_H3_CUMULATIVE_EXPERIMENTAL") != "1"
+                or _kwargs.get("_h3_cumulative_capture") is not True
+            ):
+                raise ValueError("H3 cumulative sampling requires the private experimental capture gate.")
+            # This first sampler probe accepts native FL2VA only. No opaque
+            # state is routed through public settings, queue JSON or sidecars.
+            incompatible = (
+                bool(getattr(self, "reference_mode", False))
+                or str(getattr(self, "selected_model_type", "")) not in ("", "minimax_h3")
+                or any(value is not None for value in (
+                    input_ref_images, input_frames, input_frames2, input_frames3,
+                    input_waveform, audio_guide, audio_guide2, audio_guide3,
+                    _kwargs.get("input_video"), _kwargs.get("audio_source"),
+                    *(_kwargs.get(key) for key in ("audio_guide4", "audio_guide5", "audio_guide6")),
+                ))
+                or bool(audio_prompt_type or video_prompt_type)
+                or bool(_kwargs.get("prefix_frames_count"))
+                or _kwargs.get("h3_native_boundary_conditioning") is True
+                or bool(_kwargs.get("activated_loras"))
+                or bool(_kwargs.get("skip_steps_cache_type") or _kwargs.get("tea_cache"))
+                or any(key in custom_settings for key in (
+                    "_h3_timeline_still_guide", "_h3_bridge_guides",
+                    "h3_native_boundary_conditioning", "h3_ref2va_handoff",
+                    "h3_turbo_profile", "h3_lightx2v_profile",
+                    "h3_spectrum_profile", "h3_source_audio_mode",
+                ))
+            )
+            if incompatible:
+                raise ValueError("H3 cumulative sampling requires an independent native FL2VA request.")
+            handoff = _kwargs.get("_h3_cumulative_previous")
+            cumulative_step = _kwargs.get("_h3_cumulative_step")
+            if handoff is not None or cumulative_step is not None:
+                cumulative_token = getattr(self, "_h3_cumulative_token", None)
+                if (
+                    not isinstance(handoff, dict)
+                    or not isinstance(cumulative_step, H3NativeContinuationStep)
+                    or cumulative_token is None
+                    or handoff.get("model_token") is not cumulative_token
+                    or not isinstance(handoff.get("state"), H3CumulativeLatents)
+                ):
+                    raise ValueError("H3 cumulative handoff requires the same loaded model and an exact step.")
+                if image_start is not None or image_end is not None:
+                    raise ValueError("H3 cumulative tail guide cannot be combined with new keyframes.")
+                cumulative_previous = handoff["state"]
+                if any(
+                    tensor.device.type != "cpu" or tensor.dtype != torch.float32
+                    for tensor in (cumulative_previous.video, cumulative_previous.audio)
+                ):
+                    raise ValueError("H3 cumulative handoff must contain normalized CPU float32 AV state.")
+                cumulative_context = extract_h3_cumulative_context(
+                    cumulative_previous, cumulative_step,
+                )
+            else:
+                cumulative_token = object()
         if "_h3_timeline_still_guide" in _kwargs:
             raise ValueError(
                 "MiniMax H3 timeline still guide must be supplied in custom_settings."
@@ -1380,6 +1456,10 @@ class MiniMaxH3Model:
         fps = float(fps)
         if fps != MINIMAX_H3_FPS:
             raise ValueError(f"MiniMax H3 runs at its native {MINIMAX_H3_FPS} fps.")
+        if cumulative_step is not None and (
+            type(frame_num) is not int or frame_num != cumulative_step.target_frames
+        ):
+            raise ValueError("H3 cumulative request must match the planned sampling window.")
         frame_num = align_num_frames(int(frame_num))
         continuation = _as_video_tensor(_kwargs.get("input_video"))
         prefix_frames_count = int(_kwargs.get("prefix_frames_count") or 0)
@@ -1415,6 +1495,9 @@ class MiniMaxH3Model:
             target_frame_num = frame_num
         duration = target_frame_num / fps
         minimum_duration = 4.0 if self.reference_mode else MINIMAX_H3_MIN_DURATION
+        if cumulative_step is not None:
+            # A planned final tail may be shorter than an ordinary first clip.
+            minimum_duration = 22 / MINIMAX_H3_FPS
         if not minimum_duration <= duration <= MINIMAX_H3_MAX_DURATION:
             raise ValueError(
                 f"MiniMax H3 supports {minimum_duration:g}-{MINIMAX_H3_MAX_DURATION:g}s at 24 fps; "
@@ -1614,6 +1697,39 @@ class MiniMaxH3Model:
         latent_height = height // self.vae.spatial_compression_ratio
         latent_width = width // self.vae.spatial_compression_ratio
         num_audio_latents = audio_latent_num_frames(target_frame_num)
+        if cumulative_step is not None:
+            num_audio_latents = cumulative_step.target_audio_ticks
+            if tuple(cumulative_previous.video.shape[-2:]) != (latent_height, latent_width):
+                raise ValueError("H3 cumulative handoff canvas must match the sampling canvas.")
+        if cumulative_requested:
+            # Bound retained-state allocation before sampling or copying rows.
+            output_latent_frames = num_latent_frames
+            output_audio_ticks = num_audio_latents
+            if cumulative_previous is not None:
+                output_latent_frames = (
+                    cumulative_previous.video.shape[2] + cumulative_step.extension_latent_frames
+                )
+                output_audio_ticks = (
+                    cumulative_previous.audio.shape[-1] + cumulative_step.extension_audio_ticks
+                )
+            output_bytes = 4 * (
+                24 * output_latent_frames * latent_height * latent_width
+                + 2 * 32 * output_audio_ticks
+            )
+            if output_bytes > 512 * 1024 * 1024:
+                raise ValueError("H3 cumulative retained AV state exceeds the 512 MiB allocation limit.")
+            output_frames = (
+                target_frame_num if cumulative_previous is None
+                else cumulative_previous.frame_count + cumulative_step.extension_frames
+            )
+            decoded_bytes = 4 * (
+                3 * output_frames * height * width + 2 * output_audio_ticks * 800
+            )
+            if decoded_bytes > 2 * 1024 * 1024 * 1024:
+                raise ValueError(
+                    "H3 cumulative full decode exceeds the private 2 GiB output limit. "
+                    "Use a shorter chain or a smaller canvas."
+                )
 
         source_audio_target_rows = None
         source_audio_condition_rows = None
@@ -1750,6 +1866,27 @@ class MiniMaxH3Model:
                 else torch.cat([boundary_video_rows, condition_rows])
             )
 
+        cumulative_audio_rows = None
+        cumulative_audio_anchors = ()
+        if cumulative_context is not None:
+            guide_rows = patchify_video_latents(
+                cumulative_context.video.to(self.device), self.patch_size,
+            )
+            guide_noise = keyframe_condition_noise(
+                ((cumulative_step.context_latent_frames, latent_height, latent_width),),
+                self.patch_size, 24, generator=generator, device=self.device,
+            )
+            guide_rows = self.scheduler.scale_noise(
+                guide_rows, MINIMAX_H3_KEYFRAME_NOISE_AUG, guide_noise,
+            )
+            condition_rows = (
+                guide_rows if condition_rows is None
+                else torch.cat([guide_rows, condition_rows])
+            )
+            anchors = (("first", cumulative_step.context_latent_frames),) + anchors
+            cumulative_audio_rows = _audio_rows(cumulative_context.audio.to(self.device))
+            cumulative_audio_anchors = (("first", cumulative_step.context_audio_ticks),)
+
         reference_presentation = []
         references: list[MiniMaxH3PreparedReference] = []
         reference_video_rows = reference_audio_rows = None
@@ -1828,7 +1965,8 @@ class MiniMaxH3Model:
         if prompt_embeds is None or self._interrupt:
             return None
         audio_condition_anchors = (
-            tuple(boundary_audio_anchors) + tuple(source_audio_condition_anchors)
+            tuple(cumulative_audio_anchors) + tuple(boundary_audio_anchors)
+            + tuple(source_audio_condition_anchors)
         )
         if self.reference_mode:
             layout = build_ref2va_packed_sequence(
@@ -1895,6 +2033,8 @@ class MiniMaxH3Model:
             audio_rows = torch.cat([boundary_audio_rows, audio_rows])
         if source_audio_condition_rows is not None:
             audio_rows = torch.cat([source_audio_condition_rows, audio_rows])
+        if cumulative_audio_rows is not None:
+            audio_rows = torch.cat([cumulative_audio_rows, audio_rows])
 
         turbo_schedule = None
         if lightx2v_enabled:
@@ -2194,15 +2334,40 @@ class MiniMaxH3Model:
 
         if self._interrupt:
             return None
+        decode_video_rows = video_rows[layout.num_condition_video_rows :]
+        decode_audio_latents = unpack_audio_tokens(
+            audio_rows[layout.num_condition_audio_rows :], num_audio_latents,
+        )
+        decode_frames = target_frame_num
+        decode_latent_frames = num_latent_frames
+        cumulative_state = None
+        if cumulative_requested:
+            sampled_video = unpatchify_video_tokens(
+                decode_video_rows, num_latent_frames, latent_height, latent_width,
+                24, self.patch_size,
+            ).detach().float().cpu().clone()
+            sampled_audio = decode_audio_latents.detach().float().cpu().clone()
+            if cumulative_previous is None:
+                cumulative_state = H3CumulativeLatents(sampled_video, sampled_audio, target_frame_num)
+            else:
+                cumulative_state = append_h3_cumulative_window(
+                    cumulative_previous, sampled_video, sampled_audio, cumulative_step,
+                )
+            decode_frames = cumulative_state.frame_count
+            decode_latent_frames = cumulative_state.video.shape[2]
+            decode_video_rows = patchify_video_latents(
+                cumulative_state.video.to(self.device), self.patch_size,
+            )
+            decode_audio_latents = cumulative_state.audio.to(self.device)
         report_phase("Decoding H3 video")
         video, normalized_video_latents = _decode_h3_video_rows(
             vae=self.vae,
             device=self.device,
-            packed_rows=video_rows[layout.num_condition_video_rows :],
-            latent_frames=num_latent_frames,
+            packed_rows=decode_video_rows,
+            latent_frames=decode_latent_frames,
             latent_height=latent_height,
             latent_width=latent_width,
-            pixel_frames=target_frame_num,
+            pixel_frames=decode_frames,
             pixel_height=height,
             pixel_width=width,
             channels=24,
@@ -2211,10 +2376,7 @@ class MiniMaxH3Model:
         )
 
         report_phase("Decoding H3 audio")
-        audio_latents = unpack_audio_tokens(
-            audio_rows[layout.num_condition_audio_rows :],
-            num_audio_latents,
-        )
+        audio_latents = decode_audio_latents
         audio_mean = torch.tensor(AUDIO_LATENTS_MEAN, device=self.device).view(1, -1, 1)
         audio_std = torch.tensor(AUDIO_LATENTS_STD, device=self.device).view(1, -1, 1)
         audio_latents = audio_latents * audio_std + audio_mean
@@ -2244,8 +2406,22 @@ class MiniMaxH3Model:
             )
             prefix_audio = boundary_waveform[:, :history_samples].transpose(0, 1)
             audio = np.concatenate([prefix_audio.cpu().numpy(), audio], axis=0)
-        return {
+        result = {
             "x": output_video,
             "audio": audio,
             "audio_sampling_rate": 32000,
         }
+        if cumulative_state is not None:
+            if self._interrupt:
+                return None
+            published_frames = cumulative_state.published_frames
+            sample_count = round(Fraction(published_frames * 32000, MINIMAX_H3_FPS))
+            padding = max(0, sample_count - audio.shape[0])
+            result["x"] = output_video[:, :published_frames]
+            result["audio"] = np.pad(audio[:sample_count], ((0, padding), (0, 0)))
+            self._h3_cumulative_token = cumulative_token
+            result["_h3_cumulative_handoff"] = {
+                "state": cumulative_state, "model_token": cumulative_token,
+                "audio_padding_samples": padding,
+            }
+        return result
