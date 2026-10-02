@@ -16,12 +16,12 @@ const server = await createServer({
     name: 'editor-test-transforms',
     transform(code, id) {
       if (id.endsWith('/src/editor/EditorWorkspace.tsx')) {
-        return `${code}\nexport { changeTrim, moveClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio, imageLayer, changeImage, availableImages, imageLayout };`
+        return `${code}\nexport { changeTrim, moveClip, removeClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio, imageLayer, changeImage, availableImages, imageLayout };`
       }
     },
   }],
 })
-const { changeTrim, moveClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio, imageLayer, changeImage, availableImages, imageLayout } = await server.ssrLoadModule('/src/editor/EditorWorkspace.tsx')
+const { changeTrim, moveClip, removeClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio, imageLayer, changeImage, availableImages, imageLayout } = await server.ssrLoadModule('/src/editor/EditorWorkspace.tsx')
 after(() => server.close())
 
 function sequenceProject() {
@@ -40,6 +40,25 @@ function sequenceProject() {
     ] }, { id: 'retained-track', name: 'Retained', type: 'text', items: [] }],
   }
 }
+
+test('clip removal retains remaining trims, opening metadata and absolute overlays, and keeps one clip', () => {
+  const original = sequenceProject()
+  original.opening_source = { output_id: 'a.mp4', output_revision: 'sha256:a' }
+  original.tracks.push({ id: 'images-main', type: 'video', items: [{ id: 'image', asset_id: 'image', start: 8, duration: 3 }] })
+  original.assets.image = { id: 'image', output_id: 'still.png' }
+  const removed = removeClip(original, 'clip-a')
+  assert.deepEqual(removed.tracks[0].items.map(item => [item.id, item.start, item.source_in, item.duration]), [['clip-b', 0, 2, 4], ['clip-c', 4, 0, 5]])
+  assert.equal(removed.opening_source, original.opening_source)
+  assert.equal(removed.canvas, original.canvas)
+  assert.equal(removed.tracks.at(-1), original.tracks.at(-1))
+  assert.equal(removed.assets.a, undefined)
+  assert.equal(removed.assets.image, original.assets.image)
+  assert.equal(original.tracks[0].items.length, 3)
+  assert.equal(availableVideos(removed, [{ workspace: 'scene', name:'a.mp4', type:'video', revision:'new-a' }]).length, 1)
+  const one = removeClip(removed, 'clip-c')
+  assert.equal(removeClip(one, 'clip-b'), one)
+  assert.equal(removeClip(original, 'unknown'), original)
+})
 
 test('text CRUD retains absolute times and source identity through trim/reorder', () => {
   const original = sequenceProject()

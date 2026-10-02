@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "app"))
 from fastapi import HTTPException  # noqa: E402
 from services.editor_projects import (  # noqa: E402
-    append_output_video_clip, create_output_video_timeline, load_editor_project, save_editor_project,
+    append_output_video_clip, apply_output_video_trim, create_output_video_timeline, load_editor_project, save_editor_project,
 )
 from services.output_access import public_output_policy, stamp_sidecar_policy  # noqa: E402
 
@@ -331,6 +331,25 @@ class EditorExportRouteTests(unittest.TestCase):
             append(dict(request, expected_revision=2, path="/foreign/source.mp4"))
         self.assertEqual(forged.exception.status_code, 400)
 
+    def test_export_after_original_clip_removal_seals_only_remaining_source(self):
+        second = self.sequence()
+        sidecar = second.with_suffix(".meta.json")
+        sidecar.write_text(json.dumps({"workspace":"scene", "private":False, "explicit":False}))
+        self.timeline["assets"][self.timeline["tracks"][0]["items"][1]["asset_id"]]["output_revision"] = self.source_revision(second)
+        proposed = copy.deepcopy(self.timeline); proposed["tracks"][0]["items"].pop(0)
+        self.timeline = save_editor_project(str(self.outputs), "scene",
+            apply_output_video_trim(self.timeline, proposed), expected_revision=self.timeline["revision"])
+        self.submit()
+        params = self.registered[-1][0]["params"]
+        self.assertEqual(params["editor_source_name"], second.name)
+        self.assertEqual(params["editor_source_path"], str(second))
+        self.assertNotIn("editor_sources", params)
+        self.assertEqual(params["editor_canvas"], self.timeline["canvas"])
+        self.assertEqual(params["editor_source_fps"], 30)
+        self.assertFalse(params["private_output"])
+        self.assertFalse(params["explicit_output"])
+        self.assertTrue(self.source.exists())
+
     def test_sequence_checks_second_source_inherits_privacy_and_seals_recovery(self):
         # A public first source must still yield a private/explicit sequence.
         self.source.with_suffix(".meta.json").write_text(json.dumps({"workspace": "scene", "private": False, "explicit": False}))
@@ -602,6 +621,33 @@ class EditorExportRouteTests(unittest.TestCase):
                     self.assertFalse(self.ns["_run_tool_editor_export"](job["id"]))
                 self.assertEqual(job["status"], "failed")
                 self.assertFalse(list(self.project.glob("editor_cut_*")))
+
+    def test_single_remaining_clip_uses_canvas_and_rejects_wrong_size(self):
+        second = self.sequence()
+        proposed = copy.deepcopy(self.timeline)
+        proposed["tracks"][0]["items"].pop(0)
+        self.timeline = save_editor_project(str(self.outputs), "scene",
+            apply_output_video_trim(self.timeline, proposed), expected_revision=self.timeline["revision"])
+        for width, height in ((72, 128), (128, 72)):
+            with self.subTest(width=width, height=height):
+                self.jobs.clear(); self.registered.clear()
+                job = self.worker_namespace()
+                def render(source, destination, **options):
+                    self.assertEqual(source, str(second))
+                    self.assertEqual(options["canvas"], self.timeline["canvas"])
+                    Path(destination).write_bytes(b"rendered-video")
+                with mock.patch("services.editor_export.render_single_source_cut", side_effect=render), mock.patch("services.editor_projects.probe_media", return_value={
+                    "type": "video", "duration": 2, "size": 14, "has_audio": False,
+                    "width": width, "height": height, "fps": 30,
+                }):
+                    accepted = self.ns["_run_tool_editor_export"](job["id"])
+                self.assertEqual(accepted, width == 128)
+                if accepted:
+                    sidecar = json.loads((self.project / job["output_files"][0]).with_suffix(".meta.json").read_text())
+                    self.assertEqual(sidecar["transform"]["canvas"], self.timeline["canvas"])
+                    self.assertIsNone(sidecar["params"])
+                else:
+                    self.assertFalse(list(self.project.glob("editor_cut_*")))
 
     def test_worker_cancel_or_source_replacement_never_publishes(self):
         for mode in ("cancel", "changed"):

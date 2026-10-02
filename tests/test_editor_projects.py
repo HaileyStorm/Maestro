@@ -262,13 +262,13 @@ class TestEditorProjectFoundation(unittest.TestCase):
         self.assertEqual(updated["assets"], sequence["assets"])
         saved = save_editor_project(self.outputs, "scene", updated, expected_revision=0)
         self.assertEqual(len(editor_sequence_clips(load_editor_project(self.outputs, "scene", saved["id"]))), 2)
-        for mode in ("duplicate", "missing", "unknown"):
+        for mode in ("duplicate", "empty", "unknown"):
             invalid = copy.deepcopy(proposed)
             items = invalid["tracks"][0]["items"]
             if mode == "duplicate":
                 items[1]["id"] = items[0]["id"]
-            elif mode == "missing":
-                items.pop()
+            elif mode == "empty":
+                items.clear()
             else:
                 items[0]["id"] = "unknown"
             with self.subTest(mode=mode), self.assertRaises(EditorProjectError):
@@ -279,6 +279,41 @@ class TestEditorProjectFoundation(unittest.TestCase):
             sequence = append_output_video_clip(sequence, output_name=f"more-{index}.mp4", output_revision="revision", media=media)
         with self.assertRaisesRegex(EditorProjectError, "eight"):
             append_output_video_clip(sequence, output_name="overflow.mp4", output_revision="revision", media=media)
+
+    def test_remove_original_and_appended_clips_preserves_anchor_layers_and_cas(self):
+        from services.editor_projects import add_output_audio_layer, add_output_image_layer, editor_audio_layer, editor_image_layer, editor_text_layers
+        self._workspace("scene")
+        media = {"type": "video", "duration": 3, "width": 128, "height": 72, "fps": 24}
+        first = create_output_video_timeline(workspace="scene", output_name="first.mp4", output_revision="first", media=media)
+        first.pop("opening_source")  # Legacy draft upgrades on its first save.
+        current = append_output_video_clip(first, output_name="second.mp4", output_revision="second", media=media)
+        current = append_output_video_clip(current, output_name="third.mp4", output_revision="third", media=media)
+        current["tracks"][2]["items"] = [{"id": "title", "text": "Kept", "start": 5, "duration": 1, "position": "top"}]
+        current = add_output_audio_layer(current, output_name="sound.wav", output_revision="audio", media={"type":"audio", "duration":10, "has_audio":True})
+        current = add_output_image_layer(current, output_name="still.png", output_revision="image", media={"type":"image", "width":16, "height":8, "has_audio":False})
+        original_layers = (editor_text_layers(current), editor_audio_layer(current), editor_image_layer(current))
+        proposed = copy.deepcopy(current)
+        proposed["tracks"][0]["items"].pop(0)
+        proposed["opening_source"] = {"output_id":"forged"}
+        remaining = apply_output_video_trim(current, proposed)
+        self.assertEqual([asset["output_id"] for asset, _ in editor_sequence_clips(remaining)], ["second.mp4", "third.mp4"])
+        self.assertNotIn("source-video", remaining["assets"])
+        self.assertEqual(remaining["opening_source"]["output_id"], "first.mp4")
+        self.assertEqual(remaining["canvas"], current["canvas"])
+        self.assertEqual((editor_text_layers(remaining), editor_audio_layer(remaining), editor_image_layer(remaining)), original_layers)
+        saved = save_editor_project(self.outputs, "scene", remaining, expected_revision=0)
+        proposed = copy.deepcopy(saved); proposed["tracks"][0]["items"].pop()
+        last = apply_output_video_trim(saved, proposed)
+        self.assertEqual(last["opening_source"], remaining["opening_source"])
+        self.assertEqual([clip["start"] for _, clip in editor_sequence_clips(last)], [0])
+        with self.assertRaises(EditorProjectError):
+            editor_image_layer(last, require_fit=True)
+        save_editor_project(self.outputs, "scene", last, expected_revision=saved["revision"])
+        with self.assertRaises(EditorProjectError):
+            save_editor_project(self.outputs, "scene", remaining, expected_revision=saved["revision"])
+        proposed["tracks"].append(copy.deepcopy(proposed["tracks"][0]))
+        with self.assertRaises(EditorProjectError):
+            apply_output_video_trim(saved, proposed)
 
     def test_round_trip_and_stale_autosave_cannot_overwrite_newer_edit(self):
         self._workspace("scene-a")
@@ -515,6 +550,29 @@ class TestEditorProjectRoutes(unittest.TestCase):
         }
         exec(compile(module, str(launch_path), "exec"), namespace)
         self.routes = namespace
+
+    def test_reopen_original_gallery_video_after_its_clip_is_removed(self):
+        media = {"type":"video", "duration":3, "width":128, "height":72, "fps":24}
+        request = _EditorRequest({"output_name":"clip.mp4", "output_revision":self.revision})
+        with mock.patch("services.editor_projects.probe_media", return_value=media):
+            opened = asyncio.run(self.routes["open_output_editor_project"]("scene", request))["project"]
+        second = Path(self.scene) / "second.mp4"; second.write_bytes(b"second")
+        revision = "sha256:" + hashlib.sha256(second.read_bytes()).hexdigest()
+        sequence = append_output_video_clip(opened, output_name=second.name, output_revision=revision, media=media)
+        sequence = save_editor_project(self.outputs, "scene", sequence, expected_revision=opened["revision"])
+        self.routes["_require_authorized_output"] = lambda _r, _p, name: (self.scene, str(Path(self.scene)/name), {"private":False})
+        self.routes["_output_share_revision"] = lambda path, *_a: "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        proposed = copy.deepcopy(sequence); proposed["tracks"][0]["items"].pop(0)
+        proposed["opening_source"] = {"output_id":"forged.mp4"}
+        saved = asyncio.run(self.routes["save_output_editor_project"]("scene", sequence["id"],
+            _EditorRequest({"project":proposed,"expected_revision":sequence["revision"]})))["project"]
+        with mock.patch("services.editor_projects.probe_media", return_value=media):
+            reopened = asyncio.run(self.routes["open_output_editor_project"]("scene", request))["project"]
+        self.assertEqual((reopened["id"],reopened["revision"]), (saved["id"],saved["revision"]))
+        self.assertNotIn("source-video", reopened["assets"])
+        self.assertEqual(reopened["opening_source"], opened["opening_source"])
+        self.assertEqual([asset["output_id"] for asset,_ in editor_sequence_clips(reopened)], [second.name])
+        self.assertTrue(Path(self.clip).exists())
 
     def test_open_replay_trim_and_stale_or_foreign_mutation(self):
         media = {

@@ -36,6 +36,62 @@ function editorProject(revision: number, sourceIn = 0) {
   }
 }
 
+for (const viewport of [
+  { name: 'desktop', width: 1440, height: 900 },
+  { name: 'mobile', width: 390, height: 844 },
+]) {
+  test(`${viewport.name} clip removal saves, reopens and keeps the last clip`, async ({ page }) => {
+    await page.setViewportSize({ width: viewport.width, height: viewport.height })
+    await skipWelcome(page)
+    api!.setAccountScenario('remote-user')
+    await page.route('**/editor-fonts/DejaVuSans.ttf', route => route.fulfill({
+      path: new URL('../public/editor-fonts/DejaVuSans.ttf', import.meta.url).pathname,
+      contentType: 'font/ttf',
+    }))
+    const original = editorProject(1)
+    const second = { ...original.assets['source-video'], id: 'second', name: 'second.mp4', output_id: 'second.mp4' }
+    let saved = { ...original, opening_source: original.assets['source-video'],
+      assets: { ...original.assets, second }, tracks: [{ ...original.tracks[0], items: [
+        { ...original.tracks[0].items[0], duration: 3 },
+        { ...original.tracks[0].items[0], id: 'second-clip', asset_id: 'second', start: 3, duration: 4, source_in: 2 },
+      ] }] }
+    let saves = 0
+    await page.route(/\/api\/v1\/outputs(?:\?.*)?$/, route => route.fulfill({ contentType:'application/json', body:JSON.stringify({ outputs:[VIDEO], total:1 }) }))
+    await page.route('**/api/v1/outputs/sidecarless-clip.mp4/metadata*', route => route.fulfill({ contentType:'application/json', body:JSON.stringify({ params:null, source:'none' }) }))
+    await page.route(/\/api\/v1\/file\/(?:sidecarless-clip|second)\.mp4(?:\?.*)?$/, route => route.fulfill({ status:404, body:'Synthetic media unavailable' }))
+    await page.route(/\/api\/v1\/projects\/[^/]+\/editor\/projects(?:\/[^/?]+)?(?:\?.*)?$/, route => {
+      if (route.request().method() === 'PUT') {
+        const body = route.request().postDataJSON()
+        expect(body.expected_revision).toBe(saved.revision)
+        expect(body.project.tracks[0].items).toEqual([{ ...original.tracks[0].items[0], id:'second-clip', asset_id:'second', start:0, duration:4, source_in:2 }])
+        expect(body.project.assets['source-video']).toBeUndefined()
+        expect(body.project.opening_source).toEqual(original.assets['source-video'])
+        saved = { ...body.project, revision: saved.revision + 1 }
+        saves++
+      }
+      return route.fulfill({ contentType:'application/json', body:JSON.stringify({ project:saved }) })
+    })
+    await page.goto('/')
+    await page.getByRole('tab', { name:'Gallery' }).click()
+    await page.getByRole('button', { name:`Open ${VIDEO.name} in Editor` }).click()
+    const editor = page.getByRole('main', { name:'Video Editor' })
+    const remove = editor.getByRole('button', { name:'Remove clip', exact:true })
+    await expect(remove).toBeEnabled()
+    await remove.click()
+    await expect(editor.getByRole('button', { name:'Select clip 1: second.mp4', exact:true })).toBeFocused()
+    await expect(remove).toBeDisabled()
+    await expect.poll(() => saves).toBe(1)
+    await expect(editor.getByRole('status').filter({ hasText:'Draft saved' })).toBeVisible()
+    await editor.getByRole('button', { name:'Gallery', exact:true }).click()
+    await page.getByRole('button', { name:`Open ${VIDEO.name} in Editor` }).click()
+    await expect(editor.getByRole('button', { name:'Select clip 1: second.mp4', exact:true })).toBeVisible()
+    await expect(remove).toBeDisabled()
+    expect(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 1)).toBe(false)
+    const accessibility = await new AxeBuilder({ page }).include('main[aria-label="Video Editor"]').analyze()
+    expect(accessibility.violations.filter(v => v.impact === 'critical' || v.impact === 'serious')).toEqual([])
+  })
+}
+
 async function skipWelcome(page: Page) {
   await page.addInitScript(() => localStorage.setItem('maestro_welcome_seen_v1', '1'))
 }

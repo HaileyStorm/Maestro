@@ -27385,7 +27385,7 @@ async def open_output_editor_project(project: str, request: Request):
                     # A second tab may have created the same deterministic
                     # draft while this request was probing the video.
                     saved = load_editor_project(_editor_save_root(), project, timeline["id"])
-            source = saved.get("assets", {}).get("source-video", {})
+            source = saved.get("opening_source", saved.get("assets", {}).get("source-video", {}))
             if any(source.get(key) != timeline["assets"]["source-video"].get(key)
                    for key in ("output_id", "output_revision", "workspace", "origin", "type")):
                 raise EditorProjectError("Editor source changed")
@@ -27696,6 +27696,8 @@ async def export_output_editor_project(project: str, editor_id: str, request: Re
             name, source = first["name"], first["path"]
             canvas = timeline["canvas"]
             multiple = len(sources) > 1
+            fit_canvas = not multiple and (clips[0][0]["width"] != canvas["width"]
+                                          or clips[0][0]["height"] != canvas["height"])
             duration = (sum(max(1, round(item["duration"] * canvas["fps"])) for item in sources) / canvas["fps"]
                         if multiple else first["duration"])
             for existing in _jobs.values():
@@ -27725,6 +27727,7 @@ async def export_output_editor_project(project: str, editor_id: str, request: Re
                     "editor_source_in": first["source_in"],
                     "editor_duration": duration,
                     **({"editor_sources": sources, "editor_canvas": copy.deepcopy(canvas)} if multiple else {}),
+                    **({"editor_canvas": copy.deepcopy(canvas)} if fit_canvas else {}),
                     **({"editor_text_layers": text_layers, "editor_canvas": copy.deepcopy(canvas)} if text_layers else {}),
                     **({"editor_audio_layer": bed, "editor_audio_path": bed["path"]} if bed else {}),
                     **({"editor_image_layer": image, "editor_image_path": image["path"], "editor_canvas": copy.deepcopy(canvas)} if image else {}),
@@ -63791,6 +63794,9 @@ def _write_tool_sidecar(out_dir, filename, *, source_name, tool, params, elapsed
             "duration": job.get("params", {}).get("editor_duration"),
             "video": "h264", "audio": "aac",
         }
+        if job.get("params", {}).get("editor_canvas"):
+            sidecar["params"] = None
+            sidecar["transform"]["canvas"] = copy.deepcopy(job["params"]["editor_canvas"])
         if job.get("params", {}).get("editor_sources"):
             # A sequence has no single generation recipe. Each pinned source
             # retains its own settings; copying the first would misrepresent
@@ -64382,10 +64388,10 @@ def _run_tool_editor_export(job_id: str):
                                 or rendered.get("height") != canvas["height"]
                                 or not math.isclose(float(rendered.get("fps") or 0), canvas["fps"], rel_tol=1e-4, abs_tol=1e-4)):
                             raise ValueError("The exported sequence does not match its saved size and frame rate.")
-                    elif params.get("editor_text_layers") or params.get("editor_image_layer"):
+                    elif params.get("editor_canvas"):
                         canvas = params["editor_canvas"]
                         if rendered.get("width") != canvas["width"] or rendered.get("height") != canvas["height"]:
-                            raise ValueError("The exported text does not match its saved canvas.")
+                            raise ValueError("The exported cut does not match its saved canvas.")
                     fps = float(params.get("editor_source_fps") or 0)
                     tolerance = max(0.1, min(0.5, 2 / max(1.0, fps)))
                     if (rendered["type"] != "video"

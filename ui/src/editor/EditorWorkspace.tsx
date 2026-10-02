@@ -110,6 +110,16 @@ function moveClip(project: EditorProject, clipId: string, direction: -1 | 1): Ed
     ? { ...track, items: sequenceStarts(reordered) } : track) }
 }
 
+function removeClip(project: EditorProject, clipId: string): EditorProject {
+  const items = sequenceClips(project)
+  const removed = items.find(item => item.id === clipId)
+  if (!removed || items.length <= 1) return project
+  const assets = { ...project.assets }
+  delete assets[removed.asset_id ?? '']
+  return { ...project, assets, tracks: project.tracks.map(track => track.id === 'video-main'
+    ? { ...track, items: sequenceStarts(items.filter(item => item.id !== clipId)) } : track) }
+}
+
 function availableVideos(project: EditorProject, outputs: OutputFile[]): OutputFile[] {
   const imported = new Set(Object.values(project.assets).map(asset => asset.output_id))
   return outputs.filter(output => output.workspace === project.workspace && output.type === 'video'
@@ -505,6 +515,17 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
     updateDraft(moveClip(projectRef.current, clip.id, direction))
   }
 
+  const handleRemoveClip = () => {
+    if (!projectRef.current || !clip || saving.current || appending.current || exporting.current || !isCurrent(scope.current)) return
+    const next = removeClip(projectRef.current, clip.id)
+    if (next === projectRef.current) return
+    const remaining = sequenceClips(next)
+    const selected = remaining[Math.min(clips.findIndex(item => item.id === clip.id), remaining.length - 1)]
+    selectClip(selected.id)
+    updateDraft(next)
+    window.requestAnimationFrame(() => document.getElementById(`editor-clip-${selected.id}`)?.focus())
+  }
+
   const handleAppend = async (kind: 'video' | 'audio' | 'image' = 'video', requestedName = appendName) => {
     const epoch = scope.current
     if (!projectRef.current || !isCurrent(epoch) || appending.current || exporting.current || saveState === 'error') return
@@ -730,7 +751,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
                 const asset = project.assets[item.asset_id ?? '']
                 const selected = item.id === clip?.id
                 return <li key={item.id} className="w-44 shrink-0">
-                  <button type="button" aria-label={`Select clip ${index + 1}: ${asset?.name ?? 'Video'}`} aria-pressed={selected}
+                  <button id={`editor-clip-${item.id}`} type="button" aria-label={`Select clip ${index + 1}: ${asset?.name ?? 'Video'}`} aria-pressed={selected}
                     disabled={busy} onClick={() => selectClip(item.id)}
                     className={`min-h-24 w-full rounded-lg border p-3 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50 ${selected ? 'border-accent-blue bg-accent-blue/15' : 'border-border bg-bg-primary hover:bg-bg-hover'}`}>
                     <span className="mb-2 flex items-center justify-between gap-2 text-xs text-text-secondary"><span>Clip {index + 1}</span><span className="tabular-nums">{displayTime(item.duration)}</span></span>
@@ -745,7 +766,10 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
                 className="flex min-h-11 items-center gap-2 rounded-lg border border-border px-3 text-sm hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50"><ArrowLeft size={14} aria-hidden="true" /> Move earlier</button>
               <button type="button" disabled={!canReorder || selectedIndex >= clips.length - 1} onClick={() => reorder(1)}
                 className="flex min-h-11 items-center gap-2 rounded-lg border border-border px-3 text-sm hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50"><ArrowRight size={14} aria-hidden="true" /> Move later</button>
+              <button type="button" disabled={!canReorder || clips.length <= 1} onClick={handleRemoveClip}
+                className={audioButtonClass}><Trash2 size={14} aria-hidden="true" />Remove clip</button>
             </div>
+            <p className="mb-5 text-xs leading-relaxed text-text-secondary">Remove changes this edit only; the Gallery video stays intact. Keep at least one clip. Audio, image and title times stay fixed. Reopen this draft from its original Gallery video.</p>
             <div className="mb-6 border-y border-border py-4">
               <div className="flex flex-wrap items-end gap-3">
                 <label className="block min-w-0 flex-1 text-sm"><span className="mb-2 block">Add a video from this project’s Gallery</span>

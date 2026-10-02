@@ -7,14 +7,20 @@ project. Select each clip to trim it; use Move earlier / Move later to change
 playback order. Drafts save in the project with revision conflict protection.
 Export MP4 submits the saved revision to the existing queue. Originals stay
 intact. The preview plays the selected clip; joined playback is available on
-the exported video in Gallery.
+the exported video in Gallery. [Clip removal](MAESTRO_EDITOR_CLIP_REMOVAL_2026-10-02.md)
+now permits removal of any clip while keeping at least one; originals remain
+in Gallery and the draft retains its opening identity.
 
 Exports use CPU H.264/AAC. The sequence keeps the first imported video's canvas
 and frame rate, rounding odd dimensions up to even pixels. Other shapes receive
 black bars. Each clip uses its first audio stream; absent audio becomes silence.
 Clip lengths round individually to output frames. Single-source cuts retain
-their existing behavior. This slice does not add overlapping layers, clip
-removal, transitions, or an interactive preview of the full sequence.
+their existing behavior. Later milestones add
+[titles](MAESTRO_EDITOR_TEXT_LAYERS_2026-10-02.md),
+[audio](MAESTRO_EDITOR_AUDIO_LAYER_2026-10-02.md) and
+[a still image](MAESTRO_EDITOR_IMAGE_LAYER_2026-10-02.md).
+Transitions, overlapping video and an interactive preview of the full sequence
+remain later work.
 
 ## Source and publication boundaries
 

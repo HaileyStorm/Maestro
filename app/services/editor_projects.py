@@ -332,6 +332,8 @@ def create_output_video_timeline(
         "fps": _finite_number(media.get("fps"), 0.0),
         "has_audio": bool(media.get("has_audio")),
     }
+    project["opening_source"] = {key: project["assets"]["source-video"][key]
+        for key in ("output_id", "output_revision", "workspace", "origin", "type")}
     project["tracks"][0]["items"] = [{
         "id": "source-clip", "asset_id": "source-video", "start": 0.0,
         "duration": duration, "source_in": 0.0, "speed": 1.0,
@@ -342,7 +344,7 @@ def create_output_video_timeline(
 def apply_output_video_trim(
     current: Mapping[str, Any], proposed: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Accept trims/order and bounded titles; source identity stays server-owned."""
+    """Accept a nonempty subset of existing clips, trims/order and bounded layers."""
     if (
         proposed.get("id") != current.get("id")
         or proposed.get("workspace") != current.get("workspace")
@@ -352,11 +354,20 @@ def apply_output_video_trim(
         raise EditorProjectError("Select valid Editor tracks")
     try:
         originals = editor_sequence_clips(current)
-        proposed_items = next(track for track in proposed["tracks"] if track.get("id") == "video-main")["items"]
-        if len(proposed_items) != len(originals):
-            raise ValueError("clip count changed")
+        incoming_video = [track for track in proposed["tracks"] if track.get("id") == "video-main"]
+        if len(incoming_video) != 1:
+            raise ValueError("video track changed")
+        proposed_items = incoming_video[0]["items"]
+        if not isinstance(proposed_items, list) or not 1 <= len(proposed_items) <= len(originals):
+            raise ValueError("keep at least one existing clip")
         by_id = {clip["id"]: (asset, clip) for asset, clip in originals}
         updated = copy.deepcopy(dict(current))
+        # Legacy drafts keep their opening identity when the original clip leaves
+        # the timeline. It is navigation metadata, never an export input.
+        if "opening_source" not in updated:
+            source = current["assets"]["source-video"]
+            updated["opening_source"] = {key: source[key]
+                for key in ("output_id", "output_revision", "workspace", "origin", "type")}
         track = next(track for track in updated["tracks"] if track["id"] == "video-main")
         items = []
         position = 0.0
@@ -382,6 +393,9 @@ def apply_output_video_trim(
         if position > 86400:
             raise ValueError("sequence too long")
         track["items"] = items
+        for asset, clip in originals:
+            if clip["id"] not in used:
+                del updated["assets"][asset["id"]]
     except (KeyError, IndexError, StopIteration, TypeError, ValueError):
         raise EditorProjectError("Select a valid source range") from None
     incoming_titles = [track for track in proposed.get("tracks", []) if track.get("id") == "titles-main"]

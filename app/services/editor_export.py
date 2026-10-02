@@ -211,6 +211,14 @@ def render_single_source_cut(
         raise TypeError("abort_check must be callable")
     if runner is not None and not callable(runner):
         raise TypeError("runner must be callable")
+    if canvas is not None:
+        if (not isinstance(canvas, dict)
+                or type(canvas.get("width")) is not int or type(canvas.get("height")) is not int
+                or not 64 <= canvas["width"] <= 7680 or not 64 <= canvas["height"] <= 4320
+                or canvas["width"] % 2 or canvas["height"] % 2
+                or type(canvas.get("fps", 30)) not in (int, float)
+                or not math.isfinite(canvas.get("fps", 30)) or not 1 <= canvas.get("fps", 30) <= 120):
+            raise ValueError("Editor cut canvas is invalid")
 
     source_path = Path(os.path.abspath(os.fspath(source)))
     destination_path = Path(os.path.abspath(os.fspath(destination)))
@@ -246,14 +254,14 @@ def render_single_source_cut(
                                     "force_original_aspect_ratio=decrease:force_divisible_by=2,"
                                     f"pad={canvas['width']}:{canvas['height']}:(ow-iw)/2:(oh-ih)/2,setsar=1[cut]",
                                     *image_filters, *title_filters]), "-map", f"[{label}]"]
-                         if text_layers or image_layer else ["-map", "0:v:0", "-vf", "setpts=PTS-STARTPTS"])
+                         if canvas is not None else ["-map", "0:v:0", "-vf", "setpts=PTS-STARTPTS"])
         layouts = _source_audio_layouts(source_path) if audio_layer and not audio_layer["muted"] and audio_layer["volume"] > 0 else []
         bed_inputs, bed_filters, audio_options = _audio_mix_filters(
             audio_layer, duration=float(length), first_input=1 + len(image_inputs) // 2 + len(title_inputs) // 2,
             bases=[f"0:a:{index}" for index in range(len(layouts))], layouts=layouts,
         )
         if bed_filters:
-            if text_layers or image_layer:
+            if canvas is not None:
                 video_options[3] += ";" + ";".join(bed_filters)
             else:
                 video_options += ["-filter_complex_threads", "2", "-filter_complex", ";".join(bed_filters)]
@@ -262,7 +270,9 @@ def render_single_source_cut(
         command = [
             os.environ.get("FFMPEG_BINARY") or "ffmpeg",
             "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-            "-ss", start, "-i", str(source_path), *image_inputs, *title_inputs, *bed_inputs, "-t", length,
+            # Bound the source before the joined video/audio graph so decoded
+            # frames beyond the cut cannot make FFmpeg finish mixed audio early.
+            "-ss", start, "-t", length, "-i", str(source_path), *image_inputs, *title_inputs, *bed_inputs, "-t", length,
             *video_options, *audio_options,
             "-map_metadata", "-1", "-map_chapters", "-1",
             "-fps_mode", "passthrough", "-threads", "2",

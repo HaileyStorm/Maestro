@@ -260,6 +260,51 @@ class EditorExportMediaTests(unittest.TestCase):
         render_single_source_cut(source, destination, source_in=1.0, duration=0.5, timeout=30)
         self.assertEqual([stream["codec_type"] for stream in self.probe(destination)["streams"]], ["video"])
 
+    def test_single_cut_fits_saved_canvas_without_overlays_and_keeps_audio(self):
+        source = self.make_source()
+        bed = self.root / "bed.wav"
+        self.run_media([FFMPEG, "-v", "error", "-f", "lavfi", "-i", "sine=frequency=960:duration=1", str(bed)])
+        hashes = [hashlib.sha256(path.read_bytes()).hexdigest() for path in (source, bed)]
+        canvas = {"width": 128, "height": 128, "fps": 30}
+        for mixed in (False, True):
+            with self.subTest(mixed=mixed):
+                options = {"audio_layer": {"path": str(bed), "source_in": 0, "duration": 1,
+                            "start": 0, "volume": 0.5, "muted": False}} if mixed else {}
+                baseline = self.root / f"baseline-{mixed}.mp4"
+                fitted = self.root / f"fit-{mixed}.mp4"
+                render_single_source_cut(source, baseline, source_in=0.5, duration=1, timeout=30, **options)
+                render_single_source_cut(source, fitted, source_in=0.5, duration=1, canvas=canvas, timeout=30, **options)
+                streams = json.loads(self.run_media([FFPROBE, "-v", "error", "-show_entries",
+                    "stream=codec_type,width,height,avg_frame_rate,nb_frames", "-of", "json", str(fitted)]))["streams"]
+                self.assertEqual((streams[0]["width"], streams[0]["height"], streams[0]["avg_frame_rate"], streams[0]["nb_frames"]), (128, 128, "24/1", "24"))
+                self.assertEqual([stream["codec_type"] for stream in streams], ["video", "audio", "audio"])
+                for index in (0, 1):
+                    def sound(path):
+                        return self.run_media([FFMPEG, "-v", "error", "-i", str(path), "-map", f"0:a:{index}", "-f", "s16le", "-"])
+                    actual, expected = sound(fitted), sound(baseline)
+                    if mixed:
+                        # AAC encoder/filter timing need not be byte-identical.
+                        # Both the original stream and bed must stay audible.
+                        values = array.array("f", self.run_media([FFMPEG, "-v", "error", "-i", str(fitted),
+                            "-map", f"0:a:{index}", "-ac", "1", "-ar", "48000", "-f", "f32le", "-"]))
+                        part = values[14400:33600]
+                        for frequency in ((440, 660)[index], 960):
+                            real = sum(value * math.cos(2 * math.pi * frequency * sample / 48000) for sample, value in enumerate(part))
+                            imag = sum(value * math.sin(2 * math.pi * frequency * sample / 48000) for sample, value in enumerate(part))
+                            self.assertGreater(2 * math.hypot(real, imag) / len(part), 0.02)
+                    else:
+                        self.assertEqual(actual, expected)
+                    self.assertAlmostEqual(float(self.probe(fitted)["streams"][index + 1]["duration"]), 1, delta=0.035)
+                raw = self.run_media([FFMPEG, "-v", "error", "-i", str(fitted), "-frames:v", "1", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"])
+                self.assertLess(max(raw[:128 * 20 * 3]), 12)
+                self.assertLess(max(raw[-128 * 20 * 3:]), 12)
+                self.assertGreater(max(raw[128 * 32 * 3:128 * 96 * 3]), 150)
+        self.assertEqual(hashes, [hashlib.sha256(path.read_bytes()).hexdigest() for path in (source, bed)])
+        for invalid in ({**canvas, "width": "128"}, {**canvas, "width": 127}, {**canvas, "height": 8192}, {**canvas, "fps": float("nan")}):
+            with self.assertRaisesRegex(ValueError, "canvas"):
+                render_single_source_cut(source, self.root / "invalid.mp4", source_in=0, duration=1, canvas=invalid)
+        self.assertFalse((self.root / "invalid.mp4").exists())
+
     def test_sequence_joins_mixed_canvas_fps_and_audio_at_exact_frames(self):
         sources = []
         for name, color, size, fps, audio in (("red", "red", "128x72", 24, True), ("blue", "blue", "72x128", 30, False)):
