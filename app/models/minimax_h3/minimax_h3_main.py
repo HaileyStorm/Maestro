@@ -369,6 +369,7 @@ def _decode_h3_video_rows(
     pixel_width: int,
     channels: int,
     patch_size: tuple[int, int, int],
+    observer=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the exact native H3 video decode recipe for final or preview use."""
 
@@ -427,6 +428,8 @@ def _decode_h3_video_rows(
         raise H3PreviewGeometryError(
             "MiniMax H3 unpacked video latent geometry is invalid"
         )
+    from services.h3_decode_capture import notify_decode_capture
+    notify_decode_capture(observer, "normalized_latents", video_latents)
     video_mean = torch.tensor(VIDEO_LATENTS_MEAN, device=device).view(1, -1, 1, 1, 1)
     video_std = torch.tensor(VIDEO_LATENTS_STD, device=device).view(1, -1, 1, 1, 1)
     denormalized_latents = video_latents * video_std + video_mean
@@ -444,6 +447,7 @@ def _decode_h3_video_rows(
         )
     pixel_mean = torch.tensor(MINIMAX_H3_PIXEL_MEAN, device=device).view(1, -1, 1, 1, 1)
     pixel_std = torch.tensor(MINIMAX_H3_PIXEL_STD, device=device).view(1, -1, 1, 1, 1)
+    notify_decode_capture(observer, "raw_vae", video, convention="vae")
     video = (video.float() * pixel_std + pixel_mean).clamp(0, 1).mul(2).sub(1)
     return video, video_latents
 
@@ -2203,6 +2207,7 @@ class MiniMaxH3Model:
             pixel_width=width,
             channels=24,
             patch_size=self.patch_size,
+            observer=_kwargs.get("_h3_decode_observer"),
         )
 
         report_phase("Decoding H3 audio")

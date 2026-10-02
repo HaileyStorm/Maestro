@@ -94,6 +94,7 @@ from services.job_lifecycle import (
     make_residency_key,
     note_residency_state,
 )
+from services.h3_decode_capture import begin_decode_capture, notify_decode_capture
 from services.model_terms import (
     PORNMASTER_V4_PONPOKE_RECIPE,
     require_model_terms,
@@ -11611,6 +11612,7 @@ def _generate_video_impl(
     audio_conditioning_guide=None,
     # Ephemeral API-owned observation callback, never saved in task settings.
     _h3_profile_observer=None,
+    _h3_decode_observer=None,
 ):
 
     # API scheduling needs a model-safe boundary between independent outputs.
@@ -13939,6 +13941,13 @@ def _generate_video_impl(
                         prepare=lambda path: prepare_semantic_reference_video(path, fps, model_def),
                     )
                 overridden_inputs = None
+                if base_model_type in {"minimax_h3", "minimax_h3_ref2va"}:
+                    begin_decode_capture(_h3_decode_observer, {
+                        "repeat_index": max(0, repeat_no - 1), "window_index": window_no,
+                        "seed": seed, "frames": align_model_frame_count(current_video_length, model_def, for_generation=True),
+                        "height": image_size[0], "width": image_size[1], "fps": fps,
+                        "model_filename": model_filename,
+                    })
                 samples = call_with_lightx2v_cleanup(
                     lightx2v_runtime_requested,
                     _unload_generation_loras,
@@ -14099,6 +14108,7 @@ def _generate_video_impl(
                         "loras_multipliers": loras_multipliers,
                         "skip_steps_cache_type": skip_steps_cache_type,
                         "multi_clip_info": multi_clip_info,
+                        "_h3_decode_observer": _h3_decode_observer,
                     }),
                     # Motion suffix: only passed when the loaded suffix video
                     # is available. Other model handlers (Wan / Flux / Qwen /
@@ -14294,6 +14304,8 @@ def _generate_video_impl(
 
                 if samples is not None:
                     samples = samples.to("cpu")
+                    if base_model_type in {"minimax_h3", "minimax_h3_ref2va"}:
+                        notify_decode_capture(_h3_decode_observer, "model_output", samples)
   
             clear_gen_cache()
             offloadobj.unload_all()
@@ -14476,6 +14488,7 @@ def _generate_video_impl(
                     inputs["video_length"] = published_video_length
                 if overridden_inputs is not None: inputs.update(overridden_inputs)
                 inputs.pop("_h3_profile_observer", None)
+                inputs.pop("_h3_decode_observer", None)
                 durable_file_stem = None
                 if durable_output_dir is not None:
                     durable_repeat = (
@@ -14529,6 +14542,8 @@ def _generate_video_impl(
                     ]
                     print(f"[Progressive] Center-cropped final video: {width}x{height} → {_orig_w}x{_orig_h}")
 
+                if not audio_only and not is_image and base_model_type in {"minimax_h3", "minimax_h3_ref2va"}:
+                    notify_decode_capture(_h3_decode_observer, "encoder_input", output_video_frames, convention="encoder")
                 if audio_only:
                     audio_path = os.path.join(output_dir, file_name)
                     audio_path = save_audio_file(audio_path, sample.squeeze(0), output_audio_sampling_rate, audio_codec)

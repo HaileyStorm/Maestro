@@ -68358,6 +68358,7 @@ def _run_generation(
                             worker_started.set()
                         call_started = time.perf_counter()
                         profile_observation = None
+                        decode_observation = None
                         try:
                             expected_args = set(inspect.signature(wgp.generate_video).parameters.keys())
                             filtered_params = {k: v for k, v in params.items() if k in expected_args}
@@ -68368,10 +68369,18 @@ def _run_generation(
                             plugin_data = task.get('plugin_data', {})
                             call_model = str(filtered_params.get("model_type") or "")
                             filtered_params.pop("_h3_profile_observer", None)
+                            filtered_params.pop("_h3_decode_observer", None)
                             if call_model in _H3_LONG_STUDIO_MODELS:
                                 from services.h3_benchmark import H3OffloadObservation
                                 profile_observation = H3OffloadObservation(call_model)
                                 filtered_params["_h3_profile_observer"] = profile_observation
+                                from services.h3_decode_capture import capture_for_job
+                                decode_observation = capture_for_job(
+                                    root=Path(_app_dir).parent, job_id=job_id,
+                                    task_index=task_idx, params=filtered_params,
+                                )
+                                if decode_observation is not None:
+                                    filtered_params["_h3_decode_observer"] = decode_observation
                             call_timing["offload_context"] = {
                                 key: filtered_params.get(key)
                                 for key in ("model_type", "resolution", "video_length", "num_inference_steps", "repeat_generation", "batch_size")
@@ -68402,6 +68411,11 @@ def _run_generation(
                                 ],
                             )
                         finally:
+                            if decode_observation is not None:
+                                try:
+                                    decode_observation.finalize()
+                                except Exception:
+                                    pass
                             call_timing["model_load_state"] = (
                                 profile_observation.load_state
                                 if profile_observation is not None else "unknown"

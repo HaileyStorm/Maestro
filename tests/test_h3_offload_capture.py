@@ -6,6 +6,7 @@ import copy
 import functools
 import gc
 import inspect
+import os
 from pathlib import Path
 import sys
 import types
@@ -237,6 +238,7 @@ class LaunchCaptureTests(unittest.TestCase):
 
         namespace = {
             'inspect': inspect, 'time': time, '_h3_call_timing': timing,
+            'Path': Path, '_app_dir': str(APP), 'job_id': 'profile-fixture', 'task_idx': 0,
             'worker_start_lock': threading.Lock(), 'worker_started': threading.Event(),
             'worker_start_state': {'cancelled': False},
             'task_h3_turbo_validation_authorized': False,
@@ -251,7 +253,8 @@ class LaunchCaptureTests(unittest.TestCase):
         handler = namespace['make_error_handler'](task, params, lambda *message: messages.append(message), timing)
         later_task_timing = {}
         namespace['_h3_call_timing'] = later_task_timing
-        handler()
+        with patch.dict(os.environ, {'MAESTRO_H3_DECODE_CAPTURE_PLAN': ''}):
+            handler()
         self.assertEqual(later_task_timing, {})
         self.assertEqual(len(received), 1)
         self.assertEqual(timing['offload_profile'], 4.5)
