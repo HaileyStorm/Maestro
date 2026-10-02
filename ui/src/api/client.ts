@@ -1004,13 +1004,17 @@ export async function fetchJobLog(jobId: string, limit = 100): Promise<{ job_id:
   return res.json()
 }
 
-export async function pauseQueueAfterOutput(enabled = true) {
+export async function pauseQueueAfterOutput(enabled = true, immediate = false) {
   const res = await fetch(`${BASE}/api/v1/queue/pause-after-output`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ enabled }),
+    body: JSON.stringify({ enabled, ...(immediate ? { immediate: true } : {}) }),
   })
   if (!res.ok) throw new Error('Queue pause request failed')
-  return res.json()
+  const result = await res.json()
+  if (immediate && result?.paused !== true) {
+    throw new Error('Maestro did not pause the queue. Restart Maestro, then try Pause queue again.')
+  }
+  return result
 }
 
 export async function resumeQueue() {

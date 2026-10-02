@@ -70,6 +70,78 @@ class TestJobLifecycleWiring(unittest.TestCase):
     def setUpClass(cls):
         cls.launch = _parse("app/launch.py")
 
+    def test_immediate_queue_pause_blocks_idle_admission_until_resume(self):
+        import asyncio
+        import sys
+        import threading
+        import time
+        app_dir = os.path.join(_ROOT, "app")
+        if app_dir not in sys.path:
+            sys.path.insert(0, app_dir)
+        from services import job_lifecycle as lifecycle
+        lifecycle._reset_queue_state_for_tests()
+        self.addCleanup(lifecycle._reset_queue_state_for_tests)
+        async def body():
+            return {"enabled": True, "immediate": True}
+        pause = _load_isolated_function("app/launch.py", "pause_queue_after_output", {
+            "api": SimpleNamespace(post=lambda path: lambda function: function),
+            "Request": SimpleNamespace, "Response": SimpleNamespace,
+            "_set_recovery_no_store": Mock(),
+            "set_queue_paused": lifecycle.set_queue_paused,
+            "set_queue_pause_after_current": lifecycle.set_queue_pause_after_current,
+        })
+        self.assertTrue(asyncio.run(pause(SimpleNamespace(json=body), Mock()))["paused"])
+        job = {"id": "idle-pause", "status": "queued", "output_files": []}
+        lock = threading.Lock()
+        admitted = threading.Event()
+        def worker():
+            if lifecycle.acquire_generation_slot(lock, job, poll_interval=0.005):
+                admitted.set()
+                lock.release()
+        thread = threading.Thread(target=worker)
+        thread.start()
+        try:
+            deadline = time.monotonic() + 1
+            while lifecycle.queue_position(job) is None and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertIsNotNone(lifecycle.queue_position(job))
+            self.assertFalse(admitted.wait(0.04))
+            lifecycle.set_queue_paused(False)
+            self.assertTrue(admitted.wait(1))
+        finally:
+            lifecycle.request_cancel(job)
+            thread.join(timeout=1)
+        self.assertFalse(thread.is_alive())
+
+    def test_queue_pause_modes_validate_before_mutation(self):
+        import asyncio
+        class BadRequest(Exception):
+            def __init__(self, status_code, detail):
+                self.status_code = status_code
+        immediate = Mock(return_value={"paused": True})
+        cooperative = Mock(return_value={"pause_after_current": True})
+        pause = _load_isolated_function("app/launch.py", "pause_queue_after_output", {
+            "api": SimpleNamespace(post=lambda path: lambda function: function),
+            "Request": SimpleNamespace, "Response": SimpleNamespace,
+            "HTTPException": BadRequest, "_set_recovery_no_store": Mock(),
+            "set_queue_paused": immediate, "set_queue_pause_after_current": cooperative,
+        })
+        for payload in ([], {"immediate": "true"}, {"enabled": False, "immediate": True},
+                        {"enabled": "false", "immediate": True}, {"enabled": 1}):
+            async def body():
+                return payload
+            with self.assertRaises(BadRequest) as caught:
+                asyncio.run(pause(SimpleNamespace(json=body), Mock()))
+            self.assertEqual(caught.exception.status_code, 400)
+        immediate.assert_not_called()
+        cooperative.assert_not_called()
+        for enabled in (True, False):
+            async def body():
+                return {"enabled": enabled}
+            asyncio.run(pause(SimpleNamespace(json=body), Mock()))
+            cooperative.assert_called_with(enabled)
+        immediate.assert_not_called()
+
     def test_wgp_mmgp_target_matches_requirement_without_version_drift(self):
         wgp = _parse("app/wgp.py")
         assignments = {

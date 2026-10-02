@@ -108,7 +108,7 @@ async function loadJobPlaceholder() {
               export const reattachBlendRecoveryInputs = async (...args) => record('reattachBlendRecoveryInputs', ...args)
               export const fetchProjectAssets = async project => globalThis.__resourceWaitFetchProjectAssets?.(project) ?? []
               export const projectReferenceJobQualitySummary = (assets, jobId) => globalThis.__resourceWaitSummarizeQuality?.(assets, jobId) ?? null
-              export const resumeQueue = async () => record('resumeQueue'), pauseQueueAfterOutput = async value => record('pauseQueueAfterOutput', value), setQueueOutputCount = async (id, value) => record('setQueueOutputCount', id, value), startQueueJobNext = async id => record('startQueueJobNext', id), setQueuePriority = async (id, value) => record('setQueuePriority', id, value), resumeQueueJob = async id => record('resumeQueueJob', id), holdQueueJob = async id => record('holdQueueJob', id)
+              export const resumeQueue = async () => record('resumeQueue'), pauseQueueAfterOutput = async (...values) => record('pauseQueueAfterOutput', ...values), setQueueOutputCount = async (id, value) => record('setQueueOutputCount', id, value), startQueueJobNext = async id => record('startQueueJobNext', id), setQueuePriority = async (id, value) => record('setQueuePriority', id, value), resumeQueueJob = async id => record('resumeQueueJob', id), holdQueueJob = async id => record('holdQueueJob', id)
             ` }
           }
           if (args.path === 'lib') {
@@ -1947,4 +1947,61 @@ test('failed-card retry follows current project permissions and the advertised a
   assert.doesNotMatch(elementText(readOnlyMismatch), /Open Generate/)
   assert.match(elementText(readOnlyMismatch), /This saved H3 plan cannot run\./)
   assert.deepEqual(calls, [job.id])
+})
+
+test('queue controls pause idle admission and preserve running output-boundary behavior', async t => {
+  const previousStore = globalThis.__resourceWaitStore
+  const previousCalls = globalThis.__resourceWaitApiCalls
+  globalThis.__resourceWaitStore = { accessContext: { machine_controls: true }, workspaces: [] }
+  globalThis.__resourceWaitApiCalls = []
+  t.after(() => {
+    globalThis.__resourceWaitStore = previousStore
+    globalThis.__resourceWaitApiCalls = previousCalls
+  })
+  const { QueuePanel } = await loadJobPlaceholder()
+  const cases = [
+    { running: 0, after: false, paused: false, label: 'Pause queue', call: ['pauseQueueAfterOutput', true, true] },
+    { running: 1, after: false, paused: false, label: 'Pause after output', call: ['pauseQueueAfterOutput', true, false] },
+    { running: 0, after: true, paused: false, label: 'Cancel pause', call: ['pauseQueueAfterOutput', false, false] },
+    { running: 0, after: false, paused: true, label: 'Resume queue', call: ['resumeQueue'] },
+  ]
+  for (const item of cases) {
+    const queue = { paused: item.paused, pause_after_current: item.after, jobs: [],
+      summary: { running: item.running, waiting: 0, held: 0, registering: 0, preparing: 0, approval_waiting: 0, active_total: item.running } }
+    const render = () => QueuePanel({ jobs: [], sampleCampaignPairs: [], onStop() {}, onDismiss() {}, queue,
+      queueError: null, queueLastSuccessAt: Date.now(), async refreshQueue() {} })
+    const button = flattenElements(render()).find(element => element.type === 'button' && elementText(element).trim() === item.label)
+    assert.ok(button, item.label)
+    button.props.onClick()
+    await Promise.resolve()
+    assert.deepEqual(globalThis.__resourceWaitApiCalls.pop(), item.call)
+    globalThis.__resourceWaitStore.accessContext.machine_controls = false
+    assert.equal(flattenElements(render()).some(element => element.type === 'button' && elementText(element).trim() === item.label), false)
+    globalThis.__resourceWaitStore.accessContext.machine_controls = true
+  }
+})
+
+test('queue API preserves the existing request and adds explicit immediate admission pause', async t => {
+  const previousFetch = globalThis.fetch
+  const calls = []
+  globalThis.fetch = async (url, options) => {
+    calls.push([url, JSON.parse(options.body)])
+    return { ok: true, json: async () => ({ paused: true }) }
+  }
+  t.after(() => { globalThis.fetch = previousFetch })
+  const bundle = await build({
+    stdin: { contents: "export { pauseQueueAfterOutput } from '../api/client.ts'", loader: 'ts', resolveDir: new URL('../src/components/', import.meta.url).pathname },
+    bundle: true, format: 'esm', platform: 'node', write: false, treeShaking: true, logLevel: 'silent',
+  })
+  const { pauseQueueAfterOutput } = await import(asDataModule(bundle.outputFiles[0].text))
+  await pauseQueueAfterOutput(true)
+  await pauseQueueAfterOutput(false)
+  await pauseQueueAfterOutput(true, true)
+  assert.deepEqual(calls, [
+    ['/api/v1/queue/pause-after-output', { enabled: true }],
+    ['/api/v1/queue/pause-after-output', { enabled: false }],
+    ['/api/v1/queue/pause-after-output', { enabled: true, immediate: true }],
+  ])
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ paused: false, pause_after_current: true }) })
+  await assert.rejects(pauseQueueAfterOutput(true, true), /did not pause.*Restart Maestro/)
 })

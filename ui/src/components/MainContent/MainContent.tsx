@@ -2244,8 +2244,11 @@ function QueuePanel({
                 Resume queue
               </button>
             ) : (
-              <button className="flex items-center gap-1 rounded-md border border-border px-2.5 py-1 text-[10px] text-text-secondary" onClick={() => void act(() => api.pauseQueueAfterOutput(!(queue?.pause_after_current)))}>
-                <Pause size={11} /> {queue?.pause_after_current ? 'Cancel pause' : 'Pause after output'}
+              <button className="flex items-center gap-1 rounded-md border border-border px-2.5 py-1 text-[10px] text-text-secondary" onClick={() => void act(() => api.pauseQueueAfterOutput(
+                !queue.pause_after_current,
+                !queue.pause_after_current && queue.summary.running === 0,
+              ))}>
+                <Pause size={11} /> {queue.pause_after_current ? 'Cancel pause' : queue.summary.running === 0 ? 'Pause queue' : 'Pause after output'}
               </button>
             )}
           </div>}

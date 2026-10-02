@@ -75273,7 +75273,16 @@ def get_job_log(
 async def pause_queue_after_output(request: Request, response: Response):
     _set_recovery_no_store(response)
     body = await request.json()
-    enabled = bool(body.get("enabled", True))
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Queue pause request must be an object")
+    enabled = body.get("enabled", True)
+    immediate = body.get("immediate", False)
+    if type(enabled) is not bool or type(immediate) is not bool:
+        raise HTTPException(status_code=400, detail="Queue pause controls must be true or false")
+    if immediate and not enabled:
+        raise HTTPException(status_code=400, detail="Immediate queue pause requires enabled=true")
+    if immediate:
+        return set_queue_paused(True)
     return set_queue_pause_after_current(enabled)
 
 
