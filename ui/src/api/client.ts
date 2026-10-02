@@ -4876,7 +4876,8 @@ export interface EditorProject {
   tracks: Array<{
     id: string; name: string; type: 'video' | 'audio' | 'text';
     items: Array<{ id: string; asset_id?: string; start: number; duration: number; source_in: number; speed: number;
-      text?: string; position?: 'top' | 'center' | 'bottom'; size?: number; opacity?: number; volume?: number; muted?: boolean }>
+      text?: string; position?: 'top' | 'center' | 'bottom'; size?: number; opacity?: number; volume?: number; muted?: boolean;
+      fade_in?: number; fade_out?: number }>
   }>
 }
 
@@ -4887,7 +4888,7 @@ function editorRequestError(status: number, fallback: string): ProjectAssetReque
     404: 'The source video or saved edit is no longer available',
     409: 'This edit changed in another tab. Return to Gallery and reopen it',
     413: 'This edit is too large to save',
-    422: 'Check the video, text, audio and still image ranges. Images must be static PNG, JPEG or WebP up to 32 megapixels. Image size must be 10–100%, opacity 0–100%, and duration at least one frame. Titles must last at least one frame. The audio source trim and volume must be valid, and all layers must end within the cut for export',
+    422: 'Check the video, text, audio and still image ranges. Images must be static PNG, JPEG or WebP up to 32 megapixels. Image size must be 10–100%, opacity 0–100%, and duration at least one frame. Titles must last at least one frame. Audio trim and volume must be valid; each fade must be between zero and the trimmed audio duration. All layers must end within the cut for export',
     423: 'Unlock this project before editing',
     500: 'Editor could not save the draft right now',
     503: 'Editor is temporarily unavailable',

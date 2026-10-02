@@ -136,7 +136,23 @@ function availableAudio(project: EditorProject, outputs: OutputFile[]) {
 
 function changeAudio(project: EditorProject, change: Partial<NonNullable<ReturnType<typeof audioLayer>>> | null): EditorProject {
   return { ...project, tracks: project.tracks.map(track => track.id === 'audio-main'
-    ? { ...track, items: change === null ? [] : track.items.map(item => ({ ...item, ...change, id: item.id, asset_id: item.asset_id })) } : track) }
+    ? { ...track, items: change === null ? [] : track.items.map(item => {
+      const next = { ...item, ...change, id: item.id, asset_id: item.asset_id }
+      if (change.duration !== undefined) {
+        next.fade_in = Math.min(next.fade_in ?? 0, next.duration)
+        next.fade_out = Math.min(next.fade_out ?? 0, next.duration)
+      }
+      return next
+    }) } : track) }
+}
+
+function audioGain(layer: NonNullable<ReturnType<typeof audioLayer>>, sourceTime: number) {
+  const elapsed = sourceTime - layer.source_in
+  if (layer.muted || elapsed < 0 || elapsed >= layer.duration) return 0
+  const fadeIn = layer.fade_in ?? 0
+  const fadeOut = layer.fade_out ?? 0
+  return (layer.volume ?? 1) * (fadeIn > 0 ? Math.min(1, elapsed / fadeIn) : 1)
+    * (fadeOut > 0 ? Math.min(1, (layer.duration - elapsed) / fadeOut) : 1)
 }
 
 const audioInputClass = 'min-h-11 w-full min-w-0 rounded-lg border border-border bg-bg-primary px-3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50'
@@ -166,6 +182,19 @@ function AudioLayerPanel({ project, outputs, busy, error, stopKey, videoPlaying,
     return () => element?.pause()
   }, [project, stopKey, revealed, layer?.volume])
   useEffect(() => { if (videoPlaying || busy) audio.current?.pause() }, [videoPlaying, busy])
+  useEffect(() => {
+    const element = audio.current
+    if (!playing || !element || !layer) return
+    let frame = 0
+    const tick = () => {
+      if (element.paused) return
+      element.volume = audioGain(layer, element.currentTime)
+      if (element.currentTime >= layer.source_in + layer.duration) { element.pause(); return }
+      frame = window.requestAnimationFrame(tick)
+    }
+    tick()
+    return () => window.cancelAnimationFrame(frame)
+  }, [playing, layer])
 
   const update = (change: Parameters<typeof changeAudio>[1]) => onChange(changeAudio(project, change))
   const audition = () => {
@@ -174,7 +203,7 @@ function AudioLayerPanel({ project, outputs, busy, error, stopKey, videoPlaying,
     if (!element.paused) { element.pause(); return }
     onAudition()
     element.currentTime = layer.source_in
-    element.volume = layer.volume ?? 1
+    element.volume = audioGain(layer, layer.source_in)
     void element.play().catch(() => { if (audio.current === element) setMediaErrorIdentity(identity) })
   }
   return <section className="rounded-xl border border-border bg-bg-secondary p-4 md:p-6" aria-label="Audio layer">
@@ -226,6 +255,17 @@ function AudioLayerPanel({ project, outputs, busy, error, stopKey, videoPlaying,
             onChange={event => { const value = Number(event.target.value); if (Number.isFinite(value) && value >= 0 && value + layer.duration <= 86400) update({ start: value }) }} />
           <span id="audio-timeline-help" className="mt-1 block text-xs text-text-secondary">Where the trimmed audio begins in the sequence. This time stays fixed when video clips move.</span>
         </label>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <label className="block text-sm"><span className="mb-2 block">Audio fade in (seconds)</span>
+            <input type="number" min={0} max={layer.duration} step={0.1} value={layer.fade_in ?? 0} disabled={busy} className={audioInputClass}
+              onChange={event => { const value = Number(event.target.value); if (Number.isFinite(value) && value >= 0 && value <= layer.duration) update({ fade_in: value }) }} />
+          </label>
+          <label className="block text-sm"><span className="mb-2 block">Audio fade out (seconds)</span>
+            <input type="number" min={0} max={layer.duration} step={0.1} value={layer.fade_out ?? 0} disabled={busy} className={audioInputClass}
+              onChange={event => { const value = Number(event.target.value); if (Number.isFinite(value) && value >= 0 && value <= layer.duration) update({ fade_out: value }) }} />
+          </label>
+          <p className="text-xs leading-relaxed text-text-secondary sm:col-span-2">Linear fades apply to this trimmed audio layer in audition and export. Zero leaves the edge unchanged. Each fade is limited to the trimmed duration and shortens with it. Overlapping fades multiply, lowering the whole layer.</p>
+        </div>
         <label className="block text-sm"><span className="mb-2 flex justify-between"><span>Audio volume</span><span>{Math.round((layer.volume ?? 1) * 100)}%</span></span>
           <input type="range" min={0} max={100} step={1} value={(layer.volume ?? 1) * 100} disabled={busy} onChange={event => update({ volume: Number(event.target.value) / 100 })}
             className="min-h-11 w-full rounded accent-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue" />

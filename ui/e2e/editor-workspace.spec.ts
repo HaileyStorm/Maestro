@@ -256,7 +256,7 @@ for (const viewport of [{ name: 'desktop', width: 1440, height: 900 }, { name: '
     const sound = { ...VIDEO, name: 'evening.wav', type: 'audio', mode: 'audio', revision: 'audio-gallery-v1', url: '/api/v1/file/evening.wav' }
     const base = editorProject(1)
     let saved = { ...base, assets: { ...base.assets } as Record<string, typeof base.assets['source-video']>, tracks: [
-      ...base.tracks, { id: 'audio-main', name: 'Audio', type: 'audio', items: [] as Array<typeof base.tracks[0]['items'][0] & { volume?: number; muted?: boolean }> },
+      ...base.tracks, { id: 'audio-main', name: 'Audio', type: 'audio', items: [] as Array<typeof base.tracks[0]['items'][0] & { volume?: number; muted?: boolean; fade_in?: number; fade_out?: number }> },
     ] }
     const imports: unknown[] = []
     const exports: unknown[] = []
@@ -298,6 +298,8 @@ for (const viewport of [{ name: 'desktop', width: 1440, height: 900 }, { name: '
     expect(previewPins).toEqual([])
     await panel.getByLabel('Audio source start (seconds)', { exact: true }).fill('2')
     await panel.getByLabel('Audio source end (seconds)', { exact: true }).fill('5')
+    await panel.getByLabel('Audio fade in (seconds)', { exact: true }).fill('1')
+    await panel.getByLabel('Audio fade out (seconds)', { exact: true }).fill('2.5')
     await panel.getByLabel('Audio timeline start (seconds)', { exact: true }).fill('3')
     await panel.getByRole('slider', { name: /Audio volume/ }).focus()
     await panel.getByRole('slider', { name: /Audio volume/ }).press('Home')
@@ -308,6 +310,8 @@ for (const viewport of [{ name: 'desktop', width: 1440, height: 900 }, { name: '
     await page.getByRole('button', { name: `Open ${VIDEO.name} in Editor` }).click()
     await expect(panel.getByLabel('Audio source start (seconds)', { exact: true })).toHaveValue('2')
     await expect(panel.getByRole('checkbox', { name: 'Mute audio layer' })).toBeChecked()
+    await expect(panel.getByLabel('Audio fade in (seconds)', { exact: true })).toHaveValue('1')
+    await expect(panel.getByLabel('Audio fade out (seconds)', { exact: true })).toHaveValue('2.5')
     await panel.getByRole('button', { name: 'Reveal private audio' }).click()
     await expect.poll(() => previewPins.length).toBeGreaterThan(0)
     expect(previewPins.every(pin => pin === `sha256:${'b'.repeat(64)}`)).toBe(true)

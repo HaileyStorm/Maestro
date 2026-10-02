@@ -280,8 +280,16 @@ flow. The prior backend exited, the restarted app reports no generation model
 loaded, direct and stable-share health/readiness return 200, and the public
 restart notice is cleared. Owner resource-release API acceptance remains open.
 
-The next continuation gate is the experimental native boundary path, with its
-own bounded live evidence. Preserve the ordinary Extend result and the earlier
-interior-guide fade evidence as separate samples. Native audio/video history,
-broader continuity quality and human acceptance remain unfinished. Any new
-GPU execution requires a fresh exact coherent grant.
+Continuation audit corrected this next-action note: the experimental native
+boundary ON/OFF pair and retained prefix retry already passed execution and
+browser playback, as recorded in [GPU acceptance](GPU_ACCEPTANCE.md) under
+“Native H3 boundary” and the retained request retry. The matched pair did not
+improve the measured seam: resized RGB MAE was 2.746528 OFF versus 3.208623 ON;
+the adjacent audio sample jump was 1.418422e-08 OFF versus 0.00058821874 ON.
+Keep the native boundary capability experimental and disabled by default.
+
+Reuse that accepted evidence; another identical pair is not the next gate.
+Cumulative append runtime and broader motion/audio quality remain open, with
+human acceptance separate. Preserve ordinary Extend and the earlier
+interior-guide fade as separate samples. Any new GPU execution requires a
+fresh exact coherent grant.

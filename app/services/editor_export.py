@@ -147,10 +147,13 @@ def _audio_mix_filters(layer: dict | None, *, duration: float, first_input: int,
     source_in = _seconds(layer["source_in"], allow_zero=True)
     length = _seconds(layer["duration"])
     gain = layer["volume"]
+    fades = [layer.get(key, 0.0) for key in ("fade_in", "fade_out")]
     if (type(layer["muted"]) is not bool or type(gain) not in (int, float)
             or not math.isfinite(gain) or not 0 <= gain <= 1
+            or any(type(value) not in (int, float) or not math.isfinite(value)
+                   or not 0 <= value <= layer["duration"] for value in fades)
             or float(start) + float(length) > duration + 1e-6):
-        raise ValueError("Editor audio interval or volume is invalid")
+        raise ValueError("Editor audio interval, volume or fades are invalid")
     path = Path(os.path.abspath(os.fspath(layer["path"])))
     if not path.is_file() or path.is_symlink():
         raise FileNotFoundError("Editor audio source is unavailable")
@@ -166,8 +169,16 @@ def _audio_mix_filters(layer: dict | None, *, duration: float, first_input: int,
     inputs = ["-ss", source_in, "-t", length, "-i", str(path)]
     samples = round(float(start) * 48000)
     total_samples = round(duration * 48000)
+    # Fades are relative to the trimmed source, before timeline delay. When
+    # they overlap, the two linear gain ramps multiply. Zero skips the filter.
+    envelope = ""
+    for kind, value in zip(("in", "out"), fades):
+        if value > 0:
+            fade_samples = max(1, round(value * 48000))
+            begin = 0 if kind == "in" else max(0, round(float(length) * 48000) - fade_samples)
+            envelope += f"afade=t={kind}:ss={begin}:ns={fade_samples}:curve=tri,"
     filters.append(f"[{first_input}:a:0]asetpts=PTS-STARTPTS,aresample=48000,"
-                   f"atrim=duration={length},volume={gain},adelay={samples}S:all=1,"
+                   f"atrim=duration={length},{envelope}volume={gain},adelay={samples}S:all=1,"
                    f"apad,atrim=end_sample={total_samples},asplit={len(bases)}"
                    + "".join(f"[bed{index}]" for index in range(len(bases))))
     maps = []

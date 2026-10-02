@@ -436,7 +436,8 @@ def _editor_audio_item(plan: Mapping[str, Any]) -> dict[str, Any]:
     asset_id = plan["asset_id"]
     return {
         **dict(plan), "speed": 1.0, "opacity": 1.0,
-        "fade_in": 0.0, "fade_out": 0.0, "transition_in": "none", "transition_out": "none",
+        "fade_in": plan.get("fade_in", 0.0), "fade_out": plan.get("fade_out", 0.0),
+        "transition_in": "none", "transition_out": "none",
         "take_asset_ids": [asset_id],
         "take_states": {asset_id: {"source_in": plan["source_in"], "speed": 1.0}},
         "transform": {"x": 0.0, "y": 0.0, "scale": 1.0, "rotation": 0.0},
@@ -463,17 +464,19 @@ def editor_audio_layer(project: Mapping[str, Any], *, require_fit: bool = False)
             return None
         item = items[0]
         plan = {key: item[key] for key in ("id", "asset_id", "start", "source_in", "duration", "volume", "muted")}
+        plan.update({key: item.get(key, 0.0) for key in ("fade_in", "fade_out")})
         asset = project["assets"][plan["asset_id"]]
         if (not isinstance(plan["id"], str) or not _PROJECT_ID_RE.fullmatch(plan["id"])
                 or asset.get("type") != "audio" or asset.get("origin") != "output"
                 or asset.get("workspace") != project["workspace"] or not asset.get("has_audio")
                 or type(plan["muted"]) is not bool):
             raise ValueError()
-        for key in ("start", "source_in", "duration", "volume"):
+        for key in ("start", "source_in", "duration", "volume", "fade_in", "fade_out"):
             if type(plan[key]) not in (int, float) or not math.isfinite(plan[key]):
                 raise ValueError()
         if (plan["start"] < 0 or plan["source_in"] < 0 or plan["duration"] < 1 / 240
                 or not 0 <= plan["volume"] <= 1
+                or any(not 0 <= plan[key] <= plan["duration"] for key in ("fade_in", "fade_out"))
                 or plan["source_in"] + plan["duration"] > asset["duration"] + 1e-6
                 or plan["start"] + plan["duration"] > 86400):
             raise ValueError()
@@ -489,7 +492,7 @@ def editor_audio_layer(project: Mapping[str, Any], *, require_fit: bool = False)
                 raise ValueError()
         return plan
     except (KeyError, StopIteration, TypeError, ValueError):
-        raise EditorProjectError("Use one Gallery audio layer with a valid source trim, timeline start and volume from 0 to 100%. Its interval must end within the exported cut.") from None
+        raise EditorProjectError("Use one Gallery audio layer with a valid source trim, timeline start and volume from 0 to 100%. Each fade must be between zero and the trimmed audio duration. Its interval must end within the exported cut.") from None
 
 
 def add_output_audio_layer(current: Mapping[str, Any], *, output_name: str,

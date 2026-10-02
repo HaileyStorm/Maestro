@@ -63817,6 +63817,7 @@ def _write_tool_sidecar(out_dir, filename, *, source_name, tool, params, elapsed
             bed = job["params"]["editor_audio_layer"]
             sidecar["transform"]["audio_layer"] = {key: bed[key] for key in (
                 "name", "revision", "source_in", "start", "duration", "volume", "muted")}
+            sidecar["transform"]["audio_layer"].update({key: bed.get(key, 0.0) for key in ("fade_in", "fade_out")})
             sidecar["transform"]["audio_mix"] = "added to each retained stream; no looping or video extension"
         if job.get("params", {}).get("editor_image_layer"):
             from services.editor_export import editor_image_plans

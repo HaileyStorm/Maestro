@@ -144,20 +144,27 @@ class TestEditorProjectFoundation(unittest.TestCase):
         proposed = copy.deepcopy(current)
         proposed["assets"]["source-audio"]["output_id"] = "foreign.wav"
         item = proposed["tracks"][1]["items"][0]
-        item.update(source_in=2, duration=1.5, start=1, volume=0.25, muted=True)
+        item.update(source_in=2, duration=1.5, start=1, volume=0.25, muted=True, fade_in=1, fade_out=1.25)
         updated = apply_output_video_trim(current, proposed)
         self.assertEqual(updated["assets"], current["assets"])
         self.assertEqual(editor_audio_layer(updated, require_fit=True), {
             "id": "audio-layer", "asset_id": "source-audio", "source_in": 2,
-            "start": 1, "duration": 1.5, "volume": 0.25, "muted": True})
+            "start": 1, "duration": 1.5, "volume": 0.25, "muted": True, "fade_in": 1, "fade_out": 1.25})
         saved = save_editor_project(self.outputs, "audio", updated, expected_revision=1)
         self.assertEqual(editor_audio_layer(load_editor_project(self.outputs, "audio", saved["id"])), editor_audio_layer(updated))
         self.assertEqual(len(editor_sequence_clips(saved)), 1)
         for change in ({"volume": 1.01}, {"volume": True}, {"duration": float("nan")}, {"source_in": 7},
-                       {"start": -1}, {"muted": 1}, {"asset_id": "source-video"}, {"fade_in": 0.2}):
+                       {"start": -1}, {"muted": 1}, {"asset_id": "source-video"},
+                       {"fade_in": 1.6}, {"fade_out": -0.1}, {"fade_in": True}, {"fade_out": float("inf")},
+                       {"fade_in": "0.2"}, {"fade_out": float("nan")}):
             broken = copy.deepcopy(saved); broken["tracks"][1]["items"][0].update(change)
             with self.subTest(change=change), self.assertRaises(EditorProjectError):
                 apply_output_video_trim(saved, broken)
+        legacy = copy.deepcopy(saved)
+        for key in ("fade_in", "fade_out"):
+            del legacy["tracks"][1]["items"][0][key]
+        self.assertEqual(editor_audio_layer(legacy)["fade_in"], 0)
+        self.assertEqual(editor_audio_layer(legacy)["fade_out"], 0)
         late = copy.deepcopy(saved); late["tracks"][1]["items"][0]["start"] = 3
         late = apply_output_video_trim(saved, late)
         self.assertIsNotNone(editor_audio_layer(late))

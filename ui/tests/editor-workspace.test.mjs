@@ -16,12 +16,12 @@ const server = await createServer({
     name: 'editor-test-transforms',
     transform(code, id) {
       if (id.endsWith('/src/editor/EditorWorkspace.tsx')) {
-        return `${code}\nexport { changeTrim, moveClip, removeClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio, imageLayers, changeImage, availableImages, imageLayout };`
+        return `${code}\nexport { changeTrim, moveClip, removeClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio, audioGain, imageLayers, changeImage, availableImages, imageLayout };`
       }
     },
   }],
 })
-const { changeTrim, moveClip, removeClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio, imageLayers, changeImage, availableImages, imageLayout } = await server.ssrLoadModule('/src/editor/EditorWorkspace.tsx')
+const { changeTrim, moveClip, removeClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio, audioGain, imageLayers, changeImage, availableImages, imageLayout } = await server.ssrLoadModule('/src/editor/EditorWorkspace.tsx')
 after(() => server.close())
 
 function sequenceProject() {
@@ -248,13 +248,28 @@ test('Editor export reports a changed draft as an actionable conflict', async ()
 test('audio edits retain identity, video/title lanes and absolute time through reorder', () => {
   const project = sequenceProject()
   project.tracks.push({ id: 'audio-main', type: 'audio', name: 'Audio', items: [{ id: 'bed', asset_id: 'sound', source_in: 1, start: 2, duration: 3, speed: 1, volume: 1, muted: false }] })
-  const changed = changeAudio(project, { source_in: 4, start: 1, duration: 2, volume: 0.25, muted: true, asset_id: 'foreign', id: 'forged' })
+  const changed = changeAudio(project, { source_in: 4, start: 1, duration: 2, volume: 0.25, muted: true, fade_in: 1.5, fade_out: 2, asset_id: 'foreign', id: 'forged' })
   assert.equal(audioLayer(changed).asset_id, 'sound')
   assert.equal(audioLayer(changed).id, 'bed')
   assert.equal(changed.tracks[0], project.tracks[0])
   assert.equal(changed.assets, project.assets)
   assert.deepEqual(audioLayer(moveClip(changed, 'clip-c', -1)), audioLayer(changed))
   assert.equal(audioLayer(changeAudio(changed, null)), undefined)
+})
+
+test('audio audition ramps follow source-relative trim, gain, mute and overlapping fades', () => {
+  const layer = { source_in: 4, duration: 2, volume: 0.5, muted: false, fade_in: 0.5, fade_out: 1 }
+  for (const [time, expected] of [[3.9, 0], [4, 0], [4.25, 0.25], [4.5, 0.5], [5, 0.5], [5.5, 0.25], [6, 0]]) {
+    assert.equal(audioGain(layer, time), expected)
+  }
+  assert.equal(audioGain({ ...layer, muted: true }, 5), 0)
+  assert.equal(audioGain({ ...layer, fade_in: 2, fade_out: 2 }, 5), 0.125)
+  assert.equal(audioGain({ source_in: 4, duration: 2, volume: 0.5 }, 4), 0.5)
+  const project = sequenceProject()
+  project.tracks.push({ id: 'audio-main', items: [{ id: 'bed', asset_id: 'sound', ...layer }] })
+  const shortened = audioLayer(changeAudio(project, { duration: 0.25 }))
+  assert.deepEqual([shortened.fade_in, shortened.fade_out], [0.25, 0.25])
+  assert.equal(audioLayer(project).duration, 2)
 })
 
 test('audio choices and import pin the current same-project Gallery revision', async () => {

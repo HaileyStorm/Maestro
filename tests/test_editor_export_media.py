@@ -176,6 +176,66 @@ class EditorExportMediaTests(unittest.TestCase):
         self.assertEqual([hashlib.sha256(p.read_bytes()).hexdigest() for p in (source, bed)], hashes)
         self.assertFalse(list(self.root.glob(".editor-cut-*")))
 
+    def test_audio_fades_follow_trim_before_delay_and_preserve_original_sound(self):
+        source = self.make_source()
+        bed = self.root / "fades.wav"
+        self.run_media([FFMPEG, "-v", "error", "-f", "lavfi", "-i",
+            "sine=frequency=960:duration=3:sample_rate=48000", "-c:a", "pcm_s16le", str(bed)])
+        hashes = [hashlib.sha256(p.read_bytes()).hexdigest() for p in (source, bed)]
+        plan = {"path": str(bed), "source_in": 0.75, "duration": 1, "start": 0.25, "volume": 0.5, "muted": False}
+        def samples(path, index=0):
+            return array.array("f", self.run_media([FFMPEG, "-v", "error", "-i", str(path), "-map", f"0:a:{index}",
+                "-ac", "1", "-ar", "48000", "-f", "f32le", "-"]))
+        def amplitude(values, frequency, start, end):
+            part = values[round(start * 48000):round(end * 48000)]
+            real = sum(value * math.cos(2 * math.pi * frequency * index / 48000) for index, value in enumerate(part))
+            imag = sum(value * math.sin(2 * math.pi * frequency * index / 48000) for index, value in enumerate(part))
+            return 2 * math.hypot(real, imag) / len(part)
+        baseline = self.root / "no-fades.mp4"
+        render_single_source_cut(source, baseline, source_in=0, duration=1.5, audio_layer=plan, timeout=30)
+        explicit_zero = self.root / "zero-fades.mp4"
+        render_single_source_cut(source, explicit_zero, source_in=0, duration=1.5,
+            audio_layer={**plan, "fade_in": 0, "fade_out": 0}, timeout=30)
+        self.assertEqual(samples(baseline), samples(explicit_zero))
+        for kind in ("cut", "sequence", "overlap"):
+            output = self.root / f"fades-{kind}.mp4"
+            length = 1 if kind == "overlap" else 0.25
+            layer = {**plan, "fade_in": length, "fade_out": length}
+            if kind == "sequence":
+                render_video_sequence([{"path": source, "source_in": 0, "duration": 0.75, "has_audio": True}] * 2,
+                    output, width=128, height=72, fps=24, audio_layer=layer, timeout=30)
+            else:
+                render_single_source_cut(source, output, source_in=0, duration=1.5, audio_layer=layer, timeout=30)
+            # Windows are inside the audio's delayed interval and span whole tone cycles.
+            for stream, original in enumerate((440, 660) if kind != "sequence" else (440,)):
+                values = samples(output, stream)
+                base = samples(baseline, stream)
+                for start, end in ((0.27, 0.32), (0.60, 0.65), (1.18, 1.23)):
+                    center = (start + end) / 2 - plan["start"]
+                    expected = min(1, center / length) * min(1, (plan["duration"] - center) / length)
+                    actual = amplitude(values, 960, start, end) / amplitude(base, 960, start, end)
+                    self.assertAlmostEqual(actual, expected, delta=0.04)
+                    self.assertAlmostEqual(amplitude(values, original, start, end) / amplitude(base, original, start, end), 1, delta=0.05)
+                self.assertLess(amplitude(values, 960, 0.05, 0.15), 0.002)
+                self.assertLess(amplitude(values, 960, 1.35, 1.45), 0.002)
+            self.assertAlmostEqual(float(self.probe(output)["streams"][0]["duration"]), 1.5, delta=0.001)
+        self.assertEqual([hashlib.sha256(p.read_bytes()).hexdigest() for p in (source, bed)], hashes)
+
+    def test_audio_fades_reject_invalid_export_plan_even_when_muted(self):
+        from services.editor_export import _audio_mix_filters
+        source = self.make_source()
+        layer = {"path": str(source), "start": 0, "source_in": 0, "duration": 1, "volume": 0, "muted": True}
+        for key in ("fade_in", "fade_out"):
+            for value in (-0.01, 1.01, float("nan"), float("inf"), True, "0.2", None):
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    _audio_mix_filters({**layer, key: value}, duration=1.5, first_input=1, bases=[], layouts=[])
+        # Saved values can carry precision beyond the FFmpeg duration string.
+        # Validate the raw contract, then quantize the fades on the sample clock.
+        precise = {**layer, "duration": 1.0000000004, "fade_in": 1.0000000002,
+                   "fade_out": 1.0000000004, "volume": 0.5, "muted": False}
+        _, filters, _ = _audio_mix_filters(precise, duration=1.5, first_input=1, bases=[], layouts=[])
+        self.assertTrue(any("afade=t=in:ss=0:ns=48000" in part and "afade=t=out:ss=0:ns=48000" in part for part in filters))
+
     def test_audio_mix_keeps_multichannel_layout(self):
         source = self.root / "surround.mkv"
         bed = self.root / "mono.wav"

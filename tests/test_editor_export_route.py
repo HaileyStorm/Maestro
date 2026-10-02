@@ -199,6 +199,9 @@ class EditorExportRouteTests(unittest.TestCase):
 
     def test_audio_sealed_recovery_input_and_private_finality_rechecks(self):
         path = self.with_audio()
+        audio = next(track for track in self.timeline["tracks"] if track["id"] == "audio-main")["items"][0]
+        audio.update(fade_in=0.5, fade_out=0.75)
+        self.timeline = save_editor_project(str(self.outputs), "scene", self.timeline, expected_revision=self.timeline["revision"])
         job = self.worker_namespace()
         params = job["params"]
         self.assertEqual(params["editor_audio_path"], str(path)); self.assertTrue(params["private_output"])
@@ -217,6 +220,8 @@ class EditorExportRouteTests(unittest.TestCase):
         meta = json.loads((self.project / job["output_files"][0]).with_suffix(".meta.json").read_text())
         self.assertIsNone(meta["params"]); self.assertTrue(meta["private"])
         self.assertEqual(meta["transform"]["audio_layer"]["revision"], self.source_revision(path))
+        self.assertEqual(meta["transform"]["audio_layer"]["fade_in"], 0.5)
+        self.assertEqual(meta["transform"]["audio_layer"]["fade_out"], 0.75)
         job["id"] = "b" * 32; self.jobs[job["id"]] = job
         job["status"] = "queued"; job["output_files"] = []
         def replace(_source, destination, **_options):
