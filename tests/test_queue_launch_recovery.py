@@ -7763,6 +7763,160 @@ class QueueLaunchWiringTests(unittest.TestCase):
             deliver.index("_stage_h3_delivery_native_outputs("),
         )
 
+    def test_completed_h3_consumed_continuation_requires_sealed_final_graph(self):
+        from services.h3_audio_safety import POLICY_VERSION, DEFAULT_TARGET_DBTP
+
+        namespace = _isolated_functions(
+            self.launch,
+            ("_queue_recovery_units", "_queue_recovery_continuation_path",
+             "_queue_recovery_unit_matches", "_h3_dependency_closed_recovery_units",
+             "_queue_recovery_completed_h3_graph", "_queue_recovery_materialize_job"),
+            {"os": os, "re": re, "hmac": hmac, "math": __import__("math"),
+             "time": time, "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+             "recovery_unit_id": recovery_unit_id,
+             "_recovery_artifact_descriptor": artifact_descriptor,
+             "validate_artifact_descriptor": validate_artifact_descriptor,
+             "ensure_recovery_staging_directory": ensure_recovery_staging_directory,
+             "_recovery_sha256_file": recovery_sha256_file,
+             "_queue_recovery_final_adoption_jobs": {},
+             "_h3_final_output_integrity": lambda *_a, **_kw: {"validation": "valid"},
+             "h3_integrity_is_pending": lambda *_a: False,
+             "h3_integrity_pending_path": lambda *_a: "unused",
+             "load_request_manifest": lambda *_a, **_kw: self.fail("completion must not reload private inputs"),
+             "H3_OFFLOAD_PLAN_PARAM_KEY": H3_OFFLOAD_PLAN_PARAM_KEY},
+        )
+        graph = namespace["_queue_recovery_completed_h3_graph"]
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            job = {"id": "job-sealed", "workspace": "project-a", "status": "completed",
+                   "queue_held": False, "h3_segment_plan": {"published_frames": 350, "fps": 24},
+                   "owner_principal": "owner:v1:" + "a" * 64,
+                   "project_instance": "project:v1:" + "b" * 64,
+                   "recovery_cursor": {"completed_units": []}}
+            sidecars = {}
+            def seal(kind, index, settings, dependencies=(), continuation=None, attestation=None):
+                unit_id = recovery_unit_id(job["id"], kind, index=index,
+                                           dependencies=dependencies, settings=settings)
+                name = f"{kind}-{index}.mp4"
+                raw = name.encode()
+                (project / name).write_bytes(raw)
+                meta = {"job_id": job["id"], "workspace": job["workspace"], "output_filename": name,
+                        "producer_unit_id": unit_id, "producer_unit_kind": kind,
+                        "producer_unit_variant": 0, "producer_unit_index": index,
+                        "producer_unit_settings": settings,
+                        "producer_unit_dependencies": list(dependencies),
+                        "producer_unit_artifact_names": [name],
+                        "producer_media_size": len(raw), "producer_media_sha256": hashlib.sha256(raw).hexdigest(),
+                        "artifact_class": "final" if kind == "h3_concat" else "component",
+                        "producer_artifact_class": "final" if kind == "h3_concat" else "component",
+                        "params": {"multi_clip_info": {"output_total": 1, "output_index": 0}}}
+                if continuation is not None:
+                    continuation = dict(continuation, dependency=unit_id)
+                    meta["producer_unit_continuation"] = continuation
+                (project / name.replace(".mp4", ".meta.json")).write_text(json.dumps(meta))
+                sidecars[name] = meta
+                unit = {"unit_id": unit_id, "kind": kind, "index": index, "variant": 0,
+                        "settings": settings, "dependencies": list(dependencies), "state": "completed",
+                        "artifacts": [artifact_descriptor(project, basename=name,
+                            sidecar_basename=name.replace(".mp4", ".meta.json"), producer_unit_id=unit_id)]}
+                if continuation is not None:
+                    unit["continuation"] = continuation
+                if attestation is not None:
+                    unit["attestation"] = attestation
+                return unit
+            first = seal("h3_segment", 0, {"trim_tail_frames": 0}, continuation={
+                "basename": "unit-job-sealed-continuation.png", "storage": "recovery_staging",
+                "mode": "last_frame", "size": 5, "sha256": hashlib.sha256(b"frame").hexdigest()})
+            second = seal("h3_segment", 1, {"trim_tail_frames": 0,
+                "predecessor_artifact_hashes": [first["artifacts"][0]["sha256"]],
+                "predecessor_continuation_sha256": first["continuation"]["sha256"]}, [first["unit_id"]])
+            final = seal("h3_concat", 0, {
+                "component_hashes": [u["artifacts"][0]["sha256"] for u in (first, second)],
+                "clip_start_frames": [0, 0], "clip_tail_frames": [0, 0],
+                "h3_audio_true_peak_policy": {"policy_version": POLICY_VERSION, "target_dbtp": DEFAULT_TARGET_DBTP}},
+                [first["unit_id"], second["unit_id"]], attestation={"h3_audio_true_peak": {
+                    "verified": True, "policy_version": POLICY_VERSION, "target_dbtp": DEFAULT_TARGET_DBTP}})
+            job["recovery_unit"] = final
+            search = types.ModuleType("services.search_index")
+            search.load_media_sidecars = lambda _p: sidecars
+            with mock.patch.dict(sys.modules, {"services.search_index": search}):
+                self.assertEqual(len(graph(job, str(project))["completed_units"]), 3)
+                held = dict(job, status="queued", queue_held=True,
+                            _recovery_reason_code="final_output_recovery_incomplete")
+                recovered, may_start = namespace["_queue_recovery_materialize_job"](
+                    held, {"project-a": (str(project), job["project_instance"])})
+                self.assertFalse(may_start)
+                self.assertEqual(recovered["status"], "completed")
+                self.assertFalse(recovered["queue_held"])
+                self.assertEqual(recovered["output_files"], [final["artifacts"][0]["basename"]])
+                integrity_calls = []
+                namespace["_h3_final_output_integrity"] = lambda *_a, **kw: (
+                    integrity_calls.append(kw) or {"validation": "invalid"})
+                invalid, may_start = namespace["_queue_recovery_materialize_job"](
+                    held, {"project-a": (str(project), job["project_instance"])})
+                self.assertFalse(may_start)
+                self.assertTrue(invalid["queue_held"])
+                self.assertEqual(invalid["_recovery_reason_code"], "h3_output_integrity_failed")
+                self.assertEqual(integrity_calls, [{"expected_frames": 350, "expected_fps": 24}])
+                wrong_audio = copy.deepcopy(job)
+                wrong_audio["recovery_unit"]["attestation"]["h3_audio_true_peak"]["verified"] = False
+                self.assertIsNone(graph(wrong_audio, str(project)))
+                self.assertIsNone(graph(dict(job, status="failed"), str(project)))
+                self.assertIsNone(graph(dict(job, recovery_unit=None), str(project)))
+                # A resumable prefix still requires the real image.
+                self.assertIsNone(namespace["_queue_recovery_unit_matches"](
+                    dict(job, recovery_cursor={"completed_units": [first]}), kind="h3_segment",
+                    variant=0, index=0, project_dir=str(project), quarantine_invalid=False))
+                continuation_path = Path(ensure_recovery_staging_directory(project)) / first["continuation"]["basename"]
+                continuation_path.write_bytes(b"wrong")
+                self.assertIsNone(graph(job, str(project)))
+                continuation_path.unlink()
+                for name in tuple(sidecars):
+                    with self.subTest(missing=name):
+                        saved = sidecars.pop(name)
+                        self.assertIsNone(graph(job, str(project)))
+                        sidecars[name] = saved
+                broken = copy.deepcopy(sidecars)
+                sidecars["h3_segment-1.mp4"]["producer_unit_settings"]["predecessor_continuation_sha256"] = "f" * 64
+                self.assertIsNone(graph(job, str(project)))
+                sidecars.clear(); sidecars.update(broken)
+                final_meta = sidecars["h3_concat-0.mp4"]
+                valid_params = copy.deepcopy(final_meta["params"])
+                for malformed in (True, "bad", {"multi_clip_info": True}, {"multi_clip_info": [1]}):
+                    with self.subTest(malformed_params=malformed):
+                        final_meta["params"] = malformed
+                        (project / "h3_concat-0.meta.json").write_text(json.dumps(final_meta))
+                        self.assertIsNone(graph(job, str(project)))
+                final_meta["params"] = valid_params
+                # Even a newly sealed producer cannot claim a missing variant.
+                final_meta["params"]["multi_clip_info"]["output_total"] = 2
+                (project / "h3_concat-0.meta.json").write_text(json.dumps(final_meta))
+                final["artifacts"] = [artifact_descriptor(project, basename="h3_concat-0.mp4",
+                    sidecar_basename="h3_concat-0.meta.json", producer_unit_id=final["unit_id"])]
+                self.assertIsNone(graph(job, str(project)))
+                final_meta["params"]["multi_clip_info"]["output_total"] = 1
+                (project / "h3_concat-0.meta.json").write_text(json.dumps(final_meta))
+                final["artifacts"] = [artifact_descriptor(project, basename="h3_concat-0.mp4",
+                    sidecar_basename="h3_concat-0.meta.json", producer_unit_id=final["unit_id"])]
+                final_path = project / final["artifacts"][0]["basename"]
+                final_path.write_bytes(b"corrupt")
+                self.assertIsNone(graph(job, str(project)))
+                # Freshly sealed IDs/media still cannot excuse a broken edge.
+                wrong_second = seal("h3_segment", 1, {"trim_tail_frames": 0,
+                    "predecessor_artifact_hashes": [first["artifacts"][0]["sha256"]],
+                    "predecessor_continuation_sha256": "f" * 64}, [first["unit_id"]])
+                bad_final = seal("h3_concat", 0, final["settings"],
+                    [first["unit_id"], wrong_second["unit_id"]], attestation=final["attestation"])
+                job["recovery_unit"] = bad_final
+                self.assertIsNone(graph(job, str(project)))
+                wrong_second = seal("h3_segment", 1, {"trim_tail_frames": 0,
+                    "predecessor_artifact_hashes": [first["artifacts"][0]["sha256"]],
+                    "predecessor_continuation_sha256": first["continuation"]["sha256"]}, [first["unit_id"]])
+                bad_final = seal("h3_concat", 0, dict(final["settings"], component_hashes=["f" * 64, "e" * 64]),
+                    [first["unit_id"], wrong_second["unit_id"]], attestation=final["attestation"])
+                job["recovery_unit"] = bad_final
+                self.assertIsNone(graph(job, str(project)))
+
     def test_h3_continuation_hash_mismatch_prevents_segment_skip(self):
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
@@ -10700,6 +10854,42 @@ class QueueLaunchWiringTests(unittest.TestCase):
             self.assertTrue(partial.is_file())
             self.assertFalse((root / pointers[completed_id]["path"]).exists())
             self.assertEqual(registry[failed_id]["status"], "failed")
+
+    def test_completed_h3_graph_settlement_checkpoints_before_publication(self):
+        events = []
+        class Registry(dict):
+            def prepare(self, job):
+                return dict(job)
+            def publish_prepared(self, job_id, job):
+                events.append("publish")
+                self[job_id] = job
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = {"id": "job-graph", "workspace": "project-a", "status": "queued",
+                        "queue_held": True, "_recovery_reason_code": "final_output_recovery_incomplete"}
+            completed = dict(snapshot, status="completed", queue_held=False,
+                             out_dir=temporary, recovery_state="terminal",
+                             _recovery_completed_h3_graph=True)
+            registry = Registry()
+            def checkpoint(job, **updates):
+                self.assertEqual(updates["status"], "completed")
+                self.assertFalse(updates["queue_held"])
+                events.append("checkpoint")
+                job.update(updates)
+                return True
+            namespace = _isolated_functions(self.launch, ("_restore_queue_recovery_on_startup",), {
+                "os": os, "_queue_recovery_workers_started": False,
+                "_queue_recovery_existing_projects": lambda: {"project-a": (temporary, "project-digest")},
+                "_queue_recovery_restored": types.SimpleNamespace(jobs={snapshot["id"]: snapshot}, global_state={}),
+                "_queue_recovery_materialize_job": lambda *_a: (completed, False),
+                "_queue_recovery_checkpoint": checkpoint,
+                "_jobs": registry, "restore_scheduler_state": lambda *_a: None,
+                "_queue_recovery_coordinator": types.SimpleNamespace(compact=lambda: None),
+                "cleanup_orphan_request_manifests": lambda *_a: None,
+                "cleanup_orphan_staged_outputs": lambda *_a: None,
+            })
+            self.assertTrue(namespace["_restore_queue_recovery_on_startup"]())
+            self.assertEqual(events, ["checkpoint", "publish"])
+            self.assertEqual(registry[snapshot["id"]]["status"], "completed")
 
     def test_completed_h3_late_adoption_settles_before_publication(self):
         class Registry(dict):

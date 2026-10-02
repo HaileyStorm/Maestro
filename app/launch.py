@@ -7411,11 +7411,27 @@ def _queue_recovery_materialize_job(
     integrity_recovery_failed = False
     if current is not None and hmac.compare_digest(current[1], expected_project):
         runtime["out_dir"] = current[0]
+        completed_graph = None
+        graph_verifier = globals().get("_queue_recovery_completed_h3_graph")
+        if callable(graph_verifier) and not integrity_failed_snapshot:
+            completed_graph = graph_verifier(runtime, current[0])
+        if completed_graph is not None:
+            adopted_outputs = completed_graph["output_files"]
+            runtime["recovery_cursor"] = dict(
+                runtime.get("recovery_cursor") or {},
+                completed_units=completed_graph["completed_units"],
+            )
+            h3_final_adoption_required = True
+            verified_h3_final_adoption = True
+            # Process-local only; the startup checkpoint persists the verified
+            # cursor/status, never a reusable continuation-byte exemption.
+            runtime["_recovery_completed_h3_graph"] = True
         if (
             verified_h3_final_adoption
             and not snapshot.get("cancel_requested")
-            and str(snapshot.get("status") or "").casefold()
-            not in {"completed", "failed", "cancelled", "canceled"}
+            and (completed_graph is not None
+                 or str(snapshot.get("status") or "").casefold()
+                 not in {"completed", "failed", "cancelled", "canceled"})
         ):
             verifier = globals().get("_h3_final_output_integrity")
             duration_plan = snapshot.get("h3_segment_plan")
@@ -7430,7 +7446,7 @@ def _queue_recovery_materialize_job(
                     expected_frames = expected_h3_final_frames(
                         expected_frames,
                         public_source_prefix=duration_plan.get("source_prefix"),
-                        recovery_cursor=snapshot.get("recovery_cursor"),
+                        recovery_cursor=runtime.get("recovery_cursor"),
                         recovery_final_unit=snapshot.get("recovery_unit"),
                         require_recovery_evidence=True,
                     )
@@ -7631,9 +7647,9 @@ def _queue_recovery_materialize_job(
         })
         return runtime, False
     if verified_h3_final_adoption and not blocked_reason:
-        # A final-adoption receipt binds every declared output to this job and
-        # project. It is stronger completion evidence than a stale pre-crash
-        # queue status, and it must never send an already-published H3 final
+        # A final-adoption receipt or exact completed producer graph binds every
+        # declared output to this job and project. This completion evidence
+        # overrides stale queue status and must never send a published H3 final
         # back through generation or a now-irrelevant legal-access hold.
         runtime.pop("_recovery_reason_code", None)
         total_steps = (
@@ -8663,8 +8679,13 @@ def _restore_queue_recovery_on_startup(
                 str(job.get("status") or "").casefold() == "completed"
                 and str(snapshot.get("status") or "").casefold()
                     not in {"completed", "failed", "cancelled", "canceled"}
-                and isinstance(job.get("_recovery_final_adoption"), dict)
-                and job["_recovery_final_adoption"].get("state") == "adopted"
+                and (
+                    job.get("_recovery_completed_h3_graph") is True
+                    or (
+                        isinstance(job.get("_recovery_final_adoption"), dict)
+                        and job["_recovery_final_adoption"].get("state") == "adopted"
+                    )
+                )
             )
         ):
             _queue_recovery_checkpoint(
@@ -9004,6 +9025,7 @@ def _queue_recovery_unit_matches(
     index: int,
     project_dir: str,
     quarantine_invalid: bool = True,
+    consumed_continuations: frozenset[str] = frozenset(),
 ) -> dict | None:
     """Return one fully verified completed unit; invalid evidence is ignored."""
     for unit in _queue_recovery_units(job):
@@ -9089,7 +9111,14 @@ def _queue_recovery_unit_matches(
                 return unit
             if type(mode) is not str or mode not in {"last_frame", "semantic_still", "temporal_tail", "native_av_overlap"}:
                 return None
-            if not continuation.get("basename") or type(continuation.get("size")) is not int:
+            if (
+                not continuation.get("basename")
+                or type(continuation.get("size")) is not int
+                or continuation["size"] <= 0
+                or type(continuation.get("sha256")) is not str
+                or len(continuation["sha256"]) != 64
+                or any(char not in "0123456789abcdef" for char in continuation["sha256"])
+            ):
                 return None
             if mode == "native_av_overlap":
                 from services.h3_boundary_policy import (
@@ -9108,6 +9137,10 @@ def _queue_recovery_unit_matches(
                 path = _queue_recovery_continuation_path(
                     project_dir, continuation,
                 )
+                # Only a complete sealed successor graph can retire consumed
+                # staging bytes. Existing corrupt files are never excused.
+                if unit_id in consumed_continuations and not os.path.lexists(path):
+                    return unit
                 size, digest = _recovery_sha256_file(path)
             except QueueRecoveryRuntimeError:
                 return None
@@ -9792,6 +9825,154 @@ def _h3_dependency_closed_recovery_units(verified: list[dict]) -> list[dict]:
             unit for unit in pending_h3 if id(unit) not in admitted_ids
         ]
     return dependency_closed
+
+
+def _queue_recovery_completed_h3_graph(job: dict, project_dir: str) -> dict | None:
+    """Verify completed Finals without requiring consumed staging images.
+
+    The journal's exact final seal anchors every dependency ID and media hash.
+    This proof is completion-only; it never grants generation/resume authority.
+    """
+    status = str(job.get("status") or "").casefold()
+    if not (
+        status == "completed"
+        or (status == "queued" and job.get("queue_held") is True
+            and job.get("_recovery_reason_code") == "final_output_recovery_incomplete")
+    ) or job.get("cancel_requested"):
+        return None
+    cursor = job.get("recovery_cursor") or {}
+    if not isinstance(cursor, dict) or isinstance(cursor.get("delivery_pending"), dict):
+        return None
+    originals = _queue_recovery_units(job)
+    last = job.get("recovery_unit")
+    if isinstance(last, dict):
+        originals.append(last)
+    sealed = {
+        unit["unit_id"]: unit for unit in originals
+        if unit.get("state") == "completed"
+        and type(unit.get("unit_id")) is str
+    }
+    finals = [unit for unit in sealed.values() if unit.get("kind") == "h3_delivery"]
+    finals = finals or [unit for unit in sealed.values() if unit.get("kind") == "h3_concat"]
+    if not finals:
+        return None
+    try:
+        from services.search_index import load_media_sidecars
+        sidecars = load_media_sidecars(project_dir)
+        by_id: dict[str, list[tuple[str, dict]]] = {}
+        for name, meta in sidecars.items():
+            if isinstance(meta, dict) and meta.get("job_id") == job.get("id"):
+                by_id.setdefault(str(meta.get("producer_unit_id") or ""), []).append((name, meta))
+        units: dict[str, dict] = {}
+        pending = [unit["unit_id"] for unit in finals]
+        positions = []
+        outputs = []
+        final_ids = set(pending)
+        while pending:
+            unit_id = pending.pop()
+            if unit_id in units:
+                continue
+            if len(units) >= 2048:
+                return None
+            entries = by_id.get(unit_id)
+            if not entries:
+                return None
+            meta = entries[0][1]
+            kind = meta.get("producer_unit_kind")
+            variant, index = meta.get("producer_unit_variant"), meta.get("producer_unit_index")
+            dependencies, settings = meta.get("producer_unit_dependencies"), meta.get("producer_unit_settings")
+            names = meta.get("producer_unit_artifact_names")
+            if (
+                kind not in {"h3_segment", "h3_concat", "h3_delivery", "ordinary_repeat"}
+                or type(variant) is not int or variant < 0
+                or type(index) is not int or index < 0
+                or not isinstance(dependencies, list)
+                or not isinstance(settings, dict)
+                or not isinstance(names, list) or not names or len(names) > 4096
+                or len(names) != len(set(names))
+                or set(names) != {name for name, _ in entries}
+                or recovery_unit_id(str(job.get("id") or ""), kind, variant=variant,
+                                    index=index, dependencies=dependencies, settings=settings) != unit_id
+            ):
+                return None
+            unit = {"unit_id": unit_id, "kind": kind, "variant": variant,
+                    "index": index, "dependencies": dependencies, "settings": settings,
+                    "state": "completed", "artifacts": []}
+            if "producer_unit_continuation" in meta:
+                unit["continuation"] = meta["producer_unit_continuation"]
+            identity_keys = ("producer_unit_kind", "producer_unit_variant", "producer_unit_index",
+                             "producer_unit_dependencies", "producer_unit_settings",
+                             "producer_unit_artifact_names", "producer_unit_continuation")
+            for name, item in entries:
+                if (item.get("workspace") != job.get("workspace")
+                    or any(item.get(key) != meta.get(key) for key in identity_keys)
+                    or item.get("output_filename") != name):
+                    return None
+                descriptor = _recovery_artifact_descriptor(
+                    project_dir, basename=name,
+                    sidecar_basename=os.path.splitext(name)[0] + ".meta.json",
+                    producer_unit_id=unit_id,
+                )
+                if (descriptor["size"] != item.get("producer_media_size")
+                    or descriptor["sha256"] != item.get("producer_media_sha256")):
+                    return None
+                unit["artifacts"].append(descriptor)
+                if unit_id in final_ids:
+                    params = item.get("params")
+                    clip = params.get("multi_clip_info") if isinstance(params, dict) else None
+                    if not isinstance(clip, dict):
+                        return None
+                    total, position = clip.get("output_total"), clip.get("output_index")
+                    if (type(total) is not int or not 1 <= total <= 4096
+                        or type(position) is not int or not 0 <= position < total
+                        or item.get("artifact_class") != "final"
+                        or item.get("producer_artifact_class") != "final"):
+                        return None
+                    positions.append((total, position))
+                    outputs.append(name)
+            original = sealed.get(unit_id)
+            if original is not None:
+                for key in ("kind", "variant", "index", "dependencies", "settings", "continuation"):
+                    if original.get(key) != unit.get(key):
+                        return None
+                original_artifacts = sorted(
+                    original.get("artifacts") or [], key=lambda artifact: artifact["basename"],
+                )
+                current_artifacts = sorted(
+                    unit["artifacts"], key=lambda artifact: artifact["basename"],
+                )
+                if original_artifacts != current_artifacts:
+                    return None
+                if "attestation" in original:
+                    unit["attestation"] = original["attestation"]
+            units[unit_id] = unit
+            pending.extend(dependencies)
+        total = positions[0][0]
+        if (len(positions) != total or set(positions) != {(total, i) for i in range(total)}):
+            return None
+        consumed = frozenset(
+            unit["dependencies"][-1] for unit in units.values()
+            if unit["kind"] == "h3_segment" and unit["dependencies"]
+            and units[unit["dependencies"][-1]]["kind"] == "h3_segment"
+            and units[unit["dependencies"][-1]]["variant"] == unit["variant"]
+            and units[unit["dependencies"][-1]]["index"] + 1 == unit["index"]
+        )
+        verified = []
+        for unit in units.values():
+            check = dict(job, recovery_cursor={"completed_units": [unit]})
+            if _queue_recovery_unit_matches(
+                check, kind=unit["kind"], variant=unit["variant"], index=unit["index"],
+                project_dir=project_dir, quarantine_invalid=False,
+                consumed_continuations=consumed,
+            ) is None:
+                return None
+            verified.append(unit)
+        closed = _h3_dependency_closed_recovery_units(verified)
+        if {unit["unit_id"] for unit in closed} != set(units):
+            return None
+        return {"completed_units": closed, "output_files": sorted(outputs)}
+    except (OSError, KeyError, TypeError, ValueError, QueueRecoveryRuntimeError):
+        return None
 
 
 def _queue_recovery_quarantine_obsolete_sidecar(

@@ -2262,3 +2262,50 @@ job's already-retired request or removed partial media. The completed baseline's
 continuation remains a separate final-closure repair. Its intact media and
 negative history are preserved, and no successful paired qualification is
 claimed.
+
+### Completed-final recovery after consumed staging cleanup
+
+A completion-only recovery proof now starts from the journal's exact final
+media/sidecar seal and follows every producer dependency. All retained component
+media, dependency IDs, predecessor hashes, consumed-continuation digests,
+concat/delivery bindings, declared output positions, and current audio
+attestation must verify. A missing staging image is accepted only when an
+adjacent same-variant successor in that complete graph consumed it. An existing
+corrupt image, missing component, incomplete output set, or malformed metadata
+still rejects the proof. Incomplete prefixes and ordinary failed retries retain
+the physical continuation-byte requirement.
+
+The materializer uses the existing completion branch after the exact final
+frame count, frame rate, audio and signal integrity check passes. It does not
+reload private request inputs or start a generation worker for this proof.
+Fourteen focused recovery checks passed, including a real isolated materializer
+transition from the prior finality hold and negative integrity checks. Review
+found malformed sidecar parameter fields could abort proof construction; explicit
+shape checks and a regression now keep that evidence invalid without aborting
+startup. No full-suite rerun or GPU workload was used.
+
+A read-only CPU preflight verifies the retained ordinary baseline's three-unit
+graph and one final: 350 frames, 24 fps, audio present and sampled signal valid.
+Its media hash remains the exact value recorded above. Live restart/queue
+acceptance is recorded separately below; experimental paired generation and
+human quality acceptance remain outstanding.
+
+The first deployment settled the live queue, but exposed a startup checkpoint
+gate that only recognized adoption receipts. That gate now also recognizes the
+process-local completed-graph proof and persists its verified cursor/status
+before publication. The proof marker itself is not durable resume authority.
+The focused startup regression asserts checkpoint-before-publication ordering.
+
+The corrected deployment passed local and stable `/health` and `/ready` checks.
+The durable journal records the ordinary baseline as completed and not held,
+with three verified units and one final, before normal terminal compaction
+retires its queue entry. Fresh signed-in Gallery retains the final; the queue
+reports zero running or held jobs. The browser still retains the earlier failed
+experimental tile as terminal history. Its already-removed request is not
+recreated and no retry or fresh generation was attempted during this repair.
+The Studio reports no generation model loaded, the prior host configuration
+hash is unchanged, and the coordinated public restart notice is clear.
+
+This closes the retained baseline's completed-output recovery gap. It does not
+claim a successful experimental pair, browser playback, or human media quality
+acceptance. A new paired qualification still requires a fresh exact GPU grant.
