@@ -206,3 +206,82 @@ this round trip alongside the captured opening and repeated-latent controls.
 The next source/runtime comparison belongs to generated latent conditioning
 and denoising, while preserving existing prompts, creative content, source
 media, timing, defaults and separate human acceptance.
+
+## Ordinary Extend: complete live sample
+
+The earlier matched capture used interior still guides at frames 31 and 90.
+It was not an ordinary Extend run. A separate Gallery Extend action now
+completed with the preserved browser-compatible source, its last frame as the
+first-frame anchor, base FL2VA, 1344 × 768, 24 fps, 28 steps and Sol attention.
+The request used a random seed; the Gallery records realized seed `738560997`.
+Prompt improvement, creative guides and LoRAs were disabled. The job retained
+its private preview flag and finished in 712 seconds.
+
+The source contains 124 frames. Extend generated another 124 frames and
+published a joined H.264/AAC output containing 248 frames. Its frame clock is
+10.333333 seconds; container duration is 10.334 seconds. Full software FFmpeg
+decoding passed for source, generated tail and joined output. Chrome loaded
+the joined output at 1344 × 768, played across the 5.166667-second join and
+reached the end without a media error. A private browser screenshot records
+the generated side of the join.
+
+The original source file remains unchanged, with SHA-256
+`1de799b8dcd8cb4e6607b21dd26d240c4d6be61d22a14ffdffbbe751c946d58a`.
+The joined output SHA-256 is
+`b25ca36ec534e643b17d45e8f47c04db2961bba9ccba71ddb390b72e0306b9bc`.
+Its source-prefix descriptor records all 124 retained frames, last-frame
+conditioning and preservation of source audio followed by generated audio.
+Joining re-encodes video and audio; decoded prefix pixels and AAC samples are
+not claimed to be identical. At 64 × 36 area-resampled RGB, prefix mean
+absolute difference was 0.065668 and maximum absolute difference was 4.0 on
+the 0–255 scale. These are descriptive resized measurements.
+
+The generated tail begins bright: first-frame mean RGB is 211.8501, and its
+first 25 frame means remain between 211.8501 and 212.3219. The source's final
+frame mean is 213.3487. This sample has no black opening fade in its new tail.
+The existing source opening, including its fade, is preserved in the prefix.
+This does not establish all-content motion continuity, audio quality or human
+acceptance. Native experimental audio/video boundary conditioning remained
+disabled; this sample does not qualify that separate path.
+
+## Conditioning layout comparison
+
+A disposable CPU comparison extracted the pure packing geometry from pinned
+[Diffusers H3 preparation](https://github.com/huggingface/diffusers/blob/578c9b2c6636ab2424a0e56186268b83623656b2/src/diffusers/modular_pipelines/minimax_h3/before_denoise.py)
+and compared it with the native packing helper. It used the captured geometry:
+37 video latent frames, a 48 × 84 latent canvas, 207 audio latents, `(1, 2, 2)`
+patches and 42 text tags including nine visual tags. Position IDs, token tags,
+video/audio/text indices and condition counts matched exactly in all cases.
+
+| Supplied anchors | Packed rows | Tensor mismatches |
+| --- | ---: | ---: |
+| None | 37,752 | 0 |
+| First | 38,760 | 0 |
+| Last | 38,760 | 0 |
+| First and last | 39,768 | 0 |
+
+The upstream source SHA-256 is
+`c0c3484b238b7cf529fb494bcfd02c286db8b34ce3e23fd78a17eeda257764d1`.
+This is numerical CPU layout evidence, not learned denoiser or pretrained-stack
+parity. No production packing change or full-suite rerun was needed.
+
+## Extend cleanup and next gate
+
+The coherent observer enforced a 900-second total runtime cap. Preparation
+consumed part of that interval; the job had completed and published before the
+cap stopped the idle owned backend. The supervisor exited with status 1 for
+that cap, while its last coherent lease receipt still authorized work. This
+was not a coordinator revocation or generation failure. The exact request was
+withdrawn and the durable coordinator response confirms withdrawal.
+
+The owner resource-release API required recent reauthentication and returned
+403; that gate was preserved. Cleanup used the authorized Pinokio stop/restart
+flow. The prior backend exited, the restarted app reports no generation model
+loaded, direct and stable-share health/readiness return 200, and the public
+restart notice is cleared. Owner resource-release API acceptance remains open.
+
+The next continuation gate is the experimental native boundary path, with its
+own bounded live evidence. Preserve the ordinary Extend result and the earlier
+interior-guide fade evidence as separate samples. Native audio/video history,
+broader continuity quality and human acceptance remain unfinished. Any new
+GPU execution requires a fresh exact coherent grant.
