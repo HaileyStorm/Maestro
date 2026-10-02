@@ -19,6 +19,43 @@ from typing import Callable
 from shared.utils.media_encoder import run_encoder
 
 
+def _image_filters(layer: dict | None, directory: Path, *, width: int, height: int,
+                   duration: float, fps: float, first_input: int, base: str) -> tuple[list[str], list[str], str]:
+    if layer is None:
+        return [], [], base
+    from services.editor_projects import inspect_editor_still
+    from PIL import Image, ImageOps
+    start = _seconds(layer["start"], allow_zero=True)
+    length = _seconds(layer["duration"])
+    size, opacity = layer["size"], layer["opacity"]
+    if (type(width) is not int or type(height) is not int or not 64 <= width <= 7680 or not 64 <= height <= 4320
+            or type(fps) not in (int, float) or not math.isfinite(fps) or not 1 <= fps <= 120
+            or any(type(v) not in (int, float) or not math.isfinite(v) for v in (size, opacity))
+            or not 0.1 <= size <= 1 or not 0 <= opacity <= 1
+            or layer["position"] not in {"top", "center", "bottom"}
+            or float(start) + float(length) > duration + 1e-6 or float(length) < 1 / fps - 1e-9):
+        raise ValueError("Editor image canvas, appearance or time range is invalid")
+    path = Path(os.path.abspath(os.fspath(layer["path"])))
+    if path.is_symlink() or not path.is_file():
+        raise FileNotFoundError("Editor image source is unavailable")
+    media = inspect_editor_still(path)
+    if (media["width"], media["height"]) != (layer["width"], layer["height"]):
+        raise ValueError("Editor image dimensions changed")
+    with Image.open(path) as source:
+        image = ImageOps.exif_transpose(source).convert("RGBA")
+    ratio = min(width * 0.9 * size / image.width, height * 0.88 * size / image.height)
+    image = image.resize((max(1, round(image.width * ratio)), max(1, round(image.height * ratio))), Image.Resampling.LANCZOS)
+    image.putalpha(image.getchannel("A").point([round(alpha * opacity) for alpha in range(256)]))
+    staged = directory / "image-layer.png"
+    image.save(staged)
+    x = (width - image.width) // 2
+    margin = round(height * 0.06)
+    y = {"top": margin, "center": (height - image.height) // 2, "bottom": height - margin - image.height}[layer["position"]]
+    end = _seconds(float(start) + float(length))
+    return ["-i", str(staged)], [f"[{base}][{first_input}:v]overlay=x={x}:y={y}:"
+        f"eof_action=repeat:enable='gte(t,{start})*lt(t,{end})'[image_v]"], "image_v"
+
+
 def _title_filters(layers: list[dict] | None, directory: Path, *, width: int, height: int,
                    duration: float, fps: float, first_input: int, base: str) -> tuple[list[str], list[str], str]:
     """Rasterize literal title text; only validated numbers enter FFmpeg filters."""
@@ -147,6 +184,7 @@ def render_single_source_cut(
     source_in: float,
     duration: float,
     text_layers: list[dict] | None = None,
+    image_layer: dict | None = None,
     canvas: dict | None = None,
     audio_layer: dict | None = None,
     abort_check: Callable[[], object] | None = None,
@@ -195,23 +233,27 @@ def render_single_source_cut(
     published = False
     titles = tempfile.TemporaryDirectory(prefix=".editor-titles-", dir=destination_path.parent)
     try:
+        image_inputs, image_filters, image_label = _image_filters(
+            image_layer, Path(titles.name), width=(canvas or {}).get("width", 0),
+            height=(canvas or {}).get("height", 0), duration=float(length), fps=(canvas or {}).get("fps", 30), first_input=1, base="cut",
+        )
         title_inputs, title_filters, label = _title_filters(
             text_layers, Path(titles.name), width=(canvas or {}).get("width", 0),
-            height=(canvas or {}).get("height", 0), duration=float(length), fps=(canvas or {}).get("fps", 30), first_input=1, base="cut",
+            height=(canvas or {}).get("height", 0), duration=float(length), fps=(canvas or {}).get("fps", 30), first_input=1 + len(image_inputs) // 2, base=image_label,
         )
         video_options = (["-filter_complex_threads", "2", "-filter_complex",
                           ";".join([f"[0:v:0]setpts=PTS-STARTPTS,scale={canvas['width']}:{canvas['height']}:"
                                     "force_original_aspect_ratio=decrease:force_divisible_by=2,"
                                     f"pad={canvas['width']}:{canvas['height']}:(ow-iw)/2:(oh-ih)/2,setsar=1[cut]",
-                                    *title_filters]), "-map", f"[{label}]"]
-                         if text_layers else ["-map", "0:v:0", "-vf", "setpts=PTS-STARTPTS"])
+                                    *image_filters, *title_filters]), "-map", f"[{label}]"]
+                         if text_layers or image_layer else ["-map", "0:v:0", "-vf", "setpts=PTS-STARTPTS"])
         layouts = _source_audio_layouts(source_path) if audio_layer and not audio_layer["muted"] and audio_layer["volume"] > 0 else []
         bed_inputs, bed_filters, audio_options = _audio_mix_filters(
-            audio_layer, duration=float(length), first_input=1 + len(title_inputs) // 2,
+            audio_layer, duration=float(length), first_input=1 + len(image_inputs) // 2 + len(title_inputs) // 2,
             bases=[f"0:a:{index}" for index in range(len(layouts))], layouts=layouts,
         )
         if bed_filters:
-            if text_layers:
+            if text_layers or image_layer:
                 video_options[3] += ";" + ";".join(bed_filters)
             else:
                 video_options += ["-filter_complex_threads", "2", "-filter_complex", ";".join(bed_filters)]
@@ -220,7 +262,7 @@ def render_single_source_cut(
         command = [
             os.environ.get("FFMPEG_BINARY") or "ffmpeg",
             "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-            "-ss", start, "-i", str(source_path), *title_inputs, *bed_inputs, "-t", length,
+            "-ss", start, "-i", str(source_path), *image_inputs, *title_inputs, *bed_inputs, "-t", length,
             *video_options, *audio_options,
             "-map_metadata", "-1", "-map_chapters", "-1",
             "-fps_mode", "passthrough", "-threads", "2",
@@ -254,6 +296,7 @@ def render_video_sequence(
     clips: list[dict], destination: str | os.PathLike[str], *,
     width: int, height: int, fps: float,
     text_layers: list[dict] | None = None,
+    image_layer: dict | None = None,
     audio_layer: dict | None = None,
     abort_check: Callable[[], object] | None = None,
     timeout: float = 3600, runner: Callable[..., int] | None = None,
@@ -320,14 +363,20 @@ def render_video_sequence(
     temporary = Path(temporary_name)
     titles = tempfile.TemporaryDirectory(prefix=".editor-titles-", dir=destination_path.parent)
     try:
+        image_inputs, image_filters, image_label = _image_filters(
+            image_layer, Path(titles.name), width=width, height=height,
+            duration=total_frames / fps, fps=fps, first_input=len(clips), base="v",
+        )
+        command += image_inputs
+        filters += image_filters
         title_inputs, title_filters, label = _title_filters(
             text_layers, Path(titles.name), width=width, height=height,
-            duration=total_frames / fps, fps=fps, first_input=len(clips), base="v",
+            duration=total_frames / fps, fps=fps, first_input=len(clips) + len(image_inputs) // 2, base=image_label,
         )
         command += title_inputs
         filters += title_filters
         bed_inputs, bed_filters, audio_maps = _audio_mix_filters(
-            audio_layer, duration=total_frames / fps, first_input=len(clips) + len(title_inputs) // 2,
+            audio_layer, duration=total_frames / fps, first_input=len(clips) + len(image_inputs) // 2 + len(title_inputs) // 2,
             bases=["a"], layouts=["stereo"],
         )
         command += bed_inputs

@@ -3,7 +3,7 @@ import test, { after } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { createServer } from 'vite'
 
-import { addEditorAudio, appendEditorClip, exportEditorProject, isBackendJobId, openOutputInEditor, saveEditorProject } from '../src/api/client.ts'
+import { addEditorAudio, addEditorImage, appendEditorClip, exportEditorProject, isBackendJobId, openOutputInEditor, saveEditorProject } from '../src/api/client.ts'
 
 // Expose the component's actual draft transformations only in this test loader.
 // Production exports remain the component, and no duplicate implementation is tested.
@@ -16,12 +16,12 @@ const server = await createServer({
     name: 'editor-test-transforms',
     transform(code, id) {
       if (id.endsWith('/src/editor/EditorWorkspace.tsx')) {
-        return `${code}\nexport { changeTrim, moveClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio };`
+        return `${code}\nexport { changeTrim, moveClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio, imageLayer, changeImage, availableImages, imageLayout };`
       }
     },
   }],
 })
-const { changeTrim, moveClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio } = await server.ssrLoadModule('/src/editor/EditorWorkspace.tsx')
+const { changeTrim, moveClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio, imageLayer, changeImage, availableImages, imageLayout } = await server.ssrLoadModule('/src/editor/EditorWorkspace.tsx')
 after(() => server.close())
 
 function sequenceProject() {
@@ -251,5 +251,32 @@ test('audio choices and import pin the current same-project Gallery revision', a
     assert.equal(await addEditorAudio('scene', project, outputs[0].name, 'current'), project)
     assert.match(calls[0].url, /\/editor\/projects\/first-source-draft\/audio$/)
     assert.deepEqual(JSON.parse(calls[0].init.body), { expected_revision: 5, output_name: 'fiction.wav', output_revision: 'current' })
+  } finally { globalThis.fetch = previous }
+})
+
+
+test('image appearance and interval retain source identity, absolute timing and other lanes', () => {
+  const project = sequenceProject()
+  project.tracks.push({ id: 'images-main', type: 'video', items: [{ id: 'overlay', asset_id: 'still', start: 2, duration: 3, source_in: 0, speed: 1, size: 0.25, opacity: 1, position: 'center' }] })
+  const changed = changeImage(project, { start: 1, duration: 2, opacity: 0.5, size: 1, position: 'bottom', id: 'forged', asset_id: 'foreign' })
+  assert.equal(imageLayer(changed).asset_id, 'still'); assert.equal(imageLayer(changed).id, 'overlay')
+  assert.equal(changed.tracks[0], project.tracks[0]); assert.equal(changed.assets, project.assets)
+  assert.deepEqual(imageLayer(moveClip(changed, 'clip-c', -1)), imageLayer(changed))
+  assert.equal(imageLayer(changeImage(changed, null)), undefined)
+  assert.deepEqual(availableImages(project, [{ name: 'yes.png', workspace: 'scene', type: 'image', revision: 'pin' }, { name: 'other.png', workspace: 'other', type: 'image', revision: 'pin' }, { name: 'missing.png', workspace: 'scene', type: 'image' }]).map(item => item.name), ['yes.png'])
+  for (const position of ['top', 'center', 'bottom']) {
+    const layout = imageLayout(128, 72, 16, 8, 1, position)
+    assert.ok(layout.x >= 0 && layout.y >= 0 && layout.x + layout.width <= 100 && layout.y + layout.height <= 100)
+  }
+})
+
+test('image import pins Gallery identity and CAS without accepting a client path', async () => {
+  const previous = globalThis.fetch
+  const calls = []
+  globalThis.fetch = async (url, init) => { calls.push({ url, init }); return { ok: true, json: async () => ({ project: { id: 'cut' } }) } }
+  try {
+    assert.deepEqual(await addEditorImage('scene a', { id: 'cut #1', revision: 5 }, 'logo.png', 'pin'), { id: 'cut' })
+    assert.match(calls[0].url, /scene%20a\/editor\/projects\/cut%20%231\/image$/)
+    assert.deepEqual(JSON.parse(calls[0].init.body), { expected_revision: 5, output_name: 'logo.png', output_revision: 'pin' })
   } finally { globalThis.fetch = previous }
 })

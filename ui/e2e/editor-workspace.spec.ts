@@ -272,3 +272,85 @@ for (const viewport of [{ name: 'desktop', width: 1440, height: 900 }, { name: '
     await expect(panel.getByRole('combobox')).toBeFocused()
   })
 }
+
+for (const viewport of [{ name: 'desktop', width: 1440, height: 900 }, { name: 'mobile', width: 390, height: 844 }]) {
+  test(`${viewport.name} timed Gallery image import saves, reopens and guards export`, async ({ page }, testInfo) => {
+    await page.setViewportSize(viewport)
+    await skipWelcome(page)
+    api!.setAccountScenario('remote-user')
+    await page.route('**/editor-fonts/DejaVuSans.ttf', route => route.fulfill({
+      path: new URL('../public/editor-fonts/DejaVuSans.ttf', import.meta.url).pathname, contentType: 'font/ttf',
+    }))
+    const sound = { ...VIDEO, name: 'logo.png', type: 'image', mode: 'image', revision: 'image-gallery-v1', url: '/api/v1/file/logo.png' }
+    const base = editorProject(1)
+    let saved = { ...base, assets: { ...base.assets } as Record<string, typeof base.assets['source-video']>, tracks: [
+      ...base.tracks, { id: 'images-main', name: 'Image layer', type: 'video', items: [] as Array<typeof base.tracks[0]['items'][0] & { size?: number; opacity?: number; position?: string }> },
+    ] }
+    const imports: unknown[] = []
+    const exports: unknown[] = []
+    const previewPins: string[] = []
+    await page.route(/\/api\/v1\/outputs(?:\?.*)?$/, route => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ outputs: [VIDEO, sound], total: 2 }) }))
+    await page.route('**/api/v1/outputs/*/metadata*', route => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ params: null, source: 'none' }) }))
+    await page.route('**/api/v1/file/sidecarless-clip.mp4*', route => route.fulfill({ status: 404, body: 'Synthetic video unavailable' }))
+    await page.route('**/api/v1/file/logo.png*', route => {
+      const pin = new URL(route.request().url()).searchParams.get('content_revision')
+      if (pin) previewPins.push(pin)
+      return route.fulfill({ contentType: 'image/png', body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==', 'base64') })
+    })
+    await page.route(/\/api\/v1\/projects\/[^/]+\/editor\/projects(?:\/[^/?]+)?(?:\?.*)?$/, route => {
+      if (route.request().method() === 'PUT') saved = { ...route.request().postDataJSON().project, revision: saved.revision + 1 }
+      return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ project: saved }) })
+    })
+    await page.route('**/editor/projects/*/image', route => {
+      imports.push(route.request().postDataJSON())
+      saved = { ...saved, revision: saved.revision + 1, assets: { ...saved.assets, 'source-image': {
+        ...base.assets['source-video'], id: 'source-image', name: sound.name, type: 'image', output_id: sound.name,
+        output_revision: `sha256:${'b'.repeat(64)}`, duration: 0, width: 32, height: 16, fps: 0, has_audio: false,
+      } }, tracks: saved.tracks.map(track => track.id === 'images-main' ? { ...track, items: [{ id: 'image-layer', asset_id: 'source-image', source_in: 0, start: 0, duration: 10, speed: 1, size: 0.25, opacity: 1, position: 'center' }] } : track) }
+      return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ project: saved }) })
+    })
+    await page.route('**/editor/projects/*/exports', route => { exports.push(route.request().postDataJSON()); return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ job_id: EXPORT_JOB_ID, status: 'queued' }) }) })
+    await page.goto('/')
+    await page.getByRole('tab', { name: 'Gallery' }).click()
+    await page.getByRole('button', { name: `Open ${VIDEO.name} in Editor` }).click()
+    const panel = page.getByRole('region', { name: 'Image layer' })
+    await expect(panel).toBeVisible()
+    await panel.getByRole('combobox').selectOption(sound.name)
+    await panel.getByRole('button', { name: 'Add image', exact: true }).click()
+    await expect(panel.getByRole('button', { name: 'Show private image' })).toBeVisible()
+    expect(imports).toEqual([{ expected_revision: 1, output_name: sound.name, output_revision: sound.revision }])
+    expect(previewPins).toEqual([])
+    const revealVideo = page.getByRole('button', { name: 'Reveal private preview', exact: true })
+    if (await revealVideo.count()) await revealVideo.click()
+    expect(previewPins).toEqual([])
+    await panel.getByRole('button', { name: 'Show private image' }).click()
+    await expect.poll(() => previewPins.length).toBeGreaterThan(0)
+    expect(previewPins.every(pin => pin === `sha256:${'b'.repeat(64)}`)).toBe(true)
+    await panel.getByLabel('Image end (seconds)', { exact: true }).fill('3')
+    await panel.getByLabel('Image start (seconds)', { exact: true }).fill('1')
+    await panel.getByLabel('Image end (seconds)', { exact: true }).fill('3')
+    await panel.getByRole('slider', { name: /Image opacity/ }).focus()
+    await panel.getByRole('slider', { name: /Image opacity/ }).press('Home')
+    for (let index = 0; index < 50; index++) await panel.getByRole('slider', { name: /Image opacity/ }).press('ArrowRight')
+    await panel.getByRole('combobox', { name: 'Image placement' }).selectOption('bottom')
+    await expect(page.getByRole('status').filter({ hasText: 'Draft saved' })).toBeVisible()
+    await page.getByRole('button', { name: 'Gallery', exact: true }).click()
+    await page.getByRole('button', { name: `Open ${VIDEO.name} in Editor` }).click()
+    await expect(panel.getByLabel('Image start (seconds)', { exact: true })).toHaveValue('1')
+    await expect(panel.getByLabel('Image end (seconds)', { exact: true })).toHaveValue('3')
+    await expect(panel.getByRole('combobox', { name: 'Image placement' })).toHaveValue('bottom')
+    await panel.getByLabel('Image start (seconds)', { exact: true }).fill('9')
+    await expect(page.getByText('The image must last at least one video frame', { exact: false })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Export MP4' })).toBeDisabled()
+    await panel.getByLabel('Image start (seconds)', { exact: true }).fill('1')
+    await expect(page.getByRole('status').filter({ hasText: 'Draft saved' })).toBeVisible()
+    expect(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 1)).toBe(false)
+    const accessibility = await new AxeBuilder({ page }).include('main[aria-label="Video Editor"]').analyze()
+    expect(accessibility.violations.filter(v => v.impact === 'critical' || v.impact === 'serious')).toEqual([])
+    await panel.screenshot({ path: testInfo.outputPath(`${viewport.name}-image-layer.png`) })
+    await page.getByRole('button', { name: 'Export MP4' }).click()
+    await expect.poll(() => exports.length).toBe(1)
+    await panel.getByRole('button', { name: 'Remove image' }).click()
+    await expect(panel.getByRole('combobox')).toBeFocused()
+  })
+}

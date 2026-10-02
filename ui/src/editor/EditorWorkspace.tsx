@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ArrowLeft, ArrowRight, Download, Eye, Film, Loader2, Pause, Play, Plus, RotateCcw, Save, Trash2 } from 'lucide-react'
-import { addEditorAudio, appendEditorClip, exportEditorProject, getEditorPreviewUrl, openOutputInEditor, projectReferenceSafeErrorMessage, saveEditorProject, type EditorProject } from '../api/client'
+import { addEditorAudio, addEditorImage, appendEditorClip, exportEditorProject, getEditorPreviewUrl, openOutputInEditor, projectReferenceSafeErrorMessage, saveEditorProject, type EditorProject } from '../api/client'
 import { privatePreviewIdentity, privatePreviewWasRevealed, revealPrivatePreview, subscribePrivatePreviewReveal } from '../lib/privatePreview'
 import { useStore } from '../stores/useStore'
 import type { OutputFile } from '../types'
@@ -229,6 +229,71 @@ function AudioLayerPanel({ project, outputs, busy, error, stopKey, videoPlaying,
   </section>
 }
 
+function imageLayer(project: EditorProject) {
+  return project.tracks.find(track => track.id === 'images-main')?.items[0]
+}
+
+function availableImages(project: EditorProject, outputs: OutputFile[]) {
+  return outputs.filter(output => output.workspace === project.workspace && output.type === 'image' && Boolean(output.revision))
+}
+
+function changeImage(project: EditorProject, change: Partial<NonNullable<ReturnType<typeof imageLayer>>> | null): EditorProject {
+  return { ...project, tracks: project.tracks.map(track => track.id === 'images-main'
+    ? { ...track, items: change && track.items[0] ? [{ ...track.items[0], ...change, id: track.items[0].id, asset_id: track.items[0].asset_id }] : [] } : track) }
+}
+
+function imageLayout(width: number, height: number, assetWidth: number, assetHeight: number, size: number, position: 'top' | 'center' | 'bottom') {
+  const ratio = Math.min(width * 0.9 * size / assetWidth, height * 0.88 * size / assetHeight)
+  const w = Math.max(1, Math.round(assetWidth * ratio)), h = Math.max(1, Math.round(assetHeight * ratio))
+  const y = { top: Math.round(height * 0.06), center: Math.floor((height - h) / 2), bottom: height - Math.round(height * 0.06) - h }[position]
+  return { x: Math.floor((width - w) / 2) / width * 100, y: y / height * 100, width: w / width * 100, height: h / height * 100 }
+}
+
+function ImageLayerPanel({ project, outputs, busy, error, revealed, mediaError, onReveal, onImport, onChange }: {
+  project: EditorProject; outputs: OutputFile[]; busy: boolean; error: string; revealed: boolean; mediaError: boolean;
+  onReveal: () => void; onImport: (name: string) => void; onChange: (project: EditorProject) => void
+}) {
+  const layer = imageLayer(project)
+  const asset = layer && project.assets[layer.asset_id ?? '']
+  const [name, setName] = useState('')
+  const select = useRef<HTMLSelectElement>(null)
+  const update = (change: Partial<NonNullable<typeof layer>>) => onChange(changeImage(project, change))
+  return <section className="rounded-xl border border-border bg-bg-secondary p-4 md:p-6" aria-label="Image layer">
+    <h2 className="mb-3 text-sm font-semibold">Image layer <span className="ml-2 font-normal text-text-secondary">{layer ? '1/1' : '0/1'}</span></h2>
+    <p className="mb-5 text-xs leading-relaxed text-text-secondary">Add one static PNG, JPEG or WebP from this project’s Gallery. It appears above video and below titles, retaining its shape and transparency. Sequence times stay fixed when clips move. Size fits inside the canvas; the image does not extend the video.</p>
+    {!layer ? <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-end">
+      <label className="block min-w-0 flex-1 text-sm"><span className="mb-2 block">Image from this project’s Gallery</span>
+        <select ref={select} value={name} disabled={busy} onChange={event => setName(event.target.value)} className={audioInputClass}>
+          <option value="">Choose image…</option>{availableImages(project, outputs).map(output => <option key={output.name} value={output.name}>{output.name}</option>)}
+        </select>
+      </label>
+      <button type="button" disabled={busy || !availableImages(project, outputs).some(item => item.name === name)} onClick={() => onImport(name)} className={audioButtonClass}><Plus size={15} aria-hidden="true" />Add image</button>
+    </div> : <div className="grid min-w-0 gap-5 md:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]">
+      <div className="min-w-0 rounded-lg border border-accent-blue bg-accent-blue/10 p-4">
+        <p className="break-all text-sm">{asset?.name}</p><p className="mt-2 text-xs text-text-secondary">{asset?.width} × {asset?.height} · Still image</p>
+        {asset?.private !== false && <button type="button" disabled={busy} onClick={onReveal} className={`${audioButtonClass} mt-4 w-full`}><Eye size={15} aria-hidden="true" />{revealed ? 'Private image revealed' : 'Show private image'}</button>}
+        <p className="mt-3 text-xs text-text-secondary">{revealed ? 'Shown in the video preview during its interval.' : 'Private preview is hidden until you reveal it.'}</p>
+        <button type="button" disabled={busy} onClick={() => { onChange(changeImage(project, null)); requestAnimationFrame(() => select.current?.focus()) }} className={`${audioButtonClass} mt-4 w-full`}><Trash2 size={15} aria-hidden="true" />Remove image</button>
+      </div>
+      <div className="grid min-w-0 gap-4 sm:grid-cols-2">
+        <label className="block text-sm"><span className="mb-2 block">Image start (seconds)</span><input type="number" min={0} max={86400 - layer.duration} step={0.05} value={layer.start} disabled={busy} className={audioInputClass}
+          onChange={event => { const v = Number(event.target.value); if (Number.isFinite(v) && v >= 0 && v + layer.duration <= 86400) update({ start: v }) }} /></label>
+        <label className="block text-sm"><span className="mb-2 block">Image end (seconds)</span><input type="number" min={layer.start + 1 / 240} max={86400} step={0.05} value={layer.start + layer.duration} disabled={busy} className={audioInputClass}
+          onChange={event => { const v = Number(event.target.value); if (Number.isFinite(v) && v >= layer.start + 1 / 240 && v <= 86400) update({ duration: v - layer.start }) }} /></label>
+        <label className="block text-sm"><span className="mb-2 block">Image size · {Math.round((layer.size ?? 0.25) * 100)}%</span><input type="range" min={10} max={100} value={(layer.size ?? 0.25) * 100} disabled={busy} className="min-h-11 w-full accent-accent-blue focus-visible:ring-2 focus-visible:ring-accent-blue"
+          onChange={event => update({ size: Number(event.target.value) / 100 })} /></label>
+        <label className="block text-sm"><span className="mb-2 block">Image opacity · {Math.round((layer.opacity ?? 1) * 100)}%</span><input type="range" min={0} max={100} value={(layer.opacity ?? 1) * 100} disabled={busy} className="min-h-11 w-full accent-accent-blue focus-visible:ring-2 focus-visible:ring-accent-blue"
+          onChange={event => update({ opacity: Number(event.target.value) / 100 })} /></label>
+        <label className="block text-sm sm:col-span-2"><span className="mb-2 block">Image placement</span><select value={layer.position ?? 'center'} disabled={busy} className={audioInputClass}
+          onChange={event => update({ position: event.target.value as 'top' | 'center' | 'bottom' })}><option value="top">Top</option><option value="center">Center</option><option value="bottom">Bottom</option></select></label>
+      </div>
+    </div>}
+    {busy && <p role="status" className="mt-3 text-xs text-text-secondary">Wait for the current Editor operation to finish.</p>}
+    {mediaError && <p role="alert" className="mt-3 text-sm text-red-400">Image preview unavailable. Refresh Gallery and reopen this edit if the image changed.</p>}
+    {error && <p role="alert" className="mt-3 text-sm text-red-400">{error}</p>}
+  </section>
+}
+
 export function EditorWorkspace({ source }: { source: OutputFile }) {
   const closeEditor = useStore(state => state.closeEditor)
   const outputs = useStore(state => state.outputs)
@@ -245,7 +310,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
   const [appendName, setAppendName] = useState('')
   const [appendPending, setAppendPending] = useState(false)
   const [appendError, setAppendError] = useState('')
-  const [importKind, setImportKind] = useState<'video' | 'audio'>('video')
+  const [importKind, setImportKind] = useState<'video' | 'audio' | 'image'>('video')
   const [saveState, setSaveState] = useState<SaveState>('saved')
   const [savePending, setSavePending] = useState(false)
   const [error, setError] = useState('')
@@ -266,6 +331,13 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
   const clips = project ? sequenceClips(project) : []
   const clip = clips.find(item => item.id === activeClipId) ?? clips[0]
   const sourceAsset = clip && project?.assets[clip.asset_id ?? '']
+  const overlay = project ? imageLayer(project) : undefined
+  const imageAsset = overlay && project?.assets[overlay.asset_id ?? '']
+  const imageIdentity = privatePreviewIdentity(source.workspace, imageAsset?.output_id ?? '', imageAsset?.output_revision ?? '')
+  const [imageRevealIdentity, setImageRevealIdentity] = useState('')
+  const [imageErrorIdentity, setImageErrorIdentity] = useState('')
+  const imageRevealed = imageAsset?.private === false || imageRevealIdentity === imageIdentity || privatePreviewWasRevealed(imageIdentity)
+  const imagePreviewError = imageErrorIdentity === imageIdentity
   const titles = project ? textLayers(project) : []
   const selectedTitle = titles.find(item => item.id === activeTextId) ?? titles[0]
   const clipIndex = clips.findIndex(item => item.id === clip?.id)
@@ -433,12 +505,12 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
     updateDraft(moveClip(projectRef.current, clip.id, direction))
   }
 
-  const handleAppend = async (kind: 'video' | 'audio' = 'video', requestedName = appendName) => {
+  const handleAppend = async (kind: 'video' | 'audio' | 'image' = 'video', requestedName = appendName) => {
     const epoch = scope.current
     if (!projectRef.current || !isCurrent(epoch) || appending.current || exporting.current || saveState === 'error') return
-    const choices = kind === 'audio' ? availableAudio : availableVideos
+    const choices = kind === 'audio' ? availableAudio : kind === 'image' ? availableImages : availableVideos
     const output = choices(projectRef.current, useStore.getState().outputs).find(item => item.name === requestedName)
-    if (!output || (kind === 'video' && sequenceClips(projectRef.current).length >= 8) || (kind === 'audio' && audioLayer(projectRef.current))) return
+    if (!output || (kind === 'video' && sequenceClips(projectRef.current).length >= 8) || (kind === 'audio' && audioLayer(projectRef.current)) || (kind === 'image' && imageLayer(projectRef.current))) return
     appending.current = true
     setImportKind(kind)
     setAppendPending(true)
@@ -462,7 +534,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
         setAppendName('')
         return
       }
-      const appended = await (kind === 'audio' ? addEditorAudio : appendEditorClip)(source.workspace, projectRef.current, output.name, output.revision)
+      const appended = await (kind === 'audio' ? addEditorAudio : kind === 'image' ? addEditorImage : appendEditorClip)(source.workspace, projectRef.current, output.name, output.revision)
       if (!isCurrent(epoch)) return
       projectRef.current = appended
       setProject(appended)
@@ -493,6 +565,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
   const titlesOutOfRange = titles.some(item => item.start + item.duration > sequenceDuration + 1e-6)
   const titleFps = clips.length > 1 ? project?.canvas.fps ?? 30 : sourceAsset?.fps || project?.canvas.fps || 30
   const titlesTooShort = titles.some(item => item.duration < 1 / titleFps - 1e-9)
+  const imageInvalidRange = Boolean(overlay && (overlay.start + overlay.duration > sequenceDuration + 1e-6 || overlay.duration < 1 / titleFps - 1e-9))
   const selectedIndex = clips.findIndex(item => item.id === clip?.id)
   const candidates = project ? availableVideos(project, outputs) : []
   const busy = appendPending || exportState === 'submitting'
@@ -500,7 +573,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
 
   const handleExport = async () => {
     const epoch = scope.current
-    if (!project || !canTrim || titlesOutOfRange || titlesTooShort || audioOutOfRange || saveState !== 'saved' || saving.current || exporting.current || appending.current || !isCurrent(epoch)) return
+    if (!project || !canTrim || titlesOutOfRange || titlesTooShort || audioOutOfRange || imageInvalidRange || saveState !== 'saved' || saving.current || exporting.current || appending.current || !isCurrent(epoch)) return
     exporting.current = true
     const version = editVersion.current
     setExportState('submitting')
@@ -583,6 +656,12 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
                     onSeeked={event => setPreviewTime(Math.max(0, event.currentTarget.currentTime - trimStart))}
                     onTimeUpdate={event => { setPreviewTime(Math.max(0, event.currentTarget.currentTime - trimStart)); if (event.currentTarget.currentTime >= trimEnd) event.currentTarget.pause() }}
                     onError={() => setPlaybackError(true)} className="h-full w-full object-contain" />
+                  {overlay && imageAsset && imageRevealed && !imagePreviewError && titleTime >= overlay.start && titleTime < overlay.start + overlay.duration && (() => {
+                    const rect = imageLayout(project.canvas.width, project.canvas.height, imageAsset.width, imageAsset.height, overlay.size ?? 0.25, overlay.position ?? 'center')
+                    return <img key={imageIdentity} alt="" aria-hidden="true" data-testid="image-layer-preview" src={getEditorPreviewUrl(imageAsset.output_id, project.workspace, imageAsset.output_revision)}
+                      onError={() => setImageErrorIdentity(imageIdentity)} className="pointer-events-none absolute object-contain"
+                      style={{ left: `${rect.x}%`, top: `${rect.y}%`, width: `${rect.width}%`, height: `${rect.height}%`, opacity: overlay.opacity ?? 1 }} />
+                  })()}
                   {fontReady && <svg className="pointer-events-none absolute inset-0 h-full w-full" viewBox={`0 0 ${project.canvas.width} ${project.canvas.height}`} aria-hidden="true" data-testid="text-layer-preview">
                     {titles.filter(item => item.text.trim() && titleTime >= item.start && titleTime < item.start + item.duration).map(item => {
                       const layout = titleLayout(item.text, project.canvas.width, project.canvas.height, item.position)
@@ -630,7 +709,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
                 : 'Your original videos stay intact. Clips play one after another, in timeline order. The sequence is saved as an editable draft in the project.'}</p>
               {clips.length > 1 && <p className="mt-3 text-xs leading-relaxed text-text-secondary">Export uses the sequence canvas set from the first video ({project.canvas.width} × {project.canvas.height}, {project.canvas.fps} fps). Odd source dimensions are rounded up to an even canvas. Other shapes receive black bars. Each clip uses its first audio track; clips without audio use silence.</p>}
               <button type="button" onClick={() => { void handleExport() }}
-                disabled={!canTrim || titlesOutOfRange || titlesTooShort || audioOutOfRange || saveState !== 'saved' || exportState !== 'idle' || appendPending}
+                disabled={!canTrim || titlesOutOfRange || titlesTooShort || audioOutOfRange || imageInvalidRange || saveState !== 'saved' || exportState !== 'idle' || appendPending}
                 className="mt-5 flex min-h-11 w-full items-center justify-center gap-2 rounded-lg border border-border bg-bg-primary px-4 text-sm font-medium text-text-primary hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50">
                 {exportState === 'submitting' ? <Loader2 size={16} className="animate-spin motion-reduce:animate-none" aria-hidden="true" /> : <Download size={16} aria-hidden="true" />}
                 {exportState === 'submitting' ? 'Queuing export…' : exportState === 'queued' ? 'Export queued' : 'Export MP4'}
@@ -721,6 +800,10 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
             stopKey={clip?.id} videoPlaying={playing} onAudition={() => { preview.current?.pause(); setPlaying(false) }}
             onImport={name => { void handleAppend('audio', name) }}
             onChange={next => { if (!appending.current && !exporting.current && isCurrent(scope.current)) updateDraft(next) }} />
+          <ImageLayerPanel key={project.id} project={project} outputs={outputs} busy={busy || saveState === 'error'} error={importKind === 'image' ? appendError : ''} revealed={imageRevealed} mediaError={imagePreviewError}
+            onReveal={() => { revealPrivatePreview(imageIdentity); setImageRevealIdentity(imageIdentity) }} onImport={name => { void handleAppend('image', name) }}
+            onChange={next => { if (!appending.current && !exporting.current && isCurrent(scope.current)) updateDraft(next) }} />
+          {imageInvalidRange && <p role="alert" className="text-sm text-red-400">The image must last at least one video frame and end within the exported cut. Adjust its interval before exporting.</p>}
           <section className="rounded-xl border border-border bg-bg-secondary p-4 md:p-6" aria-label="Text layers">
             <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
               <h2 className="text-sm font-semibold">Text layers <span className="ml-2 font-normal text-text-secondary">{titles.length}/8</span></h2>

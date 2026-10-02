@@ -104,7 +104,7 @@ class EditorExportRouteTests(unittest.TestCase):
             "_run_tool_editor_export": object(),
         }
         load_functions(self.ns, "_editor_request_body", "_editor_save_root",
-                       "_editor_require_current_source", "export_output_editor_project", "append_output_editor_clip", "add_output_editor_audio")
+                       "_editor_require_current_source", "export_output_editor_project", "append_output_editor_clip", "add_output_editor_audio", "add_output_editor_image")
 
     def source_revision(self, path=None):
         path = path or self.source
@@ -121,7 +121,7 @@ class EditorExportRouteTests(unittest.TestCase):
     def output(self, request, project, name):
         self.authorize(request, project, existing_only=True, permission="project.mutate")
         path = self.project / name
-        if name not in {"source.mp4", "second.mp4", "sound.wav"} or not path.exists():
+        if name not in {"source.mp4", "second.mp4", "sound.wav", "logo.png"} or not path.exists():
             raise HTTPException(status_code=404, detail="Output not found")
         sidecar_path = path.with_suffix(".meta.json")
         sidecar = json.loads(sidecar_path.read_text()) if sidecar_path.exists() else {}
@@ -217,6 +217,88 @@ class EditorExportRouteTests(unittest.TestCase):
         meta = json.loads((self.project / job["output_files"][0]).with_suffix(".meta.json").read_text())
         self.assertIsNone(meta["params"]); self.assertTrue(meta["private"])
         self.assertEqual(meta["transform"]["audio_layer"]["revision"], self.source_revision(path))
+        job["id"] = "b" * 32; self.jobs[job["id"]] = job
+        job["status"] = "queued"; job["output_files"] = []
+        def replace(_source, destination, **_options):
+            Path(destination).write_bytes(b"rendered"); path.write_bytes(b"replacement")
+        with mock.patch("services.editor_export.render_single_source_cut", side_effect=replace), mock.patch("services.editor_projects.probe_media", return_value=probe):
+            self.assertFalse(self.ns["_run_tool_editor_export"](job["id"]))
+        self.assertEqual(job["status"], "failed")
+        self.assertFalse(job["output_files"])
+        self.assertFalse((self.project / ("editor_cut_" + job["id"] + ".mp4")).exists())
+        # Sidecarless media remains live-only; it does not authorize restart recovery.
+        path.with_suffix(".meta.json").unlink()
+        self.assertEqual(self.ns["_queue_recovery_input_descriptors"](job, "owner")[0]["scope"], "derived")
+
+    def image_source(self):
+        path = self.project / "logo.png"
+        path.write_bytes(b"image-source")
+        path.with_suffix(".meta.json").write_text(json.dumps({"workspace": "scene", "private": True, "explicit": True}))
+        return path
+
+    def import_image(self, body=None):
+        return asyncio.run(self.ns["add_output_editor_image"]("scene", self.timeline["id"], Request(body or {
+            "expected_revision": self.timeline["revision"], "output_name": "logo.png", "output_revision": "gallery-current"})))
+
+    def test_image_import_cas_privacy_probe_race_and_forged_metadata(self):
+        path = self.image_source()
+        media = {"type": "image", "width": 32, "height": 16, "has_audio": False}
+        with mock.patch("services.editor_projects.inspect_editor_still", return_value=media):
+            saved = self.import_image()["project"]
+        asset = saved["assets"]["source-image"]
+        self.assertEqual(asset["output_revision"], self.source_revision(path)); self.assertTrue(asset["private"])
+        self.assertNotIn("path", asset); self.assertEqual(saved["revision"], 2)
+        with self.assertRaises(HTTPException) as stale: self.import_image()
+        self.assertEqual(stale.exception.status_code, 409)
+        with self.assertRaises(HTTPException) as forged:
+            self.import_image({"expected_revision": 2, "output_name": "logo.png", "output_revision": "gallery-current", "path": "/foreign.wav"})
+        self.assertEqual(forged.exception.status_code, 400)
+        self.timeline = saved
+        with self.assertRaises(HTTPException) as duplicate: self.import_image()
+        self.assertEqual(duplicate.exception.status_code, 422)
+
+    def test_image_replaced_or_privacy_changed_during_import_is_refused(self):
+        path = self.image_source()
+        def mutate(_path):
+            path.with_suffix(".meta.json").write_text(json.dumps({"private": False}))
+            return {"type": "image", "width": 32, "height": 16, "has_audio": False}
+        with mock.patch("services.editor_projects.inspect_editor_still", side_effect=mutate), self.assertRaises(HTTPException) as changed:
+            self.import_image()
+        self.assertEqual(changed.exception.status_code, 409)
+        self.assertEqual(load_editor_project(str(self.outputs), "scene", self.timeline["id"])["revision"], 1)
+
+    def with_image(self):
+        from services.editor_projects import add_output_image_layer
+        path = self.image_source()
+        self.timeline = save_editor_project(str(self.outputs), "scene", add_output_image_layer(
+            self.timeline, output_name=path.name, output_revision=self.source_revision(path),
+            media={"type": "image", "width": 32, "height": 16, "private": True}), expected_revision=self.timeline["revision"])
+        return path
+
+    def test_image_sealed_recovery_input_and_private_finality_rechecks(self):
+        self.source.with_suffix(".meta.json").write_text(json.dumps({"workspace": "scene", "private": False, "explicit": False}))
+        self.timeline["assets"]["source-video"].update(private=False, output_revision=self.source_revision())
+        path = self.with_image()
+        next(track for track in self.timeline["tracks"] if track["id"] == "images-main")["items"][0]["opacity"] = 0
+        self.timeline = save_editor_project(str(self.outputs), "scene", self.timeline, expected_revision=self.timeline["revision"])
+        job = self.worker_namespace()
+        params = job["params"]
+        self.assertEqual(params["editor_image_path"], str(path)); self.assertTrue(params["private_output"])
+        from services.queue_recovery_runtime import QueueRecoveryRuntimeError, sha256_file
+        self.ns.update({"_app_dir": str(self.root), "_RECOVERABLE_INPUT_KEYS": next({item.value for item in node.value.args[0].elts if isinstance(item, ast.Constant)} for node in TREE.body if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "_RECOVERABLE_INPUT_KEYS" for t in node.targets)), "_recovery_sha256_file": sha256_file, "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError})
+        load_functions(self.ns, "_queue_recovery_file_values", "_queue_recovery_input_descriptors")
+        descriptors = self.ns["_queue_recovery_input_descriptors"](job, "owner")
+        self.assertEqual([d["field"] for d in descriptors], ["editor_image_path:0", "editor_source_path:0"])
+        self.assertTrue(all(d["scope"] == "project" for d in descriptors))
+        def render(_source, destination, **options):
+            self.assertEqual(options["image_layer"], params["editor_image_layer"])
+            Path(destination).write_bytes(b"rendered")
+        probe = {"type": "video", "duration": 3.0, "size": 8, "has_audio": True, "width": 128, "height": 72}
+        with mock.patch("services.editor_export.render_single_source_cut", side_effect=render), mock.patch("services.editor_projects.probe_media", return_value=probe):
+            self.assertTrue(self.ns["_run_tool_editor_export"](job["id"]))
+        meta = json.loads((self.project / job["output_files"][0]).with_suffix(".meta.json").read_text())
+        self.assertIsNone(meta["params"]); self.assertTrue(meta["private"])
+        self.assertEqual(meta["transform"]["image_layer"]["revision"], self.source_revision(path))
         job["id"] = "b" * 32; self.jobs[job["id"]] = job
         job["status"] = "queued"; job["output_files"] = []
         def replace(_source, destination, **_options):

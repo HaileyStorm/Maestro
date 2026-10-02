@@ -54,6 +54,54 @@ def _competing_editor_save(root, project, barrier, results, index):
 
 
 class TestEditorProjectFoundation(unittest.TestCase):
+    def test_image_pinned_identity_timing_appearance_roundtrip_and_removal(self):
+        from services.editor_projects import add_output_image_layer, editor_image_layer
+        self._workspace("images")
+        current = create_output_video_timeline(workspace="images", output_name="source.mp4", output_revision="video",
+            media={"type": "video", "duration": 4, "width": 128, "height": 72, "fps": 24})
+        current = add_output_image_layer(current, output_name="logo.png", output_revision="image",
+            media={"type": "image", "width": 32, "height": 16})
+        current = save_editor_project(self.outputs, "images", current, expected_revision=0)
+        proposed = copy.deepcopy(current)
+        proposed["assets"]["source-image"]["output_id"] = "foreign.png"
+        track = next(t for t in proposed["tracks"] if t["id"] == "images-main")
+        track["items"][0].update(start=1, duration=2, size=0.5, opacity=0.25, position="top")
+        updated = apply_output_video_trim(current, proposed)
+        self.assertEqual(updated["assets"], current["assets"])
+        self.assertEqual(updated["tracks"][:3], current["tracks"][:3])
+        saved = save_editor_project(self.outputs, "images", updated, expected_revision=1)
+        self.assertEqual(editor_image_layer(load_editor_project(self.outputs, "images", saved["id"]), require_fit=True), editor_image_layer(updated))
+        for change in ({"size": 1.01}, {"opacity": True}, {"duration": float("nan")}, {"position": "left"},
+                       {"start": -1}, {"source_in": 1}, {"asset_id": "source-video"}, {"transform": {"x": 2}}):
+            broken = copy.deepcopy(saved); next(t for t in broken["tracks"] if t["id"] == "images-main")["items"][0].update(change)
+            with self.subTest(change=change), self.assertRaises(EditorProjectError): apply_output_video_trim(saved, broken)
+        for change in ({"start": 3}, {"duration": 1 / 240}):
+            late = copy.deepcopy(saved); next(t for t in late["tracks"] if t["id"] == "images-main")["items"][0].update(change)
+            late = apply_output_video_trim(saved, late)
+            self.assertIsNotNone(editor_image_layer(late))
+            with self.assertRaises(EditorProjectError): editor_image_layer(late, require_fit=True)
+        unknown_fps = copy.deepcopy(saved)
+        unknown_fps["assets"]["source-video"]["fps"] = 0
+        next(t for t in unknown_fps["tracks"] if t["id"] == "images-main")["items"][0]["duration"] = 0.25
+        self.assertEqual(editor_image_layer(unknown_fps, require_fit=True)["duration"], 0.25)
+        removed = copy.deepcopy(saved); next(t for t in removed["tracks"] if t["id"] == "images-main")["items"] = []
+        removed = apply_output_video_trim(saved, removed)
+        self.assertIsNone(editor_image_layer(removed)); self.assertNotIn("source-image", removed["assets"])
+        self.assertEqual(len(editor_sequence_clips(removed)), 1)
+
+    def test_still_decoder_rejects_animation_and_container_and_applies_orientation(self):
+        from services.editor_projects import inspect_editor_still
+        from PIL import Image
+        path = Path(self.outputs) / "still.png"
+        Image.new("RGBA", (12, 8), (255, 0, 0, 128)).save(path)
+        self.assertEqual(inspect_editor_still(path)["width"], 12)
+        Image.new("RGBA", (12, 8), "red").save(path, save_all=True, append_images=[Image.new("RGBA", (12, 8), "blue")], duration=100)
+        with self.assertRaises(EditorProjectError): inspect_editor_still(path)
+        jpeg = path.with_suffix(".jpg")
+        exif = Image.Exif(); exif[274] = 6
+        Image.new("RGB", (12, 8), "red").save(jpeg, exif=exif)
+        self.assertEqual((inspect_editor_still(jpeg)["width"], inspect_editor_still(jpeg)["height"]), (8, 12))
+
     def test_audio_layer_round_trip_trim_offset_gain_mute_and_closed_identity(self):
         from services.editor_projects import add_output_audio_layer, editor_audio_layer
         self._workspace("audio")

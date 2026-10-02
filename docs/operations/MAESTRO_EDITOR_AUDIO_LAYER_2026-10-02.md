@@ -18,8 +18,9 @@ Video preview plays the selected video's original sound. Audition audio plays
 only the selected audio slice, at its saved volume. Private audio requires an
 explicit reveal. Audition stops on edits, clip changes, video playback, pending
 Editor operations and leaving Editor. The combined soundtrack is available in
-the exported MP4. Live mixed preview, multiple audio layers, fades, looping,
-image layers and overlapping video remain outside this slice.
+the exported MP4. Live mixed preview, multiple audio layers, fades, looping
+and overlapping video remain outside this audio slice. A timed still image is
+[available separately](MAESTRO_EDITOR_IMAGE_LAYER_2026-10-02.md).
 
 ## Source, privacy and export
 

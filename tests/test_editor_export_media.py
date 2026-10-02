@@ -25,6 +25,49 @@ FFPROBE = shutil.which("ffprobe")
 
 @unittest.skipUnless(FFMPEG and FFPROBE, "ffmpeg and ffprobe are required")
 class EditorExportMediaTests(unittest.TestCase):
+    def test_image_alpha_interval_geometry_titles_audio_and_sequence_join(self):
+        from PIL import Image
+        from services.editor_export import _image_filters
+        source = self.make_source()
+        image = self.root / "overlay.png"
+        raster = Image.new("RGBA", (16, 8), (255, 0, 0, 255))
+        raster.putpixel((0, 0), (0, 0, 0, 0)); raster.save(image)
+        hashes = [hashlib.sha256(p.read_bytes()).hexdigest() for p in (source, image)]
+        plan = {"path": str(image), "width": 16, "height": 8, "start": 0.25, "duration": 0.5,
+                "size": 0.5, "opacity": 0.5, "position": "center"}
+        canvas = {"width": 128, "height": 72, "fps": 24}
+        def frame(path, at):
+            return self.run_media([FFMPEG, "-v", "error", "-ss", str(at), "-i", str(path), "-frames:v", "1", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"])
+        def center(raw): return tuple(raw[(36 * 128 + 64) * 3:(36 * 128 + 64) * 3 + 3])
+        original = self.root / "original.mp4"
+        render_single_source_cut(source, original, source_in=0, duration=1, timeout=30)
+        destination = self.root / "overlay.mp4"
+        render_single_source_cut(source, destination, source_in=0, duration=1, image_layer=plan, canvas=canvas, timeout=30)
+        self.assertLess(max(abs(a-b) for a,b in zip(center(frame(destination, 0.125)), center(frame(original, 0.125)))), 8)
+        self.assertLess(max(abs(a-b) for a,b in zip(center(frame(destination, 0.75)), center(frame(original, 0.75)))), 8)
+        inside = center(frame(destination, 0.5)); outside = center(frame(original, 0.5))
+        self.assertGreater(inside[0], outside[0] + 80)
+        self.assertEqual(len(self.probe(destination)["streams"]), len(self.probe(original)["streams"]))
+        for stream in range(len(self.probe(original)["streams"]) - 1):
+            def sound(path): return self.run_media([FFMPEG, "-v", "error", "-i", str(path), "-map", f"0:a:{stream}", "-f", "s16le", "-"])
+            self.assertEqual(sound(destination), sound(original))
+        for pos in ("top", "center", "bottom"):
+            _image_filters({**plan, "position": pos}, self.root, width=128, height=72, duration=1, fps=24, first_input=1, base="v")
+            with Image.open(self.root / "image-layer.png") as decoded:
+                self.assertEqual(decoded.size, (58, 29)); self.assertEqual(decoded.getpixel((30, 15))[3], 128)
+                self.assertLess(decoded.getpixel((0, 0))[3], 128)
+        sequence = self.root / "image-sequence.mp4"
+        render_video_sequence([{"path": str(source), "source_in": 0, "duration": 0.5, "has_audio": True},
+            {"path": str(source), "source_in": 1, "duration": 0.5, "has_audio": True}], sequence, width=128, height=72, fps=24,
+            image_layer=plan, text_layers=[{"id": "title", "text": "IMAGE", "start": 0.25, "duration": 0.5, "position": "center"}], timeout=30)
+        self.assertEqual(int(self.run_media([FFPROBE, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=nb_frames", "-of", "csv=p=0", str(sequence)]).strip()), 24)
+        self.assertNotEqual(center(frame(sequence, 0.5)), inside)
+        self.assertEqual(hashes, [hashlib.sha256(p.read_bytes()).hexdigest() for p in (source, image)])
+        with self.assertRaises(InterruptedError):
+            render_single_source_cut(source, self.root / "cancel-image.mp4", source_in=0, duration=1, image_layer=plan, canvas=canvas, abort_check=lambda: True, timeout=30)
+        self.assertFalse((self.root / "cancel-image.mp4").exists())
+        self.assertFalse(list(self.root.glob('.editor-titles-*')))
+
     def test_audio_layer_timing_trim_gain_mute_silence_sequence_and_all_streams(self):
         source = self.make_source()
         bed = self.root / "bed.wav"
