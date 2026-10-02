@@ -29,10 +29,12 @@ pass. No full-suite rerun or GPU work is needed for these checks.
 Independent review found boolean coercion could admit a string value. The
 route now rejects non-object requests and non-boolean controls before mutation;
 the focused route regressions pass after that correction. The rebuilt local
-Queue renders **Pause queue** with zero running/queued jobs. The action has not
-been clicked against the old backend, and no new work has been submitted.
+Queue renders **Pause queue** with zero running/queued jobs.
 
-The backend requires a coordinated Pinokio restart before the new immediate
-flag takes effect. Source checks and a rendered button do not establish live
-admission or restart-recovery acceptance. Record the paused queue, held job,
-resume, and durable restart evidence after deployment separately.
+After the coordinated Pinokio restart, live Queue acceptance observed the
+explicit paused message and **Resume queue**. Submitting one matched H3 Guide
+job left zero running and one waiting job. **Start next** then admitted that
+job. The runtime loaded the current source, and direct and stable-share health
+probes passed. This proves idle pause and explicit admission for the observed
+run. A restart while paused, concurrent submissions, and human acceptance
+remain separate checks.
