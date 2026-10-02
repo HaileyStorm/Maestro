@@ -105,6 +105,8 @@ def _function(tree: ast.AST, name: str):
 def _isolated_functions(tree: ast.Module, names: tuple[str, ...], namespace: dict):
     namespace.setdefault("AUTOMATIC_RETIREMENT_STATUSES", AUTOMATIC_RETIREMENT_STATUSES)
     dependencies = {"_h3_segment_uses_native_boundary_history"} if "_run_generation" in names else set()
+    if {"_queue_recovery_materialize_job", "_resume_recovered_job"} & set(names):
+        dependencies.add("_h3_native_boundary_exact_retry_allowed")
     selected = [
         node for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -6227,12 +6229,146 @@ class QueueLaunchWiringTests(unittest.TestCase):
         self.assertTrue(auto_resume)
         self.assertEqual(restored["recovery_attempt"], 3)
 
+    def test_native_boundary_exact_retry_requires_known_non_oom_final_failure(self):
+        namespace = _isolated_functions(self.launch,
+            ("_h3_native_boundary_exact_retry_allowed",),
+            {"_h3_incomplete_recovery_prefix": lambda job: job.get("prefix", 1)})
+        allowed = namespace["_h3_native_boundary_exact_retry_allowed"]
+        base = {
+            "params": {"h3_native_boundary_conditioning": True,
+                       "_h3_longform": {"clip_count": 2, "native_boundary_conditioning": True}},
+            "failure_details": {"code": "h3_boundary_encode_failed", "is_oom": False,
+                                "stage": "denoise", "step": {"current": 0},
+                                "segment": {"current": 2, "total": 2}},
+        }
+        self.assertTrue(allowed(base))
+        for patch in ({"is_oom": True}, {"is_oom": None}, {"code": "generation_failed"},
+                      {"stage": "decode"}, {"step": {"current": 1}},
+                      {"step": {"current": False}}, {"segment": {"current": 1, "total": 2}}):
+            with self.subTest(failure=patch):
+                self.assertFalse(allowed({**base, "failure_details": {**base["failure_details"], **patch}}))
+        for patch in ({"oom_info": {}}, {"resource_retry_reason": "generation_oom"},
+                      {"prefix": None}, {"prefix": 0}, {"failure_details": None},
+                      {"params": {}}, {"params": {**base["params"], "h3_native_boundary_conditioning": False}}):
+            with self.subTest(job=patch):
+                self.assertFalse(allowed({**base, **patch}))
+
+    def test_native_boundary_manual_retry_preserves_manifest_and_host_gate(self):
+        class FakeHTTPException(Exception):
+            def __init__(self, *, status_code, detail):
+                self.status_code, self.detail = status_code, detail
+
+        started = []
+        class FakeThread:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+            def start(self):
+                started.append(self.kwargs)
+
+        secret, owner = b"queue-recovery-test-secret-32b!", "owner-session"
+        params = {"h3_native_boundary_conditioning": True,
+                  "_h3_longform": {"clip_count": 2, "native_boundary_conditioning": True}}
+        cursor = {"completed_units": [{"kind": "h3_segment", "index": 0}]}
+        base = {"id": "native-retry", "workspace": "project-a", "status": "queued",
+                "queue_held": True, "recovery_state": "blocked", "recovery_attempt": 0,
+                "_recovery_reason_code": "h3_peak_calibration_required",
+                "_recovery_owner_digest": owner_principal_digest(secret, owner),
+                "params": params, "recovery_cursor": cursor,
+                "failure_details": {"code": "h3_boundary_encode_failed", "is_oom": False,
+                                    "stage": "denoise", "step": {"current": 0},
+                                    "segment": {"current": 2, "total": 2}}}
+        job = copy.deepcopy(base)
+        gates = {"host": False, "inputs": True}
+        calls = []
+        def host_gate(_params):
+            calls.append("host")
+            if not gates["host"]:
+                raise ValueError("Experimental boundary conditioning is disabled")
+        def calibration(_job):
+            calls.append("calibration")
+            return False
+        def revalidate(target):
+            calls.append("inputs")
+            if gates["inputs"]:
+                target["_recovery_reason_code"] = ""
+                return True
+            return False
+        namespace = _isolated_functions(self.launch, ("_resume_recovered_job",), {
+            "HTTPException": FakeHTTPException, "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+            "_require_owned_job": lambda *_args: job,
+            "_require_project_access": lambda *_args, **_kwargs: calls.append("access"),
+            "owner_principal_digest": owner_principal_digest, "_session_secret": lambda: secret,
+            "hmac": hmac, "_queue_recovery_checkpoint_lock": threading.RLock(),
+            "_queue_recovery_reason_code": lambda target: target.get("_recovery_reason_code", ""),
+            "_queue_recovery_revalidate_job": revalidate,
+            "_queue_recovery_delivery_pending": lambda _job: None,
+            "_require_job_runtime_model_admission": lambda _job: calls.append("admission"),
+            "_h3_incomplete_recovery_prefix": lambda _job: 1,
+            "_require_h3_native_boundary_experimental": host_gate,
+            "_prepare_h3_peak_recovery": calibration,
+            "_queue_recovery_worker": lambda _job: lambda *_args: None,
+            "next_recovery_attempt": next_recovery_attempt, "MAX_RECOVERY_ATTEMPTS": 3,
+            "_queue_recovery_checkpoint": lambda target, **updates: target.update(updates) or True,
+            "update_queue_job": lambda *_args, **_kwargs: calls.append("enqueue") or True,
+            "threading": types.SimpleNamespace(Thread=FakeThread),
+            "_QUEUE_RECOVERY_REASON_TEXT": {"h3_peak_calibration_required": "Calibration required"},
+        })
+        retry = namespace["_resume_recovered_job"]
+        request = types.SimpleNamespace(state=types.SimpleNamespace(maestro_session_id=owner))
+        with self.assertRaises(FakeHTTPException) as raised:
+            retry(job["id"], request, requested_action="retry")
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(job, base)
+        self.assertEqual(started, [])
+        gates["host"] = True
+        result = retry(job["id"], request, requested_action="retry")
+        self.assertEqual(result["recovery_attempt"], 1)
+        self.assertEqual(len(started), 1)
+        self.assertIsNone(job["failure_details"])
+        self.assertNotIn("calibration", calls)
+        self.assertEqual(job["params"], params)
+        self.assertEqual(job["recovery_cursor"], cursor)
+        self.assertEqual(calls[:3], ["access", "inputs", "admission"])
+        job.clear(); job.update(copy.deepcopy(base)); started.clear(); calls.clear()
+        job.update({"source_remote": True, "recovery_state": "blocked_remote_reauth",
+                    "_recovery_reason_code": "owner_reauthentication_required"})
+        retry(job["id"], request, requested_action="resume")
+        self.assertEqual(len(started), 1)
+        self.assertIn("host", calls)
+        self.assertNotIn("calibration", calls)
+        self.assertEqual(job["params"], params)
+        self.assertEqual(job["recovery_cursor"], cursor)
+        for mutation in ("oom", "remote_oom", "remote_unknown", "legal_oom", "legal_unknown", "missing_input", "other_owner", "attempt_limit"):
+            job.clear(); job.update(copy.deepcopy(base)); started.clear(); calls.clear()
+            gates["inputs"] = mutation != "missing_input"
+            selected = request
+            if mutation == "oom": job["failure_details"]["is_oom"] = True
+            if mutation.startswith("remote_"):
+                job.update({"source_remote": True, "recovery_state": "blocked_remote_reauth",
+                            "_recovery_reason_code": "owner_reauthentication_required"})
+                if mutation == "remote_oom": job["failure_details"]["is_oom"] = True
+                else: job["failure_details"]["code"] = "unknown_failure"
+            if mutation in {"legal_oom", "legal_unknown"}:
+                job["_recovery_reason_code"] = "h3_legal_access_required"
+                if mutation == "legal_oom": job["failure_details"]["is_oom"] = True
+                else: job["failure_details"] = None
+            if mutation == "other_owner": selected = types.SimpleNamespace(state=types.SimpleNamespace(maestro_session_id="other"))
+            if mutation == "attempt_limit": job["recovery_attempt"] = 3
+            with self.subTest(mutation=mutation), self.assertRaises(FakeHTTPException):
+                retry(job["id"], selected, requested_action="resume" if mutation.startswith("remote_") or mutation.startswith("legal_") else "retry")
+            self.assertEqual(started, [])
+            self.assertNotIn("enqueue", calls)
+            self.assertEqual(job["params"], params)
+            self.assertEqual(job["recovery_cursor"], cursor)
+            if mutation in {"oom", "remote_oom", "remote_unknown", "legal_oom", "legal_unknown"}: self.assertIn("calibration", calls)
+
     def test_held_incomplete_h3_restart_restores_exact_prepare_authority(self):
         prefix_valid = {"value": True}
         prune_reconciled_units = {"value": False}
         next_attempt_calls = []
         manifest_sha = "d" * 64
         cursor_sha = "e" * 64
+        sealed_params = {"_h3_longform": {"clip_count": 5}}
 
         def reconcile_cursor(job, _project_dir):
             if prune_reconciled_units["value"]:
@@ -6252,7 +6388,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
                 "_queue_recovery_worker": lambda _job: object(),
                 "load_request_manifest": lambda *_args, **_kwargs: {
-                    "params": {"_h3_longform": {"clip_count": 5}},
+                    "params": sealed_params,
                     "inputs": [],
                 },
                 "validate_manifest_inputs": lambda *_args: None,
@@ -6351,6 +6487,72 @@ class QueueLaunchWiringTests(unittest.TestCase):
             remote_failed["_recovery_reason_code"],
             "owner_reauthentication_required",
         )
+
+        # A known non-OOM boundary encoder failure retries its original plan;
+        # it cannot use the Ref2VA-only calibrated replacement path.
+        sealed_params.update({
+            "h3_native_boundary_conditioning": True,
+            "_h3_longform": {
+                "clip_count": 5, "native_boundary_conditioning": True,
+            },
+        })
+        failure = {
+            "code": "h3_boundary_encode_failed", "is_oom": False,
+            "stage": "denoise", "step": {"current": 0},
+            "segment": {"current": 5, "total": 5},
+        }
+        namespace["_job_uses_registered_h3"] = lambda _job: True
+        for status, reason in (("failed", ""), ("queued", "h3_peak_calibration_required"),
+                              ("queued", "h3_legal_access_required")):
+            restored_native, may_start = materialize({
+                **snapshot, "status": status, "failure_details": failure,
+                "_recovery_reason_code": reason,
+                "recovery_attempt": 0 if reason == "h3_legal_access_required" else 2,
+            }, projects)
+            self.assertFalse(may_start)
+            self.assertTrue(restored_native["queue_held"])
+            self.assertEqual(restored_native["_recovery_reason_code"], "generation_failed")
+            self.assertEqual(restored_native["recovery_attempt"], 0 if reason == "h3_legal_access_required" else 2)
+            self.assertEqual(restored_native["params"], sealed_params)
+        self.assertEqual(next_attempt_calls, [])
+        remote_native, may_start = materialize({
+            **snapshot, "failure_details": failure, "source_remote": True,
+            "_recovery_reason_code": "generation_failed",
+        }, projects)
+        self.assertFalse(may_start)
+        self.assertTrue(remote_native["queue_held"])
+        self.assertEqual(remote_native["recovery_state"], "blocked_remote_reauth")
+        self.assertEqual(remote_native["_recovery_reason_code"], "owner_reauthentication_required")
+        for code, oom in (("h3_boundary_encode_failed", True), ("unknown_failure", False)):
+            with self.subTest(code=code, oom=oom):
+                conservative, may_start = materialize({
+                    **snapshot, "failure_details": {**failure, "code": code, "is_oom": oom},
+                    "_recovery_reason_code": "h3_peak_calibration_required",
+                }, projects)
+                self.assertFalse(may_start)
+                self.assertTrue(conservative["queue_held"])
+                self.assertEqual(conservative["_recovery_reason_code"], "h3_peak_calibration_required")
+        for status, held, reason in (
+            ("running", True, "generation_failed"),
+            ("queued", False, "generation_failed"),
+            ("queued", True, ""),
+            ("queued", True, "unknown_failure"),
+            ("queued", True, "h3_legal_access_required"),
+        ):
+            with self.subTest(status=status, held=held, reason=reason):
+                stale, may_start = materialize({
+                    **snapshot, "status": status, "queue_held": held,
+                    "failure_details": failure, "_recovery_reason_code": reason,
+                }, projects)
+                self.assertFalse(may_start)
+                self.assertNotEqual(stale["_recovery_reason_code"], "generation_failed")
+                self.assertIsNone(stale["failure_details"])
+                self.assertIsNone(stale["oom_info"])
+                twice, may_start = materialize(stale, projects)
+                self.assertFalse(may_start)
+                self.assertNotEqual(twice["_recovery_reason_code"], "generation_failed")
+                self.assertFalse(namespace["_h3_native_boundary_exact_retry_allowed"](twice))
+        namespace["_job_uses_registered_h3"] = lambda _job: False
 
         prefix_valid["value"] = False
         ordinary, may_start = materialize({

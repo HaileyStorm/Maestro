@@ -2365,3 +2365,48 @@ seconds with ready state 4 and no media error. A browser screenshot is retained
 with the private comparison evidence. This establishes browser playback, not
 human listening or perceptual acceptance. The failed-prefix recovery remains
 held for matching capacity calibration.
+
+### Exact native boundary retry after a non-OOM encoder failure (2026-10-02 UTC)
+
+The retained experimental prefix exposed two recovery routing gaps. Generic
+startup handling assigned a license-hold message to an already queued H3 prefix
+without evaluating its actual retry state. The owner-configured admission
+policy remains unchanged. The calibrated replacement planner accepts only a
+final Ref2VA segment, so its capacity gate cannot authorize the retained native
+FL2VA boundary request.
+
+A narrow manual retry now recognizes only the recorded native boundary encoder
+failure before denoising, explicitly marked non-OOM, with a contiguous verified
+prefix and exactly the final segment missing. Restart keeps it held, with no
+automatic worker or attempt increment. Remote recovery retains owner
+reauthentication. Owner Retry revalidates the sealed request, physical inputs,
+project and ownership, model/legal admission, experimental host gate and attempt
+limit before enqueueing the original request. It does not rewrite the segment
+plan, change allocation, or consume the completed prefix. Repeated startup
+classification requires a previously held queued recovery with a recognized
+reason; running and unheld attempts cannot use stale failure details. OOM and
+unknown prefixes preserve calibration across registered-H3 startup and owner
+reauthentication. A later rejected host or admission gate retains the held
+action after successful input revalidation. New admitted attempts clear their
+current failure envelope. Startup also clears stale envelopes from interrupted
+or unheld pre-fix snapshots, unrecognized holds, and generic legal holds after
+a previous retry; earlier journal entries retain the failure history. Ambiguous
+legacy recovery keeps calibration rather than claiming an exact known failure.
+
+The affected recovery module passed 185 checks. After identifying the earlier
+registered-H3 startup branch, three focused checks additionally passed with
+registered-model identity enabled, including local and remote restoration.
+Focused review corrections additionally cover stale attempts, registered-H3
+OOM/unknown holds, remote calibration, and rejection after input validation.
+The actual retained request manifest and first segment artifact also pass a
+read-only CPU preflight. The corrected affected module passed all 185 checks
+again; two focused startup/manual-resume checks passed after the final migration
+guard, including a second startup and conservative unknown recovery.
+
+The coordinated CPU deployment returned local and stable-share health/readiness
+200 with public restart status cleared. The authenticated Queue exposed the
+original prefix for explicit retry. With the experimental host gate disabled,
+Retry rejected the request before enqueue or attempt increment. No new GPU
+inference or recovered final is established. The queued GPU request was withdrawn
+without a grant, and its CPU watcher was stopped with exit 143. A later native
+retry requires a new coherent grant and the explicit experimental host gate.

@@ -7754,9 +7754,15 @@ def _queue_recovery_materialize_job(
                 "recovery_state": "blocked",
                 "reruns_denoise": False,
                 "_recovery_reason_code": (
-                    "h3_generation_recovery_authorization_required"
+                    "generation_failed"
+                    if _h3_native_boundary_exact_retry_allowed(runtime)
+                    else "h3_generation_recovery_authorization_required"
                 ),
-                "message": "Calibrated H3 recovery authorization is required",
+                "message": (
+                    "Retry will reuse the verified completed H3 segment"
+                    if _h3_native_boundary_exact_retry_allowed(runtime)
+                    else "Calibrated H3 recovery authorization is required"
+                ),
                 "error": None,
             })
             return runtime, False
@@ -7798,6 +7804,56 @@ def _queue_recovery_materialize_job(
     if status in {"completed", "failed"}:
         runtime["status"] = status
         runtime["recovery_state"] = "terminal"
+        return runtime, False
+
+    held_prefix_reason = snapshot.get("_recovery_reason_code") in {
+        "generation_failed", "owner_reauthentication_required",
+        "h3_generation_recovery_authorization_required",
+        "h3_peak_calibration_required", "h3_legal_access_required",
+    }
+    if (
+        status != "queued" or snapshot.get("queue_held") is not True
+        or not held_prefix_reason
+        or (
+            snapshot.get("_recovery_reason_code") == "h3_legal_access_required"
+            and snapshot.get("recovery_attempt", 0) != 0
+        )
+    ):
+        # Pre-fix journals can retain an older failure on an interrupted
+        # attempt. Its result is unknown; history remains in earlier records.
+        runtime["failure_details"] = None
+        runtime["oom_info"] = None
+
+    if (
+        status == "queued"
+        and snapshot.get("queue_held") is True
+        and held_prefix_reason
+        and _h3_incomplete_recovery_prefix(runtime) is not None
+    ):
+        # Preserve the prefix recovery class across repeated restarts.
+        # Legal/model admission is rechecked by owner Retry.
+        exact_native_retry = _h3_native_boundary_exact_retry_allowed(runtime)
+        retry_reason = (
+            "generation_failed" if exact_native_retry
+            else "h3_peak_calibration_required"
+            if snapshot.get("_recovery_reason_code") == "h3_peak_calibration_required"
+            else "h3_generation_recovery_authorization_required"
+        )
+        runtime.update({
+            "status": "queued", "queue_held": True, "reruns_denoise": False,
+            "recovery_state": "blocked_remote_reauth" if remote else "blocked",
+            "_recovery_reason_code": (
+                "owner_reauthentication_required" if remote
+                else retry_reason
+            ),
+            "message": (
+                "Owner reauthentication is required to resume" if remote
+                else "Retry will reuse the verified completed H3 segment"
+                if exact_native_retry
+                else "Calibrated H3 recovery authorization is required"
+            ),
+            "error": None,
+        })
         return runtime, False
 
     # Executable H3 recovery remains visible but held.  Preserve its prior
@@ -10683,6 +10739,47 @@ def _h3_incomplete_recovery_prefix(job: dict) -> int | None:
     except (AttributeError, TypeError, ValueError):
         return None
     return prefix if prefix == clip_count - 1 else None
+
+
+def _h3_native_boundary_exact_retry_allowed(job: dict) -> bool:
+    """Recognize a pre-denoise, non-OOM boundary failure for manual exact retry.
+
+    The caller must revalidate the sealed request and physical prefix first.
+    This never authorizes automatic work or a replacement allocation plan.
+    """
+    params = job.get("params")
+    params = params if isinstance(params, dict) else {}
+    longform = params.get("_h3_longform")
+    if (
+        params.get("h3_native_boundary_conditioning") is not True
+        or not isinstance(longform, dict)
+        or longform.get("native_boundary_conditioning") is not True
+    ):
+        return False
+    failure = job.get("failure_details")
+    if (
+        not isinstance(failure, dict)
+        or failure.get("code") != "h3_boundary_encode_failed"
+        or failure.get("is_oom") is not False
+        or failure.get("stage") != "denoise"
+        or job.get("oom_info") is not None
+        or job.get("resource_retry_reason") == "generation_oom"
+    ):
+        return False
+    step = failure.get("step")
+    segment = failure.get("segment")
+    if (
+        not isinstance(step, dict) or type(step.get("current")) is not int
+        or step["current"] != 0 or not isinstance(segment, dict)
+        or type(segment.get("current")) is not int
+        or type(segment.get("total")) is not int
+        or type(longform.get("clip_count")) is not int
+        or segment["current"] != segment["total"]
+        or segment["total"] != longform["clip_count"]
+    ):
+        return False
+    prefix = _h3_incomplete_recovery_prefix(job)
+    return prefix is not None and prefix > 0
 
 
 def _replan_h3_final_segment_for_peak(
@@ -73970,8 +74067,31 @@ def _resume_recovered_job(
                     reason, "Recovery evidence is missing or changed",
                 ),
             )
+        # Successful input validation clears its diagnostic reason. Keep the
+        # held action available if a later admission or host gate rejects it.
+        job["_recovery_reason_code"] = reason
         if _queue_recovery_delivery_pending(job) is None:
             _require_job_runtime_model_admission(job)
+        if (
+            reason in {"owner_reauthentication_required", "h3_legal_access_required"}
+            and isinstance((job.get("params") or {}).get("_h3_longform"), dict)
+            and _h3_incomplete_recovery_prefix(job) is not None
+        ):
+            # Reauthentication restores access, not permission to replay an
+            # OOM or unknown H3 failure with its unchanged allocation plan.
+            reason = "h3_generation_recovery_authorization_required"
+            legal_resume = False
+        if reason in {
+            "generation_failed", "owner_reauthentication_required",
+            "h3_generation_recovery_authorization_required", "h3_peak_calibration_required",
+        } and _h3_native_boundary_exact_retry_allowed(job):
+            try:
+                _require_h3_native_boundary_experimental(job.get("params") or {})
+            except ValueError as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+            # Reuse the unchanged manifest and prefix. Calibrated replacement
+            # currently supports Ref2VA, not native FL2VA AV boundary history.
+            reason = "generation_failed"
         if reason in {
             "h3_generation_recovery_authorization_required",
             "h3_peak_calibration_required",
@@ -74036,6 +74156,10 @@ def _resume_recovered_job(
             recovery_attempt=attempt,
             recovery_state="retrying",
             reruns_denoise=reruns_denoise,
+            # Previous journal entries retain the failed attempt. A newly
+            # admitted attempt must not inherit its exact-failure authority.
+            failure_details=None,
+            oom_info=None,
             message="Queued for recovery",
             session_id=request.state.maestro_session_id,
             access_policy={
