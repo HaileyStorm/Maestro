@@ -7814,10 +7814,7 @@ def _queue_recovery_materialize_job(
     if (
         status != "queued" or snapshot.get("queue_held") is not True
         or not held_prefix_reason
-        or (
-            snapshot.get("_recovery_reason_code") == "h3_legal_access_required"
-            and snapshot.get("recovery_attempt", 0) != 0
-        )
+        or snapshot.get("_recovery_reason_code") == "h3_legal_access_required"
     ):
         # Pre-fix journals can retain an older failure on an interrupted
         # attempt. Its result is unknown; history remains in earlier records.
@@ -74084,7 +74081,8 @@ def _resume_recovered_job(
         if reason in {
             "generation_failed", "owner_reauthentication_required",
             "h3_generation_recovery_authorization_required", "h3_peak_calibration_required",
-        } and _h3_native_boundary_exact_retry_allowed(job):
+        } and job.get("_recovery_reason_code") != "h3_legal_access_required" \
+            and _h3_native_boundary_exact_retry_allowed(job):
             try:
                 _require_h3_native_boundary_experimental(job.get("params") or {})
             except ValueError as error:

@@ -2389,8 +2389,8 @@ unknown prefixes preserve calibration across registered-H3 startup and owner
 reauthentication. A later rejected host or admission gate retains the held
 action after successful input revalidation. New admitted attempts clear their
 current failure envelope. Startup also clears stale envelopes from interrupted
-or unheld pre-fix snapshots, unrecognized holds, and generic legal holds after
-a previous retry; earlier journal entries retain the failure history. Ambiguous
+or unheld pre-fix snapshots, unrecognized holds, and generic legal holds,
+including attempt zero; earlier journal entries retain the failure history. Ambiguous
 legacy recovery keeps calibration rather than claiming an exact known failure.
 
 The affected recovery module passed 185 checks. After identifying the earlier

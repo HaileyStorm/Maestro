@@ -6338,7 +6338,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
         self.assertNotIn("calibration", calls)
         self.assertEqual(job["params"], params)
         self.assertEqual(job["recovery_cursor"], cursor)
-        for mutation in ("oom", "remote_oom", "remote_unknown", "legal_oom", "legal_unknown", "missing_input", "other_owner", "attempt_limit"):
+        for mutation in ("oom", "remote_oom", "remote_unknown", "legal_known", "legal_oom", "legal_unknown", "missing_input", "other_owner", "attempt_limit"):
             job.clear(); job.update(copy.deepcopy(base)); started.clear(); calls.clear()
             gates["inputs"] = mutation != "missing_input"
             selected = request
@@ -6348,10 +6348,10 @@ class QueueLaunchWiringTests(unittest.TestCase):
                             "_recovery_reason_code": "owner_reauthentication_required"})
                 if mutation == "remote_oom": job["failure_details"]["is_oom"] = True
                 else: job["failure_details"]["code"] = "unknown_failure"
-            if mutation in {"legal_oom", "legal_unknown"}:
+            if mutation.startswith("legal_"):
                 job["_recovery_reason_code"] = "h3_legal_access_required"
                 if mutation == "legal_oom": job["failure_details"]["is_oom"] = True
-                else: job["failure_details"] = None
+                elif mutation == "legal_unknown": job["failure_details"] = None
             if mutation == "other_owner": selected = types.SimpleNamespace(state=types.SimpleNamespace(maestro_session_id="other"))
             if mutation == "attempt_limit": job["recovery_attempt"] = 3
             with self.subTest(mutation=mutation), self.assertRaises(FakeHTTPException):
@@ -6360,7 +6360,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
             self.assertNotIn("enqueue", calls)
             self.assertEqual(job["params"], params)
             self.assertEqual(job["recovery_cursor"], cursor)
-            if mutation in {"oom", "remote_oom", "remote_unknown", "legal_oom", "legal_unknown"}: self.assertIn("calibration", calls)
+            if mutation in {"oom", "remote_oom", "remote_unknown", "legal_known", "legal_oom", "legal_unknown"}: self.assertIn("calibration", calls)
 
     def test_held_incomplete_h3_restart_restores_exact_prepare_authority(self):
         prefix_valid = {"value": True}
@@ -6502,17 +6502,15 @@ class QueueLaunchWiringTests(unittest.TestCase):
             "segment": {"current": 5, "total": 5},
         }
         namespace["_job_uses_registered_h3"] = lambda _job: True
-        for status, reason in (("failed", ""), ("queued", "h3_peak_calibration_required"),
-                              ("queued", "h3_legal_access_required")):
+        for status, reason in (("failed", ""), ("queued", "h3_peak_calibration_required")):
             restored_native, may_start = materialize({
                 **snapshot, "status": status, "failure_details": failure,
                 "_recovery_reason_code": reason,
-                "recovery_attempt": 0 if reason == "h3_legal_access_required" else 2,
             }, projects)
             self.assertFalse(may_start)
             self.assertTrue(restored_native["queue_held"])
             self.assertEqual(restored_native["_recovery_reason_code"], "generation_failed")
-            self.assertEqual(restored_native["recovery_attempt"], 0 if reason == "h3_legal_access_required" else 2)
+            self.assertEqual(restored_native["recovery_attempt"], 2)
             self.assertEqual(restored_native["params"], sealed_params)
         self.assertEqual(next_attempt_calls, [])
         remote_native, may_start = materialize({
@@ -6532,17 +6530,19 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 self.assertFalse(may_start)
                 self.assertTrue(conservative["queue_held"])
                 self.assertEqual(conservative["_recovery_reason_code"], "h3_peak_calibration_required")
-        for status, held, reason in (
-            ("running", True, "generation_failed"),
-            ("queued", False, "generation_failed"),
-            ("queued", True, ""),
-            ("queued", True, "unknown_failure"),
-            ("queued", True, "h3_legal_access_required"),
+        for status, held, reason, attempt in (
+            ("running", True, "generation_failed", 2),
+            ("queued", False, "generation_failed", 2),
+            ("queued", True, "", 2),
+            ("queued", True, "unknown_failure", 2),
+            ("queued", True, "h3_legal_access_required", 2),
+            ("queued", True, "h3_legal_access_required", 0),
         ):
             with self.subTest(status=status, held=held, reason=reason):
                 stale, may_start = materialize({
                     **snapshot, "status": status, "queue_held": held,
                     "failure_details": failure, "_recovery_reason_code": reason,
+                    "recovery_attempt": attempt,
                 }, projects)
                 self.assertFalse(may_start)
                 self.assertNotEqual(stale["_recovery_reason_code"], "generation_failed")
