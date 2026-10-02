@@ -2226,7 +2226,9 @@ Retry after startup compaction retired its coordinator registration and request
 manifest. Retry failed before GPU work. These gaps remain open; do not count the
 ordinary arm as durable queue recovery acceptance or claim a completed pair,
 continuity improvement, browser playback or human quality acceptance. Original
-media, partial experimental staging and private negative receipts are retained.
+baseline media and private negative receipts are retained. Startup cleanup
+already removed the failed arm's unsealed partial staging file and request;
+neither is present in the project root or quarantine.
 
 The temporary host flag was restored byte-for-byte to its prior configuration.
 A coordinated Pinokio restart unloaded the model; the fresh signed-in Studio
@@ -2256,7 +2258,7 @@ source review agrees with the shared retention policy. No full-suite rerun or
 new GPU job was used.
 
 This prevents future automatic loss; it does not recreate the experimental
-job's already-retired request. The completed baseline's missing consumed
+job's already-retired request or removed partial media. The completed baseline's missing consumed
 continuation remains a separate final-closure repair. Its intact media and
 negative history are preserved, and no successful paired qualification is
 claimed.
