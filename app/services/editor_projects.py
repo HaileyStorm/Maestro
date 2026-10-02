@@ -45,6 +45,7 @@ _EDITOR_UPSCALE_METHODS = {
     "flashvsr2pass4",
 }
 _EDITOR_FONT_FAMILIES = {
+    "DejaVu Sans",
     "Arial",
     "Arial Black",
     "Georgia",
@@ -313,6 +314,8 @@ def create_output_video_timeline(
         height=int(media.get("height") or 1080),
         fps=float(media.get("fps") or 30),
     )
+    project["canvas"]["width"] += project["canvas"]["width"] % 2
+    project["canvas"]["height"] += project["canvas"]["height"] % 2
     project["id"] = identity
     project["assets"]["source-video"] = {
         "id": "source-video",
@@ -339,12 +342,14 @@ def create_output_video_timeline(
 def apply_output_video_trim(
     current: Mapping[str, Any], proposed: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Accept only source trim values; all other persisted data stays server-owned."""
+    """Accept trims/order and bounded titles; source identity stays server-owned."""
     if (
         proposed.get("id") != current.get("id")
         or proposed.get("workspace") != current.get("workspace")
     ):
         raise EditorProjectError("Editor project belongs to a different workspace")
+    if not isinstance(proposed.get("tracks"), list) or any(not isinstance(track, Mapping) for track in proposed["tracks"]):
+        raise EditorProjectError("Select valid Editor tracks")
     try:
         originals = editor_sequence_clips(current)
         proposed_items = next(track for track in proposed["tracks"] if track.get("id") == "video-main")["items"]
@@ -379,7 +384,74 @@ def apply_output_video_trim(
         track["items"] = items
     except (KeyError, IndexError, StopIteration, TypeError, ValueError):
         raise EditorProjectError("Select a valid source range") from None
+    incoming_titles = [track for track in proposed.get("tracks", []) if track.get("id") == "titles-main"]
+    if incoming_titles:
+        if len(incoming_titles) != 1:
+            raise EditorProjectError("Select a valid text layer")
+        titles = next(track for track in updated["tracks"] if track["id"] == "titles-main")
+        plan = editor_text_layers({**updated, "tracks": [incoming_titles[0]]})
+        titles["items"] = [_editor_title_item(item) for item in plan]
     return updated
+
+
+def _editor_title_item(plan: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "id": plan["id"], "text": plan["text"], "start": float(plan["start"]),
+        "duration": float(plan["duration"]), "position": plan["position"],
+        "source_in": 0.0, "speed": 1.0, "volume": 1.0, "opacity": 1.0,
+        "fade_in": 0.0, "fade_out": 0.0, "transition_in": "none", "transition_out": "none",
+        "transform": {"x": 0.0, "y": 0.0, "scale": 1.0, "rotation": 0.0},
+        "fit": "contain", "muted": False, "disabled": False,
+        "style": {"x": 0.0, "y": 0.0, "font_family": "DejaVu Sans", "font_size": 64,
+                  "color": "#ffffff", "background_color": "#000000",
+                  "background_opacity": 0.6, "text_align": "center"},
+    }
+
+
+def editor_text_layers(project: Mapping[str, Any], *, require_fit: bool = False) -> list[dict]:
+    """Compile only native timed titles. Unsupported effects never disappear."""
+    try:
+        tracks = [track for track in project["tracks"] if track.get("id") == "titles-main"]
+        if not tracks:
+            return []
+        if len(tracks) != 1:
+            raise ValueError()
+        track = tracks[0]
+        if (track.get("type") != "text" or track.get("muted") or track.get("locked")
+                or track.get("volume", 1.0) != 1.0 or track.get("z_index", 10) != 10):
+            raise ValueError()
+        items = track["items"]
+        if not isinstance(items, list) or len(items) > 8:
+            raise ValueError()
+        result, ids = [], set()
+        for item in items:
+            plan = {key: item[key] for key in ("id", "text", "start", "duration", "position")}
+            text, start, length = plan["text"], plan["start"], plan["duration"]
+            if (not isinstance(plan["id"], str) or not _PROJECT_ID_RE.fullmatch(plan["id"])
+                    or plan["id"] in ids or not isinstance(text, str) or len(text) > 160
+                    or text.count("\n") > 2 or any(ord(char) < 32 and char != "\n" for char in text)
+                    or plan["position"] not in {"top", "center", "bottom"}
+                    or type(start) not in (int, float) or type(length) not in (int, float)
+                    or not math.isfinite(start) or not math.isfinite(length)
+                    or start < 0 or length < 1 / 240 or start + length > 86400):
+                raise ValueError()
+            canonical = _editor_title_item(plan)
+            if any(key not in canonical or value != canonical[key] for key, value in item.items()):
+                raise ValueError()
+            ids.add(plan["id"])
+            result.append(plan)
+        if require_fit:
+            clips = next(track["items"] for track in project["tracks"] if track["id"] == "video-main")
+            fps = project["canvas"]["fps"]
+            title_fps = fps if len(clips) > 1 else project["assets"][clips[0]["asset_id"]].get("fps", fps) or fps
+            end = (sum(max(1, round(clip["duration"] * fps)) for clip in clips) / fps
+                   if len(clips) > 1 else clips[0]["duration"])
+            if any(item["start"] + item["duration"] > end + 1e-6
+                   or item["duration"] < 1 / title_fps - 1e-9 for item in result):
+                raise ValueError()
+        return result
+    except (KeyError, StopIteration, TypeError, ValueError):
+        raise EditorProjectError("Use up to eight text layers, three lines and 160 characters each, with valid times and top, center or bottom placement. Text must last at least one video frame and end within the exported cut.") from None
 
 
 def editor_sequence_clips(project: Mapping[str, Any]) -> list[tuple[dict, dict]]:
@@ -389,8 +461,9 @@ def editor_sequence_clips(project: Mapping[str, Any]) -> list[tuple[dict, dict]]
         main = [track for track in tracks if track["id"] == "video-main"]
         if len(main) != 1 or main[0].get("type") != "video":
             raise ValueError()
-        if any(track.get("items") for track in tracks if track is not main[0]):
+        if any(track.get("items") for track in tracks if track is not main[0] and track.get("id") != "titles-main"):
             raise ValueError()
+        editor_text_layers(project)
         if main[0].get("muted") or main[0].get("locked"):
             raise ValueError()
         clips = main[0]["items"]
@@ -746,6 +819,10 @@ def normalize_editor_project(project: Mapping[str, Any], *, workspace: str | Non
             # edit point but cannot occupy the same time range. Normalize old
             # or externally edited projects by retaining their order and
             # moving any overlap to the preceding clip's end.
+            # Native titles are overlapping layers; retain their stacking order.
+            if track_type == "text" and track_id == "titles-main":
+                tracks.append({**dict(raw_track), "id": track_id, "type": track_type, "items": items})
+                continue
             items.sort(key=lambda item: (item["start"], item["id"]))
             previous_end = 0.0
             for item in items:

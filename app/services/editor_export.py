@@ -16,6 +16,63 @@ from typing import Callable
 from shared.utils.media_encoder import run_encoder
 
 
+def _title_filters(layers: list[dict] | None, directory: Path, *, width: int, height: int,
+                   duration: float, fps: float, first_input: int, base: str) -> tuple[list[str], list[str], str]:
+    """Rasterize literal title text; only validated numbers enter FFmpeg filters."""
+    from services.editor_projects import editor_text_layers
+    from PIL import Image, ImageDraw, ImageFont
+
+    plans = editor_text_layers({"tracks": [{"id": "titles-main", "type": "text", "items": layers or []}]})
+    if not plans:
+        return [], [], base
+    if (type(width) is not int or type(height) is not int
+            or not 64 <= width <= 7680 or not 64 <= height <= 4320
+            or type(fps) not in (int, float) or not math.isfinite(fps) or not 1 <= fps <= 120
+            or any(item["start"] + item["duration"] > duration + 1e-6
+                   or item["duration"] < 1 / fps - 1e-9 for item in plans)):
+        raise ValueError("Editor title canvas or time range is invalid")
+    font_path = Path(__file__).resolve().parents[2] / "ui/public/editor-fonts/DejaVuSans.ttf"
+    inputs, filters = [], []
+    label = base
+    for item in plans:
+        if not item["text"].strip():
+            continue
+        lines = item["text"].split("\n")
+        size = max(1, round(height * 0.05))
+        padding = max(1, round(height * 0.015))
+        while True:
+            font = ImageFont.truetype(str(font_path), size)
+            text_width = max(font.getlength(line) for line in lines)
+            if text_width + 2 * padding <= width * 0.9 or size == 1:
+                break
+            size -= 1
+        line_height = max(1, round(size * 1.2))
+        box_width = math.ceil(text_width) + 2 * padding
+        box_height = len(lines) * line_height + 2 * padding
+        image = Image.new("RGBA", (box_width, box_height), (0, 0, 0, round(255 * 0.6)))
+        draw = ImageDraw.Draw(image)
+        for index, line in enumerate(lines):
+            draw.text(((box_width - font.getlength(line)) / 2, padding + index * line_height),
+                      line, font=font, fill="white", anchor="lt")
+        if box_width > width * 0.9:
+            box_width = max(1, math.floor(width * 0.9))
+            image = image.resize((box_width, box_height), Image.Resampling.LANCZOS)
+        number = len(inputs) // 2
+        path = directory / f"title-{number}.png"
+        image.save(path)
+        inputs += ["-i", str(path)]
+        x = (width - box_width) // 2
+        margin = round(height * 0.06)
+        y = {"top": margin, "center": (height - box_height) // 2,
+             "bottom": height - margin - box_height}[item["position"]]
+        start, end = _seconds(item["start"], allow_zero=True), _seconds(item["start"] + item["duration"])
+        output = f"title_v{number}"
+        filters.append(f"[{label}][{first_input + number}:v]overlay=x={x}:y={y}:"
+                       f"eof_action=repeat:enable='gte(t,{start})*lt(t,{end})'[{output}]")
+        label = output
+    return inputs, filters, label
+
+
 def _seconds(value: object, *, allow_zero: bool = False) -> str:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError("Editor cut times must be finite numbers")
@@ -31,6 +88,8 @@ def render_single_source_cut(
     *,
     source_in: float,
     duration: float,
+    text_layers: list[dict] | None = None,
+    canvas: dict | None = None,
     abort_check: Callable[[], object] | None = None,
     timeout: float = 3600,
     runner: Callable[..., int] | None = None,
@@ -75,14 +134,25 @@ def render_single_source_cut(
     os.close(descriptor)
     temporary = Path(temporary_name)
     published = False
+    titles = tempfile.TemporaryDirectory(prefix=".editor-titles-", dir=destination_path.parent)
     try:
+        title_inputs, title_filters, label = _title_filters(
+            text_layers, Path(titles.name), width=(canvas or {}).get("width", 0),
+            height=(canvas or {}).get("height", 0), duration=float(length), fps=(canvas or {}).get("fps", 30), first_input=1, base="cut",
+        )
+        video_options = (["-filter_complex_threads", "2", "-filter_complex",
+                          ";".join([f"[0:v:0]setpts=PTS-STARTPTS,scale={canvas['width']}:{canvas['height']}:"
+                                    "force_original_aspect_ratio=decrease:force_divisible_by=2,"
+                                    f"pad={canvas['width']}:{canvas['height']}:(ow-iw)/2:(oh-ih)/2,setsar=1[cut]",
+                                    *title_filters]), "-map", f"[{label}]"]
+                         if text_layers else ["-map", "0:v:0", "-vf", "setpts=PTS-STARTPTS"])
         command = [
             os.environ.get("FFMPEG_BINARY") or "ffmpeg",
             "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-            "-ss", start, "-i", str(source_path), "-t", length,
-            "-map", "0:v:0", "-map", "0:a?",
+            "-ss", start, "-i", str(source_path), *title_inputs, "-t", length,
+            *video_options, "-map", "0:a?",
             "-map_metadata", "-1", "-map_chapters", "-1",
-            "-vf", "setpts=PTS-STARTPTS", "-af", "asetpts=PTS-STARTPTS",
+            "-af", "asetpts=PTS-STARTPTS",
             "-fps_mode", "passthrough", "-threads", "2",
             "-c:v", "libx264", "-preset", "medium", "-crf", "18",
             "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
@@ -99,6 +169,7 @@ def render_single_source_cut(
         published = True
         return str(destination_path)
     finally:
+        titles.cleanup()
         try:
             temporary.unlink()
         except FileNotFoundError:
@@ -112,6 +183,7 @@ def render_single_source_cut(
 def render_video_sequence(
     clips: list[dict], destination: str | os.PathLike[str], *,
     width: int, height: int, fps: float,
+    text_layers: list[dict] | None = None,
     abort_check: Callable[[], object] | None = None,
     timeout: float = 3600, runner: Callable[..., int] | None = None,
 ) -> str:
@@ -175,9 +247,16 @@ def render_video_sequence(
     descriptor, temporary_name = tempfile.mkstemp(prefix=".editor-sequence-", suffix=".mp4", dir=destination_path.parent)
     os.close(descriptor)
     temporary = Path(temporary_name)
+    titles = tempfile.TemporaryDirectory(prefix=".editor-titles-", dir=destination_path.parent)
     try:
+        title_inputs, title_filters, label = _title_filters(
+            text_layers, Path(titles.name), width=width, height=height,
+            duration=total_frames / fps, fps=fps, first_input=len(clips), base="v",
+        )
+        command += title_inputs
+        filters += title_filters
         command += ["-filter_complex_threads", "2", "-filter_complex", ";".join(filters),
-                    "-map", "[v]", "-map", "[a]", "-map_metadata", "-1", "-map_chapters", "-1",
+                    "-map", f"[{label}]", "-map", "[a]", "-map_metadata", "-1", "-map_chapters", "-1",
                     "-threads", "2", "-c:v", "libx264", "-preset", "medium", "-crf", "18",
                     "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
                     "-movflags", "+faststart", str(temporary)]
@@ -190,6 +269,7 @@ def render_video_sequence(
         os.link(temporary, destination_path)
         return str(destination_path)
     finally:
+        titles.cleanup()
         try:
             temporary.unlink()
         except OSError:

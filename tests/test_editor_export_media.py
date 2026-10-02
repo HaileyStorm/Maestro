@@ -24,6 +24,76 @@ FFPROBE = shutil.which("ffprobe")
 
 @unittest.skipUnless(FFMPEG and FFPROBE, "ffmpeg and ffprobe are required")
 class EditorExportMediaTests(unittest.TestCase):
+    def test_title_positions_stacking_and_narrow_canvas_fit(self):
+        from services.editor_export import _title_filters
+        from PIL import Image
+        _title_filters([{"id": "long", "text": "W" * 160, "start": 0, "duration": 1, "position": "top"}],
+            self.root, width=64, height=64, duration=1, fps=24, first_input=1, base="cut")
+        with Image.open(self.root / "title-0.png") as raster:
+            self.assertLessEqual(raster.width, 64 * 0.9)
+        source = self.root / "positions.mkv"
+        self.run_media([FFMPEG, "-v", "error", "-f", "lavfi", "-i", "color=black:s=128x72:r=24:d=1",
+            "-c:v", "libx264", "-threads", "2", str(source)])
+        first = {"id": "wide", "text": "MMMMMMMM", "start": 0, "duration": 1, "position": "top"}
+        second = {**first, "id": "narrow", "text": "IIIIIIII"}
+        pixels = []
+        for index, layers in enumerate(([first, second], [second, first], [{**first, "position": "bottom"}])):
+            destination = self.root / f"position-{index}.mp4"
+            render_single_source_cut(source, destination, source_in=0, duration=1, text_layers=layers,
+                canvas={"width": 128, "height": 72, "fps": 24}, timeout=30)
+            frame = self.run_media([FFMPEG, "-v", "error", "-i", str(destination), "-frames:v", "1",
+                "-pix_fmt", "rgb24", "-f", "rawvideo", "-"])
+            pixels.append(frame)
+            rows = [row for row in range(72) if max(frame[row * 384:(row + 1) * 384]) > 80]
+            self.assertTrue(rows)
+            self.assertLess(max(rows), 20) if index < 2 else self.assertGreater(min(rows), 50)
+        self.assertNotEqual(pixels[0], pixels[1])
+
+    def test_blank_title_still_fits_odd_source_to_saved_canvas(self):
+        source = self.root / "odd.mkv"
+        self.run_media([FFMPEG, "-v", "error", "-f", "lavfi", "-i", "testsrc=size=127x71:rate=24:duration=1",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-map", "0:v", "-map", "1:a",
+            "-c:v", "ffv1", "-threads", "2", "-c:a", "pcm_s16le", str(source)])
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        destination = self.root / "blank.mp4"
+        render_single_source_cut(source, destination, source_in=0, duration=1,
+            text_layers=[{"id": "blank", "text": "", "start": 0, "duration": 1, "position": "top"}],
+            canvas={"width": 128, "height": 72, "fps": 24}, timeout=30)
+        streams = json.loads(self.run_media([FFPROBE, "-v", "error", "-show_streams", "-of", "json", str(destination)]))["streams"]
+        self.assertEqual((streams[0]["width"], streams[0]["height"]), (128, 72))
+        self.assertEqual([stream["codec_type"] for stream in streams], ["video", "audio"])
+        self.assertAlmostEqual(float(streams[0]["duration"]), 1, delta=0.001)
+        self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), digest)
+        self.assertFalse(list(self.root.glob(".editor-titles-*")))
+
+    def test_literal_titles_have_half_open_times_across_a_join_and_keep_all_cut_audio(self):
+        source = self.root / "black.mkv"
+        self.run_media([FFMPEG, "-v", "error", "-f", "lavfi", "-i", "color=black:s=128x72:r=24:d=3",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=3", "-f", "lavfi", "-i", "sine=frequency=660:duration=3",
+            "-map", "0:v", "-map", "1:a", "-map", "2:a", "-c:v", "libx264", "-threads", "2", "-c:a", "aac", str(source)])
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        layer = {"id": "literal", "text": "[v]; 'hello' %{text}", "start": 0.75, "duration": 0.5, "position": "center"}
+        for sequence in (False, True):
+            destination = self.root / f"titles-{sequence}.mp4"
+            if sequence:
+                render_video_sequence([{"path": source, "source_in": 0, "duration": 1, "has_audio": True}] * 2,
+                    destination, width=128, height=72, fps=24, text_layers=[layer], timeout=30)
+            else:
+                render_single_source_cut(source, destination, source_in=0.5, duration=2,
+                    text_layers=[layer], canvas={"width": 128, "height": 72}, timeout=30)
+            streams = self.probe(destination)["streams"]
+            self.assertEqual(len([item for item in streams if item["codec_type"] == "audio"]), 1 if sequence else 2)
+            self.assertAlmostEqual(float(streams[0]["duration"]), 2, delta=0.001)
+            frames = self.run_media([FFMPEG, "-v", "error", "-i", str(destination), "-map", "0:v", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"])
+            stride = 128 * 72 * 3
+            self.assertEqual(len(frames), stride * 48)
+            for frame in (0, 17, 30, 47):
+                self.assertLess(max(frames[frame * stride:(frame + 1) * stride]), 12)
+            for frame in (18, 23, 24, 29):
+                self.assertGreater(max(frames[frame * stride:(frame + 1) * stride]), 150)
+        self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), digest)
+        self.assertFalse(list(self.root.glob(".editor-titles-*")))
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

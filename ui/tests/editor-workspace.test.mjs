@@ -16,12 +16,12 @@ const server = await createServer({
     name: 'editor-test-transforms',
     transform(code, id) {
       if (id.endsWith('/src/editor/EditorWorkspace.tsx')) {
-        return `${code}\nexport { changeTrim, moveClip, availableVideos };`
+        return `${code}\nexport { changeTrim, moveClip, availableVideos, addText, changeText, textLayers, renderedDuration };`
       }
     },
   }],
 })
-const { changeTrim, moveClip, availableVideos } = await server.ssrLoadModule('/src/editor/EditorWorkspace.tsx')
+const { changeTrim, moveClip, availableVideos, addText, changeText, textLayers, renderedDuration } = await server.ssrLoadModule('/src/editor/EditorWorkspace.tsx')
 after(() => server.close())
 
 function sequenceProject() {
@@ -40,6 +40,28 @@ function sequenceProject() {
     ] }, { id: 'retained-track', name: 'Retained', type: 'text', items: [] }],
   }
 }
+
+test('text CRUD retains absolute times and source identity through trim/reorder', () => {
+  const original = sequenceProject()
+  const titled = addText(original, 'text-one', 2, 4)
+  const edited = changeText(titled, 'text-one', { text: 'Literal [v]; fiction', position: 'center' })
+  assert.deepEqual(textLayers(edited).map(item => [item.start, item.duration, item.text]), [[2, 4, 'Literal [v]; fiction']])
+  const reordered = moveClip(changeTrim(edited, 'clip-b', 3, 5), 'clip-c', -1)
+  assert.deepEqual(textLayers(reordered), textLayers(edited))
+  assert.equal(reordered.assets, original.assets)
+  assert.equal(reordered.canvas, original.canvas)
+  assert.deepEqual(textLayers(changeText(reordered, 'text-one', null)), [])
+  assert.equal(textLayers(original).length, 0)
+})
+
+test('sequence title clock matches frame rounding and enforces the eight-layer limit', () => {
+  let project = sequenceProject()
+  project.canvas.fps = 24
+  project.tracks[0].items.forEach(item => { item.duration = 0.55 })
+  assert.equal(renderedDuration(project), 39 / 24)
+  for (let index = 0; index < 8; index++) project = addText(project, `text-${index}`, 0, 1)
+  assert.equal(addText(project, 'overflow', 0, 1), project)
+})
 
 test('trim applies to the selected source and shifts only later sequence starts', () => {
   const original = sequenceProject()

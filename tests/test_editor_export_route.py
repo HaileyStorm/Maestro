@@ -254,6 +254,21 @@ class EditorExportRouteTests(unittest.TestCase):
         self.assertEqual(unsupported.exception.status_code, 422)
         self.assertFalse(self.registered)
 
+    def test_supported_title_is_sealed_with_single_source_and_canvas(self):
+        from services.editor_projects import apply_output_video_trim
+        proposed = copy.deepcopy(self.timeline)
+        proposed["tracks"][2]["items"] = [{
+            "id": "text", "text": "Literal [v]; adult fiction", "start": 0.5, "duration": 1, "position": "bottom",
+        }]
+        self.timeline = save_editor_project(str(self.outputs), "scene",
+            apply_output_video_trim(self.timeline, proposed), expected_revision=1)
+        self.submit()
+        params = self.registered[0][0]["params"]
+        self.assertEqual(params["editor_text_layers"], proposed["tracks"][2]["items"])
+        self.assertEqual(params["editor_canvas"], self.timeline["canvas"])
+        self.assertIsInstance(params["editor_source_path"], str)
+        self.assertTrue(params["private_output"])
+
     def test_unsupported_clip_effect_is_rejected_instead_of_silently_omitted(self):
         timeline = load_editor_project(str(self.outputs), "scene", self.timeline["id"])
         timeline["tracks"][0]["items"][0]["fade_in"] = 0.5
@@ -345,6 +360,29 @@ class EditorExportRouteTests(unittest.TestCase):
         self.assertNotIn("multi_clip_info", sidecar["params"])
         self.assertTrue(sidecar["private"])
         self.assertTrue(sidecar["explicit"])
+        self.assertEqual(self.source.read_bytes(), b"original-video")
+
+    def test_title_worker_receives_sealed_plan_and_drops_inherited_regeneration_recipe(self):
+        from services.editor_projects import apply_output_video_trim
+        proposed = copy.deepcopy(self.timeline)
+        layer = {"id": "one", "text": "TITLE", "start": 0.5, "duration": 1, "position": "center"}
+        proposed["tracks"][2]["items"] = [layer]
+        self.timeline = save_editor_project(str(self.outputs), "scene",
+            apply_output_video_trim(self.timeline, proposed), expected_revision=1)
+        job = self.worker_namespace()
+        def render(_source, destination, **options):
+            self.assertEqual(options["text_layers"], [layer])
+            self.assertEqual(options["canvas"], self.timeline["canvas"])
+            Path(destination).write_bytes(b"rendered-video")
+        with mock.patch("services.editor_export.render_single_source_cut", side_effect=render), \
+             mock.patch("services.editor_projects.probe_media", return_value={
+                 "type": "video", "duration": 3.0, "size": 14, "has_audio": True, "width": 128, "height": 72,
+             }):
+            self.assertTrue(self.ns["_run_tool_editor_export"](job["id"]))
+        sidecar = json.loads((self.project / job["output_files"][0]).with_suffix(".meta.json").read_text())
+        self.assertIsNone(sidecar["params"])
+        self.assertEqual(sidecar["transform"]["text_layers"], [layer])
+        self.assertTrue(sidecar["private"])
         self.assertEqual(self.source.read_bytes(), b"original-video")
 
     def test_sequence_worker_rechecks_second_source_before_atomic_publication(self):

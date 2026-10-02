@@ -57,10 +57,15 @@ for (const viewport of [
     await page.setViewportSize({ width: viewport.width, height: viewport.height })
     await skipWelcome(page)
     api!.setAccountScenario('remote-user')
+    await page.route('**/editor-fonts/DejaVuSans.ttf', route => route.fulfill({
+      path: new URL('../public/editor-fonts/DejaVuSans.ttf', import.meta.url).pathname,
+      contentType: 'font/ttf',
+    }))
     const saves: Array<{ expected_revision: number; source_in: number }> = []
     const exports: Array<{ expected_revision: number; url: string }> = []
     const previewRevisions: string[] = []
     let releaseFirstSave!: () => void
+    let savedProject = editorProject(1)
     const firstSaveGate = new Promise<void>(resolve => { releaseFirstSave = resolve })
 
     await page.route(/\/api\/v1\/outputs(?:\?.*)?$/, route => route.fulfill({
@@ -86,7 +91,7 @@ for (const viewport of [
           output_name: VIDEO.name, output_revision: VIDEO.revision,
         })
         await route.fulfill({ status: 200, contentType: 'application/json',
-          body: JSON.stringify({ project: editorProject(1) }) })
+          body: JSON.stringify({ project: savedProject }) })
         return
       }
       expect(request.method()).toBe('PUT')
@@ -94,8 +99,9 @@ for (const viewport of [
       const sourceIn = body.project.tracks[0].items[0].source_in as number
       saves.push({ expected_revision: body.expected_revision, source_in: sourceIn })
       if (saves.length === 1) await firstSaveGate
+      savedProject = { ...body.project, revision: saves.length + 1 }
       await route.fulfill({ status: 200, contentType: 'application/json',
-        body: JSON.stringify({ project: editorProject(saves.length + 1, sourceIn) }) })
+        body: JSON.stringify({ project: savedProject }) })
     })
     await page.route(/\/api\/v1\/projects\/[^/]+\/editor\/projects\/[^/]+\/exports$/, route => {
       exports.push({ expected_revision: route.request().postDataJSON().expected_revision,
@@ -144,6 +150,27 @@ for (const viewport of [
     expect(saves[1].expected_revision).toBe(2)
     expect(saves[1].source_in).toBeGreaterThan(saves[0].source_in)
     await expect(page.getByRole('status').filter({ hasText: 'Draft saved' })).toBeVisible()
+    await page.getByRole('button', { name: 'Add text', exact: true }).click()
+    const title = page.getByLabel('Text', { exact: true })
+    await expect(title).toBeFocused()
+    await title.fill('Field Notes\nLiteral [v]; fiction')
+    await page.getByLabel('Starts at (seconds)', { exact: true }).fill('0.5')
+    await page.getByLabel('Ends at (seconds)', { exact: true }).fill('1.5')
+    await page.getByRole('combobox', { name: 'Position', exact: true }).selectOption('top')
+    await page.getByRole('button', { name: 'Add text', exact: true }).click()
+    await page.getByRole('button', { name: 'Remove text', exact: true }).click()
+    await expect(title).toBeFocused()
+    await expect(title).toHaveValue('Field Notes\nLiteral [v]; fiction')
+    await expect(page.getByRole('status').filter({ hasText: 'Draft saved' })).toBeVisible()
+    await page.getByRole('button', { name: 'Gallery', exact: true }).click()
+    await open.click()
+    await expect(title).toHaveValue('Field Notes\nLiteral [v]; fiction')
+    expect(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 1)).toBe(false)
+    const titledAccessibility = await new AxeBuilder({ page }).include('main[aria-label="Video Editor"]').analyze()
+    expect(titledAccessibility.violations.filter(violation => violation.impact === 'critical' || violation.impact === 'serious')).toEqual([])
+    await title.focus()
+    await title.press('Tab')
+    await page.screenshot({ path: testInfo.outputPath(`${viewport.name}-text-layers.png`), fullPage: true })
     await page.route('**/api/v1/jobs', route => route.fulfill({
       status: 200, contentType: 'application/json',
       body: JSON.stringify({ jobs: [exportJob] }),
@@ -157,7 +184,7 @@ for (const viewport of [
     await page.getByRole('tab', { name: /Queue/ }).click()
     await expect(page.getByRole('button', { name: `Copy job id ${EXPORT_JOB_ID}` })).toBeVisible()
     expect(exports).toHaveLength(1)
-    expect(exports[0].expected_revision).toBe(3)
+    expect(exports[0].expected_revision).toBe(savedProject.revision)
     expect(exports[0].url).toContain('/projects/Synthetic%20project/editor/projects/synthetic-cut/exports')
   })
 }

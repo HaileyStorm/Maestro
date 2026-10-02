@@ -54,6 +54,64 @@ def _competing_editor_save(root, project, barrier, results, index):
 
 
 class TestEditorProjectFoundation(unittest.TestCase):
+    def test_titles_overlap_round_trip_and_keep_absolute_times_through_trim(self):
+        from services.editor_projects import editor_text_layers
+        self._workspace("titles")
+        project = create_output_video_timeline(workspace="titles", output_name="source.mp4", output_revision="source",
+            media={"type": "video", "duration": 4, "width": 128, "height": 72, "fps": 24})
+        proposed = copy.deepcopy(project)
+        proposed["tracks"][2]["items"] = [
+            {"id": "one", "text": "Adult fiction: blood & love [v]; 'literal'", "start": 0.5, "duration": 2, "position": "top"},
+            {"id": "two", "text": "Line one\nLine two", "start": 1, "duration": 2, "position": "bottom"},
+        ]
+        updated = apply_output_video_trim(project, proposed)
+        saved = save_editor_project(self.outputs, "titles", updated, expected_revision=0)
+        reopened = load_editor_project(self.outputs, "titles", saved["id"])
+        self.assertEqual(editor_text_layers(reopened, require_fit=True), proposed["tracks"][2]["items"])
+        self.assertEqual(len(editor_sequence_clips(reopened)), 1)
+        trimmed = copy.deepcopy(reopened)
+        trimmed["tracks"][0]["items"][0]["duration"] = 1
+        short = apply_output_video_trim(reopened, trimmed)
+        self.assertEqual(editor_text_layers(short), proposed["tracks"][2]["items"])
+        with self.assertRaises(EditorProjectError):
+            editor_text_layers(short, require_fit=True)
+        removed = copy.deepcopy(short)
+        removed["tracks"][2]["items"] = []
+        self.assertEqual(editor_text_layers(apply_output_video_trim(short, removed), require_fit=True), [])
+
+    def test_titles_reject_invalid_shapes_and_unsupported_effects(self):
+        project = create_output_video_timeline(workspace="scene", output_name="source.mp4", output_revision="source",
+            media={"type": "video", "duration": 4, "width": 128, "height": 72, "fps": 24})
+        title = {"id": "one", "text": "TITLE", "start": 0, "duration": 2, "position": "center"}
+        for change in ({"text": "x" * 161}, {"text": "a\nb\nc\nd"}, {"text": "\x00"},
+                       {"start": float("nan")}, {"duration": True}, {"position": "../path"},
+                       {"fade_in": 1}, {"style": {"font_family": "/host/font.ttf"}}, {"opacity": 0.5}):
+            proposed = copy.deepcopy(project)
+            proposed["tracks"][2]["items"] = [{**title, **change}]
+            with self.subTest(change=change), self.assertRaises(EditorProjectError):
+                apply_output_video_trim(project, proposed)
+
+    def test_subframe_title_can_be_saved_but_cannot_be_exported(self):
+        from services.editor_projects import editor_text_layers
+        project = create_output_video_timeline(workspace="scene", output_name="source.mp4", output_revision="source",
+            media={"type": "video", "duration": 4, "width": 128, "height": 72, "fps": 24})
+        proposed = copy.deepcopy(project)
+        proposed["tracks"][2]["items"] = [{"id": "short", "text": "TITLE", "start": 0.01,
+            "duration": 0.01, "position": "center"}]
+        updated = apply_output_video_trim(project, proposed)
+        self.assertEqual(len(editor_text_layers(updated)), 1)
+        with self.assertRaisesRegex(EditorProjectError, "one video frame"):
+            editor_text_layers(updated, require_fit=True)
+        proposed["tracks"][2]["items"][0]["duration"] = 1 / 24
+        self.assertEqual(len(editor_text_layers(apply_output_video_trim(project, proposed), require_fit=True)), 1)
+
+    def test_malformed_proposed_tracks_return_a_project_error(self):
+        project = create_output_video_timeline(workspace="scene", output_name="source.mp4", output_revision="source",
+            media={"type": "video", "duration": 4, "width": 128, "height": 72, "fps": 24})
+        for tracks in (None, {}, [None]):
+            with self.subTest(tracks=tracks), self.assertRaises(EditorProjectError):
+                apply_output_video_trim(project, {**project, "tracks": tracks})
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

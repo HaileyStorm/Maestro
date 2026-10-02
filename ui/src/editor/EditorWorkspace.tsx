@@ -1,11 +1,66 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { ArrowLeft, ArrowRight, Download, Eye, Film, Loader2, Pause, Play, Plus, RotateCcw, Save } from 'lucide-react'
+import { ArrowLeft, ArrowRight, Download, Eye, Film, Loader2, Pause, Play, Plus, RotateCcw, Save, Trash2 } from 'lucide-react'
 import { appendEditorClip, exportEditorProject, getEditorPreviewUrl, openOutputInEditor, projectReferenceSafeErrorMessage, saveEditorProject, type EditorProject } from '../api/client'
 import { privatePreviewIdentity, privatePreviewWasRevealed, revealPrivatePreview, subscribePrivatePreviewReveal } from '../lib/privatePreview'
 import { useStore } from '../stores/useStore'
 import type { OutputFile } from '../types'
 
 type SaveState = 'saved' | 'unsaved' | 'saving' | 'error'
+type TextLayer = EditorProject['tracks'][number]['items'][number] & { text: string; position: 'top' | 'center' | 'bottom' }
+
+function textLayers(project: EditorProject): TextLayer[] {
+  return (project.tracks.find(track => track.id === 'titles-main')?.items ?? [])
+    .filter((item): item is TextLayer => typeof item.text === 'string' && Boolean(item.position))
+}
+
+function changeText(project: EditorProject, id: string, change: Partial<TextLayer> | null): EditorProject {
+  return { ...project, tracks: project.tracks.map(track => track.id === 'titles-main'
+    ? { ...track, items: change === null ? track.items.filter(item => item.id !== id)
+      : track.items.map(item => item.id === id ? { ...item, ...change, id } : item) } : track) }
+}
+
+function addText(project: EditorProject, id: string, start: number, duration: number): EditorProject {
+  if (textLayers(project).length >= 8) return project
+  const item: TextLayer = { id, text: 'Your text', start, duration, position: 'bottom', source_in: 0, speed: 1 }
+  const exists = project.tracks.some(track => track.id === 'titles-main')
+  return { ...project, tracks: exists ? project.tracks.map(track => track.id === 'titles-main'
+    ? { ...track, items: [...track.items, item] } : track)
+    : [...project.tracks, { id: 'titles-main', name: 'Titles', type: 'text', items: [item] }] }
+}
+
+// Python round uses ties-to-even; mirror the sequence export's frame clock.
+function clipFrames(duration: number, fps: number) {
+  const value = duration * fps
+  const floor = Math.floor(value)
+  return Math.max(1, value - floor === 0.5 ? floor + (floor % 2) : Math.round(value))
+}
+
+function renderedDuration(project: EditorProject) {
+  const clips = sequenceClips(project)
+  return clips.reduce((sum, item) => sum + (clips.length > 1
+    ? clipFrames(item.duration, project.canvas.fps) / project.canvas.fps : item.duration), 0)
+}
+
+function titleLayout(text: string, width: number, height: number, position: TextLayer['position']) {
+  const lines = text.split('\n')
+  const context = document.createElement('canvas').getContext('2d')
+  let size = Math.max(1, Math.round(height * 0.05))
+  const padding = Math.max(1, Math.round(height * 0.015))
+  let measured = 0
+  do {
+    if (context) context.font = `${size}px "Maestro Editor"`
+    measured = Math.max(...lines.map(line => context?.measureText(line).width ?? line.length * size * 0.6))
+    if (measured + padding * 2 <= width * 0.9 || size === 1) break
+    size -= 1
+  } while (size > 0)
+  const lineHeight = Math.max(1, Math.round(size * 1.2))
+  const naturalWidth = Math.ceil(measured) + 2 * padding
+  const boxWidth = Math.min(Math.floor(width * 0.9), naturalWidth)
+  const boxHeight = lines.length * lineHeight + 2 * padding
+  const margin = Math.round(height * 0.06)
+  return { lines, size, padding, lineHeight, boxWidth, boxHeight, naturalWidth, scaleX: boxWidth / naturalWidth, x: (width - boxWidth) / 2,
+    y: position === 'top' ? margin : position === 'center' ? (height - boxHeight) / 2 : height - margin - boxHeight }
+}
 
 function displayTime(seconds: number): string {
   const safe = Math.max(0, Number.isFinite(seconds) ? seconds : 0)
@@ -28,7 +83,7 @@ function sequenceStarts(items: EditorProject['tracks'][number]['items']) {
 
 function changeTrim(project: EditorProject, clipId: string, start: number, end: number): EditorProject {
   const clip = sequenceClips(project).find(item => item.id === clipId)
-  const source = clip && project.assets[clip.asset_id]
+  const source = clip && project.assets[clip.asset_id ?? '']
   if (!clip || !source) return project
   const total = source.duration
   const minimum = Math.min(0.1, total)
@@ -69,6 +124,11 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
   const sourceKey = privatePreviewIdentity(source.workspace, source.name, source.revision)
   const project = loadedSource === sourceKey && draft?.workspace === source.workspace ? draft : null
   const [activeClipId, setActiveClipId] = useState('')
+  const [activeTextId, setActiveTextId] = useState('')
+  const [previewTime, setPreviewTime] = useState(0)
+  const [fontReady, setFontReady] = useState(false)
+  const addTextButton = useRef<HTMLButtonElement>(null)
+  const textField = useRef<HTMLTextAreaElement>(null)
   const [appendName, setAppendName] = useState('')
   const [appendPending, setAppendPending] = useState(false)
   const [appendError, setAppendError] = useState('')
@@ -91,7 +151,13 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
   const savedVersion = useRef(0)
   const clips = project ? sequenceClips(project) : []
   const clip = clips.find(item => item.id === activeClipId) ?? clips[0]
-  const sourceAsset = clip && project?.assets[clip.asset_id]
+  const sourceAsset = clip && project?.assets[clip.asset_id ?? '']
+  const titles = project ? textLayers(project) : []
+  const selectedTitle = titles.find(item => item.id === activeTextId) ?? titles[0]
+  const clipIndex = clips.findIndex(item => item.id === clip?.id)
+  const clipOffset = project ? clips.slice(0, Math.max(0, clipIndex)).reduce((sum, item) =>
+    sum + clipFrames(item.duration, project.canvas.fps) / project.canvas.fps, 0) : 0
+  const titleTime = clipOffset + previewTime
   const privateIdentity = privatePreviewIdentity(source.workspace, sourceAsset?.output_id ?? source.name, sourceAsset?.output_revision ?? source.revision)
   const privateSource = sourceAsset?.private !== false
   const [revealedIdentity, setRevealedIdentity] = useState<string | null>(null)
@@ -105,6 +171,10 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
   }, [source.workspace, source.name, source.revision])
 
   useEffect(() => {
+    void document.fonts.load('16px "Maestro Editor"').then(() => setFontReady(true))
+  }, [])
+
+  useEffect(() => {
     if (!privateSource) return
     return subscribePrivatePreviewReveal(privateIdentity, value => {
       if (value) setRevealedIdentity(privateIdentity)
@@ -116,6 +186,8 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
     projectRef.current = null
     setProject(null)
     setActiveClipId('')
+    setActiveTextId('')
+    setPreviewTime(0)
     setAppendName('')
     setAppendPending(false)
     setAppendError('')
@@ -218,6 +290,28 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
     setPlaying(false)
     setPlaybackError(false)
     setActiveClipId(id)
+    setPreviewTime(0)
+  }
+
+  const updateText = (change: Partial<TextLayer>) => {
+    if (!projectRef.current || !selectedTitle || appending.current || exporting.current || !isCurrent(scope.current)) return
+    updateDraft(changeText(projectRef.current, selectedTitle.id, change))
+  }
+
+  const handleAddText = () => {
+    if (!projectRef.current || busy || !isCurrent(scope.current)) return
+    const id = `text-${crypto.randomUUID()}`
+    updateDraft(addText(projectRef.current, id, clipOffset, Math.min(3, clip?.duration ?? 3)))
+    setActiveTextId(id)
+    window.requestAnimationFrame(() => textField.current?.focus())
+  }
+
+  const removeText = () => {
+    if (!projectRef.current || !selectedTitle || busy || !isCurrent(scope.current)) return
+    const remaining = titles.filter(item => item.id !== selectedTitle.id)
+    updateDraft(changeText(projectRef.current, selectedTitle.id, null))
+    setActiveTextId(remaining[0]?.id ?? '')
+    window.requestAnimationFrame(() => remaining.length ? textField.current?.focus() : addTextButton.current?.focus())
   }
 
   const reorder = (direction: -1 | 1) => {
@@ -277,7 +371,10 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
   const percentStart = duration > 0 ? trimStart / duration * 100 : 0
   const percentWidth = duration > 0 ? (trimEnd - trimStart) / duration * 100 : 0
   const canTrim = duration >= 0.1 && Boolean(clip) && !appendPending && exportState !== 'submitting'
-  const sequenceDuration = clips.reduce((total, item) => total + item.duration, 0)
+  const sequenceDuration = project ? renderedDuration(project) : 0
+  const titlesOutOfRange = titles.some(item => item.start + item.duration > sequenceDuration + 1e-6)
+  const titleFps = clips.length > 1 ? project?.canvas.fps ?? 30 : sourceAsset?.fps || project?.canvas.fps || 30
+  const titlesTooShort = titles.some(item => item.duration < 1 / titleFps - 1e-9)
   const selectedIndex = clips.findIndex(item => item.id === clip?.id)
   const candidates = project ? availableVideos(project, outputs) : []
   const busy = appendPending || exportState === 'submitting'
@@ -285,7 +382,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
 
   const handleExport = async () => {
     const epoch = scope.current
-    if (!project || !canTrim || saveState !== 'saved' || saving.current || exporting.current || appending.current || !isCurrent(epoch)) return
+    if (!project || !canTrim || titlesOutOfRange || titlesTooShort || saveState !== 'saved' || saving.current || exporting.current || appending.current || !isCurrent(epoch)) return
     exporting.current = true
     const version = editVersion.current
     setExportState('submitting')
@@ -329,6 +426,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
 
   return (
     <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto bg-bg-primary text-text-primary" aria-label="Video Editor">
+      <style>{'@font-face{font-family:"Maestro Editor";src:url("/editor-fonts/DejaVuSans.ttf") format("truetype");font-display:block}'}</style>
       <header className="flex flex-wrap items-center justify-between gap-3 border-b border-border bg-bg-secondary px-4 py-3 md:px-7">
         <div className="flex min-w-0 items-center gap-3">
           <button type="button" onClick={() => { void handleBack() }} disabled={savePending || busy}
@@ -358,12 +456,27 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
         <div className="mx-auto flex w-full max-w-6xl flex-1 flex-col gap-5 p-4 md:p-7">
           <div className="grid min-h-0 gap-5 lg:grid-cols-[minmax(0,1fr)_16rem]">
             <section className="overflow-hidden rounded-xl border border-border bg-bg-secondary" aria-label={clips.length > 1 ? 'Selected clip preview' : 'Video preview'}>
-              <div className="relative flex aspect-video items-center justify-center bg-black">
+              <div className="relative flex items-center justify-center bg-black" style={{ aspectRatio: `${project.canvas.width}/${project.canvas.height}` }}>
                 {revealed ? (
+                  <>
                   <video key={privateIdentity} ref={preview} src={getEditorPreviewUrl(sourceAsset?.output_id ?? source.name, source.workspace, sourceAsset?.output_revision ?? '')} preload="metadata" playsInline
                     onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)}
-                    onTimeUpdate={event => { if (event.currentTarget.currentTime >= trimEnd) event.currentTarget.pause() }}
+                    onLoadedMetadata={event => { event.currentTarget.currentTime = trimStart; setPreviewTime(0) }}
+                    onSeeked={event => setPreviewTime(Math.max(0, event.currentTarget.currentTime - trimStart))}
+                    onTimeUpdate={event => { setPreviewTime(Math.max(0, event.currentTarget.currentTime - trimStart)); if (event.currentTarget.currentTime >= trimEnd) event.currentTarget.pause() }}
                     onError={() => setPlaybackError(true)} className="h-full w-full object-contain" />
+                  {fontReady && <svg className="pointer-events-none absolute inset-0 h-full w-full" viewBox={`0 0 ${project.canvas.width} ${project.canvas.height}`} aria-hidden="true" data-testid="text-layer-preview">
+                    {titles.filter(item => item.text.trim() && titleTime >= item.start && titleTime < item.start + item.duration).map(item => {
+                      const layout = titleLayout(item.text, project.canvas.width, project.canvas.height, item.position)
+                      return <g key={item.id}>
+                        <rect x={layout.x} y={layout.y} width={layout.boxWidth} height={layout.boxHeight} fill="#000" fillOpacity={0.6} />
+                        <text transform={`translate(${layout.x} 0) scale(${layout.scaleX} 1)`} fill="#fff" textAnchor="middle" fontFamily="Maestro Editor" fontSize={layout.size} dominantBaseline="hanging">
+                          {layout.lines.map((line, index) => <tspan key={index} x={layout.naturalWidth / 2} y={layout.y + layout.padding + index * layout.lineHeight}>{line}</tspan>)}
+                        </text>
+                      </g>
+                    })}
+                  </svg>}
+                  </>
                 ) : (
                   <button type="button" onClick={() => { revealPrivatePreview(privateIdentity); setRevealedIdentity(privateIdentity) }}
                     className="flex min-h-11 items-center gap-2 rounded-lg border border-border bg-bg-secondary px-4 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">
@@ -371,6 +484,11 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
                   </button>
                 )}
               </div>
+              <label className="block px-4 pb-3 text-xs text-text-secondary"><span className="mb-1 block">Preview position · {displayTime(titleTime)} in sequence</span>
+                <input aria-label="Preview position" type="range" min={0} max={clip?.duration ?? 0} step={1 / project.canvas.fps} value={Math.min(previewTime, clip?.duration ?? 0)} disabled={!revealed || playbackError || busy}
+                  onChange={event => { const local = Number(event.target.value); preview.current?.pause(); if (preview.current) preview.current.currentTime = trimStart + local; setPreviewTime(local) }}
+                  className="min-h-11 w-full accent-accent-blue focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50" />
+              </label>
               <div className="flex items-center justify-between gap-3 px-4 py-3">
                 <button type="button" onClick={togglePlayback} disabled={!revealed || playbackError || busy}
                   className="flex min-h-11 items-center gap-2 rounded-lg bg-cta px-4 text-sm font-medium text-cta-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50">
@@ -394,13 +512,15 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
                 : 'Your original videos stay intact. Clips play one after another, in timeline order. The sequence is saved as an editable draft in the project.'}</p>
               {clips.length > 1 && <p className="mt-3 text-xs leading-relaxed text-text-secondary">Export uses the sequence canvas set from the first video ({project.canvas.width} × {project.canvas.height}, {project.canvas.fps} fps). Odd source dimensions are rounded up to an even canvas. Other shapes receive black bars. Each clip uses its first audio track; clips without audio use silence.</p>}
               <button type="button" onClick={() => { void handleExport() }}
-                disabled={!canTrim || saveState !== 'saved' || exportState !== 'idle' || appendPending}
+                disabled={!canTrim || titlesOutOfRange || titlesTooShort || saveState !== 'saved' || exportState !== 'idle' || appendPending}
                 className="mt-5 flex min-h-11 w-full items-center justify-center gap-2 rounded-lg border border-border bg-bg-primary px-4 text-sm font-medium text-text-primary hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50">
                 {exportState === 'submitting' ? <Loader2 size={16} className="animate-spin motion-reduce:animate-none" aria-hidden="true" /> : <Download size={16} aria-hidden="true" />}
                 {exportState === 'submitting' ? 'Queuing export…' : exportState === 'queued' ? 'Export queued' : 'Export MP4'}
               </button>
               {exportState === 'queued' && <p className="mt-3 text-xs leading-relaxed text-text-secondary" role="status">Track the export in Queue. The finished MP4 will appear in Gallery.</p>}
               {exportError && <p className="mt-3 text-sm text-red-400" role="alert">{exportError}</p>}
+              {titlesOutOfRange && <p className="mt-3 text-sm text-red-400" role="alert">Text ends after this cut. Shorten or remove those text layers before export.</p>}
+              {titlesTooShort && <p className="mt-3 text-sm text-red-400" role="alert">Text must last at least one video frame ({(1 / titleFps).toFixed(3)} seconds). Move its start or end before export.</p>}
               {saveState !== 'saved' && <p className="mt-3 text-xs text-text-muted">The {clips.length === 1 ? 'cut' : 'sequence'} must finish saving before export.</p>}
             </aside>
           </div>
@@ -409,7 +529,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
             <div className="mb-4 flex flex-wrap items-center justify-between gap-3"><h2 className="text-sm font-semibold">Timeline</h2><span className="text-xs tabular-nums text-text-muted">{displayTime(sequenceDuration)} total · {clips.length}/8 clips</span></div>
             <ol className="mb-4 flex min-w-0 gap-3 overflow-x-auto pb-2" aria-label="Clips in playback order">
               {clips.map((item, index) => {
-                const asset = project.assets[item.asset_id]
+                const asset = project.assets[item.asset_id ?? '']
                 const selected = item.id === clip?.id
                 return <li key={item.id} className="w-44 shrink-0">
                   <button type="button" aria-label={`Select clip ${index + 1}: ${asset?.name ?? 'Video'}`} aria-pressed={selected}
@@ -477,6 +597,50 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
             {saveState === 'error' && <button type="button" onClick={() => {
               if (window.confirm('Leave Editor and discard the unsaved changes?')) closeEditor()
             }} className="mt-3 min-h-11 rounded-lg px-3 text-sm text-text-secondary underline hover:text-text-primary">Leave without saving</button>}
+          </section>
+          <section className="rounded-xl border border-border bg-bg-secondary p-4 md:p-6" aria-label="Text layers">
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+              <h2 className="text-sm font-semibold">Text layers <span className="ml-2 font-normal text-text-secondary">{titles.length}/8</span></h2>
+              <button ref={addTextButton} type="button" onClick={handleAddText} disabled={busy || titles.length >= 8}
+                className="flex min-h-11 items-center gap-2 rounded-lg border border-border px-3 text-sm hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50"><Plus size={15} aria-hidden="true" /> Add text</button>
+            </div>
+            <p className="mb-5 text-xs leading-relaxed text-text-secondary">Text uses sequence times and stays at those times when clips are trimmed or reordered. Layers can overlap; later rows appear on top. Preview plays the selected clip.</p>
+            {titles.length === 0 ? <p className="rounded-lg border border-dashed border-border p-5 text-sm text-text-secondary">Add a title, caption or credit over your video.</p> : <div className="grid min-w-0 gap-5 md:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]">
+              <ol className="space-y-2" aria-label="Text layer order">
+                {titles.map((item, index) => <li key={item.id}><button type="button" aria-pressed={item.id === selectedTitle?.id} disabled={busy} onClick={() => setActiveTextId(item.id)}
+                  className={`min-h-16 w-full rounded-lg border p-3 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50 ${item.id === selectedTitle?.id ? 'border-accent-blue bg-accent-blue/15' : 'border-border bg-bg-primary hover:bg-bg-hover'}`}>
+                  <span className="block truncate text-sm">Text {index + 1} · {item.text || 'Empty text'}</span>
+                  <span className="mt-1 block text-xs tabular-nums text-text-secondary">{displayTime(item.start)}–{displayTime(item.start + item.duration)} · {item.position}</span>
+                </button></li>)}
+              </ol>
+              {selectedTitle && <div className="min-w-0 space-y-4">
+                <label className="block text-sm"><span className="mb-2 block">Text</span>
+                  <textarea aria-label="Text" ref={textField} rows={3} maxLength={160} value={selectedTitle.text} disabled={busy}
+                    onChange={event => updateText({ text: event.target.value.split('\n').slice(0, 3).join('\n') })}
+                    className="w-full resize-y rounded-lg border border-border bg-bg-primary p-3 text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50" />
+                  <span className="mt-1 block text-xs text-text-secondary">{selectedTitle.text.length}/160 characters · up to three lines. White text, fitted to the canvas.</span>
+                </label>
+                <div className="grid gap-3 sm:grid-cols-3">
+                  <label className="block text-sm"><span className="mb-2 block">Starts at (seconds)</span>
+                    <input type="number" min={0} max={86400 - selectedTitle.duration} step={0.1} value={selectedTitle.start} disabled={busy}
+                      onChange={event => { const start = Number(event.target.value); if (Number.isFinite(start) && start >= 0 && start + selectedTitle.duration <= 86400) updateText({ start }) }}
+                      className="min-h-11 w-full min-w-0 rounded-lg border border-border bg-bg-primary px-3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50" />
+                  </label>
+                  <label className="block text-sm"><span className="mb-2 block">Ends at (seconds)</span>
+                    <input type="number" min={selectedTitle.start + 1 / 240} max={86400} step={0.1} value={Number((selectedTitle.start + selectedTitle.duration).toFixed(6))} disabled={busy}
+                      onChange={event => { const end = Number(event.target.value); if (Number.isFinite(end) && end - selectedTitle.start >= 1 / 240 && end <= 86400) updateText({ duration: end - selectedTitle.start }) }}
+                      className="min-h-11 w-full min-w-0 rounded-lg border border-border bg-bg-primary px-3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50" />
+                  </label>
+                  <label className="block text-sm"><span className="mb-2 block">Position</span>
+                    <select value={selectedTitle.position} disabled={busy} onChange={event => updateText({ position: event.target.value as TextLayer['position'] })}
+                      className="min-h-11 w-full rounded-lg border border-border bg-bg-primary px-3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50">
+                      <option value="top">Top</option><option value="center">Center</option><option value="bottom">Bottom</option>
+                    </select>
+                  </label>
+                </div>
+                <button type="button" onClick={removeText} disabled={busy} className="flex min-h-11 items-center gap-2 rounded-lg border border-border px-3 text-sm hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50"><Trash2 size={15} aria-hidden="true" /> Remove text</button>
+              </div>}
+            </div>}
           </section>
         </div>
       ) : null}

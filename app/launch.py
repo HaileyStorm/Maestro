@@ -27424,7 +27424,7 @@ async def save_output_editor_project(project: str, editor_id: str, request: Requ
         try:
             updated = apply_output_video_trim(current, proposed)
         except EditorProjectError as error:
-            raise HTTPException(status_code=422, detail="Select a valid source range") from error
+            raise HTTPException(status_code=422, detail=str(error)) from error
         try:
             saved = save_editor_project(
                 _editor_save_root(), project, updated, expected_revision=expected,
@@ -27521,9 +27521,10 @@ async def export_output_editor_project(project: str, editor_id: str, request: Re
             raise HTTPException(status_code=503, detail="Editor draft is unavailable") from error
         if timeline["revision"] != expected:
             raise HTTPException(status_code=409, detail="Editor draft changed; reload before exporting")
-        from services.editor_projects import editor_sequence_clips
+        from services.editor_projects import editor_sequence_clips, editor_text_layers
         try:
             clips = editor_sequence_clips(timeline)
+            text_layers = editor_text_layers(timeline, require_fit=True)
         except EditorProjectError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         with _output_lineage_mutation_guard(out_dir):
@@ -27580,6 +27581,7 @@ async def export_output_editor_project(project: str, editor_id: str, request: Re
                     "editor_source_in": first["source_in"],
                     "editor_duration": duration,
                     **({"editor_sources": sources, "editor_canvas": copy.deepcopy(canvas)} if multiple else {}),
+                    **({"editor_text_layers": text_layers, "editor_canvas": copy.deepcopy(canvas)} if text_layers else {}),
                     "private_output": any(item["private"] for item in sources),
                     "explicit_output": any(item["explicit"] for item in sources),
                 },
@@ -63654,6 +63656,10 @@ def _write_tool_sidecar(out_dir, filename, *, source_name, tool, params, elapsed
             } for item in job["params"]["editor_sources"]]
             sidecar["transform"]["canvas"] = job["params"]["editor_canvas"]
             sidecar["transform"]["audio"] = "first stream per clip; silence when absent"
+        if job.get("params", {}).get("editor_text_layers"):
+            sidecar["params"] = None
+            sidecar["transform"]["text_layers"] = copy.deepcopy(job["params"]["editor_text_layers"])
+            sidecar["transform"]["canvas"] = copy.deepcopy(job["params"]["editor_canvas"])
     elif tool == "browser_copy":
         sidecar["artifact_class"] = "final"
         sidecar["params"].pop("multi_clip_info", None)
@@ -64190,12 +64196,14 @@ def _run_tool_editor_export(job_id: str):
                         render_video_sequence(
                             params["editor_sources"], staged,
                             width=canvas["width"], height=canvas["height"], fps=canvas["fps"],
+                            text_layers=params.get("editor_text_layers"),
                             abort_check=aborted, timeout=3600,
                         )
                     else:
                         render_single_source_cut(
                             source, staged, source_in=params["editor_source_in"],
                             duration=params["editor_duration"], abort_check=aborted, timeout=3600,
+                            text_layers=params.get("editor_text_layers"), canvas=params.get("editor_canvas"),
                         )
                     rendered = probe_media(staged)
                     if params.get("editor_sources") is not None:
@@ -64204,6 +64212,10 @@ def _run_tool_editor_export(job_id: str):
                                 or rendered.get("height") != canvas["height"]
                                 or not math.isclose(float(rendered.get("fps") or 0), canvas["fps"], rel_tol=1e-4, abs_tol=1e-4)):
                             raise ValueError("The exported sequence does not match its saved size and frame rate.")
+                    elif params.get("editor_text_layers"):
+                        canvas = params["editor_canvas"]
+                        if rendered.get("width") != canvas["width"] or rendered.get("height") != canvas["height"]:
+                            raise ValueError("The exported text does not match its saved canvas.")
                     fps = float(params.get("editor_source_fps") or 0)
                     tolerance = max(0.1, min(0.5, 2 / max(1.0, fps)))
                     if (rendered["type"] != "video"

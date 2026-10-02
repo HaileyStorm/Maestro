@@ -4871,7 +4871,8 @@ export interface EditorProject {
   }>
   tracks: Array<{
     id: string; name: string; type: 'video' | 'audio' | 'text';
-    items: Array<{ id: string; asset_id: string; start: number; duration: number; source_in: number; speed: number }>
+    items: Array<{ id: string; asset_id?: string; start: number; duration: number; source_in: number; speed: number;
+      text?: string; position?: 'top' | 'center' | 'bottom' }>
   }>
 }
 
@@ -4882,7 +4883,7 @@ function editorRequestError(status: number, fallback: string): ProjectAssetReque
     404: 'The source video or saved edit is no longer available',
     409: 'This edit changed in another tab. Return to Gallery and reopen it',
     413: 'This edit is too large to save',
-    422: 'This video cannot be opened for editing',
+    422: 'Check the video ranges and text layers. Use up to eight titles, three lines and 160 characters each, lasting at least one video frame and ending within the cut',
     423: 'Unlock this project before editing',
     500: 'Editor could not save the draft right now',
     503: 'Editor is temporarily unavailable',
