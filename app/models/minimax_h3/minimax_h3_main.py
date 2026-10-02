@@ -847,6 +847,36 @@ class MiniMaxH3Model:
         self.scheduler = None
         self.audio_scheduler = None
 
+    def restore_h3_cumulative_handoff(self, recovered, *, expected_identity):
+        """Bind verified disk state to this loaded instance under private authority.
+
+        The trusted caller must verify that expected_identity.runtime_sha256
+        describes the loaded bundle. This method does not hash model weights.
+        """
+        from services.h3_cumulative_recovery import (
+            H3CumulativeIdentity,
+            H3CumulativeRecovery,
+            _validate,
+        )
+
+        if os.environ.get("MAESTRO_H3_CUMULATIVE_EXPERIMENTAL") != "1":
+            raise ValueError("H3 cumulative restore requires the private experimental gate.")
+        if (
+            not isinstance(recovered, H3CumulativeRecovery)
+            or not isinstance(expected_identity, H3CumulativeIdentity)
+            or recovered.identity != expected_identity
+            or bool(getattr(self, "reference_mode", False))
+            or str(getattr(self, "selected_model_type", "")) not in ("", "minimax_h3")
+            or any(getattr(self, name, None) is None for name in (
+                "transformer", "conditioner", "vae", "audio_vae", "scheduler", "audio_scheduler",
+            ))
+        ):
+            raise ValueError("H3 cumulative restore requires matching identity and a loaded native FL2VA model.")
+        _validate(recovered.state, expected_identity, recovered.dependency)
+        token = object()
+        self._h3_cumulative_token = token
+        return {"state": recovered.state, "model_token": token}
+
     @property
     def _interrupt(self) -> bool:
         return self.__interrupt

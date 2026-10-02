@@ -113,10 +113,83 @@ includes that guard and its regression. Local service health and readiness
 remained 200 after rediscovery through Pinokio; no restart was required.
 
 Next: forward owned retained state through the handler/WGP/long-form caller,
-define atomic durable state publication and checkpoint/canvas/chain identity,
-and test cancellation/restart recovery before public exposure. Subsequent live
+using the private serialization contract below, and verify queue crash recovery
+before public exposure. Subsequent live
 execution needs a fresh exact GPU grant and coherent validation throughout;
 reuse existing accepted Extend/boundary runs instead of repeating them.
+
+## Private durable checkpoint milestone
+
+`services/h3_cumulative_recovery.py` now serializes normalized CPU float32 video
+and audio in a single bounded safetensors file, with no pickle or model token.
+A JSON-only receipt binds the declared owner, project, chain, job, native runtime
+bundle digest, canvas, completed predecessor dependency, generated/published
+frame counts, payload size and SHA-256. The caller must verify owner/project
+access and the actual loaded bundle; declared identities and a content digest
+do not establish authorization or model provenance by themselves. The bundle
+identity must cover transformer, conditioner, both VAEs, processor, configuration
+and normalization contract. No loaded-bundle resolver is wired yet.
+
+Publication uses a private project recovery staging directory, mode 0600 files,
+file/directory synchronization and create-only hard-link publication. A receipt
+is returned only after complete publication. Existing different content is never
+overwritten. Loading requires a confined relative name, unchanged single-link
+regular file, exact size/hash and metadata, bounded header, and reconciled AV
+geometry before tensor allocation. Non-finite numeric values are rejected;
+creative text and subject matter are not inspected. Unsupported platforms fail
+closed before storage creation; Windows runtime acceptance remains open.
+
+Independent review found that the original filename would be removed by generic
+queue cleanup even for a live job. Permanent files now use the existing
+`unit-{job_id}-` prefix. A focused integration regression calls the unmodified
+cleaner: a live job retains its checkpoint, and terminal cleanup removes it.
+Review also found name-only temporary cleanup could delete a replaced entry.
+The writer now holds its created file open through publication and verifies
+its device/inode before linking and unlinking; failure cleanup preserves a
+replacement. Controlled cancellation and pre-publication replacement regressions
+exercise that boundary. Publication still assumes the owning caller serializes
+writers in its private directory; these checks do not make competing directory
+mutations atomic. The correction review confirms both deterministic findings
+are addressed, with a narrow stat/unlink race remaining against a hostile
+same-UID actor; this module does not claim that isolation boundary.
+
+Hard process crashes may leave an unreferenced complete checkpoint, an extra
+hard link, or a private partial `.h3-av-*.tmp`. The loader never accepts a partial
+file as a receipt. Generic cleanup skips temporary names and multiple-link
+files; exact orphan retention/cleanup needs an integration plan. Each step stores
+a complete AV snapshot. Serialization and loading hold whole payloads and
+tensors, so the 512 MiB tensor limit does not bound process peak memory or total
+chain disk usage. Live-job census, checkpoint reference retention and terminal
+cleanup must be verified with the queue before activation.
+
+`MiniMaxH3Model.restore_h3_cumulative_handoff` restores a verified record to a
+fresh loaded native FL2VA instance under the experimental gate, checks declared
+identity and loaded component presence, then mints a fresh instance token. It
+does not hash loaded weights. A CPU fake-model restart test captures AV, seals
+it, releases the original instance, reloads it, restores a fresh instance and
+appends while preserving the retained latent prefix. This is disk/fake-model
+restart evidence, not an actual queue, process-crash, model-weight or GPU run.
+
+Seventeen recovery tests and eleven sampler tests passed together after the
+review fixes. The recovery seventeen passed again after the test fixture and
+lint corrections; sampler evidence was reused. New service/tests pass Ruff
+lint/format; syntax and diff checks pass. The model retains its ten prior Ruff
+diagnostics with no new lint finding. Direct service health and readiness were rediscovered through Pinokio and
+both returned 200; no restart was needed. No full suite, weights, CUDA or
+generated media were used. Public UI, WGP and queue routing remain unchanged.
+
+Next integration anchors from the bounded read-only queue map:
+
+- Capture private AV handoff before `wgp.py` unwraps dictionary samples to `x`.
+  Keep tensors and opaque tokens out of queue JSON.
+- Seal AV with segment completion in the long-form callback; preserve the
+  descriptor through every recovery-unit checkpoint/enrichment path.
+- Include the AV payload hash in predecessor dependency evidence; verify/load
+  it before treating a recovered unit as skippable or dispatching a successor.
+- Supply a verified actual loaded-bundle digest and authorized project/owner/job
+  identity before calling restore. Keep bad/missing AV state explicit.
+- Exercise queue crash/cancel/cleanup with fakes, then run a separate bounded
+  live continuation only under fresh GPU authority.
 
 ## Recovery and ownership
 
@@ -128,9 +201,13 @@ no restart.
 
 The supported claim receipt verifies the current host and physical-workspace
 bindings. The completed primitive claim `maestro-h3-cumulative-core-20261002`
-was released through the supported helper. The next exact claim,
-`maestro-h3-cumulative-sampler-20261002`, covers only this note, the native model
-and its new focused test file. Foreign `AGENTS.md`,
+was released through the supported helper. The completed sampler claim
+`maestro-h3-cumulative-sampler-20261002` was also released after commit `d9261e1`
+and verified origin parity. The recovery claim
+`maestro-h3-cumulative-recovery-20261002` covers only this note, the native model,
+the new serialization service and its focused test file. The controller owns
+implementation; the existing native read-only agent supplied the queue map and
+independent review. Release this exact recovery claim after serial Git closure. Foreign `AGENTS.md`,
 storage-janitor work and private
 artifacts remain preserved. Historical SQLite Beads remains on its mutation
 hold despite the activation audit's Dolt metadata. No Beads lifecycle command,
