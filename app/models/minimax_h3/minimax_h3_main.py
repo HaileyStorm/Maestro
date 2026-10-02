@@ -8,11 +8,13 @@ Comfy-Org's compact consumer weights on machines that cannot hold the full
 
 from __future__ import annotations
 
+import importlib
 import math
 import os
 import time
 from contextlib import nullcontext
 from fractions import Fraction
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -641,14 +643,16 @@ def _load_conditioner(
     config_relative_path: str,
     processor_relative_paths: list[str],
     dtype: torch.dtype,
+    *,
+    resolved_assets=None,
 ) -> MiniMaxH3Conditioner:
-    config_path = fl.locate_file(config_relative_path)
+    config_path = fl.locate_file(config_relative_path) if resolved_assets is None else resolved_assets[0]
     processor_folder = os.path.dirname(processor_relative_paths[0])
     processor_files = [os.path.basename(path) for path in processor_relative_paths]
     processor_path = fl.locate_folder(
         processor_folder,
         required_files=processor_files,
-    )
+    ) if resolved_assets is None else resolved_assets[1]
     missing_processor_files = [
         filename
         for filename in processor_files
@@ -660,7 +664,8 @@ def _load_conditioner(
             + ", ".join(missing_processor_files)
         )
     config = load_h3_qwen_config(config_path)
-    tokenizer, processor = build_h3_processor(processor_path)
+    processor_options = {"local_files_only": True} if resolved_assets is not None else {}
+    tokenizer, processor = build_h3_processor(processor_path, **processor_options)
     # Qwen keeps rotary-frequency tables as computed, non-persistent buffers,
     # so they are intentionally absent from the checkpoint.  Keep those small
     # buffers materialized while Accelerate places the 32B parameters on meta.
@@ -751,6 +756,9 @@ class MiniMaxH3Model:
         self.audio_scheduler = None
         self._ref2va_handoff_cache = None
         self._h3_cumulative_token = None
+        self._h3_runtime_binding = None
+        self._h3_runtime_snapshot = None
+        self._h3_runtime_profile = None
         self._last_spectrum_stats = None
         self.__interrupt = False
 
@@ -797,6 +805,62 @@ class MiniMaxH3Model:
                 load_status_callback(label)
 
         try:
+            snapshot = None
+            conditioner_assets = None
+            if (
+                os.environ.get("MAESTRO_H3_CUMULATIVE_EXPERIMENTAL") == "1"
+                and not self.reference_mode
+                and self.selected_model_type in ("", "minimax_h3")
+            ):
+                from services.h3_runtime_binding import (
+                    PROCESSOR_FILES,
+                    H3RuntimeBindingError,
+                    snapshot_h3_runtime_files,
+                )
+
+                if {os.path.basename(path) for path in processor_relative} != PROCESSOR_FILES:
+                    raise H3RuntimeBindingError("H3 private processor manifest is incomplete.")
+                config_path = fl.locate_file(text_config_relative)
+                processor_path = fl.locate_folder(
+                    os.path.dirname(processor_relative[0]),
+                    required_files=[os.path.basename(path) for path in processor_relative],
+                )
+                conditioner_paths = (
+                    list(text_encoder_filename)
+                    if isinstance(text_encoder_filename, (list, tuple))
+                    else [text_encoder_filename]
+                )
+                files = {
+                    "transformer": transformer_path, "video_vae": video_vae_path,
+                    "audio_vae": audio_vae_path, "text_config": config_path,
+                    **{"conditioner_" + str(i): path for i, path in enumerate(conditioner_paths)},
+                }
+                report_load_stage("Verifying private H3 runtime assets")
+                def abort_identity_capture():
+                    # WGP passes its reporter's bound transition callback.
+                    # Check cancellation throughout the potentially long read.
+                    reporter = getattr(load_status_callback, "__self__", None)
+                    check_cancelled = getattr(reporter, "check_cancelled", None)
+                    if callable(check_cancelled):
+                        check_cancelled()
+                    return self._interrupt
+
+                snapshot = snapshot_h3_runtime_files(
+                    files, self._h3_runtime_code_contract(), processor_dir=processor_path,
+                    abort_check=abort_identity_capture,
+                )
+                # Load the same canonical files whose bytes were captured. The
+                # snapshot also verifies the original linked-root resolutions.
+                resolved = {name: file.resolved for name, file in snapshot.files}
+                transformer_path = resolved["transformer"]
+                video_vae_path = resolved["video_vae"]
+                audio_vae_path = resolved["audio_vae"]
+                resolved_conditioners = [resolved["conditioner_" + str(i)] for i in range(len(conditioner_paths))]
+                text_encoder_filename = (
+                    resolved_conditioners if isinstance(text_encoder_filename, (list, tuple))
+                    else resolved_conditioners[0]
+                )
+                conditioner_assets = (resolved["text_config"], str(Path(processor_path).resolve(strict=True)))
             report_load_stage("Loading H3 transformer checkpoint")
             self.transformer = _load_transformer(
                 transformer_path,
@@ -804,11 +868,13 @@ class MiniMaxH3Model:
                 qkv_layout=qkv_layout,
             )
             report_load_stage("Loading H3 conditioner checkpoint")
+            conditioner_options = {"resolved_assets": conditioner_assets} if snapshot is not None else {}
             self.conditioner = _load_conditioner(
                 text_encoder_filename,
                 text_config_relative,
                 list(processor_relative),
                 dtype,
+                **conditioner_options,
             )
             report_load_stage("Loading H3 video VAE checkpoint")
             self.vae = _load_video_vae(video_vae_path)
@@ -816,6 +882,11 @@ class MiniMaxH3Model:
             self.audio_vae = _load_audio_vae(audio_vae_path)
             self.scheduler = MiniMaxH3Scheduler(shift=12.0)
             self.audio_scheduler = MiniMaxH3Scheduler(shift=3.0)
+            if snapshot is not None:
+                if snapshot.contract_json != self._h3_runtime_code_json():
+                    raise ValueError("H3 runtime implementation changed during loading.")
+                snapshot.verify()
+                self._h3_runtime_snapshot = snapshot
         except Exception:
             # A checkpoint OOM can occur before the wrapper is returned to
             # WGP. Sever every component already constructed so the allocator
@@ -839,6 +910,9 @@ class MiniMaxH3Model:
                     pass
         self._ref2va_handoff_cache = None
         self._h3_cumulative_token = None
+        self._h3_runtime_binding = None
+        self._h3_runtime_snapshot = None
+        self._h3_runtime_profile = None
         self._last_spectrum_stats = None
         self.transformer = None
         self.conditioner = None
@@ -847,11 +921,92 @@ class MiniMaxH3Model:
         self.scheduler = None
         self.audio_scheduler = None
 
-    def restore_h3_cumulative_handoff(self, recovered, *, expected_identity):
-        """Bind verified disk state to this loaded instance under private authority.
+    def _h3_runtime_components(self):
+        return tuple(getattr(self, name, None) for name in (
+            "transformer", "conditioner", "vae", "audio_vae", "scheduler", "audio_scheduler",
+        ))
 
-        The trusted caller must verify that expected_identity.runtime_sha256
-        describes the loaded bundle. This method does not hash model weights.
+    def _h3_runtime_code_contract(self):
+        from services.h3_runtime_binding import (
+            implementation_sha256,
+            installed_runtime_versions,
+        )
+
+        modules = [importlib.import_module(__package__ + "." + name) for name in (
+            "minimax_h3_main", "conditioner", "transformer", "video_vae", "audio_vae",
+            "packing", "checkpoint", "scheduler", "convrot",
+        )]
+        # Shared latent/packing changes must also invalidate recovery evidence.
+        modules += [importlib.import_module("services." + name) for name in (
+            "h3_cumulative_latents", "h3_native_continuation", "h3_runtime_binding",
+        )]
+        modules += [offload, quant_router]
+        return {
+            "implementation": implementation_sha256(modules),
+            "packages": installed_runtime_versions(),
+            "selected_model_type": self.selected_model_type or "minimax_h3",
+            "reference_mode": self.reference_mode,
+            "dtype": str(self.dtype),
+        }
+
+    def _h3_runtime_code_json(self):
+        from services.h3_runtime_binding import _canonical
+        return _canonical(self._h3_runtime_code_contract())
+
+    def _h3_loaded_runtime_contract(self):
+        from services.h3_runtime_binding import tensor_layout_sha256
+        return {
+            "runtime": self._h3_runtime_code_contract(),
+            "dtypes": [str(component._model_dtype) for component in self._h3_runtime_components()[:4]],
+            "checkpoint": self.transformer.h3_checkpoint_info,
+            "qkv_layout": self.transformer.h3_qkv_layout,
+            "patch_size": list(self.patch_size),
+            "conditioner_config": self.conditioner.qwen.config.to_dict(),
+            "max_text_tokens": self.conditioner.max_text_tokens,
+            "video_config": dict(self.vae.config),
+            "audio_config": dict(self.audio_vae.config),
+            "video_shift": self.scheduler.shift,
+            "audio_shift": self.audio_scheduler.shift,
+            "normalization": [VIDEO_LATENTS_MEAN, VIDEO_LATENTS_STD, AUDIO_LATENTS_MEAN, AUDIO_LATENTS_STD],
+            "tensor_layout": tensor_layout_sha256(self._h3_runtime_components()[:4]),
+            "profile": self._h3_runtime_profile,
+        }
+
+    def finalize_h3_runtime_binding(self, *, compile, quantize_transformer, convert_weights_float_to):
+        """Trusted WGP hook, after successful MMGP setup, before any sampling."""
+        from services.h3_runtime_binding import H3RuntimeBindingError
+
+        snapshot = getattr(self, "_h3_runtime_snapshot", None)
+        if snapshot is None:
+            return  # Ordinary/private-excluded loaders did not capture assets.
+        self._h3_runtime_binding = None
+        if compile or quantize_transformer is not False:
+            raise H3RuntimeBindingError("H3 private recovery requires eager, pre-quantized loading.")
+        if snapshot.contract_json != self._h3_runtime_code_json():
+            raise H3RuntimeBindingError("H3 runtime implementation changed during loading.")
+        self._h3_runtime_profile = {
+            "compile": False, "quantize_transformer": False,
+            "convert_weights_float_to": str(convert_weights_float_to),
+        }
+        self._h3_runtime_binding = snapshot.bind(
+            self._h3_runtime_components(), self._h3_loaded_runtime_contract(),
+        )
+        self._h3_runtime_snapshot = None  # One load may be finalized only once.
+
+    def verified_h3_runtime_sha256(self):
+        """Verify private load evidence; ordinary requests invalidate this proof."""
+        from services.h3_runtime_binding import H3RuntimeBindingError
+
+        binding = getattr(self, "_h3_runtime_binding", None)
+        if os.environ.get("MAESTRO_H3_CUMULATIVE_EXPERIMENTAL") != "1" or binding is None:
+            raise H3RuntimeBindingError("H3 private loaded runtime identity is unavailable.")
+        return binding.verified_digest(self._h3_runtime_components(), self._h3_loaded_runtime_contract())
+
+    def restore_h3_cumulative_handoff(self, recovered, *, expected_identity):
+        """Bind verified disk state to an independently verified loaded bundle.
+
+        Asset bytes are captured at private load time, then stat/contract and
+        component identity are checked here. This is not a live parameter hash.
         """
         from services.h3_cumulative_recovery import (
             H3CumulativeIdentity,
@@ -872,6 +1027,8 @@ class MiniMaxH3Model:
             ))
         ):
             raise ValueError("H3 cumulative restore requires matching identity and a loaded native FL2VA model.")
+        if expected_identity.runtime_sha256 != self.verified_h3_runtime_sha256():
+            raise ValueError("H3 cumulative restore loaded runtime identity does not match.")
         _validate(recovered.state, expected_identity, recovered.dependency)
         token = object()
         self._h3_cumulative_token = token
@@ -1200,6 +1357,9 @@ class MiniMaxH3Model:
         if not cumulative_requested:
             # An intervening ordinary request may reconfigure managed weights.
             self._h3_cumulative_token = None
+            self._h3_runtime_binding = None
+            self._h3_runtime_snapshot = None
+            self._h3_runtime_profile = None
         if cumulative_requested:
             from services.h3_cumulative_latents import (
                 H3CumulativeLatents,

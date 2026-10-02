@@ -366,9 +366,16 @@ class H3CumulativeRecoveryTests(unittest.TestCase):
             original.release()
             restored = self.load(json.loads(json.dumps(receipt)))
             fresh = fake_model()
-            handoff = fresh.restore_h3_cumulative_handoff(
-                restored, expected_identity=self.identity
-            )
+            # This restart test uses CPU model fakes. The actual loader/temp-file
+            # binding and rejection paths live in test_h3_runtime_binding.
+            with patch.object(
+                fresh,
+                "verified_h3_runtime_sha256",
+                return_value=self.identity.runtime_sha256,
+            ):
+                handoff = fresh.restore_h3_cumulative_handoff(
+                    restored, expected_identity=self.identity
+                )
             step = plan_h3_native_continuation_step(
                 22, 34, absolute_context_start_frame=119
             )

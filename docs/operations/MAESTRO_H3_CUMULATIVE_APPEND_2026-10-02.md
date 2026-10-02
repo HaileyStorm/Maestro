@@ -128,7 +128,8 @@ frame counts, payload size and SHA-256. The caller must verify owner/project
 access and the actual loaded bundle; declared identities and a content digest
 do not establish authorization or model provenance by themselves. The bundle
 identity must cover transformer, conditioner, both VAEs, processor, configuration
-and normalization contract. No loaded-bundle resolver is wired yet.
+and normalization contract. At this checkpoint, no loaded-bundle resolver was
+wired; the private runtime-binding milestone below supplies it.
 
 Publication uses a private project recovery staging directory, mode 0600 files,
 file/directory synchronization and create-only hard-link publication. A receipt
@@ -241,8 +242,8 @@ could retain prior tensors outside the cleanup boundary. Valid dispatch begin
 now discards on failure, profile setup is protected, and observer reset is inside
 the protected loop. A regression verifies all three fail before sampling and
 release prior state. The correction review confirms that lifecycle finding is
-closed. Public/queue injection and actual loaded-bundle verification remain
-pending.
+closed. Public/queue injection remained pending. Actual loaded-bundle
+verification is supplied by the subsequent private milestone below.
 This is CPU sampler/transport evidence, not an end-to-end WGP encode or device
 run. The initial nine passed with 26 adjacent OOM-relief/planning-failure checks (35 total),
 then ten passed after final lifetime/metadata and review corrections. The
@@ -266,6 +267,83 @@ and restore against the verified actually loaded bundle. No public UI or queue
 activation, model weights, CUDA, generated media, restart or full-suite run was
 used for this milestone.
 
+## Private loaded-runtime binding milestone
+
+`services/h3_runtime_binding.py` now captures content identity for the exact
+files consumed by a private native FL2VA load. Ordinary loading and Ref2VA do
+not hash assets. Only `MAESTRO_H3_CUMULATIVE_EXPERIMENTAL=1` enables capture.
+Transformer, every conditioner shard, both VAEs, text config and every direct
+processor file are hashed once in bounded streaming reads before loading. The
+constructor passes the same canonical checkpoint/config/processor paths to its
+loaders. Processor loading has local-only fallback, requires the seven expected
+files and includes optional direct files in the digest. A file census catches
+additions/removals. Nested processor asset directories are currently rejected;
+only the unused Hugging Face `.cache` directory is excluded. Linked checkpoint
+roots remain supported and their original resolutions must remain unchanged.
+
+File size/device/inode/mtime/ctime evidence is checked after hashing, after
+loading and at identity lookup. Empty/nonregular/oversized files, changed
+assets, missing versions and nonfinite/non-JSON contracts fail closed. Inventory
+is capped at 80 files and each file at 1 TiB; this is a streamed-read bound, not
+a model resource-admission or process-memory guarantee. Hashing a real large
+bundle adds one complete disk read on a private load. Cancellation is checked
+for each read block, using WGP's load reporter when present.
+
+The digest includes actual loaded H3/shared/MMGP Python implementations and
+serializable defaults/constants, installed required and optional runtime
+versions, selected native model/type/dtype, effective QKV/checkpoint geometry,
+conditioner/VAE configuration, normalization, paired scheduler shifts and
+post-offload tensor names/shapes/dtypes/module classes. Paths, process addresses
+and scheduler progress are excluded from the digest. Same-byte asset relocation
+does not change it. Python build/code changes may conservatively invalidate it.
+This is load provenance and an effective configuration check, **not a hash of
+live parameter values or an attestation against hostile in-process/filesystem
+mutation**. Existing serialized trusted-owner execution and file immutability
+assumptions remain necessary.
+
+The independent review identified that MMGP setup happens after the model
+constructor. Capture therefore stays pending: `verified_h3_runtime_sha256()`
+fails until WGP finalizes immediately after successful offload setup and its
+cancellation check. A second cancellation check follows the metadata walk,
+before runtime-ready. Finalization rejects compilation, fresh transformer
+quantization, loaded LoRA adapters and Turbo overlays for this experiment.
+Failures reach existing partial-load cleanup. Finalization consumes its pending
+snapshot once; it cannot renew provenance after an intervening ordinary request.
+The binding uses weak component references and owns no AV state.
+
+Restore now requires the saved runtime SHA to match
+`verified_h3_runtime_sha256()` before validating state and minting a new token.
+Release and ordinary generation clear the binding, pending snapshot and token.
+Missing proof, replaced components, changed files, scheduler/configuration
+changes and mismatched identities are rejected. No queue or public caller is
+activated by this addition.
+
+Fifty-four focused checks passed together: 16 runtime-binding, 17 disk recovery,
+11 sampler and 10 WGP transport checks. A subsequent cancellation regression
+and the affected constructor check passed, then the WGP setup boundary passed
+again after the review correction. The final runtime-binding file has 17 tests;
+the adjacent evidence above is reused. These tests use temporary files and CPU
+model/offloader fakes. The WGP setup regression executes its actual protected
+boundary with fake success/setup failure/compile/quantization/LoRA/cancellation
+paths. The separate disk restart test explicitly mocks the loaded proof;
+runtime-binding tests independently exercise the actual temp-file digest and
+fresh-instance restore.
+
+The final runs hid CUDA devices. An initial run had CUDA visible and observed
+the library context initialized; it did not load model weights or run device
+sampling. No real weight file was read/hashed, no real MMGP/device run or media
+was produced, and no GPU lease or live acceptance is claimed. New service/tests
+pass Ruff lint/format, syntax and diff checks. The changed existing files retain
+their baseline Ruff findings (model 10, conditioner 2, WGP 445), with no new
+diagnostic. No full suite, provider request or service restart was performed.
+
+Next safe unit: authorize the long-form caller to obtain this actual digest,
+inject transient dispatch outside task JSON, replace the complete cumulative
+media chain, seal AV receipts with completed media dependencies, verify queue
+resume/skip/reference retention and terminal/crash cleanup. Only then perform
+bounded device and browser/media acceptance under fresh authority. Existing
+accepted Extend/boundary evidence remains retained; the broader sprint is open.
+
 ## Recovery and ownership
 
 On the Codex app restart, `main` at `b023f4a` and the saved Editor draft were
@@ -283,9 +361,16 @@ and verified origin parity. The recovery claim
 the new serialization service and its focused test file. The controller owns
 implementation; the existing native read-only agent supplied the queue map and
 independent review. The exact recovery claim was released after commit `0ece65e` and verified
-origin parity. The next exact claim `maestro-h3-cumulative-dispatch-20261002`
-covers only WGP, its new private transport service/tests and this note; release
-it after serial Git closure. Foreign `AGENTS.md`,
+origin parity. The dispatch claim `maestro-h3-cumulative-dispatch-20261002`
+was released after commit `6b9e497` and verified origin parity. On the subsequent
+Codex restart, that revision, untracked binding service and exact narrow claim
+were recovered. Rediscovered direct health/readiness both returned 200; the
+service was already running. The binding claim
+`maestro-h3-runtime-binding-20261002` was released/reacquired through the
+supported helper to add offline conditioner loading and the WGP finalization
+hook. It covers only those three existing source files, the new binding service,
+new tests, recovery test correction and this note. Release it after serial Git
+closure. Foreign `AGENTS.md`,
 storage-janitor work and private
 artifacts remain preserved. Historical SQLite Beads remains on its mutation
 hold despite the activation audit's Dolt metadata. No Beads lifecycle command,

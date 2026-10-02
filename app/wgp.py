@@ -6716,6 +6716,13 @@ def load_models(
             force_reprofile=force_residency_reprofile,
         )
         status_reporter.check_cancelled()
+        if is_h3_load and hasattr(wan_model, "finalize_h3_runtime_binding"):
+            wan_model.finalize_h3_runtime_binding(
+                compile=offload_kwargs["compile"],
+                quantize_transformer=offload_kwargs["quantizeTransformer"],
+                convert_weights_float_to=offload_kwargs["convertWeightsFloatTo"],
+            )
+            status_reporter.check_cancelled()
         status_reporter.transition("Model runtime ready")
         model_load_succeeded = True
     except Exception:

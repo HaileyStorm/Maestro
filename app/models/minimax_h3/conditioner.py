@@ -297,10 +297,11 @@ def load_h3_qwen_config(config_path: str) -> Qwen3VLConfig:
     return config
 
 
-def build_h3_processor(config_dir: str):
-    tokenizer = AutoTokenizer.from_pretrained(config_dir, trust_remote_code=False)
+def build_h3_processor(config_dir: str, *, local_files_only: bool = False):
+    options = {"local_files_only": True} if local_files_only else {}
+    tokenizer = AutoTokenizer.from_pretrained(config_dir, trust_remote_code=False, **options)
     _ensure_h3_marker_tokens(tokenizer)
-    image_processor = Qwen2VLImageProcessorFast.from_pretrained(config_dir)
+    image_processor = Qwen2VLImageProcessorFast.from_pretrained(config_dir, **options)
     return tokenizer, Krea2Qwen3VLProcessor(image_processor, tokenizer)
 
 
