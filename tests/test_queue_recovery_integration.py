@@ -1426,6 +1426,30 @@ class QueueRecoveryIntegrationTests(unittest.TestCase):
             path.read_text(encoding="utf-8"),
         )
 
+    def test_failed_retry_registration_survives_compaction_and_restart(self):
+        failed = self._job("retry-job", status="failed")
+        manifest = {"path": "retry-job.sealed.request.json", "sha256": "a" * 64}
+        self._register(failed, manifest=manifest)
+        self._register(self._job("finished-job", status="completed"))
+        self._register(self._job("cancelled-job", status="cancelled"))
+        compacted = self.coordinator.compact()
+        self.assertEqual(set(compacted.jobs), {"retry-job"})
+        self.assertEqual(compacted.jobs["retry-job"]["request_manifest"], manifest)
+        # Recreate the process-local coordinator, then exercise the actual
+        # prospective checkpoint that previously raised "must be registered".
+        restarted = QueueRecoveryCoordinator(self.journal)
+        lifecycle.configure_durability_hook(restarted.prospective_transition)
+        self.assertTrue(lifecycle.checkpoint_recovery_job(
+            failed, queue_held=True, recovery_state="blocked",
+            message="Waiting for owner retry",
+        ))
+        snapshot = restarted.restore().jobs["retry-job"]
+        self.assertEqual(snapshot["status"], "failed")
+        self.assertEqual(snapshot["request_manifest"], manifest)
+        lifecycle.finish_job(failed, "failed", message="Retry failed")
+        restarted.tombstone_terminal("retry-job")
+        self.assertNotIn("retry-job", restarted.restore().jobs)
+
     def test_restore_scheduler_state_preserves_order_and_pause_not_monotonic(self):
         first = self._job("first", queue_priority=0)
         second = self._job("second", queue_priority=0)

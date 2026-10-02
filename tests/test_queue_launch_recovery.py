@@ -47,6 +47,7 @@ from services.queue_recovery_runtime import (
     write_sealed_request_manifest,
 )
 from services.queue_recovery_adapter import (
+    AUTOMATIC_RETIREMENT_STATUSES,
     QueueRecoveryCoordinator,
     owner_principal_digest,
     project_instance_digest,
@@ -102,10 +103,12 @@ def _function(tree: ast.AST, name: str):
 
 
 def _isolated_functions(tree: ast.Module, names: tuple[str, ...], namespace: dict):
+    namespace.setdefault("AUTOMATIC_RETIREMENT_STATUSES", AUTOMATIC_RETIREMENT_STATUSES)
+    dependencies = {"_h3_segment_uses_native_boundary_history"} if "_run_generation" in names else set()
     selected = [
         node for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name in names
+        and (node.name in names or node.name in dependencies)
     ]
     module = ast.Module(body=selected, type_ignores=[])
     ast.fix_missing_locations(module)
@@ -10646,6 +10649,57 @@ class QueueLaunchWiringTests(unittest.TestCase):
         self.assertLess(projects, adoption)
         self.assertLess(adoption, cleanup)
         self.assertLess(cleanup, workers)
+
+    def test_startup_cleanup_preserves_failed_retry_request_and_staging(self):
+        class Registry(dict):
+            def prepare(self, job):
+                return dict(job)
+
+            def publish_prepared(self, job_id, job):
+                self[job_id] = job
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            failed_id = "a" * 32
+            completed_id = "b" * 32
+            pointers = {
+                job_id: write_sealed_request_manifest(
+                    root, job_id=job_id, params={"prompt": "synthetic"}, inputs=[],
+                ) for job_id in (failed_id, completed_id)
+            }
+            staging = Path(ensure_recovery_staging_directory(root))
+            partial = staging / f"unit-{failed_id}-t0-r0-w1.mp4"
+            partial.write_bytes(b"synthetic partial media")
+            snapshots = {
+                job_id: {
+                    "id": job_id, "workspace": "synthetic-project", "status": status,
+                    "request_manifest": pointers[job_id],
+                } for job_id, status in ((failed_id, "failed"), (completed_id, "completed"))
+            }
+            registry = Registry()
+            namespace = _isolated_functions(
+                self.launch, ("_restore_queue_recovery_on_startup",), {
+                    "os": os,
+                    "_queue_recovery_workers_started": False,
+                    "_queue_recovery_existing_projects": lambda: {
+                        "synthetic-project": (str(root), "project-digest"),
+                    },
+                    "_queue_recovery_restored": types.SimpleNamespace(jobs=snapshots, global_state={}),
+                    "_queue_recovery_materialize_job": lambda snapshot, _projects: (
+                        dict(snapshot, out_dir=str(root), _recovery_manifest_pointer=snapshot["request_manifest"]), False,
+                    ),
+                    "_jobs": registry,
+                    "restore_scheduler_state": lambda *_args: None,
+                    "_queue_recovery_coordinator": types.SimpleNamespace(compact=lambda: None),
+                    "cleanup_orphan_request_manifests": cleanup_orphan_request_manifests,
+                    "cleanup_orphan_staged_outputs": cleanup_orphan_staged_outputs,
+                },
+            )
+            self.assertTrue(namespace["_restore_queue_recovery_on_startup"]())
+            self.assertTrue((root / pointers[failed_id]["path"]).is_file())
+            self.assertTrue(partial.is_file())
+            self.assertFalse((root / pointers[completed_id]["path"]).exists())
+            self.assertEqual(registry[failed_id]["status"], "failed")
 
     def test_completed_h3_late_adoption_settles_before_publication(self):
         class Registry(dict):

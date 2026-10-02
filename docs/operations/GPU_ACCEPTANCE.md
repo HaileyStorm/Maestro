@@ -2235,3 +2235,28 @@ reports no generation model loaded. Local and stable health/readiness returned
 and the exact grant was withdrawn. Post-withdraw validation rejects GPU use.
 Recovery repair and a new paired live qualification remain separate next
 gates; the broad sprint Goal stays active.
+
+### Failed-job retry retention repair
+
+Automatic compaction and startup file cleanup now share one retirement policy:
+completed and cancelled jobs may retire automatically; failed jobs retain their
+coordinator registration, sealed request and partial staging until an explicit
+owner dismissal. This preserves the Retry action across restart without
+reviving a terminal job automatically or changing owner/project validation.
+The journal's existing bounded capacity remains in effect.
+
+A new integration regression passes through compaction, a fresh coordinator,
+the real prospective recovery checkpoint and explicit failed-job tombstoning.
+A startup regression executes the real request/staging cleanup and proves the
+failed request and partial media survive while a completed request retires.
+Across the three affected recovery modules, 236 checks passed initially. One
+isolated worker fixture omitted the new native-history dispatch helper; after
+including that production dependency, its focused rerun passed. Independent
+source review agrees with the shared retention policy. No full-suite rerun or
+new GPU job was used.
+
+This prevents future automatic loss; it does not recreate the experimental
+job's already-retired request. The completed baseline's missing consumed
+continuation remains a separate final-closure repair. Its intact media and
+negative history are preserved, and no successful paired qualification is
+claimed.

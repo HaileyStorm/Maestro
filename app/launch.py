@@ -1836,6 +1836,7 @@ from services.h3_duration_plan import (
     snap_published_duration,
 )
 from services.queue_recovery_adapter import (
+    AUTOMATIC_RETIREMENT_STATUSES,
     PromptEnhancementRecoveryCapacityError,
     PromptEnhancementRecoveryConflictError,
     PromptEnhancementRecoveryError,
@@ -8718,7 +8719,9 @@ def _restore_queue_recovery_on_startup(
     )
     if retire_old_preparations is not None:
         retire_old_preparations(projects)
-    terminal_statuses = {"cancelled", "canceled", "completed", "failed"}
+    # Failed tiles retain an executable Retry action. Their exact registration,
+    # request and partial staging must survive the same startup cleanup.
+    terminal_statuses = AUTOMATIC_RETIREMENT_STATUSES
     if not unsettled_terminal_credit and (
         director_legacy_payloads or any(
             str(snapshot.get("status") or "").casefold() in terminal_statuses

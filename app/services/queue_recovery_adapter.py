@@ -87,6 +87,9 @@ _GLOBAL_FIELDS = frozenset({
     "paused", "pause_after_current", "manual_order_sequence", "queue_order",
 })
 _TERMINAL = frozenset({"completed", "failed", "cancelled"})
+# Failed jobs still offer owner-controlled Retry. Keep their registration and
+# sealed request until explicit dismissal, including bounded compaction.
+AUTOMATIC_RETIREMENT_STATUSES = frozenset({"completed", "cancelled", "canceled"})
 _FORBIDDEN_KEY_PARTS = frozenset({
     "authorization", "capability", "cookie", "credential", "credentials",
     "password", "passphrase", "passwd", "secret", "secrets", "session",
@@ -1808,6 +1811,7 @@ class QueueRecoveryCoordinator:
             # works even when no append event/byte capacity remains.
             compacted = self.journal.compact(
                 drop_terminal=True,
+                terminal_statuses=AUTOMATIC_RETIREMENT_STATUSES,
                 replacement_jobs=clean_before_jobs,
                 replacement_global_state=(
                     clean_before_global if before.global_state is not None else None
