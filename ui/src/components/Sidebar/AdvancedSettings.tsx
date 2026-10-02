@@ -87,6 +87,7 @@ function useAdvancedActiveItems(): string[] {
   } else if ((params.custom_settings as H3CustomSettings | undefined)?.h3_attention_engine === 'sdpa') {
     items.push('H3 Dense SDPA')
   }
+  if (params.h3_native_boundary_conditioning === true) items.push('Experimental clip continuity')
   // injection_strength only matters when injected frames actually exist.
   // The persisted snapshot strips image_refs (file paths are ephemeral)
   // but kept the strength value — counting it alone produced a ghost
@@ -198,6 +199,8 @@ export function AdvancedSettings() {
   const isH3 = ['minimax_h3', 'minimax_h3_ref2va'].includes(
     String(modelOptions?.architecture || ''),
   )
+  const nativeBoundarySelected = params.h3_native_boundary_conditioning != null && params.h3_native_boundary_conditioning !== false
+  const nativeBoundaryAvailable = isH3 && isVideo && modelOptions?.h3_native_boundary_conditioning === true
   const minimumInferenceSteps = isH3 ? 2 : 1
   const [h3AccelerationResult, setH3AccelerationResult] = useState<H3AccelerationStatus | false | null>(null)
   const h3Acceleration = h3AccelerationResult || null
@@ -334,6 +337,24 @@ export function AdvancedSettings() {
               {(isVideo || (isAvatar && !isScailEdit))
                 && modelOptions?.sliding_window
                 && <WindowSettings />}
+
+              {(nativeBoundaryAvailable || nativeBoundarySelected) && (
+                <label className="mobile-control-target flex items-start gap-2 rounded border border-border p-2 text-[10px] text-text-muted">
+                  <input
+                    type="checkbox"
+                    aria-label="Experimental clip continuity"
+                    checked={nativeBoundarySelected}
+                    disabled={!nativeBoundarySelected && (!nativeBoundaryAvailable || params.image_mode === 3 || !!params.video_source)}
+                    onChange={event => setParam('h3_native_boundary_conditioning', event.target.checked)}
+                    className="mt-0.5"
+                  />
+                  <span>
+                    <span className="block text-text-secondary">Experimental clip continuity</span>
+                    <span className="block text-[9px]">Uses the previous clip’s ending picture and sound to guide the next clip. Quality is still being evaluated. For segmented Studio videos; does not apply to Extend.</span>
+                    {!nativeBoundaryAvailable && <span className="block text-[9px]">Unavailable for this selection. Turn it off to use ordinary generation.</span>}
+                  </span>
+                </label>
+              )}
 
               {isH3 && (
                 <div className="space-y-3 rounded-lg border border-border bg-bg-tertiary/35 p-3">

@@ -97,6 +97,7 @@ export function H3PerformanceProfiles() {
     state.params.num_inference_steps,
     state.params.resolution,
     state.params.custom_settings || {},
+    state.params.h3_native_boundary_conditioning === true,
     state.params.activated_loras || [],
     state.params.loras_multipliers || '',
     state.params.tea_cache,

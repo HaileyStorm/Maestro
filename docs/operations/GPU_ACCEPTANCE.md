@@ -2186,3 +2186,52 @@ negative result. Private receipts retain exact outputs, source identities,
 lease binding, frame measurements and helper scripts; originals and negative
 history remain intact. Music3 and other deferred acceptance gates remain as
 previously recorded; the broad sprint Goal stays active.
+
+## 2026-10-02 Studio experimental clip continuity: source checkpoint
+
+Advanced Settings now exposes the existing experimental 18-frame decoded AV
+boundary path when the host explicitly enables it. The setting defaults off,
+remains clearable after an incompatible model or mode change, and rejects Extend
+and unsupported accelerator combinations before dispatch. Estimates refresh
+when the setting changes, retain the setting in profile candidates, and identify
+native-boundary timing as an uncalibrated baseline. Experimental observations
+cannot calibrate the ordinary timing cache. This does not implement cumulative
+latent append or the separate 22-context/119-extension path.
+
+Focused backend regressions, UI contracts, scoped lint and the production UI
+build passed. Independent source review covered selection repair, accelerator
+admission, estimate isolation and failure ordering. Fresh evidence was reused;
+no redundant full-suite run was made.
+
+A signed-in private comparison used Base FL2VA, SDPA, 20 steps, seed 314159265,
+608 × 352 and a 350-frame two-segment plan. The ordinary arm completed. Its
+H.264/AAC final contains 350 frames at 24 fps, lasting 14.583333 seconds, and
+fully decodes with CPU FFmpeg. Its SHA-256 is
+`5bc8598b9c25a91cd5a233cf1c257e45a1b2acec777ca4f017dd5a52d3519d17`,
+matching its producer sidecar. Both component media hashes also still match.
+
+The first experimental arm failed: the opening segment's single start frame was
+incorrectly treated as strict 18-frame continuation history. The worker then
+attempted a dependent segment without a durably sealed predecessor. No native
+final was published. The source repair now sets the strict flag only on actual
+overlap segments in both model dispatch paths and stops dependent dispatch
+after failure, after the existing checkpoint and pre-mux recovery steps. Four
+focused regressions and the existing concat-failure checkpoint test passed;
+the repaired path has not yet completed a live generation.
+
+The subsequent restart exposed separate recovery gaps. The ordinary job became
+held for incomplete final recovery although its media remained valid; its
+continuation image had been removed from staging. The failed tile still offered
+Retry after startup compaction retired its coordinator registration and request
+manifest. Retry failed before GPU work. These gaps remain open; do not count the
+ordinary arm as durable queue recovery acceptance or claim a completed pair,
+continuity improvement, browser playback or human quality acceptance. Original
+media, partial experimental staging and private negative receipts are retained.
+
+The temporary host flag was restored byte-for-byte to its prior configuration.
+A coordinated Pinokio restart unloaded the model; the fresh signed-in Studio
+reports no generation model loaded. Local and stable health/readiness returned
+200, public restart status cleared, the five-second observer stopped cleanly,
+and the exact grant was withdrawn. Post-withdraw validation rejects GPU use.
+Recovery repair and a new paired live qualification remain separate next
+gates; the broad sprint Goal stays active.

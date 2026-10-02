@@ -273,6 +273,123 @@ def _load_handler():
 
 
 class NativeBoundaryPolicyTests(unittest.TestCase):
+
+    def test_model_options_advertise_exact_host_gate_without_enabling_requests(self):
+        namespace = {
+            "Request": object, "HTTPException": _HTTPException, "os": os,
+            "_H3_LONG_STUDIO_MODELS": {"minimax_h3", "minimax_h3_ref2va"},
+            "_require_remote_visible_models": lambda *_args: None,
+            "_model_resolution_contract": lambda _md: {},
+            "wgp": types.SimpleNamespace(
+                get_model_def=lambda model: {"architecture": model},
+                get_default_settings=lambda _model: {},
+            ),
+        }
+        _load_functions(APP / "launch.py", {"get_model_options"}, namespace)
+        for flag, available in ((None, False), ("true", False), ("1", True)):
+            with self.subTest(flag=flag), mock.patch.dict(os.environ, {}, clear=True):
+                if flag is not None:
+                    os.environ["MAESTRO_H3_NATIVE_BOUNDARY_EXPERIMENTAL"] = flag
+                self.assertEqual(namespace["get_model_options"]("minimax_h3", object())["h3_native_boundary_conditioning"], available)
+                self.assertFalse(namespace["get_model_options"]("ltx_video", object())["h3_native_boundary_conditioning"])
+
+    def test_estimate_preserves_native_choice_and_applies_host_gate(self):
+        namespace = {
+            "Request": object, "HTTPException": _HTTPException, "os": os,
+            "_H3_LONG_STUDIO_MODELS": {"minimax_h3", "minimax_h3_ref2va"},
+            "_H3_ESTIMATE_PROMPT_FIELD": "prompt",
+            "_require_remote_visible_models": lambda *_args: None,
+            "_require_h3_legal_execution": lambda *_args: None,
+            "_validate_h3_lora_request": lambda *_args: None,
+            "_validate_h3_turbo_estimate_context": lambda *_args: None,
+            "_validate_h3_spectrum_estimate_context": lambda *_args: None,
+            "_validate_h3_lightx2v_estimate_context": lambda *_args: None,
+            "_h3_estimate_context": lambda body: {
+                "model_type": body["model_type"],
+                "custom_settings": {"h3_attention_engine": "sdpa"},
+            },
+            "_h3_profile_estimate_payload": lambda context, **_kwargs: context,
+        }
+        _load_functions(APP / "launch.py", {"h3_estimate", "_require_h3_native_boundary_experimental"}, namespace)
+        base = {"model_type": "minimax_h3", "resolution": "608x352"}
+        with mock.patch.dict(os.environ, {}, clear=True):
+            ordinary = asyncio.run(namespace["h3_estimate"](_AdmissionRequest(base)))
+            self.assertNotIn("h3_native_boundary_conditioning", ordinary["custom_settings"])
+            with self.assertRaisesRegex(_HTTPException, "unavailable"):
+                asyncio.run(namespace["h3_estimate"](_AdmissionRequest({**base, "h3_native_boundary_conditioning": True})))
+        with mock.patch.dict(os.environ, {"MAESTRO_H3_NATIVE_BOUNDARY_EXPERIMENTAL": "1"}, clear=True):
+            enabled = asyncio.run(namespace["h3_estimate"](_AdmissionRequest({**base, "h3_native_boundary_conditioning": True})))
+            self.assertTrue(enabled["custom_settings"]["h3_native_boundary_conditioning"])
+            self.assertEqual(enabled["custom_settings"]["h3_attention_engine"], "sdpa")
+            with self.assertRaisesRegex(_HTTPException, "true or false"):
+                asyncio.run(namespace["h3_estimate"](_AdmissionRequest({**base, "h3_native_boundary_conditioning": "true"})))
+    def test_native_projection_rejects_accelerators_before_dispatch(self):
+        namespace = {
+            "_apply_h3_adaptive_checkpoint": lambda _body: None,
+            "_H3_BASE_FL2VA_MODEL": "minimax_h3",
+            "_H3_REF2VA_MODEL": "minimax_h3_ref2va",
+            "wgp": types.SimpleNamespace(get_model_def=lambda _model: {"fps": 24}),
+        }
+        _load_functions(APP / "launch.py", {
+            "_h3_estimate_context", "_validate_h3_spectrum_estimate_context",
+            "_validate_h3_lightx2v_estimate_context",
+        }, namespace)
+        for setting, profile, steps, validator in (
+            ("h3_spectrum_profile", "spectrum_h3_v1", 20, "_validate_h3_spectrum_estimate_context"),
+            ("h3_lightx2v_profile", "h3_lightx2v_fl2v_4_v1", 4, "_validate_h3_lightx2v_estimate_context"),
+        ):
+            with self.subTest(accelerator=setting):
+                body = {
+                    "model_type": "minimax_h3", "num_inference_steps": steps,
+                    "h3_native_boundary_conditioning": True,
+                    "custom_settings": {setting: profile, "h3_attention_engine": "sdpa"},
+                }
+                context = namespace["_h3_estimate_context"](body)
+                self.assertTrue(context["custom_settings"]["h3_native_boundary_conditioning"])
+                self.assertNotIn("h3_native_boundary_conditioning", body["custom_settings"])
+                with self.assertRaisesRegex((ValueError, RuntimeError), "native boundary"):
+                    namespace[validator](context)
+
+    def test_native_timing_never_reads_or_writes_ordinary_calibration(self):
+        def forbid_cache():
+            raise AssertionError("experimental boundary touched ordinary calibration")
+        namespace = {
+            "_h3_model_is_resident": lambda _model: False,
+            "_get_h3_benchmark_cache": forbid_cache,
+            "_h3_observed_offload_profile": lambda _profile: 1,
+        }
+        _load_functions(APP / "launch.py", {
+            "_h3_estimate_for_context", "_record_h3_benchmark_observation",
+        }, namespace)
+        context = {
+            "model_type": "minimax_h3", "resolution": "608x352",
+            "duration_seconds": 175 / 24, "num_inference_steps": 20,
+            "custom_settings": {"h3_attention_engine": "sdpa", "h3_native_boundary_conditioning": True},
+        }
+        estimate = namespace["_h3_estimate_for_context"](context)
+        self.assertEqual(estimate["sample_count"], 0)
+        self.assertEqual(estimate["confidence"], "low")
+        self.assertEqual(estimate["source"], "uncalibrated_native_boundary_baseline")
+        self.assertTrue(any("not comparable" in item for item in estimate["uncertainty_reasons"]))
+        namespace["_record_h3_benchmark_observation"](
+            {**context, "repeat_generation": 1, "batch_size": 1},
+            wall_time_seconds=123, output_files=[], out_dir="unused",
+        )
+
+    def test_profile_candidates_retain_native_boundary_for_every_segment(self):
+        from services.h3_profiles import default_profile_settings
+        context = {
+            "model_type": "minimax_h3", "_planned_segment_count": 2,
+            "custom_settings": {"h3_native_boundary_conditioning": True},
+            "_segment_contexts": [{"model_type": "minimax_h3"}] * 2,
+        }
+        candidate_for_settings = _load_nested_function(
+            APP / "launch.py", "candidate_for_settings", {"context": context},
+        )
+        candidate = candidate_for_settings(default_profile_settings("minimax_h3"))
+        self.assertTrue(candidate["custom_settings"]["h3_native_boundary_conditioning"])
+        self.assertTrue(all(segment["custom_settings"]["h3_native_boundary_conditioning"] for segment in candidate["_segment_contexts"]))
+
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg tools required")
     def test_continuation_helpers_encode_real_cpu_media(self):
         def video_info(path):
@@ -484,7 +601,7 @@ class NativeBoundaryPlanningTests(unittest.TestCase):
         launch_path = APP / "launch.py"
         cls.studio = _load_functions(
             launch_path,
-            {"_h3_preferred_fl2va_model", "_plan_h3_adaptive_models"},
+            {"_h3_preferred_fl2va_model", "_plan_h3_adaptive_models", "_h3_segment_uses_native_boundary_history"},
             {
                 "_H3_LONG_STUDIO_MODELS": {
                     "minimax_h3", "minimax_h3_w4a8_fl2va",
@@ -513,6 +630,59 @@ class NativeBoundaryPlanningTests(unittest.TestCase):
                 },
             },
         )
+
+    def test_opening_and_cut_anchors_are_not_native_boundary_history(self):
+        for flavor in sorted(H3_FL2VA_MODELS):
+            plan = self.studio["_plan_h3_adaptive_models"](
+                {"model_type": flavor, "h3_native_boundary_conditioning": True},
+                clip_count=4,
+                clip_boundaries=[{"type": "continuous"}, {"type": "cut"}, {"type": "continuous"}],
+                first_anchor="edge.png", last_anchor=None,
+            )
+            history = self.studio["_h3_segment_uses_native_boundary_history"]
+            self.assertEqual([history(True, segment) for segment in plan], [False, True, False, True])
+            self.assertTrue(all(not history(False, segment) for segment in plan))
+
+    def test_failed_dependent_segment_stops_before_next_dispatch(self):
+        tree = ast.parse((APP / "launch.py").read_text())
+        guard = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
+            and isinstance(node.test, ast.BoolOp)
+            and ast.unparse(node.test) == "task_error and isinstance(clip_info, dict) and clip_info.get('automatic_h3_longform')"
+            and any(isinstance(child, ast.Break) for child in node.body))
+        loop = ast.For(target=ast.Name(id="unused", ctx=ast.Store()),
+            iter=ast.List(elts=[ast.Constant(1)], ctx=ast.Load()),
+            body=[guard, ast.Assign(targets=[ast.Name(id="dispatched_next", ctx=ast.Store())], value=ast.Constant(True))], orelse=[])
+        module = ast.fix_missing_locations(ast.Module(body=[loop], type_ignores=[]))
+        for failed, automatic, expected in ((True, True, False), (False, True, True), (True, False, True)):
+            namespace = {"task_error": failed, "clip_info": {"automatic_h3_longform": automatic}, "dispatched_next": False}
+            exec(compile(module, "segment-stop", "exec"), namespace)
+            self.assertEqual(namespace["dispatched_next"], expected)
+
+    def test_child_dispatch_flags_only_actual_history_in_both_model_paths(self):
+        tree = ast.parse((APP / "launch.py").read_text())
+        dispatch = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
+            and ast.unparse(node.test) == "segment_model == 'minimax_h3_ref2va'"
+            and node.orelse and isinstance(node.orelse[0], ast.If)
+            and ast.unparse(node.orelse[0].test) == "segment_model in _H3_FL2VA_MODELS and h3_longform")
+        module = ast.fix_missing_locations(ast.Module(body=[dispatch], type_ignores=[]))
+        for model in [*sorted(H3_FL2VA_MODELS), "minimax_h3_ref2va"]:
+            for index, overlap in ((0, False), (1, True), (2, False)):
+                original = {"h3_attention_engine": "sdpa"}
+                namespace = {
+                    "segment_model": model, "native_h3_boundaries": True,
+                    "segment_plan": {"temporal_overlap": overlap},
+                    "clip_params": {"custom_settings": original}, "clip_end": None,
+                    "h3_longform": {"original_image_start": "edge.png"},
+                    "i": index, "clip_count": 3, "group_id": "test",
+                    "_H3_FL2VA_MODELS": H3_FL2VA_MODELS,
+                    "_h3_segment_uses_native_boundary_history": self.studio["_h3_segment_uses_native_boundary_history"],
+                }
+                exec(compile(module, "segment-dispatch", "exec"), namespace)
+                child = namespace["clip_params"]
+                self.assertIs(child["custom_settings"]["h3_native_boundary_conditioning"], overlap)
+                self.assertEqual(child["custom_settings"]["h3_attention_engine"], "sdpa")
+                self.assertEqual(child["image_start"], "edge.png" if index == 0 else None)
+                self.assertNotIn("h3_native_boundary_conditioning", original)
 
     def test_native_policy_is_re_evaluated_and_matches_studio_director(self):
         boundaries = [

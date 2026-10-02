@@ -14,6 +14,35 @@ const ordinary = 'folder/ordinary.safetensors'
 const motion = 'folder/h3_Better_NSFW_Motion_V1.safetensors'
 const turbo = 'folder/minimax_h3_turbo_sla_4step_comfyui_bf16.safetensors'
 
+test('continuity selection invalidates the displayed timing and profile estimates', async () => {
+  const component = await readFile(new URL('../src/components/Sidebar/H3PerformanceProfiles.tsx', import.meta.url), 'utf8')
+  const start = component.indexOf('const estimateSignature = useStore(state => ')
+  const end = component.indexOf('\n\n  useEffect(', start)
+  assert.ok(start >= 0 && end > start)
+  const expression = component.slice(start, end).replace('const estimateSignature = useStore(state => ', '').replace(/\)$/, '')
+  const signature = new Function('state', `return ${expression}`)
+  const state = { params: {}, imageRefs: [] }
+  const ordinary = signature(state)
+  assert.equal(signature({ ...state, params: { h3_native_boundary_conditioning: false } }), ordinary)
+  assert.notEqual(signature({ ...state, params: { h3_native_boundary_conditioning: true } }), ordinary)
+})
+
+test('native clip continuity preserves explicit opt-in and rejects unsupported or stale selection', () => {
+  for (const model_type of [base, pink, quantized, ref]) {
+    const params = { model_type, h3_native_boundary_conditioning: true, image_mode: 0 }
+    assert.equal(h3.h3NativeBoundarySelectionError(params, true, 'video'), null)
+    assert.match(h3.h3NativeBoundarySelectionError(params, false, 'video'), /unavailable/)
+    assert.match(h3.h3NativeBoundarySelectionError(params, undefined, 'video'), /unavailable/)
+    assert.match(h3.h3NativeBoundarySelectionError({ ...params, image_mode: 3 }, true, 'video'), /Extend/)
+    assert.match(h3.h3NativeBoundarySelectionError({ ...params, video_source: 'source.mp4' }, true, 'video'), /Extend/)
+    assert.match(h3.h3NativeBoundarySelectionError(params, true, 'image'), /Studio video/)
+  }
+  assert.equal(h3.h3NativeBoundarySelectionError({ model_type: base }, false, 'video'), null)
+  assert.equal(h3.h3NativeBoundarySelectionError({ model_type: base, h3_native_boundary_conditioning: false }, false, 'video'), null)
+  assert.match(h3.h3NativeBoundarySelectionError({ model_type: 'ltx_video', h3_native_boundary_conditioning: true }, true, 'video'), /Studio video/)
+  assert.match(h3.h3NativeBoundarySelectionError({ model_type: base, h3_native_boundary_conditioning: 'true' }, true, 'video'), /invalid saved/)
+})
+
 test('explicit checkpoint choice wins, then selected flavor, then Base', () => {
   for (const selected of [base, pink, quantized, ref]) {
     assert.equal(h3.defaultAdaptiveFl2vaModel(selected, quantized), quantized)

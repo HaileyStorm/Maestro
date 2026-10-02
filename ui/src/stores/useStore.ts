@@ -29,6 +29,7 @@ import {
   h3ArchitectureForModel,
   h3LorasForArchitecture,
   h3LoraBlockReason,
+  h3NativeBoundarySelectionError,
   h3Sage2Eligibility,
   h3SemanticRouteRequested,
   hasManualH3SegmentCeiling,
@@ -1213,6 +1214,7 @@ function _buildH3EstimateRequest(
     window_overlap: state.slidingWindowOverlap,
     prompt: String(state.params.prompt || ''),
     h3_adaptive_conditioning: state.params.h3_adaptive_conditioning !== false,
+    h3_native_boundary_conditioning: state.params.h3_native_boundary_conditioning === true,
     manual_segment_ceiling: state.slidingWindowLocked,
     num_inference_steps: state.params.num_inference_steps,
     resolution: state.params.resolution,
@@ -2283,6 +2285,7 @@ const H3_PROFILE_PARAM_KEYS = new Set<keyof GenerateParams>([
   'activated_loras',
   'loras_multipliers',
   'h3_adaptive_conditioning',
+  'h3_native_boundary_conditioning',
   'h3_adaptive_fl2va_model',
   'h3_adaptive_ref2va_model',
   'h3_fl2va_loras',
@@ -4014,6 +4017,7 @@ const defaultParams: GenerateParams = {
   h3_adaptive_ref2va_model: H3_REF2VA_MODEL,
   settings_version: 2.52,
   h3_adaptive_conditioning: true,
+  h3_native_boundary_conditioning: false,
   custom_settings: { h3_attention_engine: 'sol_attn' },
   tea_cache: 0,
 }
@@ -8730,6 +8734,13 @@ export const useStore = create<AppState>((set, get) => ({
         window.alert(`Attach ${requiredVoiceRefs === 2 ? 'both voice references' : 'a voice reference'} before generating with Voice Clone.`)
         return
       }
+    }
+    const nativeBoundaryError = h3NativeBoundarySelectionError(
+      state.params, state.modelOptions?.h3_native_boundary_conditioning, state.generationMode,
+    )
+    if (nativeBoundaryError) {
+      window.alert(nativeBoundaryError)
+      return
     }
     const h3StudioModel = H3_STUDIO_MODELS.has(state.params.model_type)
     const h3AdaptiveConditioning = state.params.h3_adaptive_conditioning !== false

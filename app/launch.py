@@ -16714,6 +16714,12 @@ def _attach_h3_ref2va_handoff(
     return result
 
 
+def _h3_segment_uses_native_boundary_history(native_boundaries: bool, segment_plan: dict) -> bool:
+    # An opening/cut segment can have an ordinary one-frame anchor. Only an
+    # explicitly planned overlap supplies the runtime's 18-frame A/V history.
+    return native_boundaries and segment_plan.get("temporal_overlap") is True
+
+
 def _plan_h3_adaptive_models(
     body: dict,
     *,
@@ -22252,6 +22258,10 @@ def get_model_options(model_type: str, request: Request):
         "image_outputs": md.get("image_outputs", False),
         "supports_end_frame": "E" in md.get("image_prompt_types_allowed", ""),
         "minimax_h3_reference_mode": md.get("minimax_h3_reference_mode", False),
+        "h3_native_boundary_conditioning": (
+            model_type in _H3_LONG_STUDIO_MODELS
+            and os.environ.get("MAESTRO_H3_NATIVE_BOUNDARY_EXPERIMENTAL") == "1"
+        ),
         "minimax_h3_conditioning_mode": md.get("minimax_h3_conditioning_mode"),
         "minimax_h3_conditioning_modes_mutually_exclusive": md.get(
             "minimax_h3_conditioning_modes_mutually_exclusive", False,
@@ -43550,6 +43560,13 @@ def _record_h3_benchmark_observation(
     custom = params.get("custom_settings")
     if not isinstance(custom, dict):
         custom = {}
+    if (
+        custom.get("h3_native_boundary_conditioning") is True
+        or params.get("h3_native_boundary_conditioning") is True
+    ):
+        # Native boundary history is absent from the current timing identity.
+        # Keep experimental observations out of ordinary calibration.
+        return
     if str(custom.get("h3_source_audio_mode") or "native") != "native":
         # Launch capture cannot yet persist the exact T8 source-audio
         # mode/version. Exclude the observation rather than contaminate the
@@ -43742,6 +43759,11 @@ def _h3_estimate_context(body: dict, plan: dict | None = None) -> dict:
         body["model_type"] = routing["model_type"]
         if "custom_settings" in routing:
             body["custom_settings"] = routing["custom_settings"]
+    if body.get("h3_native_boundary_conditioning") is True:
+        body["custom_settings"] = {
+            **dict(body.get("custom_settings") or {}),
+            "h3_native_boundary_conditioning": True,
+        }
     model_type = str(body.get("model_type") or "minimax_h3")
     model_def = wgp.get_model_def(model_type) or {}
     fps = float(model_def.get("fps") or 24)
@@ -44128,7 +44150,25 @@ def _h3_estimate_for_context(
     resident = None
     if selected and include_residency:
         resident = _h3_model_is_resident(selected)
-    records = _get_h3_benchmark_cache().load() if include_residency else []
+    native_boundary = dict(context.get("custom_settings") or {}).get(
+        "h3_native_boundary_conditioning"
+    ) is True
+    records = (
+        _get_h3_benchmark_cache().load()
+        if include_residency and not native_boundary else []
+    )
+
+    def qualify_estimate(estimate: dict) -> dict:
+        if native_boundary:
+            estimate["confidence"] = "low"
+            estimate["source"] = "uncalibrated_native_boundary_baseline"
+            estimate["sample_count"] = 0
+            estimate["uncertainty_reasons"] = [
+                *list(estimate.get("uncertainty_reasons") or []),
+                "Experimental clip continuity uses an uncalibrated baseline; "
+                "ordinary-generation measurements are not comparable.",
+            ]
+        return estimate
     if records:
         current_gpu = (
             torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
@@ -44167,10 +44207,10 @@ def _h3_estimate_for_context(
                 segment, records, model_resident=segment_resident,
             ))
         if estimates:
-            return add_h3_postprocess_estimate(
+            return qualify_estimate(add_h3_postprocess_estimate(
                 aggregate_h3_estimates(estimates), context,
-            )
-    return estimate_h3_output(context, records, model_resident=resident)
+            ))
+    return qualify_estimate(estimate_h3_output(context, records, model_resident=resident))
 
 
 def _h3_profile_estimate_payload(
@@ -44271,6 +44311,11 @@ def _h3_profile_estimate_payload(
             # rather than merge with, the previously selected profile.
             "custom_settings": dict(settings["custom_settings"]),
         })
+        native_boundary = dict(context.get("custom_settings") or {}).get(
+            "h3_native_boundary_conditioning"
+        ) is True
+        if native_boundary:
+            candidate["custom_settings"]["h3_native_boundary_conditioning"] = True
         if int(candidate.get("_planned_segment_count") or 0) <= 0:
             candidate["_planned_segment_count"] = int(
                 _h3_segment_count_estimate(candidate).get("likely") or 0
@@ -44297,6 +44342,8 @@ def _h3_profile_estimate_payload(
                 if isinstance(segment, dict)
             ]
         for segment in candidate.get("_segment_contexts") or []:
+            if native_boundary:
+                segment["custom_settings"]["h3_native_boundary_conditioning"] = True
             names, weights = h3_request_loras_for_model(
                 {**context, **settings}, segment["model_type"],
             )
@@ -44557,7 +44604,7 @@ async def h3_estimate(request: Request):
     allowed = {
         "model_type", "duration_seconds", "window_seconds", "window_overlap",
         _H3_ESTIMATE_PROMPT_FIELD, "segment_scenes",
-        "h3_adaptive_conditioning", "manual_segment_ceiling",
+        "h3_adaptive_conditioning", "h3_native_boundary_conditioning", "manual_segment_ceiling",
         "num_inference_steps", "resolution", "custom_settings",
         "activated_loras", "loras_multipliers", "reference_shape",
         "h3_adaptive_fl2va_model", "h3_adaptive_ref2va_model",
@@ -44613,7 +44660,15 @@ async def h3_estimate(request: Request):
     ):
         raise HTTPException(status_code=400, detail="Unsupported H3 reference shape")
     try:
+        if type(body.get("h3_native_boundary_conditioning", False)) is not bool:
+            raise ValueError("H3 experimental clip continuity must be true or false")
+        _require_h3_native_boundary_experimental(body)
         context = _h3_estimate_context(body)
+        if body.get("h3_native_boundary_conditioning") is True:
+            context["custom_settings"] = {
+                **dict(context.get("custom_settings") or {}),
+                "h3_native_boundary_conditioning": True,
+            }
         estimate_models = {context["model_type"]}
         if body.get("h3_adaptive_conditioning", True) is not False:
             estimate_models.update(
@@ -65814,7 +65869,9 @@ def _run_generation(
                         if not native_h3_boundaries:
                             ref_custom["h3_ref2va_chain_id"] = group_id
                         ref_custom["h3_native_boundary_conditioning"] = (
-                            native_h3_boundaries
+                            _h3_segment_uses_native_boundary_history(
+                                native_h3_boundaries, segment_plan,
+                            )
                         )
                         clip_params["custom_settings"] = ref_custom
                         if not native_h3_boundaries:
@@ -65840,7 +65897,11 @@ def _run_generation(
                                     "Native H3 boundary planning cannot drop semantic references"
                                 )
                             fl_custom = dict(clip_params.get("custom_settings") or {})
-                            fl_custom["h3_native_boundary_conditioning"] = True
+                            fl_custom["h3_native_boundary_conditioning"] = (
+                                _h3_segment_uses_native_boundary_history(
+                                    native_h3_boundaries, segment_plan,
+                                )
+                            )
                             clip_params["custom_settings"] = fl_custom
                         else:
                             # Legacy adaptive routing carried continuity with
@@ -68498,6 +68559,15 @@ def _run_generation(
                                 for path in premux_paths:
                                     roles.pop(path, None)
                     job["reruns_denoise"] = False
+
+                # Preserve the checkpoints above, then stop a dependent H3
+                # timeline. Its successor cannot run without this predecessor.
+                if (
+                    task_error
+                    and isinstance(clip_info, dict)
+                    and clip_info.get("automatic_h3_longform")
+                ):
+                    break
 
                 if not task_error:
                     completed += 1

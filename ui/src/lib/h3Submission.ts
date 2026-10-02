@@ -36,6 +36,27 @@ export function isH3StudioModel(modelType: unknown): boolean {
   return typeof modelType === 'string' && H3_STUDIO_MODELS.has(modelType)
 }
 
+export function h3NativeBoundarySelectionError(
+  params: { model_type?: unknown; h3_native_boundary_conditioning?: unknown; image_mode?: unknown; video_source?: unknown },
+  hostAvailable: unknown,
+  generationMode: unknown,
+): string | null {
+  if (params.h3_native_boundary_conditioning != null && typeof params.h3_native_boundary_conditioning !== 'boolean') {
+    return 'Experimental clip continuity has an invalid saved setting. Choose it again in Advanced settings.'
+  }
+  if (params.h3_native_boundary_conditioning !== true) return null
+  if (!isH3StudioModel(params.model_type) || generationMode !== 'video') {
+    return 'Experimental clip continuity requires a MiniMax H3 Studio video. Turn it off in Advanced settings before changing modes.'
+  }
+  if (params.image_mode === 3 || params.video_source) {
+    return 'Experimental clip continuity does not support Extend. Turn it off in Advanced settings or choose a new Studio video.'
+  }
+  if (hostAvailable !== true) {
+    return 'Experimental clip continuity is unavailable on this host. Turn it off in Advanced settings or refresh after the host enables it.'
+  }
+  return null
+}
+
 export function h3ArchitectureForModel(modelType: unknown): 'fl2va' | 'ref2va' | null {
   const value = typeof modelType === 'string' ? modelType : ''
   if (H3_FL2VA_MODELS.includes(value as typeof H3_FL2VA_MODELS[number])) return 'fl2va'

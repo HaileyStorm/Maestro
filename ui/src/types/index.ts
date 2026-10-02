@@ -511,6 +511,7 @@ export interface H3EstimateRequest extends H3AdaptiveSelection {
   /** Director scenes are planned independently by the runtime. */
   segment_scenes?: { duration_seconds: number; prompt: string }[]
   h3_adaptive_conditioning: boolean
+  h3_native_boundary_conditioning?: boolean
   manual_segment_ceiling: boolean
   num_inference_steps: number
   resolution: string
@@ -573,6 +574,8 @@ export interface GenerateParams extends H3AdaptiveSelection {
   /** Automatically choose FL2VA frame anchoring vs Ref2VA semantic/temporal
    * continuity per H3 segment. Enabled by default for long Studio videos. */
   h3_adaptive_conditioning?: boolean
+  /** Opt-in decoded A/V boundary history; requires the host experimental gate. */
+  h3_native_boundary_conditioning?: boolean
   /** Explicit acknowledgement required whenever the effective plan loads the
    * separately licensed Ref2VA checkpoint. Filled from the local terms UI. */
   h3_ref2va_terms_accepted?: boolean
@@ -1464,6 +1467,7 @@ export interface ModelOptions {
   ltx25_video_vae_default?: 'fast' | 'nad'
   max_image_refs?: number | null
   minimax_h3_reference_mode?: boolean
+  h3_native_boundary_conditioning?: boolean
   minimax_h3_conditioning_mode?: 'semantic_references' | 'first_last_frames'
   minimax_h3_conditioning_modes_mutually_exclusive?: boolean
   reference_image_max_count?: number
