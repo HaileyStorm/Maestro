@@ -77,5 +77,15 @@ Live desktop controls and mobile DOM reflow/touch targets were inspected. The
 mobile visual capture uses the same native component in the synthetic Chromium
 fixture because live Chrome capture emulation returned a scaled image. The
 sanitized image-first evidence record validated successfully. Browser zoom,
-Windows, variable-frame-rate timing, a live titled join and human visual-quality
-acceptance remain unverified; the join has real CPU fixture coverage.
+Windows, variable-frame-rate timing and human visual-quality acceptance remain
+unverified.
+
+Live titled join acceptance: two retained test videos were trimmed to two seconds
+each, saved and reopened as a four-second draft. Top and bottom titles spanned
+the two-second seam. The native queue produced a 608×352 / 24 fps MP4 with
+96 video frames and four seconds of AAC audio. Full decode passed, both source
+hashes were unchanged, and Gallery playback ended without a media error. Its
+private sidecar retained both source identities, both absolute title intervals,
+the canvas and saved revision, with no inherited generation recipe. The existing
+real CPU fixture remains the detailed title-pixel boundary evidence; live playback
+is technical media acceptance and does not establish human visual quality.
