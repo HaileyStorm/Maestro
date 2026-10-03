@@ -16928,6 +16928,64 @@ def _reject_client_h3_internal_state(
         )
 
 
+def _consume_h3_cumulative_selection(
+    body: dict, *, enhance_before_generate: bool = False,
+) -> bool:
+    """Consume the public selection after project access/private-field checks."""
+    selected = body.pop("h3_cumulative_append", False)
+    if type(selected) is not bool:
+        raise HTTPException(status_code=400, detail="h3_cumulative_append must be a boolean")
+    if not selected:
+        return False
+    if os.environ.get("MAESTRO_H3_CUMULATIVE_EXPERIMENTAL") != "1":
+        raise HTTPException(status_code=400, detail="H3 cumulative generation is disabled on this host")
+    if (
+        body.get("model_type") != "minimax_h3"
+        or body.get("generation_mode", "video") != "video"
+        or body.get("sfx_mode")
+        or body.get("image_mode") not in (None, 0)
+    ):
+        raise HTTPException(status_code=400, detail="H3 cumulative generation requires Base H3 video")
+    if enhance_before_generate is not False:
+        raise HTTPException(status_code=400, detail="Turn off prompt enhancement for H3 cumulative generation")
+    if (
+        body.get("multi_prompts_gen_type") in (3, "3")
+        or body.get("per_clip_frames") or body.get("per_clip_prompts")
+        or any(body.get(key) for key in (
+            "activated_loras", "h3_fl2va_loras", "h3_ref2va_loras",
+        ))
+    ):
+        raise HTTPException(status_code=400, detail="H3 cumulative generation requires one timeline prompt without LoRAs")
+    body["_h3_cumulative_append"] = True
+    return True
+
+
+def _validate_h3_cumulative_acceleration(body: dict) -> None:
+    custom = body.get("custom_settings") or {}
+    if any(key in custom for key in (
+        "h3_turbo_profile", "h3_spectrum_profile", "h3_lightx2v_profile",
+    )):
+        raise ValueError("Turn off Turbo, Spectrum and LightX2V for H3 cumulative generation")
+
+
+def _public_h3_cumulative_plan(plan: dict) -> dict:
+    """Expose validated geometry without authored text or recovery identity."""
+    return {
+        "mode": "cumulative_append",
+        "fps": plan["fps"],
+        "requested_frames": plan["requested_frames"],
+        "published_frames": plan["published_frames"],
+        "window_count": len(plan["windows"]),
+        "windows": [{
+            "index": window["index"] + 1,
+            "sampler_frames": window["sampler_frames"],
+            "context_frames": window["history_context_frames"],
+            "new_published_frames": window["published_tail_frames"],
+            "cumulative_published_frames": window["cumulative_published_frames"],
+        } for window in plan["windows"]],
+    }
+
+
 def _reject_client_h3_turbo_validation_controls(body: dict) -> None:
     """Keep synthetic Turbo compatibility controls off every HTTP lane.
 
@@ -43960,8 +44018,12 @@ def _plan_generation_submission(
     _apply_h3_style_workflow_to_request(body)
     _validate_h3_sampling_steps(body)
     _validate_h3_explicit_multiclip_request(body)
-    plan = _prepare_h3_long_studio_request(body)
-    if plan is None and not isinstance(body.get("_h3_longform"), dict) and str(body.get("model_type") or "") in _H3_LONG_STUDIO_MODELS:
+    from services.h3_cumulative_execution import prepare_h3_cumulative_request
+    cumulative = prepare_h3_cumulative_request(body)
+    if cumulative is not None:
+        _validate_h3_cumulative_acceleration(body)
+    plan = None if cumulative is not None else _prepare_h3_long_studio_request(body)
+    if cumulative is None and plan is None and not isinstance(body.get("_h3_longform"), dict) and str(body.get("model_type") or "") in _H3_LONG_STUDIO_MODELS:
         from services.h3_mapping_dispatch import prepare_h3_single_mapping_source
         prepare_h3_single_mapping_source(body, wgp.get_model_def(body["model_type"]) or {},
                                          align_frame_count=wgp.align_model_frame_count)
@@ -43984,7 +44046,7 @@ def _plan_generation_submission(
     if require_terms:
         _require_h3_generation_terms(body, plan)
     estimate = None
-    if str(body.get("model_type") or "") in _H3_LONG_STUDIO_MODELS:
+    if cumulative is None and str(body.get("model_type") or "") in _H3_LONG_STUDIO_MODELS:
         estimate = _h3_profile_estimate_payload(
             estimate_context,
             include_residency=not bool(
@@ -44012,6 +44074,9 @@ async def preview_generation_plan(request: Request):
     _require_h3_legal_execution([model_type])
     _reject_client_h3_internal_state(body)
     _reject_client_h3_turbo_validation_controls(body)
+    _consume_h3_cumulative_selection(
+        body, enhance_before_generate=body.get("enhance_before_generate", False),
+    )
     _authorize_generation_media_inputs(request, body, workspace)
     try:
         _apply_h3_adaptive_checkpoint(body)
@@ -44036,6 +44101,19 @@ async def preview_generation_plan(request: Request):
             for option in requirements.get("checkpoint_options") or []
             if str(option.get("model_type") or "") in remote_visible
         ]
+    if body.get("_h3_cumulative_append") is True:
+        from services.h3_cumulative_execution import prepare_h3_cumulative_request
+        return {
+            "requires_review": False,
+            "plan": None,
+            "h3_cumulative_plan": _public_h3_cumulative_plan(
+                prepare_h3_cumulative_request(body),
+            ),
+            "effective_model_type": str(body.get("model_type") or ""),
+            "requirements": requirements,
+            "h3_estimate": None,
+            "segment_count_estimate": None,
+        }
     estimate_payload = (
         _h3_profile_estimate_payload(
             estimate_context,
@@ -48604,6 +48682,9 @@ async def generate(request: Request):
     else:
         _reject_client_h3_internal_state(body)
     _reject_client_h3_turbo_validation_controls(body)
+    cumulative_selected = _consume_h3_cumulative_selection(
+        body, enhance_before_generate=enhance_before_generate,
+    )
     _authorize_generation_media_inputs(request, body, workspace)
     if director_role_mode:
         _resolve_director_image_role_request(request, body)
@@ -48649,7 +48730,10 @@ async def generate(request: Request):
     _resolve_h3_style_workflow_request(body)
     durable_generation_preparation = bool(
         enhance_before_generate
-        or str(body.get("model_type") or "") in _H3_LONG_STUDIO_MODELS
+        or (
+            not cumulative_selected
+            and str(body.get("model_type") or "") in _H3_LONG_STUDIO_MODELS
+        )
     )
 
     # A complete Studio prompt with global timestamps must remain one
@@ -48695,11 +48779,9 @@ async def generate(request: Request):
             # source selector. Control-video requests keep their explicit mode.
             body["audio_prompt_type"] = f"A{_audio_prompt_type}"
 
-    # MiniMax H3 checkpoints have a hard native 15-second ceiling and do not
-    # implement latent sliding windows. A longer Studio duration is therefore
-    # planned as consecutive legal H3 clips, using the existing multi-clip
-    # renderer/concatenator. This runs after input normalization so stale
-    # anchor flags cannot leak into the generated clip manifest.
+    # Ordinary longer H3 requests use consecutive decoded clips. Explicit
+    # cumulative selection uses its own validated native sampling windows.
+    # Both paths retain shared model, terms and settings admission here.
     _h3_long_plan = None
     _submitted_h3_estimate = None
     # Hold freezes a complete Studio request without starting the LLM/GPU
@@ -48815,7 +48897,7 @@ async def generate(request: Request):
     try:
         _video_length = int(body.get("video_length") or 0)
         _sliding_window = int(body.get("sliding_window_size") or 0)
-        if _video_length > 0 and _sliding_window > 0:
+        if not cumulative_selected and _video_length > 0 and _sliding_window > 0:
             try:
                 _, _, _latent = wgp.get_model_min_frames_and_step(body["model_type"])
             except Exception:
@@ -48861,6 +48943,16 @@ async def generate(request: Request):
         owner_session_id=session_id,
     )
 
+    # Revalidate the final source after normalization, before allocating a job
+    # or sealing its project-owned manifest. Never persist a client-authored plan.
+    _submitted_cumulative_plan = None
+    if cumulative_selected:
+        from services.h3_cumulative_execution import prepare_h3_cumulative_request
+        try:
+            _submitted_cumulative_plan = prepare_h3_cumulative_request(body)
+            _validate_h3_cumulative_acceleration(body)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     job_id = _new_generation_job_id()
     _long_plan = body.get("_h3_longform")
     if not isinstance(_long_plan, dict):
@@ -48869,8 +48961,11 @@ async def generate(request: Request):
         _planned_clip_count = max(0, int(_long_plan.get("clip_count") or 0))
     except (TypeError, ValueError):
         _planned_clip_count = 0
+    if _submitted_cumulative_plan is not None:
+        _planned_clip_count = len(_submitted_cumulative_plan["windows"])
     if (
         not durable_generation_preparation
+        and not cumulative_selected
         and str(body.get("model_type") or "") in _H3_LONG_STUDIO_MODELS
         and _submitted_h3_estimate is None
     ):
@@ -49054,6 +49149,9 @@ async def generate(request: Request):
         "status": job["status"],
         "held": bool(job.get("queue_held")),
         "h3_estimate": _submitted_h3_estimate,
+        **({"h3_cumulative_plan": _public_h3_cumulative_plan(
+            _submitted_cumulative_plan,
+        )} if _submitted_cumulative_plan is not None else {}),
     }
 
 
@@ -67624,7 +67722,8 @@ def _run_generation(
                 # continuation evidence, never staging paths or stale requests.
                 sidecar_params.pop("_h3_native_boundary", None)
                 sidecar_params.pop("_h3_native_boundary_request", None)
-                sidecar_params.pop("_h3_cumulative_append", None)
+                if sidecar_params.pop("_h3_cumulative_append", None) is True:
+                    sidecar_params["h3_cumulative_append"] = True
                 sidecar_params.pop("_h3_cumulative_plan", None)
                 _strip_director_image_role_internals(sidecar_params)
                 # These settings are stripped before generation and applied

@@ -1078,3 +1078,74 @@ offload modules retain their respective 817 and one baseline lint diagnostics
 with no additions. No full suite was repeated. Bounded independent review found
 no concrete correctness or ordinary-job regression. Multi-window native
 completion and runtime peak evidence remain unverified.
+
+## Full-canvas resume and final-container evidence
+
+The resume-only worker completed the retained 124→141-frame chain at 1344×768.
+It sampled only the second window: 39 sampler frames, including retained
+context, delivered 17 new frames. The first window was not regenerated. The
+second process's complete runtime binding payload equalled the first process's
+payload; retained video and audio latent prefixes were byte-identical. The
+terminal latent shapes were video `[1, 24, 42, 48, 84]` and audio `[2, 32, 235]`.
+This is real standalone native/WGP fresh-process restore evidence using private
+synthetic project identities, not authenticated HTTP queue recovery.
+
+The existing final-copy helper copied the whole terminal container without
+concatenation, and its final hash matched the source. Independent FFprobe found
+HEVC 1344×768, 141 frames at 24 FPS (5.875000 seconds), with stereo 32 kHz AAC
+(5.856000 seconds). The actual final audio policy measured −22.6 dBTP, below the
+−1.0 dBTP ceiling; no attenuation was applied. A six-frame contact sheet,
+including frames 123 and 124 at the append boundary, was inspected. This does
+not establish motion, listening or human quality acceptance.
+
+The second window took 409.4 seconds, including loading, sampling and encoding.
+Across both completed windows, maximum observed CUDA allocation was
+5,184,347,648 bytes, reservation was 8,042,577,920 bytes, and process peak RSS
+was 48,362,036 KiB. These are observations for this exact conservative offload
+run, not general admission limits or speed/memory promises. The resumed owned
+supervisor and child exited, and withdrawal of the fresh exact lease was
+confirmed denied. Private receipts retain both binding payloads, source/asset
+pins, checkpoint/media hashes, resources, final-media inspection and closure.
+
+## Gated HTTP admission source milestone
+
+The public request selector `h3_cumulative_append` now has a source admission
+path through the existing project-authorized generation route. It requires an
+exact boolean, the operator's experimental gate, Base H3 video, one timeline
+prompt and no LoRAs or prompt enhancement. Existing project, model, legal,
+media-input and client-private-field checks remain in place. Only the server
+authors the private cumulative marker; final normalized source validation runs
+before a job identifier or recovery manifest is allocated.
+
+Immediate and held cumulative submissions use the existing durable queue and
+generation worker. They skip decoded clip planning, ordinary preparation and
+the ordinary sliding-window length adjustment. The sealed source retains the
+requested 141 frames and 124-frame first window. Ordinary H3 submissions keep
+their preparation/planning path. Preview returns separate cumulative geometry:
+sampler windows 124 and 39, delivered tails 124 and 17, final 141 frames. It
+exposes no authored prompt or recovery identity and supplies no ordinary time
+or memory estimate. Final metadata preserves only the public mode selection.
+
+Six focused CPU admission tests pass using the complete source routes and real
+cumulative compiler with mocked authorization/queue collaborators. They cover
+invalid/gate-off/private-field inputs, unsupported settings and denial before
+queue mutation; immediate and held admission; bounded truthful preview;
+ordinary H3 compatibility; and identical admission paths for authorized
+sensitive creative prompts; and rejection of otherwise-valid accelerator
+profiles using real Turbo, Spectrum and LightX2V compatibility validators.
+Three adjacent focused queue/planning checks pass.
+New tests pass lint/format; source compilation and diff checks pass, with the
+existing launch lint baseline unchanged. No full suite was repeated, following
+the owner's request to run it less often. Bounded independent review identified
+that accelerator profiles could pass ordinary admission before the cumulative
+sampler rejected them. Admission now rejects those profiles after style/default
+normalization and again before job allocation, with an actionable error. The
+new regression proves the otherwise-valid candidates create no queue state.
+The test's first attempt lacked the Turbo checkpoint URL in its model stub;
+the corrected structural fixture passes. No second review was needed for this
+focused correction.
+
+The live operator gate remains off. Authenticated live queue publication and
+crash/restart, rendered browser behavior, and human listening/visual acceptance
+remain open. Native restore, mocked route checks and final-copy media evidence
+do not satisfy those gates. The continuous sprint Goal remains active.
