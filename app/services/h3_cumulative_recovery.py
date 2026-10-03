@@ -230,7 +230,10 @@ def write_h3_cumulative_checkpoint(
     basename = f"unit-{identity.job_id}-h3-av-{digest}.safetensors"
     staging, directories = _directories(project_directory, create=True)
     directory = _open_private_directory(staging)
-    temporary = f".h3-av-{uuid.uuid4().hex}.tmp"
+    # The private staging directory hides partial writes. Keep the job prefix
+    # so startup can retire a crash-left temporary only after that job retires;
+    # live and failed/retryable jobs retain every file with this prefix.
+    temporary = f"unit-{identity.job_id}-h3-av-{uuid.uuid4().hex}.tmp"
     handle = -1
     temporary_identity = None
     try:

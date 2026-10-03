@@ -71288,11 +71288,21 @@ def _run_generation(
                 # private until every dependent segment, concat, and delivery
                 # checkpoint has completed. Retire them only at that terminal
                 # boundary while preserving staging owned by all live jobs.
+                # Failed jobs retain Retry and must keep their recovery bytes,
+                # matching startup's automatic-retirement policy.
+                # Completed cumulative graphs still require AV bytes on the
+                # next startup. That path verifies them before journal
+                # compaction retires their snapshots and staging together.
                 live_job_ids = [
                     str(candidate.get("id") or "")
                     for candidate in list(_jobs.values())
                     if str(candidate.get("status") or "").casefold()
-                    not in {"cancelled", "canceled", "completed", "failed"}
+                    not in AUTOMATIC_RETIREMENT_STATUSES
+                    or (
+                        str(candidate.get("status") or "").casefold() == "completed"
+                        and isinstance(candidate.get("params"), dict)
+                        and candidate["params"].get("_h3_cumulative_append") is True
+                    )
                 ]
                 from services.h3_reference_binding import cleanup_orphan_h3_reference_files
                 from services.queue_recovery_runtime import MANIFEST_DIRECTORY

@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -94,6 +95,47 @@ class H3CumulativeRecoveryTests(unittest.TestCase):
             cleanup_orphan_staged_outputs(self.project, live_job_ids=[]), 1
         )
         self.assertFalse((self.staging / receipt["basename"]).exists())
+
+    def test_process_crash_partial_is_job_scoped_and_retired_only_when_terminal(self):
+        script = """
+import os, sys, torch
+from services import h3_cumulative_recovery as recovery
+from services.h3_cumulative_latents import H3CumulativeLatents
+from services.h3_native_continuation import audio_tick_at_frame, latent_frames_for_video_frames
+torch.set_num_threads(1)
+state = H3CumulativeLatents(
+    torch.zeros(1, 24, latent_frames_for_video_frames(22), 4, 4),
+    torch.zeros(2, 32, audio_tick_at_frame(22)), 22)
+identity = recovery.H3CumulativeIdentity(
+    'owner-1', 'project-1', 'chain-1', 'job-1', 'a' * 64, 64, 64)
+original_write = os.write
+def crash_after_write(handle, payload):
+    original_write(handle, payload[:128])
+    os._exit(73)
+recovery.os.write = crash_after_write
+recovery.write_h3_cumulative_checkpoint(sys.argv[1], state, identity, 'unit:v1:' + 'b' * 64)
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(self.project)],
+            env=dict(os.environ, CUDA_VISIBLE_DEVICES=""),
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 73, result.stderr.decode())
+        partials = list(self.staging.glob("unit-job-1-h3-av-*.tmp"))
+        self.assertEqual(len(partials), 1)
+        self.assertEqual(partials[0].stat().st_size, 128)
+        self.assertEqual(stat.S_IMODE(partials[0].stat().st_mode), 0o600)
+        self.assertEqual(list(self.staging.glob("*.safetensors")), [])
+        # Anonymous legacy partials cannot be assigned to a retired job.
+        legacy = self.staging / ".h3-av-legacy.tmp"
+        legacy.write_bytes(b"unknown owner")
+        self.assertEqual(cleanup_orphan_staged_outputs(self.project, ["job-1"]), 0)
+        self.assertTrue(partials[0].exists())
+        self.assertEqual(cleanup_orphan_staged_outputs(self.project, []), 1)
+        self.assertFalse(partials[0].exists())
+        self.assertTrue(legacy.exists())
 
     def test_replaced_temporary_entry_is_preserved_on_cancel_and_publication(self):
         def run_case(cancelled):

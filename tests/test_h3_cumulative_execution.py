@@ -33,8 +33,10 @@ from services.h3_native_continuation import (
     audio_tick_at_frame,
     latent_frames_for_video_frames,
 )
+from services.queue_recovery_adapter import AUTOMATIC_RETIREMENT_STATUSES
 from services.queue_recovery_runtime import (
     QueueRecoveryRuntimeError,
+    cleanup_orphan_staged_outputs,
     ensure_recovery_staging_directory,
     promote_recovery_staged_artifact,
     recovery_unit_id,
@@ -329,6 +331,146 @@ class H3CumulativeExecutionTests(unittest.TestCase):
         sidecar = self.fixture.project / f"{Path(name).stem}.meta.json"
         sidecar.write_text(json.dumps(meta))
         return path, sidecar
+
+    def run_success_cleanup(self, completed):
+        worker = next(
+            node
+            for node in self.launch.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_run_generation"
+        )
+        cleanup = [
+            node
+            for node in ast.walk(worker)
+            if isinstance(node, ast.If)
+            and ast.unparse(node.test) == "success and job.get('status') == 'completed'"
+            and any(
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Name)
+                and child.func.id == "cleanup_orphan_staged_outputs"
+                for child in ast.walk(node)
+            )
+        ]
+        self.assertEqual(len(cleanup), 1)
+        namespace = {
+            "success": True,
+            "job": completed,
+            "job_id": completed["id"],
+            "allocation_success_observations": [],
+            "_record_h3_allocation_success_observations": Mock(),
+            "_jobs": {
+                self.job["id"]: self.job,
+                completed["id"]: completed,
+                "active-job": {"id": "active-job", "status": "queued"},
+                "cancelled-job": {"id": "cancelled-job", "status": "cancelled"},
+            },
+            "out_dir": str(self.fixture.project),
+            "os": os,
+            "AUTOMATIC_RETIREMENT_STATUSES": AUTOMATIC_RETIREMENT_STATUSES,
+            "cleanup_orphan_staged_outputs": cleanup_orphan_staged_outputs,
+        }
+        exec(
+            compile(
+                ast.Module(body=cleanup, type_ignores=[]), "worker-cleanup", "exec"
+            ),
+            namespace,
+        )
+
+    def test_other_job_success_preserves_failed_retry_av_and_partial_staging(self):
+        self.job["status"] = "failed"
+        staging = Path(ensure_recovery_staging_directory(self.fixture.project))
+        failed_partial = staging / f"unit-{self.job['id']}-h3-av-partial.tmp"
+        active_partial = staging / "unit-active-job-h3-av-partial.tmp"
+        retired_partial = staging / "unit-other-job-h3-av-partial.tmp"
+        cancelled_partial = staging / "unit-cancelled-job-h3-av-partial.tmp"
+        for path in (
+            failed_partial,
+            active_partial,
+            retired_partial,
+            cancelled_partial,
+        ):
+            path.write_bytes(b"partial checkpoint")
+        self.run_success_cleanup({"id": "other-job", "status": "completed"})
+        self.assertTrue(failed_partial.exists())
+        self.assertTrue(active_partial.exists())
+        self.assertFalse(retired_partial.exists())
+        self.assertFalse(cancelled_partial.exists())
+        for index in range(2):
+            self.assertEqual(self.match(index)["unit_id"], self.units[index]["unit_id"])
+
+    def test_completed_chain_av_survives_success_until_startup_retires_snapshot(self):
+        stats = {**self.ns["_h3_true_peak_policy_identity"](), "verified": True}
+        self.ns["_enforce_deferred_h3_final_audio"] = lambda *args, **kwargs: stats
+        self.ns["_publish_h3_cumulative_final"](
+            self.job,
+            self.plan,
+            0,
+            str(self.fixture.project),
+            write_sidecars=self.write_sidecars,
+            abort_check=lambda: None,
+            update_job_fn=lambda *args, **kwargs: True,
+        )
+        self.job["status"] = "completed"
+        self.run_success_cleanup(self.job)
+        self.run_success_cleanup({"id": "other-job", "status": "completed"})
+        events = []
+
+        class Registry(dict):
+            def prepare(self, job):
+                return dict(job)
+
+            def publish_prepared(self, job_id, job):
+                self[job_id] = job
+
+        def materialize(snapshot, projects):
+            graph = self.ns["_queue_recovery_completed_h3_graph"](
+                snapshot, str(self.fixture.project)
+            )
+            self.assertIsNotNone(graph)
+            events.append("verified_graph")
+            return dict(snapshot, out_dir=str(self.fixture.project)), False
+
+        def compact():
+            self.assertEqual(events, ["verified_graph"])
+            events.append("compacted")
+
+        def cleanup(project, live_ids):
+            self.assertEqual(events, ["verified_graph", "compacted"])
+            events.append("cleaned")
+            return cleanup_orphan_staged_outputs(project, live_ids)
+
+        startup = next(
+            node
+            for node in self.launch.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_restore_queue_recovery_on_startup"
+        )
+        namespace = {
+            "os": os,
+            "AUTOMATIC_RETIREMENT_STATUSES": AUTOMATIC_RETIREMENT_STATUSES,
+            "_queue_recovery_workers_started": False,
+            "_CREDIT_CLEANUP_PARAM": "_maestro_credit_accounting_cleanup",
+            "_queue_recovery_existing_projects": lambda: {
+                "default": (str(self.fixture.project), self.authority.project_id)
+            },
+            "_queue_recovery_restored": types.SimpleNamespace(
+                jobs={self.job["id"]: self.job}, global_state={}
+            ),
+            "_queue_recovery_materialize_job": materialize,
+            "_jobs": Registry(),
+            "restore_scheduler_state": lambda *args: None,
+            "_queue_recovery_coordinator": types.SimpleNamespace(compact=compact),
+            "cleanup_orphan_request_manifests": lambda *args: 0,
+            "cleanup_orphan_staged_outputs": cleanup,
+        }
+        exec(
+            compile(ast.Module(body=[startup], type_ignores=[]), "startup", "exec"),
+            namespace,
+        )
+        self.assertTrue(namespace["_restore_queue_recovery_on_startup"]())
+        self.assertEqual(events, ["verified_graph", "compacted", "cleaned"])
+        for unit in self.units:
+            path = self.fixture.project / ".maestro-recovery" / "staging"
+            self.assertFalse((path / unit["continuation"]["basename"]).exists())
 
     def test_startup_adopts_staged_chain_without_generation_gate(self):
         staged = [self.stage_window(index)[0] for index in range(2)]

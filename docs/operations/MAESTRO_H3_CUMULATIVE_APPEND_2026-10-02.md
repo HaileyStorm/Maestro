@@ -760,3 +760,55 @@ Public activation, actual authorized queue/process-crash recovery, cleanup and
 storage admission, full-resolution memory, decoded-prefix quality, browser and
 human acceptance remain open. The continuous Goal and fallback item
 `UH-20260927-MAESTRO-EXTEND-FLAGS` remain active; the historical tracker is unchanged.
+
+## AV crash-write cleanup and retry/completion retention
+
+New private AV temporary files carry the same `unit-{job_id}-` prefix as their
+sealed checkpoints. A partial write remains inside the existing private staging
+directory with mode 0600. This lets the bounded startup cleanup retain bytes for
+live or failed/retryable jobs and retire a crashed partial after its job retires.
+Anonymous legacy `.h3-av-*.tmp` files remain untouched: their names do not establish
+which job owns them. No prompt or media-content inspection is introduced.
+
+Completion cleanup now shares startup's automatic-retirement policy, which keeps
+failed jobs' executable Retry data. It also retains completed cumulative jobs'
+staging through the next startup. Their completed graph still requires the
+stable AV checkpoint bytes to verify each sealed producer dependency. Removing
+those bytes immediately after success could turn a completed snapshot into a
+held incomplete recovery on restart. Later jobs' completion cleanup now preserves
+earlier completed cumulative jobs as well.
+
+Startup already verifies/materializes completed graphs before successfully
+compacting their terminal journal snapshots and then retiring their staging and
+request manifests. Unsettled terminal accounting retains those snapshots and
+bytes. This existing retirement boundary is preferable to retaining checkpoints
+for every surviving sidecar indefinitely. The interim retention is per job:
+all its unit-prefixed staging survives until that boundary, including partials.
+It is not a total chain storage bound or garbage collection of live-job orphans.
+
+Focused evidence includes an actual CPU subprocess exiting during its first
+partial checkpoint write, job-prefixed retention and terminal cleanup, unchanged
+legacy-file preservation, and the actual worker success-cleanup seam preserving
+failed jobs' verified two-window AV receipts. A completed cumulative graph test
+uses real synthetic AV receipts and final sidecars, runs completion cleanup for
+both that job and a later job, then executes the startup seam and requires graph
+verification before compaction before cleanup. These three final regressions
+pass, alongside four adjacent cleanup/startup checks; unchanged AV/adoption checks
+from the 36-check affected run are reused. The independent review identified the
+completed-graph retention gap and confirmed the existing startup retirement
+authority. Service/test lint and formatting, syntax compilation and diff checks
+pass; launch retains its 817 baseline Ruff diagnostics. No full suite was repeated.
+
+The queued private native probe's source preflight must be refreshed for these
+changed bytes before execution; it still requires the same request's fresh exact
+grant. This milestone is source, CPU process and synthetic filesystem/queue
+evidence. No CUDA generation, real media encode, production restart, browser or
+human acceptance occurred. Total chain storage, live-job orphan pruning and true
+peak-memory admission remain open, as do the native qualification requirements
+above. The public cumulative gate remains closed and the Goal stays active.
+
+Policy checklist: exact ownership and foreign dirty preservation, focused
+verification, durable evidence and serial Git closure apply; launcher-specific
+destination, example, menu and URL-capture checks are inapplicable. Release the
+exact `maestro-h3-crash-staging-retention-20261003` claim after Git closure; retain
+only the narrow unfinished private native-probe tree through the supported helper.
