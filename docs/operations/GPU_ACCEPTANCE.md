@@ -2472,3 +2472,37 @@ were released. The post-reauthenticated owner release check remains open;
 coordinated Pinokio restart remains the available cleanup path. Local health
 and readiness both return 200. The renewed exact GPU request is queued and no
 public cumulative execution has started.
+
+## 2026-10-03 public Profile 1 streaming qualification and checkpoint correction
+
+The unchanged held Profile 1 request subsequently ran through the signed-in
+owner's Queue action, under a fresh coherent GPU grant and a supervisor that
+checked authority every five seconds and could stop the exact owned backend.
+Both private cumulative experiment flags were deliberately enabled for this
+bounded check. The request retained its 1344×768 canvas, 28 denoising steps,
+124-frame first window and 141-frame requested final timeline.
+
+The native first window completed model loading, denoising, streamed VAE
+decoding, video encoding and shared audio/video muxing. CPU probing counted
+124 HEVC frames at 24 fps and 5.166667 seconds, plus stereo 32 kHz AAC at
+5.152000 seconds. This is actual native first-window evidence. It does not
+establish the two-window continuation, a 141-frame final, memory bounds,
+performance improvement, whole-media quality or human acceptance.
+
+The queue failed before starting window two: the ordinary segment callback
+promoted the staged file and sealed an ordinary checkpoint before the
+cumulative checkpoint could retain its audio/video state. Commit `e12720c`
+restricts that callback to ordinary segments, leaving cumulative windows
+staged for their existing retained-state seal. A reproducer failed before the
+correction; three new route checks and three adjacent focused checks passed
+afterward. Source/test lint, AST parsing, diff and tracked publication checks
+passed, and one bounded independent review found no remaining blocker. No
+full suite was repeated. The correction still needs native two-window
+qualification.
+
+Cleanup stopped the exact owned qualification backend, withdrew the grant,
+restored the exact pre-check environment bytes and restarted through installed
+Pinokio. Local health and readiness returned 200, both experiment flags were
+off, and the owner browser retained the failed job with **Retry generation**.
+The first-window output and private receipts were preserved. The separate
+owner **Free resources** check after recent password confirmation remains open.
