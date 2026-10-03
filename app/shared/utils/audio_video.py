@@ -349,6 +349,7 @@ def combine_and_concatenate_video_with_audio_tracks(
     audio_codec_key="aac_128",
     verbose=False,
     output_audio_channels=1,
+    *, abort_check=None, timeout=None,
 ):
     if type(output_audio_channels) is not int or output_audio_channels not in (1, 2):
         raise ValueError("Output audio must be mono or stereo")
@@ -426,22 +427,47 @@ def combine_and_concatenate_video_with_audio_tracks(
 
     if verbose:
         print(f"ffmpeg command: {cmd}")
+    controlled = abort_check is not None or timeout is not None
+    mux_temporary = None
     try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        if controlled:
+            from shared.utils.media_encoder import run_encoder
+            from shared.utils.video_decode import _resolve_media_binary
+
+            target = os.fspath(save_path_tmp)
+            handle, mux_temporary = tempfile.mkstemp(
+                prefix=".maestro-mux-", suffix=os.path.splitext(target)[1],
+                dir=os.path.dirname(os.path.abspath(target)),
+            )
+            os.close(handle)
+            cmd[0] = _resolve_media_binary("ffmpeg") or "ffmpeg"
+            cmd[-1] = mux_temporary
+            if run_encoder(cmd, timeout=300 if timeout is None else timeout, abort_check=abort_check) != 0:
+                raise RuntimeError("Video audio mux failed")
+            if callable(abort_check) and abort_check():
+                raise InterruptedError("Video audio mux cancelled")
+            if not os.path.isfile(mux_temporary) or os.path.getsize(mux_temporary) < 1:
+                raise RuntimeError("Video audio mux produced no output")
+            os.replace(mux_temporary, target)
+        else:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as e:
         try:
-            if os.path.isfile(save_path_tmp):
+            if not controlled and os.path.isfile(save_path_tmp):
                 os.remove(save_path_tmp)
         except OSError:
             pass
         raise Exception(f"FFmpeg error: {e.stderr}") from e
     except Exception:
         try:
-            if os.path.isfile(save_path_tmp):
+            if not controlled and os.path.isfile(save_path_tmp):
                 os.remove(save_path_tmp)
         except OSError:
             pass
         raise
+    finally:
+        if mux_temporary is not None:
+            _remove_encoding_temporary(mux_temporary)
 
 
 def _remove_encoding_temporary(path):

@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
 
+import numpy as np
 import torch
 from models.minimax_h3.packing import MINIMAX_H3_PIXEL_MEAN, MINIMAX_H3_PIXEL_STD
 from shared.utils.audio_video import _CancellableVideoWriter, _get_codec_params
@@ -54,6 +55,23 @@ class H3EncodedVideo:
     def transfer_to(self, destination):
         """Move once to a server-selected direct child of the same private root."""
         self._owner.transfer(self, destination)
+
+    def mux_controls(self):
+        return {"abort_check": self._owner.abort_check, "timeout": self._owner.remaining_seconds()}
+
+
+def validate_h3_streamed_post_decode(receipt, *, height, width, fps, audio, audio_rate, has_transform):
+    """Validate actual WGP post-decode state before bypassing tensor stages."""
+    if type(receipt) is not H3EncodedVideo:
+        raise TypeError("H3 streamed output requires its verified video receipt")
+    if (
+        has_transform or fps != 24 or (height, width) != (receipt.height, receipt.width)
+        or type(audio_rate) is not int or audio_rate != 32000
+        or not isinstance(audio, np.ndarray) or audio.dtype != np.float32
+        or audio.shape != (round(Fraction(receipt.published_frames * 32000, 24)), 2)
+    ):
+        raise ValueError("H3 streamed output requires unchanged native video and stereo audio")
+    receipt.verify()
 
 
 class H3VideoSink:
@@ -99,6 +117,7 @@ class H3VideoSink:
         self._seen = self._published = 0
         self._phase = "new"
         self._receipt = self._file_identity = None
+        self.transferred = False
 
     def __getstate__(self):
         raise TypeError("H3 video sink is transient and cannot be serialized")
@@ -115,6 +134,13 @@ class H3VideoSink:
         except QueueRecoveryRuntimeError:
             raise ValueError("H3 stream staging directory changed or is unsafe") from None
         return remaining
+
+    def remaining_seconds(self):
+        """Keep later native mux work under this operation's deadline."""
+        return self._remaining()
+
+    def check(self):
+        self._remaining()
 
     def __enter__(self):
         if self._phase != "new":
@@ -258,6 +284,7 @@ class H3VideoSink:
         self.verify(receipt)
         self._remaining()
         os.replace(self._path, destination)
+        self.transferred = True
         self._phase = "transferred"
         self.cleanup()
 

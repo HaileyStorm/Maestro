@@ -17,6 +17,11 @@ from services.h3_native_continuation import (
 )
 
 
+def h3_cumulative_streaming_enabled():
+    """Private server selection, never a serialized job or public option."""
+    return os.environ.get("MAESTRO_H3_CUMULATIVE_STREAMING_EXPERIMENTAL") == "1"
+
+
 def validate_h3_cumulative_settings(settings, *, frames):
     """Pure eligibility check, also used during recovery with the gate off."""
     if (
@@ -92,6 +97,7 @@ def validate_h3_cumulative_settings(settings, *, frames):
             "sliding_window_discard_last_frames",
             "trim_tail_frames",
             "h3_native_boundary_conditioning",
+            "progressive_pipeline",
         )
     ):
         raise ValueError(
@@ -132,6 +138,7 @@ class H3CumulativeDispatch:
         self._forwarded = False
         self._candidate = None
         self.handoff = None
+        self._video_settings = self._video_sink = self._encoded_video = None
 
     def __getstate__(self):
         raise TypeError("H3 cumulative dispatch is transient and cannot be serialized.")
@@ -148,6 +155,22 @@ class H3CumulativeDispatch:
 
     def bind_loaded_model(self, model):
         """Optional deferred restore boundary, after WGP has finalized its load."""
+
+    def configure_video_sink(self, **settings):
+        if (
+            self._phase != "running" or self._forwarded
+            or self._video_settings is not None or not h3_cumulative_streaming_enabled()
+        ):
+            raise ValueError("H3 streaming transport must be selected once before sampling")
+        self._video_settings = settings
+
+    def cleanup_video_sink(self):
+        if self._video_sink is not None:
+            self._video_sink.cleanup()
+
+    @property
+    def encoded_video(self):
+        return self._encoded_video
 
     def sampling_frames(self, requested_frames):
         """Keep a legal append window below the ordinary first-clip minimum."""
@@ -181,6 +204,17 @@ class H3CumulativeDispatch:
             result.update(
                 _h3_cumulative_previous=self.previous, _h3_cumulative_step=self.step
             )
+        if self._video_settings is not None:
+            from services.h3_stream_video import H3VideoSink
+
+            generated = self.frames if self.step is None else (
+                self.previous["state"].frame_count + self.step.extension_frames
+            )
+            published = generated if self.step is None else generated - self.step.publication_trim_frames
+            self._video_sink = H3VideoSink(
+                generated_frames=generated, published_frames=published, **self._video_settings,
+            )
+            result["_h3_cumulative_video_sink"] = self._video_sink
         return result
 
     def capture(self, samples):
@@ -212,17 +246,31 @@ class H3CumulativeDispatch:
             else expected_frames - self.step.publication_trim_frames
         )
         pixels, audio = samples.get("x"), samples.get("audio")
+        video_valid = getattr(pixels, "ndim", None) == 4 and pixels.shape[1] == expected_published
+        artifact = samples.get("_h3_encoded_video")
+        if self._video_sink is not None:
+            from services.h3_stream_video import H3EncodedVideo
+
+            if type(artifact) is not H3EncodedVideo or artifact is not self._video_sink.receipt:
+                raise ValueError("H3 sampler did not return its bound encoded video receipt")
+            artifact.verify()
+            video_valid = (
+                pixels is None and artifact.generated_frames == expected_frames
+                and artifact.published_frames == expected_published
+            )
+        elif artifact is not None:
+            raise ValueError("H3 sampler returned an unrequested encoded video receipt")
         expected_samples = round(Fraction(expected_published * 32000, 24))
         if (
             state.frame_count != expected_frames
             or state.published_frames != expected_published
-            or getattr(pixels, "ndim", None) != 4
-            or pixels.shape[1] != expected_published
+            or not video_valid
             or getattr(audio, "shape", None) != (expected_samples, 2)
             or samples.get("audio_sampling_rate") != 32000
         ):
             raise ValueError("H3 cumulative sampler returned a different AV timeline.")
         self._candidate = handoff
+        self._encoded_video = artifact
 
     @property
     def published_frames(self):
@@ -233,6 +281,12 @@ class H3CumulativeDispatch:
         return self._candidate["state"].published_frames
 
     def finish(self, success):
+        # WGP's successful return is the output commit receipt: its mux,
+        # finality and durable publication already completed. A later abort
+        # belongs to the next operation and must not invalidate that handoff.
+        if success is True and self._video_sink is not None and not self._video_sink.transferred:
+            self.discard()
+            raise ValueError("H3 streaming output completed without transferring its verified video")
         if success is True and self._phase == "running" and self._candidate is not None:
             self.handoff = self._candidate
             self._candidate = None
@@ -247,8 +301,10 @@ class H3CumulativeDispatch:
 
     def discard(self):
         self._candidate = self.handoff = None
+        self._encoded_video = None
         self.previous = None
         self._phase = "failed"
+        self.cleanup_video_sink()
 
 
 def begin_h3_cumulative_dispatch(dispatch, settings):

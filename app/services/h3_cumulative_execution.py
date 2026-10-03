@@ -15,7 +15,10 @@ import re
 import shutil
 from pathlib import Path
 
-from services.h3_cumulative_dispatch import validate_h3_cumulative_settings
+from services.h3_cumulative_dispatch import (
+    h3_cumulative_streaming_enabled,
+    validate_h3_cumulative_settings,
+)
 from services.h3_cumulative_plan import plan_h3_cumulative_chain
 from services.h3_cumulative_queue import H3CumulativeQueueDispatch, H3QueueAuthority
 from services.h3_cumulative_recovery import _MAX_HEADER_BYTES
@@ -194,7 +197,7 @@ def prepare_h3_cumulative_request(params, *, require_gate=True):
                 "H3 cumulative retained AV state exceeds the 512 MiB allocation limit."
             )
         decoded_bytes = 4 * (3 * frames * height * width + 2 * audio_ticks * 800)
-        if decoded_bytes > 2 * 1024 * 1024 * 1024:
+        if not h3_cumulative_streaming_enabled() and decoded_bytes > 2 * 1024 * 1024 * 1024:
             raise ValueError(
                 "H3 cumulative full decode exceeds the private 2 GiB output limit. "
                 "Use a shorter chain or a smaller canvas."

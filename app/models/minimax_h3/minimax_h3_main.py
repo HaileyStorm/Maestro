@@ -373,7 +373,9 @@ def _decode_h3_video_rows(
     channels: int,
     patch_size: tuple[int, int, int],
     observer=None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    video_sink=None,
+    abort_check=None,
+) -> tuple[torch.Tensor | None, torch.Tensor]:
     """Run the exact native H3 video decode recipe for final or preview use."""
 
     if channels != len(VIDEO_LATENTS_MEAN) or channels != len(VIDEO_LATENTS_STD):
@@ -442,6 +444,18 @@ def _decode_h3_video_rows(
         else nullcontext()
     )
     with autocast:
+        if video_sink is not None:
+            with video_sink:
+                def cancelled():
+                    if abort_check is not None and abort_check():
+                        return True
+                    video_sink.check()
+                    return False
+
+                emitted = vae.decode_to_sink(denormalized_latents, video_sink, abort_check=cancelled)
+                if emitted != pixel_frames:
+                    raise H3PreviewGeometryError("MiniMax H3 streamed video frame count is invalid")
+            return None, video_latents
         video = vae.decode(denormalized_latents, return_dict=False)[0]
     expected_pixel_shape = (1, 3, pixel_frames, pixel_height, pixel_width)
     if tuple(video.shape) != expected_pixel_shape:
@@ -1353,10 +1367,12 @@ class MiniMaxH3Model:
         cumulative_requested = any(
             key in _kwargs for key in (
                 "_h3_cumulative_capture", "_h3_cumulative_previous", "_h3_cumulative_step",
+                "_h3_cumulative_video_sink",
             )
         )
         cumulative_previous = cumulative_step = cumulative_context = None
         cumulative_token = None
+        cumulative_video_sink = _kwargs.get("_h3_cumulative_video_sink")
         if not cumulative_requested:
             # An intervening ordinary request may reconfigure managed weights.
             self._h3_cumulative_token = None
@@ -1401,6 +1417,14 @@ class MiniMaxH3Model:
             )
             if incompatible:
                 raise ValueError("H3 cumulative sampling requires an independent native FL2VA request.")
+            if cumulative_video_sink is not None:
+                from services.h3_cumulative_dispatch import (
+                    h3_cumulative_streaming_enabled,
+                )
+                from services.h3_stream_video import H3VideoSink
+
+                if not h3_cumulative_streaming_enabled() or type(cumulative_video_sink) is not H3VideoSink:
+                    raise ValueError("H3 cumulative video requires the selected private streaming transport")
             handoff = _kwargs.get("_h3_cumulative_previous")
             cumulative_step = _kwargs.get("_h3_cumulative_step")
             if handoff is not None or cumulative_step is not None:
@@ -1920,7 +1944,15 @@ class MiniMaxH3Model:
             decoded_bytes = 4 * (
                 3 * output_frames * height * width + 2 * output_audio_ticks * 800
             )
-            if decoded_bytes > 2 * 1024 * 1024 * 1024:
+            if cumulative_video_sink is not None:
+                output_published = output_frames if cumulative_step is None else output_frames - cumulative_step.publication_trim_frames
+                if (
+                    (cumulative_video_sink.generated_frames, cumulative_video_sink.published_frames,
+                     cumulative_video_sink.height, cumulative_video_sink.width)
+                    != (output_frames, output_published, height, width)
+                ):
+                    raise ValueError("H3 streaming sink differs from the exact cumulative output geometry")
+            elif decoded_bytes > 2 * 1024 * 1024 * 1024:
                 raise ValueError(
                     "H3 cumulative full decode exceeds the private 2 GiB output limit. "
                     "Use a shorter chain or a smaller canvas."
@@ -2568,6 +2600,8 @@ class MiniMaxH3Model:
             channels=24,
             patch_size=self.patch_size,
             observer=_kwargs.get("_h3_decode_observer"),
+            video_sink=cumulative_video_sink,
+            abort_check=lambda: self._interrupt,
         )
 
         report_phase("Decoding H3 audio")
@@ -2591,7 +2625,7 @@ class MiniMaxH3Model:
                     :, :, -handoff_video_latents:
                 ].detach().float().cpu(),
             }
-        output_video = video[0]
+        output_video = video[0] if video is not None else None
         if native_continuation:
             output_video = torch.cat(
                 [boundary_history.to(output_video), output_video], dim=1,
@@ -2612,7 +2646,10 @@ class MiniMaxH3Model:
             published_frames = cumulative_state.published_frames
             sample_count = round(Fraction(published_frames * 32000, MINIMAX_H3_FPS))
             padding = max(0, sample_count - audio.shape[0])
-            result["x"] = output_video[:, :published_frames]
+            if cumulative_video_sink is None:
+                result["x"] = output_video[:, :published_frames]
+            else:
+                result["_h3_encoded_video"] = cumulative_video_sink.receipt
             result["audio"] = np.pad(audio[:sample_count], ((0, padding), (0, 0)))
             self._h3_cumulative_token = cumulative_token
             result["_h3_cumulative_handoff"] = {

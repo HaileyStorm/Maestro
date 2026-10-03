@@ -11314,6 +11314,9 @@ def generate_video(*args, **kwargs):
             except Exception as cleanup_error:
                 print(f"[Memory] Failed-generation cleanup: {type(cleanup_error).__name__}")
             raise
+        finally:
+            if cumulative_dispatch is not None:
+                cumulative_dispatch.cleanup_video_sink()
 
 
 def _resolve_ltx25_video_vae_request(
@@ -11844,6 +11847,7 @@ def _generate_video_impl(
             == active_owner
         )
         gen["early_stop_forwarded"] = False
+    h3_streamed_output_committed = False
     torch.set_grad_enabled(False) 
     if mode.startswith("edit_"):
         edit_video(send_cmd, state, mode, video_source, seed, temporal_upsampling, spatial_upsampling, film_grain_intensity, film_grain_saturation, MMAudio_setting, MMAudio_prompt, MMAudio_neg_prompt, repeat_generation, audio_source)
@@ -13986,6 +13990,20 @@ def _generate_video_impl(
                         prepare=lambda path: prepare_semantic_reference_video(path, fps, model_def),
                     )
                 overridden_inputs = None
+                if _h3_cumulative_dispatch is not None:
+                    from services.h3_cumulative_dispatch import (
+                        h3_cumulative_streaming_enabled,
+                    )
+                    if h3_cumulative_streaming_enabled():
+                        if durable_output_dir is None:
+                            raise ValueError("H3 streaming requires the authorized private recovery staging directory")
+                        _h3_cumulative_dispatch.configure_video_sink(
+                            staging_directory=durable_output_dir,
+                            height=image_size[0], width=image_size[1],
+                            codec_type=server_config.get("video_output_codec"),
+                            container=server_config.get("video_container", "mp4"),
+                            abort_check=lambda: gen.get("abort", False), timeout=600,
+                        )
                 if base_model_type in {"minimax_h3", "minimax_h3_ref2va"}:
                     begin_decode_capture(_h3_decode_observer, {
                         "repeat_index": max(0, repeat_no - 1), "window_index": window_no,
@@ -14316,9 +14334,11 @@ def _generate_video_impl(
             post_decode_pre_trim = 0
             _retake_stitch_info = None
             output_audio_sampling_rate= audio_sampling_rate
+            h3_encoded_video = None
             if samples != None:
                 if _h3_cumulative_dispatch is not None:
                     _h3_cumulative_dispatch.capture(samples)
+                    h3_encoded_video = _h3_cumulative_dispatch.encoded_video
                 if isinstance(samples, dict):
                     overlapped_latents = samples.get("latent_slice", None)
                     BGRA_frames = samples.get("BGRA_frames", None)
@@ -14366,144 +14386,170 @@ def _generate_video_impl(
             gc.collect()
             torch.cuda.empty_cache()
 
-            if samples == None:
+            if samples is None and h3_encoded_video is None:
                 abort = True
                 state["prompt"] = ""
                 send_cmd("output")  
             else:
-                sample = samples.cpu()
-                abort = abort_scheduled or not (is_image or audio_only) and sample.shape[1] < current_video_length    
-                # if True: # for testing
-                #     torch.save(sample, "output.pt")
-                # else:
-                #     sample =torch.load("output.pt")
-                if post_decode_pre_trim > 0 :
-                    sample = sample[:, post_decode_pre_trim:]
-                if gen.get("extra_windows",0) > 0:
-                    sliding_window = True 
-                if sliding_window :
-                    guide_start_frame += current_video_length
-                    if discard_last_frames > 0:
-                        sample = sample[: , :-discard_last_frames]
-                        guide_start_frame -= discard_last_frames
-                        if generated_audio is not None:
-                            generated_audio = truncate_audio( generated_audio, 0, discard_last_frames, fps, output_audio_sampling_rate,)
-                    # Sliding-window audio continuity: capture the trailing
-                    # reuse_frames worth of generated audio so the next window
-                    # can use it as a clean prefix (via AudioConditionByLatentPrefix
-                    # in ltx2.py) when source audio runs out.
-                    if generated_audio is not None and reuse_frames > 0:
-                        pre_audio_guide = generated_audio[-int(round(reuse_frames * output_audio_sampling_rate / fps)):]
-                        pre_audio_guide_sample_rate = output_audio_sampling_rate
-                    else:
-                        pre_audio_guide, pre_audio_guide_sample_rate = None, 0
-
-                    if reuse_frames == 0:
-                        pre_video_guide =  sample[:,max_source_video_frames :].clone()
-                    else:
-                        pre_video_guide =  sample[:, -reuse_frames:].clone()
-                    if pre_video_guide.dtype == torch.uint8:
-                        pre_video_guide =  pre_video_guide.float().div_(127.5).sub_(1.0)
-                if not (audio_only or is_image):                    
-                    sample = _video_tensor_to_uint8_chunk_inplace(sample)
-
-                # SCAIL-2's fake start image carries identity only and has
-                # zero output-timeline frames.  Do not let its original
-                # spatial canvas reach final assembly: even ``[:, :-0]`` is
-                # an empty tensor whose height/width must match torch.cat's
-                # generated chunk, which fails when the control video chose
-                # a different canvas.
-                if fake_start_image and window_no == 1:
-                    prefix_video = None
-                elif (
-                    prefix_video is not None
-                    and window_no == 1
-                    and not h3_timeline_still_guide_requested
-                ):
-                    sample = _restore_h3_first_window_prefix(
-                        sample,
-                        prefix_video,
-                        source_video_overlap_frames_count,
+                if h3_encoded_video is not None:
+                    from services.h3_stream_video import (
+                        validate_h3_streamed_post_decode,
                     )
-                    prefix_video = None
-                    guide_start_frame -= source_video_overlap_frames_count 
-                    if generated_audio is not None:
-                        generated_audio = truncate_audio( generated_audio, source_video_overlap_frames_count, 0, fps, output_audio_sampling_rate,)
-                elif sliding_window and window_no > 1 and reuse_frames > 0:
-                    # remove sliding window overlapped frames at the beginning of the generation
-                    sample = sample[: , reuse_frames:]
-                    guide_start_frame -= reuse_frames 
-                    if generated_audio is not None:
-                        generated_audio = truncate_audio( generated_audio, reuse_frames, 0, fps, output_audio_sampling_rate,)
-
-                num_frames_generated = guide_start_frame - (source_video_frames_count - source_video_overlap_frames_count)
-                if generated_audio is not None:
-                    if full_generated_audio is None:
-                        # First window: if we have pre-existing source audio (from
-                        # a video_source or audio_guide), splice the committed
-                        # prefix onto the newly generated audio so the output
-                        # covers the full timeline. Later windows just concat.
-                        if output_new_audio_data is not None or output_new_audio_filepath is not None:
-                            committed_audio_samples = int(round((num_frames_generated - sample.shape[1]) * output_audio_sampling_rate / fps))
-                            full_generated_audio = append_sliding_window_audio(
-                                output_new_audio_data, output_new_audio_filepath,
-                                generated_audio, output_audio_sampling_rate,
-                                committed_audio_samples,
-                            )
-                        else:
-                            full_generated_audio = generated_audio
-                    else:
-                        full_generated_audio = np.concatenate([full_generated_audio, generated_audio], axis=0)
-                    output_new_audio_data = full_generated_audio
-
-
-                if len(temporal_upsampling) > 0 or len(spatial_upsampling) > 0 and not "vae2" in spatial_upsampling:                
-                    send_cmd("progress", [0, get_latest_status(state,"Upsampling")])
-                
-                output_fps  = fps
-                if len(temporal_upsampling) > 0:
-                    sample, previous_last_frame, output_fps = perform_temporal_upsampling(sample, previous_last_frame if sliding_window and window_no > 1 else None, temporal_upsampling, fps)
-
-                if len(spatial_upsampling) > 0:
-                    # Forward FlashVSR's per-step progress to the job tile. FlashVSR
-                    # reports (phase, current_step, total_steps); send_cmd("progress",
-                    # [(step, total), msg]) makes the tile show "Step x/y" and a bar
-                    # driven by the steps. Without this the bar stays full (left at
-                    # ~100% by the denoising phase) for the whole ~minutes-long upscale.
-                    # Phases with no step counts (Caching / Color Correction) send
-                    # (0, 0) to reset the stale-full bar and just show the phase.
-                    # Lanczos never calls back, so this is a no-op there.
-                    def _spatial_progress(phase, current_step=None, total_steps=None):
-                        _msg = get_latest_status(state, phase or "Upsampling")
-                        if total_steps:
-                            send_cmd("progress", [(int(current_step or 0), int(total_steps)), _msg])
-                        else:
-                            send_cmd("progress", [(0, 0), _msg])
-                    sample = perform_spatial_upsampling(
-                        sample,
-                        spatial_upsampling,
-                        seed=seed,
-                        abort_callback=lambda: gen.get("abort", False),
-                        progress_callback=_spatial_progress,
+                    if abort_scheduled or gen.get("abort", False):
+                        raise InterruptedError("H3 output publication cancelled")
+                    validate_h3_streamed_post_decode(
+                        h3_encoded_video, height=height, width=width, fps=fps,
+                        audio=generated_audio, audio_rate=output_audio_sampling_rate,
+                        has_transform=bool(
+                            is_image or audio_only or sliding_window or prefix_video is not None
+                            or post_decode_pre_trim or _retake_stitch_info is not None
+                            or _progressive_pad_info is not None or gen.get("extra_windows", 0)
+                            or temporal_upsampling or spatial_upsampling or film_grain_intensity
+                            or MMAudio_setting or source_video_frames_count or audio_source
+                            or output_new_audio_filepath or output_new_audio_data is not None
+                            or full_generated_audio is not None
+                        ),
                     )
-                    if sample is None or gen.get("abort", False):
-                        abort = True
-                        break
-                if film_grain_intensity> 0:
-                    from postprocessing.film_grain import add_film_grain
-                    sample = add_film_grain(sample, film_grain_intensity, film_grain_saturation) 
-                mmaudio_enabled, mmaudio_mode, mmaudio_persistence, mmaudio_model_name, mmaudio_model_path = get_mmaudio_settings(server_config)
-                if audio_only or is_image:
-                    output_video_frames = None
-                    output_frame_count = None
+                    abort = False
+                    sample = output_video_frames = None
+                    num_frames_generated = output_frame_count = h3_encoded_video.published_frames
+                    output_fps = fps
+                    full_generated_audio = output_new_audio_data = generated_audio
                     any_mmaudio = False
                 else:
-                    frames_already_processed.append(sample)
-                    frames_already_processed_count += sample.shape[1]
-                    output_video_frames = frames_already_processed
-                    output_frame_count = frames_already_processed_count
-                    sample = None
-                    any_mmaudio = MMAudio_setting != 0 and mmaudio_enabled and output_frame_count >= fps
+                    sample = samples.cpu()
+                    abort = abort_scheduled or not (is_image or audio_only) and sample.shape[1] < current_video_length
+                    # if True: # for testing
+                    #     torch.save(sample, "output.pt")
+                    # else:
+                    #     sample =torch.load("output.pt")
+                    if post_decode_pre_trim > 0 :
+                        sample = sample[:, post_decode_pre_trim:]
+                    if gen.get("extra_windows",0) > 0:
+                        sliding_window = True
+                    if sliding_window :
+                        guide_start_frame += current_video_length
+                        if discard_last_frames > 0:
+                            sample = sample[: , :-discard_last_frames]
+                            guide_start_frame -= discard_last_frames
+                            if generated_audio is not None:
+                                generated_audio = truncate_audio( generated_audio, 0, discard_last_frames, fps, output_audio_sampling_rate,)
+                        # Sliding-window audio continuity: capture the trailing
+                        # reuse_frames worth of generated audio so the next window
+                        # can use it as a clean prefix (via AudioConditionByLatentPrefix
+                        # in ltx2.py) when source audio runs out.
+                        if generated_audio is not None and reuse_frames > 0:
+                            pre_audio_guide = generated_audio[-int(round(reuse_frames * output_audio_sampling_rate / fps)):]
+                            pre_audio_guide_sample_rate = output_audio_sampling_rate
+                        else:
+                            pre_audio_guide, pre_audio_guide_sample_rate = None, 0
+
+                        if reuse_frames == 0:
+                            pre_video_guide =  sample[:,max_source_video_frames :].clone()
+                        else:
+                            pre_video_guide =  sample[:, -reuse_frames:].clone()
+                        if pre_video_guide.dtype == torch.uint8:
+                            pre_video_guide =  pre_video_guide.float().div_(127.5).sub_(1.0)
+                    if not (audio_only or is_image):
+                        sample = _video_tensor_to_uint8_chunk_inplace(sample)
+
+                    # SCAIL-2's fake start image carries identity only and has
+                    # zero output-timeline frames.  Do not let its original
+                    # spatial canvas reach final assembly: even ``[:, :-0]`` is
+                    # an empty tensor whose height/width must match torch.cat's
+                    # generated chunk, which fails when the control video chose
+                    # a different canvas.
+                    if fake_start_image and window_no == 1:
+                        prefix_video = None
+                    elif (
+                        prefix_video is not None
+                        and window_no == 1
+                        and not h3_timeline_still_guide_requested
+                    ):
+                        sample = _restore_h3_first_window_prefix(
+                            sample,
+                            prefix_video,
+                            source_video_overlap_frames_count,
+                        )
+                        prefix_video = None
+                        guide_start_frame -= source_video_overlap_frames_count
+                        if generated_audio is not None:
+                            generated_audio = truncate_audio( generated_audio, source_video_overlap_frames_count, 0, fps, output_audio_sampling_rate,)
+                    elif sliding_window and window_no > 1 and reuse_frames > 0:
+                        # remove sliding window overlapped frames at the beginning of the generation
+                        sample = sample[: , reuse_frames:]
+                        guide_start_frame -= reuse_frames
+                        if generated_audio is not None:
+                            generated_audio = truncate_audio( generated_audio, reuse_frames, 0, fps, output_audio_sampling_rate,)
+
+                    num_frames_generated = guide_start_frame - (source_video_frames_count - source_video_overlap_frames_count)
+                    if generated_audio is not None:
+                        if full_generated_audio is None:
+                            # First window: if we have pre-existing source audio (from
+                            # a video_source or audio_guide), splice the committed
+                            # prefix onto the newly generated audio so the output
+                            # covers the full timeline. Later windows just concat.
+                            if output_new_audio_data is not None or output_new_audio_filepath is not None:
+                                committed_audio_samples = int(round((num_frames_generated - sample.shape[1]) * output_audio_sampling_rate / fps))
+                                full_generated_audio = append_sliding_window_audio(
+                                    output_new_audio_data, output_new_audio_filepath,
+                                    generated_audio, output_audio_sampling_rate,
+                                    committed_audio_samples,
+                                )
+                            else:
+                                full_generated_audio = generated_audio
+                        else:
+                            full_generated_audio = np.concatenate([full_generated_audio, generated_audio], axis=0)
+                        output_new_audio_data = full_generated_audio
+
+
+                    if len(temporal_upsampling) > 0 or len(spatial_upsampling) > 0 and not "vae2" in spatial_upsampling:
+                        send_cmd("progress", [0, get_latest_status(state,"Upsampling")])
+
+                    output_fps  = fps
+                    if len(temporal_upsampling) > 0:
+                        sample, previous_last_frame, output_fps = perform_temporal_upsampling(sample, previous_last_frame if sliding_window and window_no > 1 else None, temporal_upsampling, fps)
+
+                    if len(spatial_upsampling) > 0:
+                        # Forward FlashVSR's per-step progress to the job tile. FlashVSR
+                        # reports (phase, current_step, total_steps); send_cmd("progress",
+                        # [(step, total), msg]) makes the tile show "Step x/y" and a bar
+                        # driven by the steps. Without this the bar stays full (left at
+                        # ~100% by the denoising phase) for the whole ~minutes-long upscale.
+                        # Phases with no step counts (Caching / Color Correction) send
+                        # (0, 0) to reset the stale-full bar and just show the phase.
+                        # Lanczos never calls back, so this is a no-op there.
+                        def _spatial_progress(phase, current_step=None, total_steps=None):
+                            _msg = get_latest_status(state, phase or "Upsampling")
+                            if total_steps:
+                                send_cmd("progress", [(int(current_step or 0), int(total_steps)), _msg])
+                            else:
+                                send_cmd("progress", [(0, 0), _msg])
+                        sample = perform_spatial_upsampling(
+                            sample,
+                            spatial_upsampling,
+                            seed=seed,
+                            abort_callback=lambda: gen.get("abort", False),
+                            progress_callback=_spatial_progress,
+                        )
+                        if sample is None or gen.get("abort", False):
+                            abort = True
+                            break
+                    if film_grain_intensity> 0:
+                        from postprocessing.film_grain import add_film_grain
+                        sample = add_film_grain(sample, film_grain_intensity, film_grain_saturation)
+                    mmaudio_enabled, mmaudio_mode, mmaudio_persistence, mmaudio_model_name, mmaudio_model_path = get_mmaudio_settings(server_config)
+                    if audio_only or is_image:
+                        output_video_frames = None
+                        output_frame_count = None
+                        any_mmaudio = False
+                    else:
+                        frames_already_processed.append(sample)
+                        frames_already_processed_count += sample.shape[1]
+                        output_video_frames = frames_already_processed
+                        output_frame_count = frames_already_processed_count
+                        sample = None
+                        any_mmaudio = MMAudio_setting != 0 and mmaudio_enabled and output_frame_count >= fps
                 time_flag = datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d-%Hh%Mm%Ss")
                 save_prompt = original_prompts[0]
                 h3_audio_true_peak_stats = None
@@ -14602,7 +14648,7 @@ def _generate_video_impl(
                     ]
                     print(f"[Progressive] Center-cropped final video: {width}x{height} → {_orig_w}x{_orig_h}")
 
-                if not audio_only and not is_image and base_model_type in {"minimax_h3", "minimax_h3_ref2va"}:
+                if h3_encoded_video is None and not audio_only and not is_image and base_model_type in {"minimax_h3", "minimax_h3_ref2va"}:
                     notify_decode_capture(_h3_decode_observer, "encoder_input", output_video_frames, convention="encoder")
                 if audio_only:
                     audio_path = os.path.join(output_dir, file_name)
@@ -14622,13 +14668,17 @@ def _generate_video_impl(
                     save_path_tmp = video_path.rsplit('.', 1)[0] + f"_tmp.{container}"
                     h3_keep_premux = bool(
                         durable_output_dir is not None
-                        and h3_audio_roles is not None
-                        and h3_audio_roles.experimental
+                        and (h3_encoded_video is not None or (
+                            h3_audio_roles is not None and h3_audio_roles.experimental
+                        ))
                     )
                     h3_premux_paths = []
                     h3_mux_succeeded = False
                     try:
-                        save_video( tensor=output_video_frames, save_file=save_path_tmp, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type = server_config.get("video_output_codec", None), container=container)
+                        if h3_encoded_video is not None:
+                            h3_encoded_video.transfer_to(save_path_tmp)
+                        else:
+                            save_video( tensor=output_video_frames, save_file=save_path_tmp, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type = server_config.get("video_output_codec", None), container=container)
                     except Exception as error:
                         raise PostDecodeStageError(
                             "The rendered segment could not be encoded",
@@ -14643,6 +14693,14 @@ def _generate_video_impl(
                         os.replace(save_path_tmp, premux_video_path)
                         save_path_tmp = premux_video_path
                         h3_premux_paths.append(premux_video_path)
+                        if h3_encoded_video is not None:
+                            # Keep the transferred checkpoint visible even if
+                            # writing its paired waveform fails before muxing.
+                            with lock:
+                                artifact_list = gen.setdefault("artifact_list", [])
+                                if premux_video_path not in artifact_list:
+                                    artifact_list.append(premux_video_path)
+                                gen.setdefault("artifact_roles", {})[premux_video_path] = "temporary"
                     output_new_audio_temp_filepath = None
                     try:
                         native_h3_audio_selected = False
@@ -14696,7 +14754,7 @@ def _generate_video_impl(
 
                         if h3_keep_premux:
                             if (
-                                h3_audio_roles.final_audio_kind == "generated"
+                                (h3_encoded_video is not None or h3_audio_roles.final_audio_kind == "generated")
                                 and output_new_audio_filepath is not None
                             ):
                                 h3_premux_paths.append(output_new_audio_filepath)
@@ -14734,6 +14792,7 @@ def _generate_video_impl(
                             audio_codec_key=server_config.get("audio_output_codec", "aac_128"),
                             output_audio_channels=mux_audio_channels,
                             verbose=verbose_level >= 2,
+                            **({} if h3_encoded_video is None else h3_encoded_video.mux_controls()),
                         )
                         try:
                             if (
@@ -14748,8 +14807,16 @@ def _generate_video_impl(
                                         state=state,
                                     )
                                 )
+                            if h3_encoded_video is not None:
+                                # Recheck cancellation/deadline after the shared
+                                # finality stage before consuming recovery inputs.
+                                h3_encoded_video.mux_controls()
                         except PostDecodeStageError:
                             remove_failed_h3_final_output(video_path)
+                            raise
+                        except Exception:
+                            if h3_encoded_video is not None:
+                                remove_failed_h3_final_output(video_path)
                             raise
                         # Retake stitching mutates this container later. Keep
                         # the H3 pre-mux recovery inputs until that actual
@@ -15397,6 +15464,10 @@ def _generate_video_impl(
                 except Exception as e:
                     print(f"Error playing notification sound for individual video: {e}")
 
+                if h3_encoded_video is not None:
+                    # All shared media, metadata and durable-seal steps are
+                    # complete. A late abort must retain this output's state.
+                    h3_streamed_output_committed = True
                 send_cmd("output")
 
         seed = set_seed(-1)
@@ -15407,7 +15478,7 @@ def _generate_video_impl(
         # consumes it only after this complete model task has returned.
         gen["extra_orders"] = pending_extra_orders
 
-    success = not gen.get("abort", False)
+    success = h3_streamed_output_committed or not gen.get("abort", False)
     if (
         success
         and not single_repeat_dispatch
