@@ -2601,3 +2601,45 @@ native qualification should retain bounded tensor-prefix and pre-encode
 receipts before staging cleanup; another generation solely to repeat this
 media comparison is unnecessary. Reproducible CPU measurements and plots are
 retained privately.
+
+
+## 2026-10-03 three-still Gallery Guide native qualification
+
+One Gallery-submitted MiniMax H3 Base FL2VA run at source revision `710898d`
+completed in 665 seconds. It used three existing stills at frames 62, 90 and
+31, deliberately preserving selection order independently of temporal order.
+The public Guide defaults produced 124 frames at 24 fps, 1344×768, with
+28 steps, Sol attention and no activated LoRAs. Cumulative timeline and native
+boundary conditioning stayed off.
+
+A fresh exact-workspace GPU grant passed coherent validation before submission
+and every five seconds under the retained supervisor. Queue reached idle after
+publication. The producer media hash matched the saved file; its sidecar records
+`guide_count: 3`, frame indices `[62, 90, 31]`, and zero audio/video guides.
+Private Guide source bindings, plan, tensor transport and third-still path are
+absent from the published sidecar. Existing first/last-frame local parameter
+metadata retains its established schema.
+
+Full software FFmpeg decoding passed for all 124 video frames and stereo AAC
+at 32 kHz. Video duration is 5.166667 seconds; audio duration is 5.152 seconds.
+Sampled frames show the green sphere at 31, red robot at 62, and red pyramid
+beside the sphere at 90. All frames were measured: none has at least 99% of
+pixels with every RGB channel below 10. This sample begins with a visible
+sphere; it does not resolve the earlier two-still black-opening negative or
+establish general visual, motion or soundtrack quality.
+
+After completion, the guarded stop released only the pinned Maestro backend;
+its process and GPU allocation disappeared. The exact lease was withdrawn and
+its durable response no longer authorizes work. Pinokio's coordinated restart
+restored local and stable health/readiness, and the public restart status
+cleared. The finished output remained visible in Gallery after restart.
+
+The original HEVC picture remains unsupported in the tested browser. Maestro's
+existing CPU H.264 copy action produced a separate 124-frame result, and its
+browser player reached the 5.166667-second end without a media error. Original
+media and sidecar hashes remained unchanged. Private execution, source, decode,
+frame and browser receipts are retained separately. Existing focused source
+checks were reused; no redundant full suite was run for this evidence-only
+update. Owner whole-clip and listening acceptance remain pending, as does the
+recent-password gate for the owner's Free resources control. Guide video/audio,
+more than three stills, Control and native continuation remain separate work.
