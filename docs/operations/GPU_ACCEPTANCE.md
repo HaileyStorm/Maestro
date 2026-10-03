@@ -2567,3 +2567,37 @@ the actual replacement backend has both cumulative experiment flags absent,
 and local health/readiness return 200. Owner password confirmation was still
 pending, so this cleanup does not count as acceptance of the owner’s **Free
 resources** action.
+
+### Retained cumulative prefix readback (2026-10-03 UTC)
+
+A CPU-only comparison reused the exact first-window media and the completed
+141-frame cumulative container from this run. Media and sidecar hashes matched
+their sealed journal before and after inspection; the published final still
+equals the complete second-window container. No generation or GPU work was
+repeated, and original files were preserved.
+
+Both HEVC video streams are 1344×768 at 24 fps with a zero start time. Of the
+first window's 124 frames, frames 0–104 decode to identical RGB24 pixels;
+frames 105–123 differ. Mean absolute RGB difference across the full prefix is
+0.09623 on the 0–255 channel scale, with a largest per-frame mean of 0.9253
+at frame 123 and a largest individual channel difference of 36. These
+measurements do not establish a perceptual quality threshold. Four paired
+samples retain the mug, tabletop and background under limited agent visual
+inspection; whole-media and human acceptance remain open.
+
+The 164,864-sample stereo 32 kHz audio prefix (5.152 seconds) is not
+bit-identical either: RMS difference is 1.18284e-6 and maximum sample difference
+is 6.02392e-5. The earlier nearly silent-audio result remains authoritative;
+small numerical differences do not prove audible continuity or sound quality.
+
+Both retained native safetensors paths in the completed journal are absent
+now. Their earlier physical hash and shape receipts do not establish actual
+tensor-prefix equality. The independently decoded and encoded media alone
+cannot attribute the changed pixels or samples to the VAE versus the encoder.
+Exact decoded prefix identity is therefore **not achieved** by this pair,
+while source-level latent retention and the previous native execution evidence
+remain distinct. The feature stays experimental. A later otherwise-justified
+native qualification should retain bounded tensor-prefix and pre-encode
+receipts before staging cleanup; another generation solely to repeat this
+media comparison is unnecessary. Reproducible CPU measurements and plots are
+retained privately.
