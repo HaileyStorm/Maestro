@@ -12,21 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.utils import logging
-from diffusers.utils.accelerate_utils import apply_forward_hook
 from diffusers.models.attention import AttentionMixin, AttentionModuleMixin, FeedForward
 from diffusers.models.attention_dispatch import dispatch_attention_fn
+from diffusers.models.autoencoders.vae import (
+    AutoencoderMixin,
+    DecoderOutput,
+    DiagonalGaussianDistribution,
+)
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from diffusers.models.modeling_utils import ModelMixin
-from diffusers.models.autoencoders.vae import AutoencoderMixin, DecoderOutput, DiagonalGaussianDistribution
-
+from diffusers.utils import logging
+from diffusers.utils.accelerate_utils import apply_forward_hook
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -928,6 +931,99 @@ class AutoencoderKLMiniMaxH3(ModelMixin, ConfigMixin, AttentionMixin, Autoencode
             )
             dec = dec[:, :, :-pad_frames]
         return dec
+
+    def _iter_decode_chunks(self, z: torch.Tensor, abort_check=None):
+        """Native temporal recipe without collecting the complete pixel video.
+
+        Keep the last target chunk until final padding can be removed. Pad only
+        the clip being decoded rather than copying the complete latent video.
+        Yielded views can retain a full decoder clip; a bounded sink must consume
+        each chunk synchronously and release its references.
+        """
+        size = self.tokens_chunk_size
+        drop = self.config.token_drop
+        ratio = self.temporal_compression_ratio
+        chunk_frames = size * ratio
+        original_tokens = z.shape[2]
+        pad_tokens = (-(original_tokens + drop)) % size
+        count = (original_tokens + drop + pad_tokens) // size - int(drop > 0)
+        if count < 1:
+            raise ValueError("No complete MiniMax H3 decoder chunk")
+        intra_tail = self.config.clip_length % ratio
+        pad_frames = sum(
+            intra_tail if intra_tail and (original_tokens + k) % size == 0 else ratio
+            for k in range(pad_tokens)
+        )
+        pending = overlap = None
+        for i in range(count):
+            if abort_check is not None and abort_check():
+                raise InterruptedError("MiniMax H3 video decode cancelled")
+            start = i * size
+            end = min(start + size + self.token_overlap, original_tokens + pad_tokens)
+            clip_latents = z[:, :, start : min(end, original_tokens)]
+            repeats = max(0, end - max(start, original_tokens))
+            if repeats:
+                clip_latents = torch.cat(
+                    [clip_latents, z[:, :, -1:].repeat(1, 1, repeats, 1, 1)], dim=2
+                )
+            clip = self._decode_clip(clip_latents)
+            if abort_check is not None and abort_check():
+                raise InterruptedError("MiniMax H3 video decode cancelled")
+            current = clip[:, :, :chunk_frames][:, :, self.frame_pre_padding :]
+            if overlap is not None:
+                current = self._blend(overlap, current, self.frame_overlap, dim=-3)
+            if pending is not None:
+                yield pending
+            pending = current
+            overlap = (
+                clip[:, :, chunk_frames : 2 * chunk_frames][:, :, self.frame_pre_padding :]
+                if drop > 0 else None
+            )
+        tail = pending if overlap is None else torch.cat([pending, overlap], dim=2)
+        if pad_frames:
+            if pad_frames >= tail.shape[2]:
+                raise ValueError("MiniMax H3 padding exceeds the final decoder chunk")
+            tail = tail[:, :, :-pad_frames]
+        yield tail
+
+    @apply_forward_hook
+    def decode_to_sink(self, z: torch.Tensor, sink, *, abort_check=None) -> int:
+        """Consume one video's raw VAE-space chunks before returning.
+
+        Uses the same registered loading hook as ``decode`` and stays within
+        the caller's autocast/gradient context for all model and sink work.
+        ``sink`` must synchronously consume [1,C,T,H,W] chunks and return None; it owns pixel
+        normalization, encoding and publication. Returns the emitted frame
+        count after native padding trim. This method grants no GPU authority.
+        """
+        if (
+            not isinstance(z, torch.Tensor) or z.ndim != 5 or z.shape[0] != 1
+            or not z.is_floating_point() or z.layout != torch.strided
+            or z.device.type == "meta" or any(size < 1 for size in z.shape)
+        ):
+            raise ValueError("MiniMax H3 sink decode requires one real floating-point latent video")
+        if (
+            not callable(sink) or inspect.iscoroutinefunction(sink)
+            or inspect.isasyncgenfunction(sink) or inspect.isgeneratorfunction(sink)
+        ):
+            raise TypeError("MiniMax H3 decode sink must be synchronous")
+        if abort_check is not None and not callable(abort_check):
+            raise TypeError("MiniMax H3 decode cancellation check must be callable")
+        chunks = self._iter_decode_chunks(z, abort_check=abort_check)
+        emitted_frames = 0
+        try:
+            for chunk in chunks:
+                result = sink(chunk)
+                if result is not None:
+                    if inspect.iscoroutine(result) or inspect.isgenerator(result):
+                        result.close()
+                    raise TypeError("MiniMax H3 decode sink must return None after synchronous consumption")
+                emitted_frames += chunk.shape[2]
+                if abort_check is not None and abort_check():
+                    raise InterruptedError("MiniMax H3 video decode cancelled")
+        finally:
+            chunks.close()
+        return emitted_frames
 
     @apply_forward_hook
     def encode(self, x: torch.Tensor, return_dict: bool = True) -> AutoencoderKLOutput | tuple[torch.Tensor]:
