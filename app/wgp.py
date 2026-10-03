@@ -12682,7 +12682,11 @@ def _generate_video_impl(
             f"{recast_warmup_frames} frames "
             f"({published_video_length} published, {video_length} generated)."
         )
-    if sliding_window_size !=0:
+    if _h3_cumulative_dispatch is not None:
+        # Cumulative append uses H3's 17n+5 grid, including short windows.
+        # Generic n*latent_size+1 quantization would split this single call.
+        sliding_window_size = _h3_cumulative_dispatch.sampling_frames(video_length)
+    elif sliding_window_size !=0:
         sliding_window_size = (sliding_window_size -1) // latent_size * latent_size + 1
     # Requantize audio_frame_offset to match the actual quantized video_length per clip.
     # Only recalculate for uniform-duration clips (multi_prompts_gen_type==3).

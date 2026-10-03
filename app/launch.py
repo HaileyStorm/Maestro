@@ -9070,6 +9070,148 @@ def _h3_true_peak_policy_identity() -> dict:
     }
 
 
+def _h3_cumulative_job_plan(job: dict, *, require_gate: bool = False):
+    from services.h3_cumulative_execution import prepare_h3_cumulative_request
+
+    params = job.get("params")
+    return (
+        prepare_h3_cumulative_request(params, require_gate=require_gate)
+        if isinstance(params, dict)
+        else None
+    )
+
+
+def _h3_cumulative_final_settings(plan, components):
+    """The stable final-unit kind also represents a last-output copy, not concat."""
+    return {
+        "assembly": "cumulative_last_output",
+        "cumulative_plan_sha256": plan["plan_sha256"],
+        "published_frames": plan["published_frames"],
+        "component_hashes": [
+            artifact["sha256"] for unit in components for artifact in unit["artifacts"]
+        ],
+        "clip_start_frames": [
+            unit["settings"]["discard_prefix_frames"] for unit in components
+        ],
+        "clip_tail_frames": [
+            unit["settings"]["trim_tail_frames"] for unit in components
+        ],
+        "preserve_generated_audio": True,
+        "audio_start_ms": 0,
+        "h3_audio_true_peak_policy": _h3_true_peak_policy_identity(),
+    }
+
+
+def _publish_h3_cumulative_final(
+    job, plan, variant, project_dir, *, write_sidecars, abort_check, update_job_fn
+):
+    """Publish only the terminal complete container, with durable final evidence."""
+    from services.h3_cumulative_execution import copy_h3_cumulative_final
+
+    existing = _queue_recovery_unit_matches(
+        job,
+        kind="h3_concat",
+        variant=variant,
+        index=0,
+        project_dir=project_dir,
+        quarantine_invalid=False,
+    )
+    if existing is not None:
+        return existing
+    components = [
+        _queue_recovery_unit_matches(
+            job,
+            kind="h3_segment",
+            variant=variant,
+            index=index,
+            project_dir=project_dir,
+            quarantine_invalid=False,
+        )
+        for index in range(len(plan["windows"]))
+    ]
+    if any(unit is None for unit in components):
+        raise QueueRecoveryRuntimeError(
+            "H3 cumulative final is missing a verified window."
+        )
+    if len(_h3_dependency_closed_recovery_units(components)) != len(components):
+        raise QueueRecoveryRuntimeError(
+            "H3 cumulative window dependencies are incomplete."
+        )
+    settings = _h3_cumulative_final_settings(plan, components)
+    dependencies = [unit["unit_id"] for unit in components]
+    unit_id = recovery_unit_id(
+        job["id"],
+        "h3_concat",
+        variant=variant,
+        dependencies=dependencies,
+        settings=settings,
+    )
+
+    def prepare_publication(name, staging, stats):
+        # Hide the stable name before atomic media promotion. A crash between
+        # promotion and journaling remains pending, never a legacy Gallery final.
+        with _sample_campaign_transition_lock:
+            abort_check()
+            write_sidecars(
+                [name],
+                recovery_units={
+                    name: {
+                        "kind": "h3_concat",
+                        "index": 0,
+                        "variant": variant,
+                        "unit_id": unit_id,
+                        "dependencies": dependencies,
+                        "settings": settings,
+                    }
+                },
+                media_paths={name: staging},
+                task_params={
+                    **job["params"], "h3_audio_true_peak": stats,
+                    "multi_clip_info": {
+                        "output_index": variant,
+                        "output_total": job["params"].get("repeat_generation", 1),
+                        "index": len(plan["windows"]) - 1,
+                        "total": len(plan["windows"]),
+                        "defer_concat": True,
+                        "cumulative_plan_sha256": plan["plan_sha256"],
+                    },
+                },
+            )
+            abort_check()
+
+    name, stats = copy_h3_cumulative_final(
+        job,
+        plan,
+        variant,
+        project_dir,
+        components[-1],
+        enforce_audio=lambda path: _enforce_deferred_h3_final_audio(
+            job, path, update_job_fn=update_job_fn
+        ),
+        abort_check=abort_check,
+        prepare_publication=prepare_publication,
+    )
+    with _sample_campaign_transition_lock:
+        abort_check()
+        unit = _queue_recovery_checkpoint_unit(
+            job,
+            kind="h3_concat",
+            variant=variant,
+            index=0,
+            project_dir=project_dir,
+            artifact_names=[name],
+            dependencies=dependencies,
+            settings=settings,
+            attestation={"h3_audio_true_peak": stats},
+        )
+        if not unit:
+            raise InterruptedError("H3 cumulative final checkpoint rejected")
+        if not update_job_fn(job, h3_audio_true_peak=dict(stats)):
+            raise InterruptedError("H3 cumulative final status was cancelled")
+
+    return unit
+
+
 def _queue_recovery_unit_matches(
     job: dict,
     *,
@@ -9157,6 +9299,100 @@ def _queue_recovery_unit_matches(
         continuation = unit.get("continuation")
         unit_settings = unit.get("settings")
         cumulative = unit_settings.get("cumulative_append") if isinstance(unit_settings, dict) else None
+        private_cumulative_plan = None
+        if (
+            isinstance(job.get("params"), dict)
+            and job["params"].get("_h3_cumulative_append") is True
+        ):
+            try:
+                from services.h3_cumulative_execution import (
+                    h3_cumulative_authority,
+                    h3_cumulative_settings,
+                )
+
+                private_cumulative_plan = _h3_cumulative_job_plan(job)
+                planned_authority = h3_cumulative_authority(
+                    job, private_cumulative_plan, variant
+                )
+                if kind == "h3_segment":
+                    expected_settings = h3_cumulative_settings(
+                        private_cumulative_plan, planned_authority, index
+                    )
+                    actual_settings = dict(unit_settings or {})
+                    for key in (
+                        "predecessor_artifact_hashes",
+                        "predecessor_continuation_sha256",
+                    ):
+                        actual_settings.pop(key, None)
+                    if actual_settings != expected_settings:
+                        return None
+                    if len(artifacts) != 1:
+                        return None
+                    if index == 0:
+                        if unit.get("dependencies") or unit_settings != expected_settings:
+                            return None
+                    else:
+                        prior = next(
+                            (
+                                candidate
+                                for candidate in _queue_recovery_units(job)
+                                if candidate.get("kind") == "h3_segment"
+                                and candidate.get("variant") == variant
+                                and candidate.get("index") == index - 1
+                                and candidate.get("state") == "completed"
+                            ),
+                            None,
+                        )
+                        if prior is None or unit.get("dependencies") != [prior.get("unit_id")]:
+                            return None
+                        prior_artifacts = prior.get("artifacts")
+                        prior_continuation = prior.get("continuation")
+                        if (
+                            not isinstance(prior_artifacts, list)
+                            or len(prior_artifacts) != 1
+                            or not isinstance(prior_artifacts[0], dict)
+                            or not isinstance(prior_continuation, dict)
+                        ):
+                            return None
+                        if unit_settings.get("predecessor_artifact_hashes") != sorted(
+                            item.get("sha256") for item in prior_artifacts
+                        ) or unit_settings.get("predecessor_continuation_sha256") != (
+                            prior_continuation
+                        ).get("sha256"):
+                            return None
+                    if (
+                        expected_h3_cumulative_authority is not None
+                        and expected_h3_cumulative_authority != planned_authority
+                    ):
+                        return None
+                    expected_h3_cumulative_authority = planned_authority
+                elif kind == "h3_concat":
+                    components = [
+                        _queue_recovery_unit_matches(
+                            job,
+                            kind="h3_segment",
+                            variant=variant,
+                            index=position,
+                            project_dir=project_dir,
+                            quarantine_invalid=False,
+                            expected_h3_cumulative_authority=planned_authority,
+                        )
+                        for position in range(len(private_cumulative_plan["windows"]))
+                    ]
+                    if any(component is None for component in components):
+                        return None
+                    if len(_h3_dependency_closed_recovery_units(components)) != len(components):
+                        return None
+                    if unit_settings != _h3_cumulative_final_settings(
+                        private_cumulative_plan, components
+                    ):
+                        return None
+                    if unit.get("dependencies") != [
+                        component["unit_id"] for component in components
+                    ]:
+                        return None
+            except (QueueRecoveryRuntimeError, TypeError, ValueError, KeyError):
+                return None
         if cumulative is not None or (
             isinstance(continuation, dict)
             and continuation.get("mode") == "cumulative_append"
@@ -10130,7 +10366,11 @@ def _queue_recovery_completed_h3_graph(job: dict, project_dir: str) -> dict | No
         )
         verified = []
         for unit in units.values():
-            check = dict(job, recovery_cursor={"completed_units": [unit]})
+            check = dict(job, recovery_cursor={"completed_units": (
+                list(units.values())
+                if isinstance(job.get("params"), dict) and job["params"].get("_h3_cumulative_append") is True
+                else [unit]
+            )})
             if _queue_recovery_unit_matches(
                 check, kind=unit["kind"], variant=unit["variant"], index=unit["index"],
                 project_dir=project_dir, quarantine_invalid=False,
@@ -10335,6 +10575,16 @@ def _queue_recovery_reconcile_cursor(job: dict, project_dir: str) -> None:
             continue
         if settings:
             recovered["settings"] = dict(settings)
+        if kind == "h3_concat" and isinstance(job.get("params"), dict) and job["params"].get("_h3_cumulative_append") is True:
+            meta_params = meta.get("params")
+            stats = meta_params.get("h3_audio_true_peak") if isinstance(meta_params, dict) else None
+            if not isinstance(stats, dict):
+                invalid_recovered_units.add(unit_id)
+            else:
+                attestation = {"h3_audio_true_peak": dict(stats)}
+                if "attestation" in recovered and recovered["attestation"] != attestation:
+                    invalid_recovered_units.add(unit_id)
+                recovered["attestation"] = attestation
         if "producer_unit_continuation" in meta:
             recovered["continuation"] = dict(continuation)
         recovered["artifacts"].append(artifact)
@@ -10378,7 +10628,11 @@ def _queue_recovery_reconcile_cursor(job: dict, project_dir: str) -> None:
                 old_media, new_media = media_identity(original), media_identity(unit)
                 if old_media is None or new_media is None or old_media != new_media:
                     continue
-            check_job = dict(job, recovery_cursor={"completed_units": [unit]})
+            check_job = dict(job, recovery_cursor={"completed_units": (
+                [unit] + verified + [candidate for key, candidate in recovered_by_unit.items() if key != unit_id]
+                if isinstance(job.get("params"), dict) and job["params"].get("_h3_cumulative_append") is True
+                else [unit]
+            )})
             if _queue_recovery_unit_matches(
                 check_job, kind=unit["kind"], variant=unit["variant"],
                 index=unit["index"], project_dir=project_dir,
@@ -65393,6 +65647,7 @@ def _run_generation(
     job = _jobs[job_id]
     h3_delivery_request = False
     h3_integrity_passed = False
+    cumulative_dispatch = None
 
     def _defer_h3_final_publication(target: Mapping[str, Any]) -> bool:
         params = target.get("params")
@@ -65816,10 +66071,18 @@ def _run_generation(
             server_prepared_h3_plan = _trusted_h3_prepared_plan(
                 raw_params, allow_server_prepared=True,
             )
+            from services.h3_cumulative_execution import prepare_h3_cumulative_request
+            try:
+                h3_cumulative_plan = prepare_h3_cumulative_request(raw_params, require_gate=False)
+                if h3_cumulative_plan is not None and not job.get("_recovery_manifest_pointer"):
+                    raise ValueError("Private cumulative generation requires durable request authority.")
+            except (TypeError, ValueError) as exc:
+                finish_job(job, "failed", error=str(exc), message="Cumulative generation plan is unavailable")
+                return False
             if "_h3_longform" in raw_params and not isinstance(raw_params["_h3_longform"], dict):
                 fail_h3_plan_mismatch()
                 return False
-            if server_prepared_h3_plan is None:
+            if server_prepared_h3_plan is None and h3_cumulative_plan is None:
                 try:
                     _apply_h3_adaptive_checkpoint(raw_params)
                 except ValueError as exc:
@@ -65844,8 +66107,10 @@ def _run_generation(
             try:
                 _require_h3_native_boundary_experimental(raw_params)
                 _validate_h3_sampling_steps(raw_params)
-                _validate_h3_explicit_multiclip_request(raw_params)
+                if h3_cumulative_plan is None:
+                    _validate_h3_explicit_multiclip_request(raw_params)
                 worker_h3_plan = (
+                    None if h3_cumulative_plan is not None else
                     server_prepared_h3_plan if server_prepared_h3_plan is not None
                     else _prepare_h3_long_studio_request(raw_params)
                 )
@@ -66202,7 +66467,7 @@ def _run_generation(
                 h3_mapping_plan = raw_params.get("_h3_prompt_mapping_source_plan")
             h3_mapping_descriptors = None
             h3_mapping_project_dir = None
-            h3_templates_resolved = h3_mapping_plan is not None
+            h3_templates_resolved = h3_mapping_plan is not None or h3_cumulative_plan is not None
             if h3_mapping_plan is not None:
                 h3_mapping_project_dir, h3_mapping_descriptors = (
                     _load_h3_mapping_manifest_inputs(job)
@@ -66281,6 +66546,13 @@ def _run_generation(
                     })
 
             # Multi-clip mode: split single request into per-clip tasks
+            elif h3_cumulative_plan is not None:
+                from services.h3_cumulative_execution import build_h3_cumulative_tasks
+                def allocate_cumulative_task_id():
+                    wgp.task_id += 1
+                    return wgp.task_id
+                manifest = build_h3_cumulative_tasks(job, h3_cumulative_plan, allocate_cumulative_task_id, execution_params=raw_params)
+                update_job(job, window_total=len(manifest), clip_total=len(manifest), message="Preparing cumulative windows")
             elif raw_params.get("multi_prompts_gen_type") == 3:
                 from services.multiclip_inputs import multiclip_prompt_inputs
                 prompt_lines, image_starts, image_ends = multiclip_prompt_inputs(
@@ -66881,6 +67153,7 @@ def _run_generation(
                 if (
                     (isinstance(manifest_info, dict) and manifest_info.get("automatic_h3_longform"))
                     or h3_mapping_plan is not None
+                    or h3_cumulative_plan is not None
                 ):
                     h3_task_sidecar_params[str(manifest_task.get("id"))] = (
                         _attach_voice_clone_sidecar_request(
@@ -67130,6 +67403,8 @@ def _run_generation(
                 # continuation evidence, never staging paths or stale requests.
                 sidecar_params.pop("_h3_native_boundary", None)
                 sidecar_params.pop("_h3_native_boundary_request", None)
+                sidecar_params.pop("_h3_cumulative_append", None)
+                sidecar_params.pop("_h3_cumulative_plan", None)
                 _strip_director_image_role_internals(sidecar_params)
                 # These settings are stripped before generation and applied
                 # afterward, so retain them for pencil-restore metadata.
@@ -67658,6 +67933,22 @@ def _run_generation(
                         gen["file_list"].append(path)
                     return unit
 
+            def _cumulative_abort_check():
+                if is_cancel_requested(job) or not sample_safe_unit_current(abort_state):
+                    raise InterruptedError("H3 cumulative publication was cancelled")
+
+            def _publish_cumulative_variant(variant):
+                def write_final_sidecars(names, **kwargs):
+                    _write_output_sidecars(
+                        names, native_source=h3_delivery_native_source,
+                        private_native_parent=h3_copy_on_write_delivery, **kwargs,
+                    )
+                return _publish_h3_cumulative_final(
+                    job, h3_cumulative_plan, variant, out_dir,
+                    write_sidecars=write_final_sidecars,
+                    abort_check=_cumulative_abort_check, update_job_fn=update_job,
+                )
+
             def _h3_checkpoint_error(message: str) -> QueueRecoveryRuntimeError:
                 error = QueueRecoveryRuntimeError(message)
                 error.stage = "segment_checkpoint"
@@ -67699,7 +67990,7 @@ def _run_generation(
                 return [str(predecessor["unit_id"])], evidence
 
             is_multiclip = bool(
-                (total_tasks > 1 or h3_source_prefix)
+                (h3_cumulative_plan is not None or total_tasks > 1 or h3_source_prefix)
                 and any(
                     t.get("params", {}).get("multi_clip_info")
                     for t in queue
@@ -67785,6 +68076,58 @@ def _run_generation(
                 task_sidecar_params = h3_task_sidecar_params.get(
                     str(task.get("id")), task_params,
                 )
+                cumulative_dispatch = None
+                cumulative_authority = None
+                cumulative_predecessor = None
+                if h3_cumulative_plan is not None:
+                    from services.h3_cumulative_execution import h3_cumulative_authority
+
+                    cumulative_variant = recovery_clip_info["output_index"]
+                    cumulative_index = recovery_clip_info["index"]
+                    cumulative_authority = h3_cumulative_authority(
+                        job, h3_cumulative_plan, cumulative_variant
+                    )
+                    recovered_cumulative = _queue_recovery_unit_matches(
+                        job,
+                        kind="h3_segment",
+                        variant=cumulative_variant,
+                        index=cumulative_index,
+                        project_dir=out_dir,
+                        expected_h3_cumulative_authority=cumulative_authority,
+                    )
+                    if cumulative_index:
+                        cumulative_predecessor = _queue_recovery_unit_matches(
+                            job,
+                            kind="h3_segment",
+                            variant=cumulative_variant,
+                            index=cumulative_index - 1,
+                            project_dir=out_dir,
+                            expected_h3_cumulative_authority=cumulative_authority,
+                        )
+                        if cumulative_predecessor is None:
+                            raise _h3_checkpoint_error(
+                                "H3 cumulative predecessor is not durably verified."
+                            )
+                    if recovered_cumulative is not None:
+                        for artifact in recovered_cumulative["artifacts"]:
+                            path = os.path.join(out_dir, artifact["basename"])
+                            if path not in gen["file_list"]:
+                                gen["file_list"].append(path)
+                            producer_artifact_roles[artifact["basename"]] = "component"
+                        if cumulative_index + 1 == len(h3_cumulative_plan["windows"]):
+                            final_unit = _publish_cumulative_variant(cumulative_variant)
+                            for artifact in final_unit["artifacts"]:
+                                path = os.path.join(out_dir, artifact["basename"])
+                                if path not in gen["file_list"]:
+                                    gen["file_list"].append(path)
+                                producer_artifact_roles[artifact["basename"]] = "final"
+                                if join_output_file is None:
+                                    join_output_file = artifact["basename"]
+                        completed += 1
+                        print(f"  Task {task_no} recovered from verified cumulative output")
+                        continue
+                    if os.environ.get("MAESTRO_H3_CUMULATIVE_EXPERIMENTAL") != "1":
+                        raise QueueRecoveryRuntimeError("Private H3 cumulative generation is disabled.")
                 mapping_receipt = None
                 if h3_mapping_plan is not None:
                     task, task_sidecar_params = _bind_h3_task_prompt_mapping(
@@ -67986,6 +68329,33 @@ def _run_generation(
                             task_params,
                             validation_reference_restoration,
                         )
+                if validated_params is None and h3_cumulative_plan is not None:
+                    raise QueueRecoveryRuntimeError("H3 cumulative window failed validation.")
+                if validated_params is not None and h3_cumulative_plan is not None:
+                    from services.h3_cumulative_execution import (
+                        create_h3_cumulative_dispatch,
+                    )
+
+                    window = h3_cumulative_plan["windows"][cumulative_index]
+                    if (
+                        validated_params.get("prompt") != window["sampler_prompt"]
+                        or validated_params.get("resolution") != job["params"]["resolution"]
+                    ):
+                        raise QueueRecoveryRuntimeError(
+                            "H3 cumulative prompt or canvas changed during validation."
+                        )
+                    # Ordinary validation clamps short windows to the first-clip
+                    # minimum. The sealed append plan supplies its exact count.
+                    validated_params["video_length"] = window["sampler_frames"]
+                    validated_params["sliding_window_size"] = window["sampler_frames"]
+                    validated_params["multi_clip_info"] = copy.deepcopy(recovery_clip_info)
+                    cumulative_dispatch = create_h3_cumulative_dispatch(
+                        h3_cumulative_plan,
+                        cumulative_authority,
+                        cumulative_index,
+                        out_dir,
+                        cumulative_predecessor,
+                    )
                 if validated_params is None:
                     print(f"  [SKIP] Task {task_no} failed validation")
                     skipped += 1
@@ -67998,7 +68368,7 @@ def _run_generation(
                 recovery_clip = params.get("multi_clip_info")
                 recovery_h3_segment = bool(
                     isinstance(recovery_clip, dict)
-                    and recovery_clip.get("automatic_h3_longform")
+                    and (recovery_clip.get("automatic_h3_longform") or h3_cumulative_plan is not None)
                 )
                 recovery_native_output = bool(
                     job.get("_recovery_manifest_pointer")
@@ -68477,7 +68847,7 @@ def _run_generation(
                 worker_started = threading.Event()
                 worker_start_state = {"cancelled": False}
 
-                def make_error_handler(task, params, send_cmd, call_timing):
+                def make_error_handler(task, params, send_cmd, call_timing, cumulative_dispatch=None):
                     def error_handler():
                         with worker_start_lock:
                             if worker_start_state["cancelled"]:
@@ -68498,6 +68868,8 @@ def _run_generation(
                             call_model = str(filtered_params.get("model_type") or "")
                             filtered_params.pop("_h3_profile_observer", None)
                             filtered_params.pop("_h3_decode_observer", None)
+                            if cumulative_dispatch is not None:
+                                filtered_params["_h3_cumulative_dispatch"] = cumulative_dispatch
                             if call_model in _H3_LONG_STUDIO_MODELS:
                                 from services.h3_benchmark import H3OffloadObservation
                                 profile_observation = H3OffloadObservation(call_model)
@@ -68560,7 +68932,7 @@ def _run_generation(
 
                 wgp._recover_dead_async_listener(Listener)
                 try:
-                    async_run(make_error_handler(task, params, send_cmd, _h3_call_timing))
+                    async_run(make_error_handler(task, params, send_cmd, _h3_call_timing, cumulative_dispatch=cumulative_dispatch))
                 except BaseException:
                     with worker_start_lock:
                         worker_start_state["cancelled"] = True
@@ -68941,6 +69313,8 @@ def _run_generation(
                         ))
                     except Exception as benchmark_error:
                         print(f"[H3 Estimate] Observation skipped: {benchmark_error}")
+                if h3_cumulative_plan is not None:
+                    task_role_by_filename = {name: "component" for name in task_media_names}
                 task_video_names = [
                     filename for filename in task_media_names
                     if os.path.splitext(filename)[1].lower()
@@ -68994,7 +69368,12 @@ def _run_generation(
                             pass
 
                 if is_cancel_requested(job) or gen.get("abort"):
+                    if cumulative_dispatch is not None:
+                        cumulative_dispatch.discard()
                     cancelled = True
+                    break
+                if task_error and cumulative_dispatch is not None:
+                    cumulative_dispatch.discard()
                     break
 
                 # WGP renders and registers the last H3 segment before it
@@ -69180,6 +69559,98 @@ def _run_generation(
                 if not task_error:
                     completed += 1
                     print(f"\n  Task {task_no} completed")
+
+                    if cumulative_dispatch is not None:
+                        from services.h3_cumulative_execution import (
+                            h3_cumulative_settings,
+                        )
+
+                        dependencies, predecessor_evidence = _h3_verified_segment_dependency_evidence(
+                            cumulative_variant, cumulative_index
+                        )
+                        cumulative_settings = h3_cumulative_settings(
+                            h3_cumulative_plan, cumulative_authority, cumulative_index
+                        )
+                        cumulative_settings.update(predecessor_evidence)
+                        cumulative_unit_id = recovery_unit_id(
+                            job_id,
+                            "h3_segment",
+                            variant=cumulative_variant,
+                            index=cumulative_index,
+                            dependencies=dependencies,
+                            settings=cumulative_settings,
+                        )
+                        if (
+                            len(task_media_names) != 1
+                            or len(task_video_names) != 1
+                            or not task_staged_media
+                        ):
+                            cumulative_dispatch.discard()
+                            raise _h3_checkpoint_error(
+                                "H3 cumulative window did not produce one staged complete video."
+                            )
+                        try:
+                            continuation = cumulative_dispatch.seal_completed(
+                                cumulative_unit_id, abort_check=lambda: is_cancel_requested(job)
+                            )
+                            name = task_video_names[0]
+                            with _sample_campaign_transition_lock:
+                                _cumulative_abort_check()
+                                _write_output_sidecars(
+                                    [name],
+                                    native_source=h3_delivery_native_source,
+                                    private_native_parent=True,
+                                    recovery_units={
+                                        name: {
+                                            "kind": "h3_segment",
+                                            "index": cumulative_index,
+                                            "variant": cumulative_variant,
+                                            "unit_id": cumulative_unit_id,
+                                            "dependencies": dependencies,
+                                            "settings": cumulative_settings,
+                                            "continuation": continuation,
+                                        }
+                                    },
+                                    media_paths={name: task_staged_media[name]},
+                                    task_params={
+                                        **task_sidecar_params,
+                                        "video_length": h3_cumulative_plan["windows"][cumulative_index][
+                                            "cumulative_published_frames"
+                                        ],
+                                        "duration_seconds": h3_cumulative_plan["windows"][cumulative_index][
+                                            "cumulative_published_frames"
+                                        ]
+                                        / 24.0,
+                                    },
+                                )
+                                _queue_recovery_promote_staged_outputs(
+                                    gen, out_dir, {name: task_staged_media[name]}
+                                )
+                                unit = _queue_recovery_checkpoint_unit(
+                                    job,
+                                    kind="h3_segment",
+                                    variant=cumulative_variant,
+                                    index=cumulative_index,
+                                    project_dir=out_dir,
+                                    artifact_names=[name],
+                                    dependencies=dependencies,
+                                    settings=cumulative_settings,
+                                    continuation=continuation,
+                                    expected_h3_cumulative_authority=cumulative_authority,
+                                )
+                                if not unit:
+                                    raise InterruptedError("H3 cumulative window checkpoint rejected")
+                            if cumulative_index + 1 == len(h3_cumulative_plan["windows"]):
+                                final_unit = _publish_cumulative_variant(cumulative_variant)
+                                for artifact in final_unit["artifacts"]:
+                                    path = os.path.join(out_dir, artifact["basename"])
+                                    if path not in gen["file_list"]:
+                                        gen["file_list"].append(path)
+                                    producer_artifact_roles[artifact["basename"]] = "final"
+                                    if join_output_file is None:
+                                        join_output_file = artifact["basename"]
+                        finally:
+                            cumulative_dispatch.discard()
 
                     # Free VRAM between clips to prevent OOM on long pipelines
                     if is_multiclip and task_idx + 1 < total_tasks:
@@ -69633,7 +70104,7 @@ def _run_generation(
                 )
                 verified_h3_final_files = (
                     _verified_h3_concat_output_names(job, out_dir, new_files)
-                    if automatic_h3_longform else []
+                    if automatic_h3_longform or h3_cumulative_plan is not None else []
                 )
                 with _sample_campaign_transition_lock:
                     if not sample_safe_unit_current(abort_state):
@@ -69651,7 +70122,7 @@ def _run_generation(
                             if defer_output_publication
                             else (
                                 join_output_file
-                                if not automatic_h3_longform
+                                if not (automatic_h3_longform or h3_cumulative_plan is not None)
                                 or join_output_file in verified_h3_final_files
                                 else None
                             )
@@ -69662,7 +70133,7 @@ def _run_generation(
                             else []
                             if h3_delivery_request
                             else verified_h3_final_files
-                            if automatic_h3_longform
+                            if automatic_h3_longform or h3_cumulative_plan is not None
                             else None
                             if is_multiclip
                             else [
@@ -70399,6 +70870,10 @@ def _run_generation(
                             )
                         if type(fps) in {int, float} and fps > 0:
                             h3_expected["expected_fps"] = float(fps)
+                    if h3_cumulative_plan is not None:
+                        h3_expected["expected_frames"] = h3_cumulative_plan["published_frames"]
+                        h3_expected["expected_fps"] = 24.0
+                        h3_expected["expected_resolution"] = tuple(map(int, job["params"]["resolution"].split("x")))
                     integrity = _h3_final_output_integrity(
                         out_dir, h3_final_names, **h3_expected,
                     )
@@ -70749,6 +71224,8 @@ def _run_generation(
                     unregister_abort_state(
                         job_id, _active_gen_states, abort_state,
                     )
+            if cumulative_dispatch is not None:
+                cumulative_dispatch.discard()
             # Restore the persisted base coefficient so the next job
             # starts from the user's auto-tuned value, not whatever
             # this job's adjustment left it at.

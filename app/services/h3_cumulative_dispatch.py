@@ -17,6 +17,95 @@ from services.h3_native_continuation import (
 )
 
 
+def validate_h3_cumulative_settings(settings, *, frames):
+    """Pure eligibility check, also used during recovery with the gate off."""
+    if (
+        settings.get("model_type") != "minimax_h3"
+        or type(settings.get("video_length")) is not int
+        or settings["video_length"] != frames
+        or type(settings.get("repeat_generation")) is not int
+        or settings.get("repeat_generation") != 1
+        or type(settings.get("batch_size")) is not int
+        or settings.get("batch_size") != 1
+        or settings.get("image_mode") not in (0, None)
+        or settings.get("repeat_start_offset", 0) != 0
+        or settings.get("after_repeat_output") is not None
+    ):
+        raise ValueError(
+            "H3 cumulative dispatch requires one native FL2VA video output."
+        )
+    # A cumulative output already contains every retained frame. Ordinary
+    # source-prefix restoration, concat, offsets and postprocessing would
+    # change that timeline or duplicate it.
+    clip = settings.get("multi_clip_info")
+    if clip is not None and (
+        type(clip) is not dict
+        or clip.get("source_prefix") is not None
+        or clip.get("trim_tail", 0)
+        or (int(clip.get("total", 1)) > 1 and clip.get("defer_concat") is not True)
+    ):
+        raise ValueError(
+            "H3 cumulative output requires deferred concatenation without a source prefix."
+        )
+    empty_only = (
+        "video_source",
+        "retake_video",
+        "video_guide",
+        "video_guide2",
+        "video_guide3",
+        "image_start",
+        "image_end",
+        "image_refs",
+        "audio_source",
+        "audio_guide",
+        "audio_guide2",
+        "audio_guide3",
+        "audio_guide4",
+        "audio_guide5",
+        "audio_guide6",
+        "audio_conditioning_guide",
+        "audio_prompt_type",
+        "video_prompt_type",
+        "temporal_upsampling",
+        "spatial_upsampling",
+        "_h3_native_boundary",
+        "activated_loras",
+        "skip_steps_cache_type",
+        "_h3_source_audio_premux_recovery",
+    )
+    for name in empty_only:
+        value = settings.get(name)
+        if value is not None and not (
+            isinstance(value, str)
+            and not value
+            or isinstance(value, (list, tuple))
+            and not value
+        ):
+            raise ValueError(f"H3 cumulative dispatch cannot combine with {name}.")
+    if any(
+        settings.get(name) not in (None, 0, "")
+        for name in (
+            "force_fps",
+            "audio_frame_offset",
+            "film_grain_intensity",
+            "MMAudio_setting",
+            "sliding_window_discard_last_frames",
+            "trim_tail_frames",
+            "h3_native_boundary_conditioning",
+        )
+    ):
+        raise ValueError(
+            "H3 cumulative dispatch requires an unchanged native AV timeline."
+        )
+    prompt = settings.get("prompt")
+    if (
+        not isinstance(prompt, str)
+        or "\n" in prompt
+        and settings.get("multi_prompts_gen_type") != 2
+    ):
+        raise ValueError("H3 cumulative dispatch requires one prompt invocation.")
+
+
 class H3CumulativeDispatch:
     def __init__(self, *, frames: int, previous=None, step=None):
         if (
@@ -54,91 +143,7 @@ class H3CumulativeDispatch:
             raise ValueError(
                 "H3 cumulative dispatch requires the private experimental gate."
             )
-        if (
-            settings.get("model_type") != "minimax_h3"
-            or type(settings.get("video_length")) is not int
-            or settings["video_length"] != self.frames
-            or type(settings.get("repeat_generation")) is not int
-            or settings.get("repeat_generation") != 1
-            or type(settings.get("batch_size")) is not int
-            or settings.get("batch_size") != 1
-            or settings.get("image_mode") not in (0, None)
-            or settings.get("repeat_start_offset", 0) != 0
-            or settings.get("after_repeat_output") is not None
-        ):
-            raise ValueError(
-                "H3 cumulative dispatch requires one native FL2VA video output."
-            )
-        # A cumulative output already contains every retained frame. Ordinary
-        # source-prefix restoration, concat, offsets and postprocessing would
-        # change that timeline or duplicate it.
-        clip = settings.get("multi_clip_info")
-        if clip is not None and (
-            type(clip) is not dict
-            or clip.get("source_prefix") is not None
-            or clip.get("trim_tail", 0)
-            or (int(clip.get("total", 1)) > 1 and clip.get("defer_concat") is not True)
-        ):
-            raise ValueError(
-                "H3 cumulative output requires deferred concatenation without a source prefix."
-            )
-        empty_only = (
-            "video_source",
-            "retake_video",
-            "video_guide",
-            "video_guide2",
-            "video_guide3",
-            "image_start",
-            "image_end",
-            "image_refs",
-            "audio_source",
-            "audio_guide",
-            "audio_guide2",
-            "audio_guide3",
-            "audio_guide4",
-            "audio_guide5",
-            "audio_guide6",
-            "audio_conditioning_guide",
-            "audio_prompt_type",
-            "video_prompt_type",
-            "temporal_upsampling",
-            "spatial_upsampling",
-            "_h3_native_boundary",
-            "activated_loras",
-            "skip_steps_cache_type",
-            "_h3_source_audio_premux_recovery",
-        )
-        for name in empty_only:
-            value = settings.get(name)
-            if value is not None and not (
-                isinstance(value, str)
-                and not value
-                or isinstance(value, (list, tuple))
-                and not value
-            ):
-                raise ValueError(f"H3 cumulative dispatch cannot combine with {name}.")
-        if any(
-            settings.get(name) not in (None, 0, "")
-            for name in (
-                "force_fps",
-                "audio_frame_offset",
-                "film_grain_intensity",
-                "MMAudio_setting",
-                "sliding_window_discard_last_frames",
-                "trim_tail_frames",
-                "h3_native_boundary_conditioning",
-            )
-        ):
-            raise ValueError(
-                "H3 cumulative dispatch requires an unchanged native AV timeline."
-            )
-        prompt = settings.get("prompt")
-        if (
-            not isinstance(prompt, str)
-            or "\n" in prompt
-            and settings.get("multi_prompts_gen_type") != 2
-        ):
-            raise ValueError("H3 cumulative dispatch requires one prompt invocation.")
+        validate_h3_cumulative_settings(settings, frames=self.frames)
         self._phase = "running"
 
     def bind_loaded_model(self, model):

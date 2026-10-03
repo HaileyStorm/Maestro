@@ -1,11 +1,11 @@
-# H3 cumulative append: tensor primitive and private sampler
+# H3 cumulative append: private worker and durable recovery
 
 ## Current milestone and intent
 
-Latest checkpoint: an explicit, sealed cumulative window compiler over the
-unchanged publication contract, described at the end of this file. The public
-long-form caller still needs authorized worker dispatch and the final full-output
-replacement path before activation. Earlier sections retain their milestone-specific
+Latest checkpoint: private worker dispatch, durable AV/media sealing, recovery
+from sealed sidecars and final publication from the last complete output,
+described at the end of this file. Public activation and live generated-media
+acceptance remain open. Earlier sections retain their milestone-specific
 evidence and limitations.
 
 Continue fallback item `UH-20260927-MAESTRO-EXTEND-FLAGS` in the existing
@@ -562,3 +562,91 @@ example, menu and URL-capture checks are inapplicable because no launcher was
 edited. Pinokio reports the existing Maestro process running/ready, and fresh
 probes against its rediscovered URL returned 200 for health and readiness.
 HTTP health is not browser acceptance. The broad sprint remains unfinished.
+
+## Private cumulative worker integration
+
+The worker now prepares the sealed plan from the authorized job's private source
+manifest before ordinary parameter processing. It derives each variant's chain
+identity from that source, the job and the plan digest, then dispatches windows
+in variant order. The transport object travels directly through the real handler
+to WGP outside serialized task parameters. Exact sampler prompts and short legal
+frame counts survive ordinary validation. WGP retains the private window size
+instead of applying the generic sliding-window quantization; the focused case
+uses 39 frames rather than the ordinary 37-frame result. Public HTTP selection
+remains rejected and missing-window execution still requires the experimental
+environment gate.
+
+Eligibility is shared by admission and recovery. Recovery can verify an already
+completed chain with the execution gate disabled, but cannot start a missing
+window. Source/guide inputs, LoRAs, alternate continuation modes, prompt
+enhancement, film grain, upsampling and auxiliary audio processing remain
+excluded. Structural validation does not inspect creative subject matter.
+
+After successful native generation and encoding, the worker seals the normalized
+AV state, writes the private component sidecar, promotes the media and records
+the completed recovery unit under the existing transition lock. Its dependency
+evidence includes both predecessor media hashes and the predecessor AV receipt
+hash. Verification derives authority from the original job rather than trusting
+the journal's declared chain. Missing, changed or malformed source, canvas,
+dependency and continuation metadata prevent reuse. A recovered terminal
+window reaches final publication without validation/model dispatch or denoising.
+
+Final publication copies only the last complete cumulative output. It never
+concatenates overlapping full-output snapshots. The copy is verified before the
+existing final-container audio policy runs, and its pending sealed sidecar is
+prepared before atomic promotion. Components remain private and unchanged;
+the selected final represents the complete published frame count at native FPS.
+Cancellation and audio-policy failure publish no final. A local cancellation
+bridge preserves interruption through the existing atomic publication helper,
+which otherwise wraps an interrupted copy as a generic I/O failure. An already
+verified final is reused without copying or reapplying audio processing.
+
+Startup graph verification supplies the full dependency cursor. When the journal
+is lost after media and sidecar publication, reconciliation reconstructs the
+window chain and final from sealed sidecars plus existing AV receipts. Final
+sidecars preserve variant/window positions and verified audio-policy attestation.
+This does not establish adoption or cleanup of AV/sidecar/staging files created
+before media promotion; that crash interval remains a separate open item.
+
+Evidence after the final metadata guards: 40 focused CPU/mock checks passed in
+`test_h3_cumulative_execution`, `test_h3_cumulative_queue` and
+`test_h3_cumulative_dispatch`. Thirteen new checks exercise admission and
+gate-disabled recovery, variant-major tasks, trusted-source replay, predecessor
+evidence, malformed metadata, actual handler forwarding, actual WGP short-window
+selection, actual worker sealing, recovered terminal bypass, final copy/reuse,
+sidecar-only reconciliation, cancellation and audio failure. Five ordinary H3
+recovery/publication regressions also passed earlier in this integration; those
+unchanged checks are reused. New/changed service and test files pass Ruff lint
+and format checks. Syntax compilation and diff checks pass. The large launch
+and WGP modules retain their baseline 817 and 445 Ruff diagnostics respectively,
+with no added diagnostic. Full suites were not repeated under the owner's
+explicit request to run them less often; UI code was unchanged.
+
+One bounded independent read-only review found no remaining concrete integration
+blocker after correcting its initial film-grain/upsampling concern: the pure
+admission validator already rejects those settings before parameter mutation.
+This is source and CPU/mock evidence, including real worker seams and synthetic
+AV state. No GPU/model-weight generation, real encode/audio measurements,
+process-kill crash, browser or human acceptance was performed. The running
+service remained healthy/ready after Pinokio URL rediscovery; it was not restarted
+or upgraded to this private code during verification.
+
+Next coherent work: resolve checkpoint references and bounded cleanup across the
+pre-promotion crash interval, total chain storage and true peak decode memory,
+then perform separately authorized live GPU/encode/recovery and media acceptance.
+The 512 MiB retained-state limit and 2 GiB decoded-geometry limit remain
+allocation bounds, not total RAM/VRAM admission. Keep public activation closed
+until those acceptance boundaries are satisfied. Existing accepted Extend and
+decoded-boundary evidence should be reused.
+
+Continuation: fallback item `UH-20260927-MAESTRO-EXTEND-FLAGS` and the continuous
+Goal remain active in the same physical checkout on `main`. Owned changes are
+`app/launch.py`, `app/wgp.py`, `app/services/h3_cumulative_dispatch.py`,
+`app/services/h3_cumulative_execution.py`, `tests/test_h3_cumulative_execution.py`
+and this note. Release the exact claims
+`maestro-h3-cumulative-worker-20261003` and
+`maestro-h3-cumulative-admission-20261003` after serial Git closure, through the
+supported helper. Preserve foreign dirty files and the historical tracker hold.
+Policy exit checklist: ownership and dirty-state checks, focused verification,
+durable evidence and serial Git closure apply; launcher destination, examples,
+menu and URL-capture checks are inapplicable because no launcher was edited.
