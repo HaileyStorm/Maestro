@@ -239,6 +239,52 @@ class H3CumulativeExecutionTests(unittest.TestCase):
                         request(**invalid), require_gate=False
                     )
 
+    def test_request_rejects_native_output_limits_before_tensor_allocation(self):
+        cases = (
+            (
+                {
+                    "resolution": "8192x8192",
+                    "video_length": 73,
+                    "sliding_window_size": 73,
+                },
+                "512 MiB",
+            ),
+            (
+                {
+                    "resolution": "864x480",
+                    "video_length": 500,
+                    "sliding_window_size": 345,
+                },
+                "2 GiB",
+            ),
+        )
+        for settings, message in cases:
+            source = request(**settings)
+            original = copy.deepcopy(source)
+            with (
+                self.subTest(settings=settings),
+                patch.object(torch, "empty", side_effect=AssertionError("allocation")),
+                patch.object(torch, "zeros", side_effect=AssertionError("allocation")),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                prepare_h3_cumulative_request(source, require_gate=False)
+            self.assertEqual(source, original)
+
+    def test_request_bound_counts_terminal_grid_padding_before_publication_trim(self):
+        settings = request(
+            resolution="512x512", video_length=668, sliding_window_size=345
+        )
+        plan = prepare_h3_cumulative_request(settings, require_gate=False)
+        self.assertEqual(plan["windows"][-1]["cumulative_generated_frames"], 668)
+        # Requested 669 frames fit below 2 GiB, but native sampling/decoding must
+        # produce the full legal 685-frame AV state before publication trims it.
+        requested_bytes = 4 * (3 * 669 * 512 * 512 + 2 * audio_tick_at_frame(669) * 800)
+        self.assertLess(requested_bytes, 2 * 1024**3)
+        with self.assertRaisesRegex(ValueError, "2 GiB"):
+            prepare_h3_cumulative_request(
+                dict(settings, video_length=669), require_gate=False
+            )
+
     def test_tasks_use_variant_major_short_windows_and_serializable_params(self):
         job = copy.deepcopy(self.job)
         job["params"]["repeat_generation"] = 2

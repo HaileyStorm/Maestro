@@ -17,7 +17,10 @@ from pathlib import Path
 from services.h3_cumulative_dispatch import validate_h3_cumulative_settings
 from services.h3_cumulative_plan import plan_h3_cumulative_chain
 from services.h3_cumulative_queue import H3CumulativeQueueDispatch, H3QueueAuthority
-from services.h3_native_continuation import H3NativeContinuationStep
+from services.h3_native_continuation import (
+    H3NativeContinuationStep,
+    latent_frames_for_video_frames,
+)
 from services.queue_recovery_runtime import (
     MANIFEST_DIRECTORY,
     MAX_MANIFEST_BYTES,
@@ -167,11 +170,33 @@ def prepare_h3_cumulative_request(params, *, require_gate=True):
         raise ValueError(
             "Private cumulative generation cannot use a decoded boundary guide."
         )
-    return plan_h3_cumulative_chain(
+    plan = plan_h3_cumulative_chain(
         global_prompt=params.get("prompt"),
         requested_frames=params.get("video_length"),
         first_window_frames=params.get("sliding_window_size") or 345,
     )
+    # Mirror the loaded native model's existing output-allocation limits before
+    # task creation/model loading. Full cumulative geometry includes terminal
+    # grid padding, even though publication trims that padding after decoding.
+    # These counts do not estimate VAE activations or total process/device peak.
+    for window in plan["windows"]:
+        frames = window["cumulative_generated_frames"]
+        audio_ticks = window["cumulative_generated_audio_ticks"]
+        retained_bytes = 4 * (
+            24 * latent_frames_for_video_frames(frames) * (height // 16) * (width // 16)
+            + 2 * 32 * audio_ticks
+        )
+        if retained_bytes > 512 * 1024 * 1024:
+            raise ValueError(
+                "H3 cumulative retained AV state exceeds the 512 MiB allocation limit."
+            )
+        decoded_bytes = 4 * (3 * frames * height * width + 2 * audio_ticks * 800)
+        if decoded_bytes > 2 * 1024 * 1024 * 1024:
+            raise ValueError(
+                "H3 cumulative full decode exceeds the private 2 GiB output limit. "
+                "Use a shorter chain or a smaller canvas."
+            )
+    return plan
 
 
 def h3_cumulative_authority(job, plan, variant):

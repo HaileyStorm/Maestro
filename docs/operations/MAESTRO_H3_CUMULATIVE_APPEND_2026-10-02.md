@@ -812,3 +812,41 @@ verification, durable evidence and serial Git closure apply; launcher-specific
 destination, example, menu and URL-capture checks are inapplicable. Release the
 exact `maestro-h3-crash-staging-retention-20261003` claim after Git closure; retain
 only the narrow unfinished private native-probe tree through the supported helper.
+
+## Early cumulative output admission
+
+Request preparation now mirrors the existing native retained-state (512 MiB)
+and full-decode (2 GiB) allocation limits for every planned cumulative window,
+before task creation or model loading. It counts the complete generated frame
+and audio geometry, including terminal grid padding that publication later
+trims. Accepted plans and the native limits are unchanged. Recovery preparation
+uses the same deterministic geometry checks. These are output-size screens;
+they do not establish total CPU/GPU peak memory or checkpoint disk capacity.
+
+Two new focused admission regressions pass: oversized retained/decode geometry
+is rejected without tensor allocation or request mutation, and the terminal
+padding boundary is counted before publication trim. The existing gate/recovery
+exclusion and task-serialization checks pass, as does the focused native
+pre-sampling full-decode guard regression. Ruff lint/format, compilation and diff
+checks pass. One test invocation named a nonexistent native test class; the
+corrected individual test passed. No full suite was repeated.
+
+A bounded independent read-only review confirmed parity with the native byte
+formulas and identified the remaining aggregate checkpoint-storage preflight:
+each repeat retains a full cumulative checkpoint for every window. A planned
+byte estimate must be compared with staging-filesystem capacity before loading,
+while preserving write-time error handling because free space can change. That
+capacity work and process peak measurements remain open.
+
+The refreshed installed-asset/source preflight passed, and a fresh exact lease
+started the private two-window native probe. Its supervisor validates authority
+every five seconds and stops its owned process on failure or deadline. Native
+generation, real media, fresh-process restore and public acceptance remain
+pending until the retained probe results are inspected. The public gate stays
+closed; the running app and historical tracker were not changed.
+
+Exit checklist: exact source/test/doc ownership and foreign dirty preservation,
+focused evidence, durable records and serial Git closure apply. No launcher was
+changed, so destination/example/menu/URL-capture checks are inapplicable. Release
+only the early-admission claim after Git closure; retain the unfinished private
+probe claim until its owned execution and evidence are complete.
