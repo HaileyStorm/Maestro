@@ -12,16 +12,92 @@ import hashlib
 import json
 import os
 import re
+from pathlib import Path
 
 from services.h3_cumulative_dispatch import validate_h3_cumulative_settings
 from services.h3_cumulative_plan import plan_h3_cumulative_chain
 from services.h3_cumulative_queue import H3CumulativeQueueDispatch, H3QueueAuthority
 from services.h3_native_continuation import H3NativeContinuationStep
 from services.queue_recovery_runtime import (
+    MANIFEST_DIRECTORY,
+    MAX_MANIFEST_BYTES,
     QueueRecoveryRuntimeError,
+    _private_directory_identity,
+    _read_exact_file,
+    _validated_project_root,
+    _verify_directory_identity,
     replay_concat_to_stable_output,
     sha256_file,
 )
+
+
+def staged_h3_cumulative_descriptor(project, basename, producer_unit_id):
+    """Verify a private staged component against its direct-child sidecar.
+
+    This transient descriptor has the ordinary media receipt shape. It must be
+    rebuilt against promoted media before entering a durable recovery cursor.
+    """
+    root = _validated_project_root(project)
+    if (
+        type(basename) is not str
+        or not basename.startswith("unit-")
+        or Path(basename).name != basename
+        or Path(basename).suffix.lower() not in {".mp4", ".mkv", ".webm", ".mov"}
+        or type(producer_unit_id) is not str
+        or re.fullmatch(r"unit:v1:[0-9a-f]{64}", producer_unit_id) is None
+    ):
+        raise QueueRecoveryRuntimeError("Staged H3 component identity is invalid.")
+    recovery = root / MANIFEST_DIRECTORY
+    staging = recovery / "staging"
+    identities = [
+        (path, _private_directory_identity(path)) for path in (recovery, staging)
+    ]
+    sidecar_name = str(Path(basename).with_suffix(".meta.json"))
+    sidecar = root / sidecar_name
+    raw = _read_exact_file(sidecar, maximum_bytes=MAX_MANIFEST_BYTES)
+    try:
+        meta = json.loads(raw)
+    except ValueError:
+        raise QueueRecoveryRuntimeError(
+            "Staged H3 component sidecar is invalid."
+        ) from None
+    size, digest = sha256_file(staging / basename)
+    if (
+        type(meta) is not dict
+        or meta.get("output_filename") != basename
+        or meta.get("producer_unit_id") != producer_unit_id
+        or meta.get("producer_unit_kind") != "h3_segment"
+        or meta.get("producer_unit_artifact_names") != [basename]
+        or meta.get("producer_artifact_class") != "component"
+        or meta.get("artifact_class") != "component"
+        or meta.get("private") is not True
+        or meta.get("producer_media_size") != size
+        or meta.get("producer_media_sha256") != digest
+    ):
+        raise QueueRecoveryRuntimeError("Staged H3 component evidence changed.")
+    for path, identity in identities:
+        _verify_directory_identity(path, identity)
+    return {
+        "basename": basename,
+        "producer_unit_id": producer_unit_id,
+        "sha256": digest,
+        "sidecar_basename": sidecar_name,
+        "sidecar_sha256": hashlib.sha256(raw).hexdigest(),
+        "sidecar_size": len(raw),
+        "size": size,
+    }
+
+
+def validate_staged_h3_cumulative_descriptor(project, descriptor, *, producer_unit_id):
+    if type(descriptor) is not dict:
+        return False
+    try:
+        rebuilt = staged_h3_cumulative_descriptor(
+            project, descriptor.get("basename"), producer_unit_id
+        )
+    except (OSError, QueueRecoveryRuntimeError):
+        return False
+    return descriptor == rebuilt
 
 
 def h3_cumulative_request(params):

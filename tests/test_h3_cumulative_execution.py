@@ -25,6 +25,7 @@ from services.h3_cumulative_execution import (
     h3_cumulative_authority,
     h3_cumulative_settings,
     prepare_h3_cumulative_request,
+    staged_h3_cumulative_descriptor,
 )
 from services.h3_cumulative_latents import H3CumulativeLatents
 from services.h3_cumulative_queue import encode_h3_queue_receipt
@@ -35,6 +36,7 @@ from services.h3_native_continuation import (
 from services.queue_recovery_runtime import (
     QueueRecoveryRuntimeError,
     ensure_recovery_staging_directory,
+    promote_recovery_staged_artifact,
     recovery_unit_id,
     sha256_file,
 )
@@ -85,6 +87,7 @@ class H3CumulativeExecutionTests(unittest.TestCase):
             "_queue_recovery_reconcile_cursor",
             "_queue_recovery_continuation_path",
             "_queue_recovery_completed_h3_graph",
+            "_queue_recovery_adopt_staged_h3_cumulative",
         }
         functions = [
             node
@@ -95,6 +98,7 @@ class H3CumulativeExecutionTests(unittest.TestCase):
         self.ns["_sample_campaign_transition_lock"] = threading.RLock()
         self.ns["_recovery_sha256_file"] = sha256_file
         self.ns["ensure_recovery_staging_directory"] = ensure_recovery_staging_directory
+        self.ns["promote_recovery_staged_artifact"] = promote_recovery_staged_artifact
         self.ns["_queue_recovery_reconcile_orphan_delivery"] = lambda *args: None
         exec(
             compile(
@@ -191,6 +195,7 @@ class H3CumulativeExecutionTests(unittest.TestCase):
                 producer_media_sha256=digest,
                 producer_artifact_class=role,
                 artifact_class=role,
+                private=role == "component",
             )
             (self.fixture.project / f"{Path(name).stem}.meta.json").write_text(
                 json.dumps(sidecar)
@@ -309,6 +314,114 @@ class H3CumulativeExecutionTests(unittest.TestCase):
                 predecessor[key] = value
                 self.assertIsNone(self.match(1))
                 predecessor[key] = saved
+
+    def stage_window(self, index):
+        unit = self.units[index]
+        old = unit["artifacts"][0]["basename"]
+        name = f"unit-{self.job['id']}-t{index}.mp4"
+        old_meta = self.fixture.project / f"{Path(old).stem}.meta.json"
+        meta = json.loads(old_meta.read_text())
+        meta["output_filename"] = name
+        meta["producer_unit_artifact_names"] = [name]
+        path = self.fixture.project / ".maestro-recovery" / "staging" / name
+        (self.fixture.project / old).replace(path)
+        old_meta.unlink()
+        sidecar = self.fixture.project / f"{Path(name).stem}.meta.json"
+        sidecar.write_text(json.dumps(meta))
+        return path, sidecar
+
+    def test_startup_adopts_staged_chain_without_generation_gate(self):
+        staged = [self.stage_window(index)[0] for index in range(2)]
+        self.job["recovery_cursor"]["completed_units"] = []
+        with patch.dict(os.environ, {"MAESTRO_H3_CUMULATIVE_EXPERIMENTAL": "0"}):
+            self.ns["_queue_recovery_reconcile_cursor"](
+                self.job, str(self.fixture.project), adopt_staged=True
+            )
+        self.assertEqual(len(self.job["recovery_cursor"]["completed_units"]), 2)
+        for index, path in enumerate(staged):
+            self.assertFalse(path.exists())
+            self.assertTrue((self.fixture.project / path.name).is_file())
+            self.assertEqual(self.match(index)["unit_id"], self.units[index]["unit_id"])
+        self.assertEqual(self.job["output_files"], [])
+        self.assertEqual(
+            self.ns["_queue_recovery_adopt_staged_h3_cumulative"](
+                self.job, str(self.fixture.project)
+            ),
+            0,
+        )
+
+    def test_staged_adoption_rejects_changed_source_media_av_and_privacy(self):
+        path, sidecar = self.stage_window(1)
+        original = json.loads(sidecar.read_text())
+        params = dict(self.job["params"])
+        for failure in ("source", "media", "av", "privacy", "predecessor"):
+            with self.subTest(failure=failure):
+                meta = copy.deepcopy(original)
+                self.job["params"] = dict(params)
+                self.job["recovery_cursor"]["completed_units"] = [self.units[0]]
+                if failure == "source":
+                    self.job["params"]["prompt"] += " Changed."
+                elif failure == "media":
+                    meta["producer_media_sha256"] = "0" * 64
+                elif failure == "av":
+                    meta["producer_unit_continuation"]["sha256"] = "0" * 64
+                elif failure == "privacy":
+                    meta["private"] = False
+                else:
+                    self.job["recovery_cursor"]["completed_units"] = []
+                sidecar.write_text(json.dumps(meta))
+                self.assertEqual(
+                    self.ns["_queue_recovery_adopt_staged_h3_cumulative"](
+                        self.job, str(self.fixture.project)
+                    ),
+                    0,
+                )
+                self.assertTrue(path.is_file())
+                self.assertFalse((self.fixture.project / path.name).exists())
+
+    def test_staged_descriptor_rejects_symlink_and_changed_private_directory(self):
+        path, _sidecar = self.stage_window(1)
+        unit_id = self.units[1]["unit_id"]
+        self.assertEqual(
+            staged_h3_cumulative_descriptor(self.fixture.project, path.name, unit_id)[
+                "sha256"
+            ],
+            self.units[1]["artifacts"][0]["sha256"],
+        )
+        original = path.with_suffix(".saved")
+        path.replace(original)
+        path.symlink_to(original)
+        with self.assertRaises(QueueRecoveryRuntimeError):
+            staged_h3_cumulative_descriptor(self.fixture.project, path.name, unit_id)
+        path.unlink()
+        original.replace(path)
+        path.parent.chmod(0o755)
+        with self.assertRaises(QueueRecoveryRuntimeError):
+            staged_h3_cumulative_descriptor(self.fixture.project, path.name, unit_id)
+        path.parent.chmod(0o700)
+
+    def test_staged_discovery_preserves_existing_and_ambiguous_outputs(self):
+        path, sidecar = self.stage_window(1)
+        self.job["recovery_cursor"]["completed_units"] = [self.units[0]]
+        self.ns["_queue_recovery_reconcile_cursor"](self.job, str(self.fixture.project))
+        self.assertTrue(path.is_file())
+        target = self.fixture.project / path.name
+        target.write_bytes(b"existing unrelated winner")
+        adopt = self.ns["_queue_recovery_adopt_staged_h3_cumulative"]
+        self.assertEqual(adopt(self.job, str(self.fixture.project)), 0)
+        self.assertEqual(target.read_bytes(), b"existing unrelated winner")
+        target.unlink()
+        other = path.with_name(f"unit-{self.job['id']}-t1-other.mp4")
+        other.write_bytes(path.read_bytes())
+        meta = json.loads(sidecar.read_text())
+        meta["output_filename"] = other.name
+        meta["producer_unit_artifact_names"] = [other.name]
+        other_sidecar = self.fixture.project / f"{other.stem}.meta.json"
+        other_sidecar.write_text(json.dumps(meta))
+        self.assertEqual(adopt(self.job, str(self.fixture.project)), 0)
+        self.assertTrue(path.is_file())
+        self.assertTrue(other.is_file())
+        self.assertFalse(target.exists())
 
     def test_cancelled_copy_never_reaches_audio_or_publication(self):
         audio = Mock()

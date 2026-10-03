@@ -2,8 +2,9 @@
 
 ## Current milestone and intent
 
-Latest checkpoint: private worker dispatch, durable AV/media sealing, recovery
-from sealed sidecars and final publication from the last complete output,
+Latest checkpoint: private worker dispatch, durable AV/media sealing, adoption
+of verified pre-promotion staged media, recovery from sealed sidecars and final
+publication from the last complete output,
 described at the end of this file. Public activation and live generated-media
 acceptance remain open. Earlier sections retain their milestone-specific
 evidence and limitations.
@@ -650,3 +651,55 @@ supported helper. Preserve foreign dirty files and the historical tracker hold.
 Policy exit checklist: ownership and dirty-state checks, focused verification,
 durable evidence and serial Git closure apply; launcher destination, examples,
 menu and URL-capture checks are inapplicable because no launcher was edited.
+
+## Verified staged-window startup adoption
+
+Authorized startup materialization now explicitly enables one bounded adoption
+pass after ordinary cursor reconciliation, before recovered workers start. The
+default reconciliation path preserves staged files without adopting them, so
+local recovery discovery remains read-only. This pass applies only to private
+cumulative jobs and exact job-prefixed video names in private recovery staging.
+At most 256 components promote per pass; an oversized directory census is
+uncertainty and produces no adoption.
+
+A candidate requires its unchanged direct-child sidecar, exact media size/hash,
+private component role, original source-derived plan, physical project identity,
+AV receipt and completed predecessor. The predecessor must already verify
+against promoted media. Candidates with the same variant/window position are
+ambiguous and remain untouched. An existing destination is preserved. After
+the ordinary staging promotion, recovery rebuilds and verifies the public-root
+descriptor before updating the cursor, then reconciles finality again. No
+staging descriptor is persisted as a completed media unit. The media stays a
+private component until the existing last-output final publication succeeds.
+
+This closes the sidecar-plus-complete-staged-media-before-promotion interval for
+an authorized restored job: a focused restart fixture reconstructs and promotes
+both windows with execution disabled and then verifies their normal receipts.
+Incomplete AV-only files, partial temporary writes and missing-sidecar media are
+not accepted. Their reference retention/cleanup, full storage admission and true
+peak decode memory remain open. The existing transition lock serializes app
+writers; it does not claim isolation from a hostile same-UID filesystem actor.
+The default path performs no orphan deletion.
+
+Focused evidence: staged source/media/AV/privacy/predecessor negatives,
+symlink/private-directory rejection, ambiguous candidates, preservation of an
+existing destination and read-only discovery all pass. The existing ordinary H3
+publication/recovery regressions and startup identity/project recreation,
+staged native adoption, final-adoption ordering and failed-retry retention checks
+also pass: 17 execution checks and ten distinct adjacent recovery/startup checks.
+The bounded independent read-only review found no remaining concrete blocker
+in the current source or startup-only authority boundary. Service/test Ruff
+lint and format, syntax compilation and diff checks pass; launch retains its
+817 baseline Ruff diagnostics with none added. Full-suite evidence was not
+repeated under the owner's explicit testing preference. Source/static and
+synthetic filesystem recovery are the evidence
+level; no process-kill crash, GPU generation, encode/audio measurement or browser
+acceptance occurred, and the running service was not restarted for this change.
+
+Continuation remains on fallback item `UH-20260927-MAESTRO-EXTEND-FLAGS` and the
+active continuous Goal. The exact claim `maestro-h3-staged-recovery-20261003`
+owns launch integration, the cumulative execution service, its focused tests
+and this note; release it through the supported helper after serial Git closure.
+Foreign changes and the historical tracker hold remain preserved. The applicable
+policy checklist is unchanged: ownership, focused checks and durable/Git closure
+apply; launcher-specific destination/examples/menu/URL checks do not apply.

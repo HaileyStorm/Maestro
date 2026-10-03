@@ -7543,7 +7543,7 @@ def _queue_recovery_materialize_job(
                     # and direct jobs never receive this process-local marker.
                     runtime["_h3_offload_legacy_recovery"] = True
                 _require_h3_offload_plan_parity(runtime)
-                _queue_recovery_reconcile_cursor(runtime, current[0])
+                _queue_recovery_reconcile_cursor(runtime, current[0], adopt_staged=True)
                 blocked_reason = ""
                 blocked_code = ""
             except QueueRecoveryRuntimeError:
@@ -9222,6 +9222,7 @@ def _queue_recovery_unit_matches(
     quarantine_invalid: bool = True,
     consumed_continuations: frozenset[str] = frozenset(),
     expected_h3_cumulative_authority=None,
+    staged_cumulative_media: bool = False,
 ) -> dict | None:
     """Return one fully verified completed unit; invalid evidence is ignored."""
     for unit in _queue_recovery_units(job):
@@ -9266,7 +9267,24 @@ def _queue_recovery_unit_matches(
         artifacts = unit.get("artifacts")
         if not isinstance(artifacts, list) or not artifacts:
             continue
-        if kind == "h3_source_audio_premux":
+        if staged_cumulative_media:
+            from services.h3_cumulative_execution import (
+                validate_staged_h3_cumulative_descriptor,
+            )
+
+            if (
+                kind != "h3_segment"
+                or not isinstance(job.get("params"), dict)
+                or job["params"].get("_h3_cumulative_append") is not True
+            ):
+                return None
+            artifacts_valid = all(
+                validate_staged_h3_cumulative_descriptor(
+                    project_dir, descriptor, producer_unit_id=unit_id,
+                )
+                for descriptor in artifacts
+            )
+        elif kind == "h3_source_audio_premux":
             artifacts_valid = all(
                 _queue_recovery_validate_staged_artifact(
                     project_dir, descriptor,
@@ -9291,7 +9309,7 @@ def _queue_recovery_unit_matches(
             # sidecars and cannot use the public artifact quarantine path.
             # Leave invalid private bytes for the bounded staging-orphan
             # cleanup rather than interpreting them as gallery artifacts.
-            if quarantine_invalid and kind != "h3_source_audio_premux":
+            if quarantine_invalid and not staged_cumulative_media and kind != "h3_source_audio_premux":
                 for descriptor in artifacts:
                     if isinstance(descriptor, dict):
                         _quarantine_recovery_artifact(project_dir, descriptor)
@@ -9398,7 +9416,10 @@ def _queue_recovery_unit_matches(
             and continuation.get("mode") == "cumulative_append"
         ):
             try:
-                _queue_recovery_verify_h3_cumulative(job, unit, project_dir, expected_authority=expected_h3_cumulative_authority)
+                _queue_recovery_verify_h3_cumulative(
+                    job, unit, project_dir, expected_authority=expected_h3_cumulative_authority,
+                    staged_media=staged_cumulative_media,
+                )
             except (QueueRecoveryRuntimeError, TypeError, ValueError):
                 return None
             return unit
@@ -9451,7 +9472,7 @@ def _queue_recovery_unit_matches(
     return None
 
 
-def _queue_recovery_verify_h3_cumulative(job: dict, unit: dict, project_dir: str, *, expected_authority, require_media_receipt: bool = True) -> None:
+def _queue_recovery_verify_h3_cumulative(job: dict, unit: dict, project_dir: str, *, expected_authority, require_media_receipt: bool = True, staged_media: bool = False) -> None:
     """Bind private AV bytes to the authorized job, physical project and media."""
     from services.h3_cumulative_queue import H3QueueAuthority, verify_h3_queue_receipt
     from services.queue_recovery_runtime import MAX_MANIFEST_BYTES, _read_exact_file
@@ -9508,7 +9529,14 @@ def _queue_recovery_verify_h3_cumulative(job: dict, unit: dict, project_dir: str
     if type(artifacts) is not list or not artifacts:
         raise QueueRecoveryRuntimeError("H3 cumulative media evidence is missing.")
     for artifact in artifacts:
-        if not validate_artifact_descriptor(project_dir, artifact, producer_unit_id=unit["unit_id"]):
+        validator = validate_artifact_descriptor
+        if staged_media:
+            from services.h3_cumulative_execution import (
+                validate_staged_h3_cumulative_descriptor,
+            )
+
+            validator = validate_staged_h3_cumulative_descriptor
+        if not validator(project_dir, artifact, producer_unit_id=unit["unit_id"]):
             raise QueueRecoveryRuntimeError("H3 cumulative media evidence changed.")
         try:
             metadata = json.loads(_read_exact_file(
@@ -10438,7 +10466,160 @@ def _queue_recovery_quarantine_obsolete_sidecar(
         return
 
 
-def _queue_recovery_reconcile_cursor(job: dict, project_dir: str) -> None:
+def _queue_recovery_adopt_staged_h3_cumulative(job: dict, project_dir: str) -> int:
+    """Promote complete private components left before media publication.
+
+    Called during startup reconciliation, before workers run. A sidecar alone
+    cannot authorize adoption: validate the source plan, predecessor, private AV
+    and staged media together, then rebuild the ordinary promoted descriptor.
+    """
+    from services.h3_cumulative_execution import staged_h3_cumulative_descriptor
+    from services.queue_recovery_runtime import MANIFEST_DIRECTORY
+    from services.search_index import load_media_sidecars
+
+    if (
+        not isinstance(job.get("params"), dict)
+        or job["params"].get("_h3_cumulative_append") is not True
+    ):
+        return 0
+    staging = os.path.join(project_dir, MANIFEST_DIRECTORY, "staging")
+    try:
+        names = os.listdir(staging)
+    except OSError:
+        return 0
+    if len(names) > 65536:
+        return 0
+    prefix = f"unit-{job.get('id')}-"
+    names = [
+        name
+        for name in names
+        if name.startswith(prefix) and name.endswith((".mp4", ".mkv", ".webm", ".mov"))
+    ]
+    sidecars = load_media_sidecars(project_dir, media_names=names)
+    candidates = {}
+    ambiguous = set()
+    for name, meta in sidecars.items():
+        if (
+            meta.get("job_id") != job.get("id")
+            or meta.get("producer_unit_kind") != "h3_segment"
+        ):
+            continue
+        variant, index = (
+            meta.get("producer_unit_variant"),
+            meta.get("producer_unit_index"),
+        )
+        if (
+            type(variant) is not int
+            or type(index) is not int
+            or variant < 0
+            or index < 0
+        ):
+            continue
+        position = (variant, index)
+        if position in candidates:
+            ambiguous.add(position)
+        candidates[position] = (name, meta)
+    promoted = 0
+    for (variant, index), (name, meta) in sorted(candidates.items()):
+        if promoted >= 256:
+            break
+        if (variant, index) in ambiguous or os.path.lexists(
+            os.path.join(project_dir, name)
+        ):
+            continue
+        with _sample_campaign_transition_lock:
+            if (
+                index
+                and _queue_recovery_unit_matches(
+                    job,
+                    kind="h3_segment",
+                    variant=variant,
+                    index=index - 1,
+                    project_dir=project_dir,
+                    quarantine_invalid=False,
+                )
+                is None
+            ):
+                continue
+            try:
+                descriptor = staged_h3_cumulative_descriptor(
+                    project_dir, name, meta.get("producer_unit_id")
+                )
+                unit = {
+                    "kind": "h3_segment",
+                    "state": "completed",
+                    "variant": variant,
+                    "index": index,
+                    "unit_id": meta.get("producer_unit_id"),
+                    "dependencies": meta.get("producer_unit_dependencies"),
+                    "settings": meta.get("producer_unit_settings"),
+                    "continuation": meta.get("producer_unit_continuation"),
+                    "artifacts": [descriptor],
+                }
+                check_job = dict(
+                    job,
+                    recovery_cursor={
+                        "completed_units": [unit, *_queue_recovery_units(job)]
+                    },
+                )
+                if (
+                    _queue_recovery_unit_matches(
+                        check_job,
+                        kind="h3_segment",
+                        variant=variant,
+                        index=index,
+                        project_dir=project_dir,
+                        quarantine_invalid=False,
+                        staged_cumulative_media=True,
+                    )
+                    is None
+                ):
+                    continue
+                # Recheck immediately before promotion; never replace an
+                # existing public child. The transition lock serializes this
+                # application's writers, not a hostile same-UID filesystem actor.
+                if os.path.lexists(os.path.join(project_dir, name)):
+                    continue
+                promote_recovery_staged_artifact(
+                    project_dir,
+                    staged_path=os.path.join(staging, name),
+                    output_basename=name,
+                )
+                unit["artifacts"] = [
+                    _recovery_artifact_descriptor(
+                        project_dir,
+                        basename=name,
+                        sidecar_basename=descriptor["sidecar_basename"],
+                        producer_unit_id=unit["unit_id"],
+                    )
+                ]
+                check_job["recovery_cursor"]["completed_units"][0] = unit
+                if (
+                    _queue_recovery_unit_matches(
+                        check_job,
+                        kind="h3_segment",
+                        variant=variant,
+                        index=index,
+                        project_dir=project_dir,
+                        quarantine_invalid=False,
+                    )
+                    is None
+                ):
+                    continue
+                job["recovery_cursor"]["completed_units"].append(unit)
+                promoted += 1
+            except (
+                OSError,
+                QueueRecoveryRuntimeError,
+                TypeError,
+                ValueError,
+                KeyError,
+            ):
+                continue
+    return promoted
+
+
+def _queue_recovery_reconcile_cursor(job: dict, project_dir: str, *, adopt_staged: bool = False) -> None:
     """Keep verified units and recover the sidecar-before-journal crash gap."""
     verified: list[dict] = []
     seen: set[str] = set()
@@ -10769,6 +10950,9 @@ def _queue_recovery_reconcile_cursor(job: dict, project_dir: str) -> None:
             cursor["delivery_pending"] = recovered_delivery
             job["reruns_denoise"] = False
     job["recovery_cursor"] = cursor
+    adopt_staged_fn = globals().get("_queue_recovery_adopt_staged_h3_cumulative")
+    if adopt_staged and callable(adopt_staged_fn) and adopt_staged_fn(job, project_dir):
+        _queue_recovery_reconcile_cursor(job, project_dir, adopt_staged=False)
 
 
 def _h3_segment_recovery_settings(clip_info: dict) -> dict:
