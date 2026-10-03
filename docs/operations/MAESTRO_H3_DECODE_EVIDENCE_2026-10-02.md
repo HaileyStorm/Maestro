@@ -435,6 +435,47 @@ publication guard and scoped diff checks pass. No full suite was repeated.
 This repairs a demonstrated final-head source mismatch. It does not establish
 learned checkpoint parity, actual MMGP hook residency, GPU peak memory or
 throughput, or an opening-fade improvement. The original two-still negative
-remains open. A matched learned run after coordinated rollout, with fresh
-coherent GPU authority and retained source/media evidence, is the next quality
-gate; previous generations must not be relabelled as repaired output.
+remains open. The matched learned run after coordinated rollout is recorded
+below. Previous generations must not be relabelled as repaired output.
+
+## Matched native result after compact final-head repair (2026-10-03 UTC)
+
+The coordinated rollout of `dd1346b` completed the original two-still Dense SDPA
+recipe in 724 seconds. All sealed request parameters and input descriptors
+match the retained Dense baseline exactly: seed `935314058`, guides at frames
+31/90, base FL2VA, 1344 × 768, 124 frames, 28 evaluations, profile 1 and no LoRA.
+The published parameters and two-guide execution receipt also match. Fresh
+runtime counters remain zero for Sol, Sage and acceleration errors.
+
+Full CPU software decoding passed for all 124 HEVC frames and stereo 32 kHz
+AAC audio. Video duration is 5.166667 seconds; audio duration is 5.152000 seconds.
+The output SHA-256 is
+`7f35800f6ffb10d74bd9ee446a7bc1eb420d31b16225c5cdb9e0c69595188e69`.
+The published sidecar omits private guide transport fields. Both source stills,
+their sidecars, the retained Dense video and its sidecar remain byte-identical.
+
+The opening fade persists after the precision repair. Frame 0 has mean decoded
+RGB 0 on the 0–255 scale; frames 0–2 again have at least 99% of pixels with every
+channel below 10. Across the first 25 frames, the mean absolute difference in
+frame-average RGB brightness from the prior Dense run is 0.412558; the maximum
+is 0.916802. The retained before/after plot and sampled frames show closely
+matching opening rises. These are two individual samples, not a throughput or
+quality benchmark. The proven numerical repair is retained, but it is not a
+remedy for this recipe's opening fade.
+
+The fresh exact lease was supervised independently with coherent validation
+at five-second intervals. After publication and an idle queue, the coordinated
+Pinokio restart stopped the pinned backend and released its model resources.
+The guard recorded that expected backend exit; it was not a generation failure.
+The exact request was withdrawn, and subsequent coherent validation denies it.
+Maestro was restored with local/stable health and readiness passing, no loaded
+model, and the public restart notice cleared.
+No full test suite was repeated; the accepted CPU precision/regression evidence
+is reused, with this native run and focused media/control checks added.
+
+This establishes successful native execution of the repaired conventional
+heads for the matched recipe. It does not establish learned checkpoint parity,
+peak GPU memory, repeatable throughput, native browser HEVC playback, or owner
+whole-clip/listening acceptance. Further fade diagnosis should capture bounded
+prediction and temporal-conditioning observations against the pinned learned
+path; another unchanged Dense repeat would add little evidence.
