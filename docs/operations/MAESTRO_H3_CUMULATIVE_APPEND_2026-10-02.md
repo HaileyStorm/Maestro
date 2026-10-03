@@ -850,3 +850,49 @@ focused evidence, durable records and serial Git closure apply. No launcher was
 changed, so destination/example/menu/URL-capture checks are inapplicable. Release
 only the early-admission claim after Git closure; retain the unfinished private
 probe claim until its owned execution and evidence are complete.
+
+## Short private first-window duration parity
+
+The next leased native attempt passed the repaired loading guards and native
+MMGP setup, then stopped before denoising: the planned 56-frame first capture
+still used the ordinary five-second minimum. No media or AV checkpoint was
+produced. The owned worker exited, and its exact lease was withdrawn and
+confirmed denied. Its logs and closure receipt remain in the private evidence
+tree. This is a real loading-path observation, not generation acceptance.
+
+The native duration guard now applies the existing 22-frame minimum to private
+cumulative first captures as well as append tails. The private experimental
+gate and FL2VA/reference/LoRA/cache exclusions run before this condition.
+Ordinary requests retain their five-second minimum. Private capture now
+requires an integer frame count of at least 22 before native grid alignment;
+raw 5, 6 and 21, floating-point counts and booleans are rejected. No public capability or model-quality promise changes.
+
+Two focused CPU checks pass through the real native generate method with fake
+weights: first captures of 22 and 56 frames each accept a 17-frame append with
+unchanged retained video/audio prefixes, reject an ordinary 56-frame request and
+a private five-frame request, and preserve the existing absolute audio-span
+regression. Two adjacent gate/exclusion and exact handoff checks also pass.
+Test lint/format, syntax and diff checks pass. Native source keeps its
+ten baseline Ruff diagnostics with unchanged code/message counts. The refreshed
+installed-source/asset preflight passes. No full suite was repeated.
+
+A fresh exact lease has started a retry of the same standalone two-window
+probe. It remains pending; its supervisor validates authority every five seconds.
+Independent review caught raw below-22 counts rounding upward before the
+duration guard; the pre-alignment integer/minimum check and focused cases above
+resolve that finding. Native results remain separately required.
+Public activation, authenticated queue crash/restart, full-resolution
+memory, aggregate storage admission, browser and human acceptance remain open.
+
+The next native attempt completed all 28 first-window denoising steps and
+reached AV decoding, then failed in standalone WGP metadata preparation because
+its optional application global was absent. No completed output/checkpoint was
+verified. The owned process exited, and that exact lease was withdrawn and
+confirmed denied. The private probe now supplies an absent optional UI/plugin
+application context; production WGP is unchanged. Its CPU preflight was refreshed
+for the final duration guard and probe bytes before another fresh lease started.
+
+The source milestone's exit checklist remains exact ownership, focused tests,
+review finding resolution, durable evidence and serial Git closure. Launcher
+destination/example/menu/URL checks are inapplicable. Release the short-first
+claim after closure; retain the narrow unfinished probe claim.

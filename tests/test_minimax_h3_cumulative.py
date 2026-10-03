@@ -155,6 +155,50 @@ class TestMiniMaxH3CumulativeGenerate(unittest.TestCase):
             **kwargs,
         )
 
+    def test_short_first_window_and_tail_require_private_capture(self):
+        for frames in (22, 56):
+            with self.subTest(frames=frames):
+                result = self.generate(frame_num=frames)
+                handoff = result["_h3_cumulative_handoff"]
+                previous = handoff["state"]
+                self.assertEqual(previous.frame_count, frames)
+                self.assertEqual(result["x"].shape[1], frames)
+                step = plan_h3_native_continuation_step(
+                    22, 17, absolute_context_start_frame=frames - 22
+                )
+                appended = self.append(handoff, step)
+                state = appended["_h3_cumulative_handoff"]["state"]
+                self.assertEqual(state.frame_count, frames + 17)
+                torch.testing.assert_close(
+                    state.video[:, :, : previous.video.shape[2]],
+                    previous.video,
+                    rtol=0,
+                    atol=0,
+                )
+                torch.testing.assert_close(
+                    state.audio[..., : previous.audio.shape[-1]],
+                    previous.audio,
+                    rtol=0,
+                    atol=0,
+                )
+        with self.assertRaisesRegex(ValueError, "supports 5-15s"):
+            self.model.generate(
+                "ordinary scene",
+                frame_num=56,
+                height=64,
+                width=64,
+                sampling_steps=2,
+                custom_settings={"h3_attention_engine": "sdpa"},
+            )
+        for frames in (5, 6, 21, 22.0, True):
+            with (
+                self.subTest(rejected_frames=frames),
+                self.assertRaisesRegex(
+                    ValueError, "requires at least 22 integer frames"
+                ),
+            ):
+                self.generate(frame_num=frames)
+
     def test_real_sampler_uses_separate_guide_and_absolute_audio_span(self):
         handoff = self.start()
         previous = handoff["state"]

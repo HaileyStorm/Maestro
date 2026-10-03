@@ -1646,6 +1646,8 @@ class MiniMaxH3Model:
         fps = float(fps)
         if fps != MINIMAX_H3_FPS:
             raise ValueError(f"MiniMax H3 runs at its native {MINIMAX_H3_FPS} fps.")
+        if cumulative_requested and (type(frame_num) is not int or frame_num < 22):
+            raise ValueError("H3 cumulative sampling requires at least 22 integer frames.")
         if cumulative_step is not None and (
             type(frame_num) is not int or frame_num != cumulative_step.target_frames
         ):
@@ -1685,8 +1687,8 @@ class MiniMaxH3Model:
             target_frame_num = frame_num
         duration = target_frame_num / fps
         minimum_duration = 4.0 if self.reference_mode else MINIMAX_H3_MIN_DURATION
-        if cumulative_step is not None:
-            # A planned final tail may be shorter than an ordinary first clip.
+        if cumulative_requested:
+            # Private chain plans permit short first windows as well as tails.
             minimum_duration = 22 / MINIMAX_H3_FPS
         if not minimum_duration <= duration <= MINIMAX_H3_MAX_DURATION:
             raise ValueError(
