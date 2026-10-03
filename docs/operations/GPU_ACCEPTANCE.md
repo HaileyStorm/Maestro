@@ -2643,3 +2643,23 @@ checks were reused; no redundant full suite was run for this evidence-only
 update. Owner whole-clip and listening acceptance remain pending, as does the
 recent-password gate for the owner's Free resources control. Guide video/audio,
 more than three stills, Control and native continuation remain separate work.
+
+### Matched two-still Dense SDPA fade control (2026-10-03 UTC)
+
+At `c58754f`, the normal signed-in Gallery Guide path completed a matched
+base-FL2VA run with seed `935314058`, guide frames 31/90, 1344 × 768,
+124 frames and 28 steps. A per-clip Dense SDPA choice was sealed into the
+request and publication. Fresh-process Sol and Sage kernel counters stayed
+zero. Full CPU video/audio decode passed; the 124-frame video is 5.166667
+seconds, with stereo 32 kHz AAC audio lasting 5.152000 seconds. Output SHA-256:
+`666dde22846503af3acf930a704e989297b119b503db0b0c3d84195582e9b7dd`.
+
+The diagnostic result is negative: frame 0 remains black and frames 0–2 are
+at least 99% near-black under the retained per-pixel threshold. Dense attention
+also produces the opening fade, so Sol is not required for this failure.
+The historical sample records requested Sol without effective-kernel proof;
+this comparison does not establish same-revision causal attribution. Original
+video and source seals remain intact. Exact owned backend stop, lease withdrawal,
+coherent denial, restored readiness and cleared restart status were verified.
+This does not close broader Guide quality or owner listening acceptance. See
+[the decoded evidence](MAESTRO_H3_DECODE_EVIDENCE_2026-10-02.md#matched-dense-sdpa-result-2026-10-03-utc).

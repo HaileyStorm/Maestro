@@ -344,3 +344,59 @@ The next useful diagnosis is a bounded comparison of learned predictions and
 attention/checkpoint behavior on the failing recipe. Repeating an identical
 uninstrumented generation would not distinguish these remaining possibilities.
 No production change or full-suite rerun was needed for this numerical audit.
+
+## Per-clip Guide attention control (2026-10-03 UTC)
+
+Source revision `c58754f` adds an optional attention choice to Gallery H3 Guide:
+model default, Dense SDPA or Sol. An explicit choice applies to the queued clip
+and its sealed offload schedule; omission preserves configured model defaults.
+The server rejects other values before queuing. Still revision checks, guide
+order, seed and inherited privacy/explicit flags retain their existing path.
+
+Thirty focused backend checks, fifteen focused UI checks, scoped lint and the
+production UI build passed. One independent source review corrected the copy:
+Sol can fall back to dense attention. The rendered form and sealed native
+request verified Dense SDPA with the original two-still controls. No full-suite
+rerun was needed for this bounded addition.
+
+The older failing sample records requested Sol attention, but its metadata does
+not prove effective Sol kernel execution. The new comparison preserves the
+original recipe and uses explicit Dense SDPA. A visible improvement alone would
+require a fresh current-revision Sol control and effective-kernel evidence before
+attributing the difference to attention.
+
+## Matched Dense SDPA result (2026-10-03 UTC)
+
+The signed-in Gallery Guide run at `c58754f` completed in 723 seconds with the
+original seed `935314058`, base FL2VA checkpoint, two source stills at frames
+31/90, 1344 × 768, 124 frames and 28 steps. The sealed request and published
+sidecar agree on those controls and explicit Dense SDPA. Fresh-process runtime
+counters remained zero for Sol and Sage kernel calls throughout the run.
+
+Full software FFmpeg decoding passed for all 124 HEVC frames and the stereo
+32 kHz AAC stream. Video duration is 5.166667 seconds; audio duration is
+5.152000 seconds. The output SHA-256 is
+`666dde22846503af3acf930a704e989297b119b503db0b0c3d84195582e9b7dd`.
+The public sidecar contains the truthful two-guide execution receipt and no
+private guide transport fields. Existing preview flags remain unchanged.
+
+The opening fade persists: frame 0 has mean decoded RGB 0 on the 0–255 scale;
+frames 0–2 have at least 99% of pixels with all channels below 10. A retained
+measurement plot shows the opening rise alongside the prior sample. This is
+positive evidence that Dense SDPA can produce the same failure: Sol attention
+is not a necessary cause for this recipe. It does not prove learned-stack
+parity or identify the remaining conditioning/checkpoint cause. The prior
+sample's effective Sol path remains unproven, and revisions differ.
+
+The original video hash, both source image hashes and both source-sidecar hashes
+remain unchanged; the original video sidecar matches its retained JSON content.
+The queue became idle before cleanup. The coordinated Pinokio restart stopped
+the exact owned backend; the guard's exit records that expected backend exit,
+not a generation or authority failure. The lease was withdrawn and a fresh
+coherent validation rejects it. Maestro was restored with local/stable health
+and readiness verified and the public restart notice cleared. Owner whole-clip
+and listening acceptance remain separate.
+
+Reuse this negative comparison. The next diagnosis should inspect how arbitrary
+interior guides affect learned predictions and temporal conditioning; another
+uninstrumented Dense/Sol repeat cannot isolate those paths.
