@@ -1011,3 +1011,70 @@ algorithm; native evidence remains tied to its recorded preflight bytes. Full
 resolution resource qualification, authenticated queue crash/restart, rendered
 browser behavior and listening/visual acceptance remain open. Public cumulative
 generation remains disabled; the continuous Goal remains active.
+
+## Full-canvas checkpoint and desktop-restart recovery
+
+The next private probe completed its first 124-frame window at the shipped
+1344×768 canvas, with 28 steps, eager SDPA and requested offload profile 4.
+The actual sealed AV checkpoint and encoded media hashes were independently
+verified after the desktop restart. FFprobe found 124 frames at 24 FPS
+(5.166667 seconds), HEVC video and stereo 32 kHz AAC (5.152000 seconds).
+Its complete binding payload matched the interrupted second process's payload.
+
+The first window took 661.3 seconds. Its observed maximum CUDA allocation was
+5,184,347,648 bytes, CUDA reservation 8,042,577,920 bytes, and process peak RSS
+48,088,672 KiB. This run selected a conservative asynchronous MMGP offload plan
+after reporting an unsupported cached residency region. These are first-window
+observations for that runtime, not complete-chain peak admission or a general
+performance guarantee; they cannot be compared directly to the tiny-canvas
+probe's different offload plan.
+
+The desktop restart terminated the owned supervisor and second worker before a
+completed 141-frame receipt was saved. The old exact lease was withdrawn and
+confirmed denied. The accepted first window is retained; it will not be
+regenerated. A CPU preflight verified that a resume-only supervisor uses the
+same job, plan, production source hashes and installed asset identities. Its
+fresh exact request is queued, with a bounded wait and coherent validation
+before starting only the second window. The existing supervision retains its
+five-second validation cadence, operation deadline and owned-child stop guard.
+Completion must still prove the retained AV prefixes and final container.
+Two initial waiters stopped before GPU startup: the CLI can emit multiple
+queued JSON snapshots, and the first outbox receipt is asynchronous. Both exact
+requests were withdrawn and confirmed denied. The corrected waiter reads the
+exact durable outbox, treats an absent receipt or acknowledgement as no authority,
+and passed disposable checks for missing, queued, granted, denied, wrong-request
+and malformed responses. Its observed current state is queued.
+
+Local health/readiness and stable-share readiness returned 200 after recovery.
+No Maestro restart or public cumulative activation occurred. Authenticated
+queue crash/restart, full-chain resource qualification, browser rendering and
+human listening/visual acceptance remain open.
+
+## Cumulative offload-plan prerequisite
+
+Source inspection found that the existing sealed offload contract represented
+a cumulative request as one ordinary clip. It could therefore reject the
+server-generated continuation tasks before dispatch. The contract now derives
+the actual sampler windows and newly published tails from the existing
+cumulative compiler, including during recovery with the experimental gate off.
+For the retained full-canvas plan those pairs are 124/124 and 39/17; the final
+cumulative publication remains 141 frames. Sampled frames include retained
+context and must not be presented as additional delivered frames.
+
+The generation worker supplies its independently derived cumulative plan to
+the existing child offload check. It binds the plan digest, window index,
+sampler geometry and cumulative output geometry before applying any profiles.
+The entire manifest must pass before profile mutation; ordinary dispatch keeps
+its existing path. This preserves the sealed manual/default profile contract
+and does not establish live queue or physical offload acceptance.
+
+Three new focused CPU regressions pass: gate-off sealing/recovery parity and
+changed-source rejection; real repeated cumulative task construction and
+profile assignment; changed/incomplete child evidence rejected before mutation.
+Three existing focused offload/child-dispatch checks also pass. An initial
+test invocation named the wrong existing class; the corrected check passes.
+The new test file passes lint/format; syntax and diff checks pass. Launch and
+offload modules retain their respective 817 and one baseline lint diagnostics
+with no additions. No full suite was repeated. Bounded independent review found
+no concrete correctness or ordinary-job regression. Multi-window native
+completion and runtime peak evidence remain unverified.

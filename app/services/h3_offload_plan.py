@@ -221,6 +221,23 @@ def _profile_and_source(
 def _segment_inputs(
     params: Mapping[str, Any],
 ) -> tuple[list[int], list[int], list[str], float]:
+    if "_h3_cumulative_append" in params:
+        from services.h3_cumulative_execution import prepare_h3_cumulative_request
+
+        try:
+            cumulative = prepare_h3_cumulative_request(params, require_gate=False)
+        except (TypeError, ValueError) as error:
+            raise H3OffloadPlanError("H3 cumulative offload geometry is invalid.") from error
+        if cumulative is not None:
+            # Each dispatch samples its own legal window. Retained context and
+            # full cumulative decoding are separate from sampled/new frames.
+            windows = cumulative["windows"]
+            return (
+                [window["sampler_frames"] for window in windows],
+                [window["published_tail_frames"] for window in windows],
+                ["minimax_h3"] * len(windows),
+                24.0,
+            )
     longform = params.get("_h3_longform")
     if isinstance(longform, Mapping):
         raw_generated = longform.get("clip_frames")

@@ -12191,6 +12191,7 @@ def _snapshot_h3_recovery_task_params(
 
 def _apply_h3_offload_plan_to_manifest(
     manifest: list[dict], plan: dict | None,
+    *, cumulative_plan: dict | None = None,
 ) -> None:
     """Bind every H3 child dispatch to its sealed requested profile."""
     if plan is None:
@@ -12202,7 +12203,15 @@ def _apply_h3_offload_plan_to_manifest(
             "H3 child offload plan is invalid."
         ) from error
     segments = sealed["segments"]
+    cumulative_windows = (
+        cumulative_plan["windows"] if cumulative_plan is not None else None
+    )
+    if cumulative_windows is not None and len(cumulative_windows) != len(segments):
+        raise QueueRecoveryRuntimeError(
+            "H3 cumulative offload window count changed."
+        )
     seen: set[int] = set()
+    projections: list[tuple[dict, int]] = []
     for task in manifest:
         task_params = task.get("params") if isinstance(task, dict) else None
         if not isinstance(task_params, dict) or not str(
@@ -12210,7 +12219,19 @@ def _apply_h3_offload_plan_to_manifest(
         ).startswith("minimax_h3"):
             continue
         clip_info = task_params.get("multi_clip_info")
-        if (
+        if cumulative_windows is not None:
+            if (
+                not isinstance(clip_info, dict)
+                or clip_info.get("cumulative_plan_sha256")
+                    != cumulative_plan["plan_sha256"]
+                or clip_info.get("defer_concat") is not True
+                or type(clip_info.get("index")) is not int
+            ):
+                raise QueueRecoveryRuntimeError(
+                    "H3 cumulative child offload identity changed."
+                )
+            raw_index = clip_info["index"]
+        elif (
             isinstance(clip_info, dict)
             and clip_info.get("automatic_h3_longform")
         ):
@@ -12236,6 +12257,19 @@ def _apply_h3_offload_plan_to_manifest(
                 "H3 child offload segment index is invalid."
             )
         segment = segments[segment_index]
+        if cumulative_windows is not None:
+            window = cumulative_windows[segment_index]
+            if (
+                segment["generated_frames"] != window["sampler_frames"]
+                or segment["published_frames"] != window["published_tail_frames"]
+                or clip_info.get("generated_frames")
+                    != window["cumulative_generated_frames"]
+                or clip_info.get("published_frames")
+                    != window["cumulative_published_frames"]
+            ):
+                raise QueueRecoveryRuntimeError(
+                    "H3 cumulative child offload geometry changed."
+                )
         try:
             matches = (
                 str(task_params.get("model_type") or "")
@@ -12249,12 +12283,14 @@ def _apply_h3_offload_plan_to_manifest(
             raise QueueRecoveryRuntimeError(
                 "H3 child dispatch changed after offload planning."
             )
-        task_params["override_profile"] = int(segment["profile"])
+        projections.append((task_params, int(segment["profile"])))
         seen.add(segment_index)
     if seen != set(range(len(segments))):
         raise QueueRecoveryRuntimeError(
             "H3 child offload plan was not dispatched completely."
         )
+    for task_params, profile in projections:
+        task_params["override_profile"] = profile
 
 
 def _merge_h3_ref2va_keyframes(
@@ -67318,6 +67354,7 @@ def _run_generation(
             _apply_h3_loras_to_manifest(manifest, raw_params)
             _apply_h3_offload_plan_to_manifest(
                 manifest, sealed_h3_offload_plan,
+                cumulative_plan=h3_cumulative_plan,
             )
 
             # WanGP's manifest parser materializes authorized image/video
