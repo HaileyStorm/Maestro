@@ -7903,7 +7903,13 @@ def _queue_recovery_materialize_job(
             for cursor in (snapshot_cursor, runtime.get("recovery_cursor"))
         )
         untouched_hold = (
-            status == "queued" and snapshot.get("queue_held") is True
+            status == "queued" and (
+                snapshot.get("queue_held") is True
+                or (
+                    snapshot.get("queue_held") is False
+                    and snapshot.get("_recovery_worker_pending") is True
+                )
+            )
             and not remote and not blocked_reason
             and type(snapshot.get("execution_attempt")) is int
             and snapshot["execution_attempt"] == 1
@@ -7945,6 +7951,7 @@ def _queue_recovery_materialize_job(
                     "reruns_denoise": False, "_recovery_reason_code": "",
                     "message": "Held — use Start next or Resume when ready",
                     "error": None,
+                    "_recovery_worker_pending": True,
                 })
                 return runtime, False
         runtime.update({
@@ -9117,6 +9124,45 @@ def _queue_recovery_revalidate_job(job: dict) -> bool:
     except (QueueRecoveryRuntimeError, ValueError):
         job["_recovery_reason_code"] = "input_missing_or_changed"
         return False
+
+
+def _start_restored_held_generation_worker(job: dict) -> None:
+    """Attach one worker only after an explicit release of pristine held work."""
+    with _queue_recovery_checkpoint_lock:
+        if (
+            job.get("_recovery_worker_pending") is not True
+            or job.get("status") != "queued"
+            or job.get("queue_held") is True
+            or _queue_recovery_is_blocked(job)
+        ):
+            return
+        if not _queue_recovery_revalidate_job(job):
+            _queue_recovery_checkpoint(
+                job,
+                queue_held=True,
+                recovery_state="blocked",
+                reruns_denoise=False,
+                message="Recovery request or input validation failed",
+            )
+            raise HTTPException(
+                status_code=409,
+                detail="Recovery request or input validation failed",
+            )
+        try:
+            _require_job_runtime_model_admission(job)
+            _start_generation_worker(job, name_prefix="studio-held-recovery")
+        except Exception:
+            if not _queue_recovery_is_blocked(job):
+                job["_recovery_reason_code"] = "worker_start_failed"
+                _queue_recovery_checkpoint(
+                    job,
+                    queue_held=True,
+                    recovery_state="blocked",
+                    reruns_denoise=False,
+                    message="Recovery worker could not be started",
+                )
+            raise
+        job.pop("_recovery_worker_pending", None)
 
 
 def _queue_recovery_units(job: dict) -> list[dict]:
@@ -16663,6 +16709,20 @@ def _require_job_krea_actor_admission(job: dict) -> None:
 
 def _require_job_runtime_model_admission(job: dict) -> None:
     """Revalidate generic role snapshots and legacy terms before execution."""
+    from services.h3_cumulative_execution import prepare_h3_cumulative_request
+
+    params = job.get("params")
+    params = params if isinstance(params, dict) else {}
+    try:
+        prepare_h3_cumulative_request(params, require_gate=True)
+    except ValueError as error:
+        detail = (
+            "Cumulative H3 generation is unavailable in this server session. "
+            "Keep this job held until experimental H3 mode is enabled."
+            if str(error) == "Private H3 cumulative generation is disabled."
+            else str(error)
+        )
+        raise HTTPException(status_code=409, detail=detail) from error
     requested_models = _h3_job_model_types(job)
     _require_h3_legal_execution(requested_models)
     params = job.get("params")
@@ -74727,6 +74787,7 @@ def start_studio_queue(request: Request, response: Response):
                 continue
         mode = set_job_hold(owned, False)
         if mode:
+            _start_restored_held_generation_worker(owned)
             released.append(job_id)
     return {"released": released, "job_ids": released}
 
@@ -74744,6 +74805,7 @@ def resume_held_job(job_id: str, request: Request, response: Response):
             status_code=409,
             detail="This job has no pending or active hold",
         )
+    _start_restored_held_generation_worker(job)
     return {"job_id": job_id, "held": False, "hold_after_output": False}
 
 
@@ -76242,6 +76304,7 @@ def start_queued_job_next(job_id: str, request: Request, response: Response):
     promoted = promote_queued_job(job)
     if not promoted:
         raise HTTPException(status_code=409, detail="Only queued jobs can be started next")
+    _start_restored_held_generation_worker(job)
     return {
         "job_id": job_id,
         "held": False,

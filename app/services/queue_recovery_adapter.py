@@ -81,6 +81,7 @@ _JOB_FIELDS = frozenset({
     "residency_base_key", "residency_affinity_key", "_queue_manual_order",
     "recovery_attempt", "recovery_state", "reruns_denoise",
     "recovery_unit", "recovery_cursor", "_recovery_reason_code",
+    "_recovery_worker_pending",
     "credit_queue", "prompt_result_reference", "prompt_result_consumed",
 })
 _GLOBAL_FIELDS = frozenset({
@@ -1070,7 +1071,11 @@ def serialize_job(
             "failed_child_status", "failed_child_reason",
         } and value is None:
             continue
-        if key in {"output_files", "artifact_files"}:
+        if key == "_recovery_worker_pending":
+            if type(value) is not bool:
+                raise QueueRecoveryAdapterError("Pending worker receipt is invalid.")
+            result[key] = value
+        elif key in {"output_files", "artifact_files"}:
             result[key] = [
                 safe for safe in (_safe_filename(item) for item in (value or []))
                 if safe is not None

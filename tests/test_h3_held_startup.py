@@ -6,12 +6,14 @@ import copy
 import hmac
 import json
 import math
+import tempfile
 import time
 import types
 import unittest
 
 import test_h3_legal_access as legal_fixture
 from services.h3_offload_plan import H3_OFFLOAD_PLAN_PARAM_KEY
+from services.queue_recovery import QueueRecoveryJournal
 from services.queue_recovery_adapter import serialize_job
 from services.queue_recovery_runtime import QueueRecoveryRuntimeError
 from test_h3_legal_access import (
@@ -134,7 +136,62 @@ class H3HeldStartupTests(unittest.TestCase):
                 self.assertEqual(job["execution_attempt"], 1)
                 self.assertEqual(job["params"], self.params)
                 self.assertEqual(job["_recovery_manifest_pointer"], {})
+                self.assertTrue(job["_recovery_worker_pending"])
         self.assertEqual(self.calls, [("minimax_h3",)] * 2)
+
+    def test_crash_after_explicit_release_restores_pending_receipt_to_held(self):
+        job, may_start = self.recover()
+        self.assertFalse(may_start)
+        job["queue_held"] = False
+        serialized = serialize_job(
+            job,
+            owner_digest=self.snapshot["owner_principal"],
+            project_digest=self.snapshot["project_instance"],
+            request_manifest={},
+        )
+        self.assertTrue(serialized["_recovery_worker_pending"])
+        self.assertFalse(serialized["queue_held"])
+        with tempfile.TemporaryDirectory() as folder:
+            journal = QueueRecoveryJournal(f"{folder}/queue.jsonl")
+            journal.commit_job(
+                job["id"], serialized,
+                expected_revision=0, expected_epoch=journal.recover().epoch,
+            )
+            serialized = journal.recover().jobs[job["id"]]
+        recovered, may_start = self.namespace["_queue_recovery_materialize_job"](
+            serialized, self.projects,
+        )
+        self.assertFalse(may_start)
+        self.assertTrue(recovered["queue_held"])
+        self.assertTrue(recovered["_recovery_worker_pending"])
+        self.assertEqual(recovered["recovery_state"], "restored")
+        self.assertEqual(recovered["execution_attempt"], 1)
+        self.assertEqual(recovered["recovery_attempt"], 0)
+        for patch in (
+            {"phase": "loading"}, {"started_at": 1}, {"step": 1},
+            {"_recovery_worker_pending": False},
+            {"_recovery_worker_pending": 1},
+            {"recovery_cursor": {"completed_units": [{"kind": "h3_segment"}]}},
+        ):
+            with self.subTest(patch=patch):
+                denied, may_start = self.namespace["_queue_recovery_materialize_job"](
+                    {**serialized, **patch}, self.projects,
+                )
+                self.assertFalse(may_start)
+                self.assertNotEqual(denied["recovery_state"], "restored")
+
+    def test_pending_receipt_serializer_rejects_non_boolean_values(self):
+        from services.queue_recovery_adapter import QueueRecoveryAdapterError
+
+        job, _ = self.recover()
+        for value in (1, "true", [], None):
+            with self.subTest(value=value), self.assertRaises(QueueRecoveryAdapterError):
+                serialize_job(
+                    {**job, "_recovery_worker_pending": value},
+                    owner_digest=self.snapshot["owner_principal"],
+                    project_digest=self.snapshot["project_instance"],
+                    request_manifest={},
+                )
 
     def test_actual_policy_denial_remains_held(self):
         for services in ({}, legal_fixture.H3LegalAccessPolicyTests()._services("US")):

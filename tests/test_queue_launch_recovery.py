@@ -11526,5 +11526,119 @@ class QueueLaunchWiringTests(unittest.TestCase):
         self.assertNotIn('"final_output_recovery_incomplete"', resume)
 
 
+class RestoredHeldWorkerTests(unittest.TestCase):
+    def setUp(self):
+        self.calls = []
+        self.job = {
+            "id": "held-h3", "status": "queued", "queue_held": False,
+            "recovery_state": "restored", "_recovery_worker_pending": True,
+            "execution_attempt": 1, "recovery_attempt": 0,
+            "params": {"sealed": "unchanged"},
+        }
+        self.namespace = _isolated_functions(
+            _tree("app/launch.py"),
+            ("_start_restored_held_generation_worker",),
+            {
+                "HTTPException": type("Denied", (Exception,), {
+                    "__init__": lambda self, **kwargs: Exception.__init__(self, kwargs),
+                }),
+                "_queue_recovery_checkpoint_lock": threading.RLock(),
+                "_queue_recovery_is_blocked": lambda job: job.get("recovery_state") == "blocked",
+                "_queue_recovery_revalidate_job": lambda job: self.calls.append("inputs") or True,
+                "_require_job_runtime_model_admission": lambda job: self.calls.append("admission"),
+                "_start_generation_worker": lambda job, **kwargs: self.calls.append("worker"),
+                "_queue_recovery_checkpoint": lambda job, **updates: job.update(updates),
+            },
+        )
+        self.start = self.namespace["_start_restored_held_generation_worker"]
+
+    def test_concurrent_explicit_release_attaches_only_one_worker(self):
+        original_params = copy.deepcopy(self.job["params"])
+        threads = [threading.Thread(target=self.start, args=(self.job,)) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(self.calls, ["inputs", "admission", "worker"])
+        self.assertNotIn("_recovery_worker_pending", self.job)
+        self.assertEqual(self.job["params"], original_params)
+        self.assertEqual((self.job["execution_attempt"], self.job["recovery_attempt"]), (1, 0))
+
+    def test_held_blocked_running_and_existing_worker_do_not_dispatch(self):
+        for patch in (
+            {"queue_held": True}, {"recovery_state": "blocked"},
+            {"status": "running"}, {"_recovery_worker_pending": False},
+        ):
+            with self.subTest(patch=patch):
+                self.start({**self.job, **patch})
+        self.assertEqual(self.calls, [])
+
+    def test_changed_manifest_reholds_without_model_admission_or_worker(self):
+        self.namespace["_queue_recovery_revalidate_job"] = lambda job: False
+        with self.assertRaises(self.namespace["HTTPException"]):
+            self.start(self.job)
+        self.assertTrue(self.job["queue_held"])
+        self.assertEqual(self.job["recovery_state"], "blocked")
+        self.assertEqual(self.calls, [])
+
+    def test_admission_or_worker_failure_reholds_without_duplicate_retry(self):
+        for failing in ("_require_job_runtime_model_admission", "_start_generation_worker"):
+            with self.subTest(failing=failing):
+                original = self.namespace[failing]
+                def fail(*args, **kwargs):
+                    raise RuntimeError("unavailable")
+                self.namespace[failing] = fail
+                job = copy.deepcopy(self.job)
+                with self.assertRaises(RuntimeError):
+                    self.start(job)
+                self.assertTrue(job["queue_held"])
+                self.assertEqual(job["recovery_state"], "blocked")
+                self.assertTrue(job["_recovery_worker_pending"])
+                calls = list(self.calls)
+                self.start(job)
+                self.assertEqual(self.calls, calls)
+                self.namespace[failing] = original
+
+    def test_every_explicit_held_release_route_attaches_after_durable_release(self):
+        tree = _tree("app/launch.py")
+        for route, release in (
+            ("start_queued_job_next", "promote_queued_job"),
+            ("resume_held_job", "set_job_hold"),
+            ("start_studio_queue", "set_job_hold"),
+        ):
+            calls = [node.func.id for node in ast.walk(_function(tree, route))
+                     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)]
+            self.assertEqual(calls.count("_start_restored_held_generation_worker"), 1)
+            self.assertIn(release, calls)
+
+    def test_disabled_cumulative_admission_preserves_held_job_before_dispatch(self):
+        namespace = _isolated_functions(
+            _tree("app/launch.py"),
+            ("_require_job_runtime_model_admission", "start_queued_job_next"),
+            {
+                "api": types.SimpleNamespace(post=lambda *_args: lambda function: function),
+                "Request": object, "Response": object, "os": os,
+                "HTTPException": self.namespace["HTTPException"],
+                "_set_recovery_no_store": lambda response: None,
+                "_require_generic_queue_control_job": lambda *_args: self.job,
+                "_reject_generic_sample_campaign_release": lambda job: None,
+                "_queue_recovery_delivery_pending": lambda job: None,
+                "promote_queued_job": lambda job: self.fail("Queue released while disabled"),
+                "_start_restored_held_generation_worker": lambda job: self.fail("Worker dispatched while disabled"),
+            },
+        )
+        self.job["queue_held"] = True
+        self.job["params"] = {"_h3_cumulative_append": True}
+        original = copy.deepcopy(self.job)
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            self.assertRaises(namespace["HTTPException"]) as raised,
+        ):
+            namespace["start_queued_job_next"]("held-h3", object(), object())
+        self.assertIn("experimental H3 mode", str(raised.exception))
+        self.assertEqual(self.job, original)
+
+
 if __name__ == "__main__":
     unittest.main()
