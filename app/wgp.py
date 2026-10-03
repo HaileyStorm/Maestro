@@ -12646,7 +12646,8 @@ def _generate_video_impl(
     model_filename = get_model_filename(base_model_type)  
 
     _, _, latent_size = get_model_min_frames_and_step(model_type)
-    video_length = align_model_frame_count(video_length, model_def)
+    video_length = (align_model_frame_count(video_length, model_def) if _h3_cumulative_dispatch is None
+                    else _h3_cumulative_dispatch.sampling_frames(video_length))
     published_video_length = video_length
     h3_native_boundary_video = None
     h3_native_boundary_audio = None
@@ -13984,7 +13985,7 @@ def _generate_video_impl(
                 if base_model_type in {"minimax_h3", "minimax_h3_ref2va"}:
                     begin_decode_capture(_h3_decode_observer, {
                         "repeat_index": max(0, repeat_no - 1), "window_index": window_no,
-                        "seed": seed, "frames": align_model_frame_count(current_video_length, model_def, for_generation=True),
+                        "seed": seed, "frames": (align_model_frame_count(current_video_length, model_def, for_generation=True) if _h3_cumulative_dispatch is None else _h3_cumulative_dispatch.sampling_frames(current_video_length)),
                         "height": image_size[0], "width": image_size[1], "fps": fps,
                         "model_filename": model_filename,
                     })
@@ -14012,7 +14013,7 @@ def _generate_video_impl(
                     denoising_strength=denoising_strength,
                     masking_strength=masking_strength,
                     prefix_frames_count = prefix_frames_count,
-                    frame_num=align_model_frame_count(current_video_length, model_def, for_generation=True),
+                    frame_num=(align_model_frame_count(current_video_length, model_def, for_generation=True) if _h3_cumulative_dispatch is None else _h3_cumulative_dispatch.sampling_frames(current_video_length)),
                     batch_size = batch_size,
                     height = image_size[0],
                     width = image_size[1],
@@ -14153,8 +14154,9 @@ def _generate_video_impl(
                     **({} if _h3_cumulative_dispatch is None else
                        _h3_cumulative_dispatch.model_kwargs(
                            base_model_type=base_model_type,
-                           frame_num=align_model_frame_count(current_video_length, model_def, for_generation=True),
+                           frame_num=_h3_cumulative_dispatch.sampling_frames(current_video_length),
                            repeat_no=repeat_no, window_no=window_no,
+                           model=wan_model,
                        )),
                     # Motion suffix: only passed when the loaded suffix video
                     # is available. Other model handlers (Wan / Flux / Qwen /

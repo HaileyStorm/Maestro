@@ -15,6 +15,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 
+import numpy as np
 import torch
 from safetensors.torch import load, save
 
@@ -406,13 +407,12 @@ def _validate_header(payload, receipt, identity, dependency):
         )
 
 
-def load_h3_cumulative_checkpoint(
-    project_directory,
-    receipt: dict,
+def validate_h3_cumulative_receipt(
+    receipt,
     expected_identity: H3CumulativeIdentity,
     expected_dependency: str,
-) -> H3CumulativeRecovery:
-    """Verify one bounded no-follow file before allocating its tensor state."""
+) -> None:
+    """Validate the exact receipt schema without accessing files or tensors."""
     if not isinstance(expected_identity, H3CumulativeIdentity):
         raise QueueRecoveryRuntimeError("H3 cumulative expected identity is required.")
     expected_identity.__post_init__()
@@ -458,6 +458,18 @@ def load_h3_cumulative_checkpoint(
         raise QueueRecoveryRuntimeError(
             "H3 cumulative checkpoint file receipt is invalid."
         )
+    if (
+        not is_legal_h3_video_frame_count(receipt["frame_count"])
+        or type(receipt["published_frames"]) is not int
+        or not 1 <= receipt["published_frames"] <= receipt["frame_count"]
+    ):
+        raise QueueRecoveryRuntimeError(
+            "H3 cumulative checkpoint frame geometry is invalid."
+        )
+
+
+def _verified_checkpoint_payload(project_directory, receipt, identity, dependency):
+    validate_h3_cumulative_receipt(receipt, identity, dependency)
     staging, directories = _directories(project_directory, create=False)
     directory = _open_private_directory(staging)
     try:
@@ -467,11 +479,47 @@ def load_h3_cumulative_checkpoint(
         _verify_directories(directories)
     finally:
         os.close(directory)
-    if len(payload) != size or hashlib.sha256(payload).hexdigest() != digest:
+    if (
+        len(payload) != receipt["size"]
+        or hashlib.sha256(payload).hexdigest() != receipt["sha256"]
+    ):
         raise QueueRecoveryRuntimeError(
             "H3 cumulative checkpoint hash or size does not match."
         )
-    _validate_header(payload, receipt, expected_identity, expected_dependency)
+    _validate_header(payload, receipt, identity, dependency)
+    # Both arrays are contiguous little-endian float32 spans. Scan bounded
+    # views without materializing full tensors during queue skip validation.
+    start = 8 + int.from_bytes(payload[:8], "little")
+    view = memoryview(payload)
+    for offset in range(start, len(payload), 1024 * 1024):
+        if not np.isfinite(
+            np.frombuffer(view[offset : offset + 1024 * 1024], dtype="<f4")
+        ).all():
+            raise QueueRecoveryRuntimeError(
+                "H3 cumulative checkpoint contains non-finite AV values."
+            )
+    return payload
+
+
+def verify_h3_cumulative_checkpoint(
+    project_directory, receipt, expected_identity, expected_dependency
+):
+    """Verify bytes, header and finite AV data without restoring tensor state."""
+    _verified_checkpoint_payload(
+        project_directory, receipt, expected_identity, expected_dependency
+    )
+
+
+def load_h3_cumulative_checkpoint(
+    project_directory,
+    receipt: dict,
+    expected_identity: H3CumulativeIdentity,
+    expected_dependency: str,
+) -> H3CumulativeRecovery:
+    """Verify one bounded no-follow file before allocating its tensor state."""
+    payload = _verified_checkpoint_payload(
+        project_directory, receipt, expected_identity, expected_dependency
+    )
     try:
         tensors = load(payload)
         state = H3CumulativeLatents(

@@ -9079,6 +9079,7 @@ def _queue_recovery_unit_matches(
     project_dir: str,
     quarantine_invalid: bool = True,
     consumed_continuations: frozenset[str] = frozenset(),
+    expected_h3_cumulative_authority=None,
 ) -> dict | None:
     """Return one fully verified completed unit; invalid evidence is ignored."""
     for unit in _queue_recovery_units(job):
@@ -9154,6 +9155,17 @@ def _queue_recovery_unit_matches(
                         _quarantine_recovery_artifact(project_dir, descriptor)
             return None
         continuation = unit.get("continuation")
+        unit_settings = unit.get("settings")
+        cumulative = unit_settings.get("cumulative_append") if isinstance(unit_settings, dict) else None
+        if cumulative is not None or (
+            isinstance(continuation, dict)
+            and continuation.get("mode") == "cumulative_append"
+        ):
+            try:
+                _queue_recovery_verify_h3_cumulative(job, unit, project_dir, expected_authority=expected_h3_cumulative_authority)
+            except (QueueRecoveryRuntimeError, TypeError, ValueError):
+                return None
+            return unit
         if "continuation" in unit:
             if not isinstance(continuation, dict) or continuation.get("dependency") != unit_id:
                 return None
@@ -9201,6 +9213,87 @@ def _queue_recovery_unit_matches(
                 return None
         return unit
     return None
+
+
+def _queue_recovery_verify_h3_cumulative(job: dict, unit: dict, project_dir: str, *, expected_authority, require_media_receipt: bool = True) -> None:
+    """Bind private AV bytes to the authorized job, physical project and media."""
+    from services.h3_cumulative_queue import H3QueueAuthority, verify_h3_queue_receipt
+    from services.queue_recovery_runtime import MAX_MANIFEST_BYTES, _read_exact_file
+
+    if not isinstance(expected_authority, H3QueueAuthority):
+        raise QueueRecoveryRuntimeError("H3 cumulative trusted plan authority is required.")
+    settings = unit.get("settings")
+    geometry = settings.get("cumulative_append") if type(settings) is dict else None
+    if (
+        unit.get("kind") != "h3_segment"
+        or unit.get("state") != "completed"
+        or type(geometry) is not dict
+        or set(geometry) != {"chain_id", "width", "height"}
+        or settings.get("native_boundary_conditioning") is not False
+        or settings.get("discard_prefix_frames") != 0
+        or settings.get("source_prefix") is not None
+        or type(unit.get("variant")) is not int or unit["variant"] < 0
+        or type(unit.get("index")) is not int or unit["index"] < 0
+        or type(settings.get("trim_tail_frames")) is not int
+        or type(settings.get("generated_frames")) is not int
+        or type(settings.get("published_frames")) is not int
+        or settings["trim_tail_frames"] != settings["generated_frames"] - settings["published_frames"]
+    ):
+        raise QueueRecoveryRuntimeError("H3 cumulative safe-unit settings are invalid.")
+    if unit.get("unit_id") != recovery_unit_id(
+        job.get("id"), "h3_segment", variant=unit["variant"], index=unit["index"],
+        dependencies=unit.get("dependencies") or (), settings=settings,
+    ):
+        raise QueueRecoveryRuntimeError("H3 cumulative safe-unit identity changed.")
+    try:
+        project_digest = _queue_recovery_existing_project_identity(project_dir)
+    except QueueRecoveryAdapterError:
+        raise QueueRecoveryRuntimeError("H3 cumulative project instance is unavailable.") from None
+    if (
+        not project_digest
+        or type(job.get("_recovery_project_digest")) is not str
+        or not hmac.compare_digest(project_digest, job["_recovery_project_digest"])
+    ):
+        raise QueueRecoveryRuntimeError("H3 cumulative project instance changed.")
+    authority = H3QueueAuthority(
+        job.get("_recovery_owner_digest"), project_digest, geometry["chain_id"],
+        job.get("id"), geometry["width"], geometry["height"],
+    )
+    if authority != expected_authority:
+        raise QueueRecoveryRuntimeError("H3 cumulative chain or canvas changed from the trusted plan.")
+    verify_h3_queue_receipt(
+        project_dir, unit.get("continuation"), authority, unit.get("unit_id"),
+        frame_count=settings.get("generated_frames"),
+        published_frames=settings.get("published_frames"),
+    )
+    # The AV receipt must be part of the sealed media evidence, not only an
+    # independently valid file referenced by a journal record.
+    artifacts = unit.get("artifacts")
+    if type(artifacts) is not list or not artifacts:
+        raise QueueRecoveryRuntimeError("H3 cumulative media evidence is missing.")
+    for artifact in artifacts:
+        if not validate_artifact_descriptor(project_dir, artifact, producer_unit_id=unit["unit_id"]):
+            raise QueueRecoveryRuntimeError("H3 cumulative media evidence changed.")
+        try:
+            metadata = json.loads(_read_exact_file(
+                os.path.join(project_dir, artifact["sidecar_basename"]),
+                maximum_bytes=MAX_MANIFEST_BYTES,
+            ))
+        except ValueError:
+            raise QueueRecoveryRuntimeError("H3 cumulative media sidecar is invalid.") from None
+        expected = {
+            "producer_unit_id": unit["unit_id"], "producer_unit_kind": "h3_segment",
+            "producer_unit_variant": unit["variant"], "producer_unit_index": unit["index"],
+            "producer_unit_dependencies": unit.get("dependencies") or [],
+            "producer_unit_settings": settings,
+            "producer_unit_continuation": unit.get("continuation"),
+        }
+        if not require_media_receipt:
+            expected.pop("producer_unit_continuation")
+        if type(metadata) is not dict or any(metadata.get(key) != value for key, value in expected.items()):
+            raise QueueRecoveryRuntimeError("H3 cumulative media receipt changed.")
+        if not require_media_receipt and metadata.get("producer_unit_continuation") not in (None, unit.get("continuation")):
+            raise QueueRecoveryRuntimeError("H3 cumulative media already has a different receipt.")
 
 
 def _queue_recovery_validate_staged_artifact(
@@ -9262,6 +9355,7 @@ def _queue_recovery_checkpoint_unit(
     settings: dict | None = None,
     attestation: dict | None = None,
     ordinary_repeat_offset: int | None = None,
+    expected_h3_cumulative_authority=None,
 ) -> dict:
     """Seal media+sidecars, then persist one completed safe-unit descriptor."""
     unit_id = recovery_unit_id(
@@ -9271,6 +9365,18 @@ def _queue_recovery_checkpoint_unit(
         dependencies=dependencies or (),
         settings=settings or {},
     )
+    # A repeated media seal must preserve its cumulative AV receipt. An omitted
+    # argument cannot quietly turn a restartable cumulative unit into media-only.
+    for previous in _queue_recovery_units(job):
+        prior = previous.get("continuation")
+        if (
+            previous.get("unit_id") == unit_id and isinstance(prior, dict)
+            and prior.get("mode") == "cumulative_append"
+        ):
+            if continuation is not None and continuation != prior:
+                raise QueueRecoveryRuntimeError("H3 cumulative checkpoint receipt changed.")
+            continuation = dict(prior)
+            break
     artifacts = []
     for name in artifact_names:
         sidecar_name = os.path.splitext(name)[0] + ".meta.json"
@@ -9295,6 +9401,10 @@ def _queue_recovery_checkpoint_unit(
         unit["settings"] = dict(settings)
     if attestation:
         unit["attestation"] = dict(attestation)
+    if (unit.get("settings") or {}).get("cumulative_append") is not None or (
+        isinstance(continuation, dict) and continuation.get("mode") == "cumulative_append"
+    ):
+        _queue_recovery_verify_h3_cumulative(job, unit, project_dir, expected_authority=expected_h3_cumulative_authority)
     units = [
         item for item in _queue_recovery_units(job)
         if not (
@@ -9328,6 +9438,7 @@ def _queue_recovery_enrich_h3_continuation(
     dependencies: list[str],
     settings: dict,
     continuation: dict,
+    expected_h3_cumulative_authority=None,
 ) -> dict | None:
     """Attach a verified handoff to the exact already-sealed component."""
     expected_id = recovery_unit_id(
@@ -9350,7 +9461,13 @@ def _queue_recovery_enrich_h3_continuation(
         raise QueueRecoveryRuntimeError("H3 continuation checkpoint identity changed.")
     proposed = dict(unit, continuation=dict(continuation))
     check_job = dict(job, recovery_cursor={"completed_units": [proposed]})
-    if _queue_recovery_unit_matches(
+    if continuation.get("mode") == "cumulative_append":
+        # Verify AV plus the existing media before attaching the receipt; the
+        # strict media+receipt gate runs again on the rebuilt descriptor below.
+        _queue_recovery_verify_h3_cumulative(
+            check_job, proposed, project_dir, expected_authority=expected_h3_cumulative_authority, require_media_receipt=False,
+        )
+    elif _queue_recovery_unit_matches(
         check_job, kind="h3_segment", variant=variant, index=index,
         project_dir=project_dir,
     ) is None:
@@ -9384,6 +9501,7 @@ def _queue_recovery_enrich_h3_continuation(
         project_dir=project_dir,
         artifact_names=names,
         dependencies=dependencies, settings=settings, continuation=continuation,
+        expected_h3_cumulative_authority=expected_h3_cumulative_authority,
     )
 
 

@@ -356,6 +356,7 @@ class H3CumulativeDispatchTests(unittest.TestCase):
             "model_def": {},
             "repeat_no": 1,
             "window_no": 1,
+            "wan_model": self.model,
             "align_model_frame_count": lambda frames, *args, **kwargs: frames,
         }
         kwargs = eval(

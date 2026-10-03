@@ -2,6 +2,12 @@
 
 ## Current milestone and intent
 
+Latest checkpoint: private queue receipt verification and deferred restore
+through WGP's actual loaded-model boundary, described at the end of this file.
+The public long-form caller still needs a sealed cumulative step plan and final
+full-output replacement path before activation. Earlier sections retain their
+milestone-specific evidence and limitations.
+
 Continue fallback item `UH-20260927-MAESTRO-EXTEND-FLAGS` in the existing
 physical checkout. Preserve completed Extend, decoded-boundary and Editor
 evidence. The next selected H3 lane is cumulative latent append, using the
@@ -368,10 +374,108 @@ were recovered. Rediscovered direct health/readiness both returned 200; the
 service was already running. The binding claim
 `maestro-h3-runtime-binding-20261002` was released/reacquired through the
 supported helper to add offline conditioner loading and the WGP finalization
-hook. It covers only those three existing source files, the new binding service,
-new tests, recovery test correction and this note. Release it after serial Git
-closure. Foreign `AGENTS.md`,
+hook. It covered only those three existing source files, the new binding service,
+new tests, recovery test correction and this note. That exact binding claim was
+released after commit `64be4a0` and verified origin parity. Foreign `AGENTS.md`,
 storage-janitor work and private
 artifacts remain preserved. Historical SQLite Beads remains on its mutation
 hold despite the activation audit's Dolt metadata. No Beads lifecycle command,
 launcher edit, full-suite rerun, GPU request or provider delegation was used.
+
+## Private queue receipt and loaded-model restore milestone
+
+The actual queue safe-unit matcher now recognizes an explicit
+`settings.cumulative_append` contract containing the chain ID and native canvas.
+It checks owner/job identity, re-reads the physical project-instance marker,
+recomputes the media unit ID and verifies generated/published/trim geometry.
+The matcher, checkpoint and enrichment require an independently supplied
+`H3QueueAuthority` from the trusted sealed plan. Receipt/sidecar/journal values
+cannot authorize their own chain or canvas. Until the new caller supplies that
+authority, cumulative units cannot be committed or treated as skippable.
+The AV receipt must match the exact unit dependency and the receipt sealed into
+each verified media sidecar. Missing, corrupt, non-finite, replaced or
+mismatched AV bytes make the unit unskippable, even when media is intact or the
+generic consumed-continuation set would otherwise permit a retired file.
+
+Queue receipt encoding renames only the proven bundle digest key to
+`bundle_sha256`. Exact schema validation maps it back to the checkpoint's
+`runtime_sha256` field before loading. The generic journal runtime/tensor/token
+denylist is unchanged. A real temporary journal restart preserves this receipt;
+no host path, tensor or opaque instance token enters the journal. Verification
+reads the bounded whole payload and scans float32 data in 1 MiB NumPy views
+without constructing full tensor arrays. This reduces allocation during skip
+verification; it does not remove the bounded whole-file byte allocation or
+establish a peak-memory limit.
+
+Re-sealing the same media unit preserves its cumulative receipt when omitted
+from the call and rejects a different receipt. Enrichment verifies AV and the
+already sealed media first, rejects a conflicting sidecar handoff, updates the
+sidecar and then commits the rebuilt media-plus-AV descriptor. An interrupted
+sidecar/journal update fails closed under the existing orphan recovery flow;
+this is not a new atomic transaction spanning those files.
+
+`H3CumulativeQueueDispatch` binds server-supplied owner/project/job/chain/canvas
+authority to the actual loaded native FL2VA model. WGP forwards that handler at
+its sampler-kwargs boundary, after load finalization and canvas normalization.
+The dispatch compares the loaded bundle with the prior receipt, verifies and
+loads the AV checkpoint, validates the planned step and restores a fresh model
+token before sampling. After successful output completion it can seal the next
+full AV state against the caller's media unit ID; it rechecks loaded identity
+and releases its handoff after returning the durable receipt. It holds the model
+weakly, is single-use and cannot be serialized. Failed generation discards AV.
+Ordinary calls retain their prior transport behavior.
+
+The real WGP alignment helper applies the ordinary first-clip minimum even
+when `for_generation=True`. A legal 56-frame continuation window would otherwise
+be expanded to 124 frames before dispatch. The private transport now preserves
+its exact legal window at request alignment, observer timing, sampler frame
+count and loaded-model dispatch. It rejects a changed window and caps native
+windows at 345 frames. Ordinary calls still use their existing alignment.
+The regression executes all three actual WGP alignment expressions with the
+real alignment helper and native minimum/maximum, plus the actual dispatch node.
+
+Public queue admission is still pending. Existing long-form plans encode local
+segment timelines and cannot be reinterpreted as cumulative windows. The next
+coherent unit must seal explicit cumulative context/extension/absolute-audio
+steps against the authored semantic slices, inject the private dispatch from
+the authorized worker, and checkpoint/publish the last complete output through
+the final audio policy without concatenating cumulative snapshots. Recovery
+must restore from durable AV before dispatch and preserve exact predecessor
+receipt hashes. A resident model whose proof was invalidated by an ordinary
+request needs a fresh private load; it must not mint a replacement proof from
+configuration alone. Private staging crash-orphan retention/cleanup and actual
+live GPU/encode/media/browser/human acceptance remain open.
+
+CPU evidence: 44 distinct focused checks passed across queue integration,
+disk recovery and WGP transport. The first combined 40-check run had one old
+AST fixture missing the newly forwarded loaded model; that fixture was corrected
+and the failing check passed. The additional journal restart and conflicting
+sidecar checks passed, with affected enrichment/re-seal checks rerun. After the
+independent review's authority correction and the private short-window fix,
+27 queue/transport checks passed together; the unchanged 17 disk checks are
+reused. The queue
+tests execute actual AST-extracted launch matcher/checkpoint/enrichment/project
+identity functions, real temporary files/journal, the real WGP wrapper and
+sampler kwargs node, and the native sampler with CPU components. Bundle getter
+substitution is explicit; prior actual temp-asset binding evidence is reused.
+Scoped lint/format, syntax and diff checks pass. Launch and WGP retain exactly
+817 and 445 pre-existing Ruff diagnostics respectively, with no new finding.
+No full suite, real assets, CUDA sampling, generated media, service restart,
+provider call or public activation is claimed.
+The bounded independent review found the trusted-plan authority gap, corrected
+above with explicit authority and a focused negative regression. Its noted
+sidecar/journal crash residual remains explicit pending the existing orphan
+recovery and upcoming final-replacement integration. There is no live queue,
+encode or hostile same-UID isolation claim.
+
+Recovery record: the existing physical checkout remains on `main`, same host
+and workspace instance, active fallback item
+`UH-20260927-MAESTRO-EXTEND-FLAGS` and continuous Goal. The exact claim
+`maestro-h3-queue-recovery-20261002` covers the queue bridge, dispatch/recovery,
+WGP/launch, two focused test files and this note. It was released/reacquired
+through the supported helper to include the old AST fixture correction. Release
+that exact claim after serial Git closure. Foreign dirty files and historical
+SQLite tracker remain preserved. The rediscovered Maestro ready URL passed
+health/readiness with 200; HTTP health is not browser acceptance. Launcher
+destination/example/URL-capture checks are inapplicable because no launcher was
+edited. The broad sprint remains active.

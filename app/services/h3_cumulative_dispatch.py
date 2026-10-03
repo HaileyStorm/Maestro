@@ -11,6 +11,7 @@ from fractions import Fraction
 
 from services.h3_cumulative_latents import H3CumulativeLatents, _validate_step
 from services.h3_native_continuation import (
+    H3_DEFAULT_MAX_WINDOW_FRAMES,
     H3NativeContinuationStep,
     is_legal_h3_video_frame_count,
 )
@@ -18,7 +19,10 @@ from services.h3_native_continuation import (
 
 class H3CumulativeDispatch:
     def __init__(self, *, frames: int, previous=None, step=None):
-        if not is_legal_h3_video_frame_count(frames):
+        if (
+            not is_legal_h3_video_frame_count(frames)
+            or frames > H3_DEFAULT_MAX_WINDOW_FRAMES
+        ):
             raise ValueError("H3 cumulative dispatch requires a native frame count.")
         if previous is not None or step is not None:
             if (
@@ -137,7 +141,22 @@ class H3CumulativeDispatch:
             raise ValueError("H3 cumulative dispatch requires one prompt invocation.")
         self._phase = "running"
 
-    def model_kwargs(self, *, base_model_type, frame_num, repeat_no, window_no):
+    def bind_loaded_model(self, model):
+        """Optional deferred restore boundary, after WGP has finalized its load."""
+
+    def sampling_frames(self, requested_frames):
+        """Keep a legal append window below the ordinary first-clip minimum."""
+        if (
+            self._phase != "running"
+            or type(requested_frames) is not int
+            or requested_frames != self.frames
+        ):
+            raise ValueError("H3 cumulative sampling window changed before dispatch.")
+        return self.frames
+
+    def model_kwargs(
+        self, *, base_model_type, frame_num, repeat_no, window_no, model=None
+    ):
         if (
             self._phase != "running"
             or self._forwarded
@@ -150,6 +169,7 @@ class H3CumulativeDispatch:
             raise ValueError(
                 "H3 cumulative dispatch geometry or invocation changed before sampling."
             )
+        self.bind_loaded_model(model)
         self._forwarded = True
         result = {"_h3_cumulative_capture": True}
         if self.previous is not None:
