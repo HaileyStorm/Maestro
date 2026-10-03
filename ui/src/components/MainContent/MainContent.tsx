@@ -1346,11 +1346,14 @@ function JobPlaceholder({
   const planNeedsModelTerms = job.planReviewTermsRequired === true || planNeedsRef2VATerms
   const hasSteps = job.totalSteps > 0
   const progressPct = hasSteps ? (job.step / job.totalSteps) * 100 : job.progress * 100
-  const hasWindows = (job.windowTotal ?? 0) > 1
+  const cumulativePlan = job.h3CumulativePlan?.mode === 'cumulative_append' ? job.h3CumulativePlan : null
+  const windowTotal = cumulativePlan?.window_count ?? job.windowTotal ?? 0
+  const hasWindows = windowTotal > 1
   const currentStep = (job.windowTotalSteps ?? 0) > 0 ? (job.windowStep ?? 0) : job.step
   const currentTotalSteps = (job.windowTotalSteps ?? 0) > 0 ? (job.windowTotalSteps ?? 0) : job.totalSteps
   const hasExactCurrentSteps = currentTotalSteps > 0
-  const progressUnit = job.modelType?.startsWith('minimax_h3') ? 'Segment' : 'Window'
+  const cumulativeWaiting = cumulativePlan && (job.status === 'queued' || job.status === 'preparing' || job.status === 'waiting_for_plan_approval')
+  const progressUnit = !cumulativePlan && job.modelType?.startsWith('minimax_h3') ? 'Segment' : 'Window'
   const overallPct = hasWindows
     ? Math.max(0, Math.min(100, job.overallProgress ?? job.progress * 100))
     : progressPct
@@ -1359,7 +1362,8 @@ function JobPlaceholder({
         ? (currentStep / currentTotalSteps) * 100
         : (job.windowProgress ?? progressPct)))
     : progressPct
-  const currentProgressIndeterminate = job.progressIndeterminate === true || !hasExactCurrentSteps
+  const currentProgressIndeterminate = (!cumulativePlan || job.status === 'running')
+    && (job.progressIndeterminate === true || !hasExactCurrentSteps)
   const finishingOutput = isFinishingOutput(job)
   const queuedH3Runtime = (job.status === 'queued' || job.status === 'waiting_for_plan_approval') && job.modelType?.startsWith('minimax_h3')
     ? h3QueuedRuntime(job)
@@ -1560,8 +1564,14 @@ function JobPlaceholder({
                     : `Estimated time ${formatApproximateDuration(queuedH3Runtime)} after start`
                   : `Overall ETA ${formatApproximateDuration(finishingOutput ? null : job.etaSeconds)}`}
                 {job.status === 'running' && !finishingOutput && hasWindows && job.modelType?.startsWith('minimax_h3')
-                    ? ` · Current segment ETA ${formatApproximateDuration(job.subtaskEtaSeconds)}`
+                    ? ` · Current ${progressUnit.toLowerCase()} ETA ${formatApproximateDuration(job.subtaskEtaSeconds)}`
                     : ''}
+              </p>
+            )}
+            {cumulativePlan && (
+              <p className="mt-1 text-[10px] text-text-secondary">
+                Planned cumulative timeline · {formatMediaDuration(cumulativePlan.published_frames / cumulativePlan.fps, 3)}
+                {' · '}{cumulativePlan.published_frames} frames at {cumulativePlan.fps} fps
               </p>
             )}
             {recoveryBlocked && (
@@ -1646,7 +1656,9 @@ function JobPlaceholder({
               <div className="mt-2 space-y-1.5 text-left">
                 <div className="flex items-center justify-between text-[10px] text-text-secondary">
                   <span>{finishingOutput ? 'Finishing output' : 'Overall'}</span>
-                  {!finishingOutput && <span>{progressUnit} {job.windowCurrent || 1}/{job.windowTotal}</span>}
+                  {!finishingOutput && <span>{cumulativeWaiting
+                    ? `${cumulativePlan.window_count} windows planned`
+                    : `${progressUnit} ${job.windowCurrent || 1}/${windowTotal}`}</span>}
                 </div>
                 <div className="w-full bg-bg-active rounded-full h-1.5 overflow-hidden">
                   {finishingOutput ? (
@@ -1658,7 +1670,10 @@ function JobPlaceholder({
                 {!finishingOutput && <>
                   <div className="flex items-center justify-between text-[10px] text-text-secondary">
                     <span>Current {progressUnit.toLowerCase()}</span>
-                    <span>{hasExactCurrentSteps ? `Step ${currentStep}/${currentTotalSteps}` : 'Preparing'}</span>
+                    <span>{cumulativeWaiting
+                      ? 'Waiting to start'
+                      : cumulativePlan && job.status === 'completed' ? 'Complete'
+                      : hasExactCurrentSteps ? `Step ${currentStep}/${currentTotalSteps}` : 'Preparing'}</span>
                   </div>
                   <div className="w-full bg-bg-active rounded-full h-1.5 overflow-hidden">
                     {currentProgressIndeterminate ? (

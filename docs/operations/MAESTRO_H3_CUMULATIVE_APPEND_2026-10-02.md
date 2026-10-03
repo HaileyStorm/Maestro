@@ -1242,3 +1242,32 @@ The held request uses the current machine profile. Prior native Profile 4
 evidence does not qualify that different profile for execution. Fresh resource
 authority and an appropriate execution profile remain prerequisites for the
 next live generation qualification.
+
+## Retained cumulative queue timing
+
+Cumulative submission and the authorized status/reconnection projections now
+carry the same closed public timing summary: fps, requested/published frames,
+window count, sampler/context/new-frame counts, and cumulative published frames.
+The summary is rebuilt with the current planner from the retained request, even
+when the experimental submission gate is off. It contains no authored text,
+private paths, hashes or recovery identity. A future planner revision must
+preserve that retained-request contract or explicitly version its projection.
+
+The queue card displays the planned cumulative timeline separately from runtime
+ETA. A held 141-frame request at 24 fps therefore reads 5.875 seconds and two
+windows planned. Held work says Waiting to start without an animated progress
+bar; running cumulative work uses window labels and completed work does not
+claim it is still waiting. Ordinary H3 keeps segment labels. The timing comes
+from the job, so unrelated editor settings cannot change its displayed plan.
+
+Four focused backend checks cover exact 124 + 17 frame geometry, gate-off
+projection, no private fields, status/list parity, owner denial, malformed
+parameters and the adjacent blocked-status contract. Three focused UI checks
+cover reconnection, stale-field clearing, held/running/completed cards and
+ordinary H3 presentation. Seven adjacent cumulative UI checks pass, including
+immediate/held response hydration. Production build, scoped UI lint, new-test
+lint/format, Python compilation and diff checks pass. Launch lint remains at
+its existing 817-diagnostic baseline. No full suite or GPU workload was repeated.
+
+Live deployment, browser display and actual held-job execution remain separate
+acceptance steps. A queued GPU request is not execution authority.

@@ -107,6 +107,10 @@ def _isolated_functions(tree: ast.Module, names: tuple[str, ...], namespace: dic
     dependencies = {"_h3_segment_uses_native_boundary_history"} if "_run_generation" in names else set()
     if {"_queue_recovery_materialize_job", "_resume_recovered_job"} & set(names):
         dependencies.add("_h3_native_boundary_exact_retry_allowed")
+    if {"get_status", "list_jobs"} & set(names):
+        dependencies.update({"_public_h3_cumulative_plan", "_public_job_h3_cumulative_plan"})
+        namespace.setdefault("Mapping", dict)
+        namespace.setdefault("Any", object)
     selected = [
         node for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))

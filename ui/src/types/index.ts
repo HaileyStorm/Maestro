@@ -1203,6 +1203,8 @@ export interface GenerationJob {
   /** Exact server-authored logical queue role; absent for legacy and non-Reference jobs. */
   logicalJobKind?: LogicalJobKind
   h3SegmentPlan?: H3SegmentPlan | null
+  /** Server-authored retained cumulative timing; independent of editor settings. */
+  h3CumulativePlan?: H3CumulativePlan | null
   planReviewRequired?: boolean
   planReviewTermsRequired?: boolean
   /** Server-authored absolute Unix epoch seconds; null outside plan review. */
@@ -1231,6 +1233,21 @@ export interface GenerationJob {
   /** Frozen estimate shown only as work expected after a safe resume. */
   estimateAfterResume?: H3PerformanceEstimate | null
   logEvents?: import('../api/client').JobLogEvent[]
+}
+
+export interface H3CumulativePlan {
+  mode: 'cumulative_append'
+  fps: number
+  requested_frames: number
+  published_frames: number
+  window_count: number
+  windows: Array<{
+    index: number
+    sampler_frames: number
+    context_frames: number
+    new_published_frames: number
+    cumulative_published_frames: number
+  }>
 }
 
 export interface H3SegmentBoundary {

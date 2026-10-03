@@ -1462,6 +1462,7 @@ function _jobStatusDetails(
         }
       : {}),
     h3SegmentPlan: status.h3_segment_plan,
+    h3CumulativePlan: status.h3_cumulative_plan ?? null,
     planReviewRequired: status.plan_review_required === true,
     ...(status.plan_review_terms_required != null
       ? { planReviewTermsRequired: status.plan_review_terms_required === true }
@@ -10086,7 +10087,7 @@ export const useStore = create<AppState>((set, get) => ({
         window.alert('Scene Kit references changed while this generation was preparing. Review the current selection in References, then try again.')
         return
       }
-      const { job_id, status, held, h3_estimate } = await api.submitGeneration(params, holdForQueue)
+      const { job_id, status, held, h3_estimate, h3_cumulative_plan } = await api.submitGeneration(params, holdForQueue)
       if (!ownsSubmission()) {
         _discardStaleGenerationPlaceholder(newJob)
         return
@@ -10113,6 +10114,8 @@ export const useStore = create<AppState>((set, get) => ({
                 ? enhanceBeforeGenerate ? 'Enhancing prompt' : 'Planning generation'
                 : 'Queued...',
               h3Estimate: submittedEstimate,
+              h3CumulativePlan: h3_cumulative_plan ?? null,
+              ...(h3_cumulative_plan ? { windowTotal: h3_cumulative_plan.window_count } : {}),
               etaSeconds: _h3EstimateTotalSeconds(submittedEstimate),
             } : job),
           ...(enhanceBeforeGenerate && s.activeWorkspace === submissionWorkspace

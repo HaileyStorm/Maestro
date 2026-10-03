@@ -266,6 +266,7 @@ export interface ApiJobStatus extends QueueRecoveryMetadata {
   h3_estimate?: import('../types').H3PerformanceEstimate | null
   queue: { paused: boolean; pause_after_current: boolean }
   h3_segment_plan?: import('../types').H3SegmentPlan | null
+  h3_cumulative_plan?: import('../types').H3CumulativePlan | null
   plan_review_required?: boolean
   /** True when the frozen plan cannot auto-accept until Ref2VA terms are accepted. */
   plan_review_terms_required?: boolean
@@ -1390,6 +1391,7 @@ export async function submitGeneration(
   status?: 'preparing' | 'queued'
   held?: boolean
   h3_estimate?: import('../types').H3PerformanceEstimate | null
+  h3_cumulative_plan?: import('../types').H3CumulativePlan | null
 }> {
   const res = await fetch(`${BASE}/api/v1/generate`, {
     method: 'POST',

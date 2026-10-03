@@ -17061,6 +17061,20 @@ def _public_h3_cumulative_plan(plan: dict) -> dict:
     }
 
 
+def _public_job_h3_cumulative_plan(job: Mapping[str, Any]) -> dict | None:
+    """Rebuild public timing from the authorized job's retained request."""
+    params = job.get("params")
+    if not isinstance(params, dict) or params.get("_h3_cumulative_append") is not True:
+        return None
+    from services.h3_cumulative_execution import prepare_h3_cumulative_request
+
+    try:
+        plan = prepare_h3_cumulative_request(params, require_gate=False)
+    except (TypeError, ValueError):
+        return None
+    return _public_h3_cumulative_plan(plan) if plan is not None else None
+
+
 def _reject_client_h3_turbo_validation_controls(body: dict) -> None:
     """Keep synthetic Turbo compatibility controls off every HTTP lane.
 
@@ -73094,6 +73108,7 @@ def get_status(job_id: str, request: Request, response: Response):
         "clip_total": j.get("clip_total", 0),
         "clip_progress": j.get("clip_progress", 0),
         "h3_segment_plan": j.get("h3_segment_plan"),
+        "h3_cumulative_plan": _public_job_h3_cumulative_plan(j),
         "h3_offload_plan": public_h3_offload_plan(
             j.get("h3_offload_plan")
         ),
@@ -73321,6 +73336,7 @@ def list_jobs(
                 "clip_total": j.get("clip_total", 0),
                 "clip_progress": j.get("clip_progress", 0),
                 "h3_segment_plan": j.get("h3_segment_plan"),
+                "h3_cumulative_plan": _public_job_h3_cumulative_plan(j),
                 "h3_offload_plan": public_h3_offload_plan(
                     j.get("h3_offload_plan")
                 ),

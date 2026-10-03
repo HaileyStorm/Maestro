@@ -195,6 +195,72 @@ function elementText(value) {
   return elementText(value.props?.children)
 }
 
+const cumulativeTiming = {
+  mode: 'cumulative_append', fps: 24, requested_frames: 141,
+  published_frames: 141, window_count: 2,
+  windows: [
+    { index: 1, sampler_frames: 124, context_frames: 0, new_published_frames: 124, cumulative_published_frames: 124 },
+    { index: 2, sampler_frames: 39, context_frames: 22, new_published_frames: 17, cumulative_published_frames: 141 },
+  ],
+}
+
+test('cumulative queue timing survives reconnect and clears for ordinary jobs', async () => {
+  const { _newGenerationJobFromStatus, _mergeJobStatus } = await loadStoreMappers()
+  const status = {
+    job_id: 'held-cumulative', status: 'queued', progress: 0, step: 0,
+    total_steps: 0, phase: '', message: '', output_files: [], error: null,
+    model_type: 'minimax_h3', queue_held: true, window_total: 2,
+    h3_cumulative_plan: cumulativeTiming,
+  }
+  const restored = _newGenerationJobFromStatus(status)
+  assert.deepEqual(restored.h3CumulativePlan, cumulativeTiming)
+  const running = _mergeJobStatus(restored, { ...status, status: 'running', window_current: 2 })
+  assert.deepEqual(running.h3CumulativePlan, cumulativeTiming)
+  assert.equal(running.windowCurrent, 2)
+  assert.equal(_mergeJobStatus(running, { ...status, h3_cumulative_plan: null }).h3CumulativePlan, null)
+  const { h3_cumulative_plan: _unused, ...ordinary } = status
+  assert.equal(_mergeJobStatus(running, ordinary).h3CumulativePlan, null)
+})
+
+test('held cumulative card shows planned timeline and idle windows, running and ordinary H3 remain distinct', async t => {
+  const previous = globalThis.__resourceWaitStore
+  globalThis.__resourceWaitStore = {
+    accessContext: { machine_controls: false },
+    hostTerms: { minimax_h3_ref2va: { accepted: true } },
+    models: [{ model_type: 'minimax_h3', name: 'H3' }],
+  }
+  t.after(() => { globalThis.__resourceWaitStore = previous })
+  const { JobPlaceholder } = await loadJobPlaceholder()
+  const job = {
+    id: 'held-cumulative', status: 'queued', progress: 0, step: 0,
+    totalSteps: 0, phase: '', message: '', outputFiles: [], error: null,
+    modelType: 'minimax_h3', workspace: 'project', held: true, queueWaitReason: 'held',
+    windowCurrent: 0, windowTotal: 0, h3CumulativePlan: cumulativeTiming,
+  }
+  const render = changes => JobPlaceholder({
+    job: { ...job, ...changes }, canManageGeneration: false,
+    onStop() {}, onDismiss() {},
+  })
+  const held = render({})
+  assert.match(elementText(held), /Planned cumulative timeline · 5\.875s · 141 frames at 24 fps/)
+  assert.match(elementText(held), /2 windows planned/)
+  assert.match(elementText(held), /Current windowWaiting to start/)
+  assert.doesNotMatch(elementText(held), /Segment 1\/2|Preparing|ETA 5\.875/)
+  assert.equal(flattenElements(held).some(node => node.props?.className?.includes('animate-pulse') && node.props.className.includes('h-full')), false)
+  const running = render({ status: 'running', windowCurrent: 2, windowStep: 3, windowTotalSteps: 28 })
+  assert.match(elementText(running), /Window 2\/2/)
+  assert.match(elementText(running), /Current windowStep 3\/28/)
+  assert.doesNotMatch(elementText(running), /windows planned|Waiting to start/)
+  const completed = render({ status: 'completed', windowCurrent: 2 })
+  assert.match(elementText(completed), /Window 2\/2/)
+  assert.match(elementText(completed), /Current windowComplete/)
+  assert.doesNotMatch(elementText(completed), /windows planned|Waiting to start|Preparing/)
+  const ordinary = render({ h3CumulativePlan: null, status: 'running', windowCurrent: 1, windowTotal: 2 })
+  assert.match(elementText(ordinary), /Segment 1\/2/)
+  assert.match(elementText(ordinary), /Current segmentPreparing/)
+  assert.doesNotMatch(elementText(ordinary), /cumulative timeline|windows planned/)
+})
+
 const descriptor = {
   intent: 'generation',
   execution: 'standard',
