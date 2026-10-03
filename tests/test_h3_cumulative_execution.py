@@ -25,6 +25,7 @@ from services.h3_cumulative_execution import (
     h3_cumulative_authority,
     h3_cumulative_settings,
     prepare_h3_cumulative_request,
+    require_h3_cumulative_checkpoint_capacity,
     staged_h3_cumulative_descriptor,
 )
 from services.h3_cumulative_latents import H3CumulativeLatents
@@ -284,6 +285,208 @@ class H3CumulativeExecutionTests(unittest.TestCase):
             prepare_h3_cumulative_request(
                 dict(settings, video_length=669), require_gate=False
             )
+
+    def test_checkpoint_capacity_counts_full_states_repeats_and_remaining_tail(self):
+        job = copy.deepcopy(self.job)
+        job["params"] = request(
+            video_length=72, sliding_window_size=56, repeat_generation=3
+        )
+        plan = prepare_h3_cumulative_request(job["params"], require_gate=False)
+        original = copy.deepcopy(plan)
+        authority = h3_cumulative_authority(job, plan, 0)
+        bounds = []
+        for window in plan["windows"]:
+            frames = window["cumulative_generated_frames"]
+            state = H3CumulativeLatents(
+                torch.zeros(1, 24, latent_frames_for_video_frames(frames), 4, 4),
+                torch.zeros(2, 32, window["cumulative_generated_audio_ticks"]),
+                frames,
+            )
+            bound = (
+                sum(t.numel() * t.element_size() for t in (state.video, state.audio))
+                + recovery._MAX_HEADER_BYTES
+                + 8
+            )
+            bounds.append(bound)
+            receipt = recovery.write_h3_cumulative_checkpoint(
+                self.fixture.project,
+                state,
+                authority.identity("a" * 64),
+                self.units[0]["unit_id"],
+            )
+            self.assertLessEqual(receipt["size"], bound)
+        self.assertEqual(plan["windows"][-1]["cumulative_generated_frames"], 73)
+        full = sum(bounds) * 3
+        tail = bounds[1] + sum(bounds)
+        staging = Path(ensure_recovery_staging_directory(self.fixture.project))
+        with patch(
+            "services.h3_cumulative_execution.shutil.disk_usage",
+            return_value=types.SimpleNamespace(free=full),
+        ) as disk:
+            facts = require_h3_cumulative_checkpoint_capacity(
+                self.fixture.project,
+                plan,
+                authority,
+                window_index=0,
+                remaining_variants=3,
+            )
+            self.assertEqual(facts["required_checkpoint_bytes"], full)
+            disk.assert_called_once_with(staging)
+        with patch(
+            "services.h3_cumulative_execution.shutil.disk_usage",
+            return_value=types.SimpleNamespace(free=tail),
+        ):
+            facts = require_h3_cumulative_checkpoint_capacity(
+                self.fixture.project,
+                plan,
+                authority,
+                window_index=1,
+                remaining_variants=2,
+            )
+            self.assertEqual(facts["required_checkpoint_bytes"], tail)
+        with (
+            patch(
+                "services.h3_cumulative_execution.shutil.disk_usage",
+                return_value=types.SimpleNamespace(free=tail - 1),
+            ),
+            self.assertRaisesRegex(ValueError, "Free at least 1 MiB more"),
+        ):
+            require_h3_cumulative_checkpoint_capacity(
+                self.fixture.project,
+                plan,
+                authority,
+                window_index=1,
+                remaining_variants=2,
+            )
+        self.assertEqual(plan, original)
+
+    def test_worker_capacity_failure_prevents_dispatch_and_preserves_request(self):
+        worker = next(
+            node
+            for node in self.launch.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_run_generation"
+        )
+        blocks = [
+            node
+            for node in ast.walk(worker)
+            if isinstance(node, ast.If)
+            and ast.unparse(node.test)
+            == "validated_params is not None and h3_cumulative_plan is not None"
+        ]
+        self.assertEqual(len(blocks), 1)
+        job = copy.deepcopy(self.job)
+        plan = prepare_h3_cumulative_request(job["params"], require_gate=False)
+        params = {
+            "prompt": plan["windows"][0]["sampler_prompt"],
+            "resolution": job["params"]["resolution"],
+        }
+        original = copy.deepcopy(params)
+        namespace = {
+            "validated_params": params,
+            "h3_cumulative_plan": plan,
+            "job": job,
+            "out_dir": self.fixture.project,
+            "cumulative_authority": h3_cumulative_authority(job, plan, 0),
+            "cumulative_index": 0,
+            "cumulative_variant": 0,
+            "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+        }
+        with (
+            patch(
+                "services.h3_cumulative_execution.shutil.disk_usage",
+                return_value=types.SimpleNamespace(free=0),
+            ),
+            patch(
+                "services.h3_cumulative_execution.create_h3_cumulative_dispatch"
+            ) as dispatch,
+            self.assertRaisesRegex(ValueError, "not enough free space") as caught,
+        ):
+            exec(
+                compile(
+                    ast.Module(body=blocks, type_ignores=[]), "worker-capacity", "exec"
+                ),
+                namespace,
+            )
+        dispatch.assert_not_called()
+        self.assertEqual(params, original)
+
+        safe_updates = next(
+            node
+            for node in self.launch.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_safe_failure_updates"
+        )
+        failure_ns = {
+            "_job_failure_positions": lambda _job: (None, None, None),
+            "wgp": types.SimpleNamespace(server_config={}),
+        }
+        exec(
+            compile(
+                ast.Module(body=[safe_updates], type_ignores=[]), "safe-failure", "exec"
+            ),
+            failure_ns,
+        )
+        translate = failure_ns["_safe_failure_updates"]
+        updates = translate(caught.exception, job, stage="generation")
+        self.assertEqual(updates["message"], str(caught.exception))
+        self.assertEqual(updates["error"], str(caught.exception))
+        self.assertEqual(updates["failure_details"]["detail"], str(caught.exception))
+        for unsafe in (
+            str(caught.exception) + " /private/authored text",
+            str(caught.exception).replace("MiB more", "MiB more /private"),
+            str(caught.exception).replace("Free at least ", "Free at least 0"),
+        ):
+            self.assertEqual(
+                translate(ValueError(unsafe), job, stage="generation")["message"],
+                "Generation failed.",
+            )
+
+    def test_checkpoint_capacity_fails_closed_on_unavailable_or_changed_storage(self):
+        plan = prepare_h3_cumulative_request(self.job["params"], require_gate=False)
+        authority = h3_cumulative_authority(self.job, plan, 0)
+        with (
+            patch(
+                "services.h3_cumulative_execution.shutil.disk_usage",
+                side_effect=OSError("private host path"),
+            ),
+            self.assertRaisesRegex(
+                QueueRecoveryRuntimeError, "Make the project storage available"
+            ) as caught,
+        ):
+            require_h3_cumulative_checkpoint_capacity(
+                self.fixture.project,
+                plan,
+                authority,
+                window_index=0,
+                remaining_variants=1,
+            )
+        self.assertNotIn("private host path", str(caught.exception))
+        staging = Path(ensure_recovery_staging_directory(self.fixture.project))
+        prior = staging.with_name("test-prior-staging")
+
+        def swap(_path):
+            staging.rename(prior)
+            staging.mkdir(mode=0o700)
+            return types.SimpleNamespace(free=10**9)
+
+        try:
+            with (
+                patch(
+                    "services.h3_cumulative_execution.shutil.disk_usage",
+                    side_effect=swap,
+                ),
+                self.assertRaisesRegex(QueueRecoveryRuntimeError, "changed"),
+            ):
+                require_h3_cumulative_checkpoint_capacity(
+                    self.fixture.project,
+                    plan,
+                    authority,
+                    window_index=0,
+                    remaining_variants=1,
+                )
+        finally:
+            staging.rmdir()
+            prior.rename(staging)
 
     def test_tasks_use_variant_major_short_windows_and_serializable_params(self):
         job = copy.deepcopy(self.job)

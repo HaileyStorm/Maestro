@@ -130,13 +130,19 @@ _CLIP_LIMIT = re.compile(
     r"single long Studio prompt is segmented automatically\."
 )
 
+_CHECKPOINT_SPACE = re.compile(
+    r"There is not enough free space for the remaining generation checkpoints\. "
+    r"Free at least [1-9][0-9]{0,8} MiB more in the project's storage before "
+    r"retrying; encoded media needs additional space\."
+)
+
 
 def reviewed_contract_message(text: object) -> str | None:
-    """Accept complete reviewed copy or the bounded native-frame-limit template."""
+    """Accept complete reviewed copy or bounded numeric producer templates."""
     if type(text) is not str or not text or len(text) > 240:
         return None
     if text in PUBLIC_CONTRACT_MESSAGES:
         return text
-    if _CLIP_LIMIT.fullmatch(text):
+    if _CLIP_LIMIT.fullmatch(text) or _CHECKPOINT_SPACE.fullmatch(text):
         return text
     return None

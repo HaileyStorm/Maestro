@@ -68518,8 +68518,16 @@ def _run_generation(
                 if validated_params is not None and h3_cumulative_plan is not None:
                     from services.h3_cumulative_execution import (
                         create_h3_cumulative_dispatch,
+                        require_h3_cumulative_checkpoint_capacity,
                     )
 
+                    require_h3_cumulative_checkpoint_capacity(
+                        out_dir,
+                        h3_cumulative_plan,
+                        cumulative_authority,
+                        window_index=cumulative_index,
+                        remaining_variants=job["params"].get("repeat_generation", 1) - cumulative_variant,
+                    )
                     window = h3_cumulative_plan["windows"][cumulative_index]
                     if (
                         validated_params.get("prompt") != window["sampler_prompt"]

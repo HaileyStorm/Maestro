@@ -934,3 +934,80 @@ Fresh native two-window restore qualification remains pending for these bytes. A
 full-resolution peak admission, authenticated queue crash/restart, final media,
 browser and human acceptance remain separate requirements. Public cumulative
 generation stays disabled and the continuous Goal remains active.
+
+## Remaining checkpoint storage admission
+
+The worker now screens free bytes on the authorized project's private staging
+filesystem before dispatch/model loading for each pending cumulative window.
+The bound sums every remaining full FP32 AV state, including native terminal
+padding and the writer's maximum header, plus all windows for later variants.
+Verified earlier windows and completed variants are excluded. The staging
+directory identity is checked after the capacity query; unavailable or changed
+storage fails closed with a useful retry message. No output or request is removed.
+
+Three focused CPU checks pass: real serialized AV checkpoints fit the bound;
+repeat and resumed-tail accounting accepts exact capacity and rejects one byte
+less; the actual extracted worker block stops before dispatch without modifying
+the request; unavailable storage errors are redacted and directory substitution
+is rejected. Lint/format and syntax checks pass. The large launch module retains
+its 817 baseline lint diagnostics with no additions. No full suite was repeated.
+
+This is an early capacity screen, not a storage reservation or total-output
+quota. Encoded media, final copies and future crash/retry orphans are not
+estimated. Concurrent consumption can still exhaust space, so checkpoint-write
+failure and retry handling remain necessary. Full-resolution GPU peak admission,
+authenticated queue crash/restart, browser and human acceptance remain separate.
+
+Independent review found no estimate or worker-placement defect. It identified
+that repeated insufficient-space retries can consume the existing recovery
+budget. The refusal now gives the rounded-up minimum additional MiB and states
+that encoded media needs more space. The one-byte-deficit regression verifies
+that actionable amount and passes. Recovery attempt semantics remain unchanged;
+users must prepare the indicated storage before retrying.
+
+The saved job failure now carries that guidance through the existing reviewed
+public-copy boundary. Insufficient capacity raises the already permitted exact
+`ValueError` type; only the complete numeric template with a positive bounded
+decimal MiB amount is admitted. Arbitrary recovery exceptions remain hidden.
+Two changed focused regressions pass, including the actual extracted
+`_safe_failure_updates` path's saved message/error/detail and rejection of
+suffix/path/leading-zero injections. Public-copy lint retains its two baseline
+diagnostics; execution/tests lint and format pass. No broad suite was rerun.
+
+## Native fresh-process continuation observed
+
+This observation supersedes the earlier pending standalone native continuation
+and final-media qualification statements. The checkpoint capacity screen above
+also supersedes the earlier missing aggregate checkpoint estimate; it does not
+establish a total storage reservation.
+
+The next exact checkout-bound lease completed the standalone two-window WGP
+probe with installed assets. The first process generated 56 frames and sealed
+its AV checkpoint. A separate second process restored it and sampled the legal
+39-frame window to produce 73 cumulative frames. Both complete binding payloads
+were identical. The retained normalized video and audio latent prefixes compared
+exactly equal; this does not imply decoded pixel-prefix identity.
+
+The native output passed the existing cumulative final-copy helper and actual
+audio policy in the private synthetic project. Independent FFprobe found HEVC
+320×192, 73 frames at 24 FPS (3.041667 seconds), with stereo 32 kHz AAC
+(3.040000 seconds). Final true peak was −13.0 dBTP, below the −1.0 dBTP ceiling;
+no attenuation was applied and the final-copy hash matched the source. No
+concatenation occurred. This is real media and final-copy evidence, not an
+authenticated queue publication or human quality acceptance.
+
+The maximum observed CUDA allocation across the two windows was 21,356,353,024
+bytes; maximum CUDA reservation was 21,600,665,600 bytes. Process peak RSS was
+56,179,724 KiB. These observations apply only to this tiny-canvas probe, not to
+full-resolution admission or a general memory/performance guarantee. Both
+workers exited after model release; the exact lease withdrawal was confirmed
+denied. The local and stable-share health/readiness endpoints returned 200 while
+the app remained running.
+
+Private receipts retain the exact preflight source/probe hashes, asset identities,
+window/binding/AV receipts, capacity observations, final-container inspection and
+lease closure. The later actionable storage-error wording changes no native
+algorithm; native evidence remains tied to its recorded preflight bytes. Full
+resolution resource qualification, authenticated queue crash/restart, rendered
+browser behavior and listening/visual acceptance remain open. Public cumulative
+generation remains disabled; the continuous Goal remains active.

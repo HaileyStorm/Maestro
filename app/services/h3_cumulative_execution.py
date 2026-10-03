@@ -12,11 +12,13 @@ import hashlib
 import json
 import os
 import re
+import shutil
 from pathlib import Path
 
 from services.h3_cumulative_dispatch import validate_h3_cumulative_settings
 from services.h3_cumulative_plan import plan_h3_cumulative_chain
 from services.h3_cumulative_queue import H3CumulativeQueueDispatch, H3QueueAuthority
+from services.h3_cumulative_recovery import _MAX_HEADER_BYTES
 from services.h3_native_continuation import (
     H3NativeContinuationStep,
     latent_frames_for_video_frames,
@@ -29,6 +31,7 @@ from services.queue_recovery_runtime import (
     _read_exact_file,
     _validated_project_root,
     _verify_directory_identity,
+    ensure_recovery_staging_directory,
     replay_concat_to_stable_output,
     sha256_file,
 )
@@ -197,6 +200,60 @@ def prepare_h3_cumulative_request(params, *, require_gate=True):
                 "Use a shorter chain or a smaller canvas."
             )
     return plan
+
+
+def require_h3_cumulative_checkpoint_capacity(
+    project_directory, plan, authority, *, window_index, remaining_variants
+):
+    """Screen remaining checkpoint writes; free space is not a reservation.
+
+    The worker supplies its first unverified window after skipping verified
+    completed units. Earlier windows/variants already occupy disk and need no
+    new allocation. Future windows/variants are conservatively counted in full.
+    Encoded media, final copies and retained crash/retry orphans are not estimated.
+    """
+    windows = plan["windows"]
+    if (
+        type(window_index) is not int
+        or not 0 <= window_index < len(windows)
+        or type(remaining_variants) is not int
+        or not 1 <= remaining_variants <= 32
+    ):
+        raise QueueRecoveryRuntimeError(
+            "H3 cumulative pending checkpoint range is invalid."
+        )
+    sizes = [
+        4
+        * (
+            24
+            * latent_frames_for_video_frames(window["cumulative_generated_frames"])
+            * (authority.height // 16)
+            * (authority.width // 16)
+            + 2 * 32 * window["cumulative_generated_audio_ticks"]
+        )
+        + _MAX_HEADER_BYTES
+        + 8
+        for window in windows
+    ]
+    required = sum(sizes[window_index:]) + (remaining_variants - 1) * sum(sizes)
+    staging = Path(ensure_recovery_staging_directory(project_directory))
+    identity = _private_directory_identity(staging)
+    try:
+        available = shutil.disk_usage(staging).free
+        _verify_directory_identity(staging, identity)
+    except OSError:
+        raise QueueRecoveryRuntimeError(
+            "Project storage capacity could not be checked. "
+            "Make the project storage available and retry."
+        ) from None
+    if available < required:
+        missing_mib = (required - available + 1024**2 - 1) // 1024**2
+        raise ValueError(
+            "There is not enough free space for the remaining generation "
+            f"checkpoints. Free at least {missing_mib} MiB more in the project's "
+            "storage before retrying; encoded media needs additional space."
+        )
+    return {"required_checkpoint_bytes": required, "available_bytes": available}
 
 
 def h3_cumulative_authority(job, plan, variant):
