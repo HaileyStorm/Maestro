@@ -2,11 +2,11 @@
 
 ## Current milestone and intent
 
-Latest checkpoint: private queue receipt verification and deferred restore
-through WGP's actual loaded-model boundary, described at the end of this file.
-The public long-form caller still needs a sealed cumulative step plan and final
-full-output replacement path before activation. Earlier sections retain their
-milestone-specific evidence and limitations.
+Latest checkpoint: an explicit, sealed cumulative window compiler over the
+unchanged publication contract, described at the end of this file. The public
+long-form caller still needs authorized worker dispatch and the final full-output
+replacement path before activation. Earlier sections retain their milestone-specific
+evidence and limitations.
 
 Continue fallback item `UH-20260927-MAESTRO-EXTEND-FLAGS` in the existing
 physical checkout. Preserve completed Extend, decoded-boundary and Editor
@@ -479,3 +479,86 @@ SQLite tracker remain preserved. The rediscovered Maestro ready URL passed
 health/readiness with 200; HTTP health is not browser acceptance. Launcher
 destination/example/URL-capture checks are inapplicable because no launcher was
 edited. The broad sprint remains active.
+
+## Explicit cumulative window compiler
+
+`h3_cumulative_plan.py` compiles one full authored narrative for the private
+native FL2VA path. It reuses the existing v2 semantic compiler against disjoint
+publication pieces, retaining its exact source, canonicalization descriptor,
+event/dialogue ownership, execution slices and seal. A separately versioned
+`cumulative_append` wrapper records each sampler window, retained history,
+absolute native AV step and cumulative generated/published output clock. It
+never upgrades or changes the meaning of an existing saved v2 plan.
+
+For 500 requested frames, the default generated pieces are 345/119/51 and
+published pieces are 345/119/36. Actual sampler windows are 345/141/73: later
+windows include 22 retained context frames. Complete generated outputs are
+345/464/515, with published outputs 345/464/500. The final trim is 15 frames;
+hidden context is never counted as publication trim or a newly published tail.
+The first sampler ceiling is caller-selected on the legal grid through 345;
+extensions use a caller-selected multiple of 17 through 119. The compiler
+requires at least 22 requested frames and bounds planning to 256 windows,
+256 KiB source text and half the private manifest's byte ceiling. The manifest
+writer must still check the complete enclosing request before queue admission.
+These limits do not establish runtime RAM/VRAM or decode admission.
+
+Sampler prompts preserve the full payload bytes of each publication record and
+shift only generated canonical headers. Hidden history receives a neutral
+record requesting preservation of already generated AV; it contains no authored
+action or dialogue. Final alignment padding receives a separate neutral record
+after the last published frame, so final blocking remains in its published
+tail. Dialogue is protected during structural parsing and restored exactly;
+literal shot labels, timecodes and field labels inside speech remain payload.
+The existing source canonicalizer still requires dialogue blocks on one line;
+that error is surfaced without changing the authored wording. This compiler
+does not admit reference guides, alternate checkpoints or LoRAs. Their existing
+contracts remain separate, and the eventual worker must enforce native runtime
+eligibility before sampling.
+
+Replay requires independently supplied expected source and plan hashes,
+recompiles the full source, and compares the complete JSON contract. Changes to
+geometry, prompt bytes, ownership, source descriptors, unknown fields or even a
+re-sealed malformed journal are rejected. The validator returns independent
+data rather than retaining mutable journal objects. Hashes provide drift
+detection, not authorization; taking the expected hashes from that same journal
+would not bind a job to trusted source authority.
+
+CPU evidence: 15 focused compiler checks pass, including grid and tail rounding,
+selected ceilings, absolute audio counts, exact unchanged publication contracts,
+complete payload-byte preservation, one dialogue owner, completed-history
+non-replay, published final blocking, sensitive subject matter on the same
+compiler path, invalid bounds and trusted/re-sealed replay negatives. An initial
+test incorrectly treated the legal 124-frame count as invalid and expected the
+existing multiline-dialogue restriction to be relaxed; both expectations were
+corrected and the current focused set passes. The bounded independent review
+found one size-boundary defect: the builder checked bytes before adding its
+hash, while replay checked the complete object. The builder now gates its final
+serialized size, and the regression verifies rejection one byte below the
+sealed size and successful build/replay at the exact boundary. No other concrete
+compiler defect was reported. Scoped lint/format, syntax and diff checks pass.
+No full suite, CUDA sampling, model loading,
+service restart or public activation is involved.
+
+Next coherent integration: create this plan only in the authorized private
+request preparation path, bind its digest and normalized canvas to the owning
+job/variant chain, inject `H3CumulativeQueueDispatch` outside serialized sampler
+parameters, and seal media plus AV after successful WGP completion. Cumulative
+recovery settings must distinguish full-output frame counts from the disjoint
+semantic execution slice. Resume from the previous verified durable AV receipt
+before dispatch. Final publication must use the last complete output through the
+existing audio policy without concatenating cumulative snapshots; verified final
+recovery must avoid denoising. Sidecar/journal crash recovery, private staging
+crash orphans and fresh GPU/encode/media/browser/human acceptance remain open.
+
+Continuation record: fallback item `UH-20260927-MAESTRO-EXTEND-FLAGS` and the
+continuous Goal remain active in the same physical checkout on `main`. The exact
+claim `maestro-h3-cumulative-plan-20261002` covers this note and the new compiler
+and focused test file; release it after serial Git closure. Foreign dirty work
+and the historical SQLite tracker hold remain preserved. Applicable policy
+snapshot: Non-Negotiable Execution Workflow, Durable continuation, Bird-in-hand
+delivery, Local Content Neutrality and proportional verification under the
+owner's explicit request to run full suites less often. Launcher destination,
+example, menu and URL-capture checks are inapplicable because no launcher was
+edited. Pinokio reports the existing Maestro process running/ready, and fresh
+probes against its rediscovered URL returned 200 for health and readiness.
+HTTP health is not browser acceptance. The broad sprint remains unfinished.
