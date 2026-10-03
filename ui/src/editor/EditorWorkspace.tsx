@@ -4,6 +4,8 @@ import { addEditorAudio, addEditorImage, appendEditorClip, exportEditorProject, 
 import { privatePreviewIdentity, privatePreviewWasRevealed, revealPrivatePreview, subscribePrivatePreviewReveal } from '../lib/privatePreview'
 import { useStore } from '../stores/useStore'
 import type { OutputFile } from '../types'
+import { MixedAudioPreview } from './MixedAudioPreview'
+import { audioLayerGain as audioGain } from './audioPreviewClock'
 
 type SaveState = 'saved' | 'unsaved' | 'saving' | 'error'
 type TextLayer = EditorProject['tracks'][number]['items'][number] & { text: string; position: 'top' | 'center' | 'bottom' }
@@ -146,15 +148,6 @@ function changeAudio(project: EditorProject, change: Partial<NonNullable<ReturnT
     }) } : track) }
 }
 
-function audioGain(layer: NonNullable<ReturnType<typeof audioLayer>>, sourceTime: number) {
-  const elapsed = sourceTime - layer.source_in
-  if (layer.muted || elapsed < 0 || elapsed >= layer.duration) return 0
-  const fadeIn = layer.fade_in ?? 0
-  const fadeOut = layer.fade_out ?? 0
-  return (layer.volume ?? 1) * (fadeIn > 0 ? Math.min(1, elapsed / fadeIn) : 1)
-    * (fadeOut > 0 ? Math.min(1, (layer.duration - elapsed) / fadeOut) : 1)
-}
-
 const audioInputClass = 'min-h-11 w-full min-w-0 rounded-lg border border-border bg-bg-primary px-3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50'
 const audioButtonClass = 'flex min-h-11 items-center justify-center gap-2 rounded-lg border border-border px-3 text-sm hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50'
 
@@ -208,7 +201,7 @@ function AudioLayerPanel({ project, outputs, busy, error, stopKey, videoPlaying,
   }
   return <section className="rounded-xl border border-border bg-bg-secondary p-4 md:p-6" aria-label="Audio layer">
     <h2 className="mb-3 text-sm font-semibold">Audio layer <span className="ml-2 font-normal text-text-secondary">{layer ? '1/1' : '0/1'}</span></h2>
-    <p className="mb-5 text-xs leading-relaxed text-text-secondary">Add one audio file from this project’s Gallery. It mixes with the source sound during its chosen interval, without looping or extending the video. Lower the volume if the mix distorts. Video preview plays source sound; audition below plays only this audio layer.</p>
+    <p className="mb-5 text-xs leading-relaxed text-text-secondary">Add one audio file from this project’s Gallery. It mixes with the source sound during its chosen interval, without looping or extending the video. Lower the volume if the mix distorts. Include this layer in the video preview to hear the mix. Audition below plays only this audio layer.</p>
     {!layer || !asset ? <div className="rounded-lg border border-dashed border-border p-4">
       <div className="flex flex-wrap items-end gap-3">
         <label className="block min-w-0 flex-1 text-sm"><span className="mb-2 block">Audio from this project’s Gallery</span>
@@ -264,7 +257,7 @@ function AudioLayerPanel({ project, outputs, busy, error, stopKey, videoPlaying,
             <input type="number" min={0} max={layer.duration} step={0.1} value={layer.fade_out ?? 0} disabled={busy} className={audioInputClass}
               onChange={event => { const value = Number(event.target.value); if (Number.isFinite(value) && value >= 0 && value <= layer.duration) update({ fade_out: value }) }} />
           </label>
-          <p className="text-xs leading-relaxed text-text-secondary sm:col-span-2">Linear fades apply to this trimmed audio layer in audition and export. Zero leaves the edge unchanged. Each fade is limited to the trimmed duration and shortens with it. Overlapping fades multiply, lowering the whole layer.</p>
+          <p className="text-xs leading-relaxed text-text-secondary sm:col-span-2">Linear fades apply to this trimmed audio layer in preview, audition and export. Zero leaves the edge unchanged. Each fade is limited to the trimmed duration and shortens with it. Overlapping fades multiply, lowering the whole layer.</p>
         </div>
         <label className="block text-sm"><span className="mb-2 flex justify-between"><span>Audio volume</span><span>{Math.round((layer.volume ?? 1) * 100)}%</span></span>
           <input type="range" min={0} max={100} step={1} value={(layer.volume ?? 1) * 100} disabled={busy} onChange={event => update({ volume: Number(event.target.value) / 100 })}
@@ -781,6 +774,9 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
                 <span className="text-xs tabular-nums text-text-secondary">{displayTime(trimStart)}–{displayTime(trimEnd)}</span>
               </div>
               {playbackError && <p className="px-4 pb-3 text-sm text-red-400" role="alert">Preview unavailable. The saved cut is still available.</p>}
+              {clip && <MixedAudioPreview project={project} clip={clip} clipOffset={clipOffset}
+                clipDuration={clips.length > 1 ? clipFrames(clip.duration, project.canvas.fps) / project.canvas.fps : clip.duration}
+                video={preview} playing={playing} busy={busy || savePending || saveState === 'error' || !revealed || playbackError} />}
             </section>
 
             <aside className="rounded-xl border border-border bg-bg-secondary p-5" aria-label="Edit details">

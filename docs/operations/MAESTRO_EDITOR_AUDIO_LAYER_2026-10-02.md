@@ -18,12 +18,14 @@ A shortened cut can leave audio beyond its end: the draft saves, and export
 requires adjusting or removing that audio. Additive mixing preserves original
 volume; lower the audio layer volume if the mix distorts.
 
-Video preview plays the selected video's original sound. Audition audio plays
-only the selected audio slice, at its saved volume with its explicit fades.
-Private audio requires an explicit reveal. Audition stops on edits, clip
-changes, video playback, pending Editor operations and leaving Editor. The combined soundtrack is available in
-the exported MP4. Live mixed preview, multiple audio layers, looping
-and overlapping video remain outside this audio slice. A timed still image is
+Video preview can include the saved audio layer alongside the selected video's
+original sound. Its timeline placement, trimmed source, gain and fades follow
+the selected clip's media clock; private audio still requires explicit reveal.
+See [mixed preview acceptance](MAESTRO_EDITOR_MIXED_PREVIEW_2026-10-03.md).
+Audition audio plays only the selected audio slice, at its saved volume with its
+explicit fades. Audition stops on edits, clip changes, video playback, pending
+Editor operations and leaving Editor. Multiple audio layers, looping and
+overlapping video remain outside this audio slice. A timed still image is
 [available separately](MAESTRO_EDITOR_IMAGE_LAYER_2026-10-02.md).
 
 ## Source, privacy and export
