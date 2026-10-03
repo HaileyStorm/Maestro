@@ -25,11 +25,7 @@ To guarantee every contribution follows this guide precisely, obey this checklis
   composed global/project policy hashes, `bd --version`, static tracker/redirect
   metadata, `git status --short --branch`, and `.working` state. Do not use
   `bd where` merely to discover a historical tracker.
-- This checkout currently retains a historical SQLite tracker. Preserve it as
-  canonical, but do not run `bd init`, migration, sync, hooks, or any other
-  Beads mutation. Report/queue the condition and continue independent work.
-  Only a later controlled tracker migration may restore normal Beads lifecycle
-  commands.
+- If the activation audit finds an absent, ambiguous, or historical tracker, preserve its state and do not initialize, migrate, sync, install hooks, or run Beads mutations. Report/queue the condition and continue independent work. Normal lifecycle commands require a current compatible tracker route and local policy review.
 - Use the shared `working_sentinel.py` tool for new structured reservations.
   Legacy, malformed, or foreign reservations fail closed: never overwrite,
   remove, or reinterpret them without explicit owner/recovery review. Keep one
@@ -46,9 +42,9 @@ To guarantee every contribution follows this guide precisely, obey this checklis
   and show the empty/current state. Never publish operator secrets, private
   runtime identifiers, or host paths in tracked files or logs.
 - Before completion, run the full applicable test suite and every CI-equivalent
-  check. Commit and perform Git closure serially. Skip Beads sync while the
-  historical tracker is preserved. Never run index/ref mutations in parallel
-  or force them through unrelated dirty work.
+  check. Commit and perform Git closure serially through the shared landing
+  procedure and current tracker contract. Never run index/ref mutations in
+  parallel or force them through unrelated dirty work.
 - See `CONTRIBUTING.md` for the exact startup, restart, evidence, test, and
   closure procedure.
 
@@ -108,13 +104,7 @@ To guarantee every contribution follows this guide precisely, obey this checklis
   policy, security, or infrastructure work. For the next fresh thread, make the
   already-pushed accounts/project flow usable first; keep credit enforcement
   out of that critical path.
-- New unpinned Codex tasks use GPT-6 Astra at medium as the primary
-  controller. An explicit user, picker, task, or project model and reasoning
-  choice always wins. Astra owns synthesis and acceptance; use the global
-  Astra-first Pareto envelope for specialists: Sol high for bounded
-  implementation, invariant, and review work, and Luna high or xhigh for
-  read-heavy scouting and documentation. Use another route only when current
-  task evidence supports it.
+- Inherit model, effort, context, delegation, and provider rules from `~/.codex/AGENTS.md`, `~/.codex/harness-operations.md`, and `~/.codex/providers.md`. Preserve explicit user, picker, task, project, and domain-provider selections; project-specific safeguards remain controlling.
 - For genuinely multi-file or cross-layer work, choose the smallest useful set
   of one to three bounded, read-only ownership, invariant, or test guard roles.
   Do not require a fixed three-map ceremony. Synthesize centrally, then use one
@@ -131,10 +121,10 @@ If any step cannot be completed, stop immediately and ask the user how to procee
 
 - While Maestro work is active, promptly classify each user follow-up (including “oh, add this,” a test result, or a correction) as an override, a same-scope addition, independent bounded work, or a deferred dependency. Acknowledge it and preserve the latest authoritative user evidence.
 - Stop or redirect superseded work for an override. Merge same-scope additions into the current owner, and route corrections to the existing owner of the affected invariant or files.
-- When a same-scope secondary follow-up belongs to a subagent rather than main-thread synthesis or decision ownership, deliver it to the active owning thread with `send_message`. Do not trigger, restart, or spawn a duplicate unless the owner is inactive and the work must resume; use `followup_task` for an actionable correction only when that thread needs a new turn. If deferred work has no active owner, use Beads only when the tracker is healthy; while the historical tracker is preserved, use the approved versioned Coordination fallback queue instead.
-- Delegate independent bounded work to a fresh, appropriately strong and reasoned agent only when capacity and ownership allow and the expected latency or rework benefit exceeds coordination cost. Reuse suitable existing agents and evidence; follow the global Astra-first Pareto envelope and explicit-choice precedence above, and never weaken reasoning merely because capacity exists.
+- When a same-scope secondary follow-up belongs to a subagent rather than main-thread synthesis or decision ownership, deliver it to the active owning thread with `send_message`. Do not trigger, restart, or spawn a duplicate unless the owner is inactive and the work must resume; use `followup_task` for an actionable correction only when that thread needs a new turn. If deferred work has no active owner, use Beads only after the activation audit confirms a compatible canonical tracker route and local policy review. If the audit finds an absent, ambiguous, or historical tracker, preserve its state and use the approved versioned Coordination fallback queue instead.
+- Delegate independent bounded work only when capacity and ownership allow and the expected latency or rework benefit exceeds coordination cost. Reuse suitable existing agents and evidence; follow the shared model-routing rules and explicit-choice precedence. Keep implementation and acceptance with the controlling thread.
 - Sequence shared-file, high-risk, or state-mutating work. Do not fan out trivial questions, duplicate evidence paths, or work overlapping an active owner; keep asks bounded, enforce one writer per file or symbol cluster, and stop fan-out when findings converge. Prefer sequential main-thread work when delegation would add token churn or toe-stepping.
-- Create or update the repo-root Beads tracker for deferred multi-session work only after tracker health is verified. While this checkout retains historical SQLite, do not mutate it; use the approved versioned Coordination fallback queue. Triage must preserve privacy, authorization, thread limits, and mandatory evidence paths, while the main thread retains synthesis, priority, and merge decisions.
+- Record deferred multi-session work in the repo-root Beads tracker only after the activation audit confirms a compatible canonical route and local policy review is complete. If the audit finds an absent, ambiguous, or historical tracker, preserve it without lifecycle mutation and use the approved versioned Coordination fallback queue. Triage must preserve privacy, authorization, thread limits, and mandatory evidence paths, while the main thread retains synthesis, priority, and merge decisions.
 - When the user leaves an implementation or design choice open, including “your call,” make and execute the best evidence-backed in-scope decision by default. Do not stop for preference clarification unless the choice requires new authority, materially expands scope or external risk, or would diverge from explicit user intent.
 
 ## Candidate intake (research dumps)
