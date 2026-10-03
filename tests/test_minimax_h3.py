@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 import threading
 import types
 import unittest
@@ -1760,6 +1761,136 @@ class TestMiniMaxH3TimelineStillGuide(unittest.TestCase):
                 self.assertAlmostEqual(float(layout.position_ids[int(row), 0]), 4 + index * 5 / 3)
         self.assertIn("user_anchors = h3_timeline_still_guide_keyframe_anchors(", _MAIN_PATH.read_text())
 
+    def _triple_settings(self):
+        return {"_h3_timeline_still_guide": {
+            "frame_index": 62, "end_frame_index": 90,
+            "third_frame_index": 31, "third_still_path": "bound-third.png",
+        }}
+
+    def test_three_stills_validate_shapes_and_keep_picture_order_in_packer(self):
+        settings = self._triple_settings()
+        tensor = self.torch.zeros((3, 8, 8))
+        anchor = self._validate(custom_settings=settings, image_end=tensor, third_still=tensor)
+        anchors = self.guide_anchors(settings, anchor)
+        self.assertEqual(anchors, (("frame", 1, 62), ("frame", 1, 90), ("frame", 1, 31)))
+        layout = self.build_packed_sequence(
+            self.torch.ones((4,), dtype=self.torch.long),
+            self.video_latent_num_frames(124), 2, 2,
+            self.audio_latent_num_frames(124), (1, 1, 1),
+            keyframe_anchors=anchors,
+        )
+        for offset, index in ((0, 62), (4, 90), (8, 31)):
+            for row in layout.video_indices[offset:offset + 4]:
+                self.assertAlmostEqual(float(layout.position_ids[int(row), 0]), 4 + index * 5 / 3)
+        for field, bad_values in (
+            ("third_frame_index", (True, 31.5, 0, 123, 62, 90)),
+            ("third_still_path", (None, "", [])),
+        ):
+            for bad in bad_values:
+                invalid = copy.deepcopy(settings)
+                invalid["_h3_timeline_still_guide"][field] = bad
+                with self.subTest(field=field, bad=bad), self.assertRaises(ValueError):
+                    self._validate(custom_settings=invalid, image_end=tensor, third_still=tensor)
+        for third in (None, self.torch.zeros((3, 2, 8, 8))):
+            with self.assertRaises(ValueError):
+                self._validate(custom_settings=settings, image_end=tensor, third_still=third)
+        invalid = copy.deepcopy(settings)
+        invalid["_h3_timeline_still_guide"]["fourth_frame_index"] = 40
+        with self.assertRaises(ValueError):
+            self._validate(custom_settings=invalid, image_end=tensor, third_still=tensor)
+        with self.assertRaisesRegex(ValueError, "private Guide setting"):
+            self._validate(custom_settings={}, third_still=tensor)
+        model = object.__new__(self.model_type)
+        model.reference_mode = False
+        with self.assertRaisesRegex(ValueError, "bound image"):
+            model.generate("<Picture 1> <Picture 2> <Picture 3> turns", image_start=tensor, image_end=tensor,
+                           frame_num=124, custom_settings=settings)
+
+    def test_wgp_third_path_loads_crop_tensor_into_actual_native_keyframe_block(self):
+        import numpy as np
+        from models.minimax_h3.minimax_h3_main import _tensor_to_pil
+        from shared.utils.utils import convert_image_to_tensor, has_image_file_extension
+        tree = ast.parse(_read(_WGP_PATH))
+        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                     and node.name in {"clean_image_list", "convert_image", "_load_h3_timeline_third_still"}]
+        namespace = {"Image": self.Image, "np": np, "torch": self.torch,
+                     "has_image_file_extension": has_image_file_extension,
+                     "convert_image_to_tensor": convert_image_to_tensor,
+                     "_resize_h3_timeline_still_guide_image": self.resize_timeline_guide}
+        exec(compile(ast.fix_missing_locations(ast.Module(body=functions, type_ignores=[])),
+                     str(_WGP_PATH), "exec"), namespace)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "third.png"
+            image = self.Image.new("RGB", (12, 4), (255, 0, 0))
+            image.paste((0, 255, 0), (4, 0, 8, 4))
+            image.save(path)
+            settings = self._triple_settings()
+            settings["_h3_timeline_still_guide"]["third_still_path"] = str(path)
+            third = namespace["_load_h3_timeline_third_still"](settings, 4, 4)
+            self.assertEqual(tuple(third.shape), (3, 4, 4))
+            self.assertEqual(set(_tensor_to_pil(third).getdata()), {(0, 255, 0)})
+            self.assertIsNone(namespace["_load_h3_timeline_third_still"]({}, 4, 4))
+            native = ast.parse(_read(_MAIN_PATH))
+            model_node = next(node for node in native.body if isinstance(node, ast.ClassDef)
+                              and node.name == "MiniMaxH3Model")
+            generate = next(node for node in model_node.body if isinstance(node, ast.FunctionDef)
+                            and node.name == "generate")
+            start = next(i for i, node in enumerate(generate.body) if isinstance(node, ast.Assign)
+                         and any(isinstance(target, ast.Name) and target.id == "user_keyframes" for target in node.targets))
+            block = generate.body[start:start + 3]
+            first = convert_image_to_tensor(self.Image.new("RGB", (4, 4), (255, 0, 0)))
+            second = convert_image_to_tensor(self.Image.new("RGB", (4, 4), (0, 0, 255)))
+            bound = {"image_start": first, "image_end": second,
+                     "_kwargs": {"_h3_timeline_third_still": third},
+                     "custom_settings": settings, "timeline_still_anchor": ("frame", 1, 62),
+                     "height": 4, "width": 4, "_tensor_to_pil": _tensor_to_pil,
+                     "h3_timeline_still_guide_keyframe_anchors": self.guide_anchors,
+                     "prepare_h3_timeline_still_guide_image": self.prepare_timeline_image}
+            exec(compile(ast.fix_missing_locations(ast.Module(body=block, type_ignores=[])),
+                         str(_MAIN_PATH), "exec"), bound)
+            self.assertEqual([item.getpixel((0, 0)) for item in bound["user_keyframes"]],
+                             [(255, 0, 0), (0, 0, 255), (0, 255, 0)])
+            self.assertEqual(bound["user_anchors"], (("frame", 1, 62), ("frame", 1, 90), ("frame", 1, 31)))
+
+    def test_handler_binds_third_picture_ordinal_and_rejects_fourth(self):
+        payload = {"custom_settings": self._triple_settings(),
+                   "image_start": self.Image.new("RGB", (8, 8)),
+                   "image_end": [self.Image.new("RGB", (8, 8))],
+                   "video_length": 124, "prompt": "<Picture 1> <Picture 2> <Picture 3> turns"}
+        self.assertIsNone(self.handler.validate_generative_settings("minimax_h3", {}, payload))
+        payload["prompt"] = "<Picture 1> <Picture 2> <Picture 3> <Picture 4> turns"
+        self.assertIn("Picture 4", self.handler.validate_generative_settings("minimax_h3", {}, payload))
+        payload["prompt"] = "<Picture 1> <Picture 2> <Picture 3> turns"
+        payload["custom_settings"]["_h3_timeline_still_guide"]["third_still_path"] = ""
+        self.assertIn("bound image", self.handler.validate_generative_settings("minimax_h3", {}, payload))
+
+    def test_third_still_counts_in_residency_and_cannot_vote_as_ordinary_calibration(self):
+        wgp_tree = ast.parse(_read(_WGP_PATH))
+        generation = next(node for node in wgp_tree.body if isinstance(node, ast.FunctionDef)
+                          and node.name == "_generate_video_impl")
+        calls = [node for node in ast.walk(generation) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Name) and node.func.id == "_generation_residency_context"]
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            references = next(item.value for item in call.keywords if item.arg == "references")
+            names = {node.id: None for node in ast.walk(references) if isinstance(node, ast.Name)}
+            names.update(image_start="first.png", image_end="second.png", custom_settings=self._triple_settings())
+            values = eval(compile(ast.Expression(references), str(_WGP_PATH), "eval"), names)
+            self.assertEqual([value for value in values if value is not None],
+                             ["first.png", "second.png", "bound-third.png"])
+        launch = ast.parse(_read(_LAUNCH_PATH))
+        selected = [node for node in launch.body if isinstance(node, ast.FunctionDef)
+                    and node.name in {"_h3_allocation_success_outcome", "_record_h3_benchmark_observation"}]
+        namespace = {"_h3_observed_offload_profile": lambda value: value}
+        exec(compile(ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[])),
+                     str(_LAUNCH_PATH), "exec"), namespace)
+        params = {"custom_settings": self._triple_settings(), "num_inference_steps": 20,
+                  "repeat_generation": 1, "batch_size": 1}
+        self.assertEqual(namespace["_h3_allocation_success_outcome"](params), "probe_success")
+        self.assertEqual(namespace["_h3_allocation_success_outcome"]({"num_inference_steps": 20}), "production_success")
+        self.assertIsNone(namespace["_record_h3_benchmark_observation"](
+            params, wall_time_seconds=1, output_files=["out.mp4"], out_dir="unused", observed_profile=1))
+
     def test_second_still_requires_distinct_interior_index_and_one_frame_shape(self):
         for index in (True, 1.5, 0, 123, 47):
             with self.subTest(index=index), self.assertRaises(ValueError):
@@ -1859,11 +1990,19 @@ class TestMiniMaxH3TimelineStillGuide(unittest.TestCase):
         )
         self.assertIn("prefix_video = pre_video_frame = None", generate_source)
         self.assertIn("pre_video_frame=pre_video_frame", generate_source)
-        self.assertRegex(
-            generate_source,
-            r"frame_num=align_model_frame_count\(current_video_length,\s*"
-            r"model_def, for_generation=True\)",
+        frame_expression = next(
+            keyword.value for call in ast.walk(generate_video) if isinstance(call, ast.Call)
+            for keyword in call.keywords if keyword.arg == "frame_num"
+            and isinstance(keyword.value, ast.IfExp)
+            and isinstance(keyword.value.body, ast.Call)
+            and isinstance(keyword.value.body.func, ast.Name)
+            and keyword.value.body.func.id == "align_model_frame_count"
         )
+        align = _load_frame_aligner()
+        frame_namespace = {"current_video_length": 124, "model_def": {"frame_alignment_modulus": 17, "frame_alignment_remainder": 5, "frames_minimum": 124},
+                           "align_model_frame_count": align, "_h3_cumulative_dispatch": None}
+        self.assertEqual(eval(compile(ast.Expression(frame_expression), str(_WGP_PATH), "eval"),
+                              frame_namespace), 124)
 
         sample = self.torch.zeros((1, 124, 3, 2, 2), dtype=self.torch.uint8)
         assembled = self.restore_first_window_prefix(sample, None, 0)

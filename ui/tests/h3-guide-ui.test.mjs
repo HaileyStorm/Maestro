@@ -488,3 +488,60 @@ test('two-guide panel requires distinct positions, binds both revisions and inhe
     delete globalThis.__h3GuideHookIndex
   }
 })
+
+test('three-guide selection preserves Picture order and caps execution at three', async () => {
+  const { resolveH3GuideSelections } = await loadGuideModule()
+  const files = ['first.png', 'second.png', 'third.png', 'fourth.png'].map(name => output(name))
+  assert.deepEqual(resolveH3GuideSelections(files, [key(files[2]), key(files[0]), key(files[1])], 'project-a', true), [files[2], files[0], files[1]])
+  assert.equal(resolveH3GuideSelections(files, files.map(key), 'project-a', true), null)
+  assert.equal(resolveH3GuideSelections(files, [key(files[0]), key(files[1]), key(files[1])], 'project-a', true), null)
+  assert.equal(resolveH3GuideSelections(files.map((file, i) => i === 2 ? { ...file, workspace: 'other' } : file), files.slice(0, 3).map(key), 'project-a', true), null)
+})
+
+test('three-guide panel binds revisions, reverse chronological positions and third privacy', async () => {
+  const { H3GuidePanel } = await loadGuideModule()
+  const originalFetch = globalThis.fetch
+  const requests = []
+  let current = true
+  globalThis.__h3GuideHookStates = []
+  globalThis.fetch = async (url, options) => {
+    requests.push(JSON.parse(options.body))
+    return Response.json({ job_id: 'triple-job', status: 'queued' })
+  }
+  try {
+    const props = panelProps({
+      still: output('first.png'), secondStill: output('second.png'),
+      thirdStill: output('third.png', { private: true, explicit: true }),
+      isCurrentSelection: () => current,
+    })
+    let tree = openPanel(H3GuidePanel, props)
+    assert.match(elementText(tree), /Guide three frames with H3/)
+    assert.match(elementText(tree), /third.png/)
+    fillGuide(tree, { length: '141' })
+    findLabel(tree, 'Second guide frame index, 0-based').props.onChange({ target: { value: '90' } })
+    for (const invalid of ['', '62', '90', '140', '1.5']) {
+      findLabel(tree, 'Third guide frame index, 0-based').props.onChange({ target: { value: invalid } })
+      tree = renderPanel(H3GuidePanel, props)
+      assert.equal(flatten(tree).find(element => elementText(element) === 'Create guided clip').props.disabled, true)
+      await flatten(tree).find(element => element.type === 'form').props.onSubmit({ preventDefault() {} })
+      assert.equal(requests.length, 0)
+    }
+    findLabel(tree, 'Third guide frame index, 0-based').props.onChange({ target: { value: '31' } })
+    tree = renderPanel(H3GuidePanel, props)
+    await flatten(tree).find(element => element.type === 'form').props.onSubmit({ preventDefault() {} })
+    assert.equal(requests.length, 1)
+    assert.deepEqual(requests[0].second_still, { name: 'second.png', revision: 'revision-second.png', frame_index: 90 })
+    assert.deepEqual(requests[0].third_still, { name: 'third.png', revision: 'revision-third.png', frame_index: 31 })
+    assert.equal(requests[0].frame_index, 62)
+    assert.equal(requests[0].private_output, true)
+    assert.equal(requests[0].explicit_output, true)
+    current = false
+    tree = renderPanel(H3GuidePanel, props)
+    await flatten(tree).find(element => element.type === 'form').props.onSubmit({ preventDefault() {} })
+    assert.equal(requests.length, 1)
+  } finally {
+    globalThis.fetch = originalFetch
+    delete globalThis.__h3GuideHookStates
+    delete globalThis.__h3GuideHookIndex
+  }
+})

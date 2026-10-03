@@ -11419,6 +11419,20 @@ def _resize_h3_timeline_still_guide_image(
     )
 
 
+def _load_h3_timeline_third_still(custom_settings, canvas_height, canvas_width):
+    """Load the server-bound third still onto the established Guide canvas."""
+    guide = custom_settings.get("_h3_timeline_still_guide", {})
+    if "third_frame_index" not in guide:
+        return None
+    images = clean_image_list([guide["third_still_path"]])
+    if images is None or len(images) != 1:
+        raise ValueError("MiniMax H3 third timeline still is unavailable.")
+    image, _, _ = _resize_h3_timeline_still_guide_image(
+        images[0], canvas_height, canvas_width, None, True,
+    )
+    return convert_image_to_tensor(image)
+
+
 def _restore_h3_first_window_prefix(sample, prefix_video, overlap_frames):
     """Restore the ordinary start/source prefix without changing H3 guides."""
     if prefix_video is None:
@@ -12164,6 +12178,7 @@ def _generate_video_impl(
         steps=num_inference_steps,
         references=[
             image_start, image_end, image_refs, image_guide,
+            (custom_settings.get("_h3_timeline_still_guide") or {}).get("third_still_path"),
             video_source, video_end, video_guide, video_guide2,
             video_guide3, custom_guide, voice_reference,
             audio_source, audio_guide, audio_guide2, audio_guide3,
@@ -13176,6 +13191,7 @@ def _generate_video_impl(
         steps=num_inference_steps,
         references=[
             image_start, image_end, image_refs, image_guide,
+            (custom_settings.get("_h3_timeline_still_guide") or {}).get("third_still_path"),
             video_source, video_end, video_guide, video_guide2,
             video_guide3, custom_guide, voice_reference,
             audio_source, audio_guide, audio_guide2, audio_guide3,
@@ -13461,6 +13477,10 @@ def _generate_video_impl(
                         image_size  = image_end_tensor.shape[-2:]
                         sample_fit_canvas = None
                 image_end_list= None
+            timeline_third_still = (
+                _load_h3_timeline_third_still(custom_settings, *image_size)
+                if h3_timeline_still_guide_requested else None
+            )
             # ── Motion suffix (video_end) loading ───────────────────────────
             # Symmetric to video_source: encodes the last N frames of the
             # output latent sequence so the generator has actual motion
@@ -14022,6 +14042,8 @@ def _generate_video_impl(
                     alt_prompt = alt_prompt,
                     image_start = image_start_tensor,  
                     image_end = image_end_tensor,
+                    **({"_h3_timeline_third_still": timeline_third_still}
+                       if h3_timeline_still_guide_requested else {}),
                     input_frames = src_video,
                     input_frames2 = src_video2,
                     input_frames3 = src_video3,

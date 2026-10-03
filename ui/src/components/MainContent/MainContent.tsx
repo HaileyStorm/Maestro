@@ -2579,6 +2579,7 @@ function GalleryBulkToolbar() {
             workspace={activeWorkspace}
             still={guideStill}
             secondStill={guideStills?.[1]}
+            thirdStill={guideStills?.[2]}
             models={models}
             enabledModels={enabledModels}
             modelsLoaded={modelsLoaded}

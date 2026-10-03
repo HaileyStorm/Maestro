@@ -1462,6 +1462,7 @@ class MiniMaxH3Model:
             frame_num=frame_num,
             image_start=image_start,
             image_end=image_end,
+            third_still=_kwargs.get("_h3_timeline_third_still"),
             reference_mode=bool(getattr(self, "reference_mode", False)),
             native_boundary=native_boundary_enabled
             or _kwargs.get("h3_native_boundary_conditioning") is True,
@@ -1861,6 +1862,9 @@ class MiniMaxH3Model:
             if item is not None
         )
         if timeline_still_anchor is not None:
+            third_still = _kwargs.get("_h3_timeline_third_still")
+            if third_still is not None:
+                user_keyframes.append(_tensor_to_pil(third_still))
             user_anchors = h3_timeline_still_guide_keyframe_anchors(
                 custom_settings, timeline_still_anchor,
             )

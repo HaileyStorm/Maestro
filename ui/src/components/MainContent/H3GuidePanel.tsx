@@ -37,7 +37,7 @@ export function resolveH3GuideSelections(
   activeWorkspace: string,
   canGenerate: boolean,
 ): OutputFile[] | null {
-  if (selectedKeys.length < 1 || selectedKeys.length > 2 || new Set(selectedKeys).size !== selectedKeys.length) return null
+  if (selectedKeys.length < 1 || selectedKeys.length > 3 || new Set(selectedKeys).size !== selectedKeys.length) return null
   const stills = selectedKeys.map(key => resolveH3GuideSelection(outputs, [key], activeWorkspace, canGenerate))
   return stills.every((still): still is OutputFile => still !== null) ? stills : null
 }
@@ -74,6 +74,7 @@ interface Props {
   workspace: string
   still: OutputFile
   secondStill?: OutputFile
+  thirdStill?: OutputFile
   models: readonly ModelDef[]
   enabledModels: ReadonlySet<string>
   modelsLoaded: boolean
@@ -85,6 +86,7 @@ export function H3GuidePanel({
   workspace,
   still,
   secondStill,
+  thirdStill,
   models,
   enabledModels,
   modelsLoaded,
@@ -100,6 +102,7 @@ export function H3GuidePanel({
   const [error, setError] = useState<string | null>(null)
   const [secondFrameIndexValue, setSecondFrameIndexValue] = useState('')
   const [seedValue, setSeedValue] = useState('')
+  const [thirdFrameIndexValue, setThirdFrameIndexValue] = useState('')
 
   const compatibleModels = resolveH3GuideModels(models, enabledModels, modelsLoaded)
   const selectedModel = compatibleModels.find(model => model.model_type === modelType)
@@ -109,6 +112,9 @@ export function H3GuidePanel({
   const secondFrameIndex = isInteriorH3GuideFrame(secondFrameIndexValue, targetFrameCount)
     ? Number(secondFrameIndexValue) : null
   const validSecondFrame = !secondStill || (secondFrameIndex !== null && secondFrameIndex !== frameIndex)
+  const thirdFrameIndex = isInteriorH3GuideFrame(thirdFrameIndexValue, targetFrameCount)
+    ? Number(thirdFrameIndexValue) : null
+  const validThirdFrame = !thirdStill || (Boolean(secondStill) && thirdFrameIndex !== null && thirdFrameIndex !== frameIndex && thirdFrameIndex !== secondFrameIndex)
   const validSeed = seedValue === '' || (
     /^(?:-1|\d+)$/.test(seedValue) && Number.isSafeInteger(Number(seedValue))
   )
@@ -117,6 +123,7 @@ export function H3GuidePanel({
     && prompt.trim()
     && validFrame
     && validSecondFrame
+    && validThirdFrame
     && validSeed
     && !pending,
   )
@@ -139,14 +146,17 @@ export function H3GuidePanel({
         ...(secondStill && secondFrameIndex !== null ? {
           second_still: { name: secondStill.name, revision: secondStill.revision, frame_index: secondFrameIndex },
         } : {}),
+        ...(thirdStill && thirdFrameIndex !== null ? {
+          third_still: { name: thirdStill.name, revision: thirdStill.revision, frame_index: thirdFrameIndex },
+        } : {}),
         model_type: selectedModel.model_type as typeof H3_GUIDE_MODEL_ORDER[number],
         prompt,
         settings: {
           video_length: targetFrameCount,
           ...(seedValue !== '' ? { seed: Number(seedValue) } : {}),
         },
-        private_output: still.private || Boolean(secondStill?.private),
-        explicit_output: still.explicit || Boolean(secondStill?.explicit),
+        private_output: still.private || Boolean(secondStill?.private) || Boolean(thirdStill?.private),
+        explicit_output: still.explicit || Boolean(secondStill?.explicit) || Boolean(thirdStill?.explicit),
       })
     } catch (reason) {
       if (isCurrentSelection()) {
@@ -188,9 +198,11 @@ export function H3GuidePanel({
           onSubmit={submit}
         >
           <div className="mb-3">
-            <h3 className="text-sm font-semibold text-text-primary">{secondStill ? 'Guide two frames with H3' : 'Guide one frame with H3'}</h3>
+            <h3 className="text-sm font-semibold text-text-primary">{thirdStill ? 'Guide three frames with H3' : secondStill ? 'Guide two frames with H3' : 'Guide one frame with H3'}</h3>
             <p className="mt-1 text-xs text-text-muted">
-              {secondStill
+              {thirdStill
+                ? 'Use three Gallery stills as visual guides for three different interior frames of a new clip. '
+                : secondStill
                 ? 'Use two Gallery stills as visual guides for two different interior frames of a new clip. '
                 : 'Use one Gallery still as a visual guide for one interior frame of a new clip. '}
               This uses the base FL2VA model only; PinkCherry and W4A8 variants are not included. It does not use guide video or audio. Each still is cropped to fit the clip without stretching.
@@ -202,6 +214,11 @@ export function H3GuidePanel({
           {secondStill && (
             <p className="mb-3 truncate text-xs text-text-secondary" title={secondStill.name}>
               Second guide still: <span className="text-text-primary">{secondStill.name}</span>
+            </p>
+          )}
+          {thirdStill && (
+            <p className="mb-3 truncate text-xs text-text-secondary" title={thirdStill.name}>
+              Third guide still: <span className="text-text-primary">{thirdStill.name}</span>
             </p>
           )}
           <div className="grid gap-2 sm:grid-cols-2">
@@ -302,6 +319,33 @@ export function H3GuidePanel({
                   : secondFrameIndex === frameIndex
                     ? 'Choose two different guide frame indices.'
                     : `Second guide: frame ${secondFrameIndex}, about ${(secondFrameIndex / 24).toFixed(3)} seconds into the clip.`}
+              </p>
+            </>
+          )}
+          {thirdStill && (
+            <>
+              <label className="mt-3 flex flex-col gap-1 text-xs text-text-secondary">
+                <span>Third guide frame index (0-based)</span>
+                <input
+                  aria-label="Third guide frame index, 0-based"
+                  type="number"
+                  min={1}
+                  max={frameLimit}
+                  step={1}
+                  inputMode="numeric"
+                  value={thirdFrameIndexValue}
+                  onChange={event => setThirdFrameIndexValue(event.target.value)}
+                  placeholder={`Enter a different frame from 1 to ${frameLimit}`}
+                  disabled={pending}
+                  className="min-h-11 rounded-md border border-border bg-bg-tertiary px-2 text-text-primary placeholder:text-text-muted"
+                />
+              </label>
+              <p className="mt-1 text-[11px] text-text-muted">
+                {thirdFrameIndex === null
+                  ? 'Choose an exact interior frame for the third still.'
+                  : !validThirdFrame
+                    ? 'Choose three different guide frame indices.'
+                    : `Third guide: frame ${thirdFrameIndex}, about ${(thirdFrameIndex / 24).toFixed(3)} seconds into the clip.`}
               </p>
             </>
           )}

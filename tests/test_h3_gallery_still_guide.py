@@ -27,6 +27,8 @@ from services.h3_gallery_still_guide import (
     H3GalleryStillGuideError,
     build_gallery_still_guide_plan,
     build_gallery_still_guide_pair_plan,
+    build_gallery_still_guide_multiple_plan,
+    make_gallery_still_guide_triple_source,
     make_gallery_still_guide_pair_source,
     make_gallery_still_guide_source,
     probe_gallery_still,
@@ -181,6 +183,104 @@ class H3GalleryStillGuidePairServiceTests(unittest.TestCase):
         params["image_end"] = str(self.second.path)
         params["custom_settings"][H3_GALLERY_STILL_GUIDE_CUSTOM_KEY] = {"frame_index":62,"end_frame_index":90}
         return params
+
+    def triple_params(self):
+        params = self.params()
+        self.third = StillSourceFixture(self.root, name="third.png", private=False, explicit=False)
+        self.third.save_image((20, 30, 240))
+        third = self.third.params()[H3_GALLERY_STILL_GUIDE_SOURCE_KEY]
+        third["frame_index"] = 31
+        source = params[H3_GALLERY_STILL_GUIDE_SOURCE_KEY]
+        first = {key: value for key, value in source.items() if key != "second_source"}
+        second = source["second_source"]
+        plan = build_gallery_still_guide_multiple_plan([first, second, third])
+        params[H3_GALLERY_STILL_GUIDE_PLAN_KEY] = plan
+        params[H3_GALLERY_STILL_GUIDE_SOURCE_KEY] = make_gallery_still_guide_triple_source(first, second, third, plan)
+        params["custom_settings"][H3_GALLERY_STILL_GUIDE_CUSTOM_KEY].update({
+            "third_frame_index": 31, "third_still_path": str(self.third.path),
+        })
+        return params
+
+    def test_three_stills_preserve_picture_order_and_every_exact_binding(self):
+        params = self.triple_params()
+        before = copy.deepcopy(params)
+        receipt = self.first.validate(params)
+        self.assertEqual(receipt["guide_count"], 3)
+        self.assertEqual(receipt["frame_indices"], [62, 90, 31])
+        self.assertEqual([item["name"] for item in receipt["sources"]], ["guide.png", "second.png", "third.png"])
+        self.assertEqual(params, before)
+        # Use the actual worker manifest branch to prove the private path and
+        # position survive preparation without becoming image_refs.
+        import ast
+        namespace = {"wgp": types.SimpleNamespace(task_id=1, get_model_min_frames_and_step=lambda _model: (124,17,345)), "raw_params": params}
+        load_launch_functions(namespace, "_apply_generation_end_image_trim")
+        worker = next(node for node in ast.parse((ROOT / "app/launch.py").read_text()).body if isinstance(node, ast.FunctionDef) and node.name == "_run_generation")
+        branch = next(node.orelse for node in ast.walk(worker) if isinstance(node, ast.If) and any(
+            isinstance(item, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "manifest" for target in item.targets)
+            and isinstance(item.value, ast.List) for item in node.orelse
+        ))
+        exec(compile(ast.Module(body=branch, type_ignores=[]), "launch.py", "exec"), namespace)
+        prepared = namespace["manifest"][0]["params"]
+        self.assertEqual(self.first.validate(prepared)["frame_indices"], [62, 90, 31])
+        self.assertEqual(prepared["image_refs"], [])
+        self.assertEqual(prepared["trim_tail_frames"], 0)
+        self.assertEqual(prepared["custom_settings"][H3_GALLERY_STILL_GUIDE_CUSTOM_KEY]["third_still_path"], str(self.third.path))
+
+    def test_triple_publication_strips_private_transport_and_preserves_exact_receipt(self):
+        import ast
+        params = self.triple_params()
+        source = params[H3_GALLERY_STILL_GUIDE_SOURCE_KEY]
+        tree = ast.parse((ROOT / "app/launch.py").read_text())
+        writer = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                      and node.name == "_write_output_sidecars")
+        guards = [node for node in writer.body if isinstance(node, ast.If)
+                  and isinstance(node.test, ast.Call) and isinstance(node.test.func, ast.Name)
+                  and node.test.func.id == "isinstance" and isinstance(node.test.args[0], ast.Name)
+                  and node.test.args[0].id == "guide_source"
+                  and not any(isinstance(item, ast.Try) for item in node.body)]
+        self.assertEqual(len(guards), 2)
+        namespace = {"guide_source": source, "sidecar_params": copy.deepcopy(params), "sidecar": {}}
+        exec(compile(ast.Module(body=guards, type_ignores=[]), "launch.py", "exec"), namespace)
+        published = namespace["sidecar_params"]
+        self.assertNotIn(H3_GALLERY_STILL_GUIDE_SOURCE_KEY, published)
+        self.assertNotIn(H3_GALLERY_STILL_GUIDE_PLAN_KEY, published)
+        self.assertNotIn(H3_GALLERY_STILL_GUIDE_CUSTOM_KEY, published["custom_settings"])
+        self.assertNotIn(str(self.third.path), __import__("json").dumps(published))
+        receipt = namespace["sidecar"]["h3_guide_execution"]
+        self.assertEqual(receipt["guide_count"], 3)
+        self.assertEqual(receipt["frame_indices"], [62, 90, 31])
+
+    def test_three_source_plan_rejects_malformed_types_without_raw_type_errors(self):
+        params = self.triple_params()
+        source = params[H3_GALLERY_STILL_GUIDE_SOURCE_KEY]
+        records = [{key: value for key, value in source.items() if key not in {"second_source", "third_source"}},
+                   source["second_source"], source["third_source"]]
+        for field, value in (("name", []), ("frame_index", []), ("frame_index", True),
+                             ("target_frames", []), ("workspace", {})):
+            invalid = copy.deepcopy(records)
+            invalid[2][field] = value
+            with self.subTest(field=field), self.assertRaises(H3GalleryStillGuideError):
+                build_gallery_still_guide_multiple_plan(invalid)
+
+    def test_third_still_replay_refuses_revision_bytes_path_policy_and_position_drift(self):
+        mutations = (
+            lambda p: p["custom_settings"][H3_GALLERY_STILL_GUIDE_CUSTOM_KEY].update(third_frame_index=90),
+            lambda p: p["custom_settings"][H3_GALLERY_STILL_GUIDE_CUSTOM_KEY].update(third_still_path=str(self.second.path)),
+            lambda p: p[H3_GALLERY_STILL_GUIDE_SOURCE_KEY]["third_source"].update(workspace="project-b"),
+            lambda p: p[H3_GALLERY_STILL_GUIDE_SOURCE_KEY]["third_source"].update(source_private=True),
+            lambda p: p[H3_GALLERY_STILL_GUIDE_SOURCE_KEY]["third_source"].update(plan_sha256="changed"),
+            lambda p: p[H3_GALLERY_STILL_GUIDE_SOURCE_KEY]["third_source"].update(name="second.png"),
+            lambda p: p[H3_GALLERY_STILL_GUIDE_SOURCE_KEY].pop("second_source"),
+            lambda p: self.third.save_image((200, 100, 200)),
+        )
+        for index, mutate in enumerate(mutations):
+            params = self.triple_params()
+            mutate(params)
+            with self.subTest(index=index), self.assertRaises(H3GalleryStillGuideError):
+                self.first.validate(params)
+        params = self.triple_params()
+        self.first.revision = lambda _path, _root, name: "revision-2" if name == "third.png" else "revision-1"
+        with self.assertRaises(H3GalleryStillGuideError): self.first.validate(params)
 
     def test_binds_both_stills_in_picture_order_without_mutating_request(self):
         params = self.params()
@@ -708,6 +808,63 @@ class H3GalleryStillGuideRouteTests(unittest.TestCase):
         return self.request(second_still={
             "name": self.second.path.name, "revision": "revision-1", "frame_index": 90,
         }, **changes)
+
+    def triple_request(self, **changes):
+        self.pair_request()
+        # Only the third source carries protected access flags in this case.
+        self.second.sidecar.update(private=False, explicit=False)
+        (self.root / "second.meta.json").write_text(__import__("json").dumps(self.second.sidecar))
+        self.third = StillSourceFixture(self.root, name="third.png")
+        self.third.save_image((10, 20, 230))
+        def authorize(_request, workspace, name):
+            self.authorized_names.append(name)
+            source = next((item for item in (self.source, self.second, self.third) if item.path.name == name), None)
+            if workspace != "project-a" or source is None: raise HTTPException(404, "Output file not found")
+            return str(self.root), str(source.path), source.sidecar
+        self.ns["_require_authorized_output"] = authorize
+        body = {"second_still": {"name": "second.png", "revision": "revision-1", "frame_index": 90},
+                "third_still": {"name": "third.png", "revision": "revision-1", "frame_index": 31}}
+        body.update(changes)
+        return self.request(**body)
+
+    def test_triple_route_authorizes_every_source_and_inherits_third_policy_without_scanning_prompt(self):
+        prompt = "<Picture 3> Consenting adult lovers, a violent battlefield, and controversial political satire."
+        response = asyncio.run(self.ns["h3_gallery_still_guide_endpoint"](self.triple_request(prompt=prompt)))
+        self.assertEqual(self.authorized_names, ["guide.png", "second.png", "third.png"])
+        self.assertEqual(response["h3_guide_execution"]["frame_indices"], [62, 90, 31])
+        self.assertEqual(response["h3_guide_execution"]["guide_count"], 3)
+        params = self.queued[0]
+        self.assertEqual(params["prompt"], prompt)
+        self.assertEqual(params["image_refs"], [])
+        self.assertEqual(params["image_prompt_type"], "SE")
+        self.assertTrue(params["private_output"])
+        self.assertTrue(params["explicit_output"])
+        self.assertEqual(params["custom_settings"][H3_GALLERY_STILL_GUIDE_CUSTOM_KEY], {
+            "frame_index": 62, "end_frame_index": 90, "third_frame_index": 31, "third_still_path": str(self.third.path),
+        })
+        self.assertEqual(self.source.validate(params)["guide_count"], 3)
+
+    def test_triple_route_rejects_missing_second_duplicate_position_client_path_and_stale_third(self):
+        request = self.triple_request()
+        self.ns["_output_revision"] = lambda _path, _root, name: "changed" if name == "third.png" else "revision-1"
+        with self.assertRaises(HTTPException) as error:
+            asyncio.run(self.ns["h3_gallery_still_guide_endpoint"](request))
+        self.assertEqual(error.exception.status_code, 409)
+        self.assertEqual(self.queued, [])
+        self.ns["_output_revision"] = lambda *_args: "revision-1"
+        for third in (None,
+            {"name":"third.png","revision":"revision-1","frame_index":True},
+            {"name":"third.png","revision":"revision-1","frame_index":90},
+            {"name":"third.png","revision":"revision-1","frame_index":123},
+            {"name":"second.png","revision":"revision-1","frame_index":31},
+            {"name":"third.png","revision":"revision-1","frame_index":31,"path":"foreign"},
+        ):
+            with self.subTest(third=third), self.assertRaises(HTTPException) as error:
+                asyncio.run(self.ns["h3_gallery_still_guide_endpoint"](self.triple_request(third_still=third)))
+            self.assertEqual(error.exception.status_code, 400)
+        with self.assertRaises(HTTPException):
+            asyncio.run(self.ns["h3_gallery_still_guide_endpoint"](self.request(third_still={"name":"third.png","revision":"revision-1","frame_index":31})))
+        self.assertEqual(self.queued, [])
 
     def test_pair_route_authorizes_both_sources_and_preserves_second_privacy(self):
         response = asyncio.run(self.ns["h3_gallery_still_guide_endpoint"](self.pair_request()))

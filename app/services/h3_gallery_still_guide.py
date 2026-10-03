@@ -1,4 +1,4 @@
-"""Bounded source and replay validation for one or two Gallery H3 still guides."""
+"""Bounded source and replay validation for up to three Gallery H3 still guides."""
 
 from __future__ import annotations
 
@@ -282,6 +282,46 @@ def make_gallery_still_guide_pair_source(
     }
 
 
+
+def build_gallery_still_guide_multiple_plan(sources: list[Mapping[str, Any]]) -> dict[str, Any]:
+    """Seal two or three source records in Picture order, never time-sort them."""
+    if (
+        type(sources) is not list or len(sources) not in (2, 3)
+        or any(not isinstance(item, Mapping) or set(item) != _SOURCE_FIELDS for item in sources)
+        or any(
+            not isinstance(item["name"], str) or not item["name"]
+            or not isinstance(item["workspace"], str) or not item["workspace"]
+            or type(item["frame_index"]) is not int
+            or type(item["target_frames"]) is not int
+            for item in sources
+        )
+        or len({item["name"] for item in sources}) != len(sources)
+        or len({item["frame_index"] for item in sources}) != len(sources)
+        or any(item["workspace"] != sources[0]["workspace"] or item["target_frames"] != sources[0]["target_frames"] for item in sources)
+    ):
+        raise H3GalleryStillGuideError("Guide sources must be distinct and bound to one target")
+    for item in sources:
+        build_gallery_still_guide_plan(sha256=item["sha256"], frame_index=item["frame_index"], target_frames=item["target_frames"])
+    try:
+        return plan_h3_guide_inputs(
+            sources[0]["target_frames"],
+            [{"frame_idx": item["frame_index"], "visual": {"sha256": item["sha256"], "count": 1}, "audio": None} for item in sources],
+            conditioning_family="fl2va_timeline",
+        )
+    except (H3GuidePlanError, TypeError, ValueError) as error:
+        raise H3GalleryStillGuideError("Guide plan is invalid") from error
+
+
+def make_gallery_still_guide_triple_source(
+    first: Mapping[str, Any], second: Mapping[str, Any], third: Mapping[str, Any], plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected = build_gallery_still_guide_multiple_plan([first, second, third])
+    if validate_h3_guide_plan(dict(plan)) != expected:
+        raise H3GalleryStillGuideError("Guide plan does not match the three selected stills")
+    records = [{**dict(item), "plan_sha256": expected["plan_sha256"]} for item in (first, second, third)]
+    return {**records[0], "second_source": records[1], "third_source": records[2]}
+
+
 def validate_gallery_still_guide_job(
     params: Mapping[str, Any],
     *,
@@ -299,7 +339,7 @@ def validate_gallery_still_guide_job(
     if not isinstance(params, Mapping):
         raise H3GalleryStillGuideError("Guide request is invalid")
     source = params.get(H3_GALLERY_STILL_GUIDE_SOURCE_KEY)
-    if isinstance(source, Mapping) and "second_source" in source:
+    if isinstance(source, Mapping) and ("second_source" in source or "third_source" in source):
         return _validate_gallery_still_guide_pair_job(
             params, workspace=workspace, out_dir=out_dir,
             safe_direct_file_under=safe_direct_file_under,
@@ -446,64 +486,50 @@ def validate_gallery_still_guide_job(
 def _validate_gallery_still_guide_pair_job(
     params: Mapping[str, Any], **validation: Any,
 ) -> dict[str, Any]:
-    """Revalidate both sources with the existing exact one-still replay gate."""
+    """Revalidate every source through the exact one-still replay gate."""
     source = params[H3_GALLERY_STILL_GUIDE_SOURCE_KEY]
-    if set(source) != _SOURCE_FIELDS | {"second_source"}:
+    tripled = "third_source" in source
+    extra_fields = {"second_source"} | ({"third_source"} if tripled else set())
+    if set(source) != _SOURCE_FIELDS | extra_fields:
         raise H3GalleryStillGuideError("Guide request binding is invalid")
-    first = {key: value for key, value in source.items() if key != "second_source"}
-    second = source["second_source"]
+    first = {key: value for key, value in source.items() if key not in extra_fields}
+    records = [first, source["second_source"]] + ([source["third_source"]] if tripled else [])
     custom = params.get("custom_settings")
     setting = custom.get(H3_GALLERY_STILL_GUIDE_CUSTOM_KEY) if isinstance(custom, Mapping) else None
+    fields = {"frame_index", "end_frame_index"} | ({"third_frame_index", "third_still_path"} if tripled else set())
     if (
-        not isinstance(second, Mapping) or set(second) != _SOURCE_FIELDS
-        or type(setting) is not dict or set(setting) != {"frame_index", "end_frame_index"}
-        or type(setting["frame_index"]) is not int
-        or type(setting["end_frame_index"]) is not int
-        or setting["frame_index"] != first["frame_index"]
-        or setting["end_frame_index"] != second["frame_index"]
-        or first["workspace"] != second["workspace"]
-        or first["name"] == second["name"]
-        or first["target_frames"] != second["target_frames"]
+        any(not isinstance(item, Mapping) or set(item) != _SOURCE_FIELDS for item in records)
+        or type(setting) is not dict or set(setting) != fields
         or not isinstance(params.get("image_end"), (str, os.PathLike))
+        or (tripled and (type(setting["third_still_path"]) is not str or not setting["third_still_path"]))
     ):
-        raise H3GalleryStillGuideError("Guide request does not bind two distinct stills")
-    expected = build_gallery_still_guide_pair_plan(
-        sha256=first["sha256"], frame_index=first["frame_index"],
-        second_sha256=second["sha256"], second_frame_index=second["frame_index"],
-        target_frames=first["target_frames"],
-    )
+        raise H3GalleryStillGuideError("Guide request does not bind all selected stills")
+    keys = ["frame_index", "end_frame_index"] + (["third_frame_index"] if tripled else [])
+    if any(type(setting[key]) is not int or setting[key] != item["frame_index"] for key, item in zip(keys, records)):
+        raise H3GalleryStillGuideError("Guide frame positions changed")
     try:
+        expected = build_gallery_still_guide_multiple_plan(records)
         plan = validate_h3_guide_plan(params.get(H3_GALLERY_STILL_GUIDE_PLAN_KEY))
     except (H3GuidePlanError, TypeError, ValueError) as error:
         raise H3GalleryStillGuideError("Guide plan is invalid") from error
-    if (
-        plan != expected
-        or first["plan_sha256"] != plan["plan_sha256"]
-        or second["plan_sha256"] != plan["plan_sha256"]
-    ):
-        raise H3GalleryStillGuideError("Guide plan does not match both selected stills")
+    if plan != expected or any(item["plan_sha256"] != plan["plan_sha256"] for item in records):
+        raise H3GalleryStillGuideError("Guide plan does not match all selected stills")
+    paths = [params.get("image_start"), params["image_end"]] + ([setting["third_still_path"]] if tripled else [])
     results = []
-    for item, path in ((first, params.get("image_start")), (second, params["image_end"])):
+    for item, path in zip(records, paths):
         single_plan = build_gallery_still_guide_plan(
-            sha256=item["sha256"], frame_index=item["frame_index"],
-            target_frames=item["target_frames"],
+            sha256=item["sha256"], frame_index=item["frame_index"], target_frames=item["target_frames"],
         )
         single_params = {
             **dict(params), "image_start": path, "image_end": None,
-            H3_GALLERY_STILL_GUIDE_SOURCE_KEY: {
-                **dict(item), "plan_sha256": single_plan["plan_sha256"],
-            },
+            H3_GALLERY_STILL_GUIDE_SOURCE_KEY: {**dict(item), "plan_sha256": single_plan["plan_sha256"]},
             H3_GALLERY_STILL_GUIDE_PLAN_KEY: single_plan,
-            "custom_settings": {
-                **dict(custom),
-                H3_GALLERY_STILL_GUIDE_CUSTOM_KEY: {"frame_index": item["frame_index"]},
-            },
+            "custom_settings": {**dict(custom), H3_GALLERY_STILL_GUIDE_CUSTOM_KEY: {"frame_index": item["frame_index"]}},
         }
         results.append(validate_gallery_still_guide_job(single_params, **validation))
     return {
-        **results[0], "plan_sha256": plan["plan_sha256"], "guide_count": 2,
-        "frame_indices": [item["frame_index"] for item in results],
-        "sources": results,
+        **results[0], "plan_sha256": plan["plan_sha256"], "guide_count": len(results),
+        "frame_indices": [item["frame_index"] for item in results], "sources": results,
     }
 
 
@@ -516,6 +542,8 @@ __all__ = [
     "H3GalleryStillGuideError",
     "build_gallery_still_guide_plan",
     "build_gallery_still_guide_pair_plan",
+    "build_gallery_still_guide_multiple_plan",
+    "make_gallery_still_guide_triple_source",
     "make_gallery_still_guide_pair_source",
     "make_gallery_still_guide_source",
     "probe_gallery_still",
