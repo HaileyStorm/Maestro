@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import ast
 import gc
+import json
 import os
 import pickle
 import shutil
+import subprocess
 import sys
 import tempfile
 import types
@@ -264,6 +266,85 @@ class RuntimeBindingTests(unittest.TestCase):
             "latents_std": main.AUDIO_LATENTS_STD,
         }
         return model
+
+    def test_diffusers_default_fields_bind_across_fresh_hash_seed_processes(self):
+        code = """
+import json
+from diffusers.configuration_utils import ConfigMixin, register_to_config
+from services.h3_runtime_binding import diffusers_config_contract
+class Config(ConfigMixin):
+    config_name = "config.json"
+    @register_to_config
+    def __init__(self, channels=24, rate=32000, layers=(1, 2), alpha=1, beta=2, gamma=3):
+        pass
+print(json.dumps(diffusers_config_contract(Config().config), sort_keys=True))
+"""
+        contracts = []
+        for seed in ("1", "2", "3"):
+            environment = dict(
+                os.environ,
+                CUDA_VISIBLE_DEVICES="",
+                PYTHONHASHSEED=seed,
+                PYTHONPATH=str(Path(__file__).resolve().parents[1] / "app"),
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", code],
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            contracts.append(json.loads(result.stdout))
+        self.assertEqual(contracts[0], contracts[1])
+        self.assertEqual(contracts[0], contracts[2])
+        self.assertEqual(contracts[0]["layers"], [1, 2])
+
+    def test_default_metadata_order_is_stable_but_values_and_sequences_are_bound(self):
+        model = self.fake_loaded()
+        model.vae.config.update(
+            _use_default_values=["channels", "layers"], channels=24, layers=[1, 2]
+        )
+        model.audio_vae.config.update(
+            _use_default_values=["rate", "latents"], rate=32000, latents=32
+        )
+        snapshot = binding.snapshot_h3_runtime_files(
+            self.files, model._h3_runtime_code_contract(), processor_dir=self.processor
+        )
+        model._h3_runtime_binding = snapshot.bind(
+            model._h3_runtime_components(), model._h3_loaded_runtime_contract()
+        )
+        with patch.dict(os.environ, {"MAESTRO_H3_CUMULATIVE_EXPERIMENTAL": "1"}):
+            digest = model.verified_h3_runtime_sha256()
+            model.vae.config["_use_default_values"].reverse()
+            model.audio_vae.config["_use_default_values"].reverse()
+            self.assertEqual(digest, model.verified_h3_runtime_sha256())
+            # Contract preparation does not reorder the producer's config.
+            self.assertEqual(
+                model.vae.config["_use_default_values"], ["layers", "channels"]
+            )
+            for key, changed in (
+                ("channels", 25),
+                ("layers", [2, 1]),
+                ("_use_default_values", ["channels"]),
+            ):
+                with self.subTest(key=key):
+                    original = model.vae.config[key]
+                    model.vae.config[key] = changed
+                    with self.assertRaisesRegex(
+                        binding.H3RuntimeBindingError, "contract changed"
+                    ):
+                        model.verified_h3_runtime_sha256()
+                    model.vae.config[key] = original
+        for malformed in ("channels", [1], [""], ["channels", "channels"]):
+            with (
+                self.subTest(malformed=malformed),
+                self.assertRaisesRegex(
+                    binding.H3RuntimeBindingError, "metadata is invalid"
+                ),
+            ):
+                binding.diffusers_config_contract({"_use_default_values": malformed})
 
     def test_real_getter_rejects_replacement_release_ordinary_and_scheduler_change(
         self,

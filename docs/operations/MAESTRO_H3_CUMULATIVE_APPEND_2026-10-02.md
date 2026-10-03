@@ -896,3 +896,41 @@ The source milestone's exit checklist remains exact ownership, focused tests,
 review finding resolution, durable evidence and serial Git closure. Launcher
 destination/example/menu/URL checks are inapplicable. Release the short-first
 claim after closure; retain the narrow unfinished probe claim.
+
+## Fresh-process default-config identity repair
+
+Two native attempts now encode the first 56-frame window and seal a verified
+AV checkpoint; fresh second processes still rejected their loaded-bundle
+identity before sampling. All owned workers exited and both exact leases were
+withdrawn and confirmed denied. The first file's independent FFprobe check found
+56 frames, 24 FPS, 320×192 HEVC and stereo 32 kHz AAC; measured true peak was
+−21.72 dBTP. This remains a partial first-window result, not a complete chain.
+
+A private diagnostic compared both verified binding payloads before the unchanged
+restore guard. Only the video/audio Diffusers configs' `_use_default_values`
+list order differed. Field membership, config values, code, package versions,
+asset hashes, effective dtypes and tensor layout matched. Sorting only those
+two lists made the complete recorded binding inputs equal. Installed Diffusers
+0.36.0 constructs this metadata list from a set and uses it as field membership.
+
+The native loaded contract now copies each VAE config and sorts only that exact
+metadata field. It requires a list of unique nonempty strings. Actual values,
+all other sequence order and the default-field membership remain bound; the
+producer's config is not mutated. Changed implementation code intentionally
+invalidates older private runtime receipts; a fresh native run is required.
+
+Three focused CPU checks pass: actual Diffusers ConfigMixin configurations agree
+across three fresh hash-seed processes; the real loaded getter accepts only
+default-name reordering while rejecting value/semantic-order/membership changes
+and malformed metadata; existing replacement/release/ordinary-request/scheduler
+invalidation remains enforced. An initial subprocess fixture lacked the required
+`config_name`; the corrected fixture and final focused run pass. Lint/format,
+syntax and diff checks pass; native source retains its ten baseline diagnostics.
+The installed-assets/source preflight is refreshed. No full suite was repeated.
+
+Bounded independent review found no remaining concrete issue with the narrow
+normalization; it verified installed Diffusers field-membership semantics.
+Fresh native two-window restore qualification remains pending for these bytes. Aggregate checkpoint capacity, true
+full-resolution peak admission, authenticated queue crash/restart, final media,
+browser and human acceptance remain separate requirements. Public cumulative
+generation stays disabled and the continuous Goal remains active.

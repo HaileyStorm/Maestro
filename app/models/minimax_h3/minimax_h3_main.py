@@ -954,7 +954,10 @@ class MiniMaxH3Model:
         return _canonical(self._h3_runtime_code_contract())
 
     def _h3_loaded_runtime_contract(self):
-        from services.h3_runtime_binding import tensor_layout_sha256
+        from services.h3_runtime_binding import (
+            diffusers_config_contract,
+            tensor_layout_sha256,
+        )
         return {
             "runtime": self._h3_runtime_code_contract(),
             "dtypes": [str(component._model_dtype) for component in self._h3_runtime_components()[:4]],
@@ -963,8 +966,8 @@ class MiniMaxH3Model:
             "patch_size": list(self.patch_size),
             "conditioner_config": self.conditioner.qwen.config.to_dict(),
             "max_text_tokens": self.conditioner.max_text_tokens,
-            "video_config": dict(self.vae.config),
-            "audio_config": dict(self.audio_vae.config),
+            "video_config": diffusers_config_contract(self.vae.config),
+            "audio_config": diffusers_config_contract(self.audio_vae.config),
             "video_shift": self.scheduler.shift,
             "audio_shift": self.audio_scheduler.shift,
             "normalization": [VIDEO_LATENTS_MEAN, VIDEO_LATENTS_STD, AUDIO_LATENTS_MEAN, AUDIO_LATENTS_STD],

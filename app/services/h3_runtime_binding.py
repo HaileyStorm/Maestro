@@ -186,6 +186,25 @@ def installed_runtime_versions():
     return versions
 
 
+def diffusers_config_contract(config):
+    """Keep config values bound; normalize only Diffusers' default-name set."""
+    result = dict(config)
+    if "_use_default_values" in result:
+        names = result["_use_default_values"]
+        if (
+            type(names) is not list
+            or any(type(name) is not str or not name for name in names)
+            or len(set(names)) != len(names)
+        ):
+            raise H3RuntimeBindingError(
+                "H3 Diffusers default-field metadata is invalid."
+            )
+        # ConfigMixin creates this list from a set. Its process-dependent order
+        # has no model meaning; values and all other sequence orders stay exact.
+        result["_use_default_values"] = sorted(names)
+    return result
+
+
 def tensor_layout_sha256(components):
     """Bind effective post-offload types/shapes/dtypes, never read tensor values."""
     entries = []
