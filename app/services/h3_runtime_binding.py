@@ -45,6 +45,14 @@ _PACKAGES = (
     "huggingface-hub",
 )
 _OPTIONAL_PACKAGES = ("comfy-kitchen", "flash-attn", "sageattention", "triton")
+# MMGP fills these discovery caches during its first real checkpoint load.
+# Their initial None value is JSON, but their populated qtype/class/set values
+# are not. Neither representation is an implementation constant. Keep this
+# exact module/name list narrow: routing priorities, functions and defaults
+# still bind the implementation, and selected modules bind the loaded layout.
+_IMPLEMENTATION_RUNTIME_STATE = {
+    "mmgp.quant_router": ("_QTYPE_QMODULE_CACHE", "_QMODULE_BASE_ATTRS"),
+}
 
 
 class H3RuntimeBindingError(ValueError):
@@ -144,6 +152,8 @@ def implementation_sha256(modules):
 
     for module in modules:
         for name, value in vars(module).items():
+            if name in _IMPLEMENTATION_RUNTIME_STATE.get(module.__name__, ()):
+                continue
             if getattr(value, "__module__", None) == module.__name__:
                 visit(module.__name__ + "." + name, value)
             elif name.isupper():
@@ -180,7 +190,14 @@ def tensor_layout_sha256(components):
     """Bind effective post-offload types/shapes/dtypes, never read tensor values."""
     entries = []
     for index, component in enumerate(components):
-        if getattr(component, "_loras_model_data", None):
+        loras = getattr(component, "_loras_model_data", None)
+        # MMGP installs {owned_submodule: {}} before any adapter is loaded.
+        # Empty support hooks delegate to the original forward unchanged.
+        # Reject actual adapter entries and uncertain metadata shapes.
+        if loras is not None and (
+            type(loras) is not dict
+            or any(type(value) is not dict or value for value in loras.values())
+        ):
             raise H3RuntimeBindingError(
                 "H3 private recovery requires no loaded LoRA adapters."
             )
@@ -192,7 +209,16 @@ def tensor_layout_sha256(components):
                 entries.append(
                     (index, kind, name, list(tensor.shape), str(tensor.dtype))
                 )
+        module_ids = set()
         for name, module in component.named_modules():
+            module_ids.add(id(module))
+            adapter_data = getattr(module, "_mm_lora_data", None)
+            if adapter_data is not None and (
+                type(adapter_data) is not dict or adapter_data
+            ):
+                raise H3RuntimeBindingError(
+                    "H3 private recovery requires no loaded LoRA adapters."
+                )
             if (
                 getattr(module, "_h3_turbo_prepared", False)
                 or getattr(module, "_h3_turbo_active", False)
@@ -209,6 +235,10 @@ def tensor_layout_sha256(components):
                     type(module).__module__,
                     type(module).__qualname__,
                 )
+            )
+        if loras is not None and any(id(module) not in module_ids for module in loras):
+            raise H3RuntimeBindingError(
+                "H3 private recovery requires owned empty LoRA support hooks."
             )
     return hashlib.sha256(_canonical(entries)).hexdigest()
 

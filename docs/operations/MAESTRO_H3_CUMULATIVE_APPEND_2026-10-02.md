@@ -703,3 +703,60 @@ and this note; release it through the supported helper after serial Git closure.
 Foreign changes and the historical tracker hold remain preserved. The applicable
 policy checklist is unchanged: ownership, focused checks and durable/Git closure
 apply; launcher-specific destination/examples/menu/URL checks do not apply.
+
+## Native loading probes and two runtime-binding repairs
+
+Recovery resumed in the same physical checkout and continuous Goal. Local and
+stable-share HTTP health/readiness probes pass; the stable surface requires a
+browser-style client header for these probes. This is endpoint evidence, not an
+authenticated browser workflow. The running app was not restarted for this work.
+
+A private standalone native/WGP probe was prepared for two short windows on a
+320×192 canvas: 56 initial frames and a 39-frame sampler append, producing a
+planned complete 73-frame output at 24 FPS. It uses installed scaled-FP8 H3 and
+NVFP4 Qwen assets, 28 steps, eager SDPA and MMGP profile 4. CPU preflight verifies
+the installed assets, existing loader terms, sealed settings and source hashes.
+No downloads or terms changes occur. The probe declares its own private chain;
+it does not impersonate an authenticated server job or enable public generation.
+
+Two freshly leased native attempts stopped before sampling and produced no
+media or AV checkpoint. Their owned processes exited, resources were released,
+and both exact leases were withdrawn and confirmed closed. The first exposed a
+false implementation-identity mismatch during checkpoint loading: MMGP changes
+its two lazy quantizer discovery caches from `None` to populated runtime state.
+The fingerprint now excludes only `_QTYPE_QMODULE_CACHE` and
+`_QMODULE_BASE_ATTRS` in the exact `mmgp.quant_router` module. Functions, defaults,
+routing priorities, other constants, package versions and selected loaded module
+layout remain bound. This avoids making code identity depend on discovery order.
+
+The second attempt passed that repaired guard and completed native MMGP setup,
+then exposed the LoRA guard treating support hooks as loaded adapters. MMGP
+installs `{owned_submodule: {}}` support metadata before any adapter is loaded;
+empty hooks delegate to the original forward. The layout verifier now permits
+only exact empty dictionaries keyed by the component's own named modules. It
+rejects actual adapter entries, malformed metadata and foreign keys, and checks
+module-level adapter data independently so an absent root registry cannot hide
+an adapter. Public request and native LoRA exclusions remain enforced.
+
+Evidence: 19 focused CPU runtime-binding checks pass. New regressions exercise
+real MMGP cache discovery and real tiny CPU LoRA hook forwarding, preserve output
+and layout identity, and reject changed routing priorities, loaded adapters,
+stale registries, malformed shapes and cache-name collisions in other modules.
+Ruff lint/format and diff checks pass. A bounded read-only review of each changed
+boundary found no remaining concrete blocker. The probe supervisor also closes
+parent-crash termination and worker lease-identity races; its Linux parent-death
+stop passed a separate CPU process check. No full suites were repeated under the
+owner's testing preference; no UI or launcher changed.
+
+The LoRA repair is CPU-verified; a complete native run remains pending. The next
+fresh exact GPU request is queued behind another project's active reservation.
+Keep that same request and validate coherent authority before starting; queue
+timing and a notification do not authorize work. The retained private probe must
+check unchanged source bytes and installed assets, validate before each process
+and every five seconds during work, stop owned work on failure or deadline,
+unload and withdraw the exact lease. Its planned fresh-process AV restore,
+prefix identity, real encode/audio and peak-memory observations have not passed.
+Public activation, actual authorized queue/process-crash recovery, cleanup and
+storage admission, full-resolution memory, decoded-prefix quality, browser and
+human acceptance remain open. The continuous Goal and fallback item
+`UH-20260927-MAESTRO-EXTEND-FLAGS` remain active; the historical tracker is unchanged.

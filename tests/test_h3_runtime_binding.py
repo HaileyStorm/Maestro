@@ -212,6 +212,32 @@ class RuntimeBindingTests(unittest.TestCase):
         with self.assertRaisesRegex(binding.H3RuntimeBindingError, "cycle"):
             binding.implementation_sha256([module])
 
+    def test_real_quant_router_lazy_caches_do_not_change_code_identity(self):
+        from mmgp import quant_router
+        from optimum.quanto import qint8
+
+        with (
+            patch.object(quant_router, "_QTYPE_QMODULE_CACHE", None),
+            patch.object(quant_router, "_QMODULE_BASE_ATTRS", None),
+        ):
+            original = binding.implementation_sha256([quant_router])
+            # Real MMGP discovery, no checkpoint/model-weight load or CUDA.
+            quant_router._get_qmodule_base_attrs()
+            quant_router._get_qmodule_for_qtype(qint8)
+            self.assertIsInstance(quant_router._QTYPE_QMODULE_CACHE, dict)
+            self.assertEqual(binding.implementation_sha256([quant_router]), original)
+            with patch.dict(quant_router._DEFAULT_KIND_PRIORITIES, {"int8": 99}):
+                self.assertNotEqual(
+                    binding.implementation_sha256([quant_router]), original
+                )
+
+        # The same spelling in an unrelated module remains a bound constant.
+        module = types.ModuleType("fixture_cache_names")
+        module._QTYPE_QMODULE_CACHE = None
+        original = binding.implementation_sha256([module])
+        module._QTYPE_QMODULE_CACHE = "changed"
+        self.assertNotEqual(binding.implementation_sha256([module]), original)
+
     def fake_loaded(self):
         model = fake_model()
         model._h3_runtime_profile = {"fixture": True}
@@ -699,6 +725,32 @@ class RuntimeBindingTests(unittest.TestCase):
             )
             self.assertIs(handoff["state"], recovered.state)
             self.assertIs(handoff["model_token"], fresh._h3_cumulative_token)
+
+    def test_real_empty_mmgp_lora_hooks_are_allowed_but_adapters_are_rejected(self):
+        from mmgp import offload
+
+        model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+        inputs = torch.ones(1, 2)
+        expected = model(inputs)
+        original = binding.tensor_layout_sha256([model])
+        model._loras_model_data = {}
+        model[0].forward = offload.offload.hook_lora(
+            None, model[0], model, "transformer", model._loras_model_data, {}, "0"
+        )
+        self.assertEqual(binding.tensor_layout_sha256([model]), original)
+        self.assertTrue(torch.equal(model(inputs), expected))
+        model[0]._mm_lora_data["adapter"] = {"weight": torch.ones(2, 2)}
+        with self.assertRaisesRegex(binding.H3RuntimeBindingError, "LoRA"):
+            binding.tensor_layout_sha256([model])
+        # A stale/missing root registry cannot hide module-level adapter data.
+        del model._loras_model_data
+        with self.assertRaisesRegex(binding.H3RuntimeBindingError, "LoRA"):
+            binding.tensor_layout_sha256([model])
+        model[0]._mm_lora_data = {}
+        for malformed in ({"foreign": {}}, {model[0]: None}, False):
+            model._loras_model_data = malformed
+            with self.assertRaisesRegex(binding.H3RuntimeBindingError, "LoRA"):
+                binding.tensor_layout_sha256([model])
 
     def test_effective_tensor_dtype_and_loaded_loras_invalidate_contract(self):
         parameter = torch.nn.Parameter(torch.zeros(2, dtype=torch.float32))
