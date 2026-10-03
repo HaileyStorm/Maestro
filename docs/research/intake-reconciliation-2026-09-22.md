@@ -465,9 +465,12 @@ environment. This does not establish GPU generation or owner acceptance.
    [GPU_ACCEPTANCE.md](../operations/GPU_ACCEPTANCE.md). In-call cancellation
    preemption, the result-adoption crash window, other variants,
    speaker/detail quality, and owner acceptance remain open. Gallery Extend
-   and manual flip have CPU/UI/live-flow evidence; flip crash-window adoption
-   has CPU simulation evidence, while a process-kill/restart check and human
-   acceptance remain distinct.
+   and manual flip have CPU/UI/live-flow evidence. Flip now also has three
+   real POSIX SIGKILL/CPU-media publication-recovery checks: sealed-result
+   adoption without re-encoding, sidecar-only replay, and changed-source
+   rejection. These use the actual worker and journal with synthetic app
+   wiring; whole-service crash/restart, Windows and human acceptance remain
+   distinct. See [flip process recovery](../operations/MAESTRO_HFLIP_PROCESS_RECOVERY_2026-10-03.md).
 2. Complete Music3 native live generation and recovery acceptance after the
    pinned host-term review and asset download. The hidden Quad CharacterSheet
    job and atomic publication path now have CPU checks; install the pinned
