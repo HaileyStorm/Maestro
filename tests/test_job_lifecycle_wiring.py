@@ -2235,6 +2235,9 @@ class TestJobLifecycleWiring(unittest.TestCase):
 
     def test_director_multiclip_dispatch_preserves_structured_h3_prompts(self):
         from services.multiclip_inputs import multiclip_prompt_inputs
+        from services.h3_lora_compat import (
+            H3_LORA_ARCHITECTURES, architecture_for_h3_model,
+        )
 
         generation = _function(self.launch, "_run_generation")
         with open(
@@ -2243,10 +2246,56 @@ class TestJobLifecycleWiring(unittest.TestCase):
             source = ast.get_source_segment(handle.read(), generation)
         self.assertIn("multiclip_prompt_inputs(", source)
         self.assertNotIn('"per_clip_prompt_modes"', source)
-        self.assertIn(
-            '2 if h3_longform else (1 if "\\n" in clip_prompt else 0)',
-            source,
+        mode_assignment = next(
+            node for node in ast.walk(generation)
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Subscript)
+            and isinstance(node.targets[0].value, ast.Name)
+            and node.targets[0].value.id == "clip_params"
+            and isinstance(node.targets[0].slice, ast.Constant)
+            and node.targets[0].slice.value == "multi_prompts_gen_type"
         )
+        mode_module = ast.fix_missing_locations(ast.Module(
+            body=[mode_assignment], type_ignores=[],
+        ))
+        # Execute the actual WGP mode-dependent split, without importing torch.
+        wgp_tree = _parse("app/wgp.py")
+        wgp_split = next(
+            node for node in ast.walk(_function(wgp_tree, "_generate_video_impl"))
+            if isinstance(node, ast.If)
+            and ast.unparse(node.test) == "multi_prompts_gen_type == 2"
+            and any(
+                isinstance(child, ast.Assign)
+                and any(isinstance(target, ast.Name) and target.id == "prompts"
+                        for target in child.targets)
+                for child in node.body
+            )
+        )
+        split_module = ast.fix_missing_locations(ast.Module(
+            body=[wgp_split], type_ignores=[],
+        ))
+        authored = "[Shot 1] Walk.\nscreen direction: left to right\nfacing: right"
+        for model in H3_LORA_ARCHITECTURES:
+            with self.subTest(model=model):
+                child = {"model_type": model}
+                namespace = {
+                    "clip_params": child, "clip_prompt": authored,
+                    "h3_longform": None,
+                    "architecture_for_h3_model": architecture_for_h3_model,
+                }
+                exec(compile(mode_module, "app/launch.py", "exec"), namespace)  # noqa: S102 - repository-owned AST fixture
+                self.assertEqual(child["multi_prompts_gen_type"], 2)
+                split_namespace = {"multi_prompts_gen_type": 2, "prompt": authored}
+                exec(compile(split_module, "app/wgp.py", "exec"), split_namespace)  # noqa: S102 - repository-owned AST fixture
+                self.assertEqual(split_namespace["prompts"], [authored])
+        for prompt, expected_mode in ((authored, 1), ("One line", 0)):
+            child = {"model_type": "ltx2"}
+            namespace = {"clip_params": child, "clip_prompt": prompt,
+                         "h3_longform": None,
+                         "architecture_for_h3_model": architecture_for_h3_model}
+            exec(compile(mode_module, "app/launch.py", "exec"), namespace)  # noqa: S102 - repository-owned AST fixture
+            self.assertEqual(child["multi_prompts_gen_type"], expected_mode)
         params = {
             "prompt": "fallback prompt",
             "per_clip_prompts": [

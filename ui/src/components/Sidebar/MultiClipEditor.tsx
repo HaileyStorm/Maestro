@@ -1,5 +1,7 @@
 import { Upload, X } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
+import { readH3DirectionField, writeH3DirectionField } from '../../lib/h3DirectionFields'
+import { isH3StudioModel } from '../../lib/h3Submission'
 
 function ClipDropZone({ file, onFile, onClear }: {
   file: File | null
@@ -57,6 +59,8 @@ export function MultiClipEditor() {
   const setClipPrompt = useStore(s => s.setClipPrompt)
   const setClipStartImage = useStore(s => s.setClipStartImage)
   const slidingWindowSeconds = useStore(s => s.slidingWindowSeconds)
+  const modelType = useStore(s => s.params.model_type)
+  const isH3 = isH3StudioModel(modelType)
 
   if (clips.length === 0) return null
 
@@ -104,6 +108,35 @@ export function MultiClipEditor() {
               rows={2}
               className="w-full bg-bg-tertiary border border-border rounded-lg px-3 py-2 text-sm text-text-primary placeholder:text-text-muted resize-none focus:outline-none focus:border-accent-blue transition-colors disabled:opacity-40"
             />
+            {isH3 && (
+              <details className="text-xs text-text-secondary">
+                <summary className="cursor-pointer rounded py-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue">
+                  Screen continuity (optional)
+                </summary>
+                <div className="mt-2 space-y-2">
+                  <p className="text-[11px] text-text-muted">
+                    Add explicit motion and facing instructions for this clip.
+                  </p>
+                  {(['screen direction', 'facing'] as const).map(field => (
+                    <label key={field} className="block space-y-1">
+                      <span>{field === 'facing' ? 'Subject facing' : 'Screen direction'}</span>
+                      <input
+                        aria-label={`Clip ${i + 1} ${field === 'facing' ? 'subject facing' : 'screen direction'}`}
+                        value={readH3DirectionField(singlePromptMode ? clips[0].prompt : clip.prompt, field)}
+                        onChange={e => setClipPrompt(
+                          singlePromptMode ? 0 : i,
+                          writeH3DirectionField(singlePromptMode ? clips[0].prompt : clip.prompt, field, e.target.value),
+                        )}
+                        disabled={singlePromptMode && i > 0}
+                        maxLength={160}
+                        placeholder={field === 'facing' ? 'e.g. faces screen right' : 'e.g. moves from left to right'}
+                        className="w-full rounded-lg border border-border bg-bg-tertiary px-3 py-2 text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent-blue disabled:opacity-40"
+                      />
+                    </label>
+                  ))}
+                </div>
+              </details>
+            )}
           </div>
         ))}
       </div>

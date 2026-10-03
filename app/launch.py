@@ -67481,9 +67481,12 @@ def _run_generation(
                     # Structured H3 local timelines must stay intact. Mode 0
                     # splits newline content into separate prompts; mode 2 is
                     # the WGP structured Studio prompt path.
+                    from services.h3_lora_compat import architecture_for_h3_model
                     clip_prompt = clip_params.get("prompt", "")
                     clip_params["multi_prompts_gen_type"] = (
-                        2 if h3_longform else (1 if "\n" in clip_prompt else 0)
+                        2 if h3_longform or architecture_for_h3_model(
+                            clip_params.get("model_type")
+                        ) is not None else (1 if "\n" in clip_prompt else 0)
                     )
                     # Keyframe injection: add image_refs and frames_positions for this clip
                     if per_clip_keyframes and i < len(per_clip_keyframes) and per_clip_keyframes[i]:

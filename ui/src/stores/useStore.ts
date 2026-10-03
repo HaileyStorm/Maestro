@@ -1,6 +1,7 @@
 import { supportsPromptPreparation } from '../lib/promptEnhancement'
 import { H3_GALLERY_STILL_GUIDE_RESTORE_MESSAGE, isH3GalleryStillGuideOutput } from '../lib/h3GalleryStillGuide'
 import { create } from 'zustand'
+import { multiclipPromptPayload, restoreMulticlipPrompts } from '../lib/h3DirectionFields'
 import {
   captureGenerationModeUiSettings,
   captureGenerationProfileSettings,
@@ -9819,15 +9820,9 @@ export const useStore = create<AppState>((set, get) => ({
         }
       }
 
-      let promptLines: string[]
-      if (state.singlePromptMode) {
-        const p: string = clips[0]?.prompt || (params.prompt as string) || ''
-        promptLines = clips.map(() => p)
-      } else {
-        promptLines = clips.map(c => c.prompt || '')
-      }
-
-      params.prompt = promptLines.join('\n')
+      Object.assign(params, multiclipPromptPayload(
+        clips, state.singlePromptMode, (params.prompt as string) || '',
+      ))
       params.image_start = imagePaths
       if (hasAnyEndImage) {
         params.image_end = endImagePaths
@@ -17560,23 +17555,12 @@ export const useStore = create<AppState>((set, get) => ({
     }
     // Detect multi-clip output and reconstruct clips
     if (!automaticH3Longform && p.multi_prompts_gen_type === 3 && Array.isArray(p.image_start)) {
-      // Director Mode joins per-clip prompts with `\n---CLIP_BOUNDARY---\n`
-      // (see app/launch.py:7279). Studio Mode multi-shot joins with plain
-      // `\n` (single-line prompts only). Split on the boundary token first
-      // so Director prompts that contain their own newlines survive; fall
-      // back to plain newline split for legacy Studio multi-clip sidecars
-      // that don't carry the boundary marker.
-      //
-      // Before this fix: every internal `\n` in a Director clip prompt
-      // became a clip break, doubling+ the clip count and leaving half of
-      // them with the literal string `---CLIP_BOUNDARY---` as their prompt.
-      // The visible symptom was "some prompts populate but others don't"
-      // and start-image indices going to the wrong clips.
-      const promptText = (p.prompt as string) || ''
-      const CLIP_BOUNDARY = '\n---CLIP_BOUNDARY---\n'
-      const promptLines = promptText.includes(CLIP_BOUNDARY)
-        ? promptText.split(CLIP_BOUNDARY).map(s => s.trim()).filter(Boolean)
-        : promptText.split('\n').map(s => s.trim()).filter(Boolean)
+      // Studio and Director use the same explicit boundary for multiline
+      // clips. Prefer an exact retained array when present; older Studio
+      // sidecars still use one prompt per line.
+      const promptLines = restoreMulticlipPrompts(
+        (p.prompt as string) || '', p.per_clip_prompts,
+      )
       const imagePaths = p.image_start as string[]
       // Per-clip durations (Director Mode populates this; Studio mode may not).
       // Saved by app/launch.py as part of raw_params before per-clip split;
