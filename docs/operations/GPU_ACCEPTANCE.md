@@ -2446,3 +2446,29 @@ health/readiness 200, cleared the public restart status, preserved the recovered
 Gallery final and empty queue, and showed no generation model loaded. The
 five-second coherent authority observer continued through restoration and then
 exited zero; the exact grant was withdrawn after unloading.
+
+## 2026-10-03 retained cumulative boundary frame review
+
+The completed private full-canvas cumulative sample described in
+[the native restore record](MAESTRO_H3_CUMULATIVE_APPEND_2026-10-02.md)
+was reviewed without regeneration or GPU work. Its retained final SHA-256 is
+`66c21fa097b3e1ff89026b7936fdabaeecef17013d9e0cd7cbfb82fcf2429139`.
+This is the Profile 4 native probe, not the held public Profile 1 queue job.
+
+Software CPU decoding extracted zero-based frames 112, 118, 124, 130 and 136
+(4.667–5.667 seconds), spanning the 124-frame first-window boundary at
+5.167 seconds. In this five-frame sequence, the courier continues walking
+toward the right doorway and leaves view; the hallway remains visually
+consistent, with no visible scene jump at the sampled boundary. The generating
+script, extracted frames and labelled contact sheet are retained privately.
+This limited agent visual review does not establish pixel-prefix identity,
+whole-video or audio quality, authenticated publication, or human acceptance.
+
+The resumed local owner browser still shows the unchanged cumulative job held,
+no running/preparing jobs and no loaded generation model. Opening **Free
+resources** reports that owner sign-in and fresh password confirmation are
+required, and offers **Open Account**. No password was entered and no resources
+were released. The post-reauthenticated owner release check remains open;
+coordinated Pinokio restart remains the available cleanup path. Local health
+and readiness both return 200. The renewed exact GPU request is queued and no
+public cumulative execution has started.
