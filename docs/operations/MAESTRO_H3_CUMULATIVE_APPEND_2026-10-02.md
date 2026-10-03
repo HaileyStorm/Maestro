@@ -1204,3 +1204,41 @@ calibrating badge after turning cumulative mode off. This markup check is not
 enabled-mode live browser acceptance. The first test-harness attempts needed
 Node require/JSX setup and the arranged Zustand server snapshot; the corrected
 fixture passes. The final production build also passes after these corrections.
+
+## Held queue admission and startup recovery
+
+The signed-in owner browser selected the enabled experimental cumulative mode,
+124 first-window frames and 141 total frames, with Dense SDPA at 1344×768 and
+28 steps. The ordinary held Queue action created a real durable request without
+starting model work. Its sealed request retained the cumulative mode and exact
+frame counts across a coordinated restart with the operator gate restored off.
+The ignored runtime configuration was restored byte-for-byte to its original
+digest. This closes enabled-control and authenticated held-admission evidence;
+it does not qualify live execution or human media quality.
+
+That restart exposed an unconditional H3 startup classification: a never-started
+held job displayed a written-license hold even when the current configured H3
+policy allowed execution. Startup now rechecks that policy for a narrow initial
+queue shape: local, explicitly held, first execution attempt, no recovery
+attempt consumed, blank phase, zero progress, and no start, failure, output,
+unit, prefix or finality evidence. Both source and reconciled cursors must remain
+pristine. The job stays held and startup cannot dispatch it. Interrupted,
+remote, malformed and finality cases retain conservative holds;
+non-pristine work retains a manual-recovery reason across repeated startup
+normalization. The actual legal gate remains enforced. No policy declaration was changed.
+
+Eight focused startup regressions cover allowed and denied policy, preserved
+request geometry and attempts, prior execution evidence, reconciliation that
+prunes units, missing core state, manual prefix recovery, and project/input/
+finality precedence, plus repeated restart through the real persistence
+allowlist after malformed attempts or pruned evidence. Four adjacent remote-resume, finality and legal checks pass.
+The older held-prefix test has a pre-existing fixture signature mismatch for
+`adopt_staged`; the same error was reproduced against the unchanged revision.
+New-test lint and formatting pass, and launch lint adds no diagnostics to its
+817-diagnostic baseline. No full suite, frontend build or GPU run was repeated
+for this backend-only change.
+
+The held request uses the current machine profile. Prior native Profile 4
+evidence does not qualify that different profile for execution. Fresh resource
+authority and an appropriate execution profile remain prerequisites for the
+next live generation qualification.

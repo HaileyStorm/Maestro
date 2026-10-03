@@ -7888,14 +7888,82 @@ def _queue_recovery_materialize_job(
                 "error": None,
             })
             return runtime, False
+        # An explicit hold before the first worker started is ordinary queued
+        # work, not an interrupted generation. Recheck current legal admission
+        # without dispatching it or consuming an attempt. Both the original
+        # and reconciled cursors must be pristine: reconciliation can discard
+        # invalid units, which must never erase evidence of prior execution.
+        pristine_cursors = all(
+            cursor is None or (
+                isinstance(cursor, dict)
+                and cursor.get("completed_units") == []
+                and type(cursor.get("ordinary_repeat_offset", 0)) is int
+                and cursor.get("ordinary_repeat_offset", 0) == 0
+            )
+            for cursor in (snapshot_cursor, runtime.get("recovery_cursor"))
+        )
+        untouched_hold = (
+            status == "queued" and snapshot.get("queue_held") is True
+            and not remote and not blocked_reason
+            and type(snapshot.get("execution_attempt")) is int
+            and snapshot["execution_attempt"] == 1
+            and (snapshot.get("recovery_attempt") is None or (
+                type(snapshot["recovery_attempt"]) is int
+                and snapshot["recovery_attempt"] == 0
+            ))
+            and snapshot.get("_recovery_reason_code") in {
+                None, "", "h3_legal_access_required",
+            }
+            and snapshot.get("phase") == ""
+            and snapshot.get("started_at") is None
+            and snapshot.get("phase_started_at") is None
+            and all(
+                type(snapshot.get(field)) in {int, float}
+                and snapshot[field] == 0
+                for field in (
+                    "step", "progress", "overall_progress", "window_current",
+                    "window_step", "window_progress", "clip_current", "clip_progress",
+                )
+            )
+            and pristine_cursors and not snapshot.get("recovery_unit")
+            and not runtime.get("recovery_unit") and final_adoption is None
+            and not any(snapshot.get(field) for field in (
+                "output_files", "artifact_files", "failure_details", "oom_info",
+                "finished_at",
+            ))
+        )
+        if untouched_hold:
+            try:
+                _require_h3_legal_execution(_h3_job_model_types(runtime))
+            except HTTPException as error:
+                if error.status_code != 451:
+                    raise
+            else:
+                runtime.update({
+                    "status": "queued", "queue_held": True,
+                    "recovery_state": "restored", "recovery_attempt": legal_attempt,
+                    "reruns_denoise": False, "_recovery_reason_code": "",
+                    "message": "Held — use Start next or Resume when ready",
+                    "error": None,
+                })
+                return runtime, False
         runtime.update({
             "status": "queued",
             "queue_held": True,
             "recovery_state": "blocked",
             "recovery_attempt": legal_attempt,
             "reruns_denoise": False,
-            "_recovery_reason_code": "h3_legal_access_required",
-            "message": "MiniMax H3 needs a separate written license",
+            # Persist a non-pristine classification. Normalization may clear
+            # invalid units/failure details or coerce an invalid attempt to
+            # zero; a later restart must not reinterpret that as unstarted.
+            "_recovery_reason_code": (
+                "h3_legal_access_required" if untouched_hold
+                else "h3_generation_recovery_authorization_required"
+            ),
+            "message": (
+                "MiniMax H3 needs a separate written license" if untouched_hold
+                else "Saved H3 generation needs manual recovery review"
+            ),
             "error": None,
         })
         return runtime, False
