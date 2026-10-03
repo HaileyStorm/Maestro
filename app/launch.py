@@ -1758,6 +1758,7 @@ from services.job_lifecycle import (
     request_sample_preemption,
     request_cancel,
     restore_scheduler_state,
+    retry_failed_recovery_job,
     RESOURCE_EXECUTION_CPU,
     RESOURCE_EXECUTION_STANDARD,
     RESOURCE_INTENT_GENERATION,
@@ -75425,7 +75426,7 @@ def _resume_recovered_job(
                 status_code=409,
                 detail="This interrupted preparation must be resubmitted",
             )
-        if legal_resume:
+        if legal_resume and str(job.get("status") or "") != "failed":
             try:
                 attempt = max(
                     0, int(job.get("recovery_attempt", 0) or 0),
@@ -75449,25 +75450,35 @@ def _resume_recovered_job(
                 detail="Recovery attempt limit reached",
             )
         reruns_denoise = _queue_recovery_delivery_pending(job) is None
-        if not _queue_recovery_checkpoint(
-            job,
-            status="queued",
-            queue_held=False,
-            recovery_attempt=attempt,
-            recovery_state="retrying",
-            reruns_denoise=reruns_denoise,
+        retry_updates = {
+            "queue_held": False,
+            "recovery_attempt": attempt,
+            "recovery_state": "retrying",
+            "reruns_denoise": reruns_denoise,
             # Previous journal entries retain the failed attempt. A newly
             # admitted attempt must not inherit its exact-failure authority.
-            failure_details=None,
-            oom_info=None,
-            message="Queued for recovery",
-            session_id=request.state.maestro_session_id,
-            access_policy={
+            "failure_details": None,
+            "oom_info": None,
+            "message": "Queued for recovery",
+            "session_id": request.state.maestro_session_id,
+            "access_policy": {
                 "private": bool(job.get("private", False)),
                 "explicit": bool(job.get("explicit", False)),
             },
-            _recovery_reason_code="",
-        ):
+            "_recovery_reason_code": "",
+        }
+        if str(job.get("status") or "") == "failed":
+            committed = retry_failed_recovery_job(
+                job,
+                expected_execution_attempt=job.get("execution_attempt", 1),
+                expected_recovery_attempt=attempt - 1,
+                **retry_updates,
+            )
+        else:
+            committed = _queue_recovery_checkpoint(
+                job, status="queued", **retry_updates,
+            )
+        if not committed:
             raise HTTPException(
                 status_code=409, detail="Recovery was cancelled",
             )

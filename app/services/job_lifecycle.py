@@ -2827,6 +2827,86 @@ def checkpoint_recovery_job(
         return True
 
 
+def retry_failed_recovery_job(
+    job: MutableMapping[str, Any],
+    *,
+    expected_execution_attempt: int,
+    expected_recovery_attempt: int,
+    **updates: Any,
+) -> bool:
+    """Commit one owner-validated failed retry and fence its previous worker.
+
+    The caller must validate owner/project/input/admission and the retry limit.
+    Generic checkpoints still cannot revive terminal jobs.
+    """
+    if "status" in updates or "execution_attempt" in updates:
+        raise ValueError("Lifecycle and execution attempt are transition-owned")
+    with _queue_condition, _lifecycle_lock:
+        def still_failed():
+            return (
+                job.get("status") == "failed"
+                and job.get(_TERMINAL_TRANSITION_MARKER) is not True
+                and job.get("kind") != SAMPLE_CAMPAIGN_JOB_KIND
+                and not is_cancel_requested(job)
+                and type(expected_execution_attempt) is int
+                and 1 <= expected_execution_attempt < MAX_EXECUTION_ATTEMPT
+                and type(job.get("execution_attempt", 1)) is int
+                and job.get("execution_attempt", 1) == expected_execution_attempt
+                and type(expected_recovery_attempt) is int
+                and expected_recovery_attempt >= 0
+                and type(job.get("recovery_attempt", 0)) is int
+                and job.get("recovery_attempt", 0) == expected_recovery_attempt
+            )
+
+        if (
+            not still_failed()
+            or type(updates.get("recovery_attempt")) is not int
+            or updates["recovery_attempt"] != expected_recovery_attempt + 1
+            or updates.get("recovery_state") != "retrying"
+        ):
+            return False
+        candidate = _copy_job_for_transition(job)
+        candidate.update(updates)
+        candidate.update({
+            "status": "queued",
+            "queue_held": False,
+            "hold_after_output": False,
+            "execution_attempt": expected_execution_attempt + 1,
+            "error": None,
+            "failure_details": None,
+            "oom_info": None,
+            "progress": 0,
+            "overall_progress": 0,
+            "step": 0,
+            "total_steps": 0,
+            "window_step": 0,
+            "window_total_steps": 0,
+            "window_progress": 0,
+            "phase": "",
+            "plan_review_required": False,
+            "plan_review_terms_required": False,
+            "plan_review_deadline": None,
+        })
+        for key in ("started_at", "finished_at", "phase_started_at"):
+            candidate.pop(key, None)
+        if candidate.get("resource_intent") in _RESOURCE_INTENTS:
+            candidate["resource_state"] = "queued"
+            candidate["preemption_mode"] = PREEMPTION_MODE_NONE
+        _append_job_event_unlocked(candidate)
+        _persist_prospective_unlocked(
+            "failed_recovery_retry",
+            jobs=(candidate,),
+            global_state=_global_state_unlocked(replacements={id(job): candidate}),
+        )
+        # A reentrant durability hook can commit a newer retry or terminal
+        # winner. Never publish this older candidate over it.
+        if not still_failed():
+            return False
+        _publish_job_unlocked(job, candidate)
+        _queue_condition.notify_all()
+        return True
+
+
 def block_generation_recovery(
     job: MutableMapping[str, Any],
     *,

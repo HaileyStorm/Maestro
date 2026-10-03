@@ -6203,7 +6203,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "validate_manifest_inputs": lambda *_args: None,
                 "_queue_recovery_manifest_validator": lambda *_args, **_kwargs: True,
                 "_require_h3_offload_plan_parity": lambda *_args, **_kwargs: None,
-                "_queue_recovery_reconcile_cursor": lambda *_args: None,
+                "_queue_recovery_reconcile_cursor": lambda *_args, **_kwargs: None,
                 "_h3_incomplete_recovery_prefix": lambda _job: None,
                 "_job_uses_registered_h3": lambda _job: False,
                 "next_recovery_attempt": next_recovery_attempt,
@@ -7250,6 +7250,8 @@ class QueueLaunchWiringTests(unittest.TestCase):
                     "_queue_recovery_delivery_pending": lambda _job: None,
                     "_require_job_runtime_model_admission": lambda _job: None,
                     "_queue_recovery_checkpoint": checkpoint, "next_recovery_attempt": next_recovery_attempt,
+                    "retry_failed_recovery_job": lambda target, expected_execution_attempt,
+                    expected_recovery_attempt, **updates: checkpoint(target, status="queued", **updates),
                     "update_queue_job": lambda *_args, **_kwargs: True,
                     "threading": types.SimpleNamespace(Thread=WorkerThread),
                 })
