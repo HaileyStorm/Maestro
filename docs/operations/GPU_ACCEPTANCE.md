@@ -2506,3 +2506,64 @@ Pinokio. Local health and readiness returned 200, both experiment flags were
 off, and the owner browser retained the failed job with **Retry generation**.
 The first-window output and private receipts were preserved. The separate
 owner **Free resources** check after recent password confirmation remains open.
+
+## 2026-10-03 Profile 1 owner retry: native two-window completion
+
+The owner’s **Retry generation** action initially returned 409 before model
+loading: the generic terminal-safe checkpoint correctly refused to requeue a
+failed job. Commit `1372044` adds a dedicated owner-validated failed retry
+transition. It durably increments recovery and execution attempts, fences the
+previous worker, resets stale progress/resource state, and preserves generic
+terminal checkpoint protection. Six real-journal checks and nine adjacent
+checks passed, including persistence failure, stale attempts, ownership/input
+admission, legal-access retry, and reentrant cancellation/completion. Changed
+source lint, AST, diff and tracked publication checks passed. One bounded review
+identified the failed legal-hold counter case; its correction and regression
+check passed. No full suite was repeated.
+
+A fresh exact grant then supervised the unchanged request through the signed-in
+owner retry, returning 200 and recording execution attempt 2/recovery attempt 1.
+Native Profile 1 used 1344×768, 28 Dense SDPA steps, no LoRAs and the sealed
+124-frame first window / 141-frame publication contract. Both windows completed.
+The first retained AV checkpoint contains video shape `[1,24,37,48,84]` and
+audio shape `[2,32,207]`; the second contains `[1,24,42,48,84]` and `[2,32,235]`.
+Both physical checkpoint sizes and hashes match their durable receipts.
+
+Window two uses 22 frames of context and a 39-frame sampling window to add
+17 published frames. The durable final uses `cumulative_last_output`, with
+dependencies on both native windows. Its byte hash equals the second window’s
+complete cumulative container; it is not a concatenation of independent shots.
+CPU decoding counts 141 HEVC frames at 24 fps, 1344×768 and 5.875000 seconds.
+Stereo 32 kHz AAC is present at 5.856000 seconds. The audio is nearly silent:
+measured true peak −72.2 dBFS, so this run does not establish audible sound
+quality. No performance improvement, peak-memory bound or human acceptance is
+claimed from this single run.
+
+A retained five-frame CPU contact sheet samples frames 118, 123, 124, 130 and
+140 across the 124-frame boundary. The red mug, tabletop, background and fixed
+camera remain consistent in those samples; a hand enters during the new tail.
+This limited agent visual inspection does not establish whole-video quality
+or exact decoded prefix identity. The retry replaced its own prior ordinary
+first-window component at the same stable basename; that negative receipt is
+retained, but the superseded component’s original media bytes were not kept.
+The sealed request and unrelated outputs were preserved.
+
+Gallery lists the final. This Chrome browser cannot decode the original HEVC
+preview; the owner’s built-in **Create H.264 browser copy** action completed and
+preserved the original hash. CPU decoding counts the same 141 frames and duration
+in the separate H.264 copy. Authenticated browser playback and exact runtime
+cleanup are recorded below when observed. Recent owner password confirmation
+remains required for the separate **Free resources** acceptance check.
+
+The signed-in Chrome Gallery viewer decoded the H.264 copy at 1344×768 and
+played from 0 to 5.875 seconds, ending with no media error. A screenshot and
+DOM media-state receipt are retained privately. Human visual/audio acceptance
+remains open; playback completion does not establish it.
+
+Cleanup stopped the exact supervised backend, confirmed its exit, restored the
+exact pre-check environment bytes, withdrew the exact grant and verified its
+authoritative denied response. Installed Pinokio restart restored service;
+the actual replacement backend has both cumulative experiment flags absent,
+and local health/readiness return 200. Owner password confirmation was still
+pending, so this cleanup does not count as acceptance of the owner’s **Free
+resources** action.
