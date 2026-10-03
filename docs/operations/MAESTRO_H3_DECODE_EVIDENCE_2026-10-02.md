@@ -400,3 +400,41 @@ and listening acceptance remain separate.
 Reuse this negative comparison. The next diagnosis should inspect how arbitrary
 interior guides affect learned predictions and temporal conditioning; another
 uninstrumented Dense/Sol repeat cannot isolate those paths.
+## Compact final-head precision repair (2026-10-03 UTC)
+
+Source inspection after the matched Dense negative found a separate numerical
+mismatch. Pinned [WanGP compact final heads](https://github.com/deepbeepmeep/Wan2GP/blob/fa79896eadbcb048dc13e76233b3b72486b522a8/models/minimax_h3/transformer.py#L334)
+normalize in the backbone dtype, convert those normalized rows to FP32, apply
+the compact shift/scale in FP32, and then run FP32 output projections. Maestro
+previously rounded the shift/scale to BF16 or FP16 before modulation.
+
+A disposable CPU comparison extracted the pinned `FinalLayer` and `AdalnProj`
+methods and supplied both paths with the same stored projection values. Three
+seeds, two output modalities and three backbone dtypes gave eighteen cases.
+Before repair, all twelve BF16/FP16 cases differed; the largest BF16 output
+error was 0.00936544. The six FP32 cases matched exactly. After repair, all
+eighteen cases match exactly. Eighteen additional chunked-head comparisons
+also match exactly on these small tensors.
+
+The compact path now retains FP32 modulation. The original full-width
+timestep path retains its previous backbone modulation. Conventional and
+Spectrum output heads gather and process at most 8,192 rows per chunk, so the
+repair does not require a full packed-sequence FP32 activation. Output order,
+separate video/audio clocks, condition-row output geometry and sealed Spectrum
+features are preserved. Module calls retain their ordinary pre/post hooks.
+
+One bounded independent review identified per-chunk device synchronization in
+clock preparation. The helper now prepares clock runs once and clips the
+small run table locally for each chunk. Focused regressions cover that call
+count, mixed clocks, reordered output indices, BF16/FP16/FP32 math, chunk
+boundaries, module hooks, source immutability and the unchanged full-width
+precision path. Twenty-three CPU head/Spectrum tests pass; four additional
+existing tiny transformer/projection checks pass on CPU. Compilation,
+publication guard and scoped diff checks pass. No full suite was repeated.
+
+This repairs a demonstrated final-head source mismatch. It does not establish
+learned checkpoint parity, actual MMGP hook residency, GPU peak memory or
+throughput, or an opening-fade improvement. The original two-still negative
+remains open. A matched learned run after coordinated rollout, with fresh
+coherent GPU authority and retained source/media evidence, is the next quality
+gate; previous generations must not be relabelled as repaired output.

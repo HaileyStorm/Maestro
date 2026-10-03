@@ -2158,6 +2158,124 @@ def _gpu_runtime_available():
 _RUNTIME_AVAILABLE = _gpu_runtime_available()
 
 
+@unittest.skipUnless(importlib.util.find_spec("torch"), "PyTorch is not installed")
+class TestMiniMaxH3FinalHeadsCPU(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(_APP))
+        import torch
+
+        cls.torch = torch
+
+    @classmethod
+    def tearDownClass(cls):
+        if sys.path and sys.path[0] == str(_APP):
+            sys.path.pop(0)
+
+    def test_final_head_modulates_after_bf16_norm_in_fp32(self):
+        from models.minimax_h3.transformer import MiniMaxH3FinalLayer, _index_runs
+
+        torch = self.torch
+        torch.manual_seed(935314058)
+        layer = MiniMaxH3FinalLayer(8, 2, 2, 3, 1e-5, torch.bfloat16).eval()
+        hidden = torch.randn(1, 7, 8).to(torch.bfloat16)
+        curve = torch.tensor([[0.12345, -0.98765], [0.31415, 0.27182]])
+        clocks = torch.tensor([1, 1, 0, 0, 0, 1, 0])
+        with torch.inference_mode():
+            # Pinned compact WanGP final head: BF16 norm, FP32 modulation,
+            # then FP32 projection, with no round-trip through BF16.
+            projected = torch.nn.functional.linear(
+                curve, layer.adaln_proj.linear.weight.float(),
+                layer.adaln_proj.linear.bias.float(),
+            )
+            shift, scale = projected.chunk(2, dim=-1)
+            normed = layer.norm(hidden).float()
+            expected = normed * (1.0 + scale[clocks]) + shift[clocks]
+            actual = layer(hidden, curve, None, _index_runs(clocks))
+            self.assertEqual(actual.dtype, torch.float32)
+            self.assertTrue(torch.equal(actual, expected))
+            self.assertFalse(torch.equal(actual, actual.bfloat16().float()))
+
+
+    def test_final_heads_bound_rows_and_preserve_mixed_clocks_and_source(self):
+        import models.minimax_h3.transformer as h3
+
+        torch = self.torch
+        previous = h3.MINIMAX_H3_ACTIVATION_CHUNK_TOKENS
+        try:
+            h3.MINIMAX_H3_ACTIVATION_CHUNK_TOKENS = 3
+            for dtype in (torch.float32, torch.bfloat16, torch.float16):
+                with self.subTest(dtype=dtype), torch.inference_mode():
+                    torch.manual_seed(42)
+                    layer = h3.MiniMaxH3FinalLayer(8, 2, 2, 3, 1e-5, dtype).eval()
+                    hidden = torch.randn(1, 13, 8).to(dtype)
+                    original = hidden.clone()
+                    curve = torch.randn(3, 2)
+                    clocks = torch.tensor([0, 2, 1, 1, 2, 0, 2, 1, 0, 2, 1, 0, 2])
+                    audio_indices = torch.tensor([2, 4, 3, 1, 5])
+                    video_indices = torch.tensor([12, 7, 6, 8, 9, 11])
+                    projected = torch.nn.functional.linear(
+                        curve, layer.adaln_proj.linear.weight.float(),
+                        layer.adaln_proj.linear.bias.float(),
+                    )
+                    shift, scale = projected.chunk(2, dim=-1)
+                    expected_hidden = layer.norm(hidden).float()
+                    expected_hidden = expected_hidden * (1.0 + scale[clocks]) + shift[clocks]
+                    expected_video = layer.video_out(expected_hidden[:, video_indices])
+                    expected_audio = layer.audio_out(expected_hidden[:, audio_indices])
+                    observed_rows = []
+                    observed_outputs = []
+                    hook = layer.register_forward_pre_hook(
+                        lambda _layer, args: observed_rows.append(args[0].shape[1])
+                    )
+                    post_hook = layer.register_forward_hook(
+                        lambda _layer, _args, result: observed_outputs.append(
+                            (result.shape[1], result.dtype)
+                        )
+                    )
+                    try:
+                        with mock.patch.object(h3, "_index_runs", wraps=h3._index_runs) as run_preparation:
+                            video, audio = h3._project_h3_final_heads(
+                                layer, hidden, curve, None, clocks, video_indices, audio_indices,
+                            )
+                        self.assertEqual(run_preparation.call_count, 1)
+                    finally:
+                        hook.remove()
+                        post_hook.remove()
+                    self.assertEqual(observed_rows, [3, 3, 3, 2])
+                    self.assertEqual(observed_outputs, [(n, torch.float32) for n in observed_rows])
+                    self.assertTrue(torch.equal(hidden, original))
+                    torch.testing.assert_close(video, expected_video, atol=1e-6, rtol=1e-6)
+                    torch.testing.assert_close(audio, expected_audio, atol=1e-6, rtol=1e-6)
+        finally:
+            h3.MINIMAX_H3_ACTIVATION_CHUNK_TOKENS = previous
+
+    def test_full_timestep_final_head_keeps_backbone_modulation(self):
+        from models.minimax_h3.transformer import MiniMaxH3FinalLayer, _index_runs
+
+        torch = self.torch
+        torch.manual_seed(42)
+        layer = MiniMaxH3FinalLayer(
+            8, 2, 2, 3, 1e-5, torch.bfloat16,
+            adaln_dtype=torch.bfloat16, apply_adaln_silu=True,
+        ).eval()
+        hidden = torch.randn(1, 7, 8).to(torch.bfloat16)
+        curve = torch.randn(2, 2)
+        clocks = torch.tensor([0, 1, 1, 0, 1, 0, 0])
+        with torch.inference_mode():
+            projected = torch.nn.functional.linear(
+                torch.nn.functional.silu(curve),
+                layer.adaln_proj.linear.weight.float(),
+                layer.adaln_proj.linear.bias.float(),
+            )
+            shift, scale = projected.bfloat16().chunk(2, dim=-1)
+            expected = layer.norm(hidden) * (1.0 + scale[clocks]) + shift[clocks]
+            actual = layer(hidden, curve, None, _index_runs(clocks))
+            self.assertEqual(actual.dtype, torch.bfloat16)
+            self.assertTrue(torch.equal(actual, expected))
+
+
+
 @unittest.skipUnless(_RUNTIME_AVAILABLE, "MiniMax H3 CUDA runtime is not available")
 class TestMiniMaxH3RuntimeMath(unittest.TestCase):
     @classmethod
@@ -2326,6 +2444,8 @@ class TestMiniMaxH3RuntimeMath(unittest.TestCase):
 
         self.assertTrue(self.torch.allclose(actual_attention, expected_attention, atol=1e-5, rtol=1e-5))
         self.assertTrue(self.torch.allclose(actual_mlp, expected_mlp, atol=1e-5, rtol=1e-5))
+
+
 
     def test_curve_adaln_uses_fp32_math_with_compact_fp16_storage(self):
         from models.minimax_h3.transformer import MiniMaxH3AdaLNProjection

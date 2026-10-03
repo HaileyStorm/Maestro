@@ -136,19 +136,12 @@ def _spectrum_finalize_target_hidden(
         + total_video_rows - num_condition_video_rows
     ):
         raise SpectrumStateError("Spectrum target hidden rows no longer match H3 layout")
-    # H3's inference FinalLayer may modulate its freshly normalized input in
-    # place. Replay features include archived actual anchors, so never let a
-    # current-coordinate head mutate the sealed hidden-feature history.
-    headed = final_layer(
-        target_hidden.clone(),
-        curve,
-        turbo_silu_t_emb,
-        _index_runs(target_timestep_indices),
+    target_indices = torch.arange(target_hidden.shape[1], device=target_hidden.device)
+    video_target, audio_target = _project_h3_final_heads(
+        final_layer, target_hidden, curve, turbo_silu_t_emb,
+        target_timestep_indices, target_indices[audio_target_rows:],
+        target_indices[:audio_target_rows],
     )
-    audio_hidden = headed[:, :audio_target_rows].to(torch.float32)
-    video_hidden = headed[:, audio_target_rows:].to(torch.float32)
-    audio_target = final_layer.audio_out(audio_hidden)
-    video_target = final_layer.video_out(video_hidden)
     audio_output = audio_target.new_zeros(
         (audio_target.shape[0], total_audio_rows, audio_target.shape[-1])
     )
@@ -160,6 +153,52 @@ def _spectrum_finalize_target_hidden(
     if not return_dict:
         return video_output, audio_output
     return MiniMaxH3TransformerOutput(video_output, audio_output)
+
+
+def _project_h3_final_heads(
+    final_layer: nn.Module,
+    hidden_states: torch.Tensor,
+    curve: torch.Tensor,
+    turbo_silu_t_emb: torch.Tensor | None,
+    timestep_indices: torch.Tensor,
+    video_indices: torch.Tensor,
+    audio_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Evaluate FP32 final heads without a packed-sequence FP32 activation.
+
+    Gather fresh bounded rows so final-layer inference and offload hooks can
+    run normally, while retained Spectrum features remain untouched.
+    """
+    selected = torch.cat((audio_indices, video_indices))
+    audio_length = audio_indices.numel()
+    selected_runs = _index_runs(timestep_indices.index_select(0, selected))
+    video_parts, audio_parts = [], []
+    chunk = max(1, int(MINIMAX_H3_ACTIVATION_CHUNK_TOKENS))
+    for start in range(0, selected.numel(), chunk):
+        indices = selected[start:start + chunk]
+        end = start + indices.numel()
+        # Transfer the clock map once above; clip its small run table locally
+        # instead of synchronizing with the device for every activation chunk.
+        runs = tuple(
+            (max(left, start) - start, min(right, end) - start, value)
+            for left, right, value in selected_runs
+            if left < end and right > start
+        )
+        headed = final_layer(
+            hidden_states.index_select(1, indices), curve, turbo_silu_t_emb,
+            runs,
+        ).to(torch.float32)
+        audio_count = max(0, min(indices.numel(), audio_length - start))
+        if audio_count:
+            audio_parts.append(final_layer.audio_out(headed[:, :audio_count]))
+        if audio_count < indices.numel():
+            video_parts.append(final_layer.video_out(headed[:, audio_count:]))
+        del headed
+    video = (torch.cat(video_parts, dim=1) if video_parts else
+             final_layer.video_out(hidden_states[:, :0].to(torch.float32)))
+    audio = (torch.cat(audio_parts, dim=1) if audio_parts else
+             final_layer.audio_out(hidden_states[:, :0].to(torch.float32)))
+    return video, audio
 
 
 def _modulate_by_runs(
@@ -603,7 +642,12 @@ class MiniMaxH3FinalLayer(nn.Module):
         timestep_runs: tuple[tuple[int, int, int], ...],
     ) -> torch.Tensor:
         shift, scale = self.adaln_proj(curve, turbo_silu_t_emb)
+        # The compact reference normalizes at backbone precision, then
+        # modulates in FP32 before its FP32 heads. Rounding the modulation
+        # down to BF16/FP16 here changes every predicted velocity.
         normed = _rms_norm_in_chunks(self.norm, hidden_states)
+        if not self.adaln_proj.apply_silu:
+            normed = normed.to(torch.float32)
         return _modulate_by_runs(normed, shift, scale, timestep_runs)
 
 
@@ -1030,7 +1074,6 @@ class MiniMaxH3Transformer(nn.Module):
         turbo_silu_t_emb = self._turbo_silu_t_emb_at(timestep, device)
         adaln_indices = timestep_indices * MODALITY_COUNT + token_tags.clamp_min(0)
         adaln_runs = _index_runs(adaln_indices)
-        timestep_runs = _index_runs(timestep_indices)
         rotary = self.rope(position_ids.to(device))
         attention_mask = None
         padding = token_tags < 0
@@ -1082,11 +1125,10 @@ class MiniMaxH3Transformer(nn.Module):
                 actual_call=lambda: target_hidden,
             )
 
-        packed = self.final_layer(packed, curve, turbo_silu_t_emb, timestep_runs)
-        video_activations = packed.index_select(1, video_indices).to(torch.float32)
-        audio_activations = packed.index_select(1, audio_indices).to(torch.float32)
-        video_output = self.final_layer.video_out(video_activations)
-        audio_output = self.final_layer.audio_out(audio_activations)
+        video_output, audio_output = _project_h3_final_heads(
+            self.final_layer, packed, curve, turbo_silu_t_emb,
+            timestep_indices, video_indices, audio_indices,
+        )
         if not return_dict:
             return video_output, audio_output
         return MiniMaxH3TransformerOutput(video_output, audio_output)
