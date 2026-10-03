@@ -289,7 +289,58 @@ the adjacent audio sample jump was 1.418422e-08 OFF versus 0.00058821874 ON.
 Keep the native boundary capability experimental and disabled by default.
 
 Reuse that accepted evidence; another identical pair is not the next gate.
-Cumulative append runtime and broader motion/audio quality remain open, with
-human acceptance separate. Preserve ordinary Extend and the earlier
-interior-guide fade as separate samples. Any new GPU execution requires a
-fresh exact coherent grant.
+The later [cumulative execution and prefix readback](GPU_ACCEPTANCE.md#retained-cumulative-prefix-readback-2026-10-03-utc)
+qualified two native windows and a 141-frame publication. Exact decoded prefix
+identity was not achieved; broader motion/audio quality and human acceptance
+remain open. Preserve ordinary Extend and the earlier interior-guide fade as
+separate samples. Any new GPU execution requires a fresh exact coherent grant.
+
+## Conditioning noise and denoising arithmetic comparison (2026-10-03 UTC)
+
+A disposable CPU comparison at source revision `f4c0940` extended the earlier
+layout comparison to actual native noise preparation, schedulers, row timestep
+plans and paired advancement. It extracted the corresponding methods from
+pinned [Diffusers preparation](https://github.com/huggingface/diffusers/blob/578c9b2c6636ab2424a0e56186268b83623656b2/src/diffusers/modular_pipelines/minimax_h3/before_denoise.py),
+[paired denoising](https://github.com/huggingface/diffusers/blob/578c9b2c6636ab2424a0e56186268b83623656b2/src/diffusers/modular_pipelines/minimax_h3/denoise.py)
+and [scheduler](https://github.com/huggingface/diffusers/blob/578c9b2c6636ab2424a0e56186268b83623656b2/src/diffusers/schedulers/scheduling_minimax_h3.py).
+No learned component was loaded and CUDA was hidden.
+
+The captured geometry was retained: video noise `[1,24,37,48,84]`, 414 audio
+rows of width 32, `(1,2,2)` patches and seed `935314058`. Synthetic clean
+conditioning covered zero, one, two and three stills plus mixed one-, two-
+and five-latent-frame references. Condition noise and mixing matched exactly,
+as did the subsequent target video/audio noise and generator state.
+
+| Comparison | Tensor checks | Mismatches | Maximum absolute error |
+| --- | ---: | ---: | ---: |
+| Condition noise, target noise and generator state | 24 | 0 | 0 |
+| Video/audio sigma grids and timesteps | 12 | 0 | 0 |
+| Row timestep values and indices | 400 | 0 | 0 |
+| Paired updates and immutable conditioning slices | 480 | 0 | 0 |
+| Total | 916 | 0 | 0 |
+
+Schedules covered 4, 8 and 28 authored evaluations, using equal
+terminal-inclusive grid sizes of 5, 9 and 29. The reference counts grid points;
+Maestro's UI counts evaluations. Row plans covered no anchors, first, last,
+first/last and the original interior frame indices 31/90. The interior cases
+compare timestep arithmetic only: upstream layout does not establish Maestro's
+arbitrary-frame guide semantics. Paired updates used step-varying synthetic
+velocities at the full captured geometry, with no conditioning, two image
+conditions, and image plus audio conditions. Every leading conditioning slice
+remained unchanged at every step.
+
+Reference SHA-256 values are the preparation hash recorded above,
+`4c2bc8b9856c38ba1692b02e35aa68ec92beda4db273e2e71f0ebbf997e19c79`
+for paired denoising, and
+`307d5bf755337ef00c47237f9ac8be116e627d26e1df3b5f0bd504a80f9de8dd`
+for the scheduler. The reproducible private script and per-check report retain
+native source hashes and the CPU environment (Python 3.10.20, PyTorch 2.7.0).
+
+This comparison found no arithmetic mismatch to repair. It does not establish
+posterior encoding, tokenizer, learned denoiser, attention, checkpoint, GPU or
+quality parity, nor does it resolve the two-interior-still fade. Half-precision
+scheduler inputs were not tested; the captured generated rows use float32.
+The next useful diagnosis is a bounded comparison of learned predictions and
+attention/checkpoint behavior on the failing recipe. Repeating an identical
+uninstrumented generation would not distinguish these remaining possibilities.
+No production change or full-suite rerun was needed for this numerical audit.
