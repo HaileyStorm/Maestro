@@ -178,6 +178,7 @@ export function PromptInput() {
   const studioPromptEnhance = useStore(s => s.studioPromptEnhance)
   const setStudioPromptEnhance = useStore(s => s.setStudioPromptEnhance)
   const imageMode = useStore(s => s.params.image_mode)
+  const cumulative = useStore(s => s.params.h3_cumulative_append === true)
   const effectiveVideoModel = useStore(s => s.params.model_type)
   const migrateLegacyH3StylePrompt = useStore(s => s.migrateLegacyH3StylePrompt)
   const [ttsMenuOpen, setTtsMenuOpen] = useState(false)
@@ -214,7 +215,7 @@ export function PromptInput() {
         { totalFrames: controlFpsTotalFrames(durationSeconds, forceFps, videoGuide, guideVideoFps, guideVideoFrameCount) },
       ).windowCount
     : 1
-  const usesWindows = generationMode === 'video' && supportsSlidingWindows && windowCount > 1 && imageMode !== 2
+  const usesWindows = !cumulative && generationMode === 'video' && supportsSlidingWindows && windowCount > 1 && imageMode !== 2
   const globalTimelineDetected = hasGlobalTimeline(prompt)
   const authoredTimelineEnd = globalTimelineEndSeconds(prompt)
   const setDurationSeconds = useStore(s => s.setDurationSeconds)
@@ -287,7 +288,9 @@ export function PromptInput() {
       <textarea
         value={prompt}
         onChange={e => setParam('prompt', e.target.value)}
-        placeholder={usesWindows
+        placeholder={cumulative
+          ? 'Describe one timeline across the whole video; use [00:00-00:10] for timed events...'
+          : usesWindows
           ? `Describe the whole video; add [00:00-00:10] timed beats for ${windowCount} planned ${usesSegmentedStudio ? 'shots' : 'sections'}`
           : modePlaceholder}
         className="w-full flex-1 rounded-lg border border-border bg-bg-tertiary px-3 py-2 pr-14 text-sm text-text-primary placeholder:text-text-muted transition-colors focus:border-accent-blue focus:outline-none md:pr-10"

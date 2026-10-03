@@ -18,6 +18,7 @@ import {
 } from '../lib/directorProfiles'
 import type { GenerateParams, ProjectAssetGenerateReference, OutputFile, MediaFilter, OutputArtifactScope, AspectRatio, ResolutionPreset, ScailResolutionProfile, GenerationJob, H3SegmentPlan, H3PlanDecision, H3PerformanceEstimate, H3SegmentCountEstimate, H3PerformanceProfile, H3PerformanceProfileId, ModelFamily, ModelDef, GenerationMode, ModelOptions, SystemConfig, SettingsTab, OutputMetadata, MultiClip, ServicesConfig, HostTermId, HostTermsStatus, LlmStatus, LlmModelOption, AudioAnalysisResult, PlannedClip, ClipPlan, DirectorClipImage, DirectorImageGenProgress, DirectorImageRole, DirectorImageRoleLoraSelection, SpeakerMapping, DirectorSkill, DirectorShotImageGuidance, ShortFilmCharacter, ShortFilmPath, CivitAIModel, CivitAIDownload, PipelineListItem, PipelineRepairState, SavedPipelineState, SystemDetectResponse, SystemStats, RecastCharacterMapping, RepaintRegionMapping, AccountAuthResult, AccountContext, AccountProjectMigrationStatus, AccountSession, AccountSummary, ResponsibleUseProjection, SupportAdminProjection, SupportFulfillmentMutationInput, SupportManualContributionInput, SupportPublicProjection, SupportSelfProjection, SupportH3LegalAccessProjection, SupportH3LegalAccessLocationInput } from '../types'
 import * as api from '../api/client'
+import { h3CumulativeSelectionError } from '../lib/h3Cumulative'
 import { applyThemePrefs, getStoredPrefs, type FamilyId, type ThemeMode, type ThemePrefs } from '../lib/theme'
 import { HOST_TERM_NOTICES } from '../lib/hostTerms'
 import {
@@ -2286,6 +2287,7 @@ const H3_PROFILE_PARAM_KEYS = new Set<keyof GenerateParams>([
   'loras_multipliers',
   'h3_adaptive_conditioning',
   'h3_native_boundary_conditioning',
+  'h3_cumulative_append',
   'h3_adaptive_fl2va_model',
   'h3_adaptive_ref2va_model',
   'h3_fl2va_loras',
@@ -6438,6 +6440,7 @@ export const useStore = create<AppState>((set, get) => ({
     // param write flips image_mode (see videoSubModeStash).
     const prevImageMode = key === 'image_mode' ? ((get().params.image_mode as number) ?? 0) : null
     const profileSettingChanged = H3_PROFILE_PARAM_KEYS.has(key)
+    if (key === 'h3_cumulative_append') ++_h3EstimateSeq
     let adaptivePrepared: GenerateParams | undefined
     if (
       key === 'h3_adaptive_conditioning'
@@ -6457,6 +6460,13 @@ export const useStore = create<AppState>((set, get) => ({
     if (key === 'h3_adaptive_conditioning') ++_loraLoadSeq
     set(s => ({
       params: adaptivePrepared || { ...s.params, [key]: value },
+      ...(key === 'h3_cumulative_append' ? {
+        h3CurrentEstimate: null,
+        h3SegmentCountEstimate: null,
+        h3PerformanceProfiles: [],
+        h3EstimateLoading: false,
+        h3EstimateError: null,
+      } : {}),
       ...(profileSettingChanged ? {
         h3SelectedProfile: 'custom' as const,
         h3ProfileApplying: null,
@@ -7722,7 +7732,9 @@ export const useStore = create<AppState>((set, get) => ({
       return
     }
     const fps = options?.fps ?? 16
-    const frames = options
+    const frames = get().params.h3_cumulative_append === true
+      ? Math.max(22, Math.round(s * 24))
+      : options
       ? alignStudioTotalFrames(Math.round(s * fps), options)
       : Math.round(s * fps)
     const effectiveSeconds = Math.round((frames / fps) * 1000) / 1000
@@ -8740,6 +8752,17 @@ export const useStore = create<AppState>((set, get) => ({
     )
     if (nativeBoundaryError) {
       window.alert(nativeBoundaryError)
+      return
+    }
+    const cumulativeError = h3CumulativeSelectionError(
+      state.params, state.modelOptions?.h3_cumulative_append, state.generationMode, {
+        references: !!(state.startImage || state.endImage || state.imageRefs.length || state.projectAssetRefs.length),
+        enhancement: state.studioPromptEnhance,
+        postprocessing: !!(state.spatialUpsampling || state.filmGrainIntensity > 0 || state.voiceCloneEnabled),
+      },
+    )
+    if (cumulativeError) {
+      window.alert(cumulativeError)
       return
     }
     const h3StudioModel = H3_STUDIO_MODELS.has(state.params.model_type)
@@ -9999,7 +10022,7 @@ export const useStore = create<AppState>((set, get) => ({
       }
     }
 
-    const initialH3Estimate = String(params.model_type || '').startsWith('minimax_h3')
+    const initialH3Estimate = params.h3_cumulative_append !== true && String(params.model_type || '').startsWith('minimax_h3')
       ? state.h3CurrentEstimate
       : null
     // Uploads above can outlive a project switch. Never admit the frozen
@@ -10010,7 +10033,7 @@ export const useStore = create<AppState>((set, get) => ({
     const holdForQueue = mode === 'queue'
     const durablePreparationExpected = !holdForQueue && (
       enhanceBeforeGenerate
-      || String(params.model_type || '').startsWith('minimax_h3')
+      || (params.h3_cumulative_append !== true && String(params.model_type || '').startsWith('minimax_h3'))
     )
     const newJob: GenerationJob = {
       id: '',
@@ -10045,7 +10068,7 @@ export const useStore = create<AppState>((set, get) => ({
     }))
 
     try {
-      applyH3SegmentCeilingPolicy(params, state.slidingWindowLocked)
+      if (params.h3_cumulative_append !== true) applyH3SegmentCeilingPolicy(params, state.slidingWindowLocked)
       const liveProjectAssetRefs = get()
       const stagedProjectAssetRefScopeMatches = projectAssetRefScopeForSubmission === null
         ? liveProjectAssetRefs.projectAssetRefScope === null
@@ -11353,6 +11376,11 @@ export const useStore = create<AppState>((set, get) => ({
   refreshH3PerformanceEstimates: async () => {
     const seq = ++_h3EstimateSeq
     const state = get()
+    if (state.params.h3_cumulative_append === true) {
+      set({ h3PerformanceProfiles: [], h3CurrentEstimate: null, h3SegmentCountEstimate: null,
+        h3EstimateLoading: false, h3EstimateError: null })
+      return
+    }
     const isH3 = state.generationMode === 'video' && (
       state.params.model_type.startsWith('minimax_h3')
       || String(state.modelOptions?.architecture || '').startsWith('minimax_h3')
@@ -11384,6 +11412,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   refreshH3ModelProfileCompatibility: async (modelType) => {
     const state = get()
+    if (state.params.h3_cumulative_append === true) return
     const requestedProfileId = state.h3SelectedProfile
     if (
       requestedProfileId === 'custom'
@@ -11444,6 +11473,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   normalizeH3EditableProfile: async () => {
     const state = get()
+    if (state.params.h3_cumulative_append === true) return false
     if (state.generationMode !== 'video' || !H3_STUDIO_MODELS.has(state.params.model_type)) return false
     const seq = ++_h3ProfileApplySeq
     ++_h3EstimateSeq
@@ -11527,11 +11557,14 @@ export const useStore = create<AppState>((set, get) => ({
         return
       }
       const { durationSeconds, slidingWindowSeconds, slidingWindowLocked } = get()
+      const cumulative = get().params.h3_cumulative_append === true
       const fps = options.fps || 16
       // Set overlap from model defaults
       const swDefaults = (options as unknown as Record<string, unknown>).sliding_window_defaults as Record<string, number> | undefined
       const requestedDurationFrames = Math.round(durationSeconds * fps)
-      const effectiveDurationFrames = alignStudioTotalFrames(requestedDurationFrames, options)
+      const effectiveDurationFrames = cumulative
+        ? Number(get().params.video_length) || Math.max(22, requestedDurationFrames)
+        : alignStudioTotalFrames(requestedDurationFrames, options)
       const effectiveDurationSeconds = Math.round((effectiveDurationFrames / fps) * 1000) / 1000
       const latent = Math.max(1, Math.trunc(options.latent_size || options.frames_steps || 4))
       const segmented = usesStudioSegments(options)
@@ -11564,7 +11597,7 @@ export const useStore = create<AppState>((set, get) => ({
       const paramUpdates: Record<string, unknown> = {
         guidance_phases: options.guidance_max_phases,
         video_length: effectiveDurationFrames,
-        sliding_window_size: supportsWindowPlanning ? effectiveWindowFrames : undefined,
+        sliding_window_size: cumulative ? get().params.sliding_window_size : supportsWindowPlanning ? effectiveWindowFrames : undefined,
         sliding_window_overlap: overlapDefault,
         sliding_window_discard_last_frames: discardDefault,
       }
@@ -11635,9 +11668,10 @@ export const useStore = create<AppState>((set, get) => ({
         modelOptions: options,
         modelOptionsLoading: false,
         ...(!options.audio_only ? { durationSeconds: effectiveDurationSeconds } : {}),
-        ...(supportsWindowPlanning ? { slidingWindowSeconds: effectiveWindowSeconds } : {}),
+        ...(cumulative ? { slidingWindowSeconds: Number(get().params.sliding_window_size || 124) / 24 }
+          : supportsWindowPlanning ? { slidingWindowSeconds: effectiveWindowSeconds } : {}),
         slidingWindowOverlap: overlapDefault,
-        slidingWindowLocked: supportsWindowPlanning ? slidingWindowLocked : false,
+        slidingWindowLocked: cumulative || (supportsWindowPlanning && slidingWindowLocked),
         params: {
           ...s.params,
           ...paramUpdates,
@@ -17438,6 +17472,7 @@ export const useStore = create<AppState>((set, get) => ({
     // For image_mode: use 1 (I2V UI toggle) if start image was used, else 0
     const newParams = {
       ...projectGenerationProfileParameters(p),
+      h3_cumulative_append: p.h3_cumulative_append === true,
       prompt: originalPrompt,
       model_type: modelType,
       resolution: (p.resolution as string) || '1280x720',
@@ -17842,7 +17877,9 @@ export const useStore = create<AppState>((set, get) => ({
     // different model; clamp those instead of reintroducing hidden stale state.
     const restoredOptions = get().modelOptions
     const fps = restoredOptions?.fps || model?.fps || 16
-    const restoredFrames = restoredOptions
+    const restoredFrames = newParams.h3_cumulative_append === true
+      ? Math.max(22, Math.round(Number(newParams.video_length || 22)))
+      : restoredOptions
       ? alignStudioTotalFrames(Number(newParams.video_length || 81), restoredOptions)
       : Math.max(1, Math.round(Number(newParams.video_length || 81)))
     newParams.video_length = restoredFrames
@@ -17854,7 +17891,10 @@ export const useStore = create<AppState>((set, get) => ({
           ? newParams.duration_seconds
           : Math.round((restoredFrames / fps) * 1000) / 1000,
     }
-    if (restoredOptions && (restoredOptions.sliding_window || usesStudioSegments(restoredOptions))) {
+    if (newParams.h3_cumulative_append === true) {
+      timingState.slidingWindowSeconds = Number(newParams.sliding_window_size || 124) / 24
+      timingState.slidingWindowLocked = true
+    } else if (restoredOptions && (restoredOptions.sliding_window || usesStudioSegments(restoredOptions))) {
       const defaults = restoredOptions.sliding_window_defaults || {}
       const latent = Math.max(1, Math.trunc(restoredOptions.latent_size || restoredOptions.frames_steps || 4))
       const requestedWindow = Math.max(1, Math.round(Number(newParams.sliding_window_size || defaults.window_default || restoredFrames)))

@@ -92,12 +92,14 @@ export function H3PerformanceProfiles() {
   const spatialUpsampling = useStore(state => state.spatialUpsampling)
   const applyProfile = useStore(state => state.applyH3PerformanceProfile)
   const refresh = useStore(state => state.refreshH3PerformanceEstimates)
+  const cumulative = useStore(state => state.params.h3_cumulative_append === true)
   const estimateSignature = useStore(state => JSON.stringify([
     state.params.model_type,
     state.params.num_inference_steps,
     state.params.resolution,
     state.params.custom_settings || {},
     state.params.h3_native_boundary_conditioning === true,
+    state.params.h3_cumulative_append === true,
     state.params.activated_loras || [],
     state.params.loras_multipliers || '',
     state.params.tea_cache,
@@ -152,6 +154,8 @@ export function H3PerformanceProfiles() {
       }, new Map<string, string[]>()),
     ([reason, labels]) => `${labels.join('/')} unavailable: ${reason}`,
   )
+
+  if (cumulative) return <p className="rounded border border-border p-3 text-[10px] text-text-muted">Cumulative timeline uses native H3 settings. Time and memory estimates and performance presets are unavailable for this mode.</p>
 
   return (
     <div className="rounded-lg border border-border bg-bg-tertiary/35 p-3 space-y-2">

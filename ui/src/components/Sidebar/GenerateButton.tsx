@@ -100,6 +100,7 @@ export function GenerateButton() {
     )
   ))
   const h3Estimate = useStore(s => s.h3CurrentEstimate)
+  const cumulative = useStore(s => s.params.h3_cumulative_append === true)
   const h3EstimateLoading = useStore(s => s.h3EstimateLoading)
   const h3DownloadRequired = useStore(s => {
     const types = h3ActiveCheckpoints(s.params)
@@ -305,7 +306,7 @@ export function GenerateButton() {
             Use Dense SDPA
           </button>
         )}
-        {isH3 && <H3EstimateBadge estimate={h3Estimate} loading={h3EstimateLoading} downloadRequired={h3DownloadRequired} />}
+        {isH3 && !cumulative && <H3EstimateBadge estimate={h3Estimate} loading={h3EstimateLoading} downloadRequired={h3DownloadRequired} />}
       </div>
     )
   }
@@ -340,7 +341,7 @@ export function GenerateButton() {
           <ListPlus size={13} />
         </button>
       </div>
-      {isH3 && <H3EstimateBadge estimate={h3Estimate} loading={h3EstimateLoading} downloadRequired={h3DownloadRequired} />}
+      {isH3 && !cumulative && <H3EstimateBadge estimate={h3Estimate} loading={h3EstimateLoading} downloadRequired={h3DownloadRequired} />}
     </div>
   )
 }

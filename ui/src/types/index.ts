@@ -576,6 +576,8 @@ export interface GenerateParams extends H3AdaptiveSelection {
   h3_adaptive_conditioning?: boolean
   /** Opt-in decoded A/V boundary history; requires the host experimental gate. */
   h3_native_boundary_conditioning?: boolean
+  /** Native cumulative timeline; availability is supplied by the host. */
+  h3_cumulative_append?: boolean
   /** Explicit acknowledgement required whenever the effective plan loads the
    * separately licensed Ref2VA checkpoint. Filled from the local terms UI. */
   h3_ref2va_terms_accepted?: boolean
@@ -1433,6 +1435,7 @@ export interface ChoiceConfig {
 }
 
 export interface ModelOptions {
+  h3_cumulative_append?: boolean
   model_type: string
   architecture: string
   guidance_max_phases: number

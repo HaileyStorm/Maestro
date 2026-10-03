@@ -1149,3 +1149,58 @@ The live operator gate remains off. Authenticated live queue publication and
 crash/restart, rendered browser behavior, and human listening/visual acceptance
 remain open. Native restore, mocked route checks and final-copy media evidence
 do not satisfy those gates. The continuous sprint Goal remains active.
+
+## Gated cumulative browser controls
+
+Advanced Settings now contains an experimental cumulative timeline selection
+and a legal first-window frame selector. The host advertises availability only
+for exact Base H3 with the cumulative operator gate enabled. An unavailable
+saved selection can still be turned off. The existing Generate and held Queue
+paths submit the public boolean; the server remains authoritative for capacity
+and final normalized admission. No new public activation is implied.
+
+Cumulative total duration edits and Load Settings retain exact total and
+first-window frame counts rather than using the ordinary clip grid. Model
+metadata refresh preserves those counts. The duration and prompt controls omit
+ordinary shot/section counts, and H3 performance presets and time/memory
+estimates are unavailable. Selecting this mode invalidates outstanding ordinary
+estimate requests. Incompatible references, LoRAs, acceleration profiles,
+enhancement and postprocessing produce actionable errors before uploads or job
+creation. The prompt is retained without subject-matter inspection.
+
+Both public cumulative and decoded clip-continuity booleans are classified in
+the canonical saved-profile catalog. The existing clip-continuity flag was
+missing from that catalog and prevented complete profile capture even when
+false. Profile capture and restore now retain these public choices and clear
+omitted legacy selections; private worker state remains excluded.
+
+Twelve focused UI/profile checks and eight source admission/profile checks pass.
+They include actual store immediate/held submission, rejection before mutation,
+estimate suppression, model-options hydration, Load Settings, and saved-profile
+round trips, plus stale estimate response rejection and ordinary estimation
+after turning the mode off. Backend profile normalization accepts the boolean
+and rejects malformed values. Two adjacent backend profile storage/catalog
+checks also pass. The frontend production build and scoped lint pass; launch
+lint retains its existing 817-diagnostic baseline. No full suite or native/GPU
+workload was repeated.
+
+The built UI was inspected in a temporary local browser tab. The cumulative
+checkbox was visibly disabled and explained host unavailability while the gate
+remained off. The existing owner editor draft was preserved. Local health and
+readiness returned 200, and the stable-share readiness endpoint returned 200
+through curl. The Python default user agent received Cloudflare 1010, and this
+browser blocked the stable-share navigation; neither observation proves remote
+browser acceptance. Enabled-mode rendered interaction, authenticated live queue
+publication/recovery and human quality acceptance remain open.
+
+The bounded independent review found two source issues: a nullable profile
+selector could reach an HTTP route requiring an exact boolean, and Generate
+still showed a calibrating badge despite unavailable cumulative estimates.
+The cumulative profile field now rejects null, with a focused real profile
+normalization/HTTP-selector regression. Both Generate button branches omit the
+badge in cumulative mode. A focused component markup check uses the arranged
+store snapshot, covers ready and disabled controls, and preserves the ordinary
+calibrating badge after turning cumulative mode off. This markup check is not
+enabled-mode live browser acceptance. The first test-harness attempts needed
+Node require/JSX setup and the arranged Zustand server snapshot; the corrected
+fixture passes. The final production build also passes after these corrections.

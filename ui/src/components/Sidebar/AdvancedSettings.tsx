@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { createPortal } from 'react-dom'
 import { X, SlidersHorizontal } from 'lucide-react'
 import { useStore } from '../../stores/useStore'
+import { H3_CUMULATIVE_FIRST_WINDOWS, h3CumulativeSelectionError } from '../../lib/h3Cumulative'
 import { closeModalIfTop, installModalFocus } from '../../lib/modalFocus'
 import { PostProcessing } from './PostProcessing'
 import { ControlVideoSection } from './ControlVideoSection'
@@ -88,6 +89,7 @@ function useAdvancedActiveItems(): string[] {
     items.push('H3 Dense SDPA')
   }
   if (params.h3_native_boundary_conditioning === true) items.push('Experimental clip continuity')
+  if (params.h3_cumulative_append === true) items.push('Cumulative timeline')
   // injection_strength only matters when injected frames actually exist.
   // The persisted snapshot strips image_refs (file paths are ephemeral)
   // but kept the strength value — counting it alone produced a ghost
@@ -187,6 +189,9 @@ export function AdvancedSettings() {
     return refs && refs.length > 0
   })
   const localImageRefCount = useStore(s => s.imageRefs?.length ?? 0)
+  const projectAssetRefCount = useStore(s => s.projectAssetRefs.length)
+  const studioPromptEnhance = useStore(s => s.studioPromptEnhance)
+  const cumulativePostprocessing = useStore(s => Boolean(s.spatialUpsampling || s.filmGrainIntensity > 0 || s.voiceCloneEnabled))
   const durationSeconds = useStore(s => s.durationSeconds)
   const setDurationSeconds = useStore(s => s.setDurationSeconds)
   const selectModel = useStore(s => s.selectModel)
@@ -201,6 +206,13 @@ export function AdvancedSettings() {
   )
   const nativeBoundarySelected = params.h3_native_boundary_conditioning != null && params.h3_native_boundary_conditioning !== false
   const nativeBoundaryAvailable = isH3 && isVideo && modelOptions?.h3_native_boundary_conditioning === true
+  const cumulativeSelected = params.h3_cumulative_append === true
+  const cumulativeAvailable = modelOptions?.h3_cumulative_append === true
+  const cumulativeError = h3CumulativeSelectionError(params, cumulativeAvailable, isVideo ? 'video' : 'other', {
+    references: hasStartImage || hasEndImage || !!localImageRefCount || !!projectAssetRefCount,
+    enhancement: studioPromptEnhance,
+    postprocessing: cumulativePostprocessing,
+  })
   const minimumInferenceSteps = isH3 ? 2 : 1
   const [h3AccelerationResult, setH3AccelerationResult] = useState<H3AccelerationStatus | false | null>(null)
   const h3Acceleration = h3AccelerationResult || null
@@ -335,8 +347,37 @@ export function AdvancedSettings() {
 
               {/* Window Settings */}
               {(isVideo || (isAvatar && !isScailEdit))
-                && modelOptions?.sliding_window
+                && !cumulativeSelected && modelOptions?.sliding_window
                 && <WindowSettings />}
+
+              {((isH3 && isVideo) || cumulativeSelected) && (
+                <div className="space-y-2 rounded border border-border p-2 text-[10px] text-text-muted">
+                  <label className="mobile-control-target flex items-start gap-2">
+                    <input type="checkbox" aria-label="Cumulative timeline (experimental)"
+                      checked={cumulativeSelected} disabled={!cumulativeSelected && !cumulativeAvailable}
+                      onChange={event => {
+                        if (event.target.checked && !H3_CUMULATIVE_FIRST_WINDOWS.includes(Number(params.sliding_window_size))) {
+                          setParam('sliding_window_size', 124)
+                        }
+                        setParam('h3_cumulative_append', event.target.checked)
+                      }} className="mt-0.5 accent-accent-blue" />
+                    <span><span className="block text-text-primary">Cumulative timeline · experimental</span>
+                      <span className="block">Continue one video with its retained picture and sound. Each window adds new frames; the last output contains the whole timeline. Quality is still being evaluated.</span>
+                      {!cumulativeAvailable && <span className="block">Unavailable on this host. A saved selection can be turned off here.</span>}
+                    </span>
+                  </label>
+                  {cumulativeSelected && <>
+                    <label className="block" htmlFor="h3-cumulative-first-window">First window</label>
+                    <select id="h3-cumulative-first-window" value={params.sliding_window_size ?? 124}
+                      onChange={event => setParam('sliding_window_size', Number(event.target.value))}
+                      className="mobile-control-target w-full rounded border border-border bg-bg-primary p-2 text-text-primary">
+                      {H3_CUMULATIVE_FIRST_WINDOWS.map(frames => <option key={frames} value={frames}>{frames} frames · {(frames / 24).toFixed(3)} seconds</option>)}
+                    </select>
+                    <p>Set the total length with Duration. Smaller first windows start continuation sooner. Longer timelines may need a smaller canvas; Maestro checks output capacity before queueing. Time and memory estimates are unavailable for this mode.</p>
+                    {cumulativeError && <p role="status" className="text-amber-200">{cumulativeError}</p>}
+                  </>}
+                </div>
+              )}
 
               {(nativeBoundaryAvailable || nativeBoundarySelected) && (
                 <label className="mobile-control-target flex items-start gap-2 rounded border border-border p-2 text-[10px] text-text-muted">

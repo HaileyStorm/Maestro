@@ -13,6 +13,8 @@
     "sliding_window_overlap": {"type":"integer","nullable":true,"minimum":0,"maximum":16777216},
     "sliding_window_discard_last_frames": {"type":"integer","nullable":true,"minimum":0,"maximum":16777216},
     "h3_adaptive_conditioning": {"type":"boolean","nullable":true},
+    "h3_cumulative_append": {"type":"boolean"},
+    "h3_native_boundary_conditioning": {"type":"boolean","nullable":true},
     "h3_adaptive_fl2va_model": {"type":"string","nullable":true,"max_bytes":128,"pattern":"(?:[A-Za-z0-9][A-Za-z0-9_.:+~-]{0,127})?"},
     "h3_adaptive_ref2va_model": {"type":"string","nullable":true,"max_bytes":128,"pattern":"(?:[A-Za-z0-9][A-Za-z0-9_.:+~-]{0,127})?"},
     "h3_fl2va_loras": {"type":"string_array","nullable":true,"max_items":64,"max_bytes":512},

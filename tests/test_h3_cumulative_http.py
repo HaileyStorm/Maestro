@@ -151,6 +151,7 @@ class H3CumulativeHttpTests(unittest.TestCase):
         wanted = {
             "_reject_client_h3_internal_state",
             "_consume_h3_cumulative_selection",
+            "_h3_cumulative_http_available",
             "_validate_h3_cumulative_acceleration",
             "_public_h3_cumulative_plan",
             "_plan_generation_submission",
@@ -216,6 +217,51 @@ class H3CumulativeHttpTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as raised:
             self.call(source())
         self.assertEqual(raised.exception.status_code, 403)
+        self.assertEqual(self.jobs, [])
+        self.next_id.assert_not_called()
+
+    def test_host_availability_is_exact_base_and_gate(self):
+        available = self.ns["_h3_cumulative_http_available"]
+        self.assertTrue(available("minimax_h3"))
+        for model in ("minimax_h3_ref2va", "minimax_h3_w4a8_fl2va", "other"):
+            self.assertFalse(available(model))
+        with patch.dict(os.environ, {"MAESTRO_H3_CUMULATIVE_EXPERIMENTAL": "0"}):
+            self.assertFalse(available("minimax_h3"))
+
+    def test_saved_profile_selector_matches_http_boolean_contract(self):
+        from services.generation_presets import (
+            GenerationPresetError,
+            _normalize_v2_params,
+        )
+
+        params = {
+            "resolution": "1344x768",
+            "video_length": 141,
+            "num_inference_steps": 28,
+            "guidance_scale": 1,
+            "seed": 41,
+            "image_mode": 0,
+            "repeat_generation": 1,
+            "settings_version": 2,
+        }
+        for enabled in (True, False):
+            normalized = _normalize_v2_params(
+                {**params, "h3_cumulative_append": enabled}, mode="video"
+            )
+            self.assertEqual(
+                self.ns["_consume_h3_cumulative_selection"](
+                    source(h3_cumulative_append=normalized["h3_cumulative_append"])
+                ),
+                enabled,
+            )
+        for invalid in (None, "true", 1, [], {}):
+            with (
+                self.subTest(invalid=invalid),
+                self.assertRaises(GenerationPresetError),
+            ):
+                _normalize_v2_params(
+                    {**params, "h3_cumulative_append": invalid}, mode="video"
+                )
         self.assertEqual(self.jobs, [])
         self.next_id.assert_not_called()
 

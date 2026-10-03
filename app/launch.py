@@ -16928,6 +16928,13 @@ def _reject_client_h3_internal_state(
         )
 
 
+def _h3_cumulative_http_available(model_type: str) -> bool:
+    return (
+        model_type == "minimax_h3"
+        and os.environ.get("MAESTRO_H3_CUMULATIVE_EXPERIMENTAL") == "1"
+    )
+
+
 def _consume_h3_cumulative_selection(
     body: dict, *, enhance_before_generate: bool = False,
 ) -> bool:
@@ -23190,6 +23197,7 @@ def get_model_options(model_type: str, request: Request):
             model_type in _H3_LONG_STUDIO_MODELS
             and os.environ.get("MAESTRO_H3_NATIVE_BOUNDARY_EXPERIMENTAL") == "1"
         ),
+        "h3_cumulative_append": _h3_cumulative_http_available(model_type),
         "minimax_h3_conditioning_mode": md.get("minimax_h3_conditioning_mode"),
         "minimax_h3_conditioning_modes_mutually_exclusive": md.get(
             "minimax_h3_conditioning_modes_mutually_exclusive", False,

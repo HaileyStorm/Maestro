@@ -13,6 +13,7 @@ export function DurationSlider() {
   const locked = useStore(s => s.slidingWindowLocked)
   const setLocked = useStore(s => s.setSlidingWindowLocked)
   const modelOptions = useStore(s => s.modelOptions)
+  const cumulative = useStore(s => s.params.h3_cumulative_append === true)
   const guideVideoFps = useStore(s => s.guideVideoFps)
   const guideVideoFrameCount = useStore(s => s.guideVideoFrameCount)
   const forceFps = useStore(s => s.params.force_fps)
@@ -36,11 +37,11 @@ export function DurationSlider() {
   ].join(':'))
   const fps = modelOptions?.fps ?? 16
   const supportsSliding = modelOptions?.sliding_window === true
-  const usesSegments = usesStudioSegments(modelOptions)
-  const supportsWindowPlanning = supportsSliding || usesSegments
+  const usesSegments = !cumulative && usesStudioSegments(modelOptions)
+  const supportsWindowPlanning = !cumulative && (supportsSliding || usesSegments)
   const swDefaults = modelOptions?.sliding_window_defaults || {}
-  const durationMin = modelOptions ? modelOptions.frames_minimum / fps : 1
-  const durationMax = usesSegments ? 300 : modelOptions?.frames_maximum ? modelOptions.frames_maximum / fps : 300
+  const durationMin = cumulative ? 22 / 24 : modelOptions ? modelOptions.frames_minimum / fps : 1
+  const durationMax = cumulative || usesSegments ? 300 : modelOptions?.frames_maximum ? modelOptions.frames_maximum / fps : 300
   // A short H3 clip must land on its native temporal grid. One-second range
   // steps make the thumb report a different duration from the aligned output.
   // Longer timelines retain frame-level precision for exact authored timing.
@@ -48,7 +49,7 @@ export function DurationSlider() {
     1 / fps,
     (modelOptions?.frame_alignment_modulus || modelOptions?.frames_steps || 1) / fps,
   )
-  const durationStep = usesSegments
+  const durationStep = cumulative ? 1 / 24 : usesSegments
     ? Math.round(duration * fps) <= (modelOptions?.frames_maximum ?? 0)
       ? nativeDurationStep
       : 1 / fps
@@ -66,7 +67,7 @@ export function DurationSlider() {
   const plannedUnitLabel = usesSegments
     ? windowCount === 1 ? 'shot' : 'shots'
     : windowCount === 1 ? 'section' : 'sections'
-  const showSlidingWindow = windowCount > 1
+  const showSlidingWindow = !cumulative && windowCount > 1
 
   const prompt = useStore(s => s.params.prompt)
   useEffect(() => {
@@ -119,6 +120,7 @@ export function DurationSlider() {
         <label htmlFor="studio-duration-seconds" className="text-[11px] text-text-muted uppercase tracking-wider">Duration</label>
         <span className="text-xs text-text-secondary">
           {formatMediaDuration(duration)}
+          {cumulative && <span className="ml-1 text-text-muted">({Math.round(duration * 24)} final frames)</span>}
           {(usesSegments || showSlidingWindow) && (
             <span className="text-text-muted ml-1">
               ({usesSegments
@@ -219,7 +221,7 @@ export function DurationSlider() {
           )}
         </div>
       )}
-      {!supportsWindowPlanning && modelOptions && (
+      {!cumulative && !supportsWindowPlanning && modelOptions && (
         <p className="mt-1 text-[9px] text-text-muted">
           Creates this clip in one pass · {geometry?.totalFrames ?? Math.round(duration * fps)} frames at {fps} fps.
         </p>
