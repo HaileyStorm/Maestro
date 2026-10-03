@@ -69265,7 +69265,10 @@ def _run_generation(
                             )
                         except (TypeError, ValueError):
                             params["repeat_start_offset"] = 0
-                if recovery_h3_segment:
+                # Cumulative windows seal below with their retained AV state.
+                # The ordinary callback would promote their media too early
+                # and record a segment checkpoint without that continuation.
+                if recovery_h3_segment and h3_cumulative_plan is None:
                     params["after_segment_output"] = (
                         _seal_h3_segment_before_concat
                     )
