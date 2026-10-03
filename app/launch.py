@@ -48232,7 +48232,7 @@ _H3_GALLERY_STILL_GUIDE_REQUEST_TOKEN = object()
 _H3_GALLERY_STILL_GUIDE_SETTINGS = frozenset({
     "video_length", "resolution", "num_inference_steps", "guidance_scale",
     "seed", "activated_loras", "loras_multipliers", "tea_cache",
-    "override_profile",
+    "override_profile", "attention_engine",
 })
 
 
@@ -48558,6 +48558,14 @@ async def h3_gallery_still_guide_endpoint(request: Request):
         raise HTTPException(
             status_code=400, detail="H3 Guide request fields are invalid",
         )
+    if "attention_engine" in settings and (
+        not isinstance(settings["attention_engine"], str)
+        or settings["attention_engine"] not in {"sdpa", "sol_attn"}
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="H3 Guide attention must be Dense SDPA or Sol",
+        )
     second_still = submitted.get("second_still")
     if "second_still" in submitted and (
         not isinstance(second_still, dict)
@@ -48697,7 +48705,9 @@ async def h3_gallery_still_guide_endpoint(request: Request):
             status_code=503, detail="H3 Guide model settings are unavailable",
         )
     params = copy.deepcopy(defaults)
-    params.update(copy.deepcopy(settings))
+    request_settings = copy.deepcopy(settings)
+    requested_attention = request_settings.pop("attention_engine", None)
+    params.update(request_settings)
     for key in _GENERATION_MEDIA_INPUTS:
         if key != "image_start":
             params[key] = [] if key == "image_refs" else None
@@ -48732,6 +48742,8 @@ async def h3_gallery_still_guide_endpoint(request: Request):
     }
     safe_custom["h3_source_audio_mode"] = "native"
     safe_custom["h3_native_boundary_conditioning"] = False
+    if requested_attention is not None:
+        safe_custom["h3_attention_engine"] = requested_attention
     safe_custom[H3_GALLERY_STILL_GUIDE_CUSTOM_KEY] = {
         "frame_index": frame_index,
     }

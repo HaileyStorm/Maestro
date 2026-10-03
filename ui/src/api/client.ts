@@ -1294,6 +1294,7 @@ export interface H3GalleryStillGuideRequest {
   prompt: string
   settings: {
     video_length: number
+    attention_engine?: 'sdpa' | 'sol_attn'
     resolution?: string
     num_inference_steps?: number
     guidance_scale?: number

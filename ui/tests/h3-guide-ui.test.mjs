@@ -259,6 +259,42 @@ test('the panel requires an explicit frame and submits exact image revision, FL2
   }
 })
 
+test('Guide attention applies only an explicit per-clip choice and preserves the sealed still request', async () => {
+  const { H3GuidePanel } = await loadGuideModule()
+  const originalFetch = globalThis.fetch
+  const requests = []
+  globalThis.__h3GuideHookStates = []
+  globalThis.fetch = async (_url, options) => {
+    requests.push(JSON.parse(options.body))
+    return Response.json({ job_id: 'guide-job', status: 'queued' })
+  }
+  try {
+    const props = panelProps({ secondStill: output('second.png') })
+    let tree = openPanel(H3GuidePanel, props)
+    fillGuide(tree, { frame: '31', length: '124' })
+    findLabel(tree, 'Second guide frame index, 0-based').props.onChange({ target: { value: '90' } })
+    findLabel(tree, 'Seed (optional)').props.onChange({ target: { value: '935314058' } })
+    assert.equal(findLabel(tree, 'Guide attention').props.value, '')
+    for (const engine of ['', 'sdpa', 'sol_attn', '']) {
+      findLabel(tree, 'Guide attention').props.onChange({ target: { value: engine } })
+      tree = renderPanel(H3GuidePanel, props)
+      await flatten(tree).find(element => element.type === 'form').props.onSubmit({ preventDefault() {} })
+      const request = requests.at(-1)
+      assert.deepEqual(request.settings, { video_length: 124, seed: 935314058, ...(engine ? { attention_engine: engine } : {}) })
+      assert.equal(request.frame_index, 31)
+      assert.equal(request.second_still.frame_index, 90)
+      assert.equal(request.private_output, true)
+      assert.equal(request.explicit_output, true)
+      tree = renderPanel(H3GuidePanel, props)
+    }
+    assert.equal(requests.length, 4)
+  } finally {
+    globalThis.fetch = originalFetch
+    delete globalThis.__h3GuideHookStates
+    delete globalThis.__h3GuideHookIndex
+  }
+})
+
 test('Guide seed is optional, preserves exact reusable values, and rejects invalid values before submission', async () => {
   const { H3GuidePanel } = await loadGuideModule()
   const originalFetch = globalThis.fetch

@@ -103,6 +103,7 @@ export function H3GuidePanel({
   const [secondFrameIndexValue, setSecondFrameIndexValue] = useState('')
   const [seedValue, setSeedValue] = useState('')
   const [thirdFrameIndexValue, setThirdFrameIndexValue] = useState('')
+  const [attentionEngine, setAttentionEngine] = useState<'' | 'sdpa' | 'sol_attn'>('')
 
   const compatibleModels = resolveH3GuideModels(models, enabledModels, modelsLoaded)
   const selectedModel = compatibleModels.find(model => model.model_type === modelType)
@@ -153,6 +154,7 @@ export function H3GuidePanel({
         prompt,
         settings: {
           video_length: targetFrameCount,
+          ...(attentionEngine !== '' ? { attention_engine: attentionEngine } : {}),
           ...(seedValue !== '' ? { seed: Number(seedValue) } : {}),
         },
         private_output: still.private || Boolean(secondStill?.private) || Boolean(thirdStill?.private),
@@ -254,6 +256,23 @@ export function H3GuidePanel({
               </select>
             </label>
           </div>
+          <label className="mt-3 flex flex-col gap-1 text-xs text-text-secondary">
+            <span>Attention</span>
+            <select
+              aria-label="Guide attention"
+              value={attentionEngine}
+              onChange={event => setAttentionEngine(event.target.value as '' | 'sdpa' | 'sol_attn')}
+              disabled={pending}
+              className="min-h-11 rounded-md border border-border bg-bg-tertiary px-2 text-text-primary"
+            >
+              <option value="">Use model default</option>
+              <option value="sdpa">Dense SDPA</option>
+              <option value="sol_attn">Sol</option>
+            </select>
+          </label>
+          <p className="mt-1 text-[11px] text-text-muted">
+            Applies to this clip only. Dense SDPA uses dense attention throughout. Sol can use sparse attention after its initial dense steps, with dense fallback when needed.
+          </p>
           <label className="mt-3 flex flex-col gap-1 text-xs text-text-secondary">
             <span>Seed (optional)</span>
             <input

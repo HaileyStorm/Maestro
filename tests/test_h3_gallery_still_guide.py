@@ -714,11 +714,6 @@ class H3GalleryStillGuideRouteTests(unittest.TestCase):
             "os": os,
             "_H3_BASE_FL2VA_MODEL": "minimax_h3",
             "_H3_GALLERY_STILL_GUIDE_REQUEST_TOKEN": self.token,
-            "_H3_GALLERY_STILL_GUIDE_SETTINGS": frozenset({
-                "video_length", "resolution", "num_inference_steps",
-                "guidance_scale", "seed", "activated_loras",
-                "loras_multipliers", "tea_cache", "override_profile",
-            }),
             "_GENERATION_MEDIA_INPUTS": (
                 "image_start", "image_end", "image_refs", "image_guide",
                 "image_mask", "video_guide", "video_guide2", "video_guide3",
@@ -783,6 +778,13 @@ class H3GalleryStillGuideRouteTests(unittest.TestCase):
             "_GenerationPreparationRequest": FakePreparationRequest,
             "generate": generate,
         }
+        # Exercise the production whitelist rather than a mirrored test copy.
+        import ast
+        tree = ast.parse((ROOT / "app/launch.py").read_text(encoding="utf-8"))
+        settings_node = next(node for node in tree.body if isinstance(node, ast.Assign)
+                             and any(isinstance(target, ast.Name) and target.id == "_H3_GALLERY_STILL_GUIDE_SETTINGS"
+                                     for target in node.targets))
+        exec(compile(ast.Module(body=[settings_node], type_ignores=[]), "launch.py", "exec"), self.ns)
         load_launch_functions(self.ns, "_resolve_h3_gallery_still_guide_source", "h3_gallery_still_guide_endpoint")
 
     def _authorized_output(self, _request, workspace, name):
@@ -944,6 +946,33 @@ class H3GalleryStillGuideRouteTests(unittest.TestCase):
                 maestro_account_session_id="s" * 32,
             ),
         )
+
+    def test_attention_override_is_per_job_and_preserves_guide_and_default_settings(self):
+        defaults = self.ns["wgp"].get_default_settings("minimax_h3")
+        self.ns["wgp"].get_default_settings = lambda _model: defaults
+        original = copy.deepcopy(defaults)
+        for attention in (None, "sdpa", "sol_attn"):
+            with self.subTest(attention=attention):
+                settings = {"video_length": 124, "seed": 935314058}
+                if attention is not None:
+                    settings["attention_engine"] = attention
+                asyncio.run(self.ns["h3_gallery_still_guide_endpoint"](self.pair_request(settings=settings)))
+                params = self.queued[-1]
+                self.assertEqual(params["custom_settings"]["h3_attention_engine"], attention or "sol_attn")
+                self.assertNotIn("attention_engine", params)
+                self.assertEqual(params["seed"], 935314058)
+                self.assertEqual(self.source.validate(params)["guide_count"], 2)
+                self.assertTrue(params["private_output"])
+                self.assertTrue(params["explicit_output"])
+                self.assertEqual(defaults, original)
+
+    def test_invalid_attention_is_rejected_before_any_job_is_queued(self):
+        for attention in ("", "sage2", "SDPA", None, True, 1, {}, []):
+            with self.subTest(attention=attention), self.assertRaises(HTTPException) as raised:
+                asyncio.run(self.ns["h3_gallery_still_guide_endpoint"](
+                    self.request(settings={"video_length": 124, "attention_engine": attention})))
+            self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(self.queued, [])
 
     def test_route_builds_one_trusted_still_and_inherits_source_privacy(self):
         loop_thread = threading.get_ident()
