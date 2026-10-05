@@ -61,7 +61,10 @@ def _load_functions(*names, extra=None):
 
 
 class BlenderDirectorVisionTests(unittest.TestCase):
-    def exercise(self, root, *, nonvision_lease=None):
+    def exercise(self, root, *, nonvision_lease=None, revision_mutator=None,
+                 director_prompt="Move the cube across the scene"):
+        from services.blender_mcp_service import BlenderMCPService
+
         selection = {
             "model_id": "configured-vision", "device": "cuda", "provider": "local",
             "remote_url": "", "api_key": "", "local_gguf_path": "",
@@ -70,14 +73,28 @@ class BlenderDirectorVisionTests(unittest.TestCase):
         observations = SimpleNamespace(
             leases=[], calls=[], samples=[], videos=[], assets=[], inside=False,
             resolves=0, generated=0, vision_checks=0, status_checks=0,
+            generation_inputs=[],
         )
         self.observations = observations
         plan = {
-            "scene": {"objects": [{"name": "Cube"}]},
-            "animation": {"frame_start": 0, "frame_end": 23},
+            "scene": {"clear_scene": True, "objects": [{
+                "name": "Cube", "primitive": "cube", "location": [0, 0, 0],
+                "material": {"name": "Blue", "color": [0.3, 0.5, 0.9, 1]},
+            }]},
+            "animation": {"frame_start": 0, "frame_end": 23, "objects": [{
+                "name": "Cube", "keyframes": [
+                    {"frame": 0, "location": [0, 0, 0], "interpolation": "LINEAR"},
+                    {"frame": 23, "location": [2, 0, 0], "interpolation": "LINEAR"},
+                ],
+            }]},
             "review_frames": [0, 23], "fps": 24,
-            "director_prompt": "Move the cube across the scene",
-            "semantic_mapping": {"conditioned_prompt": "moving cube"},
+            "director_prompt": director_prompt,
+            "semantic_mapping": {
+                "legend": [{"object_name": "Cube", "primitive": "cube",
+                            "color": [0.3, 0.5, 0.9, 1], "subject": "cube",
+                            "action": "moves to the right"}],
+                "conditioned_prompt": "moving cube",
+            },
         }
 
         async def body():
@@ -123,13 +140,19 @@ class BlenderDirectorVisionTests(unittest.TestCase):
             self.assertTrue(observations.inside)
             self.assertEqual(len(kwargs["image_paths"]), 2)
             self.assertTrue(all(Path(path).is_file() for path in kwargs["image_paths"]))
+            observations.generation_inputs.append(copy.deepcopy(kwargs))
             observations.generated += 1
             if observations.generated == 1:
-                return json.dumps({
+                revised = copy.deepcopy({
                     "verdict": "revise", "analysis": "Move farther",
                     "scene": plan["scene"], "animation": plan["animation"],
                     "review_frames": [0, 23],
+                    "semantic_mapping": plan["semantic_mapping"],
                 })
+                revised["animation"]["objects"][0]["keyframes"][1]["location"] = [3, 0, 0]
+                if revision_mutator:
+                    revision_mutator(revised)
+                return json.dumps(revised)
             return json.dumps({"verdict": "approved", "analysis": "Motion is readable"})
 
         def invoke(tool, args):
@@ -166,15 +189,16 @@ class BlenderDirectorVisionTests(unittest.TestCase):
         def forbidden(*args, **kwargs):
             self.fail("Blender review must not use global text-chat dispatch")
 
-        service = SimpleNamespace(
-            _normalize_scene_create=copy.deepcopy,
-            _normalize_animation=copy.deepcopy, invoke=invoke,
-        )
+        # Real pure validators exercise the revision boundary; the transport,
+        # rendering and model remain offline.
+        service = BlenderMCPService(SimpleNamespace(), root)
+        service.invoke = invoke
         llm = SimpleNamespace(
             vision_available=vision_available, get_status=status, generate=generate,
         )
         namespace = _load_functions(
             "blender_director_finalize", "_run_authorized_llm_with_selection",
+            "_normalize_blender_semantic_mapping", "_normalize_blender_review_frames",
             extra={
                 "api": SimpleNamespace(post=lambda _path: lambda function: function),
                 "Request": object, "asyncio": asyncio, "quote": quote,
@@ -187,9 +211,6 @@ class BlenderDirectorVisionTests(unittest.TestCase):
                     "private": False, "explicit": False,
                 },
                 "_blender_service_for": lambda *args: service,
-                "_normalize_blender_semantic_mapping": lambda value, *args, **kwargs:
-                    copy.deepcopy(value or kwargs["fallback"]),
-                "_normalize_blender_review_frames": lambda frames, *args: frames,
                 "_resolve_vision_llm_selection": resolve,
                 "_run_llm_with_selection": lease,
                 "_ensure_llm_loaded": forbidden,
@@ -226,6 +247,42 @@ class BlenderDirectorVisionTests(unittest.TestCase):
         self.assertEqual(candidate["metadata"]["director_model"], "configured-vision")
         self.assertEqual(candidate["status"], "candidate")
         self.assertEqual(observed.calls.count("render_animation"), 1)
+
+    def test_review_supplies_the_contract_to_the_model_without_mutating_tools(self):
+        from services.blender_mcp_service import PUBLIC_TOOL_SCHEMAS
+
+        original = copy.deepcopy(PUBLIC_TOOL_SCHEMAS)
+        with tempfile.TemporaryDirectory() as temporary:
+            result = self.exercise(
+                Path(temporary), director_prompt="Adult characters in a controversial violent drama",
+            )
+        self.assertEqual(result["status"], "awaiting_user_review")
+        inputs = self.observations.generation_inputs[0]
+        self.assertIn(json.dumps(inputs["json_schema"]), inputs["prompt"])
+        self.assertIn("Adult characters in a controversial violent drama", inputs["prompt"])
+        self.assertEqual(PUBLIC_TOOL_SCHEMAS, original)
+        self.assertNotIn('"$ref"', json.dumps(inputs["json_schema"]))
+
+    def test_invalid_revisions_remain_unpublished_and_clean_all_review_frames(self):
+        def arbitrary_code(value):
+            value["scene"]["objects"][0]["python"] = "bpy.ops.object.delete()"
+
+        def out_of_range(value):
+            value["animation"]["objects"][0]["keyframes"][1]["frame"] = 24
+
+        def conflicting_legend(value):
+            value["semantic_mapping"]["legend"][0]["color"] = [1, 0, 0, 1]
+
+        for mutate in (arbitrary_code, out_of_range, conflicting_legend):
+            with self.subTest(mutate=mutate.__name__), tempfile.TemporaryDirectory() as temporary:
+                with self.assertRaises(HTTPException) as failure:
+                    self.exercise(Path(temporary), revision_mutator=mutate)
+                self.assertEqual(failure.exception.status_code, 422)
+                self.assertEqual(list(Path(temporary).iterdir()), [])
+                self.assertNotIn("render_animation", self.observations.calls)
+                self.assertEqual(self.observations.calls.count("scene_create"), 1)
+                self.assertEqual(self.observations.assets, [])
+                self.assertEqual(self.observations.videos, [])
 
     def test_nonvision_load_stops_before_scene_work(self):
         with tempfile.TemporaryDirectory() as temporary:

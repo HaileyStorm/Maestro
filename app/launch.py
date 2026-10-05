@@ -34913,6 +34913,91 @@ async def blender_director_finalize(request: Request):
     lineage = f"blender-director:{run_id}"
 
     def execute_review_loop():
+        from services.blender_mcp_service import PUBLIC_TOOL_SCHEMAS
+
+        def inline_tool_schema(schema):
+            # llama-server's grammar converter cannot resolve nested refs or
+            # combine object properties with anyOf. Expand the existing tool
+            # contract rather than maintaining a second scene/animation shape.
+            definitions = schema.get("$defs", {})
+
+            def expand(value):
+                if isinstance(value, list):
+                    return [expand(item) for item in value]
+                if not isinstance(value, dict):
+                    return value
+                if "$ref" in value:
+                    return expand(definitions[value["$ref"].split("/")[-1]])
+                result = {
+                    key: expand(item) for key, item in value.items()
+                    if key != "$defs"
+                }
+                if "properties" in result and "anyOf" in result:
+                    alternatives = result.pop("anyOf")
+                    return {"anyOf": [
+                        {**result, "required": list(dict.fromkeys(
+                            result.get("required", []) + item["required"]
+                        ))}
+                        for item in alternatives
+                    ]}
+                return result
+
+            return expand(schema)
+
+        scene_schema = inline_tool_schema(PUBLIC_TOOL_SCHEMAS["scene_create"])
+        # A revision replaces the current scene; additive creation would collide
+        # with its existing object names on the next pass.
+        scene_schema["required"] = ["clear_scene", "objects"]
+        scene_schema["properties"]["clear_scene"] = {"enum": [True]}
+        animation_schema = inline_tool_schema(PUBLIC_TOOL_SCHEMAS["animate_keyframes"])
+        object_properties = scene_schema["properties"]["objects"]["items"]["properties"]
+        semantic_schema = {
+            "type": "object", "additionalProperties": False,
+            "required": ["legend", "conditioned_prompt"],
+            "properties": {
+                "legend": {
+                    "type": "array", "minItems": 1,
+                    "maxItems": scene_schema["properties"]["objects"]["maxItems"],
+                    "items": {
+                        "type": "object", "additionalProperties": False,
+                        "required": ["object_name", "primitive", "color", "subject", "action"],
+                        "properties": {
+                            "object_name": object_properties["name"],
+                            "primitive": object_properties["primitive"],
+                            "color": object_properties["material"]["properties"]["color"],
+                            "subject": {"type": "string", "minLength": 1, "maxLength": 500},
+                            "action": {"type": "string", "minLength": 1, "maxLength": 1000},
+                        },
+                    },
+                },
+                "conditioned_prompt": {"type": "string", "minLength": 1, "maxLength": 10000},
+            },
+        }
+        verdict_schema = {"anyOf": [
+            {
+                "type": "object", "additionalProperties": False,
+                "required": ["verdict", "analysis"],
+                "properties": {
+                    "verdict": {"enum": ["approved"]},
+                    "analysis": {"type": "string"},
+                },
+            },
+            {
+                "type": "object", "additionalProperties": False,
+                "required": ["verdict", "analysis", "scene", "animation", "review_frames", "semantic_mapping"],
+                "properties": {
+                    "verdict": {"enum": ["revise"]},
+                    "analysis": {"type": "string"},
+                    "scene": scene_schema,
+                    "animation": animation_schema,
+                    "review_frames": {
+                        "type": "array", "minItems": 2, "maxItems": 8,
+                        "items": {"type": "integer", "minimum": 0, "maximum": 1000000},
+                    },
+                    "semantic_mapping": semantic_schema,
+                },
+            },
+        ]}
         service = _blender_service_for(workspace, project_root)
         try:
             scene = service._normalize_scene_create(plan.get("scene") or {})
@@ -35018,25 +35103,19 @@ async def blender_director_finalize(request: Request):
                         "normalized object names, primitives, and colors. "
                         "Return verdict=approved only if the animation is ready for a "
                         "full-frame-rate render. Otherwise return verdict=revise and a "
-                        "complete replacement scene, animation, and 2-8 review_frames. "
+                        "complete replacement scene, animation, semantic_mapping, and "
+                        "2-8 distinct review_frames within the animation range. "
+                        "Use only the structured primitive and transform fields below; "
+                        "do not add cameras, lights, Python, paths, or external assets. "
+                        "Set scene.clear_scene=true to replace the previous scene. "
+                        "Preserve the requested animation duration. Every animation "
+                        "object must exist in the scene, every keyframe must be within "
+                        "frame_start..frame_end, and each keyframe needs a transform. "
+                        "Each legend entry must exactly match its scene object's name, "
+                        "primitive, and material color; keep material names consistent. "
+                        f"Response JSON schema: {json.dumps(verdict_schema)}. "
                         f"Current normalized plan: {json.dumps({'scene': scene, 'animation': animation, 'semantic_mapping': semantic_mapping})}"
                     )
-                    verdict_schema = {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "required": ["verdict", "analysis"],
-                        "properties": {
-                            "verdict": {"enum": ["approved", "revise"]},
-                            "analysis": {"type": "string"},
-                            "scene": {"type": "object"},
-                            "animation": {"type": "object"},
-                            "review_frames": {
-                                "type": "array", "minItems": 2, "maxItems": 8,
-                                "items": {"type": "integer"},
-                            },
-                            "semantic_mapping": {"type": "object"},
-                        },
-                    }
                     raw = _run_authorized_llm_with_selection(
                         request,
                         review_selection,

@@ -670,3 +670,16 @@ MCP service and LLM runtime tests passed, including actual extracted-route
 execution with mocked leases/renderers for two-pass review, changing settings,
 early capability rejection and mid-loop cleanup. These tests establish offline
 behavior; native Blender review and kept-video Editor acceptance remain pending.
+
+A leased native Blender attempt loaded the configured vision model and produced
+two visual-review responses, then rejected a revision during structured-plan
+validation before publishing a video. The raw revision was not retained, so its
+exact invalid field is unknown. The model was unloaded and the grant withdrawn.
+Director revisions now use the existing detailed scene/animation contracts,
+expanded for the local grammar converter, with a complete data-only semantic
+legend and replacement-scene requirement. The model also receives the schema
+in its prompt. All 135 affected tests passed; the final integration rerun passed
+20 tests, and the pinned runtime's official Python grammar converter accepted
+the schema without warnings. Actual scene, animation and legend validators
+remain controlling and invalid revisions clean their private review frames
+without publication. Native candidate, Keep and Editor acceptance remain pending.
