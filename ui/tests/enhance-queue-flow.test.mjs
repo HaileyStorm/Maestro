@@ -3101,6 +3101,76 @@ async function studioSubmissionFixture(t, handler, outputHandler) {
   return { useStore, requests, polls, outputReads, actualPoll: base._pollRecoveredJob }
 }
 
+test('Tools submissions keep canonical status polling across queued and running hydration', async t => {
+  for (const tool of ['revoice', 'upscale']) await t.test(tool, async t => {
+    const timers = new Map()
+    let timerId = 0
+    let statusReads = 0
+    let submitted
+    const { useStore, actualPoll } = await studioSubmissionFixture(t, async request => {
+      if (request.url === `/api/v1/tools/${tool}`) {
+        submitted = JSON.parse(request.body)
+        return jsonResponse({ job_id: 'tool-status-job', status: 'queued' })
+      }
+      if (request.url === '/api/v1/status/tool-status-job') {
+        statusReads++
+        return jsonResponse({ ...apiJobStatus('tool-status-job', 'studio-a', null, 17),
+          status: ['queued', 'running', 'cancelled'][statusReads - 1],
+          phase: statusReads === 2 ? 'Audio chunk 1: starting voice step 3 of 25' : '',
+        })
+      }
+      assert.fail(`Unexpected tool request ${request.url}`)
+    })
+    window.setTimeout = (callback, delay) => { const id = ++timerId; timers.set(id, { callback, delay }); return id }
+    window.clearTimeout = id => timers.delete(id)
+    useStore.setState({ toolsTool: tool, toolsSourcePath: 'source.mp4',
+      toolsRevoiceRefs: [{ path: 'voice.wav', filename: 'voice.wav' }],
+      _pollRecoveredJob: actualPoll, refreshOutputs: async () => {}, loadOutputs: async () => {},
+    })
+    await useStore.getState().runTool()
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(submitted.workspace, 'studio-a')
+    assert.equal(statusReads, 1)
+    assert.equal(useStore.getState().jobs[0].workspace, 'studio-a')
+    assert.equal(useStore.getState().jobs[0].createdAt, 17)
+    for (const expectedReads of [2, 3]) {
+      assert.equal(timers.size, 1)
+      const [id, timer] = timers.entries().next().value
+      assert.equal(timer.delay, 2_000, 'short tool jobs need canonical polling while queued too')
+      timers.delete(id)
+      timer.callback()
+      await new Promise(resolve => setImmediate(resolve))
+      assert.equal(statusReads, expectedReads)
+    }
+    assert.equal(useStore.getState().jobs[0].status, 'cancelled')
+    assert.equal(useStore.getState().isGenerating, false)
+    assert.equal(timers.size, 0)
+  })
+})
+
+test('Tools late acknowledgements and errors cannot follow a project round trip', async t => {
+  for (const outcome of ['ack', 'error']) await t.test(outcome, async t => {
+    const response = deferred()
+    const { useStore, polls, requests } = await studioSubmissionFixture(t, request => {
+      assert.equal(request.url, '/api/v1/tools/revoice')
+      return response.promise
+    })
+    useStore.setState({ toolsTool: 'revoice', toolsSourcePath: 'source.mp4',
+      toolsRevoiceRefs: [{ path: 'voice.wav', filename: 'voice.wav' }],
+    })
+    const pending = useStore.getState().runTool()
+    useStore.setState({ activeWorkspace: 'studio-b' })
+    useStore.setState({ activeWorkspace: 'studio-a' })
+    if (outcome === 'ack') response.resolve(jsonResponse({ job_id: 'late-tool-job', status: 'queued' }))
+    else response.reject(new Error('Late tool failure'))
+    await pending
+    assert.equal(requests.length, 1, 'never resubmit a tool operation')
+    assert.deepEqual(useStore.getState().jobs, [])
+    assert.deepEqual(polls, [])
+    assert.equal(useStore.getState().isGenerating, false)
+  })
+})
+
 function studioAccepted(body, overrides = {}) {
   const request = typeof body === 'string' ? JSON.parse(body) : body
   const job = {

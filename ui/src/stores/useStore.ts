@@ -8449,6 +8449,7 @@ export const useStore = create<AppState>((set, get) => ({
   runTool: async () => {
     const accountIdentityEpoch = _accountIdentityEpoch
     const s = get()
+    const workspace = s.activeWorkspace
     const source = s.toolsSourcePath
     if (!source) return
     const tool = s.toolsTool
@@ -8465,14 +8466,19 @@ export const useStore = create<AppState>((set, get) => ({
       id: '', status: 'queued', progress: 0, step: 0, totalSteps: 0,
       phase: '', message: tool === 'upscale' ? 'Submitting upscale...' : 'Submitting revoice...',
       outputFiles: [], error: null, oomInfo: null,
+      workspace, createdAt: Date.now() / 1000,
     }
     set(st => ({ isGenerating: true, jobs: [newJob, ...st.jobs] }))
+    let scopeLost = false
+    const unsubscribe = useStore.subscribe(state => {
+      if (state.activeWorkspace !== workspace) scopeLost = true
+    })
 
     try {
       const result = tool === 'upscale'
-        ? await api.submitToolUpscale({ video_path: source, method: s.toolsUpscaleMethod, workspace: s.activeWorkspace })
-        : await api.submitToolRevoice({ video_path: source, voice_ref_paths: refPaths, mode: s.toolsRevoiceMode, workspace: s.activeWorkspace })
-      if (!_accountIdentityIsCurrent(accountIdentityEpoch)) {
+        ? await api.submitToolUpscale({ video_path: source, method: s.toolsUpscaleMethod, workspace })
+        : await api.submitToolRevoice({ video_path: source, voice_ref_paths: refPaths, mode: s.toolsRevoiceMode, workspace })
+      if (scopeLost || !_accountIdentityIsCurrent(accountIdentityEpoch) || get().activeWorkspace !== workspace) {
         _discardStaleGenerationPlaceholder(newJob)
         return
       }
@@ -8480,10 +8486,10 @@ export const useStore = create<AppState>((set, get) => ({
       set(st => ({
         jobs: st.jobs.map(j => j === newJob ? { ...j, id: result.job_id, status: 'queued', message: 'Queued...' } : j),
       }))
-      get()._pollRecoveredJob(result.job_id)
+      get()._pollRecoveredJob(result.job_id, workspace, true)
       window.dispatchEvent(new CustomEvent('maestro:queue-refresh'))
     } catch (e) {
-      if (!_accountIdentityIsCurrent(accountIdentityEpoch)) {
+      if (scopeLost || !_accountIdentityIsCurrent(accountIdentityEpoch) || get().activeWorkspace !== workspace) {
         _discardStaleGenerationPlaceholder(newJob)
         return
       }
@@ -8493,6 +8499,8 @@ export const useStore = create<AppState>((set, get) => ({
         isGenerating: st.jobs.some(j => j !== newJob && _isActiveGenerationJob(j)),
       }))
       console.error(`Tool ${tool} failed:`, msg)
+    } finally {
+      unsubscribe()
     }
   },
   quickUpscaleClip: async (name, url) => {
