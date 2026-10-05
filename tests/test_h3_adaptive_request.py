@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import os
 from pathlib import Path
 import sys
 import types
@@ -22,13 +23,14 @@ class RequestError(Exception):
 class AdaptiveRequestTests(unittest.TestCase):
     def setUp(self):
         names = {'_h3_preferred_fl2va_model', '_apply_h3_adaptive_checkpoint',
-                 '_h3_estimate_context', 'h3_estimate'}
+                 '_h3_estimate_context', 'h3_estimate',
+                 '_require_h3_native_boundary_experimental'}
         nodes = [n for n in ast.parse((APP / 'launch.py').read_text()).body
                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in names]
         for n in nodes:
             n.decorator_list = []
         self.fl = {'minimax_h3', 'minimax_h3_pinkcherry_fl2va', 'minimax_h3_w4a8_fl2va'}
-        self.ns = dict(_H3_FL2VA_MODELS=self.fl,
+        self.ns = dict(os=os, _H3_FL2VA_MODELS=self.fl,
                        _H3_LONG_STUDIO_MODELS=self.fl | {'minimax_h3_ref2va'},
                        _H3_BASE_FL2VA_MODEL='minimax_h3', _H3_REF2VA_MODEL='minimax_h3_ref2va',
                        _H3_ESTIMATE_PROMPT_FIELD='prompt', Request=object, HTTPException=RequestError,

@@ -171,6 +171,7 @@ function createStore() {
     openQueueAfterSubmit: true,
     durationSeconds: 5,
     imageRefs: [],
+    projectAssetRefs: [],
     setParam() {},
     setOpenQueueAfterSubmit() {},
     setDurationSeconds() {},

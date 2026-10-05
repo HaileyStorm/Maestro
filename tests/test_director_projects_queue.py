@@ -552,9 +552,14 @@ class TestContinuumHoldQueueContracts(unittest.TestCase):
             running["id"]: running,
             leftover_status["id"]: leftover_status,
         }
+        declined = self._queued_hold()
+        jobs[declined["id"]] = declined
         released_ids = []
+        dispatched_ids = []
 
         def set_hold(job, held):
+            if job is declined:
+                return None
             if job.get("queue_held") is not True or held is not False:
                 return None
             if job.get("status") == "held":
@@ -562,6 +567,11 @@ class TestContinuumHoldQueueContracts(unittest.TestCase):
             job["queue_held"] = False
             released_ids.append(job["id"])
             return "resumed"
+
+        def start_worker(job):
+            self.assertFalse(job["queue_held"])
+            self.assertIn(job["id"], released_ids)
+            dispatched_ids.append(job["id"])
 
         start_queue = _load_isolated_function(
             "start_studio_queue",
@@ -580,6 +590,7 @@ class TestContinuumHoldQueueContracts(unittest.TestCase):
                 "_queue_recovery_delivery_pending": lambda _job: None,
                 "_require_job_runtime_model_admission": lambda _job: None,
                 "set_job_hold": set_hold,
+                "_start_restored_held_generation_worker": start_worker,
                 "HTTPException": RuntimeError,
             },
         )
@@ -596,6 +607,9 @@ class TestContinuumHoldQueueContracts(unittest.TestCase):
         self.assertEqual(leftover_status["status"], "held")
         self.assertNotIn(leftover_status["id"], released_ids)
         self.assertNotIn(running["id"], released_ids)
+
+        self.assertEqual(dispatched_ids, released_ids)
+        self.assertTrue(declined["queue_held"])
 
     def test_start_studio_queue_source_calls_set_job_hold(self):
         start_queue = _function(_parse_launch(), "start_studio_queue")

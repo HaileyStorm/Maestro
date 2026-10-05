@@ -77,27 +77,35 @@ def _signature(info):
 def _code_bytes(code):
     # Paths and line numbers do not alter the runtime contract. Preserve actual
     # loaded bytecode/constants rather than re-reading possibly edited source.
+    # Format 3+ records object sharing: lazy imports can change serialization
+    # even when the code object and all its semantic fields remain identical.
+    # Format 2 removes that reference-graph dependence. Encode constants
+    # separately so unordered frozensets also survive a fresh hash seed.
+    # Older saved binding digests remain mismatches; never reinterpret them.
     return marshal.dumps(
-        code.replace(
-            co_filename="",
-            co_firstlineno=1,
-            co_consts=tuple(
-                _normalized_code(value) if isinstance(value, types.CodeType) else value
-                for value in code.co_consts
+        (
+            "code",
+            marshal.dumps(
+                code.replace(co_filename="", co_firstlineno=1, co_consts=()), 2
             ),
-        )
-    )
-
-
-def _normalized_code(code):
-    return code.replace(
-        co_filename="",
-        co_firstlineno=1,
-        co_consts=tuple(
-            _normalized_code(value) if isinstance(value, types.CodeType) else value
-            for value in code.co_consts
+            tuple(_constant_bytes(value) for value in code.co_consts),
         ),
+        2,
     )
+
+
+def _constant_bytes(value):
+    # Tags preserve container/type identity; sort encoded set members only.
+    # Scalar marshal bytes retain signed zero, float bits and binary values.
+    if isinstance(value, types.CodeType):
+        return _code_bytes(value)
+    if isinstance(value, tuple):
+        encoded = ("tuple", tuple(_constant_bytes(item) for item in value))
+    elif isinstance(value, frozenset):
+        encoded = ("frozenset", tuple(sorted(_constant_bytes(item) for item in value)))
+    else:
+        encoded = ("scalar", marshal.dumps(value, 2))
+    return marshal.dumps(encoded, 2)
 
 
 def implementation_sha256(modules):

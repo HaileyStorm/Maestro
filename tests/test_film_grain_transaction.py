@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import ast
+import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 from types import SimpleNamespace
@@ -135,17 +137,10 @@ class FilmGrainTransactionTests(unittest.TestCase):
         self._assert_no_intermediate_files()
 
     def test_audio_remux_success_replaces_video_with_muxed_output(self):
-        audio_path = None
-
         def run_ffmpeg(args, **_kwargs):
-            nonlocal audio_path
             if args[0] == "ffprobe":
                 return SimpleNamespace(returncode=0, stdout="audio")
-            if "-vn" in args:
-                audio_path = Path(args[-1])
-                audio_path.write_bytes(b"audio")
-            else:
-                Path(args[-1]).write_bytes(b"grained-with-audio")
+            Path(args[-1]).write_bytes(b"grained-with-audio")
             return SimpleNamespace(returncode=0)
 
         def encode(**kwargs):
@@ -154,21 +149,13 @@ class FilmGrainTransactionTests(unittest.TestCase):
         with mock.patch.object(subprocess, "run", side_effect=run_ffmpeg):
             self._run(encode)
         self.assertEqual(self.video.read_bytes(), b"grained-with-audio")
-        self.assertIsNotNone(audio_path)
-        self.assertFalse(audio_path.exists())
         self._assert_no_intermediate_files()
 
     def test_audio_mux_failure_keeps_original_and_cleans_staging(self):
-        audio_path = None
-
         def run_ffmpeg(args, **_kwargs):
-            nonlocal audio_path
             if args[0] == "ffprobe":
                 return SimpleNamespace(returncode=0, stdout="audio")
-            if "-vn" in args:
-                audio_path = Path(args[-1])
-                audio_path.write_bytes(b"audio")
-                return SimpleNamespace(returncode=0)
+            Path(args[-1]).write_bytes(b"incomplete mux")
             return SimpleNamespace(returncode=1)
 
         def encode(**kwargs):
@@ -178,9 +165,110 @@ class FilmGrainTransactionTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "audio remux failed"):
                 self._run(encode)
         self.assertEqual(self.video.read_bytes(), b"original")
-        self.assertIsNotNone(audio_path)
-        self.assertFalse(audio_path.exists())
         self._assert_no_intermediate_files()
+
+    def test_cancel_after_remux_keeps_original_and_cleans_staging(self):
+        cancelled = False
+        mux_completed = False
+
+        def run_ffmpeg(args, **_kwargs):
+            nonlocal cancelled, mux_completed
+            if args[0] == "ffprobe":
+                return SimpleNamespace(returncode=0, stdout="audio")
+            Path(args[-1]).write_bytes(b"grained-with-audio")
+            if ".muxed." in args[-1]:
+                mux_completed = cancelled = True
+            return SimpleNamespace(returncode=0)
+
+        def encode(**kwargs):
+            Path(kwargs["save_file"]).write_bytes(b"grained")
+
+        with mock.patch.object(subprocess, "run", side_effect=run_ffmpeg):
+            with self.assertRaises(InterruptedError):
+                self._run(encode, cancel_check=lambda: cancelled)
+        self.assertTrue(mux_completed)
+        self.assertEqual(self.video.read_bytes(), b"original")
+        self._assert_no_intermediate_files()
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "CPU ffmpeg/ffprobe required")
+    def test_native_remux_preserves_every_audio_stream_and_exact_timeline(self):
+        def native(args):
+            return subprocess.run(args, capture_output=True, check=True, timeout=15).stdout
+
+        native([
+            "ffmpeg", "-nostdin", "-y", "-v", "error", "-filter_threads", "1",
+            "-filter_complex_threads", "1", "-f", "lavfi", "-i",
+            "testsrc2=size=192x128:rate=24:duration=1", "-f", "lavfi", "-i",
+            "sine=frequency=440:sample_rate=48000:duration=1", "-f", "lavfi", "-i",
+            "sine=frequency=880:sample_rate=48000:duration=1",
+            "-map", "0:v:0", "-map", "1:a:0", "-map", "2:a:0",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+            "-pix_fmt", "yuv420p", "-threads", "2", "-c:a", "aac", "-b:a", "64k",
+            "-t", "1", str(self.video),
+        ])
+        original = self.video.parent / "protected-source.mp4"
+        shutil.copyfile(self.video, original)
+        original.chmod(0o400)
+        self.addCleanup(original.chmod, 0o600)
+        protected_bytes = original.read_bytes()
+
+        def streams(path):
+            return json.loads(native([
+                "ffprobe", "-v", "error", "-show_streams", "-of", "json", str(path),
+            ]))["streams"]
+
+        def packets(path, stream):
+            payload = json.loads(native([
+                "ffprobe", "-v", "error", "-select_streams", stream,
+                "-show_packets", "-show_data_hash", "sha256", "-of", "json", str(path),
+            ]))
+            fields = ("pts", "dts", "duration", "size", "flags", "data_hash", "side_data_list")
+            return [{key: packet[key] for key in fields if key in packet}
+                    for packet in payload["packets"]]
+
+        def pcm(path, stream):
+            return native([
+                "ffmpeg", "-nostdin", "-v", "error", "-threads", "2", "-i", str(path),
+                "-map", stream, "-vn", "-acodec", "pcm_f32le", "-f", "f32le", "-",
+            ])
+
+        def encode(**kwargs):
+            # Isolate the real audio mux from frame processing with a valid video-only stage.
+            native([
+                "ffmpeg", "-nostdin", "-y", "-v", "error", "-threads", "2",
+                "-i", str(original), "-map", "0:v:0", "-c:v", "copy", "-an",
+                kwargs["save_file"],
+            ])
+
+        self._run(encode)
+        source_streams = streams(original)
+        result_streams = streams(self.video)
+        source_audio = [stream for stream in source_streams if stream["codec_type"] == "audio"]
+        result_audio = [stream for stream in result_streams if stream["codec_type"] == "audio"]
+        self.assertEqual(len(source_audio), 2)
+        self.assertEqual(len(result_audio), len(source_audio), "Every original audio track must survive")
+        for index, (source, result) in enumerate(zip(source_audio, result_audio)):
+            with self.subTest(audio_stream=index):
+                fields = ("codec_name", "sample_rate", "time_base", "start_time", "duration")
+                self.assertEqual({key: result[key] for key in fields}, {key: source[key] for key in fields})
+                self.assertEqual(packets(self.video, f"a:{index}"), packets(original, f"a:{index}"))
+                source_pcm = pcm(original, f"0:a:{index}")
+                self.assertGreater(len(source_pcm), 0)
+                self.assertEqual(pcm(self.video, f"0:a:{index}"), source_pcm)
+        source_video = next(stream for stream in source_streams if stream["codec_type"] == "video")
+        result_video = next(stream for stream in result_streams if stream["codec_type"] == "video")
+        fields = ("width", "height", "avg_frame_rate", "time_base", "start_time", "duration", "nb_frames")
+        self.assertEqual({key: result_video[key] for key in fields}, {key: source_video[key] for key in fields})
+        self.assertEqual((result_video["width"], result_video["height"], result_video["nb_frames"],
+                          result_video["avg_frame_rate"]), (192, 128, "24", "24/1"))
+        self.assertEqual(packets(self.video, "v:0"), packets(original, "v:0"))
+        native([
+            "ffmpeg", "-nostdin", "-v", "error", "-threads", "2", "-i", str(self.video),
+            "-map", "0", "-f", "null", "-",
+        ])
+        self.assertEqual(original.read_bytes(), protected_bytes)
+        self.assertEqual(sorted(path.name for path in self.video.parent.iterdir()),
+                         ["output.mp4", "protected-source.mp4"])
 
 
 if __name__ == "__main__":

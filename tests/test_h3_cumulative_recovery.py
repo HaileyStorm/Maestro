@@ -117,7 +117,14 @@ recovery.write_h3_cumulative_checkpoint(sys.argv[1], state, identity, 'unit:v1:'
 """
         result = subprocess.run(
             [sys.executable, "-c", script, str(self.project)],
-            env=dict(os.environ, CUDA_VISIBLE_DEVICES=""),
+            env=dict(
+                os.environ,
+                CUDA_VISIBLE_DEVICES="",
+                PYTHONPATH=os.pathsep.join(filter(None, (
+                    str(Path(__file__).resolve().parents[1] / "app"),
+                    os.environ.get("PYTHONPATH", ""),
+                ))),
+            ),
             capture_output=True,
             check=False,
             timeout=30,

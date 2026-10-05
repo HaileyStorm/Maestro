@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import unittest
 from types import SimpleNamespace
+from typing import Any, Mapping
 from unittest.mock import Mock, patch
 
 
@@ -46,8 +47,15 @@ def _called_names(node: ast.AST) -> set[str]:
 
 
 def _load_isolated_function(relative_path: str, name: str, namespace: dict):
-    function = _function(_parse(relative_path), name)
-    module = ast.Module(body=[function], type_ignores=[])
+    tree = _parse(relative_path)
+    functions = [_function(tree, name)]
+    if name in {"get_status", "list_jobs"}:
+        functions.extend(_function(tree, helper) for helper in (
+            "_public_job_h3_cumulative_plan", "_public_h3_cumulative_plan",
+        ))
+        namespace.setdefault("Mapping", Mapping)
+        namespace.setdefault("Any", Any)
+    module = ast.Module(body=functions, type_ignores=[])
     ast.fix_missing_locations(module)
     exec(compile(module, relative_path, "exec"), namespace)
     return namespace[name]
@@ -262,14 +270,23 @@ class TestJobLifecycleWiring(unittest.TestCase):
             "earlier": {"id": "earlier", "status": "queued", "queue_held": True, "created_at": 10},
             "blank": {"id": "", "status": "queued", "queue_held": True},
         }
+        jobs["declined"] = {"id": "declined", "status": "queued", "queue_held": True}
         released_ids = []
+        dispatched_ids = []
 
         def set_hold(job, held):
+            if job["id"] == "declined":
+                return None
             if job.get("queue_held") is not True or held is not False:
                 return None
             job["queue_held"] = False
             released_ids.append(job["id"])
             return "resumed"
+
+        def start_worker(job):
+            self.assertFalse(job["queue_held"])
+            self.assertIn(job["id"], released_ids)
+            dispatched_ids.append(job["id"])
 
         start_queue = _load_isolated_function(
             "app/launch.py",
@@ -287,6 +304,7 @@ class TestJobLifecycleWiring(unittest.TestCase):
                 "_queue_recovery_delivery_pending": lambda _job: None,
                 "_require_job_runtime_model_admission": lambda _job: None,
                 "set_job_hold": set_hold,
+                "_start_restored_held_generation_worker": start_worker,
                 "HTTPException": RuntimeError,
             },
         )
@@ -299,6 +317,9 @@ class TestJobLifecycleWiring(unittest.TestCase):
         self.assertTrue(jobs["active"]["queue_held"] is False)
         self.assertEqual(jobs["active"]["status"], "running")
         self.assertEqual(set(released_ids), {"earlier", "later"})
+
+        self.assertEqual(dispatched_ids, released_ids)
+        self.assertTrue(jobs["declined"]["queue_held"])
 
     def test_director_music_requires_verified_recovery_evidence(self):
         generate_music = _function(self.launch, "director_generate_music")

@@ -727,7 +727,9 @@ its two lazy quantizer discovery caches from `None` to populated runtime state.
 The fingerprint now excludes only `_QTYPE_QMODULE_CACHE` and
 `_QMODULE_BASE_ATTRS` in the exact `mmgp.quant_router` module. Functions, defaults,
 routing priorities, other constants, package versions and selected loaded module
-layout remain bound. This avoids making code identity depend on discovery order.
+layout remain bound. This removes the two discovery-cache values from code
+identity; the later October 5 serialization check below addresses a separate
+remaining source of identity drift.
 
 The second attempt passed that repaired guard and completed native MMGP setup,
 then exposed the LoRA guard treating support hooks as loaded adapters. MMGP
@@ -1271,3 +1273,47 @@ its existing 817-diagnostic baseline. No full suite or GPU workload was repeated
 
 Live deployment, browser display and actual held-job execution remain separate
 acceptance steps. A queued GPU request is not execution authority.
+
+## Loaded-code serialization stability (2026-10-05 UTC)
+
+The complete CPU suite exposed a remaining false code-identity mismatch during
+real MMGP quantizer discovery. A bounded follow-up isolated one function's code
+serialization: the code object remained identical, and its bytecode, argument
+counts, flags, names, variables, closure names and recursively compared constants
+remained equal. Marshal formats 3 and 4 nevertheless produced different bytes;
+format 2 remained stable. Python documents format 3's addition of object-instance
+sharing in its [marshal reference](https://docs.python.org/3.10/library/marshal.html).
+
+Fresh-process checks then isolated a second issue: two functions containing
+compiled set literals differed across hash seeds. The loaded-code fingerprint
+now uses format 2 for code metadata and encodes constants separately with type
+tags. Ordered tuples retain their order; encoded frozenset members are sorted;
+nested code is encoded recursively. Scalar bytes retain exact values rather
+than converting them to JSON. It still
+binds loaded bytecode and constants, defaults, wrappers, module constants,
+routing priorities, Python/package versions and selected component layout.
+The exact two MMGP cache exclusions are unchanged. All 22 runtime-binding
+checks pass, including real lazy discovery and rejection after changed routing
+priorities, defaults, constants, code or loaded components. The added fresh-seed
+regression failed before the repair and now passes, including rejection after
+constant-type or membership changes. Two fresh CPU processes using different
+hash seeds also produced the same real MMGP fingerprint before and after lazy
+discovery. These are loaded-code identity checks, not native continuation.
+
+Recovery continues to require exact binding-digest equality. Previously saved
+digests are not rewritten or accepted through an alternate comparison. A digest
+mismatch preserves the retained checkpoint and prevents automatic continuation;
+this change does not establish compatibility for every older saved binding.
+The CPU identity checks loaded no generative model or weights and used no CUDA.
+A separate fresh-grant native qualification then captured and restored H3 state
+in two processes with different Python hash seeds. Their complete binding
+payloads matched. On a 320 × 192 canvas, the first process produced 56 frames;
+the second restored its checkpoint and extended it to 73 frames using a
+39-frame sampler window. Retained video and audio latent prefixes matched by
+dtype, shape and bytes. Both HEVC/AAC outputs passed complete CPU decoding with
+the expected frame counts. Both workers exited successfully, and the exact
+lease was withdrawn with durable denial and coherent validation rejection.
+This qualifies the changed fingerprint for that private native capture/restore
+case. It does not establish full-resolution quality, opening-fade repair,
+public queue recovery or human acceptance. Prior accepted full-canvas receipts
+remain historical evidence and their saved bindings are not rewritten.

@@ -387,6 +387,7 @@ test('Load Settings clears omitted optional technical keys instead of retaining 
     await useStore.getState().loadSettingsFromOutput()
     const restored = useStore.getState().params
     const intentionalDefaults = {
+      h3_cumulative_append: false,
       sliding_window_size: 1,
       sliding_window_overlap: 0,
       audio_scale: 1,

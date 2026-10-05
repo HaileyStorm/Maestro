@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import ast
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock
 from pathlib import Path
 
 
@@ -76,12 +78,35 @@ class GenerateVideoImplLeftoverTests(unittest.TestCase):
             1,
         )
         finalized = self.impl.index("finalized_residency_evidence_context = ")
-        self.assertLess(
-            self.impl.index(
-                "video_length = align_model_frame_count(video_length, model_def)"
-            ),
-            finalized,
-        )
+        frame_assignments = [
+            node for node in ast.walk(ast.parse(self.impl))
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.IfExp)
+            and any(isinstance(target, ast.Name) and target.id == "video_length"
+                    for target in node.targets)
+            and any(isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                    and call.func.id == "align_model_frame_count"
+                    for call in ast.walk(node.value))
+        ]
+        self.assertEqual(len(frame_assignments), 1)
+        frame_assignment = frame_assignments[0]
+        frame_choice = compile(ast.Expression(frame_assignment.value), "frame-choice", "eval")
+        aligner = Mock(return_value=124)
+        dispatcher = SimpleNamespace(sampling_frames=Mock(return_value=128))
+        model_def = {"frame_grid": "native"}
+        frame_namespace = {
+            "video_length": 123, "model_def": model_def,
+            "align_model_frame_count": aligner, "_h3_cumulative_dispatch": None,
+        }
+        self.assertEqual(eval(frame_choice, frame_namespace), 124)
+        aligner.assert_called_once_with(123, model_def)
+        dispatcher.sampling_frames.assert_not_called()
+        aligner.reset_mock()
+        frame_namespace["_h3_cumulative_dispatch"] = dispatcher
+        self.assertEqual(eval(frame_choice, frame_namespace), 128)
+        dispatcher.sampling_frames.assert_called_once_with(123)
+        aligner.assert_not_called()
+        finalized_line = self.impl[:finalized].count("\n") + 1
+        self.assertLess(frame_assignment.lineno, finalized_line)
         self.assertLess(
             self.impl.index("width, height = resolution.split"),
             finalized,

@@ -135,6 +135,8 @@ def _load_route_symbols(namespace):
         "_public_parent_job_id",
         "_public_logical_job_kind",
         "_public_failed_child_metadata",
+        "_public_job_h3_cumulative_plan",
+        "_public_h3_cumulative_plan",
         "_public_job_prompt_fields",
         "_public_job_created_at",
         "_generic_job_visible",

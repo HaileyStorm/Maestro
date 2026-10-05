@@ -625,11 +625,34 @@ class TestMiniMaxH3Definition(unittest.TestCase):
     def test_maestro_registers_the_family_and_uses_its_native_frame_grid(self):
         source = _read(_WGP_PATH)
         self.assertIn('"models.minimax_h3.minimax_h3_handler"', source)
-        self.assertIn("video_length = align_model_frame_count(video_length, model_def)", source)
-        self.assertIn(
-            "frame_num=align_model_frame_count(current_video_length, model_def, for_generation=True)",
-            source,
+        tree = ast.parse(source, filename=str(_WGP_PATH))
+        video_length = next(
+            node.value for node in ast.walk(tree) if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "video_length"
+                    for target in node.targets)
+            and isinstance(node.value, ast.IfExp) and isinstance(node.value.body, ast.Call)
+            and isinstance(node.value.body.func, ast.Name)
+            and node.value.body.func.id == "align_model_frame_count"
         )
+        frame_counts = [
+            keyword.value for node in ast.walk(tree) if isinstance(node, ast.Call)
+            for keyword in node.keywords if keyword.arg == "frame_num"
+            and isinstance(keyword.value, ast.IfExp) and isinstance(keyword.value.body, ast.Call)
+            and isinstance(keyword.value.body.func, ast.Name)
+            and keyword.value.body.func.id == "align_model_frame_count"
+        ]
+        self.assertTrue(frame_counts)
+        definition = {"frame_alignment_modulus": 17, "frame_alignment_remainder": 5,
+                      "frames_minimum": 124, "frames_maximum": 345, "frame_alignment_mode": "ceil"}
+        align = mock.Mock(wraps=_load_frame_aligner())
+        scope = {"video_length": 125, "current_video_length": 125, "model_def": definition,
+                 "align_model_frame_count": align, "_h3_cumulative_dispatch": None}
+        self.assertEqual(eval(compile(ast.Expression(video_length), str(_WGP_PATH), "eval"), scope), 141)
+        align.assert_called_once_with(125, definition)
+        for expression in frame_counts:
+            align.reset_mock()
+            self.assertEqual(eval(compile(ast.Expression(expression), str(_WGP_PATH), "eval"), scope), 141)
+            align.assert_called_once_with(125, definition, for_generation=True)
         self.assertIn('model_def.get("frames_maximum", None)', source)
 
     def test_h3_is_enabled_for_existing_and_fresh_installs(self):

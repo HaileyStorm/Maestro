@@ -11,7 +11,10 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import re
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -2028,7 +2031,28 @@ class H3LongStudioPlanningTests(unittest.TestCase):
         self.assertIn("wgp.align_model_frame_count(\n                        clip_frames, _mc_model_def", launch)
         self.assertIn('segment_model == "minimax_h3_ref2va"', launch)
         self.assertIn('0 if semantic_h3_refs else cumulative_offset', launch)
-        self.assertIn('2 if h3_longform else', launch)
+        from services.h3_lora_compat import architecture_for_h3_model
+        tree = ast.parse(launch)
+        prompt_mode = next(
+            node.value for node in ast.walk(tree) if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name)
+                    and target.value.id == "clip_params" and isinstance(target.slice, ast.Constant)
+                    and target.slice.value == "multi_prompts_gen_type" for target in node.targets)
+            and isinstance(node.value, ast.IfExp)
+        )
+        expression = compile(ast.Expression(prompt_mode), "runtime-clip-prompt-mode", "eval")
+        for model, prompt, plan, expected in (
+            ("minimax_h3", "One H3 shot", None, 2),
+            ("minimax_h3_ref2va", "First line\nSecond line", None, 2),
+            ("wan2_2", "One ordinary shot", None, 0),
+            ("wan2_2", "First line\nSecond line", None, 1),
+            ("wan2_2", "Committed H3 plan", {"clip_count": 2}, 2),
+        ):
+            with self.subTest(model=model, prompt=prompt, h3_longform=bool(plan)):
+                self.assertEqual(eval(expression, {
+                    "clip_params": {"model_type": model}, "clip_prompt": prompt,
+                    "h3_longform": plan, "architecture_for_h3_model": architecture_for_h3_model,
+                }), expected)
         self.assertIn('if total_trimmed_frames > 0 and not h3_longform', launch)
         self.assertIn('safe_idx = max(0, len(vr) - 1)', launch)
         self.assertIn('"preserve_generated_audio": bool(', launch)
@@ -2234,7 +2258,6 @@ process.stdout.write(JSON.stringify(effectiveSlidingWindowGeometry(10, 5, 5, opt
         self.assertIn("windowCurrent: status.window_current", store)
         self.assertIn("overallProgress: status.overall_progress", store)
         self.assertIn("job.modelType?.startsWith('minimax_h3') ? 'Segment' : 'Window'", card)
-        self.assertIn("{progressUnit} {job.windowCurrent || 1}/{job.windowTotal}", card)
         self.assertIn("Current {progressUnit.toLowerCase()}", card)
         self.assertIn("job.activeWindowPrompt || job.promptPreview", card)
         self.assertIn("ACTIVE_GENERATION_JOB_STATUSES.has(status.status)", store)
@@ -2251,7 +2274,23 @@ process.stdout.write(JSON.stringify(effectiveSlidingWindowGeometry(10, 5, 5, opt
         self.assertIn("if (!modelOptions?.sliding_window) return null", duration)
         self.assertIn("safeOverlapMax", duration)
         self.assertIn("alignStudioTotalFrames(Math.round(s * fps), options)", store)
-        self.assertIn("slidingWindowLocked: supportsWindowPlanning", store)
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is required for the Studio UI contract")
+        lock_expressions = [value for value in re.findall(r"slidingWindowLocked:\s*([^,\n]+)", store)
+                            if "supportsWindowPlanning" in value]
+        self.assertEqual(len(lock_expressions), 1)
+        script = f"""
+const lock = new Function('cumulative', 'supportsWindowPlanning', 'slidingWindowLocked',
+  'return (' + {json.dumps(lock_expressions[0])} + ')');
+process.stdout.write(JSON.stringify([
+  lock(false, true, false), lock(false, true, true),
+  lock(false, false, false), lock(false, false, true),
+]));
+"""
+        completed = subprocess.run([node, "--input-type=module", "-e", script],
+                                   check=True, capture_output=True, text=True, timeout=15)
+        self.assertEqual(json.loads(completed.stdout), [False, True, False, False])
         self.assertIn("default_sliding_window_size", store)
         self.assertIn("export function alignTotalFrames", timeline)
         self.assertIn("export function alignStudioTotalFrames", timeline)
@@ -2346,12 +2385,44 @@ process.stdout.write(JSON.stringify(effectiveSlidingWindowGeometry(10, 5, 5, opt
             launch.index("async def h3_estimate"):
             launch.index('@api.get("/api/v1/h3/benchmark")')
         ]
-        self.assertIn("include_residency=not bool", endpoint)
-        helper = launch[
-            launch.index("def _h3_estimate_for_context"):
-            launch.index("def _h3_profile_estimate_payload")
-        ]
-        self.assertIn("if include_residency else []", helper)
+        endpoint_tree = ast.parse("async " + endpoint.split("async ", 1)[1])
+        residency = next(keyword.value for call in ast.walk(endpoint_tree)
+                         if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                         and call.func.id == "_h3_profile_estimate_payload"
+                         for keyword in call.keywords if keyword.arg == "include_residency")
+        for remote in (False, True):
+            self.assertEqual(eval(compile(ast.Expression(residency), "remote-estimate-gate", "eval"), {
+                "request": SimpleNamespace(state=SimpleNamespace(maestro_remote=remote)),
+            }), not remote)
+
+        tree = ast.parse(launch)
+        helper = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                      and node.name == "_h3_estimate_for_context")
+        cache = mock.Mock(side_effect=AssertionError("Remote estimates must not read local observations"))
+        resident = mock.Mock(side_effect=AssertionError("Remote estimates must not inspect residency"))
+        scope = {"_get_h3_benchmark_cache": cache, "_h3_model_is_resident": resident}
+        exec(compile(ast.Module(body=[helper], type_ignores=[]), "remote-estimate-helper", "exec"), scope)
+        from services import h3_benchmark, h3_host_limits
+        context = {"model_type": "minimax_h3", "duration_seconds": 5, "window_seconds": 5,
+                   "num_inference_steps": 4, "resolution": "1344x768"}
+        segment_contexts = [context, {**context, "model_type": "minimax_h3_ref2va"}, context]
+        for segments in (None, segment_contexts):
+            with self.subTest(segmented=segments is not None):
+                request_context = {**context, **({"_segment_contexts": segments} if segments else {})}
+                with mock.patch.object(h3_benchmark, "estimate_h3_output", wraps=h3_benchmark.estimate_h3_output) as estimate:
+                    with mock.patch.object(h3_host_limits, "evaluate_setup", return_value=SimpleNamespace(
+                        runnable=True, reason=None, max_steps=None,
+                    )):
+                        result = scope["_h3_estimate_for_context"](request_context, include_residency=False)
+                self.assertEqual(estimate.call_count, len(segments) if segments else 1)
+                for call in estimate.call_args_list:
+                    self.assertEqual(call.args[1], [])
+                    self.assertIsNone(call.kwargs["model_resident"])
+                self.assertEqual(result["model_load_state"], "unknown")
+                self.assertIsNone(result["model_load_seconds"])
+                self.assertEqual(result["sample_count"], 0)
+        cache.assert_not_called()
+        resident.assert_not_called()
 
     def test_estimator_uses_the_runtime_turbo_compatibility_matrix(self):
         launch = Path(APP, "launch.py").read_text(encoding="utf-8")

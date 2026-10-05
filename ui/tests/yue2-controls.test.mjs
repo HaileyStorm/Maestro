@@ -2,6 +2,248 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { build } from 'esbuild'
 
+const componentBundle = await build({
+  stdin: {
+    contents: `export { Yue2Controls } from './src/components/Sidebar/Yue2Controls';
+      export { createHarness } from 'react'; export { control } from './src/api/client';`,
+    resolveDir: new URL('..', import.meta.url).pathname,
+  },
+  bundle: true, format: 'esm', platform: 'node', jsx: 'automatic', write: false,
+  plugins: [{
+    name: 'yue2-component-harness',
+    setup(bundle) {
+      const modules = {
+        react: `
+          let active;
+          const equal = (a, b) => a && b && a.length === b.length && a.every((v, i) => Object.is(v, b[i]));
+          export function createHarness(Component, props) {
+            const h = { slots: [], index: 0, dirty: false, layout: [], passive: [], mutations: [], props };
+            h.render = (next = h.props) => {
+              h.props = next; h.index = 0; h.dirty = false; active = h;
+              h.tree = Component(next); active = null;
+              h.flushLayout(); return h.tree;
+            };
+            const flush = queue => {
+              for (const { slot, effect } of queue.splice(0)) {
+                slot.cleanup?.(); slot.cleanup = effect();
+              }
+            };
+            h.flushLayout = () => flush(h.layout);
+            h.flush = () => {
+              for (let i = 0; i < 20; i++) {
+                flush(h.passive);
+                if (!h.dirty) return;
+                h.render();
+              }
+              throw new Error('YuE2 hook harness did not settle');
+            };
+            h.unmount = () => {
+              for (const slot of h.slots) slot?.cleanup?.();
+              h.layout = []; h.passive = [];
+            };
+            return h;
+          }
+          export function useState(initial) {
+            const h = active, index = h.index++;
+            const slot = h.slots[index] ||= { value: typeof initial === 'function' ? initial() : initial };
+            return [slot.value, value => {
+              const next = typeof value === 'function' ? value(slot.value) : value;
+              h.mutations.push({ index, value: next });
+              if (!Object.is(next, slot.value)) { slot.value = next; h.dirty = true; }
+            }];
+          }
+          export function useRef(initial) {
+            return (active.slots[active.index++] ||= { value: { current: initial } }).value;
+          }
+          export function useMemo(factory, deps) {
+            const h = active, index = h.index++, previous = h.slots[index];
+            if (!previous || !equal(previous.deps, deps)) h.slots[index] = { value: factory(), deps };
+            return h.slots[index].value;
+          }
+          export const useCallback = (callback, deps) => useMemo(() => callback, deps);
+          const effect = (callback, deps, queue) => {
+            const h = active, slot = h.slots[h.index++] ||= {};
+            if (!equal(slot.deps, deps)) {
+              slot.deps = deps; h[queue].push({ slot, effect: callback });
+            }
+          };
+          export const useEffect = (callback, deps) => effect(callback, deps, 'passive');
+          export const useLayoutEffect = (callback, deps) => effect(callback, deps, 'layout');
+        `,
+        'react/jsx-runtime': `
+          export const Fragment = Symbol('Fragment');
+          export const jsx = (type, props) => ({ type, props }); export const jsxs = jsx;
+        `,
+        'lucide-react': `export const Check = 'Check', Loader2 = 'Loader2', Music2 = 'Music2',
+          RefreshCw = 'RefreshCw', Sparkles = 'Sparkles', Square = 'Square';`,
+        api: `
+          export const control = { reads: [], submits: [], continues: [], libraries: {}, nextLibrary: null };
+          const deferred = () => {
+            let resolve, reject;
+            const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
+            return { promise, resolve, reject };
+          };
+          export async function fetchYue2Status(workspace) {
+            control.reads.push(workspace);
+            return { available: true, model: 'YuE2', sampleRate: 44100, queue: 'local', loras: [] };
+          }
+          export async function fetchYue2Library(workspace) {
+            if (control.nextLibrary) {
+              const pending = control.nextLibrary; control.nextLibrary = null;
+              return pending.promise;
+            }
+            return { tracks: control.libraries[workspace] || [] };
+          }
+          export async function fetchYue2Training() { return { jobs: [] }; }
+          export async function fetchYue2Plan(id) { return { reviewable: true, abc: 'X:1\\n% ' + id + '\\nK:C\\nC4|' }; }
+          export function submitYue2(input) {
+            const pending = { ...deferred(), input }; control.submits.push(pending); return pending.promise;
+          }
+          export function continueYue2(id, workspace, abc) {
+            const pending = { ...deferred(), id, workspace, abc }; control.continues.push(pending); return pending.promise;
+          }
+          export function composeYue2() { throw new Error('Unexpected compose request'); }
+          export function cancelYue2() { throw new Error('Unexpected cancel request'); }
+          export function yue2AudioUrl(id) { return '/audio/' + id; }
+        `,
+        training: 'export const Yue2Training = () => null;',
+      }
+      bundle.onResolve({ filter: /.*/ }, args => {
+        const key = args.path.includes('api/client') ? 'api'
+          : args.path.endsWith('/Yue2Training') ? 'training' : args.path
+        if (key in modules) return { path: key, namespace: 'yue2-test' }
+      })
+      bundle.onLoad({ filter: /.*/, namespace: 'yue2-test' }, args => ({ contents: modules[args.path], loader: 'js' }))
+    },
+  }],
+})
+let componentRealm = 0
+const textContent = node => Array.isArray(node) ? node.map(textContent).join('')
+  : node && typeof node === 'object' ? textContent(node.props?.children)
+    : node == null || typeof node === 'boolean' ? '' : String(node)
+function findNode(node, predicate) {
+  if (Array.isArray(node)) return node.map(child => findNode(child, predicate)).find(Boolean)
+  if (!node || typeof node !== 'object') return null
+  return predicate(node) ? node : findNode(node.props?.children, predicate)
+}
+const button = (h, label) => {
+  const node = findNode(h.tree, node => node.type === 'button' && textContent(node).includes(label))
+  assert.ok(node, `Missing button: ${label}`)
+  return node
+}
+async function settle(h) {
+  for (let i = 0; i < 4; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+    h.flush()
+  }
+}
+function deferred() {
+  let resolve, reject
+  const promise = new Promise((done, fail) => { resolve = done; reject = fail })
+  return { promise, resolve, reject }
+}
+async function componentFixture({ review = false } = {}) {
+  const { Yue2Controls, createHarness, control } = await import(
+    `data:text/javascript;base64,${Buffer.from(componentBundle.outputFiles[0].text).toString('base64')}#yue2-${++componentRealm}`,
+  )
+  const props = { workspace: 'A', description: 'A local song', style: 'pop', lyrics: 'Rain falls',
+    instrumental: false, onStyle() {}, onLyrics() {} }
+  if (review) control.libraries.A = [{ id: 'old-take', project: 'A', title: 'Old take', status: 'needs-review' }]
+  const h = createHarness(Yue2Controls, props)
+  h.render(); h.flush(); await settle(h)
+  const transition = async (workspace, passive = true) => {
+    h.render({ ...h.props, workspace })
+    if (passive) { h.flush(); await settle(h) }
+  }
+  return { h, control, transition }
+}
+
+for (const action of ['submit', 'continue']) {
+  const label = action === 'submit' ? 'Generate with YuE2' : 'Continue with reviewed score'
+  const requests = control => action === 'submit' ? control.submits : control.continues
+  for (const outcome of ['success', 'failure']) {
+    test(`late YuE2 ${action} ${outcome} cannot change a returned project or clear its new operation`, async () => {
+      const { h, control, transition } = await componentFixture({ review: action === 'continue' })
+      assert.equal(button(h, label).props.disabled, false)
+      button(h, label).props.onClick(); h.flush()
+      const old = requests(control)[0]
+      if (action === 'continue') assert.equal(old.abc, undefined, 'unchanged review resumes its saved plan')
+      else assert.equal(old.input.workspace, 'A')
+      await transition('B')
+      if (action === 'continue') control.libraries.A = [{ id: 'new-take', project: 'A', title: 'New take', status: 'needs-review' }]
+      await transition('A')
+      assert.equal(button(h, label).props.disabled, false)
+      button(h, label).props.onClick(); h.flush()
+      const reads = control.reads.length
+      h.mutations.length = 0
+      if (outcome === 'failure') old.reject(new Error('Obsolete operation failed'))
+      else old.resolve({})
+      await settle(h)
+      assert.deepEqual(h.mutations, [], 'late result must not run any state setters')
+      assert.equal(control.reads.length, reads, 'late success must not start a refresh')
+      assert.equal(button(h, label).props.disabled, true, 'new operation remains busy')
+      assert.doesNotMatch(textContent(h.tree), /Obsolete operation failed/)
+      assert.equal(requests(control).length, 2, 'project changes do not resend accepted requests')
+      if (action === 'continue') assert.equal(requests(control)[1].id, 'new-take')
+      requests(control)[1].reject(new Error('Current operation failed'))
+      await settle(h)
+      assert.match(textContent(h.tree), /Current operation failed/)
+      assert.equal(button(h, label).props.disabled, false, 'current operation can clear its own busy state')
+    })
+  }
+
+  test(`YuE2 ${action} invalidates before passive project effects and on unmount`, async () => {
+    for (const boundary of ['layout', 'unmount']) {
+      const { h, control, transition } = await componentFixture({ review: action === 'continue' })
+      button(h, label).props.onClick(); h.flush()
+      if (boundary === 'layout') {
+        await transition('B', false)
+        await transition('A', false)
+      } else h.unmount()
+      const reads = control.reads.length
+      h.mutations.length = 0
+      requests(control)[0].resolve({})
+      await new Promise(resolve => setImmediate(resolve))
+      assert.deepEqual(h.mutations, [], `${boundary} boundary must fence completion before passive cleanup`)
+      assert.equal(control.reads.length, reads)
+    }
+  })
+
+  test(`current YuE2 ${action} success refreshes its project and clears its own busy state`, async () => {
+    const { h, control } = await componentFixture({ review: action === 'continue' })
+    button(h, label).props.onClick(); h.flush()
+    const reads = control.reads.length
+    control.libraries.A = [{ id: 'accepted-take', project: 'A', title: 'Accepted take', status: 'succeeded' }]
+    requests(control)[0].resolve({})
+    await settle(h)
+    assert.equal(control.reads.length, reads + 1)
+    assert.match(textContent(h.tree), /Accepted take/)
+    assert.equal(button(h, 'Generate with YuE2').props.disabled, false)
+    assert.equal(requests(control).length, 1, 'completion does not create another generation request')
+  })
+
+  for (const outcome of ['success', 'failure']) {
+    test(`YuE2 ${action} refresh ${outcome} is fenced if the project changes while it is pending`, async () => {
+      const { h, control, transition } = await componentFixture({ review: action === 'continue' })
+      button(h, label).props.onClick(); h.flush()
+      const refreshResponse = deferred()
+      control.nextLibrary = refreshResponse
+      const reads = control.reads.length
+      requests(control)[0].resolve({})
+      await new Promise(resolve => setImmediate(resolve))
+      assert.equal(control.reads.length, reads + 1, 'accepted operation started its refresh')
+      await transition('B', false)
+      await transition('A', false)
+      h.mutations.length = 0
+      if (outcome === 'failure') refreshResponse.reject(new Error('Obsolete refresh failed'))
+      else refreshResponse.resolve({ tracks: [{ id: 'obsolete', project: 'A', title: 'Obsolete take', status: 'succeeded' }] })
+      await new Promise(resolve => setImmediate(resolve))
+      assert.deepEqual(h.mutations, [], 'neither the refresh nor operation finalizer may mutate the new scope')
+      assert.equal(requests(control).length, 1)
+    })
+  }
+}
+
 const result = await build({
   entryPoints: [new URL('../src/components/Sidebar/yue2GenerationSettings.ts', import.meta.url).pathname],
   bundle: true,

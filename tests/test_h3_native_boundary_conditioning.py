@@ -65,7 +65,21 @@ class _AdmissionRequest:
 def _load_functions(path: Path, names: set[str], namespace: dict):
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     nodes = []
+    constants = set()
+    if "get_model_options" in names:
+        names = names | {"_h3_cumulative_http_available"}
+        constants = {
+            "_H3_BASE_FL2VA_MODEL", "_H3_EXPLICIT_FL2VA_MODEL",
+            "_H3_W4A8_FL2VA_MODEL", "_H3_REF2VA_MODEL",
+            "_H3_FL2VA_MODELS", "_H3_LONG_STUDIO_MODELS",
+        }
     for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id in constants
+            for target in node.targets
+        ):
+            nodes.append(copy.deepcopy(node))
+            continue
         if not (
             isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
             and node.name in names
@@ -225,6 +239,7 @@ def _native_admission_namespace():
             "_job_failure_positions", "_failure_stage_from_job", "_safe_failure_updates",
             "_require_h3_native_boundary_experimental",
             "_plan_generation_submission",
+            "_consume_h3_cumulative_selection",
             "preview_generation_plan",
             "_run_generation_preparation",
             "_run_generation",

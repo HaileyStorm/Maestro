@@ -433,10 +433,37 @@ class TestScail2ControlVideoFraming(unittest.TestCase):
 
     def test_fake_identity_start_is_not_concatenated_into_output(self):
         source = _read(_WGP_PATH)
-        self.assertIn(
-            "if fake_start_image and window_no == 1:\n                    prefix_video = None",
-            source,
-        )
+        tree = ast.parse(source, filename=_WGP_PATH)
+        branch = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
+                      and ast.unparse(node.test) == "fake_start_image and window_no == 1"
+                      and any(isinstance(statement, ast.Assign)
+                              and any(isinstance(target, ast.Name) and target.id == "prefix_video"
+                                      for target in statement.targets) for statement in node.body))
+        code = compile(ast.Module(body=[branch], type_ignores=[]), _WGP_PATH, "exec")
+        for fake, window in ((True, 1), (True, 2), (False, 1)):
+            with self.subTest(fake_start_image=fake, window_no=window):
+                sample = np.zeros((1, 6, 3, 2, 2), dtype=np.uint8)
+                identity = np.ones((1, 1, 3, 9, 9), dtype=np.uint8)
+                restored = []
+                scope = {
+                    "fake_start_image": fake, "window_no": window, "prefix_video": identity,
+                    "h3_timeline_still_guide_requested": False, "sample": sample,
+                    "sliding_window": True, "reuse_frames": 2, "generated_audio": None,
+                    "source_video_overlap_frames_count": 1, "guide_start_frame": 6,
+                    "_restore_h3_first_window_prefix": lambda value, prefix, overlap: (
+                        restored.append((prefix, overlap)) or value
+                    ),
+                }
+                exec(code, scope)
+                if window == 2:
+                    self.assertIs(scope["prefix_video"], identity)
+                    np.testing.assert_array_equal(scope["sample"], sample[:, 2:])
+                    self.assertEqual(restored, [])
+                else:
+                    self.assertIsNone(scope["prefix_video"])
+                    self.assertIs(scope["sample"], sample)
+                    self.assertEqual(len(restored), 0 if fake else 1)
+                self.assertEqual(scope["sample"].shape[-2:], (2, 2))
         self.assertNotIn(
             "prefix_video[:, :-source_video_overlap_frames_count] if fake_start_image",
             source,

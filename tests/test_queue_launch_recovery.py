@@ -105,6 +105,13 @@ def _function(tree: ast.AST, name: str):
 def _isolated_functions(tree: ast.Module, names: tuple[str, ...], namespace: dict):
     namespace.setdefault("AUTOMATIC_RETIREMENT_STATUSES", AUTOMATIC_RETIREMENT_STATUSES)
     dependencies = {"_h3_segment_uses_native_boundary_history"} if "_run_generation" in names else set()
+    if "_publish_h3_delivery_outputs" in names:
+        namespace.setdefault("_recovery_sha256_file", recovery_sha256_file)
+    if {"_run_generation", "_resume_pending_h3_delivery_only", "_process_h3_delivery_from_protected_native", "_deliver_h3_outputs_transactionally"} & set(names):
+        dependencies.update({
+            "_h3_delivery_finishing_identity", "_validate_h3_delivery_finishing",
+            "_build_h3_delivery_finishing", "_apply_h3_delivery_finishing",
+        })
     if {"_queue_recovery_materialize_job", "_resume_recovered_job"} & set(names):
         dependencies.add("_h3_native_boundary_exact_retry_allowed")
     if {"get_status", "list_jobs"} & set(names):
@@ -5538,6 +5545,9 @@ class QueueLaunchWiringTests(unittest.TestCase):
         self.assertEqual(corrupt_waiting["recovery_state"], "terminal")
 
     def test_prompt_enhancement_restart_terminalizes_without_auto_generation(self):
+        def reconcile_cursor(job, _path, *, adopt_staged=False):
+            self.assertTrue(adopt_staged)
+
         worker_calls = []
         namespace = _isolated_functions(
             self.launch,
@@ -5565,7 +5575,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "validate_manifest_inputs": lambda *_args: None,
                 "_queue_recovery_manifest_validator": lambda *_args, **_kwargs: True,
                 "_require_h3_offload_plan_parity": lambda *_args, **_kwargs: None,
-                "_queue_recovery_reconcile_cursor": lambda *_args: None,
+                "_queue_recovery_reconcile_cursor": reconcile_cursor,
             },
         )
         project_digest = "project:v1:" + "b" * 64
@@ -5696,6 +5706,12 @@ class QueueLaunchWiringTests(unittest.TestCase):
         self.assertEqual(worker_calls, [])
 
     def test_completed_h3_requires_exact_adopted_finals_before_terminal_state(self):
+        def reconcile_cursor(job, _path, *, adopt_staged=False):
+            self.assertTrue(adopt_staged)
+            job.update({
+                "output_files": [],
+            })
+
         manifest_params = {"value": {}}
         finality = {
             ("project-a", "job-completed"): {
@@ -5738,9 +5754,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "h3_integrity_is_pending": lambda *_args: False,
                 "h3_integrity_pending_path": lambda *_args: "unused",
                 "_h3_incomplete_recovery_prefix": lambda _job: None,
-                "_queue_recovery_reconcile_cursor": lambda job, _path: job.update({
-                    "output_files": [],
-                }),
+                "_queue_recovery_reconcile_cursor": reconcile_cursor,
             },
         )
         snapshot = {
@@ -6066,6 +6080,12 @@ class QueueLaunchWiringTests(unittest.TestCase):
         )
 
     def test_completed_final_only_and_cursor_loss_h3_never_hide_missing_finals(self):
+        def reconcile_cursor(job, _path, *, adopt_staged=False):
+            self.assertTrue(adopt_staged)
+            job.update({
+                "output_files": [],
+            })
+
         manifest_params = {"value": {}}
         namespace = _isolated_functions(
             self.launch,
@@ -6084,9 +6104,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "validate_manifest_inputs": lambda *_args: None,
                 "_queue_recovery_manifest_validator": lambda *_args, **_kwargs: True,
                 "_require_h3_offload_plan_parity": lambda *_args, **_kwargs: None,
-                "_queue_recovery_reconcile_cursor": lambda job, _path: job.update({
-                    "output_files": [],
-                }),
+                "_queue_recovery_reconcile_cursor": reconcile_cursor,
             },
         )
         materialize = namespace["_queue_recovery_materialize_job"]
@@ -6131,6 +6149,9 @@ class QueueLaunchWiringTests(unittest.TestCase):
         self.assertEqual(ordinary["recovery_state"], "terminal")
 
     def test_waiting_plan_restore_does_not_increment_attempt_or_start_worker(self):
+        def reconcile_cursor(job, _path, *, adopt_staged=False):
+            self.assertTrue(adopt_staged)
+
         namespace = _isolated_functions(
             self.launch,
             ("_queue_recovery_materialize_job",),
@@ -6150,7 +6171,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "validate_manifest_inputs": lambda *_args: None,
                 "_queue_recovery_manifest_validator": lambda *_args, **_kwargs: True,
                 "_require_h3_offload_plan_parity": lambda *_args, **_kwargs: None,
-                "_queue_recovery_reconcile_cursor": lambda *_args: None,
+                "_queue_recovery_reconcile_cursor": reconcile_cursor,
                 "_job_uses_registered_h3": lambda _job: False,
                 "next_recovery_attempt": lambda _job: (_ for _ in ()).throw(
                     AssertionError("waiting state incremented recovery attempt")
@@ -6374,7 +6395,8 @@ class QueueLaunchWiringTests(unittest.TestCase):
         cursor_sha = "e" * 64
         sealed_params = {"_h3_longform": {"clip_count": 5}}
 
-        def reconcile_cursor(job, _project_dir):
+        def reconcile_cursor(job, _project_dir, *, adopt_staged=False):
+            self.assertTrue(adopt_staged)
             if prune_reconciled_units["value"]:
                 job["recovery_cursor"] = {"completed_units": []}
 
@@ -6582,6 +6604,9 @@ class QueueLaunchWiringTests(unittest.TestCase):
         )
 
     def test_durable_h3_resource_retry_survives_prepare_crash_points(self):
+        def reconcile_cursor(job, _path, *, adopt_staged=False):
+            self.assertTrue(adopt_staged)
+
         next_attempt_calls = []
         namespace = _isolated_functions(
             self.launch,
@@ -6605,7 +6630,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "_require_h3_offload_plan_parity": (
                     lambda *_args, **_kwargs: None
                 ),
-                "_queue_recovery_reconcile_cursor": lambda *_args: None,
+                "_queue_recovery_reconcile_cursor": reconcile_cursor,
                 "_h3_incomplete_recovery_prefix": lambda _job: 4,
                 "_h3_dependency_closed_recovery_prefix": lambda _job: 4,
                 "_job_uses_registered_h3": lambda _job: False,
@@ -7443,6 +7468,9 @@ class QueueLaunchWiringTests(unittest.TestCase):
         )
 
     def test_reference_terminal_journal_restore_projects_child_oom_correlation(self):
+        def reconcile_cursor(job, _path, *, adopt_staged=False):
+            self.assertTrue(adopt_staged)
+
         secret = b"reference-journal-projection-secret"
         owner = "owner-session"
         owner_digest = owner_principal_digest(secret, owner)
@@ -7518,7 +7546,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                         lambda *_args, **_kwargs: True
                     ),
                     "_require_h3_offload_plan_parity": lambda _job: None,
-                    "_queue_recovery_reconcile_cursor": lambda *_args: None,
+                    "_queue_recovery_reconcile_cursor": reconcile_cursor,
                     "_h3_incomplete_recovery_prefix": lambda _job: None,
                 },
             )["_queue_recovery_materialize_job"]
@@ -10999,6 +11027,46 @@ class QueueLaunchWiringTests(unittest.TestCase):
             })
             self.assertNotIn("/private/source", sidecar_path.read_text())
 
+    def test_generic_finishing_runs_once_for_ordinary_outputs_and_skips_transaction_outputs(self):
+        runner = _function(self.launch, "_run_generation")
+        passes = [node for node in ast.walk(runner) if isinstance(node, ast.If)
+                  and {"success", "pp_film_grain_intensity"} <=
+                      {child.id for child in ast.walk(node.test) if isinstance(child, ast.Name)}]
+        passes.extend(node for node in ast.walk(runner) if isinstance(node, ast.If)
+                      and {"success", "pp_voice_clone_enabled"} <=
+                          {child.id for child in ast.walk(node.test) if isinstance(child, ast.Name)})
+        module = ast.Module(body=[ast.FunctionDef(
+            name="finish_outputs", args=ast.arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]),
+            body=passes, decorator_list=[],
+        )], type_ignores=[])
+        ast.fix_missing_locations(module)
+        with tempfile.TemporaryDirectory() as temporary:
+            media = Path(temporary, "fresh.mp4")
+            voice = types.ModuleType("postprocessing.voice_clone")
+            def finish(path, tag):
+                media.write_bytes(media.read_bytes() + tag)
+                return True
+            voice.apply_voice_clone_to_file = lambda **kwargs: finish(kwargs["video_path"], b"-voice")
+            namespace = {
+                "success": True, "os": os, "out_dir": temporary,
+                "new_files": [media.name], "director_postprocess_files": None,
+                "pp_film_grain_intensity": 0.25, "pp_film_grain_saturation": 0.5,
+                "pp_voice_clone_enabled": True, "pp_voice_clone_refs": ["reference.wav"],
+                "pp_voice_clone_mode": "single", "job": {},
+                "update_job": lambda *_args, **_kwargs: True,
+                "is_cancel_requested": lambda _job: False,
+                "_apply_film_grain_to_file": lambda path, *_args, **_kwargs: finish(path, b"-grain"),
+                "_record_postprocessing_outcome": mock.Mock(),
+            }
+            with mock.patch.dict(sys.modules, {"postprocessing.voice_clone": voice}), mock.patch("builtins.print"):
+                for owned in (False, True):
+                    with self.subTest(transaction_owned=owned):
+                        media.write_bytes(b"native")
+                        namespace["h3_delivery_transaction_owned"] = owned
+                        exec(compile(module, "generic-finishing-routing", "exec"), namespace)
+                        namespace["finish_outputs"]()
+                        self.assertEqual(media.read_bytes(), b"native" if owned else b"native-grain-voice")
+
     def test_final_adoption_runs_before_cleanup_index_and_workers(self):
         restore = ast.get_source_segment(
             self.launch_source,
@@ -11209,6 +11277,9 @@ class QueueLaunchWiringTests(unittest.TestCase):
                     )
 
     def test_completed_h3_sample_arm_requires_final_receipt(self):
+        def reconcile_cursor(job, _path, *, adopt_staged=False):
+            self.assertTrue(adopt_staged)
+
         namespace = _isolated_functions(
             self.launch,
             ("_queue_recovery_materialize_job",),
@@ -11225,7 +11296,7 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "validate_manifest_inputs": lambda *_args: None,
                 "_queue_recovery_manifest_validator": lambda *_args, **_kwargs: True,
                 "_require_h3_offload_plan_parity": lambda *_args, **_kwargs: None,
-                "_queue_recovery_reconcile_cursor": lambda *_args: None,
+                "_queue_recovery_reconcile_cursor": reconcile_cursor,
             },
         )
         snapshot = {
@@ -11615,6 +11686,12 @@ class RestoredHeldWorkerTests(unittest.TestCase):
             self.assertIn(release, calls)
 
     def test_disabled_cumulative_admission_preserves_held_job_before_dispatch(self):
+        cumulative = types.ModuleType("services.h3_cumulative_execution")
+        cumulative.__dict__.update(_isolated_functions(
+            _tree("app/services/h3_cumulative_execution.py"),
+            ("h3_cumulative_request", "prepare_h3_cumulative_request"),
+            {"os": os},
+        ))
         namespace = _isolated_functions(
             _tree("app/launch.py"),
             ("_require_job_runtime_model_admission", "start_queued_job_next"),
@@ -11635,6 +11712,7 @@ class RestoredHeldWorkerTests(unittest.TestCase):
         original = copy.deepcopy(self.job)
         with (
             mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.dict(sys.modules, {"services.h3_cumulative_execution": cumulative}),
             self.assertRaises(namespace["HTTPException"]) as raised,
         ):
             namespace["start_queued_job_next"]("held-h3", object(), object())

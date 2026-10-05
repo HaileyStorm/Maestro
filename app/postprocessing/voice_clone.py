@@ -101,7 +101,7 @@ def _ffmpeg_demux_audio(video_path: str, out_wav: str, sample_rate: int = 22050)
     return os.path.isfile(out_wav) and os.path.getsize(out_wav) > 100
 
 
-def _ffmpeg_remux_audio(video_path: str, new_audio_wav: str) -> bool:
+def _ffmpeg_remux_audio(video_path: str, new_audio_wav: str, *, strict_in_place: bool = False) -> bool:
     """Replace `video_path`'s audio track with the contents of
     `new_audio_wav`. Video stream is copied (no re-encode); audio is
     re-encoded to AAC for container compatibility.
@@ -117,11 +117,17 @@ def _ffmpeg_remux_audio(video_path: str, new_audio_wav: str) -> bool:
     gallery picks it up on next refresh; the user gets both the
     original AND the cloned version.
 
-    Returns True on success (either in-place or sibling-rename).
-    Returns False only when ffmpeg itself fails to produce the
-    cloned file.
+    strict_in_place disables sibling publication and removes the owned temporary
+    on replacement failure. The original remains unchanged and False is returned.
+    The default retains the legacy sibling fallback.
     """
-    tmp_out = video_path + ".voicecloned_tmp.mp4"
+    if strict_in_place:
+        descriptor, tmp_out = tempfile.mkstemp(
+            prefix=".voicecloned-", suffix=".mp4", dir=os.path.dirname(os.path.abspath(video_path)),
+        )
+        os.close(descriptor)
+    else:
+        tmp_out = video_path + ".voicecloned_tmp.mp4"
     try:
         result = subprocess.run(
             [
@@ -166,6 +172,12 @@ def _ffmpeg_remux_audio(video_path: str, new_audio_wav: str) -> bool:
                 gc.collect()
                 time.sleep(0.5)
                 continue
+            if strict_in_place:
+                try:
+                    os.remove(tmp_out)
+                except FileNotFoundError:
+                    pass
+                return False
             # All retries exhausted. Don't delete the cloned content —
             # rename to a user-visible sibling so the work is preserved
             # and the gallery can show both versions.
@@ -342,6 +354,7 @@ def apply_voice_clone_to_file(
     diffusion_steps: int = 25,
     cfg_rate: float = 0.5,
     cancel_check: Optional[Callable[[], bool]] = None,
+    *, strict_in_place: bool = False,
 ) -> bool:
     """Replace the voice(s) in `video_path` using SeedVC voice conversion.
 
@@ -354,6 +367,7 @@ def apply_voice_clone_to_file(
               speech audio like background music).
         diffusion_steps: SeedVC diffusion steps (default 25; lower=faster).
         cfg_rate: SeedVC CFG rate (default 0.5).
+        strict_in_place: Require replacement of this exact file; never create a sibling.
         cancel_check: Optional job cancellation probe. A cancelled job stops
             before the next stage; an active SeedVC inference call must return
             before its result can be discarded.
@@ -613,7 +627,11 @@ def apply_voice_clone_to_file(
             return False
 
         # Step 6: remux
-        if not _ffmpeg_remux_audio(video_path, out_wav):
+        remuxed = (
+            _ffmpeg_remux_audio(video_path, out_wav, strict_in_place=True)
+            if strict_in_place else _ffmpeg_remux_audio(video_path, out_wav)
+        )
+        if not remuxed:
             print(f"[VoiceClone] remux failed — video left unchanged")
             return False
 

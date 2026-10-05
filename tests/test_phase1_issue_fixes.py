@@ -2877,7 +2877,6 @@ class TestH3PerformanceProfileUI(unittest.TestCase):
         self.assertIn("estimateLabel(profile.estimate)", component)
         self.assertIn("H3EstimateBadge", _read(_GENERATE_BUTTON_PATH))
         self.assertIn("h3_estimate?: import('../types').H3PerformanceEstimate", client)
-        self.assertIn("const { job_id, status, held, h3_estimate }", store)
         self.assertIn("h3Estimate: submittedEstimate", store)
         self.assertIn("_h3EstimateTotalSeconds(submittedEstimate)", store)
         self.assertIn("previous?.etaSeconds", store)

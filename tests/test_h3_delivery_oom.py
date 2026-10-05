@@ -17,7 +17,7 @@ import time
 import unittest
 import uuid
 from pathlib import Path
-from types import SimpleNamespace
+from types import SimpleNamespace, ModuleType
 from unittest.mock import Mock, patch
 
 
@@ -41,13 +41,18 @@ from services.queue_recovery_runtime import (  # noqa: E402
     sha256_file,
     validate_artifact_descriptor,
     validate_protected_artifact_descriptor,
+    replay_delivery_from_protected_native,
 )
 
 
 def _load_launch_symbols(*names: str, namespace: dict | None = None) -> dict:
     source = (APP / "launch.py").read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(APP / "launch.py"))
-    wanted = set(names)
+    wanted = set(names) | {
+        "_h3_delivery_finishing_identity", "_validate_h3_delivery_finishing",
+        "_build_h3_delivery_finishing", "_apply_h3_delivery_finishing",
+        "_validate_h3_recovery_finishing",
+    }
     nodes = [
         node for node in tree.body
         if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
@@ -61,6 +66,9 @@ def _load_launch_symbols(*names: str, namespace: dict | None = None) -> dict:
         "time": time,
         "uuid": uuid,
         "base64": base64,
+        "hashlib": hashlib,
+        "_recovery_sha256_file": sha256_file,
+        "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
         "stamp_sidecar_policy": stamp_sidecar_policy,
         **(namespace or {}),
     }
@@ -189,7 +197,7 @@ class H3DeliveryTransactionTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def test_copy_on_write_eligibility_excludes_later_video_passes(self):
+    def test_copy_on_write_keeps_manual_recovery_compatibility_exclusions(self):
         eligible = _load_launch_symbols(
             "_h3_copy_on_write_delivery_eligible",
         )["_h3_copy_on_write_delivery_eligible"]
@@ -201,8 +209,8 @@ class H3DeliveryTransactionTests(unittest.TestCase):
         }
         self.assertTrue(eligible(True, **base))
         self.assertFalse(eligible(False, **base))
+        self.assertFalse(eligible(True, **{**base, "director_final_video_postprocess": True}))
         for change in (
-            {"director_final_video_postprocess": True},
             {"film_grain_intensity": 0.25},
             {"voice_clone_enabled": True, "voice_clone_refs": ["reference.wav"]},
         ):
@@ -948,6 +956,378 @@ class H3DeliveryTransactionTests(unittest.TestCase):
         )
         return symbols, release
 
+    def _finishing_symbols(self):
+        self.job["out_dir"] = self.out_dir
+        units = []
+        for index, filename in enumerate(self.files):
+            unit_id = recovery_unit_id("job-1", "ordinary_repeat", index=index)
+            meta_path = Path(self.out_dir, Path(filename).stem + ".meta.json")
+            meta = json.loads(meta_path.read_text())
+            size, digest = sha256_file(Path(self.out_dir, filename))
+            meta.update({
+                "job_id": "job-1", "producer_unit_id": unit_id,
+                "producer_unit_kind": "ordinary_repeat", "producer_unit_variant": 0,
+                "producer_unit_index": index, "producer_unit_dependencies": [],
+                "producer_media_size": size, "producer_media_sha256": digest,
+            })
+            meta_path.write_text(json.dumps(meta))
+            units.append({
+                "artifacts": [artifact_descriptor(
+                    self.out_dir, basename=filename, sidecar_basename=meta_path.name,
+                    producer_unit_id=unit_id,
+                )], "dependencies": [], "index": index, "kind": "ordinary_repeat",
+                "state": "completed", "unit_id": unit_id, "variant": 0,
+            })
+        self.job["recovery_cursor"] = {"completed_units": units}
+        ref = Path(self.out_dir, "voice.wav")
+        ref.write_bytes(b"authorized voice")
+        access = Path(str(ref) + ".access.json")
+        access.write_text(json.dumps({"owner_session_id": "owner-session"}))
+        self.job["params"] = {
+            "film_grain_intensity": 0.25, "film_grain_saturation": 0.5,
+            "voice_clone_enabled": True, "voice_clone_mode": "two",
+            "voice_clone_refs": [str(ref)], "delivery_resolution": "3840x2160",
+        }
+        events = []
+        def transform(path, tag):
+            events.append((tag, Path(path).read_bytes()))
+            Path(path).write_bytes(Path(path).read_bytes() + tag.encode())
+        def checkpoint(job, **updates):
+            job.update(updates)
+            return True
+        def inputs(job, _owner):
+            result = []
+            for index, path in enumerate(job["params"]["voice_clone_refs"]):
+                size, digest = sha256_file(path)
+                sidecar_size, sidecar_digest = sha256_file(path + ".access.json")
+                result.append({
+                    "field": f"voice_clone_refs:{index}", "path": path,
+                    "size": size, "sha256": digest, "scope": "upload",
+                    "sidecar_path": path + ".access.json", "sidecar_size": sidecar_size,
+                    "sidecar_sha256": sidecar_digest,
+                })
+            return result
+        def authorize(descriptor, *, owner_digest, **_kwargs):
+            return (owner_digest == "owner-session"
+                    and descriptor["path"] == str(ref)
+                    and sha256_file(ref) == (descriptor["size"], descriptor["sha256"])
+                    and sha256_file(access) == (descriptor["sidecar_size"], descriptor["sidecar_sha256"]))
+        def unit_checkpoint(job, **values):
+            pending = job["recovery_cursor"]["delivery_pending"]
+            unit = {"unit_id": pending["unit_id"], **values}
+            unit["artifacts"] = [artifact_descriptor(
+                self.out_dir, basename=name,
+                sidecar_basename=Path(name).stem + ".meta.json",
+                producer_unit_id=unit["unit_id"],
+            ) for name in values["artifact_names"]]
+            events.append(("checkpoint", unit))
+            return unit
+        namespace = {
+            "hashlib": hashlib, "hmac": hmac, "recovery_unit_id": recovery_unit_id,
+            "_queue_recovery_units": lambda job: job["recovery_cursor"]["completed_units"],
+            "_queue_recovery_checkpoint": checkpoint,
+            "_queue_recovery_checkpoint_unit": unit_checkpoint,
+            "_queue_recovery_unit_matches": lambda *_args, **_kwargs: None,
+            "_queue_recovery_input_descriptors": inputs,
+            "_queue_recovery_manifest_validator": authorize,
+            "owner_principal_digest": lambda _secret, owner: owner,
+            "_session_secret": lambda: "test",
+            "validate_artifact_descriptor": validate_artifact_descriptor,
+            "validate_protected_artifact_descriptor": validate_protected_artifact_descriptor,
+            "_protected_recovery_artifact_descriptor": protected_artifact_descriptor,
+            "replay_delivery_from_protected_native": replay_delivery_from_protected_native,
+            "_release_h3_delivery_vram": lambda: [],
+            "_apply_spatial_upsampling_to_file": lambda path, *_args, **_kwargs: transform(path, "-up"),
+            "_apply_delivery_fit_to_file": lambda path, *_args, **_kwargs: transform(path, "-fit"),
+            "_apply_film_grain_to_file": lambda path, *_args, **_kwargs: transform(path, "-grain"),
+            "_h3_final_output_integrity": lambda *_args, **_kwargs: {"validation": "valid"},
+            "_sample_campaign_transition_lock": threading.RLock(),
+            "_SAMPLE_CAMPAIGN_JOB_KIND": "sample_campaign_generation",
+            "is_cancel_requested": lambda job: bool(job.get("cancel_requested")),
+            "update_job": lambda job, **values: checkpoint(job, **values),
+            "finish_job": lambda job, _status, **values: checkpoint(job, **values),
+            "try_requeue": lambda *_args, **_kwargs: True,
+            "_persist_h3_delivery_failure_details": Mock(return_value=True),
+            "logging": logging,
+            "wgp": SimpleNamespace(server_config={"vram_safety_coefficient": 0.8}),
+        }
+        symbols = _load_launch_symbols(
+            "_H3DeliveryFailure", "_atomic_write_json", "_atomic_write_bytes", "_atomic_create_json",
+            "_stage_h3_delivery_native_outputs_v2", "_stage_h3_delivery_native_outputs",
+            "_queue_recovery_delivery_plan", "_queue_recovery_checkpoint_delivery_intent",
+            "_queue_recovery_checkpoint_delivery_pending", "_queue_recovery_delivery_pending",
+            "_queue_recovery_validate_delivery_parents", "_queue_recovery_completed_delivery_sidecar",
+            "_queue_recovery_checkpoint_delivery_publication", "_queue_recovery_reconcile_delivery_publication",
+            "_queue_recovery_restore_delivery_staged", "_queue_recovery_checkpoint_delivery_completed",
+            "_publish_h3_delivery_outputs", "_process_h3_delivery_from_protected_native",
+            "_deliver_h3_outputs_transactionally", "_resume_pending_h3_delivery_only",
+            "_retry_h3_delivery_postprocess_only", "_reset_h3_delivery_work",
+            "_h3_delivery_native_available", "_finalize_h3_delivery_publication",
+            "_rollback_h3_delivery_publication", namespace=namespace,
+        )
+        voice = ModuleType("postprocessing.voice_clone")
+        def clone(*, video_path, strict_in_place, mode, voice_ref_paths, **_kwargs):
+            self.assertTrue(strict_in_place)
+            self.assertEqual(mode, "single")
+            self.assertEqual(voice_ref_paths, [str(ref)])
+            transform(video_path, "-voice")
+            return True
+        voice.apply_voice_clone_to_file = clone
+        return symbols, voice, ref, events
+
+    def _deliver_finished(self, symbols, *, commit=None):
+        return symbols["_deliver_h3_outputs_transactionally"](
+            self.job, self.out_dir, self.files, "flashvsr3", "3840x2160", "center_crop",
+            copy_on_write=False,
+            publication_commit_fn=commit or (lambda names: bool(
+                symbols["_queue_recovery_checkpoint_delivery_completed"](
+                    self.job, self.out_dir, names, self.job["recovery_cursor"]["delivery_pending"],
+                )
+            )),
+        )
+
+    def test_transactional_finishing_seals_final_bytes_and_distinct_outcomes(self):
+        symbols, voice, ref, events = self._finishing_symbols()
+        normal_clone = voice.apply_voice_clone_to_file
+        def clone(**kwargs):
+            if Path(kwargs["video_path"]).read_bytes().startswith(b"native-1"):
+                return False
+            return normal_clone(**kwargs)
+        voice.apply_voice_clone_to_file = clone
+        def grain(path, *_args, **_kwargs):
+            if Path(path).read_bytes().startswith(b"native-1"):
+                raise RuntimeError("optional encoder unavailable")
+            Path(path).write_bytes(Path(path).read_bytes() + b"-grain")
+        symbols["_apply_film_grain_to_file"] = grain
+        with patch.dict(sys.modules, {"postprocessing.voice_clone": voice}):
+            names = self._deliver_finished(symbols)
+        for index, name in enumerate(names):
+            media = Path(self.out_dir, name)
+            self.assertEqual(media.read_bytes(), [b"native-0-up-fit-grain-voice", b"native-1-up-fit"][index])
+            meta_path = media.with_suffix(".meta.json")
+            meta = json.loads(meta_path.read_text())
+            self.assertNotIn(str(ref), meta_path.read_text())
+            self.assertNotIn("optional_finishing", meta["delivery_recovery"])
+            self.assertNotIn("optional_finishing", meta["delivery_recovery"]["queue_recovery_settings"])
+            self.assertEqual(meta["postprocessing"]["steps"][-2:], [
+                {"step": "film_grain", "outcome": "applied" if index == 0 else "not_applied"},
+                {"step": "voice_clone", "outcome": "applied" if index == 0 else "not_applied"},
+            ])
+            self.assertTrue(validate_artifact_descriptor(
+                self.out_dir, artifact_descriptor(
+                    self.out_dir, basename=name, sidecar_basename=meta_path.name,
+                    producer_unit_id=meta["producer_unit_id"],
+                ),
+            ))
+            self.assertEqual(sha256_file(media), (meta["producer_media_size"], meta["producer_media_sha256"]))
+        self.assertEqual(events[-1][0], "checkpoint")
+        for index, item in enumerate(self.job["_h3_delivery_native"]):
+            self.assertEqual(Path(item["native_path"]).read_bytes(), f"native-{index}".encode())
+
+    def test_finishing_crash_replay_uses_frozen_contract_and_clean_native(self):
+        symbols, voice, ref, events = self._finishing_symbols()
+        publisher = symbols["_publish_h3_delivery_outputs"]
+        symbols["_publish_h3_delivery_outputs"] = Mock(side_effect=RuntimeError("crash before publication"))
+        with patch.dict(sys.modules, {"postprocessing.voice_clone": voice}):
+            with self.assertRaises(symbols["_H3DeliveryFailure"]):
+                self._deliver_finished(symbols)
+        pending = json.loads(json.dumps(self.job["recovery_cursor"]["delivery_pending"]))
+        identity = pending["settings"]["optional_finishing"]
+        self.assertEqual(identity["voice_clone"]["mode"], "single")
+        self.assertNotIn(str(ref), json.dumps(identity))
+        self.assertEqual(pending["optional_finishing"]["voice_clone"]["references"][0]["path"], str(ref))
+        # A new worker has only the durable cursor, not volatile work or outcomes.
+        restarted = {key: value for key, value in self.job.items() if not key.startswith("_h3_delivery")}
+        restarted["params"] = {"film_grain_intensity": 0.9, "voice_clone_enabled": True}
+        symbols["_publish_h3_delivery_outputs"] = publisher
+        with patch.dict(sys.modules, {"postprocessing.voice_clone": voice}):
+            self.assertTrue(symbols["_resume_pending_h3_delivery_only"](restarted))
+        for index, name in enumerate(restarted["output_files"]):
+            self.assertEqual(Path(self.out_dir, name).read_bytes(), f"native-{index}-up-fit-grain-voice".encode())
+            meta = json.loads(Path(self.out_dir, Path(name).stem + ".meta.json").read_text())
+            self.assertEqual(meta["producer_unit_settings"]["optional_finishing"], identity)
+        self.assertEqual([value for tag, value in events if tag == "-up"], [b"native-0", b"native-1"] * 2)
+
+    def test_completed_finishing_adopts_sealed_delivery_after_reference_deletion(self):
+        symbols, voice, ref, events = self._finishing_symbols()
+        with patch.dict(sys.modules, {"postprocessing.voice_clone": voice}):
+            names = self._deliver_finished(symbols)
+        unit = next(value for tag, value in events if tag == "checkpoint")
+        sealed = [(Path(self.out_dir, name).read_bytes(),
+                   Path(self.out_dir, Path(name).stem + ".meta.json").read_bytes()) for name in names]
+        ref.unlink()
+        def completed_unit(*_args, **_kwargs):
+            self.assertTrue(all(validate_artifact_descriptor(
+                self.out_dir, descriptor, producer_unit_id=unit["unit_id"],
+            ) for descriptor in unit["artifacts"]))
+            return unit
+        symbols["_queue_recovery_unit_matches"] = completed_unit
+        symbols["_process_h3_delivery_from_protected_native"] = Mock(side_effect=AssertionError("completed delivery must not replay"))
+        symbols["_queue_recovery_manifest_validator"] = Mock(side_effect=AssertionError("completed delivery must not consume references"))
+        restarted = json.loads(json.dumps({key: value for key, value in self.job.items() if not key.startswith("_h3_delivery")}))
+        changed = json.loads(json.dumps(restarted))
+        changed["recovery_cursor"]["delivery_pending"]["optional_finishing"]["film_grain"]["intensity"] = 0.5
+        with self.assertRaises(symbols["_H3DeliveryFailure"]):
+            symbols["_resume_pending_h3_delivery_only"](changed)
+        self.assertTrue(symbols["_resume_pending_h3_delivery_only"](restarted))
+        self.assertEqual(restarted["output_files"], names)
+        self.assertNotIn("delivery_pending", restarted["recovery_cursor"])
+        self.assertEqual(restarted["recovery_state"], "terminal")
+        self.assertEqual([(Path(self.out_dir, name).read_bytes(),
+                           Path(self.out_dir, Path(name).stem + ".meta.json").read_bytes()) for name in names], sealed)
+        symbols["_process_h3_delivery_from_protected_native"].assert_not_called()
+        symbols["_queue_recovery_manifest_validator"].assert_not_called()
+
+    def test_changed_finishing_refs_block_recovery_before_work_or_publication(self):
+        symbols, voice, ref, _events = self._finishing_symbols()
+        symbols["_apply_spatial_upsampling_to_file"] = Mock(side_effect=RuntimeError("hold native"))
+        with self.assertRaises(symbols["_H3DeliveryFailure"]):
+            self._deliver_finished(symbols)
+        recovery = self.job["_h3_delivery_recovery"]
+        upscale = Mock()
+        publish = Mock()
+        symbols["_apply_spatial_upsampling_to_file"] = upscale
+        symbols["_publish_h3_delivery_outputs"] = publish
+        original = ref.read_bytes()
+        for mutation in ("changed", "missing", "access"):
+            with self.subTest(mutation=mutation):
+                ref.write_bytes(original)
+                Path(str(ref) + ".access.json").write_text(json.dumps({"owner_session_id": "owner-session"}))
+                if mutation == "changed":
+                    ref.write_bytes(b"changed reference")
+                elif mutation == "missing":
+                    ref.unlink()
+                else:
+                    Path(str(ref) + ".access.json").write_text("changed owner")
+                with self.assertRaises(symbols["_H3DeliveryFailure"]):
+                    symbols["_resume_pending_h3_delivery_only"](self.job)
+                child = {**self.job, "params": {}, "_h3_delivery_recovery_source_job": "job-1"}
+                with self.assertRaises(symbols["_H3DeliveryFailure"]):
+                    symbols["_retry_h3_delivery_postprocess_only"](child, recovery["staged"], recovery)
+                self.assertEqual(recovery["manual_retry_count"], 0)
+                self.assertFalse(recovery["consumed"])
+        upscale.assert_not_called()
+        publish.assert_not_called()
+        self.assertEqual(self.job["output_files"], [])
+
+    def test_finishing_cancellation_and_ambiguous_mutation_keep_native_private(self):
+        for cancelled in (True, False):
+            with self.subTest(cancelled=cancelled):
+                self.out_dir = str(Path(self.temp.name, str(cancelled)))
+                Path(self.out_dir).mkdir()
+                for index, filename in enumerate(self.files):
+                    Path(self.out_dir, filename).write_bytes(f"native-{index}".encode())
+                    Path(self.out_dir, Path(filename).stem + ".meta.json").write_text(json.dumps(_sidecar(filename)))
+                symbols, voice, _ref, _events = self._finishing_symbols()
+                def grain(path, *_args, **_kwargs):
+                    Path(path).write_bytes(b"partial finishing")
+                    if cancelled:
+                        self.job["cancel_requested"] = True
+                        raise InterruptedError("cancel during grain")
+                    raise RuntimeError("failed after mutation")
+                symbols["_apply_film_grain_to_file"] = grain
+                with self.assertRaises(InterruptedError if cancelled else symbols["_H3DeliveryFailure"]):
+                    self._deliver_finished(symbols)
+                self.assertEqual(self.job["output_files"], [])
+                for index, item in enumerate(self.job["_h3_delivery_native"]):
+                    self.assertEqual(Path(item["native_path"]).read_bytes(), f"native-{index}".encode())
+                    self.assertFalse(Path(item["source_path"]).exists())
+                self.job.pop("cancel_requested", None)
+                self.job.pop("_h3_delivery_native", None)
+                self.job.pop("_h3_delivery_recovery", None)
+
+    def test_manual_retry_finishes_from_native_and_refreshes_final_receipts(self):
+        symbols, voice, _ref, _events = self._finishing_symbols()
+        publisher = symbols["_publish_h3_delivery_outputs"]
+        symbols["_publish_h3_delivery_outputs"] = Mock(side_effect=RuntimeError("crash before publication"))
+        with patch.dict(sys.modules, {"postprocessing.voice_clone": voice}):
+            with self.assertRaises(symbols["_H3DeliveryFailure"]):
+                self._deliver_finished(symbols)
+        recovery = self.job["_h3_delivery_recovery"]
+        symbols["_publish_h3_delivery_outputs"] = publisher
+        child = {**self.job, "id": "manual-child", "params": {}, "_h3_delivery_recovery_source_job": "job-1"}
+        with patch.dict(sys.modules, {"postprocessing.voice_clone": voice}):
+            names = symbols["_retry_h3_delivery_postprocess_only"](child, recovery["staged"], recovery)
+        for index, name in enumerate(names):
+            media = Path(self.out_dir, name)
+            meta_path = media.with_suffix(".meta.json")
+            meta = json.loads(meta_path.read_text())
+            self.assertEqual(media.read_bytes(), f"native-{index}-up-fit-grain-voice".encode())
+            self.assertEqual(meta["job_id"], "job-1")
+            self.assertEqual(meta["recovery_job_id"], "manual-child")
+            self.assertEqual(meta["postprocessing"]["steps"][-1], {"step": "voice_clone", "outcome": "applied"})
+            self.assertEqual(sha256_file(media), (meta["producer_media_size"], meta["producer_media_sha256"]))
+            descriptor = artifact_descriptor(
+                self.out_dir, basename=name, sidecar_basename=meta_path.name,
+                producer_unit_id=meta["producer_unit_id"],
+            )
+            self.assertTrue(validate_artifact_descriptor(self.out_dir, descriptor))
+
+    def test_legacy_optional_request_blocks_retry_but_can_accept_native(self):
+        symbols, _release = self._symbols(Mock(), Mock())
+        # Old retained sidecars record requested grain but have no sealed finishing contract.
+        for name in self.files:
+            meta_path = Path(self.out_dir, Path(name).stem + ".meta.json")
+            meta = json.loads(meta_path.read_text())
+            meta["params"]["film_grain_intensity"] = 0.25
+            meta_path.write_text(json.dumps(meta))
+        staged = symbols["_stage_h3_delivery_native_outputs"](self.job, self.out_dir, self.files)
+        recovery = {"staged": staged, "delivery_resolution": "3840x2160", "delivery_fit": "center_crop"}
+        retry = _load_launch_symbols("_retry_h3_delivery_postprocess_only", namespace=symbols)
+        with self.assertRaisesRegex(symbols["_H3DeliveryFailure"], "finishing inputs are missing or changed"):
+            retry["_retry_h3_delivery_postprocess_only"](self.job, staged, recovery)
+        symbols["_apply_spatial_upsampling_to_file"].assert_not_called()
+        symbols["_reset_h3_delivery_work"](staged)
+        names = symbols["_publish_h3_delivery_outputs"](
+            self.job, staged, recovery_action="accept_native", requested_target="3840x2160",
+        )
+        for index, name in enumerate(names):
+            self.assertEqual(Path(self.out_dir, name).read_bytes(), f"native-{index}".encode())
+            meta = json.loads(Path(self.out_dir, Path(name).stem + ".meta.json").read_text())
+            self.assertNotIn("postprocessing", meta)
+
+    def test_finishing_contract_bounds_grain_and_preserves_effective_reference_order(self):
+        symbols = _load_launch_symbols("_H3DeliveryFailure", namespace={
+            "owner_principal_digest": lambda _secret, owner: owner,
+            "_session_secret": lambda: "test",
+            "_queue_recovery_manifest_validator": lambda descriptor, **_kwargs: (
+                sha256_file(descriptor["path"]) == (descriptor["size"], descriptor["sha256"])
+            ),
+        })
+        for grain in (None, {"intensity": float("nan"), "saturation": 0.5},
+                      {"intensity": 1.1, "saturation": 0.5}, {"intensity": True, "saturation": 0.5}):
+            with self.subTest(grain=grain), self.assertRaises(symbols["_H3DeliveryFailure"]):
+                symbols["_validate_h3_delivery_finishing"](self.job, {"schema_version": 1, "film_grain": grain})
+        references = [Path(self.out_dir, f"voice-{index}.wav") for index in range(3)]
+        for index, path in enumerate(references):
+            path.write_bytes(f"voice-{index}".encode())
+        def inputs(job, _owner):
+            return [{"path": path, "size": sha256_file(path)[0], "sha256": sha256_file(path)[1], "scope": "upload"}
+                    for path in job["params"]["voice_clone_refs"]]
+        symbols["_queue_recovery_input_descriptors"] = inputs
+        params = {"voice_clone_enabled": True, "voice_clone_mode": "two", "voice_clone_refs": [str(path) for path in references]}
+        first = symbols["_build_h3_delivery_finishing"](self.job, params)
+        self.assertEqual([ref["path"] for ref in first["voice_clone"]["references"]], params["voice_clone_refs"][:2])
+        references[-1].unlink()  # An unused third reference is not consumed.
+        second = symbols["_build_h3_delivery_finishing"](self.job, {**params, "voice_clone_refs": params["voice_clone_refs"][:2][::-1]})
+        self.assertNotEqual(symbols["_h3_delivery_finishing_identity"](first), symbols["_h3_delivery_finishing_identity"](second))
+
+    def test_strict_voice_remux_failure_cleans_owned_temp_without_sibling(self):
+        tree = ast.parse((APP / "postprocessing/voice_clone.py").read_text())
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_ffmpeg_remux_audio")
+        import subprocess
+        namespace = {"os": os, "tempfile": tempfile, "subprocess": subprocess}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), "strict-voice-remux", "exec"), namespace)
+        path = str(Path(self.out_dir, self.files[0]))
+        before = Path(path).read_bytes()
+        def ffmpeg(command, **_kwargs):
+            Path(command[-1]).write_bytes(b"converted audio")
+            return SimpleNamespace(returncode=0)
+        with patch.object(subprocess, "run", side_effect=ffmpeg), patch.object(os, "replace", side_effect=PermissionError("locked")), patch("time.sleep"), patch("gc.collect"):
+            self.assertFalse(namespace["_ffmpeg_remux_audio"](path, "audio.wav", strict_in_place=True))
+        self.assertEqual(Path(path).read_bytes(), before)
+        self.assertFalse(any("voicecloned" in name for name in os.listdir(self.out_dir)))
+
     def test_first_delivery_oom_releases_and_retries_same_native_files_once(self):
         calls = []
 
@@ -1394,7 +1774,8 @@ class H3DeliverySelectionAndPrivacyTests(unittest.TestCase):
                 "workspace": "project-a", "delivery_native_source": True,
                 "params": {"model_type": "minimax_h3_video"},
                 "delivery_recovery": {
-                    "schema_version": 1, "source_job_id": "source",
+                    "schema_version": 1,
+                    "optional_finishing": {"schema_version": 1, "film_grain": {"intensity": 0.25, "saturation": 0.5}}, "source_job_id": "source",
                     "original_filename": "variant.mp4",
                     "requested_target": "3840x2160",
                     "delivery_fit": "center_crop",
@@ -1430,6 +1811,9 @@ class H3DeliverySelectionAndPrivacyTests(unittest.TestCase):
             self.assertEqual(restored["status"], "failed")
             self.assertEqual(restored["session_id"], "owner")
             self.assertTrue(restored["_h3_delivery_recovery"]["restart_supported"])
+            self.assertEqual(restored["_h3_delivery_recovery"]["optional_finishing"], {
+                "schema_version": 1, "film_grain": {"intensity": 0.25, "saturation": 0.5},
+            })
             self.assertTrue(restored["source_remote"])
             self.assertTrue(restored["failure_details"]["is_oom"])
             self.assertEqual(set(restored["oom_info"]), {

@@ -5,6 +5,7 @@ import ast
 import asyncio
 import copy
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -63,6 +64,19 @@ def _launch_functions_namespace(function_names, **extras):
     source = LAUNCH_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(LAUNCH_PATH))
     selected = []
+    if "get_model_options" in function_names:
+        function_names = [*function_names, "_h3_cumulative_http_available"]
+        constants = {
+            "_H3_BASE_FL2VA_MODEL", "_H3_EXPLICIT_FL2VA_MODEL",
+            "_H3_W4A8_FL2VA_MODEL", "_H3_REF2VA_MODEL",
+            "_H3_FL2VA_MODELS", "_H3_LONG_STUDIO_MODELS",
+        }
+        selected.extend(
+            copy.deepcopy(node) for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id in constants
+                    for target in node.targets)
+        )
     for name in function_names:
         function = next(
             node for node in tree.body
@@ -79,6 +93,7 @@ def _launch_functions_namespace(function_names, **extras):
         "JSONResponse": _JSONResponse,
         "HTTPException": _HTTPException,
         "traceback": __import__("traceback"),
+        "os": os,
         **extras,
     }
     exec(compile(module, str(LAUNCH_PATH), "exec"), namespace)

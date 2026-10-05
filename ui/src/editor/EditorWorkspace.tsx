@@ -768,7 +768,7 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
               </label>
               <div className="flex items-center justify-between gap-3 px-4 py-3">
                 <button type="button" onClick={togglePlayback} disabled={!revealed || playbackError || busy}
-                  className="flex min-h-11 items-center gap-2 rounded-lg bg-cta px-4 text-sm font-medium text-cta-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50">
+                  className="flex min-h-11 items-center gap-2 rounded-lg bg-cta px-4 text-sm font-medium text-cta-foreground hover:ring-2 hover:ring-accent-blue/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50">
                   {playing ? <Pause size={15} aria-hidden="true" /> : <Play size={15} aria-hidden="true" />} {playing ? 'Pause' : clips.length > 1 ? 'Play clip' : 'Play cut'}
                 </button>
                 <span className="text-xs tabular-nums text-text-secondary">{displayTime(trimStart)}–{displayTime(trimEnd)}</span>

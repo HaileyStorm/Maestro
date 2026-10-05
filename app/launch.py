@@ -12870,6 +12870,179 @@ def _queue_recovery_reseal_delivery_source(
     return refreshed
 
 
+def _h3_delivery_finishing_identity(contract: dict | None) -> dict | None:
+    """Bind finishing inputs without publishing their private locations."""
+    if contract is None:
+        return None
+    identity = {"schema_version": 1}
+    if "film_grain" in contract:
+        identity["film_grain"] = dict(contract["film_grain"])
+    if "voice_clone" in contract:
+        voice = contract["voice_clone"]
+        identity["voice_clone"] = {
+            "mode": voice["mode"],
+            "references": [
+                {
+                    **{key: value for key, value in reference.items()
+                       if key not in {"path", "sidecar_path"}},
+                    "path_sha256": hashlib.sha256(
+                        reference["path"].encode("utf-8")
+                    ).hexdigest(),
+                    **({"sidecar_path_sha256": hashlib.sha256(
+                        reference["sidecar_path"].encode("utf-8")
+                    ).hexdigest()} if "sidecar_path" in reference else {}),
+                }
+                for reference in voice["references"]
+            ],
+        }
+    return identity
+
+
+def _validate_h3_delivery_finishing(
+    job: dict, contract: dict | None, *, settings: dict | None = None,
+    requested_params: dict | None = None,
+    verify_references: bool = True,
+) -> None:
+    """Bind the contract; revalidate live references only when consuming them."""
+    import math
+
+    try:
+        params = requested_params if requested_params is not None else job.get("params") or {}
+        requested = bool(params.get("film_grain_intensity", 0) or params.get("voice_clone_enabled"))
+        if contract is None:
+            if requested or (settings or {}).get("optional_finishing") is not None:
+                raise ValueError("Missing finishing identity")
+            return
+        if (not isinstance(contract, dict)
+                or type(contract.get("schema_version")) is not int
+                or contract.get("schema_version") != 1
+                or not set(contract) <= {"schema_version", "film_grain", "voice_clone"}
+                or not (set(contract) & {"film_grain", "voice_clone"})):
+            raise ValueError("Invalid finishing contract")
+        grain = contract.get("film_grain")
+        if "film_grain" in contract:
+            if (not isinstance(grain, dict) or set(grain) != {"intensity", "saturation"}
+                    or any(type(grain[key]) not in {int, float}
+                           or not math.isfinite(grain[key]) or not 0 <= grain[key] <= 1
+                           for key in grain)
+                    or grain["intensity"] <= 0):
+                raise ValueError("Invalid grain settings")
+        voice = contract.get("voice_clone")
+        if "voice_clone" in contract:
+            if (not isinstance(voice, dict) or set(voice) != {"mode", "references"}
+                    or voice.get("mode") not in {"single", "two"}
+                    or not isinstance(voice.get("references"), list)
+                    or len(voice["references"]) != (2 if voice["mode"] == "two" else 1)):
+                raise ValueError("Invalid voice settings")
+            for reference in voice["references"]:
+                if (not isinstance(reference, dict)
+                        or reference.get("scope") not in {"upload", "upload_audio", "recovery_upload", "project"}
+                        or not isinstance(reference.get("path"), str)
+                        or not os.path.isabs(reference["path"])
+                        or os.path.normpath(reference["path"]) != reference["path"]
+                        or type(reference.get("size")) is not int or reference["size"] < 0
+                        or not isinstance(reference.get("sha256"), str)
+                        or len(reference["sha256"]) != 64
+                        or any(char not in "0123456789abcdef" for char in reference["sha256"])):
+                    raise ValueError("Invalid voice reference identity")
+                if verify_references and not _queue_recovery_manifest_validator(
+                    reference,
+                    owner_digest=owner_principal_digest(_session_secret(), str(job.get("session_id") or "")),
+                    workspace=str(job.get("workspace") or "default"),
+                    project_dir=str(job.get("out_dir") or ""),
+                ):
+                    raise ValueError("Voice reference changed or lost authorization")
+        if settings is not None and settings.get("optional_finishing") != _h3_delivery_finishing_identity(contract):
+            raise ValueError("Finishing identity changed")
+    except (OSError, ValueError, TypeError, KeyError, QueueRecoveryRuntimeError) as error:
+        raise _H3DeliveryFailure(
+            "Delivery finishing inputs are missing or changed; the native result is still available",
+            stage="postprocess", code="delivery_finishing_identity_changed",
+        ) from error
+
+
+def _build_h3_delivery_finishing(job: dict, params: dict) -> dict | None:
+    """Freeze only effective passes from the admitted generation request."""
+    contract = {"schema_version": 1}
+    intensity = params.get("film_grain_intensity", 0)
+    if intensity:
+        contract["film_grain"] = {
+            "intensity": intensity,
+            "saturation": params.get("film_grain_saturation", 0.5),
+        }
+    if params.get("voice_clone_enabled"):
+        refs = params.get("voice_clone_refs")
+        if not isinstance(refs, list) or not refs:
+            _validate_h3_delivery_finishing(job, None, requested_params=params)
+        mode = "two" if params.get("voice_clone_mode") == "two" and len(refs) >= 2 else "single"
+        refs = refs[:2 if mode == "two" else 1]
+        owner = owner_principal_digest(_session_secret(), str(job.get("session_id") or ""))
+        inputs = _queue_recovery_input_descriptors(
+            {**job, "params": {"voice_clone_refs": refs}}, owner,
+        )
+        contract["voice_clone"] = {"mode": mode, "references": inputs}
+    result = contract if len(contract) > 1 else None
+    _validate_h3_delivery_finishing(job, result, requested_params=params)
+    return result
+
+
+def _apply_h3_delivery_finishing(
+    job: dict, path: str, contract: dict | None, *, update_job_fn=None,
+) -> list[dict]:
+    """Keep optional failures best-effort only when unchanged bytes are proven."""
+    _validate_h3_delivery_finishing(job, contract)
+    if contract is None:
+        return []
+    publisher = update_job if update_job_fn is None else update_job_fn
+
+    def cancelled():
+        return bool(is_cancel_requested(job) or (
+            job.get("kind") == _SAMPLE_CAMPAIGN_JOB_KIND
+            and job.get("resource_state") == "preemption_requested"
+        ))
+
+    outcomes = []
+    for step in ("film_grain", "voice_clone"):
+        if step not in contract:
+            continue
+        if cancelled() or not publisher(job, phase="Delivery finishing", message=(
+            "Applying film grain..." if step == "film_grain" else "Applying voice cloning..."
+        )):
+            raise InterruptedError("H3 delivery cancelled")
+        before = _recovery_sha256_file(path)
+        applied = False
+        failure = None
+        try:
+            if step == "film_grain":
+                grain = contract[step]
+                _apply_film_grain_to_file(
+                    path, grain["intensity"], grain["saturation"], cancel_check=cancelled,
+                )
+                applied = True
+            else:
+                _validate_h3_delivery_finishing(job, contract)
+                from postprocessing.voice_clone import apply_voice_clone_to_file
+                voice = contract[step]
+                applied = apply_voice_clone_to_file(
+                    video_path=path,
+                    voice_ref_paths=[ref["path"] for ref in voice["references"]],
+                    mode=voice["mode"], cancel_check=cancelled, strict_in_place=True,
+                ) is True
+        except (InterruptedError, _H3DeliveryFailure):
+            raise
+        except Exception as error:
+            failure = error
+        if cancelled():
+            raise InterruptedError("H3 delivery cancelled")
+        if not applied and _recovery_sha256_file(path) != before:
+            raise _H3DeliveryFailure(
+                "Delivery finishing changed the video without confirming success",
+                stage="postprocess", code="delivery_finishing_mutation_unconfirmed",
+            ) from failure
+        outcomes.append({"step": step, "outcome": "applied" if applied else "not_applied"})
+    return outcomes
+
+
 def _queue_recovery_delivery_plan(
     job: dict,
     project_dir: str,
@@ -12879,6 +13052,7 @@ def _queue_recovery_delivery_plan(
     delivery_resolution: str,
     delivery_fit: str,
     copy_on_write: bool = False,
+    optional_finishing: dict | None = None,
 ) -> dict:
     """Bind delivery to ordered verified native hashes and producer units."""
     if copy_on_write and not file_names:
@@ -12954,6 +13128,8 @@ def _queue_recovery_delivery_plan(
         "native_hashes": native_hashes,
         "spatial_upsampling": spatial_upsampling,
     }
+    if optional_finishing is not None:
+        settings["optional_finishing"] = _h3_delivery_finishing_identity(optional_finishing)
     use_copy_on_write = copy_on_write and not resealed_legacy_source
     if copy_on_write and not use_copy_on_write:
         raise QueueRecoveryRuntimeError(
@@ -12989,6 +13165,7 @@ def _queue_recovery_delivery_plan(
             } if use_copy_on_write else {}),
         })
     return {
+        **({"optional_finishing": optional_finishing} if optional_finishing is not None else {}),
         "dependencies": dependencies,
         "publication_schema": 2 if use_copy_on_write else 1,
         "staging": staging,
@@ -13000,6 +13177,7 @@ def _queue_recovery_delivery_plan(
 def _queue_recovery_checkpoint_delivery_intent(job: dict, plan: dict) -> dict:
     """Persist planned native names and source hashes before the first rename."""
     pending = {
+        **({"optional_finishing": plan["optional_finishing"]} if "optional_finishing" in plan else {}),
         "dependencies": list(plan.get("dependencies") or []),
         "publication_schema": plan.get("publication_schema", 1),
         "settings": dict(plan.get("settings") or {}),
@@ -13038,6 +13216,7 @@ def _queue_recovery_checkpoint_delivery_pending(
         item["work_basename"] = os.path.basename(item["work_path"])
         artifacts.append(descriptor)
     pending = {
+        **({"optional_finishing": plan["optional_finishing"]} if "optional_finishing" in plan else {}),
         "artifacts": artifacts,
         "dependencies": list(plan["dependencies"]),
         "publication_schema": plan.get("publication_schema", 1),
@@ -60835,7 +61014,6 @@ def _apply_film_grain_to_file_impl(video_path: str, intensity: float, saturation
         frames = add_film_grain(frames, intensity, saturation)
     check_cancel()
     # Check if source has audio track to preserve it
-    audio_tmp = None
     codec_type = wgp.server_config.get("video_output_codec", "libx264_8")
     container = wgp.server_config.get("video_container", "mp4")
     tmp_path = video_path + ".grain_tmp." + container
@@ -60850,17 +61028,6 @@ def _apply_film_grain_to_file_impl(video_path: str, intensity: float, saturation
             raise RuntimeError("Film grain audio probe failed")
         has_audio = 'audio' in probe.stdout
         check_cancel()
-        if has_audio:
-            import tempfile
-            descriptor, audio_tmp = tempfile.mkstemp(suffix='.aac')
-            os.close(descriptor)
-            demux = subprocess.run(
-                ['ffmpeg', '-y', '-i', video_path, '-vn', '-acodec', 'copy', audio_tmp],
-                capture_output=True, timeout=60
-            )
-            if demux.returncode != 0 or os.path.getsize(audio_tmp) == 0:
-                raise RuntimeError("Film grain audio extraction failed")
-            check_cancel()
         # Save back — save_video expects [B, C, F, H, W] for the uint8 fast path.
         save_video(tensor=frames.unsqueeze(0), save_file=tmp_path, fps=fps, nrow=1,
                    normalize=False, codec_type=codec_type, container=container)
@@ -60868,8 +61035,13 @@ def _apply_film_grain_to_file_impl(video_path: str, intensity: float, saturation
             raise RuntimeError("Film grain video encoding failed")
         check_cancel()
         if has_audio:
+            # Keep audio packets and their container timing, including AAC skip
+            # metadata. A raw AAC round trip loses timing and re-encoding can
+            # shorten the tail. Grain changes video only; preserve all audio
+            # streams and fail without replacing the source if copy is unsupported.
             mux = subprocess.run(
-                ['ffmpeg', '-y', '-i', tmp_path, '-i', audio_tmp, '-c:v', 'copy', '-c:a', 'aac', '-shortest', muxed_path],
+                ['ffmpeg', '-nostdin', '-y', '-i', tmp_path, '-i', video_path,
+                 '-map', '0:v:0', '-map', '1:a', '-c:v', 'copy', '-c:a', 'copy', muxed_path],
                 capture_output=True, timeout=120
             )
             if mux.returncode != 0 or not os.path.isfile(muxed_path) or os.path.getsize(muxed_path) == 0:
@@ -60892,7 +61064,7 @@ def _apply_film_grain_to_file_impl(video_path: str, intensity: float, saturation
 
         replace_with_retry(muxed_path if has_audio else tmp_path)
     finally:
-        for temporary in (audio_tmp, tmp_path, muxed_path):
+        for temporary in (tmp_path, muxed_path):
             if temporary and os.path.exists(temporary):
                 try:
                     os.remove(temporary)
@@ -62165,7 +62337,10 @@ def _stage_h3_delivery_native_outputs_v2(
             "artifact_class": "temporary",
             "delivery_native_source": True,
             "delivery_recovery": {
+                **({"optional_finishing": delivery_plan["optional_finishing"]} if "optional_finishing" in delivery_plan else {}),
                 "schema_version": 2,
+                "native_size": source["size"],
+                "native_sha256": source["sha256"],
                 "source_job_id": str(job.get("id") or ""),
                 "original_filename": file_name,
                 "requested_target": str((job.get("params") or {}).get("delivery_resolution") or ""),
@@ -62380,8 +62555,13 @@ def _stage_h3_delivery_native_outputs(
                 private_policy,
                 workspace=str(job.get("workspace") or "default"),
             )
+            native_size, native_sha256 = _recovery_sha256_file(native_path)
             durable_recovery = {
+                **({"optional_finishing": (delivery_plan or {}).get("optional_finishing", job.get("_h3_delivery_finishing"))}
+                   if (delivery_plan or {}).get("optional_finishing", job.get("_h3_delivery_finishing")) is not None else {}),
                 "schema_version": 1,
+                "native_size": native_size,
+                "native_sha256": native_sha256,
                 "source_job_id": str(job.get("id") or ""),
                 "original_filename": file_name,
                 "requested_target": str(
@@ -62454,6 +62634,14 @@ def _reset_h3_delivery_work(staged: list[dict]) -> None:
     import shutil
 
     for item in staged:
+        with open(item["native_meta"], "r", encoding="utf-8") as handle:
+            durable = json.load(handle).get("delivery_recovery") or {}
+        expected = item.get("recovery_descriptor") or durable
+        expected_size = expected.get("size", expected.get("native_size"))
+        expected_hash = expected.get("sha256", expected.get("native_sha256"))
+        if expected_hash is not None and _recovery_sha256_file(item["native_path"]) != (expected_size, expected_hash):
+            raise _H3DeliveryFailure("Protected H3 native bytes changed")
+        item.pop("finishing_outcomes", None)
         try:
             os.remove(item["work_path"])
         except FileNotFoundError:
@@ -62515,6 +62703,11 @@ def _publish_h3_delivery_outputs(
             "artifact_class": "final" if final else "temporary",
         })
         if final:
+            media_size, media_sha256 = _recovery_sha256_file(
+                item["work_path"] if os.path.isfile(item["work_path"]) else item["source_path"]
+            )
+            sidecar["producer_media_size"] = media_size
+            sidecar["producer_media_sha256"] = media_sha256
             sidecar.pop("delivery_native_source", None)
             # Only callers that finished both delivery passes supply this
             # receipt. Native acceptance and direct publication must not
@@ -62537,12 +62730,16 @@ def _publish_h3_delivery_outputs(
                     "steps": [
                         upscale_step,
                         {"step": "delivery_fit", "outcome": "applied"},
+                        *item.get("finishing_outcomes", []),
                     ],
                 }
             durable = (
                 sidecar.get("delivery_recovery")
                 if isinstance(sidecar.get("delivery_recovery"), dict) else {}
             )
+            durable.pop("optional_finishing", None)
+            if isinstance(durable.get("queue_recovery_settings"), dict):
+                durable["queue_recovery_settings"].pop("optional_finishing", None)
             producer_job_id = str(
                 durable.get("producer_job_id") or sidecar.get("job_id") or ""
             )
@@ -62930,9 +63127,13 @@ def _process_h3_delivery_from_protected_native(
     delivery_fit: str,
     update_job_fn=None,
     publication_commit_fn=None,
+    optional_finishing: dict | None = None,
+    recovery_action: str = "",
 ) -> list[str]:
-    """Run no operation except delivery from hash-verified native bytes."""
+    """Finish private work files from verified native bytes before publication."""
+    _validate_h3_delivery_finishing(job, optional_finishing)
     for item in staged:
+        item.pop("finishing_outcomes", None)
         if is_cancel_requested(job):
             raise InterruptedError("H3 delivery cancelled")
 
@@ -62981,6 +63182,9 @@ def _process_h3_delivery_from_protected_native(
                     stage="delivery",
                     code="delivery_fit_failed",
                 ) from error
+            item["finishing_outcomes"] = _apply_h3_delivery_finishing(
+                job, staging_path, optional_finishing, update_job_fn=update_job_fn,
+            )
             return True
 
         replay_delivery_from_protected_native(
@@ -62994,6 +63198,8 @@ def _process_h3_delivery_from_protected_native(
             job,
             staged,
             completed_delivery={"spatial_upsampling": spatial_upsampling},
+            recovery_action=recovery_action,
+            requested_target=delivery_resolution if recovery_action else "",
             update_job_fn=update_job_fn,
             publication_commit_fn=publication_commit_fn,
         )
@@ -63017,7 +63223,11 @@ def _h3_copy_on_write_delivery_eligible(
     voice_clone_enabled: bool,
     voice_clone_refs: list,
 ) -> bool:
-    """Use protected child publication only when no later pass changes it."""
+    """Keep optional finishing on the manual-recoverable native-move path.
+
+    Copy-on-write children still require a separate manual publication intent.
+    Director final assembly also remains outside this transaction.
+    """
     return bool(
         delivery_requested
         and not director_final_video_postprocess
@@ -63036,6 +63246,7 @@ def _deliver_h3_outputs_transactionally(
     update_job_fn=None,
     publication_commit_fn=None,
     copy_on_write: bool = False,
+    optional_finishing: dict | None = None,
 ) -> list[str]:
     """Deliver all H3 finals from protected native bytes with one OOM retry."""
     from services.oom_detect import delivery_oom_info, is_oom
@@ -63044,6 +63255,10 @@ def _deliver_h3_outputs_transactionally(
         raise _H3DeliveryFailure("H3 delivery target is invalid")
     if delivery_fit not in {"upscale_exact", "center_crop"}:
         raise _H3DeliveryFailure("H3 delivery fit is invalid")
+    if optional_finishing is None:
+        optional_finishing = _build_h3_delivery_finishing(job, job.get("params") or {})
+    _validate_h3_delivery_finishing(job, optional_finishing)
+    job["_h3_delivery_finishing"] = optional_finishing
     try:
         plan_builder = globals().get("_queue_recovery_delivery_plan")
         intent_checkpoint = globals().get(
@@ -63065,6 +63280,7 @@ def _deliver_h3_outputs_transactionally(
                 delivery_resolution=delivery_resolution,
                 delivery_fit=delivery_fit,
                 copy_on_write=copy_on_write,
+                optional_finishing=optional_finishing,
             )
             intent_checkpoint(job, delivery_plan)
             staged = _stage_h3_delivery_native_outputs(
@@ -63084,6 +63300,7 @@ def _deliver_h3_outputs_transactionally(
             code="delivery_native_protection_failed",
         ) from error
     job["_h3_delivery_recovery"] = {
+        **({"optional_finishing": optional_finishing} if optional_finishing is not None else {}),
         "nonce": uuid.uuid4().hex,
         "staged": staged,
         "spatial_upsampling": spatial_upsampling,
@@ -63123,6 +63340,7 @@ def _deliver_h3_outputs_transactionally(
                     delivery_fit=delivery_fit,
                     update_job_fn=update_job_fn,
                     publication_commit_fn=publication_commit_fn,
+                    optional_finishing=optional_finishing,
                 )
             _reset_h3_delivery_work(staged)
             for item in staged:
@@ -63154,6 +63372,9 @@ def _deliver_h3_outputs_transactionally(
                 active_code = "delivery_fit_failed"
                 _apply_delivery_fit_to_file(
                     item["work_path"], delivery_resolution, delivery_fit, job=job,
+                )
+                item["finishing_outcomes"] = _apply_h3_delivery_finishing(
+                    job, item["work_path"], optional_finishing, update_job_fn=update_job_fn,
                 )
             active_stage = "publication"
             active_code = "publication_failed"
@@ -63243,6 +63464,10 @@ def _resume_pending_h3_delivery_only(
     out_dir = os.path.realpath(str(job.get("out_dir") or ""))
     settings = dict(pending.get("settings") or {})
     dependencies = list(pending.get("dependencies") or [])
+    optional_finishing = pending.get("optional_finishing")
+    _validate_h3_delivery_finishing(
+        job, optional_finishing, settings=settings, verify_references=False,
+    )
     expected = recovery_unit_id(
         str(job.get("id") or ""),
         "h3_delivery",
@@ -63252,7 +63477,9 @@ def _resume_pending_h3_delivery_only(
     if not hmac.compare_digest(expected, str(pending.get("unit_id") or "")):
         raise QueueRecoveryRuntimeError("Protected delivery identity changed.")
     if pending.get("state") == "staging_native":
+        _validate_h3_delivery_finishing(job, optional_finishing, settings=settings)
         plan = {
+            **({"optional_finishing": optional_finishing} if optional_finishing is not None else {}),
             "dependencies": dependencies,
             "publication_schema": pending.get("publication_schema", 1),
             "settings": settings,
@@ -63320,6 +63547,7 @@ def _resume_pending_h3_delivery_only(
             job, update_job_fn=update_job_fn,
         )
         return False
+    _validate_h3_delivery_finishing(job, optional_finishing, settings=settings)
     if pending.get("publication_schema") == 2 and pending.get("publication"):
         publisher = update_job if update_job_fn is None else update_job_fn
         if not publisher(job, output_files=[]):
@@ -63328,6 +63556,7 @@ def _resume_pending_h3_delivery_only(
     job["_h3_delivery_recovery"] = {
         "nonce": uuid.uuid4().hex,
         "staged": staged,
+        **({"optional_finishing": optional_finishing} if optional_finishing is not None else {}),
         "spatial_upsampling": str(settings.get("spatial_upsampling") or ""),
         "delivery_resolution": str(settings.get("delivery_resolution") or ""),
         "delivery_fit": str(settings.get("delivery_fit") or ""),
@@ -63362,6 +63591,7 @@ def _resume_pending_h3_delivery_only(
             delivery_fit=str(settings.get("delivery_fit") or ""),
             update_job_fn=update_job_fn,
             publication_commit_fn=commit_delivery_publication,
+            optional_finishing=optional_finishing,
         )
         finisher = finish_job if finish_job_fn is None else finish_job_fn
         completed = finisher(
@@ -63581,6 +63811,7 @@ def _reindex_h3_delivery_recoveries() -> int:
                 str(record[1].get("spatial_upsampling") or ""),
                 bool(record[1].get("final_private")),
                 bool(record[1].get("final_explicit")),
+                json.dumps(record[1].get("optional_finishing"), sort_keys=True),
             )
             for record in records
         }
@@ -63629,6 +63860,7 @@ def _reindex_h3_delivery_recoveries() -> int:
             "owner_session_id": owner if first.get("final_private") else None,
         }
         recovery = {
+            **({"optional_finishing": first["optional_finishing"]} if "optional_finishing" in first else {}),
             "nonce": uuid.uuid4().hex, "staged": staged,
             "spatial_upsampling": str(first.get("spatial_upsampling") or ""),
             "delivery_resolution": str(first.get("requested_target") or ""),
@@ -63828,6 +64060,40 @@ def _public_h3_delivery_recovery(job: dict) -> dict:
     }
 
 
+def _validate_h3_recovery_finishing(
+    job: dict, staged: list[dict], recovery: dict,
+) -> dict | None:
+    contract = recovery.get("optional_finishing")
+    _validate_h3_delivery_finishing(job, contract)
+    for item in staged:
+        with open(item["native_meta"], "r", encoding="utf-8") as handle:
+            sidecar = json.load(handle)
+        durable = sidecar.get("delivery_recovery") or {}
+        if durable.get("optional_finishing") != contract:
+            raise _H3DeliveryFailure(
+                "Delivery finishing identity changed", stage="postprocess",
+                code="delivery_finishing_identity_changed",
+            )
+        _validate_h3_delivery_finishing(
+            job, contract, requested_params=sidecar.get("params") or {},
+            settings=durable.get("queue_recovery_settings") or (
+                {"optional_finishing": _h3_delivery_finishing_identity(contract)}
+                if contract is not None else {}
+            ),
+        )
+        expected = item.get("recovery_descriptor") or durable
+        size = expected.get("size", expected.get("native_size"))
+        digest = expected.get("sha256", expected.get("native_sha256"))
+        if contract is not None and digest is None:
+            raise _H3DeliveryFailure(
+                "Delivery finishing needs verified native bytes", stage="postprocess",
+                code="delivery_finishing_identity_changed",
+            )
+        if digest is not None and _recovery_sha256_file(item["native_path"]) != (size, digest):
+            raise _H3DeliveryFailure("Protected H3 native bytes changed")
+    return contract
+
+
 def _retry_h3_delivery_postprocess_only(
     job: dict,
     staged: list[dict],
@@ -63836,8 +64102,32 @@ def _retry_h3_delivery_postprocess_only(
     """Run one manual delivery attempt from retained native bytes only."""
     from services.oom_detect import delivery_oom_info, is_oom
 
+    optional_finishing = _validate_h3_recovery_finishing(job, staged, recovery)
     actions = _release_h3_delivery_vram()
     try:
+        if optional_finishing is not None or all(isinstance(item.get("recovery_descriptor"), dict) for item in staged):
+            from services.queue_recovery_runtime import protected_artifact_descriptor
+            for item in staged:
+                # Manual-attempt bookkeeping changes the private sidecar digest,
+                # never the verified native bytes or finishing contract.
+                item["recovery_descriptor"] = protected_artifact_descriptor(
+                    os.path.dirname(item["native_path"]),
+                    basename=os.path.basename(item["native_path"]),
+                    sidecar_basename=os.path.basename(item["native_meta"]),
+                    original_basename=item["file_name"],
+                    producer_unit_id=recovery_unit_id(
+                        str(job.get("_h3_delivery_recovery_source_job") or job.get("id") or ""),
+                        "h3_delivery", settings={"manual_retry": True},
+                    ),
+                )
+                item["work_basename"] = os.path.basename(item["work_path"])
+            return _process_h3_delivery_from_protected_native(
+                job, os.path.dirname(staged[0]["native_path"]), staged,
+                spatial_upsampling=str(recovery.get("spatial_upsampling") or ""),
+                delivery_resolution=str(recovery.get("delivery_resolution") or ""),
+                delivery_fit=str(recovery.get("delivery_fit") or ""),
+                optional_finishing=optional_finishing, recovery_action="retry_delivery",
+            )
         _reset_h3_delivery_work(staged)
         for item in staged:
             if is_cancel_requested(job):
@@ -63947,6 +64237,7 @@ def _run_h3_delivery_recovery_job(job_id: str) -> None:
                     limit = max(0, int(recovery.get("manual_retry_limit") or 0))
                     if count >= limit:
                         raise _H3DeliveryFailure("H3 delivery recovery is no longer available")
+                    _validate_h3_recovery_finishing(job, staged, recovery)
                     # Charge only after admission, start, registration, and
                     # retained-native validation: this is the actual attempt.
                     recovery["manual_retry_count"] = count + 1
@@ -66926,6 +67217,8 @@ def _run_generation(
                 )
             )
 
+            h3_delivery_transaction_owned = False
+
             # Voice clone postprocessing (SeedVC) — replaces 1 or 2 voices
             # in the generated video's audio with user-supplied reference
             # voice(s). Driven by three params (set by the UI):
@@ -66937,6 +67230,15 @@ def _run_generation(
             pp_voice_clone_enabled = bool(raw_params.pop("voice_clone_enabled", False))
             pp_voice_clone_refs = raw_params.pop("voice_clone_refs", None) or []
             pp_voice_clone_mode = raw_params.pop("voice_clone_mode", "single")
+            h3_delivery_finishing = (
+                _build_h3_delivery_finishing(job, {
+                    "film_grain_intensity": pp_film_grain_intensity,
+                    "film_grain_saturation": pp_film_grain_saturation,
+                    "voice_clone_enabled": pp_voice_clone_enabled,
+                    "voice_clone_refs": pp_voice_clone_refs,
+                    "voice_clone_mode": pp_voice_clone_mode,
+                }) if h3_delivery_request else None
+            )
             h3_copy_on_write_delivery = _h3_copy_on_write_delivery_eligible(
                 h3_delivery_request,
                 director_final_video_postprocess=(
@@ -71196,7 +71498,9 @@ def _run_generation(
                                     commit_h3_delivery_publication
                                 ),
                                 copy_on_write=h3_copy_on_write_delivery,
+                                optional_finishing=h3_delivery_finishing,
                             )
+                            h3_delivery_transaction_owned = True
                             if director_postprocess_files is not None:
                                 director_postprocess_files = list(delivered_files)
                         except InterruptedError:
@@ -71249,7 +71553,7 @@ def _run_generation(
                                 traceback.print_exc()
 
                 # Post-generation film grain pass (applied to output files, not during inference)
-                if success and pp_film_grain_intensity > 0:
+                if success and pp_film_grain_intensity > 0 and not h3_delivery_transaction_owned:
                     video_exts = {".mp4", ".webm", ".mkv"}
                     film_grain_files = (
                         director_postprocess_files
@@ -71295,7 +71599,7 @@ def _run_generation(
                 # The voice-clone function leaves the video unchanged on any
                 # failure (no audio track, missing refs, SeedVC failure,
                 # remux failure) — it's safe to enable speculatively.
-                if success and pp_voice_clone_enabled and pp_voice_clone_refs:
+                if success and pp_voice_clone_enabled and pp_voice_clone_refs and not h3_delivery_transaction_owned:
                     video_exts = {".mp4", ".webm", ".mkv"}
                     for fname in new_files:
                         ext = os.path.splitext(fname)[1].lower()

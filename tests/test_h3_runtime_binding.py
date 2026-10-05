@@ -240,6 +240,43 @@ class RuntimeBindingTests(unittest.TestCase):
         module._QTYPE_QMODULE_CACHE = "changed"
         self.assertNotEqual(binding.implementation_sha256([module]), original)
 
+    def test_loaded_set_constants_bind_across_fresh_hash_seed_processes(self):
+        code = """
+import types
+from services.h3_runtime_binding import implementation_sha256
+module = types.ModuleType('fixture_set_constants')
+exec("def compute(value):\\n return value in {'alpha', 'beta', 'gamma', 'delta'}\\n", module.__dict__)
+print(implementation_sha256([module]))
+"""
+        digests = []
+        for seed in ("1", "2"):
+            env = os.environ.copy()
+            env.update(
+                PYTHONPATH=str(Path(__file__).resolve().parents[1] / "app"),
+                PYTHONHASHSEED=seed,
+                CUDA_VISIBLE_DEVICES="",
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", code], env=env, capture_output=True,
+                text=True, timeout=30, check=True,
+            )
+            digests.append(result.stdout.strip())
+        self.assertRegex(digests[0], r"^[0-9a-f]{64}$")
+        self.assertEqual(digests[0], digests[1])
+
+        module = types.ModuleType("fixture_constant_types")
+        exec("def compute():\n return ('alpha', 'beta')\n", module.__dict__)
+        original = binding.implementation_sha256([module])
+        module.compute.__code__ = module.compute.__code__.replace(
+            co_consts=(None, frozenset(("alpha", "beta")))
+        )
+        self.assertNotEqual(binding.implementation_sha256([module]), original)
+        changed = binding.implementation_sha256([module])
+        module.compute.__code__ = module.compute.__code__.replace(
+            co_consts=(None, frozenset(("alpha", "gamma")))
+        )
+        self.assertNotEqual(binding.implementation_sha256([module]), changed)
+
     def fake_loaded(self):
         model = fake_model()
         model._h3_runtime_profile = {"fixture": True}

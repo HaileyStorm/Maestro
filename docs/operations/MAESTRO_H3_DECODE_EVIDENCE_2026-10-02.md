@@ -479,3 +479,85 @@ peak GPU memory, repeatable throughput, native browser HEVC playback, or owner
 whole-clip/listening acceptance. Further fade diagnosis should capture bounded
 prediction and temporal-conditioning observations against the pinned learned
 path; another unchanged Dense repeat would add little evidence.
+
+## Matched private pinned-rotary clip (2026-10-05 UTC)
+
+One private native clip tested the split-half `mul_`/`addcmul_` rotary
+arithmetic from pinned WanGP commit
+`fa79896eadbcb048dc13e76233b3b72486b522a8`. The substitution applied only to
+the master denoising schedule; production source arithmetic remains unchanged.
+The recipe retained seed `935314058`, ordered guides at frames 31/90, base
+FL2VA, 1344 × 768, 124 frames, 28 evaluations, Dense SDPA, no LoRA and the
+disabled AV boundary option. Requested offload profile 1 resolved to the
+observed H3 floor of 5. Model binding and all eight initial packed video,
+audio, prompt and guide tensor digests match the retained control. The
+worker executed exactly one generation and one complete 28-step schedule.
+
+Generation completed in approximately 795 seconds. Full CPU software decode
+passed for all 124 HEVC frames and stereo 32 kHz AAC audio. Video duration is
+5.166667 seconds; audio duration is 5.152000 seconds, matching the accepted
+final-head-repair control. The private candidate SHA-256 is
+`d5e678337efc78438760c51547cbb8639dbbe28469d408f3613cefa10cd0b825`.
+The control media was rehashed and retains
+`7f35800f6ffb10d74bd9ee446a7bc1eb420d31b16225c5cdb9e0c69595188e69`.
+
+The opening fade persists: both clips have at least 99% near-black pixels in
+frames 0–2. Across the first 25 frames, the mean absolute difference in
+frame-average decoded RGB brightness is 1.155420 on the 0–255 scale. The
+sampled opening frames and brightness curves confirm the remaining fade.
+This is one matched clip per condition, not a quality or throughput benchmark.
+Pinned rotary arithmetic changes the output but does not remedy this fade.
+Do not repeat this comparison or promote the arithmetic as a quality fix.
+
+The standalone worker saved a private output rather than publishing a queue
+job or Gallery sidecar. Its model cleanup restored private hooks, and the
+supervised child exited with code zero. The fresh checkout-bound lease was
+validated every five seconds; withdrawal was acknowledged and a subsequent
+coherent authority check rejects the request. Maestro remained online. This
+evidence does not establish native browser HEVC playback, whole-clip motion
+quality, listening acceptance, or general learned-path parity.
+
+### CPU follow-up: coordinates and historical latent structure
+
+A CPU-only reconstruction preserved the exact video, audio and text row-index
+hashes. Source-derived guide positions remain at displayed frames 31/90, with
+separate conditioning rows; target latent starts include 30 and 34 around the
+first guide. The reconstructed coordinate bytes did not match the retained
+live receipt. WGP selects CUDA as the default tensor device after model load,
+whereas this audit used CPU. Reduction arithmetic is a possible explanation,
+not a verified cause. This check does not establish exact live coordinate
+parity or identify a concrete packing defect.
+
+The retained normalized tensor from source revision
+`6ad0f28d156a01634c7832a5d756337694d0590e` passed its original hash, shape and
+finite-value checks on CPU. Its mean per-channel spatial variance rises from
+0.014191 at latent frame 0 to 0.361645 at latent frame 9, then is 0.257556 at
+latent frame 10. This is historical evidence predating the head repair and
+matched rotary candidate. Spatial variance alone cannot prove decoder meaning,
+a causal guide effect, or learned-stack parity. No model was loaded, no GPU
+work was performed, and no production change follows from this audit.
+
+### Tensor-only device follow-up (2026-10-05 UTC)
+
+A separately leased tensor-only check now reproduces the retained live
+coordinate SHA-256 exactly on CUDA:
+`86123c76f2e3e8a1053f51fa9ff0eea6e20c5bc1c656a568098d65cc980bac8e`.
+A second construction on CUDA is byte-identical. Video, audio and text
+row-index hashes also match the retained receipt and the CPU reconstruction.
+No checkpoint or generative model was loaded and no media was generated.
+
+The CPU/CUDA coordinate difference is confined to 1,008 time-coordinate
+elements in one late target-video latent frame. The largest absolute
+difference is `4.547473508864641e-13`; spatial coordinates and audio/text
+coordinates agree. Building only the temporal grid on CPU and then moving it
+to CUDA restores the whole CPU coordinate hash. This resolves the earlier
+device-arithmetic uncertainty for this exact geometry. It does not establish
+a packing defect, learned-path parity, or a cause or repair for the opening
+fade. Production arithmetic remains unchanged.
+
+The owned child exited successfully, its exact lease was withdrawn, and a
+subsequent coherent validator rejected authority. A later review found and
+fixed a private supervisor cleanup gap on watchdog-construction failure.
+An owned CPU child verified that failure cleanup while preserving the
+injected error; the successful tensor check's original script is retained
+separately. No tensor workload was repeated for that supervisor repair.

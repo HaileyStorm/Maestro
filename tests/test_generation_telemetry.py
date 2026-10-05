@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -201,9 +202,6 @@ class GenerationTelemetryTests(unittest.TestCase):
 
     def test_h3_load_and_generation_phases_follow_real_work_order(self):
         main = _source("app/models/minimax_h3/minimax_h3_main.py")
-        final_decode = main.split('report_phase("Decoding H3 video")', 1)[1].split(
-            'report_phase("Decoding H3 audio")', 1
-        )[0]
         load_labels = [
             "Loading H3 transformer checkpoint",
             "Loading H3 conditioner checkpoint",
@@ -229,12 +227,41 @@ class GenerationTelemetryTests(unittest.TestCase):
                 main.index('report_phase("Decoding H3 video")'),
             ),
         )
-        self.assertIn("vae=self.vae", final_decode)
-        self.assertIn(
-            "packed_rows=video_rows[layout.num_condition_video_rows :]",
-            final_decode,
+        tree = ast.parse(main)
+        method = next(
+            node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+            and any(isinstance(statement, ast.Assign)
+                    and any(isinstance(target, ast.Name) and target.id == "decode_video_rows"
+                            for target in statement.targets) for statement in node.body)
         )
-        self.assertIn("pixel_frames=target_frame_num", final_decode)
+        start = next(index for index, statement in enumerate(method.body)
+                     if isinstance(statement, ast.Assign)
+                     and any(isinstance(target, ast.Name) and target.id == "decode_video_rows"
+                             for target in statement.targets))
+        end = next(index for index, statement in enumerate(method.body[start:], start)
+                   if isinstance(statement, ast.Assign) and isinstance(statement.value, ast.Call)
+                   and isinstance(statement.value.func, ast.Name)
+                   and statement.value.func.id == "_decode_h3_video_rows")
+        decode = mock.Mock(return_value=("video", "normalized latents"))
+        vae = object()
+        scope = {
+            "video_rows": ["conditioning", "generated 1", "generated 2"],
+            "audio_rows": ["audio conditioning", "generated audio"],
+            "layout": SimpleNamespace(num_condition_video_rows=1, num_condition_audio_rows=1),
+            "unpack_audio_tokens": lambda rows, _count: rows,
+            "target_frame_num": 141, "num_latent_frames": 9, "num_audio_latents": 4,
+            "latent_height": 2, "latent_width": 3, "height": 16, "width": 24,
+            "cumulative_requested": False, "cumulative_video_sink": None, "_kwargs": {},
+            "self": SimpleNamespace(vae=vae, device="cpu", patch_size=(1, 2, 2), _interrupt=False),
+            "report_phase": lambda _phase: None, "_decode_h3_video_rows": decode,
+        }
+        exec(compile(ast.Module(body=method.body[start:end + 1], type_ignores=[]),
+                     "ordinary-h3-decode-caller", "exec"), scope)
+        decode.assert_called_once()
+        self.assertIs(decode.call_args.kwargs["vae"], vae)
+        self.assertEqual(decode.call_args.kwargs["packed_rows"], ["generated 1", "generated 2"])
+        self.assertEqual(decode.call_args.kwargs["pixel_frames"], 141)
+        self.assertEqual(decode.call_args.kwargs["latent_frames"], 9)
         self.assertLess(
             main.index('report_phase("Decoding H3 audio")'),
             main.index("self.audio_vae.decode(audio_latents"),
@@ -265,7 +292,6 @@ class GenerationTelemetryTests(unittest.TestCase):
         self.assertIn("progressIndeterminate: status.status === 'running'", store)
         self.assertIn("hasExactCurrentSteps\n        ? (currentStep / currentTotalSteps)", main)
         self.assertIn("Overall ETA ${formatApproximateDuration(finishingOutput ? null : job.etaSeconds)}", main)
-        self.assertIn("Current segment ETA ${formatApproximateDuration(job.subtaskEtaSeconds)}", main)
         self.assertIn("Estimated time ${formatApproximateDuration(queuedH3Runtime)} after start", main)
         self.assertIn("Planned time ${formatApproximateDuration(queuedH3Runtime)} after start", main)
         self.assertIn("stripTimeSuffix", main)

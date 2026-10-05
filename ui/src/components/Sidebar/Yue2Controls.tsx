@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { Check, Loader2, Music2, RefreshCw, Sparkles, Square } from 'lucide-react'
 import * as api from '../../api/client'
 import {
@@ -50,15 +50,23 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
   const refreshSequence = useRef(0)
   const composeSequence = useRef(0)
   const planSequence = useRef(0)
+  const operationSequence = useRef(0)
   const abcRef = useRef(abc)
   const composeDraftRef = useRef({ workspace, description, language, instrumental, style, lyrics, abc })
   workspaceRef.current = workspace
   abcRef.current = abc
   composeDraftRef.current = { workspace, description, language, instrumental, style, lyrics, abc }
 
+  useLayoutEffect(() => {
+    // Invalidate before passive resets so returning to a project cannot revive an old operation.
+    operationSequence.current += 1
+    return () => { operationSequence.current += 1 }
+  }, [workspace])
+
   const refresh = useCallback(async () => {
     if (!workspace) return
     const requestWorkspace = workspace
+    const operation = operationSequence.current
     const sequence = ++refreshSequence.current
     try {
       const [nextStatus, library, training] = await Promise.all([
@@ -66,13 +74,13 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
         api.fetchYue2Library(requestWorkspace),
         api.fetchYue2Training(requestWorkspace).catch(() => ({ jobs: [] as api.Yue2TrainingJob[] })),
       ])
-      if (workspaceRef.current !== requestWorkspace || refreshSequence.current !== sequence) return
+      if (workspaceRef.current !== requestWorkspace || refreshSequence.current !== sequence || operationSequence.current !== operation) return
       setStatus(nextStatus)
       setTracks(library.tracks.filter(track => track.project === requestWorkspace))
       setTrainingJobs(training.jobs.filter(job => job.project === requestWorkspace))
       setError(null)
     } catch (cause) {
-      if (workspaceRef.current !== requestWorkspace || refreshSequence.current !== sequence) return
+      if (workspaceRef.current !== requestWorkspace || refreshSequence.current !== sequence || operationSequence.current !== operation) return
       setError(cause instanceof Error ? cause.message : 'YuE2 status is unavailable')
     }
   }, [workspace])
@@ -229,6 +237,8 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
     }
     setBusy('submit'); setError(null)
     const requestWorkspace = workspace
+    const operation = ++operationSequence.current
+    const isCurrent = () => workspaceRef.current === requestWorkspace && operationSequence.current === operation
     const loras = resolvedLoraCheckpoints.flatMap(({ checkpoint, strength, group }) => (
       strength && checkpoint ? [{ id: checkpoint.id, sha256: checkpoint.sha256, strength,
         ...(group.trainingJobId ? { trainingJobId: group.trainingJobId } : {}) }] : []
@@ -259,34 +269,37 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
           loras,
         },
       })
+      if (!isCurrent()) return
       await refresh()
     } catch (cause) {
-      if (workspaceRef.current !== requestWorkspace) return
+      if (!isCurrent()) return
       setError(cause instanceof Error ? cause.message : 'YuE2 generation could not be queued')
     } finally {
-      if (workspaceRef.current === requestWorkspace) setBusy(null)
+      if (isCurrent()) setBusy(null)
     }
   }
 
   const continuePlan = async () => {
     if (!activeTrack || busy || reviewedAbc === null) return
     const requestWorkspace = workspace
+    const operation = ++operationSequence.current
+    const isCurrent = () => workspaceRef.current === requestWorkspace && operationSequence.current === operation
     const requestTake = activeTrack.id
     const editedAbc = reviewedAbcForContinuation(reviewedAbc, abc)
     setBusy('continue'); setError(null)
     try {
       await api.continueYue2(requestTake, requestWorkspace, editedAbc)
-      if (workspaceRef.current !== requestWorkspace) return
+      if (!isCurrent()) return
       // Keep the consumed take marked until the refreshed library replaces its old review row.
       setReviewTake(requestTake)
       setReviewedAbc(null)
       setReviewError(null)
       await refresh()
     } catch (cause) {
-      if (workspaceRef.current !== requestWorkspace) return
+      if (!isCurrent()) return
       setError(cause instanceof Error ? cause.message : 'YuE2 score could not be continued')
     } finally {
-      if (workspaceRef.current === requestWorkspace) setBusy(null)
+      if (isCurrent()) setBusy(null)
     }
   }
 

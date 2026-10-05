@@ -312,9 +312,40 @@ media does not claim either pass. Gallery shows the recorded steps in its
 collapsed finishing section after private reveal, validates the closed step
 and outcome vocabulary, and ignores request settings or embedded metadata as
 evidence. This is a new-output record, not a historical backfill or a complete
-processing-chain ledger. Optional passes after H3 delivery publication are
-not yet part of its transactional record. CPU and synthetic UI checks do not
-establish a live generation, signed-in Gallery viewing or owner acceptance.
+processing-chain ledger. At that checkpoint, optional passes after H3 delivery
+publication were not part of its transactional record. The October 5 finishing
+repair moves requested grain and voice replacement into private work before
+publication and final hashes. Durable recovery binds effective options and
+ordered authorized voice-reference identities; replay starts from verified
+native bytes. Completed sealed delivery adopts its finished bytes without
+requiring already-consumed references. Per-output outcomes survive publication,
+and strict transaction-owned voice remux cannot create a Gallery sibling.
+Legacy ordinary remux retains its existing behavior. Grain and voice jobs keep
+the manual-recoverable native-move route; manual copy-on-write recovery still
+needs a separate publication-intent implementation. CPU regression evidence
+does not establish native GPU finishing, Windows behavior, signed-in Gallery
+viewing or owner acceptance.
+
+A real CPU grain check applied the finishing pass, preserved protected source
+bytes and decoded all video frames, but exposed a 19 ms shorter AAC tail after
+the legacy raw-AAC round trip. Grain now copies every original audio stream
+directly from its container. The existing transaction suite's native FFmpeg
+regression preserves both AAC tracks' packet payloads, timestamps, skip metadata
+and decoded PCM exactly; all seven tests pass, including late-remux cancellation
+and failure cleanup. Unsupported stream-copy/container combinations preserve
+the original instead of silently transcoding or dropping audio. This proves
+the tested MP4/H.264/AAC mux path; it does not extend the native GPU or Windows
+acceptance claims above.
+
+The October 5 YuE2 controls repair fences submission and score-continuation
+responses across project switches, including A → B → A, and unmount. Obsolete
+success, failure and refresh responses cannot overwrite a current review or
+clear a newer operation's busy indicator. Accepted backend requests are neither
+cancelled nor resent. Deferred component-handler tests reproduce the original
+race and verify current-operation completion; production compilation passes.
+A private headless browser fixture with real React/ReactDOM in StrictMode also
+passes obsolete-response and current-completion checks, with no external
+requests. This fixture does not establish live Maestro generation or listening.
 
 Generic Gallery upload deletion remains deferred. Uploads are session-owned
 and the virtual Uploads workspace is browse-only; project-output deletion
@@ -546,3 +577,22 @@ All 124 candidate clusters now have explicit current disposition anchors. The
 228 source IDs and 301 occurrence pointers are unchanged. Historical source-only
 or absent decisions remain recorded as gaps; this does not turn watch/defer
 decisions, implemented features or technical samples into completed acceptance.
+
+
+## 2026-10-05 bounded verification update
+
+The current finishing, runtime-binding and YuE2 response-fencing changes passed
+the complete backend CI gate: 5,833 tests with 17 existing skips. The complete
+UI gate passed 810 tests and the production build; the applicable Editor browser
+checks passed 16 cases. A separate native CPU grain run preserved all original
+AAC packets, timestamps and decoded audio samples while changing the video.
+
+A fresh-grant private H3 check then restored a checkpoint across two processes
+with different Python hash seeds. Complete runtime bindings matched, the clip
+extended from 56 to 73 frames, and the retained video/audio latent prefix bytes
+remained identical. Both small-canvas outputs passed full CPU decoding; workers
+exited and the exact grant was withdrawn. See the
+[loaded-code qualification](../operations/MAESTRO_H3_CUMULATIVE_APPEND_2026-10-02.md#loaded-code-serialization-stability-2026-10-05-utc).
+These checks do not close full-resolution quality, the retained opening fade,
+manual copy-on-write recovery, owner resource-unload acceptance, Music3 consent
+and first-song acceptance, YuE2 listening/duration fidelity, or Windows gates.
