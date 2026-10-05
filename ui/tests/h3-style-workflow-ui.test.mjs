@@ -99,7 +99,10 @@ function loadControlModule() {
               export const jsxs = jsx
             ` }
           }
-          return { contents: 'export const useStore = selector => selector(globalThis.__maestroH3WorkflowStore)' }
+          return { contents: `
+            export const useStore = selector => selector(globalThis.__maestroH3WorkflowStore)
+            export const h3ComposeInputMode = () => { throw new Error('Compose mode is outside the jukebox fixture') }
+          ` }
         })
       },
     }],

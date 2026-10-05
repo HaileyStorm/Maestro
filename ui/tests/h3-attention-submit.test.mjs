@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 
 import { build } from 'esbuild'
+import { acceptedStudioSubmission } from './studioAdmissionFixture.mjs'
 
 const STORE_ROOT = new URL('../src/stores/', import.meta.url).pathname
 
@@ -188,7 +189,7 @@ async function withFreshStore(action, { acceleration = accelerationStatus(true) 
       return Response.json({ filename: 'reference.png', path: '/uploads/reference.png', url: '/api/v1/file/reference.png' })
     }
     if (url === '/api/v1/generate' && request.method === 'POST') {
-      return Response.json({ job_id: 'sage-held', status: 'queued', held: true })
+      return Response.json(acceptedStudioSubmission(JSON.parse(init.body), '11111111111111111111111111111111'))
     }
     throw new Error(`Unexpected attention-submit request: ${request.method} ${url}`)
   }
@@ -324,7 +325,7 @@ test('available Sage Base submission preserves the selected engine and creates o
         held: useStore.getState().jobs[0].held,
         status: useStore.getState().jobs[0].status,
       },
-      { id: 'sage-held', held: true, status: 'queued' },
+      { id: '11111111111111111111111111111111', held: true, status: 'queued' },
     )
   })
 })

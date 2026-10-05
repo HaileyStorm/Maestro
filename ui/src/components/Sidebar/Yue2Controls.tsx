@@ -38,6 +38,7 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
   const [status, setStatus] = useState<api.Yue2Status | null>(null)
   const [trainingJobs, setTrainingJobs] = useState<api.Yue2TrainingJob[]>([])
   const [tracks, setTracks] = useState<api.Yue2Track[]>([])
+  const [playbackFormat, setPlaybackFormat] = useState<'mp3' | 'wav'>('mp3')
   const [title, setTitle] = useState('Untitled YuE2 song')
   const [language, setLanguage] = useState('English')
   const [abc, setAbc] = useState('')
@@ -120,6 +121,7 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
     planSequence.current += 1
     setStatus(null)
     setTracks([])
+    setPlaybackFormat('mp3')
     setTrainingJobs([])
     setSelectedLoras({})
     setCheckpointSelections({})
@@ -572,6 +574,15 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
           <span className="text-text-muted">{projectTracks.length} {projectTracks.length === 1 ? 'take' : 'takes'} in this project</span>
         </div>
         {projectTracks.length === 0 && <p className="text-[10px] text-text-muted">YuE2 takes will appear here.</p>}
+        {projectTracks.some(track => track.status === 'succeeded') && (
+          <label className="block text-[10px] text-text-muted">Playback format
+            <select aria-label="YuE2 playback format" value={playbackFormat} onChange={event => setPlaybackFormat(event.target.value === 'wav' ? 'wav' : 'mp3')} className={`${fieldClass} mt-1 text-xs`}>
+              <option value="mp3">MP3 preview</option>
+              <option value="wav">WAV original</option>
+            </select>
+            <span className="mt-1 block text-[9px]">Switching format stops playback.</span>
+          </label>
+        )}
         <div className="max-h-96 space-y-1.5 overflow-y-auto">
           {projectTracks.map(track => (
             <article key={track.id} aria-label={`${track.title} · ${track.status}`} className="space-y-1.5 rounded-lg border border-border bg-bg-tertiary/60 p-2 text-[10px]">
@@ -591,7 +602,7 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
               {track.warnings?.map(warning => <p key={warning} className="text-amber-300">{warning}</p>)}
               {track.status === 'succeeded' && (
                 <div className="space-y-1">
-                  <audio controls preload="none" className="w-full" src={api.yue2AudioUrl(track.id, workspace)} />
+                  <audio key={`${accountEpoch}:${workspace}:${track.id}:${playbackFormat}`} aria-label={`${track.title} · ${playbackFormat === 'wav' ? 'WAV original' : 'MP3 preview'}`} controls preload="none" className="w-full" src={api.yue2AudioUrl(track.id, workspace, playbackFormat)} />
                   <a href={api.yue2AudioUrl(track.id, workspace, 'wav')} download={`${track.id}.wav`} className="inline-block text-accent-blue hover:underline">Download WAV</a>
                 </div>
               )}

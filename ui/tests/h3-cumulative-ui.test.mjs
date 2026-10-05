@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { build } from 'esbuild'
+import { acceptedStudioSubmission } from './studioAdmissionFixture.mjs'
 
 const STORE_ROOT = new URL('../src/stores/', import.meta.url).pathname
 const cumulativePlan = { mode: 'cumulative_append', fps: 24, requested_frames: 141, published_frames: 141, window_count: 2, windows: [] }
@@ -206,7 +207,9 @@ async function withFreshStore(action, {
       return Response.json({ filename: 'reference.png', path: '/uploads/reference.png', url: '/api/v1/file/reference.png' })
     }
     if (url === '/api/v1/generate' && request.method === 'POST') {
-      return Response.json({ job_id: 'cumulative-job', status: 'queued', held: JSON.parse(init.body)._queue_mode === 'held', h3_estimate: null, h3_cumulative_plan: cumulativePlan })
+      return Response.json(acceptedStudioSubmission(JSON.parse(init.body), '22222222222222222222222222222222', {
+        h3_estimate: null, h3_cumulative_plan: cumulativePlan, window_total: 2,
+      }))
     }
     throw new Error(`Unexpected cumulative UI request: ${request.method} ${url}`)
   }
@@ -266,7 +269,7 @@ test('cumulative immediate and held submit preserve exact authored geometry with
     assert.equal(body.enhance_before_generate, false)
     assert.equal(body._queue_mode, mode === 'queue' ? 'held' : 'now')
     assert.equal('_h3_cumulative_append' in body, false)
-    assert.equal(useStore.getState().jobs[0].h3Estimate, null)
+    assert.equal(useStore.getState().jobs[0].h3Estimate ?? null, null)
     assert.equal(useStore.getState().jobs[0].status, 'queued')
     assert.deepEqual(useStore.getState().jobs[0].h3CumulativePlan, cumulativePlan)
     assert.equal(useStore.getState().jobs[0].windowTotal, 2)

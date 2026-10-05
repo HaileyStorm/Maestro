@@ -74,7 +74,16 @@ test('actual submission projection honors an explicit empty upscaler over a stal
     ts.forEachChild(node, find)
   }
   find(source)
-  const statement = start.body.statements.find(node => node.getText(source).includes('params.spatial_upsampling'))
+  const statements = []
+  function findProjection(node) {
+    if (ts.isExpressionStatement(node) && ts.isBinaryExpression(node.expression)
+      && node.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken
+      && node.expression.left.getText(source) === 'params.spatial_upsampling') statements.push(node)
+    ts.forEachChild(node, findProjection)
+  }
+  findProjection(start.body)
+  assert.equal(statements.length, 1)
+  const statement = statements[0]
   assert.ok(statement)
   const code = ts.transpileModule(statement.getText(source), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
   const project = new Function('params', 'state', code)

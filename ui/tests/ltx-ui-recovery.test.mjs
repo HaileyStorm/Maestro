@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 
 import { build } from 'esbuild'
+import { acceptedStudioSubmission } from './studioAdmissionFixture.mjs'
 
 const UI_ROOT = new URL('..', import.meta.url).pathname
 const source = relative => readFile(new URL(relative, import.meta.url), 'utf8')
@@ -245,15 +246,14 @@ async function withVisibility(visibility, action) {
       return Response.json(options(decodeURIComponent(url.split('/').pop())))
     }
     if (url === '/api/v1/generate' && method === 'POST') {
-      generationRequests.push(JSON.parse(String(init.body)))
-      return Response.json({ job_id: 'ltx-ui-test', status: 'queued' })
-    }
-    if (url === '/api/v1/status/ltx-ui-test') {
-      return Response.json({
-        job_id: 'ltx-ui-test', status: 'cancelled', progress: 0,
-        step: 0, total_steps: 0, phase: '', message: 'Cancelled',
-        output_files: [], error: null, oom_info: null,
-      })
+      const params = JSON.parse(String(init.body))
+      generationRequests.push(params)
+      const jobId = generationRequests.length.toString(16).padStart(32, '0')
+      // This request-projection fixture settles immediately; polling behavior
+      // is covered by the admission/recovery suites.
+      return Response.json(acceptedStudioSubmission(params, jobId, {
+        status: 'cancelled', phase: '', message: 'Cancelled',
+      }))
     }
     if (url.startsWith('/api/v1/outputs')) return Response.json({ outputs: [], total: 0 })
     throw new Error(`Unexpected LTX UI request: ${method} ${url}`)
@@ -487,8 +487,10 @@ test('generation heals a soundtrack mode and invalid decoder in the request copy
       useStore.setState(state => ({
         params: { ...state.params, audio_prompt_type: loadedValue },
       }))
+      const before = generationRequests.length
       await useStore.getState().startGeneration('now')
       await settleAsyncWork()
+      assert.equal(generationRequests.length, before + 1)
       assert.equal(generationRequests.at(-1).audio_prompt_type, expectedValue)
     }
 
