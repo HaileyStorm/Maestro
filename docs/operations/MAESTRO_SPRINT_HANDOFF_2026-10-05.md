@@ -551,3 +551,34 @@ verified. The real signed-in Chrome Studio shows the existing Gallery, idle
 queue and available Generate/Hold controls; no new generation was submitted.
 This is rollout/browser evidence, not native lost-acknowledgement, Windows or
 human acceptance. The full continuous Goal and its remaining gates stay open.
+
+## October 5 Chat response recovery checkpoint
+
+Commit `f5489a5e73976fbfaa7a9a92884d4eeef88820b9` validates successful Chat
+submission and status responses against the original normalized request ID
+and operation schema before accepting text or acknowledgement callbacks.
+Truncated JSON, a foreign request ID, or malformed status remains uncertain.
+Recovery and Resume read the original scoped operation; a missing status never
+automatically sends another turn or creates a new request ID. The submitted
+message remains visible and Send stays locked while Resume is available.
+
+Resume no longer deletes uploads to infer whether admission occurred. An
+uncertain attempted submission retains its image references; a definitive
+initial rejection still permits cleanup and branch rollback. Validated failed
+operations retain their terminal behavior. The explicit upload-cleanup API
+remains compatible, while its obsolete reload-recovery test and unused special
+polling branch have been retired.
+
+The affected checks passed nine actual-client/cleanup tests, 42 existing
+source/runtime tests, 39 adjacent Studio client tests, TypeScript, scoped lint,
+private build and publication guard. Six synthetic desktop Firefox/mobile
+Chromium checks cover truncated acceptance, foreign/missing status, explicit
+Resume and browser reload with one original POST. Independent final source
+review is clear, and the before-fix failure is retained in private evidence.
+
+The UI was promoted atomically without a backend restart. Fresh local/stable
+health and exact asset bytes passed. Browser reload evidence uses a synthetic
+persistent operation table: the real backend table remains bounded process
+memory and can expire or disappear after restart. This change cannot recover
+an absent result or prove native lost-response recovery, model quality,
+Windows or human acceptance. The full continuous Goal remains open.
