@@ -5,7 +5,8 @@ import { build } from 'esbuild'
 const componentBundle = await build({
   stdin: {
     contents: `export { Yue2Controls } from './src/components/Sidebar/Yue2Controls';
-      export { createHarness } from 'react'; export { control } from './src/api/client';`,
+      export { createHarness } from 'react'; export { control } from './src/api/client';
+      export { account } from './src/stores/useStore';`,
     resolveDir: new URL('..', import.meta.url).pathname,
   },
   bundle: true, format: 'esm', platform: 'node', jsx: 'automatic', write: false,
@@ -76,8 +77,24 @@ const componentBundle = await build({
         `,
         'lucide-react': `export const Check = 'Check', Loader2 = 'Loader2', Music2 = 'Music2',
           RefreshCw = 'RefreshCw', Sparkles = 'Sparkles', Square = 'Square';`,
+        store: `
+          import { useState, useLayoutEffect } from 'react';
+          const listeners = new Set();
+          const subscribe = listener => { listeners.add(listener); return () => listeners.delete(listener); };
+          export const account = { epoch: 0, advance() { this.epoch++; for (const listener of listeners) listener(); } };
+          export const currentAccountIdentityEpoch = () => account.epoch;
+          export const useStore = selector => {
+            const [value, setValue] = useState(() => selector({}));
+            useLayoutEffect(() => subscribe(() => setValue(selector({}))), [selector]);
+            return value;
+          };
+          useStore.subscribe = subscribe;
+        `,
         api: `
-          export const control = { reads: [], submits: [], continues: [], libraries: {}, nextLibrary: null };
+          export class Yue2RequestError extends Error {
+            constructor(status, message) { super(message); this.status = status; }
+          }
+          export const control = { reads: [], submits: [], continues: [], libraries: {}, nextLibrary: null, requestError: (status, message) => new Yue2RequestError(status, message) };
           const deferred = () => {
             let resolve, reject;
             const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
@@ -109,7 +126,7 @@ const componentBundle = await build({
         training: 'export const Yue2Training = () => null;',
       }
       bundle.onResolve({ filter: /.*/ }, args => {
-        const key = args.path.includes('api/client') ? 'api'
+        const key = args.path.includes('stores/useStore') ? 'store' : args.path.includes('api/client') ? 'api'
           : args.path.endsWith('/Yue2Training') ? 'training' : args.path
         if (key in modules) return { path: key, namespace: 'yue2-test' }
       })
@@ -143,7 +160,7 @@ function deferred() {
   return { promise, resolve, reject }
 }
 async function componentFixture({ review = false } = {}) {
-  const { Yue2Controls, createHarness, control } = await import(
+  const { Yue2Controls, createHarness, control, account } = await import(
     `data:text/javascript;base64,${Buffer.from(componentBundle.outputFiles[0].text).toString('base64')}#yue2-${++componentRealm}`,
   )
   const props = { workspace: 'A', description: 'A local song', style: 'pop', lyrics: 'Rain falls',
@@ -155,22 +172,259 @@ async function componentFixture({ review = false } = {}) {
     h.render({ ...h.props, workspace })
     if (passive) { h.flush(); await settle(h) }
   }
-  return { h, control, transition }
+  const remount = async () => {
+    h.unmount();
+    const next = createHarness(Yue2Controls, h.props);
+    next.render(); next.flush(); await settle(next);
+    return next;
+  };
+  return { h, control, transition, account, remount }
 }
 
-for (const action of ['submit', 'continue']) {
-  const label = action === 'submit' ? 'Generate with YuE2' : 'Continue with reviewed score'
-  const requests = control => action === 'submit' ? control.submits : control.continues
+
+const submittedTrack = (request, fields = {}) => ({
+  id: 'accepted-take', project: request.input.workspace, requestId: request.input.requestId,
+  title: 'Accepted take', status: 'succeeded', stage: 'done', duration: 1, elapsed: 1, ...fields,
+})
+const acknowledgement = (request, fields = {}) => ({
+  requestId: request.input.requestId, tracks: [submittedTrack(request)], reused: false, ...fields,
+})
+const refreshButton = h => {
+  const node = findNode(h.tree, node => node.type === 'button' && node.props['aria-label'] === 'Refresh YuE2 status')
+  assert.ok(node)
+  return node
+}
+
+test('YuE2 coalesces rapid clicks before render and freezes the entire retry payload', async () => {
+  const { h, control } = await componentFixture()
+  const click = button(h, 'Generate with YuE2').props.onClick
+  click(); click()
+  assert.equal(control.submits.length, 1)
+  const original = control.submits[0]
+  const frozen = JSON.stringify(original.input)
+  assert.equal(Object.isFrozen(original.input.form.semantic), true)
+  assert.equal(Object.isFrozen(original.input.form.loras), true)
+  original.reject(new TypeError('Connection lost after acceptance'))
+  await settle(h)
+  assert.match(textContent(h.tree), /not yet confirmed/)
+  assert.equal(button(h, 'Generate with YuE2').props.disabled, true)
+  h.render({ ...h.props, description: 'Edited description', style: 'jazz', lyrics: 'New words' })
+  h.flush()
+  const title = findNode(h.tree, node => node.type === 'input' && node.props.value === 'Untitled YuE2 song')
+  title.props.onChange({ target: { value: 'Edited title' } }); h.flush()
+  const score = findNode(h.tree, node => node.type === 'textarea' && node.props.value === '')
+  score.props.onChange({ target: { value: 'X:2\nK:G\nG4|' } }); h.flush()
+  const decoder = findNode(h.tree, node => node.type === 'select' && node.props.value === 'stock')
+  decoder.props.onChange({ target: { value: 'joint-v9' } }); h.flush()
+  assert.equal(button(h, 'Generate with YuE2').props.disabled, true)
+  const retry = button(h, 'Retry this submission').props.onClick
+  retry(); retry()
+  assert.equal(control.submits.length, 2)
+  assert.equal(JSON.stringify(control.submits[1].input), frozen)
+  control.submits[1].resolve(acknowledgement(control.submits[1], { reused: true }))
+  control.libraries.A = [submittedTrack(original)]
+  await settle(h)
+  assert.doesNotMatch(textContent(h.tree), /not yet confirmed/)
+  assert.match(textContent(h.tree), /Accepted take/)
+  assert.equal(control.submits.length, 2, 'library reconciliation never submits')
+})
+
+test('YuE2 lost acknowledgement reconciles only exact request and project and preserves score review', async () => {
+  const { h, control } = await componentFixture()
+  button(h, 'Generate with YuE2').props.onClick()
+  const original = control.submits[0]
+  control.libraries.A = [submittedTrack(original, { requestId: 'another-request' })]
+  original.reject(new Error('Lost acknowledgement'))
+  await settle(h)
+  assert.match(textContent(h.tree), /not yet confirmed/)
+  control.libraries.A = [submittedTrack(original, { project: 'B' })]
+  refreshButton(h).props.onClick(); await settle(h)
+  assert.match(textContent(h.tree), /not yet confirmed/)
+  control.libraries.A = [submittedTrack(original, { status: 'needs-review' })]
+  refreshButton(h).props.onClick(); await settle(h)
+  assert.doesNotMatch(textContent(h.tree), /not yet confirmed/)
+  assert.equal(button(h, 'Continue with reviewed score').props.disabled, false)
+  assert.equal(control.submits.length, 1)
+})
+
+for (const status of ['needs-review', 'succeeded']) {
+  for (const rejection of [400, 422]) {
+    test(`YuE2 library acceptance of ${status} completes pending POST and fences later HTTP ${rejection}`, async () => {
+      const { h, control } = await componentFixture()
+      button(h, 'Generate with YuE2').props.onClick(); h.flush()
+      const pending = control.submits[0]
+      control.libraries.A = [submittedTrack(pending, { status })]
+      refreshButton(h).props.onClick(); await settle(h)
+      assert.doesNotMatch(textContent(h.tree), /Waiting for YuE2|not yet confirmed/)
+      assert.equal(button(h, status === 'needs-review' ? 'Continue with reviewed score' : 'Generate with YuE2').props.disabled, false,
+        'canonical GET acceptance completes busy submission even while POST remains pending')
+      h.mutations.length = 0
+      pending.reject(control.requestError(rejection, 'Obsolete validation rejection'))
+      await settle(h)
+      assert.deepEqual(h.mutations, [], 'accepted GET fences every old POST setter and finalizer')
+      assert.doesNotMatch(textContent(h.tree), /Obsolete validation rejection/)
+      assert.match(textContent(h.tree), /Accepted take/)
+      assert.equal(control.submits.length, 1)
+    })
+  }
+}
+
+test('YuE2 library acceptance allows a newer submission before old POST acknowledgement and fences that acknowledgement', async () => {
+  const { h, control } = await componentFixture()
+  button(h, 'Generate with YuE2').props.onClick(); h.flush()
+  const old = control.submits[0]
+  control.libraries.A = [submittedTrack(old)]
+  refreshButton(h).props.onClick(); await settle(h)
+  assert.equal(button(h, 'Generate with YuE2').props.disabled, false)
+  button(h, 'Generate with YuE2').props.onClick(); h.flush()
+  const current = control.submits[1]
+  assert.ok(current)
+  assert.notEqual(current.input.requestId, old.input.requestId)
+  h.mutations.length = 0
+  const reads = control.reads.length
+  old.resolve(acknowledgement(old, { tracks: [submittedTrack(old, { title: 'Obsolete acknowledged take', status: 'needs-review' })] }))
+  await settle(h)
+  assert.deepEqual(h.mutations, [])
+  assert.equal(control.reads.length, reads, 'old acknowledgement cannot refresh the newer operation')
+  assert.doesNotMatch(textContent(h.tree), /Obsolete acknowledged take/)
+  assert.equal(button(h, 'Generate with YuE2').props.disabled, true)
+  control.libraries.A = [submittedTrack(current, { id: 'new-take', title: 'Newer take' }), submittedTrack(old)]
+  current.resolve(acknowledgement(current, { tracks: [submittedTrack(current, { id: 'new-take', title: 'Newer take' })] }))
+  await settle(h)
+  assert.match(textContent(h.tree), /Newer take/)
+  assert.equal(button(h, 'Generate with YuE2').props.disabled, false)
+})
+
+for (const malformed of ['empty', 'wrong request', 'wrong project', 'invalid track']) {
+  test(`YuE2 ${malformed} acknowledgement remains unresolved even after an empty library`, async () => {
+    const { h, control } = await componentFixture()
+    button(h, 'Generate with YuE2').props.onClick()
+    const request = control.submits[0]
+    const response = malformed === 'empty' ? {}
+      : malformed === 'wrong request' ? acknowledgement(request, { requestId: 'wrong' })
+        : acknowledgement(request, { tracks: [submittedTrack(request,
+          malformed === 'wrong project' ? { project: 'B' } : { duration: 'invalid' })] })
+    request.resolve(response)
+    await settle(h)
+    assert.match(textContent(h.tree), /not yet confirmed/)
+    assert.ok(button(h, 'Retry this submission'))
+    assert.equal(button(h, 'Generate with YuE2').props.disabled, true)
+    assert.equal(control.submits.length, 1)
+  })
+}
+
+for (const status of [400, 422, 408, 409, 429, 500]) {
+  test(`YuE2 initial HTTP ${status} ${[400, 422].includes(status) ? 'releases validation rejection' : 'retains uncertain submission'}`, async () => {
+    const { h, control } = await componentFixture()
+    button(h, 'Generate with YuE2').props.onClick()
+    control.submits[0].reject(control.requestError(status, 'Request rejected'))
+    await settle(h)
+    if ([400, 422].includes(status)) {
+      assert.match(textContent(h.tree), /Request rejected/)
+      assert.equal(button(h, 'Generate with YuE2').props.disabled, false)
+    } else {
+      assert.match(textContent(h.tree), /not yet confirmed/)
+      button(h, 'Retry this submission').props.onClick()
+      control.submits[1].reject(control.requestError(422, 'Retry validation rejected'))
+      await settle(h)
+      assert.match(textContent(h.tree), /not yet confirmed/, 'a later rejection cannot disprove original acceptance')
+      assert.equal(button(h, 'Generate with YuE2').props.disabled, true)
+      assert.equal(control.submits[1].input.requestId, control.submits[0].input.requestId)
+    }
+  })
+}
+
+for (const outcome of ['success', 'failure']) {
+  test(`YuE2 submission survives A–B–A and unmount after late ${outcome} without resending`, async () => {
+    const { h, control, transition, remount } = await componentFixture()
+    button(h, 'Generate with YuE2').props.onClick(); h.flush()
+    const request = control.submits[0]
+    await transition('B'); await transition('A')
+    assert.equal(button(h, 'Generate with YuE2').props.disabled, true)
+    button(h, 'Generate with YuE2').props.onClick()
+    assert.equal(control.submits.length, 1)
+    const mounted = await remount()
+    h.mutations.length = 0
+    if (outcome === 'success') request.resolve(acknowledgement(request))
+    else request.reject(new Error('Late lost acknowledgement'))
+    await settle(mounted)
+    assert.deepEqual(h.mutations, [], 'unmounted handler cannot mutate its old component')
+    assert.match(textContent(mounted.tree), /not yet confirmed/)
+    assert.equal(control.submits.length, 1)
+    button(mounted, 'Retry this submission').props.onClick()
+    assert.deepEqual(control.submits[1].input, request.input)
+  })
+}
+
+test('YuE2 account changes exclude old intents and fence late submit and library responses', async () => {
+  const { h, control, account } = await componentFixture()
+  button(h, 'Generate with YuE2').props.onClick(); h.flush()
+  const old = control.submits[0]
+  const library = deferred()
+  control.nextLibrary = library
+  refreshButton(h).props.onClick()
+  account.advance()
+  h.flush(); await settle(h)
+  assert.equal(button(h, 'Generate with YuE2').props.disabled, false)
+  button(h, 'Generate with YuE2').props.onClick(); h.flush()
+  const current = control.submits[1]
+  h.mutations.length = 0
+  old.resolve(acknowledgement(old))
+  library.resolve({ tracks: [submittedTrack(old)] })
+  await settle(h)
+  assert.deepEqual(h.mutations, [])
+  assert.notEqual(current.input.requestId, old.input.requestId)
+  current.reject(new Error('Current lost acknowledgement')); await settle(h)
+  assert.match(textContent(h.tree), /not yet confirmed/)
+  button(h, 'Retry this submission').props.onClick()
+  assert.equal(control.submits[2].input.requestId, current.input.requestId)
+})
+
+test('YuE2 account changes while unmounted discard the old submission before remount', async () => {
+  const { h, control, account, remount } = await componentFixture()
+  button(h, 'Generate with YuE2').props.onClick(); h.flush()
+  const old = control.submits[0]
+  h.unmount()
+  account.advance()
+  old.reject(new Error('Old account lost acknowledgement'))
+  await new Promise(resolve => setImmediate(resolve))
+  const current = await remount()
+  assert.equal(button(current, 'Generate with YuE2').props.disabled, false)
+  assert.doesNotMatch(textContent(current.tree), /not yet confirmed/)
+  button(current, 'Generate with YuE2').props.onClick()
+  assert.notEqual(control.submits[1].input.requestId, old.input.requestId)
+})
+
+test('YuE2 bounded intent store fails new projects closed and never evicts unresolved submissions', async () => {
+  const { h, control, transition } = await componentFixture()
+  for (let i = 0; i < 16; i++) {
+    await transition(`project-${i}`)
+    button(h, 'Generate with YuE2').props.onClick()
+    control.submits[i].reject(new Error('Unconfirmed'))
+    await settle(h)
+  }
+  await transition('overflow')
+  button(h, 'Generate with YuE2').props.onClick(); await settle(h)
+  assert.equal(control.submits.length, 16)
+  assert.match(textContent(h.tree), /Confirm an unresolved YuE2 submission/)
+  await transition('project-0')
+  button(h, 'Retry this submission').props.onClick()
+  assert.equal(control.submits[16].input.requestId, control.submits[0].input.requestId)
+})
+
+{
+  const action = 'continue'
+  const label = 'Continue with reviewed score'
+  const requests = control => control.continues
   for (const outcome of ['success', 'failure']) {
     test(`late YuE2 ${action} ${outcome} cannot change a returned project or clear its new operation`, async () => {
-      const { h, control, transition } = await componentFixture({ review: action === 'continue' })
+      const { h, control, transition } = await componentFixture({ review: true })
       assert.equal(button(h, label).props.disabled, false)
       button(h, label).props.onClick(); h.flush()
       const old = requests(control)[0]
-      if (action === 'continue') assert.equal(old.abc, undefined, 'unchanged review resumes its saved plan')
-      else assert.equal(old.input.workspace, 'A')
+      assert.equal(old.abc, undefined, 'unchanged review resumes its saved plan')
       await transition('B')
-      if (action === 'continue') control.libraries.A = [{ id: 'new-take', project: 'A', title: 'New take', status: 'needs-review' }]
+      control.libraries.A = [{ id: 'new-take', project: 'A', title: 'New take', status: 'needs-review' }]
       await transition('A')
       assert.equal(button(h, label).props.disabled, false)
       button(h, label).props.onClick(); h.flush()
@@ -184,7 +438,7 @@ for (const action of ['submit', 'continue']) {
       assert.equal(button(h, label).props.disabled, true, 'new operation remains busy')
       assert.doesNotMatch(textContent(h.tree), /Obsolete operation failed/)
       assert.equal(requests(control).length, 2, 'project changes do not resend accepted requests')
-      if (action === 'continue') assert.equal(requests(control)[1].id, 'new-take')
+      assert.equal(requests(control)[1].id, 'new-take')
       requests(control)[1].reject(new Error('Current operation failed'))
       await settle(h)
       assert.match(textContent(h.tree), /Current operation failed/)
@@ -194,7 +448,7 @@ for (const action of ['submit', 'continue']) {
 
   test(`YuE2 ${action} invalidates before passive project effects and on unmount`, async () => {
     for (const boundary of ['layout', 'unmount']) {
-      const { h, control, transition } = await componentFixture({ review: action === 'continue' })
+      const { h, control, transition } = await componentFixture({ review: true })
       button(h, label).props.onClick(); h.flush()
       if (boundary === 'layout') {
         await transition('B', false)
@@ -210,7 +464,7 @@ for (const action of ['submit', 'continue']) {
   })
 
   test(`current YuE2 ${action} success refreshes its project and clears its own busy state`, async () => {
-    const { h, control } = await componentFixture({ review: action === 'continue' })
+    const { h, control } = await componentFixture({ review: true })
     button(h, label).props.onClick(); h.flush()
     const reads = control.reads.length
     control.libraries.A = [{ id: 'accepted-take', project: 'A', title: 'Accepted take', status: 'succeeded' }]
@@ -224,7 +478,7 @@ for (const action of ['submit', 'continue']) {
 
   for (const outcome of ['success', 'failure']) {
     test(`YuE2 ${action} refresh ${outcome} is fenced if the project changes while it is pending`, async () => {
-      const { h, control, transition } = await componentFixture({ review: action === 'continue' })
+      const { h, control, transition } = await componentFixture({ review: true })
       button(h, label).props.onClick(); h.flush()
       const refreshResponse = deferred()
       control.nextLibrary = refreshResponse

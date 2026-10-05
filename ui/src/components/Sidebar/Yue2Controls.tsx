@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { Check, Loader2, Music2, RefreshCw, Sparkles, Square } from 'lucide-react'
 import * as api from '../../api/client'
+import { currentAccountIdentityEpoch, useStore } from '../../stores/useStore'
+import { acknowledgedYue2SubmissionTracks, getYue2SubmissionIntent, markYue2SubmissionUnconfirmed,
+  matchingYue2SubmissionTracks, pruneYue2SubmissionIntents, releaseYue2SubmissionIntent,
+  reserveYue2SubmissionIntent, retryYue2SubmissionIntent, subscribeYue2SubmissionIntents } from '../../lib/yue2SubmissionIntent'
+import type { Yue2SubmissionIntent } from '../../lib/yue2SubmissionIntent'
 import {
   preferredYue2Checkpoint,
   resolveYue2CheckpointSelection,
@@ -28,6 +33,8 @@ type Props = {
 const fieldClass = 'w-full rounded-lg border border-border bg-bg-tertiary px-3 py-2 text-sm text-text-primary focus:border-accent-blue focus:outline-none'
 
 export function Yue2Controls({ workspace, description, style, lyrics, instrumental, onStyle, onLyrics }: Props) {
+  const accountEpoch = useStore(() => currentAccountIdentityEpoch())
+  const [submission, setSubmission] = useState<Yue2SubmissionIntent | null>(null)
   const [status, setStatus] = useState<api.Yue2Status | null>(null)
   const [trainingJobs, setTrainingJobs] = useState<api.Yue2TrainingJob[]>([])
   const [tracks, setTracks] = useState<api.Yue2Track[]>([])
@@ -51,6 +58,7 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
   const composeSequence = useRef(0)
   const planSequence = useRef(0)
   const operationSequence = useRef(0)
+  const submissionOperation = useRef<{ intent: Yue2SubmissionIntent; sequence: number } | null>(null)
   const abcRef = useRef(abc)
   const composeDraftRef = useRef({ workspace, description, language, instrumental, style, lyrics, abc })
   workspaceRef.current = workspace
@@ -60,13 +68,22 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
   useLayoutEffect(() => {
     // Invalidate before passive resets so returning to a project cannot revive an old operation.
     operationSequence.current += 1
-    return () => { operationSequence.current += 1 }
-  }, [workspace])
+    pruneYue2SubmissionIntents(accountEpoch)
+    const update = () => {
+      if (workspaceRef.current === workspace && currentAccountIdentityEpoch() === accountEpoch) {
+        setSubmission(getYue2SubmissionIntent(accountEpoch, workspace))
+      }
+    }
+    const unsubscribe = subscribeYue2SubmissionIntents(update)
+    update()
+    return () => { operationSequence.current += 1; unsubscribe() }
+  }, [workspace, accountEpoch])
 
   const refresh = useCallback(async () => {
-    if (!workspace) return
+    if (!workspace || currentAccountIdentityEpoch() !== accountEpoch) return
     const requestWorkspace = workspace
     const operation = operationSequence.current
+    const requestEpoch = accountEpoch
     const sequence = ++refreshSequence.current
     try {
       const [nextStatus, library, training] = await Promise.all([
@@ -74,16 +91,28 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
         api.fetchYue2Library(requestWorkspace),
         api.fetchYue2Training(requestWorkspace).catch(() => ({ jobs: [] as api.Yue2TrainingJob[] })),
       ])
-      if (workspaceRef.current !== requestWorkspace || refreshSequence.current !== sequence || operationSequence.current !== operation) return
+      if (workspaceRef.current !== requestWorkspace || refreshSequence.current !== sequence || operationSequence.current !== operation || currentAccountIdentityEpoch() !== requestEpoch) return
+      const pending = getYue2SubmissionIntent(requestEpoch, requestWorkspace)
+      if (pending && matchingYue2SubmissionTracks(pending, library.tracks)) {
+        const active = submissionOperation.current
+        if (active?.sequence === operation && active.intent.requestId === pending.requestId
+          && active.intent.workspace === requestWorkspace && active.intent.accountEpoch === requestEpoch) {
+          // Canonical library acceptance completes this operation even if its POST never settles.
+          operationSequence.current += 1
+          submissionOperation.current = null
+          setBusy(null)
+        }
+        releaseYue2SubmissionIntent(pending)
+      }
       setStatus(nextStatus)
       setTracks(library.tracks.filter(track => track.project === requestWorkspace))
       setTrainingJobs(training.jobs.filter(job => job.project === requestWorkspace))
       setError(null)
     } catch (cause) {
-      if (workspaceRef.current !== requestWorkspace || refreshSequence.current !== sequence || operationSequence.current !== operation) return
+      if (workspaceRef.current !== requestWorkspace || refreshSequence.current !== sequence || operationSequence.current !== operation || currentAccountIdentityEpoch() !== requestEpoch) return
       setError(cause instanceof Error ? cause.message : 'YuE2 status is unavailable')
     }
-  }, [workspace])
+  }, [workspace, accountEpoch])
 
   useEffect(() => {
     refreshSequence.current += 1
@@ -105,9 +134,12 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
     setReviewedAbc(null)
     setReviewLoading(false)
     setReviewError(null)
-  }, [workspace])
+  }, [workspace, accountEpoch])
 
   useEffect(() => { void refresh() }, [refresh])
+  useEffect(() => {
+    if (submission?.phase === 'unconfirmed') void refresh()
+  }, [refresh, submission?.phase])
   useEffect(() => {
     if (!tracks.some(track => ['queued', 'running'].includes(track.status))) return
     const timer = window.setInterval(() => { void refresh() }, 2000)
@@ -115,7 +147,10 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
   }, [refresh, tracks])
 
   const loadPlan = useCallback(async (take: api.Yue2Track) => {
+    if (currentAccountIdentityEpoch() !== accountEpoch) return
     const requestWorkspace = workspace
+    const requestEpoch = accountEpoch
+    const operation = operationSequence.current
     const requestAbc = abcRef.current
     const sequence = ++planSequence.current
     setReviewTake(take.id)
@@ -124,19 +159,19 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
     setReviewError(null)
     try {
       const plan = await api.fetchYue2Plan(take.id, requestWorkspace)
-      if (workspaceRef.current !== requestWorkspace || planSequence.current !== sequence) return
+      if (workspaceRef.current !== requestWorkspace || planSequence.current !== sequence || operationSequence.current !== operation || currentAccountIdentityEpoch() !== requestEpoch) return
       if (!plan.reviewable) throw new Error('This YuE2 score is no longer available for review. Refresh its status.')
       if (abcRef.current !== requestAbc) throw new Error('The ABC score changed while its saved plan was loading. Retry score review.')
       setAbc(plan.abc)
       setScoreWarning(null)
       setReviewedAbc(plan.abc)
     } catch (cause) {
-      if (workspaceRef.current !== requestWorkspace || planSequence.current !== sequence) return
+      if (workspaceRef.current !== requestWorkspace || planSequence.current !== sequence || operationSequence.current !== operation || currentAccountIdentityEpoch() !== requestEpoch) return
       setReviewError(cause instanceof Error ? cause.message : 'Score review is unavailable')
     } finally {
-      if (workspaceRef.current === requestWorkspace && planSequence.current === sequence) setReviewLoading(false)
+      if (workspaceRef.current === requestWorkspace && planSequence.current === sequence && operationSequence.current === operation && currentAccountIdentityEpoch() === requestEpoch) setReviewLoading(false)
     }
-  }, [workspace])
+  }, [workspace, accountEpoch])
 
   useEffect(() => {
     const waiting = tracks.find(track => track.project === workspace && track.status === 'needs-review')
@@ -205,29 +240,71 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
     : null
 
   const compose = async () => {
-    if (!description.trim() || busy) return
+    if (!description.trim() || busy || currentAccountIdentityEpoch() !== accountEpoch) return
     const requestWorkspace = workspace
+    const requestEpoch = accountEpoch
+    const operation = operationSequence.current
     const requestDraft = { ...composeDraftRef.current }
     const sequence = ++composeSequence.current
     setBusy('compose'); setError(null); setScoreWarning(null)
     try {
       const result = await api.composeYue2({ workspace: requestWorkspace, description: description.trim(), language, instrumental })
-      if (composeSequence.current !== sequence || !sameYue2ComposeDraft(composeDraftRef.current, requestDraft)) return
+      if (composeSequence.current !== sequence || !sameYue2ComposeDraft(composeDraftRef.current, requestDraft) || operationSequence.current !== operation || currentAccountIdentityEpoch() !== requestEpoch) return
       onStyle(result.style)
       onLyrics(instrumental ? '[Instrumental]' : result.lyrics)
       setAbc(result.abc)
       setGuides(result.guides)
       setScoreWarning(result.scoreWarning ?? null)
     } catch (cause) {
-      if (workspaceRef.current !== requestWorkspace || composeSequence.current !== sequence) return
+      if (workspaceRef.current !== requestWorkspace || composeSequence.current !== sequence || operationSequence.current !== operation || currentAccountIdentityEpoch() !== requestEpoch) return
       setError(cause instanceof Error ? cause.message : 'YuE2 composition drafting failed')
     } finally {
-      if (workspaceRef.current === requestWorkspace && composeSequence.current === sequence) setBusy(null)
+      if (workspaceRef.current === requestWorkspace && composeSequence.current === sequence && operationSequence.current === operation && currentAccountIdentityEpoch() === requestEpoch) setBusy(null)
     }
   }
 
-  const submit = async () => {
-    if (!style.trim() || !lyrics.trim() || busy) return
+  const sendSubmission = async (intent: Yue2SubmissionIntent) => {
+    const requestWorkspace = workspace
+    const requestEpoch = accountEpoch
+    const operation = ++operationSequence.current
+    submissionOperation.current = { intent, sequence: operation }
+    const isCurrent = () => workspaceRef.current === requestWorkspace && operationSequence.current === operation
+      && currentAccountIdentityEpoch() === requestEpoch
+    setBusy('submit'); setError(null)
+    try {
+      const response = await api.submitYue2(intent.payload)
+      if (currentAccountIdentityEpoch() !== requestEpoch) return
+      const accepted = acknowledgedYue2SubmissionTracks(intent, response)
+      if (!accepted) throw new Error('YuE2 did not return a valid submission confirmation.')
+      if (!isCurrent()) { markYue2SubmissionUnconfirmed(intent); return }
+      setTracks(current => [...accepted, ...current.filter(track => track.requestId !== intent.requestId)])
+      releaseYue2SubmissionIntent(intent)
+      await refresh()
+    } catch (cause) {
+      if (currentAccountIdentityEpoch() !== requestEpoch) return
+      const rejected = !intent.ambiguous && cause instanceof api.Yue2RequestError
+        && [400, 422].includes(cause.status)
+      if (rejected) releaseYue2SubmissionIntent(intent)
+      else markYue2SubmissionUnconfirmed(intent)
+      if (!isCurrent()) return
+      if (rejected) setError(cause.message)
+    } finally {
+      if (isCurrent()) {
+        submissionOperation.current = null
+        setBusy(null)
+      }
+    }
+  }
+
+  const retrySubmission = () => {
+    const pending = getYue2SubmissionIntent(accountEpoch, workspace)
+    if (!pending || busy || currentAccountIdentityEpoch() !== accountEpoch) return
+    const attempt = retryYue2SubmissionIntent(pending)
+    if (attempt) void sendSubmission(attempt)
+  }
+
+  const submit = () => {
+    if (currentAccountIdentityEpoch() !== accountEpoch || !style.trim() || !lyrics.trim() || busy || getYue2SubmissionIntent(accountEpoch, workspace)) return
     if (decoderSelectionError) { setError(decoderSelectionError); return }
     if (!resolvedGeneration.settings || checkpointError || unavailableLoras.length) {
       setError(unavailableLoras.length
@@ -235,17 +312,14 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
         : resolvedGeneration.error || checkpointError)
       return
     }
-    setBusy('submit'); setError(null)
     const requestWorkspace = workspace
-    const operation = ++operationSequence.current
-    const isCurrent = () => workspaceRef.current === requestWorkspace && operationSequence.current === operation
     const loras = resolvedLoraCheckpoints.flatMap(({ checkpoint, strength, group }) => (
       strength && checkpoint ? [{ id: checkpoint.id, sha256: checkpoint.sha256, strength,
         ...(group.trainingJobId ? { trainingJobId: group.trainingJobId } : {}) }] : []
     ))
     const generation = resolvedGeneration.settings
     try {
-      await api.submitYue2({
+      const intent = reserveYue2SubmissionIntent(accountEpoch, requestWorkspace, {
         workspace: requestWorkspace,
         requestId: `maestro-${crypto.randomUUID()}`,
         form: {
@@ -269,21 +343,19 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
           loras,
         },
       })
-      if (!isCurrent()) return
-      await refresh()
+      void sendSubmission(intent)
     } catch (cause) {
-      if (!isCurrent()) return
-      setError(cause instanceof Error ? cause.message : 'YuE2 generation could not be queued')
-    } finally {
-      if (isCurrent()) setBusy(null)
+      setError(cause instanceof Error ? cause.message : 'YuE2 submission could not be retained')
     }
   }
 
   const continuePlan = async () => {
-    if (!activeTrack || busy || reviewedAbc === null) return
+    if (!activeTrack || busy || reviewedAbc === null || currentAccountIdentityEpoch() !== accountEpoch) return
     const requestWorkspace = workspace
+    const requestEpoch = accountEpoch
     const operation = ++operationSequence.current
     const isCurrent = () => workspaceRef.current === requestWorkspace && operationSequence.current === operation
+      && currentAccountIdentityEpoch() === requestEpoch
     const requestTake = activeTrack.id
     const editedAbc = reviewedAbcForContinuation(reviewedAbc, abc)
     setBusy('continue'); setError(null)
@@ -302,6 +374,22 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
       if (isCurrent()) setBusy(null)
     }
   }
+
+  const cancel = async (take: api.Yue2Track) => {
+    if (currentAccountIdentityEpoch() !== accountEpoch) return
+    const requestWorkspace = workspace
+    const requestEpoch = accountEpoch
+    const operation = operationSequence.current
+    const isCurrent = () => workspaceRef.current === requestWorkspace && operationSequence.current === operation
+      && currentAccountIdentityEpoch() === requestEpoch
+    try {
+      await api.cancelYue2(take.id, requestWorkspace)
+      if (isCurrent()) await refresh()
+    } catch (cause) {
+      if (isCurrent()) setError(cause instanceof Error ? cause.message : 'YuE2 cancellation failed')
+    }
+  }
+  const renderedOperation = operationSequence.current
 
   return (
     <section aria-label="YuE2 composer" className="space-y-3 rounded-xl border border-accent-blue/25 bg-bg-secondary/70 p-3">
@@ -454,6 +542,14 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
         Pause for ABC review before rendering
       </label>
 
+      {submission && (
+        <div role="status" className="space-y-2 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-2 text-[10px] text-amber-200">
+          <p>{submission.phase === 'sending' ? 'Waiting for YuE2 to confirm this submission…' : 'This submission is not yet confirmed. It may already be queued. Refresh to check, or retry the same submission.'}</p>
+          <p>Retry keeps the original song and settings. This pending submission stays available while you move between projects in this app; reloading the page clears it.</p>
+          {submission.phase === 'unconfirmed' && <button type="button" onClick={retrySubmission} disabled={!!busy} className="mobile-control-target underline disabled:opacity-40">Retry this submission</button>}
+        </div>
+      )}
+
       {activeTrack?.status === 'needs-review' ? (
         reviewError ? (
           <button type="button" onClick={() => void loadPlan(activeTrack)} disabled={reviewLoading} className="mobile-control-target flex w-full items-center justify-center gap-1.5 rounded-lg border border-red-400/30 bg-red-400/10 px-3 text-[10px] font-semibold text-red-300 hover:bg-red-400/20 disabled:opacity-40">
@@ -465,7 +561,7 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
           </button>
         )
       ) : (
-        <button type="button" onClick={() => void submit()} disabled={!status?.available || !style.trim() || !lyrics.trim() || !!busy || !resolvedGeneration.settings || !!checkpointError || !!decoderSelectionError || unavailableLoras.length > 0 || ['queued', 'running'].includes(activeTrack?.status || '')} className="mobile-control-target flex w-full items-center justify-center gap-1.5 rounded-lg bg-cta px-3 text-[10px] font-semibold text-cta-foreground hover:ring-2 hover:ring-accent-blue/40 disabled:opacity-40">
+        <button type="button" onClick={() => void submit()} disabled={!!submission || !status?.available || !style.trim() || !lyrics.trim() || !!busy || !resolvedGeneration.settings || !!checkpointError || !!decoderSelectionError || unavailableLoras.length > 0 || ['queued', 'running'].includes(activeTrack?.status || '')} className="mobile-control-target flex w-full items-center justify-center gap-1.5 rounded-lg bg-cta px-3 text-[10px] font-semibold text-cta-foreground hover:ring-2 hover:ring-accent-blue/40 disabled:opacity-40">
           {busy === 'submit' ? <Loader2 size={12} className="animate-spin" /> : <Music2 size={12} />} Generate with YuE2
         </button>
       )}
@@ -499,12 +595,12 @@ export function Yue2Controls({ workspace, description, style, lyrics, instrument
                   <a href={api.yue2AudioUrl(track.id, workspace, 'wav')} download={`${track.id}.wav`} className="inline-block text-accent-blue hover:underline">Download WAV</a>
                 </div>
               )}
-              {['queued', 'running'].includes(track.status) && <button type="button" onClick={() => void api.cancelYue2(track.id, workspace).then(refresh).catch(cause => setError(cause instanceof Error ? cause.message : 'YuE2 cancellation failed'))} className="flex items-center gap-1 text-red-300 hover:text-red-200"><Square size={10} /> Cancel</button>}
+              {['queued', 'running'].includes(track.status) && <button type="button" onClick={() => void cancel(track)} className="flex items-center gap-1 text-red-300 hover:text-red-200"><Square size={10} /> Cancel</button>}
             </article>
           ))}
         </div>
       </section>
-      {status?.training && <Yue2Training key={workspace} workspace={workspace} tracks={projectTracks} gpuBlocked={!!status.gpuBlocked} onJobs={jobs => { if (workspaceRef.current === workspace) setTrainingJobs(jobs) }} />}
+      {status?.training && <Yue2Training key={`${accountEpoch}:${workspace}`} workspace={workspace} tracks={projectTracks} gpuBlocked={!!status.gpuBlocked} onJobs={jobs => { if (workspaceRef.current === workspace && currentAccountIdentityEpoch() === accountEpoch && operationSequence.current === renderedOperation) setTrainingJobs(jobs) }} />}
       {reviewError && <p className="text-[10px] text-red-400">{reviewError}</p>}
       {error && <p className="text-[10px] text-red-400">{error}</p>}
     </section>
