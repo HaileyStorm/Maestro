@@ -34885,6 +34885,7 @@ async def blender_director_finalize(request: Request):
     body = await request.json()
     if not isinstance(body, dict) or not isinstance(body.get("plan"), dict):
         raise HTTPException(status_code=400, detail="A Director Blender plan is required")
+    _promote_external_llm_request(request)
     workspace = str(body.get("workspace") or _get_active_workspace())
     project_root = _require_project_access(request, workspace)
     _require_blender_ready()
@@ -34932,18 +34933,30 @@ async def blender_director_finalize(request: Request):
         except (TypeError, ValueError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
-        _ensure_llm_loaded()
         from services import llm_service
-        if not llm_service.vision_available():
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Director Blender review needs a vision-capable LLM. "
-                    "Select a Director model marked Vision, then retry."
-                ),
-            )
-        llm_status = llm_service.get_status()
-        director_model = str(llm_status.get("model_id") or "Director vision model")
+        # Visual review follows the existing image-work selection, independently
+        # of the owner's text-only chat model. Freeze it across review passes.
+        review_selection = _resolve_vision_llm_selection()
+
+        def require_vision_runtime():
+            if not llm_service.vision_available():
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Director Blender review needs a vision-capable model. "
+                        "Select a Prompt Enhance model marked Vision, then retry."
+                    ),
+                )
+            return str(llm_service.get_status().get("model_id") or "Director vision model")
+
+        director_model = _run_authorized_llm_with_selection(
+            request, review_selection, require_vision_runtime,
+        )
+
+        def review_selected_frames(**kwargs):
+            nonlocal director_model
+            director_model = require_vision_runtime()
+            return llm_service.generate(**kwargs)
 
         sample_names: list[str] = []
         reviews: list[dict] = []
@@ -35024,8 +35037,10 @@ async def blender_director_finalize(request: Request):
                             "semantic_mapping": {"type": "object"},
                         },
                     }
-                    raw = _run_configured_llm_operation(
-                        llm_service.generate,
+                    raw = _run_authorized_llm_with_selection(
+                        request,
+                        review_selection,
+                        review_selected_frames,
                         prompt=review_prompt,
                         system_prompt=(
                             "You are Director's visual quality controller for Blender. "

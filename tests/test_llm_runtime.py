@@ -1230,7 +1230,6 @@ class LlmRuntimeTests(unittest.TestCase):
             "_generate_and_save_lora_guide",
             "_generate_and_save_checkpoint_guide",
             "blender_director_plan",
-            "blender_director_finalize",
         ):
             function_node = next(
                 node for node in tree.body

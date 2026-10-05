@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import copy
 import hashlib
 import hmac
@@ -15,6 +16,9 @@ import unittest
 import uuid
 from unittest import mock
 from pathlib import Path
+from contextlib import contextmanager
+from types import SimpleNamespace
+from urllib.parse import quote
 
 from fastapi import HTTPException
 
@@ -54,6 +58,195 @@ def _load_functions(*names, extra=None):
         namespace,
     )
     return namespace
+
+
+class BlenderDirectorVisionTests(unittest.TestCase):
+    def exercise(self, root, *, nonvision_lease=None):
+        selection = {
+            "model_id": "configured-vision", "device": "cuda", "provider": "local",
+            "remote_url": "", "api_key": "", "local_gguf_path": "",
+            "gguf_file_override": "",
+        }
+        observations = SimpleNamespace(
+            leases=[], calls=[], samples=[], videos=[], assets=[], inside=False,
+            resolves=0, generated=0, vision_checks=0, status_checks=0,
+        )
+        self.observations = observations
+        plan = {
+            "scene": {"objects": [{"name": "Cube"}]},
+            "animation": {"frame_start": 0, "frame_end": 23},
+            "review_frames": [0, 23], "fps": 24,
+            "director_prompt": "Move the cube across the scene",
+            "semantic_mapping": {"conditioned_prompt": "moving cube"},
+        }
+
+        async def body():
+            return {"workspace": "protected-project", "plan": plan, "max_attempts": 2}
+
+        request = SimpleNamespace(
+            json=body, method="POST",
+            state=SimpleNamespace(maestro_session_id="a" * 32, maestro_remote=False),
+        )
+
+        def promote(req):
+            req.state.maestro_remote = True
+
+        def project_access(req, workspace):
+            self.assertTrue(req.state.maestro_remote)
+            self.assertEqual(workspace, "protected-project")
+            return str(root)
+
+        def resolve():
+            observations.resolves += 1
+            return dict(selection)
+
+        def lease(selected, operation, **_kwargs):
+            self.assertFalse(observations.inside)
+            observations.leases.append(dict(selected))
+            observations.inside = True
+            try:
+                return operation()
+            finally:
+                observations.inside = False
+
+        def vision_available():
+            self.assertTrue(observations.inside)
+            observations.vision_checks += 1
+            return len(observations.leases) != nonvision_lease
+
+        def status():
+            self.assertTrue(observations.inside)
+            observations.status_checks += 1
+            return {"model_id": observations.leases[-1]["model_id"]}
+
+        def generate(**kwargs):
+            self.assertTrue(observations.inside)
+            self.assertEqual(len(kwargs["image_paths"]), 2)
+            self.assertTrue(all(Path(path).is_file() for path in kwargs["image_paths"]))
+            observations.generated += 1
+            if observations.generated == 1:
+                return json.dumps({
+                    "verdict": "revise", "analysis": "Move farther",
+                    "scene": plan["scene"], "animation": plan["animation"],
+                    "review_frames": [0, 23],
+                })
+            return json.dumps({"verdict": "approved", "analysis": "Motion is readable"})
+
+        def invoke(tool, args):
+            self.assertFalse(observations.inside, "Blender must not render under the LLM lease")
+            observations.calls.append(tool)
+            if tool == "render_preview":
+                # A concurrent settings change must not replace the frozen selection.
+                selection["model_id"] = "changed-text-chat"
+                outputs = []
+                for frame in args["frames"]:
+                    path = root / (Path(args["output_path"]).stem + f"_{frame}.png")
+                    path.write_bytes(b"offline-frame")
+                    outputs.append({"output_path": str(path)})
+                return {"outputs": outputs}
+            if tool == "render_animation":
+                path = root / args["output_path"]
+                path.write_bytes(b"offline-video")
+                return {"output_path": str(path)}
+            return {}
+
+        def preview_sidecar(project, name, **kwargs):
+            observations.samples.append(kwargs)
+            (root / (Path(name).stem + ".meta.json")).write_text("{}")
+
+        def create_asset(*args, **kwargs):
+            observations.assets.append(kwargs)
+            return {"id": "asset", "variants": [{"id": "variant"}]}
+
+        @contextmanager
+        def render_slot():
+            self.assertFalse(observations.inside)
+            yield
+
+        def forbidden(*args, **kwargs):
+            self.fail("Blender review must not use global text-chat dispatch")
+
+        service = SimpleNamespace(
+            _normalize_scene_create=copy.deepcopy,
+            _normalize_animation=copy.deepcopy, invoke=invoke,
+        )
+        llm = SimpleNamespace(
+            vision_available=vision_available, get_status=status, generate=generate,
+        )
+        namespace = _load_functions(
+            "blender_director_finalize", "_run_authorized_llm_with_selection",
+            extra={
+                "api": SimpleNamespace(post=lambda _path: lambda function: function),
+                "Request": object, "asyncio": asyncio, "quote": quote,
+                "_promote_external_llm_request": promote,
+                "_llm_chat_request_is_external": lambda req: req.state.maestro_remote,
+                "_require_project_access": project_access,
+                "_get_active_workspace": forbidden,
+                "_require_blender_ready": lambda: None,
+                "output_policy_from_request": lambda *args, **kwargs: {
+                    "private": False, "explicit": False,
+                },
+                "_blender_service_for": lambda *args: service,
+                "_normalize_blender_semantic_mapping": lambda value, *args, **kwargs:
+                    copy.deepcopy(value or kwargs["fallback"]),
+                "_normalize_blender_review_frames": lambda frames, *args: frames,
+                "_resolve_vision_llm_selection": resolve,
+                "_run_llm_with_selection": lease,
+                "_ensure_llm_loaded": forbidden,
+                "_run_configured_llm_operation": forbidden,
+                "_blender_scene_lock": threading.RLock(),
+                "_BlenderGpuRenderSlot": render_slot,
+                "_write_blender_preview_sidecar": preview_sidecar,
+                "_write_blender_video_sidecar": lambda *args, **kwargs:
+                    observations.videos.append(kwargs),
+                "_blender_plan_json": json.loads,
+                "_project_asset_store": lambda: SimpleNamespace(create_asset=create_asset),
+                "_blender_error": lambda error: HTTPException(503, str(error)),
+            },
+        )
+        with mock.patch("services.llm_service", llm, create=True):
+            return asyncio.run(namespace["blender_director_finalize"](request))
+
+    def test_review_freezes_vision_selection_and_records_leased_model(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            result = self.exercise(Path(temporary))
+        observed = self.observations
+        self.assertEqual(result["status"], "awaiting_user_review")
+        self.assertEqual([item["verdict"] for item in result["director_reviews"]], ["revise", "approved"])
+        self.assertEqual(observed.resolves, 1)
+        self.assertEqual(len(observed.leases), 3)
+        self.assertEqual(observed.vision_checks, 3)
+        self.assertEqual(observed.status_checks, 3)
+        self.assertTrue(all(item == observed.leases[0] for item in observed.leases))
+        self.assertEqual(observed.leases[0]["model_id"], "configured-vision")
+        self.assertTrue(all(item["policy"]["private"] for item in observed.samples))
+        self.assertEqual(result["director_model"], "configured-vision")
+        self.assertEqual(observed.videos[0]["director_model"], "configured-vision")
+        candidate = observed.assets[0]["variants"][0]
+        self.assertEqual(candidate["metadata"]["director_model"], "configured-vision")
+        self.assertEqual(candidate["status"], "candidate")
+        self.assertEqual(observed.calls.count("render_animation"), 1)
+
+    def test_nonvision_load_stops_before_scene_work(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaises(HTTPException) as failure:
+                self.exercise(Path(temporary), nonvision_lease=1)
+            self.assertEqual(list(Path(temporary).iterdir()), [])
+        self.assertEqual(failure.exception.status_code, 409)
+        self.assertIn("Prompt Enhance", failure.exception.detail)
+        self.assertEqual(self.observations.calls, [])
+        self.assertEqual(self.observations.generated, 0)
+
+    def test_lost_vision_capability_cleans_samples_without_publication(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaises(HTTPException) as failure:
+                self.exercise(Path(temporary), nonvision_lease=3)
+            self.assertEqual(list(Path(temporary).iterdir()), [])
+        self.assertEqual(failure.exception.status_code, 409)
+        self.assertEqual(self.observations.generated, 1)
+        self.assertNotIn("render_animation", self.observations.calls)
+        self.assertEqual(self.observations.assets, [])
+        self.assertEqual(self.observations.videos, [])
 
 
 class _FakeAssetStore:
@@ -133,7 +326,7 @@ class BlenderLaunchIntegrationTests(unittest.TestCase):
                 self.assertIn(f"readiness.{key}", component)
         self.assertIn("_require_blender_ready()", invoke)
         self.assertLess(plan.index("_require_blender_ready()"), plan.index("_ensure_llm_loaded()"))
-        self.assertLess(finalize.index("_require_blender_ready()"), finalize.index("_ensure_llm_loaded()"))
+        self.assertLess(finalize.index("_require_blender_ready()"), finalize.index("_run_authorized_llm_with_selection("))
         self.assertNotIn("disabled={!installed", component)
         self.assertGreaterEqual(component.count("disabled={!ready"), 6)
         self.assertIn("Verify / Repair Blender Runtime", self.function("_blender_readiness"))

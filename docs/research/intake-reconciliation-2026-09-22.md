@@ -660,3 +660,13 @@ without a restart. The panel now identifies this missing-client condition
 and directs users to the same repair action. Four focused desktop/mobile
 browser checks and all 811 UI tests passed; no native render or model load
 was performed during this runtime repair.
+
+Blender frame review now uses the configured local vision-enhancer selection
+instead of the global chat selection. Each review pass loads and checks that
+same selection under its exact model lease; capability and model provenance
+are checked inside the lease. Rendering runs after the lease releases. LAN
+origin detection precedes project authorization. All 133 Blender integration,
+MCP service and LLM runtime tests passed, including actual extracted-route
+execution with mocked leases/renderers for two-pass review, changing settings,
+early capability rejection and mid-loop cleanup. These tests establish offline
+behavior; native Blender review and kept-video Editor acceptance remain pending.
