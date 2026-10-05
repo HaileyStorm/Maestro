@@ -135,7 +135,7 @@ checkpoint was installed.
 | Animation principles, storyboard/parkour boards, character reveals, kinetic typography, limited palettes, logos, tapestry, origami/page turns, sprites, ink/smoke, noir/foley, fake speedpaint | Adapt / benchmark leads as recorded per source | Craft/data guidance exists for some families. A named recipe does not prove local reproduction of a social example. Keep exact source/model/seed/style and visual/audio checks for each promoted recipe. |
 | Mayz, Kōda, Shams, Dave, Renataro, Naoneko, TechHalla, Andrew, lepadphone, PhotogenicWeekE, airina, ailker and Kashiko examples | Preserve source-specific decisions | All URLs remain in the appendix/original tables; missing post bodies/comments remain evidence gaps. Hosted Seedance/Magnific/Hailuo/Vidu/PixVerse examples are not local executors. |
 | MiniMax Design desktop / Lazy Frames / OpenMontage / Director Cut Studio | Adapt ideas; reject wholesale runtime | Grow existing Director/Reference rather than import another project store, queue or agent canvas. |
-| Remotion + Blender-MCP composition | Adopt neutral composition capability, unfinished | Typed Blender facade exists for primitives/materials/keyframes/rendering. The Editor has a CPU 2D sequence renderer; repeated immutable video sources now have independent clip identities, trims and ordering, with source/privacy checks and real-media tests. Integrated append/export routes and recovery tests pass; signed-in live browser acceptance remains pending. A shared composition package across Editor and Blender is still unfinished. Camera/light/physics extensions need their own contract. |
+| Remotion + Blender-MCP composition | Adopt neutral composition capability, unfinished | Typed Blender facade exists for primitives/materials/keyframes/rendering. The Editor has a CPU 2D sequence renderer; repeated immutable video sources now have independent clip identities, trims and ordering, with source/privacy checks and real-media tests. Integrated append/export routes and recovery tests pass. Live browser acceptance verified duplicate append, independent trims, reorder/removal, saved-draft reopening and a fully decoded 48-frame export with unchanged original media. A shared composition package across Editor and Blender is still unfinished. Camera/light/physics extensions need their own contract. |
 | Diffusion Studio / Revideo / Motion Canvas / Twick / Friction / CozyClay | Reference or benchmark; reject duplicate application dependency | Native Editor/composition can reuse ideas after project/output/resource review. Friction licensing and unresolved Rendave identity remain explicit constraints. |
 | Prompt Intelligence / known-character index | Adapt / extract | Role-dialogue ablation and local evaluation-schema ideas; no downloaded character library or blanket prompt rule. Sources remain in the August 25 record. |
 | kimodo.cpp / NKD VFX and Preview Tools | Watch / adapt respectively | CPU/Vulkan SMPL-X-to-Blender candidate; NKD face-rig/timeline/mask/camera/depth techniques. No imported tool suite or accepted runtime. |
@@ -633,5 +633,11 @@ The eight-clip limit counts clip instances. CPU media and real-journal tests
 verify ordered ranges, source authority and privacy without changing originals.
 All 811 UI tests, the type-check/build and 16 mounted synthetic Editor browser
 checks passed on unchanged sources. All 29 integrated append/export route tests
-passed. The signed-in live trim/reorder/export flow remains pending; these checks do not establish a
-shared Editor/Blender composition package or owner acceptance.
+passed. After the coordinated release, the existing authorized project passed
+live duplicate append, independent 0.5–1.5 and 2.5–3.5 second trims, reorder,
+removal of a third instance and reopening the saved draft. Two distinct clip
+IDs retained one source asset. The CPU export contained 48 frames at 24 fps
+with AAC audio and a two-second duration; full audio/video decoding and browser
+playback completed without error. Original media and sidecar hashes stayed
+unchanged. These checks do not establish a shared Editor/Blender composition
+package or owner creative/listening acceptance.
