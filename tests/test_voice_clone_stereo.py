@@ -61,8 +61,15 @@ class VoiceCloneStereoTests(unittest.TestCase):
                 foreign = estimator.register_forward_pre_hook(lambda *_: None)
                 self.addCleanup(foreign.remove)
                 existing_hooks = dict(estimator._forward_pre_hooks)
-                with self.assertRaises(_VoiceCloneCancelled):
+                with patch("builtins.print") as emit, self.assertRaises(_VoiceCloneCancelled):
                     _convert_seedvc_with_cancellation(converter, lambda: len(estimator.batches) >= 2,
+                                                      diffusion_steps=6, cfg_rate=cfg_rate)
+                emit.assert_called_once_with(
+                    "[VoiceClone] Diffusion-step cancellation reached; estimator call skipped.", flush=True)
+                self.assertEqual(estimator.batches, [2 if cfg_rate else 1] * 2)
+                self.assertEqual(dict(estimator._forward_pre_hooks), existing_hooks)
+                with patch("builtins.print", side_effect=BrokenPipeError), self.assertRaises(_VoiceCloneCancelled):
+                    _convert_seedvc_with_cancellation(converter, lambda: True,
                                                       diffusion_steps=6, cfg_rate=cfg_rate)
                 self.assertEqual(estimator.batches, [2 if cfg_rate else 1] * 2)
                 self.assertEqual(dict(estimator._forward_pre_hooks), existing_hooks)

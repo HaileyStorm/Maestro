@@ -381,6 +381,10 @@ def _convert_seedvc_with_cancellation(converter, cancel_check, *, step_callback=
         if threading.get_ident() != owner_thread:
             return
         if cancel_check is not None and cancel_check():
+            try:
+                print("[VoiceClone] Diffusion-step cancellation reached; estimator call skipped.", flush=True)
+            except (OSError, ValueError):
+                pass  # A closed log stream cannot prevent cancellation.
             raise _VoiceCloneCancelled()
         if step_callback is not None and report_steps:
             # Installed v1 Euler calls the estimator once per step, including CFG.
