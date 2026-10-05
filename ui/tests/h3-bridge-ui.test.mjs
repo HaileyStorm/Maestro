@@ -14,7 +14,7 @@ function loadBridgeModule() {
   if (bridgeModulePromise) return bridgeModulePromise
   bridgeModulePromise = build({
     stdin: {
-      contents: "export { H3BridgePanel, H3_BRIDGE_GENERATED_FRAMES, resolveH3BridgeSelection } from './src/components/MainContent/H3BridgePanel.tsx'; export { submitH3Bridge } from './src/api/client'",
+      contents: "export { H3BridgePanel } from './src/components/MainContent/H3BridgePanel.tsx'; export { H3_BRIDGE_GENERATED_FRAMES, resolveH3BridgeSelection } from './src/components/MainContent/h3BridgeSelection'; export { submitH3Bridge } from './src/api/client'",
       resolveDir: UI_ROOT,
       loader: 'js',
     },
