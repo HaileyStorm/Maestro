@@ -22,14 +22,17 @@ export { captureGenerationProfileSettings, restoreGenerationProfileSettings } fr
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { GenerateButton } from '../components/Sidebar/GenerateButton'
-export function renderGenerateButton() {
+import { GlobalQueuePopover } from '../components/GlobalQueuePopover'
+function renderControl(component) {
   const initial = useStore.getInitialState()
   const original = { ...initial }
   // SSR reads the initial snapshot; use the arranged state for this component check.
   Object.assign(initial, useStore.getState())
-  try { return renderToStaticMarkup(createElement(GenerateButton)) }
+  try { return renderToStaticMarkup(createElement(component)) }
   finally { Object.assign(initial, original) }
 }
+export function renderGenerateButton() { return renderControl(GenerateButton) }
+export function renderGlobalQueue() { return renderControl(GlobalQueuePopover) }
 `,
       resolveDir: STORE_ROOT,
       loader: 'ts',
@@ -390,5 +393,22 @@ test('rendered Generate and held Queue controls omit calibrating badges in cumul
     assert.doesNotMatch(renderGenerateButton(), /calibrating|Collecting enough local timing data/)
     useStore.getState().setParam('h3_cumulative_append', false)
     assert.match(renderGenerateButton(), /calibrating/)
+  })
+})
+
+
+test('rendered queue controls exclude terminal retained holds and count all live Studio stages', async () => {
+  await withFreshStore(async ({ useStore, renderGenerateButton, renderGlobalQueue }) => {
+    const row = status => ({ id: status, status, held: true, step: 0, totalSteps: 0, progress: 0 })
+    const terminalRows = ['cancelled', 'failed', 'completed'].map(row)
+    useStore.setState({ jobs: terminalRows, directorQueue: null, pipelineId: null, pipelineStatus: null })
+    assert.match(renderGenerateButton(), />Generate</)
+    assert.doesNotMatch(renderGenerateButton(), /Go \(/)
+    assert.match(renderGlobalQueue(), /aria-label="Generation queue, 0 items"/)
+    for (const status of ['queued', 'running', 'preparing', 'waiting_for_plan_approval']) {
+      useStore.setState({ jobs: [...terminalRows, row(status)] })
+      assert.match(renderGenerateButton(), />Go \(1\)</, status)
+      assert.match(renderGlobalQueue(), /aria-label="Generation queue, 1 item"/, status)
+    }
   })
 })

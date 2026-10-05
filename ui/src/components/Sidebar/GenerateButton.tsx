@@ -223,9 +223,7 @@ export function GenerateButton() {
     if (mode === 'now') setSidebarOpen(false)
   }
 
-  const queueCount = projectLogicalQueue(jobs).visibleJobs.filter(job =>
-    job.status === 'queued' || job.status === 'running' || job.held
-  ).length
+  const queueCount = projectLogicalQueue(jobs).activeCount
 
   if (blocked) {
     const label = modelOptionsLoading

@@ -128,13 +128,13 @@ test('queue badge uses Continuum held flag instead of status held', () => {
   assert.match(queueProjection, /queueJob\?\.held \|\| publicJob\.held/)
   assert.match(
     generateButton,
-    /job\.status === 'queued' \|\| job\.status === 'running' \|\| job\.held/,
+    /projectLogicalQueue\(jobs\)\.activeCount/,
   )
 })
 
 test('GlobalQueuePopover keeps Continuum held jobs without requiring status held', () => {
   assert.match(globalQueuePopover, /projectLogicalQueue\(jobs\)/)
-  assert.match(globalQueuePopover, /isActiveLogicalQueueJob\(job\) \|\| job\.held/)
+  assert.match(globalQueuePopover, /job => isActiveLogicalQueueJob\(job\),/)
   assert.match(
     globalQueuePopover,
     /studioProjection\.visibleJobs\.filter/,
@@ -252,32 +252,4 @@ test('projectLogicalQueue counts queued Continuum holds via job.held', () => {
   const completedHold = projectHeldSummary([job({ id: 'done-1', status: 'completed', held: true })])
   assert.equal(completedHold.held, 0)
   assert.equal(completedHold.active_total, 0)
-})
-
-test('GlobalQueuePopover studio filter treats job.held as sufficient', () => {
-  const ACTIVE_JOB_STATUSES = new Set([
-    'held',
-    'preparing',
-    'waiting_for_plan_approval',
-    'queued',
-    'running',
-  ])
-  const studioJobs = (jobs) => jobs.filter(row => ACTIVE_JOB_STATUSES.has(row.status) || row.held)
-  const studioHeldCount = (jobs) => studioJobs(jobs).filter(row => row.held || row.status === 'held').length
-
-  const queuedHold = [job({ id: 'q1', status: 'queued', held: true })]
-  assert.equal(studioJobs(queuedHold).length, 1)
-  assert.equal(studioHeldCount(queuedHold), 1)
-
-  const leftoverStatus = [job({ id: 'legacy', status: 'held', held: false })]
-  assert.equal(studioJobs(leftoverStatus).length, 1)
-  assert.equal(studioHeldCount(leftoverStatus), 1)
-
-  const completedHold = [job({ id: 'done', status: 'completed', held: true })]
-  assert.equal(studioJobs(completedHold).length, 1)
-  assert.equal(studioHeldCount(completedHold), 1)
-
-  const finished = [job({ id: 'fin', status: 'completed', held: false })]
-  assert.equal(studioJobs(finished).length, 0)
-  assert.equal(studioHeldCount(finished), 0)
 })

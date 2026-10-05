@@ -84,7 +84,7 @@ export function GlobalQueuePopover({
 
   const studioProjection = useMemo(() => projectLogicalQueue(jobs), [jobs])
   const studioJobs = useMemo(() => studioProjection.visibleJobs.filter(
-    job => isActiveLogicalQueueJob(job) || job.held,
+    job => isActiveLogicalQueueJob(job),
   ), [studioProjection.visibleJobs])
   const studioHeldCount = studioJobs.filter(job => job.held).length
   const directorEntries = directorQueue?.entries || []
