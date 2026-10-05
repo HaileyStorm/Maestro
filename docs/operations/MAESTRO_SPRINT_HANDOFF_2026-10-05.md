@@ -410,3 +410,45 @@ was unavailable at rollover. Do not treat that as empty memory or a fresh
 recall. Existing project artifacts carry the exact work evidence. Preserve
 legacy memory originals and current cutover controls; do not change memory
 stores, credentials or provider configuration to make startup look complete.
+
+## October 5 Stop and Revoice delivery checkpoint
+
+Commit `1d671554` preserves the full video tail when replacement audio is
+shorter and reports actual Revoice chunk/step activity. The focused backend
+gate passed 221 tests. A retained native HTTP run produced all 350 source
+video packets with identical ordered timestamps, sizes and data hashes; full
+CPU decoding passed. This is output-preservation evidence, not listening
+acceptance. The original inputs remain unchanged.
+
+That run completed before the UI Stop click. The cancellation endpoint returned
+HTTP 200, but its response body was unavailable; this does not prove that
+cancellation won. During collection, the guardian's controller heartbeat
+expired and stopped the exact owned workload before withdrawing its request.
+Normal Pinokio service and stable access were restored and verified. Preserve
+the failed guardian receipt and terminal request; do not replay this attempt.
+Native HTTP Stop qualification remains open.
+
+Commit `3574ff02` keeps the job card, terminal waiter and canonical status
+observation after Stop, including while the cancellation POST is pending or
+its acknowledgement is lost. Repeated pending clicks coalesce without an
+automatic POST retry. Account, project and job-incarnation fences reject stale
+results. H3 cancellation also follows the actual terminal winner instead of
+manufacturing cancellation from HTTP 200. The applicable UI gate passed 111
+tests, TypeScript, scoped lint/build and six Firefox/Chromium browser checks;
+independent final review found no remaining issues.
+
+Commit `81fd38c1` shows completed Revoice source and timing records in Gallery's
+existing Finishing details section. The section requires a completed sidecar
+record and private reveal, exposes only the source basename, and omits unrelated
+upscale settings. Fourteen private-preview tests, TypeScript, scoped lint/build
+and the publication guard passed. The signed-in local Gallery showed the
+retained output's result, source, recorded timestamp and seven-second job time;
+re-hiding the preview hid the section. Media bytes remained unchanged.
+
+Both UI releases were promoted atomically while retaining earlier hashed assets
+for open clients. Fresh Pinokio discovery, local and stable health/readiness,
+exact served assets and an empty public restart notice were verified. No backend
+restart was needed for either UI release. Owned source and promotion claims were
+released; foreign work and the historical tracker hold remain preserved.
+These milestones do not complete the full sprint, human quality/listening,
+remote signed-in viewing, Windows acceptance or native HTTP cancellation.
