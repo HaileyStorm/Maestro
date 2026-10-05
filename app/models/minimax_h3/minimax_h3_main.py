@@ -27,6 +27,7 @@ from tqdm import tqdm
 from mmgp import offload, quant_router
 from shared.utils import files_locator as fl
 from services.h3_preview import H3PreviewGeometryError
+from services.h3_pdd import clear_pdd_runtime, pdd_generation_cleanup
 
 from .audio_vae import AutoencoderKLMiniMaxH3Audio
 from .checkpoint import (
@@ -915,6 +916,7 @@ class MiniMaxH3Model:
     def release(self) -> None:
         """Sever every heavyweight H3 component during model replacement."""
         self.__interrupt = True
+        clear_pdd_runtime(getattr(self, "transformer", None))
         for component_name in ("transformer", "conditioner"):
             component = getattr(self, component_name, None)
             if component is not None:
@@ -948,11 +950,11 @@ class MiniMaxH3Model:
 
         modules = [importlib.import_module(__package__ + "." + name) for name in (
             "minimax_h3_main", "conditioner", "transformer", "video_vae", "audio_vae",
-            "packing", "checkpoint", "scheduler", "convrot",
+            "packing", "checkpoint", "scheduler", "convrot", "pdd",
         )]
         # Shared latent/packing changes must also invalidate recovery evidence.
         modules += [importlib.import_module("services." + name) for name in (
-            "h3_cumulative_latents", "h3_native_continuation", "h3_runtime_binding",
+            "h3_cumulative_latents", "h3_native_continuation", "h3_runtime_binding", "h3_pdd",
         )]
         modules += [offload, quant_router]
         return {
@@ -1333,6 +1335,7 @@ class MiniMaxH3Model:
         return presentation, prepared, condition_video_rows, condition_audio_rows
 
     @torch.inference_mode()
+    @pdd_generation_cleanup
     def generate(
         self,
         input_prompt: str,
@@ -1364,6 +1367,33 @@ class MiniMaxH3Model:
         custom_settings = _kwargs.get("custom_settings")
         if not isinstance(custom_settings, dict):
             custom_settings = {}
+        from services.h3_pdd import H3PDDError, pdd_requested, validate_pdd_request
+        pdd_controller = getattr(getattr(self, "transformer", None), "_h3_pdd_controller", None)
+        pdd_enabled = pdd_requested(custom_settings, _kwargs.get("activated_loras"))
+        if pdd_enabled or pdd_controller is not None:
+            admission = getattr(self.transformer, "_h3_pdd_admission", None)
+            if admission is None or pdd_controller is None or not pdd_enabled:
+                raise H3PDDError("H3 PDD requires an admitted, loaded coupled-head executor.")
+            admission.verify(self.transformer, device=self.device)
+            if bool(self.reference_mode) != (admission.family == "minimax_h3_ref2va"):
+                raise H3PDDError("H3 PDD artifact does not match the model's reference family.")
+            validate_pdd_request(
+                model_type=self.selected_model_type or "minimax_h3",
+                custom_settings=custom_settings,
+                activated_loras=_kwargs.get("activated_loras", [admission.artifact.requested]),
+                loras_multipliers=admission.strength, num_inference_steps=sampling_steps,
+                skip_steps_cache_type=_kwargs.get("skip_steps_cache_type"),
+                cumulative=any(key.startswith("_h3_cumulative_") for key in _kwargs),
+                native_boundary=_kwargs.get("h3_native_boundary_conditioning") is True,
+                audio_prompt_type=audio_prompt_type,
+            )
+            if not self.reference_mode and (
+                video_prompt_type or any(value is not None for value in (
+                    input_frames, input_frames2, input_frames3,
+                    input_waveform, audio_guide, audio_guide2, audio_guide3,
+                ))
+            ):
+                raise H3PDDError("H3 PDD FL2VA requires first/last-frame conditioning without source-audio schedules.")
         cumulative_requested = any(
             key in _kwargs for key in (
                 "_h3_cumulative_capture", "_h3_cumulative_previous", "_h3_cumulative_step",
@@ -1412,7 +1442,7 @@ class MiniMaxH3Model:
                     "_h3_timeline_still_guide", "_h3_bridge_guides",
                     "h3_native_boundary_conditioning", "h3_ref2va_handoff",
                     "h3_turbo_profile", "h3_lightx2v_profile",
-                    "h3_spectrum_profile", "h3_source_audio_mode",
+                    "h3_spectrum_profile", "h3_source_audio_mode", "h3_pdd_profile",
                 ))
             )
             if incompatible:
@@ -2285,10 +2315,14 @@ class MiniMaxH3Model:
             # native steps are model evaluations, so N/N needs N+1 points.
             video_scheduler_points = int(sampling_steps) + 1
             audio_scheduler_points = video_scheduler_points
-        self.scheduler.set_timesteps(video_scheduler_points, device=self.device)
-        self.audio_scheduler.set_timesteps(
-            audio_scheduler_points, device=self.device,
-        )
+        if pdd_enabled:
+            from .pdd import pdd_sigmas
+            self.scheduler.set_timesteps(sigmas=pdd_sigmas(12), device=self.device)
+            self.audio_scheduler.set_timesteps(sigmas=pdd_sigmas(3), device=self.device)
+            pdd_controller.configure_sigmas(self.scheduler.sigmas, self.audio_scheduler.sigmas)
+        else:
+            self.scheduler.set_timesteps(video_scheduler_points, device=self.device)
+            self.audio_scheduler.set_timesteps(audio_scheduler_points, device=self.device)
         if source_audio_roles.mode == "remix_source":
             # Preserve the paired call count while beginning only the audio
             # clock at the requested source-denoise strength.  The two row
@@ -2346,6 +2380,8 @@ class MiniMaxH3Model:
         def run_transformer_step(
             index, unique_timesteps, timestep_indices, spectrum_phase=None,
         ):
+            if pdd_enabled:
+                pdd_controller.set_step(index)
             transformer_kwargs = dict(
                 hidden_states=video_rows[None],
                 audio_hidden_states=audio_rows[None],

@@ -12097,6 +12097,20 @@ def _generate_video_impl(
         profile = apply_h3_baseline_offload_profile(
             profile, model_type, resolution,
         )
+    from services.h3_pdd import (
+        enforce_pdd_runtime, pdd_requested, prepare_pdd_runtime,
+        activate_pdd_runtime, clear_pdd_runtime,
+    )
+    pdd_runtime_requested = pdd_requested(custom_settings, activated_loras)
+    pdd_admission = enforce_pdd_runtime(
+        model_type=model_type, custom_settings=custom_settings,
+        activated_loras=activated_loras, loras_multipliers=loras_multipliers,
+        num_inference_steps=num_inference_steps,
+        skip_steps_cache_type=skip_steps_cache_type,
+        cumulative=_h3_cumulative_dispatch is not None,
+        native_boundary=_h3_native_boundary is not None,
+        audio_prompt_type=audio_prompt_type,
+    )
     dasiwa_checkpoint_admission = None
     dasiwa_lora_path = None
     dasiwa_lora_candidates = (
@@ -12595,12 +12609,16 @@ def _generate_video_impl(
 
     def _unload_generation_loras():
         nonlocal _generation_loras_loaded
-        offload.unload_loras_from_model(trans_lora)
-        clear_h3_turbo_runtime(trans_lora)
-        if trans2_lora is not None:
-            offload.unload_loras_from_model(trans2_lora)
-            clear_h3_turbo_runtime(trans2_lora)
-        _generation_loras_loaded = False
+        try:
+            offload.unload_loras_from_model(trans_lora)
+            clear_h3_turbo_runtime(trans_lora)
+            if trans2_lora is not None:
+                offload.unload_loras_from_model(trans2_lora)
+                clear_h3_turbo_runtime(trans2_lora)
+        finally:
+            clear_pdd_runtime(trans_lora)
+            clear_pdd_runtime(trans2_lora)
+            _generation_loras_loaded = False
 
     def _load_generation_loras():
         nonlocal _generation_loras_loaded
@@ -12608,6 +12626,11 @@ def _generate_video_impl(
             return
 
         def prepare():
+            if pdd_admission is not None:
+                if (len(loras_selected) != 1 or trans2_lora is not None
+                        or os.path.realpath(loras_selected[0]) != pdd_admission.artifact.resolved):
+                    raise ValueError("H3 PDD cannot share a model-defined or user adapter stack.")
+                prepare_pdd_runtime(trans_lora, pdd_admission, device=wan_model.device)
             if len(loras_selected) > 0:
                 if dasiwa_checkpoint_admission is not None:
                     from services.h3_dasiwa import recheck_dasiwa_lora_admission
@@ -12643,6 +12666,8 @@ def _generate_video_impl(
                     wan_model.finalize_loras()
             if turbo_assets is not None:
                 activate_h3_turbo_runtime(trans_lora)
+            if pdd_admission is not None:
+                activate_pdd_runtime(trans_lora)
 
         if lightx2v_runtime_requested:
             guard_lightx2v_lora_load(prepare, _unload_generation_loras)
@@ -12654,10 +12679,9 @@ def _generate_video_impl(
                 raise
         _generation_loras_loaded = True
 
-    # Preserve every existing model/user/Turbo LoRA load point. Only the new
-    # managed LightX2V adapter waits until fallible window preprocessing has
-    # completed, so it cannot survive an exception before inference begins.
-    if not lightx2v_runtime_requested:
+    # Fallible window preprocessing precedes managed adapters with a scoped
+    # inference lifetime; ordinary model/user/Turbo load points stay intact.
+    if not (lightx2v_runtime_requested or pdd_runtime_requested):
         _load_generation_loras()
 
     seed = None if seed == -1 else seed
@@ -14032,7 +14056,7 @@ def _generate_video_impl(
                         "model_filename": model_filename,
                     })
                 samples = call_with_lightx2v_cleanup(
-                    lightx2v_runtime_requested,
+                    lightx2v_runtime_requested or pdd_runtime_requested,
                     _unload_generation_loras,
                     call_with_sticky_interrupt,
                     gen,
@@ -14597,6 +14621,8 @@ def _generate_video_impl(
                 # Runtime-only authorization must not reach filename
                 # formatting, embedded metadata, saved settings, or sidecars.
                 inputs.pop("_h3_turbo_validation_authorized", None)
+                if pdd_admission is not None:
+                    inputs["h3_pdd_runtime_sha256"] = pdd_admission.identity()
                 inputs.pop("_h3_native_boundary", None)
                 inputs.pop("_maestro_enhanced_prompt_cardinality", None)
                 inputs.pop("_recovery_output_directory", None)

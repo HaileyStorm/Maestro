@@ -857,6 +857,11 @@ class MiniMaxH3Transformer(nn.Module):
         )
 
     def preprocess_loras(self, model_type: str, state_dict: dict) -> dict:
+        if getattr(self, "_h3_pdd_admission", None) is not None:
+            from services.h3_pdd import preprocess_pdd_backbone
+            return preprocess_pdd_backbone(self, model_type, state_dict)
+        if "proj_out.weight" in state_dict or "audio_proj_out.weight" in state_dict:
+            raise ValueError("H3 interval-head adapters require experimental PDD admission.")
         if self._h3_turbo_prepared:
             if self._h3_turbo_backbone_mode == "residual_output":
                 # Residual-output Turbo owns the complete managed LoRA itself;

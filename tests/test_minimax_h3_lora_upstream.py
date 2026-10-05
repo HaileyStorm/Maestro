@@ -83,6 +83,24 @@ class MiniMaxH3OrdinaryLoraTests(unittest.TestCase):
             module_specs=self.specs if specs is None else specs,
         )
 
+    def test_pdd_admission_failure_preserves_ordinary_normalization(self):
+        from services.h3_pdd import clear_pdd_runtime
+
+        ordinary = _pair("transformer_blocks.0.attn.to_out.0", 8, 8)
+        expected = self.model.preprocess_loras("minimax_h3", ordinary)
+        video, audio = self.model.final_layer.video_out, self.model.final_layer.audio_out
+        bank = {"proj_out.weight": video.weight[None].expand(32, -1, -1).clone(),
+                "audio_proj_out.weight": audio.weight[None].expand(32, -1, -1).clone()}
+        with self.assertRaisesRegex(ValueError, "require experimental PDD admission"):
+            self.model.preprocess_loras("minimax_h3", bank | ordinary)
+        clear_pdd_runtime(self.model)
+        actual = self.model.preprocess_loras("minimax_h3", ordinary)
+        self.assertEqual(set(actual), set(expected))
+        for name in expected:
+            torch.testing.assert_close(actual[name], expected[name], rtol=0, atol=0)
+        self.assertIs(self.model.final_layer.video_out, video)
+        self.assertIs(self.model.final_layer.audio_out, audio)
+
     def test_diffusers_peft_qkv_fuses_and_preserves_each_alpha(self):
         state = {}
         for index, projection in enumerate(("q", "k", "v"), start=1):

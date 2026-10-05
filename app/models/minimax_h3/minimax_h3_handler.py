@@ -585,6 +585,21 @@ class family_handler:
         custom_for_timeline = (
             custom_settings if isinstance(custom_settings, dict) else {}
         )
+        from services.h3_pdd import H3PDDError, enforce_pdd_runtime
+        try:
+            enforce_pdd_runtime(
+                model_type=inputs.get("model_type", base_model_type),
+                custom_settings=custom_for_timeline,
+                activated_loras=inputs.get("activated_loras"),
+                loras_multipliers=inputs.get("loras_multipliers"),
+                num_inference_steps=inputs.get("num_inference_steps"),
+                skip_steps_cache_type=inputs.get("skip_steps_cache_type"),
+                cumulative=inputs.get("_h3_cumulative_dispatch") is not None,
+                native_boundary=inputs.get("h3_native_boundary_conditioning") is True,
+                audio_prompt_type=inputs.get("audio_prompt_type", ""),
+            )
+        except H3PDDError as error:
+            return str(error)
         if "_h3_timeline_still_guide" in inputs:
             return (
                 "MiniMax H3 timeline still guide must be supplied in custom_settings."
