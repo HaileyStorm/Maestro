@@ -3119,6 +3119,198 @@ function studioRejected(body, status = 422) {
     message: 'The submitted settings are invalid.' } }, status)
 }
 
+function enableStudioReloadFixture(t) {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  Object.defineProperty(globalThis, 'navigator', { configurable: true, value: {
+    locks: { request: (name, options, callback) => Promise.resolve(callback({ name })) },
+  } })
+  t.after(() => {
+    if (previous) Object.defineProperty(globalThis, 'navigator', previous)
+    else delete globalThis.navigator
+  })
+}
+
+async function freshStudioReloadRealm(polls) {
+  const { useStore } = await loadStoreModuleFresh()
+  useStore.setState({ activeWorkspace: 'studio-a', accessContext: { remote: false },
+    workspaces: [{ name: 'studio-a' }], _pollRecoveredJob(id) { polls.push(id) },
+  })
+  assert.equal(await useStore.getState().loadWorkspaces(), true)
+  return useStore
+}
+
+test('Studio reload keeps only opaque identity and adopts a retired completed receipt without POST or polling', async t => {
+  enableStudioReloadFixture(t)
+  let wire
+  let accepted = false
+  let posts = 0
+  let lookups = 0
+  const { useStore, polls } = await studioSubmissionFixture(t, async request => {
+    if (request.url.startsWith('/api/v1/llm/models')) return jsonResponse({ models: [], guides: [], project_instance: '1'.repeat(64) })
+    if (request.url === '/api/v1/workspaces') return jsonResponse({ workspaces: [{ name: 'studio-a' }], active: 'studio-a' })
+    if (request.url === '/api/v1/generate') {
+      posts++
+      wire = request.body
+      return jsonResponse({ detail: 'Lost acknowledgement' }, 503)
+    }
+    if (request.url.includes('/generate/submissions/')) {
+      lookups++
+      if (!accepted) return jsonResponse({ generation_request_id: JSON.parse(wire).generation_request_id,
+        workspace: 'studio-a', admission_state: 'unknown' })
+      return jsonResponse({ ...studioAccepted(wire, { status: 'completed', output_files: ['completed.png'], queue_held: false }), retained_job: false })
+    }
+    assert.fail(`Unexpected request ${request.url}`)
+  })
+  await useStore.getState().startGeneration()
+  const raw = sessionStorage.getItem('maestro:studio-submissions-v1')
+  assert.equal(JSON.parse(raw).submissions[0].requestId, JSON.parse(wire).generation_request_id)
+  assert.deepEqual(Object.keys(JSON.parse(raw).submissions[0]).sort(), ['accountFingerprint', 'claimToken', 'projectInstance', 'requestId', 'workspace'])
+  assert.equal(raw.includes('original ordinary request'), false)
+  const reloaded = await freshStudioReloadRealm(polls)
+  await waitForCondition(() => reloaded.getState().studioSubmissions.length === 1, 'reloaded Studio handle')
+  assert.equal(reloaded.getState().studioSubmissions[0].canRetry, false)
+  assert.equal(lookups, 1, 'reload does not automatically check or resend')
+  await reloaded.getState().retryStudioSubmission()
+  assert.equal(posts, 1, 'identity-only recovery cannot retry without the original wire')
+  accepted = true
+  await reloaded.getState().checkStudioSubmission()
+  assert.deepEqual(reloaded.getState().studioSubmissions, [])
+  assert.equal(reloaded.getState().jobs[0].status, 'completed')
+  assert.deepEqual(reloaded.getState().jobs[0].outputFiles, ['completed.png'])
+  assert.deepEqual(polls, [])
+  assert.equal(posts, 1)
+  assert.equal(lookups, 2)
+  assert.equal(sessionStorage.getItem('maestro:studio-submissions-v1'), null)
+})
+
+test('Studio reload fences project recreation during acceptance lookup and preserves malformed storage without requests', async t => {
+  enableStudioReloadFixture(t)
+  let projectInstance = '1'.repeat(64)
+  let wire
+  let posts = 0
+  let lookups = 0
+  let recreateDuringLookup = false
+  const { useStore, polls } = await studioSubmissionFixture(t, async request => {
+    if (request.url.startsWith('/api/v1/llm/models')) return jsonResponse({ models: [], guides: [], project_instance: projectInstance })
+    if (request.url === '/api/v1/workspaces') return jsonResponse({ workspaces: [{ name: 'studio-a' }], active: 'studio-a' })
+    if (request.url === '/api/v1/generate') {
+      posts++
+      wire = request.body
+      return jsonResponse({ detail: 'Lost acknowledgement' }, 503)
+    }
+    if (request.url.includes('/generate/submissions/')) {
+      lookups++
+      if (recreateDuringLookup) { projectInstance = '2'.repeat(64); return jsonResponse(studioAccepted(wire)) }
+      return jsonResponse({ generation_request_id: JSON.parse(wire).generation_request_id,
+        workspace: 'studio-a', admission_state: 'unknown' })
+    }
+    assert.fail(`Unexpected request ${request.url}`)
+  })
+  await useStore.getState().startGeneration()
+  const raw = sessionStorage.getItem('maestro:studio-submissions-v1')
+  const reloaded = await freshStudioReloadRealm(polls)
+  await waitForCondition(() => reloaded.getState().studioSubmissions.length === 1, 'reloaded Studio handle')
+  recreateDuringLookup = true
+  await reloaded.getState().checkStudioSubmission()
+  assert.deepEqual(reloaded.getState().jobs, [])
+  assert.deepEqual(reloaded.getState().studioSubmissions, [])
+  assert.deepEqual(polls, [])
+  assert.equal(sessionStorage.getItem('maestro:studio-submissions-v1'), null)
+  assert.equal(posts, 1)
+  assert.equal(lookups, 2)
+  const record = JSON.parse(raw).submissions[0]
+  for (const invalid of ['{', JSON.stringify({ schemaVersion: 2, submissions: [record] }),
+    JSON.stringify({ schemaVersion: 1, submissions: [{ ...record, prompt: 'Never persist creative inputs' }] }),
+    JSON.stringify({ schemaVersion: 1, submissions: Array(17).fill(record) })]) {
+    sessionStorage.setItem('maestro:studio-submissions-v1', invalid)
+    const invalidRealm = await freshStudioReloadRealm(polls)
+    await new Promise(resolve => setImmediate(resolve))
+    assert.deepEqual(invalidRealm.getState().studioSubmissions, [])
+    assert.equal(sessionStorage.getItem('maestro:studio-submissions-v1'), invalid)
+    assert.equal(posts, 1)
+    assert.equal(lookups, 2)
+  }
+})
+
+test('Studio live submission preserves invalid storage and corrupted acceptance cleanup evidence', async t => {
+  enableStudioReloadFixture(t)
+  const key = 'maestro:studio-submissions-v1'
+  for (const invalid of ['{', '', 'x'.repeat(16_385)]) {
+    const { useStore } = await studioSubmissionFixture(t, async request => {
+      if (request.url.startsWith('/api/v1/llm/models')) return jsonResponse({ models: [], guides: [], project_instance: '1'.repeat(64) })
+      if (request.url === '/api/v1/generate') return jsonResponse(studioAccepted(request.body))
+      assert.fail(`Unexpected request ${request.url}`)
+    })
+    sessionStorage.setItem(key, invalid)
+    await useStore.getState().startGeneration()
+    assert.equal(useStore.getState().jobs.length, 1, 'live admission still works without reload storage')
+    assert.equal(sessionStorage.getItem(key), invalid, 'a new POST cannot overwrite invalid evidence')
+  }
+  const { useStore } = await studioSubmissionFixture(t, async request => {
+    if (request.url.startsWith('/api/v1/llm/models')) return jsonResponse({ models: [], guides: [], project_instance: '1'.repeat(64) })
+    if (request.url === '/api/v1/generate') {
+      assert.equal(JSON.parse(sessionStorage.getItem(key)).submissions.length, 1)
+      sessionStorage.setItem(key, '{')
+      return jsonResponse(studioAccepted(request.body))
+    }
+    assert.fail(`Unexpected request ${request.url}`)
+  })
+  await useStore.getState().startGeneration()
+  assert.equal(useStore.getState().jobs.length, 1)
+  assert.equal(sessionStorage.getItem(key), '{', 'acceptance cleanup cannot delete corrupt evidence')
+})
+
+test('Studio invalid catalog identity preserves uncertainty through restore, Check, acceptance and live Retry', async t => {
+  enableStudioReloadFixture(t)
+  const key = 'maestro:studio-submissions-v1'
+  let projectInstance = '1'.repeat(64)
+  let wire
+  let posts = 0
+  let lookups = 0
+  let malformedAfterLookup = false
+  const { useStore, polls } = await studioSubmissionFixture(t, async request => {
+    if (request.url.startsWith('/api/v1/llm/models')) return jsonResponse({ models: [], guides: [], project_instance: projectInstance })
+    if (request.url === '/api/v1/workspaces') return jsonResponse({ workspaces: [{ name: 'studio-a' }], active: 'studio-a' })
+    if (request.url === '/api/v1/generate') {
+      posts++
+      wire = request.body
+      return jsonResponse({ detail: 'Lost acknowledgement' }, 503)
+    }
+    if (request.url.includes('/generate/submissions/')) {
+      lookups++
+      if (malformedAfterLookup) { projectInstance = 'bad'; return jsonResponse(studioAccepted(wire)) }
+      return jsonResponse({ generation_request_id: JSON.parse(wire).generation_request_id,
+        workspace: 'studio-a', admission_state: 'unknown' })
+    }
+    assert.fail(`Unexpected request ${request.url}`)
+  })
+  await useStore.getState().startGeneration()
+  const raw = sessionStorage.getItem(key)
+  projectInstance = 'bad'
+  await useStore.getState().checkStudioSubmission()
+  await useStore.getState().retryStudioSubmission()
+  assert.equal(posts, 1, 'invalid identity cannot authorize a resend')
+  assert.equal(lookups, 1, 'invalid identity cannot authorize a lookup')
+  assert.equal(useStore.getState().studioSubmissions.length, 1)
+  assert.equal(sessionStorage.getItem(key), raw)
+  const unavailable = await freshStudioReloadRealm(polls)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(unavailable.getState().studioSubmissions, [])
+  assert.equal(sessionStorage.getItem(key), raw, 'malformed identity is not project recreation')
+  projectInstance = '1'.repeat(64)
+  const reloaded = await freshStudioReloadRealm(polls)
+  await waitForCondition(() => reloaded.getState().studioSubmissions.length === 1, 'reloaded valid project')
+  malformedAfterLookup = true
+  await reloaded.getState().checkStudioSubmission()
+  assert.deepEqual(reloaded.getState().jobs, [], 'invalid post-lookup identity cannot authorize adoption')
+  assert.equal(reloaded.getState().studioSubmissions.length, 1)
+  assert.equal(reloaded.getState().studioSubmissions[0].checking, false)
+  assert.equal(sessionStorage.getItem(key), raw)
+  assert.equal(posts, 1)
+  assert.equal(lookups, 2)
+  assert.deepEqual(polls, [])
+})
+
 test('Studio lost ACK retains exact frozen wire and retries explicitly without rebuilding sensitive inputs', async t => {
   let posts = 0
   let wire

@@ -532,26 +532,160 @@ interface StudioSubmissionView {
   state: 'preparing' | 'sending' | 'unconfirmed'
   checking: boolean
   message: string
+  canRetry: boolean
 }
 
-interface StudioSubmissionIntent extends StudioSubmissionView {
+interface StudioSubmissionIntent extends Omit<StudioSubmissionView, 'canRetry'> {
   accountEpoch: number
   body: string | null
   attempt: number
   checkSequence: number
   ambiguous: boolean
   enhanceBeforeGenerate: boolean
+  recovered: boolean
+  recovery: StoredStudioSubmission | null
+}
+
+type StoredStudioSubmission = {
+  requestId: string
+  workspace: string
+  projectInstance: string
+  accountFingerprint: string
+  claimToken: string
 }
 
 const _studioSubmissionIntents = new Map<string, StudioSubmissionIntent>()
 const STUDIO_SUBMISSION_CAPACITY = 16
+const STUDIO_SUBMISSION_STORAGE_KEY = 'maestro:studio-submissions-v1'
 let _studioWorkspaceSequence = 0
 const STUDIO_UNCONFIRMED_MESSAGE = 'Could not confirm whether this submission was queued.'
+
+function _validStudioProjectInstance(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{64}$/i.test(value)
+}
+
+function _loadStoredStudioSubmissions(): StoredStudioSubmission[] | null {
+  try {
+    const raw = sessionStorage.getItem(STUDIO_SUBMISSION_STORAGE_KEY)
+    if (raw === null) return []
+    if (!raw || raw.length > 16_384) return null
+    const value = JSON.parse(raw)
+    if (!value || typeof value !== 'object' || Array.isArray(value)
+      || Object.keys(value).length !== 2 || value.schemaVersion !== 1
+      || !Array.isArray(value.submissions) || value.submissions.length > STUDIO_SUBMISSION_CAPACITY) return null
+    const requests = new Set<string>()
+    const scopes = new Set<string>()
+    for (const record of value.submissions) {
+      if (!record || typeof record !== 'object' || Array.isArray(record)
+        || Object.keys(record).length !== 5
+        || !Object.keys(record).every(key => ['requestId', 'workspace', 'projectInstance', 'accountFingerprint', 'claimToken'].includes(key))
+        || typeof record.requestId !== 'string'
+        || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(record.requestId)
+        || typeof record.workspace !== 'string' || !record.workspace || record.workspace.length > 255
+        || typeof record.projectInstance !== 'string' || !/^[0-9a-f]{64}$/i.test(record.projectInstance)
+        || typeof record.accountFingerprint !== 'string' || !/^[0-9a-f]{16}$/i.test(record.accountFingerprint)
+        || typeof record.claimToken !== 'string' || !/^[0-9a-f]{64}$/i.test(record.claimToken)) return null
+      const scope = JSON.stringify([record.workspace, record.claimToken])
+      if (requests.has(record.requestId) || scopes.has(scope)) return null
+      requests.add(record.requestId)
+      scopes.add(scope)
+    }
+    return value.submissions
+  } catch { return null }
+}
+
+function _writeStoredStudioSubmissions(submissions: StoredStudioSubmission[]): boolean {
+  try {
+    // Unreadable or malformed evidence is never an empty ledger.
+    if (_loadStoredStudioSubmissions() === null) return false
+    if (submissions.length > STUDIO_SUBMISSION_CAPACITY) return false
+    if (!submissions.length) {
+      sessionStorage.removeItem(STUDIO_SUBMISSION_STORAGE_KEY)
+      return sessionStorage.getItem(STUDIO_SUBMISSION_STORAGE_KEY) === null
+    }
+    const encoded = JSON.stringify({ schemaVersion: 1, submissions })
+    if (encoded.length > 16_384) return false
+    sessionStorage.setItem(STUDIO_SUBMISSION_STORAGE_KEY, encoded)
+    return sessionStorage.getItem(STUDIO_SUBMISSION_STORAGE_KEY) === encoded
+  } catch { return false }
+}
+
+function _removeStoredStudioSubmission(record: StoredStudioSubmission | null): void {
+  if (!record || record.claimToken !== _ownedEnhanceFingerprintClaimToken()) return
+  const stored = _loadStoredStudioSubmissions()
+  if (!stored) return
+  _writeStoredStudioSubmissions(stored.filter(item => (
+    item.requestId !== record.requestId || item.claimToken !== record.claimToken
+  )))
+}
+
+async function _retainStudioSubmissionForReload(intent: StudioSubmissionIntent, current: () => boolean): Promise<void> {
+  try {
+    await _enhanceFingerprintSalt()
+    if (!current()) return
+    const claimToken = _ownedEnhanceFingerprintClaimToken()
+    if (!claimToken) return
+    const accountFingerprint = _enhanceAccountFingerprint(useStore.getState())
+    const catalog = await api.fetchLlmModels(intent.workspace)
+    if (!current() || !_validStudioProjectInstance(catalog.project_instance)) return
+    const record = { requestId: intent.requestId, workspace: intent.workspace,
+      projectInstance: catalog.project_instance, accountFingerprint, claimToken }
+    const stored = _loadStoredStudioSubmissions()
+    if (!stored) return
+    // Never evict an unresolved request to make room for another one.
+    if (stored.length >= STUDIO_SUBMISSION_CAPACITY
+      || stored.some(item => item.workspace === record.workspace && item.claimToken === claimToken)) return
+    if (_writeStoredStudioSubmissions([...stored, record])) intent.recovery = record
+  } catch { /* Live submission remains usable when browser recovery is unavailable. */ }
+}
+
+async function _restoreStudioSubmissionAfterReload(): Promise<void> {
+  const state = useStore.getState()
+  const workspace = state.activeWorkspace
+  const accountEpoch = _accountIdentityEpoch
+  const workspaceSequence = _studioWorkspaceSequence
+  const loadSequence = _workspaceLoadSequence
+  const current = () => _accountIdentityIsCurrent(accountEpoch)
+    && _studioWorkspaceSequence === workspaceSequence && _workspaceLoadSequence === loadSequence
+    && useStore.getState().activeWorkspace === workspace
+  if (!state.accessContext || !state.workspaces.some(project => project.name === workspace)
+    || _studioSubmissionIntents.has(workspace)) return
+  try {
+    await _enhanceFingerprintSalt()
+    if (!current()) return
+    const claimToken = _ownedEnhanceFingerprintClaimToken()
+    if (!claimToken) return
+    const accountFingerprint = _enhanceAccountFingerprint(useStore.getState())
+    const stored = _loadStoredStudioSubmissions()
+    if (!stored) return
+    const owned = stored.filter(item => item.claimToken !== claimToken || item.accountFingerprint === accountFingerprint)
+    if (owned.length !== stored.length) _writeStoredStudioSubmissions(owned)
+    const record = owned.find(item => item.workspace === workspace
+      && item.claimToken === claimToken && item.accountFingerprint === accountFingerprint)
+    if (!record) return
+    // This fresh authorized catalog binds the immutable project, including
+    // deletion/recreation under an unchanged display name. It loads no model.
+    const catalog = await api.fetchLlmModels(workspace)
+    if (!current() || _studioSubmissionIntents.has(workspace)) return
+    if (!_validStudioProjectInstance(catalog.project_instance)) return
+    if (catalog.project_instance !== record.projectInstance) {
+      _removeStoredStudioSubmission(record)
+      return
+    }
+    _studioSubmissionIntents.set(workspace, {
+      requestId: record.requestId, workspace, accountEpoch, state: 'unconfirmed', checking: false,
+      message: STUDIO_UNCONFIRMED_MESSAGE, body: null, attempt: 0, checkSequence: 0,
+      ambiguous: true, enhanceBeforeGenerate: false, recovered: true, recovery: record,
+    })
+    _publishStudioSubmissions()
+  } catch { /* Preserve the handle; unavailable lookup is not rejection. */ }
+}
 
 function _publishStudioSubmissions(): void {
   useStore.setState({ studioSubmissions: Array.from(_studioSubmissionIntents.values(), intent => ({
     requestId: intent.requestId, workspace: intent.workspace, state: intent.state,
     checking: intent.checking, message: intent.message,
+    canRetry: intent.body !== null,
   })) })
 }
 
@@ -564,6 +698,7 @@ function _studioSubmissionIsCurrent(intent: StudioSubmissionIntent, workspaceSeq
 
 function _adoptStudioSubmission(intent: StudioSubmissionIntent, admission: api.StudioGenerationAdmission, observedJobs?: Map<string, GenerationJob>): void {
   const status = admission.job!
+  _removeStoredStudioSubmission(intent.recovery)
   _studioSubmissionIntents.delete(intent.workspace)
   ++intent.attempt
   ++intent.checkSequence
@@ -603,15 +738,36 @@ function _adoptStudioSubmission(intent: StudioSubmissionIntent, admission: api.S
 
 async function _checkStudioSubmission(intent: StudioSubmissionIntent): Promise<void> {
   const workspaceSequence = _studioWorkspaceSequence
-  if (!intent.body || intent.checking || !_studioSubmissionIsCurrent(intent, workspaceSequence)) return
+  if ((!intent.body && !intent.recovered) || intent.checking || !_studioSubmissionIsCurrent(intent, workspaceSequence)) return
   const checkSequence = ++intent.checkSequence
   const observedJobs = new Map(useStore.getState().jobs.map(job => [job.id, job]))
   const current = () => _studioSubmissionIsCurrent(intent, workspaceSequence) && intent.checkSequence === checkSequence
   intent.checking = true
   _publishStudioSubmissions()
   try {
+    if (intent.recovery) {
+      const catalog = await api.fetchLlmModels(intent.workspace)
+      if (!current()) return
+      if (!_validStudioProjectInstance(catalog.project_instance)) return
+      if (catalog.project_instance !== intent.recovery.projectInstance) {
+        _removeStoredStudioSubmission(intent.recovery)
+        _studioSubmissionIntents.delete(intent.workspace)
+        _publishStudioSubmissions()
+        return
+      }
+    }
     const admission = await api.fetchStudioGenerationSubmission(intent.requestId, intent.workspace)
     if (!current()) return
+    if (intent.recovery && admission.admission_state === 'accepted') {
+      const catalog = await api.fetchLlmModels(intent.workspace)
+      if (!current() || !_validStudioProjectInstance(catalog.project_instance)) return
+      if (catalog.project_instance !== intent.recovery.projectInstance) {
+        _removeStoredStudioSubmission(intent.recovery)
+        _studioSubmissionIntents.delete(intent.workspace)
+        _publishStudioSubmissions()
+        return
+      }
+    }
     if (admission.admission_state === 'accepted') _adoptStudioSubmission(intent, admission, observedJobs)
   } catch {
     // A missing or inaccessible receipt cannot prove that admission failed.
@@ -633,6 +789,21 @@ async function _sendStudioSubmission(intent: StudioSubmissionIntent, retry = fal
   intent.message = 'Confirming submission…'
   _publishStudioSubmissions()
   try {
+    if (attempt === 1 && !retry && typeof globalThis.navigator?.locks?.request === 'function') {
+      await _retainStudioSubmissionForReload(intent, current)
+    }
+    if (!current()) return
+    if (retry && intent.recovery) {
+      const catalog = await api.fetchLlmModels(intent.workspace)
+      if (!current()) return
+      if (!_validStudioProjectInstance(catalog.project_instance)) throw new Error('Project could not be verified.')
+      if (catalog.project_instance !== intent.recovery.projectInstance) {
+        _removeStoredStudioSubmission(intent.recovery)
+        _studioSubmissionIntents.delete(intent.workspace)
+        _publishStudioSubmissions()
+        return
+      }
+    }
     const admission = await api.submitStudioGeneration(intent.body, intent.requestId, intent.workspace)
     if (!current()) return
     if (admission.admission_state === 'accepted') {
@@ -647,6 +818,7 @@ async function _sendStudioSubmission(intent: StudioSubmissionIntent, retry = fal
       && [400, 422].includes(error.status) && detail?.admission_state === 'rejected'
       && detail.generation_request_id === intent.requestId && detail.workspace === intent.workspace
       && typeof detail.message === 'string') {
+      _removeStoredStudioSubmission(intent.recovery)
       _studioSubmissionIntents.delete(intent.workspace)
       _publishStudioSubmissions()
       window.alert(detail.message)
@@ -5423,6 +5595,13 @@ async function _runDirectorV2Preview(
 
 function _advanceAccountIdentityEpoch(): void {
   _accountIdentityEpoch += 1
+  // Initial account bootstrap must leave matching reload handles available.
+  // An actual account change removes only this tab's owned handles.
+  const token = _ownedEnhanceFingerprintClaimToken()
+  if (useStore.getState().accountContext !== null && token) {
+    const stored = _loadStoredStudioSubmissions()
+    if (stored) _writeStoredStudioSubmissions(stored.filter(item => item.claimToken !== token))
+  }
   _studioSubmissionIntents.clear()
   useStore.setState({ studioSubmissions: [] })
   // Account-role H3 defaults and profile availability are identity-bound.
@@ -8970,6 +9149,7 @@ export const useStore = create<AppState>((set, get) => ({
         requestId: api.createLlmRequestId(), workspace: submissionWorkspace, accountEpoch: accountIdentityEpoch,
         state: 'preparing', checking: false, message: 'Preparing submission…', body: null,
         attempt: 0, checkSequence: 0, ambiguous: false, enhanceBeforeGenerate: false,
+        recovered: false, recovery: null,
       }
       _studioSubmissionIntents.set(submissionWorkspace, preparation)
       _publishStudioSubmissions()
@@ -16833,6 +17013,7 @@ export const useStore = create<AppState>((set, get) => ({
       }
       // Reload recovery retains only opaque request fences. Resume status
       // waiting after the authoritative active project has been restored.
+      void _restoreStudioSubmissionAfterReload()
       void get().resumeEnhancePrompt()
       void get().resumeDirectorPreview()
       if (get().accessContext?.remote && data.active) {
@@ -19484,7 +19665,7 @@ useStore.subscribe((state, previous) => {
   ++intent.attempt
   ++intent.checkSequence
   intent.checking = false
-  if (intent.body) {
+  if (intent.body || intent.recovered) {
     intent.ambiguous = true
     intent.state = 'unconfirmed'
     intent.message = STUDIO_UNCONFIRMED_MESSAGE

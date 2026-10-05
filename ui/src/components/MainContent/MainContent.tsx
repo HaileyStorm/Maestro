@@ -3488,10 +3488,12 @@ export function MainContent() {
               <button type="button" disabled={studioSubmission.checking} onClick={() => void checkStudioSubmission()} className="mobile-control-target rounded border border-border px-3 py-2 text-xs disabled:opacity-40">
                 {studioSubmission.checking ? 'Checking…' : 'Check submission'}
               </button>
-              <button type="button" disabled={studioSubmission.state !== 'unconfirmed' || studioSubmission.checking} onClick={() => void retryStudioSubmission()} className="mobile-control-target rounded border border-border px-3 py-2 text-xs disabled:opacity-40">
+              <button type="button" disabled={!studioSubmission.canRetry || studioSubmission.state !== 'unconfirmed' || studioSubmission.checking} onClick={() => void retryStudioSubmission()} className="mobile-control-target rounded border border-border px-3 py-2 text-xs disabled:opacity-40">
                 Retry this submission
               </button>
-              <p className="text-xs text-text-secondary">Retry uses the original settings. Edited settings are kept for your next submission.</p>
+              <p className="text-xs text-text-secondary">{studioSubmission.canRetry
+                ? 'Retry uses the original settings. Edited settings are kept for your next submission.'
+                : 'This page reloaded. Check submission reads its existing status. Retry is unavailable because the original settings were not saved.'}</p>
             </div>
           )}
         </section>
