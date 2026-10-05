@@ -67962,11 +67962,26 @@ async def tools_upscale(request: Request):
     return {"job_id": job_id, "status": "queued"}
 
 
+def _resolve_tool_voice_reference(request: Request, reference, workspace: str) -> str | None:
+    """Keep Gallery selections distinct from session-owned upload names."""
+    if isinstance(reference, str):
+        return _resolve_authorized_request_media(request, reference, workspace)
+    if not isinstance(reference, dict) or set(reference) != {"name", "revision"}:
+        raise HTTPException(status_code=400, detail="Select a current voice sample")
+    name, revision = reference["name"], reference["revision"]
+    if not isinstance(name, str) or not name or not isinstance(revision, str) or not revision:
+        raise HTTPException(status_code=400, detail="Select a current voice sample")
+    out_dir, source, _sidecar = _require_authorized_output(request, workspace, name)
+    if _output_revision(source, out_dir, name) != revision:
+        raise HTTPException(status_code=409, detail="The voice sample changed. Refresh and select it again.")
+    return source
+
+
 @api.post("/api/v1/tools/revoice")
 async def tools_revoice(request: Request):
     """Replace the voice(s) in an existing clip via SeedVC. Returns a job_id.
 
-    Body: { video_path: str, voice_ref_paths: [str, ...],
+    Body: { video_path: str, voice_ref_paths: [str | {name, revision}, ...],
             mode?: "single"|"two", diffusion_steps?: int, cfg_rate?: float,
             workspace?: str (required remotely) }
     """
@@ -67989,7 +68004,7 @@ async def tools_revoice(request: Request):
             voice_refs = body.get("voice_ref_paths")
             if not voice_refs and body.get("voice_ref_path"):
                 voice_refs = [body.get("voice_ref_path")]
-            if not isinstance(voice_refs, list) or not voice_refs or any(not isinstance(ref, str) or not ref for ref in voice_refs):
+            if not isinstance(voice_refs, list) or not voice_refs:
                 raise HTTPException(status_code=400, detail="At least one voice_ref_path is required")
 
             mode = body.get("mode", "single")
@@ -67997,7 +68012,7 @@ async def tools_revoice(request: Request):
                 mode = "single"
 
             resolved_voice_refs = [
-                _resolve_authorized_request_media(request, ref, workspace) for ref in voice_refs
+                _resolve_tool_voice_reference(request, ref, workspace) for ref in voice_refs
             ]
             if any(not ref for ref in resolved_voice_refs):
                 raise HTTPException(status_code=400, detail="No authorized voice reference found")

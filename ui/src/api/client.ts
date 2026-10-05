@@ -2107,7 +2107,7 @@ export async function submitToolBrowserCopy(params: {
 
 export async function submitToolRevoice(params: {
   video_path: string
-  voice_ref_paths: string[]
+  voice_ref_paths: (string | { name: string; revision: string })[]
   mode?: 'single' | 'two'
   diffusion_steps?: number
   cfg_rate?: number

@@ -30,6 +30,7 @@ export function ToolsPanel() {
   const revoiceRefs = useStore(s => s.toolsRevoiceRefs)
   const setRevoiceRef = useStore(s => s.setToolsRevoiceRef)
   const uploadRevoiceRef = useStore(s => s.uploadToolsRevoiceRef)
+  const selectVoiceReference = useStore(s => s.useSelectedGalleryVoiceReference)
   const runTool = useStore(s => s.runTool)
 
   const outputs = useStore(s => s.outputs)
@@ -37,6 +38,11 @@ export function ToolsPanel() {
   const flashvsrMode = useStore(s => s.servicesConfig?.flashvsr_mode ?? 1)
   const current = outputs[selectedOutput]
   const currentIsVideo = !!current && current.type === 'video'
+  const currentIsAudio = useStore(s => {
+    const audio = s.filteredOutputs()[s.selectedOutput]
+    return !!audio && audio.type === 'audio' && !!audio.revision
+      && audio.workspace === s.activeWorkspace && !s.browsingUploads
+  })
 
   const fileRef = useRef<HTMLInputElement>(null)
   const vcFileRefs = [useRef<HTMLInputElement>(null), useRef<HTMLInputElement>(null)]
@@ -220,6 +226,15 @@ export function ToolsPanel() {
                     </button>
                   </div>
                 )}
+                <button
+                  type="button"
+                  onClick={() => selectVoiceReference(idx)}
+                  disabled={!currentIsAudio || vcUploading !== null}
+                  aria-label={`Use selected Gallery audio as ${label.toLowerCase()}`}
+                  className="mt-1.5 min-h-11 w-full rounded-md border border-border bg-bg-tertiary px-2 text-[11px] text-text-secondary transition-colors hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  {currentIsAudio ? 'Use selected Gallery audio' : 'Select audio in Gallery first'}
+                </button>
               </div>
             )
           })}

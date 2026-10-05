@@ -85,7 +85,7 @@ class ToolInputExecutionTests(unittest.TestCase):
              '_publish_processed_tool_output', '_write_tool_sidecar', '_queue_recovery_worker',
              '_output_revision', '_hflip_source', '_run_tool_hflip',
              '_run_tool_upscale', '_run_tool_revoice', 'tools_upscale', 'tools_revoice',
-             '_request_project_workspace')
+             '_request_project_workspace', '_resolve_tool_voice_reference')
 
     def job(self, kind='tool_revoice', legacy=False):
         if legacy: self.video.with_suffix('.meta.json').unlink()
@@ -652,6 +652,67 @@ class ToolInputExecutionTests(unittest.TestCase):
         self.jobs.clear(); body['voice_ref_paths'].append('/missing/voice.wav')
         with self.assertRaises(HTTPException): asyncio.run(self.ns['tools_revoice'](request(body)))
         self.assertEqual(self.jobs,{})
+
+    def test_gallery_voice_reference_uses_exact_output_even_with_same_named_upload(self):
+        import wave
+        gallery_voice = self.project / self.voice.name
+        with wave.open(str(gallery_voice), 'wb') as audio:
+            audio.setnchannels(1); audio.setsampwidth(2); audio.setframerate(8000)
+            audio.writeframes(b'\x00\x00' * 800)
+        gallery_voice.with_suffix('.meta.json').write_text(json.dumps({
+            'workspace': 'project-a', 'private': True, 'explicit': True,
+        }))
+        load(self.ns, '_require_authorized_output', '_resolve_authorized_request_media',
+             '_inherit_media_access_policy')
+        self.ns.update(
+            _require_project_access=lambda req, ws, **kw: str(self.project) if ws == 'project-a' else self._deny_project(),
+            _require_upload_content_access=lambda *a: None,
+            can_access_upload=lambda path, session: path == str(self.voice) and session == 'session',
+            _workspace_dir=lambda ws: str(self.project),
+            _new_generation_job_id=lambda: 'b'*32,
+            _request_remote=types.SimpleNamespace(get=lambda: True),
+            _queue_recovery_register_and_publish=lambda job, **kw: self.jobs.update({job['id']: job}),
+        )
+        revision = self.ns['_output_revision'](str(gallery_voice), str(self.project), gallery_voice.name)
+        selected = {'name': gallery_voice.name, 'revision': revision}
+        body = {'workspace': 'project-a', 'video_path': str(self.video),
+                'voice_ref_paths': [selected, str(self.voice)], 'mode': 'two'}
+        with patch('os.getcwd', return_value=str(self.root)):
+            asyncio.run(self.ns['tools_revoice'](self._tool_request(body)))
+        job = self.jobs['b'*32]
+        self.assertEqual(job['params']['voice_ref_paths'], [str(gallery_voice), str(self.voice)])
+        self.assertEqual(job['params']['_tool_input_paths'], [str(self.video), str(gallery_voice), str(self.voice)])
+        self.assertTrue(job['params']['private_output'])
+        self.assertTrue(job['params']['explicit_output'])
+        descriptors = self.ns['_queue_recovery_input_descriptors'](job, self.owner)
+        self.assertEqual({d['path'] for d in descriptors}, {str(self.video), str(gallery_voice), str(self.voice)})
+
+        self.jobs.clear()
+        gallery_voice.write_bytes(b'changed')
+        with patch('os.getcwd', return_value=str(self.root)), self.assertRaises(HTTPException) as error:
+            asyncio.run(self.ns['tools_revoice'](self._tool_request(body)))
+        self.assertEqual(error.exception.status_code, 409)
+        self.assertEqual(self.jobs, {})
+
+        for invalid in ({'name': '../voice.wav', 'revision': revision},
+                        {'name': self.voice.name}, {'name': self.voice.name, 'revision': ''},
+                        {'name': self.voice.name, 'revision': revision, 'workspace': 'other'}, 17, ''):
+            with self.subTest(reference=invalid), patch('os.getcwd', return_value=str(self.root)), self.assertRaises(HTTPException):
+                asyncio.run(self.ns['tools_revoice'](self._tool_request({**body, 'voice_ref_paths': [invalid]})))
+            self.assertEqual(self.jobs, {})
+        with self.assertRaises(HTTPException) as error:
+            asyncio.run(self.ns['tools_revoice'](self._tool_request({**body, 'workspace': 'other'})))
+        self.assertEqual(error.exception.status_code, 403)
+
+    @staticmethod
+    def _deny_project():
+        raise HTTPException(status_code=403, detail='Project access required')
+
+    @staticmethod
+    def _tool_request(body):
+        async def read(): return body
+        return types.SimpleNamespace(json=read, state=types.SimpleNamespace(
+            maestro_remote=True, maestro_session_id='session'))
 
 
 if __name__ == '__main__': unittest.main()

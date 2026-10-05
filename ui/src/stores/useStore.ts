@@ -3173,6 +3173,12 @@ const SYSTEM_CONFIG_UPDATE_CANCELLED_MESSAGE = 'System settings update was inter
 let _systemConfigUpdateSequence = 0
 let _systemConfigUpdateController: AbortController | null = null
 
+type ToolsRevoiceReference = {
+  filename: string
+  path: string
+  output?: { workspace: string; revision: string }
+}
+
 interface AppState {
   // Generation mode (top-level: image/video/audio/avatar)
   generationMode: GenerationMode
@@ -3627,8 +3633,9 @@ interface AppState {
   setToolsUpscaleMethod: (m: string) => void
   toolsRevoiceMode: 'single' | 'two'
   setToolsRevoiceMode: (m: 'single' | 'two') => void
-  toolsRevoiceRefs: ({ filename: string; path: string } | null)[]
-  setToolsRevoiceRef: (index: number, ref: { filename: string; path: string } | null) => void
+  toolsRevoiceRefs: (ToolsRevoiceReference | null)[]
+  setToolsRevoiceRef: (index: number, ref: ToolsRevoiceReference | null) => void
+  useSelectedGalleryVoiceReference: (index: number) => boolean
   uploadToolsRevoiceRef: (index: number, file: File) => Promise<boolean>
   runTool: () => Promise<void>
   /** Gallery one-click: upscale a specific clip now, with the configured method. */
@@ -8428,6 +8435,15 @@ export const useStore = create<AppState>((set, get) => ({
     next[index] = ref
     return { toolsRevoiceRefs: next }
   }),
+  useSelectedGalleryVoiceReference: (index) => {
+    const s = get()
+    const output = s.filteredOutputs()[s.selectedOutput]
+    if ((index !== 0 && index !== 1) || s.browsingUploads || !output
+      || output.type !== 'audio' || output.workspace !== s.activeWorkspace || !output.revision) return false
+    get().setToolsRevoiceRef(index, { filename: output.name, path: output.name,
+      output: { workspace: output.workspace, revision: output.revision } })
+    return true
+  },
   uploadToolsRevoiceRef: async (index, file) => {
     const accountIdentityEpoch = _accountIdentityEpoch
     let uploaded: Awaited<ReturnType<typeof api.uploadAudio>>
@@ -8455,9 +8471,10 @@ export const useStore = create<AppState>((set, get) => ({
     const tool = s.toolsTool
 
     // Revoice needs at least one resolved voice reference.
-    const refPaths = s.toolsRevoiceRefs
-      .filter((r): r is { filename: string; path: string } => !!r && !!r.path)
-      .map(r => r.path)
+    const references = s.toolsRevoiceRefs.filter((r): r is ToolsRevoiceReference => !!r && !!r.path)
+    if (tool === 'revoice' && references.some(r => r.output && r.output.workspace !== workspace)) return
+    const refPaths = references.map(r => r.output
+      ? { name: r.path, revision: r.output.revision } : r.path)
     if (tool === 'revoice' && refPaths.length === 0) return
 
     // Placeholder job tile — mirrors the blend/edit submit pattern so the
@@ -19689,6 +19706,9 @@ export const useStore = create<AppState>((set, get) => ({
 
 useStore.subscribe((state, previous) => {
   if (state.activeWorkspace === previous.activeWorkspace) return
+  if (state.toolsRevoiceRefs.some(reference => reference?.output)) {
+    useStore.setState({ toolsRevoiceRefs: state.toolsRevoiceRefs.map(reference => reference?.output ? null : reference) })
+  }
   ++_studioWorkspaceSequence
   const intent = _studioSubmissionIntents.get(previous.activeWorkspace)
   if (!intent) return

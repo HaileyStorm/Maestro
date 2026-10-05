@@ -320,7 +320,8 @@ class ToolProcessCrashTests(unittest.TestCase):
                   _require_job_runtime_model_admission=lambda _: None,
                   Mapping=dict)
         tool_fixture.load(ns, '_h3_cow_manual_source_supported', '_require_h3_offload_plan_parity',
-                          '_queue_recovery_materialize_job', '_restore_queue_recovery_on_startup')
+                          '_queue_recovery_materialize_job', '_restore_h3_prompt_rewriter_cleanup',
+                          '_restore_queue_recovery_on_startup')
         self.assertTrue(ns['_restore_queue_recovery_on_startup']())
         self.assertEqual(workers, [])
         self.assertEqual(ns['_jobs'][self.job['id']]['status'], 'cancelled')

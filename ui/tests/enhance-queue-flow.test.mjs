@@ -3148,6 +3148,43 @@ test('Tools submissions keep canonical status polling across queued and running 
   })
 })
 
+test('Gallery audio voice references submit exact revisions without upload and clear on project departure', async t => {
+  let submitted
+  const { useStore, requests } = await studioSubmissionFixture(t, request => {
+    assert.equal(request.url, '/api/v1/tools/revoice')
+    submitted = JSON.parse(request.body)
+    return Promise.resolve(jsonResponse({ job_id: 'gallery-voice-job' }))
+  })
+  const audio = { name: 'voice.wav', workspace: 'studio-a', revision: 'voice-revision', type: 'audio', url: '/voice.wav',
+    private: true, explicit: true, favorite: true }
+  const otherAudio = { ...audio, name: 'other.wav', revision: 'other-revision', favorite: false }
+  const video = { ...audio, name: 'source.mp4', type: 'video', favorite: false }
+  useStore.setState({ outputs: [video, otherAudio, audio], mediaFilter: 'audio', selectedOutput: 1, browsingUploads: false,
+    outputsLoading: true,
+    toolsTool: 'revoice', toolsSourcePath: 'source.mp4', toolsRevoiceRefs: [null, null] })
+  assert.equal(useStore.getState().useSelectedGalleryVoiceReference(0), true)
+  assert.equal(useStore.getState().toolsRevoiceRefs[0].filename, 'voice.wav', 'use the visible filtered selection during refresh')
+  useStore.setState({ mediaFilter: 'favorites', selectedOutput: 0 })
+  assert.equal(useStore.getState().useSelectedGalleryVoiceReference(0), true)
+  assert.equal(useStore.getState().toolsRevoiceRefs[0].filename, 'voice.wav', 'Favorites must use the same Gallery selection')
+  assert.equal(requests.length, 0, 'reference selection must not upload or start inference')
+  await useStore.getState().runTool()
+  assert.deepEqual(submitted.voice_ref_paths, [{ name: 'voice.wav', revision: 'voice-revision' }])
+  assert.equal(submitted.workspace, 'studio-a')
+  assert.equal(requests.length, 1)
+  useStore.getState().setToolsRevoiceRef(1, { filename: 'uploaded.wav', path: '/uploads/audio/uploaded.wav' })
+  useStore.setState({ activeWorkspace: 'studio-b' })
+  useStore.setState({ activeWorkspace: 'studio-a' })
+  assert.deepEqual(useStore.getState().toolsRevoiceRefs, [null, { filename: 'uploaded.wav', path: '/uploads/audio/uploaded.wav' }])
+  for (const patch of [{ browsingUploads: true }, { outputs: [{ ...audio, workspace: 'studio-b' }] },
+    { outputs: [{ ...audio, type: 'image' }] }, { outputs: [{ ...audio, revision: '' }] }]) {
+    useStore.setState({ outputs: [audio], mediaFilter: 'all', selectedOutput: 0, browsingUploads: false, ...patch })
+    assert.equal(useStore.getState().useSelectedGalleryVoiceReference(0), false)
+    assert.equal(useStore.getState().toolsRevoiceRefs[0], null)
+  }
+  assert.equal(useStore.getState().useSelectedGalleryVoiceReference(2), false)
+})
+
 test('Tools late acknowledgements and errors cannot follow a project round trip', async t => {
   for (const outcome of ['ack', 'error']) await t.test(outcome, async t => {
     const response = deferred()
