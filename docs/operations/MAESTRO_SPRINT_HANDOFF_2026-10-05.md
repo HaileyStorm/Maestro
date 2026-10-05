@@ -582,3 +582,29 @@ persistent operation table: the real backend table remains bounded process
 memory and can expire or disappear after restart. This change cannot recover
 an absent result or prove native lost-response recovery, model quality,
 Windows or human acceptance. The full continuous Goal remains open.
+
+## October 5 native Chat response recovery acceptance
+
+The released Chat recovery now has one native local acceptance run. The
+already-installed Gemma 4 31B Heretic ARA Q4_K_M loaded on CUDA under a fresh,
+coherently validated lease. In the actual Chrome Chat view, one ordinary Send
+was admitted with HTTP 202. The controlled test tab then received truncated
+acknowledgement JSON. Chat retrieved the original normalized request ID with
+GET and displayed one assistant response, `Ready.`, without another POST.
+The original acknowledgement, canonical completed result, request counts,
+runtime log, visible transcript and screenshot are retained privately.
+
+The independent systemd guardian checked coherent authority every three
+seconds, with an eight-second watchdog and independent cleanup. Source review
+and eleven CPU cleanup boundaries preceded execution; a disposable CPU browser
+probe also verified response replacement and removal of interception. The
+native model unloaded through its existing idle timeout. The guardian then
+confirmed explicit unloaded/not-loading status, no download and no live owned
+llama process before withdrawing the exact lease. Maestro stayed healthy and
+ready without a restart; the completed runtime claim is released.
+
+This verifies the selected native lost-acknowledgement response path. It does
+not establish backend-restart recovery, native pending-request reload,
+Windows, general model quality, or owner Free Resources acceptance. Source
+code did not change, so the revision-bound checks above remain applicable.
+The full continuous Goal remains open.
