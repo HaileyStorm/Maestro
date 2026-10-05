@@ -452,3 +452,29 @@ restart was needed for either UI release. Owned source and promotion claims were
 released; foreign work and the historical tracker hold remain preserved.
 These milestones do not complete the full sprint, human quality/listening,
 remote signed-in viewing, Windows acceptance or native HTTP cancellation.
+
+## October 5 YuE2 submission recovery checkpoint
+
+Commit `f381008ad3b3c648ed6f2df5cba4d86c76ba6a4d` retains an exact frozen
+YuE2 submission before dispatch. A lost, invalid or uncertain acknowledgement
+keeps that request pending. Project-library reconciliation can adopt its exact
+matching take; an explicit retry reuses the original request ID and settings,
+even after edits or reopening the composer. Absent library evidence does not
+prove rejection. Unresolved requests are bounded without eviction, and account
+changes clear their memory and fence stale callbacks.
+
+Canonical library acceptance now releases the exact submission's busy state
+while its POST is pending. Late responses cannot overwrite that accepted take
+or a newer submission. Independent review is clean; 42 focused UI checks and
+six synthetic browser cases across desktop Firefox and Android-like Chromium
+pass, along with TypeScript, scoped lint, private build and publication guard.
+Before-fix controls reproduced the lost-acknowledgement and GET-adoption races.
+
+The UI build was promoted without a backend restart. Fresh local and stable
+health/readiness and identical served asset bytes were verified. The signed-in
+local music composer opened its existing project library without submitting
+another generation. This is browser/readiness evidence, not native recovery or
+listening acceptance. Pending submissions survive SPA navigation only;
+reloading the page clears them. Native YuE2 duration/listening, Music3 consent,
+owner resource unloading, H3 quality, HTTP Stop, Windows and other remaining
+whole-sprint lanes remain open. The full continuous Goal stays active.
