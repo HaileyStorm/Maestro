@@ -1,4 +1,8 @@
 import asyncio
+import copy
+import json
+import threading
+from unittest.mock import patch
 import ast
 import os
 import sys
@@ -634,3 +638,243 @@ class UploadRouteSourceContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OrdinaryUploadDeletionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        tree = ast.parse(LAUNCH_PATH.read_text())
+        names = {"_upload_retained_input", "_queue_recovery_file_values", "delete_upload", "_upload_registration_guard"}
+        cls.nodes = [copy.deepcopy(node) for node in tree.body
+                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
+        for node in cls.nodes:
+            node.decorator_list = []
+
+    def setUp(self):
+        from services import upload_usage
+        from services.queue_recovery import QueueRecoveryJournal
+        from services.queue_recovery_adapter import (QueueRecoveryCoordinator,
+            processed_tool_publication_pending, prompt_enhancement_gpu_cleanup_pending)
+        from services.queue_recovery_runtime import load_request_manifest
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.uploads = self.root / "uploads"
+        self.uploads.mkdir()
+        self.project = self.root / "outputs"
+        self.project.mkdir()
+        self.media = self.uploads / "song.wav"
+        self.media.write_bytes(b"ordinary audio")
+        self.owner = "a" * 32
+        write_upload_access_sidecar(str(self.media), self.owner)
+        self.request = types.SimpleNamespace(state=types.SimpleNamespace(maestro_session_id=self.owner))
+        self.coordinator = QueueRecoveryCoordinator(QueueRecoveryJournal(self.root / "queue.jsonl"))
+        self.ns = dict(os=os, json=json, uuid=uuid, Request=object, HTTPException=_HTTPException,
+                       upload_usage=upload_usage, can_access_upload=can_access_upload,
+                       _workspace_lifecycle_lock=threading.RLock(),
+                       _queue_recovery_coordinator=self.coordinator,
+                       processed_tool_publication_pending=processed_tool_publication_pending,
+                       prompt_enhancement_gpu_cleanup_pending=prompt_enhancement_gpu_cleanup_pending,
+                       _require_upload_content_access=lambda request: None,
+                       _list_workspaces=lambda: [{"name": "default", "path": str(self.project)}],
+                       load_request_manifest=load_request_manifest,
+                       _RECOVERABLE_INPUT_KEYS={"audio_path", "image_paths"},
+                       _llm_chat_upload_marker_path=lambda path: path + ".chat-upload.json")
+        exec(compile(ast.Module(body=copy.deepcopy(self.nodes), type_ignores=[]), str(LAUNCH_PATH), "exec"), self.ns)
+        cwd_patch = patch("os.getcwd", return_value=str(self.root))
+        cwd_patch.start()
+        self.addCleanup(cwd_patch.stop)
+
+    def delete(self):
+        return self.ns["delete_upload"](self.request, self.media.name)
+
+    def manifest(self, job_id="retained"):
+        from services.queue_recovery_runtime import atomic_write_request_manifest
+        return atomic_write_request_manifest(str(self.project), job_id=job_id, params={},
+                                             inputs=[{"path": str(self.media), "field": "audio_path:0"}])
+
+    def test_unused_upload_is_physically_removed_without_derivative_cleanup(self):
+        derivative = self.uploads / "song-preview.wav"
+        derivative.write_bytes(b"independent")
+        self.assertEqual(self.delete(), {"deleted": "song.wav"})
+        self.assertFalse(self.media.exists())
+        self.assertFalse(Path(str(self.media) + ".access.json").exists())
+        self.assertTrue(derivative.exists())
+        self.assertFalse(list(self.uploads.glob(".trash*")))
+
+    def test_wrong_session_and_symlink_metadata_fail_closed(self):
+        self.request.state.maestro_session_id = "b" * 32
+        with self.assertRaises(_HTTPException) as caught:
+            self.delete()
+        self.assertEqual(caught.exception.status_code, 404)
+        self.request.state.maestro_session_id = self.owner
+        sidecar = Path(str(self.media) + ".access.json")
+        elsewhere = self.root / "outside.json"
+        sidecar.replace(elsewhere)
+        sidecar.symlink_to(elsewhere)
+        with self.assertRaises(_HTTPException) as caught:
+            self.delete()
+        self.assertEqual(caught.exception.status_code, 404)
+        self.assertTrue(self.media.exists())
+
+    def test_live_reader_and_chat_marker_reject_removal(self):
+        with self.ns["upload_usage"].reader([str(self.media)]):
+            with self.assertRaises(_HTTPException) as caught:
+                self.delete()
+            self.assertEqual(caught.exception.detail, "This upload is still in use")
+        Path(str(self.media) + ".chat-upload.json").write_text("{}")
+        with self.assertRaises(_HTTPException) as caught:
+            self.delete()
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertTrue(self.media.exists())
+
+    def test_restart_retained_and_orphan_manifest_keep_input(self):
+        self.manifest()
+        with self.assertRaises(_HTTPException) as caught:
+            self.delete()
+        self.assertEqual(caught.exception.detail, "This upload is still in use")
+        self.assertTrue(self.media.exists())
+
+    def test_corrupt_manifest_does_not_authorize_removal(self):
+        pointer = self.manifest()
+        (self.project / pointer["path"]).write_text("bad")
+        with self.assertRaises(_HTTPException) as caught:
+            self.delete()
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertIn("could not be checked", caught.exception.detail)
+        self.assertTrue(self.media.exists())
+
+    def test_completed_director_keeps_original_song_for_rejoin(self):
+        (self.project / "_director_pipeline_finished.json").write_text(json.dumps(
+            {"status": "completed", "_params_snapshot": {"audio_path": str(self.media)}}))
+        with self.assertRaises(_HTTPException) as caught:
+            self.delete()
+        self.assertEqual(caught.exception.detail, "This upload is still in use")
+        self.assertTrue(self.media.exists())
+
+    def test_second_staging_failure_restores_media_and_sidecar(self):
+        original = os.replace
+        calls = []
+        def fail_second(source, destination):
+            calls.append((source, destination))
+            if len(calls) == 2:
+                raise PermissionError("busy")
+            return original(source, destination)
+        with patch("os.replace", side_effect=fail_second):
+            with self.assertRaises(_HTTPException) as caught:
+                self.delete()
+        self.assertEqual(caught.exception.status_code, 423)
+        self.assertEqual(self.media.read_bytes(), b"ordinary audio")
+        self.assertTrue(can_access_upload(str(self.media), self.owner))
+        self.assertFalse(list(self.uploads.glob(".trash*")))
+
+    def test_registration_and_deletion_serialize_at_one_boundary(self):
+        entered = threading.Event()
+        finish = threading.Event()
+        outcome = []
+        def register():
+            entered.set()
+            finish.wait(2)
+            self.manifest()
+        worker = threading.Thread(target=self.ns["_upload_registration_guard"](register))
+        worker.start()
+        self.assertTrue(entered.wait(1))
+        def remove():
+            try:
+                self.delete()
+            except _HTTPException as error:
+                outcome.append(error.status_code)
+        deletion = threading.Thread(target=remove)
+        deletion.start()
+        self.assertTrue(deletion.is_alive())
+        finish.set()
+        worker.join(2)
+        deletion.join(2)
+        self.assertEqual(outcome, [409])
+        self.assertTrue(self.media.exists())
+
+    def test_snapshot_read_does_not_restore_or_mutate_live_coordinator(self):
+        from services.queue_recovery_adapter import owner_principal_digest, project_instance_digest
+        owner = owner_principal_digest(b"test-upload-secret-value", self.owner)
+        project = project_instance_digest(b"test-upload-secret-value", "c" * 32)
+        pointer = self.manifest("live-job")
+        self.coordinator.register_job({"id": "live-job", "status": "running", "workspace": "default"},
+                                     owner_digest=owner, project_digest=project, request_manifest=pointer)
+        before = copy.deepcopy(self.coordinator._snapshots)
+        snapshots, retired = self.coordinator.read_only_snapshot()
+        self.assertEqual(snapshots["live-job"]["status"], "running")
+        self.assertEqual(self.coordinator._snapshots, before)
+        snapshots["live-job"]["status"] = "cancelled"
+        self.assertEqual(self.coordinator._snapshots, before)
+
+
+    def test_retired_ordinary_job_does_not_keep_completed_input(self):
+        from services.queue_recovery_adapter import owner_principal_digest, project_instance_digest
+        owner = owner_principal_digest(b"test-upload-secret-value", self.owner)
+        project = project_instance_digest(b"test-upload-secret-value", "c" * 32)
+        pointer = self.manifest("done-job")
+        self.coordinator.register_job({"id": "done-job", "status": "completed", "workspace": "default"},
+                                     owner_digest=owner, project_digest=project, request_manifest=pointer)
+        self.assertEqual(self.delete(), {"deleted": "song.wav"})
+
+    def test_tombstoned_ordinary_job_does_not_keep_input(self):
+        from services.queue_recovery_adapter import owner_principal_digest, project_instance_digest
+        owner = owner_principal_digest(b"test-upload-secret-value", self.owner)
+        project = project_instance_digest(b"test-upload-secret-value", "c" * 32)
+        pointer = self.manifest("retired-job")
+        self.coordinator.register_job({"id": "retired-job", "status": "completed", "workspace": "default"},
+                                     owner_digest=owner, project_digest=project, request_manifest=pointer)
+        self.coordinator.tombstone_terminal("retired-job")
+        self.assertEqual(self.delete(), {"deleted": "song.wav"})
+
+    def test_canonical_volume_alias_cannot_hide_retained_input(self):
+        from services.queue_recovery_runtime import atomic_write_request_manifest
+        alias = self.root / "volume-alias"
+        alias.symlink_to(self.uploads, target_is_directory=True)
+        atomic_write_request_manifest(str(self.project), job_id="alias-job", params={},
+                                      inputs=[{"path": str(alias / self.media.name)}])
+        with self.assertRaises(_HTTPException) as caught:
+            self.delete()
+        self.assertEqual(caught.exception.detail, "This upload is still in use")
+
+    def test_media_reclaim_failure_restores_exact_access_pair(self):
+        access = Path(str(self.media) + ".access.json")
+        before = access.read_bytes()
+        original = os.remove
+        def fail_media(path, *args, **kwargs):
+            if str(path).startswith(str(self.uploads / ".trash_upload_")) and str(path).endswith(self.media.name):
+                raise PermissionError("busy")
+            return original(path, *args, **kwargs)
+        with patch("os.remove", side_effect=fail_media):
+            with self.assertRaises(_HTTPException) as caught:
+                self.delete()
+        self.assertEqual(caught.exception.status_code, 423)
+        self.assertEqual(access.read_bytes(), before)
+        self.assertEqual(self.media.read_bytes(), b"ordinary audio")
+        self.assertFalse(list(self.uploads.glob(".trash*")))
+
+    def test_snapshot_accessor_never_calls_repairing_journal_recover(self):
+        with patch.object(self.coordinator.journal, "recover", side_effect=AssertionError("read repaired journal")):
+            self.assertEqual(self.coordinator.read_only_snapshot(), ({}, frozenset()))
+
+    def test_unrelated_legacy_director_without_snapshot_does_not_block(self):
+        (self.project / "_director_pipeline_legacy.json").write_text(json.dumps({"status": "completed"}))
+        self.assertEqual(self.delete(), {"deleted": "song.wav"})
+
+
+    def test_known_retired_corrupt_manifest_is_ignored_without_prefix_aliases(self):
+        from services.queue_recovery_adapter import owner_principal_digest, project_instance_digest
+        owner = owner_principal_digest(b"test-upload-secret-value", self.owner)
+        project = project_instance_digest(b"test-upload-secret-value", "c" * 32)
+        pointer = self.manifest("retired-job")
+        self.coordinator.register_job({"id": "retired-job", "status": "completed", "workspace": "default"},
+                                     owner_digest=owner, project_digest=project, request_manifest=pointer)
+        self.coordinator.tombstone_terminal("retired-job")
+        (self.project / pointer["path"]).write_text("bad retired record")
+        alias = self.project / ".maestro-recovery" / "retired-job.other.request.json"
+        alias.write_text("bad unresolved alias")
+        with self.assertRaises(_HTTPException) as caught:
+            self.delete()
+        self.assertEqual(caught.exception.status_code, 409)
+        alias.unlink()
+        self.assertEqual(self.delete(), {"deleted": "song.wav"})

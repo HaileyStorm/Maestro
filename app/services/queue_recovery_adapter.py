@@ -2039,6 +2039,12 @@ class QueueRecoveryCoordinator:
         self._job_revisions.update(receipt.job_revisions)
         self._global_revision = receipt.global_revision
 
+    def read_only_snapshot(self) -> tuple[dict[str, dict[str, Any]], frozenset[str]]:
+        """Copy coordinator-owned references without journal repair or restore."""
+        with self._lock:
+            return (deepcopy(self._snapshots),
+                    frozenset(self._job_revisions).difference(self._snapshots))
+
     def restore(self) -> RestoredQueueState:
         """Re-read and return safe state without holding the coordinator lock."""
         with self._lock:

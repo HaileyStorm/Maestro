@@ -594,6 +594,7 @@ def discover_request_manifest_pointers(
     *,
     expected_sha256: str = "",
     maximum_candidates: int = 128,
+    excluded_job_ids: Sequence[str] = (),
 ) -> list[dict[str, Any]]:
     """Return bounded content-free pointers for valid sealed manifests.
 
@@ -602,6 +603,14 @@ def discover_request_manifest_pointers(
     the same no-follow/hash/schema validation as a journal-owned pointer.
     """
     root = _validated_project_root(project_directory)
+    if isinstance(excluded_job_ids, (str, bytes)):
+        raise QueueRecoveryRuntimeError("Recovery manifest exclusions are invalid.")
+    # Exclude only exact initial canonical names. A versioned or malformed
+    # alias remains evidence requiring validation, never a prefix match.
+    excluded_names = {
+        PurePosixPath(_manifest_relative_path(job_id)).name
+        for job_id in excluded_job_ids
+    }
     recovery_directory = root / MANIFEST_DIRECTORY
     expected = str(expected_sha256 or "")
     if expected and _SHA256_RE.fullmatch(expected) is None:
@@ -646,6 +655,8 @@ def discover_request_manifest_pointers(
     discovered: list[dict[str, Any]] = []
     try:
         for name in manifest_names:
+            if name in excluded_names:
+                continue
             raw = (
                 _read_exact_file_at(
                     directory_descriptor, name,

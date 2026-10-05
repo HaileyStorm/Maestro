@@ -202,6 +202,7 @@ Multiple isolated output directories with a quick switcher in the sidebar. Usefu
 - **Reference** is a persistent sidebar peer to Generate and Director. Its create/manage workspace stays mounted while inactive so authored state survives navigation; Queue leaves Reference only after the submission and job reconnect are durably confirmed. Locked projects disable entry, and a newly locked active project returns to the prior workspace after clearing private Reference state.
 - Reference makes reusable character, setting, item, and style cards, generates multiple candidates, and lets you keep/reject/delete variants before using them in Director or Generate semantic-reference workflows. The catalog includes explicit Moody Krea 2 quick-select cards when a recipe is enabled and present; disabled, missing, and manual-install states remain visible and are never auto-enabled or auto-selected.
 - Gallery selection supports bulk move, privacy, and deletion. Finals are shown by default; All, Components, Windows, and Temporary views expose intermediate artifacts when needed. Deleting a final can atomically include its linked parts.
+- Open **Uploads** in the project selector to remove an unused upload with its **Delete** action. Click again to confirm permanent removal. Maestro keeps files that active work or recovery still needs; Chat images use Chat's own removal action. Uploads belong to the browser session that uploaded them.
 - Gallery video cards show recorded finishing steps after private media is revealed: applied upscaling and delivery fit, film grain, voice replacement, and audio level smoothing where an output sidecar recorded their outcomes. An unsuccessful attempt is shown as not applied or unconfirmed rather than as completed work. Older outputs without a record show no inferred history.
 - **Bridge two videos** in the Gallery: select two project videos, choose which comes first, describe the motion between them, and choose the added duration. MiniMax H3 Ref2VA generates the conditioned interval; the finished video joins the complete selected cuts with that interval and inherits their project access and privacy. Source revisions are checked again before publication, so a changed clip fails instead of silently bridging different media.
 - **Flip horizontally** in a video's Gallery actions creates a separate flipped copy on the CPU. It preserves the original and copies every audio stream unchanged. Keep the original to undo the choice, or delete only the flipped copy. The queued operation supports cancellation and retains source/provenance and privacy metadata.
@@ -844,6 +845,11 @@ curl -fsS -b cookies.txt "$BASE/api/v1/access-context"
 # After signing in through the account UI, list only an account-authorized
 # project's final outputs. The browser session cookie is revocable server state.
 curl -fsS -b cookies.txt "$BASE/api/v1/outputs?workspace=my-project&artifact_scope=final"
+
+# Permanently remove an unused upload from the same session that uploaded it.
+# Use the returned filename; 409 means the file is retained or use cannot be checked.
+curl -fsS -b cookies.txt -H "Origin: $BASE" -X DELETE \
+  "$BASE/api/v1/uploads/RETURNED-FILENAME.png"
 
 # Create and animate a bounded Blender scene; no Python/code field is accepted
 curl -fsS -b cookies.txt -H "Origin: $BASE" -H 'Content-Type: application/json' \

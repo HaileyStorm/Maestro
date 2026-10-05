@@ -348,12 +348,15 @@ A private headless browser fixture with real React/ReactDOM in StrictMode also
 passes obsolete-response and current-completion checks, with no external
 requests. This fixture does not establish live Maestro generation or listening.
 
-Generic Gallery upload deletion remains deferred. Uploads are session-owned
-and the virtual Uploads workspace is browse-only; project-output deletion
-does not supply upload authority. The existing `.trash_*` path is transient
-rollback staging and later cleanup, not a user-restorable trash. An upload
-delete action needs exact session authorization, active and recoverable job
-input fencing, and an explicit recovery contract before adoption.
+The October 5 Gallery upload-removal implementation adds a confirmed Delete
+action in Uploads and a session-authorized upload endpoint. It preserves files
+used by active readers, recoverable jobs, or Director audio rejoining; Chat
+images retain their separate removal flow. Media and access metadata are
+staged together with rollback on failure. Temporary staging is not a
+user-restorable trash. Automated checks cover session isolation, reader drain,
+recovery references, rollback, and stale Gallery responses; all 923 UI tests
+pass. Backend review, service activation, live permanent removal, and Windows
+file-release acceptance remain separate gates.
 
 The [YuE2 real-audio model card](https://huggingface.co/Mothersuperior/yue2-mothersuperior-realaudio-tokenizer-v4)
 documents a matched joint-v9 tokenizer head and NAR decoder LoRA. The pinned

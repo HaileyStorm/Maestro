@@ -23,6 +23,8 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from services import upload_usage
+
 from services.llm_cancellation import (
     LlmCancellationHandle,
     LlmRequestCancelled,
@@ -282,7 +284,7 @@ class LlmPreparationManager:
             )
             self._operations[operation.operation_id] = operation
             self._prune_locked(now)
-            operation.task = asyncio.create_task(self._run(operation, prepare))
+            operation.task = upload_usage.create_task(self._run(operation, prepare))
             return self._public(operation)
 
     async def _run(
@@ -297,7 +299,7 @@ class LlmPreparationManager:
         try:
             # The task owns the worker future. Cancelling an HTTP waiter does
             # not cancel this manager-owned preparation.
-            await asyncio.shield(asyncio.to_thread(prepare))
+            await asyncio.shield(upload_usage.to_thread(prepare))
         except asyncio.CancelledError:
             with self._lock:
                 if self._operations.get(operation.operation_id) is operation:
@@ -661,7 +663,7 @@ class LlmChatOperationManager:
             self._prune_locked(now)
             release_once = _ReleaseOnce(release)
             try:
-                operation.task = asyncio.create_task(
+                operation.task = upload_usage.create_task(
                     self._run(operation, execute, release_once),
                 )
                 def release_unstarted(done):
@@ -699,7 +701,7 @@ class LlmChatOperationManager:
                 operation.updated_at = self._clock()
         worker: asyncio.Future[dict[str, Any]] | None = None
         try:
-            worker = asyncio.ensure_future(execute(
+            worker = upload_usage.create_task(execute(
                 lambda event: self._update_progress(operation, event),
             ))
             result = await asyncio.shield(worker)
@@ -1163,7 +1165,7 @@ class LlmRouteOperationManager:
             self._operations[request_id] = operation
             release_once = _ReleaseOnce(release)
             try:
-                operation.task = asyncio.create_task(
+                operation.task = upload_usage.create_task(
                     self._run(operation, execute, release_once),
                 )
             except Exception:
@@ -1234,7 +1236,7 @@ class LlmRouteOperationManager:
                 operation.phase = "inference"
                 operation.stage = "inference"
                 operation.updated_at = self._clock()
-                worker_task = asyncio.create_task(execute_if_current())
+                worker_task = upload_usage.create_task(execute_if_current())
                 operation.worker_task = worker_task
 
             result = await asyncio.shield(worker_task)
@@ -1699,7 +1701,7 @@ class PromptEnhancementOperationManager:
         with self._lock:
             self._active[normalized] = operation
             try:
-                operation.task = asyncio.create_task(
+                operation.task = upload_usage.create_task(
                     self._run(operation, execute, release_once, prepare, close),
                 )
             except Exception:
@@ -1770,13 +1772,13 @@ class PromptEnhancementOperationManager:
             # before the store acquires Maestro's generation slot. The owner
             # must persist its exact intent before prepare contacts a service.
             if prepare is not None:
-                prepare_task = asyncio.create_task(prepare(
+                prepare_task = upload_usage.create_task(prepare(
                     lambda event: self._progress(operation, event),
                     operation.cancellation,
                 ))
                 await asyncio.shield(prepare_task)
             operation.cancellation.checkpoint()
-            admission_task = asyncio.create_task(asyncio.to_thread(
+            admission_task = upload_usage.create_task(upload_usage.to_thread(
                 self._store.mark_running,
                 operation.request_id,
                 **self._claim_scope(operation),
@@ -1810,13 +1812,13 @@ class PromptEnhancementOperationManager:
                         operation.cancellation,
                     )
                 )
-                worker_task = asyncio.create_task(execution)
+                worker_task = upload_usage.create_task(execution)
                 operation.worker_task = worker_task
             result = await asyncio.shield(worker_task)
             operation.cancellation.checkpoint()
             if close is not None:
                 close_started = True
-                close_task = asyncio.create_task(close())
+                close_task = upload_usage.create_task(close())
                 await asyncio.shield(close_task)
             operation.cancellation.checkpoint()
             completed = self._store.complete(
@@ -1864,7 +1866,7 @@ class PromptEnhancementOperationManager:
                 if close is not None and not close_started:
                     close_started = True
                     try:
-                        close_task = asyncio.create_task(close())
+                        close_task = upload_usage.create_task(close())
                         await asyncio.shield(close_task)
                     except asyncio.CancelledError:
                         operation.cancellation.cancel()
@@ -1964,7 +1966,7 @@ async def run_blocking_shielded(
     **kwargs: Any,
 ) -> Any:
     """Run blocking work off-loop and keep it alive if its waiter disconnects."""
-    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    task = upload_usage.create_task(upload_usage.to_thread(function, *args, **kwargs))
 
     def consume_result(done: asyncio.Task[Any]) -> None:
         if not done.cancelled():

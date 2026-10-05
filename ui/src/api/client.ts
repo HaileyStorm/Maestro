@@ -5726,6 +5726,15 @@ export interface OutputCleanupResult {
   failed: string[]
 }
 
+export async function deleteUpload(name: string): Promise<{ deleted: string }> {
+  const res = await fetch(`${BASE}/api/v1/uploads/${encodeURIComponent(name)}`, { method: 'DELETE' })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Failed to delete upload' }))
+    throw new Error(err.detail || 'Failed to delete upload')
+  }
+  return res.json()
+}
+
 export async function deleteOutput(name: string, deleteComponents = false, workspace?: string): Promise<{
   deleted: string
   components?: OutputCleanupResult | null

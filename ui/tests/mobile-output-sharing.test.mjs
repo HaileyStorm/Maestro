@@ -8,10 +8,16 @@ const componentUrl = new URL('../src/components/MainContent/MediaFeedItem.tsx', 
 
 function createHooks(stateSeeds = {}) {
   const states = []
+  const refs = []
   const initialized = new Set()
   let cursor = 0
+  let refCursor = 0
   return {
-    begin() { cursor = 0 },
+    begin() { cursor = 0; refCursor = 0 },
+    useRef(initial) {
+      const index = refCursor++
+      return refs[index] ??= { current: initial }
+    },
     useState(initial) {
       const index = cursor++
       if (!initialized.has(index)) {
@@ -37,7 +43,7 @@ async function loadHarness() {
     ['react', `
       export function useState(initial) { return globalThis.__outputShareHooks.useState(initial) }
       export function useEffect() {}
-      export function useRef(initial) { return { current: initial } }
+      export function useRef(initial) { return globalThis.__outputShareHooks.useRef(initial) }
       export function useCallback(callback) { return callback }
     `],
     ['react/jsx-runtime', `
@@ -51,7 +57,7 @@ async function loadHarness() {
     `],
     ['../Recipes/SaveRecipeDialog', 'export function SaveRecipeDialog() { return null }'],
     ['../../stores/useStore', `
-      export function currentAccountIdentityEpoch() { return 0 }
+      export function currentAccountIdentityEpoch() { return globalThis.__outputShareAccountEpoch ?? 0 }
       export function useStore(selector) { return selector(globalThis.__outputShareStore) }
       useStore.getState = () => globalThis.__outputShareStore
       useStore.setState = () => {}
@@ -206,7 +212,7 @@ function createRuntime(MediaFeedItem, file = output(), stateSeeds = {}) {
       onMeasured() {},
     }))
   }
-  return { render }
+  return { render, setFile(value) { file = value } }
 }
 
 function button(tree, label) {
@@ -255,6 +261,7 @@ function installBrowser(t, { navigator, confirm = () => true, execCommand = () =
     delete globalThis.__outputShareStore
     delete globalThis.__createOutputShare
     delete globalThis.__revokeOutputShare
+    delete globalThis.__outputShareAccountEpoch
   })
   return { copiedAreas }
 }
@@ -287,6 +294,76 @@ test('mobile output controls keep 44px touch targets while desktop compacts them
   }
   assert.equal(button(tree, 'Add final-shot.png to favorites').props['aria-pressed'], false)
   assert.equal(button(tree, 'Move final-shot.png to another project').props['aria-haspopup'], 'menu')
+})
+
+test('Uploads exposes a confirmed Delete action with an exact upload target and no duplicate pending deletion', async t => {
+  const MediaFeedItem = await loadHarness()
+  const file = output({ name: 'input.png', workspace: '__uploads__' })
+  globalThis.__outputShareStore = { ...createStore(), browsingUploads: true, outputs: [file] }
+  installBrowser(t)
+  const calls = []
+  let finish
+  const pending = new Promise(resolve => { finish = resolve })
+  globalThis.__outputShareStore.deleteSelectedOutput = (...args) => { calls.push(args); return pending }
+  const { render } = createRuntime(MediaFeedItem, file)
+  const control = button(render(), 'Delete input.png')
+  assert.equal(control.props.title, 'Delete upload')
+  assert.equal(button(render(), 'Add input.png to favorites'), undefined)
+  await control.props.onClick()
+  assert.deepEqual(calls, [])
+  const confirm = button(render(), 'Confirm permanent deletion of input.png')
+  const operation = confirm.props.onClick()
+  assert.deepEqual(calls, [['input.png', '__uploads__']])
+  assert.equal(button(render(), 'Delete input.png').props.disabled, true)
+  await confirm.props.onClick()
+  assert.equal(calls.length, 1)
+  finish()
+  await operation
+  assert.equal(button(render(), 'Delete input.png').props.disabled, false)
+})
+
+test('A Gallery card confirmation cannot carry to another file or account', async t => {
+  const MediaFeedItem = await loadHarness()
+  const first = output({ name: 'first.png', workspace: '__uploads__' })
+  const second = output({ name: 'second.png', workspace: '__uploads__' })
+  const calls = []
+  globalThis.__outputShareStore = { ...createStore(), browsingUploads: true, outputs: [first, second],
+    deleteSelectedOutput: async (...args) => { calls.push(args) } }
+  installBrowser(t)
+  const runtime = createRuntime(MediaFeedItem, first)
+  await button(runtime.render(), 'Delete first.png').props.onClick()
+  runtime.setFile(second)
+  await button(runtime.render(), 'Confirm permanent deletion of second.png').props.onClick()
+  assert.deepEqual(calls, [])
+  globalThis.__outputShareAccountEpoch = 1
+  await button(runtime.render(), 'Confirm permanent deletion of second.png').props.onClick()
+  assert.deepEqual(calls, [])
+  await button(runtime.render(), 'Confirm permanent deletion of second.png').props.onClick()
+  assert.deepEqual(calls, [['second.png', '__uploads__']])
+})
+
+test('A rejected delete cannot restart a video preview that was released while waiting', async t => {
+  const MediaFeedItem = await loadHarness()
+  const file = output({ name: 'input.mp4', type: 'video', workspace: '__uploads__' })
+  globalThis.__outputShareStore = { ...createStore(), browsingUploads: true, outputs: [file] }
+  installBrowser(t)
+  let finish
+  globalThis.__outputShareStore.deleteSelectedOutput = () => new Promise(resolve => { finish = resolve })
+  const { render } = createRuntime(MediaFeedItem, file)
+  const videoElement = findElements(render(), element => element.type === 'video')[0]
+  assert.ok(videoElement)
+  const video = { src: '/owned-preview', loads: 0, pause() {},
+    getAttribute() { return this.src || null },
+    removeAttribute() { this.src = '' }, load() { this.loads += 1 } }
+  videoElement.props.ref(video)
+  await button(render(), 'Delete input.mp4').props.onClick()
+  const deletion = button(render(), 'Confirm permanent deletion of input.mp4').props.onClick()
+  videoElement.props.ref(null)
+  const releasedLoads = video.loads
+  finish()
+  await deletion
+  assert.equal(video.src, '')
+  assert.equal(video.loads, releasedLoads)
 })
 
 test('metadata and video actions share the mobile target and naming contract', async t => {

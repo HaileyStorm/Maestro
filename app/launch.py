@@ -357,6 +357,9 @@ install_quiet_access_filter()
 
 api = FastAPI(title="Maestro API", version="1.0.0")
 
+from services import upload_usage
+api.add_middleware(upload_usage.UploadUsageMiddleware)
+
 from services.output_access import (
     MIN_PROJECT_PASSWORD_LENGTH,
     PROJECT_UNLOCK_REMEMBER_POLICIES,
@@ -5280,6 +5283,29 @@ def _queue_recovery_manifest_validator(
         return False
 
 
+def _upload_job_reader(function):
+    from functools import wraps
+
+    @wraps(function)
+    def read_job(job_id, *args, **kwargs):
+        job = _jobs[job_id]
+        paths = [path for _field, path in _queue_recovery_file_values(job.get("params") or {})]
+        with upload_usage.reader(paths):
+            return function(job_id, *args, **kwargs)
+    return read_job
+
+
+def _upload_registration_guard(function):
+    from functools import wraps
+
+    @wraps(function)
+    def registered(*args, **kwargs):
+        with _workspace_lifecycle_lock, upload_usage.lock:
+            return function(*args, **kwargs)
+    return registered
+
+
+@_upload_registration_guard
 def _queue_recovery_register_and_publish(
     job: dict,
     *,
@@ -5416,7 +5442,7 @@ def _queue_recovery_register_and_publish(
             raise
     if defer_worker:
         return None
-    worker = worker or _run_generation
+    worker = _upload_job_reader(worker or _run_generation)
     thread = threading.Thread(
         target=worker,
         args=(job_id,),
@@ -6128,6 +6154,7 @@ def _director_snapshot_has_legacy_artifacts(snapshot) -> bool:
     return False
 
 
+@_upload_registration_guard
 def _director_recovery_register_parent(
     pid: str,
     pipeline: dict,
@@ -6739,6 +6766,7 @@ def _director_recovery_retire_old_preparations(
     return retired
 
 
+@_upload_registration_guard
 def _register_director_preparation(
     request: Request,
     body: dict,
@@ -39315,8 +39343,8 @@ async def yue2_audio(take_id: str, fmt: str, request: Request, workspace: str | 
     _require_project_access(request, selected, permission="project.open")
     try:
         bridge = _yue2_bridge()
-        await asyncio.to_thread(bridge.require_take, take_id, selected)
-        raw, content_type = await asyncio.to_thread(bridge.audio, take_id, fmt)
+        await upload_usage.to_thread(bridge.require_take, take_id, selected)
+        raw, content_type = await upload_usage.to_thread(bridge.audio, take_id, fmt)
     except Exception as error:
         _raise_yue2_bridge_error(error)
     return Response(content=raw, media_type=content_type)
@@ -39654,7 +39682,7 @@ async def director_generate_music(request: Request):
     _init_pipeline()
     from services.director_pipeline import _submit_and_wait
     try:
-        output_files = await asyncio.to_thread(
+        output_files = await upload_usage.to_thread(
             _submit_and_wait,
             gen_params,
             timeout_s=1800,
@@ -42185,7 +42213,7 @@ async def analyze_audio(request: Request):
     try:
         # Keep FastAPI's event loop available for the scoped progress poller.
         # The synchronous audio stack may run for minutes and download models.
-        worker_task = asyncio.create_task(asyncio.to_thread(run_analysis))
+        worker_task = upload_usage.create_task(upload_usage.to_thread(run_analysis))
 
         def finalize_worker_task(done_task):
             # Executor shutdown/submission failure can complete the future
@@ -43732,7 +43760,7 @@ async def director_queue_add(request: Request, workspace: str = ""):
     if not params.get("workspace"):
         params["workspace"] = _request_project_workspace(request, workspace)
     try:
-        return await asyncio.to_thread(
+        return await upload_usage.to_thread(
             enqueue_director_pipeline,
             _director_queue_base(request, workspace),
             params,
@@ -43789,7 +43817,7 @@ async def director_queue_update(request: Request, entry_id: str, workspace: str 
     if not isinstance(params, dict):
         raise HTTPException(status_code=400, detail="Director queue params are required")
     try:
-        return await asyncio.to_thread(
+        return await upload_usage.to_thread(
             update_director_queue_entry,
             _director_queue_base(request, workspace),
             entry_id,
@@ -44107,7 +44135,7 @@ async def rerun_pipeline_clip_image(pid: str, clip_index: int, request: Request)
         # async route blocks every heartbeat/poll request and can make the
         # Pinokio webview reload, aborting the browser-owned bulk repair loop
         # after its first clip.
-        result = await asyncio.to_thread(
+        result = await upload_usage.to_thread(
             rerun_clip_image,
             base,
             pid,
@@ -44148,7 +44176,7 @@ async def rerun_pipeline_clip_video(pid: str, clip_index: int, request: Request)
     _revalidate_saved_director_runtime(request, _state)
     _begin_workspace_operation(selected_workspace)
     try:
-        result = await asyncio.to_thread(
+        result = await upload_usage.to_thread(
             rerun_clip_video,
             base,
             pid,
@@ -44181,7 +44209,7 @@ async def rejoin_pipeline_clips(request: Request, pid: str, workspace: str = "")
     state, base = _require_saved_pipeline(request, pid, selected_workspace)
     _begin_workspace_operation(selected_workspace)
     try:
-        result = await asyncio.to_thread(rejoin_clips, base, pid)
+        result = await upload_usage.to_thread(rejoin_clips, base, pid)
         filename = str(result.get("filename") or "")
         joined_path = os.path.join(base, filename)
         if not filename or not os.path.isfile(joined_path):
@@ -47297,6 +47325,7 @@ def _start_generation_worker(job: dict, *, name_prefix: str) -> None:
         ) from error
 
 
+@_upload_job_reader
 def _run_generation_preparation(
     job_id: str,
     request: _GenerationPreparationRequest,
@@ -49197,7 +49226,7 @@ async def _resolve_h3_gallery_still_guide_source(request, workspace, out_dir, na
 
     try:
         # Decode and hash at most one bounded still away from the API loop.
-        probe = await asyncio.to_thread(probe_gallery_still, source_path)
+        probe = await upload_usage.to_thread(probe_gallery_still, source_path)
     except H3GalleryStillGuideError as error:
         raise HTTPException(
             status_code=400,
@@ -49211,7 +49240,7 @@ async def _resolve_h3_gallery_still_guide_source(request, workspace, out_dir, na
     try:
         # Re-probe exact bytes after decoding to close same-size/timestamp
         # replacement races before the durable request manifest is written.
-        verified_probe = await asyncio.to_thread(probe_gallery_still, source_path)
+        verified_probe = await upload_usage.to_thread(probe_gallery_still, source_path)
     except Exception as error:
         raise HTTPException(
             status_code=409,
@@ -59027,6 +59056,7 @@ def _build_outpaint_shot_manifest(
     }
 
 
+@_upload_job_reader
 def _prepare_and_run_outpaint(job_id):
     """Detect camera cuts, prepare private shot tasks, then generate."""
     import secrets
@@ -59816,7 +59846,7 @@ async def h3_bridge_endpoint(request: Request):
         try:
             # Media hashing and CFR timestamp inspection can take seconds for
             # an authorized Gallery clip. Keep that work off the API loop.
-            probe = await asyncio.to_thread(probe_source, path)
+            probe = await upload_usage.to_thread(probe_source, path)
         except H3BridgeMediaError as error:
             raise HTTPException(status_code=400, detail=f"{label}: {error}") from error
         except Exception as error:
@@ -60484,6 +60514,7 @@ async def blend_endpoint(request: Request):
         raise
 
 
+@_upload_job_reader
 def _run_h3_bridge_generation(job_id: str):
     """Regenerate the conditioned interval, then publish one A-Bridge-B file."""
     import tempfile
@@ -60773,6 +60804,7 @@ def _run_h3_bridge_generation(job_id: str):
         unregister_abort_state(job_id, _active_gen_states, bridge_state)
 
 
+@_upload_job_reader
 def _run_blend_generation(job_id: str):
     """Background thread: run VG blend generation, then assemble the clips.
 
@@ -61354,13 +61386,13 @@ async def segment_preview_endpoint(request: Request):
 
         sam_target = text
 
-        sam_ready = await asyncio.to_thread(ensure_sam_running)
+        sam_ready = await upload_usage.to_thread(ensure_sam_running)
         if not sam_ready:
             raise HTTPException(status_code=503, detail="SAM service not available. Check installation.")
 
         full_video = body.get("full_video", False)
         if full_video:
-            result = await asyncio.to_thread(
+            result = await upload_usage.to_thread(
                 segment_video,
                 video_path=video_path,
                 text=sam_target,
@@ -61369,7 +61401,7 @@ async def segment_preview_endpoint(request: Request):
                 mask_padding=int(body.get("mask_padding", 20)),
             )
         else:
-            result = await asyncio.to_thread(
+            result = await upload_usage.to_thread(
                 segment_image_preview,
                 video_path=video_path,
                 text=sam_target,
@@ -61531,11 +61563,11 @@ async def inpaint_endpoint(request: Request):
         else:
             # Start SAM on demand if needed
             import asyncio
-            sam_ready = await asyncio.to_thread(ensure_sam_running)
+            sam_ready = await upload_usage.to_thread(ensure_sam_running)
             if not sam_ready:
                 raise HTTPException(status_code=503, detail="SAM service not available. Check installation.")
             try:
-                seg_result = await asyncio.to_thread(
+                seg_result = await upload_usage.to_thread(
                     segment_video,
                     video_path=sam_video_path,
                     text=sam_target,
@@ -61586,7 +61618,7 @@ async def inpaint_endpoint(request: Request):
     # Step 2b: Shut down SAM completely to free all VRAM (including CUDA context)
     try:
         import asyncio
-        await asyncio.to_thread(shutdown_sam)
+        await upload_usage.to_thread(shutdown_sam)
     except Exception:
         pass
 
@@ -64927,6 +64959,7 @@ def _h3_cow_completed_unit(job):
     return unit, names
 
 
+@_upload_job_reader
 def _run_h3_cow_delivery_child(job_id):
     job = _jobs[job_id]
     source = _jobs.get(job.get("parent_job_id"))
@@ -65918,17 +65951,20 @@ def _resolve_authorized_request_media(
         return os.path.normcase(os.path.abspath(value)) == os.path.normcase(candidate)
 
     def _authorized_upload(root: str) -> tuple[str | None, bool]:
-        lexical = os.path.abspath(os.path.join(os.path.realpath(root), name))
-        matching_entry = _matches(lexical) and os.path.lexists(lexical)
-        candidate = safe_direct_file_under(root, name)
-        if (
-            candidate
-            and _matches(candidate)
-            and os.path.isfile(candidate)
-            and can_access_upload(candidate, request.state.maestro_session_id)
-        ):
-            return candidate, True
-        return None, matching_entry
+        from services import upload_usage
+        with upload_usage.lock:
+            lexical = os.path.abspath(os.path.join(os.path.realpath(root), name))
+            matching_entry = _matches(lexical) and os.path.lexists(lexical)
+            candidate = safe_direct_file_under(root, name)
+            if (
+                candidate
+                and _matches(candidate)
+                and os.path.isfile(candidate)
+                and can_access_upload(candidate, request.state.maestro_session_id)
+            ):
+                upload_usage.pin(candidate, request)
+                return candidate, True
+            return None, matching_entry
 
     upload_roots = (
         os.path.join(os.getcwd(), "uploads"),
@@ -66174,6 +66210,7 @@ def _browser_copy_source(job: dict) -> tuple[str, dict]:
     return source, metadata
 
 
+@_upload_job_reader
 def _run_tool_hflip(job_id: str):
     """CPU-only video transform with normal queue finality and cancellation."""
     import tempfile
@@ -66277,6 +66314,7 @@ async def tools_hflip(request: Request):
     return {"job_id": job_id, "status": "queued"}
 
 
+@_upload_job_reader
 def _run_tool_browser_copy(job_id: str):
     """Create a browser-compatible CPU copy through normal queue finality."""
     import tempfile
@@ -66366,8 +66404,8 @@ def _browser_copy_preflight_acquire(key, source, out_dir, validate_browser_copy)
             _BROWSER_COPY_PREFLIGHTS.pop(key, None)
         entry = None
     if entry is None:
-        task = asyncio.create_task(
-            asyncio.to_thread(validate_browser_copy, source, out_dir),
+        task = upload_usage.create_task(
+            upload_usage.to_thread(validate_browser_copy, source, out_dir),
         )
         entry = {"task": task, "waiters": 0}
         _BROWSER_COPY_PREFLIGHTS[key] = entry
@@ -66802,6 +66840,7 @@ def _composition_reconcile_cursor(job, project_dir):
         _composition_job_context(job)
 
 
+@_upload_job_reader
 def _run_tool_composition_export(job_id):
     from contextlib import contextmanager
     from services.composition_package import (
@@ -67089,6 +67128,7 @@ async def submit_blender_editor_composition(project: str, request: Request):
     return {"job_id": job_id, "status": "queued"}
 
 
+@_upload_job_reader
 def _run_tool_editor_export(job_id: str):
     """Render a CPU cut through ordinary queue cancellation and finality."""
     job = _jobs[job_id]
@@ -67547,6 +67587,7 @@ def _publish_processed_tool_output(job, staged_path, *, source, tool, params, el
         return completed
 
 
+@_upload_job_reader
 def _run_tool_upscale(job_id: str):
     """Background worker: upscale an existing clip with the configured spatial
     upsampler (FlashVSR / Lanczos), preserving the original audio. Thin extract
@@ -67724,6 +67765,7 @@ def _run_tool_upscale(job_id: str):
                 pass
 
 
+@_upload_job_reader
 def _run_tool_revoice(job_id: str):
     """Background worker: replace the voice(s) in an existing clip via SeedVC.
     Always writes a NEW file (copy first, convert the copy) — the source clip
@@ -68131,6 +68173,7 @@ def _apply_generation_end_image_trim(raw_params: dict) -> None:
         raw_params["trim_tail_frames"] = frame_step
 
 
+@_upload_job_reader
 def _run_generation(
     job_id: str,
     *,
@@ -78949,8 +78992,7 @@ def serve_file(request: Request, filename: str, workspace: str = "", content_rev
         )
         if (
             filepath
-            and os.path.isfile(filepath)
-            and can_access_upload(filepath, request.state.maestro_session_id)
+            and _resolve_authorized_request_media(request, filepath) == filepath
         ):
             return share_delete_file_response(filepath)
         raise HTTPException(status_code=404, detail="File not found")
@@ -79341,7 +79383,7 @@ class _PinnedOutputShareResponse(Response):
         from services.win_safe_files import _RangeError, _parse_range
 
         handle = None
-        snapshot_task = asyncio.create_task(asyncio.to_thread(
+        snapshot_task = upload_usage.create_task(upload_usage.to_thread(
             _materialize_output_share_snapshot, self.token,
         ))
         try:
@@ -80712,6 +80754,165 @@ async def upload_image(
         except Exception:
             pass
     return result
+
+
+def _upload_retained_input(path: str) -> bool:
+    """Census durable references, including crash manifests and Director rejoin."""
+    from services.queue_recovery_runtime import discover_request_manifest_pointers
+    from services.queue_recovery_adapter import prompt_enhancement_gpu_cleanup_pending
+    from services.win_safe_files import safe_direct_file_under
+
+    target = os.path.normcase(os.path.realpath(path))
+    projects = _list_workspaces()
+    roots = {}
+    for project in projects:
+        root = os.path.abspath(project["path"])
+        if os.path.islink(root):
+            # The configured output volume may be a symlink; named project
+            # aliases cannot substitute a different census scope.
+            if project["name"] != "default":
+                raise ValueError("Unsafe project census")
+            root = os.path.realpath(root)
+        if not os.path.isdir(root):
+            raise ValueError("Incomplete project census")
+        roots[project["name"]] = root
+    snapshots, tombstoned = _queue_recovery_coordinator.read_only_snapshot()
+    retired = set(tombstoned)
+    for snapshot in snapshots.values():
+        if (snapshot.get("status") in {"completed", "cancelled", "canceled"}
+                and not processed_tool_publication_pending(snapshot)
+                and not prompt_enhancement_gpu_cleanup_pending(snapshot)
+                and snapshot.get("kind") not in {"director_pipeline", "director_preparation"}):
+            retired.add(snapshot["id"])
+            continue
+        workspace = snapshot.get("workspace") or "default"
+        if workspace not in roots:
+            raise ValueError("Missing recovery project")
+        load_request_manifest(
+            roots[workspace], snapshot["request_manifest"],
+            expected_job_id=snapshot["id"],
+        )
+    for root in dict.fromkeys(roots.values()):
+        for record in discover_request_manifest_pointers(root, maximum_candidates=1024, excluded_job_ids=tuple(retired)):
+            if record["job_id"] in retired:
+                continue
+            manifest = load_request_manifest(
+                root, record["pointer"], expected_job_id=record["job_id"],
+            )
+            for descriptor in manifest["inputs"]:
+                source = descriptor.get("path")
+                if not isinstance(source, str) or not os.path.isabs(source):
+                    raise ValueError("Invalid recovery input")
+                if os.path.normcase(os.path.realpath(source)) == target:
+                    return True
+        # Completed Director states retain the pristine audio for later
+        # rejoin even after their queue parent has been compacted away.
+        for name in os.listdir(root):
+            if not name.startswith("_director_pipeline_") or not name.endswith(".json"):
+                continue
+            state_path = safe_direct_file_under(root, name)
+            if state_path is None:
+                raise ValueError("Unsafe Director state")
+            before = os.stat(state_path, follow_symlinks=False)
+            if before.st_size > 16 * 1024 * 1024:
+                raise ValueError("Director state is too large")
+            with open(state_path, "rb") as handle:
+                raw = handle.read(16 * 1024 * 1024 + 1)
+            after = os.stat(state_path, follow_symlinks=False)
+            if (before.st_ino, before.st_size, before.st_mtime_ns) != (
+                after.st_ino, after.st_size, after.st_mtime_ns,
+            ):
+                raise ValueError("Director state changed")
+            state = json.loads(raw)
+            if not isinstance(state, dict):
+                raise ValueError("Invalid Director state")
+            params = state.get("_params_snapshot", {})
+            if not isinstance(params, dict):
+                raise ValueError("Invalid Director inputs")
+            for source in _queue_recovery_file_values(params):
+                if os.path.normcase(os.path.realpath(source[1])) == target:
+                    return True
+    return False
+
+
+@api.delete("/api/v1/uploads/{filename}")
+def delete_upload(request: Request, filename: str):
+    """Remove an unused ordinary upload belonging to this browser session."""
+    from services.win_safe_files import safe_direct_file_under
+
+    _require_upload_content_access(request)
+    base = os.path.join(os.getcwd(), "uploads")
+    with _workspace_lifecycle_lock, upload_usage.lock:
+        media = safe_direct_file_under(base, filename)
+        sidecar = safe_direct_file_under(base, filename + ".access.json")
+        owner = request.state.maestro_session_id
+        if (
+            filename.startswith(".") or filename.endswith(".json")
+            or media is None or sidecar is None
+            or not os.path.isfile(media) or not os.path.isfile(sidecar)
+            or not can_access_upload(media, owner)
+        ):
+            raise HTTPException(status_code=404, detail="Upload not found")
+        if os.path.lexists(_llm_chat_upload_marker_path(media)):
+            raise HTTPException(status_code=409, detail="Remove this image from Chat instead")
+        if upload_usage.in_use(media):
+            raise HTTPException(status_code=409, detail="This upload is still in use")
+        try:
+            if _upload_retained_input(media):
+                raise HTTPException(status_code=409, detail="This upload is still in use")
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(
+                status_code=409,
+                detail="Upload use could not be checked. Try again after current work finishes.",
+            ) from None
+        if (safe_direct_file_under(base, filename) != media
+                or safe_direct_file_under(base, filename + ".access.json") != sidecar
+                or not can_access_upload(media, owner)):
+            raise HTTPException(status_code=409, detail="Upload changed. Refresh and try again.")
+        with open(sidecar, "rb") as handle:
+            access_bytes = handle.read(64 * 1024 + 1)
+        if len(access_bytes) > 64 * 1024:
+            raise HTTPException(status_code=409, detail="Upload access could not be checked")
+        # Stage both owning files before reclaiming either. A staging fault
+        # restores the whole pair; unrelated derivatives remain untouched.
+        staged = []
+        removal_id = uuid.uuid4().hex
+        try:
+            for source in (media, sidecar):
+                destination = os.path.join(
+                    os.path.dirname(media),
+                    f".trash_upload_{removal_id}_{os.path.basename(source)}",
+                )
+                os.replace(source, destination)
+                staged.append((source, destination))
+        except OSError:
+            try:
+                for source, destination in reversed(staged):
+                    os.replace(destination, source)
+            except OSError:
+                raise HTTPException(status_code=500, detail="Upload removal needs recovery") from None
+            raise HTTPException(status_code=423, detail="Upload is locked. Close it and try again.") from None
+        try:
+            # Remove metadata first; if media reclamation fails, its small
+            # exact metadata backup lets us restore the whole visible pair.
+            os.remove(staged[1][1])
+            os.remove(staged[0][1])
+        except OSError:
+            try:
+                if not os.path.exists(staged[1][1]):
+                    descriptor = os.open(staged[1][1], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    with os.fdopen(descriptor, "wb") as handle:
+                        handle.write(access_bytes)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                for source, destination in reversed(staged):
+                    os.replace(destination, source)
+            except OSError:
+                raise HTTPException(status_code=500, detail="Upload removal needs recovery") from None
+            raise HTTPException(status_code=423, detail="Upload is locked. Close it and try again.") from None
+    return {"deleted": filename}
 
 
 @api.get("/api/v1/uploads/{filename}")

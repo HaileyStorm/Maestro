@@ -1,6 +1,6 @@
 import { useEffect, useState, useRef } from 'react'
 import { Pencil, RefreshCw, Copy, Trash2, Check, Combine, Loader2, Sparkles, Mic } from 'lucide-react'
-import { useStore } from '../../stores/useStore'
+import { currentAccountIdentityEpoch, useStore } from '../../stores/useStore'
 import { H3_GALLERY_STILL_GUIDE_RESTORE_MESSAGE, isH3GalleryStillGuideOutput } from '../../lib/h3GalleryStillGuide'
 import { getUploadUrl } from '../../api/client'
 import { formatGenerationDuration } from '../../lib/format'
@@ -16,6 +16,7 @@ export function VideoInfoBar() {
   const rerollGeneration = useStore(s => s.rerollGeneration)
   const deleteSelectedOutput = useStore(s => s.deleteSelectedOutput)
   const activeWorkspace = useStore(s => s.activeWorkspace)
+  const browsingUploads = useStore(s => s.browsingUploads)
   const rejoinClipGroup = useStore(s => s.rejoinClipGroup)
   const quickUpscaleClip = useStore(s => s.quickUpscaleClip)
   const sendClipToTools = useStore(s => s.sendClipToTools)
@@ -23,19 +24,22 @@ export function VideoInfoBar() {
   // (see modelDisplayName helper).
   const models = useStore(s => s.models)
   const [confirmDelete, setConfirmDelete] = useState(false)
-  const confirmRef = useRef<{ name: string; workspace: string } | null>(null)
+  const [deleting, setDeleting] = useState(false)
+  const deletingRef = useRef(false)
+  const confirmRef = useRef<{ name: string; workspace: string; accountEpoch: number } | null>(null)
   const timeoutRef = useRef<ReturnType<typeof setTimeout>>(undefined)
   const [copied, setCopied] = useState(false)
   const [rejoining, setRejoining] = useState(false)
   const [upscaling, setUpscaling] = useState(false)
 
   const selected = outputs[selectedOutput]
+  const selectedWorkspace = selected?.workspace || (browsingUploads ? '__uploads__' : activeWorkspace)
   const isGalleryStillGuideOutput = isH3GalleryStillGuideOutput(meta)
   useEffect(() => {
     confirmRef.current = null
     setConfirmDelete(false)
     clearTimeout(timeoutRef.current)
-  }, [selected?.name, activeWorkspace])
+  }, [selected?.name, selected?.revision, selectedWorkspace, activeWorkspace, browsingUploads])
   if (!selected) return null
 
   // While loading, show a subtle bar
@@ -80,13 +84,15 @@ export function VideoInfoBar() {
   }
 
   const handleDelete = async () => {
+    if (deletingRef.current) return
     const confirmed = confirmRef.current
     if (
       !confirmed
       || confirmed.name !== selected.name
-      || confirmed.workspace !== activeWorkspace
+      || confirmed.workspace !== selectedWorkspace
+      || confirmed.accountEpoch !== currentAccountIdentityEpoch()
     ) {
-      confirmRef.current = { name: selected.name, workspace: activeWorkspace }
+      confirmRef.current = { name: selected.name, workspace: selectedWorkspace, accountEpoch: currentAccountIdentityEpoch() }
       setConfirmDelete(true)
       clearTimeout(timeoutRef.current)
       timeoutRef.current = setTimeout(() => {
@@ -99,7 +105,16 @@ export function VideoInfoBar() {
     const target = confirmRef.current
     confirmRef.current = null
     setConfirmDelete(false)
-    if (target) await deleteSelectedOutput(target.name, target.workspace)
+    if (target) {
+      deletingRef.current = true
+      setDeleting(true)
+      try {
+        await deleteSelectedOutput(target.name, target.workspace)
+      } finally {
+        deletingRef.current = false
+        setDeleting(false)
+      }
+    }
   }
 
   const handleRejoin = async () => {
@@ -245,12 +260,13 @@ export function VideoInfoBar() {
         )}
         <button
           onClick={handleDelete}
+          disabled={deleting}
           className={`p-1.5 rounded-lg transition-colors flex items-center gap-1 ${
             confirmDelete
               ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30'
               : 'hover:bg-bg-hover text-text-secondary hover:text-red-400'
           }`}
-          title={confirmDelete ? 'Click again to confirm delete' : 'Delete output'}
+          title={confirmDelete ? 'Click again to confirm delete' : browsingUploads ? 'Delete upload' : 'Delete output'}
         >
           <Trash2 size={14} />
           {confirmDelete && <span className="text-[11px] font-medium">Delete?</span>}

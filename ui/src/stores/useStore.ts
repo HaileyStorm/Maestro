@@ -19061,28 +19061,50 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   deleteSelectedOutput: async (name, workspace) => {
+    const captured = get()
     const output = name
-      ? get().outputs.find(candidate => candidate.name === name)
-      : get().filteredOutputs()[get().selectedOutput]
+      ? captured.outputs.find(candidate => candidate.name === name && (!workspace || candidate.workspace === workspace))
+      : captured.filteredOutputs()[captured.selectedOutput]
     if (!output) return
+    const targetWorkspace = output.workspace || (captured.browsingUploads ? '__uploads__' : captured.activeWorkspace)
+    if (workspace && workspace !== targetWorkspace) return
+    if ((targetWorkspace === '__uploads__') !== captured.browsingUploads) return
+    const accountEpoch = _accountIdentityEpoch
+    let departed = false
+    const unsubscribe = useStore.subscribe(state => {
+      if (state.activeWorkspace !== captured.activeWorkspace
+        || state.browsingUploads !== captured.browsingUploads
+        || _accountIdentityEpoch !== accountEpoch) departed = true
+    })
+    const isCurrent = () => !departed && _accountIdentityEpoch === accountEpoch
 
     try {
-      const result = await api.deleteOutput(
-        output.name,
-        output.artifact_class === 'final' && output.linked_component_count > 0,
-        workspace || get().activeWorkspace,
-      )
-      if (result.components?.failed?.length) {
+      let components: api.OutputCleanupResult | null | undefined
+      if (targetWorkspace === '__uploads__') {
+        await api.deleteUpload(output.name)
+      } else {
+        const result = await api.deleteOutput(
+          output.name,
+          output.artifact_class === 'final' && output.linked_component_count > 0,
+          targetWorkspace,
+        )
+        components = result.components
+      }
+      if (isCurrent() && components?.failed?.length) {
         window.alert(
-          `The final output was deleted, but ${result.components.failed.length} linked artifact(s) could not be removed. They remain visible for retry.`,
+          `The final output was deleted, but ${components.failed.length} linked artifact(s) could not be removed. They remain visible for retry.`,
         )
       }
     } catch (e) {
       console.error('Failed to delete output:', e)
-      window.alert(e instanceof Error ? e.message : 'Failed to delete output')
+      if (isCurrent()) window.alert(e instanceof Error ? e.message : 'Failed to delete file')
     } finally {
       // Cascades and partial cleanup can change several visible rows.
-      await get().loadOutputs()
+      try {
+        if (isCurrent()) await get().loadOutputs()
+      } finally {
+        unsubscribe()
+      }
     }
   },
 

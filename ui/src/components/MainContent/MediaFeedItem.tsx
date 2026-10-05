@@ -177,11 +177,10 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
     || owningWorkspace.project_permissions.includes('project.mutate')
   )
   const accessContext = useStore(s => s.accessContext)
-  // Virtual Uploads view: browse-only. Move/favorite/delete resolve
-  // against the active OUTPUT workspace server-side, so they can't act
-  // on upload files — hide them. Download + send-to-input still work
-  // (serve_file falls back to the uploads folder).
+  // Uploads have their own session-scoped deletion endpoint. Project-only
+  // actions such as favorites and moving still stay out of this view.
   const browsingUploads = useStore(s => s.browsingUploads)
+  const activeWorkspace = useStore(s => s.activeWorkspace)
   // Used to translate the raw model_type slug (e.g.
   // "ltx2_22B_distilled_1_1") in the per-clip metadata bar into the
   // human-readable display name (e.g. "LTX-2.3 Distilled 1.1 22B")
@@ -196,6 +195,7 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
   const [meta, setMeta] = useState<OutputMetadata | null>(null)
   const [metaLoaded, setMetaLoaded] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
+  const [deleting, setDeleting] = useState(false)
   const [confirmCleanup, setConfirmCleanup] = useState(false)
   const [cleaningComponents, setCleaningComponents] = useState(false)
   const [cleanupError, setCleanupError] = useState('')
@@ -206,7 +206,8 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
     saveRecipeEpochRef.current += 1
     setShowSaveRecipe(false)
   }, [])
-  const confirmRef = useRef(false)
+  const confirmRef = useRef<{ name: string; workspace?: string; revision?: string; accountEpoch: number } | null>(null)
+  const deletingRef = useRef(false)
   const timeoutRef = useRef<ReturnType<typeof setTimeout>>(undefined)
   const [copied, setCopied] = useState(false)
   const [rejoining, setRejoining] = useState(false)
@@ -264,6 +265,11 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
   useEffect(() => () => {
     clearTimeout(timeoutRef.current)
   }, [])
+  useEffect(() => {
+    clearTimeout(timeoutRef.current)
+    confirmRef.current = null
+    setConfirmDelete(false)
+  }, [file.name, file.workspace, file.revision, activeWorkspace, browsingUploads])
   useEffect(() => () => {
     inputRequest.current?.abort()
     if (sentToInputTimer.current !== null) clearTimeout(sentToInputTimer.current)
@@ -560,19 +566,27 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
   }
 
   const handleDelete = async () => {
-    if (!confirmRef.current) {
-      confirmRef.current = true
+    if (deletingRef.current) return
+    const accountEpoch = currentAccountIdentityEpoch()
+    const confirmed = confirmRef.current
+    if (!confirmed || confirmed.name !== file.name || confirmed.workspace !== file.workspace
+      || confirmed.revision !== file.revision || confirmed.accountEpoch !== accountEpoch) {
+      confirmRef.current = { name: file.name, workspace: file.workspace, revision: file.revision, accountEpoch }
       setConfirmDelete(true)
       clearTimeout(timeoutRef.current)
       timeoutRef.current = setTimeout(() => {
-        confirmRef.current = false
+        confirmRef.current = null
         setConfirmDelete(false)
       }, 3000)
       return
     }
     clearTimeout(timeoutRef.current)
-    confirmRef.current = false
+    confirmRef.current = null
     setConfirmDelete(false)
+    deletingRef.current = true
+    setDeleting(true)
+    const video = videoRef.current
+    const videoSource = video?.getAttribute('src')
     // Release video element src to unlock the file on Windows
     if (videoRef.current) {
       videoRef.current.pause()
@@ -583,7 +597,22 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
     // remaining lock itself. Delete immediately with the workspace captured
     // by this item so a workspace switch cannot redirect a delayed action to
     // a same-named output elsewhere.
-    await deleteOutput(file.name, file.workspace)
+    try {
+      await deleteOutput(file.name, file.workspace)
+    } finally {
+      deletingRef.current = false
+      setDeleting(false)
+      const state = useStore.getState()
+      if (video && videoRef.current === video && videoSource && !video.getAttribute('src')
+        && currentAccountIdentityEpoch() === accountEpoch
+        && state.activeWorkspace === activeWorkspace && state.browsingUploads === browsingUploads
+        && state.outputs.some(output => output.name === file.name && output.workspace === file.workspace
+          && output.revision === file.revision)) {
+        // An in-use rejection leaves the file available for preview and retry.
+        video.src = videoSource
+        video.load()
+      }
+    }
   }
 
   const handleComponentCleanup = async () => {
@@ -1338,9 +1367,9 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
             <Heart size={13} fill={file.favorite ? 'currentColor' : 'none'} />
           </button>
           )}
-          {!browsingUploads && (
           <button
             onClick={handleDelete}
+            disabled={deleting}
             type="button"
             aria-label={confirmDelete
               ? `Confirm permanent deletion of ${file.name}`
@@ -1351,19 +1380,18 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
                 : 'hover:bg-bg-hover text-text-secondary hover:text-red-400'
             }`}
             title={confirmDelete
-              ? file.linked_component_count > 0
+              ? !browsingUploads && file.linked_component_count > 0
                 ? `Click again to permanently delete this output and ${file.linked_component_count} related files`
                 : 'Click again to confirm delete'
-              : 'Delete output'}
+              : browsingUploads ? 'Delete upload' : 'Delete output'}
           >
             <Trash2 size={13} />
             {confirmDelete && (
               <span className="text-[11px] font-medium">
-                {file.linked_component_count > 0 ? `Delete + ${file.linked_component_count}?` : 'Delete?'}
+                {!browsingUploads && file.linked_component_count > 0 ? `Delete + ${file.linked_component_count}?` : 'Delete?'}
               </span>
             )}
           </button>
-          )}
           {shareMessage && (
             <span
               className="w-full text-right text-[10px] leading-4 text-text-muted md:max-w-56 md:truncate"
