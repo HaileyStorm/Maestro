@@ -329,14 +329,29 @@ export function BlenderSceneTool({
     const operation = activeOperation.current
     if (!operation || !isOperationCurrent(operation)) return false
     const promptRevision = directorPromptRevision.current
-    const result = await api.finalizeBlenderScene({
-      workspace,
-      plan,
-      edit_prompt: requestedEdits,
-      reference_name: resolvedReferenceName,
-      recommended_video_prompt_type: controlMode,
-      private_output: privateOutput,
-    })
+    let result: api.BlenderDirectorFinal
+    try {
+      result = await api.finalizeBlenderScene({
+        workspace,
+        plan,
+        edit_prompt: requestedEdits,
+        reference_name: resolvedReferenceName,
+        recommended_video_prompt_type: controlMode,
+        private_output: privateOutput,
+      })
+    } catch (error) {
+      if (isOperationCurrent(operation) && promptRevision !== directorPromptRevision.current
+        && error instanceof api.BlenderReviewError) {
+        throw new api.CompositionSubmissionError('The description or guidance changed during review. Review the current scene again.')
+      }
+      if (isOperationCurrent(operation) && promptRevision === directorPromptRevision.current
+        && error instanceof api.BlenderReviewError && error.failedPlan?.workspace === operation.workspace) {
+        setDirectorPlan(error.failedPlan)
+        setDirectorFinal(null)
+        setKeptResult(null)
+      }
+      throw error
+    }
     if (!isOperationCurrent(operation)) return false
     if (promptRevision === directorPromptRevision.current) setDirectorPlan(result.final_plan)
     setDirectorFinal(result)
@@ -465,6 +480,7 @@ export function BlenderSceneTool({
   })
 
   const updateSemanticLegend = (index: number, field: 'subject' | 'action', value: string) => {
+    directorPromptRevision.current += 1
     setDirectorPlan(current => current ? {
       ...current,
       semantic_mapping: {
@@ -477,6 +493,7 @@ export function BlenderSceneTool({
   }
 
   const updateConditionedPrompt = (value: string) => {
+    directorPromptRevision.current += 1
     setDirectorPlan(current => current ? {
       ...current,
       semantic_mapping: { ...current.semantic_mapping, conditioned_prompt: value },
@@ -489,7 +506,7 @@ export function BlenderSceneTool({
         <div className="flex items-center gap-1.5 text-[11px] uppercase tracking-wider text-text-muted"><Box size={12} /> Blender Motion Video</div>
         <span className={`text-[9px] ${ready ? 'text-accent-green' : 'text-amber-400'}`}>{installed == null ? 'checking' : ready ? 'ready' : installed ? 'not connected' : 'setup needed'}</span>
       </div>
-      <p className="text-[9px] leading-relaxed text-text-muted">Build a scene, preview its motion and camera work, then keep the full video with your project. Blender runs on the Maestro computer, and previews stay in the selected project.</p>
+      <p className="text-[9px] leading-relaxed text-text-muted">Build a scene, preview its motion, then keep the full video with your project. Blender runs on the Maestro computer, and previews stay in the selected project.</p>
       <p className="rounded border border-border/70 bg-bg-secondary/40 px-2 py-1 text-[8px] leading-relaxed text-text-muted">
         Saved as <span className="text-text-secondary">{resolvedReferenceName}</span> · {privateOutput ? 'preview starts blurred' : 'preview shown normally'}.
         {referenceDescription?.trim() ? ' Your Reference description stays with the original reference, while this Blender scene keeps its own description.' : ' Your Reference description stays with the original reference.'}
@@ -503,13 +520,23 @@ export function BlenderSceneTool({
       )}
       <div className="rounded-lg border border-accent-blue/20 bg-accent-blue/5 p-2">
         <label className="text-[9px] uppercase tracking-wide text-text-muted">Director scene plan</label>
-        <textarea value={directorPrompt} onChange={event => { directorPromptRevision.current += 1; setDirectorPrompt(event.target.value); setDirectorPlan(null) }} rows={compact ? 2 : 3} placeholder="Describe the scene, subjects, props, movement, and camera layout…" className="mt-1 w-full resize-y rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px]" />
+        <textarea value={directorPrompt} onChange={event => { directorPromptRevision.current += 1; setDirectorPrompt(event.target.value); setDirectorPlan(null) }} rows={compact ? 2 : 3} placeholder="Describe the scene, subjects, props, and movement…" className="mt-1 w-full resize-y rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px]" />
         <button disabled={!ready || !!busy || !directorPrompt.trim()} onClick={runDirector} className="mt-1.5 w-full rounded bg-accent-blue px-2 py-1.5 text-[10px] text-white disabled:opacity-40">Plan, review, and render</button>
         <button disabled={!ready || !!busy || submittingComposition || !canRenderRepeats || !directorPrompt.trim()} onClick={planOnly} className="mt-1.5 w-full rounded border border-accent-blue/40 px-2 py-1.5 text-[10px] text-accent-blue disabled:opacity-40">Plan scene only</button>
+        <p className="mt-1.5 text-[9px] leading-relaxed text-text-muted">Fresh scenes use a fixed camera. Adjust object positions, scale and movement to keep them in view.</p>
         <p className="mt-1.5 text-[9px] leading-relaxed text-text-muted">Director checks 2–8 moments from the animation together, can revise the scene up to three times, then renders the smooth full video for you.</p>
         {directorPlan && (
           <div className="mt-1.5 text-[9px] leading-relaxed text-text-muted">
-            <p>Scene planned · {directorPlan.review_frames.length} moments selected for review</p>
+            <p>{directorPlan.review_status === 'needs_changes' ? 'Review needs changes' : 'Scene planned'} · {directorPlan.review_frames.length} moments selected for review</p>
+            {directorPlan.review_status === 'needs_changes' && <p className="mt-1">This is the last scene Director rendered for review. It has not been approved. Adjust the guidance below or review it again.</p>}
+            {directorPlan.review_status === 'needs_changes' && <label className="mt-1 block">Changes for the next review
+              <textarea value={editPrompt} onChange={event => { directorPromptRevision.current += 1; setEditPrompt(event.target.value) }} rows={2} placeholder="Adjust the retained scene…" className="mt-1 w-full resize-y rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px]" />
+            </label>}
+            <button disabled={!ready || !!busy || submittingComposition || !canRenderRepeats} onClick={() => void run('Director visual review', async () => {
+              setDirectorFinal(null)
+              setKeptResult(null)
+              await finalizePlan(directorPlan, editPrompt.trim())
+            })} className="mt-1.5 w-full min-h-9 rounded border border-border px-2 py-1.5 text-[10px] disabled:opacity-40">Review retained scene</button>
             <button disabled={!ready || !!busy || submittingComposition || !canRenderRepeats || !plannedRepeatsValid} onClick={() => void renderRepeats(true)} className="mt-1.5 w-full min-h-9 rounded border border-accent-blue/40 px-2 py-1.5 text-[10px] text-accent-blue disabled:opacity-40">Queue planned repeats</button>
             <p className="mt-1">Queues this planned scene and motion {repeatCount} times at 720p with silent audio: {plannedFrames} frames at {directorPlan.fps} FPS per repeat. Manual controls below do not change it. Its preview {repeatPrivateOutput ? 'starts blurred' : 'is shown normally'}. This skips visual review. Follow Queue, then open the finished video from Gallery in Editor.</p>
             {!plannedRepeatsValid && <p className="mt-1 text-amber-400">The planned sequence needs 2–7200 frames, a whole-number FPS from 1–120 and 2–8 repeats in the current project.</p>}
@@ -597,7 +624,7 @@ export function BlenderSceneTool({
           {canEditProject && keptResult?.result === directorFinal && keptResult.accountEpoch === currentAccountIdentityEpoch() && (
             <button disabled={!!busy} onClick={() => void editFinalVideo()} className="min-h-11 w-full rounded border border-accent-blue/40 px-2 py-1.5 text-[10px] text-accent-blue disabled:opacity-40 md:min-h-0">Edit this video</button>
           )}
-          <textarea value={editPrompt} onChange={event => setEditPrompt(event.target.value)} rows={2} placeholder="Describe what Director should change, then it will review and render a new video…" className="w-full resize-y rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px]" />
+          <textarea value={editPrompt} onChange={event => { directorPromptRevision.current += 1; setEditPrompt(event.target.value) }} rows={2} placeholder="Describe what Director should change, then it will review and render a new video…" className="w-full resize-y rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px]" />
           <button disabled={!ready || !!busy || !editPrompt.trim()} onClick={requestEdits} className="flex w-full items-center justify-center gap-1 rounded border border-accent-blue/40 px-2 py-1.5 text-[10px] text-accent-blue disabled:opacity-40"><RotateCcw size={10} />Make changes and review again</button>
         </div>
       )}

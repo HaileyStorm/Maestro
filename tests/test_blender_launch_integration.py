@@ -233,6 +233,9 @@ class BlenderDirectorVisionTests(unittest.TestCase):
             result = self.exercise(Path(temporary))
         observed = self.observations
         self.assertEqual(result["status"], "awaiting_user_review")
+        self.assertEqual(result["final_plan"]["review_status"], "approved")
+        self.assertEqual(result["final_plan"]["frame_count"], 24)
+        self.assertEqual(result["final_plan"]["duration_seconds"], 1.0)
         self.assertEqual([item["verdict"] for item in result["director_reviews"]], ["revise", "approved"])
         self.assertEqual(observed.resolves, 1)
         self.assertEqual(len(observed.leases), 3)
@@ -297,10 +300,28 @@ class BlenderDirectorVisionTests(unittest.TestCase):
     def test_nonapproval_returns_feedback_without_a_candidate_or_review_files(self):
         with tempfile.TemporaryDirectory() as temporary:
             with self.assertRaises(HTTPException) as failure:
-                self.exercise(Path(temporary), approve=False)
+                def different_proposal(revision):
+                    revision["animation"]["objects"][0]["keyframes"][1]["location"] = [
+                        3 if self.observations.generated == 1 else 99, 0, 0,
+                    ]
+                    if self.observations.generated == 1:
+                        revision["animation"].update(frame_start=8, frame_end=55)
+                        revision["animation"]["objects"][0]["keyframes"][0]["frame"] = 8
+                        revision["animation"]["objects"][0]["keyframes"][1]["frame"] = 55
+                        revision["review_frames"] = [8, 55]
+                self.exercise(Path(temporary), approve=False, revision_mutator=different_proposal)
             self.assertEqual(list(Path(temporary).iterdir()), [])
         self.assertEqual(failure.exception.status_code, 409)
-        self.assertEqual(failure.exception.detail, {
+        detail = dict(failure.exception.detail)
+        applied = detail.pop("failed_plan")
+        self.assertEqual(applied["review_status"], "needs_changes")
+        self.assertEqual(applied["workspace"], "protected-project")
+        self.assertEqual(applied["animation"]["objects"][0]["keyframes"][1]["location"], [3.0, 0.0, 0.0])
+        self.assertEqual(applied["frame_count"], 48)
+        self.assertEqual(applied["duration_seconds"], 2.0)
+        self.assertEqual(applied["fps"], 24)
+        self.assertEqual(applied["review_frames"], [8, 55])
+        self.assertEqual(detail, {
             "code": "blender_review_not_approved",
             "message": "Director could not approve this animation. Adjust the scene or request, then review again.",
             "review_count": 2, "feedback": "Move farther",

@@ -195,6 +195,12 @@ keyframe, using the plan's frame range and FPS even if manual controls change.
 This skips visual review; use **Plan, review, and render** when you want Director
 approval before keeping a motion guide.
 
+If Director needs changes, Maestro retains the last scene it actually rendered
+for review, including any applied revisions. Adjust the visible guidance and
+choose **Review retained scene** to review that exact plan again. A rejected
+review creates no Keep or Editor candidate. Fresh scenes use a fixed camera;
+adjust object positions, scale and movement to keep the action in view.
+
 The project-scoped [Blender and Editor composition API](docs/composition-api.md)
 can render typed animation segments and reuse them in a single MP4. Its first
 format supports silent audio, one or two Blender segments, and up to eight

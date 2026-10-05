@@ -35205,6 +35205,25 @@ async def blender_director_finalize(request: Request):
                             "message": "Director could not approve this animation. Adjust the scene or request, then review again.",
                             "review_count": len(reviews),
                             "feedback": reviews[-1]["analysis"] if reviews else "",
+                            # Only the normalized state already applied/rendered is
+                            # executable recovery state. The final proposal was not
+                            # applied when the attempt limit was reached.
+                            "failed_plan": {
+                                "workspace": workspace,
+                                "director_prompt": str(plan.get("director_prompt") or ""),
+                                "scene": scene,
+                                "animation": animation,
+                                "semantic_mapping": semantic_mapping,
+                                "review_frames": review_frames,
+                                "fps": fps,
+                                "frame_count": frame_end - frame_start + 1,
+                                "duration_seconds": (frame_end - frame_start + 1) / fps,
+                                "llm_model": director_model,
+                                "notes": "",
+                                "confirmation_required": True,
+                                "review_strategy": "",
+                                "review_status": "needs_changes",
+                            },
                         },
                     )
 
@@ -35332,6 +35351,9 @@ async def blender_director_finalize(request: Request):
                 "semantic_mapping": semantic_mapping,
                 "final_plan": {
                     **plan,
+                    "review_status": "approved",
+                    "frame_count": frame_end - frame_start + 1,
+                    "duration_seconds": (frame_end - frame_start + 1) / fps,
                     "scene": scene,
                     "animation": animation,
                     "semantic_mapping": semantic_mapping,

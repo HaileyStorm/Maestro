@@ -5271,11 +5271,13 @@ export interface BlenderSemanticMapping {
 
 export class BlenderReviewError extends Error {
   readonly feedback: string
+  readonly failedPlan: BlenderDirectorPlan | null
 
-  constructor(feedback: string) {
+  constructor(feedback: string, failedPlan: BlenderDirectorPlan | null = null) {
     super('Director could not approve this animation. Adjust the scene or request, then review again.')
     this.name = 'BlenderReviewError'
     this.feedback = feedback.slice(0, 4000).trim()
+    this.failedPlan = failedPlan
   }
 }
 
@@ -5287,7 +5289,16 @@ async function blenderRequest<T>(path: string, body: Record<string, unknown>): P
     const err = await res.json().catch(() => ({ detail: 'Blender operation failed' }))
     if (path === 'director-finalize' && res.status === 409
       && err.detail?.code === 'blender_review_not_approved') {
-      throw new BlenderReviewError(typeof err.detail.feedback === 'string' ? err.detail.feedback : '')
+      const plan = err.detail.failed_plan
+      const failedPlan = plan?.review_status === 'needs_changes'
+        && typeof plan.workspace === 'string' && typeof plan.director_prompt === 'string'
+        && Array.isArray(plan.scene?.objects) && Array.isArray(plan.animation?.objects)
+        && Number.isInteger(plan.animation.frame_start) && Number.isInteger(plan.animation.frame_end)
+        && Number.isInteger(plan.fps) && plan.fps >= 1 && plan.fps <= 240
+        && Array.isArray(plan.review_frames) && Array.isArray(plan.semantic_mapping?.legend)
+        && typeof plan.semantic_mapping.conditioned_prompt === 'string'
+        ? plan as BlenderDirectorPlan : null
+      throw new BlenderReviewError(typeof err.detail.feedback === 'string' ? err.detail.feedback : '', failedPlan)
     }
     throw new Error(err.detail || 'Blender operation failed')
   }
@@ -5363,6 +5374,7 @@ export async function fetchBlenderStatus(workspace: string): Promise<BlenderStat
 
 export const createBlenderScene = (body: Record<string, unknown>) => blenderRequest<Record<string, unknown>>('scene', body)
 export interface BlenderDirectorPlan {
+  review_status?: 'needs_changes' | 'approved'
   workspace: string
   director_prompt: string
   scene: BlenderCompositionPackage['segments'][number]['scene']

@@ -23,6 +23,7 @@ async function setup(page: Page, nonapproval = false, manualOnly = false, permis
     contentType: 'font/ttf',
   }))
   const editorRequests: unknown[] = []
+  const finalizeRequests: Record<string, unknown>[] = []
   let pending: Route | undefined
   const json = (route: Route, value: unknown) => route.fulfill({ contentType: 'application/json', body: JSON.stringify(value) })
   await page.route('**/api/v1/blender/status*', route => json(route, {
@@ -30,11 +31,12 @@ async function setup(page: Page, nonapproval = false, manualOnly = false, permis
     bridge_ready: true, workspace: video.workspace, max_total_frames: 7200,
   }))
   await page.route('**/api/v1/blender/director-finalize', route => {
+    const body = route.request().postDataJSON()
+    finalizeRequests.push(body)
     if (nonapproval) return route.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({
       detail: { code: 'blender_review_not_approved', review_count: 3,
-        feedback: 'The cube is outside the camera view. Move it toward the center.' },
+        feedback: 'The cube is outside the camera view. Move it toward the center.', failed_plan: failedScene(body.plan) },
     }) })
-    const body = route.request().postDataJSON()
     return json(route, { workspace: body.workspace, asset_id: 'asset', variant_id: 'variant',
       video: { filename: video.name, url: video.url }, director_reviews: [], final_plan: body.plan })
   })
@@ -80,7 +82,7 @@ async function setup(page: Page, nonapproval = false, manualOnly = false, permis
     await expect(edit).toBeEnabled()
   }
   return {
-    api, edit, keep, editorRequests,
+    api, edit, keep, editorRequests, finalizeRequests,
     resolve: async (outputs: unknown[]) => {
       await expect.poll(() => Boolean(pending)).toBe(true)
       const current = pending!
@@ -96,7 +98,23 @@ test('Director nonapproval shows actionable feedback without Keep or Editor cont
   await expect(page.getByRole('button', { name: 'Review and render', exact: true })).toBeEnabled()
   await expect(fixture.keep).toHaveCount(0)
   await expect(fixture.edit).toHaveCount(0)
+  await expect(page.getByText('Review needs changes · 2 moments selected for review', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: 'Review retained scene', exact: true }).click()
+  await expect.poll(() => fixture.finalizeRequests.length).toBe(2)
+  expect(fixture.finalizeRequests[1].plan).toEqual(failedScene((fixture.finalizeRequests[0] as {plan: object}).plan))
+  await expect(fixture.keep).toHaveCount(0)
   expect(fixture.editorRequests).toEqual([])
+  await page.route('**/api/v1/blender/director-finalize', route => {
+    const body = route.request().postDataJSON()
+    return route.fulfill({ contentType: 'application/json', body: JSON.stringify({
+      workspace: body.workspace, asset_id: 'asset', variant_id: 'variant',
+      video: { filename: video.name, url: video.url }, director_reviews: [],
+      final_plan: { ...body.plan, review_status: 'approved' },
+    }) })
+  })
+  await page.getByRole('button', { name: 'Review retained scene', exact: true }).click()
+  await expect(fixture.keep).toBeEnabled()
+  await expect(page.getByText('Review needs changes · 2 moments selected for review', { exact: true })).toHaveCount(0)
   await fixture.api.assertClean()
 })
 
@@ -249,7 +267,7 @@ const plannedScene = {
 
 async function planOnly(page: Page, value: unknown = plannedScene) {
   await page.route('**/api/v1/blender/director-plan', route => route.fulfill({ contentType: 'application/json', body: JSON.stringify(value) }))
-  await page.getByPlaceholder('Describe the scene, subjects, props, movement, and camera layout…').filter({ visible: true }).fill('Two shapes move together')
+  await page.getByPlaceholder('Describe the scene, subjects, props, and movement…').filter({ visible: true }).fill('Two shapes move together')
   await page.getByRole('button', { name: 'Plan scene only', exact: true }).click()
   await expect(page.getByRole('button', { name: 'Queue planned repeats', exact: true })).toBeVisible()
 }
@@ -292,7 +310,7 @@ test('Director planned repeats reject unsupported plan clocks and missing genera
   await expect(page.getByText('The planned sequence needs 2–7200 frames, a whole-number FPS from 1–120 and 2–8 repeats in the current project.', { exact: true })).toBeVisible()
   await fixture.api.assertClean()
   fixture = await setup(page, false, true, ['project.open', 'project.read', 'project.mutate'])
-  await page.getByPlaceholder('Describe the scene, subjects, props, movement, and camera layout…').filter({ visible: true }).fill('Two shapes move together')
+  await page.getByPlaceholder('Describe the scene, subjects, props, and movement…').filter({ visible: true }).fill('Two shapes move together')
   await expect(page.getByRole('button', { name: 'Plan scene only', exact: true })).toBeDisabled()
   await fixture.api.assertClean()
 })
@@ -301,7 +319,7 @@ test('Director planning cannot restore a plan after its description changes', as
   const fixture = await setup(page, false, true)
   let pending: Route | undefined
   await page.route('**/api/v1/blender/director-plan', route => { pending = route })
-  const prompt = page.getByPlaceholder('Describe the scene, subjects, props, movement, and camera layout…').filter({ visible: true })
+  const prompt = page.getByPlaceholder('Describe the scene, subjects, props, and movement…').filter({ visible: true })
   await prompt.fill('Original description')
   await page.getByRole('button', { name: 'Plan scene only', exact: true }).click()
   await expect.poll(() => Boolean(pending)).toBe(true)
@@ -356,7 +374,7 @@ test('A delayed visual finalization keeps its video without restoring a plan for
   await page.route('**/api/v1/blender/director-plan', route => route.fulfill({ contentType: 'application/json', body: JSON.stringify(plannedScene) }))
   let pending: Route | undefined
   await page.route('**/api/v1/blender/director-finalize', route => { pending = route })
-  const prompt = page.getByPlaceholder('Describe the scene, subjects, props, movement, and camera layout…').filter({ visible: true })
+  const prompt = page.getByPlaceholder('Describe the scene, subjects, props, and movement…').filter({ visible: true })
   await prompt.fill('Original scene description')
   await page.getByRole('button', { name: 'Plan, review, and render', exact: true }).click()
   await expect.poll(() => Boolean(pending)).toBe(true)
@@ -368,5 +386,68 @@ test('A delayed visual finalization keeps its video without restoring a plan for
   await expect(fixture.keep).toBeEnabled()
   await expect(page.getByRole('button', { name: 'Queue planned repeats', exact: true })).toHaveCount(0)
   await expect(prompt).toHaveValue('New scene description')
+  await fixture.api.assertClean()
+})
+
+function failedScene(plan: object) {
+  const original = plan as typeof plannedScene
+  return { ...original, review_status: 'needs_changes',
+    animation: { ...original.animation, frame_start: 10, frame_end: 57,
+      objects: [{ name: original.scene.objects[0].name, keyframes: [
+        { frame: 10, location: [0, 0, 0], interpolation: 'LINEAR' },
+        { frame: 57, location: [0.5, 0, 0], interpolation: 'LINEAR' },
+      ] }] }, review_frames: [10, 57], fps: 24, frame_count: 48, duration_seconds: 2,
+  }
+}
+
+for (const transition of ['description', 'project'] as const) {
+  test(`A rejected retained scene cannot return after changing ${transition}`, async ({ page }) => {
+    const fixture = await setup(page, false, true, undefined, [video.workspace, 'Other project'])
+    await page.route('**/api/v1/workspaces/active', route => route.fulfill({ contentType: 'application/json', body: '{}' }))
+    await planOnly(page)
+    let pending: Route | undefined
+    await page.route('**/api/v1/blender/director-finalize', route => { pending = route })
+    await page.getByRole('button', { name: 'Review retained scene', exact: true }).click()
+    await expect.poll(() => Boolean(pending)).toBe(true)
+    if (transition === 'description') {
+      await page.getByPlaceholder('Describe the scene, subjects, props, and movement…').filter({ visible: true }).fill('Replacement description')
+    } else {
+      const closeMenu = page.getByRole('dialog', { name: 'Generate, Director, and References menu', exact: true }).getByRole('button', { name: 'Close creative workspace menu', exact: true })
+      if (await closeMenu.isVisible()) await closeMenu.click()
+      await page.getByRole('button', { name: /Current project: .*Open project selector/ }).click()
+      await page.getByRole('dialog', { name: 'Projects', exact: true }).getByRole('button', { name: 'Other project', exact: true }).click()
+    }
+    await pending!.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({
+      detail: { code: 'blender_review_not_approved', feedback: 'Old scene feedback', failed_plan: failedScene(plannedScene) },
+    }) })
+    await expect(page.getByRole('button', { name: 'Queue planned repeats', exact: true })).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Review retained scene', exact: true })).toHaveCount(0)
+    await expect(fixture.keep).toHaveCount(0)
+    await expect(page.getByText('Old scene feedback', { exact: false })).toHaveCount(0)
+    await fixture.api.assertClean()
+  })
+}
+
+test('A failed edit review keeps its instruction visible and editable for recovery', async ({ page }) => {
+  const fixture = await setup(page)
+  const requests: Record<string, unknown>[] = []
+  await page.route('**/api/v1/blender/director-finalize', route => {
+    const body = route.request().postDataJSON()
+    requests.push(body)
+    return route.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({
+      detail: { code: 'blender_review_not_approved', feedback: 'Change the framing', failed_plan: failedScene(body.plan) },
+    }) })
+  })
+  await page.getByPlaceholder('Describe what Director should change, then it will review and render a new video…').fill('Move closer to the center')
+  await page.getByRole('button', { name: 'Make changes and review again', exact: true }).click()
+  const retainedEdit = page.getByPlaceholder('Adjust the retained scene…')
+  await expect(retainedEdit).toHaveValue('Move closer to the center')
+  await expect(fixture.keep).toHaveCount(0)
+  await expect(fixture.edit).toHaveCount(0)
+  await retainedEdit.fill('Use a smaller cube')
+  await page.getByRole('button', { name: 'Review retained scene', exact: true }).click()
+  await expect.poll(() => requests.length).toBe(2)
+  expect(requests[1].edit_prompt).toBe('Use a smaller cube')
+  await expect(retainedEdit).toHaveValue('Use a smaller cube')
   await fixture.api.assertClean()
 })
