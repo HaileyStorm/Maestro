@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -43,6 +44,7 @@ from app.services.blender_mcp_service import (
     quarantine_invalid_mcp_checkout,
     read_blender_runtime_info,
     reuse_compatible_mcp_checkout,
+    _scene_create_code,
 )
 from app.services.blender_mcp_transport import StdioBlenderMCPClient
 
@@ -532,6 +534,79 @@ class TestBlenderMCPService(unittest.TestCase):
         self.assertIn('light_data.energy = 1200.0', setup_code)
         self.assertIn('scene.camera = cameras[0]', setup_code)
         self.assertNotIn("open(", setup_code)
+
+    def test_scene_material_color_reaches_connected_shader_and_reused_material(self):
+        class Nodes(list):
+            def new(self, *, type):
+                if type == "ShaderNodeBsdfPrincipled":
+                    node = SimpleNamespace(
+                        inputs={name: SimpleNamespace(default_value=None)
+                                for name in ("Base Color", "Alpha")},
+                        outputs={"BSDF": object()},
+                    )
+                else:
+                    self.assert_type(type)
+                    node = SimpleNamespace(inputs={"Surface": object()})
+                self.append(node)
+                return node
+
+            @staticmethod
+            def assert_type(value):
+                if value != "ShaderNodeOutputMaterial":
+                    raise AssertionError(value)
+
+        class Links(list):
+            def new(self, source, destination):
+                self.append((source, destination))
+
+        for version in ((4, 2, 0), (5, 1, 2)):
+            with self.subTest(version=version):
+                materials = {}
+                objects = {}
+                context = SimpleNamespace(active_object=None)
+
+                def create_object(**kwargs):
+                    obj = SimpleNamespace(name="Cube", data=SimpleNamespace(materials=[]))
+                    context.active_object = obj
+
+                def new_material(name):
+                    material = SimpleNamespace(
+                        use_nodes=version >= (5, 0, 0),
+                        node_tree=SimpleNamespace(nodes=Nodes(), links=Links()),
+                    )
+                    materials[name] = material
+                    return material
+
+                bpy = SimpleNamespace(
+                    app=SimpleNamespace(version=version), context=context,
+                    data=SimpleNamespace(objects=objects, materials=SimpleNamespace(
+                        get=materials.get, new=new_material)),
+                    ops=SimpleNamespace(
+                        object=SimpleNamespace(select_all=lambda **kw: None,
+                                               delete=lambda **kw: objects.clear()),
+                        mesh=SimpleNamespace(**{f"primitive_{name}_add": create_object
+                                                for name in ("cube", "uv_sphere", "cylinder",
+                                                             "cone", "torus", "plane")}),
+                    ),
+                )
+                scene = _scene()
+                with mock.patch.dict(sys.modules, {"bpy": bpy}):
+                    exec(_scene_create_code(scene), {})
+                    material = materials["HeroBlue"]
+                    first_shader = material.node_tree.nodes[0]
+                    revised_color = [0.8, 0.1, 0.2, 0.4]
+                    scene["objects"][0]["material"]["color"] = revised_color
+                    exec(_scene_create_code(scene), {})
+                self.assertIs(materials["HeroBlue"], material)
+                self.assertEqual(material.diffuse_color, revised_color)
+                self.assertTrue(material.use_nodes)
+                shader, output = material.node_tree.nodes
+                self.assertIsNot(shader, first_shader)
+                self.assertEqual(shader.inputs["Base Color"].default_value, revised_color)
+                self.assertEqual(shader.inputs["Alpha"].default_value, revised_color[3])
+                self.assertEqual(material.node_tree.links[-1],
+                                 (shader.outputs["BSDF"], output.inputs["Surface"]))
+                self.assertEqual(context.active_object.data.materials, [material])
 
     def test_scene_create_validates_all_values_before_connecting(self):
         cases = []

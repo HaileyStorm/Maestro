@@ -1798,6 +1798,16 @@ for item in spec[\"objects\"]:
         if material is None:
             material = bpy.data.materials.new(material_spec[\"name\"])
         material.diffuse_color = material_spec[\"color\"]
+        # Blender 5 always renders node materials; diffuse_color is viewport-only.
+        if bpy.app.version < (5, 0, 0):
+            material.use_nodes = True
+        nodes = material.node_tree.nodes
+        nodes.clear()
+        shader = nodes.new(type=\"ShaderNodeBsdfPrincipled\")
+        shader.inputs[\"Base Color\"].default_value = material_spec[\"color\"]
+        shader.inputs[\"Alpha\"].default_value = material_spec[\"color\"][3]
+        output = nodes.new(type=\"ShaderNodeOutputMaterial\")
+        material.node_tree.links.new(shader.outputs[\"BSDF\"], output.inputs[\"Surface\"])
         obj.data.materials.clear()
         obj.data.materials.append(material)
     created.append(obj.name)
