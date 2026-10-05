@@ -66,6 +66,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import threading
 from typing import Callable, Optional
 
 import torch
@@ -347,6 +348,38 @@ def _remix_vocals_with_background(vocals_wav: str, background_wav: str, out_wav:
     return out_wav
 
 
+class _VoiceCloneCancelled(Exception):
+    pass
+
+
+class _VoiceCloneCancellationUnavailable(RuntimeError):
+    pass
+
+
+def _convert_seedvc_with_cancellation(converter, cancel_check, **kwargs):
+    if cancel_check is None:
+        return converter.convert_tensor(**kwargs)
+    app_vc = getattr(converter, "_app_vc", None)
+    model = getattr(app_vc, "model", None)
+    cfm = getattr(model, "cfm", None)
+    estimator = getattr(cfm, "estimator", None)
+    if not isinstance(estimator, torch.nn.Module):
+        raise _VoiceCloneCancellationUnavailable(
+            "SeedVC converter does not support diffusion-step cancellation")
+    owner_thread = threading.get_ident()
+
+    def before_step(_module, _args):
+        # SeedVC's app module can be shared with another converter/thread.
+        if threading.get_ident() == owner_thread and cancel_check():
+            raise _VoiceCloneCancelled()
+
+    handle = estimator.register_forward_pre_hook(before_step)
+    try:
+        return converter.convert_tensor(**kwargs)
+    finally:
+        handle.remove()
+
+
 def apply_voice_clone_to_file(
     video_path: str,
     voice_ref_paths: list[str],
@@ -369,8 +402,8 @@ def apply_voice_clone_to_file(
         cfg_rate: SeedVC CFG rate (default 0.5).
         strict_in_place: Require replacement of this exact file; never create a sibling.
         cancel_check: Optional job cancellation probe. A cancelled job stops
-            before the next stage; an active SeedVC inference call must return
-            before its result can be discarded.
+            before the next stage or SeedVC diffusion estimator step. A running
+            estimator call completes before cancellation can be observed.
 
     Returns:
         True if the video's audio was replaced. False if the video had
@@ -508,15 +541,19 @@ def apply_voice_clone_to_file(
         out_wav = os.path.join(tmpdir, "converted.wav")
         if mode == "single":
             print(f"[VoiceClone] Single-voice mode: converting entire audio with ref={os.path.basename(voice_ref_paths[0])}")
-            converted = converter.convert_tensor(
-                source_audio=source_audio,
-                source_rate=source_sr,
-                reference_audio=refs[0][0],
-                reference_rate=refs[0][1],
-                output_rate=source_sr,
-                diffusion_steps=diffusion_steps,
-                cfg_rate=cfg_rate,
-            )
+            try:
+                converted = _convert_seedvc_with_cancellation(
+                    converter, cancel_check,
+                    source_audio=source_audio,
+                    source_rate=source_sr,
+                    reference_audio=refs[0][0],
+                    reference_rate=refs[0][1],
+                    output_rate=source_sr,
+                    diffusion_steps=diffusion_steps,
+                    cfg_rate=cfg_rate,
+                )
+            except _VoiceCloneCancelled:
+                return False
             if cancel_check is not None and cancel_check():
                 return False
             # Keep SeedVC's channel layout here. The remix centers the converted
@@ -533,11 +570,15 @@ def apply_voice_clone_to_file(
                 return False
             if not segments:
                 print(f"[VoiceClone] No diarized segments — falling back to single-voice with ref[0]")
-                converted = converter.convert_tensor(
-                    source_audio=source_audio, source_rate=source_sr,
-                    reference_audio=refs[0][0], reference_rate=refs[0][1],
-                    output_rate=source_sr, diffusion_steps=diffusion_steps, cfg_rate=cfg_rate,
-                )
+                try:
+                    converted = _convert_seedvc_with_cancellation(
+                        converter, cancel_check,
+                        source_audio=source_audio, source_rate=source_sr,
+                        reference_audio=refs[0][0], reference_rate=refs[0][1],
+                        output_rate=source_sr, diffusion_steps=diffusion_steps, cfg_rate=cfg_rate,
+                    )
+                except _VoiceCloneCancelled:
+                    return False
                 if cancel_check is not None and cancel_check():
                     return False
                 torchaudio.save(out_wav, converted.cpu().float(), source_sr)
@@ -577,12 +618,17 @@ def apply_voice_clone_to_file(
                     print(f"[VoiceClone] Segment {seg_idx+1}/{len(segments)}: "
                           f"{start_sec:.2f}-{end_sec:.2f}s speaker={spk} → ref[{ref_idx}]")
                     try:
-                        seg_converted = converter.convert_tensor(
+                        seg_converted = _convert_seedvc_with_cancellation(
+                            converter, cancel_check,
                             source_audio=seg_audio, source_rate=source_sr,
                             reference_audio=refs[ref_idx][0], reference_rate=refs[ref_idx][1],
                             output_rate=source_sr,
                             diffusion_steps=diffusion_steps, cfg_rate=cfg_rate,
                         )
+                    except _VoiceCloneCancelled:
+                        return False
+                    except _VoiceCloneCancellationUnavailable:
+                        raise
                     except Exception as e:
                         print(f"[VoiceClone]   conversion failed (keeping original): {e}")
                         skipped_count += 1
