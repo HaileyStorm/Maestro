@@ -5,6 +5,12 @@ import sys
 import tempfile
 import unittest
 import types
+import json
+import threading
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from unittest import mock
+import services.queue_recovery_adapter as recovery_adapter
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,6 +48,135 @@ def _serialize(job):
 
 
 class LogicalReferenceRecoveryTests(unittest.TestCase):
+    def _studio_scope(self):
+        return {"scope_digest": "a" * 64, "owner_digest": OWNER,
+                "project_digest": PROJECT, "workspace": "project-a", "request_digest": "b" * 64}
+
+    def _accept_studio(self, coordinator, request_id, job_id, *, held=False):
+        job = {"id": job_id, "workspace": "project-a", "status": "queued", "queue_held": held,
+               "kind": "studio_generation", "params": {"prompt": "PRIVATE CONTENT", "image_start": "/private/input"}}
+        coordinator.register_job(job, owner_digest=OWNER, project_digest=PROJECT,
+            request_manifest={"path": ".maestro-recovery/" + job_id + ".request.json", "sha256": "f" * 64, "size": 10, "schema": 1},
+            global_state={"paused": True}, generation_request_id=request_id)
+        return job
+
+    def test_studio_concurrent_reservation_admits_once_and_replays_after_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = QueueRecoveryJournal(Path(directory) / "queue.jsonl")
+            coordinator = QueueRecoveryCoordinator(journal)
+            request_id, job_id = str(uuid.uuid4()), uuid.uuid4().hex
+            barrier = threading.Barrier(4)
+            def attempt():
+                barrier.wait()
+                return coordinator.reserve_studio_submission(request_id, job_id=job_id, **self._studio_scope())
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                outcomes = list(pool.map(lambda _: attempt(), range(4)))
+            self.assertEqual(sum(fresh for fresh, _ in outcomes), 1)
+            self.assertEqual(len(journal.recover().jobs), 0)
+            self._accept_studio(coordinator, request_id, job_id, held=True)
+            fresh = QueueRecoveryCoordinator(journal)
+            record = fresh.lookup_studio_submission(request_id, **self._studio_scope())
+            self.assertTrue(record["accepted"])
+            self.assertEqual(record["job_id"], job_id)
+            self.assertTrue(record["snapshot"]["queue_held"])
+            self.assertTrue(journal.recover().global_state["paused"])
+            self.assertFalse(fresh.reserve_studio_submission(request_id, job_id=uuid.uuid4().hex, **self._studio_scope())[0])
+            raw = json.dumps(journal.recover().global_state)
+            self.assertNotIn("PRIVATE CONTENT", raw)
+            self.assertNotIn("/private/input", raw)
+            self.assertNotIn("PRIVATE CONTENT", (Path(directory) / "queue.jsonl").read_text())
+
+    def test_studio_changed_payload_and_scope_never_replace_reserved_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator = QueueRecoveryCoordinator(QueueRecoveryJournal(Path(directory) / "queue.jsonl"))
+            request_id, job_id = str(uuid.uuid4()), uuid.uuid4().hex
+            coordinator.reserve_studio_submission(request_id, job_id=job_id, **self._studio_scope())
+            for field, value, error in (("request_digest", "c" * 64, recovery_adapter.StudioSubmissionConflict),
+                                        ("scope_digest", "c" * 64, recovery_adapter.StudioSubmissionScopeError),
+                                        ("project_digest", project_instance_digest(SECRET, "b" * 32), recovery_adapter.StudioSubmissionScopeError),
+                                        ("owner_digest", owner_principal_digest(SECRET, "other-session"), recovery_adapter.StudioSubmissionScopeError)):
+                scope = dict(self._studio_scope(), **{field: value})
+                with self.subTest(field=field), self.assertRaises(error):
+                    coordinator.reserve_studio_submission(request_id, job_id=uuid.uuid4().hex, **scope)
+            self.assertEqual(coordinator.lookup_studio_submission(request_id, **self._studio_scope())["job_id"], job_id)
+
+    def test_studio_terminal_receipts_survive_controls_dismissal_and_compaction(self):
+        for status, retire in (("completed", "compact"), ("cancelled", "compact"), ("failed", "dismiss")):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                journal = QueueRecoveryJournal(Path(directory) / "queue.jsonl")
+                coordinator = QueueRecoveryCoordinator(journal)
+                request_id, job_id = str(uuid.uuid4()), uuid.uuid4().hex
+                coordinator.reserve_studio_submission(request_id, job_id=job_id, **self._studio_scope())
+                job = self._accept_studio(coordinator, request_id, job_id)
+                job["status"] = status
+                coordinator.prospective_transition(types.SimpleNamespace(jobs=(job,), tombstones=(), global_state=None))
+                coordinator.prospective_transition(types.SimpleNamespace(jobs=(), tombstones=(), global_state={"paused": False, "queue_order": []}))
+                if retire == "dismiss":
+                    coordinator.tombstone_terminal(job_id)
+                coordinator.compact()
+                fresh = QueueRecoveryCoordinator(journal)
+                fresh.restore()
+                record = fresh.lookup_studio_submission(request_id, **self._studio_scope())
+                self.assertTrue(record["accepted"])
+                self.assertEqual(record["status"], status)
+                self.assertIsNone(record["snapshot"])
+                self.assertFalse(fresh.reserve_studio_submission(request_id, job_id=uuid.uuid4().hex, **self._studio_scope())[0])
+                self.assertEqual(journal.recover().jobs, {})
+
+    def test_studio_ambiguous_reservation_and_registration_ack_reconcile_durable_authority(self):
+        for stage, failure in ((stage, failure) for stage in ("reservation", "registration") for failure in ("append_ack", "cache_ack")):
+            with self.subTest(stage=stage, failure=failure), tempfile.TemporaryDirectory() as directory:
+                journal = QueueRecoveryJournal(Path(directory) / "queue.jsonl")
+                coordinator = QueueRecoveryCoordinator(journal)
+                request_id, job_id = str(uuid.uuid4()), uuid.uuid4().hex
+                real_commit = journal.commit_state
+                def lost_ack(**kwargs):
+                    real_commit(**kwargs)
+                    raise OSError("injected post-fsync ACK loss")
+                if stage == "registration":
+                    coordinator.reserve_studio_submission(request_id, job_id=job_id, **self._studio_scope())
+                patcher = (mock.patch.object(journal, "commit_state", side_effect=lost_ack) if failure == "append_ack"
+                           else mock.patch.object(coordinator, "_accept_receipt", side_effect=OSError("injected cache ACK loss")))
+                with patcher, self.assertRaises(OSError):
+                    if stage == "reservation":
+                        coordinator.reserve_studio_submission(request_id, job_id=job_id, **self._studio_scope())
+                    else:
+                        self._accept_studio(coordinator, request_id, job_id)
+                record = coordinator.lookup_studio_submission(request_id, **self._studio_scope())
+                self.assertEqual(record["accepted"], stage == "registration")
+                self.assertEqual(record["job_id"], job_id)
+                self.assertFalse(coordinator.reserve_studio_submission(request_id, job_id=uuid.uuid4().hex, **self._studio_scope())[0])
+                self.assertEqual(len(journal.recover().jobs), int(stage == "registration"))
+
+    def test_studio_capacity_rejects_new_ids_without_eviction_or_journal_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = QueueRecoveryJournal(Path(directory) / "queue.jsonl")
+            coordinator = QueueRecoveryCoordinator(journal)
+            request_id = str(uuid.uuid4())
+            coordinator.reserve_studio_submission(request_id, job_id=uuid.uuid4().hex, **self._studio_scope())
+            before = (Path(directory) / "queue.jsonl").read_bytes()
+            for limits in ({"STUDIO_SUBMISSION_MAX_RECORDS": 1}, {"STUDIO_SUBMISSION_MAX_BYTES": len(json.dumps(journal.recover().global_state["studio_submissions"], sort_keys=True, separators=(",", ":")).encode()) + 1}):
+                with self.subTest(limits=limits), mock.patch.multiple(recovery_adapter, **limits):
+                    with self.assertRaisesRegex(recovery_adapter.StudioSubmissionCapacityError, "history is full"):
+                        coordinator.reserve_studio_submission(str(uuid.uuid4()), job_id=uuid.uuid4().hex, **self._studio_scope())
+                    self.assertIsNotNone(coordinator.lookup_studio_submission(request_id, **self._studio_scope()))
+                    self.assertEqual((Path(directory) / "queue.jsonl").read_bytes(), before)
+
+    def test_studio_corrupt_ledger_and_external_controls_replacement_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = QueueRecoveryJournal(Path(directory) / "queue.jsonl")
+            coordinator = QueueRecoveryCoordinator(journal)
+            request_id = str(uuid.uuid4())
+            coordinator.reserve_studio_submission(request_id, job_id=uuid.uuid4().hex, **self._studio_scope())
+            with self.assertRaisesRegex(QueueRecoveryAdapterError, "cannot be replaced"):
+                coordinator.prospective_transition(types.SimpleNamespace(jobs=(), tombstones=(), global_state={"studio_submissions": {"schema_version": 1, "records": {}}}))
+            state = journal.recover().global_state
+            state["studio_submissions"]["records"][request_id]["raw_prompt"] = "PRIVATE CONTENT"
+            journal.commit_state(global_state=state, expected_epoch=journal.recover().epoch, expected_global_revision=journal.recover().global_revision)
+            with self.assertRaises(QueueRecoveryAdapterError):
+                coordinator.reserve_studio_submission(str(uuid.uuid4()), job_id=uuid.uuid4().hex, **self._studio_scope())
+            self.assertEqual(len(journal.recover().global_state["studio_submissions"]["records"]), 1)
+
     def test_cancelled_tool_intent_survives_compaction_and_dismissal_until_settled(self):
         with tempfile.TemporaryDirectory() as directory:
             coordinator = QueueRecoveryCoordinator(QueueRecoveryJournal(Path(directory) / 'queue.jsonl'))

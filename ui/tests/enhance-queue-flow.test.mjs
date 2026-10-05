@@ -2204,14 +2204,16 @@ test('account identity changes fence deferred generation submission and active-j
   assert.notEqual(globalThis.localStorage.getItem('maestro:prompt-enhance-operations-v2'), null)
   const pendingSubmit = useStore.getState().startGeneration()
   await Promise.resolve()
-  assert.equal(useStore.getState().jobs.length, 1, 'submission placeholder should be visible before logout')
+  assert.equal(useStore.getState().studioSubmissions.length, 1, 'ordinary pending submission should be visible before logout')
+  assert.deepEqual(useStore.getState().jobs, [], 'pending ordinary submission is not an admitted job')
   await useStore.getState().logoutAccount()
   assert.equal(await pendingEnhance, false)
   assert.equal(globalThis.localStorage.getItem('maestro:prompt-enhance-operations-v2'), null)
   assert.equal(useStore.getState().isEnhancing, false)
   assert.equal(useStore.getState().enhanceRequestScope, null)
   assert.equal(useStore.getState().enhanceQueueCard, null)
-  assert.deepEqual(useStore.getState().jobs, [], 'logout synchronously scrubs the old placeholder')
+  assert.deepEqual(useStore.getState().jobs, [], 'logout synchronously scrubs old jobs')
+  assert.deepEqual(useStore.getState().studioSubmissions, [], 'logout synchronously scrubs the old frozen intent')
   const newerIdentityJob = {
     id: 'newer-identity-job', status: 'queued', progress: 0, step: 0, totalSteps: 0,
     phase: '', message: 'Queued...', outputFiles: [], error: null, oomInfo: null,
@@ -3049,4 +3051,509 @@ test('same-poller wakes coalesce behind one in-flight request and stop at termin
   await new Promise(resolve => setImmediate(resolve))
   assert.equal(requestCount, 2)
   assert.equal(timers.size, 0)
+})
+
+const studioSubmissionFixtureContexts = new WeakSet()
+
+async function studioSubmissionFixture(t, handler, outputHandler) {
+  const globals = Object.fromEntries(['fetch', 'window', 'document', 'localStorage', 'sessionStorage', 'CustomEvent'].map(key => [key, globalThis[key]]))
+  class Storage {
+    values = new Map()
+    getItem(key) { return this.values.get(key) ?? null }
+    setItem(key, value) { this.values.set(key, String(value)) }
+    removeItem(key) { this.values.delete(key) }
+  }
+  globalThis.window = Object.assign(new EventTarget(), {
+    setTimeout, clearTimeout, setInterval, clearInterval, alert() {},
+    location: { hostname: 'localhost' },
+  })
+  globalThis.document = Object.assign(new EventTarget(), { hidden: false })
+  globalThis.localStorage = new Storage()
+  globalThis.sessionStorage = new Storage()
+  globalThis.CustomEvent ??= class extends Event { constructor(name) { super(name) } }
+  const requests = []
+  const outputReads = []
+  globalThis.fetch = (input, init = {}) => {
+    const request = { url: String(input), ...init }
+    requests.push(request)
+    if (request.url.startsWith('/api/v1/outputs?')) {
+      outputReads.push(request)
+      return outputHandler ? outputHandler(request) : Promise.resolve(jsonResponse({ outputs: [], total: 0 }))
+    }
+    return handler(request, requests)
+  }
+  if (!studioSubmissionFixtureContexts.has(t)) {
+    studioSubmissionFixtureContexts.add(t)
+    t.after(() => { for (const [key, value] of Object.entries(globals)) globalThis[key] = value })
+  }
+  const { useStore } = await loadStoreModuleFresh()
+  const base = useStore.getState()
+  const polls = []
+  useStore.setState({
+    activeWorkspace: 'studio-a', generationMode: 'image', modelOptions: null,
+    modelOptionsLoading: false, h3StyleWorkflow: '', studioPromptEnhance: false,
+    startImage: null, endImage: null, imageRefs: [], clips: [], directorVoiceRef: null,
+    params: { ...base.params, model_type: 'test_image_model', prompt: 'original ordinary request', image_mode: 1 },
+    privateOutput: true, explicitOutput: true, jobs: [], isGenerating: false,
+    _pollRecoveredJob(id) { polls.push(id) }, reconnectDirectorPreparation: async () => {},
+  })
+  return { useStore, requests, polls, outputReads, actualPoll: base._pollRecoveredJob }
+}
+
+function studioAccepted(body, overrides = {}) {
+  const request = typeof body === 'string' ? JSON.parse(body) : body
+  const job = {
+    ...apiJobStatus('a1b2c3d4', request.workspace, null, 1),
+    status: 'queued', phase: 'registered', message: 'Queued', h3_segment_plan: null,
+    queue_held: request._queue_mode === 'held', ...overrides,
+  }
+  return { generation_request_id: request.generation_request_id, workspace: request.workspace,
+    admission_state: 'accepted', retained_job: true, reused: false, job }
+}
+
+function studioRejected(body, status = 422) {
+  const request = JSON.parse(body)
+  return jsonResponse({ detail: { admission_state: 'rejected',
+    generation_request_id: request.generation_request_id, workspace: request.workspace,
+    message: 'The submitted settings are invalid.' } }, status)
+}
+
+test('Studio lost ACK retains exact frozen wire and retries explicitly without rebuilding sensitive inputs', async t => {
+  let posts = 0
+  let wire
+  const { useStore, requests, polls } = await studioSubmissionFixture(t, async request => {
+    if (request.url === '/api/v1/generate') {
+      posts += 1
+      wire ??= request.body
+      if (posts === 1) throw new TypeError('connection lost after admission')
+      assert.equal(request.body, wire)
+      return jsonResponse(studioAccepted(wire))
+    }
+    if (request.url.includes('/generate/submissions/')) return jsonResponse({
+      generation_request_id: JSON.parse(wire).generation_request_id, workspace: 'studio-a', admission_state: 'unknown',
+    })
+    assert.fail(`Unexpected request ${request.url}`)
+  })
+  useStore.setState({ studioPromptEnhance: true, params: {
+    ...useStore.getState().params, prompt: 'Adult consensual intimacy; violent fictional battle; controversial political dialogue.',
+    custom_settings: { nested: { exact: ['private original'] } },
+  } })
+  await useStore.getState().startGeneration('queue')
+  assert.match(JSON.parse(wire).generation_request_id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+  assert.deepEqual(useStore.getState().jobs, [], 'uncertainty is not a failed or admitted job')
+  assert.equal(useStore.getState().studioSubmissions[0].state, 'unconfirmed')
+  assert.equal(posts, 1, 'lookup must not resend')
+  useStore.setState({ params: { ...useStore.getState().params, prompt: 'edited', custom_settings: {} }, privateOutput: false, explicitOutput: false, studioPromptEnhance: false })
+  await useStore.getState().startGeneration()
+  assert.equal(posts, 1, 'ordinary Generate cannot substitute edited settings')
+  await useStore.getState().retryStudioSubmission()
+  assert.equal(posts, 2)
+  assert.equal(JSON.parse(wire)._queue_mode, 'held')
+  assert.equal(JSON.parse(wire).enhance_before_generate, true)
+  assert.equal(JSON.parse(wire).private_output, true)
+  assert.equal(JSON.parse(wire).explicit_output, true)
+  assert.match(JSON.parse(wire).prompt, /Adult consensual intimacy/)
+  assert.deepEqual(useStore.getState().studioSubmissions, [])
+  assert.equal(useStore.getState().jobs[0].held, true)
+  assert.deepEqual(polls, ['a1b2c3d4'])
+  assert.equal(requests.filter(request => request.url.includes('/upload')).length, 0)
+})
+
+test('Studio preparation coalesces synchronously and retry reuses uploaded media paths', async t => {
+  const upload = deferred()
+  let uploads = 0
+  let posts = 0
+  let wire
+  const { useStore } = await studioSubmissionFixture(t, async request => {
+    if (request.url === '/api/v1/upload') { uploads += 1; return upload.promise }
+    if (request.url === '/api/v1/generate') {
+      posts += 1
+      wire ??= request.body
+      assert.equal(request.body, wire)
+      if (posts === 1) return jsonResponse({ detail: 'connection failure' }, 503)
+      return jsonResponse(studioAccepted(wire))
+    }
+    if (request.url.includes('/generate/submissions/')) return jsonResponse({
+      generation_request_id: JSON.parse(wire).generation_request_id, workspace: 'studio-a', admission_state: 'pending',
+    })
+    assert.fail(`Unexpected request ${request.url}`)
+  })
+  useStore.setState({ imageRefType: 'I', imageRefs: [new File(['first'], 'reference.png', { type: 'image/png' })] })
+  const initial = useStore.getState().startGeneration()
+  const duplicate = useStore.getState().startGeneration('queue')
+  assert.equal(uploads, 1)
+  assert.equal(useStore.getState().studioSubmissions[0].state, 'preparing')
+  upload.resolve(jsonResponse({ path: 'uploaded/reference.png', filename: 'reference.png' }))
+  await Promise.all([initial, duplicate])
+  assert.equal(posts, 1)
+  useStore.setState({ imageRefs: [new File(['edited'], 'new.png', { type: 'image/png' })] })
+  await useStore.getState().retryStudioSubmission()
+  assert.equal(uploads, 1, 'retry cannot reupload')
+  assert.deepEqual(JSON.parse(wire).image_refs, ['uploaded/reference.png'])
+  assert.equal(JSON.parse(wire)._queue_mode, 'now')
+  assert.deepEqual(useStore.getState().studioSubmissions, [])
+})
+
+test('Studio canonical GET completes pending POST and fences its late rejection or ACK against newer submission', async t => {
+  for (const lateResult of ['rejection', 'ack']) {
+    const first = deferred()
+    const next = deferred()
+    let firstWire
+    let secondWire
+    let posts = 0
+    const { useStore, polls } = await studioSubmissionFixture(t, async request => {
+      if (request.url === '/api/v1/generate') {
+        posts += 1
+        if (posts === 1) { firstWire = request.body; return first.promise }
+        secondWire = request.body
+        return next.promise
+      }
+      if (request.url.includes('/generate/submissions/')) {
+        const accepted = studioAccepted(firstWire, { status: 'waiting_for_plan_approval', h3_segment_plan: plan(), plan_review_required: true })
+        return jsonResponse(accepted)
+      }
+      assert.fail(`Unexpected request ${request.url}`)
+    })
+    const original = useStore.getState().startGeneration()
+    assert.equal(useStore.getState().studioSubmissions[0].state, 'sending')
+    await useStore.getState().checkStudioSubmission()
+    assert.deepEqual(useStore.getState().studioSubmissions, [], 'GET releases the original operation')
+    assert.equal(useStore.getState().jobs[0].status, 'waiting_for_plan_approval')
+    assert.equal(useStore.getState().jobs[0].planReviewRequired, true)
+    const newer = useStore.getState().startGeneration()
+    assert.notEqual(JSON.parse(secondWire).generation_request_id, JSON.parse(firstWire).generation_request_id)
+    first.resolve(lateResult === 'rejection' ? studioRejected(firstWire, 400) : jsonResponse(studioAccepted(firstWire, { status: 'failed', error: 'old failure' })))
+    await original
+    assert.equal(useStore.getState().studioSubmissions[0].requestId, JSON.parse(secondWire).generation_request_id)
+    assert.equal(useStore.getState().jobs.length, 1)
+    assert.equal(useStore.getState().jobs[0].status, 'waiting_for_plan_approval')
+    next.resolve(jsonResponse(studioAccepted(secondWire, { job_id: 'b2c3d4e5' })))
+    await newer
+    assert.deepEqual(useStore.getState().studioSubmissions, [])
+    assert.equal(useStore.getState().jobs.length, 2)
+    assert.deepEqual(polls, ['a1b2c3d4', 'b2c3d4e5'])
+  }
+})
+
+test('Studio only exact initial admission rejection releases identity; ambiguity and project round trips retain it', async t => {
+  for (const priorOutcome of ['initial', 'lost-ack', 'pending-roundtrip']) {
+    let wire
+    let posts = 0
+    const pending = deferred()
+    const { useStore } = await studioSubmissionFixture(t, async request => {
+      if (request.url === '/api/v1/generate') {
+        posts += 1
+        wire ??= request.body
+        assert.equal(request.body, wire)
+        if (posts === 1 && priorOutcome === 'lost-ack') return jsonResponse({ detail: 'uncertain' }, 503)
+        if (posts === 1 && priorOutcome === 'pending-roundtrip') return pending.promise
+        return studioRejected(wire)
+      }
+      if (request.url.includes('/generate/submissions/')) return jsonResponse({
+        generation_request_id: JSON.parse(wire).generation_request_id, workspace: 'studio-a', admission_state: 'unknown',
+      })
+      assert.fail(`Unexpected request ${request.url}`)
+    })
+    const original = useStore.getState().startGeneration()
+    if (priorOutcome === 'pending-roundtrip') {
+      useStore.setState({ activeWorkspace: 'studio-b' })
+      useStore.setState({ activeWorkspace: 'studio-a' })
+    } else await original
+    if (priorOutcome === 'initial') {
+      assert.deepEqual(useStore.getState().studioSubmissions, [])
+      assert.equal(posts, 1)
+    } else {
+      await useStore.getState().retryStudioSubmission()
+      assert.equal(posts, 2)
+      assert.equal(useStore.getState().studioSubmissions[0].requestId, JSON.parse(wire).generation_request_id)
+      assert.equal(useStore.getState().studioSubmissions[0].state, 'unconfirmed')
+      if (priorOutcome === 'pending-roundtrip') {
+        pending.resolve(jsonResponse(studioAccepted(wire)))
+        await original
+        assert.equal(useStore.getState().studioSubmissions.length, 1, 'old ACK cannot revive across ABA')
+      }
+    }
+    assert.deepEqual(useStore.getState().jobs, [])
+  }
+})
+
+test('Studio strict ACK identity and full job validation reject malformed success and retain uncertainty', async t => {
+  for (const mutation of [
+    admission => { delete admission.generation_request_id },
+    admission => { admission.workspace = 'foreign' },
+    admission => { admission.job.workspace = 'foreign' },
+    admission => { admission.generation_request_id = '00000000-0000-4000-8000-000000000000' },
+    admission => { delete admission.retained_job },
+    admission => { delete admission.job.output_files },
+    admission => { admission.retained_job = false },
+    admission => { admission.job.status = ['queued'] },
+    admission => { admission.admission_state = ['accepted'] },
+  ]) {
+    let wire
+    const { useStore } = await studioSubmissionFixture(t, async request => {
+      if (request.url === '/api/v1/generate') {
+        wire = request.body
+        const admission = studioAccepted(wire)
+        mutation(admission)
+        return jsonResponse(admission)
+      }
+      if (request.url.includes('/generate/submissions/')) return jsonResponse({
+        generation_request_id: JSON.parse(wire).generation_request_id, workspace: 'studio-a', admission_state: 'unknown',
+      })
+      assert.fail(`Unexpected request ${request.url}`)
+    })
+    await useStore.getState().startGeneration()
+    assert.deepEqual(useStore.getState().jobs, [])
+    assert.equal(useStore.getState().studioSubmissions[0].state, 'unconfirmed')
+  }
+})
+
+test('Studio canonical terminal receipt merges reconnect discovery without polling a retired job', async t => {
+  const post = deferred()
+  const statusRead = deferred()
+  let statusReads = 0
+  let wire
+  const { useStore, actualPoll, outputReads } = await studioSubmissionFixture(t, async request => {
+    if (request.url === '/api/v1/generate') { wire = request.body; return post.promise }
+    if (request.url === '/api/v1/status/a1b2c3d4') { statusReads += 1; return statusRead.promise }
+    if (request.url === '/api/v1/jobs') return jsonResponse({ jobs: [studioAccepted(wire).job] })
+    if (request.url.includes('/generate/submissions/')) return jsonResponse({
+      ...studioAccepted(wire, { status: 'completed', output_files: [] }), retained_job: false, reused: true,
+    })
+    assert.fail(`Unexpected request ${request.url}`)
+  })
+  useStore.setState({ _pollRecoveredJob: actualPoll, mediaFilter: 'favorites', outputSearchQuery: 'kept search' })
+  const pending = useStore.getState().startGeneration()
+  await useStore.getState().reconnectJobs()
+  assert.equal(useStore.getState().jobs.length, 1)
+  await useStore.getState().checkStudioSubmission()
+  assert.equal(useStore.getState().jobs.length, 1)
+  assert.equal(useStore.getState().jobs[0].status, 'completed')
+  assert.equal(useStore.getState().isGenerating, false)
+  assert.equal(outputReads.length, 1, 'retired completion refreshes Gallery without a status poll')
+  const outputUrl = new URL(outputReads[0].url, 'http://localhost')
+  assert.equal(outputUrl.searchParams.get('workspace'), 'studio-a')
+  assert.equal(outputUrl.searchParams.get('search'), 'kept search')
+  assert.equal(useStore.getState().mediaFilter, 'favorites')
+  assert.deepEqual(useStore.getState().studioSubmissions, [])
+  assert.equal(statusReads, 1, 'reconnect starts the real live-job poll')
+  statusRead.resolve(jsonResponse(studioAccepted(wire).job))
+  try {
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(useStore.getState().jobs[0].status, 'completed', 'retired acceptance stops the poll and fences its pending status response')
+  } finally {
+    useStore.setState({ activeWorkspace: 'studio-b' })
+  }
+  post.reject(new TypeError('late ACK loss'))
+  await pending
+  assert.equal(useStore.getState().jobs.length, 1)
+})
+
+test('Studio account change prunes unresolved inputs and fences late POST and lookup on same project', async t => {
+  for (const pendingOperation of ['post', 'lookup']) {
+    let wire
+    const deferredPost = deferred()
+    const deferredLookup = deferred()
+    const accountContext = id => ({
+      enabled: true, authenticated: true, account: { id, username: id, role: 'owner', disabled: false },
+      capabilities: ['account.self', 'owner.admin'], activation_state: 'ready', bootstrap_available: false,
+    })
+    let lookups = 0
+    const { useStore, polls } = await studioSubmissionFixture(t, async request => {
+      if (request.url === '/api/v1/generate') {
+        wire = request.body
+        if (pendingOperation === 'post') return deferredPost.promise
+        return jsonResponse({ detail: 'uncertain' }, 503)
+      }
+      if (request.url.includes('/generate/submissions/')) { lookups += 1; return deferredLookup.promise }
+      if (request.url === '/api/v1/access-context') return jsonResponse({ remote: false, accounts: accountContext('account-b') })
+      assert.fail(`Unexpected request ${request.url}`)
+    })
+    useStore.setState({ accountContext: accountContext('account-a'), accessContext: { remote: false, accounts: accountContext('account-a') } })
+    const pending = useStore.getState().startGeneration()
+    if (pendingOperation === 'lookup') await waitForCondition(() => lookups === 1, 'old account lookup')
+    await useStore.getState().loadAccessContext(false)
+    assert.deepEqual(useStore.getState().studioSubmissions, [])
+    useStore.setState({ activeWorkspace: 'studio-a', jobs: [{ id: 'b2c3d4e5', workspace: 'studio-a', status: 'queued' }] })
+    if (pendingOperation === 'post') deferredPost.reject(new TypeError('old account disconnect'))
+    else deferredLookup.resolve(jsonResponse(studioAccepted(wire)))
+    await pending
+    assert.equal(lookups, pendingOperation === 'lookup' ? 1 : 0, 'stale catch cannot start another account lookup')
+    assert.deepEqual(useStore.getState().studioSubmissions, [])
+    assert.equal(useStore.getState().jobs.length, 1)
+    assert.equal(useStore.getState().jobs[0].id, 'b2c3d4e5')
+    assert.deepEqual(polls, [])
+    await useStore.getState().retryStudioSubmission()
+    assert.equal(useStore.getState().jobs[0].id, 'b2c3d4e5')
+  }
+})
+
+test('Studio project transition fences in-flight preparation and canonical lookup without losing uncertain identity', async t => {
+  for (const stage of ['upload', 'lookup']) {
+    const delayed = deferred()
+    let wire
+    let posts = 0
+    const { useStore } = await studioSubmissionFixture(t, async request => {
+      if (request.url === '/api/v1/upload') return delayed.promise
+      if (request.url === '/api/v1/generate') { posts += 1; wire = request.body; throw new TypeError('lost ACK') }
+      if (request.url.includes('/generate/submissions/')) return delayed.promise
+      assert.fail(`Unexpected request ${request.url}`)
+    })
+    if (stage === 'upload') useStore.setState({ imageRefType: 'I', imageRefs: [new File(['image'], 'ref.png')] })
+    const pending = useStore.getState().startGeneration()
+    if (stage === 'lookup') await waitForCondition(() => useStore.getState().studioSubmissions[0]?.checking, 'lookup before project transition')
+    useStore.setState({ activeWorkspace: 'studio-b' })
+    useStore.setState({ activeWorkspace: 'studio-a' })
+    delayed.resolve(stage === 'upload' ? jsonResponse({ path: 'uploaded/ref.png', filename: 'ref.png' }) : jsonResponse(studioAccepted(wire)))
+    await pending
+    assert.deepEqual(useStore.getState().jobs, [])
+    assert.equal(posts, stage === 'lookup' ? 1 : 0)
+    assert.equal(useStore.getState().studioSubmissions.length, stage === 'lookup' ? 1 : 0)
+    if (stage === 'lookup') assert.equal(useStore.getState().studioSubmissions[0].checking, false)
+  }
+})
+
+test('Studio UUID works on plain HTTP LAN and other media routes keep their legacy submission contract', async t => {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'crypto')
+  const nativeCrypto = globalThis.crypto
+  Object.defineProperty(globalThis, 'crypto', { configurable: true, value: { getRandomValues: bytes => nativeCrypto.getRandomValues(bytes) } })
+  t.after(() => Object.defineProperty(globalThis, 'crypto', descriptor))
+  let wire
+  const { useStore } = await studioSubmissionFixture(t, async request => {
+    assert.equal(request.url, '/api/v1/generate')
+    wire = request.body
+    const body = JSON.parse(wire)
+    return jsonResponse(body.generation_request_id ? studioAccepted(wire) : { job_id: 'b2c3d4e5', status: 'queued' })
+  })
+  await useStore.getState().startGeneration()
+  assert.match(JSON.parse(wire).generation_request_id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+  for (const route of [{ generationMode: 'audio' }, { generationMode: 'tools' }, { generationMode: 'image', modelOptions: { audio_only: true } }]) {
+    useStore.setState({ ...route, jobs: [], studioSubmissions: [] })
+    await useStore.getState().startGeneration()
+    assert.equal(JSON.parse(wire).generation_request_id, undefined, 'nonordinary route retains legacy wire')
+    assert.deepEqual(useStore.getState().studioSubmissions, [])
+    assert.equal(useStore.getState().jobs[0].id, 'b2c3d4e5')
+  }
+})
+
+test('Studio unresolved capacity fails new requests closed without evicting earlier frozen identities', async t => {
+  let posts = 0
+  const wires = []
+  const { useStore } = await studioSubmissionFixture(t, async request => {
+    if (request.url === '/api/v1/generate') { posts += 1; wires.push(request.body); throw new TypeError('uncertain') }
+    if (request.url.includes('/generate/submissions/')) {
+      const body = JSON.parse(wires.at(-1))
+      return jsonResponse({ generation_request_id: body.generation_request_id, workspace: body.workspace, admission_state: 'unknown' })
+    }
+    assert.fail(`Unexpected request ${request.url}`)
+  })
+  for (let index = 0; index < 17; index += 1) {
+    useStore.setState({ activeWorkspace: `bounded-${index}` })
+    await useStore.getState().startGeneration()
+  }
+  assert.equal(posts, 16)
+  assert.equal(useStore.getState().studioSubmissions.length, 16)
+  useStore.setState({ activeWorkspace: 'bounded-0' })
+  assert.equal(useStore.getState().studioSubmissions[0].requestId, JSON.parse(wires[0]).generation_request_id)
+})
+
+test('Studio malformed or nondefinitive rejection never frees an uncertain logical request', async t => {
+  for (const rejection of [
+    { status: 400, change: detail => { detail.workspace = 'foreign' } },
+    { status: 422, change: detail => { delete detail.generation_request_id } },
+    { status: 400, change: detail => { delete detail.admission_state } },
+    { status: 408 }, { status: 409 }, { status: 429 }, { status: 403 }, { status: 404 },
+  ]) {
+    let wire
+    const { useStore, requests } = await studioSubmissionFixture(t, async request => {
+      if (request.url === '/api/v1/generate') {
+        wire = request.body
+        const body = JSON.parse(wire)
+        const detail = { admission_state: 'rejected', generation_request_id: body.generation_request_id, workspace: body.workspace, message: 'not definitive' }
+        rejection.change?.(detail)
+        return jsonResponse({ detail }, rejection.status)
+      }
+      if (request.url.includes('/generate/submissions/')) return jsonResponse({
+        generation_request_id: JSON.parse(wire).generation_request_id, workspace: 'studio-a', admission_state: 'unknown',
+      })
+      assert.fail(`Unexpected request ${request.url}`)
+    })
+    await useStore.getState().startGeneration()
+    assert.equal(useStore.getState().studioSubmissions[0].state, 'unconfirmed')
+    assert.deepEqual(useStore.getState().jobs, [])
+    assert.equal(requests.filter(request => request.method === 'POST').length, 1)
+  }
+})
+
+test('Studio delayed POST admission preserves an already discovered terminal, review or held canonical winner', async t => {
+  for (const winner of [
+    { status: 'completed', held: false }, { status: 'failed', held: false }, { status: 'cancelled', held: false },
+    { status: 'waiting_for_plan_approval', planReviewRequired: true, held: false }, { status: 'queued', held: true },
+  ]) {
+    const post = deferred()
+    let wire
+    const { useStore, polls } = await studioSubmissionFixture(t, async request => {
+      assert.equal(request.url, '/api/v1/generate')
+      wire = request.body
+      return post.promise
+    })
+    const pending = useStore.getState().startGeneration()
+    const canonical = { id: 'a1b2c3d4', workspace: 'studio-a', ...winner, progress: 0.75, message: 'Newer canonical state', outputFiles: ['retained-output'], error: null }
+    useStore.setState({ jobs: [canonical] })
+    post.resolve(jsonResponse(studioAccepted(wire)))
+    await pending
+    assert.deepEqual(useStore.getState().studioSubmissions, [])
+    assert.equal(useStore.getState().jobs[0], canonical, 'admission ACK cannot downgrade discovered state')
+    assert.deepEqual(polls, ['waiting_for_plan_approval', 'queued'].includes(winner.status) ? ['a1b2c3d4'] : [])
+  }
+})
+
+test('Studio lookup respects newer Stop/review changes while a terminal receipt outranks nonterminal progress', async t => {
+  for (const winner of ['cancelled', 'waiting_for_plan_approval', 'running']) {
+    const post = deferred()
+    const lookup = deferred()
+    let wire
+    const { useStore, polls } = await studioSubmissionFixture(t, async request => {
+      if (request.url === '/api/v1/generate') { wire = request.body; return post.promise }
+      if (request.url.includes('/generate/submissions/')) return lookup.promise
+      assert.fail(`Unexpected request ${request.url}`)
+    })
+    const original = useStore.getState().startGeneration()
+    useStore.setState({ jobs: [{ id: 'a1b2c3d4', workspace: 'studio-a', status: 'queued' }] })
+    const checking = useStore.getState().checkStudioSubmission()
+    const newer = { id: 'a1b2c3d4', workspace: 'studio-a', status: winner, progress: 0.8, held: true, message: 'newer state', outputFiles: [], error: null }
+    useStore.setState({ jobs: [newer] })
+    const response = studioAccepted(wire, winner === 'running' ? { status: 'completed' } : {})
+    if (winner === 'running') response.retained_job = false
+    lookup.resolve(jsonResponse(response))
+    await checking
+    assert.deepEqual(useStore.getState().studioSubmissions, [])
+    if (winner === 'running') assert.equal(useStore.getState().jobs[0].status, 'completed', 'terminal acceptance wins over in-flight progress')
+    else assert.equal(useStore.getState().jobs[0], newer, 'newer Stop/review state wins over earlier nonterminal lookup')
+    assert.deepEqual(polls, winner === 'waiting_for_plan_approval' ? ['a1b2c3d4'] : [])
+    post.resolve(jsonResponse(studioAccepted(wire)))
+    await original
+    assert.equal(useStore.getState().jobs[0].status, winner === 'running' ? 'completed' : winner)
+  }
+})
+
+test('Studio completed admission fences its deferred Gallery refresh across project ABA without a newer output read', async t => {
+  const gallery = deferred()
+  const { useStore, outputReads } = await studioSubmissionFixture(t, async request => {
+    assert.equal(request.url, '/api/v1/generate')
+    return jsonResponse({ ...studioAccepted(request.body, { status: 'completed' }), retained_job: false })
+  }, () => gallery.promise)
+  await useStore.getState().startGeneration()
+  assert.equal(outputReads.length, 1)
+  useStore.setState({ activeWorkspace: 'studio-b' })
+  useStore.setState({ activeWorkspace: 'studio-a' })
+  gallery.resolve(jsonResponse({ outputs: [{
+    name: 'private-late.png', url: '/private-late.png', type: 'image', mode: 'image',
+    size: 1, created_at: 1, revision: 'sealed-private-output', workspace: 'studio-a', private: true, explicit: true,
+  }], total: 1 }))
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(outputReads.length, 1, 'no later output request supplies the fence')
+  assert.deepEqual(useStore.getState().outputs, [], 'old private Gallery read cannot revive after ABA')
+  assert.equal(useStore.getState().outputsTotal, 0)
+  assert.equal(useStore.getState().jobs[0].status, 'completed')
 })

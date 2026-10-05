@@ -1850,6 +1850,10 @@ from services.queue_recovery_adapter import (
     PromptEnhancementResultStore,
     QueueRecoveryAdapterError,
     QueueRecoveryCoordinator,
+    StudioSubmissionCapacityError,
+    StudioSubmissionConflict,
+    StudioSubmissionScopeError,
+    validate_generation_request_id,
     ensure_project_instance_marker,
     owner_principal_digest,
     project_instance_digest,
@@ -5322,6 +5326,14 @@ def _queue_recovery_register_and_publish(
         # project-relative pointer, schema, size, and SHA-256.
         request_manifest = None
         try:
+            context = prepared.get("_studio_submission_context")
+            if context is not None:
+                if (context.get("owner_digest") != owner_digest or context.get("project_digest") != project_digest
+                        or context.get("workspace") != workspace):
+                    raise QueueRecoveryRuntimeError("Submission scope changed before registration.")
+                reserved = _studio_submission_lookup(context)
+                if reserved is None or reserved["accepted"] or reserved["job_id"] != job_id:
+                    raise QueueRecoveryRuntimeError("Submission reservation changed before registration.")
             credit_manifest_preflight = globals().get(
                 "_credit_prepare_submission_manifest"
             )
@@ -5360,6 +5372,8 @@ def _queue_recovery_register_and_publish(
                     project_digest=project_digest,
                     request_manifest=request_manifest,
                     global_state=durable_queue_state(additions=(prepared,)),
+                    **({"generation_request_id": prepared["_studio_submission_context"]["request_id"]}
+                       if "_studio_submission_context" in prepared else {}),
                 ),
             )
             prepared["_recovery_owner_digest"] = owner_digest
@@ -5367,6 +5381,16 @@ def _queue_recovery_register_and_publish(
             prepared["_recovery_manifest_pointer"] = dict(request_manifest)
             _jobs.publish_prepared(job_id, prepared)
         except Exception:
+            context = prepared.get("_studio_submission_context")
+            if context is not None:
+                # A durable append may have succeeded even if its ACK/cache or
+                # live publication failed. Never release its inputs or charge.
+                try:
+                    admission = _studio_submission_lookup(context)
+                except Exception:
+                    raise
+                if admission is None or admission["accepted"]:
+                    raise
             credit_release = globals().get("_credit_release_accounting")
             cleanup_required = bool(
                 isinstance(prepared.get("params"), dict)
@@ -9023,6 +9047,9 @@ def _restore_queue_recovery_on_startup(
         "_preserve_local_h3_recovery_evidence"
     )
     recovery_cleanup_blocked: set[str] = set(credit_cleanup_blocked)
+    admission_cleanup_holds = globals().get("_studio_submission_cleanup_holds")
+    if callable(admission_cleanup_holds):
+        recovery_cleanup_blocked.update(admission_cleanup_holds(projects))
     if callable(preserve_local_candidates):
         for workspace, (project_dir, _project_digest) in projects.items():
             if not preserve_local_candidates(
@@ -49218,10 +49245,129 @@ async def h3_gallery_still_guide_endpoint(request: Request):
     }
 
 
+def _studio_submission_context(request, workspace, project_dir, request_id, wire=None):
+    try:
+        validate_generation_request_id(request_id)
+    except QueueRecoveryAdapterError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    with _workspace_lifecycle_lock:
+        _require_job_workspace_available({"workspace": workspace, "out_dir": project_dir})
+        project_digest = _queue_recovery_project_identity(workspace, project_dir)
+        owner_digest = owner_principal_digest(_session_secret(), request.state.maestro_session_id)
+        principal = getattr(request.state, "maestro_account_principal", None)
+        account = "legacy-session"
+        if principal is not None:
+            if not isinstance(principal, dict) or not isinstance(principal.get("id"), str) or not principal["id"]:
+                raise HTTPException(status_code=403, detail="Project access unavailable")
+            account = "account:" + principal["id"]
+        scope = json.dumps(["studio-submission-v1", owner_digest, project_digest, account], separators=(",", ":")).encode("utf-8")
+        context = {"request_id": request_id, "workspace": workspace,
+                   "owner_digest": owner_digest, "project_digest": project_digest,
+                   "scope_digest": hmac.new(_session_secret(), scope, hashlib.sha256).hexdigest()}
+        if wire is not None:
+            try:
+                encoded = json.dumps(wire, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+            except (ValueError, TypeError, UnicodeError) as error:
+                raise HTTPException(status_code=422, detail="Generation settings must be finite JSON values") from error
+            context["request_digest"] = hashlib.sha256(encoded).hexdigest()
+        return context
+
+
+def _studio_submission_lookup(context):
+    try:
+        return _queue_recovery_coordinator.lookup_studio_submission(
+            context["request_id"], **{key: value for key, value in context.items() if key != "request_id"})
+    except StudioSubmissionScopeError as error:
+        raise HTTPException(status_code=404, detail="Submission not found") from error
+    except StudioSubmissionConflict as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(status_code=503, detail="Submission recovery is temporarily unavailable") from error
+
+
+def _studio_submission_envelope(context, record, *, reused):
+    envelope = {"generation_request_id": context["request_id"], "workspace": context["workspace"],
+                "admission_state": "unknown" if record is None else "pending"}
+    if record is None or not record["accepted"]:
+        return envelope
+    job_id = record["job_id"]
+    # A sealed admission may precede live publication, or outlive a dismissed
+    # terminal job. Its projection contains no manifest or creative content.
+    snapshot = record.get("snapshot") or {}
+    status = snapshot.get("status", record["status"])
+    progress = 100 if status == "completed" else 0
+    job = {"job_id": job_id, "created_at": record["receipt"]["created_at"], "status": status,
+           "progress": progress, "step": 0, "total_steps": 0, "phase": "", "message": "",
+           "output_files": [], "error": None, "prompt_preview": "", "active_window_prompt": "",
+           "model_type": "", "generation_mode": "", "workspace": context["workspace"],
+           "window_current": 0, "window_total": 0, "window_step": 0, "window_total_steps": 0,
+           "window_progress": 0, "overall_progress": progress, "queue_priority": 0,
+           "queue_held": bool(record["receipt"]["queue_held"]), "hold_after_output": False,
+           "queue_position": None, "queue_wait_reason": None, "queue_reorder_reason": None,
+           "queue_residency_bypass_count": 0, "queue_residency_bypassed_waiters": 0,
+           "requested_outputs": 1, "produced_outputs": 0, "queue": queue_control_state()}
+    for key in ("queue_held", "hold_after_output", "queue_priority", "requested_outputs",
+                "plan_review_required", "plan_review_terms_required", "plan_review_deadline"):
+        if key in snapshot:
+            job[key] = snapshot[key]
+    metadata = globals().get("_public_queue_recovery_metadata")
+    if snapshot and callable(metadata):
+        job.update(metadata(snapshot))
+    envelope.update(admission_state="accepted", job=job, retained_job=record.get("snapshot") is not None, reused=bool(reused))
+    return envelope
+
+
+def _studio_submission_response(context, record, request, *, reused):
+    envelope = _studio_submission_envelope(context, record, reused=reused)
+    if envelope["admission_state"] == "accepted":
+        if _jobs.get(record["job_id"]) is not None:
+            try:
+                envelope["job"] = get_status(record["job_id"], request, Response())
+                envelope["retained_job"] = True
+            except HTTPException as error:
+                if error.status_code != 404:
+                    raise
+        envelope.update(job_id=record["job_id"], status=envelope["job"]["status"], held=envelope["job"]["queue_held"])
+        return envelope
+    return JSONResponse(status_code=202, content=envelope, headers={"Cache-Control": "no-store"})
+
+
+@api.get("/api/v1/generate/submissions/{generation_request_id}")
+def get_generation_submission(generation_request_id: str, workspace: str, request: Request, response: Response):
+    _set_recovery_no_store(response)
+    project_dir = _require_project_access(request, workspace, permission="project.generate")
+    context = _studio_submission_context(request, workspace, project_dir, generation_request_id)
+    record = _studio_submission_lookup(context)
+    if record is None:
+        return _studio_submission_envelope(context, None, reused=True)
+    return _studio_submission_response(context, record, request, reused=True)
+
+
+def _studio_submission_cleanup_holds(projects):
+    coordinator = _queue_recovery_coordinator
+    with coordinator._lock:
+        records = coordinator._global_state.get("studio_submissions", {}).get("records", {}).values()
+        # A pending admission can own staging or a manifest after a crash without
+        # any registered snapshot. Absence of that snapshot is not cleanup proof.
+        return {record["workspace"] for record in records if not record["accepted"]
+                and record["workspace"] in projects
+                and record["project_instance"] == projects[record["workspace"]][1]}
+
+
 @api.post("/api/v1/generate")
 async def generate(request: Request):
     """Submit a generation job. Returns immediately with a job_id."""
     body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="Generation settings must be an object")
+    if "generation_request_id" in body:
+        try:
+            validate_generation_request_id(body["generation_request_id"])
+        except QueueRecoveryAdapterError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+    generation_request_id = body.pop("generation_request_id", None)
+    submission_wire = copy.deepcopy(body) if generation_request_id is not None else None
+    submission_context = None
     preparation_request_type = globals().get("_GenerationPreparationRequest")
     gallery_guide_token = globals().get(
         "_H3_GALLERY_STILL_GUIDE_REQUEST_TOKEN",
@@ -49237,10 +49383,12 @@ async def generate(request: Request):
             None,
         ) is gallery_guide_token
     )
-    _reject_client_krea_authority(body)
-    if (
+    if generation_request_id is None:
+        _reject_client_krea_authority(body)
+    if generation_request_id is None and (
         "_project_asset_ref_provenance" in body
         or "_project_asset_ref_paths" in body
+        or "_studio_submission_context" in body
     ):
         raise HTTPException(
             status_code=400,
@@ -49248,7 +49396,7 @@ async def generate(request: Request):
         )
     submitted_project_asset_refs = "project_asset_refs" in body
     raw_project_asset_refs = body.pop("project_asset_refs", None)
-    if _ENHANCED_PROMPT_CARDINALITY_KEY in body:
+    if generation_request_id is None and _ENHANCED_PROMPT_CARDINALITY_KEY in body:
         raise HTTPException(
             status_code=400,
             detail="Enhanced prompt preparation state is server-owned",
@@ -49257,13 +49405,13 @@ async def generate(request: Request):
     enhance_before_generate = body.pop(
         "enhance_before_generate", False,
     )
-    if not isinstance(enhance_before_generate, bool):
+    if generation_request_id is None and not isinstance(enhance_before_generate, bool):
         raise HTTPException(
             status_code=400,
             detail="enhance_before_generate must be a boolean",
         )
     queue_mode = str(body.pop("_queue_mode", "now") or "now").strip().lower()
-    if queue_mode not in {"now", "held"}:
+    if generation_request_id is None and queue_mode not in {"now", "held"}:
         raise HTTPException(
             status_code=400,
             detail="_queue_mode must be either 'now' or 'held'",
@@ -49272,318 +49420,365 @@ async def generate(request: Request):
     job_out_dir = _require_project_access(
         request, workspace, permission="project.generate",
     )
-    project_asset_ref_descriptors = (
-        _normalize_project_asset_ref_descriptors(raw_project_asset_refs)
-        if submitted_project_asset_refs else []
-    )
-    is_sfx = body.get("sfx_mode")
-    if project_asset_ref_descriptors and is_sfx:
-        raise HTTPException(
-            status_code=400,
-            detail="Project asset image references cannot be used for audio-only generation",
-        )
-    _reject_client_director_image_role_internals(body)
-    director_role_mode = _director_image_role_wire_mode(body) == "roles"
-    if director_role_mode and is_sfx:
-        raise HTTPException(
-            status_code=400,
-            detail="Director image role fields require image generation mode",
-        )
-    if director_role_mode:
-        _require_h3_legal_execution([
-            body.get("video_model"), body.get("model_type"),
-            body.get("image_model"), body.get("image_creator_model"),
-            body.get("image_editor_model"),
-        ])
-    if not director_role_mode:
-        if not body.get("model_type"):
-            raise HTTPException(status_code=400, detail="model_type is required")
-        # SFX virtual models (mmaudio_*) are frontend-only; skip backend model validation.
-        if not is_sfx and wgp.get_model_def(body["model_type"]) is None:
-            raise HTTPException(status_code=400, detail=f"Unknown model: {body['model_type']}")
-        _require_remote_visible_models(request, [body.get("model_type")])
-        if not is_sfx:
-            _require_h3_legal_execution([body["model_type"]])
-            _require_model_recipe_terms([body["model_type"]])
-    if trusted_h3_gallery_still_guide:
-        _reject_client_h3_internal_state(
-            body, allow_gallery_still_guide=True,
-        )
-    else:
-        _reject_client_h3_internal_state(body)
-    _reject_client_h3_turbo_validation_controls(body)
-    cumulative_selected = _consume_h3_cumulative_selection(
-        body, enhance_before_generate=enhance_before_generate,
-    )
-    _authorize_generation_media_inputs(request, body, workspace)
-    if director_role_mode:
-        _resolve_director_image_role_request(request, body)
-        _apply_director_image_role_generation(body)
-    normal_image_refs = body.get("image_refs")
-    if isinstance(normal_image_refs, str):
-        normal_image_refs = [normal_image_refs] if normal_image_refs else []
-    elif isinstance(normal_image_refs, (list, tuple)):
-        normal_image_refs = list(normal_image_refs)
-    else:
-        normal_image_refs = []
-    _krea_principal_role = _request_krea_principal_role(
-        request, body.get("model_type"),
-    )
-    _h3_turbo_validation_reference_bytes = (
-        _authorize_h3_turbo_benchmark_request(request, body)
-    )
-    if project_asset_ref_descriptors and _h3_turbo_validation_reference_bytes is not None:
-        raise HTTPException(
-            status_code=400,
-            detail="Project asset references cannot be used by the H3 benchmark request",
-        )
-    _h3_turbo_validation_authorized = (
-        _h3_turbo_validation_reference_bytes is not None
-    )
-    if project_asset_ref_descriptors:
-        # Presence-only placeholders let existing adaptive planning and H3
-        # estimates see the requested count without resolving or copying
-        # mutable project media before the rest of admission has passed.
-        requested_count = sum(
-            len(item["output_ids"]) for item in project_asset_ref_descriptors
-        )
-        body["image_refs"] = normal_image_refs + [True] * requested_count
-        video_prompt_type = str(body.get("video_prompt_type") or "")
-        if "I" not in video_prompt_type:
-            body["video_prompt_type"] = f"{video_prompt_type}I"
+    if generation_request_id is not None:
+        submission_context = _studio_submission_context(request, workspace, job_out_dir, generation_request_id, submission_wire)
+        existing_submission = _studio_submission_lookup(submission_context)
+        if existing_submission is not None:
+            return _studio_submission_response(submission_context, existing_submission, request, reused=True)
     try:
-        _apply_h3_adaptive_checkpoint(body)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if not is_sfx and not body.get("prompt"):
-        raise HTTPException(status_code=400, detail="prompt is required")
-    _resolve_h3_style_workflow_request(body)
-    durable_generation_preparation = bool(
-        enhance_before_generate
-        or (
-            not cumulative_selected
-            and str(body.get("model_type") or "") in _H3_LONG_STUDIO_MODELS
+        if submission_context is not None:
+            _reject_client_krea_authority(body)
+            if ("_project_asset_ref_provenance" in body or "_project_asset_ref_paths" in body
+                    or "_studio_submission_context" in body):
+                raise HTTPException(status_code=400, detail="Project asset reference metadata is server-owned")
+            if _ENHANCED_PROMPT_CARDINALITY_KEY in body:
+                raise HTTPException(status_code=400, detail="Enhanced prompt preparation state is server-owned")
+            if not isinstance(enhance_before_generate, bool):
+                raise HTTPException(status_code=400, detail="enhance_before_generate must be a boolean")
+            if queue_mode not in {"now", "held"}:
+                raise HTTPException(status_code=400, detail="_queue_mode must be either 'now' or 'held'")
+        project_asset_ref_descriptors = (
+            _normalize_project_asset_ref_descriptors(raw_project_asset_refs)
+            if submitted_project_asset_refs else []
         )
-    )
-
-    # A complete Studio prompt with global timestamps must remain one
-    # structured prompt until wgp knows the backend's effective FPS and exact
-    # quantized sliding-window geometry. This server-side normalization also
-    # covers older clients and direct API callers; Frames/multi-clip mode keeps
-    # its separate per-clip semantics.
-    if (
-        not is_sfx
-        and int(body.get("image_mode") or 0) != 2
-        and int(body.get("multi_prompts_gen_type") or 0) != 3
-    ):
-        from shared.utils import prompt_parser as _studio_prompt_parser
-        if _studio_prompt_parser.has_global_timeline(body.get("prompt", "")):
-            body["multi_prompts_gen_type"] = 2
-
-    # Defense: normalize video_prompt_type so flags whose required input
-    # is missing get stripped before wgp.py's validation rejects the job.
-    # This catches stale UI state (e.g. "I" persisting in a saved snapshot
-    # after the user cleared their reference image) so users don't have to
-    # manually wipe localStorage to recover.
-    _normalize_video_prompt_type(body)
-    # Same defense for image_prompt_type. Catches the user-reported bug
-    # where image_prompt_type='S' persisted after the user cleared the
-    # start-image preview (or never set one), causing wgp to reject T2V
-    # generations with "You must provide a Start Image" instead of
-    # falling back to T2V as Maestro's UX promises.
-    _normalize_image_prompt_type(body)
-
-    _generation_model_def = {} if is_sfx else (wgp.get_model_def(body["model_type"]) or {})
-    if (
-        _generation_model_def.get("infer_audio_prompt_from_guide", False)
-        and body.get("image_mode", 0) == 0
-        and body.get("audio_guide")
-        and (not body.get("video_guide") or "V" not in str(body.get("video_prompt_type") or ""))
-    ):
-        _audio_prompt_type = body.get("audio_prompt_type")
-        if _audio_prompt_type is not None and not isinstance(_audio_prompt_type, str):
-            raise HTTPException(status_code=400, detail="audio_prompt_type must be a string")
-        _audio_prompt_type = _audio_prompt_type or ""
-        if not any(letter in _audio_prompt_type for letter in "AK2"):
-            # Retain processing flags while restoring a standalone soundtrack's
-            # source selector. Control-video requests keep their explicit mode.
-            body["audio_prompt_type"] = f"A{_audio_prompt_type}"
-
-    # Ordinary longer H3 requests use consecutive decoded clips. Explicit
-    # cumulative selection uses its own validated native sampling windows.
-    # Both paths retain shared model, terms and settings admission here.
-    _h3_long_plan = None
-    _submitted_h3_estimate = None
-    # Hold freezes a complete Studio request without starting the LLM/GPU
-    # preparation worker. Still seal H3 clip geometry here so Start Queue
-    # can run the ordinary generation worker against a finished plan.
-    if hold_for_queue or not durable_generation_preparation:
-        try:
-            _h3_long_plan, _submitted_h3_estimate = (
-                _plan_generation_submission(
-                    body,
-                    request,
-                    turbo_validation_authorized=(
-                        _h3_turbo_validation_authorized
-                    ),
-                )
-            )
-        except (TypeError, ValueError, RuntimeError) as exc:
+        is_sfx = body.get("sfx_mode")
+        if project_asset_ref_descriptors and is_sfx:
             raise HTTPException(
                 status_code=400,
-                detail=f"Unable to plan long MiniMax H3 generation: {exc}",
-            ) from exc
-    if _h3_long_plan:
-        print(
-            "[Generate] MiniMax H3 long Studio plan: "
-            f"{_h3_long_plan['requested_frames']} requested frames -> "
-            f"{_h3_long_plan['clip_count']} native clips / "
-            f"{_h3_long_plan['planned_frames']} aligned frames"
+                detail="Project asset image references cannot be used for audio-only generation",
+            )
+        _reject_client_director_image_role_internals(body)
+        director_role_mode = _director_image_role_wire_mode(body) == "roles"
+        if director_role_mode and is_sfx:
+            raise HTTPException(
+                status_code=400,
+                detail="Director image role fields require image generation mode",
+            )
+        if director_role_mode:
+            _require_h3_legal_execution([
+                body.get("video_model"), body.get("model_type"),
+                body.get("image_model"), body.get("image_creator_model"),
+                body.get("image_editor_model"),
+            ])
+        if not director_role_mode:
+            if not body.get("model_type"):
+                raise HTTPException(status_code=400, detail="model_type is required")
+            # SFX virtual models (mmaudio_*) are frontend-only; skip backend model validation.
+            if not is_sfx and wgp.get_model_def(body["model_type"]) is None:
+                raise HTTPException(status_code=400, detail=f"Unknown model: {body['model_type']}")
+            _require_remote_visible_models(request, [body.get("model_type")])
+            if not is_sfx:
+                _require_h3_legal_execution([body["model_type"]])
+                _require_model_recipe_terms([body["model_type"]])
+        if trusted_h3_gallery_still_guide:
+            _reject_client_h3_internal_state(
+                body, allow_gallery_still_guide=True,
+            )
+        else:
+            _reject_client_h3_internal_state(body)
+        _reject_client_h3_turbo_validation_controls(body)
+        cumulative_selected = _consume_h3_cumulative_selection(
+            body, enhance_before_generate=enhance_before_generate,
+        )
+        _authorize_generation_media_inputs(request, body, workspace)
+        if director_role_mode:
+            _resolve_director_image_role_request(request, body)
+            _apply_director_image_role_generation(body)
+        normal_image_refs = body.get("image_refs")
+        if isinstance(normal_image_refs, str):
+            normal_image_refs = [normal_image_refs] if normal_image_refs else []
+        elif isinstance(normal_image_refs, (list, tuple)):
+            normal_image_refs = list(normal_image_refs)
+        else:
+            normal_image_refs = []
+        _krea_principal_role = _request_krea_principal_role(
+            request, body.get("model_type"),
+        )
+        _h3_turbo_validation_reference_bytes = (
+            _authorize_h3_turbo_benchmark_request(request, body)
+        )
+        if project_asset_ref_descriptors and _h3_turbo_validation_reference_bytes is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Project asset references cannot be used by the H3 benchmark request",
+            )
+        _h3_turbo_validation_authorized = (
+            _h3_turbo_validation_reference_bytes is not None
+        )
+        if project_asset_ref_descriptors:
+            # Presence-only placeholders let existing adaptive planning and H3
+            # estimates see the requested count without resolving or copying
+            # mutable project media before the rest of admission has passed.
+            requested_count = sum(
+                len(item["output_ids"]) for item in project_asset_ref_descriptors
+            )
+            body["image_refs"] = normal_image_refs + [True] * requested_count
+            video_prompt_type = str(body.get("video_prompt_type") or "")
+            if "I" not in video_prompt_type:
+                body["video_prompt_type"] = f"{video_prompt_type}I"
+        try:
+            _apply_h3_adaptive_checkpoint(body)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not is_sfx and not body.get("prompt"):
+            raise HTTPException(status_code=400, detail="prompt is required")
+        _resolve_h3_style_workflow_request(body)
+        durable_generation_preparation = bool(
+            enhance_before_generate
+            or (
+                not cumulative_selected
+                and str(body.get("model_type") or "") in _H3_LONG_STUDIO_MODELS
+            )
         )
 
-    # ── SCAIL-2 operating guards ────────────────────────────────────
-    # The React UI exposes no fps or audio controls for the SCAIL-2
-    # class, so these keys can only reach the request via defaults
-    # hydration — which Load Settings happily overwrites with values
-    # recorded in pre-v1.3 sidecars (user-reported: restored jobs came
-    # out 16fps/silent/6.4s even after the hydration fix). The server
-    # is the durable place to hold the model's operating contract:
-    #   1. Output follows the control video's fps (force_fps=control).
-    #   2. The control video's audio is remuxed in (audio_prompt_type
-    #      R) unless the request carries a real audio source (ABXK).
-    #   3. video_length is recomputed from the UI's _duration_seconds
-    #      at the guide's REAL fps, so "10s" means 10 seconds of the
-    #      source no matter which fps the client assumed.
-    #   4. sliding_window_size is clamped to the model's 81-frame
-    #      training window — larger windows add VRAM risk (the whole
-    #      driving window rides along as in-context tokens) without
-    #      adding quality, and stale restores carried inflated values.
-    try:
-        _scail2_bmt = wgp.get_base_model_type(body.get("model_type"))
-    except Exception:
-        _scail2_bmt = None
-    if _scail2_bmt in ("scail2_14B", "scail2_1.3B"):
-        if not body.get("force_fps"):
-            body["force_fps"] = "control"
-        _apt = body.get("audio_prompt_type") or ""
-        if not any(l in _apt for l in "ABXKR"):
-            body["audio_prompt_type"] = "R"
-        _guide = body.get("video_guide")
-        _dur = body.get("_duration_seconds")
-        if _guide and _dur and body.get("force_fps") == "control":
-            try:
-                if os.path.isfile(_guide):
-                    from shared.utils.utils import get_video_info
-                    _gfps, _, _, _gframes = get_video_info(_guide)
-                    if _gfps and float(_gfps) > 0:
-                        _gfps = float(_gfps)
-                        # Cap the follow rate at 30fps: a 60fps source would
-                        # double frames (and windows) for no visible gain —
-                        # user report: a 10s test ran as 8 windows because
-                        # the source was 60fps. wgp resamples the guide to
-                        # the forced integer rate.
-                        _fps_used = _gfps
-                        if _gfps > 30.5:
-                            _fps_used = 30.0
-                            body["force_fps"] = "30"
-                            print(f"[generate] SCAIL-2 fps cap: {_gfps:.6g}fps guide → generating at 30fps")
-                        _want = int(round(float(_dur) * _fps_used))
-                        if _gframes:
-                            _want = min(_want, int(int(_gframes) * _fps_used / _gfps))
-                        if _want >= 5 and _want != int(body.get("video_length") or 0):
-                            print(
-                                f"[generate] SCAIL-2 duration: video_length "
-                                f"{body.get('video_length')} → {_want} "
-                                f"({_dur}s × {_fps_used:.6g}fps)"
-                            )
-                            body["video_length"] = _want
-            except Exception as _sferr:
-                print(f"[generate] SCAIL-2 guide fps probe skipped: {_sferr}")
-        try:
-            _sw = int(body.get("sliding_window_size") or 0)
-        except (TypeError, ValueError):
-            _sw = 0
-        if _sw > 81:
-            print(f"[generate] SCAIL-2 window clamp: sliding_window_size {_sw} → 81")
-            body["sliding_window_size"] = 81
+        # A complete Studio prompt with global timestamps must remain one
+        # structured prompt until wgp knows the backend's effective FPS and exact
+        # quantized sliding-window geometry. This server-side normalization also
+        # covers older clients and direct API callers; Frames/multi-clip mode keeps
+        # its separate per-clip semantics.
+        if (
+            not is_sfx
+            and int(body.get("image_mode") or 0) != 2
+            and int(body.get("multi_prompts_gen_type") or 0) != 3
+        ):
+            from shared.utils import prompt_parser as _studio_prompt_parser
+            if _studio_prompt_parser.has_global_timeline(body.get("prompt", "")):
+                body["multi_prompts_gen_type"] = 2
 
-    # ── Sliding-window safety bump ──────────────────────────────────
-    # User-reported bug: a 19.6s audio upload in Studio Mode caused
-    # video_length and sliding_window_size to both be auto-set to
-    # 470 frames (19.6 * 24fps), but the clip generated as TWO sliding
-    # windows with a stutter at the end. Root cause: wgp.py internally
-    # quantizes both values to (k * latent_size + 1) form (line ~6725).
-    # Floating-point rounding in the UI's Math.round(s * fps) compute
-    # can land video_length and sliding_window_size on opposite sides
-    # of a latent step boundary, triggering `video_length >
-    # sliding_window_size` and forcing a multi-window split that wasn't
-    # intended.
-    #
-    # Fix: if sliding_window_size is set and ≤ video_length + latent_size,
-    # bump it to (video_length + latent_size + 1) so the post-quantize
-    # comparison `video_length > sliding_window_size` always evaluates
-    # false for single-window clips. Direct API callers benefit too —
-    # not just the UI — because the safety net is at the endpoint.
-    try:
-        _video_length = int(body.get("video_length") or 0)
-        _sliding_window = int(body.get("sliding_window_size") or 0)
-        if not cumulative_selected and _video_length > 0 and _sliding_window > 0:
+        # Defense: normalize video_prompt_type so flags whose required input
+        # is missing get stripped before wgp.py's validation rejects the job.
+        # This catches stale UI state (e.g. "I" persisting in a saved snapshot
+        # after the user cleared their reference image) so users don't have to
+        # manually wipe localStorage to recover.
+        _normalize_video_prompt_type(body)
+        # Same defense for image_prompt_type. Catches the user-reported bug
+        # where image_prompt_type='S' persisted after the user cleared the
+        # start-image preview (or never set one), causing wgp to reject T2V
+        # generations with "You must provide a Start Image" instead of
+        # falling back to T2V as Maestro's UX promises.
+        _normalize_image_prompt_type(body)
+
+        _generation_model_def = {} if is_sfx else (wgp.get_model_def(body["model_type"]) or {})
+        if (
+            _generation_model_def.get("infer_audio_prompt_from_guide", False)
+            and body.get("image_mode", 0) == 0
+            and body.get("audio_guide")
+            and (not body.get("video_guide") or "V" not in str(body.get("video_prompt_type") or ""))
+        ):
+            _audio_prompt_type = body.get("audio_prompt_type")
+            if _audio_prompt_type is not None and not isinstance(_audio_prompt_type, str):
+                raise HTTPException(status_code=400, detail="audio_prompt_type must be a string")
+            _audio_prompt_type = _audio_prompt_type or ""
+            if not any(letter in _audio_prompt_type for letter in "AK2"):
+                # Retain processing flags while restoring a standalone soundtrack's
+                # source selector. Control-video requests keep their explicit mode.
+                body["audio_prompt_type"] = f"A{_audio_prompt_type}"
+
+        # Ordinary longer H3 requests use consecutive decoded clips. Explicit
+        # cumulative selection uses its own validated native sampling windows.
+        # Both paths retain shared model, terms and settings admission here.
+        _h3_long_plan = None
+        _submitted_h3_estimate = None
+        # Hold freezes a complete Studio request without starting the LLM/GPU
+        # preparation worker. Still seal H3 clip geometry here so Start Queue
+        # can run the ordinary generation worker against a finished plan.
+        if hold_for_queue or not durable_generation_preparation:
             try:
-                _, _, _latent = wgp.get_model_min_frames_and_step(body["model_type"])
-            except Exception:
-                _latent = 8
-            # Safety bump ONLY applies to single-window-intent cases —
-            # i.e. sliding_window_size is close to video_length. The
-            # original bug fired when the user picked duration ≈ window
-            # (e.g. both 470 frames) and float rounding pushed one above
-            # the other after quantization, splitting a single-window
-            # clip into two.
-            #
-            # CRITICAL: the OLD condition `_sliding_window <= _video_length
-            # + _latent` was wrong — it fired for EVERY legitimate
-            # sliding-window case where the window is much smaller than
-            # the video (e.g. 120s clip with 20s windows: 500 ≤ 3000+8
-            # → True → bump to 3009 → forces ENTIRE 120s into one window).
-            # User-reported regression 2026-05-18.
-            #
-            # Correct condition: only bump when sliding_window_size is
-            # within one latent step of video_length on EITHER side —
-            # that's the actual quantize-boundary danger zone. For
-            # legitimate sliding-window gens (sliding much smaller than
-            # video) leave the values alone.
-            if (_video_length - _latent) <= _sliding_window <= (_video_length + _latent):
-                _new_sw = _video_length + _latent + 1
-                print(
-                    f"[generate] Sliding-window safety bump: "
-                    f"sliding_window_size {_sliding_window} → {_new_sw} "
-                    f"(video_length={_video_length}, latent_size={_latent}). "
-                    f"Prevents off-by-quantization window split that "
-                    f"causes a stutter at the end of single-window clips."
+                _h3_long_plan, _submitted_h3_estimate = (
+                    _plan_generation_submission(
+                        body,
+                        request,
+                        turbo_validation_authorized=(
+                            _h3_turbo_validation_authorized
+                        ),
+                    )
                 )
-                body["sliding_window_size"] = _new_sw
-    except Exception as _swerr:
-        # Defensive: never let the bump break job submission. Log and
-        # carry on with the user's original values.
-        print(f"[generate] Sliding-window safety bump skipped: {_swerr}")
+            except (TypeError, ValueError, RuntimeError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unable to plan long MiniMax H3 generation: {exc}",
+                ) from exc
+        if _h3_long_plan:
+            print(
+                "[Generate] MiniMax H3 long Studio plan: "
+                f"{_h3_long_plan['requested_frames']} requested frames -> "
+                f"{_h3_long_plan['clip_count']} native clips / "
+                f"{_h3_long_plan['planned_frames']} aligned frames"
+            )
 
-    # Capture workspace at submission time — NOT at execution time
-    session_id = request.state.maestro_session_id
-    access_policy = _http_output_policy_from_request(
-        body,
-        owner_session_id=session_id,
-    )
-
-    # Revalidate the final source after normalization, before allocating a job
-    # or sealing its project-owned manifest. Never persist a client-authored plan.
-    _submitted_cumulative_plan = None
-    if cumulative_selected:
-        from services.h3_cumulative_execution import prepare_h3_cumulative_request
+        # ── SCAIL-2 operating guards ────────────────────────────────────
+        # The React UI exposes no fps or audio controls for the SCAIL-2
+        # class, so these keys can only reach the request via defaults
+        # hydration — which Load Settings happily overwrites with values
+        # recorded in pre-v1.3 sidecars (user-reported: restored jobs came
+        # out 16fps/silent/6.4s even after the hydration fix). The server
+        # is the durable place to hold the model's operating contract:
+        #   1. Output follows the control video's fps (force_fps=control).
+        #   2. The control video's audio is remuxed in (audio_prompt_type
+        #      R) unless the request carries a real audio source (ABXK).
+        #   3. video_length is recomputed from the UI's _duration_seconds
+        #      at the guide's REAL fps, so "10s" means 10 seconds of the
+        #      source no matter which fps the client assumed.
+        #   4. sliding_window_size is clamped to the model's 81-frame
+        #      training window — larger windows add VRAM risk (the whole
+        #      driving window rides along as in-context tokens) without
+        #      adding quality, and stale restores carried inflated values.
         try:
-            _submitted_cumulative_plan = prepare_h3_cumulative_request(body)
-            _validate_h3_cumulative_acceleration(body)
-        except (TypeError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            _scail2_bmt = wgp.get_base_model_type(body.get("model_type"))
+        except Exception:
+            _scail2_bmt = None
+        if _scail2_bmt in ("scail2_14B", "scail2_1.3B"):
+            if not body.get("force_fps"):
+                body["force_fps"] = "control"
+            _apt = body.get("audio_prompt_type") or ""
+            if not any(l in _apt for l in "ABXKR"):
+                body["audio_prompt_type"] = "R"
+            _guide = body.get("video_guide")
+            _dur = body.get("_duration_seconds")
+            if _guide and _dur and body.get("force_fps") == "control":
+                try:
+                    if os.path.isfile(_guide):
+                        from shared.utils.utils import get_video_info
+                        _gfps, _, _, _gframes = get_video_info(_guide)
+                        if _gfps and float(_gfps) > 0:
+                            _gfps = float(_gfps)
+                            # Cap the follow rate at 30fps: a 60fps source would
+                            # double frames (and windows) for no visible gain —
+                            # user report: a 10s test ran as 8 windows because
+                            # the source was 60fps. wgp resamples the guide to
+                            # the forced integer rate.
+                            _fps_used = _gfps
+                            if _gfps > 30.5:
+                                _fps_used = 30.0
+                                body["force_fps"] = "30"
+                                print(f"[generate] SCAIL-2 fps cap: {_gfps:.6g}fps guide → generating at 30fps")
+                            _want = int(round(float(_dur) * _fps_used))
+                            if _gframes:
+                                _want = min(_want, int(int(_gframes) * _fps_used / _gfps))
+                            if _want >= 5 and _want != int(body.get("video_length") or 0):
+                                print(
+                                    f"[generate] SCAIL-2 duration: video_length "
+                                    f"{body.get('video_length')} → {_want} "
+                                    f"({_dur}s × {_fps_used:.6g}fps)"
+                                )
+                                body["video_length"] = _want
+                except Exception as _sferr:
+                    print(f"[generate] SCAIL-2 guide fps probe skipped: {_sferr}")
+            try:
+                _sw = int(body.get("sliding_window_size") or 0)
+            except (TypeError, ValueError):
+                _sw = 0
+            if _sw > 81:
+                print(f"[generate] SCAIL-2 window clamp: sliding_window_size {_sw} → 81")
+                body["sliding_window_size"] = 81
+
+        # ── Sliding-window safety bump ──────────────────────────────────
+        # User-reported bug: a 19.6s audio upload in Studio Mode caused
+        # video_length and sliding_window_size to both be auto-set to
+        # 470 frames (19.6 * 24fps), but the clip generated as TWO sliding
+        # windows with a stutter at the end. Root cause: wgp.py internally
+        # quantizes both values to (k * latent_size + 1) form (line ~6725).
+        # Floating-point rounding in the UI's Math.round(s * fps) compute
+        # can land video_length and sliding_window_size on opposite sides
+        # of a latent step boundary, triggering `video_length >
+        # sliding_window_size` and forcing a multi-window split that wasn't
+        # intended.
+        #
+        # Fix: if sliding_window_size is set and ≤ video_length + latent_size,
+        # bump it to (video_length + latent_size + 1) so the post-quantize
+        # comparison `video_length > sliding_window_size` always evaluates
+        # false for single-window clips. Direct API callers benefit too —
+        # not just the UI — because the safety net is at the endpoint.
+        try:
+            _video_length = int(body.get("video_length") or 0)
+            _sliding_window = int(body.get("sliding_window_size") or 0)
+            if not cumulative_selected and _video_length > 0 and _sliding_window > 0:
+                try:
+                    _, _, _latent = wgp.get_model_min_frames_and_step(body["model_type"])
+                except Exception:
+                    _latent = 8
+                # Safety bump ONLY applies to single-window-intent cases —
+                # i.e. sliding_window_size is close to video_length. The
+                # original bug fired when the user picked duration ≈ window
+                # (e.g. both 470 frames) and float rounding pushed one above
+                # the other after quantization, splitting a single-window
+                # clip into two.
+                #
+                # CRITICAL: the OLD condition `_sliding_window <= _video_length
+                # + _latent` was wrong — it fired for EVERY legitimate
+                # sliding-window case where the window is much smaller than
+                # the video (e.g. 120s clip with 20s windows: 500 ≤ 3000+8
+                # → True → bump to 3009 → forces ENTIRE 120s into one window).
+                # User-reported regression 2026-05-18.
+                #
+                # Correct condition: only bump when sliding_window_size is
+                # within one latent step of video_length on EITHER side —
+                # that's the actual quantize-boundary danger zone. For
+                # legitimate sliding-window gens (sliding much smaller than
+                # video) leave the values alone.
+                if (_video_length - _latent) <= _sliding_window <= (_video_length + _latent):
+                    _new_sw = _video_length + _latent + 1
+                    print(
+                        f"[generate] Sliding-window safety bump: "
+                        f"sliding_window_size {_sliding_window} → {_new_sw} "
+                        f"(video_length={_video_length}, latent_size={_latent}). "
+                        f"Prevents off-by-quantization window split that "
+                        f"causes a stutter at the end of single-window clips."
+                    )
+                    body["sliding_window_size"] = _new_sw
+        except Exception as _swerr:
+            # Defensive: never let the bump break job submission. Log and
+            # carry on with the user's original values.
+            print(f"[generate] Sliding-window safety bump skipped: {_swerr}")
+
+        # Capture workspace at submission time — NOT at execution time
+        session_id = request.state.maestro_session_id
+        access_policy = _http_output_policy_from_request(
+            body,
+            owner_session_id=session_id,
+        )
+
+        # Revalidate the final source after normalization, before allocating a job
+        # or sealing its project-owned manifest. Never persist a client-authored plan.
+        _submitted_cumulative_plan = None
+        if cumulative_selected:
+            from services.h3_cumulative_execution import prepare_h3_cumulative_request
+            try:
+                _submitted_cumulative_plan = prepare_h3_cumulative_request(body)
+                _validate_h3_cumulative_acceleration(body)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except HTTPException as error:
+        if submission_context is not None and error.status_code in (400, 422):
+            existing_submission = _studio_submission_lookup(submission_context)
+            if existing_submission is not None:
+                return _studio_submission_response(submission_context, existing_submission, request, reused=True)
+            raise HTTPException(status_code=error.status_code, detail={"admission_state": "rejected",
+                "generation_request_id": generation_request_id, "workspace": workspace,
+                "message": str(error.detail)}) from error
+        raise
     job_id = _new_generation_job_id()
+    if submission_context is not None:
+        with _workspace_lifecycle_lock:
+            current_scope = _studio_submission_context(request, workspace, job_out_dir, generation_request_id, submission_wire)
+            if current_scope != submission_context:
+                raise HTTPException(status_code=409, detail="Project access changed during submission")
+            try:
+                reserved, record = _queue_recovery_with_bounded_compaction(
+                    lambda: _queue_recovery_coordinator.reserve_studio_submission(
+                        generation_request_id, job_id=job_id,
+                        **{key: value for key, value in submission_context.items() if key != "request_id"}))
+            except StudioSubmissionCapacityError as error:
+                raise HTTPException(status_code=400, detail={"admission_state": "rejected",
+                    "generation_request_id": generation_request_id, "workspace": workspace, "message": str(error)}) from error
+            except StudioSubmissionScopeError as error:
+                raise HTTPException(status_code=404, detail="Submission not found") from error
+            except StudioSubmissionConflict as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+            except Exception as error:
+                raise HTTPException(status_code=503, detail="Submission recovery is temporarily unavailable") from error
+            if not reserved:
+                return _studio_submission_response(submission_context, record, request, reused=True)
     _long_plan = body.get("_h3_longform")
     if not isinstance(_long_plan, dict):
         _long_plan = {}
@@ -49722,6 +49917,9 @@ async def generate(request: Request):
             if _krea_principal_role is not None else {}
         ),
     }
+    if submission_context is not None:
+        job["created_at"] = record["receipt"]["created_at"]
+        job["_studio_submission_context"] = dict(submission_context)
     # Registration, owner/project identity, and the request manifest are
     # durable before the job becomes observable or its worker can run.
     # A user hold starts the ordinary generation worker so try_start waits
@@ -49768,12 +49966,18 @@ async def generate(request: Request):
             project_asset_snapshot_paths
             and _jobs.get(job_id) is None
             and not durable_registration
+            and submission_context is None
         ):
             _cleanup_project_asset_ref_snapshots(
                 project_asset_snapshot_paths, session_id,
             )
         raise
 
+    if submission_context is not None:
+        response = _studio_submission_response(submission_context, _studio_submission_lookup(submission_context), request, reused=False)
+        if isinstance(response, dict):
+            response["h3_estimate"] = _submitted_h3_estimate
+        return response
     return {
         "job_id": job_id,
         "status": job["status"],

@@ -525,6 +525,141 @@ const ACTIVE_GENERATION_JOB_STATUSES = new Set<GenerationJob['status']>([
 let _h3PlanReviewSequence = 0
 let _workspaceLoadSequence = 0
 
+interface StudioSubmissionView {
+  requestId: string
+  workspace: string
+  state: 'preparing' | 'sending' | 'unconfirmed'
+  checking: boolean
+  message: string
+}
+
+interface StudioSubmissionIntent extends StudioSubmissionView {
+  accountEpoch: number
+  body: string | null
+  attempt: number
+  checkSequence: number
+  ambiguous: boolean
+  enhanceBeforeGenerate: boolean
+}
+
+const _studioSubmissionIntents = new Map<string, StudioSubmissionIntent>()
+const STUDIO_SUBMISSION_CAPACITY = 16
+let _studioWorkspaceSequence = 0
+const STUDIO_UNCONFIRMED_MESSAGE = 'Could not confirm whether this submission was queued.'
+
+function _publishStudioSubmissions(): void {
+  useStore.setState({ studioSubmissions: Array.from(_studioSubmissionIntents.values(), intent => ({
+    requestId: intent.requestId, workspace: intent.workspace, state: intent.state,
+    checking: intent.checking, message: intent.message,
+  })) })
+}
+
+function _studioSubmissionIsCurrent(intent: StudioSubmissionIntent, workspaceSequence: number): boolean {
+  return _accountIdentityIsCurrent(intent.accountEpoch)
+    && _studioSubmissionIntents.get(intent.workspace) === intent
+    && _studioWorkspaceSequence === workspaceSequence
+    && useStore.getState().activeWorkspace === intent.workspace
+}
+
+function _adoptStudioSubmission(intent: StudioSubmissionIntent, admission: api.StudioGenerationAdmission, observedJobs?: Map<string, GenerationJob>): void {
+  const status = admission.job!
+  _studioSubmissionIntents.delete(intent.workspace)
+  ++intent.attempt
+  ++intent.checkSequence
+  _publishStudioSubmissions()
+  useStore.setState(state => {
+    const existing = state.jobs.find(job => job.id === status.job_id)
+    // POST describes admission, not the latest execution state. A lookup can
+    // hydrate an unchanged card; polling and Stop keep their newer authority.
+    const preserveExisting = existing && (!observedJobs || !ACTIVE_GENERATION_JOB_STATUSES.has(existing.status)
+      || ACTIVE_GENERATION_JOB_STATUSES.has(status.status) && observedJobs.get(status.job_id) !== existing)
+    const adopted = preserveExisting ? existing
+      : { ...(existing ? _mergeJobStatus(existing, status) : _newGenerationJobFromStatus(status)), held: status.queue_held }
+    const jobs = existing
+      ? state.jobs.map(job => job === existing ? adopted : job)
+      : [adopted, ...state.jobs]
+    return {
+      jobs, isGenerating: jobs.some(_isActiveGenerationJob),
+      ...(intent.enhanceBeforeGenerate ? { studioPromptEnhance: false } : {}),
+    }
+  })
+  const canonical = useStore.getState().jobs.find(job => job.id === status.job_id)
+  if (admission.retained_job && canonical && ACTIVE_GENERATION_JOB_STATUSES.has(canonical.status)) {
+    useStore.getState()._pollRecoveredJob(status.job_id, intent.workspace)
+  } else {
+    _recoveryJobPolls.get(status.job_id)?.stop()
+  }
+  if (canonical?.status === 'completed') {
+    const workspaceSequence = _studioWorkspaceSequence
+    const accountEpoch = intent.accountEpoch
+    const workspace = intent.workspace
+    void useStore.getState().refreshOutputs(() => _accountIdentityIsCurrent(accountEpoch)
+      && _studioWorkspaceSequence === workspaceSequence && useStore.getState().activeWorkspace === workspace)
+  }
+  window.dispatchEvent(new CustomEvent('maestro:queue-refresh'))
+  window.dispatchEvent(new CustomEvent('maestro:downloads-refresh'))
+}
+
+async function _checkStudioSubmission(intent: StudioSubmissionIntent): Promise<void> {
+  const workspaceSequence = _studioWorkspaceSequence
+  if (!intent.body || intent.checking || !_studioSubmissionIsCurrent(intent, workspaceSequence)) return
+  const checkSequence = ++intent.checkSequence
+  const observedJobs = new Map(useStore.getState().jobs.map(job => [job.id, job]))
+  const current = () => _studioSubmissionIsCurrent(intent, workspaceSequence) && intent.checkSequence === checkSequence
+  intent.checking = true
+  _publishStudioSubmissions()
+  try {
+    const admission = await api.fetchStudioGenerationSubmission(intent.requestId, intent.workspace)
+    if (!current()) return
+    if (admission.admission_state === 'accepted') _adoptStudioSubmission(intent, admission, observedJobs)
+  } catch {
+    // A missing or inaccessible receipt cannot prove that admission failed.
+  } finally {
+    if (current()) {
+      intent.checking = false
+      _publishStudioSubmissions()
+    }
+  }
+}
+
+async function _sendStudioSubmission(intent: StudioSubmissionIntent, retry = false): Promise<void> {
+  const workspaceSequence = _studioWorkspaceSequence
+  if (!intent.body || !_studioSubmissionIsCurrent(intent, workspaceSequence)) return
+  if (retry) intent.ambiguous = true
+  const attempt = ++intent.attempt
+  const current = () => _studioSubmissionIsCurrent(intent, workspaceSequence) && intent.attempt === attempt
+  intent.state = 'sending'
+  intent.message = 'Confirming submission…'
+  _publishStudioSubmissions()
+  try {
+    const admission = await api.submitStudioGeneration(intent.body, intent.requestId, intent.workspace)
+    if (!current()) return
+    if (admission.admission_state === 'accepted') {
+      _adoptStudioSubmission(intent, admission)
+      return
+    }
+  } catch (error) {
+    if (!current()) return
+    const detail = error instanceof api.GenerationSubmissionError && error.detail !== null && typeof error.detail === 'object'
+      ? error.detail as Record<string, unknown> : null
+    if (!intent.ambiguous && error instanceof api.GenerationSubmissionError
+      && [400, 422].includes(error.status) && detail?.admission_state === 'rejected'
+      && detail.generation_request_id === intent.requestId && detail.workspace === intent.workspace
+      && typeof detail.message === 'string') {
+      _studioSubmissionIntents.delete(intent.workspace)
+      _publishStudioSubmissions()
+      window.alert(detail.message)
+      return
+    }
+  }
+  if (!current()) return
+  intent.ambiguous = true
+  intent.state = 'unconfirmed'
+  intent.message = STUDIO_UNCONFIRMED_MESSAGE
+  _publishStudioSubmissions()
+  await _checkStudioSubmission(intent)
+}
+
 function _isActiveGenerationJob(job: Pick<GenerationJob, 'status' | 'held'>): boolean {
   if (job.held) return false
   return ACTIVE_GENERATION_JOB_STATUSES.has(job.status)
@@ -3364,6 +3499,9 @@ interface AppState {
   // Generation state (queue)
   jobs: GenerationJob[]
   isGenerating: boolean
+  studioSubmissions: StudioSubmissionView[]
+  checkStudioSubmission: () => Promise<void>
+  retryStudioSubmission: () => Promise<void>
   sampleCampaignPairs: api.SampleCampaignQueuePair[]
   refreshSampleCampaignQueue: (signal?: AbortSignal) => Promise<void>
   clearSampleCampaignQueue: () => void
@@ -3609,7 +3747,7 @@ interface AppState {
   outputsLoading: boolean
   loadOutputs: () => Promise<boolean>
   loadMoreOutputs: () => Promise<void>
-  refreshOutputs: () => Promise<void>
+  refreshOutputs: (scopeIsCurrent?: () => boolean) => Promise<void>
   toggleFavorite: (name: string) => Promise<void>
   gallerySelectionMode: boolean
   selectedOutputKeys: string[]
@@ -5174,6 +5312,8 @@ async function _runDirectorV2Preview(
 
 function _advanceAccountIdentityEpoch(): void {
   _accountIdentityEpoch += 1
+  _studioSubmissionIntents.clear()
+  useStore.setState({ studioSubmissions: [] })
   // Account-role H3 defaults and profile availability are identity-bound.
   // Invalidate every older writer before the scrub exposes omitted fields:
   // a pre-auth model-options/default/profile response must not repopulate
@@ -8395,6 +8535,15 @@ export const useStore = create<AppState>((set, get) => ({
   directorQueue: null,
   directorQueueLoading: false,
   isGenerating: false,
+  studioSubmissions: [],
+  checkStudioSubmission: async () => {
+    const intent = _studioSubmissionIntents.get(get().activeWorkspace)
+    if (intent) await _checkStudioSubmission(intent)
+  },
+  retryStudioSubmission: async () => {
+    const intent = _studioSubmissionIntents.get(get().activeWorkspace)
+    if (intent?.body && intent.state === 'unconfirmed' && !intent.checking) await _sendStudioSubmission(intent, true)
+  },
   sampleCampaignPairs: [],
   refreshSampleCampaignQueue: async (signal) => {
     const requestSequence = ++_sampleCampaignQueueRequestSequence
@@ -8690,8 +8839,29 @@ export const useStore = create<AppState>((set, get) => ({
   startGeneration: async (mode = 'now') => {
     const accountIdentityEpoch = _accountIdentityEpoch
     const ownsSubmission = () => _accountIdentityIsCurrent(accountIdentityEpoch)
+      && (!preparation || _studioSubmissionIsCurrent(preparation, workspaceSequence))
     let state = get()
     const submissionWorkspace = state.activeWorkspace
+    const workspaceSequence = _studioWorkspaceSequence
+    const ordinaryStudio = (state.generationMode === 'image'
+      || state.generationMode === 'video' && state.params.image_mode !== 4)
+      && !state.modelOptions?.audio_only
+    let preparation: StudioSubmissionIntent | null = null
+    if (ordinaryStudio) {
+      if (_studioSubmissionIntents.has(submissionWorkspace)) return
+      if (_studioSubmissionIntents.size >= STUDIO_SUBMISSION_CAPACITY) {
+        window.alert('Check an unresolved submission before starting another. Submission recovery is full.')
+        return
+      }
+      preparation = {
+        requestId: api.createLlmRequestId(), workspace: submissionWorkspace, accountEpoch: accountIdentityEpoch,
+        state: 'preparing', checking: false, message: 'Preparing submission…', body: null,
+        attempt: 0, checkSequence: 0, ambiguous: false, enhanceBeforeGenerate: false,
+      }
+      _studioSubmissionIntents.set(submissionWorkspace, preparation)
+      _publishStudioSubmissions()
+    }
+    try {
     const projectAssetRefsForSubmission = state.projectAssetRefScope?.workspace === submissionWorkspace
       && state.projectAssetRefScope.accountIdentityEpoch === accountIdentityEpoch
       ? state.projectAssetRefs.map(reference => ({
@@ -8718,7 +8888,7 @@ export const useStore = create<AppState>((set, get) => ({
       && !state.h3StyleWorkflowCatalog
       && !state.h3StyleWorkflowCatalogLoading) {
       await state.loadH3StyleWorkflowCatalog()
-      if (!ownsSubmission()) return
+      if (!ownsSubmission() || preparation && !_studioSubmissionIsCurrent(preparation, workspaceSequence)) return
       state = get()
     }
     if (state.h3StyleWorkflow && state.h3StyleWorkflowCatalogLoading) {
@@ -9419,6 +9589,8 @@ export const useStore = create<AppState>((set, get) => ({
       return  // Don't fall through to normal generation
     }
 
+    if (preparation && !_studioSubmissionIsCurrent(preparation, workspaceSequence)) return
+
     const params: api.GenerationSubmissionParams = {
       ...state.params,
       generation_mode: state.generationMode,
@@ -10024,6 +10196,34 @@ export const useStore = create<AppState>((set, get) => ({
     if (!ownsSubmission() || get().activeWorkspace !== submissionWorkspace) return
     params.enhance_before_generate = enhanceBeforeGenerate
     params.h3_ref2va_terms_accepted = h3Ref2VATermsAccepted()
+    if (preparation) {
+      if (!_studioSubmissionIsCurrent(preparation, workspaceSequence)) return
+      try {
+        if (params.h3_cumulative_append !== true) {
+          applyH3SegmentCeilingPolicy(params, state.slidingWindowLocked)
+        }
+        const current = get()
+        const scopeMatches = projectAssetRefScopeForSubmission === null
+          ? current.projectAssetRefScope === null
+          : current.projectAssetRefScope?.workspace === submissionWorkspace
+            && current.projectAssetRefScope.accountIdentityEpoch === accountIdentityEpoch
+        if (!scopeMatches || !sameOrderedProjectAssetGenerateReferences(projectAssetRefsForSubmission, current.projectAssetRefs)) {
+          window.alert('The selected project assets changed while this request was preparing. Review the current selection and generate again.')
+          return
+        }
+        preparation.body = JSON.stringify({ ...params, generation_request_id: preparation.requestId,
+          _queue_mode: mode === 'queue' ? 'held' : 'now' })
+        preparation.enhanceBeforeGenerate = enhanceBeforeGenerate
+      } catch (error) {
+        if (_studioSubmissionIsCurrent(preparation, workspaceSequence)) {
+          window.alert(error instanceof Error ? error.message : 'Could not prepare this submission.')
+        }
+        return
+      }
+      await _sendStudioSubmission(preparation)
+      return
+    }
+
     const holdForQueue = mode === 'queue'
     const durablePreparationExpected = !holdForQueue && (
       enhanceBeforeGenerate
@@ -10137,6 +10337,12 @@ export const useStore = create<AppState>((set, get) => ({
         jobs: s.jobs.map(j => j === newJob ? { ...j, id: j.id || `submit-fail-${Date.now()}`, status: 'failed', message: msg, error: msg } : j),
         isGenerating: s.jobs.some(j => j !== newJob && _isActiveGenerationJob(j)),
       }))
+    }
+    } finally {
+      if (preparation && !preparation.body && _studioSubmissionIntents.get(submissionWorkspace) === preparation) {
+        _studioSubmissionIntents.delete(submissionWorkspace)
+        _publishStudioSubmissions()
+      }
     }
   },
 
@@ -17024,11 +17230,12 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   // Incremental refresh: only fetch the newest items to detect new outputs during generation
-  refreshOutputs: async () => {
+  refreshOutputs: async (scopeIsCurrent) => {
+    let requestGeneration: number | null = null
     try {
-      if (get().outputsLoading || _outputsPaginationActive) return
+      if (scopeIsCurrent?.() === false || get().outputsLoading || _outputsPaginationActive) return
       const { mediaFilter, outputArtifactScope, outputSearchQuery, browsingUploads, activeWorkspace } = get()
-      const requestGeneration = ++_outputsRequestGeneration
+      requestGeneration = ++_outputsRequestGeneration
       const refreshLimit = Math.max(50, get().outputs.length)
       const { outputs: apiOutputs, total } = await api.fetchOutputs(refreshLimit, 0, {
         favoritesOnly: mediaFilter === 'favorites',
@@ -17038,7 +17245,7 @@ export const useStore = create<AppState>((set, get) => ({
         artifactScope: outputArtifactScope,
         mediaType: mediaFilter,
       })
-      if (requestGeneration !== _outputsRequestGeneration) return
+      if (requestGeneration !== _outputsRequestGeneration || scopeIsCurrent?.() === false) return
       const fresh: OutputFile[] = apiOutputs.map(o => ({
         name: o.name,
         url: o.url,
@@ -17084,6 +17291,7 @@ export const useStore = create<AppState>((set, get) => ({
         }
       }
     } catch {
+      if (requestGeneration !== _outputsRequestGeneration || scopeIsCurrent?.() === false) return
       // Silent fail for background refresh
     }
   },
@@ -19024,6 +19232,24 @@ export const useStore = create<AppState>((set, get) => ({
     setTimeout(poll, 1000)
   },
 }))
+
+useStore.subscribe((state, previous) => {
+  if (state.activeWorkspace === previous.activeWorkspace) return
+  ++_studioWorkspaceSequence
+  const intent = _studioSubmissionIntents.get(previous.activeWorkspace)
+  if (!intent) return
+  ++intent.attempt
+  ++intent.checkSequence
+  intent.checking = false
+  if (intent.body) {
+    intent.ambiguous = true
+    intent.state = 'unconfirmed'
+    intent.message = STUDIO_UNCONFIRMED_MESSAGE
+  } else {
+    _studioSubmissionIntents.delete(intent.workspace)
+  }
+  _publishStudioSubmissions()
+})
 
 let _blendMediaScope = JSON.stringify([_accountIdentityEpoch, useStore.getState().activeWorkspace])
 useStore.subscribe(state => {

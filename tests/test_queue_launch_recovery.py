@@ -52,7 +52,7 @@ from services.queue_recovery_adapter import (
     owner_principal_digest,
     project_instance_digest,
 )
-from services.queue_recovery import QueueRecoveryJournal
+from services.queue_recovery import QueueRecoveryJournal, QueueRecoveryValidationError
 from services.h3_benchmark import H3AllocationLedger
 from services.h3_offload_plan import (
     H3OffloadPlanError,
@@ -667,6 +667,372 @@ class QueueRecoveryRuntimeTests(unittest.TestCase):
 
 
 class QueueLaunchWiringTests(unittest.TestCase):
+    def _studio_submission_test_namespace(self, directory):
+        from fastapi import HTTPException
+        from fastapi.responses import JSONResponse, Response
+        from services import queue_recovery_adapter as adapter
+        project = Path(directory) / "project-a"
+        project.mkdir()
+        coordinator = QueueRecoveryCoordinator(QueueRecoveryJournal(Path(directory) / "queue.jsonl"))
+        observations = {"credit": [], "threads": [], "staging": [], "release": []}
+        class Registry(dict):
+            fail_publication = False
+            def prepare(self, job):
+                self.prepared = copy.deepcopy(job)
+                return self.prepared
+            def publish_prepared(self, job_id, job):
+                if self.fail_publication:
+                    raise OSError("injected live publication failure")
+                self[job_id] = job
+        registry = Registry()
+        class Thread:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+            def start(self):
+                observations["threads"].append(self.kwargs["args"][0])
+        def credit(job):
+            context = job.get("_studio_submission_context")
+            if context:
+                record = coordinator.lookup_studio_submission(context["request_id"], **{k: v for k, v in context.items() if k != "request_id"})
+                self.assertFalse(record["accepted"])
+                self.assertEqual(record["job_id"], job["id"])
+            observations["credit"].append(job["id"])
+        def snapshot(_request, _workspace, descriptors, *, job_id, **kwargs):
+            self.assertEqual(len(coordinator.journal.recover().global_state["studio_submissions"]["records"]), 1)
+            path = project / ".maestro-recovery" / "staging" / job_id / "reference.png"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"owned reference input")
+            observations["staging"].append(str(path))
+            return [str(path)], [], [str(path)]
+        def normalize_nested(body):
+            if "render_controls" in body:
+                body["render_controls"]["layers"][0]["scale"] = 99
+        def access(request, workspace, *, permission):
+            self.assertEqual(permission, "project.generate")
+            if getattr(request.state, "deny_project", False) or workspace != "project-a":
+                raise HTTPException(status_code=403, detail="Project unavailable")
+            return str(project)
+        namespace = {
+            "api": types.SimpleNamespace(post=lambda *a, **k: lambda f: f, get=lambda *a, **k: lambda f: f),
+            "Request": object, "Response": Response, "JSONResponse": JSONResponse, "HTTPException": HTTPException,
+            "QueueRecoveryAdapterError": adapter.QueueRecoveryAdapterError,
+            "StudioSubmissionCapacityError": adapter.StudioSubmissionCapacityError,
+            "StudioSubmissionConflict": adapter.StudioSubmissionConflict,
+            "StudioSubmissionScopeError": adapter.StudioSubmissionScopeError,
+            "validate_generation_request_id": adapter.validate_generation_request_id,
+            "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+            "QueueRecoveryValidationError": QueueRecoveryValidationError,
+            "copy": copy, "json": json, "hmac": hmac, "hashlib": hashlib, "time": time, "os": os,
+            "_session_secret": lambda: b"studio-submission-test-secret",
+            "owner_principal_digest": owner_principal_digest, "project_instance_digest": project_instance_digest,
+            "ensure_project_instance_marker": adapter.ensure_project_instance_marker,
+            "_workspace_lifecycle_lock": threading.RLock(),
+            "_require_job_workspace_available": lambda job: self.assertEqual(job["out_dir"], str(project)),
+            "_require_project_access": access,
+            "_get_active_workspace": lambda: "project-a", "_ENHANCED_PROMPT_CARDINALITY_KEY": "_cardinality",
+            "_jobs": registry, "_queue_recovery_coordinator": coordinator,
+            "_reject_client_krea_authority": lambda body: None,
+            "_reject_client_director_image_role_internals": lambda body: None,
+            "_director_image_role_wire_mode": lambda body: "none",
+            "wgp": types.SimpleNamespace(get_model_def=lambda model: {} if model == "test-model" else None,
+                                          get_base_model_type=lambda model: "test-model"),
+            "_require_remote_visible_models": lambda *a: None,
+            "_require_h3_legal_execution": lambda *a: None, "_require_model_recipe_terms": lambda *a: None,
+            "_reject_client_h3_internal_state": lambda *a: None,
+            "_reject_client_h3_turbo_validation_controls": lambda *a: None,
+            "_consume_h3_cumulative_selection": lambda *a, **k: False,
+            "_authorize_generation_media_inputs": lambda *a: None,
+            "_request_krea_principal_role": lambda *a: None,
+            "_authorize_h3_turbo_benchmark_request": lambda *a: None,
+            "_apply_h3_adaptive_checkpoint": normalize_nested,
+            "_resolve_h3_style_workflow_request": lambda *a: None,
+            "_H3_LONG_STUDIO_MODELS": set(),
+            "_normalize_video_prompt_type": lambda *a: None, "_normalize_image_prompt_type": lambda *a: None,
+            "_plan_generation_submission": lambda *a, **k: (None, None),
+            "_http_output_policy_from_request": lambda *a, **k: {"private": True, "explicit": False},
+            "_new_generation_job_id": lambda: uuid.uuid4().hex,
+            "_public_h3_long_plan": lambda plan: None,
+            "_normalize_project_asset_ref_descriptors": lambda refs: refs,
+            "_snapshot_project_asset_refs": snapshot,
+            "_revalidate_generation_asset_ref_scope": lambda *a: None,
+            "_cleanup_project_asset_ref_snapshots": lambda paths, session: observations.setdefault("cleanup", []).extend(paths),
+            "_credit_prepare_submission": credit,
+            "_credit_release_accounting": lambda job, **k: observations["release"].append(job["id"]) or True,
+            "_stamp_job_origin": lambda job: job,
+            "_require_job_model_recipe_terms": lambda job: None,
+            "_seal_h3_offload_plan_for_job": lambda *a, **k: None,
+            "atomic_write_request_manifest": atomic_write_request_manifest,
+            "remove_request_manifest": remove_request_manifest,
+            "_queue_recovery_input_descriptors": lambda *a: [],
+            "_stamp_requested_generation_residency": lambda *a: None,
+            "durable_queue_state": lambda **kwargs: {},
+            "_run_generation": lambda job_id: None, "threading": types.SimpleNamespace(Thread=Thread),
+            "queue_control_state": lambda: {"paused": False, "pause_after_current": False},
+            "_SAMPLE_CAMPAIGN_JOB_KIND": "sample_campaign_generation",
+            "_job_owned_by_request": lambda job, request: job["session_id"] == request.state.maestro_session_id,
+            "snapshot_job": lambda job: dict(job), "_queue_recovery_is_blocked": lambda job: False,
+            "_job_eta_values": lambda job: (None, None), "queue_position": lambda job: None,
+            "_queue_wait_reason_for_job": lambda job: None, "_public_queue_residency_metadata": lambda *a, **k: {},
+            "_public_resource_metadata": lambda job: {}, "_public_parent_job_id": lambda job: None,
+            "_public_logical_job_kind": lambda job: None, "_public_progress_telemetry": lambda job: {},
+            "public_h3_offload_plan": lambda plan: None, "_public_h3_boundary": lambda value: None,
+            "math": __import__("math"), "job_events": lambda *a: [],
+            "_public_queue_recovery_metadata": lambda job: {"recovery_state": job.get("recovery_state") or None},
+            "_set_recovery_no_store": lambda response: response.headers.update({"Cache-Control": "no-store"}),
+        }
+        names = ("generate", "get_generation_submission", "_studio_submission_context", "_studio_submission_lookup",
+                 "_studio_submission_envelope", "_studio_submission_response", "_studio_submission_cleanup_holds",
+                 "_queue_recovery_project_identity", "_queue_recovery_register_and_publish", "_stamp_h3_lightx2v_recovery_identity",
+                 "_queue_recovery_with_bounded_compaction", "get_status", "_public_job_prompt_fields", "_public_job_created_at", "_generic_job_visible")
+        namespace = _isolated_functions(self.launch, names, namespace)
+        class Request:
+            def __init__(self, body, *, account="account-a", session="session-a", deny=False):
+                self.body = body
+                self.state = types.SimpleNamespace(maestro_session_id=session, maestro_account_principal={"id": account} if account else None,
+                                                   maestro_remote=False, deny_project=deny)
+            async def json(self):
+                return copy.deepcopy(self.body)
+        return namespace, Request, coordinator, registry, observations, project
+
+    def test_studio_lost_ack_exact_nested_wire_replay_has_one_manifest_charge_stage_and_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, Request, coordinator, registry, observed, project = self._studio_submission_test_namespace(directory)
+            request_id = str(uuid.uuid4())
+            wire = {"generation_request_id": request_id, "workspace": "project-a", "model_type": "test-model",
+                    "prompt": "Private sensitive creative prompt", "image_mode": 2, "_queue_mode": "held",
+                    "render_controls": {"layers": [{"scale": 2}]},
+                    "project_asset_refs": [{"output_ids": ["reference-1"]}]}
+            accepted = asyncio.run(ns["generate"](Request(wire)))
+            replay = asyncio.run(ns["generate"](Request(wire)))
+            self.assertEqual(accepted["job_id"], replay["job_id"])
+            self.assertFalse(accepted["reused"])
+            self.assertTrue(replay["reused"])
+            self.assertTrue(replay["job"]["queue_held"])
+            self.assertEqual(len(observed["credit"]), 1)
+            self.assertEqual(len(observed["staging"]), 1)
+            self.assertEqual(len(observed["threads"]), 1)
+            self.assertEqual(len(coordinator.journal.recover().jobs), 1)
+            params = load_request_manifest(project, registry[accepted["job_id"]]["_recovery_manifest_pointer"], expected_job_id=accepted["job_id"])["params"]
+            self.assertEqual(params["render_controls"]["layers"][0]["scale"], 99)
+            self.assertNotIn("generation_request_id", params)
+            record = coordinator.journal.recover().global_state["studio_submissions"]["records"][request_id]
+            original = {k: v for k, v in wire.items() if k != "generation_request_id"}
+            self.assertEqual(record["request_digest"], hashlib.sha256(json.dumps(original, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()).hexdigest())
+            raw_journal = (Path(directory) / "queue.jsonl").read_text()
+            self.assertNotIn(wire["prompt"], raw_journal)
+            self.assertNotIn(str(project), raw_journal)
+            changed = copy.deepcopy(wire)
+            changed["render_controls"]["layers"][0]["scale"] = 3
+            with self.assertRaises(ns["HTTPException"]) as conflict:
+                asyncio.run(ns["generate"](Request(changed)))
+            self.assertEqual(conflict.exception.status_code, 409)
+            for request in (Request(wire, account="account-b"), Request(wire, session="session-b"), Request(wire, deny=True)):
+                with self.assertRaises(ns["HTTPException"]) as foreign:
+                    asyncio.run(ns["generate"](request))
+                self.assertIn(foreign.exception.status_code, (403, 404))
+                self.assertNotIn(accepted["job_id"], str(foreign.exception.detail))
+            self.assertEqual(len(observed["threads"]), 1)
+
+    def test_studio_pending_failed_publication_and_terminal_lookup_never_readmit_or_clean_inputs(self):
+        from fastapi.responses import Response
+        with tempfile.TemporaryDirectory() as directory:
+            ns, Request, coordinator, registry, observed, project = self._studio_submission_test_namespace(directory)
+            wire = {"generation_request_id": str(uuid.uuid4()), "workspace": "project-a", "model_type": "test-model", "prompt": "private prompt", "image_mode": 2}
+            request = Request(wire)
+            context = ns["_studio_submission_context"](request, "project-a", str(project), wire["generation_request_id"], {k: v for k, v in wire.items() if k != "generation_request_id"})
+            coordinator.reserve_studio_submission(context["request_id"], job_id=uuid.uuid4().hex, **{k: v for k, v in context.items() if k != "request_id"})
+            pending = asyncio.run(ns["generate"](request))
+            self.assertEqual(pending.status_code, 202)
+            self.assertEqual(json.loads(pending.body)["admission_state"], "pending")
+            self.assertNotIn("job", json.loads(pending.body))
+            self.assertEqual(observed["credit"], [])
+            self.assertEqual(observed["threads"], [])
+            self.assertEqual(ns["_studio_submission_cleanup_holds"]({"project-a": (str(project), context["project_digest"])}), {"project-a"})
+            wire["generation_request_id"] = str(uuid.uuid4())
+            registry.fail_publication = True
+            with self.assertRaisesRegex(OSError, "publication failure"):
+                asyncio.run(ns["generate"](Request(wire)))
+            record = coordinator.journal.recover().global_state["studio_submissions"]["records"][wire["generation_request_id"]]
+            pointer = coordinator.journal.recover().jobs[record["job_id"]]["request_manifest"]
+            self.assertTrue((project / pointer["path"]).is_file())
+            self.assertEqual(observed["release"], [])
+            accepted = ns["get_generation_submission"](wire["generation_request_id"], "project-a", Request(wire), Response())
+            self.assertEqual(accepted["admission_state"], "accepted")
+            self.assertTrue(accepted["retained_job"])
+            self.assertEqual(accepted["job"]["prompt_preview"], "")
+            self.assertFalse(registry)
+            replay = asyncio.run(ns["generate"](Request(wire)))
+            self.assertEqual(replay["job_id"], record["job_id"])
+            self.assertEqual(len(observed["credit"]), 1)
+            self.assertFalse(observed["threads"])
+            fallback_created_at = accepted["job"]["created_at"]
+            self.assertEqual(fallback_created_at, registry.prepared["created_at"])
+            self.assertEqual(fallback_created_at, coordinator.journal.recover().jobs[record["job_id"]]["created_at"])
+            registry.fail_publication = False
+            registry.publish_prepared(record["job_id"], registry.prepared)
+            self.assertEqual(ns["get_status"](record["job_id"], Request(wire), Response())["created_at"], fallback_created_at)
+            restored = QueueRecoveryCoordinator(coordinator.journal).restore()
+            self.assertEqual(restored.jobs[record["job_id"]]["created_at"], fallback_created_at)
+            registry.clear()
+            terminal = dict(coordinator.journal.recover().jobs[record["job_id"]], status="cancelled")
+            coordinator.prospective_transition(types.SimpleNamespace(jobs=(terminal,), tombstones=(), global_state=None))
+            coordinator.compact()
+            ns["_queue_recovery_coordinator"] = QueueRecoveryCoordinator(coordinator.journal)
+            terminal = ns["get_generation_submission"](wire["generation_request_id"], "project-a", Request(wire), Response())
+            self.assertFalse(terminal["retained_job"])
+            self.assertEqual(terminal["job"]["status"], "cancelled")
+            self.assertEqual(terminal["job"]["created_at"], fallback_created_at)
+            self.assertEqual(terminal["job"]["output_files"], [])
+            self.assertEqual(terminal["job"]["workspace"], "project-a")
+            self.assertFalse(observed["threads"])
+
+    def test_studio_registration_ack_loss_preserves_manifest_staging_and_charge(self):
+        from fastapi.responses import Response
+        with tempfile.TemporaryDirectory() as directory:
+            ns, Request, coordinator, registry, observed, project = self._studio_submission_test_namespace(directory)
+            wire = {"generation_request_id": str(uuid.uuid4()), "workspace": "project-a", "model_type": "test-model",
+                    "prompt": "prompt", "image_mode": 2, "project_asset_refs": [{"output_ids": ["reference-1"]}]}
+            commit = coordinator.journal.commit_state
+            def lost_registration_ack(**kwargs):
+                receipt = commit(**kwargs)
+                if kwargs.get("jobs"):
+                    raise OSError("injected registration ACK loss after fsync")
+                return receipt
+            with mock.patch.object(coordinator.journal, "commit_state", side_effect=lost_registration_ack):
+                with self.assertRaisesRegex(OSError, "ACK loss"):
+                    asyncio.run(ns["generate"](Request(wire)))
+            ns["_authorize_generation_media_inputs"] = mock.Mock(side_effect=AssertionError("replay must not consume changed inputs"))
+            lookup = ns["get_generation_submission"](wire["generation_request_id"], "project-a", Request(wire), Response())
+            self.assertEqual(lookup["admission_state"], "accepted")
+            self.assertTrue(lookup["retained_job"])
+            self.assertEqual(lookup["job"]["status"], "queued")
+            self.assertEqual(lookup["job"]["prompt_preview"], "")
+            replay = asyncio.run(ns["generate"](Request(wire)))
+            self.assertEqual(replay["job_id"], lookup["job_id"])
+            self.assertFalse(registry)
+            self.assertEqual(observed["release"], [])
+            self.assertEqual(observed.get("cleanup", []), [])
+            self.assertEqual(len(observed["staging"]), 1)
+            self.assertTrue(Path(observed["staging"][0]).is_file())
+            pointer = coordinator.journal.recover().jobs[lookup["job_id"]]["request_manifest"]
+            self.assertTrue((project / pointer["path"]).is_file())
+            self.assertEqual(stat.S_IMODE((project / pointer["path"]).stat().st_mode), 0o600)
+            self.assertEqual(len(observed["credit"]), 1)
+            self.assertFalse(observed["threads"])
+            ns["_authorize_generation_media_inputs"].assert_not_called()
+
+    def test_studio_legacy_caller_and_legacy_session_scope_remain_supported(self):
+        from fastapi.responses import Response
+        with tempfile.TemporaryDirectory() as directory:
+            ns, Request, coordinator, registry, observed, project = self._studio_submission_test_namespace(directory)
+            wire = {"workspace": "project-a", "model_type": "test-model", "prompt": "prompt", "image_mode": 2}
+            legacy = asyncio.run(ns["generate"](Request(wire, account=None)))
+            self.assertEqual(legacy["status"], "queued")
+            self.assertNotIn("admission_state", legacy)
+            self.assertNotIn("studio_submissions", coordinator.journal.recover().global_state)
+            wire["generation_request_id"] = str(uuid.uuid4())
+            protected = asyncio.run(ns["generate"](Request(wire, account=None)))
+            self.assertEqual(asyncio.run(ns["generate"](Request(wire, account=None)))["job_id"], protected["job_id"])
+            with self.assertRaises(ns["HTTPException"]) as activated:
+                ns["get_generation_submission"](wire["generation_request_id"], "project-a", Request(wire, account="new-account"), Response())
+            self.assertEqual(activated.exception.status_code, 404)
+            marker = project / ".maestro-project-instance"
+            marker.write_text(uuid.uuid4().hex + "\n")
+            with self.assertRaises(ns["HTTPException"]) as recreated:
+                ns["get_generation_submission"](wire["generation_request_id"], "project-a", Request(wire, account=None), Response())
+            self.assertEqual(recreated.exception.status_code, 404)
+            self.assertEqual(len(observed["credit"]), 2)
+            self.assertEqual(len(observed["threads"]), 2)
+
+    def test_studio_pending_admission_retains_private_inputs_on_actual_repeated_startup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, Request, coordinator, registry, observed, project = self._studio_submission_test_namespace(directory)
+            wire = {"generation_request_id": str(uuid.uuid4()), "workspace": "project-a", "model_type": "test-model", "prompt": "private prompt", "image_mode": 2}
+            context = ns["_studio_submission_context"](Request(wire), "project-a", str(project), wire["generation_request_id"], {k: v for k, v in wire.items() if k != "generation_request_id"})
+            job_id = uuid.uuid4().hex
+            coordinator.reserve_studio_submission(context["request_id"], job_id=job_id, **{k: v for k, v in context.items() if k != "request_id"})
+            pointer = atomic_write_request_manifest(project, job_id=job_id, params={"image_start": "/now-missing/original.png"}, inputs=[])
+            staging = Path(ensure_recovery_staging_directory(project))
+            partial = staging / f"unit-{job_id}-t0-r0-w1.mp4"
+            partial.write_bytes(b"private partial bytes")
+            other = Path(directory) / "project-b"
+            other.mkdir()
+            orphan = atomic_write_request_manifest(other, job_id=uuid.uuid4().hex, params={"prompt": "unrelated orphan"}, inputs=[])
+            cleanups = []
+            def cleanup(root, live):
+                cleanups.append(str(root))
+                return cleanup_orphan_request_manifests(root, live)
+            ns.update(_queue_recovery_workers_started=False,
+                _queue_recovery_existing_projects=lambda: {"project-a": (str(project), context["project_digest"]), "project-b": (str(other), "unrelated-project")},
+                restore_scheduler_state=lambda *a: None,
+                cleanup_orphan_request_manifests=cleanup,
+                cleanup_orphan_staged_outputs=cleanup_orphan_staged_outputs)
+            ns = _isolated_functions(self.launch, ("_restore_queue_recovery_on_startup",), ns)
+            for _ in range(2):
+                ns["_queue_recovery_workers_started"] = False
+                fresh = QueueRecoveryCoordinator(coordinator.journal)
+                ns["_queue_recovery_coordinator"] = fresh
+                ns["_queue_recovery_restored"] = fresh.restore()
+                self.assertTrue(ns["_restore_queue_recovery_on_startup"]())
+                self.assertTrue((project / pointer["path"]).is_file())
+                self.assertEqual(partial.read_bytes(), b"private partial bytes")
+                self.assertFalse(registry)
+                self.assertFalse(observed["threads"])
+                self.assertFalse(fresh.lookup_studio_submission(context["request_id"], **{k: v for k, v in context.items() if k != "request_id"})["accepted"])
+            self.assertEqual(cleanups, [str(other), str(other)])
+            self.assertFalse((other / orphan["path"]).exists())
+
+    def test_studio_reservation_compacts_full_journal_without_readmitting_old_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, Request, coordinator, registry, observed, project = self._studio_submission_test_namespace(directory)
+            coordinator.journal.max_events = 2
+            wire = {"generation_request_id": str(uuid.uuid4()), "workspace": "project-a", "model_type": "test-model", "prompt": "prompt", "image_mode": 2}
+            first = asyncio.run(ns["generate"](Request(wire)))
+            self.assertEqual(coordinator.journal.recover().event_count, 2)
+            second_wire = dict(wire, generation_request_id=str(uuid.uuid4()))
+            second = asyncio.run(ns["generate"](Request(second_wire)))
+            self.assertNotEqual(first["job_id"], second["job_id"])
+            self.assertGreaterEqual(coordinator.journal.recover().epoch, 2)
+            self.assertEqual(len(coordinator.journal.recover().jobs), 2)
+            self.assertEqual(len(coordinator.journal.recover().global_state["studio_submissions"]["records"]), 2)
+            self.assertEqual(asyncio.run(ns["generate"](Request(wire)))["job_id"], first["job_id"])
+            self.assertEqual(len(observed["credit"]), 2)
+            self.assertEqual(len(observed["threads"]), 2)
+            self.assertEqual(len(list((project / ".maestro-recovery").glob("*.request.json"))), 2)
+
+    def test_studio_capacity_and_pure_validation_rejections_are_definitive_only_before_reservation(self):
+        from services import queue_recovery_adapter as adapter
+        from fastapi.responses import Response
+        with tempfile.TemporaryDirectory() as directory:
+            ns, Request, coordinator, registry, observed, project = self._studio_submission_test_namespace(directory)
+            wire = {"generation_request_id": str(uuid.uuid4()), "workspace": "project-a", "model_type": "test-model", "prompt": "prompt", "image_mode": 2}
+            accepted = asyncio.run(ns["generate"](Request(wire)))
+            new = dict(wire, generation_request_id=str(uuid.uuid4()))
+            with mock.patch.object(adapter, "STUDIO_SUBMISSION_MAX_RECORDS", 1):
+                with self.assertRaises(ns["HTTPException"]) as full:
+                    asyncio.run(ns["generate"](Request(new)))
+                self.assertEqual(full.exception.status_code, 400)
+                self.assertEqual(full.exception.detail, {"admission_state": "rejected", "generation_request_id": new["generation_request_id"], "workspace": "project-a", "message": "Request recovery history is full. Existing requests can still be checked."})
+                self.assertEqual(asyncio.run(ns["generate"](Request(wire)))["job_id"], accepted["job_id"])
+            for invalid_setting in ({"model_type": "missing-model"}, {"enhance_before_generate": "yes"},
+                                    {"_queue_mode": "wrong"}, {"_studio_submission_context": {"request_id": "foreign"}},
+                                    {"_cardinality": 3}, {"_project_asset_ref_paths": ["/private/foreign"]}):
+                invalid = dict(new, **invalid_setting)
+                with self.subTest(invalid_setting=invalid_setting), self.assertRaises(ns["HTTPException"]) as rejected:
+                    asyncio.run(ns["generate"](Request(invalid)))
+                self.assertEqual(rejected.exception.detail["admission_state"], "rejected")
+                self.assertEqual(rejected.exception.detail["generation_request_id"], new["generation_request_id"])
+                self.assertEqual(rejected.exception.detail["workspace"], "project-a")
+            lookup = ns["get_generation_submission"](new["generation_request_id"], "project-a", Request(new), Response())
+            self.assertEqual(lookup["admission_state"], "unknown")
+            self.assertNotIn("job", lookup)
+            for bad in (None, "", str(uuid.uuid4()).upper(), float("nan")):
+                with self.subTest(bad=bad), self.assertRaises(ns["HTTPException"]):
+                    asyncio.run(ns["generate"](Request(dict(new, generation_request_id=bad))))
+            self.assertEqual(len(coordinator.journal.recover().jobs), 1)
+            self.assertEqual(len(observed["credit"]), 1)
+            self.assertEqual(len(observed["threads"]), 1)
+
     def test_prompt_enhancement_logical_kind_is_closed_public_projection(self):
         public_kind = _isolated_functions(
             self.launch,

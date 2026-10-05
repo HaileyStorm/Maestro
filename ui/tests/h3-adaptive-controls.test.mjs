@@ -111,7 +111,7 @@ function loadControls() {
             export const Plus = icon
           ` }
           if (args.path === 'store') return { contents: `
-            export const useStore = selector => selector(globalThis.__maestroAdaptiveControlsStore)
+            export const useStore = selector => selector({ studioSubmissions: [], ...globalThis.__maestroAdaptiveControlsStore })
             export const getFamiliesForMode = (_mode, families) => families
             export const getModelsForFamily = (family, models) => models.filter(model => model.family === family)
           ` }

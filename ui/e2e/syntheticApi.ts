@@ -417,10 +417,29 @@ export interface SyntheticApiController {
   takeUnexpected(): string[]
 }
 
+/** Model-free ordinary Studio job, shared by acknowledgement recovery fixtures. */
+export function syntheticStudioJob(jobId: string, workspace: string, held = true) {
+  return {
+    job_id: jobId, created_at: 1, status: 'queued' as const,
+    progress: 0, step: 0, total_steps: 1, phase: 'queued',
+    message: held ? 'Ready - waiting for Start Queue' : 'Queued...',
+    output_files: [] as string[], error: null, prompt_preview: '', active_window_prompt: '',
+    model_type: 'minimax_h3', generation_mode: 'video', workspace,
+    window_current: 0, window_total: 0, window_step: 0, window_total_steps: 0,
+    window_progress: 0, overall_progress: 0, queue_priority: 0, queue_held: held,
+    hold_after_output: false, queue_position: 1, queue_wait_reason: held ? 'held' : 'waiting_for_turn',
+    queue_reorder_reason: 'queue_order', queue_residency_bypass_count: 0,
+    queue_residency_bypassed_waiters: 0, requested_outputs: 1, produced_outputs: 0,
+    eta_seconds: 12, subtask_eta_seconds: null,
+    queue: { paused: false, pause_after_current: false },
+  }
+}
+
 export async function installSyntheticApi(page: Page): Promise<SyntheticApiController> {
   const unexpected: string[] = []
   let adaptiveScenario: 'base-only' | 'ready' | 'missing-reference' | 'blocked-reference' = 'base-only'
   const generations: Record<string, unknown>[] = []
+  const studioSubmissions = new Map<string, ReturnType<typeof syntheticStudioJob>>()
   const syntheticLora = {
     filename: 'synthetic-shared.safetensors', lora_id: 'local:synthetic-shared.safetensors',
     trained_words: [], preview_url: null, civitai_model_id: null,
@@ -530,6 +549,21 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
 
     const key = `${request.method()} ${url.pathname}`
     requestCounts.set(url.pathname, (requestCounts.get(url.pathname) || 0) + 1)
+    if (request.method() === 'GET' && url.pathname.startsWith('/api/v1/status/')) {
+      const jobId = url.pathname.split('/').at(-1)
+      const job = Array.from(studioSubmissions.values()).find(value => value.job_id === jobId)
+      if (job) { await json(route, job); return }
+    }
+    if (request.method() === 'GET' && url.pathname.startsWith('/api/v1/generate/submissions/')) {
+      const generationRequestId = url.pathname.split('/').at(-1) || ''
+      const workspace = url.searchParams.get('workspace') || ''
+      const job = studioSubmissions.get(generationRequestId)
+      await json(route, job?.workspace === workspace ? {
+        generation_request_id: generationRequestId, workspace,
+        admission_state: 'accepted', job, retained_job: true, reused: true,
+      } : { generation_request_id: generationRequestId, workspace, admission_state: 'unknown' })
+      return
+    }
     switch (key) {
       case 'GET /api/v1/access-context':
         await json(route, {
@@ -657,8 +691,23 @@ export async function installSyntheticApi(page: Page): Promise<SyntheticApiContr
           await route.abort('blockedbyclient')
           return
         }
-        generations.push(request.postDataJSON() as Record<string, unknown>)
-        await json(route, { job_id: 'synthetic-adaptive-job', status: 'held', held: true })
+        {
+          const body = request.postDataJSON() as Record<string, unknown>
+          generations.push(body)
+          if (typeof body.generation_request_id === 'string') {
+            const workspace = typeof body.workspace === 'string' ? body.workspace : 'Synthetic project'
+            const job = syntheticStudioJob(body.generation_request_id.replaceAll('-', ''), workspace, body._queue_mode === 'held')
+            const reused = studioSubmissions.has(body.generation_request_id)
+            studioSubmissions.set(body.generation_request_id, job)
+            await json(route, {
+              job_id: job.job_id, status: job.status, held: job.queue_held,
+              generation_request_id: body.generation_request_id, workspace,
+              admission_state: 'accepted', job, retained_job: true, reused,
+            })
+          } else {
+            await json(route, { job_id: 'synthetic-adaptive-job', status: 'held', held: true })
+          }
+        }
         return
       case 'POST /api/v1/loras/check-updates':
         if (loraFailureStatus !== null) {

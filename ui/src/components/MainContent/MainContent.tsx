@@ -2762,6 +2762,9 @@ export function MainContent() {
   const setSelectedOutput = useStore(s => s.setSelectedOutput)
   const activeIndex = useStore(s => s.selectedOutput)
   const activeWorkspace = useStore(s => s.activeWorkspace)
+  const studioSubmission = useStore(s => s.studioSubmissions.find(submission => submission.workspace === s.activeWorkspace))
+  const checkStudioSubmission = useStore(s => s.checkStudioSubmission)
+  const retryStudioSubmission = useStore(s => s.retryStudioSubmission)
   const activeProject = useStore(s => (s.workspaces ?? []).find(workspace => workspace.name === s.activeWorkspace))
   const canMutateActiveProject = projectActionVisibility(activeProject).mutate
   const canManageActiveProjectMembers = activeProject?.project_permissions?.includes('project.membership.manage') === true
@@ -3448,6 +3451,22 @@ export function MainContent() {
 
   return (
     <main className="min-w-0 flex-1 flex flex-col h-full overflow-hidden">
+      {studioSubmission && (
+        <section aria-label="Studio submission" className="border-b border-amber-400/30 bg-amber-400/5 px-3 py-3 text-sm text-text-primary">
+          <p role="status">{studioSubmission.message}</p>
+          {studioSubmission.state !== 'preparing' && (
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <button type="button" disabled={studioSubmission.checking} onClick={() => void checkStudioSubmission()} className="mobile-control-target rounded border border-border px-3 py-2 text-xs disabled:opacity-40">
+                {studioSubmission.checking ? 'Checking…' : 'Check submission'}
+              </button>
+              <button type="button" disabled={studioSubmission.state !== 'unconfirmed' || studioSubmission.checking} onClick={() => void retryStudioSubmission()} className="mobile-control-target rounded border border-border px-3 py-2 text-xs disabled:opacity-40">
+                Retry this submission
+              </button>
+              <p className="text-xs text-text-secondary">Retry uses the original settings. Edited settings are kept for your next submission.</p>
+            </div>
+          )}
+        </section>
+      )}
       {/* Top bar */}
       <div
         data-main-toolbar

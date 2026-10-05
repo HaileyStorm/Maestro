@@ -17,6 +17,8 @@ export function GenerateButton() {
   const setSidebarOpen = useStore(s => s.setSidebarOpen)
   const modelOptionsLoading = useStore(s => s.modelOptionsLoading)
   const activeWorkspace = useStore(s => s.activeWorkspace)
+  const studioSubmission = useStore(s => s.studioSubmissions.find(submission => submission.workspace === s.activeWorkspace))
+  const audioOnly = useStore(s => s.modelOptions?.audio_only)
   const params = useStore(s => s.params)
   const setParam = useStore(s => s.setParam)
   const h3SelectionError = useStore(s => h3AdaptiveSelectionError(s.params))
@@ -210,11 +212,13 @@ export function GenerateButton() {
 
   const imageMode = useStore(s => s.params.image_mode)
   const queueSupported = generationMode !== 'avatar' && imageMode !== 4
+  const ordinaryStudio = (generationMode === 'image' || generationMode === 'video' && imageMode !== 4) && !audioOnly
+  const submissionBlocked = ordinaryStudio && Boolean(studioSubmission)
 
   const handleClick = (mode: 'now' | 'queue' = 'now') => {
-    if (blocked) return
+    if (blocked || submissionBlocked) return
     if (mode === 'queue' && !queueSupported) return
-    setCooldown(true)
+    if (!ordinaryStudio) setCooldown(true)
     startGeneration(mode)
     if (mode === 'now') setSidebarOpen(false)
   }
@@ -316,24 +320,24 @@ export function GenerateButton() {
       <div className="grid grid-cols-[1fr_auto] overflow-hidden rounded-lg shadow-accent-glow">
         <button
           onClick={() => handleClick('now')}
-          disabled={cooldown}
+          disabled={cooldown || submissionBlocked}
           className={`mobile-control-target px-4 py-2 flex items-center gap-1.5 font-medium text-xs transition-all whitespace-nowrap ${
-            cooldown
+            cooldown || submissionBlocked
               ? 'bg-bg-active text-text-muted cursor-not-allowed'
               : 'bg-cta text-cta-foreground hover:ring-2 hover:ring-accent-blue/40'
           }`}
         >
           <Play size={13} fill="currentColor" />
-          {cooldown ? 'Queued' : queueCount > 0 ? `Go (${queueCount})` : 'Generate'}
+          {submissionBlocked ? studioSubmission?.state === 'preparing' ? 'Preparing…' : 'Submission pending' : cooldown ? 'Submitting…' : queueCount > 0 ? `Go (${queueCount})` : 'Generate'}
         </button>
         <button
           onClick={() => handleClick('queue')}
-          disabled={cooldown || !queueSupported}
+          disabled={cooldown || submissionBlocked || !queueSupported}
           title={queueSupported
             ? 'Hold current Studio settings in the queue without starting generation'
             : 'Hold is unavailable for this Avatar or edit workflow'}
           className={`mobile-control-target px-2.5 py-2 border-l border-white/10 ${
-            cooldown || !queueSupported
+            cooldown || submissionBlocked || !queueSupported
               ? 'bg-bg-active text-text-muted cursor-not-allowed'
               : 'bg-cta text-cta-foreground hover:ring-2 hover:ring-accent-blue/40'
           }`}

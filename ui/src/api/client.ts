@@ -1177,6 +1177,78 @@ export async function fetchDefaults(modelType: string): Promise<Record<string, u
 
 export interface GenerationSubmissionParams extends Record<string, unknown> {
   project_asset_refs?: ProjectAssetGenerateReference[]
+  generation_request_id?: string
+}
+
+export interface StudioGenerationAdmission {
+  generation_request_id: string
+  workspace: string
+  admission_state: 'accepted' | 'pending' | 'unknown'
+  job?: ApiJobStatus
+  retained_job?: boolean
+  reused?: boolean
+}
+
+export class GenerationSubmissionError extends Error {
+  status: number
+  detail: unknown
+
+  constructor(status: number, detail: unknown) {
+    const record = detail !== null && typeof detail === 'object' ? detail as Record<string, unknown> : null
+    super(typeof detail === 'string' ? detail : typeof record?.message === 'string' ? record.message : 'Could not confirm the submission.')
+    this.status = status
+    this.detail = detail
+  }
+}
+
+function studioGenerationAdmission(value: unknown, requestId: string, workspace: string): StudioGenerationAdmission {
+  const response = value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown> : null
+  const invalid = () => new Error('Could not confirm the submission response.')
+  if (!response || response.generation_request_id !== requestId || response.workspace !== workspace
+    || typeof response.admission_state !== 'string'
+    || !['accepted', 'pending', 'unknown'].includes(response.admission_state)) throw invalid()
+  if (response.admission_state !== 'accepted') {
+    if (response.job != null) throw invalid()
+    return response as unknown as StudioGenerationAdmission
+  }
+  const job = response.job as Record<string, unknown> | null
+  if (!job || typeof job !== 'object' || Array.isArray(job) || job.workspace !== workspace
+    || typeof job.job_id !== 'string' || !isBackendJobId(job.job_id)
+    || (response.job_id !== undefined && response.job_id !== job.job_id)
+    || typeof response.retained_job !== 'boolean' || typeof response.reused !== 'boolean'
+    || typeof job.status !== 'string'
+    || !['preparing', 'waiting_for_plan_approval', 'queued', 'running', 'completed', 'failed', 'cancelled'].includes(job.status)
+    || (response.retained_job === false && !['completed', 'failed', 'cancelled'].includes(String(job.status)))
+    || !['created_at', 'progress', 'step', 'total_steps', 'window_current', 'window_total', 'window_step', 'window_total_steps', 'window_progress', 'overall_progress', 'queue_priority', 'queue_residency_bypass_count', 'queue_residency_bypassed_waiters', 'requested_outputs', 'produced_outputs'].every(key => typeof job[key] === 'number' && Number.isFinite(job[key]))
+    || !['phase', 'message', 'prompt_preview', 'active_window_prompt', 'model_type', 'generation_mode'].every(key => typeof job[key] === 'string')
+    || !Array.isArray(job.output_files) || !job.output_files.every(file => typeof file === 'string')
+    || !(job.error === null || typeof job.error === 'string')
+    || !['queue_held', 'hold_after_output'].every(key => typeof job[key] === 'boolean')
+    || !(job.queue_position === null || typeof job.queue_position === 'number' && Number.isFinite(job.queue_position))
+    || !(job.queue_wait_reason === null || typeof job.queue_wait_reason === 'string')
+    || !(job.queue_reorder_reason === null || typeof job.queue_reorder_reason === 'string')) throw invalid()
+  const queue = job.queue as Record<string, unknown> | null
+  if (!queue || typeof queue.paused !== 'boolean' || typeof queue.pause_after_current !== 'boolean') throw invalid()
+  return response as unknown as StudioGenerationAdmission
+}
+
+async function readStudioGenerationAdmission(response: Response, requestId: string, workspace: string): Promise<StudioGenerationAdmission> {
+  const value = await response.json()
+  if (!response.ok) throw new GenerationSubmissionError(response.status, value?.detail)
+  return studioGenerationAdmission(value, requestId, workspace)
+}
+
+export async function submitStudioGeneration(body: string, requestId: string, workspace: string): Promise<StudioGenerationAdmission> {
+  const response = await fetch(`${BASE}/api/v1/generate`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
+  })
+  return readStudioGenerationAdmission(response, requestId, workspace)
+}
+
+export async function fetchStudioGenerationSubmission(requestId: string, workspace: string): Promise<StudioGenerationAdmission> {
+  const response = await fetch(`${BASE}/api/v1/generate/submissions/${encodeURIComponent(requestId)}?workspace=${encodeURIComponent(workspace)}`)
+  return readStudioGenerationAdmission(response, requestId, workspace)
 }
 
 export interface H3BridgeClipARequest {

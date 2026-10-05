@@ -88,6 +88,7 @@ _JOB_FIELDS = frozenset({
 })
 _GLOBAL_FIELDS = frozenset({
     "paused", "pause_after_current", "manual_order_sequence", "queue_order",
+    "studio_submissions",
 })
 _TERMINAL = frozenset({"completed", "failed", "cancelled"})
 # Failed jobs still offer owner-controlled Retry. Keep their registration and
@@ -1371,6 +1372,87 @@ def serialize_job(
     return result
 
 
+STUDIO_SUBMISSION_MAX_RECORDS = 4096
+STUDIO_SUBMISSION_MAX_BYTES = 2 * 1024 * 1024
+_STUDIO_SUBMISSION_STATUSES = ("preparing", "waiting_for_plan_approval", "queued", "running", "completed", "failed", "cancelled")
+
+
+class StudioSubmissionConflict(QueueRecoveryAdapterError):
+    pass
+
+
+class StudioSubmissionScopeError(QueueRecoveryAdapterError):
+    pass
+
+
+class StudioSubmissionCapacityError(QueueRecoveryAdapterError):
+    pass
+
+
+def validate_generation_request_id(value):
+    try:
+        parsed = uuid.UUID(value) if isinstance(value, str) else None
+    except (ValueError, AttributeError):
+        parsed = None
+    if parsed is None or parsed.version != 4 or str(parsed) != value:
+        raise QueueRecoveryAdapterError("generation_request_id must be a canonical UUID4.")
+    return value
+
+
+def _validated_studio_submissions(value):
+    if not isinstance(value, dict) or set(value) != {"schema_version", "records"} or type(value["schema_version"]) is not int or value["schema_version"] != 1:
+        raise QueueRecoveryAdapterError("Studio submission ledger is invalid.")
+    records = value["records"]
+    if not isinstance(records, dict) or len(records) > STUDIO_SUBMISSION_MAX_RECORDS:
+        raise QueueRecoveryAdapterError("Studio submission ledger exceeds its record bound.")
+    job_ids = set()
+    for request_id, record in records.items():
+        validate_generation_request_id(request_id)
+        if (not isinstance(record, dict) or set(record) != {"scope_digest", "owner_principal", "project_instance", "request_digest", "job_id", "workspace", "accepted", "receipt"}
+                or not _valid_job_id(record.get("job_id"))
+                or type(record.get("accepted")) is not bool
+                or not isinstance(record.get("workspace"), str)
+                or not record["workspace"] or len(record["workspace"]) > 128
+                or record["workspace"] in {".", ".."}
+                or any(c in record["workspace"] for c in "/\\")
+                or any(ord(c) < 32 for c in record["workspace"])):
+            raise QueueRecoveryAdapterError("Studio submission record is invalid.")
+        for field in ("scope_digest", "request_digest"):
+            if not isinstance(record[field], str) or re.fullmatch(r"[0-9a-f]{64}", record[field]) is None:
+                raise QueueRecoveryAdapterError("Studio submission digest is invalid.")
+        for field, prefix in (("owner_principal", _OWNER_PREFIX), ("project_instance", _PROJECT_PREFIX)):
+            if not isinstance(record[field], str) or not record[field].startswith(prefix) or _DIGEST_RE.fullmatch(record[field]) is None:
+                raise QueueRecoveryAdapterError("Studio submission scope is invalid.")
+        if record["job_id"] in job_ids:
+            raise QueueRecoveryAdapterError("Studio submission job identity is duplicated.")
+        job_ids.add(record["job_id"])
+        receipt = record["receipt"]
+        if (not isinstance(receipt, dict) or set(receipt) != {"status", "queue_held", "created_at"}
+                or type(receipt["status"]) is not int or not 0 <= receipt["status"] < len(_STUDIO_SUBMISSION_STATUSES)
+                or type(receipt["queue_held"]) is not int or receipt["queue_held"] not in (0, 1)
+                or type(receipt["created_at"]) not in (int, float)
+                or not math.isfinite(receipt["created_at"]) or receipt["created_at"] < 0):
+            raise QueueRecoveryAdapterError("Studio submission receipt is invalid.")
+    if len(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")) > STUDIO_SUBMISSION_MAX_BYTES:
+        raise QueueRecoveryAdapterError("Studio submission ledger exceeds its byte bound.")
+    return deepcopy(value)
+
+
+def _studio_submissions_with_jobs(ledger, jobs):
+    result = _validated_studio_submissions(ledger)
+    for record in result["records"].values():
+        snapshot = jobs.get(record["job_id"])
+        if record["accepted"] and snapshot is not None:
+            status = snapshot.get("status")
+            if status not in _STUDIO_SUBMISSION_STATUSES:
+                raise QueueRecoveryAdapterError("Studio submission job status is invalid.")
+            # Fixed-width status codes/hold bits keep terminal updates within the
+            # capacity reserved before staging, without retaining heavy snapshots.
+            record["receipt"]["status"] = _STUDIO_SUBMISSION_STATUSES.index(status)
+            record["receipt"]["queue_held"] = int(bool(snapshot.get("queue_held")))
+    return _validated_studio_submissions(result)
+
+
 def serialize_global_state(state: Mapping[str, Any]) -> dict[str, Any]:
     """Serialize prompt/path/credential-free queue controls only."""
     if not isinstance(state, Mapping):
@@ -1378,7 +1460,8 @@ def serialize_global_state(state: Mapping[str, Any]) -> dict[str, Any]:
     unknown = set(state).difference(_GLOBAL_FIELDS)
     if unknown:
         raise QueueRecoveryAdapterError("Queue recovery global state has unknown fields.")
-    result = {key: _safe_json(value, path=f"global.{key}") for key, value in state.items()}
+    result = {key: (_validated_studio_submissions(value) if key == "studio_submissions"
+                    else _safe_json(value, path=f"global.{key}")) for key, value in state.items()}
     result.setdefault("paused", False)
     result.setdefault("pause_after_current", False)
     result.setdefault("manual_order_sequence", 0)
@@ -1561,6 +1644,11 @@ class QueueRecoveryCoordinator:
     ) -> dict[str, Any]:
         """Merge queue controls without dropping not-yet-waiting registrations."""
         clean = serialize_global_state(incoming)
+        admissions = self._global_state.get("studio_submissions")
+        if "studio_submissions" in clean and clean["studio_submissions"] != admissions:
+            raise QueueRecoveryAdapterError("Studio submission authority cannot be replaced by queue controls.")
+        if admissions is not None:
+            clean["studio_submissions"] = _studio_submissions_with_jobs(admissions, job_updates or {})
         prospective = dict(self._snapshots)
         prospective.update({
             key: dict(value) for key, value in (job_updates or {}).items()
@@ -1617,6 +1705,80 @@ class QueueRecoveryCoordinator:
         with self._lock:
             return self._epoch
 
+    def _refresh_submission_state_unlocked(self):
+        recovered = self.journal.recover()
+        # Admission reconciliation must preserve real running/terminal status;
+        # startup restore's execution normalization is deliberately not used.
+        jobs = {job_id: serialize_job(raw, owner_digest=raw.get("owner_principal"),
+                    project_digest=raw.get("project_instance"), request_manifest=raw.get("request_manifest"))
+                for job_id, raw in recovered.jobs.items()}
+        state = serialize_global_state(recovered.global_state or {})
+        for record in state.get("studio_submissions", {}).get("records", {}).values():
+            job = jobs.get(record["job_id"])
+            if record["accepted"]:
+                if job is not None and job.get("status") not in _STUDIO_SUBMISSION_STATUSES:
+                    raise QueueRecoveryAdapterError("Studio submission job status is invalid.")
+                if job is None and _STUDIO_SUBMISSION_STATUSES[record["receipt"]["status"]] not in _TERMINAL:
+                    raise QueueRecoveryAdapterError("Studio submission lost its accepted job.")
+                if job is not None and (job.get("owner_principal") != record["owner_principal"]
+                        or job.get("project_instance") != record["project_instance"]
+                        or job.get("workspace") != record["workspace"]):
+                    raise QueueRecoveryAdapterError("Studio submission job scope changed.")
+            elif job is not None:
+                raise QueueRecoveryAdapterError("Studio submission registration is inconsistent.")
+        self._epoch, self._global_revision = recovered.epoch, recovered.global_revision
+        self._job_revisions = dict(recovered.job_revisions)
+        self._snapshots, self._global_state = jobs, state
+        self._identities = {job_id: (job["owner_principal"], job["project_instance"]) for job_id, job in jobs.items()}
+        self._manifests = {job_id: deepcopy(job["request_manifest"]) for job_id, job in jobs.items()}
+
+    def lookup_studio_submission(self, request_id, *, scope_digest, owner_digest, project_digest, workspace, request_digest=None):
+        validate_generation_request_id(request_id)
+        with self._lock:
+            self._refresh_submission_state_unlocked()
+            record = self._global_state.get("studio_submissions", {}).get("records", {}).get(request_id)
+            if record is None:
+                return None
+            if any(record[key] != value for key, value in (("scope_digest", scope_digest), ("owner_principal", owner_digest),
+                    ("project_instance", project_digest), ("workspace", workspace))):
+                raise StudioSubmissionScopeError("Submission not found.")
+            if request_digest is not None and not hmac.compare_digest(record["request_digest"], request_digest):
+                raise StudioSubmissionConflict("This request ID is already bound to different settings.")
+            result = deepcopy(record)
+            result["snapshot"] = deepcopy(self._snapshots.get(record["job_id"]))
+            result["status"] = _STUDIO_SUBMISSION_STATUSES[record["receipt"]["status"]]
+            return result
+
+    def reserve_studio_submission(self, request_id, *, scope_digest, owner_digest, project_digest, workspace, request_digest, job_id):
+        with self._lock:
+            previous = self.lookup_studio_submission(request_id, scope_digest=scope_digest, owner_digest=owner_digest,
+                project_digest=project_digest, workspace=workspace, request_digest=request_digest)
+            if previous is not None:
+                return False, previous
+            ledger = deepcopy(self._global_state.get("studio_submissions") or {"schema_version": 1, "records": {}})
+            if len(ledger["records"]) >= STUDIO_SUBMISSION_MAX_RECORDS:
+                raise StudioSubmissionCapacityError("Request recovery history is full. Existing requests can still be checked.")
+            if job_id in self._snapshots or any(record["job_id"] == job_id for record in ledger["records"].values()):
+                raise QueueRecoveryAdapterError("Studio submission job identity is already reserved.")
+            ledger["records"][request_id] = {"scope_digest": scope_digest, "owner_principal": owner_digest,
+                "project_instance": project_digest, "request_digest": request_digest, "job_id": job_id,
+                "workspace": workspace, "accepted": False,
+                "receipt": {"status": 2, "queue_held": 0, "created_at": time.time()}}
+            if len(json.dumps(ledger, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")) > STUDIO_SUBMISSION_MAX_BYTES:
+                raise StudioSubmissionCapacityError("Request recovery history is full. Existing requests can still be checked.")
+            clean = self._canonical_global_state(self._global_state)
+            clean["studio_submissions"] = _validated_studio_submissions(ledger)
+            try:
+                receipt = self.journal.commit_state(global_state=clean, expected_global_revision=self._global_revision, expected_epoch=self._epoch)
+                self._accept_receipt(receipt)
+                self._global_state = clean
+            except BaseException:
+                # Reconcile an append/ACK or cache failure, but never continue the
+                # original admission automatically after an ambiguous commit.
+                self._refresh_submission_state_unlocked()
+                raise
+            return True, deepcopy(ledger["records"][request_id])
+
     def register_job(
         self,
         job: Mapping[str, Any],
@@ -1625,11 +1787,12 @@ class QueueRecoveryCoordinator:
         project_digest: str,
         request_manifest: Mapping[str, Any],
         global_state: Mapping[str, Any] | None = None,
+        generation_request_id: str | None = None,
     ) -> None:
         """Durably register a new/recovered runtime job before scheduling."""
         self.register_jobs_atomic(
             ((job, owner_digest, project_digest, request_manifest),),
-            global_state=global_state,
+            global_state=global_state, generation_request_id=generation_request_id,
         )
 
     def register_jobs_atomic(
@@ -1639,6 +1802,7 @@ class QueueRecoveryCoordinator:
         ],
         *,
         global_state: Mapping[str, Any] | None = None,
+        generation_request_id: str | None = None,
     ) -> None:
         """Durably register an all-or-nothing group before any publication."""
 
@@ -1685,6 +1849,22 @@ class QueueRecoveryCoordinator:
                     global_state, job_updates=snapshots,
                 )
             )
+            if generation_request_id is not None:
+                validate_generation_request_id(generation_request_id)
+                if len(snapshots) != 1:
+                    raise QueueRecoveryAdapterError("Studio submission must register exactly one job.")
+                if clean_global is None:
+                    clean_global = self._canonical_global_state(self._global_state, job_updates=snapshots)
+                ledger = deepcopy(clean_global.get("studio_submissions") or {})
+                record = ledger.get("records", {}).get(generation_request_id)
+                snapshot = next(iter(snapshots.values()))
+                if (record is None or record["accepted"] or record["job_id"] != snapshot["id"]
+                        or record["owner_principal"] != snapshot["owner_principal"]
+                        or record["project_instance"] != snapshot["project_instance"]
+                        or record["workspace"] != snapshot.get("workspace")):
+                    raise QueueRecoveryAdapterError("Studio submission reservation changed.")
+                record["accepted"] = True
+                clean_global["studio_submissions"] = _studio_submissions_with_jobs(ledger, snapshots)
             receipt = self.journal.commit_state(
                 jobs=snapshots,
                 global_state=clean_global,
@@ -1805,14 +1985,12 @@ class QueueRecoveryCoordinator:
                         != {key: value for key, value in current.items() if key != "h3_delivery_recovery_control"}):
                         raise QueueRecoveryAdapterError("H3 companion source metadata changed.")
                 accepted_manifests[job_id] = clean_manifest
+            admission_jobs = {r["job_id"] for r in self._global_state.get("studio_submissions", {}).get("records", {}).values()}
             clean_global = (
-                None
-                if global_state is None
-                else self._canonical_global_state(
-                    global_state,
-                    job_updates=serialized,
-                    tombstones=tombstones,
-                )
+                self._canonical_global_state(
+                    self._global_state if global_state is None else global_state,
+                    job_updates=serialized, tombstones=tombstones,
+                ) if global_state is not None or admission_jobs.intersection(set(serialized) | set(tombstones)) else None
             )
             changed_ids = set(serialized).union(tombstones)
             receipt = self.journal.commit_state(
@@ -1875,6 +2053,8 @@ class QueueRecoveryCoordinator:
         with self._lock:
             recovered = self.journal.recover()
             clean_jobs, _clean_global = _validated_recovered_state(recovered)
+            if "studio_submissions" in _clean_global:
+                self._global_state["studio_submissions"] = _studio_submissions_with_jobs(_clean_global["studio_submissions"], clean_jobs)
             snapshot = clean_jobs.get(job_id)
             if snapshot is None:
                 return
@@ -1905,6 +2085,9 @@ class QueueRecoveryCoordinator:
         with self._lock:
             before = self.journal.recover()
             clean_before_jobs, clean_before_global = _validated_recovered_state(before)
+            if "studio_submissions" in clean_before_global:
+                clean_before_global["studio_submissions"] = _studio_submissions_with_jobs(
+                    clean_before_global["studio_submissions"], clean_before_jobs)
             # Supply sanitized state directly to the atomic replacement. This
             # works even when no append event/byte capacity remains.
             compacted = self.journal.compact(

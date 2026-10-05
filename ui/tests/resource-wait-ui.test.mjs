@@ -125,7 +125,7 @@ async function loadJobPlaceholder() {
               }
             ` }
           }
-          return { contents: 'export const useStore = selector => selector(globalThis.__resourceWaitStore)' }
+          return { contents: 'export const useStore = selector => selector({ studioSubmissions: [], ...globalThis.__resourceWaitStore })' }
         })
       },
     }],
@@ -156,7 +156,7 @@ async function loadGenerateButton() {
           if (args.path === 'jsx-runtime') return { contents: 'export const jsx = (type, props, key) => ({ type, key, props: props || {} }); export const jsxs = jsx' }
           if (args.path === 'lucide') return { contents: "export const Play = 'Play', AlertTriangle = 'AlertTriangle', ListPlus = 'ListPlus'" }
           if (args.path === 'h3') return { contents: 'export const H3EstimateBadge = () => null' }
-          return { contents: 'export const useStore = selector => selector(globalThis.__resourceWaitStore)' }
+          return { contents: 'export const useStore = selector => selector({ studioSubmissions: [], ...globalThis.__resourceWaitStore })' }
         })
       },
     }],
