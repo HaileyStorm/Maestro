@@ -67312,12 +67312,23 @@ def _run_tool_revoice(job_id: str):
                         return False
 
                     from postprocessing.voice_clone import apply_voice_clone_to_file
-                    ok = apply_voice_clone_to_file(
-                        final_path, voice_refs, mode=mode,
-                        diffusion_steps=int(params.get("diffusion_steps", 25)),
-                        cfg_rate=float(params.get("cfg_rate", 0.5)),
-                        cancel_check=lambda: is_cancel_requested(job),
-                    )
+                    def voice_activity(activity):
+                        phase = "" if activity is None else (
+                            f"Audio chunk {activity['audio_chunk']}: starting voice step "
+                            f"{activity['diffusion_step']} of {activity['diffusion_steps']}"
+                        )
+                        update_job(job, phase=phase)
+
+                    try:
+                        ok = apply_voice_clone_to_file(
+                            final_path, voice_refs, mode=mode,
+                            diffusion_steps=int(params.get("diffusion_steps", 25)),
+                            cfg_rate=float(params.get("cfg_rate", 0.5)),
+                            cancel_check=lambda: is_cancel_requested(job),
+                            progress_callback=voice_activity,
+                        )
+                    finally:
+                        update_job(job, phase="")
                     if is_cancel_requested(job):
                         try:
                             os.remove(final_path)

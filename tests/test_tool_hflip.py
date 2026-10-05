@@ -5,6 +5,9 @@ import ast
 import asyncio
 from contextlib import nullcontext
 import contextvars
+import copy
+import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -21,7 +24,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'app'))
 from fastapi import HTTPException
 from services.output_access import stamp_sidecar_policy
-from services.queue_recovery_runtime import recovery_unit_id, sha256_file
+from services.queue_recovery_runtime import recovery_unit_id, sha256_file, QueueRecoveryRuntimeError
+from services.queue_recovery_adapter import (QueueRecoveryAdapterError, owner_principal_digest,
+    processed_tool_publication_pending)
 
 TREE = ast.parse((ROOT / 'app/launch.py').read_text())
 
@@ -113,6 +118,14 @@ class FlipRouteTests(unittest.TestCase):
         asyncio.run(self.ns['tools_hflip'](self.request()))
         job = self.registered[0][0]
         job['access_policy'] = {'private': True, 'explicit': True}
+        job['_recovery_owner_digest'] = owner_principal_digest(b'hflip-fixture-secret', 'owner-session')
+        job['_recovery_project_digest'] = 'hflip-project-instance'
+        manifest = {'params': copy.deepcopy(job['params'])}
+        def load_manifest(_root, pointer, *, expected_job_id):
+            self.assertEqual(_root, self.root)
+            self.assertEqual(pointer, job['_recovery_manifest_pointer'])
+            self.assertEqual(expected_job_id, job['id'])
+            return copy.deepcopy(manifest)
         def start(j, **kw): j['status'] = 'running'; return True
         def finish(j, status, **kw): j.update(status=status, **kw); return True
         def record(j, names): j['output_files'] = names; return names
@@ -126,11 +139,18 @@ class FlipRouteTests(unittest.TestCase):
             '_validated_tool_input_paths': lambda j: [self.ns['_hflip_source'](j)[0]],
             '_resume_processed_tool_output': lambda _j: None,
             '_recovery_sha256_file': sha256_file,
-            'recovery_unit_id': recovery_unit_id,
+            'recovery_unit_id': recovery_unit_id, 'hashlib': hashlib, 'hmac': hmac,
+            'QueueRecoveryRuntimeError': QueueRecoveryRuntimeError,
+            'QueueRecoveryAdapterError': QueueRecoveryAdapterError,
+            'processed_tool_publication_pending': processed_tool_publication_pending,
+            '_queue_recovery_existing_project_identity': lambda _root: 'hflip-project-instance',
+            'load_request_manifest': load_manifest,
+            '_queue_recovery_checkpoint': lambda j, **updates: j.update(**updates) or True,
         })
         job['_recovery_manifest_pointer'] = {}
         load_functions(self.ns, '_run_tool_hflip', '_write_tool_sidecar',
-                       '_processed_tool_settings', '_publish_processed_tool_output')
+                       '_processed_tool_settings', '_publish_processed_tool_output',
+                       '_cleanup_cancelled_processed_tool_output')
         return job
 
     def test_worker_publishes_new_video_with_settings_and_provenance(self):
@@ -184,8 +204,18 @@ class FlipRouteTests(unittest.TestCase):
         for mode in ('cancel', 'persistence'):
             with self.subTest(mode=mode):
                 job = self.worker_namespace()
+                completion_attempts = []
                 def finish(j, status, **updates):
                     if status == 'completed':
+                        self.assertEqual(len(updates['output_files']), 1)
+                        media = Path(self.root) / updates['output_files'][0]
+                        self.assertEqual(media.read_bytes(), b'flipped')
+                        metadata = json.loads(media.with_suffix('.meta.json').read_text())
+                        self.assertEqual(metadata['job_id'], j['id'])
+                        intent = j['recovery_cursor']['processed_tool_publication']
+                        self.assertEqual(intent['media']['basename'], media.name)
+                        self.assertEqual(intent['sidecar']['basename'], media.with_suffix('.meta.json').name)
+                        completion_attempts.append(updates['output_files'])
                         if mode == 'persistence':
                             raise RuntimeError('journal unavailable')
                         j['cancel_requested'] = True
@@ -195,8 +225,11 @@ class FlipRouteTests(unittest.TestCase):
                 def encode(src, dst, **kw): Path(dst).write_bytes(b'flipped')
                 with patch('services.video_transform.horizontal_flip', side_effect=encode):
                     self.assertFalse(self.ns['_run_tool_hflip'](job['id']))
+                self.assertEqual(len(completion_attempts), 1)
+                self.assertEqual(job['status'], 'cancelled' if mode == 'cancel' else 'failed')
                 self.assertEqual(job['output_files'], [])
                 self.assertEqual(list(Path(self.root).glob('*_hflip_*')), [])
+                self.assertEqual(self.source.read_bytes(), b'original-video')
                 self.registered.clear()
 
     def test_concurrent_creator_is_not_overwritten_or_cleaned_up(self):
@@ -204,16 +237,23 @@ class FlipRouteTests(unittest.TestCase):
             with self.subTest(target=target):
                 job = self.worker_namespace()
                 from services.atomic_file_publish import publish_file_no_replace
+                created_winners = []
                 def racing_publish(src, dst):
                     if ('_hflip_' in str(dst) and Path(dst).parent == Path(self.root)
                         and str(dst).endswith('.meta.json') == (target == 'metadata')):
                         Path(dst).write_bytes(b'foreign-winner')
+                        created_winners.append(Path(dst))
                     return publish_file_no_replace(src, dst)
                 def encode(src, dst, **kw): Path(dst).write_bytes(b'flipped')
                 with patch('services.video_transform.horizontal_flip', side_effect=encode), patch('services.atomic_file_publish.publish_file_no_replace', side_effect=racing_publish):
                     self.assertFalse(self.ns['_run_tool_hflip'](job['id']))
+                self.assertEqual(len(created_winners), 1)
+                self.assertEqual(job['status'], 'failed')
+                self.assertEqual(job['output_files'], [])
+                self.assertEqual(self.source.read_bytes(), b'original-video')
                 winners = list(Path(self.root).glob('*_hflip_*'))
                 self.assertEqual(len(winners), 1)
+                self.assertEqual(winners, created_winners)
                 self.assertEqual(winners[0].read_bytes(), b'foreign-winner')
                 winners[0].unlink()
                 self.registered.clear()

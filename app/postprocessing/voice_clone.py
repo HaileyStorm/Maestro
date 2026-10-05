@@ -67,6 +67,7 @@ import os
 import subprocess
 import tempfile
 import threading
+import time
 from typing import Callable, Optional
 
 import torch
@@ -105,7 +106,8 @@ def _ffmpeg_demux_audio(video_path: str, out_wav: str, sample_rate: int = 22050)
 def _ffmpeg_remux_audio(video_path: str, new_audio_wav: str, *, strict_in_place: bool = False) -> bool:
     """Replace `video_path`'s audio track with the contents of
     `new_audio_wav`. Video stream is copied (no re-encode); audio is
-    re-encoded to AAC for container compatibility.
+    re-encoded to AAC for container compatibility. Short audio is padded to the
+    video end; long audio ends with the video.
 
     Preferred outcome: atomic in-place replace of video_path.
 
@@ -140,6 +142,7 @@ def _ffmpeg_remux_audio(video_path: str, new_audio_wav: str, *, strict_in_place:
                 "-b:a", "192k",
                 "-map", "0:v:0",
                 "-map", "1:a:0",
+                "-af", "apad",
                 "-shortest",
                 tmp_out,
             ],
@@ -356,8 +359,8 @@ class _VoiceCloneCancellationUnavailable(RuntimeError):
     pass
 
 
-def _convert_seedvc_with_cancellation(converter, cancel_check, **kwargs):
-    if cancel_check is None:
+def _convert_seedvc_with_cancellation(converter, cancel_check, *, step_callback=None, **kwargs):
+    if cancel_check is None and step_callback is None:
         return converter.convert_tensor(**kwargs)
     app_vc = getattr(converter, "_app_vc", None)
     model = getattr(app_vc, "model", None)
@@ -368,10 +371,24 @@ def _convert_seedvc_with_cancellation(converter, cancel_check, **kwargs):
             "SeedVC converter does not support diffusion-step cancellation")
     owner_thread = threading.get_ident()
 
+    steps = kwargs.get("diffusion_steps", 25)
+    report_steps = isinstance(steps, int) and not isinstance(steps, bool) and steps > 0
+    starting_step = 0
+
     def before_step(_module, _args):
+        nonlocal starting_step
         # SeedVC's app module can be shared with another converter/thread.
-        if threading.get_ident() == owner_thread and cancel_check():
+        if threading.get_ident() != owner_thread:
+            return
+        if cancel_check is not None and cancel_check():
             raise _VoiceCloneCancelled()
+        if step_callback is not None and report_steps:
+            # Installed v1 Euler calls the estimator once per step, including CFG.
+            starting_step = starting_step % steps + 1
+            try:
+                step_callback(starting_step, steps)
+            except Exception:
+                pass
 
     handle = estimator.register_forward_pre_hook(before_step)
     try:
@@ -388,6 +405,7 @@ def apply_voice_clone_to_file(
     cfg_rate: float = 0.5,
     cancel_check: Optional[Callable[[], bool]] = None,
     *, strict_in_place: bool = False,
+    progress_callback: Optional[Callable[[Optional[dict[str, int]]], None]] = None,
 ) -> bool:
     """Replace the voice(s) in `video_path` using SeedVC voice conversion.
 
@@ -404,6 +422,10 @@ def apply_voice_clone_to_file(
         cancel_check: Optional job cancellation probe. A cancelled job stops
             before the next stage or SeedVC diffusion estimator step. A running
             estimator call completes before cancellation can be observed.
+        progress_callback: Optional observation of the current audio chunk and
+            starting diffusion step, throttled to four updates per second except
+            at chunk starts. None marks conversion end before remix/remux.
+            Callback errors and return values do not affect conversion.
 
     Returns:
         True if the video's audio was replaced. False if the video had
@@ -537,13 +559,35 @@ def apply_voice_clone_to_file(
         if cancel_check is not None and cancel_check():
             return False
 
+        audio_chunk = 0
+        last_observation = float("-inf")
+
+        def observe(event):
+            if progress_callback is not None:
+                try:
+                    progress_callback(event)
+                except Exception:
+                    pass
+
+        def starting_diffusion_step(step, steps):
+            nonlocal audio_chunk, last_observation
+            if step == 1:
+                audio_chunk += 1
+            now = time.monotonic()
+            if step == 1 or now - last_observation >= 0.25:
+                last_observation = now
+                observe({"audio_chunk": audio_chunk, "diffusion_step": step,
+                         "diffusion_steps": steps})
+
+        step_callback = starting_diffusion_step if progress_callback is not None else None
+
         # Step 5: apply conversion
         out_wav = os.path.join(tmpdir, "converted.wav")
         if mode == "single":
             print(f"[VoiceClone] Single-voice mode: converting entire audio with ref={os.path.basename(voice_ref_paths[0])}")
             try:
                 converted = _convert_seedvc_with_cancellation(
-                    converter, cancel_check,
+                    converter, cancel_check, step_callback=step_callback,
                     source_audio=source_audio,
                     source_rate=source_sr,
                     reference_audio=refs[0][0],
@@ -572,7 +616,7 @@ def apply_voice_clone_to_file(
                 print(f"[VoiceClone] No diarized segments — falling back to single-voice with ref[0]")
                 try:
                     converted = _convert_seedvc_with_cancellation(
-                        converter, cancel_check,
+                        converter, cancel_check, step_callback=step_callback,
                         source_audio=source_audio, source_rate=source_sr,
                         reference_audio=refs[0][0], reference_rate=refs[0][1],
                         output_rate=source_sr, diffusion_steps=diffusion_steps, cfg_rate=cfg_rate,
@@ -619,7 +663,7 @@ def apply_voice_clone_to_file(
                           f"{start_sec:.2f}-{end_sec:.2f}s speaker={spk} → ref[{ref_idx}]")
                     try:
                         seg_converted = _convert_seedvc_with_cancellation(
-                            converter, cancel_check,
+                            converter, cancel_check, step_callback=step_callback,
                             source_audio=seg_audio, source_rate=source_sr,
                             reference_audio=refs[ref_idx][0], reference_rate=refs[ref_idx][1],
                             output_rate=source_sr,
@@ -657,6 +701,8 @@ def apply_voice_clone_to_file(
 
         if cancel_check is not None and cancel_check():
             return False
+
+        observe(None)
 
         # Step 5b: remix converted vocals back over the original background
         # (music / SFX) so the background is preserved. No-op when separation

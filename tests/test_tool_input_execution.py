@@ -262,6 +262,53 @@ class ToolInputExecutionTests(unittest.TestCase):
             'shared.utils.audio_video': types.SimpleNamespace(_remove_encoding_temporary=lambda p: Path(p).unlink(missing_ok=True)),
             'postprocessing.voice_clone': types.SimpleNamespace(apply_voice_clone_to_file=revoice)}
 
+    def test_revoice_progress_reports_activity_and_lifecycle_cancellation_wins(self):
+        from services import job_lifecycle as lifecycle
+        lifecycle._reset_queue_state_for_tests()
+        self.addCleanup(lifecycle._reset_queue_state_for_tests)
+        for cancelled in (False, True):
+            with self.subTest(cancelled=cancelled):
+                job = self.job(); modules = self.configure_worker()
+                phases = []
+                self.ns['try_start'] = lifecycle.try_start
+                self.ns['is_cancel_requested'] = lifecycle.is_cancel_requested
+                def update(current, **updates):
+                    accepted = lifecycle.update_job(current, **updates)
+                    phases.append((updates.get('phase'), accepted))
+                    return accepted
+                self.ns['update_job'] = update
+                publish = Mock(return_value=True)
+                self.ns['_publish_processed_tool_output'] = publish
+                def convert(path, refs, **kwargs):
+                    callback = kwargs['progress_callback']
+                    callback({'audio_chunk': 1, 'diffusion_step': 1, 'diffusion_steps': 25})
+                    self.assertEqual(job['progress'], 10)
+                    self.assertEqual(job['phase'], 'Audio chunk 1: starting voice step 1 of 25')
+                    callback(None)
+                    self.assertEqual(job['phase'], '')
+                    if cancelled:
+                        self.assertTrue(lifecycle.request_cancel(job))
+                        before = (job['phase'], job['message'], job['progress'])
+                        callback({'audio_chunk': 2, 'diffusion_step': 4, 'diffusion_steps': 25})
+                        self.assertEqual((job['phase'], job['message'], job['progress']), before)
+                        self.assertTrue(kwargs['cancel_check']())
+                        return False
+                    Path(path).write_bytes(b'processed')
+                    return True
+                modules['postprocessing.voice_clone'] = types.SimpleNamespace(apply_voice_clone_to_file=convert)
+                with patch.dict(sys.modules, modules):
+                    self.assertEqual(self.ns['_run_tool_revoice'](job['id']), not cancelled)
+                if cancelled:
+                    self.assertEqual(job['status'], 'cancelled')
+                    self.assertEqual(job['message'], 'Cancelled')
+                    self.assertIn(('Audio chunk 2: starting voice step 4 of 25', False), phases)
+                    publish.assert_not_called()
+                else:
+                    publish.assert_called_once()
+                    self.assertEqual(job['phase'], '')
+                self.assertEqual(self.video.read_bytes(), b'original')
+                self.assertEqual(list(self.project.glob('.tool-*')), [])
+
     def test_both_workers_reach_processor_and_publish_only_owned_result(self):
         for kind in ('tool_upscale','tool_revoice'):
             with self.subTest(kind=kind):

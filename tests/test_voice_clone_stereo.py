@@ -1,4 +1,4 @@
-"""CPU regression checks for SeedVC background channels and cancellation."""
+"""CPU regression checks for SeedVC media preservation and observations."""
 
 from pathlib import Path
 from abc import ABC
@@ -18,7 +18,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 from postprocessing.voice_clone import (
-    _ffmpeg_demux_audio, _remix_vocals_with_background, apply_voice_clone_to_file,
+    _ffmpeg_demux_audio, _ffmpeg_remux_audio, _remix_vocals_with_background, apply_voice_clone_to_file,
     _convert_seedvc_with_cancellation, _VoiceCloneCancelled, _VoiceCloneCancellationUnavailable,
 )
 
@@ -94,6 +94,7 @@ class VoiceCloneStereoTests(unittest.TestCase):
         convert = converter.convert_tensor
         entered, release = threading.Event(), threading.Event()
         failures = []
+        observations = []
         def blocked_convert(**kwargs):
             if threading.current_thread().name == "cancelled-conversion":
                 entered.set()
@@ -103,7 +104,8 @@ class VoiceCloneStereoTests(unittest.TestCase):
         converter.convert_tensor = blocked_convert
         def cancelled_conversion():
             try:
-                _convert_seedvc_with_cancellation(converter, lambda: True)
+                _convert_seedvc_with_cancellation(converter, lambda: True,
+                    step_callback=lambda *event: observations.append(event))
             except Exception as error:
                 failures.append(error)
         worker = threading.Thread(target=cancelled_conversion, name="cancelled-conversion")
@@ -119,6 +121,7 @@ class VoiceCloneStereoTests(unittest.TestCase):
         self.assertEqual(len(failures), 1)
         self.assertIsInstance(failures[0], _VoiceCloneCancelled)
         self.assertEqual(len(estimator.batches), 6)
+        self.assertEqual(observations, [])
         self.assertEqual(dict(estimator._forward_pre_hooks), {})
 
     def test_each_wrapper_conversion_branch_cancels_before_save_remix_remux_and_cleans_scratch(self):
@@ -141,6 +144,7 @@ class VoiceCloneStereoTests(unittest.TestCase):
                     scratch.append(Path(destination).parent)
                     return True
                 segments = [(0.0, 0.5, "first"), (0.5, 1.0, "second")] if branch == "two-segments" else []
+                observations = []
                 cancel_delivered = False
                 def cancel_once():
                     nonlocal cancel_delivered
@@ -160,8 +164,10 @@ class VoiceCloneStereoTests(unittest.TestCase):
                         patch("postprocessing.voice_clone._ffmpeg_remux_audio") as remux:
                     result = apply_voice_clone_to_file(str(video), [str(ref_a), str(ref_b)],
                         mode="single" if branch == "single" else "two", diffusion_steps=6,
-                        cancel_check=cancel_once, strict_in_place=True)
+                        cancel_check=cancel_once, strict_in_place=True,
+                        progress_callback=observations.append)
                 self.assertFalse(result)
+                self.assertEqual(observations, [{"audio_chunk": 1, "diffusion_step": 1, "diffusion_steps": 6}])
                 self.assertEqual(len(estimator.batches), 2)
                 self.assertEqual(converter.convert_tensor.call_count, 1)
                 save.assert_not_called(); remix.assert_not_called(); remux.assert_not_called()
@@ -205,6 +211,128 @@ class VoiceCloneStereoTests(unittest.TestCase):
             converter.convert_tensor.assert_not_called()
             save.assert_not_called(); remux.assert_not_called()
             self.assertEqual(video.read_bytes(), b"source.mp4")
+
+    def test_installed_euler_observations_are_neutral_across_passes_cfg_and_errors(self):
+        for cfg_rate in (0.0, 0.5):
+            with self.subTest(cfg_rate=cfg_rate):
+                converter, estimator = self.installed_euler_converter()
+                convert = converter.convert_tensor.side_effect
+                def two_passes(**kwargs):
+                    convert(**kwargs)
+                    return convert(**kwargs)
+                converter.convert_tensor.side_effect = two_passes
+                torch.manual_seed(321)
+                expected = _convert_seedvc_with_cancellation(converter, None, diffusion_steps=6, cfg_rate=cfg_rate)
+                estimator.batches.clear()
+                observations = []
+                def observe(step, steps):
+                    observations.append((step, steps, len(estimator.batches)))
+                    if step == 2:
+                        raise ValueError("observer failed")
+                    return torch.ones((1, 8))  # Must never replace estimator inputs.
+                torch.manual_seed(321)
+                result = _convert_seedvc_with_cancellation(converter, None, step_callback=observe,
+                    diffusion_steps=6, cfg_rate=cfg_rate)
+                torch.testing.assert_close(result, expected, rtol=0, atol=0)
+                self.assertEqual([event[:2] for event in observations], [(step, 6) for step in range(1, 7)] * 2)
+                self.assertEqual([event[2] for event in observations], list(range(12)))
+                self.assertEqual(estimator.batches, [2 if cfg_rate else 1] * 12)
+                self.assertEqual(dict(estimator._forward_pre_hooks), {})
+                estimator.batches.clear(); estimator.fail_at = 2
+                with self.assertRaisesRegex(ValueError, "estimator failed"):
+                    _convert_seedvc_with_cancellation(converter, None, step_callback=observe, diffusion_steps=6)
+                self.assertEqual(dict(estimator._forward_pre_hooks), {})
+
+    def test_wrapper_progress_tracks_actual_chunks_resets_after_segment_error_and_clears_before_remix(self):
+        for branch in ("single", "two-fallback", "two-segments", "two-partial"):
+            with self.subTest(branch=branch), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                video, ref_a, ref_b = (root / name for name in ("source.mp4", "a.wav", "b.wav"))
+                for path in (video, ref_a, ref_b):
+                    path.write_bytes(path.name.encode())
+                converter, estimator = self.installed_euler_converter()
+                convert = converter.convert_tensor.side_effect
+                def two_passes(**kwargs):
+                    convert(**kwargs)
+                    return convert(**kwargs)
+                converter.convert_tensor.side_effect = two_passes
+                if branch == "two-partial":
+                    estimator.fail_at = 2
+                seedvc = types.ModuleType("postprocessing.seedvc")
+                seedvc.download_assets = Mock(); seedvc.get_model = Mock(return_value=converter)
+                separator = types.ModuleType("preprocessing.extract_vocals")
+                separator.get_stems = Mock(return_value=("vocals.wav", "background.wav"))
+                segments = [(0.0, 0.5, "first"), (0.5, 1.0, "second")] if branch in ("two-segments", "two-partial") else []
+                observations, saved = [], []
+                def observe(event):
+                    observations.append(event)
+                    return "ignored"
+                def remix(*_args):
+                    self.assertIsNone(observations[-1])
+                with patch.dict(sys.modules, {"postprocessing.seedvc": seedvc,
+                        "preprocessing.extract_vocals": separator}), \
+                        patch("postprocessing.voice_clone._ffmpeg_demux_audio", return_value=True), \
+                        patch("postprocessing.voice_clone.torchaudio.load", return_value=(torch.zeros((1, 100)), 100)), \
+                        patch("postprocessing.voice_clone._load_reference_voice", return_value=(torch.zeros((1, 100)), 100)), \
+                        patch("postprocessing.voice_clone._diarize_audio_for_segments", return_value=segments), \
+                        patch("postprocessing.voice_clone.torch.cuda.is_available", return_value=False), \
+                        patch("postprocessing.voice_clone.torchaudio.save", side_effect=lambda _path, audio, _sr: saved.append(audio.clone())), \
+                        patch("postprocessing.voice_clone._remix_vocals_with_background", side_effect=remix), \
+                        patch("postprocessing.voice_clone._ffmpeg_remux_audio", return_value=True), \
+                        patch("postprocessing.voice_clone.time.monotonic", side_effect=[i * 0.1 for i in range(50)]):
+                    torch.manual_seed(123)
+                    self.assertTrue(apply_voice_clone_to_file(str(video), [str(ref_a), str(ref_b)],
+                        mode="single" if branch == "single" else "two", diffusion_steps=6,
+                        progress_callback=observe))
+                    expected = saved[-1].clone()
+                    observations.clear(); saved.clear(); estimator.batches.clear()
+                    torch.manual_seed(123)
+                    def broken_observer(event):
+                        observe(event)
+                        raise RuntimeError("UI observer unavailable")
+                    self.assertTrue(apply_voice_clone_to_file(str(video), [str(ref_a), str(ref_b)],
+                        mode="single" if branch == "single" else "two", diffusion_steps=6,
+                        progress_callback=broken_observer))
+                    torch.testing.assert_close(saved[-1], expected, rtol=0, atol=0)
+                chunks = [event["audio_chunk"] for event in observations if event and event["diffusion_step"] == 1]
+                self.assertEqual(chunks, list(range(1, (4 if branch == "two-segments" else 3 if branch == "two-partial" else 2) + 1)))
+                self.assertTrue(all(1 <= event["diffusion_step"] <= 6 for event in observations if event))
+                self.assertLess(len([event for event in observations if event]), len(estimator.batches))
+                self.assertIsNone(observations[-1])
+                self.assertEqual(dict(estimator._forward_pre_hooks), {})
+                self.assertEqual(video.read_bytes(), b"source.mp4")
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg and ffprobe are required")
+    def test_remux_short_and_long_audio_preserves_every_video_packet_and_timing(self):
+        import json
+        import subprocess
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); source = root / "source.mp4"
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=24",
+                "-f", "lavfi", "-i", "sine=frequency=220:sample_rate=44100", "-t", str(350/24),
+                "-c:v", "libx264", "-g", "48", "-bf", "3", "-c:a", "aac", str(source)], check=True, capture_output=True, timeout=30)
+            def probe(path, *args):
+                return json.loads(subprocess.run(["ffprobe", "-v", "error", *args, "-of", "json", str(path)],
+                    check=True, capture_output=True, text=True, timeout=30).stdout)
+            def packets(path):
+                return probe(path, "-select_streams", "v:0", "-show_packets", "-show_data_hash", "sha256",
+                    "-show_entries", "packet=pts,dts,duration,data_hash")['packets']
+            original_packets = packets(source)
+            self.assertEqual(len(original_packets), 350)
+            original_stream = probe(source, "-select_streams", "v:0", "-show_streams")['streams'][0]
+            for seconds in (1, 30):
+                with self.subTest(replacement_seconds=seconds):
+                    output = root / f"revoiced-{seconds}.mp4"; shutil.copyfile(source, output)
+                    wav = root / f"voice-{seconds}.wav"
+                    torchaudio.save(str(wav), torch.zeros((1, 44100 * seconds)), 44100)
+                    self.assertTrue(_ffmpeg_remux_audio(str(output), str(wav), strict_in_place=True))
+                    self.assertEqual(packets(output), original_packets)
+                    stream = probe(output, "-select_streams", "v:0", "-show_streams")['streams'][0]
+                    for field in ("time_base", "start_pts", "duration_ts", "nb_frames"):
+                        self.assertEqual(stream[field], original_stream[field])
+                    audio = probe(output, "-select_streams", "a:0", "-show_streams")['streams'][0]
+                    self.assertAlmostEqual(float(audio['duration']), float(stream['duration']), delta=0.1)
+            self.assertEqual(packets(source), original_packets)
 
     @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg is required for demux")
     def test_demux_retains_stereo_source_channels(self):
