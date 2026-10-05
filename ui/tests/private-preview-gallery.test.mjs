@@ -843,6 +843,30 @@ test('private audio and retry images acquire no media URL before reveal', async 
   assert.match(processed, /Measured output/)
   assert.match(processed, /128×96 · 48 fps · 1s · no audio track/)
 
+  const revoicedVideo = { name: 'revoiced.mp4', type: 'video', url: '/revoiced.mp4' }
+  globalThis.__mediaFeedTestMeta = {
+    source: 'sidecar', tool: 'revoice', tool_source: 'C:\\private\\source.mp4',
+    params: { spatial_upsampling: 'lanczos2', voice_ref_paths: ['/private/voice.wav'] },
+    generation_time: 7, created_at: 1700000000,
+  }
+  assert.equal(JSON.stringify(render(revoicedVideo)).includes('Finishing details'), false)
+  globalThis.__mediaFeedRevealed.add(privatePreviewIdentity('private-media', revoicedVideo.name, 'r1'))
+  const revoiced = JSON.stringify(findElements(render(revoicedVideo), element => element.type === 'details'))
+  assert.match(revoiced, /Revoiced video/)
+  assert.match(revoiced, /source\.mp4/)
+  assert.match(revoiced, /Recorded at/)
+  assert.match(revoiced, /Recorded job time/)
+  for (const absent of ['C:', 'private', 'voice.wav', 'Lanczos', 'Measured source', 'Measured output']) {
+    assert.equal(revoiced.includes(absent), false, absent)
+  }
+  for (const metadata of [
+    { source: 'sidecar', params: { edit_sub_mode: 'revoice' } },
+    { source: 'embedded', tool: 'revoice' },
+  ]) {
+    globalThis.__mediaFeedTestMeta = metadata
+    assert.equal(JSON.stringify(render(revoicedVideo)).includes('Finishing details'), false)
+  }
+
   globalThis.__mediaFeedTestMeta = {
     source: 'sidecar', tool: 'upscale', params: { method: 'lanczos2' },
     processing: { input: { width: 999, height: 999 } },

@@ -59,7 +59,7 @@ function measuredVideoSummary(value: MeasuredVideoFacts | undefined): string | n
 }
 
 function finishedToolDetails(metadata: OutputMetadata | null) {
-  if (metadata?.source !== 'sidecar' || !['upscale', 'media_flow'].includes(metadata.tool || '')) return null
+  if (metadata?.source !== 'sidecar' || !['upscale', 'media_flow', 'revoice'].includes(metadata.tool || '')) return null
   const params = metadata.params
   const sourceName = typeof metadata.tool_source === 'string'
     ? metadata.tool_source.replace(/\\/g, '/').split('/').filter(Boolean).pop()
@@ -68,8 +68,8 @@ function finishedToolDetails(metadata: OutputMetadata | null) {
     ? new Date(metadata.created_at * 1000) : null
   const processing = metadata.processing?.version === 1 ? metadata.processing : null
   return {
-    result: metadata.tool === 'upscale' ? 'Upscaled video' : 'Finished media',
-    method: finishingMethodLabel(params?.method ?? params?.spatial_upsampling),
+    result: metadata.tool === 'revoice' ? 'Revoiced video' : metadata.tool === 'upscale' ? 'Upscaled video' : 'Finished media',
+    method: metadata.tool === 'revoice' ? null : finishingMethodLabel(params?.method ?? params?.spatial_upsampling),
     sourceName,
     recordedAt: recordedAt && Number.isFinite(recordedAt.getTime()) ? recordedAt.toLocaleString() : null,
     jobTime: typeof metadata.generation_time === 'number' && Number.isFinite(metadata.generation_time) && metadata.generation_time >= 0
