@@ -641,3 +641,13 @@ with AAC audio and a two-second duration; full audio/video decoding and browser
 playback completed without error. Original media and sidecar hashes stayed
 unchanged. These checks do not establish a shared Editor/Blender composition
 package or owner creative/listening acceptance.
+
+The next UI slice adds **Edit this video** after a successful Blender Keep.
+It resolves the exact current video through the authorized project Gallery
+listing, retaining revision and privacy. Project, account, result, permission
+and unmount changes fence delayed responses. All 811 UI tests, type checking,
+the production build and four focused full-UI synthetic browser checks passed
+across desktop Firefox and mobile Chromium. A separate mounted StrictMode
+probe covered permission revocation and account/project transition races.
+Native kept-Blender-to-Editor acceptance remains pending; this handoff does
+not complete the neutral composition package or its worker/publication gates.

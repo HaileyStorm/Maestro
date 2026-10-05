@@ -169,6 +169,12 @@ held and resumed.
 
 Blender Motion Video is a first-class Reference creation method as well as an existing Tools surface. It creates primitives/materials, animates the full requested frame range, inspects and previews the scene, and can Keep the rendered motion/camera guide as a protected project candidate for Generate control. The method stays orthogonal to durable semantic asset types and uses its own reference-name/privacy contract; the image-pack description remains on the authored pack. Pinokio installs a pinned portable Blender runtime plus the official Blender Lab MCP extension, then starts its localhost-only bridge with Maestro. Remote project users can invoke the same hosted tool through Maestro's project-scoped API; they never receive filesystem or machine-control access. Maestro never exposes the upstream arbitrary-Python surface.
 
+After **Keep motion video** succeeds, choose **Edit this video** to open its
+current Gallery video in Editor. Trim, reorder or reuse it without changing the
+original. The action follows the current project's editing permissions and
+keeps private previews blurred. If the video has moved or changed, refresh
+Gallery and open its current entry there.
+
 ### 🔒 Explicit guidance + experimental gate
 - **Explicit prompt guidance** is an opt-in authoring aid with a disclaimer step. It never hides models, LoRAs, recipes, prompts, or locally processed outputs, and it does not moderate local content.
 - **Experimental features gate** hides power-user toggles (external API keys, Voice Reference, Inpaint, Restyle, Wan2GP Enhancer) by default for a focused first-launch experience.

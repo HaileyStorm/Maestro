@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Box, Check, Eye, Loader2, Play, RotateCcw, X } from 'lucide-react'
-import { useStore } from '../../stores/useStore'
+import { currentAccountIdentityEpoch, useStore } from '../../stores/useStore'
+import type { OutputFile } from '../../types'
 import * as api from '../../api/client'
 
 type Primitive = 'cube' | 'sphere' | 'cylinder' | 'cone' | 'torus' | 'plane'
 type LtxControlMode = 'VG' | 'TVG' | 'EVG' | 'PTVG' | 'TEVG'
-type BlenderOperation = { sequence: number; workspace: string }
+type BlenderOperation = { sequence: number; workspace: string; accountEpoch: number }
 
 function parseVector(value: string): [number, number, number] {
   const parts = value.split(',').map(part => Number(part.trim()))
@@ -34,7 +35,14 @@ export function BlenderSceneTool({
   privateOutput?: boolean
 }) {
   const workspace = useStore(state => state.activeWorkspace)
+  const accountEpoch = useStore(() => currentAccountIdentityEpoch())
+  const canEditProject = useStore(state => {
+    const project = state.workspaces.find(project => project.name === state.activeWorkspace)
+    return Boolean(project) && (project?.project_permissions === undefined
+      || project.project_permissions.includes('project.mutate'))
+  })
   const refreshOutputs = useStore(state => state.refreshOutputs)
+  const openEditor = useStore(state => state.openEditor)
   const mountedRef = useRef(false)
   const workspaceRef = useRef(workspace)
   const statusRequest = useRef(0)
@@ -57,6 +65,7 @@ export function BlenderSceneTool({
   const [directorPrompt, setDirectorPrompt] = useState('')
   const [directorPlan, setDirectorPlan] = useState<api.BlenderDirectorPlan | null>(null)
   const [directorFinal, setDirectorFinal] = useState<api.BlenderDirectorFinal | null>(null)
+  const [keptResult, setKeptResult] = useState<{ result: api.BlenderDirectorFinal; accountEpoch: number } | null>(null)
   const [editPrompt, setEditPrompt] = useState('')
   const frameCount = useMemo(() => Math.max(1, Math.round(duration * fps)), [duration, fps])
   const endFrame = frameCount - 1
@@ -75,7 +84,9 @@ export function BlenderSceneTool({
       && operation
       && activeOperation.current?.sequence === operation.sequence
       && activeOperation.current.workspace === operation.workspace
-      && workspaceRef.current === operation.workspace,
+      && workspaceRef.current === operation.workspace
+      && useStore.getState().activeWorkspace === operation.workspace
+      && currentAccountIdentityEpoch() === operation.accountEpoch,
   )
 
   useEffect(() => {
@@ -93,10 +104,11 @@ export function BlenderSceneTool({
     activeOperation.current = null
     setDirectorPlan(null)
     setDirectorFinal(null)
+    setKeptResult(null)
     setBusy('')
     setMessage('')
     setEditPrompt('')
-  }, [workspace])
+  }, [workspace, accountEpoch])
 
   useEffect(() => {
     const request = ++statusRequest.current
@@ -106,9 +118,12 @@ export function BlenderSceneTool({
       setReady(false)
       return
     }
+    setReady(false)
+    setReadiness(null)
     let active = true
     void api.fetchBlenderStatus(workspace).then(status => {
-      if (!active || request !== statusRequest.current || workspaceRef.current !== workspace) return
+      if (!active || request !== statusRequest.current || workspaceRef.current !== workspace
+        || currentAccountIdentityEpoch() !== accountEpoch) return
       setReadiness(status)
       setInstalled(status.installed)
       setReady(status.ready)
@@ -117,7 +132,8 @@ export function BlenderSceneTool({
         ? `Blender ready · ${status.blender_version || 'installed'}`
         : blenderRecoveryMessage(status))
     }).catch(error => {
-      if (!active || request !== statusRequest.current || workspaceRef.current !== workspace) return
+      if (!active || request !== statusRequest.current || workspaceRef.current !== workspace
+        || currentAccountIdentityEpoch() !== accountEpoch) return
       setReadiness(null)
       setInstalled(false)
       setReady(false)
@@ -126,13 +142,13 @@ export function BlenderSceneTool({
         : 'Blender is unavailable right now.')
     })
     return () => { active = false }
-  }, [workspace])
+  }, [workspace, accountEpoch])
 
-  const run = async (label: string, task: () => Promise<unknown>) => {
+  const run = async (label: string, task: () => Promise<unknown>, requiresBlender = true) => {
     const operationWorkspace = workspace
-    const operation = { sequence: ++operationSequence.current, workspace: operationWorkspace }
+    const operation = { sequence: ++operationSequence.current, workspace: operationWorkspace, accountEpoch: currentAccountIdentityEpoch() }
     activeOperation.current = operation
-    if (!ready) {
+    if (requiresBlender && !ready) {
       activeOperation.current = null
       setMessage(blenderRecoveryMessage(readiness))
       return
@@ -145,7 +161,9 @@ export function BlenderSceneTool({
       setMessage(`${label} complete`)
     } catch {
       if (!isOperationCurrent(operation)) return
-      setMessage(`${label} could not finish. Check the scene settings and try again.`)
+      setMessage(requiresBlender
+        ? `${label} could not finish. Check the scene settings and try again.`
+        : 'This video could not open in Editor. Refresh Gallery and open the current video from there.')
     } finally {
       if (isOperationCurrent(operation)) {
         setBusy('')
@@ -211,6 +229,7 @@ export function BlenderSceneTool({
     if (!isOperationCurrent(operation)) return false
     setDirectorPlan(result.final_plan)
     setDirectorFinal(result)
+    setKeptResult(null)
     if (!isOperationCurrent(operation)) return false
     await refreshOutputs()
     return isOperationCurrent(operation)
@@ -219,6 +238,7 @@ export function BlenderSceneTool({
   const runDirector = () => run('Director visual review', async () => {
     if (!isOperationCurrent(activeOperation.current)) return
     setDirectorFinal(null)
+    setKeptResult(null)
     const plan = await planWithDirector()
     if (!plan || !isOperationCurrent(activeOperation.current)) return
     await finalizePlan(plan)
@@ -227,6 +247,7 @@ export function BlenderSceneTool({
   const runManualDirector = () => run('Director visual review', async () => {
     if (!isOperationCurrent(activeOperation.current)) return
     setDirectorFinal(null)
+    setKeptResult(null)
     const plan: api.BlenderDirectorPlan = {
       workspace,
       director_prompt: `Animate ${name} from ${start} to ${end}`,
@@ -284,9 +305,45 @@ export function BlenderSceneTool({
         workspace, directorFinal.asset_id, directorFinal.variant_id, status,
       )
       if (!isOperationCurrent(operation)) return
+      setKeptResult(status === 'kept' && operation
+        ? { result: directorFinal, accountEpoch: operation.accountEpoch } : null)
       setMessage(status === 'kept' ? 'Full video approved as a project reference' : 'Full video rejected')
     },
   )
+
+  const editFinalVideo = () => run('Opening Editor', async () => {
+    const operation = activeOperation.current
+    const result = directorFinal
+    if (!operation || !isOperationCurrent(operation) || !result
+      || keptResult?.result !== result || keptResult.accountEpoch !== operation.accountEpoch
+      || result.workspace !== operation.workspace || !canEditProject) return
+    const { outputs } = await api.fetchOutputs(50, 0, {
+      workspace: operation.workspace,
+      search: result.video.filename,
+      mediaType: 'video',
+      artifactScope: 'final',
+    })
+    if (!isOperationCurrent(operation)) return
+    const currentProject = useStore.getState().workspaces.find(project => project.name === operation.workspace)
+    if (!currentProject || (currentProject.project_permissions !== undefined
+      && !currentProject.project_permissions.includes('project.mutate'))) {
+      throw new Error('Project editing is unavailable')
+    }
+    const matches = outputs.filter(output => (
+      output.name === result.video.filename && output.workspace === operation.workspace
+      && output.type === 'video' && Boolean(output.revision?.trim())
+    ))
+    if (matches.length !== 1) throw new Error('The current video is unavailable')
+    const output = matches[0]
+    openEditor({
+      ...output,
+      mode: (output.mode as OutputFile['mode']) || null,
+      edit_sub_mode: (output.edit_sub_mode as OutputFile['edit_sub_mode']) || null,
+      artifact_class: output.artifact_class || 'final',
+      linked_component_count: output.linked_component_count || 0,
+      favorite: output.favorite || false,
+    })
+  }, false)
 
   const requestEdits = () => run('Director edit review', async () => {
     if (!directorPlan || !editPrompt.trim()) return
@@ -413,6 +470,9 @@ export function BlenderSceneTool({
             <button disabled={!!busy} onClick={() => void setFinalStatus('kept')} className="flex flex-1 items-center justify-center gap-1 rounded bg-accent-green/20 px-2 py-1.5 text-[10px] text-accent-green"><Check size={10} />Keep motion video</button>
             <button disabled={!!busy} onClick={() => void setFinalStatus('rejected')} className="flex items-center justify-center gap-1 rounded border border-border px-2 py-1.5 text-[10px] text-text-muted"><X size={10} />Reject</button>
           </div>
+          {canEditProject && keptResult?.result === directorFinal && keptResult.accountEpoch === currentAccountIdentityEpoch() && (
+            <button disabled={!!busy} onClick={() => void editFinalVideo()} className="min-h-11 w-full rounded border border-accent-blue/40 px-2 py-1.5 text-[10px] text-accent-blue disabled:opacity-40 md:min-h-0">Edit this video</button>
+          )}
           <textarea value={editPrompt} onChange={event => setEditPrompt(event.target.value)} rows={2} placeholder="Describe what Director should change, then it will review and render a new video…" className="w-full resize-y rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px]" />
           <button disabled={!ready || !!busy || !editPrompt.trim()} onClick={requestEdits} className="flex w-full items-center justify-center gap-1 rounded border border-accent-blue/40 px-2 py-1.5 text-[10px] text-accent-blue disabled:opacity-40"><RotateCcw size={10} />Make changes and review again</button>
         </div>
