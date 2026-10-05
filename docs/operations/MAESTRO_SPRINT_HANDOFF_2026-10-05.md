@@ -478,3 +478,32 @@ listening acceptance. Pending submissions survive SPA navigation only;
 reloading the page clears them. Native YuE2 duration/listening, Music3 consent,
 owner resource unloading, H3 quality, HTTP Stop, Windows and other remaining
 whole-sprint lanes remain open. The full continuous Goal stays active.
+
+## October 5 YuE2 training recovery checkpoint
+
+Commit `28c930119dccda381cbdeb81715cc31eccb8cd30` confines pending training
+requests to their account and project. Account changes prune private frozen
+inputs even while the panel is unmounted; old callbacks cannot start status
+requests or alter a newer account's attempts. Same-account explicit retries
+retain the original request ID and inputs, including a still-pending POST
+after leaving and reopening the panel. A later validation rejection cannot
+discard an already uncertain request. Exact canonical job confirmation clears
+the stale uncertainty alert and busy state, and fences the late POST.
+
+Independent review is clean. Fifty-nine focused checks, TypeScript, scoped
+lint, private build, publication guard and eight synthetic browser cases
+across desktop Firefox and Android-like Chromium pass. Before-fix controls
+reproduced the account/late-response gaps and stale alert. Browser fixture
+failures and corrections remain in private evidence; the final run is green.
+The change covers SPA memory, not reload recovery. Synthetic account switching
+is distinct from live owner authentication and native training acceptance.
+
+Fresh local and stable health/readiness and exact served assets were verified
+after atomic UI promotion. The signed-in local training panel shows the
+existing private project checkpoints, empty fields and disabled empty-submit
+control. No new training/generation or backend restart was performed.
+Foreign changes and the historical tracker hold remain preserved. The next
+source-proven reliability gap is ordinary Image/Video generation lost-ACK
+recovery: submission needs a durable owner/project-bound identity before
+admission, exact retry, and truthful UI reconciliation. Full sprint acceptance
+and the other previously recorded runtime/human gates remain open.
