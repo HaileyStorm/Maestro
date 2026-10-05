@@ -25,6 +25,33 @@ FFPROBE = shutil.which("ffprobe")
 
 @unittest.skipUnless(FFMPEG and FFPROBE, "ffmpeg and ffprobe are required")
 class EditorExportMediaTests(unittest.TestCase):
+    def test_fractional_single_and_repeated_clip_encode_exact_frames_and_silence(self):
+        source = self.root / "fractional.mp4"
+        self.run_media([FFMPEG, "-v", "error", "-nostdin", "-f", "lavfi", "-i",
+            "color=blue:s=128x72:r=3", "-frames:v", "2", "-an", "-c:v", "libx264",
+            "-threads", "2", str(source)])
+        original_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+        clip = {"path": str(source), "source_in": 0, "duration": 2 / 3, "has_audio": False}
+        for count in (1, 2):
+            with self.subTest(clips=count):
+                output = self.root / f"fractional-{count}.mp4"
+                render_video_sequence([dict(clip) for _ in range(count)], output,
+                    width=128, height=72, fps=3.75, timeout=30)
+                probe = json.loads(self.run_media([FFPROBE, "-v", "error", "-show_entries",
+                    "stream=codec_type,codec_name,sample_rate,avg_frame_rate,nb_frames:format=duration", "-of", "json", str(output)]))
+                video = next(stream for stream in probe["streams"] if stream["codec_type"] == "video")
+                audio = next(stream for stream in probe["streams"] if stream["codec_type"] == "audio")
+                self.assertEqual((int(video["nb_frames"]), video["avg_frame_rate"]), (3 * count, "15/4"))
+                self.assertEqual((audio["codec_name"], audio["sample_rate"]), ("aac", "48000"))
+                self.assertAlmostEqual(float(probe["format"]["duration"]), 0.8 * count, delta=0.025)
+                pixels = self.run_media([FFMPEG, "-v", "error", "-i", str(output), "-map", "0:v:0", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"])
+                self.assertEqual(len(pixels), 3 * count * 128 * 72 * 3)
+                self.assertGreater(pixels[2], 200)
+                samples = array.array("f", self.run_media([FFMPEG, "-v", "error", "-i", str(output), "-map", "0:a:0", "-ac", "1", "-ar", "48000", "-f", "f32le", "-"]))
+                self.assertLess(max(abs(value) for value in samples), 1e-6)
+        self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), original_hash)
+        self.assertFalse(list(self.root.glob(".editor-sequence-*")))
+
     def test_shared_immutable_source_two_ranges_keep_frame_order_audio_and_rounded_duration(self):
         from services.editor_projects import create_output_video_timeline, append_output_video_clip, apply_output_video_trim, editor_sequence_clips
         source = self.root / "immutable.mp4"

@@ -247,12 +247,15 @@ PUBLIC_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     RENDER_ANIMATION: {
         "type": "object",
         "additionalProperties": False,
+        "dependentRequired": {"width": ["height"], "height": ["width"]},
         "required": ["output_path", "frame_start", "frame_end", "fps"],
         "properties": {
             "output_path": {"type": "string", "pattern": ".*\\.[Mm][Pp]4$"},
             "frame_start": {"type": "integer", "minimum": 0, "maximum": 1000000},
             "frame_end": {"type": "integer", "minimum": 0, "maximum": 1000000},
             "fps": {"type": "integer", "minimum": 1, "maximum": 240},
+            "width": {"type": "integer", "minimum": 64, "maximum": 7680, "multipleOf": 2},
+            "height": {"type": "integer", "minimum": 64, "maximum": 4320, "multipleOf": 2},
             "overwrite": {"type": "boolean", "default": False},
         },
     },
@@ -1077,6 +1080,7 @@ class BlenderMCPService:
         destination, overwrite, frame_start, frame_end, fps = (
             self._normalize_render_animation(arguments)
         )
+        dimensions = self._normalize_render_dimensions(arguments)
         if destination.exists() and not overwrite:
             raise BlenderMCPValidationError("animation output already exists")
 
@@ -1097,6 +1101,7 @@ class BlenderMCPService:
                         frame_start=frame_start,
                         frame_end=frame_end,
                         fps=fps,
+                        dimensions=dimensions,
                     )
                 },
                 cancelled=cancelled,
@@ -1513,7 +1518,7 @@ class BlenderMCPService:
             )
         _reject_unknown(
             arguments,
-            {"output_path", "frame_start", "frame_end", "fps", "overwrite"},
+            {"output_path", "frame_start", "frame_end", "fps", "overwrite", "width", "height"},
             "render_animation",
         )
         overwrite = arguments.get("overwrite", False)
@@ -1533,10 +1538,23 @@ class BlenderMCPService:
                 "frame range is invalid or exceeds the configured limit"
             )
         fps = _bounded_integer(arguments.get("fps"), "fps", 1, 240)
+        self._normalize_render_dimensions(arguments)
         path = self._resolve_project_file(
             arguments.get("output_path"), _VIDEO_EXTENSIONS
         )
         return path, overwrite, frame_start, frame_end, fps
+
+    @staticmethod
+    def _normalize_render_dimensions(arguments: Mapping[str, Any]) -> tuple[int, int] | None:
+        if "width" not in arguments and "height" not in arguments:
+            return None
+        if "width" not in arguments or "height" not in arguments:
+            raise BlenderMCPValidationError("render dimensions require both width and height")
+        width = _bounded_integer(arguments["width"], "width", 64, 7680)
+        height = _bounded_integer(arguments["height"], "height", 64, 4320)
+        if width % 2 or height % 2:
+            raise BlenderMCPValidationError("render dimensions must be even")
+        return width, height
 
     def _resolve_project_file(self, value: Any, extensions: frozenset[str]) -> Path:
         if not isinstance(value, (str, os.PathLike)):
@@ -1927,8 +1945,10 @@ def _render_animation_code(
     frame_start: int,
     frame_end: int,
     fps: int,
+    dimensions: tuple[int, int] | None = None,
 ) -> str:
     path_literal = repr(str(frame_prefix))
+    resolution = (f"scene.render.resolution_x = {dimensions[0]}\nscene.render.resolution_y = {dimensions[1]}\nscene.render.resolution_percentage = 100" if dimensions is not None else "")
     return f"""# Maestro deterministic render_animation v1
 import bpy
 scene = bpy.context.scene
@@ -1936,6 +1956,7 @@ scene.frame_start = {frame_start}
 scene.frame_end = {frame_end}
 scene.render.fps = {fps}
 scene.render.fps_base = 1.0
+{resolution}
 scene.render.image_settings.file_format = "PNG"
 scene.render.use_file_extension = True
 scene.render.filepath = {path_literal}

@@ -5294,6 +5294,61 @@ async function blenderRequest<T>(path: string, body: Record<string, unknown>): P
   return res.json()
 }
 
+export interface BlenderCompositionPackage {
+  schema: 'maestro/composition/v1'
+  id: string
+  canvas: { width: number; height: number; fps: number }
+  audio: { mode: 'silence'; sample_rate: 48000 }
+  segments: Array<{
+    id: string
+    scene: { clear_scene: true; objects: Array<{
+      name: string; primitive: string; location: [number, number, number]; scale: [number, number, number]
+      material: { name: string; color: [number, number, number, number] }
+    }> }
+    animation: { frame_start: number; frame_end: number; objects: Array<{
+      name: string; keyframes: Array<{ frame: number; location: [number, number, number]; interpolation: 'BEZIER' }>
+    }> }
+    fps: number; width: number; height: number
+  }>
+  clips: Array<{ id: string; segment_id: string; source_frame: number; frame_count: number }>
+}
+
+export class CompositionSubmissionError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'CompositionSubmissionError'
+  }
+}
+
+export async function submitBlenderComposition(
+  project: string, composition: BlenderCompositionPackage, privateOutput: boolean,
+): Promise<{ job_id: string; status: 'queued' }> {
+  const ambiguous = 'Maestro could not confirm this submission. Check Queue before rendering repeats again; the sequence may already be queued.'
+  let res: Response
+  try {
+    res = await fetch(`${BASE}/api/v1/projects/${encodeURIComponent(project)}/compositions`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ package: composition, private_output: privateOutput }),
+    })
+  } catch {
+    throw new CompositionSubmissionError(ambiguous)
+  }
+  if (!res.ok) {
+    if (res.status >= 500) throw new CompositionSubmissionError(ambiguous)
+    throw new CompositionSubmissionError(res.status === 401 || res.status === 403
+      ? 'This project does not currently allow you to render repeats. Check your project access.'
+      : res.status === 409
+      ? 'Blender is unavailable for this sequence. Check its setup in Pinokio.'
+      : 'The sequence was not accepted. Check the object name, positions, duration and frame rate.')
+  }
+  let value: unknown
+  try { value = await res.json() } catch { throw new CompositionSubmissionError(ambiguous) }
+  if (!value || typeof value !== 'object' || !('job_id' in value) || !('status' in value)
+    || typeof value.job_id !== 'string' || !/^[A-Za-z0-9_-]{1,80}$/.test(value.job_id)
+    || value.status !== 'queued') throw new CompositionSubmissionError(ambiguous)
+  return { job_id: value.job_id, status: 'queued' }
+}
+
 export async function fetchBlenderStatus(workspace: string): Promise<BlenderStatus> {
   const res = await fetch(`${BASE}/api/v1/blender/status?workspace=${encodeURIComponent(workspace)}`)
   if (!res.ok) {

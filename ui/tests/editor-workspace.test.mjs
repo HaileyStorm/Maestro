@@ -82,6 +82,24 @@ test('sequence title clock matches frame rounding and enforces the eight-layer l
   assert.equal(addText(project, 'overflow', 0, 1), project)
 })
 
+test('sequence duration matches encoder decimals at frame and decimal ties', () => {
+  for (const [duration, fps, frames] of [
+    [2 / 3, 3.75, 3],
+    [1.0048828124999998, 3.482993195545877, 3],
+    [1.0048828125, 3.482993195545877, 3],
+    [1.0048828125000002, 3.482993195545877, 4],
+  ]) {
+    const project = sequenceProject()
+    project.canvas.fps = fps
+    project.tracks[0].items = project.tracks[0].items.slice(0, 2)
+    project.tracks[0].items.forEach(item => { item.duration = duration })
+    assert.equal(renderedDuration(project), 2 * frames / fps)
+    // Preserve the separate single-cut duration contract.
+    project.tracks[0].items.pop()
+    assert.equal(renderedDuration(project), duration)
+  }
+})
+
 test('trim applies to the selected source and shifts only later sequence starts', () => {
   const original = sequenceProject()
   const next = changeTrim(original, 'clip-b', 3, 5)

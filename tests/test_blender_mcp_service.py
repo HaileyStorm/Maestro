@@ -879,6 +879,26 @@ class TestBlenderMCPService(unittest.TestCase):
         self.assertEqual(frame_prefix.name, "frame_")
         self.assertNotIn(str(destination), code)
 
+    def test_render_animation_dimensions_reach_renderer_without_changing_legacy_contract(self):
+        arguments = {"output_path": "geometry.mp4", "frame_start": 0, "frame_end": 1, "fps": 24}
+        self.assertEqual(len(self.service._normalize_render_animation(arguments)), 5)
+        result = self.service.render_animation({**arguments, "width": 128, "height": 72})
+        self.assertEqual(result["fps"], 24)
+        code = self.client.calls[-1][1]["code"]
+        self.assertIn("scene.render.resolution_x = 128", code)
+        self.assertIn("scene.render.resolution_y = 72", code)
+        self.assertIn("scene.render.resolution_percentage = 100", code)
+        compile(code, "bounded-blender-render", "exec")
+
+    def test_invalid_render_dimensions_fail_before_native_contact(self):
+        arguments = {"output_path": "geometry.mp4", "frame_start": 0, "frame_end": 1, "fps": 24}
+        for dimensions in ({"width": 128}, {"height": 72}, {"width": True, "height": 72},
+                           {"width": 127, "height": 72}, {"width": 128, "height": 73},
+                           {"width": 7682, "height": 72}, {"width": 128, "height": 4322}):
+            with self.subTest(dimensions=dimensions), self.assertRaises(BlenderMCPValidationError):
+                self.service.render_animation({**arguments, **dimensions})
+        self.assertEqual(self.client.calls, [])
+
     def test_managed_ffmpeg_encodes_a_valid_full_rate_png_sequence(self):
         from PIL import Image
 

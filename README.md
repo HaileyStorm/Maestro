@@ -181,6 +181,20 @@ original. The action follows the current project's editing permissions and
 keeps private previews blurred. If the video has moved or changed, refresh
 Gallery and open its current entry there.
 
+In **Tools → Blender**, set the object motion, choose **2–8 Repeats**, then
+select **Render repeats**. Maestro resets the scene, renders the motion once
+and joins it at 720p with silent audio, using the selected project and privacy
+setting. This sequence does not receive Director review. Follow it in Queue,
+then open the finished video from Gallery in Editor. Use a whole-number FPS
+from 1–120. If submission cannot be confirmed, check Queue before submitting
+again.
+
+The project-scoped [Blender and Editor composition API](docs/composition-api.md)
+can render typed animation segments and reuse them in a single MP4. Its first
+format supports silent audio, one or two Blender segments, and up to eight
+ordered clip instances. The API guide includes JavaScript, Python and curl
+examples plus cancellation and recovery behavior.
+
 ### 🔒 Explicit guidance + experimental gate
 - **Explicit prompt guidance** is an opt-in authoring aid with a disclaimer step. It never hides models, LoRAs, recipes, prompts, or locally processed outputs, and it does not moderate local content.
 - **Experimental features gate** hides power-user toggles (external API keys, Voice Reference, Inpaint, Restyle, Wan2GP Enhancer) by default for a focused first-launch experience.

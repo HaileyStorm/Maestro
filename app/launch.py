@@ -7354,6 +7354,8 @@ def _queue_recovery_materialize_job(
         "_recovery_project_digest": expected_project,
         "_recovery_manifest_pointer": dict(snapshot.get("request_manifest") or {}),
     })
+    if snapshot.get("kind") == "tool_editor_export" and "composition" in (snapshot.get("recovery_cursor") or {}):
+        return _composition_materialize_job(snapshot, projects)
     special_h3 = (snapshot.get("kind") == "studio_h3_delivery_recovery"
                   or _h3_cow_manual_source_supported(snapshot))
     if special_h3:
@@ -10808,6 +10810,9 @@ def _queue_recovery_adopt_staged_h3_cumulative(job: dict, project_dir: str) -> i
 
 def _queue_recovery_reconcile_cursor(job: dict, project_dir: str, *, adopt_staged: bool = False) -> None:
     """Keep verified units and recover the sidecar-before-journal crash gap."""
+    if "composition" in (job.get("recovery_cursor") or {}):
+        _composition_reconcile_cursor(job, project_dir)
+        return
     verified: list[dict] = []
     seen: set[str] = set()
     original_units = _queue_recovery_units(job)
@@ -28697,6 +28702,7 @@ async def add_output_editor_image(project: str, editor_id: str, request: Request
 @api.post("/api/v1/projects/{project}/editor/projects/{editor_id}/exports")
 async def export_output_editor_project(project: str, editor_id: str, request: Request):
     """Queue a source-safe MP4 cut from one saved Editor draft revision."""
+    from services.editor_export import editor_clip_frames
     from services.editor_projects import EditorProjectError, load_editor_project
 
     body = await _editor_request_body(request)
@@ -28769,7 +28775,7 @@ async def export_output_editor_project(project: str, editor_id: str, request: Re
             multiple = len(sources) > 1
             fit_canvas = not multiple and (clips[0][0]["width"] != canvas["width"]
                                           or clips[0][0]["height"] != canvas["height"])
-            duration = (sum(max(1, round(item["duration"] * canvas["fps"])) for item in sources) / canvas["fps"]
+            duration = (sum(editor_clip_frames(item["duration"], canvas["fps"]) for item in sources) / canvas["fps"]
                         if multiple else first["duration"])
             for existing in _jobs.values():
                 params = existing.get("params") if isinstance(existing.get("params"), dict) else {}
@@ -66049,8 +66055,502 @@ def _editor_export_source(job: dict) -> tuple[str, dict]:
     return resolved[0]
 
 
+# Queue, recovery, and publication adapters for Blender compositions.
+
+
+def _composition_renderer_identity():
+    import hashlib
+    from pathlib import Path
+    from services import blender_mcp_service, editor_export
+
+    return {
+        "blender_mcp_revision": blender_mcp_service.PINNED_INSTALL.revision,
+        "blender_version": str(_blender_runtime_info().get("version") or ""),
+        "blender_service_sha256": hashlib.sha256(
+            Path(blender_mcp_service.__file__).read_bytes()
+        ).hexdigest(),
+        "editor_service_sha256": hashlib.sha256(
+            Path(editor_export.__file__).read_bytes()
+        ).hexdigest(),
+    }
+
+
+def _composition_directory(project_dir, job_id):
+    from pathlib import Path
+    from services.composition_package import identifier
+    from services.queue_recovery_runtime import (
+        ensure_recovery_staging_directory,
+        _ensure_private_directory,
+    )
+
+    root = Path(ensure_recovery_staging_directory(project_dir))
+    directory, _identity = _ensure_private_directory(
+        root / ("composition-" + identifier(job_id))
+    )
+    return directory
+
+
+def _composition_job_context(job, *, require_current_renderer=True):
+    from services.blender_mcp_service import BlenderMCPService
+    from services.composition_package import (
+        CompositionError,
+        digest,
+        validate_normalized_package,
+    )
+
+    project_dir = _existing_workspace_dir(job["workspace"])
+    if not hmac.compare_digest(
+        _queue_recovery_existing_project_identity(project_dir),
+        job["_recovery_project_digest"],
+    ):
+        raise CompositionError("Composition project changed")
+    manifest = load_request_manifest(
+        project_dir, job["_recovery_manifest_pointer"], expected_job_id=job["id"]
+    )
+    params = manifest["params"]
+    if manifest.get("inputs") or (
+        require_current_renderer
+        and params.get("composition_renderer") != _composition_renderer_identity()
+    ):
+        raise CompositionError("Composition renderer or execution inputs changed")
+    directory = _composition_directory(project_dir, job["id"])
+    validator = BlenderMCPService(object(), directory)
+    package = validate_normalized_package(params["composition_package"], validator)
+    if params.get("composition_sha256") != digest(package):
+        raise CompositionError("Composition package changed")
+    policy = job.get("access_policy") or {}
+    expected_policy = params.get("composition_policy")
+    if (
+        type(expected_policy) is not dict
+        or set(expected_policy) != {"private", "explicit"}
+        or type(expected_policy.get("private")) is not bool
+        or expected_policy.get("explicit") is not False
+        or bool(policy.get("private")) != expected_policy["private"]
+        or bool(policy.get("explicit"))
+    ):
+        raise CompositionError("Composition output privacy changed")
+    marker = (job.get("recovery_cursor") or {}).get("composition") or {}
+    if marker.get("package_sha256") != digest(package):
+        raise CompositionError("Composition queue commitment changed")
+    binding = {
+        "job_id": job["id"],
+        "workspace": job["workspace"],
+        "project_digest": job["_recovery_project_digest"],
+        "owner_digest": job["_recovery_owner_digest"],
+        "renderer_identity": params["composition_renderer"],
+        "output_policy": copy.deepcopy(expected_policy),
+    }
+    job["params"] = copy.deepcopy(params)
+    return package, directory, project_dir, binding
+
+
+def _composition_materialize_job(snapshot, projects):
+    from services.composition_package import (
+        CompositionAttemptUnresolved,
+        render_segments,
+    )
+    from services.composition_worker import (
+        load_delivery,
+        delivery_paths,
+        rollback_delivery,
+    )
+    from services.blender_mcp_service import BlenderMCPService
+    from services.editor_projects import probe_media
+
+    runtime = {
+        key: copy.deepcopy(value)
+        for key, value in snapshot.items()
+        if key not in {"owner_principal", "project_instance", "request_manifest"}
+    }
+    runtime.update(
+        session_id=None,
+        _recovery_owner_digest=snapshot["owner_principal"],
+        _recovery_project_digest=snapshot["project_instance"],
+        _recovery_manifest_pointer=copy.deepcopy(snapshot["request_manifest"]),
+        access_policy={
+            "private": bool(snapshot.get("private")),
+            "explicit": bool(snapshot.get("explicit")),
+        },
+    )
+    try:
+        current = projects.get(snapshot["workspace"])
+        if current is None or current[1] != snapshot["project_instance"]:
+            raise ValueError("Project changed")
+        package, directory, project_dir, binding = _composition_job_context(
+            runtime, require_current_renderer=False
+        )
+        secret = _session_secret()
+        delivery = load_delivery(
+            package, directory, project_dir, binding=binding, secret=secret
+        )
+        if snapshot.get("status") in {"failed", "cancelled"} or snapshot.get(
+            "cancel_requested"
+        ):
+            if (
+                snapshot.get("cancel_requested")
+                or snapshot.get("status") == "cancelled"
+            ):
+                rollback_delivery(
+                    package, directory, project_dir, binding=binding, secret=secret
+                )
+            return runtime, False
+        if snapshot.get("status") == "completed":
+            if delivery is None or not all(
+                final.is_file()
+                for _staged, final in delivery_paths(directory, project_dir, binding)
+            ):
+                raise ValueError("Completed delivery is missing")
+            return runtime, False
+        if delivery is None:
+            _composition_job_context(runtime)
+            from services.composition_package import CompositionNeedsNative
+
+            try:
+                render_segments(
+                    package,
+                    BlenderMCPService(object(), directory),
+                    directory,
+                    binding=binding,
+                    probe=probe_media,
+                    cancelled=lambda: False,
+                    secret=secret,
+                    allow_native=False,
+                )
+            except CompositionNeedsNative:
+                # Missing pristine units can resume; armed unknown units cannot.
+                pass
+        runtime.update(
+            status="queued",
+            resource_state="queued",
+            recovery_state="interrupted",
+            reruns_denoise=False,
+        )
+        return runtime, not runtime.get("queue_held", False)
+    except Exception:
+        terminal = snapshot.get("status") in {"completed", "failed", "cancelled"}
+        runtime.update(
+            status=snapshot["status"] if terminal else "queued",
+            queue_held=True,
+            recovery_state="blocked",
+            reruns_denoise=False,
+            _recovery_reason_code="composition_evidence_unavailable",
+            message="Composition recovery needs review",
+            output_files=[],
+        )
+        return runtime, False
+
+
+def _composition_reconcile_cursor(job, project_dir):
+    # Composition has its own authenticated receipts. Generic H3/unit/sidecar
+    # adoption never supplies composition execution authority.
+    from services.composition_worker import load_delivery
+
+    package, directory, root, binding = _composition_job_context(
+        job, require_current_renderer=False
+    )
+    if root != project_dir:
+        raise ValueError("Composition project changed")
+    if (
+        load_delivery(
+            package, directory, root, binding=binding, secret=_session_secret()
+        )
+        is None
+    ):
+        _composition_job_context(job)
+
+
+def _run_tool_composition_export(job_id):
+    from contextlib import contextmanager
+    from services.composition_package import (
+        CompositionError,
+        CompositionAttemptUnresolved,
+    )
+    from services.composition_worker import (
+        prepare_delivery,
+        publish_delivery,
+        rollback_delivery,
+        load_delivery,
+    )
+    from services.blender_mcp_service import BlenderMCPService
+    from services.blender_mcp_transport import StdioBlenderMCPClient
+    from services.editor_projects import probe_media
+
+    job = _jobs[job_id]
+    abort_state = {"abort": False}
+    context = None
+    client = None
+    attempt = None
+    initial_attempt = job.get("execution_attempt")
+
+    def aborted():
+        return bool(abort_state.get("abort")) or is_cancel_requested(job)
+
+    def hold_owned(reason, message):
+        expected = initial_attempt if attempt is None else attempt
+        if type(expected) is not int or expected < 1:
+            return False
+        with _jobs._registry_lock:
+            if _jobs.get(job_id) is not job or job.get("execution_attempt") != expected:
+                return False
+            return _queue_recovery_checkpoint(
+                job,
+                status="queued",
+                queue_held=True,
+                recovery_state="blocked",
+                reruns_denoise=False,
+                message=message,
+                _recovery_reason_code=reason,
+                expected_execution_attempt=expected,
+            )
+
+    @contextmanager
+    def native_context():
+        nonlocal client
+        _require_blender_ready()
+        client = StdioBlenderMCPClient(
+            checkout_root=_blender_checkout_root(),
+            blender_version=binding["renderer_identity"]["blender_version"],
+        )
+        native_service = BlenderMCPService(client, directory)
+
+        def checkpoint():
+            if aborted():
+                raise _WgpNativeGpuWaitCancelled()
+
+        with _WgpNativeGpuExecutionSlot(cancel_checkpoint=checkpoint) as acquired:
+            if not acquired:
+                raise InterruptedError("Composition cancelled while waiting")
+            yield native_service
+
+    try:
+        while not aborted():
+            with generation_slot(_gen_lock, job) as acquired:
+                if not acquired:
+                    return False
+                # Existing Director holds Scene then waits for Gen. Never wait
+                # for Scene while retaining Gen; release and retry admission.
+                if not _blender_scene_lock.acquire(blocking=False):
+                    pass
+                else:
+                    try:
+                        previous_attempt = job.get("execution_attempt")
+                        if type(previous_attempt) is not int or previous_attempt < 1:
+                            raise CompositionError(
+                                "Composition execution attempt is invalid"
+                            )
+                        if not try_start(
+                            job,
+                            generation_lock=_gen_lock,
+                            expected_execution_attempt=previous_attempt,
+                            execution_attempt=previous_attempt + 1,
+                            message="Rendering composition...",
+                            phase="Rendering",
+                        ):
+                            return False
+                        attempt = job.get("execution_attempt")
+                        if not register_abort_state(
+                            job, job_id, _active_gen_states, abort_state
+                        ):
+                            return False
+                        with _reserve_workspace_operations(job["workspace"]):
+                            try:
+                                context = _composition_job_context(
+                                    job, require_current_renderer=False
+                                )
+                                package, directory, project_dir, binding = context
+                                secret = _session_secret()
+                                if (
+                                    load_delivery(
+                                        package,
+                                        directory,
+                                        project_dir,
+                                        binding=binding,
+                                        secret=secret,
+                                    )
+                                    is None
+                                ):
+                                    _composition_job_context(job)
+                                service = BlenderMCPService(object(), directory)
+
+                                def event(stage):
+                                    cursor = copy.deepcopy(
+                                        job.get("recovery_cursor") or {}
+                                    )
+                                    cursor["composition"]["stage"] = stage
+                                    if not _queue_recovery_checkpoint(
+                                        job,
+                                        recovery_cursor=cursor,
+                                        expected_execution_attempt=attempt,
+                                    ):
+                                        raise InterruptedError(
+                                            "Composition checkpoint lost its execution attempt"
+                                        )
+
+                                prepare_delivery(
+                                    package,
+                                    service,
+                                    directory,
+                                    project_dir,
+                                    binding=binding,
+                                    secret=secret,
+                                    probe=probe_media,
+                                    cancelled=aborted,
+                                    policy=job.get("access_policy") or {},
+                                    native_context=native_context,
+                                    event=event,
+                                )
+                                with _output_lineage_mutation_guard(project_dir):
+                                    _composition_job_context(
+                                        job, require_current_renderer=False
+                                    )
+                                    return publish_delivery(
+                                        package,
+                                        directory,
+                                        project_dir,
+                                        binding=binding,
+                                        secret=secret,
+                                        cancelled=aborted,
+                                        event=event,
+                                        finish=lambda filename: finish_job(
+                                            job,
+                                            "completed",
+                                            expected_execution_attempt=attempt,
+                                            output_files=[filename],
+                                            progress=100,
+                                            phase="",
+                                            message="Done",
+                                        ),
+                                    )
+                            finally:
+                                if context is not None:
+                                    with _output_lineage_mutation_guard(project_dir):
+                                        current = _jobs.get(job_id)
+                                        if (
+                                            current is job
+                                            and current.get("execution_attempt")
+                                            == attempt
+                                            and current.get("status") != "completed"
+                                        ):
+                                            rollback_delivery(
+                                                package,
+                                                directory,
+                                                project_dir,
+                                                binding=binding,
+                                                secret=_session_secret(),
+                                            )
+                    finally:
+                        _blender_scene_lock.release()
+            # Wait for the conflicting scene owner outside Gen, with bounded
+            # cancellation checks, instead of repeatedly journaling admissions.
+            while not aborted():
+                if _blender_scene_lock.acquire(timeout=0.2):
+                    _blender_scene_lock.release()
+                    break
+        return False
+    except (CompositionAttemptUnresolved, CompositionError):
+        hold_owned(
+            "composition_evidence_unavailable", "Composition recovery needs review"
+        )
+        return False
+    except Exception:
+        # A failed native call leaves its armed receipt, so it must not be
+        # offered an automatic retry or have its evidence discarded.
+        if not aborted():
+            hold_owned(
+                "composition_attempt_unresolved",
+                "Composition interrupted; review before retrying",
+            )
+        return False
+    finally:
+        try:
+            if client is not None:
+                client.close()
+        finally:
+            unregister_abort_state(job_id, _active_gen_states, abort_state)
+
+
+@api.post("/api/v1/projects/{project}/compositions")
+async def submit_blender_editor_composition(project: str, request: Request):
+    from services.blender_mcp_service import BlenderMCPService
+    from services.composition_package import CompositionError, normalize_package, digest
+
+    body = await _editor_request_body(request)
+    if (
+        set(body) != {"package", "private_output"}
+        or type(body["private_output"]) is not bool
+    ):
+        raise HTTPException(
+            status_code=400, detail="Choose a composition and its privacy setting"
+        )
+    with _reserve_workspace_operations(project):
+        _require_project_access(
+            request, project, existing_only=True, permission="project.mutate"
+        )
+        out_dir = _require_project_access(
+            request, project, existing_only=True, permission="project.generate"
+        )
+        _require_blender_ready()
+        try:
+            package = normalize_package(
+                body["package"], BlenderMCPService(object(), out_dir)
+            )
+        except (ValueError, CompositionError):
+            raise HTTPException(
+                status_code=422, detail="This composition is invalid"
+            ) from None
+        job_id = _new_generation_job_id()
+        sha = digest(package)
+        job = {
+            "id": job_id,
+            "kind": "tool_editor_export",
+            "status": "queued",
+            "progress": 0,
+            "step": 0,
+            "total_steps": 0,
+            "session_id": request.state.maestro_session_id,
+            "source_remote": bool(_request_remote.get()),
+            "phase": "",
+            "message": "Queued (composition)",
+            "created_at": time.time(),
+            "params": {
+                "composition_package": package,
+                "composition_sha256": sha,
+                "composition_renderer": _composition_renderer_identity(),
+                "private_output": body["private_output"],
+                "explicit_output": False,
+                "composition_policy": {
+                    "private": body["private_output"],
+                    "explicit": False,
+                },
+            },
+            "output_files": [],
+            "error": None,
+            "workspace": project,
+            "out_dir": out_dir,
+            "recovery_cursor": {
+                "composition": {
+                    "schema": package["schema"],
+                    "package_sha256": sha,
+                    "stage": "queued",
+                }
+            },
+            "reruns_denoise": False,
+            "execution_attempt": 1,
+        }
+        _queue_recovery_register_and_publish(
+            job,
+            worker=_run_tool_editor_export,
+            recovery_kind="tool_editor_export",
+            thread_name="composition-" + job_id,
+        )
+    return {"job_id": job_id, "status": "queued"}
+
+
 def _run_tool_editor_export(job_id: str):
     """Render a CPU cut through ordinary queue cancellation and finality."""
+    job = _jobs[job_id]
+    if "composition" in (job.get("recovery_cursor") or {}) or "composition_package" in (job.get("params") or {}):
+        return _run_tool_composition_export(job_id)
     import tempfile
     from services.editor_export import render_single_source_cut, render_video_sequence
     from services.editor_projects import probe_media

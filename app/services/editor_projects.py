@@ -22,6 +22,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
+from services.editor_export import editor_clip_frames
+
 
 EDITOR_SCHEMA_VERSION = 5
 EDITOR_PROJECT_DIR = ".maestro_editor"
@@ -488,7 +490,7 @@ def editor_audio_layer(project: Mapping[str, Any], *, require_fit: bool = False)
         if require_fit:
             clips = next(track["items"] for track in project["tracks"] if track["id"] == "video-main")
             fps = project["canvas"]["fps"]
-            end = sum(max(1, round(clip["duration"] * fps)) for clip in clips) / fps if len(clips) > 1 else clips[0]["duration"]
+            end = sum(editor_clip_frames(clip["duration"], fps) for clip in clips) / fps if len(clips) > 1 else clips[0]["duration"]
             if plan["start"] + plan["duration"] > end + 1e-6:
                 raise ValueError()
         return plan
@@ -518,7 +520,7 @@ def add_output_audio_layer(current: Mapping[str, Any], *, output_name: str,
         "width": 0, "height": 0, "fps": 0.0, "has_audio": True,
     }
     fps = current["canvas"]["fps"]
-    end = sum(max(1, round(clip["duration"] * fps)) for _, clip in clips) / fps if len(clips) > 1 else clips[0][1]["duration"]
+    end = sum(editor_clip_frames(clip["duration"], fps) for _, clip in clips) / fps if len(clips) > 1 else clips[0][1]["duration"]
     plan = {"id": "audio-layer", "asset_id": asset_id, "source_in": 0.0, "start": 0.0,
             "duration": min(duration, end), "volume": 1.0, "muted": False}
     next(track for track in updated["tracks"] if track["id"] == "audio-main")["items"] = [_editor_audio_item(plan)]
@@ -590,7 +592,7 @@ def editor_image_layers(project: Mapping[str, Any], *, require_fit: bool = False
             if require_fit:
                 clips = next(track["items"] for track in project["tracks"] if track["id"] == "video-main")
                 fps = project["canvas"]["fps"] if len(clips) > 1 else (project["assets"][clips[0]["asset_id"]].get("fps") or project["canvas"]["fps"])
-                end = sum(max(1, round(clip["duration"] * fps)) for clip in clips) / fps if len(clips) > 1 else clips[0]["duration"]
+                end = sum(editor_clip_frames(clip["duration"], fps) for clip in clips) / fps if len(clips) > 1 else clips[0]["duration"]
                 if plan["start"] + plan["duration"] > end + 1e-6 or plan["duration"] < 1 / max(1, fps) - 1e-9:
                     raise ValueError()
             if plan["id"] in ids or plan["asset_id"] in asset_ids:
@@ -628,7 +630,7 @@ def add_output_image_layer(current: Mapping[str, Any], *, output_name: str,
         "private": bool(media.get("private", True)), "duration": 0.0, "fps": 0.0, "has_audio": False,
         "width": media.get("width"), "height": media.get("height")}
     fps = current["canvas"]["fps"]
-    end = sum(max(1, round(clip["duration"] * fps)) for _, clip in clips) / fps if len(clips) > 1 else clips[0][1]["duration"]
+    end = sum(editor_clip_frames(clip["duration"], fps) for _, clip in clips) / fps if len(clips) > 1 else clips[0][1]["duration"]
     plan = {"id": "image-layer" if asset_id == "source-image" else f"image-{uuid.uuid4().hex}", "asset_id": asset_id, "start": 0.0, "duration": end,
             "size": 0.25, "opacity": 1.0, "position": "center"}
     track = next((track for track in updated["tracks"] if track["id"] == "images-main"), None)
@@ -691,7 +693,7 @@ def editor_text_layers(project: Mapping[str, Any], *, require_fit: bool = False)
             clips = next(track["items"] for track in project["tracks"] if track["id"] == "video-main")
             fps = project["canvas"]["fps"]
             title_fps = fps if len(clips) > 1 else project["assets"][clips[0]["asset_id"]].get("fps", fps) or fps
-            end = (sum(max(1, round(clip["duration"] * fps)) for clip in clips) / fps
+            end = (sum(editor_clip_frames(clip["duration"], fps) for clip in clips) / fps
                    if len(clips) > 1 else clips[0]["duration"])
             if any(item["start"] + item["duration"] > end + 1e-6
                    or item["duration"] < 1 / title_fps - 1e-9 for item in result):

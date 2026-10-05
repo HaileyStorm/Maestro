@@ -59,6 +59,40 @@ class Request:
 
 
 class EditorExportRouteTests(unittest.TestCase):
+    def test_fractional_repeated_clip_registration_and_layers_follow_encoded_clock(self):
+        from services.editor_projects import add_output_audio_layer, add_output_image_layer, editor_audio_layer, editor_image_layers, editor_text_layers
+        current = append_output_video_clip(self.timeline, output_name=self.source.name,
+            output_revision=self.source_revision(), media={"type": "video", "duration": 3,
+                "width": 128, "height": 72, "fps": 24, "has_audio": True, "private": True})
+        proposed = copy.deepcopy(current)
+        for item in proposed["tracks"][0]["items"]:
+            item.update(source_in=0, duration=2 / 3)
+        current = apply_output_video_trim(current, proposed)
+        current["canvas"]["fps"] = 3.75
+        current = add_output_audio_layer(current, output_name="sound.wav", output_revision="audio",
+            media={"type": "audio", "duration": 5, "has_audio": True})
+        current = add_output_image_layer(current, output_name="logo.png", output_revision="image",
+            media={"type": "image", "width": 16, "height": 8})
+        self.assertEqual(editor_audio_layer(current, require_fit=True)["duration"], 1.6)
+        self.assertEqual(editor_image_layers(current, require_fit=True)[0]["duration"], 1.6)
+        proposed = copy.deepcopy(current)
+        next(track for track in proposed["tracks"] if track["id"] == "titles-main")["items"] = [{
+            "id": "last-frame", "text": "Final frame", "start": 0, "duration": 1.6, "position": "bottom",
+        }]
+        current = apply_output_video_trim(current, proposed)
+        self.assertEqual(editor_text_layers(current, require_fit=True)[0]["duration"], 1.6)
+        # Register the same saved sequence without fixture audio/still files.
+        current["tracks"] = [track for track in current["tracks"] if track["id"] not in {"audio-main", "images-main"}]
+        current["assets"] = {key: asset for key, asset in current["assets"].items() if asset["type"] == "video"}
+        self.timeline = save_editor_project(str(self.outputs), "scene", current,
+            expected_revision=self.timeline["revision"])
+        self.submit()
+        job = self.registered[0][0]
+        self.assertEqual(job["params"]["editor_duration"], 1.6)
+        self.assertEqual(job["params"]["editor_text_layers"][0]["duration"], 1.6)
+        self.assertEqual(len(job["params"]["editor_sources"]), 2)
+        self.assertEqual(len(self.timeline["assets"]), 1)
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

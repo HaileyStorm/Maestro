@@ -26,7 +26,7 @@ export function BlenderSceneTool({
   compact = false,
   referenceName,
   referenceDescription,
-  privateOutput = true,
+  privateOutput: suppliedPrivateOutput,
 }: {
   compact?: boolean
   /** Reference Studio passes these explicitly; Blender keeps its own contract. */
@@ -34,12 +34,19 @@ export function BlenderSceneTool({
   referenceDescription?: string
   privateOutput?: boolean
 }) {
+  const privateOutput = suppliedPrivateOutput ?? true
+  const repeatPrivateOutput = useStore(state => suppliedPrivateOutput ?? state.privateOutput)
   const workspace = useStore(state => state.activeWorkspace)
   const accountEpoch = useStore(() => currentAccountIdentityEpoch())
   const canEditProject = useStore(state => {
     const project = state.workspaces.find(project => project.name === state.activeWorkspace)
     return Boolean(project) && (project?.project_permissions === undefined
       || project.project_permissions.includes('project.mutate'))
+  })
+  const canRenderRepeats = useStore(state => {
+    const project = state.workspaces.find(project => project.name === state.activeWorkspace)
+    return Boolean(project) && (project?.project_permissions === undefined
+      || ['project.mutate', 'project.generate'].every(permission => project.project_permissions?.includes(permission)))
   })
   const refreshOutputs = useStore(state => state.refreshOutputs)
   const openEditor = useStore(state => state.openEditor)
@@ -48,6 +55,9 @@ export function BlenderSceneTool({
   const statusRequest = useRef(0)
   const operationSequence = useRef(0)
   const activeOperation = useRef<BlenderOperation | null>(null)
+  const compositionSubmission = useRef(false)
+  const [submittingComposition, setSubmittingComposition] = useState(false)
+  const [repeatCount, setRepeatCount] = useState(2)
   const [installed, setInstalled] = useState<boolean | null>(null)
   const [ready, setReady] = useState(false)
   const [readiness, setReadiness] = useState<api.BlenderStatus | null>(null)
@@ -69,6 +79,9 @@ export function BlenderSceneTool({
   const [editPrompt, setEditPrompt] = useState('')
   const frameCount = useMemo(() => Math.max(1, Math.round(duration * fps)), [duration, fps])
   const endFrame = frameCount - 1
+  const repeatSettingsValid = Number.isInteger(fps) && fps >= 1 && fps <= 120
+    && frameCount >= 2 && frameCount <= maxTotalFrames
+    && Number.isInteger(repeatCount) && repeatCount >= 2 && repeatCount <= 8
   const maxDuration = maxTotalFrames / fps
   const sampleFrames = useMemo(() => [0, Math.round(endFrame / 2), endFrame], [endFrame])
   workspaceRef.current = workspace
@@ -145,7 +158,7 @@ export function BlenderSceneTool({
     return () => { active = false }
   }, [workspace, accountEpoch])
 
-  const run = async (label: string, task: () => Promise<unknown>, requiresBlender = true) => {
+  const run = async (label: string, task: () => Promise<unknown>, requiresBlender = true, successMessage = `${label} complete`) => {
     const operationWorkspace = workspace
     const operation = { sequence: ++operationSequence.current, workspace: operationWorkspace, accountEpoch: currentAccountIdentityEpoch() }
     activeOperation.current = operation
@@ -159,10 +172,12 @@ export function BlenderSceneTool({
     try {
       await task()
       if (!isOperationCurrent(operation)) return
-      setMessage(`${label} complete`)
+      setMessage(successMessage)
     } catch (error) {
       if (!isOperationCurrent(operation)) return
-      setMessage(error instanceof api.BlenderReviewError
+      setMessage(error instanceof api.CompositionSubmissionError
+        ? error.message
+        : error instanceof api.BlenderReviewError
         ? `${error.message}${error.feedback ? ` Director feedback: ${error.feedback}` : ''}`
         : requiresBlender
         ? `${label} could not finish. Check the scene settings and try again.`
@@ -172,6 +187,56 @@ export function BlenderSceneTool({
         setBusy('')
         activeOperation.current = null
       }
+    }
+  }
+
+  const renderRepeats = async () => {
+    if (compositionSubmission.current || activeOperation.current || !ready || !canRenderRepeats || !repeatSettingsValid) return
+    compositionSubmission.current = true
+    setSubmittingComposition(true)
+    try {
+      await run('Sequence submission', async () => {
+        const operation = activeOperation.current
+        if (!operation || !isOperationCurrent(operation)) return
+        const project = useStore.getState().workspaces.find(project => project.name === operation.workspace)
+        if (!project || (project.project_permissions !== undefined
+          && !['project.mutate', 'project.generate'].every(permission => project.project_permissions?.includes(permission)))) {
+          throw new api.CompositionSubmissionError('This project does not currently allow you to render repeats. Check your project access.')
+        }
+        let startPosition: [number, number, number]
+        let endPosition: [number, number, number]
+        let materialColor: [number, number, number, number]
+        try {
+          startPosition = parseVector(start)
+          endPosition = parseVector(end)
+          materialColor = rgba(color)
+        } catch {
+          throw new api.CompositionSubmissionError('Check the start and end positions and choose a valid color.')
+        }
+        if (!/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(name)) {
+          throw new api.CompositionSubmissionError('Use an object name starting with a letter, with up to 64 letters, numbers, dots, underscores or hyphens.')
+        }
+        const composition: api.BlenderCompositionPackage = {
+          // Reuse the existing secure UUID fallback for plain-HTTP LAN access.
+          schema: 'maestro/composition/v1', id: api.createLlmRequestId(),
+          canvas: { width: 1280, height: 720, fps }, audio: { mode: 'silence', sample_rate: 48000 },
+          segments: [{ id: 'motion', fps, width: 1280, height: 720,
+            scene: { clear_scene: true, objects: [{ name, primitive, location: startPosition, scale: [1, 1, 1],
+              material: { name: 'RepeatMaterial', color: materialColor } }] },
+            animation: { frame_start: 0, frame_end: endFrame, objects: [{ name, keyframes: [
+              { frame: 0, location: startPosition, interpolation: 'BEZIER' },
+              { frame: endFrame, location: endPosition, interpolation: 'BEZIER' },
+            ] }] },
+          }],
+          clips: Array.from({ length: repeatCount }, (_, index) => ({
+            id: `clip-${index + 1}`, segment_id: 'motion', source_frame: 0, frame_count: frameCount,
+          })),
+        }
+        await api.submitBlenderComposition(operation.workspace, composition, repeatPrivateOutput)
+      }, true, 'Added to Queue. When the sequence finishes, open it from Gallery in Editor.')
+    } finally {
+      compositionSubmission.current = false
+      if (mountedRef.current) setSubmittingComposition(false)
     }
   }
 
@@ -462,6 +527,15 @@ export function BlenderSceneTool({
         <button disabled={!ready || !!busy} onClick={animate} className="rounded border border-border px-2 py-1.5 text-[10px] text-text-secondary disabled:opacity-40"><Play size={10} className="mr-1 inline" />Animate {endFrame}f</button>
         <button disabled={!ready || !!busy} onClick={inspect} className="rounded border border-border px-2 py-1.5 text-[10px] text-text-secondary disabled:opacity-40"><Eye size={10} className="mr-1 inline" />Inspect</button>
         <button disabled={!ready || !!busy} onClick={runManualDirector} className="rounded border border-accent-blue/40 px-2 py-1.5 text-[10px] text-accent-blue disabled:opacity-40"><Play size={10} className="mr-1 inline" />Review and render</button>
+      </div>
+      <div className="rounded border border-border p-2">
+        <div className="flex items-end gap-2">
+          <label className="text-[9px] text-text-muted">Repeats<input type="number" min={2} max={8} step={1} value={repeatCount} onChange={event => setRepeatCount(Number(event.target.value))} className="mt-0.5 w-16 rounded border border-border bg-bg-tertiary px-1 py-1 text-xs" /></label>
+          <button disabled={!ready || !!busy || submittingComposition || !canRenderRepeats || !repeatSettingsValid} onClick={() => void renderRepeats()} className="min-h-9 flex-1 rounded border border-accent-blue/40 px-2 py-1.5 text-[10px] text-accent-blue disabled:opacity-40">Render repeats</button>
+        </div>
+        <p className="mt-1.5 text-[9px] leading-relaxed text-text-muted">Resets the Blender scene and renders this motion once, then joins 2–8 repeats at 720p with silent audio. Uses the selected project; its preview {repeatPrivateOutput ? 'starts blurred' : 'is shown normally'}. Director does not review this sequence. Follow progress in Queue, then open the finished video from Gallery in Editor.</p>
+        {!repeatSettingsValid && <p className="mt-1 text-[9px] text-amber-400">Use a whole-number FPS from 1–120, at least two motion frames and 2–8 repeats.</p>}
+        {!canRenderRepeats && <p className="mt-1 text-[9px] text-text-muted">This project needs editing and generation access to render repeats.</p>}
       </div>
       {busy && <p className="flex items-center gap-1 text-[10px] text-accent-blue"><Loader2 size={10} className="animate-spin" />{busy}…</p>}
       {message && <p className="text-[9px] leading-relaxed text-text-muted">{message}</p>}

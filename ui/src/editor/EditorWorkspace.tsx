@@ -30,9 +30,23 @@ function addText(project: EditorProject, id: string, start: number, duration: nu
     : [...project.tracks, { id: 'titles-main', name: 'Titles', type: 'text', items: [item] }] }
 }
 
-// Python round uses ties-to-even; mirror the sequence export's frame clock.
+// Mirror Python's nine-decimal encoder time, then ties-to-even frame rounding.
 function clipFrames(duration: number, fps: number) {
-  const value = duration * fps
+  if (!Number.isFinite(duration) || duration < 0 || duration > 86400) return NaN
+  const binary = new DataView(new ArrayBuffer(8))
+  binary.setFloat64(0, duration)
+  const bits = binary.getBigUint64(0)
+  const exponent = Number((bits >> 52n) & 2047n)
+  const significand = (bits & ((1n << 52n) - 1n)) | (exponent ? 1n << 52n : 0n)
+  const shift = exponent ? exponent - 1075 : -1074
+  let ticks = significand * 1_000_000_000n
+  if (shift < 0) {
+    const denominator = 1n << BigInt(-shift)
+    const quotient = ticks / denominator, remainder = ticks % denominator
+    ticks = quotient + (2n * remainder > denominator ||
+      (2n * remainder === denominator && quotient % 2n === 1n) ? 1n : 0n)
+  } else ticks <<= BigInt(shift)
+  const value = (Number(ticks) / 1e9) * fps
   const floor = Math.floor(value)
   return Math.max(1, value - floor === 0.5 ? floor + (floor % 2) : Math.round(value))
 }

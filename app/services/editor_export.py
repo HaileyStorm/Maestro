@@ -329,6 +329,13 @@ def render_single_source_cut(
                 pass
 
 
+def editor_clip_frames(duration: float, fps: float) -> int:
+    """Use the encoder's nine-decimal duration for its exact frame clock."""
+    if type(fps) not in (int, float) or not math.isfinite(fps) or not 1 <= fps <= 120:
+        raise ValueError("Editor frame rate is invalid")
+    return max(1, round(float(_seconds(duration)) * fps))
+
+
 def render_video_sequence(
     clips: list[dict], destination: str | os.PathLike[str], *,
     width: int, height: int, fps: float,
@@ -343,8 +350,8 @@ def render_video_sequence(
     Each clip contributes its first audio stream, or silence when absent.
     Sources remain read-only; the caller seals and rechecks their identities.
     """
-    if not isinstance(clips, list) or not 2 <= len(clips) <= 8:
-        raise ValueError("Editor sequence needs two through eight clips")
+    if not isinstance(clips, list) or not 1 <= len(clips) <= 8:
+        raise ValueError("Editor sequence needs one through eight clips")
     if (type(width) is not int or type(height) is not int
             or not 64 <= width <= 7680 or not 64 <= height <= 4320
             or width % 2 or height % 2
@@ -372,7 +379,7 @@ def render_video_sequence(
         start, length = _seconds(clip["source_in"], allow_zero=True), _seconds(clip["duration"])
         if float(start) + float(length) > 86400 or type(clip.get("has_audio")) is not bool:
             raise ValueError("Editor sequence source range is invalid")
-        frames = max(1, round(float(length) * fps))
+        frames = editor_clip_frames(clip["duration"], fps)
         total_frames += frames
         seconds = f"{frames / fps:.9f}"
         # Decode the range at the input, then give every stream an exact local
@@ -439,4 +446,4 @@ def render_video_sequence(
             pass
 
 
-__all__ = ["render_single_source_cut", "render_video_sequence"]
+__all__ = ["render_single_source_cut", "render_video_sequence", "editor_clip_frames"]
