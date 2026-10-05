@@ -21,7 +21,7 @@ async function setup(page: Page) {
   let pending: Route | undefined
   const json = (route: Route, value: unknown) => route.fulfill({ contentType: 'application/json', body: JSON.stringify(value) })
   await page.route('**/api/v1/blender/status*', route => json(route, {
-    installed: true, ready: true, mcp_attested: true, runtime_attested: true,
+    installed: true, ready: true, mcp_attested: true, runtime_attested: true, mcp_sdk_ready: true,
     bridge_ready: true, workspace: video.workspace, max_total_frames: 7200,
   }))
   await page.route('**/api/v1/blender/director-finalize', route => {
@@ -109,5 +109,14 @@ test('missing or ambiguous Gallery results and leaving Blender cannot initialize
   await fixture.resolve([video])
   await expect(page.getByRole('main', { name: 'Video Editor' })).toHaveCount(0)
   expect(fixture.editorRequests).toEqual([])
+  await page.route('**/api/v1/blender/status*', route => route.fulfill({
+    contentType: 'application/json', body: JSON.stringify({
+      installed: true, ready: false, mcp_attested: true, runtime_attested: true,
+      mcp_sdk_ready: false, bridge_ready: true, workspace: video.workspace, max_total_frames: 7200,
+    }),
+  }))
+  await page.getByRole('button', { name: 'Blender', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Review and render', exact: true })).toBeDisabled()
+  await expect(page.getByText('Blender support is missing from Maestro’s current environment. In Pinokio, open Maestro, run “Verify / Repair Blender MCP Support,” then reopen this panel. If Blender is still unavailable, restart Maestro.', { exact: true })).toBeVisible()
   await fixture.api.assertClean()
 })

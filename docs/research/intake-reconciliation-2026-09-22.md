@@ -651,3 +651,12 @@ across desktop Firefox and mobile Chromium. A separate mounted StrictMode
 probe covered permission revocation and account/project transition races.
 Native kept-Blender-to-Editor acceptance remains pending; this handoff does
 not complete the neutral composition package or its worker/publication gates.
+
+The live Blender panel exposed a missing client in the selected CUDA 13
+environment. The existing pinned Pinokio repair installed Blender MCP 1.0.0
+and its missing docutils dependency; all 308 pre-existing package versions
+remained unchanged. The running backend then reported Blender 5.1.2 ready
+without a restart. The panel now identifies this missing-client condition
+and directs users to the same repair action. Four focused desktop/mobile
+browser checks and all 811 UI tests passed; no native render or model load
+was performed during this runtime repair.

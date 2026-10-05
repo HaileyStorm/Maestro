@@ -76,6 +76,7 @@ export function BlenderSceneTool({
   const blenderRecoveryMessage = (status: api.BlenderStatus | null): string => {
     if (!status?.mcp_attested) return 'Blender support needs setup. In Pinokio, open Maestro, run “Verify / Repair Blender MCP Support,” then restart Maestro.'
     if (!status.runtime_attested) return 'Blender needs setup. In Pinokio, open Maestro, run “Verify / Repair Blender Runtime,” then restart Maestro.'
+    if (status.mcp_sdk_ready === false) return 'Blender support is missing from Maestro’s current environment. In Pinokio, open Maestro, run “Verify / Repair Blender MCP Support,” then reopen this panel. If Blender is still unavailable, restart Maestro.'
     if (!status.bridge_ready) return 'Maestro cannot connect to Blender. Stop and start Maestro in Pinokio, then try again.'
     return 'Blender is not ready on this Maestro computer.'
   }

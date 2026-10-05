@@ -5245,6 +5245,7 @@ export interface BlenderStatus {
   ready: boolean
   mcp_attested: boolean
   runtime_attested: boolean
+  mcp_sdk_ready: boolean
   bridge_ready: boolean
   recovery_action: string
   workspace: string
