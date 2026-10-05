@@ -427,8 +427,8 @@ function hasPendingOperation(workspace: string, projectInstance: string): boolea
     || restorePendingOperation(workspace, projectInstance) !== null
 }
 
-function cleanupUnsubmittedUploads(pending: PendingChatRequest): void {
-  if (pending.admissionAcknowledged || pending.uploadedRefs.length === 0) return
+function cleanupUnsubmittedUploads(pending: PendingChatRequest, definitiveFailure = false): void {
+  if (pending.admissionAcknowledged || pending.submissionAttempted && !definitiveFailure || pending.uploadedRefs.length === 0) return
   const filenames = pending.uploadedRefs.splice(0)
   for (const filename of filenames) {
     void api.deleteLlmChatImage(pending.workspace, filename).catch(() => {
@@ -801,46 +801,25 @@ export function LlmChat() {
       status: pending.latestStatus,
     } : null)
     setError(null)
-    const recoverPending = async () => {
-      let allowInitialMissing = false
-      if (!pending.admissionAcknowledged) {
-        const state = await api.reconcileLlmChatUploadRequest(
-          pending.workspace,
-          pending.requestId,
-          pending.projectInstance,
-          controller.signal,
-        )
-        if (state === 'retry') {
-          throw new api.LlmChatWaitError(
-            'Chat upload cleanup is still pending. Resume to try again.',
-          )
-        }
-        if (state !== 'claimed') {
-          throw new Error('This Chat request was not admitted. Retry the turn.')
-        }
+    const recoverPending = () => api.waitForLlmChatOperation(
+      pending.requestId,
+      pending.workspace,
+      controller.signal,
+      undefined,
+      status => {
+        if (!stillOwnsProject()) return
         pending.admissionAcknowledged = true
+        pending.latestStatus = status
         persistPendingOperation(pending)
-        allowInitialMissing = true
-      }
-      return api.waitForLlmChatOperation(
-        pending.requestId,
-        pending.workspace,
-        controller.signal,
-        undefined,
-        status => {
-          if (!stillOwnsProject()) return
-          pending.latestStatus = status
-          setLiveChatStatus({
-            workspace: pending.workspace,
-            projectInstance: pending.projectInstance,
-            requestId: pending.requestId,
-            status,
-          })
-          setRequestPhase(operationRequestPhase(status.phase))
-        },
-        allowInitialMissing,
-      )
-    }
+        setLiveChatStatus({
+          workspace: pending.workspace,
+          projectInstance: pending.projectInstance,
+          requestId: pending.requestId,
+          status,
+        })
+        setRequestPhase(operationRequestPhase(status.phase))
+      },
+    )
     void recoverPending().then(response => {
       if (!stillOwnsProject()) return
       suspendedChatRequests.delete(key)
@@ -1179,7 +1158,7 @@ export function LlmChat() {
       removePendingOperation(requestWorkspace, requestProjectInstance)
       setLiveChatStatus(null)
     } catch (err) {
-      cleanupUnsubmittedUploads(pending)
+      cleanupUnsubmittedUploads(pending, !controller.signal.aborted && !(err instanceof api.LlmChatWaitError))
       if (!pendingStillOwnsProject()) return
       setModelId(pending.modelId)
       setCustomModel(pending.customModel)

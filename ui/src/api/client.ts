@@ -8190,6 +8190,51 @@ export function createLlmRequestId(): string {
   ].join('-')
 }
 
+function validatedLlmChatStatus(value: unknown, requestId: string): LlmChatOperationStatus {
+  const unavailable = () => new LlmChatWaitError('Chat status is still unavailable. Resume waiting to retrieve the result.')
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw unavailable()
+  const status = value as Record<string, unknown>
+  const record = (item: unknown): item is Record<string, unknown> => item !== null && typeof item === 'object' && !Array.isArray(item)
+  const progressValid = (item: Record<string, unknown>) => {
+    for (const key of ['generated_tokens_approx', 'elapsed_seconds', 'live_tps', 'average_tps', 'attempt', 'attempt_limit']) {
+      const number = item[key]
+      if (number === undefined || number === null && ['live_tps', 'average_tps'].includes(key)) continue
+      if (typeof number !== 'number' || !Number.isFinite(number) || number < 0) return false
+      if (['generated_tokens_approx', 'attempt', 'attempt_limit'].includes(key) && !Number.isInteger(number)) return false
+    }
+    return true
+  }
+  if (typeof status.request_id !== 'string'
+    || !/^(?:[a-f0-9]{32}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$/i.test(status.request_id)
+    || canonicalLlmRequestId(status.request_id) !== canonicalLlmRequestId(requestId)
+    || typeof status.status !== 'string' || !['running', 'completed', 'failed'].includes(status.status)
+    || typeof status.phase !== 'string' || typeof status.retryable !== 'boolean'
+    || status.partial_text !== undefined && typeof status.partial_text !== 'string'
+    || !progressValid(status)) throw unavailable()
+  if (status.result !== undefined && status.result !== null) {
+    if (status.status !== 'completed' || !record(status.result)
+      || typeof status.result.text !== 'string' || typeof status.result.model_id !== 'string'
+      || !Array.isArray(status.result.guide_ids) || !status.result.guide_ids.every(id => typeof id === 'string')
+      || !progressValid(status.result)) throw unavailable()
+  } else if (status.status === 'completed') throw unavailable()
+  if (status.error !== undefined && status.error !== null) {
+    if (status.status !== 'failed' || !record(status.error)
+      || typeof status.error.code !== 'string' || typeof status.error.message !== 'string'
+      || typeof status.error.retryable !== 'boolean') throw unavailable()
+  } else if (status.status === 'failed') throw unavailable()
+  return status as unknown as LlmChatOperationStatus
+}
+
+async function readLlmChatStatus(res: Response, requestId: string): Promise<LlmChatOperationStatus> {
+  let value: unknown
+  try {
+    value = await res.json()
+  } catch {
+    throw new LlmChatWaitError('Chat status is still unavailable. Resume waiting to retrieve the result.')
+  }
+  return validatedLlmChatStatus(value, requestId)
+}
+
 async function submitLlmChat(
   request: Record<string, unknown>,
   signal?: AbortSignal,
@@ -8205,7 +8250,7 @@ async function submitLlmChat(
     const err = await res.json().catch(() => ({ detail: 'Chat request failed' }))
     throw new Error(err.detail || 'Chat request failed')
   }
-  return res.json()
+  return readLlmChatStatus(res, request.request_id as string)
 }
 
 export async function fetchLlmChatOperation(
@@ -8221,14 +8266,12 @@ export async function fetchLlmChatOperation(
   if (res.status === 404) return null
   if (isTransientHttpStatus(res.status)) throw new TransientHttpError()
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: 'Chat status is unavailable' }))
-    throw new Error(err.detail || 'Chat status is unavailable')
+    throw new LlmChatWaitError('Chat status is still unavailable. Resume waiting to retrieve the result.')
   }
-  return res.json()
+  return readLlmChatStatus(res, requestId)
 }
 
 async function recoverLlmChatSubmission(
-  request: Record<string, unknown>,
   requestId: string,
   workspace: string,
   signal?: AbortSignal,
@@ -8239,9 +8282,9 @@ async function recoverLlmChatSubmission(
     try {
       const existing = await fetchLlmChatOperation(requestId, workspace, signal)
       if (existing) return existing
-      // If the first POST never reached the host, the same UUID and exact
-      // request can be re-submitted safely. A running operation coalesces.
-      return await submitLlmChat(request, signal)
+      // The in-memory operation may have expired or the host restarted.
+      // Absence cannot prove that the original request was never admitted.
+      throw new LlmChatWaitError('Chat status is still unavailable. Resume waiting to retrieve the result.')
     } catch (error) {
       throwIfAborted(signal)
       if (!isTransientRequestError(error)) throw error
@@ -8257,10 +8300,9 @@ export async function waitForLlmChatOperation(
   signal?: AbortSignal,
   initial?: LlmChatOperationStatus,
   onStatus?: (status: LlmChatOperationStatus) => void,
-  allowInitialMissing = false,
 ): Promise<LlmChatResult> {
   const startedAt = Date.now()
-  let operation: LlmChatOperationStatus | null | undefined = initial
+  let operation: LlmChatOperationStatus | null | undefined = initial ? validatedLlmChatStatus(initial, requestId) : initial
   while (!operation) {
     if (Date.now() - startedAt >= LLM_PREPARATION_MAX_WAIT_MS) {
       throw new LlmChatWaitError('Chat status is still unavailable. Resume waiting to retrieve the result.')
@@ -8268,11 +8310,7 @@ export async function waitForLlmChatOperation(
     try {
       operation = await fetchLlmChatOperation(requestId, workspace, signal)
       if (!operation) {
-        if (allowInitialMissing) {
-          await waitForPreparationPoll(signal)
-          continue
-        }
-        throw new Error('This Chat result is no longer available. Retry the turn.')
+        throw new LlmChatWaitError('Chat status is still unavailable. Resume waiting to retrieve the result.')
       }
     } catch (error) {
       throwIfAborted(signal)
@@ -8289,14 +8327,14 @@ export async function waitForLlmChatOperation(
     try {
       const next = await fetchLlmChatOperation(requestId, workspace, signal)
       if (!next) {
-        throw new Error('This Chat result is no longer available. Retry the turn.')
+        throw new LlmChatWaitError('Chat status is still unavailable. Resume waiting to retrieve the result.')
       }
       operation = next
       onStatus?.(operation)
     } catch (error) {
       throwIfAborted(signal)
       if (!isTransientRequestError(error)) throw error
-      // A retryable proxy/status failure does not end the durable operation.
+      // A retryable proxy/status failure does not end the running operation.
     }
   }
   if (operation.status === 'completed' && operation.result) {
@@ -8345,11 +8383,10 @@ export async function llmChat(params: {
     operation = await submitLlmChat(request, signal)
   } catch (error) {
     throwIfAborted(signal)
-    if (!isTransientRequestError(error)) throw error
-    // A transient disconnect may hide a successful 202. Query the durable
-    // request id first; if it never arrived, re-submit the exact same request.
+    if (!isTransientRequestError(error) && !(error instanceof LlmChatWaitError)) throw error
+    // A disconnect or malformed acknowledgement may hide an accepted turn.
+    // Recovery reads the same request id without dispatching another turn.
     operation = await recoverLlmChatSubmission(
-      request,
       params.request_id,
       params.workspace,
       signal,

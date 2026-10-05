@@ -223,7 +223,7 @@ try {
   assert.deepEqual(lostResponseEvents, ['recoverable', 'post'])
 
   // Resume retries a transient failure on its very first status lookup using
-  // the same request id instead of discarding the durable operation record.
+  // the same request id instead of discarding the running operation record.
   visibility = 'hidden'
   let resumeChecks = 0
   globalThis.fetch = async url => {
@@ -249,9 +249,8 @@ try {
   assert.equal((await resumed).text, 'resumed')
   assert.equal(resumeChecks, 2)
 
-  // Reload reconciliation is content-free: it sends only the opaque request
-  // id/workspace and can preserve a server-claimed operation without storing
-  // any upload filename in browser state.
+  // The explicit upload-cleanup API compatibility check sends only scoped
+  // identity and projects its response without exposing an upload filename.
   calls.length = 0
   globalThis.fetch = async (url, init = {}) => {
     calls.push({ url: String(url), init })
@@ -267,34 +266,30 @@ try {
   assert.match(calls[0].url, new RegExp(`project_instance=${'d'.repeat(64)}`))
   assert.equal(calls[0].url.includes('upload.png'), false)
 
-  visibility = 'hidden'
-  let claimedResumeChecks = 0
-  globalThis.fetch = async url => {
-    if (!String(url).includes('/api/v1/llm/chat/')) {
-      throw new Error(`Unexpected URL: ${url}`)
-    }
-    claimedResumeChecks += 1
-    if (claimedResumeChecks === 1) return jsonResponse({}, 404)
+  // A missing operation remains uncertain; explicit Resume reads the same ID
+  // without inferring rejection or dispatching another Chat POST.
+  calls.length = 0
+  let resumeAfterMissingChecks = 0
+  const resumeAfterMissingId = '00000000-0000-4000-8000-000000000005'
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url: String(url), init })
+    assert.equal(String(url), `/api/v1/llm/chat/${resumeAfterMissingId}?workspace=project-a`)
+    assert.equal(init.method || 'GET', 'GET')
+    resumeAfterMissingChecks += 1
+    if (resumeAfterMissingChecks === 1) return jsonResponse({}, 404)
     return jsonResponse({
-      request_id: '00000000-0000-4000-8000-000000000005',
+      request_id: resumeAfterMissingId,
       status: 'completed', phase: 'completed', retryable: false,
-      result: { text: 'claimed resume', model_id: 'model', guide_ids: [] },
+      result: { text: 'explicit resume', model_id: 'model', guide_ids: [] },
     })
   }
-  const claimedResume = api.waitForLlmChatOperation(
-    '00000000-0000-4000-8000-000000000005',
-    'project-a',
-    undefined,
-    undefined,
-    undefined,
-    true,
+  await assert.rejects(
+    api.waitForLlmChatOperation(resumeAfterMissingId, 'project-a'), api.LlmChatWaitError,
   )
-  await new Promise(resolve => setTimeout(resolve, 20))
-  assert.equal(claimedResumeChecks, 1)
-  visibility = 'visible'
-  visibilityTarget.dispatchEvent(new Event('visibilitychange'))
-  assert.equal((await claimedResume).text, 'claimed resume')
-  assert.equal(claimedResumeChecks, 2)
+  assert.equal(resumeAfterMissingChecks, 1)
+  assert.equal((await api.waitForLlmChatOperation(resumeAfterMissingId, 'project-a')).text, 'explicit resume')
+  assert.equal(resumeAfterMissingChecks, 2)
+  assert.equal(calls.filter(call => call.init.method === 'POST').length, 0)
 
   // If a ready preparation expires while the tab is hidden, visibility wakeup
   // revalidates it and a 404 starts a new content-free preparation before the

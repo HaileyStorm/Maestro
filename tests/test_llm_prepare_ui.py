@@ -674,7 +674,6 @@ class LlmChatRecoveryContracts(unittest.TestCase):
         self.assertIn("setDraft(pending.draft)", submit)
         self.assertIn("suspendedChatRequests.set(", submit)
         self.assertIn("waitForLlmChatOperation(", CHAT)
-        self.assertIn("reconcileLlmChatUploadRequest(", CHAT)
         self.assertIn(
             "admissionAcknowledged: value.admissionAcknowledged === true",
             CHAT,

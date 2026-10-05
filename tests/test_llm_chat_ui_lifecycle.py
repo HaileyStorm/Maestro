@@ -162,7 +162,6 @@ class LlmChatUiLifecycleTests(unittest.TestCase):
             "admissionAcknowledged: value.admissionAcknowledged === true",
             self.source,
         )
-        self.assertIn("reconcileLlmChatUploadRequest(", self.source)
         before_submission = submit[optimistic:submission]
         self.assertNotIn("persistMessages(", before_submission)
         after_submission = submit[submission:]
