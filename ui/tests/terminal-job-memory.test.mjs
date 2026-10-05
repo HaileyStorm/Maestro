@@ -93,6 +93,8 @@ test('real store hydrates failures after account bootstrap and scrubs on identit
   let workspaces = [{ name: 'project-a', unlocked: true, project_permissions: ['project.read'] }]
   let active = 'project-a'
   let workspaceResponse = null
+  let jobStatusResponse = null
+  const statusRequests = []
   const mainSource = await readFile(new URL('../src/components/MainContent/MainContent.tsx', import.meta.url), 'utf8')
   const effectStart = mainSource.indexOf('useEffect(() => {\n    if (queuePollingReady) return')
   assert.notEqual(effectStart, -1)
@@ -120,6 +122,10 @@ test('real store hydrates failures after account bootstrap and scrubs on identit
       if (remote && !active) return Response.json({ detail: 'Select a project' }, { status: 423 })
       body = { jobs: statuses }
     }
+    else if (/\/status\/[^/]+$/.test(url) && jobStatusResponse) {
+      statusRequests.push({ url, method: init.method || 'GET' })
+      return jobStatusResponse()
+    }
     else if (url.endsWith('/account/nonce')) body = { nonce: 'test', purpose: JSON.parse(init.body).purpose }
     else if (url.endsWith('/account/logout')) {
       context = accountContext(null)
@@ -129,7 +135,7 @@ test('real store hydrates failures after account bootstrap and scrubs on identit
   }
   const bundled = await build({
     stdin: {
-      contents: "export { useStore } from './src/stores/useStore.ts'",
+      contents: "export { useStore, currentAccountIdentityEpoch } from './src/stores/useStore.ts'",
       resolveDir: new URL('..', import.meta.url).pathname, loader: 'js',
     },
     bundle: true, format: 'esm', platform: 'node', write: false, logLevel: 'silent',
@@ -137,8 +143,10 @@ test('real store hydrates failures after account bootstrap and scrubs on identit
   const module = `data:text/javascript;base64,${Buffer.from(bundled.outputFiles[0].text).toString('base64')}`
   const memory = await loadMemory()
   let sequence = 0
+  const accountEpochs = new WeakMap()
   async function freshStore() {
-    const { useStore } = await import(`${module}#terminal-${++sequence}`)
+    const { useStore, currentAccountIdentityEpoch } = await import(`${module}#terminal-${++sequence}`)
+    accountEpochs.set(useStore, currentAccountIdentityEpoch)
     useStore.setState({
       loadModelOptions: async () => {}, loadPresets: async () => {},
       resumeEnhancePrompt: async () => {}, resumeDirectorPreview: async () => {},
@@ -345,6 +353,136 @@ test('real store hydrates failures after account bootstrap and scrubs on identit
     await store.getState().loadAccessContext(false)
     assert.deepEqual(store.getState().jobs, [])
     assert.deepEqual(memory.loadTerminalJobs('account:a'), [])
+  })
+
+  const timers = new Map()
+  let timerId = 0
+  window.setTimeout = (callback, delay) => {
+    const id = ++timerId
+    timers.set(id, { callback, delay })
+    return id
+  }
+  window.clearTimeout = id => timers.delete(id)
+  const drain = () => new Promise(resolve => setImmediate(resolve))
+  const jobStatus = status => Response.json({
+    job_id: 'accepted-repeat', workspace: 'project-a', status,
+    progress: status === 'completed' ? 100 : 0, step: 0, total_steps: 0,
+    phase: status, message: status, error: null,
+    output_files: status === 'completed' ? ['repeats.mp4'] : [],
+    generation_mode: 'tool_editor_export', model_type: 'blender',
+  })
+  async function compositionStore() {
+    context = accountContext('a')
+    memory.clearTerminalJobs()
+    const store = await freshStore()
+    await store.getState().loadAccessContext(false)
+    const loads = []
+    store.setState({ activeWorkspace: 'project-a', jobs: [],
+      loadOutputs: async () => { loads.push(store.getState().activeWorkspace) },
+      refreshOutputs: async () => {},
+    })
+    statusRequests.length = 0
+    return { store, loads, epoch: accountEpochs.get(store)() }
+  }
+  const track = ({ store, epoch }) => store.getState().trackAcceptedCompositionJob(
+    { job_id: 'accepted-repeat', status: 'queued' }, 'project-a', epoch,
+  )
+  await t.test('accepted composition completed before discovery refreshes Gallery from its exact status', async () => {
+    const fixture = await compositionStore()
+    jobStatusResponse = () => jobStatus('completed')
+    track(fixture)
+    await drain()
+    assert.deepEqual(fixture.store.getState().jobs, [])
+    assert.equal(fixture.store.getState().isGenerating, false)
+    assert.deepEqual(fixture.loads, ['project-a'])
+    assert.deepEqual(statusRequests.map(request => request.method), ['GET'])
+    assert.match(statusRequests[0].url, /\/status\/accepted-repeat$/)
+    assert.equal(timers.size, 0)
+  })
+  await t.test('accepted queued composition completes promptly without a running or active-list snapshot', async () => {
+    const fixture = await compositionStore()
+    let complete = false
+    jobStatusResponse = () => jobStatus(complete ? 'completed' : 'queued')
+    track(fixture)
+    await drain()
+    assert.equal(fixture.store.getState().jobs[0].status, 'queued')
+    const [id, timer] = [...timers][0]
+    assert.equal(timer.delay, 2000)
+    timers.delete(id)
+    complete = true
+    timer.callback()
+    await drain()
+    assert.equal(statusRequests.length, 2)
+    assert.deepEqual(fixture.loads, ['project-a'])
+    assert.deepEqual(fixture.store.getState().jobs, [])
+    assert.equal(timers.size, 0)
+  })
+  await t.test('transient accepted-job GET failure retries status without resubmitting or losing the card', async () => {
+    const fixture = await compositionStore()
+    let calls = 0
+    jobStatusResponse = () => {
+      if (++calls === 1) throw new Error('temporary disconnect')
+      return jobStatus('completed')
+    }
+    track(fixture)
+    await drain()
+    assert.equal(fixture.store.getState().jobs[0].id, 'accepted-repeat')
+    const [id, timer] = [...timers][0]
+    assert.equal(timer.delay, 2000)
+    timers.delete(id)
+    timer.callback()
+    await drain()
+    assert.deepEqual(statusRequests.map(request => request.method), ['GET', 'GET'])
+    assert.deepEqual(fixture.loads, ['project-a'])
+    assert.equal(timers.size, 0)
+  })
+  await t.test('accepted tracking replaces an existing slow poll and ignores its late queued response', async () => {
+    const fixture = await compositionStore()
+    let resolveOldStatus
+    let calls = 0
+    jobStatusResponse = () => ++calls === 1
+      ? new Promise(resolve => { resolveOldStatus = resolve })
+      : jobStatus('completed')
+    fixture.store.setState({ jobs: [{ ...failedJob, id: 'accepted-repeat', status: 'queued' }] })
+    fixture.store.getState()._pollRecoveredJob('accepted-repeat')
+    track(fixture)
+    await drain()
+    resolveOldStatus(jobStatus('queued'))
+    await drain()
+    assert.deepEqual(fixture.store.getState().jobs, [])
+    assert.deepEqual(fixture.loads, ['project-a'])
+    assert.equal(calls, 2)
+    assert.equal(timers.size, 0)
+  })
+  await t.test('accepted-job registration and pending status responses respect account and project drift', async () => {
+    for (const drift of ['account', 'project']) {
+      const fixture = await compositionStore()
+      let resolveStatus
+      jobStatusResponse = () => new Promise(resolve => { resolveStatus = resolve })
+      track(fixture)
+      if (drift === 'account') {
+        context = accountContext('b')
+        await fixture.store.getState().loadAccountContext(false)
+      } else fixture.store.setState({ activeWorkspace: 'project-b', jobs: [] })
+      resolveStatus(jobStatus('completed'))
+      await drain()
+      track(fixture)
+      assert.deepEqual(fixture.store.getState().jobs, [])
+      assert.deepEqual(fixture.loads, [])
+      assert.equal(statusRequests.length, 1, 'stale acknowledgement must not start a new status request')
+      assert.equal(timers.size, 0)
+    }
+  })
+  await t.test('ordinary recovered queued jobs retain their queue-driven safety cadence', async () => {
+    const { store } = await compositionStore()
+    jobStatusResponse = () => jobStatus('queued')
+    store.setState({ jobs: [{ ...failedJob, id: 'accepted-repeat', status: 'queued' }] })
+    store.getState()._pollRecoveredJob('accepted-repeat', 'project-a')
+    await drain()
+    assert.equal([...timers.values()][0].delay, 300000)
+    context = accountContext('b')
+    await store.getState().loadAccountContext(false)
+    assert.equal(timers.size, 0)
   })
 })
 

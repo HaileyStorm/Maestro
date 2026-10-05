@@ -560,11 +560,11 @@ test('mounted gallery item exposes a video-only accessible pending/error flip ac
 
 async function loadScopedPoller() {
   const source = await readFile(new URL('../src/stores/useStore.ts', import.meta.url), 'utf8')
-  const start = source.indexOf('  _pollRecoveredJob: (jobId, expectedWorkspace) => {')
+  const start = source.indexOf('  _pollRecoveredJob: (jobId, expectedWorkspace, pollQueuedFast = false) => {')
   const end = source.indexOf('  reconnectJobs:', start)
   assert.ok(start >= 0 && end > start, 'scoped poller must stay in a bounded store region')
   const method = source.slice(start, end)
-    .replace(/^  _pollRecoveredJob: \(jobId, expectedWorkspace\) => \{/, `export function pollRecoveredJob(jobId, expectedWorkspace, context) {
+    .replace(/^  _pollRecoveredJob: \(jobId, expectedWorkspace, pollQueuedFast = false\) => \{/, `export function pollRecoveredJob(jobId, expectedWorkspace, context, pollQueuedFast = false) {
       const { accountEpoch, recoveryJobPolls, jobNeedsFastStatusPoll, createRefreshTracker,
         accountIdentityIsCurrent, api, get, set, mergeJobStatus, publishTerminalJobStatus,
         activeOutputRefreshDue, activePollMs, queuedSafetyMs } = context

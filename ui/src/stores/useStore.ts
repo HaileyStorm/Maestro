@@ -3391,7 +3391,8 @@ interface AppState {
   reconnectJobs: (accountIdentityEpoch?: number) => Promise<void>
   resumeJobRecovery: (jobId: string) => Promise<void>
   retryJobRecovery: (jobId: string) => Promise<void>
-  _pollRecoveredJob: (jobId: string, expectedWorkspace?: string) => void
+  trackAcceptedCompositionJob: (result: { job_id: string; status: 'queued' }, workspace: string, accountIdentityEpoch: number) => void
+  _pollRecoveredJob: (jobId: string, expectedWorkspace?: string, pollQueuedFast?: boolean) => void
 
   // LoRA state
   availableLoras: string[]
@@ -10309,12 +10310,29 @@ export const useStore = create<AppState>((set, get) => ({
     await get().reconnectJobs(accountIdentityEpoch)
   },
 
-  _pollRecoveredJob: (jobId, expectedWorkspace) => {
+  trackAcceptedCompositionJob: (result, workspace, accountIdentityEpoch) => {
+    if (!_accountIdentityIsCurrent(accountIdentityEpoch) || get().activeWorkspace !== workspace) return
+    set(s => {
+      const jobs = s.jobs.some(job => job.id === result.job_id) ? s.jobs : [{
+        id: result.job_id, status: result.status, workspace,
+        progress: 0, step: 0, totalSteps: 0, phase: '',
+        message: 'Queued...', outputFiles: [], error: null,
+      }, ...s.jobs]
+      return { jobs, isGenerating: jobs.some(_isActiveGenerationJob) }
+    })
+    get()._pollRecoveredJob(result.job_id, workspace, true)
+    window.dispatchEvent(new CustomEvent('maestro:queue-refresh'))
+  },
+
+  _pollRecoveredJob: (jobId, expectedWorkspace, pollQueuedFast = false) => {
     const accountIdentityEpoch = _accountIdentityEpoch
     const existing = _recoveryJobPolls.get(jobId)
     if (existing) {
-      existing.wake()
-      return
+      if (!pollQueuedFast) {
+        existing.wake()
+        return
+      }
+      existing.stop()
     }
     const initialJob = get().jobs.find(job => job.id === jobId)
     if (!initialJob) return
@@ -10350,7 +10368,8 @@ export const useStore = create<AppState>((set, get) => ({
         stop()
         return
       }
-      const delay = _jobNeedsFastStatusPoll(current)
+      // A short accepted composition can finish before any queue snapshot sees it running.
+      const delay = pollQueuedFast || _jobNeedsFastStatusPoll(current)
         ? ACTIVE_JOB_STATUS_POLL_MS
         : QUEUED_JOB_STATUS_SAFETY_MS
       poll.timer = window.setTimeout(() => {
@@ -10374,7 +10393,7 @@ export const useStore = create<AppState>((set, get) => ({
         stop()
         return
       }
-      if (!_jobNeedsFastStatusPoll(current) && !queuedSafety) {
+      if (!pollQueuedFast && !_jobNeedsFastStatusPoll(current) && !queuedSafety) {
         scheduleNext()
         return
       }

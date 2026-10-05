@@ -9,6 +9,15 @@ const video = {
   workspace: 'Synthetic project', private: true, explicit: true,
 }
 
+function compositionJob(jobId: string, status: 'queued' | 'completed') {
+  return { job_id: jobId, workspace: video.workspace, status,
+    progress: status === 'completed' ? 100 : 0, step: 0, total_steps: 0,
+    phase: status, message: status, error: null,
+    output_files: status === 'completed' ? [video.name] : [],
+    generation_mode: 'tool_editor_export', model_type: 'blender',
+  }
+}
+
 async function setup(page: Page, nonapproval = false, manualOnly = false, permissions?: string[], projects = [video.workspace]) {
   const api = await installSyntheticApi(page)
   api.setAccountScenario('remote-user')
@@ -26,6 +35,9 @@ async function setup(page: Page, nonapproval = false, manualOnly = false, permis
   const finalizeRequests: Record<string, unknown>[] = []
   let pending: Route | undefined
   const json = (route: Route, value: unknown) => route.fulfill({ contentType: 'application/json', body: JSON.stringify(value) })
+  await page.route(/\/api\/v1\/status\/(?:queued-repeat|planned-repeat)$/, route => json(route, compositionJob(
+    new URL(route.request().url()).pathname.split('/').at(-1)!, 'queued',
+  )))
   await page.route('**/api/v1/blender/status*', route => json(route, {
     installed: true, ready: true, mcp_attested: true, runtime_attested: true, mcp_sdk_ready: true,
     bridge_ready: true, workspace: video.workspace, max_total_frames: 7200,
@@ -48,7 +60,7 @@ async function setup(page: Page, nonapproval = false, manualOnly = false, permis
     }
     await json(route, { outputs: [video], total: 1 })
   })
-  await page.route('**/api/v1/outputs/kept-motion.mp4/metadata*', route => json(route, { params: null, source: 'none' }))
+  await page.route(/\/api\/v1\/outputs\/(?:kept-motion|completed-repeats|queued-repeats)\.mp4\/metadata(?:\?.*)?$/, route => json(route, { params: null, source: 'none' }))
   await page.route('**/api/v1/file/kept-motion.mp4*', route => route.fulfill({ status: 404, body: 'Synthetic media unavailable' }))
   await page.route(/\/api\/v1\/projects\/[^/]+\/editor\/projects(?:\/[^/?]+)?(?:\?.*)?$/, route => {
     if (route.request().method() === 'POST') editorRequests.push(route.request().postDataJSON())
@@ -198,6 +210,70 @@ test('Blender repeats submit one native segment with separate clip instances and
   await fixture.api.assertClean()
 })
 
+for (const planned of [false, true]) {
+  test(`${planned ? 'Planned' : 'Manual'} accepted repeats refresh Gallery when completed before active-job discovery`, async ({ page }) => {
+    const fixture = await setup(page, false, true)
+    if (planned) await planOnly(page)
+    const completed = { ...video, name: 'completed-repeats.mp4', revision: 'completed-repeat-revision' }
+    let submissions = 0
+    let statusChecks = 0
+    let finished = false
+    await page.route('**/api/v1/projects/*/compositions', route => {
+      submissions += 1
+      return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ job_id: 'fast-repeat', status: 'queued' }) })
+    })
+    await page.route('**/api/v1/status/fast-repeat', route => {
+      statusChecks += 1
+      finished = true
+      return route.fulfill({ contentType: 'application/json', body: JSON.stringify({
+        ...compositionJob('fast-repeat', 'completed'), output_files: [completed.name],
+      }) })
+    })
+    await page.route(/\/api\/v1\/outputs(?:\?.*)?$/, route => route.fulfill({
+      contentType: 'application/json', body: JSON.stringify({ outputs: finished ? [completed] : [], total: finished ? 1 : 0 }),
+    }))
+    await page.getByRole('button', { name: planned ? 'Queue planned repeats' : 'Render repeats', exact: true }).click()
+    await expect.poll(() => statusChecks).toBe(1)
+    const closeMenu = page.getByRole('dialog', { name: 'Generate, Director, and References menu', exact: true }).getByRole('button', { name: 'Close creative workspace menu', exact: true })
+    if (await closeMenu.isVisible()) await closeMenu.click()
+    await page.getByRole('tab', { name: 'Gallery', exact: true }).click()
+    await expect(page.getByRole('button', { name: `Open ${completed.name} in Editor`, exact: true })).toBeVisible()
+    expect(submissions).toBe(1)
+    await fixture.api.assertClean()
+  })
+}
+
+test('accepted queued repeats survive a transient status failure and complete without a running snapshot or POST resend', async ({ page }) => {
+  const fixture = await setup(page, false, true)
+  const completed = { ...video, name: 'queued-repeats.mp4', revision: 'queued-repeat-revision' }
+  let submissions = 0
+  let statusChecks = 0
+  let finished = false
+  await page.route('**/api/v1/projects/*/compositions', route => {
+    submissions += 1
+    return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ job_id: 'short-repeat', status: 'queued' }) })
+  })
+  await page.route('**/api/v1/status/short-repeat', route => {
+    statusChecks += 1
+    if (statusChecks === 2) return route.abort('failed')
+    finished = statusChecks >= 3
+    return route.fulfill({ contentType: 'application/json', body: JSON.stringify({
+      ...compositionJob('short-repeat', finished ? 'completed' : 'queued'), output_files: finished ? [completed.name] : [],
+    }) })
+  })
+  await page.route(/\/api\/v1\/outputs(?:\?.*)?$/, route => route.fulfill({
+    contentType: 'application/json', body: JSON.stringify({ outputs: finished ? [completed] : [], total: finished ? 1 : 0 }),
+  }))
+  await page.getByRole('button', { name: 'Render repeats', exact: true }).click()
+  await expect.poll(() => statusChecks).toBe(3)
+  const closeMenu = page.getByRole('dialog', { name: 'Generate, Director, and References menu', exact: true }).getByRole('button', { name: 'Close creative workspace menu', exact: true })
+  if (await closeMenu.isVisible()) await closeMenu.click()
+  await page.getByRole('tab', { name: 'Gallery', exact: true }).click()
+  await expect(page.getByRole('button', { name: `Open ${completed.name} in Editor`, exact: true })).toBeVisible()
+  expect(submissions).toBe(1)
+  await fixture.api.assertClean()
+})
+
 test('Blender repeats cannot submit without generation access or valid whole-number FPS', async ({ page }) => {
   const fixture = await setup(page, false, true, ['project.open', 'project.read', 'project.mutate'])
   const render = page.getByRole('button', { name: 'Render repeats', exact: true })
@@ -215,6 +291,7 @@ test('Blender repeats guard rapid submissions and preserve ambiguous acknowledgm
   let count = 0
   await page.route('**/api/v1/projects/*/compositions', route => { count += 1; pending = route })
   const render = page.getByRole('button', { name: 'Render repeats', exact: true })
+  await expect(render).toBeEnabled()
   await render.evaluate(button => { (button as HTMLButtonElement).click(); (button as HTMLButtonElement).click() })
   await expect.poll(() => count).toBe(1)
   await expect(render).toBeDisabled()
@@ -355,6 +432,11 @@ test('An accepted planned sequence cannot show stale success after changing proj
   await page.route('**/api/v1/workspaces/active', route => route.fulfill({ contentType: 'application/json', body: '{}' }))
   await planOnly(page)
   let pending: Route | undefined
+  let statusChecks = 0
+  await page.route('**/api/v1/status/prior-project-planned-repeat', route => {
+    statusChecks += 1
+    return route.fulfill({ contentType: 'application/json', body: JSON.stringify(compositionJob('prior-project-planned-repeat', 'completed')) })
+  })
   await page.route('**/api/v1/projects/*/compositions', route => { pending = route })
   await page.getByRole('button', { name: 'Queue planned repeats', exact: true }).click()
   await expect.poll(() => Boolean(pending)).toBe(true)
@@ -366,6 +448,7 @@ test('An accepted planned sequence cannot show stale success after changing proj
   await pending!.fulfill({ contentType: 'application/json', body: JSON.stringify({ job_id: 'prior-project-planned-repeat', status: 'queued' }) })
   await expect(page.getByText('Added to Queue. When the sequence finishes, open it from Gallery in Editor.', { exact: true })).toHaveCount(0)
   await expect(page.getByRole('button', { name: 'Queue planned repeats', exact: true })).toHaveCount(0)
+  expect(statusChecks).toBe(0)
   await fixture.api.assertClean()
 })
 
