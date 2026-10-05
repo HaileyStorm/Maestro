@@ -355,8 +355,10 @@ images retain their separate removal flow. Media and access metadata are
 staged together with rollback on failure. Temporary staging is not a
 user-restorable trash. Automated checks cover session isolation, reader drain,
 recovery references, rollback, and stale Gallery responses; all 923 UI tests
-pass. Backend review, service activation, live permanent removal, and Windows
-file-release acceptance remain separate gates.
+pass. Independent review is complete. The Pinokio restart activated the source;
+local and stable-share health/readiness checks pass with the same compiled UI
+asset, and the live Uploads view shows Delete controls. Live permanent removal
+and Windows file-release acceptance remain separate gates.
 
 The [YuE2 real-audio model card](https://huggingface.co/Mothersuperior/yue2-mothersuperior-realaudio-tokenizer-v4)
 documents a matched joint-v9 tokenizer head and NAR decoder LoRA. The pinned
