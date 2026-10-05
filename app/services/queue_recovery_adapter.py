@@ -93,6 +93,20 @@ _TERMINAL = frozenset({"completed", "failed", "cancelled"})
 # Failed jobs still offer owner-controlled Retry. Keep their registration and
 # sealed request until explicit dismissal, including bounded compaction.
 AUTOMATIC_RETIREMENT_STATUSES = frozenset({"completed", "cancelled", "canceled"})
+
+
+def processed_tool_publication_pending(job: Mapping[str, Any]) -> bool:
+    """Cancelled publication evidence remains live until exact rollback settles."""
+    cursor = job.get("recovery_cursor")
+    return bool(
+        job.get("kind") in {"tool_upscale", "tool_revoice", "tool_hflip", "tool_browser_copy"}
+        and (str(job.get("status") or "").casefold() in {"cancelled", "canceled"}
+             or job.get("cancel_requested"))
+        and isinstance(cursor, Mapping)
+        and "processed_tool_publication" in cursor
+    )
+
+
 _FORBIDDEN_KEY_PARTS = frozenset({
     "authorization", "capability", "cookie", "credential", "credentials",
     "password", "passphrase", "passwd", "secret", "secrets", "session",
@@ -1866,6 +1880,8 @@ class QueueRecoveryCoordinator:
                 return
             if str(snapshot.get("status", "")).casefold() not in _TERMINAL:
                 raise QueueRecoveryAdapterError("Only terminal jobs may be tombstoned.")
+            if processed_tool_publication_pending(snapshot):
+                raise QueueRecoveryAdapterError("Cancelled tool publication cleanup is pending.")
             clean_global = self._canonical_global_state(
                 self._global_state, tombstones=(job_id,),
             )
@@ -1894,6 +1910,8 @@ class QueueRecoveryCoordinator:
             compacted = self.journal.compact(
                 drop_terminal=True,
                 terminal_statuses=AUTOMATIC_RETIREMENT_STATUSES,
+                retain_job_ids=tuple(job_id for job_id, job in clean_before_jobs.items()
+                                     if processed_tool_publication_pending(job)),
                 replacement_jobs=clean_before_jobs,
                 replacement_global_state=(
                     clean_before_global if before.global_state is not None else None

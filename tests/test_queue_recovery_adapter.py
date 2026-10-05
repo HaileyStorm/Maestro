@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import types
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +42,27 @@ def _serialize(job):
 
 
 class LogicalReferenceRecoveryTests(unittest.TestCase):
+    def test_cancelled_tool_intent_survives_compaction_and_dismissal_until_settled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator = QueueRecoveryCoordinator(QueueRecoveryJournal(Path(directory) / 'queue.jsonl'))
+            pending = {'id': 'pending-tool', 'kind': 'tool_hflip', 'status': 'cancelled',
+                       'recovery_cursor': {'processed_tool_publication': {'schema_version': 1}}}
+            jobs = [pending,
+                    {'id': 'ordinary-cancel', 'kind': 'generation', 'status': 'cancelled'},
+                    {'id': 'settled-tool', 'kind': 'tool_hflip', 'status': 'cancelled'},
+                    {'id': 'completed-tool', 'kind': 'tool_hflip', 'status': 'completed',
+                     'recovery_cursor': pending['recovery_cursor']}]
+            for job in jobs:
+                coordinator.register_job(job, owner_digest=OWNER, project_digest=PROJECT, request_manifest={'kind': 'test'})
+            self.assertEqual(set(coordinator.compact().jobs), {'pending-tool'})
+            with self.assertRaisesRegex(QueueRecoveryAdapterError, 'cleanup is pending'):
+                coordinator.tombstone_terminal('pending-tool')
+            fresh = QueueRecoveryCoordinator(coordinator.journal)
+            fresh.restore()
+            pending['recovery_cursor'] = {}
+            fresh.prospective_transition(types.SimpleNamespace(jobs=(pending,), tombstones=(), global_state=None))
+            self.assertEqual(fresh.compact().jobs, {})
+
     def test_legacy_read_only_replay_requires_exact_request_digest(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "legacy"

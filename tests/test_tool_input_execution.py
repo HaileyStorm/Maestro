@@ -23,7 +23,7 @@ sys.path.insert(0, str(ROOT / 'app'))
 from fastapi import HTTPException
 from services.queue_recovery_runtime import (sha256_file, QueueRecoveryRuntimeError, recovery_unit_id,
     artifact_descriptor, validate_artifact_descriptor)
-from services.queue_recovery_adapter import owner_principal_digest, QueueRecoveryAdapterError
+from services.queue_recovery_adapter import owner_principal_digest, QueueRecoveryAdapterError, processed_tool_publication_pending
 from services.output_access import stamp_sidecar_policy
 
 TREE = ast.parse((ROOT / 'app/launch.py').read_text())
@@ -49,7 +49,7 @@ class ToolInputExecutionTests(unittest.TestCase):
         Path(str(self.voice)+'.access.json').write_text(json.dumps({'owner_session_id': 'session'}))
         self.jobs = {}; self.manifests = {}; self.calls = []
         self.owner = owner_principal_digest(b'tool-test-secret-value', 'session')
-        self.ns = dict(os=os, json=json, time=time, uuid=uuid, hmac=hmac, Request=object,
+        self.ns = dict(os=os, json=json, time=time, uuid=uuid, hmac=hmac, hashlib=hashlib, Request=object,
             HTTPException=HTTPException, QueueRecoveryRuntimeError=QueueRecoveryRuntimeError,
             QueueRecoveryAdapterError=QueueRecoveryAdapterError, owner_principal_digest=owner_principal_digest,
             _app_dir=str(self.root), _RECOVERABLE_INPUT_KEYS={'_tool_input_paths', 'hflip_source_path'},
@@ -73,12 +73,14 @@ class ToolInputExecutionTests(unittest.TestCase):
             try_start=lambda j,**kw: j.update(status='running') or True,
             register_abort_state=lambda *a: True, unregister_abort_state=Mock(),
             is_cancel_requested=lambda j: j.get('status') == 'cancelled',
+            processed_tool_publication_pending=processed_tool_publication_pending,
+            _queue_recovery_checkpoint=lambda j,**kw: j.update(**kw) or True,
             update_job=lambda j,**kw: j.update(**kw) or True,
             finish_job=lambda j,status,**kw: j.update(status=status,**kw) or True,
             stamp_sidecar_policy=stamp_sidecar_policy, traceback=types.SimpleNamespace(print_exc=lambda: None))
         load(self.ns, '_ToolInputChanged', '_safe_failure_updates', '_job_failure_positions', '_queue_recovery_file_values', '_queue_recovery_input_descriptors',
              '_queue_recovery_manifest_validator', '_validated_tool_input_paths',
-             '_processed_tool_settings', '_resume_processed_tool_output',
+             '_processed_tool_settings', '_cleanup_cancelled_processed_tool_output', '_resume_processed_tool_output',
              '_h3_dependency_closed_recovery_units', '_queue_recovery_units', '_queue_recovery_unit_matches', '_queue_recovery_reconcile_cursor',
              '_publish_processed_tool_output', '_write_tool_sidecar', '_queue_recovery_worker',
              '_output_revision', '_hflip_source', '_run_tool_hflip',
@@ -156,6 +158,77 @@ class ToolInputExecutionTests(unittest.TestCase):
             request_manifest={'kind':'tool_upscale'})
         restored = coordinator.restore().jobs[job['id']]
         self.assertNotIn('_tool_inputs_authorized_live', restored)
+
+    def test_publication_intent_is_durable_before_any_public_mutation_and_failure_blocks_both_names(self):
+        job = self.job('tool_hflip')
+        staged = self.project / 'staged.mp4'; staged.write_bytes(b'processed')
+        def checkpoint(current, **updates):
+            intent = updates['recovery_cursor']['processed_tool_publication']
+            self.assertEqual(intent['media']['sha256'], hashlib.sha256(staged.read_bytes()).hexdigest())
+            self.assertEqual(list(self.project.glob('*_hflip_*')), [])
+            return False
+        self.ns['_queue_recovery_checkpoint'] = checkpoint
+        with self.assertRaises(RuntimeError):
+            self.ns['_publish_processed_tool_output'](job, str(staged), source=str(self.video),
+                tool='hflip', params={}, elapsed=1)
+        self.assertEqual(staged.read_bytes(), b'processed')
+        self.assertEqual(list(self.project.glob('*_hflip_*')), [])
+
+    def test_cancel_cleanup_preserves_foreign_unsafe_members_and_invalid_bindings(self):
+        for changed in ('sidecar', 'symlink', 'hardlink', 'owner', 'project', 'manifest', 'intent'):
+            with self.subTest(changed=changed):
+                job = self.job('tool_hflip')
+                staged = self.project / 'staged.mp4'; staged.write_bytes(b'processed')
+                self.assertTrue(self.ns['_publish_processed_tool_output'](job, str(staged), source=str(self.video),
+                    tool='hflip', params={}, elapsed=1))
+                media = self.project / job['output_files'][0]
+                sidecar = media.with_suffix('.meta.json')
+                job.update(status='cancelled', cancel_requested=True)
+                if changed == 'sidecar': sidecar.write_bytes(b'foreign marker')
+                if changed in ('symlink', 'hardlink'):
+                    media.unlink()
+                    if changed == 'symlink': media.symlink_to(self.video)
+                    else: os.link(self.video, media)
+                if changed == 'owner': job['_recovery_owner_digest'] = 'changed'
+                if changed == 'project': job['_recovery_project_digest'] = 'changed'
+                if changed == 'manifest': job['_recovery_manifest_pointer'] = {'path': 'changed'}
+                if changed == 'intent': job['recovery_cursor']['processed_tool_publication']['media']['basename'] = '../clip.mp4'
+                before = media.read_bytes(), sidecar.read_bytes(), self.video.read_bytes(), self.voice.read_bytes()
+                self.assertFalse(self.ns['_cleanup_cancelled_processed_tool_output'](job))
+                self.assertEqual((media.read_bytes(), sidecar.read_bytes(), self.video.read_bytes(), self.voice.read_bytes()), before)
+                self.assertEqual(job['status'], 'cancelled')
+                self.assertEqual(job['recovery_state'], 'cleanup_blocked')
+                self.assertIn('processed_tool_publication', job['recovery_cursor'])
+                media.unlink(); sidecar.unlink()
+
+    def test_cancel_cleanup_preserves_same_inode_replacement_after_hash_with_restored_mtime(self):
+        job = self.job('tool_hflip')
+        staged = self.project / 'staged.mp4'; staged.write_bytes(b'processed')
+        self.assertTrue(self.ns['_publish_processed_tool_output'](job, str(staged), source=str(self.video),
+            tool='hflip', params={}, elapsed=1))
+        media = self.project / job['output_files'][0]
+        sidecar = media.with_suffix('.meta.json')
+        original = media.stat()
+        source_before = self.video.read_bytes(), self.voice.read_bytes(), sidecar.read_bytes()
+        hash_file = self.ns['_recovery_sha256_file']
+        def replace_after_hash(path, **kwargs):
+            result = hash_file(path, **kwargs)
+            if str(path) == str(media):
+                media.write_bytes(b'replaced!')
+                os.utime(media, ns=(original.st_atime_ns, original.st_mtime_ns))
+            return result
+        job.update(status='cancelled', cancel_requested=True)
+        with patch.dict(self.ns, _recovery_sha256_file=replace_after_hash):
+            self.assertFalse(self.ns['_cleanup_cancelled_processed_tool_output'](job))
+        current = media.stat()
+        self.assertEqual((current.st_ino, current.st_size, current.st_mtime_ns),
+                         (original.st_ino, original.st_size, original.st_mtime_ns))
+        self.assertNotEqual(current.st_ctime_ns, original.st_ctime_ns)
+        self.assertEqual(media.read_bytes(), b'replaced!')
+        self.assertEqual((self.video.read_bytes(), self.voice.read_bytes(), sidecar.read_bytes()), source_before)
+        self.assertEqual(job['status'], 'cancelled')
+        self.assertEqual(job['recovery_state'], 'cleanup_blocked')
+        self.assertIn('processed_tool_publication', job['recovery_cursor'])
 
     def test_tool_field_cannot_probe_files_from_general_generation(self):
         job = self.job(); job['kind'] = 'studio_generation'

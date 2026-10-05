@@ -63,6 +63,19 @@ def _multiprocess_writer(path, prefix, count, result_queue):
 
 
 class QueueRecoveryJournalTests(unittest.TestCase):
+    def test_exact_retained_terminal_id_survives_compaction_with_revision_fence(self):
+        for job_id in ('pending', 'settled'):
+            self.journal.commit_job(job_id, self._job(job_id, 'cancelled'),
+                                    expected_revision=0, expected_epoch=0)
+        before = self.journal.recover()
+        compacted = self.journal.compact(retain_job_ids=('pending',))
+        self.assertEqual(set(compacted.jobs), {'pending'})
+        self.assertEqual(compacted.jobs['pending']['status'], 'cancelled')
+        with self.assertRaises(QueueRecoveryValidationError):
+            self.journal.commit_job('pending', self._job('pending'),
+                expected_revision=before.job_revisions['pending'], expected_epoch=before.epoch)
+        self.assertEqual(self.journal.compact().jobs, {})
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)

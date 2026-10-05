@@ -1145,6 +1145,7 @@ class QueueRecoveryJournal:
         *,
         drop_terminal: bool = True,
         terminal_statuses: frozenset[str] = TERMINAL_JOB_STATUSES,
+        retain_job_ids: Iterable[str] = (),
         replacement_jobs: Mapping[str, Mapping[str, Any]] | None = None,
         replacement_global_state: Mapping[str, Any] | None | object = _COMPACT_UNSET,
         expected_job_revisions: Mapping[str, int] | None = None,
@@ -1162,6 +1163,7 @@ class QueueRecoveryJournal:
         Omitting ``replacement_jobs`` preserves the legacy replay-as-is mode.
         """
         normalized_terminal = frozenset(status.casefold() for status in terminal_statuses)
+        retained_ids = frozenset(_validate_job_id(job_id) for job_id in retain_job_ids)
         with self._serialized():
             records, _discarded, journal_identity = self._scan_locked()
             recovered = self._replay(records, discarded_torn_tail=False)
@@ -1235,6 +1237,7 @@ class QueueRecoveryJournal:
                     drop_terminal
                     and type(snapshot.get("status")) is str
                     and snapshot["status"].casefold() in normalized_terminal
+                    and job_id not in retained_ids
                 ):
                     continue
                 retained_jobs[job_id] = snapshot
