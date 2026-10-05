@@ -635,3 +635,45 @@ restart, an interrupted generation, image-upload recovery, Windows, owner
 Free Resources acceptance or human model-quality approval. Unchanged source
 checks are reused from the released recovery revision; no source was changed.
 The full continuous Goal and other recorded acceptance gates remain open.
+
+## October 5 native held Studio acknowledgement recovery acceptance
+
+The released Studio submission recovery passed one native, model-free held-job
+case at source checkpoint `5e7d97336d79f8dc915a8f17fe0a8c21963baa7f`.
+An ordinary Generate action received an actual accepted held-job response.
+The browser received a deliberately truncated acknowledgement while the native
+response was retained. Studio then read the original request ID and adopted
+the same held job; the complete request capture contains one submission POST
+and one recovery GET, with no second submission.
+
+The ordinary Stop control cancelled that exact held job. Its native cancel
+response and separate canonical status response both reported cancellation,
+with no output. The queue returned to idle and no model was loaded or inference
+dispatched. Private receipts retain the native responses, bounded request
+capture and recovered Queue screenshot. This proves admission recovery and
+held-job cancellation; inference cancellation, backend restart recovery and
+human quality acceptance remain separate gates.
+
+## October 5 unavailable Chat response exit
+
+When recovery cannot find the original Chat response, the UI now offers a
+confirmed **Leave pending response** action alongside GET-only Resume. Leaving
+preserves the displayed conversation, explicitly labelled partial response,
+and same-account draft; it unlocks composition without resending, cancelling
+or deleting uploaded inputs. An image-bearing draft retains available files
+and requires reattachment after reload.
+
+New drafts and pending records bind to the stable account and immutable
+project identity. Late callbacks retain the original account epoch. Historical
+records without an account scope remain GET-only recoverable; explicit exit
+does not migrate their unbound composer inputs into the new draft store.
+
+Verification covered 18 mounted synthetic browser cases across desktop Firefox
+and Android-like Chromium, 61 related Node cases, app/E2E type checks, scoped
+lint, a private production build and independent source review. The first
+mobile test failure was a redundant click on an already-selected tab; the
+corrected test asserts the selected tab and visible Chat before checking the
+late-callback boundary. Its failed receipt remains retained. These checks do
+not establish a native lost-result exit or persistent backend Chat results;
+server result storage remains bounded process memory. The full backlog and
+separate native, external, Windows and human gates remain open.

@@ -4,7 +4,7 @@ import test from 'node:test'
 
 import { transform } from 'esbuild'
 
-import { fetchLlmChatOperation, llmChat, LlmChatWaitError, waitForLlmChatOperation } from '../src/api/client.ts'
+import { fetchLlmChatOperation, llmChat, LlmChatRecoveryUnavailableError, LlmChatWaitError, waitForLlmChatOperation } from '../src/api/client.ts'
 
 const requestId = '12345678-1234-4234-8234-123456789abc'
 const normalizedId = requestId.replaceAll('-', '')
@@ -110,7 +110,7 @@ test('lost Chat ACK followed by unknown 404 retains pending without automatic re
     if (request.method === 'POST') throw new TypeError('Connection lost after dispatch')
     return response({ detail: 'Chat request not found' }, 404)
   })
-  await assert.rejects(f.send(), LlmChatWaitError)
+  await assert.rejects(f.send(), LlmChatRecoveryUnavailableError)
   assert.equal(chatPosts(f.requests).length, 1)
   assert.equal(statusReads(f.requests).length, 1)
   assert.equal(f.callbacks.attempted, 1)

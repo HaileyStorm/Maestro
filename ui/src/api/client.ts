@@ -7677,6 +7677,13 @@ export class LlmChatWaitError extends Error {
   }
 }
 
+export class LlmChatRecoveryUnavailableError extends LlmChatWaitError {
+  constructor() {
+    super('This response is no longer available to retrieve. It may already have completed.')
+    this.name = 'LlmChatRecoveryUnavailableError'
+  }
+}
+
 export class LlmEnhanceWaitError extends Error {
   constructor(message: string) {
     super(message)
@@ -8284,7 +8291,7 @@ async function recoverLlmChatSubmission(
       if (existing) return existing
       // The in-memory operation may have expired or the host restarted.
       // Absence cannot prove that the original request was never admitted.
-      throw new LlmChatWaitError('Chat status is still unavailable. Resume waiting to retrieve the result.')
+      throw new LlmChatRecoveryUnavailableError()
     } catch (error) {
       throwIfAborted(signal)
       if (!isTransientRequestError(error)) throw error
@@ -8310,7 +8317,7 @@ export async function waitForLlmChatOperation(
     try {
       operation = await fetchLlmChatOperation(requestId, workspace, signal)
       if (!operation) {
-        throw new LlmChatWaitError('Chat status is still unavailable. Resume waiting to retrieve the result.')
+        throw new LlmChatRecoveryUnavailableError()
       }
     } catch (error) {
       throwIfAborted(signal)
@@ -8327,7 +8334,7 @@ export async function waitForLlmChatOperation(
     try {
       const next = await fetchLlmChatOperation(requestId, workspace, signal)
       if (!next) {
-        throw new LlmChatWaitError('Chat status is still unavailable. Resume waiting to retrieve the result.')
+        throw new LlmChatRecoveryUnavailableError()
       }
       operation = next
       onStatus?.(operation)

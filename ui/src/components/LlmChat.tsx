@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Bot, Check, Copy, Flag, ImagePlus, Loader2, Pencil, RotateCcw, Send, Trash2, UserRound, X } from 'lucide-react'
 import * as api from '../api/client'
+import { terminalJobScope } from '../lib/terminalJobMemory'
 import { observeChatVisualViewport } from '../lib/chatVisualViewport'
 import { copyTextToClipboard, isAssistantCopyScopeCurrent } from '../lib/clipboard'
-import { useStore } from '../stores/useStore'
+import { currentAccountIdentityEpoch, useStore } from '../stores/useStore'
 import type { LlmChatMessage, LlmModelOption, LlmPromptGuideOption } from '../types'
 
 const STORAGE_PREFIX = 'maestro:llm-chat:'
@@ -57,6 +58,27 @@ function pendingKey(workspace: string, projectInstance: string): string {
 
 function operationStorageKey(workspace: string, projectInstance: string): string {
   return `${OPERATION_STORAGE_PREFIX}${encodeURIComponent(workspace)}:${projectInstance}`
+}
+
+function chatAccountScope(): string | null {
+  const state = useStore.getState()
+  return terminalJobScope(state.accountContext ?? state.accessContext?.accounts)
+}
+
+function draftStorageKey(workspace: string, projectInstance: string, accountScope: string): string {
+  return `${storageKey(workspace, projectInstance)}:draft:${encodeURIComponent(accountScope)}`
+}
+
+function restoreDraft(workspace: string, projectInstance: string, accountScope: string | null): { text: string; requiresFreshImage: boolean } {
+  if (!accountScope) return { text: '', requiresFreshImage: false }
+  try {
+    const value = JSON.parse(localStorage.getItem(draftStorageKey(workspace, projectInstance, accountScope)) || 'null')
+    if (value?.accountScope === accountScope && value.workspace === workspace
+      && value.projectInstance === projectInstance && typeof value.text === 'string') {
+      return { text: value.text, requiresFreshImage: value.requiresFreshImage === true }
+    }
+  } catch { /* private mode */ }
+  return { text: '', requiresFreshImage: false }
 }
 
 function restoreMessages(workspace: string, projectInstance: string): LlmChatMessage[] {
@@ -272,6 +294,7 @@ function downloadProgress(model?: LlmModelOption): string | null {
 interface PendingChatRequest {
   workspace: string
   projectInstance: string
+  accountScope?: string | null
   controller: AbortController
   requestId: string
   modelId: string
@@ -291,6 +314,9 @@ interface PendingChatRequest {
   requiresFreshImage: boolean
   editingTurn: EditingTurn | null
   latestStatus?: api.LlmChatOperationStatus
+  leftLocally?: boolean
+  partialText?: string
+  recoveryIdentityEpoch?: number
 }
 
 type ChatRequestPhase = 'idle' | 'uploading' | 'queued' | 'preparing' | 'generating'
@@ -349,6 +375,7 @@ function persistPendingOperation(pending: PendingChatRequest): void {
   try {
     localStorage.setItem(operationStorageKey(pending.workspace, pending.projectInstance), JSON.stringify({
       requestId: pending.requestId,
+      accountScope: pending.accountScope,
       workspace: pending.workspace,
       projectInstance: pending.projectInstance,
       modelId: pending.modelId,
@@ -364,6 +391,7 @@ function persistPendingOperation(pending: PendingChatRequest): void {
       admissionAcknowledged: pending.admissionAcknowledged,
       requires_fresh_image: pending.requiresFreshImage,
       editingTurn: pending.editingTurn,
+      partialText: pending.partialText,
     }))
   } catch { /* In-memory recovery remains available for this browser session. */ }
 }
@@ -384,6 +412,7 @@ function restorePendingOperation(
     }
     if (
       typeof value.requestId !== 'string'
+      || value.accountScope !== undefined && value.accountScope !== chatAccountScope()
       || value.workspace !== workspace
       || value.projectInstance !== projectInstance
       || !Array.isArray(value.retainedHistory)
@@ -392,6 +421,7 @@ function restorePendingOperation(
     return {
       workspace,
       projectInstance,
+      accountScope: value.accountScope,
       controller: new AbortController(),
       requestId: value.requestId,
       modelId: typeof value.modelId === 'string' ? value.modelId : '',
@@ -403,6 +433,7 @@ function restorePendingOperation(
       guideTargetOverridden: value.guideTargetOverridden === true,
       draft: typeof value.draft === 'string' ? value.draft : '',
       images: [],
+      partialText: typeof value.partialText === 'string' ? value.partialText : undefined,
       retainedHistory: value.retainedHistory,
       submittedMessages: value.submittedMessages,
       uploadedRefs: [],
@@ -423,7 +454,8 @@ function restorePendingOperation(
 }
 
 function hasPendingOperation(workspace: string, projectInstance: string): boolean {
-  return suspendedChatRequests.has(pendingKey(workspace, projectInstance))
+  const pending = suspendedChatRequests.get(pendingKey(workspace, projectInstance))
+  return !!pending && (pending.accountScope === undefined || pending.accountScope === chatAccountScope())
     || restorePendingOperation(workspace, projectInstance) !== null
 }
 
@@ -440,6 +472,8 @@ function cleanupUnsubmittedUploads(pending: PendingChatRequest, definitiveFailur
 export function LlmChat() {
   const activeWorkspace = useStore(state => state.activeWorkspace)
   const accessContext = useStore(state => state.accessContext)
+  const accountContext = useStore(state => state.accountContext)
+  const accountScope = terminalJobScope(accountContext ?? accessContext?.accounts)
   const selectedVideoModel = useStore(state => state.selectedModelPerMode.video || '')
   const [messages, setMessages] = useState<LlmChatMessage[]>([])
   const [projectInstance, setProjectInstance] = useState('')
@@ -462,6 +496,8 @@ export function LlmChat() {
   const [requestPhase, setRequestPhase] = useState<ChatRequestPhase>('idle')
   const [resumeAvailable, setResumeAvailable] = useState(false)
   const [resumeNonce, setResumeNonce] = useState(0)
+  const [unavailablePending, setUnavailablePending] = useState<PendingChatRequest | null>(null)
+  const [leaveConfirmation, setLeaveConfirmation] = useState<PendingChatRequest | null>(null)
   const [editingTurn, setEditingTurn] = useState<EditingTurn | null>(null)
   const [freshImagesRequired, setFreshImagesRequired] = useState(false)
   const [liveChatStatus, setLiveChatStatus] = useState<ScopedChatStatus | null>(null)
@@ -487,6 +523,7 @@ export function LlmChat() {
   const assistantCopyTimerRef = useRef<number | null>(null)
   const requestRef = useRef<PendingChatRequest | null>(null)
   const projectInstanceRef = useRef('')
+  const draftOwnerRef = useRef<string | null>(null)
   const guidesRef = useRef<LlmPromptGuideOption[]>([])
   const modelSelectionTouched = useRef(false)
   const guideTargetOverridden = useRef(false)
@@ -512,7 +549,7 @@ export function LlmChat() {
   const adoptProjectInstance = useCallback((nextProjectInstance: string) => {
     if (
       !nextProjectInstance
-      || nextProjectInstance === projectInstanceRef.current
+      || nextProjectInstance === projectInstanceRef.current && draftOwnerRef.current === accountScope
     ) return false
     cancelActiveRefusalLiteralSave()
     refusalSelectionSnapshotRef.current = null
@@ -544,9 +581,13 @@ export function LlmChat() {
     setProjectInstance(nextProjectInstance)
     setProjectInstanceWorkspace(activeWorkspace)
     setMessages(restoreMessages(activeWorkspace, nextProjectInstance))
-    setDraft('')
+    draftOwnerRef.current = accountScope
+    const restoredDraft = restoreDraft(activeWorkspace, nextProjectInstance, accountScope)
+    setDraft(restoredDraft.text)
+    setUnavailablePending(null)
+    setLeaveConfirmation(null)
     setEditingTurn(null)
-    setFreshImagesRequired(false)
+    setFreshImagesRequired(restoredDraft.requiresFreshImage)
     setLiveChatStatus(null)
     setRefusalCapture(null)
     setRefusalCaptureError(null)
@@ -570,7 +611,7 @@ export function LlmChat() {
     // deleted and recreated. Never import it into this project instance.
     try { localStorage.removeItem(`${STORAGE_PREFIX}${encodeURIComponent(activeWorkspace)}`) } catch { /* private mode */ }
     return true
-  }, [activeWorkspace, cancelActiveRefusalLiteralSave, clearAssistantCopyNotice])
+  }, [activeWorkspace, accountScope, cancelActiveRefusalLiteralSave, clearAssistantCopyNotice])
 
   useEffect(() => {
     cancelActiveRefusalLiteralSave()
@@ -579,6 +620,8 @@ export function LlmChat() {
     setUploadingImages(false)
     setRequestPhase('idle')
     setResumeAvailable(false)
+    setUnavailablePending(null)
+    setLeaveConfirmation(null)
     setSelectedImages([])
     setDraft('')
     setEditingTurn(null)
@@ -781,16 +824,23 @@ export function LlmChat() {
     const key = pendingKey(activeWorkspace, projectInstance)
     const pending = suspendedChatRequests.get(key)
       ?? restorePendingOperation(activeWorkspace, projectInstance)
-    if (!pending || requestRef.current) return
+    if (!pending || pending.accountScope !== undefined && pending.accountScope !== accountScope || requestRef.current) return
     suspendedChatRequests.set(key, pending)
+    const identityEpoch = currentAccountIdentityEpoch()
     const controller = new AbortController()
+    pending.recoveryIdentityEpoch = identityEpoch
     pending.controller = controller
     requestRef.current = pending
     const stillOwnsProject = () => (
       requestRef.current === pending
+      && pending.controller === controller
+      && identityEpoch === currentAccountIdentityEpoch()
+      && useStore.getState().activeWorkspace === pending.workspace
       && projectInstanceRef.current === pending.projectInstance
     )
     setResumeAvailable(false)
+    setUnavailablePending(null)
+    setLeaveConfirmation(null)
     setSending(true)
     setUploadingImages(false)
     setRequestPhase('queued')
@@ -810,6 +860,7 @@ export function LlmChat() {
         if (!stillOwnsProject()) return
         pending.admissionAcknowledged = true
         pending.latestStatus = status
+        pending.partialText = status.partial_text ?? pending.partialText
         persistPendingOperation(pending)
         setLiveChatStatus({
           workspace: pending.workspace,
@@ -853,6 +904,7 @@ export function LlmChat() {
       if (!stillOwnsProject()) return
       if (controller.signal.aborted || error instanceof api.LlmChatWaitError) {
         persistPendingOperation(pending)
+        setUnavailablePending(error instanceof api.LlmChatRecoveryUnavailableError ? pending : null)
         setResumeAvailable(true)
         setError(
           error instanceof api.LlmChatWaitError
@@ -881,7 +933,54 @@ export function LlmChat() {
       }
     })
     return () => controller.abort()
-  }, [activeWorkspace, projectInstance, resumeNonce])
+  }, [activeWorkspace, accountScope, projectInstance, resumeNonce])
+
+  useEffect(() => {
+    if (!projectInstance || projectInstanceWorkspace !== activeWorkspace
+      || !accountScope || draftOwnerRef.current !== accountScope) return
+    try {
+      localStorage.setItem(draftStorageKey(activeWorkspace, projectInstance, accountScope), JSON.stringify({
+        accountScope, workspace: activeWorkspace, projectInstance, text: draft,
+        requiresFreshImage: freshImagesRequired || selectedImages.length > 0,
+      }))
+    } catch { /* private mode */ }
+  }, [activeWorkspace, accountScope, projectInstance, projectInstanceWorkspace, draft, freshImagesRequired, selectedImages])
+
+  const leaveUnavailableResponse = () => {
+    const pending = leaveConfirmation
+    if (!pending || pending !== unavailablePending
+      || pending.recoveryIdentityEpoch !== currentAccountIdentityEpoch()
+      || pending.accountScope !== undefined && pending.accountScope !== chatAccountScope()
+      || useStore.getState().activeWorkspace !== pending.workspace
+      || projectInstanceRef.current !== pending.projectInstance
+      || suspendedChatRequests.get(pendingKey(pending.workspace, pending.projectInstance)) !== pending) return
+    // Detach before aborting: late status callbacks must not recreate recovery state.
+    pending.leftLocally = true
+    requestRef.current = null
+    pending.controller.abort()
+    suspendedChatRequests.delete(pendingKey(pending.workspace, pending.projectInstance))
+    removePendingOperation(pending.workspace, pending.projectInstance)
+    const partial = pending.partialText
+    const preserved = partial
+      ? [...messages, { role: 'assistant' as const, content: `Partial response (left unfinished):\n\n${partial}` }]
+      : messages
+    setMessages(preserved)
+    persistMessages(pending.workspace, pending.projectInstance, preserved)
+    // Legacy recovery has no account binding; keep its text without importing its composer inputs.
+    if (pending.accountScope !== undefined) {
+      setDraft(draft || pending.draft)
+      setSelectedImages(pending.images)
+      setFreshImagesRequired(pending.requiresFreshImage && pending.images.length === 0)
+      setEditingTurn(pending.editingTurn)
+    }
+    setLiveChatStatus(null)
+    setUnavailablePending(null)
+    setLeaveConfirmation(null)
+    setResumeAvailable(false)
+    setSending(false)
+    setRequestPhase('idle')
+    setError('You left the pending response. It may have completed; nothing was resent or cancelled.')
+  }
 
   const effectiveModelId = canUseCustomModel && customModel.trim() ? customModel.trim() : modelId
   const selectedModel = useMemo(
@@ -925,6 +1024,9 @@ export function LlmChat() {
     && liveChatStatus.projectInstance === projectInstance
     ? liveChatStatus.status
     : null
+  const activePartialText = activeLiveStatus?.partial_text
+    || (unavailablePending?.workspace === activeWorkspace
+      && unavailablePending.projectInstance === projectInstance ? unavailablePending.partialText : '')
   const chatEmptyState: ChatEmptyState = !activeWorkspace
     ? 'project-required'
     : catalogRead.workspace !== activeWorkspace || catalogRead.status === 'loading'
@@ -1011,7 +1113,8 @@ export function LlmChat() {
     retainedDraft: string,
     clearComposer: boolean,
   ) => {
-    if (interactionLocked || refusalLiteralSaveRef.current || !nextMessages.length) return
+    if (interactionLocked || refusalLiteralSaveRef.current || !nextMessages.length
+      || accountScope !== chatAccountScope()) return
     refusalSelectionSnapshotRef.current = null
     setRefusalCapture(null)
     setRefusalCaptureError(null)
@@ -1019,11 +1122,14 @@ export function LlmChat() {
     const requestProjectInstance = projectInstance
     const requestGuideId = useGuide ? canonicalGuideId : ''
     const requestExplicitOutput = useStore.getState().explicitOutput
+    const identityEpoch = currentAccountIdentityEpoch()
     const controller = new AbortController()
     requestRef.current?.controller.abort()
     const pending: PendingChatRequest = {
       workspace: requestWorkspace,
       projectInstance: requestProjectInstance,
+      accountScope,
+      recoveryIdentityEpoch: identityEpoch,
       controller,
       requestId: api.createLlmRequestId(),
       modelId,
@@ -1046,10 +1152,15 @@ export function LlmChat() {
     requestRef.current = pending
     const pendingStillOwnsProject = () => (
       requestRef.current === pending
+      && pending.controller === controller
+      && identityEpoch === currentAccountIdentityEpoch()
+      && useStore.getState().activeWorkspace === pending.workspace
       && projectInstanceRef.current === pending.projectInstance
     )
     setSending(true)
     setResumeAvailable(false)
+    setUnavailablePending(null)
+    setLeaveConfirmation(null)
     setLiveChatStatus(null)
     setRequestPhase(requestImages.length > 0 ? 'uploading' : 'queued')
     setError(null)
@@ -1100,7 +1211,9 @@ export function LlmChat() {
               : 'queued',
         )
       }, status => {
+        if (pending.leftLocally || identityEpoch !== currentAccountIdentityEpoch()) return
         pending.latestStatus = status
+        pending.partialText = status.partial_text ?? pending.partialText
         persistPendingOperation(pending)
         if (pendingStillOwnsProject()) {
           setLiveChatStatus({
@@ -1112,6 +1225,7 @@ export function LlmChat() {
           setRequestPhase(operationRequestPhase(status.phase))
         }
       }, () => {
+        if (pending.leftLocally || identityEpoch !== currentAccountIdentityEpoch()) return
         pending.submissionAttempted = true
         persistPendingOperation(pending)
         if (pendingStillOwnsProject()) {
@@ -1122,8 +1236,10 @@ export function LlmChat() {
           )
         }
       }, status => {
+        if (pending.leftLocally || identityEpoch !== currentAccountIdentityEpoch()) return
         pending.admissionAcknowledged = true
         pending.latestStatus = status
+        pending.partialText = status.partial_text ?? pending.partialText
         persistPendingOperation(pending)
       })
       if (!pendingStillOwnsProject()) return
@@ -1185,6 +1301,7 @@ export function LlmChat() {
             requestProjectInstance,
             pending.submittedMessages,
           )
+          setUnavailablePending(err instanceof api.LlmChatRecoveryUnavailableError ? pending : null)
           setResumeAvailable(true)
           setError(
             err instanceof api.LlmChatWaitError
@@ -1773,7 +1890,7 @@ export function LlmChat() {
               {refusalCaptureNotice}
             </div>
           )}
-          {activeLiveStatus?.partial_text && (sending || resumeAvailable) && (
+          {activePartialText && (sending || resumeAvailable) && (
             <article
               role="log"
               aria-live="polite"
@@ -1784,7 +1901,7 @@ export function LlmChat() {
             >
               <div className="mt-0.5 shrink-0 text-text-muted"><Bot size={16} /></div>
               <div className="min-w-0 whitespace-pre-wrap break-words text-sm leading-6 text-text-primary">
-                {activeLiveStatus.partial_text}
+                {activePartialText}
               </div>
             </article>
           )}
@@ -1844,6 +1961,7 @@ export function LlmChat() {
               {resumeAvailable && (
                 <button
                   type="button"
+                  disabled={leaveConfirmation !== null}
                   onClick={() => setResumeNonce(value => value + 1)}
                   className="ml-auto min-h-11 rounded border border-red-400/40 px-3 py-1 text-[10px] text-red-200 md:min-h-0 md:px-2"
                 >
@@ -1852,6 +1970,27 @@ export function LlmChat() {
               )}
             </div>
           )}
+          {resumeAvailable && unavailablePending?.workspace === activeWorkspace
+            && unavailablePending.projectInstance === projectInstance
+            && unavailablePending.recoveryIdentityEpoch === currentAccountIdentityEpoch() && (
+              <button type="button" onClick={() => setLeaveConfirmation(unavailablePending)}
+                className="min-h-11 rounded border border-border px-3 py-2 text-xs text-text-secondary">
+                Leave pending response
+              </button>
+            )}
+          {leaveConfirmation?.workspace === activeWorkspace
+            && leaveConfirmation.projectInstance === projectInstance
+            && leaveConfirmation.recoveryIdentityEpoch === currentAccountIdentityEpoch() && (
+              <div role="dialog" aria-modal="true" aria-labelledby="leave-chat-title"
+                className="rounded-md border border-border bg-bg-secondary p-3 text-xs text-text-secondary">
+                <p id="leave-chat-title" className="font-medium">Leave this pending response?</p>
+                <p className="mt-1">It may already have completed. Your conversation, partial response and draft will stay here. This will not resend or cancel the request.</p>
+                <div className="mt-2 flex gap-2">
+                  <button type="button" onClick={() => setLeaveConfirmation(null)} className="min-h-11 rounded border border-border px-3 py-2">Keep waiting</button>
+                  <button type="button" onClick={leaveUnavailableResponse} className="min-h-11 rounded border border-border px-3 py-2">Leave response</button>
+                </div>
+              </div>
+            )}
           {resumeAvailable && activeLiveStatus && (
             <div role="status" aria-live="polite" aria-label="Paused language model response" className="rounded-md border border-border bg-bg-secondary px-3 py-2 text-[10px] text-text-muted">
               Waiting is paused. Resume when you want to check for the response.
