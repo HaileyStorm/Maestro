@@ -608,3 +608,30 @@ not establish backend-restart recovery, native pending-request reload,
 Windows, general model quality, or owner Free Resources acceptance. Source
 code did not change, so the revision-bound checks above remain applicable.
 The full continuous Goal remains open.
+
+## October 5 native Chat page-reload recovery acceptance
+
+The released Chat recovery also passed one native page-reload case with the
+existing installed Gemma 4 31B Heretic ARA Q4_K_M model. One new short turn
+received a real HTTP 202 acknowledgement. The controlled browser exposed
+truncated JSON for that acknowledgement and the first original-request GET,
+leaving the visible turn pending with **Resume wait** available and Send
+disabled. The original backend operation had completed.
+
+After clearing response interception, the actual page was reloaded. Opening
+Chat restored the pending turn and automatically read that original request.
+Its completed result, `Reloaded.`, appeared once. The complete event capture
+contains one Chat POST and two GETs for the same request ID; no second POST
+or new request was sent during reload or recovery.
+
+The native model loaded on CUDA and then unloaded through its idle timeout.
+The independent guardian performed 55 coherent lease checks, confirmed cold
+model state and process cleanup, and withdrew the exact grant. The guardian
+finished successfully; Maestro remained healthy and ready without a restart.
+
+This verifies persistence and recovery across one Chrome page reload with a
+completed native text turn. It does not establish recovery after a backend
+restart, an interrupted generation, image-upload recovery, Windows, owner
+Free Resources acceptance or human model-quality approval. Unchanged source
+checks are reused from the released recovery revision; no source was changed.
+The full continuous Goal and other recorded acceptance gates remain open.
