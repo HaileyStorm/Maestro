@@ -502,8 +502,52 @@ Fresh local and stable health/readiness and exact served assets were verified
 after atomic UI promotion. The signed-in local training panel shows the
 existing private project checkpoints, empty fields and disabled empty-submit
 control. No new training/generation or backend restart was performed.
-Foreign changes and the historical tracker hold remain preserved. The next
-source-proven reliability gap is ordinary Image/Video generation lost-ACK
-recovery: submission needs a durable owner/project-bound identity before
-admission, exact retry, and truthful UI reconciliation. Full sprint acceptance
-and the other previously recorded runtime/human gates remain open.
+Foreign changes and the historical tracker hold remain preserved. Ordinary
+Image/Video submission recovery was the next source-proven reliability gap;
+its delivery is recorded below. Full sprint acceptance and the other previously
+recorded runtime/human gates remain open.
+
+## October 5 Studio submission recovery checkpoint
+
+Commit `ad7eb0b7ff94d4aefda30be574e1f5e8c552dc78` adds an optional canonical
+UUID4 `generation_request_id` to ordinary Image/Video generation. The server
+authorizes the project, binds account/session and immutable project identity,
+and durably reserves the exact original settings before staging, charging or
+worker admission. Exact replay adopts the same job; a pending reservation does
+not rerun those effects. Raw settings remain in the existing private manifest.
+Terminal receipts survive journal compaction, job removal and restart. Legacy
+callers without the new field retain their existing behavior.
+
+Read-only lookup uses
+`GET /api/v1/generate/submissions/{generation_request_id}?workspace=...`.
+Accepted results include canonical job status; pending or unknown results do
+not prove rejection. Only an exact initial pre-reservation rejection releases
+the UI's request. The visible pending notice survives closing the composer;
+Check reads status, and explicit Retry sends the original frozen wire body.
+Form edits are reserved for a later submission. Account changes and project
+round trips fence stale responses, and canonical acceptance preserves newer
+terminal, review and held states. Completed recovery refreshes Gallery with
+the same account/project fence. Frontend persistence covers SPA navigation;
+reloading the page clears its in-memory request.
+
+The durable content-free ledger has a hard limit of 4096 records and 2 MiB;
+it never evicts identities. Existing requests remain readable/replayable at
+capacity, while new admission is rejected before reservation. Unresolved
+reservations protect their project recovery inputs and remain non-executable.
+History removal or manual reconciliation needs a separate controlled contract.
+
+The final affected gates passed 204 launch/recovery tests, 22 adapter tests,
+39 UI handler tests, 41 existing UI fixture tests, TypeScript, scoped lint,
+private build, publication guard and eight synthetic desktop Firefox/mobile
+Chromium cases. Independent review of the final source bindings is clear.
+Real journal and manifest checks are distinct from substituted registry,
+credit and worker boundaries. Before-fix failures and corrected fixture
+attempts remain in private evidence.
+
+The backend restarted through Pinokio's coordinated public-status flow before
+atomic UI promotion. Fresh local and stable health/readiness, the installed
+protected route, exact served asset bytes and an empty restart notice were
+verified. The real signed-in Chrome Studio shows the existing Gallery, idle
+queue and available Generate/Hold controls; no new generation was submitted.
+This is rollout/browser evidence, not native lost-acknowledgement, Windows or
+human acceptance. The full continuous Goal and its remaining gates stay open.
