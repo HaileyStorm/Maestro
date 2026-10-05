@@ -9,7 +9,7 @@ const video = {
   workspace: 'Synthetic project', private: true, explicit: true,
 }
 
-async function setup(page: Page) {
+async function setup(page: Page, nonapproval = false) {
   const api = await installSyntheticApi(page)
   api.setAccountScenario('remote-user')
   await page.addInitScript(() => localStorage.setItem('maestro_welcome_seen_v1', '1'))
@@ -25,6 +25,10 @@ async function setup(page: Page) {
     bridge_ready: true, workspace: video.workspace, max_total_frames: 7200,
   }))
   await page.route('**/api/v1/blender/director-finalize', route => {
+    if (nonapproval) return route.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({
+      detail: { code: 'blender_review_not_approved', review_count: 3,
+        feedback: 'The cube is outside the camera view. Move it toward the center.' },
+    }) })
     const body = route.request().postDataJSON()
     return json(route, { workspace: body.workspace, asset_id: 'asset', variant_id: 'variant',
       video: { filename: video.name, url: video.url }, director_reviews: [], final_plan: body.plan })
@@ -64,10 +68,12 @@ async function setup(page: Page) {
   const edit = page.getByRole('button', { name: 'Edit this video', exact: true })
   const keep = page.getByRole('button', { name: 'Keep motion video', exact: true })
   await page.getByRole('button', { name: 'Review and render', exact: true }).click()
-  await expect(keep).toBeEnabled()
-  await expect(edit).toHaveCount(0)
-  await keep.click()
-  await expect(edit).toBeEnabled()
+  if (!nonapproval) {
+    await expect(keep).toBeEnabled()
+    await expect(edit).toHaveCount(0)
+    await keep.click()
+    await expect(edit).toBeEnabled()
+  }
   return {
     api, edit, keep, editorRequests,
     resolve: async (outputs: unknown[]) => {
@@ -78,6 +84,16 @@ async function setup(page: Page) {
     },
   }
 }
+
+test('Director nonapproval shows actionable feedback without Keep or Editor controls', async ({ page }) => {
+  const fixture = await setup(page, true)
+  await expect(page.getByText('Director could not approve this animation. Adjust the scene or request, then review again. Director feedback: The cube is outside the camera view. Move it toward the center.', { exact: true })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Review and render', exact: true })).toBeEnabled()
+  await expect(fixture.keep).toHaveCount(0)
+  await expect(fixture.edit).toHaveCount(0)
+  expect(fixture.editorRequests).toEqual([])
+  await fixture.api.assertClean()
+})
 
 test('kept Blender video opens Editor with the exact current Gallery revision and privacy', async ({ page }) => {
   const fixture = await setup(page)

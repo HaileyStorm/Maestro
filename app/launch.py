@@ -35194,10 +35194,12 @@ async def blender_director_finalize(request: Request):
                 if not approved:
                     raise HTTPException(
                         status_code=409,
-                        detail=(
-                            f"Director did not approve the Blender animation after "
-                            f"{len(reviews)} review pass(es). Refine the prompt and retry."
-                        ),
+                        detail={
+                            "code": "blender_review_not_approved",
+                            "message": "Director could not approve this animation. Adjust the scene or request, then review again.",
+                            "review_count": len(reviews),
+                            "feedback": reviews[-1]["analysis"] if reviews else "",
+                        },
                     )
 
                 video_name = f"blender_reference_{run_id[:12]}.mp4"

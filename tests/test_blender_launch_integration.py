@@ -62,7 +62,7 @@ def _load_functions(*names, extra=None):
 
 class BlenderDirectorVisionTests(unittest.TestCase):
     def exercise(self, root, *, nonvision_lease=None, revision_mutator=None,
-                 director_prompt="Move the cube across the scene"):
+                 director_prompt="Move the cube across the scene", approve=True):
         from services.blender_mcp_service import BlenderMCPService
 
         selection = {
@@ -142,7 +142,7 @@ class BlenderDirectorVisionTests(unittest.TestCase):
             self.assertTrue(all(Path(path).is_file() for path in kwargs["image_paths"]))
             observations.generation_inputs.append(copy.deepcopy(kwargs))
             observations.generated += 1
-            if observations.generated == 1:
+            if observations.generated == 1 or not approve:
                 revised = copy.deepcopy({
                     "verdict": "revise", "analysis": "Move farther",
                     "scene": plan["scene"], "animation": plan["animation"],
@@ -293,6 +293,21 @@ class BlenderDirectorVisionTests(unittest.TestCase):
         self.assertIn("Prompt Enhance", failure.exception.detail)
         self.assertEqual(self.observations.calls, [])
         self.assertEqual(self.observations.generated, 0)
+
+    def test_nonapproval_returns_feedback_without_a_candidate_or_review_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaises(HTTPException) as failure:
+                self.exercise(Path(temporary), approve=False)
+            self.assertEqual(list(Path(temporary).iterdir()), [])
+        self.assertEqual(failure.exception.status_code, 409)
+        self.assertEqual(failure.exception.detail, {
+            "code": "blender_review_not_approved",
+            "message": "Director could not approve this animation. Adjust the scene or request, then review again.",
+            "review_count": 2, "feedback": "Move farther",
+        })
+        self.assertEqual(self.observations.generated, 2)
+        self.assertNotIn("render_animation", self.observations.calls)
+        self.assertEqual(self.observations.assets, [])
 
     def test_lost_vision_capability_cleans_samples_without_publication(self):
         with tempfile.TemporaryDirectory() as temporary:

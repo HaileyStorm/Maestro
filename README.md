@@ -172,6 +172,8 @@ Blender Motion Video is a first-class Reference creation method as well as an ex
 Director's frame review uses the local vision model configured for Prompt
 Enhance. You can keep a separate text-only model for chat. If frame review
 reports a missing vision capability, select a Prompt Enhance model marked Vision.
+If Director cannot approve the animation after its review rounds, the panel
+shows its last feedback so you can adjust the scene or request before retrying.
 
 After **Keep motion video** succeeds, choose **Edit this video** to open its
 current Gallery video in Editor. Trim, reorder or reuse it without changing the

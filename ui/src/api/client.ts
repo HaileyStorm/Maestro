@@ -5269,12 +5269,26 @@ export interface BlenderSemanticMapping {
   conditioned_prompt: string
 }
 
+export class BlenderReviewError extends Error {
+  readonly feedback: string
+
+  constructor(feedback: string) {
+    super('Director could not approve this animation. Adjust the scene or request, then review again.')
+    this.name = 'BlenderReviewError'
+    this.feedback = feedback.slice(0, 4000).trim()
+  }
+}
+
 async function blenderRequest<T>(path: string, body: Record<string, unknown>): Promise<T> {
   const res = await fetch(`${BASE}/api/v1/blender/${path}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: 'Blender operation failed' }))
+    if (path === 'director-finalize' && res.status === 409
+      && err.detail?.code === 'blender_review_not_approved') {
+      throw new BlenderReviewError(typeof err.detail.feedback === 'string' ? err.detail.feedback : '')
+    }
     throw new Error(err.detail || 'Blender operation failed')
   }
   return res.json()

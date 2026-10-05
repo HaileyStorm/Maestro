@@ -160,9 +160,11 @@ export function BlenderSceneTool({
       await task()
       if (!isOperationCurrent(operation)) return
       setMessage(`${label} complete`)
-    } catch {
+    } catch (error) {
       if (!isOperationCurrent(operation)) return
-      setMessage(requiresBlender
+      setMessage(error instanceof api.BlenderReviewError
+        ? `${error.message}${error.feedback ? ` Director feedback: ${error.feedback}` : ''}`
+        : requiresBlender
         ? `${label} could not finish. Check the scene settings and try again.`
         : 'This video could not open in Editor. Refresh Gallery and open the current video from there.')
     } finally {

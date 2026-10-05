@@ -683,3 +683,14 @@ in its prompt. All 135 affected tests passed; the final integration rerun passed
 the schema without warnings. Actual scene, animation and legend validators
 remain controlling and invalid revisions clean their private review frames
 without publication. Native candidate, Keep and Editor acceptance remain pending.
+
+A second leased native attempt applied two structured revisions and completed
+three visual responses, then stopped without approval. Its model and exact
+grant were cleaned up; no full video or Keep-to-Editor acceptance was observed.
+Nonapproval now returns bounded Director feedback through a dedicated error
+type, so the panel can show the last analysis instead of discarding it. Other
+errors retain generic copy. All 21 Blender integration tests, 811 UI tests,
+type/lint/build checks and six synthetic desktop/mobile browser checks passed.
+Those checks prove feedback visibility and absence of candidate actions on
+nonapproval, plus the existing kept-video handoff; they do not prove a native
+approved candidate or human creative acceptance.
