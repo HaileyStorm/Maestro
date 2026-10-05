@@ -99,6 +99,7 @@ class H3HeldStartupTests(unittest.TestCase):
         for name in (
             "_h3_job_model_types",
             "_require_h3_legal_execution",
+            "_h3_cow_manual_source_supported",
             "_queue_recovery_materialize_job",
         ):
             _load_launch_function(self.source, name, self.namespace)

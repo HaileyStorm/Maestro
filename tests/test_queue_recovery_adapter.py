@@ -241,6 +241,42 @@ class LogicalReferenceRecoveryTests(unittest.TestCase):
                 ))
             self.assertEqual(coordinator.restore().jobs, {})
 
+    def test_h3_mixed_registration_disk_failure_and_duplicate_keep_parent_exact(self):
+        from copy import deepcopy
+        from unittest.mock import patch
+        source = {"id": "aaaaaaaa", "status": "failed", "execution_attempt": 1}
+        child_id = "b" * 32
+        source_control = {"schema_version": 1, "role": "source", "manual_retry_count": 0, "manual_retry_limit": 2,
+            "active_child_id": child_id, "active_action": "accept_native", "active_intent_digest": "c" * 64,
+            "last_charged_child_id": None, "consumed": False, "completed_child_id": None, "completed_unit_id": None}
+        child = {"id": child_id, "status": "queued", "kind": "studio_h3_delivery_recovery", "parent_job_id": source["id"],
+            "h3_delivery_recovery_control": {"schema_version": 1, "role": "child", "source_job_id": source["id"],
+                "action": "accept_native", "intent_digest": "c" * 64, "charged": False}}
+        with tempfile.TemporaryDirectory() as directory:
+            journal = QueueRecoveryJournal(Path(directory) / "queue.json")
+            coordinator = QueueRecoveryCoordinator(journal)
+            coordinator.register_job(source, owner_digest=OWNER, project_digest=PROJECT, request_manifest={"kind": "source"})
+            before = deepcopy(coordinator._snapshots)
+            def register():
+                coordinator.register_h3_delivery_child_atomic(dict(source, h3_delivery_recovery_control=source_control), child,
+                    owner_digest=OWNER, project_digest=PROJECT, request_manifest={"kind": "child"}, expected_control=None)
+            with patch.object(journal, "commit_state", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    register()
+            self.assertEqual(coordinator._snapshots, before)
+            self.assertEqual(QueueRecoveryCoordinator(journal).restore().jobs, before)
+            register()
+            restored = QueueRecoveryCoordinator(journal).restore().jobs
+            self.assertEqual(set(restored), {source["id"], child_id})
+            self.assertEqual(restored[source["id"]]["h3_delivery_recovery_control"], source_control)
+            self.assertEqual(restored[child_id]["parent_job_id"], source["id"])
+            with self.assertRaises(QueueRecoveryAdapterError):
+                register()
+            self.assertEqual(QueueRecoveryCoordinator(journal).restore().jobs, restored)
+            for changed in ({**source_control, "manual_retry_count": True}, {**source_control, "unexpected": "field"}):
+                with self.subTest(control=changed), self.assertRaises(QueueRecoveryAdapterError):
+                    _serialize(dict(source, h3_delivery_recovery_control=changed))
+
     def test_atomic_registration_rejects_duplicate_or_existing_job_without_partial_commit(self):
         job = {
             "id": "sample-arm",

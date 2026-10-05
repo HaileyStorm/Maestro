@@ -393,9 +393,10 @@ def apply_output_video_trim(
         if position > 86400:
             raise ValueError("sequence too long")
         track["items"] = items
-        for asset, clip in originals:
-            if clip["id"] not in used:
-                del updated["assets"][asset["id"]]
+        retained_assets = {item.get("asset_id") for row in updated["tracks"] for item in row.get("items", [])}
+        for asset, _ in originals:
+            if asset["id"] not in retained_assets:
+                updated["assets"].pop(asset["id"], None)
     except (KeyError, IndexError, StopIteration, TypeError, ValueError):
         raise EditorProjectError("Select a valid source range") from None
     incoming_titles = [track for track in proposed.get("tracks", []) if track.get("id") == "titles-main"]
@@ -716,7 +717,7 @@ def editor_sequence_clips(project: Mapping[str, Any]) -> list[tuple[dict, dict]]
             raise ValueError()
         clips = main[0]["items"]
         assets = project["assets"]
-        if not 1 <= len(clips) <= 8 or len(assets) != len(clips) + bool(bed) + len(images):
+        if not 1 <= len(clips) <= 8:
             raise ValueError()
         result, ids, asset_ids = [], set(), set()
         position = 0.0
@@ -735,7 +736,7 @@ def editor_sequence_clips(project: Mapping[str, Any]) -> list[tuple[dict, dict]]
                 "transform": {"x": 0.0, "y": 0.0, "scale": 1.0, "rotation": 0.0},
                 "fit": "contain", "muted": False, "disabled": False,
             }
-            if (clip != expected or clip_id in ids or asset_id in asset_ids
+            if (clip != expected or clip_id in ids
                     or asset.get("type") != "video" or asset.get("origin") != "output"
                     or asset.get("workspace") != project["workspace"]
                     or type(start) not in (int, float) or type(length) not in (int, float)
@@ -746,7 +747,10 @@ def editor_sequence_clips(project: Mapping[str, Any]) -> list[tuple[dict, dict]]
             ids.add(clip_id); asset_ids.add(asset_id)
             position += length
             result.append((asset, clip))
-        if position > 86400:
+        referenced_assets = asset_ids | {item["asset_id"] for item in images}
+        if bed:
+            referenced_assets.add(bed["asset_id"])
+        if position > 86400 or set(assets) != referenced_assets:
             raise ValueError()
         return result
     except (KeyError, TypeError, ValueError):
@@ -758,22 +762,23 @@ def append_output_video_clip(current: Mapping[str, Any], *, output_name: str,
     clips = editor_sequence_clips(current)
     if len(clips) >= 8:
         raise EditorProjectError("An Editor sequence supports up to eight clips")
-    if any(asset["output_id"] == output_name for asset, _ in clips):
-        raise EditorProjectError("This video is already in the sequence")
     candidate = create_output_video_timeline(
         workspace=current["workspace"], output_name=output_name,
         output_revision=output_revision, media=media,
     )
+    source = candidate["assets"]["source-video"]
+    matches = [asset for asset in current["assets"].values() if asset.get("output_id") == output_name]
+    if matches and (len(matches) != 1 or matches[0] != {**source, "id": matches[0]["id"]}):
+        raise EditorProjectError("This video's source changed. Reopen the edit from Gallery")
     updated = copy.deepcopy(dict(current))
     # H.264/yuv420p needs even dimensions. Keep the first-source canvas,
     # rounding an odd edge up one pixel when it becomes a sequence.
     for dimension in ("width", "height"):
         updated["canvas"][dimension] += updated["canvas"][dimension] % 2
     token = uuid.uuid4().hex[:16]
-    asset_id = f"source-video-{token}"
-    asset = candidate["assets"]["source-video"]
-    asset["id"] = asset_id
-    updated["assets"][asset_id] = asset
+    asset_id = matches[0]["id"] if matches else f"source-video-{token}"
+    if not matches:
+        updated["assets"][asset_id] = {**source, "id": asset_id}
     clip = candidate["tracks"][0]["items"][0]
     clip.update(id=f"source-clip-{token}", asset_id=asset_id,
                 start=sum(item["duration"] for _, item in clips),

@@ -126,6 +126,173 @@ class TestJobLifecycle(unittest.TestCase):
         configure_durability_hook(None)
         _reset_queue_state_for_tests()
 
+    def _h3_registered_pair(self, directory):
+        from services.job_lifecycle import register_h3_delivery_child
+        from services.queue_recovery import QueueRecoveryJournal
+        from services.queue_recovery_adapter import QueueRecoveryCoordinator, owner_principal_digest, project_instance_digest
+        owner = owner_principal_digest(b"h3-companion-test-secret", "session")
+        project = project_instance_digest(b"h3-companion-test-secret", "a" * 32)
+        source = {"id": "aaaaaaaa", "status": "failed", "execution_attempt": 3, "workspace": "project-a",
+                  "resource_intent": "generation", "resource_state": "released", "output_files": [],
+                  "_recovery_owner_digest": owner, "_recovery_project_digest": project}
+        control = {"schema_version": 1, "role": "source", "manual_retry_count": 0, "manual_retry_limit": 2,
+                   "active_child_id": None, "active_action": None, "active_intent_digest": None,
+                   "last_charged_child_id": None, "consumed": False, "completed_child_id": None, "completed_unit_id": None}
+        child = {"id": "b" * 32, "kind": "studio_h3_delivery_recovery", "parent_job_id": source["id"],
+                 "status": "queued", "execution_attempt": 1, "workspace": "project-a", "output_files": [],
+                 "resource_intent": "generation", "resource_execution": "standard", "resource_state": "queued", "preemption_mode": "none",
+                 "_recovery_owner_digest": owner, "_recovery_project_digest": project,
+                 "h3_delivery_recovery_control": {"schema_version": 1, "role": "child", "source_job_id": source["id"],
+                     "action": "retry_delivery", "intent_digest": "c" * 64, "charged": False}}
+        coordinator = QueueRecoveryCoordinator(QueueRecoveryJournal(os.path.join(directory, "queue.json")))
+        coordinator.register_job(source, owner_digest=owner, project_digest=project, request_manifest={"kind": "source"})
+        register_h3_delivery_child(source, child, source_control=control,
+            persist=lambda parent, prepared, previous: coordinator.register_h3_delivery_child_atomic(parent, prepared,
+                owner_digest=owner, project_digest=project, request_manifest={"kind": "child"}, expected_control=previous))
+        return source, child, coordinator
+
+    def test_h3_charge_cancel_before_and_after_ack_reload_exact_winner(self):
+        from services.queue_recovery_adapter import QueueRecoveryCoordinator, QueueRecoveryAdapterError
+        for acknowledged in (False, True):
+            with self.subTest(acknowledged=acknowledged), tempfile.TemporaryDirectory() as directory:
+                source, child, coordinator = self._h3_registered_pair(directory)
+                configure_durability_hook(coordinator.prospective_transition)
+                self.assertTrue(try_start(child, expected_execution_attempt=1))
+                configure_durability_hook(None)
+                injected = False
+                def persist(proposal):
+                    nonlocal injected
+                    if proposal.name == "recovery_checkpoint" and not injected:
+                        injected = True
+                        if acknowledged:
+                            coordinator.prospective_transition(proposal)
+                        self.assertTrue(request_cancel(child).changed)
+                        if not acknowledged:
+                            coordinator.prospective_transition(proposal)
+                    else:
+                        coordinator.prospective_transition(proposal)
+                configure_durability_hook(persist)
+                try:
+                    update = dict(child["h3_delivery_recovery_control"], charged=True)
+                    if acknowledged:
+                        self.assertFalse(checkpoint_recovery_job(child, expected_execution_attempt=1, h3_delivery_recovery_control=update))
+                    else:
+                        with self.assertRaisesRegex(QueueRecoveryAdapterError, "predecessor"):
+                            checkpoint_recovery_job(child, expected_execution_attempt=1, h3_delivery_recovery_control=update)
+                finally:
+                    configure_durability_hook(None)
+                restored = QueueRecoveryCoordinator(coordinator.journal).restore().jobs
+                self.assertEqual(child["status"], "cancelled")
+                self.assertEqual(restored[child["id"]]["status"], "cancelled")
+                self.assertEqual(source["h3_delivery_recovery_control"]["manual_retry_count"], int(acknowledged))
+                self.assertEqual(restored[source["id"]]["h3_delivery_recovery_control"], source["h3_delivery_recovery_control"])
+                self.assertEqual(child["h3_delivery_recovery_control"]["charged"], acknowledged)
+                self.assertEqual(restored[child["id"]]["h3_delivery_recovery_control"]["charged"], acknowledged)
+                self.assertIsNone(source["h3_delivery_recovery_control"]["active_child_id"])
+                self.assertEqual(source["status"], "failed")
+                self.assertEqual(source["execution_attempt"], 3)
+
+    def test_h3_charge_rejects_reentrant_newer_source_metadata_without_overwrite(self):
+        from services.queue_recovery_adapter import QueueRecoveryCoordinator, QueueRecoveryAdapterError
+        with tempfile.TemporaryDirectory() as directory:
+            source, child, coordinator = self._h3_registered_pair(directory)
+            configure_durability_hook(coordinator.prospective_transition)
+            generation_lock = threading.Lock()
+            generation_lock.acquire()
+            self.addCleanup(generation_lock.release)
+            self.assertTrue(try_start(child, generation_lock=generation_lock, expected_execution_attempt=1))
+            changed = []
+            def persist(proposal):
+                if not changed and any((job.get("h3_delivery_recovery_control") or {}).get("charged") for job in proposal.jobs):
+                    changed.append(True)
+                    self.assertTrue(checkpoint_recovery_job(source, message="newer failed-source metadata"))
+                coordinator.prospective_transition(proposal)
+            configure_durability_hook(None)
+            configure_durability_hook(persist)
+            with self.assertRaisesRegex(QueueRecoveryAdapterError, "source metadata changed"):
+                checkpoint_recovery_job(child, expected_execution_attempt=1,
+                    h3_delivery_recovery_control=dict(child["h3_delivery_recovery_control"], charged=True))
+            self.assertEqual(source["message"], "newer failed-source metadata")
+            self.assertEqual(source["status"], "failed")
+            self.assertEqual(source["execution_attempt"], 3)
+            self.assertEqual(source["h3_delivery_recovery_control"]["manual_retry_count"], 0)
+            self.assertFalse(child["h3_delivery_recovery_control"]["charged"])
+            restored = QueueRecoveryCoordinator(coordinator.journal).restore().jobs
+            self.assertEqual(restored[source["id"]]["message"], source["message"])
+            self.assertEqual(restored[source["id"]]["h3_delivery_recovery_control"], source["h3_delivery_recovery_control"])
+            self.assertEqual(restored[child["id"]]["status"], "running")
+            self.assertFalse(restored[child["id"]]["h3_delivery_recovery_control"]["charged"])
+
+    def test_h3_charge_persistence_failure_changes_neither_live_job(self):
+        import copy
+        with tempfile.TemporaryDirectory() as directory:
+            source, child, coordinator = self._h3_registered_pair(directory)
+            configure_durability_hook(coordinator.prospective_transition)
+            self.assertTrue(try_start(child, expected_execution_attempt=1))
+            old_source, old_child = copy.deepcopy(source), {key: copy.deepcopy(value) for key, value in child.items() if key != "_h3_delivery_control_source"}
+            with patch.object(coordinator.journal, "commit_state", side_effect=OSError("disk failure")):
+                with self.assertRaises(OSError):
+                    checkpoint_recovery_job(child, expected_execution_attempt=1,
+                        h3_delivery_recovery_control=dict(child["h3_delivery_recovery_control"], charged=True))
+            self.assertEqual(source, old_source)
+            self.assertEqual({key: value for key, value in child.items() if key != "_h3_delivery_control_source"}, old_child)
+
+    def test_h3_adoption_queued_held_is_single_terminal_group_and_idempotent(self):
+        from services.job_lifecycle import adopt_completed_h3_delivery_job
+        from services.queue_recovery_runtime import recovery_unit_id
+        from services.queue_recovery_adapter import QueueRecoveryCoordinator
+        with tempfile.TemporaryDirectory() as directory:
+            source, child, coordinator = self._h3_registered_pair(directory)
+            proposals = []
+            def persist(proposal):
+                proposals.append(proposal)
+                coordinator.prospective_transition(proposal)
+            configure_durability_hook(persist)
+            settings = {"recovery_source_job_id": source["id"], "recovery_action": "retry_delivery", "recovery_intent_digest": "c" * 64}
+            unit = {"unit_id": recovery_unit_id(child["id"], "h3_delivery", settings=settings), "kind": "h3_delivery",
+                    "variant": 0, "index": 0, "state": "completed", "dependencies": [], "settings": settings,
+                    "artifacts": [{"basename": "one.mp4"}, {"basename": "two.mp4"}]}
+            self.assertTrue(checkpoint_recovery_job(child, recovery_unit=unit, recovery_cursor={"completed_units": [unit]}, queue_held=True))
+            proposals.clear()
+            with self.assertRaisesRegex(ValueError, "not durable"):
+                adopt_completed_h3_delivery_job(child, expected_execution_attempt=1, completed_unit=unit, output_files=["two.mp4", "one.mp4"])
+            self.assertTrue(adopt_completed_h3_delivery_job(child, expected_execution_attempt=1, completed_unit=unit, output_files=["one.mp4", "two.mp4"]))
+            self.assertEqual(len(proposals), 1)
+            self.assertEqual(len(proposals[0].jobs), 2)
+            self.assertEqual(child["status"], "completed")
+            self.assertEqual(child["resource_state"], "released")
+            self.assertFalse(child["queue_held"])
+            self.assertNotIn("started_at", child)
+            self.assertTrue(source["h3_delivery_recovery_control"]["consumed"])
+            events = job_events(child, 250)
+            self.assertTrue(adopt_completed_h3_delivery_job(child, expected_execution_attempt=1, completed_unit=unit, output_files=["one.mp4", "two.mp4"]))
+            self.assertEqual(len(proposals), 1)
+            self.assertEqual(job_events(child, 250), events)
+            restored = QueueRecoveryCoordinator(coordinator.journal).restore().jobs
+            self.assertEqual(restored[child["id"]]["status"], "completed")
+            self.assertTrue(restored[source["id"]]["h3_delivery_recovery_control"]["consumed"])
+            source["h3_delivery_recovery_control"]["completed_child_id"] = "d" * 32
+            with self.assertRaisesRegex(ValueError, "settled"):
+                adopt_completed_h3_delivery_job(child, expected_execution_attempt=1, completed_unit=unit, output_files=["one.mp4", "two.mp4"])
+
+    def test_h3_companion_copy_and_validation_precede_accounting(self):
+        from services.job_lifecycle import H3DeliveryControlCompanion
+        with tempfile.TemporaryDirectory() as directory:
+            source, child, coordinator = self._h3_registered_pair(directory)
+            configure_durability_hook(coordinator.prospective_transition)
+            self.assertTrue(try_start(child))
+            expected = dict(source["h3_delivery_recovery_control"])
+            companion = H3DeliveryControlCompanion(source, expected)
+            expected["active_child_id"] = "d" * 32
+            self.assertEqual(companion.expected_control["active_child_id"], child["id"])
+            callback = Mock()
+            configure_credit_settlement_callback(callback)
+            source["h3_delivery_recovery_control"]["active_child_id"] = "d" * 32
+            with self.assertRaisesRegex(ValueError, "identity"):
+                finish_job(child, "failed", recovery_control_companion=companion)
+            callback.assert_not_called()
+            self.assertEqual(child["status"], "running")
+
     def test_prompt_style_job_admits_once_and_releases_reserved_credit_on_failure(self):
         job = _consumed_credit_job("prompt-enhance-credit-failure")
         job.update({

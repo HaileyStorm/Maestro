@@ -311,12 +311,89 @@ class TestEditorProjectFoundation(unittest.TestCase):
                 items[0]["id"] = "unknown"
             with self.subTest(mode=mode), self.assertRaises(EditorProjectError):
                 apply_output_video_trim(sequence, invalid)
-        with self.assertRaisesRegex(EditorProjectError, "already"):
-            append_output_video_clip(sequence, output_name="second.mp4", output_revision="second", media=media)
+        with self.assertRaises(EditorProjectError):
+            append_output_video_clip(sequence, output_name="second.mp4", output_revision="changed", media=media)
         for index in range(6):
             sequence = append_output_video_clip(sequence, output_name=f"more-{index}.mp4", output_revision="revision", media=media)
         with self.assertRaisesRegex(EditorProjectError, "eight"):
             append_output_video_clip(sequence, output_name="overflow.mp4", output_revision="revision", media=media)
+
+    def test_shared_source_instances_keep_independent_trims_order_and_last_reference(self):
+        from services.editor_projects import add_output_audio_layer, add_output_image_layer
+        self._workspace("scene")
+        media = {"type": "video", "duration": 3, "width": 128, "height": 72, "fps": 24, "has_audio": True, "private": True}
+        first = create_output_video_timeline(workspace="scene", output_name="a.mp4", output_revision="a", media=media)
+        current = append_output_video_clip(first, output_name="b.mp4", output_revision="b", media=media)
+        current = append_output_video_clip(current, output_name="a.mp4", output_revision="a", media=media)
+        current = add_output_audio_layer(current, output_name="sound.wav", output_revision="audio", media={"type": "audio", "duration": 10, "has_audio": True})
+        current = add_output_image_layer(current, output_name="still.png", output_revision="image", media={"type": "image", "width": 16, "height": 8})
+        current["tracks"][2]["items"] = [{"id": "title", "text": "Kept", "start": 5, "duration": 1, "position": "top"}]
+        pairs = editor_sequence_clips(current)
+        self.assertEqual(len(current["assets"]), 4)
+        self.assertEqual(len({clip["id"] for _, clip in pairs}), 3)
+        self.assertEqual(pairs[0][1]["asset_id"], pairs[2][1]["asset_id"])
+        self.assertIsNot(pairs[0][1]["take_states"], pairs[2][1]["take_states"])
+        self.assertIsNot(pairs[0][1]["take_states"]["source-video"], pairs[2][1]["take_states"]["source-video"])
+        proposed = copy.deepcopy(current)
+        proposed["tracks"][0]["items"][0].update(source_in=0.25, duration=0.55)
+        proposed["tracks"][0]["items"][2].update(source_in=1.25, duration=0.75)
+        proposed["tracks"][0]["items"].reverse()
+        updated = apply_output_video_trim(current, proposed)
+        cuts = editor_sequence_clips(updated)
+        self.assertEqual([(asset["output_id"], clip["source_in"], clip["duration"], clip["start"]) for asset, clip in cuts],
+                         [("a.mp4", 1.25, 0.75, 0), ("b.mp4", 0, 3, 0.75), ("a.mp4", 0.25, 0.55, 3.75)])
+        self.assertEqual([clip["take_states"][clip["asset_id"]]["source_in"] for _, clip in cuts], [1.25, 0, 0.25])
+        self.assertEqual(current["tracks"][0]["items"][0]["source_in"], 0)
+        saved = save_editor_project(self.outputs, "scene", updated, expected_revision=0)
+        self.assertEqual(editor_sequence_clips(load_editor_project(self.outputs, "scene", saved["id"])), editor_sequence_clips(saved))
+        proposed = copy.deepcopy(saved); proposed["tracks"][0]["items"].pop(0)
+        remaining = apply_output_video_trim(saved, proposed)
+        self.assertIn("source-video", remaining["assets"])
+        self.assertEqual(editor_sequence_clips(remaining)[1][1]["source_in"], 0.25)
+        proposed = copy.deepcopy(remaining); proposed["tracks"][0]["items"].pop()
+        last = apply_output_video_trim(remaining, proposed)
+        self.assertNotIn("source-video", last["assets"])
+        self.assertEqual(last["opening_source"], first["opening_source"])
+        self.assertEqual(len(editor_sequence_clips(last)), 1)
+        self.assertEqual(last["tracks"][1:], saved["tracks"][1:])
+        self.assertEqual(last["assets"]["source-audio"], saved["assets"]["source-audio"])
+        self.assertEqual(last["assets"]["source-image"], saved["assets"]["source-image"])
+
+    def test_shared_source_reuse_requires_exact_identity_and_counts_clip_instances(self):
+        media = {"type": "video", "duration": 3, "width": 128, "height": 72, "fps": 24, "has_audio": True, "private": True}
+        first = create_output_video_timeline(workspace="scene", output_name="a.mp4", output_revision="a", media=media)
+        for field, value in (("duration", 4), ("width", 130), ("height", 74), ("fps", 30), ("has_audio", False), ("private", False), ("type", "audio")):
+            with self.subTest(field=field), self.assertRaises(EditorProjectError):
+                append_output_video_clip(first, output_name="a.mp4", output_revision="a", media={**media, field: value})
+        for field, value in (("origin", "project"), ("name", "renamed.mp4"), ("workspace", "foreign")):
+            broken = copy.deepcopy(first); broken["assets"]["source-video"][field] = value
+            with self.subTest(field=field), self.assertRaises(EditorProjectError):
+                append_output_video_clip(broken, output_name="a.mp4", output_revision="a", media=media)
+        with self.assertRaises(EditorProjectError):
+            append_output_video_clip(first, output_name="a.mp4", output_revision="new", media=media)
+        current = first
+        for _ in range(7):
+            current = append_output_video_clip(current, output_name="a.mp4", output_revision="a", media=media)
+        self.assertEqual((len(editor_sequence_clips(current)), len(current["assets"])), (8, 1))
+        with self.assertRaisesRegex(EditorProjectError, "eight"):
+            append_output_video_clip(current, output_name="a.mp4", output_revision="a", media=media)
+        for mode in ("unused", "dangling", "duplicate"):
+            broken = copy.deepcopy(current)
+            if mode == "unused": broken["assets"]["unused"] = dict(first["assets"]["source-video"], id="unused")
+            elif mode == "dangling": broken["tracks"][0]["items"][0]["asset_id"] = "missing"
+            else: broken["tracks"][0]["items"][1]["id"] = broken["tracks"][0]["items"][0]["id"]
+            with self.subTest(mode=mode), self.assertRaises(EditorProjectError): editor_sequence_clips(broken)
+        legacy = copy.deepcopy(first)
+        legacy["assets"]["separate-source"] = dict(first["assets"]["source-video"], id="separate-source")
+        clip = copy.deepcopy(first["tracks"][0]["items"][0])
+        clip.update(id="separate-clip", asset_id="separate-source", start=3,
+                    take_asset_ids=["separate-source"], take_states={"separate-source": {"source_in": 0, "speed": 1}})
+        legacy["tracks"][0]["items"].append(clip)
+        normalized = editor_project_service.normalize_editor_project(legacy, workspace="scene")
+        self.assertEqual([item["asset_id"] for _, item in editor_sequence_clips(normalized)], ["source-video", "separate-source"])
+        self.assertEqual(len(normalized["assets"]), 2)
+        with self.assertRaises(EditorProjectError):
+            append_output_video_clip(normalized, output_name="a.mp4", output_revision="a", media=media)
 
     def test_remove_original_and_appended_clips_preserves_anchor_layers_and_cas(self):
         from services.editor_projects import add_output_audio_layer, add_output_image_layer, editor_audio_layer, editor_image_layer, editor_text_layers

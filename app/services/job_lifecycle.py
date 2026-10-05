@@ -142,6 +142,8 @@ class DurableTransition:
     global_state: Mapping[str, Any] | None = None
     tombstones: tuple[str, ...] = ()
     request_manifests: Mapping[str, Mapping[str, Any]] | None = None
+    h3_control_predecessors: Mapping[str, Mapping[str, Any]] | None = None
+    h3_control_acknowledge: Callable[[], None] | None = None
 
 
 class CreditQueueTransitionConflict(ValueError):
@@ -219,9 +221,233 @@ def configure_credit_settlement_callback(
         _credit_settlement_callback = callback
 
 
+H3_DELIVERY_CHILD_KIND = "studio_h3_delivery_recovery"
+_H3_CONTROL_FIELD = "h3_delivery_recovery_control"
+_h3_control_operation = threading.local()
+
+
+def validated_h3_delivery_recovery_control(value):
+    if not isinstance(value, Mapping) or type(value.get("schema_version")) is not int or value.get("schema_version") != 1:
+        raise ValueError("H3 recovery control is invalid")
+    clean = deepcopy(dict(value))
+    role = clean.get("role")
+    keys = ({"schema_version", "role", "source_job_id", "action", "intent_digest", "charged"}
+            if role == "child" else {"schema_version", "role", "manual_retry_count", "manual_retry_limit",
+                "active_child_id", "active_action", "active_intent_digest", "last_charged_child_id",
+                "consumed", "completed_child_id", "completed_unit_id"})
+    if set(clean) != keys or role not in {"source", "child"}:
+        raise ValueError("H3 recovery control shape is invalid")
+    def identity(v):
+        return type(v) is str and bool(re.fullmatch(r"[0-9a-f]{32}", v))
+    def digest(v):
+        return type(v) is str and bool(re.fullmatch(r"[0-9a-f]{64}", v))
+    if role == "child":
+        valid = (type(clean["source_job_id"]) is str and bool(re.fullmatch(r"(?:[0-9a-f]{8}|[0-9a-f]{32})", clean["source_job_id"])) and clean["action"] in {"accept_native", "retry_delivery"}
+                 and digest(clean["intent_digest"]) and type(clean["charged"]) is bool
+                 and (clean["action"] == "retry_delivery" or not clean["charged"]))
+    else:
+        count, limit = clean["manual_retry_count"], clean["manual_retry_limit"]
+        active = clean["active_child_id"]
+        consumed = clean["consumed"]
+        valid = (type(count) is int and type(limit) is int and 0 <= count <= limit == 2
+                 and type(consumed) is bool
+                 and (clean["last_charged_child_id"] is None or identity(clean["last_charged_child_id"]))
+                 and ((count == 0) == (clean["last_charged_child_id"] is None))
+                 and ((active is None and clean["active_action"] is None and clean["active_intent_digest"] is None)
+                      or (identity(active) and clean["active_action"] in {"accept_native", "retry_delivery"}
+                          and digest(clean["active_intent_digest"])))
+                 and ((not consumed and clean["completed_child_id"] is None and clean["completed_unit_id"] is None)
+                      or (consumed and active is None and identity(clean["completed_child_id"])
+                          and type(clean["completed_unit_id"]) is str
+                          and bool(re.fullmatch(r"unit:v1:[0-9a-f]{64}", clean["completed_unit_id"])))))
+    if not valid:
+        raise ValueError("H3 recovery control values are invalid")
+    return clean
+
+
+@dataclass(frozen=True)
+class H3DeliveryControlCompanion:
+    source_job: MutableMapping[str, Any]
+    expected_control: Mapping[str, Any]
+
+    def __post_init__(self):
+        object.__setattr__(self, "expected_control", validated_h3_delivery_recovery_control(self.expected_control))
+
+
+def _h3_predecessor(job):
+    return {"status": job.get("status"), "execution_attempt": job.get("execution_attempt"),
+            _H3_CONTROL_FIELD: deepcopy(job.get(_H3_CONTROL_FIELD)),
+            "recovery_unit": deepcopy(job.get("recovery_unit")),
+            "completed_units": deepcopy((job.get("recovery_cursor") or {}).get("completed_units"))}
+
+
+def _h3_delivery_companion_unlocked(job, candidate, companion=None):
+    if job.get("kind") != H3_DELIVERY_CHILD_KIND:
+        if companion is not None:
+            raise ValueError("H3 companion requires a delivery child")
+        return None
+    context = getattr(_h3_control_operation, "current", None)
+    if context is not None and context["job"] is job:
+        source = context["source"]
+        base_child = context["child"] if context["acknowledged"] else job
+        base_source = context["parent"] if context["acknowledged"] else source
+        companion = H3DeliveryControlCompanion(source, base_source[_H3_CONTROL_FIELD])
+        candidate[_H3_CONTROL_FIELD] = deepcopy(base_child[_H3_CONTROL_FIELD])
+    elif companion is None:
+        source = job.get("_h3_delivery_control_source")
+        if not isinstance(source, MutableMapping):
+            if candidate.get(_H3_CONTROL_FIELD) == job.get(_H3_CONTROL_FIELD) and candidate.get("status") not in TERMINAL_STATUSES:
+                return None
+            raise ValueError("H3 delivery child has no bound source")
+        companion = H3DeliveryControlCompanion(source, source[_H3_CONTROL_FIELD])
+        base_child, base_source = job, source
+    else:
+        base_child, base_source = job, companion.source_job
+    source = companion.source_job
+    current = validated_h3_delivery_recovery_control(base_source.get(_H3_CONTROL_FIELD))
+    child = validated_h3_delivery_recovery_control(candidate.get(_H3_CONTROL_FIELD))
+    before = validated_h3_delivery_recovery_control(base_child.get(_H3_CONTROL_FIELD))
+    if (source is job or source.get("status") != "failed" or current != companion.expected_control
+        or child["role"] != "child" or current["role"] != "source"
+        or child["source_job_id"] != source.get("id") or job.get("parent_job_id") != source.get("id")
+        or job.get("workspace") != source.get("workspace")
+        or not job.get("_recovery_owner_digest") or not job.get("_recovery_project_digest")
+        or job.get("_recovery_owner_digest") != source.get("_recovery_owner_digest")
+        or job.get("_recovery_project_digest") != source.get("_recovery_project_digest")):
+        raise ValueError("H3 recovery companion identity changed")
+    if current["consumed"] and job.get("status") == "completed":
+        _validate_h3_completed_delivery_unlocked(job, job.get("recovery_unit"), job.get("output_files"))
+        if (current["completed_child_id"] != job.get("id") or current["completed_unit_id"] != job["recovery_unit"]["unit_id"]
+            or candidate.get(_H3_CONTROL_FIELD) != job.get(_H3_CONTROL_FIELD) or candidate.get("status") != "completed"
+            or candidate.get("output_files") != job.get("output_files")):
+            raise ValueError("H3 settled child control changed")
+        return None
+    if (source is job or source.get("status") != "failed" or current != companion.expected_control
+        or child["role"] != "child" or current["role"] != "source"
+        or child["source_job_id"] != source.get("id") or job.get("parent_job_id") != source.get("id")
+        or job.get("workspace") != source.get("workspace")
+        or job.get("_recovery_owner_digest") != source.get("_recovery_owner_digest")
+        or job.get("_recovery_project_digest") != source.get("_recovery_project_digest")
+        or child != dict(before, charged=child["charged"])
+        or current["consumed"] or current["active_child_id"] != job.get("id")
+        or current["active_action"] != child["action"] or current["active_intent_digest"] != child["intent_digest"]):
+        raise ValueError("H3 recovery companion identity changed")
+    parent = _copy_job_for_transition(base_source)
+    control = deepcopy(current)
+    if child["charged"] != before["charged"]:
+        if before["charged"] or child["action"] != "retry_delivery" or control["manual_retry_count"] >= control["manual_retry_limit"]:
+            raise ValueError("H3 recovery charge is invalid")
+        control["manual_retry_count"] += 1
+        control["last_charged_child_id"] = job["id"]
+    if candidate.get("status") in TERMINAL_STATUSES:
+        control.update(active_child_id=None, active_action=None, active_intent_digest=None)
+        if candidate.get("status") == "completed":
+            unit = candidate.get("recovery_unit")
+            _validate_h3_completed_delivery_unlocked(job, unit, candidate.get("output_files"))
+            control.update(consumed=True, completed_child_id=job["id"], completed_unit_id=unit["unit_id"])
+    parent[_H3_CONTROL_FIELD] = validated_h3_delivery_recovery_control(control)
+    return {"job": job, "source": source, "child": candidate, "parent": parent, "acknowledged": False,
+            "predecessors": {job["id"]: _h3_predecessor(base_child), source["id"]: _h3_predecessor(base_source)}}
+
+
+def _validate_h3_completed_delivery_unlocked(job, unit, output_files):
+    units = (job.get("recovery_cursor") or {}).get("completed_units") or []
+    if (job.get("kind") != H3_DELIVERY_CHILD_KIND or not isinstance(unit, Mapping)
+        or unit != job.get("recovery_unit") or unit not in units
+        or unit.get("kind") != "h3_delivery" or unit.get("state") != "completed"
+        or not unit.get("artifacts") or output_files != [a.get("basename") for a in unit["artifacts"]]):
+        raise ValueError("H3 completed delivery receipt is not durable")
+    child = validated_h3_delivery_recovery_control(job.get(_H3_CONTROL_FIELD))
+    settings = unit.get("settings") or {}
+    if (settings.get("recovery_source_job_id") != child["source_job_id"]
+        or settings.get("recovery_action") != child["action"]
+        or settings.get("recovery_intent_digest") != child["intent_digest"]):
+        raise ValueError("H3 completed delivery receipt linkage changed")
+
+
+def _persist_h3_companion_unlocked(name, job, candidate, prepared, *, global_state=None):
+    if prepared is None:
+        _persist_prospective_unlocked(name, jobs=(candidate,), global_state=global_state)
+        return
+    previous = getattr(_h3_control_operation, "current", None)
+    _h3_control_operation.current = prepared
+    try:
+        def acknowledge():
+            prepared["acknowledged"] = True
+        _persist_prospective_unlocked(name, jobs=(candidate, prepared["parent"]), global_state=global_state,
+                                     h3_control_predecessors=prepared["predecessors"], h3_control_acknowledge=acknowledge)
+        acknowledge()
+    finally:
+        _h3_control_operation.current = previous
+
+
+def _publish_h3_companion_unlocked(prepared):
+    if prepared is not None:
+        prepared["source"][_H3_CONTROL_FIELD] = deepcopy(prepared["parent"][_H3_CONTROL_FIELD])
+
+
+def register_h3_delivery_child(source, child, *, source_control, persist):
+    """Bind an unobservable queued child without executing its failed source."""
+    with _queue_condition, _lifecycle_lock:
+        control = validated_h3_delivery_recovery_control(source_control)
+        cc = validated_h3_delivery_recovery_control(child.get(_H3_CONTROL_FIELD))
+        if (source.get("status") != "failed" or source is child or control["consumed"] or control["active_child_id"] is not None
+            or child.get("kind") != H3_DELIVERY_CHILD_KIND or child.get("status") != "queued"
+            or not re.fullmatch(r"[0-9a-f]{32}", str(child.get("id") or ""))
+            or child.get("parent_job_id") != source.get("id") or cc["source_job_id"] != source.get("id") or cc["charged"]
+            or child.get("execution_attempt") != 1 or child.get("resource_state") != "queued"
+            or child.get("resource_intent") != "generation" or child.get("resource_execution") != "standard"
+            or child.get("preemption_mode") != "none"):
+            raise ValueError("H3 recovery child registration is invalid")
+        expected = deepcopy(source.get(_H3_CONTROL_FIELD))
+        if expected is not None and expected != control:
+            raise ValueError("H3 source control changed before registration")
+        parent = _copy_job_for_transition(source)
+        parent[_H3_CONTROL_FIELD] = dict(control, active_child_id=child["id"], active_action=cc["action"], active_intent_digest=cc["intent_digest"])
+        persist(parent, child, expected)
+        source[_H3_CONTROL_FIELD] = deepcopy(parent[_H3_CONTROL_FIELD])
+        child["_h3_delivery_control_source"] = source
+        _queue_condition.notify_all()
+
+
+def adopt_completed_h3_delivery_job(job, *, expected_execution_attempt, completed_unit,
+                                    output_files, recovery_control_companion=None, finish_operation=None):
+    with _queue_condition, _lifecycle_lock:
+        _validate_h3_completed_delivery_unlocked(job, completed_unit, output_files)
+        if not _valid_expected_execution_attempt(job, expected_execution_attempt) or is_cancel_requested(job):
+            return False
+        if job.get("status") == "completed":
+            source = (recovery_control_companion.source_job if recovery_control_companion is not None
+                      else job.get("_h3_delivery_control_source"))
+            control = validated_h3_delivery_recovery_control(source.get(_H3_CONTROL_FIELD) if isinstance(source, Mapping) else None)
+            child = validated_h3_delivery_recovery_control(job.get(_H3_CONTROL_FIELD))
+            if (source.get("status") != "failed" or child["source_job_id"] != source.get("id")
+                or job.get("parent_job_id") != source.get("id") or not control["consumed"]
+                or job.get("workspace") != source.get("workspace")
+                or not job.get("_recovery_owner_digest") or not job.get("_recovery_project_digest")
+                or job.get("_recovery_owner_digest") != source.get("_recovery_owner_digest")
+                or job.get("_recovery_project_digest") != source.get("_recovery_project_digest")
+                or control["completed_child_id"] != job.get("id") or control["completed_unit_id"] != completed_unit["unit_id"]
+                or job.get("output_files") != output_files or job.get("resource_state") != "released"
+                or job.get("queue_held") or control["active_child_id"] is not None
+                or job.get("resource_execution") != "standard" or job.get("preemption_mode") != "none"
+                or (child["charged"] and control["last_charged_child_id"] != job.get("id"))
+                or (job.get("credit_queue") is not None and _validated_credit_queue_metadata(job["credit_queue"])["reservation_state"] not in {"released", "settled"})):
+                raise ValueError("H3 settled delivery receipt changed")
+            return True
+        return (finish_operation or finish_job)(job, "completed", expected_execution_attempt=expected_execution_attempt,
+                          recovery_control_companion=recovery_control_companion,
+                          _h3_delivery_adoption_unit=completed_unit, output_files=output_files,
+                          queue_held=False, hold_after_output=False, recovery_state="terminal", reruns_denoise=False,
+                          progress=100, message="Done", error=None)
+
+
 def _copy_job_for_transition(job: Mapping[str, Any]) -> dict[str, Any]:
     try:
-        return deepcopy(dict(job))
+        result = deepcopy({key: value for key, value in job.items() if key != "_h3_delivery_control_source"})
+        if "_h3_delivery_control_source" in job:
+            result["_h3_delivery_control_source"] = job["_h3_delivery_control_source"]
+        return result
     except Exception:
         # Runtime-only values can be deliberately non-copyable. Copy ordinary
         # containers where lifecycle transitions mutate them and leave opaque
@@ -309,6 +535,8 @@ def _persist_prospective_unlocked(
     global_state: Mapping[str, Any] | None = None,
     tombstones: Iterable[str] = (),
     request_manifests: Mapping[str, Mapping[str, Any]] | None = None,
+    h3_control_predecessors=None,
+    h3_control_acknowledge=None,
 ) -> None:
     hook = _durability_hook
     if hook is None:
@@ -321,6 +549,8 @@ def _persist_prospective_unlocked(
         request_manifests=(
             None if request_manifests is None else dict(request_manifests)
         ),
+        h3_control_predecessors=h3_control_predecessors,
+        h3_control_acknowledge=h3_control_acknowledge,
     ))
 
 
@@ -2779,6 +3009,7 @@ def checkpoint_recovery_job(
     job: MutableMapping[str, Any],
     *,
     expected_execution_attempt: int | None = None,
+    recovery_control_companion=None,
     **updates: Any,
 ) -> bool:
     """Durably checkpoint recovery without reviving a terminal winner."""
@@ -2804,7 +3035,8 @@ def checkpoint_recovery_job(
             return False
         candidate = _copy_job_for_transition(job)
         candidate.update(updates)
-        _persist_prospective_unlocked("recovery_checkpoint", jobs=(candidate,))
+        prepared = _h3_delivery_companion_unlocked(job, candidate, recovery_control_companion)
+        _persist_h3_companion_unlocked("recovery_checkpoint", job, candidate, prepared)
         # A durability hook may synchronously deliver cancellation (tests and
         # adapters can re-enter through the RLock). Preserve that later winner
         # instead of publishing this older recovery candidate in memory.
@@ -2823,6 +3055,7 @@ def checkpoint_recovery_job(
         ):
             return False
         _publish_job_unlocked(job, candidate)
+        _publish_h3_companion_unlocked(prepared)
         _queue_condition.notify_all()
         return True
 
@@ -3826,6 +4059,7 @@ def request_cancel(
     job_id: str | None = None,
     active_states: MutableMapping[str, MutableMapping[str, Any]] | None = None,
     expected_resource_retry_attempt: int | None = None,
+    recovery_control_companion=None,
 ) -> CancelResult:
     """Atomically cancel lifecycle state and remove scheduler membership."""
     if (
@@ -3858,6 +4092,8 @@ def request_cancel(
         candidate["cancel_requested"] = True
         candidate["message"] = "Cancelled"
         candidate["status"] = "cancelled"
+        if job.get("kind") == H3_DELIVERY_CHILD_KIND:
+            _replace_job_outputs_unlocked(candidate, [])
         candidate["finished_at"] = time.time()
         candidate["plan_review_required"] = False
         candidate["plan_review_terms_required"] = False
@@ -3872,13 +4108,13 @@ def request_cancel(
         _append_job_event_unlocked(
             candidate, status="cancelled", message="Cancelled",
         )
+        prepared = _h3_delivery_companion_unlocked(job, candidate, recovery_control_companion)
         job[_TERMINAL_TRANSITION_MARKER] = True
         try:
             if not _apply_credit_terminal_settlement_unlocked(candidate):
                 _apply_credit_lifecycle_action_unlocked(candidate, "release")
-            _persist_prospective_unlocked(
-                "cancel",
-                jobs=(candidate,),
+            _persist_h3_companion_unlocked(
+                "cancel", job, candidate, prepared,
                 global_state=_global_state_unlocked(
                     replacements={id(job): candidate},
                 ),
@@ -3890,6 +4126,7 @@ def request_cancel(
         # wrappers re-enter lifecycle helpers from their interrupt hook; they
         # must observe cancellation, never the prior running state.
         _publish_job_unlocked(job, candidate)
+        _publish_h3_companion_unlocked(prepared)
         _queue_waiters.pop(id(job), None)
 
         abort_signalled = False
@@ -3919,6 +4156,8 @@ def finish_job(
     status: str,
     *,
     expected_execution_attempt: int | None = None,
+    recovery_control_companion=None,
+    _h3_delivery_adoption_unit=None,
     **updates: Any,
 ) -> bool:
     """Publish a completed/failed result unless cancellation already won."""
@@ -3937,6 +4176,8 @@ def finish_job(
             raise ValueError(
                 "Sample completion requires an execution attempt"
             )
+        if job.get("kind") == H3_DELIVERY_CHILD_KIND and job.get("status") in TERMINAL_STATUSES:
+            return False
         if is_cancel_requested(job):
             candidate = _copy_job_for_transition(job)
             candidate["status"] = "cancelled"
@@ -3949,13 +4190,13 @@ def finish_job(
                     else "released"
                 )
                 candidate["preemption_mode"] = PREEMPTION_MODE_NONE
+            prepared = _h3_delivery_companion_unlocked(job, candidate, recovery_control_companion)
             job[_TERMINAL_TRANSITION_MARKER] = True
             try:
                 if not _apply_credit_terminal_settlement_unlocked(candidate):
                     _apply_credit_lifecycle_action_unlocked(candidate, "release")
-                _persist_prospective_unlocked(
-                    "finish_cancelled",
-                    jobs=(candidate,),
+                _persist_h3_companion_unlocked(
+                    "finish_cancelled", job, candidate, prepared,
                     global_state=_global_state_unlocked(
                         replacements={id(job): candidate},
                     ),
@@ -3963,16 +4204,21 @@ def finish_job(
             finally:
                 job.pop(_TERMINAL_TRANSITION_MARKER, None)
             _publish_job_unlocked(job, candidate)
+            _publish_h3_companion_unlocked(prepared)
             _queue_waiters.pop(id(job), None)
             _queue_condition.notify_all()
             return False
         if (
-            job.get("status") != "running"
+            (job.get("status") != "running" and not (
+                _h3_delivery_adoption_unit is not None and job.get("status") == "queued"
+                and job.get("kind") == H3_DELIVERY_CHILD_KIND))
             or not _valid_expected_execution_attempt(
                 job, expected_execution_attempt,
             )
         ):
             return False
+        if _h3_delivery_adoption_unit is not None:
+            _validate_h3_completed_delivery_unlocked(job, _h3_delivery_adoption_unit, updates.get("output_files"))
         candidate = _copy_job_for_transition(job)
         replacement_outputs = updates.pop("output_files", None)
         if (
@@ -4004,13 +4250,13 @@ def finish_job(
             )
             candidate["preemption_mode"] = PREEMPTION_MODE_NONE
         _append_job_event_unlocked(candidate, status=status, **updates)
+        prepared = _h3_delivery_companion_unlocked(job, candidate, recovery_control_companion)
         job[_TERMINAL_TRANSITION_MARKER] = True
         try:
             if not _apply_credit_terminal_settlement_unlocked(candidate):
                 _apply_credit_lifecycle_action_unlocked(candidate, "release")
-            _persist_prospective_unlocked(
-                "finish",
-                jobs=(candidate,),
+            _persist_h3_companion_unlocked(
+                "finish", job, candidate, prepared,
                 global_state=_global_state_unlocked(
                     replacements={id(job): candidate},
                 ),
@@ -4018,6 +4264,7 @@ def finish_job(
         finally:
             job.pop(_TERMINAL_TRANSITION_MARKER, None)
         _publish_job_unlocked(job, candidate)
+        _publish_h3_companion_unlocked(prepared)
         _queue_waiters.pop(id(job), None)
         _queue_condition.notify_all()
         return True

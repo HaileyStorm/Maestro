@@ -122,15 +122,46 @@ test('keyboard reorder retains exact clip and asset identities and recalculates 
   assert.equal(moveClip(original, 'clip-c', 1), original)
 })
 
-test('append choices include only current revision-pinned same-project videos not already imported', () => {
+test('append choices include current shared sources with listing tokens and retain privacy and ownership checks', () => {
   const outputs = [
-    { name: 'a.mp4', workspace: 'scene', type: 'video', revision: 'current-a' },
+    { name: 'a.mp4', workspace: 'scene', type: 'video', revision: '18fe-1234.0-0', private: true },
     { name: 'private-adult.mp4', workspace: 'scene', type: 'video', revision: 'current-d', private: true, explicit: true },
     { name: 'foreign.mp4', workspace: 'another scene', type: 'video', revision: 'current-e' },
     { name: 'unpinned.mp4', workspace: 'scene', type: 'video', revision: '' },
     { name: 'image.png', workspace: 'scene', type: 'image', revision: 'current-f' },
   ]
-  assert.deepEqual(availableVideos(sequenceProject(), outputs), [outputs[1]])
+  assert.deepEqual(availableVideos(sequenceProject(), outputs), [outputs[0], outputs[1]])
+  assert.deepEqual(availableVideos(sequenceProject(), [{ ...outputs[0], private: false }]), [])
+  const ambiguous = sequenceProject()
+  ambiguous.assets.separate = { ...ambiguous.assets.a, id: 'separate' }
+  assert.deepEqual(availableVideos(ambiguous, [outputs[0]]), [])
+})
+
+test('shared source trims and take states stay independent through reorder and last-reference removal', () => {
+  const original = sequenceProject()
+  const first = original.tracks[0].items[0]
+  first.take_asset_ids = ['a']
+  first.take_states = { a: { source_in: 1, speed: 1 } }
+  original.tracks[0].items[2] = { ...first, id: 'clip-a-second', start: 7, source_in: 6, duration: 2,
+    take_states: { a: { source_in: 6, speed: 1 } } }
+  delete original.assets.c
+  const trimmed = changeTrim(original, 'clip-a-second', 7, 9)
+  assert.deepEqual(trimmed.tracks[0].items[0], first)
+  assert.deepEqual(trimmed.tracks[0].items[0].take_states, { a: { source_in: 1, speed: 1 } })
+  assert.deepEqual(trimmed.tracks[0].items[2].take_states, { a: { source_in: 7, speed: 1 } })
+  assert.deepEqual(original.tracks[0].items[2].take_states, { a: { source_in: 6, speed: 1 } })
+  const moved = moveClip(trimmed, 'clip-a-second', -1)
+  assert.deepEqual(moved.tracks[0].items.map(item => [item.id, item.asset_id, item.start]), [
+    ['clip-a', 'a', 0], ['clip-a-second', 'a', 3], ['clip-b', 'b', 5],
+  ])
+  const remaining = removeClip(moved, 'clip-a')
+  assert.equal(remaining.assets.a, original.assets.a)
+  assert.equal(remaining.tracks[0].items[0].source_in, 7)
+  assert.equal(remaining.tracks[1], original.tracks[1])
+  const last = removeClip(remaining, 'clip-a-second')
+  assert.equal(last.assets.a, undefined)
+  assert.deepEqual(last.tracks[0].items.map(item => item.id), ['clip-b'])
+  assert.equal(original.assets.a.duration, 10)
 })
 
 test('Editor export job IDs remain usable in Queue and job logs', () => {

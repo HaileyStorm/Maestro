@@ -433,6 +433,9 @@ class H3LegalAccessWiringTests(unittest.TestCase):
             ),
         }
         _load_launch_function(
+            self.launch, "_h3_cow_manual_source_supported", namespace,
+        )
+        _load_launch_function(
             self.launch, "_resume_recovered_job", namespace,
         )
         request = types.SimpleNamespace(

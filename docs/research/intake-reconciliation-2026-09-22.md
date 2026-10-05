@@ -135,7 +135,7 @@ checkpoint was installed.
 | Animation principles, storyboard/parkour boards, character reveals, kinetic typography, limited palettes, logos, tapestry, origami/page turns, sprites, ink/smoke, noir/foley, fake speedpaint | Adapt / benchmark leads as recorded per source | Craft/data guidance exists for some families. A named recipe does not prove local reproduction of a social example. Keep exact source/model/seed/style and visual/audio checks for each promoted recipe. |
 | Mayz, Kōda, Shams, Dave, Renataro, Naoneko, TechHalla, Andrew, lepadphone, PhotogenicWeekE, airina, ailker and Kashiko examples | Preserve source-specific decisions | All URLs remain in the appendix/original tables; missing post bodies/comments remain evidence gaps. Hosted Seedance/Magnific/Hailuo/Vidu/PixVerse examples are not local executors. |
 | MiniMax Design desktop / Lazy Frames / OpenMontage / Director Cut Studio | Adapt ideas; reject wholesale runtime | Grow existing Director/Reference rather than import another project store, queue or agent canvas. |
-| Remotion + Blender-MCP composition | Adopt neutral composition capability, unfinished | Typed Blender facade exists for primitives/materials/keyframes/rendering. A shared sealed composition package and 2D renderer are not delivered. Camera/light/physics extensions need their own contract. |
+| Remotion + Blender-MCP composition | Adopt neutral composition capability, unfinished | Typed Blender facade exists for primitives/materials/keyframes/rendering. The Editor has a CPU 2D sequence renderer; repeated immutable video sources now have independent clip identities, trims and ordering, with source/privacy checks and real-media tests. Integrated append/export routes and recovery tests pass; signed-in live browser acceptance remains pending. A shared composition package across Editor and Blender is still unfinished. Camera/light/physics extensions need their own contract. |
 | Diffusion Studio / Revideo / Motion Canvas / Twick / Friction / CozyClay | Reference or benchmark; reject duplicate application dependency | Native Editor/composition can reuse ideas after project/output/resource review. Friction licensing and unresolved Rendave identity remain explicit constraints. |
 | Prompt Intelligence / known-character index | Adapt / extract | Role-dialogue ablation and local evaluation-schema ideas; no downloaded character library or blanket prompt rule. Sources remain in the August 25 record. |
 | kimodo.cpp / NKD VFX and Preview Tools | Watch / adapt respectively | CPU/Vulkan SMPL-X-to-Blender candidate; NKD face-rig/timeline/mask/camera/depth techniques. No imported tool suite or accepted runtime. |
@@ -321,8 +321,9 @@ native bytes. Completed sealed delivery adopts its finished bytes without
 requiring already-consumed references. Per-output outcomes survive publication,
 and strict transaction-owned voice remux cannot create a Gallery sibling.
 Legacy ordinary remux retains its existing behavior. Grain and voice jobs keep
-the manual-recoverable native-move route; manual copy-on-write recovery still
-needs a separate publication-intent implementation. CPU regression evidence
+the manual-recoverable native-move route. At that finishing checkpoint, manual
+copy-on-write recovery still needed a separate publication-intent implementation;
+the subsequent bounded recovery update is recorded below. CPU regression evidence
 does not establish native GPU finishing, Windows behavior, signed-in Gallery
 viewing or owner acceptance.
 
@@ -596,3 +597,41 @@ exited and the exact grant was withdrawn. See the
 These checks do not close full-resolution quality, the retained opening fade,
 manual copy-on-write recovery, owner resource-unload acceptance, Music3 consent
 and first-song acceptance, YuE2 listening/duration fidelity, or Windows gates.
+
+## 2026-10-05 manual recovery and repeated Editor sources
+
+The subsequent Studio H3 recovery implementation gives each eligible manual
+action a separate queued child with its own sealed publication intent. The
+failed source job and producer media remain intact. Retry accounting occurs
+once after admission and source verification; accepting the retained original
+does not use a retry. Completed publication, cancellation, restart adoption,
+and stale source metadata are fenced through the durable source/child pair.
+The corrected candidate passed 353 tests across the four affected suites,
+including actual parent/child materialization and fresh-journal charge/adoption.
+Independent review closed the restart metadata finding. The integrated full
+backend gate then passed all 5,859 tests with 17 existing skips on the selected
+Python 3.11 RTX 50 runtime, with all frozen inputs unchanged. The first full
+run exposed one independent legal-access fixture missing the real source
+predicate; loading that helper repaired the fixture without changing its
+assertions. The corrected file's 16 tests and the complete rerun passed.
+Grain, voice replacement, Director and cumulative variants retain their
+existing recovery paths and are outside this bounded implementation.
+
+A separate fresh-grant qualification on that runtime restored private H3
+continuation across two processes with different Python hash seeds. Runtime
+binding payloads matched and both retained latent prefixes remained byte
+identical as the clip grew from 56 to 73 frames. Both 320×192 / 24 fps HEVC/AAC
+outputs passed full CPU audio/video decoding with unchanged file hashes. Both
+workers exited and the exact lease was withdrawn. This establishes the
+selected runtime's bounded continuation execution; it does not establish live
+manual-recovery queue acceptance, opening-fade quality or human acceptance.
+
+The Editor now represents repeated uses of one authorized immutable source as
+independent clips. Each clip keeps its own trim, sequence position and take
+state; removing one use retains the shared source while another use remains.
+The eight-clip limit counts clip instances. CPU media and real-journal tests
+verify ordered ranges, source authority and privacy without changing originals.
+All 811 UI tests, the type-check/build and 16 mounted synthetic Editor browser
+checks passed on unchanged sources. All 29 integrated append/export route tests
+passed. The signed-in live trim/reorder/export flow remains pending; these checks do not establish a
+shared Editor/Blender composition package or owner acceptance.

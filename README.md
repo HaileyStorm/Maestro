@@ -72,6 +72,14 @@ separate adjustable model surface. The server validates the exact model, assets,
 and compatibility matrix and remains authoritative over stale client settings. Maestro does
 not expose First Block Cache as a public H3 control.
 
+If an eligible Studio H3 delivery pass fails, **Use saved result** publishes the
+retained original and **Retry delivery only** queues another delivery attempt
+without generating the clip again. Recovery creates a separate job and keeps
+the failed job and original media intact. At most two delivery retries may run;
+using the saved original does not use a retry. This retained-original path
+covers jobs without grain or voice replacement. Director, cumulative variants,
+and optional finishing keep their existing recovery paths.
+
 The H3 visual-style workflow selector includes official MiniMax workflow identities such as
 papercraft stop-motion, paper collage, product ads, music-video typography, and stylized 3D
 shorts. Generate and Director send only an exact workflow ID; Maestro resolves its
@@ -119,6 +127,12 @@ Three theme families, each with a dark and a light variant, switchable in Settin
 - **Onyx** — minimalist monochrome, pure black with neutral grey surfaces; white and grey in daylight
 
 Appearance mode is **Dark / Light / Auto** — Auto follows your system's appearance and switches live when it changes.
+
+### 🎞️ Editor
+Open a video from its Gallery actions to make a non-destructive cut. Add up to
+eight clips, including multiple uses of the same video. Each clip has its own
+trim and position; removing one use keeps the other uses and the original video.
+Save the draft, then export a separate finished video to the same project.
 
 ### 🛠️ Edit Mode
 - **Retake** — re-roll a section of an existing video with a new prompt

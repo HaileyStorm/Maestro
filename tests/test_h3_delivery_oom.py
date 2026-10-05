@@ -18,7 +18,7 @@ import unittest
 import uuid
 from pathlib import Path
 from types import SimpleNamespace, ModuleType
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,7 +51,7 @@ def _load_launch_symbols(*names: str, namespace: dict | None = None) -> dict:
     wanted = set(names) | {
         "_h3_delivery_finishing_identity", "_validate_h3_delivery_finishing",
         "_build_h3_delivery_finishing", "_apply_h3_delivery_finishing",
-        "_validate_h3_recovery_finishing",
+        "_validate_h3_recovery_finishing", "_h3_cow_manual_source_supported", "_h3_cow_child_settings",
     }
     nodes = [
         node for node in tree.body
@@ -1736,6 +1736,364 @@ class H3DeliveryTransactionTests(unittest.TestCase):
                 {"step": "delivery_fit", "outcome": "applied"},
             ])
         self.assertFalse(hasattr(symbols["wgp"], "generate_video"))
+
+class H3ManualCOWChildTests(unittest.TestCase):
+    def setUp(self):
+        from services.job_lifecycle import _reset_queue_state_for_tests
+        _reset_queue_state_for_tests()
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        from services.job_lifecycle import configure_durability_hook
+        self.addCleanup(lambda: configure_durability_hook(None))
+
+    def _prepare(self, action="retry_delivery", *, register_child=True, source_updates=None):
+        import copy
+        from contextlib import nullcontext
+        from services import job_lifecycle as lifecycle
+        from services.queue_recovery import QueueRecoveryJournal
+        from services.queue_recovery_adapter import QueueRecoveryCoordinator, owner_principal_digest, project_instance_digest
+        from services.queue_recovery_runtime import load_request_manifest, write_sealed_request_manifest
+        owner = owner_principal_digest(b"h3-cow-child-test-secret", "owner-session")
+        project = project_instance_digest(b"h3-cow-child-test-secret", "a" * 32)
+        source = {"id": "aaaaaaaa", "status": "failed", "execution_attempt": 1, "workspace": "project-a", "out_dir": str(self.root),
+                  "session_id": "owner-session", "access_policy": {"private": True, "explicit": False}, "private": True,
+                  "params": {"model_type": "minimax_h3_video"}, "output_files": [],
+                  "_recovery_owner_digest": owner, "_recovery_project_digest": project}
+        source.update(source_updates or {})
+        self.native = self.root / "native.mp4"
+        self.native.write_bytes(b"native-bytes")
+        parent_unit = recovery_unit_id(source["id"], "ordinary_repeat")
+        meta = dict(_sidecar(self.native.name), job_id=source["id"], producer_unit_id=parent_unit,
+                    producer_unit_kind="ordinary_repeat", producer_unit_variant=0, producer_unit_index=0,
+                    producer_unit_dependencies=[], producer_media_size=self.native.stat().st_size,
+                    producer_media_sha256=sha256_file(self.native)[1])
+        self.meta = self.root / "native.meta.json"
+        self.meta.write_text(json.dumps(meta))
+        self.original = self.native.read_bytes(), self.meta.read_bytes()
+        descriptor = artifact_descriptor(self.root, basename=self.native.name, sidecar_basename=self.meta.name, producer_unit_id=parent_unit)
+        settings = {"publication_schema": 2, "native_hashes": [descriptor["sha256"]], "delivery_resolution": "1920x1080",
+                    "delivery_fit": "upscale_exact", "spatial_upsampling": "flashvsr3"}
+        source_unit = recovery_unit_id(source["id"], "h3_delivery", dependencies=[parent_unit], settings=settings)
+        source["recovery_cursor"] = {"delivery_pending": {"publication_schema": 2, "state": "staging_native", "unit_id": source_unit,
+            "settings": settings, "dependencies": [parent_unit], "staging": [{"source": descriptor}]}}
+        coordinator = QueueRecoveryCoordinator(QueueRecoveryJournal(self.root / "queue.json"))
+        source["_recovery_manifest_pointer"] = write_sealed_request_manifest(self.root, job_id=source["id"], params=source["params"], inputs=[])
+        coordinator.register_job(source, owner_digest=owner, project_digest=project, request_manifest=source["_recovery_manifest_pointer"])
+        class Registry(dict):
+            def prepare(self, job):
+                job.setdefault("queue_held", False)
+                return job
+            def publish_prepared(self, job_id, job):
+                self[job_id] = job
+        jobs = Registry({source["id"]: source})
+        passes = []
+        def transform(path, method, **kwargs):
+            passes.append((method, Path(path).read_bytes()))
+            Path(path).write_bytes(Path(path).read_bytes() + b"-" + method.encode())
+        symbols = _load_launch_symbols(
+            "_h3_cow_source_control", "_h3_cow_source_evidence", "_h3_cow_child_plan", "_verify_h3_cow_child", "_h3_cow_completed_unit",
+            "_new_h3_delivery_recovery_job", "_run_h3_cow_delivery_child", "_finish_h3_cow_child", "_cleanup_h3_cow_child",
+            "_schedule_h3_delivery_recovery", "_h3_delivery_recovery_state", "_h3_delivery_native_available",
+            "_queue_recovery_materialize_job",
+            "_queue_recovery_delivery_pending", "_queue_recovery_checkpoint_delivery_pending", "_queue_recovery_validate_delivery_parents",
+            "_queue_recovery_checkpoint_delivery_publication", "_queue_recovery_reconcile_delivery_publication",
+            "_queue_recovery_checkpoint_delivery_completed", "_queue_recovery_completed_delivery_sidecar", "_queue_recovery_checkpoint_unit",
+            "_stage_h3_delivery_native_outputs_v2", "_queue_recovery_restore_delivery_staged", "_reset_h3_delivery_work",
+            "_atomic_create_json", "_atomic_write_json", "_atomic_write_bytes", "_publish_h3_delivery_outputs",
+            "_process_h3_delivery_from_protected_native", "_rollback_h3_delivery_publication", "_finalize_h3_delivery_publication", "_H3DeliveryFailure",
+            namespace={"copy": copy, "hmac": hmac, "re": re, "logging": logging, "Request": object,
+                "_jobs": jobs, "_gen_lock": threading.Lock(), "generation_slot": lifecycle.generation_slot,
+                "_WgpNativeGpuExecutionSlot": lambda acquired: nullcontext(), "register_abort_state": lifecycle.register_abort_state,
+                "unregister_abort_state": lifecycle.unregister_abort_state, "_active_gen_states": {},
+                "try_start": lifecycle.try_start, "request_cancel": lifecycle.request_cancel, "is_cancel_requested": lifecycle.is_cancel_requested,
+                "finish_job": lifecycle.finish_job, "update_job": lifecycle.update_job,
+                "adopt_completed_h3_delivery_job": lifecycle.adopt_completed_h3_delivery_job,
+                "validated_h3_delivery_recovery_control": lifecycle.validated_h3_delivery_recovery_control,
+                "_queue_recovery_checkpoint": lifecycle.checkpoint_recovery_job,
+                "_queue_recovery_units": lambda job: list((job.get("recovery_cursor") or {}).get("completed_units") or []),
+                "_queue_recovery_project_identity": lambda workspace, path: project,
+                "load_request_manifest": load_request_manifest, "recovery_unit_id": recovery_unit_id,
+                "validate_artifact_descriptor": validate_artifact_descriptor, "_recovery_artifact_descriptor": artifact_descriptor,
+                "_protected_recovery_artifact_descriptor": protected_artifact_descriptor,
+                "validate_protected_artifact_descriptor": validate_protected_artifact_descriptor,
+                "replay_delivery_from_protected_native": replay_delivery_from_protected_native,
+                "_release_h3_delivery_vram": lambda: [], "_apply_spatial_upsampling_to_file": transform,
+                "_apply_delivery_fit_to_file": lambda path, resolution, fit, **kw: transform(path, fit, **kw),
+                "_h3_final_output_integrity": lambda *args, **kw: {"validation": "valid"},
+                "_safe_failure_updates": lambda error, job, **kw: {"error": str(error)},
+                "_sample_campaign_transition_lock": threading.RLock(), "_SAMPLE_CAMPAIGN_JOB_KIND": "sample_campaign_generation",
+                "_begin_workspace_operation": Mock(), "_end_workspace_operation": Mock(), "wgp": SimpleNamespace(get_video_info=lambda path: (1, 640, 360, 24)),})
+        child = symbols["_new_h3_delivery_recovery_job"](source, action)
+        child["_recovery_manifest_pointer"] = write_sealed_request_manifest(self.root, job_id=child["id"], params=child["params"], inputs=[])
+        if register_child:
+            lifecycle.register_h3_delivery_child(source, child, source_control=symbols["_h3_cow_source_control"](source),
+                persist=lambda parent, prepared, old: coordinator.register_h3_delivery_child_atomic(parent, prepared,
+                    owner_digest=owner, project_digest=project, request_manifest=child["_recovery_manifest_pointer"], expected_control=old))
+            jobs[child["id"]] = child
+        lifecycle.configure_durability_hook(coordinator.prospective_transition)
+        return symbols, source, child, coordinator, passes
+
+    def test_manual_cow_actions_publish_sealed_child_and_preserve_source(self):
+        from services.job_lifecycle import configure_durability_hook
+        for action in ("retry_delivery", "accept_native"):
+            with self.subTest(action=action):
+                # Separate publication names and durable journals for each action.
+                directory = self.root / action
+                directory.mkdir()
+                original_root, self.root = self.root, directory
+                symbols, source, child, coordinator, passes = self._prepare(action)
+                symbols["_run_h3_cow_delivery_child"](child["id"])
+                self.assertEqual(child["status"], "completed", child.get("error"))
+                self.assertEqual(source["status"], "failed")
+                self.assertEqual(source["h3_delivery_recovery_control"]["manual_retry_count"], int(action == "retry_delivery"))
+                self.assertTrue(source["h3_delivery_recovery_control"]["consumed"])
+                self.assertEqual((self.native.read_bytes(), self.meta.read_bytes()), self.original)
+                expected = b"native-bytes-flashvsr3-upscale_exact" if action == "retry_delivery" else b"native-bytes"
+                final = self.root / child["output_files"][0]
+                self.assertEqual(final.read_bytes(), expected)
+                descriptor = child["recovery_unit"]["artifacts"][0]
+                self.assertTrue(validate_artifact_descriptor(self.root, descriptor, producer_unit_id=child["recovery_unit"]["unit_id"]))
+                receipt = json.loads((self.root / descriptor["sidecar_basename"]).read_text())
+                self.assertEqual(receipt["job_id"], source["id"])
+                self.assertEqual(receipt["recovery_job_id"], child["id"])
+                self.assertEqual(receipt["delivery_recovery"]["action"], action)
+                self.assertEqual(len(passes), 2 if action == "retry_delivery" else 0)
+                self.assertNotIn("delivery_pending", child["recovery_cursor"])
+                symbols["_begin_workspace_operation"].assert_called_once_with(source["workspace"])
+                symbols["_end_workspace_operation"].assert_called_once_with(source["workspace"])
+                configure_durability_hook(None)
+                self.root = original_root
+
+    def test_failed_worker_attachment_retains_one_durable_held_child_and_source_link(self):
+        import asyncio
+        from services import job_lifecycle as lifecycle
+        from services.queue_recovery_adapter import QueueRecoveryCoordinator
+        from services.queue_recovery_runtime import write_sealed_request_manifest
+        symbols, source, unused, coordinator, passes = self._prepare(register_child=False)
+        class Denied(Exception):
+            def __init__(self, *, status_code, detail):
+                self.status_code = status_code
+                super().__init__(detail)
+        class Thread:
+            def __init__(self, **kwargs):
+                pass
+            def start(self):
+                raise RuntimeError("worker attachment failed")
+        request = SimpleNamespace(json=AsyncMock(return_value={"workspace": source["workspace"], "capability": "accepted"}))
+        symbols.update(HTTPException=Denied, _h3_delivery_recovery_lock=threading.RLock(),
+            _require_h3_delivery_recovery_job=lambda *args: source,
+            _h3_delivery_recovery_token=lambda *args: "accepted", _begin_workspace_operation=Mock(),
+            _queue_recovery_coordinator=coordinator, write_sealed_request_manifest=write_sealed_request_manifest,
+            register_h3_delivery_child=lifecycle.register_h3_delivery_child, threading=SimpleNamespace(Thread=Thread))
+        self.assertIsNotNone(symbols["_h3_delivery_recovery_state"](source))
+        with self.assertRaises(Denied) as failure:
+            asyncio.run(symbols["_schedule_h3_delivery_recovery"](source["id"], "retry_delivery", request))
+        self.assertEqual(failure.exception.status_code, 503)
+        restored = QueueRecoveryCoordinator(coordinator.journal).restore().jobs
+        self.assertEqual(len(restored), 2)
+        control = restored[source["id"]]["h3_delivery_recovery_control"]
+        child = restored[control["active_child_id"]]
+        self.assertEqual(child["status"], "queued")
+        self.assertTrue(child["queue_held"])
+        self.assertEqual(child["recovery_state"], "blocked")
+        self.assertEqual(child["execution_attempt"], 1)
+        self.assertEqual(child["resource_intent"], "generation")
+        self.assertEqual(control["manual_retry_count"], 0)
+        self.assertFalse(control["consumed"])
+        self.assertEqual(source["h3_delivery_recovery_control"], control)
+        self.assertEqual((self.native.read_bytes(), self.meta.read_bytes()), self.original)
+        self.assertEqual(passes, [])
+        with self.assertRaises(Denied) as duplicate:
+            asyncio.run(symbols["_schedule_h3_delivery_recovery"](source["id"], "retry_delivery", request))
+        self.assertEqual(duplicate.exception.status_code, 404)
+        self.assertEqual(QueueRecoveryCoordinator(coordinator.journal).restore().jobs, restored)
+
+    def test_retained_cow_director_and_cumulative_sources_offer_no_manual_child(self):
+        from services.job_lifecycle import configure_durability_hook
+        for marker in ("_director_final_video_postprocess", "_h3_cumulative_append"):
+            with self.subTest(marker=marker):
+                directory = self.root / marker
+                directory.mkdir()
+                original_root, self.root = self.root, directory
+                symbols, source, child, coordinator, passes = self._prepare()
+                source["params"][marker] = True
+                self.assertIsNone(symbols["_h3_delivery_recovery_state"](source))
+                with self.assertRaises(QueueRecoveryRuntimeError):
+                    symbols["_new_h3_delivery_recovery_job"](source, "retry_delivery")
+                symbols["_run_h3_cow_delivery_child"](child["id"])
+                self.assertTrue(child["queue_held"])
+                self.assertEqual(source["h3_delivery_recovery_control"]["manual_retry_count"], 0)
+                self.assertFalse(source["h3_delivery_recovery_control"]["consumed"])
+                self.assertEqual(passes, [])
+                self.assertEqual((self.native.read_bytes(), self.meta.read_bytes()), self.original)
+                configure_durability_hook(None)
+                self.root = original_root
+
+    def test_changed_source_blocks_child_before_charge_or_any_pass(self):
+        symbols, source, child, coordinator, passes = self._prepare()
+        self.native.write_bytes(b"changed-native")
+        symbols["_run_h3_cow_delivery_child"](child["id"])
+        self.assertEqual(child["status"], "queued")
+        self.assertTrue(child["queue_held"])
+        self.assertFalse(child["h3_delivery_recovery_control"]["charged"])
+        self.assertEqual(source["h3_delivery_recovery_control"]["manual_retry_count"], 0)
+        self.assertFalse(source["h3_delivery_recovery_control"]["consumed"])
+        self.assertEqual(passes, [])
+        self.assertEqual(list(self.root.glob("h3-delivery-*.mp4")), [])
+
+    def _materialize_pair(self, symbols, source, child, coordinator):
+        from services import job_lifecycle as lifecycle
+        from services.queue_recovery_adapter import QueueRecoveryCoordinator, serialize_job
+        lifecycle.configure_durability_hook(None)
+        restarted = QueueRecoveryCoordinator(coordinator.journal)
+        snapshots = restarted.restore().jobs
+        projects = {source["workspace"]: (str(self.root), source["_recovery_project_digest"])}
+        restored_source, source_resume = symbols["_queue_recovery_materialize_job"](snapshots[source["id"]], projects)
+        restored_child, child_resume = symbols["_queue_recovery_materialize_job"](snapshots[child["id"]], projects)
+        self.assertFalse(source_resume)
+        self.assertTrue(child_resume)
+        self.assertEqual(serialize_job(restored_source, owner_digest=source["_recovery_owner_digest"],
+            project_digest=source["_recovery_project_digest"], request_manifest=source["_recovery_manifest_pointer"]), snapshots[source["id"]])
+        symbols["_jobs"].update({restored_source["id"]: restored_source, restored_child["id"]: restored_child})
+        lifecycle.configure_durability_hook(restarted.prospective_transition)
+        # Startup checkpoints interrupted children, while already-failed parents
+        # retain their original durable receipt.
+        self.assertTrue(lifecycle.checkpoint_recovery_job(restored_child))
+        restored_child["_h3_delivery_control_source"] = restored_source
+        return restored_source, restored_child, restarted
+
+    def test_restored_failed_parent_and_queued_child_charge_without_metadata_loss(self):
+        from services.queue_recovery_adapter import QueueRecoveryCoordinator
+        metadata = {"error": "delivery failed", "message": "retained producer failure", "queue_held": False,
+                    "reruns_denoise": True, "recovery_state": "terminal"}
+        symbols, source, child, coordinator, passes = self._prepare(source_updates=metadata)
+        source, child, restarted = self._materialize_pair(symbols, source, child, coordinator)
+        symbols["_run_h3_cow_delivery_child"](child["id"])
+        self.assertEqual(child["status"], "completed", child.get("error"))
+        durable = QueueRecoveryCoordinator(restarted.journal).restore().jobs
+        self.assertEqual(durable[child["id"]]["status"], "completed")
+        self.assertEqual(durable[source["id"]]["status"], "failed")
+        for key, value in metadata.items():
+            if key != "error":
+                self.assertEqual(durable[source["id"]][key], value)
+        self.assertNotIn("error", source)
+        self.assertEqual(durable[source["id"]]["h3_delivery_recovery_control"]["manual_retry_count"], 1)
+        self.assertTrue(durable[source["id"]]["h3_delivery_recovery_control"]["consumed"])
+        self.assertEqual(len(passes), 2)
+        self.assertEqual((self.native.read_bytes(), self.meta.read_bytes()), self.original)
+
+    def test_crash_after_seal_adopts_held_child_without_native_or_second_charge(self):
+        from services import job_lifecycle as lifecycle
+        from services.queue_recovery_adapter import QueueRecoveryCoordinator
+        metadata = {"error": "delivery failed", "message": "retained producer failure", "queue_held": False,
+                    "reruns_denoise": True, "recovery_state": "terminal"}
+        symbols, source, child, coordinator, passes = self._prepare(source_updates=metadata)
+        def persist(proposal):
+            coordinator.prospective_transition(proposal)
+            if proposal.name == "recovery_checkpoint" and any((job.get("recovery_unit") or {}).get("kind") == "h3_delivery" for job in proposal.jobs):
+                raise SystemExit("simulated process crash after seal acknowledgement")
+        lifecycle.configure_durability_hook(None)
+        lifecycle.configure_durability_hook(persist)
+        with self.assertRaises(SystemExit):
+            symbols["_run_h3_cow_delivery_child"](child["id"])
+        source, child, restarted = self._materialize_pair(symbols, source, child, coordinator)
+        self.assertEqual(child["status"], "queued")
+        self.assertEqual(source["h3_delivery_recovery_control"]["manual_retry_count"], 1)
+        unit = child["recovery_unit"]
+        sidecar_path = self.root / unit["artifacts"][0]["sidecar_basename"]
+        sealed_bytes = sidecar_path.read_bytes()
+        lifecycle.configure_durability_hook(restarted.prospective_transition)
+        self.assertTrue(lifecycle.checkpoint_recovery_job(child, status="queued", queue_held=True, resource_state="queued"))
+        for hidden in self.root.glob(".maestro-delivery-*"):
+            hidden.unlink()
+        self.native.unlink()
+        passes.clear()
+        symbols["_run_h3_cow_delivery_child"](child["id"])
+        self.assertEqual(child["status"], "completed", child.get("error"))
+        self.assertTrue(source["h3_delivery_recovery_control"]["consumed"])
+        self.assertEqual(source["h3_delivery_recovery_control"]["manual_retry_count"], 1)
+        self.assertEqual(passes, [])
+        self.assertEqual(sidecar_path.read_bytes(), sealed_bytes)
+        self.assertTrue(validate_artifact_descriptor(self.root, unit["artifacts"][0], producer_unit_id=unit["unit_id"]))
+        durable = QueueRecoveryCoordinator(restarted.journal).restore().jobs
+        self.assertEqual(durable[child["id"]]["status"], "completed")
+        self.assertEqual(durable[source["id"]]["status"], "failed")
+        for key, value in metadata.items():
+            if key != "error":
+                self.assertEqual(durable[source["id"]][key], value)
+        self.assertNotIn("error", source)
+        self.assertEqual(durable[source["id"]]["h3_delivery_recovery_control"]["manual_retry_count"], 1)
+
+    def test_cancel_after_publication_seal_retracts_child_and_preserves_source(self):
+        from services import job_lifecycle as lifecycle
+        from services.queue_recovery_adapter import QueueRecoveryCoordinator
+        symbols, source, child, coordinator, passes = self._prepare()
+        won = []
+        def persist(proposal):
+            coordinator.prospective_transition(proposal)
+            if not won and any((job.get("recovery_unit") or {}).get("state") == "completed" for job in proposal.jobs):
+                won.append(lifecycle.request_cancel(child, job_id=child["id"], active_states=symbols["_active_gen_states"]))
+        lifecycle.configure_durability_hook(None)
+        lifecycle.configure_durability_hook(persist)
+        symbols["_run_h3_cow_delivery_child"](child["id"])
+        self.assertTrue(won[0].changed)
+        self.assertEqual(child["status"], "cancelled")
+        self.assertEqual(child["output_files"], [])
+        self.assertEqual((self.native.read_bytes(), self.meta.read_bytes()), self.original)
+        self.assertEqual(list(self.root.glob("h3-delivery-*.mp4")), [])
+        self.assertFalse(source["h3_delivery_recovery_control"]["consumed"])
+        self.assertIsNone(source["h3_delivery_recovery_control"]["active_child_id"])
+        self.assertEqual(source["h3_delivery_recovery_control"]["manual_retry_count"], 1)
+        restored = QueueRecoveryCoordinator(coordinator.journal).restore().jobs
+        self.assertEqual(restored[child["id"]]["status"], "cancelled")
+        self.assertEqual(restored[source["id"]]["h3_delivery_recovery_control"], source["h3_delivery_recovery_control"])
+        self.assertFalse(lifecycle.finish_job(child, "completed", expected_execution_attempt=1))
+        self.assertEqual(QueueRecoveryCoordinator(coordinator.journal).restore().jobs, restored)
+
+    def test_resealed_completed_bytes_cannot_replace_frozen_child_delivery_settings(self):
+        import copy
+        symbols, source, child, coordinator, passes = self._prepare("accept_native")
+        symbols["_run_h3_cow_delivery_child"](child["id"])
+        unit = copy.deepcopy(child["recovery_unit"])
+        unit["settings"]["delivery_resolution"] = "3840x2160"
+        unit["unit_id"] = recovery_unit_id(child["id"], "h3_delivery", dependencies=unit["dependencies"], settings=unit["settings"])
+        descriptor = unit["artifacts"][0]
+        meta_path = self.root / descriptor["sidecar_basename"]
+        sidecar = json.loads(meta_path.read_text())
+        sidecar.update(producer_unit_id=unit["unit_id"], producer_unit_settings=unit["settings"])
+        meta_path.write_text(json.dumps(sidecar))
+        unit["artifacts"] = [artifact_descriptor(self.root, basename=descriptor["basename"],
+            sidecar_basename=descriptor["sidecar_basename"], producer_unit_id=unit["unit_id"])]
+        self.assertTrue(validate_artifact_descriptor(self.root, unit["artifacts"][0], producer_unit_id=unit["unit_id"]))
+        child["recovery_unit"] = unit
+        child["recovery_cursor"]["completed_units"] = [unit]
+        with self.assertRaises(QueueRecoveryRuntimeError):
+            symbols["_h3_cow_completed_unit"](child)
+        self.assertEqual(passes, [])
+
+    def test_completed_child_adoption_preserves_final_sidecar_after_cleanup(self):
+        from services.job_lifecycle import configure_durability_hook
+        from services.queue_recovery_adapter import QueueRecoveryCoordinator
+        symbols, source, child, coordinator, passes = self._prepare("accept_native")
+        symbols["_run_h3_cow_delivery_child"](child["id"])
+        descriptor = child["recovery_unit"]["artifacts"][0]
+        before = (self.root / descriptor["sidecar_basename"]).read_bytes()
+        restored = QueueRecoveryCoordinator(coordinator.journal).restore().jobs
+        # Materialize from durable records while preserving original producer ownership.
+        for job in (source, child):
+            private = {key: value for key, value in job.items() if key.startswith("_")}
+            job.update(restored[job["id"]])
+            job.update(private)
+        self.native.unlink()
+        configure_durability_hook(None)
+        configure_durability_hook(lambda proposal: self.fail("Settled adoption must not persist"))
+        # Worker cleanup remains a separate idempotent checkpoint; inspect adoption itself here.
+        final = symbols["_h3_cow_completed_unit"](child)
+        self.assertTrue(symbols["adopt_completed_h3_delivery_job"](child, expected_execution_attempt=1, completed_unit=final[0], output_files=final[1]))
+        self.assertEqual((self.root / descriptor["sidecar_basename"]).read_bytes(), before)
+        self.assertEqual(passes, [])
+
 
 class H3DeliverySelectionAndPrivacyTests(unittest.TestCase):
     def test_wgp_release_detaches_before_fault_and_always_cleans_cache(self):

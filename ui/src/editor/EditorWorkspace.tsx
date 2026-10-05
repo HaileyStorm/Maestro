@@ -94,9 +94,13 @@ function changeTrim(project: EditorProject, clipId: string, start: number, end: 
   return {
     ...project,
     tracks: project.tracks.map(track => track.id === 'video-main'
-      ? { ...track, items: sequenceStarts(track.items.map(item => item.id === clipId
-        ? { ...item, source_in: nextStart, duration: nextEnd - nextStart }
-        : item)) }
+      ? { ...track, items: sequenceStarts(track.items.map(item => {
+        if (item.id !== clipId) return item
+        const takes = (item as typeof item & { take_states?: Record<string, { source_in: number; speed: number }> }).take_states
+        const assetId = item.asset_id ?? ''
+        return { ...item, source_in: nextStart, duration: nextEnd - nextStart,
+          ...(takes ? { take_states: { ...takes, [assetId]: { ...takes[assetId], source_in: nextStart, speed: item.speed } } } : {}) }
+      })) }
       : track),
   }
 }
@@ -117,15 +121,21 @@ function removeClip(project: EditorProject, clipId: string): EditorProject {
   const removed = items.find(item => item.id === clipId)
   if (!removed || items.length <= 1) return project
   const assets = { ...project.assets }
-  delete assets[removed.asset_id ?? '']
+  const retained = project.tracks.flatMap(track => track.items).some(item => item.id !== clipId && item.asset_id === removed.asset_id)
+  if (!retained) delete assets[removed.asset_id ?? '']
   return { ...project, assets, tracks: project.tracks.map(track => track.id === 'video-main'
     ? { ...track, items: sequenceStarts(items.filter(item => item.id !== clipId)) } : track) }
 }
 
 function availableVideos(project: EditorProject, outputs: OutputFile[]): OutputFile[] {
-  const imported = new Set(Object.values(project.assets).map(asset => asset.output_id))
-  return outputs.filter(output => output.workspace === project.workspace && output.type === 'video'
-    && Boolean(output.revision) && !imported.has(output.name))
+  return outputs.filter(output => {
+    if (output.workspace !== project.workspace || output.type !== 'video' || !output.revision) return false
+    const sources = Object.values(project.assets).filter(asset => asset.output_id === output.name)
+    // Gallery revisions are stat tokens; asset revisions seal content. The server verifies both.
+    return sources.length <= 1 && sources.every(asset => asset.workspace === output.workspace
+      && asset.type === 'video' && asset.origin === 'output'
+      && asset.private === (output.private ?? true))
+  })
 }
 
 function audioLayer(project: EditorProject) {
@@ -851,8 +861,8 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
                 </button>
               </div>
               <p className="mt-2 text-xs text-text-muted">{clips.length >= 8 ? 'This sequence has reached its 8-clip limit.'
-                : candidates.length === 0 ? 'No other loaded Gallery videos are available. Return to Gallery to load more videos from this project.'
-                : 'The selected video is added after the last clip. Pending edits save before it is added.'}</p>
+                : candidates.length === 0 ? 'No current Gallery videos are loaded. Return to Gallery to load videos from this project.'
+                : 'Add another clip from any listed video, including one already in this edit. Each clip has its own trim. Pending edits save first.'}</p>
               {appendPending && importKind === 'video' && <p className="mt-2 text-xs text-text-secondary" role="status">Saving pending edits and adding the selected video…</p>}
               {appendError && importKind === 'video' && <p className="mt-3 text-sm text-red-400" role="alert">{appendError}</p>}
             </div>

@@ -387,6 +387,147 @@ class EditorExportRouteTests(unittest.TestCase):
             append(dict(request, expected_revision=2, path="/foreign/source.mp4"))
         self.assertEqual(forged.exception.status_code, 400)
 
+    def test_shared_source_append_uses_stat_token_reuses_asset_and_preserves_cas(self):
+        load_functions(self.ns, "_output_revision")
+        listing = self.ns["_output_revision"](str(self.source), str(self.project), self.source.name)
+        self.assertNotEqual(listing, self.source_revision())
+        media = {"type": "video", "duration": 3, "width": 128, "height": 72, "fps": 24, "has_audio": True}
+        body = {"expected_revision": 1, "output_name": self.source.name, "output_revision": listing}
+        def append(request):
+            return asyncio.run(self.ns["append_output_editor_clip"]("scene", self.timeline["id"], Request(request)))["project"]
+        with mock.patch("services.editor_projects.probe_media", return_value=media):
+            saved = append(body)
+        self.assertEqual(saved["revision"], 2)
+        self.assertEqual(len(saved["assets"]), 1)
+        items = saved["tracks"][0]["items"]
+        self.assertEqual([item["asset_id"] for item in items], ["source-video", "source-video"])
+        self.assertNotEqual(items[0]["id"], items[1]["id"])
+        self.assertIsNot(items[0]["take_states"], items[1]["take_states"])
+        self.assertEqual(saved["assets"]["source-video"], self.timeline["assets"]["source-video"])
+        with self.assertRaises(HTTPException) as stale:
+            append(body)
+        self.assertEqual(stale.exception.status_code, 409)
+        with self.assertRaises(HTTPException) as wrong_pin:
+            append({**body, "expected_revision": 2, "output_revision": self.source_revision()})
+        self.assertEqual(wrong_pin.exception.status_code, 409)
+        for field, value in (("duration", 4), ("width", 130), ("fps", 30), ("has_audio", False)):
+            with self.subTest(field=field), mock.patch("services.editor_projects.probe_media", return_value={**media, field: value}) as probe:
+                with self.assertRaises(HTTPException) as contradictory:
+                    append({**body, "expected_revision": 2})
+                self.assertEqual(contradictory.exception.status_code, 422)
+                probe.assert_called_once()
+        self.assertEqual(load_editor_project(str(self.outputs), "scene", self.timeline["id"]), saved)
+
+    def test_append_rejects_privacy_media_and_probe_races_without_saving(self):
+        second = self.second_source()
+        load_functions(self.ns, "_output_revision")
+        media = {"type": "video", "duration": 2, "width": 72, "height": 128, "fps": 30, "has_audio": False}
+        sidecar = second.with_suffix(".meta.json")
+        source_sidecar = self.source.with_suffix(".meta.json")
+        original = (second.read_bytes(), sidecar.read_bytes(), source_sidecar.read_bytes())
+        for mode, status in (("media", 409), ("privacy", 409), ("existing-privacy", 409), ("invalid-media", 422)):
+            with self.subTest(mode=mode):
+                second.write_bytes(original[0]); sidecar.write_bytes(original[1]); source_sidecar.write_bytes(original[2])
+                listing = self.ns["_output_revision"](str(second), str(self.project), second.name)
+                body = {"expected_revision": 1, "output_name": second.name, "output_revision": listing}
+                def mutate(_path):
+                    if mode == "media": second.write_bytes(b"replaced-video")
+                    elif mode == "privacy": sidecar.write_text(json.dumps({"workspace": "scene", "private": False}))
+                    elif mode == "existing-privacy": source_sidecar.write_text(json.dumps({"workspace": "scene", "private": False}))
+                    return {**media, "type": "audio"} if mode == "invalid-media" else media
+                with mock.patch("services.editor_projects.probe_media", side_effect=mutate) as probe:
+                    with self.assertRaises(HTTPException) as rejected:
+                        asyncio.run(self.ns["append_output_editor_clip"]("scene", self.timeline["id"], Request(body)))
+                self.assertEqual(rejected.exception.status_code, status)
+                probe.assert_called_once_with(str(second))
+                self.assertEqual(load_editor_project(str(self.outputs), "scene", self.timeline["id"]), self.timeline)
+        with self.assertRaises(HTTPException) as foreign:
+            asyncio.run(self.ns["append_output_editor_clip"]("foreign", self.timeline["id"], Request(body)))
+        self.assertEqual(foreign.exception.status_code, 403)
+
+    def test_shared_source_export_restores_distinct_indices_exact_ranges_and_sealed_authority(self):
+        from services.queue_recovery import QueueRecoveryJournal
+        from services.queue_recovery_adapter import QueueRecoveryCoordinator
+        from services.queue_recovery_runtime import (
+            QueueRecoveryRuntimeError, load_request_manifest, sha256_file,
+            validate_manifest_inputs, write_sealed_request_manifest,
+        )
+        from services.output_access import output_policy_from_request
+        self.sequence()
+        current = append_output_video_clip(self.timeline, output_name=self.source.name,
+            output_revision=self.source_revision(), media={"type": "video", "duration": 3, "width": 128,
+                "height": 72, "fps": 24, "has_audio": True, "private": True})
+        proposed = copy.deepcopy(current)
+        proposed["tracks"][0]["items"][0].update(source_in=0.25, duration=0.55)
+        proposed["tracks"][0]["items"][1].update(source_in=0.5, duration=0.75)
+        proposed["tracks"][0]["items"][2].update(source_in=1.25, duration=0.55)
+        proposed["tracks"][0]["items"].reverse()
+        self.timeline = save_editor_project(str(self.outputs), "scene", apply_output_video_trim(current, proposed), expected_revision=self.timeline["revision"])
+        job = self.worker_namespace()
+        # The route fixture skips registration; apply its real publication policy before journaling.
+        registry = next(node for node in TREE.body if isinstance(node, ast.ClassDef) and node.name == "_JobRegistry")
+        prepare = copy.deepcopy(next(node for node in registry.body if isinstance(node, ast.FunctionDef) and node.name == "prepare"))
+        policy_class = ast.ClassDef(name="EditorPolicyRegistry", bases=[ast.Name(id="dict", ctx=ast.Load())],
+            keywords=[], body=[prepare], decorator_list=[])
+        self.ns["output_policy_from_request"] = output_policy_from_request
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[policy_class], type_ignores=[])), "launch.py", "exec"), self.ns)
+        self.ns["EditorPolicyRegistry"]().prepare(job)
+        original_params = copy.deepcopy(job["params"])
+        paths = [str(self.source), str(self.project / "second.mp4"), str(self.source)]
+        ranges = [(1.25, 0.55), (0.5, 0.75), (0.25, 0.55)]
+        self.assertEqual(original_params["editor_source_path"], paths)
+        self.assertEqual([(item["source_in"], item["duration"]) for item in original_params["editor_sources"]], ranges)
+        self.ns.update({"_app_dir": str(self.root), "_RECOVERABLE_INPUT_KEYS": {"editor_source_path"},
+            "_recovery_sha256_file": sha256_file, "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+            "load_request_manifest": load_request_manifest, "validate_manifest_inputs": validate_manifest_inputs,
+            # This Editor job has no model or H3 completed-unit graph.
+            "_queue_recovery_reconcile_cursor": lambda *_args, **_kwargs: None,
+            "_job_uses_registered_h3": lambda _job: False,
+        })
+        load_functions(self.ns, "_queue_recovery_file_values", "_queue_recovery_input_descriptors",
+            "_queue_recovery_manifest_validator", "_queue_recovery_materialize_job", "_h3_cow_manual_source_supported",
+            "_queue_recovery_worker", "_require_h3_offload_plan_parity")
+        owner, project = "owner:v1:" + "a" * 64, "project:v1:" + "b" * 64
+        descriptors = self.ns["_queue_recovery_input_descriptors"](job, owner)
+        self.assertEqual([item["field"] for item in descriptors], [f"editor_source_path:{index}" for index in range(3)])
+        self.assertEqual([item["scope"] for item in descriptors], ["project"] * 3)
+        self.assertEqual({key: value for key, value in descriptors[0].items() if key != "field"},
+                         {key: value for key, value in descriptors[2].items() if key != "field"})
+        manifest = write_sealed_request_manifest(self.project, job_id=job["id"], params=original_params, inputs=descriptors)
+        journal = self.root / "private-queue.json"
+        QueueRecoveryCoordinator(QueueRecoveryJournal(journal)).register_job(
+            job, owner_digest=owner, project_digest=project, request_manifest=manifest)
+        snapshot = QueueRecoveryCoordinator(QueueRecoveryJournal(journal)).restore().jobs[job["id"]]
+        self.assertNotIn("params", snapshot)
+        self.assertNotIn(str(self.project), json.dumps(snapshot))
+        loaded = load_request_manifest(self.project, snapshot["request_manifest"], expected_job_id=job["id"])
+        self.assertEqual(loaded["params"], original_params)
+        self.assertEqual(loaded["inputs"], descriptors)
+        recovered, may_start = self.ns["_queue_recovery_materialize_job"](snapshot, {"scene": (str(self.project), project)})
+        self.assertFalse(may_start)
+        self.assertEqual(recovered["recovery_state"], "blocked_remote_reauth")
+        self.assertIsNone(recovered["session_id"])
+        self.assertEqual(recovered["params"], original_params)
+        self.assertEqual(recovered["access_policy"], {"private": True, "explicit": True})
+        def render(clips, destination, **_options):
+            self.assertEqual([item["path"] for item in clips], paths)
+            self.assertEqual([(item["source_in"], item["duration"]) for item in clips], ranges)
+            Path(destination).write_bytes(b"rendered")
+        with mock.patch("services.editor_export.render_video_sequence", side_effect=render), mock.patch(
+            "services.editor_projects.probe_media", return_value={"type": "video", "duration": 44 / 24,
+                "size": 8, "has_audio": True, "width": 128, "height": 72, "fps": 24}):
+            self.assertTrue(self.ns["_run_tool_editor_export"](job["id"]))
+        sidecar = json.loads((self.project / job["output_files"][0]).with_suffix(".meta.json").read_text())
+        sources = sidecar["transform"]["sources"]
+        self.assertEqual([(item["source_in"], item["duration"]) for item in sources], ranges)
+        self.assertEqual(sources[0]["revision"], sources[2]["revision"])
+        self.assertTrue(sidecar["private"])
+        self.source.with_suffix(".meta.json").write_text(json.dumps({"workspace": "scene", "private": False}))
+        blocked, may_start = self.ns["_queue_recovery_materialize_job"](snapshot, {"scene": (str(self.project), project)})
+        self.assertFalse(may_start)
+        self.assertEqual(blocked["_recovery_reason_code"], "input_missing_or_changed")
+        self.assertNotIn("params", blocked)
+
     def test_export_after_original_clip_removal_seals_only_remaining_source(self):
         second = self.sequence()
         sidecar = second.with_suffix(".meta.json")

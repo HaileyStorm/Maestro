@@ -1716,6 +1716,10 @@ def _safe_join(base: str, *parts: str) -> str | None:
 
 # --- Generation job tracking ---
 from services.job_lifecycle import (
+    H3DeliveryControlCompanion,
+    register_h3_delivery_child,
+    adopt_completed_h3_delivery_job,
+    validated_h3_delivery_recovery_control,
     CreditLifecycleCallbackError,
     _credit_queue_fingerprint,
     _credit_queue_metadata_from_quote,
@@ -5863,6 +5867,8 @@ def _recover_project_reference_publication(job_id: str) -> None:
 def _queue_recovery_worker(job: dict):
     """Resolve only restart-safe top-level workers; never guess a prep path."""
     kind = str(job.get("kind") or "studio_generation")
+    if kind == "studio_h3_delivery_recovery":
+        return _run_h3_cow_delivery_child
     if kind == "sample_campaign_generation":
         # Only a future dedicated pair-release path may attach a worker.
         return None
@@ -7348,6 +7354,48 @@ def _queue_recovery_materialize_job(
         "_recovery_project_digest": expected_project,
         "_recovery_manifest_pointer": dict(snapshot.get("request_manifest") or {}),
     })
+    special_h3 = (snapshot.get("kind") == "studio_h3_delivery_recovery"
+                  or _h3_cow_manual_source_supported(snapshot))
+    if special_h3:
+        current = projects.get(workspace)
+        try:
+            if current is None or current[1] != expected_project:
+                raise QueueRecoveryRuntimeError("H3 recovery project changed")
+            runtime["out_dir"] = current[0]
+            manifest = load_request_manifest(current[0], snapshot.get("request_manifest") or {}, expected_job_id=job_id)
+            runtime["params"] = dict(manifest["params"])
+            if snapshot.get("kind") != "studio_h3_delivery_recovery":
+                if _h3_cow_manual_source_supported(runtime):
+                    # Failed producers are not checkpointed during startup. Keep
+                    # their durable metadata identical to the coordinator cache.
+                    if "error" in snapshot:
+                        runtime["error"] = snapshot["error"]
+                    else:
+                        runtime.pop("error", None)
+                    _h3_cow_source_evidence(runtime)
+                    return runtime, False
+                # Private manifests carry exclusions absent from public snapshots.
+            else:
+                runtime.update(queue_held=True, reruns_denoise=False, recovery_state="blocked")
+                validated_h3_delivery_recovery_control(runtime.get("h3_delivery_recovery_control"))
+                final = _h3_cow_completed_unit(runtime)
+                if snapshot.get("status") in {"cancelled", "failed"} or snapshot.get("cancel_requested"):
+                    return runtime, False
+                if snapshot.get("status") != "completed":
+                    runtime.update(status="queued", resource_state="queued", resource_execution="standard", preemption_mode="none",
+                                   queue_held=bool(snapshot.get("queue_held", False)), recovery_state="interrupted")
+                else:
+                    runtime.update(queue_held=bool(snapshot.get("queue_held", False)), recovery_state="terminal")
+                return runtime, bool(final is not None or not runtime.get("queue_held"))
+        except (ValueError, QueueRecoveryRuntimeError):
+            if snapshot.get("kind") == "studio_h3_delivery_recovery":
+                runtime.update(queue_held=True, reruns_denoise=False, recovery_state="blocked",
+                               message="Delivery recovery evidence is unavailable", _recovery_reason_code="input_missing_or_changed")
+            elif "error" in snapshot:
+                runtime["error"] = snapshot["error"]
+            else:
+                runtime.pop("error", None)
+            return runtime, False
     final_adoption = globals().get(
         "_queue_recovery_final_adoption_jobs", {}
     ).get((workspace, job_id))
@@ -8843,6 +8891,19 @@ def _restore_queue_recovery_on_startup(
         restored_jobs.append(job)
         if auto_resume:
             resumable.append(job)
+    for restored_child in restored_jobs:
+        if restored_child.get("kind") == "studio_h3_delivery_recovery":
+            source = _jobs.get(restored_child.get("parent_job_id"))
+            if isinstance(source, dict):
+                restored_child["_h3_delivery_control_source"] = source
+                pending = _queue_recovery_delivery_pending(restored_child)
+                if restored_child.get("status") in {"cancelled", "failed"} and pending and pending.get("publication"):
+                    try:
+                        _verify_h3_cow_child(restored_child, source)
+                        staged = _queue_recovery_restore_delivery_staged(restored_child, restored_child["out_dir"], pending)
+                        _queue_recovery_reconcile_delivery_publication(restored_child, staged)
+                    except (ValueError, QueueRecoveryRuntimeError):
+                        restored_child["_recovery_reason_code"] = "delivery_publication_reconciliation_blocked"
     restore_scheduler_state(restored_jobs, _queue_recovery_restored.global_state)
     prompt_results = globals().get("_prompt_enhancement_result_store")
     if prompt_results is not None:
@@ -9028,7 +9089,7 @@ def _restore_queue_recovery_on_startup(
             callable(publication_recovery) and publication_recovery(job)
         )
         if _queue_recovery_delivery_pending(job) is None:
-            if not project_reference_finalization:
+            if not project_reference_finalization and job.get("kind") != "studio_h3_delivery_recovery":
                 try:
                     _require_job_runtime_model_admission(job)
                 except HTTPException as error:
@@ -9109,6 +9170,13 @@ def _queue_recovery_revalidate_job(job: dict) -> bool:
             job.get("_recovery_manifest_pointer") or {},
             expected_job_id=str(job.get("id") or ""),
         )
+        if job.get("kind") == "studio_h3_delivery_recovery":
+            job["params"] = dict(manifest["params"])
+            job["out_dir"] = project_dir
+            final = _h3_cow_completed_unit(job)
+            _verify_h3_cow_child(job, _jobs.get(job.get("parent_job_id")), verify_sources=final is None)
+            job["_recovery_reason_code"] = ""
+            return True
         validate_manifest_inputs(
             manifest,
             lambda descriptor: _queue_recovery_manifest_validator(
@@ -9122,7 +9190,7 @@ def _queue_recovery_revalidate_job(job: dict) -> bool:
         job["out_dir"] = project_dir
         job["_recovery_reason_code"] = ""
         return True
-    except (QueueRecoveryRuntimeError, ValueError):
+    except (QueueRecoveryRuntimeError, ValueError, OSError):
         job["_recovery_reason_code"] = "input_missing_or_changed"
         return False
 
@@ -9150,8 +9218,12 @@ def _start_restored_held_generation_worker(job: dict) -> None:
                 detail="Recovery request or input validation failed",
             )
         try:
-            _require_job_runtime_model_admission(job)
-            _start_generation_worker(job, name_prefix="studio-held-recovery")
+            if job.get("kind") == "studio_h3_delivery_recovery":
+                threading.Thread(target=_run_h3_cow_delivery_child, args=(str(job["id"]),),
+                                 daemon=False, name=f"h3-delivery-held-recovery-{job['id']}").start()
+            else:
+                _require_job_runtime_model_admission(job)
+                _start_generation_worker(job, name_prefix="studio-held-recovery")
         except Exception:
             if not _queue_recovery_is_blocked(job):
                 job["_recovery_reason_code"] = "worker_start_failed"
@@ -13231,13 +13303,12 @@ def _queue_recovery_checkpoint_delivery_pending(
         ]
     cursor = dict(job.get("recovery_cursor") or {})
     cursor["delivery_pending"] = pending
-    _queue_recovery_checkpoint(
-        job,
-        recovery_cursor=cursor,
-        recovery_state="interrupted",
-        reruns_denoise=False,
+    committed = _queue_recovery_checkpoint(
+        job, recovery_cursor=cursor, recovery_state="interrupted", reruns_denoise=False,
         message="Protected native output is ready for delivery",
     )
+    if job.get("kind") == "studio_h3_delivery_recovery" and committed is not True:
+        raise QueueRecoveryRuntimeError("H3 child native checkpoint was rejected.")
     return pending
 
 
@@ -13505,7 +13576,21 @@ def _queue_recovery_reconcile_delivery_publication(
                 if isinstance(sidecar, dict) else None
             )
             parent = pending["sources"][index]
-            if (
+            child_final = (job.get("kind") == "studio_h3_delivery_recovery"
+                           and sidecar_hash != record["private_sidecar_sha256"])
+            if child_final:
+                control = validated_h3_delivery_recovery_control(job.get("h3_delivery_recovery_control"))
+                if (not isinstance(parent, dict) or not isinstance(durable, dict)
+                    or sidecar.get("job_id") != control["source_job_id"] or sidecar.get("recovery_job_id") != job["id"]
+                    or durable.get("source_job_id") != control["source_job_id"] or durable.get("recovery_job_id") != job["id"]
+                    or durable.get("action") != control["action"] or sidecar.get("output_filename") != record["basename"]
+                    or sidecar.get("workspace") != job["workspace"]
+                    or (sidecar_hash == record["sealed_sidecar_sha256"] and
+                        (sidecar.get("producer_unit_id") != pending["unit_id"]
+                         or sidecar.get("producer_unit_dependencies") != pending["dependencies"]
+                         or sidecar.get("producer_unit_settings") != pending["settings"]))):
+                    raise QueueRecoveryRuntimeError("Delivery child publication identity changed.")
+            elif (
                 not isinstance(parent, dict)
                 or not isinstance(durable, dict)
                 or durable.get("schema_version") != 2
@@ -13869,6 +13954,11 @@ def _credit_prepare_owner_completion(job: dict) -> dict | None:
 
 def finish_job(job, *args, **kwargs):
     """Lifecycle finish plus producer-parity access metadata stamping."""
+    if job.get("kind") == "studio_h3_delivery_recovery":
+        if job.get("status") in {"failed", "cancelled", "completed"}:
+            return False
+        from services.job_lifecycle import _h3_delivery_companion_unlocked
+        _h3_delivery_companion_unlocked(job, dict(job, status=args[0] if args else "failed", **kwargs))
     deferred_credit_queue = _credit_prepare_owner_completion(job)
     try:
         result = _lifecycle_finish_job(job, *args, **kwargs)
@@ -13876,7 +13966,8 @@ def finish_job(job, *args, **kwargs):
         if deferred_credit_queue is not None:
             job["credit_queue"] = deferred_credit_queue
         raise
-    _stamp_job_output_access(job)
+    if job.get("kind") != "studio_h3_delivery_recovery":
+        _stamp_job_output_access(job)
     owner_test = job.get("_owner_test_credit")
     if isinstance(owner_test, dict):
         account_id = _credit_account_id(job)
@@ -28442,8 +28533,8 @@ async def append_output_editor_clip(project: str, editor_id: str, request: Reque
             raise HTTPException(status_code=409, detail="Editor draft changed; reload before adding a clip")
         try:
             clips = editor_sequence_clips(current)
-            if len(clips) >= 8 or any(asset["output_id"] == name for asset, _ in clips):
-                raise EditorProjectError("Choose a new video for a sequence of up to eight clips")
+            if len(clips) >= 8:
+                raise EditorProjectError("A sequence can contain up to eight clips")
         except EditorProjectError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         out_dir, filepath, _ = _require_authorized_output(request, project, name)
@@ -62799,9 +62890,10 @@ def _publish_h3_delivery_outputs(
     cow_sidecars = {}
     if copy_on_write:
         if recovery_action:
-            raise QueueRecoveryRuntimeError(
-                "Copy-on-write recovery action requires a separate publication intent."
-            )
+            control = validated_h3_delivery_recovery_control(job.get("h3_delivery_recovery_control"))
+            if (job.get("kind") != "studio_h3_delivery_recovery" or control["action"] != recovery_action
+                or ((_queue_recovery_delivery_pending(job) or {}).get("settings") or {}).get("recovery_intent_digest") != control["intent_digest"]):
+                raise QueueRecoveryRuntimeError("Copy-on-write recovery action has no child intent.")
         pending = _queue_recovery_delivery_pending(job)
         if not isinstance(pending, dict):
             raise QueueRecoveryRuntimeError("Copy-on-write delivery intent is missing.")
@@ -63225,8 +63317,8 @@ def _h3_copy_on_write_delivery_eligible(
 ) -> bool:
     """Keep optional finishing on the manual-recoverable native-move path.
 
-    Copy-on-write children still require a separate manual publication intent.
-    Director final assembly also remains outside this transaction.
+    Manual COW recovery supports no-option delivery only; grain and voice
+    retain their native-move compatibility path. Director assembly is separate.
     """
     return bool(
         delivery_requested
@@ -63704,6 +63796,8 @@ def _persist_h3_delivery_failure_details(
 
 
 def _persist_h3_delivery_recovery_state(job: dict) -> bool:
+    if ((job.get("recovery_cursor") or {}).get("delivery_pending") or {}).get("publication_schema") == 2:
+        return False
     recovery = job.get("_h3_delivery_recovery") or {}
     originals = {}
     try:
@@ -64003,8 +64097,331 @@ def _h3_delivery_recovery_token(job: dict, action: str) -> str:
     return f"h3r1.{digest}"
 
 
+def _h3_cow_manual_source_supported(source):
+    params = source.get("params") if isinstance(source.get("params"), dict) else {}
+    cursor = source.get("recovery_cursor")
+    pending = cursor.get("delivery_pending") if isinstance(cursor, dict) else None
+    settings = pending.get("settings") or {} if isinstance(pending, dict) else {}
+    if not isinstance(settings, dict):
+        return False
+    return bool(isinstance(pending, dict) and pending.get("publication_schema") == 2
+                and source.get("status") == "failed" and source.get("kind") != "studio_h3_delivery_recovery"
+                and params.get("_director_final_video_postprocess") != 1 and params.get("_h3_cumulative_append") is not True
+                and settings.get("cumulative_append") is None
+                and pending.get("optional_finishing") is None and settings.get("optional_finishing") is None)
+
+
+def _h3_cow_source_control(source):
+    existing = source.get("h3_delivery_recovery_control")
+    if existing is not None:
+        return validated_h3_delivery_recovery_control(existing)
+    if (source.get("_h3_delivery_recovery") or {}).get("manual_retry_count", 0) != 0:
+        raise QueueRecoveryRuntimeError("H3 COW retry charge has no durable control receipt.")
+    return {"schema_version": 1, "role": "source", "manual_retry_count": 0, "manual_retry_limit": 2,
+            "active_child_id": None, "active_action": None, "active_intent_digest": None,
+            "last_charged_child_id": None, "consumed": False, "completed_child_id": None, "completed_unit_id": None}
+
+
+def _h3_cow_source_evidence(source, *, verify_media=True):
+    pending = _queue_recovery_delivery_pending(source)
+    if not _h3_cow_manual_source_supported(source):
+        raise QueueRecoveryRuntimeError("H3 COW recovery source is unavailable.")
+    settings = pending.get("settings")
+    dependencies = pending.get("dependencies")
+    if (not isinstance(settings, dict) or not isinstance(dependencies, list) or not dependencies
+        or not isinstance(settings.get("native_hashes"), list) or len(settings["native_hashes"]) != len(dependencies)):
+        raise QueueRecoveryRuntimeError("H3 COW recovery source settings are incomplete.")
+    if pending.get("unit_id") != recovery_unit_id(source["id"], "h3_delivery", dependencies=dependencies, settings=settings):
+        raise QueueRecoveryRuntimeError("H3 COW recovery source identity changed.")
+    if _build_h3_delivery_finishing(source, source.get("params") or {}) is not None:
+        raise QueueRecoveryRuntimeError("Optional finishing is outside COW recovery.")
+    project = str(source.get("out_dir") or "")
+    if (not project or not source.get("_recovery_owner_digest") or not source.get("_recovery_project_digest")
+        or _queue_recovery_project_identity(str(source.get("workspace") or "default"), project) != source["_recovery_project_digest"]):
+        raise QueueRecoveryRuntimeError("H3 COW recovery project identity changed.")
+    sources = (pending.get("sources") if pending.get("state") == "protected_native"
+               else [entry.get("source") for entry in pending.get("staging") or []])
+    if not sources or len(sources) != len(pending["dependencies"]):
+        raise QueueRecoveryRuntimeError("H3 COW source descriptors are incomplete.")
+    for index, descriptor in enumerate(sources):
+        if (not isinstance(descriptor, dict) or descriptor.get("producer_unit_id") != pending["dependencies"][index]
+            or descriptor.get("sha256") != settings["native_hashes"][index]
+            or (verify_media and not validate_artifact_descriptor(project, descriptor, producer_unit_id=pending["dependencies"][index]))):
+            raise QueueRecoveryRuntimeError("H3 COW sealed source changed.")
+        if verify_media:
+            with open(os.path.join(project, descriptor["sidecar_basename"]), encoding="utf-8") as handle:
+                producer = json.load(handle)
+            if producer.get("job_id") != source["id"] or producer.get("workspace") != source["workspace"]:
+                raise QueueRecoveryRuntimeError("H3 COW source producer binding changed.")
+    return pending, [dict(item) for item in sources]
+
+
+def _h3_cow_child_settings(contract, digest):
+    requested = contract.get("requested_settings")
+    sources = contract.get("sources")
+    if not isinstance(requested, dict) or not isinstance(sources, list) or not sources or any(not isinstance(item, dict) for item in sources):
+        raise QueueRecoveryRuntimeError("H3 child settings contract is incomplete.")
+    return {"publication_schema": 2, "native_hashes": [item["sha256"] for item in sources],
+            "spatial_upsampling": requested.get("spatial_upsampling", "") if contract["action"] == "retry_delivery" else "",
+            "delivery_resolution": requested.get("delivery_resolution", "") if contract["action"] == "retry_delivery" else "",
+            "delivery_fit": requested.get("delivery_fit", "") if contract["action"] == "retry_delivery" else "",
+            "recovery_source_job_id": contract["source_job_id"], "recovery_source_unit_id": contract["source_unit_id"],
+            "recovery_action": contract["action"], "recovery_intent_digest": digest,
+            "requested_delivery_resolution": requested.get("delivery_resolution", "")}
+
+
+def _h3_cow_child_plan(source, child_id, action):
+    source_pending, sources = _h3_cow_source_evidence(source)
+    requested = source_pending["settings"]
+    intent = {"schema_version": 1, "source_job_id": source["id"], "source_unit_id": source_pending["unit_id"],
+              "action": action, "sources": sources, "dependencies": source_pending["dependencies"],
+              "requested_settings": requested, "owner_digest": source["_recovery_owner_digest"],
+              "project_digest": source["_recovery_project_digest"]}
+    expectations = []
+    for descriptor in sources:
+        fps, width, height, frames = wgp.get_video_info(os.path.join(source["out_dir"], descriptor["basename"]))
+        if not fps or float(fps) <= 0 or not frames or int(frames) <= 0 or int(width) <= 0 or int(height) <= 0:
+            raise QueueRecoveryRuntimeError("H3 native media expectations are unavailable.")
+        expectations.append({"frames": int(frames), "fps": float(fps), "resolution": [int(width), int(height)]})
+    intent["native_expectations"] = expectations
+    digest = hashlib.sha256(json.dumps(intent, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    settings = _h3_cow_child_settings(intent, digest)
+    unit_id = recovery_unit_id(child_id, "h3_delivery", dependencies=intent["dependencies"], settings=settings)
+    staging = []
+    for index, descriptor in enumerate(sources):
+        extension = os.path.splitext(descriptor["basename"])[1]
+        prefix = f".maestro-delivery-{child_id}-{unit_id[-12:]}-{index}"
+        staging.append({"native_basename": prefix + ".native" + extension,
+                        "native_sidecar_basename": prefix + ".native.meta.json", "work_basename": prefix + ".work" + extension,
+                        "original_basename": descriptor["basename"], "source": descriptor,
+                        "final_basename": f"h3-delivery-{unit_id.rsplit(':', 1)[-1]}-{index}{extension}"})
+    return intent, {"publication_schema": 2, "unit_id": unit_id, "settings": settings,
+                    "dependencies": list(intent["dependencies"]), "staging": staging}
+
+
+def _verify_h3_cow_child(job, source, *, verify_sources=True):
+    if not isinstance(source, dict):
+        raise QueueRecoveryRuntimeError("H3 recovery source is missing.")
+    child = validated_h3_delivery_recovery_control(job.get("h3_delivery_recovery_control"))
+    control = _h3_cow_source_control(source)
+    active = (not control["consumed"] and control["active_child_id"] == job.get("id")
+              and control["active_action"] == child["action"] and control["active_intent_digest"] == child["intent_digest"])
+    settled = (job.get("status") == "completed" and control["consumed"] and control["completed_child_id"] == job.get("id")
+               and control["completed_unit_id"] == (job.get("recovery_unit") or {}).get("unit_id"))
+    if not active and not settled and job.get("status") not in {"failed", "cancelled"}:
+        raise QueueRecoveryRuntimeError("H3 recovery child control authority changed.")
+    if (job.get("kind") != "studio_h3_delivery_recovery" or job.get("parent_job_id") != source.get("id")
+        or child["source_job_id"] != source.get("id") or job.get("workspace") != source.get("workspace")
+        or job.get("_recovery_owner_digest") != source.get("_recovery_owner_digest")
+        or job.get("_recovery_project_digest") != source.get("_recovery_project_digest")):
+        raise QueueRecoveryRuntimeError("H3 recovery child binding changed.")
+    manifest = load_request_manifest(job["out_dir"], job["_recovery_manifest_pointer"], expected_job_id=job["id"])
+    contract = (manifest.get("params") or {}).get("_h3_delivery_child_intent")
+    if (not isinstance(contract, dict)
+        or hashlib.sha256(json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()).hexdigest() != child["intent_digest"]
+        or contract.get("source_job_id") != source["id"] or contract.get("action") != child["action"]
+        or contract.get("owner_digest") != source["_recovery_owner_digest"]
+        or contract.get("project_digest") != source["_recovery_project_digest"]
+        or _queue_recovery_project_identity(job["workspace"], job["out_dir"]) != contract["project_digest"]):
+        raise QueueRecoveryRuntimeError("H3 recovery child manifest changed.")
+    pending, sources = _h3_cow_source_evidence(source, verify_media=verify_sources)
+    if (contract.get("source_unit_id") != pending["unit_id"] or contract.get("sources") != sources
+        or contract.get("dependencies") != pending["dependencies"] or contract.get("requested_settings") != pending["settings"]):
+        raise QueueRecoveryRuntimeError("H3 recovery source intent changed.")
+    child_pending = _queue_recovery_delivery_pending(job)
+    if child_pending is not None:
+        expected_settings = _h3_cow_child_settings(contract, child["intent_digest"])
+        if (child_pending.get("settings") != expected_settings or child_pending.get("dependencies") != contract["dependencies"]
+            or child_pending.get("publication_schema") != 2
+            or child_pending.get("unit_id") != recovery_unit_id(job["id"], "h3_delivery", dependencies=contract["dependencies"], settings=expected_settings)):
+            raise QueueRecoveryRuntimeError("H3 child delivery plan changed.")
+    job["_h3_delivery_control_source"] = source
+    return contract
+
+
+def _h3_cow_completed_unit(job):
+    unit = job.get("recovery_unit")
+    child = validated_h3_delivery_recovery_control(job.get("h3_delivery_recovery_control"))
+    if not isinstance(unit, dict) or unit.get("kind") != "h3_delivery" or unit.get("state") != "completed":
+        return None
+    if unit not in ((job.get("recovery_cursor") or {}).get("completed_units") or []):
+        raise QueueRecoveryRuntimeError("H3 child completed receipt is incomplete.")
+    if unit.get("unit_id") != recovery_unit_id(job["id"], "h3_delivery", dependencies=unit.get("dependencies") or [], settings=unit.get("settings") or {}):
+        raise QueueRecoveryRuntimeError("H3 child completed identity changed.")
+    settings = unit["settings"]
+    if (settings.get("recovery_source_job_id") != child["source_job_id"] or settings.get("recovery_action") != child["action"]
+        or settings.get("recovery_intent_digest") != child["intent_digest"]):
+        raise QueueRecoveryRuntimeError("H3 child completed linkage changed.")
+    manifest = load_request_manifest(job["out_dir"], job["_recovery_manifest_pointer"], expected_job_id=job["id"])
+    contract = (manifest.get("params") or {}).get("_h3_delivery_child_intent")
+    if (not isinstance(contract, dict)
+        or hashlib.sha256(json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()).hexdigest() != child["intent_digest"]
+        or len(contract.get("native_expectations") or []) != len(unit.get("artifacts") or [])):
+        raise QueueRecoveryRuntimeError("H3 child completed media contract changed.")
+    if unit.get("settings") != _h3_cow_child_settings(contract, child["intent_digest"]) or unit.get("dependencies") != contract.get("dependencies"):
+        raise QueueRecoveryRuntimeError("H3 child completed settings contract changed.")
+    names = []
+    for index, descriptor in enumerate(unit.get("artifacts") or []):
+        if not validate_artifact_descriptor(job["out_dir"], descriptor, producer_unit_id=unit["unit_id"]):
+            raise QueueRecoveryRuntimeError("H3 child final bytes changed.")
+        name = descriptor["basename"]
+        with open(os.path.join(job["out_dir"], descriptor["sidecar_basename"]), encoding="utf-8") as handle:
+            sidecar = json.load(handle)
+        receipt = sidecar.get("delivery_recovery") or {}
+        if (sidecar.get("recovery_job_id") != job["id"] or receipt.get("source_job_id") != child["source_job_id"]
+            or receipt.get("action") != child["action"] or receipt.get("recovery_job_id") != job["id"]
+            or sidecar.get("workspace") != job["workspace"] or sidecar.get("job_id") != child["source_job_id"]):
+            raise QueueRecoveryRuntimeError("H3 child final lineage changed.")
+        expected = contract["native_expectations"][index]
+        resolution = tuple(expected["resolution"])
+        if child["action"] == "retry_delivery" and settings.get("delivery_resolution"):
+            resolution = tuple(int(value) for value in settings["delivery_resolution"].split("x"))
+        if _h3_final_output_integrity(job["out_dir"], [name], expected_frames=expected["frames"],
+                                    expected_fps=expected["fps"], expected_resolution=resolution).get("validation") != "valid":
+            raise QueueRecoveryRuntimeError("H3 child final integrity failed.")
+        names.append(name)
+    if not names:
+        raise QueueRecoveryRuntimeError("H3 child final integrity failed.")
+    return unit, names
+
+
+def _run_h3_cow_delivery_child(job_id):
+    job = _jobs[job_id]
+    source = _jobs.get(job.get("parent_job_id"))
+    completed = False
+    state = {"abort": False}
+    try:
+        if not job.get("_h3_delivery_workspace_reserved"):
+            _begin_workspace_operation(str(job.get("workspace") or "default"))
+            job["_h3_delivery_workspace_reserved"] = True
+        if not isinstance(source, dict):
+            raise QueueRecoveryRuntimeError("H3 source job is missing.")
+        final = _h3_cow_completed_unit(job)
+        _verify_h3_cow_child(job, source, verify_sources=final is None)
+        if final is not None:
+            completed = adopt_completed_h3_delivery_job(job, expected_execution_attempt=job["execution_attempt"],
+                completed_unit=final[0], output_files=final[1], finish_operation=finish_job)
+            if completed:
+                _cleanup_h3_cow_child(job)
+            return
+        with generation_slot(_gen_lock, job) as acquired, _WgpNativeGpuExecutionSlot(acquired):
+            if not acquired or not try_start(job, generation_lock=_gen_lock, expected_execution_attempt=job["execution_attempt"],
+                                            phase="H3 delivery recovery", message="Recovering retained native output..."):
+                return
+            if not register_abort_state(job, job_id, _active_gen_states, state):
+                return
+            _verify_h3_cow_child(job, source)
+            control = validated_h3_delivery_recovery_control(job["h3_delivery_recovery_control"])
+            if control["action"] == "retry_delivery" and not control["charged"]:
+                if not _queue_recovery_checkpoint(job, expected_execution_attempt=job["execution_attempt"],
+                    h3_delivery_recovery_control=dict(control, charged=True)):
+                    raise InterruptedError("H3 recovery charge rejected")
+            pending = _queue_recovery_delivery_pending(job)
+            if pending["state"] == "staging_native":
+                plan = {key: pending[key] for key in ("publication_schema", "unit_id", "settings", "dependencies", "staging")}
+                names = [entry["original_basename"] for entry in plan["staging"]]
+                staged = _stage_h3_delivery_native_outputs_v2(job, job["out_dir"], names, plan)
+                pending = _queue_recovery_checkpoint_delivery_pending(job, job["out_dir"], staged, plan)
+            else:
+                staged = _queue_recovery_restore_delivery_staged(job, job["out_dir"], pending)
+            if pending.get("publication"):
+                _queue_recovery_reconcile_delivery_publication(job, staged)
+            def commit(names):
+                return bool(_queue_recovery_checkpoint_delivery_completed(job, job["out_dir"], names, pending))
+            settings = pending["settings"]
+            _release_h3_delivery_vram()
+            if control["action"] == "accept_native":
+                _reset_h3_delivery_work(staged)
+                names = _publish_h3_delivery_outputs(job, staged, recovery_action="accept_native",
+                    requested_target=settings["requested_delivery_resolution"], publication_commit_fn=commit)
+            else:
+                names = _process_h3_delivery_from_protected_native(job, job["out_dir"], staged,
+                    spatial_upsampling=settings["spatial_upsampling"], delivery_resolution=settings["delivery_resolution"],
+                    delivery_fit=settings["delivery_fit"], recovery_action="retry_delivery", publication_commit_fn=commit)
+            completed = _finish_h3_cow_child(job, "completed", output_files=names, progress=100, message="Done", error=None)
+            if completed:
+                _cleanup_h3_cow_child(job)
+    except InterruptedError:
+        if not is_cancel_requested(job):
+            request_cancel(job, job_id=job_id, active_states=_active_gen_states)
+    except Exception as error:
+        if job.get("status") == "running":
+            _finish_h3_cow_child(job, "failed", **_safe_failure_updates(error, job, stage="delivery", code="delivery_recovery_failed"))
+        elif job.get("status") not in {"completed", "cancelled", "failed"}:
+            _queue_recovery_checkpoint(job, queue_held=True, recovery_state="blocked", message="Delivery recovery evidence is unavailable")
+    finally:
+        if not completed:
+            _rollback_h3_delivery_publication(job)
+        unregister_abort_state(job_id, _active_gen_states, state)
+        if job.pop("_h3_delivery_workspace_reserved", False):
+            _end_workspace_operation(str(job.get("workspace") or "default"))
+
+
+def _cleanup_h3_cow_child(job):
+    pending = _queue_recovery_delivery_pending(job)
+    if not pending:
+        return
+    clean = _finalize_h3_delivery_publication(job)
+    # After restart only the durable child receipt authorizes private cleanup.
+    records = (pending.get("publication") or {}).get("items") or []
+    artifacts = pending.get("artifacts") or []
+    work_names = pending.get("work_basenames") or []
+    for index, descriptor in enumerate(artifacts):
+        extension = os.path.splitext(descriptor.get("original_basename") or "")[1]
+        prefix = f".maestro-delivery-{job['id']}-{pending['unit_id'][-12:]}-{index}"
+        if (descriptor.get("basename") != prefix + ".native" + extension
+            or descriptor.get("sidecar_basename") != prefix + ".native.meta.json"
+            or index >= len(work_names) or work_names[index] != prefix + ".work" + extension):
+            raise QueueRecoveryRuntimeError("H3 child private cleanup identity changed.")
+        native = os.path.join(job["out_dir"], descriptor["basename"])
+        meta = os.path.join(job["out_dir"], descriptor["sidecar_basename"])
+        if os.path.lexists(native) or os.path.lexists(meta):
+            if validate_protected_artifact_descriptor(job["out_dir"], descriptor, producer_unit_id=pending["unit_id"]):
+                os.remove(native)
+                os.remove(meta)
+            else:
+                clean = False
+        work = os.path.join(job["out_dir"], work_names[index])
+        rollback = os.path.splitext(work)[0] + ".rollback.meta.json"
+        record = records[index] if index < len(records) else {}
+        for path, expected in ((work, (record.get("media_size"), record.get("media_sha256"))),
+                               (rollback, (None, record.get("private_sidecar_sha256")))):
+            if os.path.lexists(path):
+                observed = _recovery_sha256_file(path) if os.path.isfile(path) and not os.path.islink(path) else None
+                if observed is not None and observed[1] == expected[1] and (expected[0] is None or observed[0] == expected[0]):
+                    os.remove(path)
+                else:
+                    clean = False
+    if clean:
+        cursor = dict(job.get("recovery_cursor") or {})
+        cursor.pop("delivery_pending", None)
+        _queue_recovery_checkpoint(job, recovery_cursor=cursor, recovery_state="terminal", reruns_denoise=False)
+
+
+def _finish_h3_cow_child(job, status, **updates):
+    if status == "failed":
+        updates["output_files"] = []
+    return finish_job(job, status, expected_execution_attempt=job["execution_attempt"], **updates)
+
+
 def _h3_delivery_recovery_state(job: dict) -> dict | None:
     recovery = job.get("_h3_delivery_recovery")
+    if ((job.get("recovery_cursor") or {}).get("delivery_pending") or {}).get("publication_schema") == 2 and job.get("kind") != "studio_h3_delivery_recovery":
+        try:
+            pending, sources = _h3_cow_source_evidence(job)
+            control = _h3_cow_source_control(job)
+            if control["consumed"]:
+                return None
+            staged = (_queue_recovery_restore_delivery_staged(job, job["out_dir"], pending) if pending["state"] == "protected_native"
+                      else [{"file_name": item["basename"], "native_path": os.path.join(job["out_dir"], item["basename"]),
+                             "native_meta": os.path.join(job["out_dir"], item["sidecar_basename"])} for item in sources])
+            recovery = dict(recovery or {}, staged=staged, manual_retry_count=control["manual_retry_count"], manual_retry_limit=control["manual_retry_limit"],
+                            active_job_id=control["active_child_id"] or "", consumed=False, restart_supported=True,
+                            delivery_resolution=pending["settings"].get("delivery_resolution", ""),
+                            nonce=(recovery or {}).get("nonce") or uuid.uuid4().hex)
+            job["_h3_delivery_recovery"] = recovery
+        except (ValueError, QueueRecoveryRuntimeError):
+            return None
     if not isinstance(recovery, dict) or recovery.get("consumed"):
         return None
     staged = recovery.get("staged")
@@ -64018,9 +64435,8 @@ def _h3_delivery_recovery_state(job: dict) -> dict | None:
 def _public_h3_delivery_recovery(job: dict) -> dict:
     recovery = _h3_delivery_recovery_state(job)
     if recovery is None:
-        completed_job = str(
-            (job.get("_h3_delivery_recovery") or {}).get("completed_job_id") or ""
-        )
+        completed_job = str((job.get("h3_delivery_recovery_control") or {}).get("completed_child_id")
+                            or (job.get("_h3_delivery_recovery") or {}).get("completed_job_id") or "")
         return {
             "recoverable": False,
             "completed_recovery_job_id": completed_job or None,
@@ -74785,8 +75201,9 @@ def get_h3_delivery_recovery(
 def _new_h3_delivery_recovery_job(source_job: dict, action: str) -> dict:
     params = source_job.get("params") or {}
     recovery = source_job.get("_h3_delivery_recovery") or {}
-    job_id = uuid.uuid4().hex[:8]
-    return {
+    cow = ((source_job.get("recovery_cursor") or {}).get("delivery_pending") or {}).get("publication_schema") == 2
+    job_id = uuid.uuid4().hex if cow else uuid.uuid4().hex[:8]
+    result = {
         "id": job_id,
         "status": "queued",
         "progress": 0,
@@ -74817,6 +75234,20 @@ def _new_h3_delivery_recovery_job(source_job: dict, action: str) -> dict:
         "_h3_delivery_recovery_action": action,
     }
 
+    if cow:
+        intent, plan = _h3_cow_child_plan(source_job, job_id, action)
+        pending = dict(plan, state="staging_native")
+        result.update(kind="studio_h3_delivery_recovery", parent_job_id=source_job["id"],
+            resource_intent="generation", resource_execution="standard", preemption_mode="none", resource_state="queued", execution_attempt=1,
+            h3_segment_plan=copy.deepcopy(source_job.get("h3_segment_plan")),
+            recovery_cursor={"delivery_pending": pending}, reruns_denoise=False, recovery_state="interrupted",
+            h3_delivery_recovery_control={"schema_version": 1, "role": "child", "source_job_id": source_job["id"],
+                "action": action, "intent_digest": plan["settings"]["recovery_intent_digest"], "charged": False})
+        result["params"]["_h3_delivery_child_intent"] = intent
+        result["_recovery_owner_digest"] = source_job["_recovery_owner_digest"]
+        result["_recovery_project_digest"] = source_job["_recovery_project_digest"]
+    return result
+
 
 async def _schedule_h3_delivery_recovery(
     job_id: str,
@@ -74836,6 +75267,7 @@ async def _schedule_h3_delivery_recovery(
     reserved = False
     recovery_job = None
     recovery_job_id = ""
+    durable_child = False
     try:
         _begin_workspace_operation(workspace_name)
         reserved = True
@@ -74859,9 +75291,22 @@ async def _schedule_h3_delivery_recovery(
             recovery["active_job_id"] = recovery_job_id
             # Every accepted schedule is one-shot, including accept-native.
             recovery["nonce"] = uuid.uuid4().hex
-            _jobs[recovery_job_id] = recovery_job
+            if recovery_job.get("kind") == "studio_h3_delivery_recovery":
+                _jobs.prepare(recovery_job)
+                pointer = write_sealed_request_manifest(source_job["out_dir"], job_id=recovery_job_id,
+                    params=recovery_job["params"], inputs=[])
+                recovery_job["_recovery_manifest_pointer"] = pointer
+                def persist(parent, child, previous):
+                    return _queue_recovery_coordinator.register_h3_delivery_child_atomic(parent, child,
+                        owner_digest=child["_recovery_owner_digest"], project_digest=child["_recovery_project_digest"],
+                        request_manifest=pointer, expected_control=previous)
+                register_h3_delivery_child(source_job, recovery_job, source_control=_h3_cow_source_control(source_job), persist=persist)
+                durable_child = True
+                _jobs.publish_prepared(recovery_job_id, recovery_job)
+            else:
+                _jobs[recovery_job_id] = recovery_job
         thread = threading.Thread(
-            target=_run_h3_delivery_recovery_job,
+            target=(_run_h3_cow_delivery_child if recovery_job.get("kind") == "studio_h3_delivery_recovery" else _run_h3_delivery_recovery_job),
             args=(recovery_job_id,), daemon=False,
             name=f"h3-delivery-recovery-{recovery_job_id}",
         )
@@ -74872,10 +75317,12 @@ async def _schedule_h3_delivery_recovery(
     except Exception as error:
         with _h3_delivery_recovery_lock:
             recovery = source_job.get("_h3_delivery_recovery") or {}
-            if str(recovery.get("active_job_id") or "") == recovery_job_id:
+            if durable_child:
+                _queue_recovery_checkpoint(recovery_job, queue_held=True, recovery_state="blocked", message="Delivery recovery worker could not start")
+            if not durable_child and str(recovery.get("active_job_id") or "") == recovery_job_id:
                 recovery["active_job_id"] = ""
                 recovery["nonce"] = uuid.uuid4().hex
-            if recovery_job_id:
+            if recovery_job_id and not durable_child:
                 _jobs.pop(recovery_job_id, None)
         raise HTTPException(status_code=503, detail="Recovery could not be scheduled") from error
     finally:
@@ -75655,6 +76102,9 @@ def _resume_recovered_job(
     """Owner/project-scoped manual recovery with a fresh worker only."""
     with _queue_recovery_checkpoint_lock:
         job = _require_owned_job(job_id, request)
+        if ((job.get("kind") == "studio_h3_delivery_recovery" and job.get("status") in {"failed", "cancelled", "completed"})
+            or _h3_cow_manual_source_supported(job)):
+            raise HTTPException(status_code=409, detail="Use the original job's delivery recovery action")
         if job.get("kind") == "sample_campaign_generation":
             raise HTTPException(
                 status_code=409,

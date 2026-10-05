@@ -25,6 +25,50 @@ FFPROBE = shutil.which("ffprobe")
 
 @unittest.skipUnless(FFMPEG and FFPROBE, "ffmpeg and ffprobe are required")
 class EditorExportMediaTests(unittest.TestCase):
+    def test_shared_immutable_source_two_ranges_keep_frame_order_audio_and_rounded_duration(self):
+        from services.editor_projects import create_output_video_timeline, append_output_video_clip, apply_output_video_trim, editor_sequence_clips
+        source = self.root / "immutable.mp4"
+        self.run_media([FFMPEG, "-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i",
+            "color=red:s=128x72:r=24:d=2,drawbox=x=0:y=0:w=iw:h=ih:color=blue:t=fill:enable='gte(t,1)'",
+            "-f", "lavfi", "-i", "aevalsrc=0.1*sin(2*PI*if(lt(t\\,1)\\,440\\,880)*t):s=48000:d=2",
+            "-c:v", "libx264", "-threads", "2", "-preset", "ultrafast", "-c:a", "aac", str(source)])
+        original_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+        media = {"type": "video", "duration": 2, "width": 128, "height": 72, "fps": 24, "has_audio": True}
+        first = create_output_video_timeline(workspace="scene", output_name=source.name, output_revision=original_hash, media=media)
+        current = append_output_video_clip(first, output_name=source.name, output_revision=original_hash, media=media)
+        proposed = json.loads(json.dumps(current))
+        proposed["tracks"][0]["items"][0].update(source_in=0.25, duration=0.55)
+        proposed["tracks"][0]["items"][1].update(source_in=1.25, duration=0.55)
+        proposed["tracks"][0]["items"].reverse()
+        project = apply_output_video_trim(current, proposed)
+        self.assertEqual(len(project["assets"]), 1)
+        clips = [{"path": str(source), "source_in": clip["source_in"], "duration": clip["duration"], "has_audio": asset["has_audio"]}
+                 for asset, clip in editor_sequence_clips(project)]
+        output = self.root / "shared-sequence.mp4"
+        render_video_sequence(clips, output, width=128, height=72, fps=24, timeout=30)
+        probe = json.loads(self.run_media([FFPROBE, "-v", "error", "-show_entries",
+            "stream=codec_type,width,height,avg_frame_rate,nb_frames:format=duration", "-of", "json", str(output)]))
+        video = next(stream for stream in probe["streams"] if stream["codec_type"] == "video")
+        self.assertEqual((video["width"], video["height"], video["avg_frame_rate"], int(video["nb_frames"])), (128, 72, "24/1", 26))
+        self.assertAlmostEqual(float(probe["format"]["duration"]), 26 / 24, delta=0.025)
+        self.assertEqual(sum(stream["codec_type"] == "audio" for stream in probe["streams"]), 1)
+        pixels = self.run_media([FFMPEG, "-v", "error", "-i", str(output), "-map", "0:v:0", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"])
+        stride = 128 * 72 * 3
+        self.assertEqual(len(pixels), 26 * stride)
+        for index in range(26):
+            red, _, blue = pixels[index * stride + (36 * 128 + 64) * 3:index * stride + (36 * 128 + 64) * 3 + 3]
+            self.assertGreater(blue if index < 13 else red, 200)
+            self.assertLess(red if index < 13 else blue, 30)
+        samples = array.array("f", self.run_media([FFMPEG, "-v", "error", "-i", str(output), "-map", "0:a:0", "-ac", "1", "-ar", "48000", "-f", "f32le", "-"]))
+        for start, frequency in ((0.1, 880), (0.7, 440)):
+            chunk = samples[int(start * 48000):int((start + 0.2) * 48000)]
+            crossings = sum(left <= 0 < right for left, right in zip(chunk, chunk[1:]))
+            self.assertAlmostEqual(crossings / 0.2, frequency, delta=15)
+            self.assertGreater(max(abs(value) for value in chunk), 0.05)
+        self.run_media([FFMPEG, "-v", "error", "-i", str(output), "-f", "null", "-"])
+        self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), original_hash)
+        self.assertFalse(list(self.root.glob(".editor-sequence-*")))
+
     def test_image_alpha_interval_geometry_titles_audio_and_sequence_join(self):
         from PIL import Image
         from services.editor_export import _image_filters

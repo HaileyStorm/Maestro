@@ -27,6 +27,7 @@ import time
 from typing import Any
 import uuid
 
+from services.job_lifecycle import validated_h3_delivery_recovery_control
 from services.queue_recovery import QueueRecoveryJournal, RecoverySnapshot
 from services.h3_offload_plan import (
     H3OffloadPlanError,
@@ -80,6 +81,7 @@ _JOB_FIELDS = frozenset({
     "queue_residency_bypass_count", "queue_residency_bypassed_waiters",
     "residency_base_key", "residency_affinity_key", "_queue_manual_order",
     "recovery_attempt", "recovery_state", "reruns_denoise",
+    "h3_delivery_recovery_control",
     "recovery_unit", "recovery_cursor", "_recovery_reason_code",
     "_recovery_worker_pending",
     "credit_queue", "prompt_result_reference", "prompt_result_consumed",
@@ -1102,6 +1104,11 @@ def serialize_job(
             ):
                 raise QueueRecoveryAdapterError("job.workspace is invalid.")
             result[key] = value
+        elif key == "h3_delivery_recovery_control":
+            try:
+                result[key] = validated_h3_delivery_recovery_control(value)
+            except ValueError as error:
+                raise QueueRecoveryAdapterError("H3 recovery control is invalid.") from error
         elif key == "h3_segment_plan":
             clean_plan = _safe_h3_segment_plan(value)
             if clean_plan is not None:
@@ -1681,6 +1688,50 @@ class QueueRecoveryCoordinator:
                 self._global_state = deepcopy(clean_global)
             self._accept_receipt(receipt)
 
+    def register_h3_delivery_child_atomic(self, parent, child, *, owner_digest, project_digest,
+                                         request_manifest, expected_control, global_state=None):
+        """Register a child and its failed parent's active link in one receipt."""
+        with self._lock:
+            parent_id, child_id = parent.get("id"), child.get("id")
+            previous = self._snapshots.get(parent_id)
+            if (previous is None or child_id in self._identities or parent_id == child_id
+                or self._identities.get(parent_id) != (owner_digest, project_digest)
+                or previous.get("status") != "failed"
+                or previous.get("h3_delivery_recovery_control") != expected_control):
+                raise QueueRecoveryAdapterError("H3 recovery registration predecessor changed.")
+            parent_snapshot = serialize_job(parent, owner_digest=owner_digest, project_digest=project_digest,
+                                            request_manifest=self._manifests[parent_id])
+            child_snapshot = serialize_job(child, owner_digest=owner_digest, project_digest=project_digest,
+                                           request_manifest=request_manifest)
+            old = {key: value for key, value in previous.items() if key != "h3_delivery_recovery_control"}
+            proposed = {key: value for key, value in parent_snapshot.items() if key != "h3_delivery_recovery_control"}
+            pc = parent_snapshot.get("h3_delivery_recovery_control") or {}
+            cc = child_snapshot.get("h3_delivery_recovery_control") or {}
+            if (old != proposed or child_snapshot.get("kind") != "studio_h3_delivery_recovery"
+                or child_snapshot.get("parent_job_id") != parent_id or cc.get("source_job_id") != parent_id
+                or cc.get("role") != "child" or cc.get("charged") is not False
+                or pc.get("active_child_id") != child_id or pc.get("active_action") != cc.get("action")
+                or pc.get("active_intent_digest") != cc.get("intent_digest") or pc.get("consumed")
+                or (expected_control is None and (pc.get("manual_retry_count") != 0 or pc.get("last_charged_child_id") is not None))
+                or (expected_control is not None and (expected_control.get("active_child_id") is not None
+                    or expected_control.get("consumed")
+                    or pc != dict(expected_control, active_child_id=child_id,
+                                  active_action=cc.get("action"), active_intent_digest=cc.get("intent_digest"))))
+                or (cc.get("action") == "retry_delivery" and pc.get("manual_retry_count", 2) >= pc.get("manual_retry_limit", 0))):
+                raise QueueRecoveryAdapterError("H3 recovery registration linkage is invalid.")
+            snapshots = {parent_id: parent_snapshot, child_id: child_snapshot}
+            clean_global = None if global_state is None else self._canonical_global_state(global_state, job_updates=snapshots)
+            receipt = self.journal.commit_state(jobs=snapshots, global_state=clean_global,
+                expected_job_revisions={parent_id: self._job_revisions[parent_id], child_id: 0},
+                expected_global_revision=self._global_revision if clean_global is not None else None,
+                expected_epoch=self._epoch)
+            self._accept_receipt(receipt)
+            self._identities[child_id] = (owner_digest, project_digest)
+            self._manifests[child_id] = deepcopy(child_snapshot["request_manifest"])
+            self._snapshots.update(deepcopy(snapshots))
+            if clean_global is not None:
+                self._global_state = deepcopy(clean_global)
+
     def prospective_transition(self, proposal: Any) -> None:
         """Persist a lifecycle ``DurableTransition`` before memory mutation."""
         jobs = tuple(getattr(proposal, "jobs", ()) or ())
@@ -1692,6 +1743,24 @@ class QueueRecoveryCoordinator:
         serialized: dict[str, dict[str, Any]] = {}
         accepted_manifests: dict[str, dict[str, Any]] = {}
         with self._lock:
+            predecessors = getattr(proposal, "h3_control_predecessors", None)
+            if predecessors is not None:
+                if set(predecessors) != {str(job.get("id") or "") for job in jobs} or len(predecessors) != 2:
+                    raise QueueRecoveryAdapterError("H3 companion predecessor shape is invalid.")
+                for job_id, expected in predecessors.items():
+                    current = self._snapshots.get(job_id)
+                    observed = ({"status": current.get("status"), "execution_attempt": current.get("execution_attempt"),
+                                 "h3_delivery_recovery_control": current.get("h3_delivery_recovery_control"),
+                                 "recovery_unit": current.get("recovery_unit"),
+                                 "completed_units": (current.get("recovery_cursor") or {}).get("completed_units")}
+                                if current is not None else None)
+                    if observed != expected:
+                        raise QueueRecoveryAdapterError("H3 companion predecessor changed.")
+            if predecessors is None:
+                for job in jobs:
+                    previous = self._snapshots.get(str(job.get("id") or ""))
+                    if previous is not None and job.get("h3_delivery_recovery_control") != previous.get("h3_delivery_recovery_control"):
+                        raise QueueRecoveryAdapterError("H3 control change requires a companion transition.")
             job_ids = {str(job.get("id") or "") for job in jobs}
             if set(manifest_updates).difference(job_ids):
                 raise QueueRecoveryAdapterError(
@@ -1716,6 +1785,11 @@ class QueueRecoveryCoordinator:
                     project_digest=identity[1],
                     request_manifest=clean_manifest,
                 )
+                if predecessors is not None and (serialized[job_id].get("h3_delivery_recovery_control") or {}).get("role") == "source":
+                    current = self._snapshots[job_id]
+                    if ({key: value for key, value in serialized[job_id].items() if key != "h3_delivery_recovery_control"}
+                        != {key: value for key, value in current.items() if key != "h3_delivery_recovery_control"}):
+                        raise QueueRecoveryAdapterError("H3 companion source metadata changed.")
                 accepted_manifests[job_id] = clean_manifest
             clean_global = (
                 None
@@ -1747,6 +1821,9 @@ class QueueRecoveryCoordinator:
                 self._identities.pop(job_id, None)
                 self._manifests.pop(job_id, None)
                 self._snapshots.pop(job_id, None)
+            acknowledge = getattr(proposal, "h3_control_acknowledge", None)
+            if acknowledge is not None:
+                acknowledge()
 
     def _accept_receipt(self, receipt: Any) -> None:
         self._epoch = receipt.epoch

@@ -114,6 +114,7 @@ def _isolated_functions(tree: ast.Module, names: tuple[str, ...], namespace: dic
         })
     if {"_queue_recovery_materialize_job", "_resume_recovered_job"} & set(names):
         dependencies.add("_h3_native_boundary_exact_retry_allowed")
+        dependencies.add("_h3_cow_manual_source_supported")
     if {"get_status", "list_jobs"} & set(names):
         dependencies.update({"_public_h3_cumulative_plan", "_public_job_h3_cumulative_plan"})
         namespace.setdefault("Mapping", dict)
@@ -7676,10 +7677,80 @@ class QueueLaunchWiringTests(unittest.TestCase):
             'f"{recovery_output_prefix}-continuation-ref.mp4"', ref2va,
         )
 
+    def test_sealed_h3_child_restore_uses_delivery_evidence_without_generation_inputs(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        project = Path(temporary.name)
+        child_id = "b" * 32
+        pointer = write_sealed_request_manifest(project, job_id=child_id,
+            params={"model_type": "minimax_h3_video", "input": "removed-reference.png"},
+            inputs=[{"scope": "synthetic", "path": "removed-reference.png"}])
+        checks = []
+        namespace = _isolated_functions(self.launch, ("_queue_recovery_materialize_job",), {
+            "load_request_manifest": load_request_manifest,
+            "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+            "validated_h3_delivery_recovery_control": lambda control: control,
+            "_h3_cow_completed_unit": lambda job: checks.append(job["id"]) or ({"state": "completed"}, ["sealed.mp4"]),
+            "validate_manifest_inputs": lambda *args, **kwargs: self.fail("completed delivery required generation inputs"),
+        })
+        snapshot = {"id": child_id, "kind": "studio_h3_delivery_recovery", "status": "running",
+                    "workspace": "project-a", "owner_principal": "owner", "project_instance": "project",
+                    "request_manifest": pointer, "queue_held": True, "execution_attempt": 1}
+        restored, resume = namespace["_queue_recovery_materialize_job"](snapshot, {"project-a": (str(project), "project")})
+        self.assertTrue(resume)
+        self.assertEqual(restored["status"], "queued")
+        self.assertTrue(restored["queue_held"])
+        self.assertFalse(restored["reruns_denoise"])
+        self.assertEqual(restored["execution_attempt"], 1)
+        self.assertEqual(checks, [child_id])
+        snapshot.update(status="completed", queue_held=False, resource_state="released", recovery_state="terminal")
+        completed, resume = namespace["_queue_recovery_materialize_job"](snapshot, {"project-a": (str(project), "project")})
+        self.assertTrue(resume)
+        self.assertEqual(completed["status"], "completed")
+        self.assertFalse(completed["queue_held"])
+        self.assertEqual(completed["resource_state"], "released")
+        self.assertEqual(completed["recovery_state"], "terminal")
+        snapshot.update(status="running", queue_held=True)
+        snapshot["cancel_requested"] = True
+        cancelled, resume = namespace["_queue_recovery_materialize_job"](snapshot, {"project-a": (str(project), "project")})
+        self.assertFalse(resume)
+        self.assertTrue(cancelled["queue_held"])
+        changed, resume = namespace["_queue_recovery_materialize_job"](snapshot, {"project-a": (str(project), "recreated")})
+        self.assertFalse(resume)
+        self.assertEqual(changed["_recovery_reason_code"], "input_missing_or_changed")
+
+    def test_private_cumulative_and_director_flags_preserve_existing_restore_input_guard(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        project = Path(temporary.name)
+        for marker in ("_h3_cumulative_append", "_director_final_video_postprocess"):
+            with self.subTest(marker=marker):
+                pointer = write_sealed_request_manifest(project, job_id="aaaaaaaa",
+                    params={marker: True}, inputs=[{"scope": "synthetic", "path": "missing.png"}])
+                input_guard = mock.Mock(side_effect=QueueRecoveryRuntimeError("existing input guard"))
+                namespace = _isolated_functions(self.launch, ("_queue_recovery_materialize_job",), {
+                    "hmac": hmac, "math": __import__("math"), "time": time,
+                    "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError, "load_request_manifest": load_request_manifest,
+                    "validate_manifest_inputs": input_guard, "_queue_recovery_manifest_validator": lambda *args, **kwargs: False,
+                    "_h3_cow_source_evidence": lambda *args, **kwargs: self.fail("excluded source entered manual child recovery"),
+                    "_queue_recovery_worker": lambda job: object(), "_require_h3_offload_plan_parity": lambda *args, **kwargs: None,
+                    "_queue_recovery_reconcile_cursor": lambda *args: None, "_job_uses_registered_h3": lambda job: False,
+                    "next_recovery_attempt": lambda job: (1, True), "_PLAN_REVIEW_TIMEOUT_SECONDS": 16.0,
+                })
+                snapshot = {"id": "aaaaaaaa", "kind": "studio_generation", "status": "failed", "workspace": "project-a",
+                    "owner_principal": "owner", "project_instance": "project", "request_manifest": pointer,
+                    "recovery_cursor": {"delivery_pending": {"publication_schema": 2, "settings": {}}}}
+                restored, resume = namespace["_queue_recovery_materialize_job"](snapshot, {"project-a": (str(project), "project")})
+                self.assertFalse(resume)
+                input_guard.assert_called_once()
+                self.assertEqual(restored["status"], "failed")
+                self.assertNotEqual(restored.get("message"), "Delivery recovery evidence is unavailable")
+
     def test_recovered_custom_workers_never_fall_back_to_generation(self):
         generation = lambda *_args: "generation"
         blend = lambda *_args: "blend"
         outpaint = lambda *_args: "outpaint"
+        delivery = lambda *_args: "delivery"
         namespace = _isolated_functions(
             self.launch,
             ("_queue_recovery_worker",),
@@ -7687,9 +7758,11 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 "_run_generation": generation,
                 "_run_blend_generation": blend,
                 "_prepare_and_run_outpaint": outpaint,
+                "_run_h3_cow_delivery_child": delivery,
             },
         )
         select = namespace["_queue_recovery_worker"]
+        self.assertIs(select({"kind": "studio_h3_delivery_recovery"}), delivery)
         self.assertIs(select({"kind": "studio_generation"}), generation)
         self.assertIs(select({"kind": "studio_blend"}), blend)
         self.assertIs(
@@ -11646,6 +11719,56 @@ class RestoredHeldWorkerTests(unittest.TestCase):
             with self.subTest(patch=patch):
                 self.start({**self.job, **patch})
         self.assertEqual(self.calls, [])
+
+    def test_released_h3_delivery_child_dispatches_once_without_generation_admission(self):
+        worker = object()
+        self.namespace["_run_h3_cow_delivery_child"] = worker
+        started = []
+        class Thread:
+            def __init__(thread, *, target, args, daemon, name):
+                self.assertIs(target, worker)
+                self.assertEqual(args, ("b" * 32,))
+                self.assertFalse(daemon)
+            def start(thread):
+                started.append(True)
+        self.namespace["threading"] = types.SimpleNamespace(Thread=Thread)
+        self.job.update(id="b" * 32, kind="studio_h3_delivery_recovery")
+        self.start(self.job)
+        self.start(self.job)
+        self.assertEqual(started, [True])
+        self.assertEqual(self.calls, ["inputs"])
+        self.assertNotIn("_recovery_worker_pending", self.job)
+
+    def test_terminal_h3_delivery_child_cannot_reuse_generic_failed_retry(self):
+        exception = self.namespace["HTTPException"]
+        for status in ("failed", "cancelled", "completed"):
+            namespace = _isolated_functions(_tree("app/launch.py"), ("_resume_recovered_job",), {
+                "Request": object, "HTTPException": exception,
+                "_queue_recovery_checkpoint_lock": threading.RLock(),
+                "_require_owned_job": lambda *args: {"kind": "studio_h3_delivery_recovery", "status": status},
+            })
+            with self.subTest(status=status), self.assertRaises(exception):
+                namespace["_resume_recovered_job"]("b" * 32, object(), requested_action="retry")
+
+    def test_failed_cow_source_uses_delivery_actions_but_excluded_sources_keep_retry_guard(self):
+        exception = self.namespace["HTTPException"]
+        calls = []
+        source = {"kind": "studio_generation", "status": "failed", "recovery_state": "terminal",
+                  "recovery_cursor": {"delivery_pending": {"publication_schema": 2, "settings": {}}}, "params": {}}
+        namespace = _isolated_functions(_tree("app/launch.py"), ("_resume_recovered_job",), {
+            "Request": object, "HTTPException": exception, "_queue_recovery_checkpoint_lock": threading.RLock(),
+            "_require_owned_job": lambda *args: source,
+            "_queue_recovery_reason_code": lambda job: calls.append("legacy-retry-guard") or "unsupported",
+            "_QUEUE_RECOVERY_REASON_TEXT": {},
+        })
+        with self.assertRaises(exception):
+            namespace["_resume_recovered_job"]("aaaaaaaa", object(), requested_action="retry")
+        self.assertEqual(calls, [])
+        for exclusion in ({"_h3_cumulative_append": True}, {"_director_final_video_postprocess": 1}):
+            source["params"] = exclusion
+            with self.subTest(exclusion=exclusion), self.assertRaises(exception):
+                namespace["_resume_recovered_job"]("aaaaaaaa", object(), requested_action="retry")
+            self.assertEqual(calls.pop(), "legacy-retry-guard")
 
     def test_changed_manifest_reholds_without_model_admission_or_worker(self):
         self.namespace["_queue_recovery_revalidate_job"] = lambda job: False
