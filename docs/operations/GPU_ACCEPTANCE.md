@@ -2663,3 +2663,34 @@ video and source seals remain intact. Exact owned backend stop, lease withdrawal
 coherent denial, restored readiness and cleared restart status were verified.
 This does not close broader Guide quality or owner listening acceptance. See
 [the decoded evidence](MAESTRO_H3_DECODE_EVIDENCE_2026-10-02.md#matched-dense-sdpa-result-2026-10-03-utc).
+
+## 2026-10-05 Revoice native diffusion-step cancellation
+
+At source revision `1ce03299`, one private standalone probe exercised the
+production Revoice wrapper, normal vocal separation and installed SeedVC on
+the RTX 5090. It reused an existing 5.166667-second H3 video and a 30-second
+generated project WAV; all 19 required model/configuration files were present
+and hash-bound. Network downloads were disabled for the probe.
+
+A forward observer counted two returned CUDA estimator calls, then the
+cancellation callback became true. The production pre-hook stopped the next
+estimator call; the native diffusion bar ended at 2/25. The wrapper returned
+`False` without saving converted audio or remuxing. Its temporary cancellation
+hook was removed, vocal scratch directories were cleared, and the private video
+copy, original inputs and model assets retained their hashes. About 1.02 ms
+elapsed from the callback's first positive result to wrapper return. This is
+host-side callback timing, not HTTP Stop latency or synchronized kernel
+preemption.
+
+The fresh exact-workspace grant passed coherent validation before launch and
+five times under the three-second guardian. The owned probe exited successfully;
+cleanup verified its unit had no remaining workload processes before withdrawing
+the exact grant. The durable response was terminal, and its GPU process was
+absent. The normal Pinokio service stayed running with local health and readiness
+returning 200; no shared runtime restart was needed.
+
+This qualifies native cancellation at a SeedVC estimator-call boundary. HTTP
+Stop during diffusion, queue/publication behavior, two-voice conversion and
+owner listening quality remain separate acceptance gates. The released wrapper
+also passed 102 targeted CPU tests; no production arithmetic or installed
+SeedVC files changed for the native probe.
