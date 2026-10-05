@@ -28,6 +28,13 @@ Director does not visually review this sequence.
 video finishes, open its Gallery entry in Editor. If the response is lost or
 cannot be confirmed, check Queue before another submission.
 
+For a Director-authored scene, enter its description and select **Plan scene
+only**. **Queue planned repeats** uses all objects and keyframes in that plan,
+including rotation and scale. It derives duration from the inclusive planned
+frame range and uses the plan's FPS; manual motion controls do not change it.
+Choose the repeat count and privacy setting before submission. This path skips
+Director visual review and does not create a kept motion-guide candidate.
+
 ## Package
 
 Save this example as `composition.json`. It is a two-second blue cube

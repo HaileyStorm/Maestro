@@ -9,12 +9,12 @@ const video = {
   workspace: 'Synthetic project', private: true, explicit: true,
 }
 
-async function setup(page: Page, nonapproval = false, manualOnly = false, permissions?: string[]) {
+async function setup(page: Page, nonapproval = false, manualOnly = false, permissions?: string[], projects = [video.workspace]) {
   const api = await installSyntheticApi(page)
   api.setAccountScenario('remote-user')
-  if (permissions) await page.route('**/api/v1/workspaces', route => route.fulfill({
+  if (permissions || projects.length > 1) await page.route('**/api/v1/workspaces', route => route.fulfill({
     contentType: 'application/json', body: JSON.stringify({
-      workspaces: [{ name: video.workspace, project_permissions: permissions }], active: video.workspace,
+      workspaces: projects.map(name => ({ name, project_permissions: permissions ?? ['project.open', 'project.read', 'project.mutate', 'project.generate'] })), active: video.workspace,
     }),
   }))
   await page.addInitScript(() => localStorage.setItem('maestro_welcome_seen_v1', '1'))
@@ -225,5 +225,148 @@ test('Blender repeats never automatically resend lost or failed submission respo
   await expect(guidance).toBeVisible()
   expect(count).toBe(2)
   await expect(page.getByText('private diagnostic', { exact: true })).toHaveCount(0)
+  await fixture.api.assertClean()
+})
+
+
+const plannedScene = {
+  workspace: video.workspace, director_prompt: 'Two shapes move together',
+  scene: { clear_scene: true, objects: [
+    { name: 'PlannedCube', primitive: 'cube', location: [0, 0, 0], rotation_degrees: [0, 0, 30], scale: [1, 2, 1], material: { name: 'Blue', color: [0, 0, 1, 1] } },
+    { name: 'PlannedSphere', primitive: 'sphere', location: [1, 0, 0], material: { name: 'Red', color: [1, 0, 0, 1] } },
+  ] },
+  animation: { frame_start: 10, frame_end: 57, objects: [
+    { name: 'PlannedCube', keyframes: [{ frame: 10, rotation_degrees: [0, 0, 30], interpolation: 'LINEAR' }, { frame: 57, rotation_degrees: [0, 0, 90], interpolation: 'LINEAR' }] },
+    { name: 'PlannedSphere', keyframes: [{ frame: 10, scale: [1, 1, 1] }, { frame: 57, scale: [2, 2, 2] }] },
+  ] },
+  semantic_mapping: { legend: [
+    { object_name: 'PlannedCube', primitive: 'cube', color: [0, 0, 1, 1], subject: 'Blue block', action: 'turns' },
+    { object_name: 'PlannedSphere', primitive: 'sphere', color: [1, 0, 0, 1], subject: 'Red ball', action: 'grows' },
+  ], conditioned_prompt: 'A blue block turns beside a growing red ball.' },
+  review_frames: [10, 34, 57], notes: 'Two independent transforms', duration_seconds: 2, frame_count: 48,
+  fps: 24, llm_model: 'Synthetic local planner', confirmation_required: false, review_strategy: 'Not visually reviewed',
+}
+
+async function planOnly(page: Page, value: unknown = plannedScene) {
+  await page.route('**/api/v1/blender/director-plan', route => route.fulfill({ contentType: 'application/json', body: JSON.stringify(value) }))
+  await page.getByPlaceholder('Describe the scene, subjects, props, movement, and camera layout…').filter({ visible: true }).fill('Two shapes move together')
+  await page.getByRole('button', { name: 'Plan scene only', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Queue planned repeats', exact: true })).toBeVisible()
+}
+
+test('Director planned repeats preserve all typed actions and their own clock when manual controls change', async ({ page }) => {
+  const fixture = await setup(page, false, true)
+  let finalized = 0
+  const requests: Array<{ package: { segments: Array<{ scene: unknown; animation: unknown; fps: number }>; clips: unknown[]; canvas: unknown; audio: unknown }; private_output: boolean }> = []
+  await page.route('**/api/v1/blender/director-finalize', route => { finalized += 1; return route.abort('failed') })
+  await page.route('**/api/v1/projects/*/compositions', route => {
+    requests.push(route.request().postDataJSON())
+    return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ job_id: 'planned-repeat', status: 'queued' }) })
+  })
+  await planOnly(page)
+  await page.getByRole('textbox', { name: 'Object name', exact: true }).filter({ visible: true }).fill('ManualDifferentObject')
+  await page.getByRole('spinbutton', { name: 'Seconds', exact: true }).fill('7')
+  await page.getByRole('spinbutton', { name: 'FPS', exact: true }).fill('60')
+  await page.getByRole('spinbutton', { name: 'Repeats', exact: true }).fill('3')
+  await page.getByText('Private Off', { exact: true }).click()
+  await page.getByRole('button', { name: 'Queue planned repeats', exact: true }).click()
+  await expect(page.getByText('Added to Queue. When the sequence finishes, open it from Gallery in Editor.', { exact: true })).toBeVisible()
+  expect(requests).toHaveLength(1)
+  expect(requests[0].private_output).toBe(true)
+  expect(requests[0].package.segments).toEqual([{ id: 'planned-motion', scene: plannedScene.scene, animation: plannedScene.animation, fps: 24, width: 1280, height: 720 }])
+  expect(requests[0].package.canvas).toEqual({ width: 1280, height: 720, fps: 24 })
+  expect(requests[0].package.audio).toEqual({ mode: 'silence', sample_rate: 48000 })
+  expect(requests[0].package.clips).toEqual([1, 2, 3].map(index => ({ id: `clip-${index}`, segment_id: 'planned-motion', source_frame: 0, frame_count: 48 })))
+  expect(finalized).toBe(0)
+  await expect(fixture.keep).toHaveCount(0)
+  await expect(fixture.edit).toHaveCount(0)
+  await expect(page.getByText('Object-to-scene guide', { exact: true })).toBeVisible()
+  console.log('DIRECTOR_COMPOSITION_JSON=' + JSON.stringify(requests[0]))
+  await fixture.api.assertClean()
+})
+
+test('Director planned repeats reject unsupported plan clocks and missing generation permission', async ({ page }) => {
+  let fixture = await setup(page, false, true)
+  await planOnly(page, { ...plannedScene, fps: 240 })
+  await expect(page.getByRole('button', { name: 'Queue planned repeats', exact: true })).toBeDisabled()
+  await expect(page.getByText('The planned sequence needs 2–7200 frames, a whole-number FPS from 1–120 and 2–8 repeats in the current project.', { exact: true })).toBeVisible()
+  await fixture.api.assertClean()
+  fixture = await setup(page, false, true, ['project.open', 'project.read', 'project.mutate'])
+  await page.getByPlaceholder('Describe the scene, subjects, props, movement, and camera layout…').filter({ visible: true }).fill('Two shapes move together')
+  await expect(page.getByRole('button', { name: 'Plan scene only', exact: true })).toBeDisabled()
+  await fixture.api.assertClean()
+})
+
+test('Director planning cannot restore a plan after its description changes', async ({ page }) => {
+  const fixture = await setup(page, false, true)
+  let pending: Route | undefined
+  await page.route('**/api/v1/blender/director-plan', route => { pending = route })
+  const prompt = page.getByPlaceholder('Describe the scene, subjects, props, movement, and camera layout…').filter({ visible: true })
+  await prompt.fill('Original description')
+  await page.getByRole('button', { name: 'Plan scene only', exact: true }).click()
+  await expect.poll(() => Boolean(pending)).toBe(true)
+  await prompt.fill('Changed description')
+  await pending!.fulfill({ contentType: 'application/json', body: JSON.stringify(plannedScene) })
+  await expect(page.getByText('The description changed while planning. Plan the current description again.', { exact: true })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Queue planned repeats', exact: true })).toHaveCount(0)
+  await fixture.api.assertClean()
+})
+
+test('Planned and manual repeats share one synchronous submission latch', async ({ page }) => {
+  const fixture = await setup(page, false, true)
+  await planOnly(page)
+  let count = 0
+  let pending: Route | undefined
+  await page.route('**/api/v1/projects/*/compositions', route => { count += 1; pending = route })
+  await page.getByRole('button', { name: 'Queue planned repeats', exact: true }).evaluate(button => {
+    (button as HTMLButtonElement).click()
+    const manual = Array.from(document.querySelectorAll('button')).find(item => item.textContent === 'Render repeats')
+    manual?.click()
+  })
+  await expect.poll(() => count).toBe(1)
+  await expect(page.getByRole('button', { name: 'Render repeats', exact: true })).toBeDisabled()
+  await pending!.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ detail: 'private backend detail' }) })
+  await expect(page.getByText('Maestro could not confirm this submission. Check Queue before rendering repeats again; the sequence may already be queued.', { exact: true })).toBeVisible()
+  expect(count).toBe(1)
+  await expect(fixture.keep).toHaveCount(0)
+  await fixture.api.assertClean()
+})
+
+test('An accepted planned sequence cannot show stale success after changing project', async ({ page }) => {
+  const fixture = await setup(page, false, true, undefined, [video.workspace, 'Other project'])
+  await page.route('**/api/v1/workspaces/active', route => route.fulfill({ contentType: 'application/json', body: '{}' }))
+  await planOnly(page)
+  let pending: Route | undefined
+  await page.route('**/api/v1/projects/*/compositions', route => { pending = route })
+  await page.getByRole('button', { name: 'Queue planned repeats', exact: true }).click()
+  await expect.poll(() => Boolean(pending)).toBe(true)
+  const closeMenu = page.getByRole('dialog', { name: 'Generate, Director, and References menu', exact: true }).getByRole('button', { name: 'Close creative workspace menu', exact: true })
+  if (await closeMenu.isVisible()) await closeMenu.click()
+  await page.getByRole('button', { name: /Current project: .*Open project selector/ }).click()
+  await page.getByRole('dialog', { name: 'Projects', exact: true }).getByRole('button', { name: 'Other project', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Current project: Other project. Open project selector', exact: true })).toBeVisible()
+  await pending!.fulfill({ contentType: 'application/json', body: JSON.stringify({ job_id: 'prior-project-planned-repeat', status: 'queued' }) })
+  await expect(page.getByText('Added to Queue. When the sequence finishes, open it from Gallery in Editor.', { exact: true })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Queue planned repeats', exact: true })).toHaveCount(0)
+  await fixture.api.assertClean()
+})
+
+test('A delayed visual finalization keeps its video without restoring a plan for an edited description', async ({ page }) => {
+  const fixture = await setup(page, false, true)
+  await page.route('**/api/v1/blender/director-plan', route => route.fulfill({ contentType: 'application/json', body: JSON.stringify(plannedScene) }))
+  let pending: Route | undefined
+  await page.route('**/api/v1/blender/director-finalize', route => { pending = route })
+  const prompt = page.getByPlaceholder('Describe the scene, subjects, props, movement, and camera layout…').filter({ visible: true })
+  await prompt.fill('Original scene description')
+  await page.getByRole('button', { name: 'Plan, review, and render', exact: true }).click()
+  await expect.poll(() => Boolean(pending)).toBe(true)
+  await prompt.fill('New scene description')
+  await pending!.fulfill({ contentType: 'application/json', body: JSON.stringify({
+    workspace: video.workspace, asset_id: 'asset', variant_id: 'variant',
+    video: { filename: video.name, url: video.url }, director_reviews: [], final_plan: plannedScene,
+  }) })
+  await expect(fixture.keep).toBeEnabled()
+  await expect(page.getByRole('button', { name: 'Queue planned repeats', exact: true })).toHaveCount(0)
+  await expect(prompt).toHaveValue('New scene description')
   await fixture.api.assertClean()
 })

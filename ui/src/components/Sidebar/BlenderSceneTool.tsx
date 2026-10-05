@@ -54,6 +54,7 @@ export function BlenderSceneTool({
   const workspaceRef = useRef(workspace)
   const statusRequest = useRef(0)
   const operationSequence = useRef(0)
+  const directorPromptRevision = useRef(0)
   const activeOperation = useRef<BlenderOperation | null>(null)
   const compositionSubmission = useRef(false)
   const [submittingComposition, setSubmittingComposition] = useState(false)
@@ -82,6 +83,14 @@ export function BlenderSceneTool({
   const repeatSettingsValid = Number.isInteger(fps) && fps >= 1 && fps <= 120
     && frameCount >= 2 && frameCount <= maxTotalFrames
     && Number.isInteger(repeatCount) && repeatCount >= 2 && repeatCount <= 8
+  const plannedFrames = directorPlan
+    ? directorPlan.animation.frame_end - directorPlan.animation.frame_start + 1 : 0
+  const plannedRepeatsValid = Boolean(directorPlan && directorPlan.workspace === workspace
+    && Number.isInteger(directorPlan.animation.frame_start) && directorPlan.animation.frame_start >= 0
+    && Number.isInteger(directorPlan.animation.frame_end) && directorPlan.animation.frame_end <= 1_000_000
+    && plannedFrames >= 2 && plannedFrames <= maxTotalFrames
+    && Number.isInteger(directorPlan.fps) && directorPlan.fps >= 1 && directorPlan.fps <= 120
+    && Number.isInteger(repeatCount) && repeatCount >= 2 && repeatCount <= 8)
   const maxDuration = maxTotalFrames / fps
   const sampleFrames = useMemo(() => [0, Math.round(endFrame / 2), endFrame], [endFrame])
   workspaceRef.current = workspace
@@ -190,8 +199,10 @@ export function BlenderSceneTool({
     }
   }
 
-  const renderRepeats = async () => {
-    if (compositionSubmission.current || activeOperation.current || !ready || !canRenderRepeats || !repeatSettingsValid) return
+  const renderRepeats = async (useDirectorPlan = false) => {
+    const capturedPlan = useDirectorPlan ? directorPlan : null
+    if (compositionSubmission.current || activeOperation.current || !ready || !canRenderRepeats
+      || !(useDirectorPlan ? plannedRepeatsValid : repeatSettingsValid)) return
     compositionSubmission.current = true
     setSubmittingComposition(true)
     try {
@@ -202,6 +213,26 @@ export function BlenderSceneTool({
         if (!project || (project.project_permissions !== undefined
           && !['project.mutate', 'project.generate'].every(permission => project.project_permissions?.includes(permission)))) {
           throw new api.CompositionSubmissionError('This project does not currently allow you to render repeats. Check your project access.')
+        }
+        if (capturedPlan) {
+          // Use the displayed plan's entire typed actions and inclusive clock.
+          // Server normalization rejects unsupported fields before queue admission.
+          if (capturedPlan.workspace !== operation.workspace) {
+            throw new api.CompositionSubmissionError('Plan this scene again in the current project.')
+          }
+          const count = capturedPlan.animation.frame_end - capturedPlan.animation.frame_start + 1
+          const composition: api.BlenderCompositionPackage = {
+            schema: 'maestro/composition/v1', id: api.createLlmRequestId(),
+            canvas: { width: 1280, height: 720, fps: capturedPlan.fps },
+            audio: { mode: 'silence', sample_rate: 48000 },
+            segments: [{ id: 'planned-motion', scene: capturedPlan.scene, animation: capturedPlan.animation,
+              fps: capturedPlan.fps, width: 1280, height: 720 }],
+            clips: Array.from({ length: repeatCount }, (_, index) => ({
+              id: `clip-${index + 1}`, segment_id: 'planned-motion', source_frame: 0, frame_count: count,
+            })),
+          }
+          await api.submitBlenderComposition(operation.workspace, composition, repeatPrivateOutput)
+          return
         }
         let startPosition: [number, number, number]
         let endPosition: [number, number, number]
@@ -270,6 +301,7 @@ export function BlenderSceneTool({
   const planWithDirector = async (): Promise<api.BlenderDirectorPlan | null> => {
     const operation = activeOperation.current
     if (!operation || !isOperationCurrent(operation)) return null
+    const promptRevision = directorPromptRevision.current
     const plan = await api.planBlenderScene({
       workspace,
       prompt: directorPrompt,
@@ -279,13 +311,24 @@ export function BlenderSceneTool({
       style: 'cinematic blocking reference',
     })
     if (!isOperationCurrent(operation)) return null
+    if (promptRevision !== directorPromptRevision.current) {
+      throw new api.CompositionSubmissionError('The description changed while planning. Plan the current description again.')
+    }
     setDirectorPlan(plan)
     return plan
   }
 
+  const planOnly = () => run('Director scene planning', async () => {
+    setDirectorPlan(null)
+    setDirectorFinal(null)
+    setKeptResult(null)
+    await planWithDirector()
+  })
+
   const finalizePlan = async (plan: api.BlenderDirectorPlan, requestedEdits = ''): Promise<boolean> => {
     const operation = activeOperation.current
     if (!operation || !isOperationCurrent(operation)) return false
+    const promptRevision = directorPromptRevision.current
     const result = await api.finalizeBlenderScene({
       workspace,
       plan,
@@ -295,7 +338,7 @@ export function BlenderSceneTool({
       private_output: privateOutput,
     })
     if (!isOperationCurrent(operation)) return false
-    setDirectorPlan(result.final_plan)
+    if (promptRevision === directorPromptRevision.current) setDirectorPlan(result.final_plan)
     setDirectorFinal(result)
     setKeptResult(null)
     if (!isOperationCurrent(operation)) return false
@@ -460,12 +503,16 @@ export function BlenderSceneTool({
       )}
       <div className="rounded-lg border border-accent-blue/20 bg-accent-blue/5 p-2">
         <label className="text-[9px] uppercase tracking-wide text-text-muted">Director scene plan</label>
-        <textarea value={directorPrompt} onChange={event => { setDirectorPrompt(event.target.value); setDirectorPlan(null) }} rows={compact ? 2 : 3} placeholder="Describe the scene, subjects, props, movement, and camera layout…" className="mt-1 w-full resize-y rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px]" />
+        <textarea value={directorPrompt} onChange={event => { directorPromptRevision.current += 1; setDirectorPrompt(event.target.value); setDirectorPlan(null) }} rows={compact ? 2 : 3} placeholder="Describe the scene, subjects, props, movement, and camera layout…" className="mt-1 w-full resize-y rounded border border-border bg-bg-tertiary px-2 py-1.5 text-[10px]" />
         <button disabled={!ready || !!busy || !directorPrompt.trim()} onClick={runDirector} className="mt-1.5 w-full rounded bg-accent-blue px-2 py-1.5 text-[10px] text-white disabled:opacity-40">Plan, review, and render</button>
+        <button disabled={!ready || !!busy || submittingComposition || !canRenderRepeats || !directorPrompt.trim()} onClick={planOnly} className="mt-1.5 w-full rounded border border-accent-blue/40 px-2 py-1.5 text-[10px] text-accent-blue disabled:opacity-40">Plan scene only</button>
         <p className="mt-1.5 text-[9px] leading-relaxed text-text-muted">Director checks 2–8 moments from the animation together, can revise the scene up to three times, then renders the smooth full video for you.</p>
         {directorPlan && (
           <div className="mt-1.5 text-[9px] leading-relaxed text-text-muted">
             <p>Scene planned · {directorPlan.review_frames.length} moments selected for review</p>
+            <button disabled={!ready || !!busy || submittingComposition || !canRenderRepeats || !plannedRepeatsValid} onClick={() => void renderRepeats(true)} className="mt-1.5 w-full min-h-9 rounded border border-accent-blue/40 px-2 py-1.5 text-[10px] text-accent-blue disabled:opacity-40">Queue planned repeats</button>
+            <p className="mt-1">Queues this planned scene and motion {repeatCount} times at 720p with silent audio: {plannedFrames} frames at {directorPlan.fps} FPS per repeat. Manual controls below do not change it. Its preview {repeatPrivateOutput ? 'starts blurred' : 'is shown normally'}. This skips visual review. Follow Queue, then open the finished video from Gallery in Editor.</p>
+            {!plannedRepeatsValid && <p className="mt-1 text-amber-400">The planned sequence needs 2–7200 frames, a whole-number FPS from 1–120 and 2–8 repeats in the current project.</p>}
             <details className="mt-1">
               <summary className="cursor-pointer text-text-secondary">Production details</summary>
               <p className="mt-1">Model: {directorPlan.llm_model}</p>

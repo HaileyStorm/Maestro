@@ -189,6 +189,12 @@ then open the finished video from Gallery in Editor. Use a whole-number FPS
 from 1–120. If submission cannot be confirmed, check Queue before submitting
 again.
 
+To repeat a Director-authored scene, describe it and select **Plan scene only**,
+then **Queue planned repeats**. The sequence preserves every planned object and
+keyframe, using the plan's frame range and FPS even if manual controls change.
+This skips visual review; use **Plan, review, and render** when you want Director
+approval before keeping a motion guide.
+
 The project-scoped [Blender and Editor composition API](docs/composition-api.md)
 can render typed animation segments and reuse them in a single MP4. Its first
 format supports silent audio, one or two Blender segments, and up to eight

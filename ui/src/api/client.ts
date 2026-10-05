@@ -5302,11 +5302,14 @@ export interface BlenderCompositionPackage {
   segments: Array<{
     id: string
     scene: { clear_scene: true; objects: Array<{
-      name: string; primitive: string; location: [number, number, number]; scale: [number, number, number]
-      material: { name: string; color: [number, number, number, number] }
+      name: string; primitive: string; location?: [number, number, number]; scale?: [number, number, number]
+      rotation_degrees?: [number, number, number]
+      material?: { name: string; color: [number, number, number, number] }
     }> }
     animation: { frame_start: number; frame_end: number; objects: Array<{
-      name: string; keyframes: Array<{ frame: number; location: [number, number, number]; interpolation: 'BEZIER' }>
+      name: string; keyframes: Array<{ frame: number; location?: [number, number, number]
+        rotation_degrees?: [number, number, number]; scale?: [number, number, number]
+        interpolation?: 'BEZIER' | 'LINEAR' | 'CONSTANT' }>
     }> }
     fps: number; width: number; height: number
   }>
@@ -5362,8 +5365,8 @@ export const createBlenderScene = (body: Record<string, unknown>) => blenderRequ
 export interface BlenderDirectorPlan {
   workspace: string
   director_prompt: string
-  scene: Record<string, unknown>
-  animation: Record<string, unknown>
+  scene: BlenderCompositionPackage['segments'][number]['scene']
+  animation: BlenderCompositionPackage['segments'][number]['animation']
   semantic_mapping: BlenderSemanticMapping
   review_frames: number[]
   notes: string
