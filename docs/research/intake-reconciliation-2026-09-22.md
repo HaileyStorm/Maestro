@@ -718,3 +718,30 @@ FL2VA or Ref2VA adapter roster and digest, matching base checkpoint, loaded
 H3 runtime binding and device receipt are qualified. No native PDD sample,
 speedup, or quality acceptance is claimed. Ordinary H3, managed Turbo and
 LightX2V retain their existing paths.
+
+## October 5 follow-on: Studio reconciliation and YuE2 timing
+
+One local Chrome held-submission check now exercises an actual reload before
+the client adopts the server acknowledgement. JavaScript was paused after
+the POST while the backend durably accepted the job. After reload, the UI
+showed uncertain admission, disabled Retry and offered Check submission.
+That manual scoped GET adopted the original held job without another POST.
+Cancellation stopped it at step zero with no output; temporary debugger and
+network settings were restored. Independent evidence/source review passed.
+This is client acknowledgement-adoption loss, not literal packet loss, and
+does not qualify in-flight generation, GPU Stop, Windows or account switching.
+The separate terminal-held badge repair (`c278df80`) passed 923 UI tests and
+shows an idle queue after cancellation in the live UI.
+
+The retained stock and duration-worded YuE2 takes still last 44.999 and
+60.279 seconds against the same eight-bar, 112-BPM score's nominal 17.143
+seconds. Exact score/token/prefix round trips pass; decoder sample counts
+match their respective semantic sequences. CPU spectral-flux analysis finds
+recurring 0.533-second attacks throughout the early, middle and late thirds
+of both recordings. This weakens a uniform single-score-pass slowdown as
+the primary explanation: that would require about 42.67 or 31.85 BPM.
+Synthetic controls discriminate all three tested tempos. Attack periodicity
+cannot identify melody, count performed bars or resolve metrical ambiguity;
+accompaniment could maintain this rhythm while melody timing differs.
+Phrase alignment, ending behavior and owner listening remain open. No model
+was loaded, accepted media regenerated, or audio trimmed or time-scaled.
