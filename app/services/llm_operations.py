@@ -5,7 +5,8 @@ only bounded generated partial/final output needed for exact owner/project
 recovery; effective input, prompt text, messages, media references, provider
 selection, rejected-attempt output, and exception text are never projected.
 Private terminal route results are exact-scope snapshots copied again on read.
-Generic Chat and route records remain in memory; Prompt Enhance delegates its
+Chat optionally seals final results and receipts for restart recovery. Route
+records remain in memory; Prompt Enhance delegates its
 durable ordinary-queue state and private result references to its bound store.
 """
 
@@ -25,6 +26,12 @@ from typing import Any, Protocol
 from services.llm_cancellation import (
     LlmCancellationHandle,
     LlmRequestCancelled,
+)
+from services.llm_chat_recovery import (
+    ChatRecoveryStore,
+    ChatRecoveryError,
+    ChatRecoveryConflict,
+    ChatRecoveryCapacityError,
 )
 
 PREPARE_TTL_SECONDS = 15 * 60
@@ -365,10 +372,11 @@ class _ChatOperation:
     avg_tps: float | None = None
     result: dict[str, Any] | None = None
     task: asyncio.Task[None] | None = None
+    execution_claim: str = ""
 
 
 class LlmChatOperationManager:
-    """Bounded in-memory Chat recovery without persistence or logging."""
+    """Bounded Chat recovery with optional private durable final results."""
 
     def __init__(
         self,
@@ -376,6 +384,8 @@ class LlmChatOperationManager:
         ttl_seconds: float = PREPARE_TTL_SECONDS,
         max_operations: int = 128,
         clock: Callable[[], float] = time.monotonic,
+        store: ChatRecoveryStore | None = None,
+        epoch: str | None = None,
     ) -> None:
         if ttl_seconds <= 0:
             raise ValueError("ttl_seconds must be positive")
@@ -386,6 +396,84 @@ class LlmChatOperationManager:
         self._clock = clock
         self._lock = threading.RLock()
         self._operations: dict[str, _ChatOperation] = {}
+        self._store: ChatRecoveryStore | None = None
+        self._epoch = epoch or uuid.uuid4().hex
+        if store is not None:
+            self.configure_recovery(store)
+
+    def configure_recovery(self, store: ChatRecoveryStore) -> None:
+        """Initialize synchronously before any admission or status read."""
+        with self._lock:
+            if self._store is store:
+                return
+            if self._store is not None or self._operations:
+                raise ChatRecoveryError("Chat recovery is already active")
+            store.initialize_epoch(self._epoch)
+            self._store = store
+
+    def _stored_status(self, request_id, owner_key, project_key, request_digest=None):
+        if self._store is None:
+            return None
+        receipt = self._store.lookup(
+            request_id, owner_key=owner_key, project_key=project_key,
+            request_digest=request_digest,
+        )
+        if receipt is None:
+            return None
+        # A running durable receipt without this process's executor is never
+        # permission to start or resume work, including ambiguous admission.
+        completed = receipt["status"] == "completed"
+        response = {
+            "request_id": receipt["request_id"],
+            "status": "completed" if completed else "failed",
+            "phase": "completed" if completed else "failed",
+            "partial_text": "", "attempt": 1, "attempt_limit": 1,
+            "generated_tokens_approx": 0, "elapsed_seconds": 0.0,
+            "live_tps": None, "average_tps": None, "retryable": False,
+        }
+        if completed:
+            result = self._store.read_result(
+                request_id, owner_key=owner_key, project_key=project_key,
+                request_digest=request_digest,
+                result_reference=receipt["result_reference"],
+            )
+            if result is None:
+                raise ChatRecoveryError("Chat final result is unavailable")
+            response["result"] = result
+        else:
+            interrupted = receipt["status"] in {"running", "interrupted"}
+            response["error"] = {
+                "code": "chat_interrupted" if interrupted else "chat_failed",
+                "message": "Chat was interrupted. Start a new turn." if interrupted else "LLM chat failed",
+                "retryable": False,
+            }
+        return response
+
+    def _persist_terminal(self, operation, *, result=None, cancelled=False):
+        if self._store is None:
+            return None
+        scope = {
+            "owner_key": operation.owner_key, "project_key": operation.project_key,
+            "execution_claim": operation.execution_claim, "epoch": self._epoch,
+        }
+        try:
+            if cancelled:
+                self._store.cancel(operation.request_id, **scope)
+            elif result is not None:
+                self._store.complete(operation.request_id, result=result, **scope)
+            else:
+                self._store.fail(operation.request_id, **scope)
+        except Exception:
+            # An exception after atomic replacement may follow a committed
+            # result. Read that exact receipt; never repeat execution/write.
+            stored = self._stored_status(
+                operation.request_id, operation.owner_key, operation.project_key,
+                operation.request_digest,
+            )
+            if result is not None and stored and stored["status"] == "completed":
+                return stored["result"]
+            raise
+        return copy.deepcopy(result)
 
     def _prune_locked(self, now: float) -> None:
         _prune_request_operations(
@@ -411,7 +499,7 @@ class LlmChatOperationManager:
             "retryable": operation.status == "failed",
         }
         if operation.status == "completed" and operation.result is not None:
-            response["result"] = dict(operation.result)
+            response["result"] = copy.deepcopy(operation.result)
         elif operation.status == "failed":
             response["error"] = {
                 "code": "chat_failed",
@@ -538,25 +626,61 @@ class LlmChatOperationManager:
             )
             if len(self._operations) >= self._max_operations:
                 raise LlmOperationCapacityError
-            if not admit():
-                raise ChatAdmissionError
+            claim = uuid.uuid4().hex
+            if self._store is not None:
+                try:
+                    fresh, _receipt = self._store.bind(
+                        request_id, owner_key=owner_key, project_key=project_key,
+                        request_digest=request_digest, execution_claim=claim,
+                        epoch=self._epoch,
+                    )
+                except ChatRecoveryCapacityError as error:
+                    raise LlmOperationCapacityError from error
+                except ChatRecoveryConflict as error:
+                    # Read scope first so another account cannot infer a
+                    # digest conflict or terminal response through this UUID.
+                    if self._store.lookup(request_id, owner_key=owner_key, project_key=project_key) is None:
+                        return None
+                    raise ChatRequestMismatchError from error
+                if not fresh:
+                    return self._stored_status(request_id, owner_key, project_key, request_digest)
             operation = _ChatOperation(
-                request_id=request_id,
-                owner_key=owner_key,
-                project_key=project_key,
-                request_digest=request_digest,
-                created_at=now,
-                updated_at=now,
+                request_id=request_id, owner_key=owner_key,
+                project_key=project_key, request_digest=request_digest,
+                created_at=now, updated_at=now, execution_claim=claim,
             )
+            try:
+                admitted = admit()
+            except Exception:
+                self._persist_terminal(operation)
+                raise
+            if not admitted:
+                self._persist_terminal(operation)
+                raise ChatAdmissionError
             self._operations[request_id] = operation
             self._prune_locked(now)
+            release_once = _ReleaseOnce(release)
             try:
                 operation.task = asyncio.create_task(
-                    self._run(operation, execute, release),
+                    self._run(operation, execute, release_once),
                 )
+                def release_unstarted(done):
+                    if done.cancelled() and operation.status == "running":
+                        with self._lock:
+                            operation.status = operation.phase = "failed"
+                            operation.updated_at = self._clock()
+                            try:
+                                self._persist_terminal(operation, cancelled=True)
+                            except Exception:
+                                pass
+                        release_once()
+                operation.task.add_done_callback(release_unstarted)
             except Exception:
                 self._operations.pop(request_id, None)
-                release()
+                try:
+                    self._persist_terminal(operation)
+                finally:
+                    release_once()
                 raise
             return self._public(operation)
 
@@ -573,10 +697,13 @@ class LlmChatOperationManager:
             if self._operations.get(operation.request_id) is operation:
                 operation.phase = "inference"
                 operation.updated_at = self._clock()
+        worker: asyncio.Future[dict[str, Any]] | None = None
         try:
-            result = await asyncio.shield(execute(
+            worker = asyncio.ensure_future(execute(
                 lambda event: self._update_progress(operation, event),
             ))
+            result = await asyncio.shield(worker)
+            result = self._persist_terminal(operation, result=result) if self._store is not None else copy.deepcopy(result)
         except asyncio.CancelledError:
             with self._lock:
                 if self._operations.get(operation.request_id) is operation:
@@ -584,8 +711,32 @@ class LlmChatOperationManager:
                     operation.phase = "failed"
                     operation.partial_text = ""
                     operation.updated_at = self._clock()
+            try:
+                self._persist_terminal(operation, cancelled=True)
+            except Exception:
+                pass  # Retain durable uncertainty; cleanup still joins worker.
+            # Keep admission and uploaded inputs owned until the shielded
+            # executor has actually exited, including its blocking thread.
+            # Repeated outer cancellation must not bypass that boundary.
+            if worker is not None:
+                while not worker.done():
+                    try:
+                        await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:  # noqa: BLE001 - cleanup only
+                        break
+                if worker.done():
+                    try:
+                        worker.exception()
+                    except asyncio.CancelledError:
+                        pass
             raise
         except Exception:  # noqa: BLE001 - public state must stay redacted
+            try:
+                self._persist_terminal(operation)
+            except Exception:
+                pass
             with self._lock:
                 if self._operations.get(operation.request_id) is operation:
                     operation.status = "failed"
@@ -600,9 +751,7 @@ class LlmChatOperationManager:
                 pass
         with self._lock:
             if self._operations.get(operation.request_id) is operation:
-                # Result content exists only in this bounded process-memory
-                # recovery record and is discarded on TTL/eviction/restart.
-                operation.result = dict(result)
+                operation.result = copy.deepcopy(result)
                 operation.status = "completed"
                 operation.phase = "completed"
                 result_text = result.get("text")
@@ -622,7 +771,7 @@ class LlmChatOperationManager:
             self._prune_locked(now)
             operation = self._operations.get(request_id)
             if operation is None:
-                return None
+                return self._stored_status(request_id, owner_key, project_key)
             if not (
                 hmac.compare_digest(operation.owner_key, owner_key)
                 and hmac.compare_digest(operation.project_key, project_key)
@@ -649,9 +798,17 @@ class LlmChatOperationManager:
                 and hmac.compare_digest(operation.project_key, project_key)
             ):
                 reconciled = None
-                if operation.status != "running" and reconcile_terminal is not None:
+                if _request_operation_evictable(operation) and reconcile_terminal is not None:
                     reconciled = reconcile_terminal()
                 return self._public(operation), reconciled
+            if operation is not None and not _request_operation_evictable(operation):
+                # Account rotation in one browser hides the old result but
+                # cannot authorize deletion of its worker's uploaded inputs.
+                return None, None
+            stored = self._stored_status(request_id, owner_key, project_key)
+            if stored is not None:
+                reconciled = reconcile_terminal() if reconcile_terminal is not None else None
+                return stored, reconciled
             # Admission uses this same manager lock before taking any injected
             # upload lock. Keeping the callback inside it makes absence +
             # cleanup one CAS winner instead of a status-then-delete race.
@@ -1479,10 +1636,16 @@ class PromptEnhancementOperationManager:
         job_context: Mapping[str, Any] | None = None,
         admit: Callable[[], bool] = lambda: True,
         release: Callable[[], None] = lambda: None,
+        prepare: Callable[..., Awaitable[None]] | None = None,
+        close: Callable[[], Awaitable[None]] | None = None,
     ) -> dict[str, Any] | None:
         """Bind once and start only a newly admitted explicit request."""
         if not callable(execute) or not callable(admit) or not callable(release):
             raise TypeError("execute, admit, and release must be callable")
+        if (prepare is None) != (close is None) or (
+            prepare is not None and (not callable(prepare) or not callable(close))
+        ):
+            raise TypeError("prepare and close must be paired callables")
         bind_scope = {
             "request_id": request_id,
             "account_key": account_key,
@@ -1537,7 +1700,7 @@ class PromptEnhancementOperationManager:
             self._active[normalized] = operation
             try:
                 operation.task = asyncio.create_task(
-                    self._run(operation, execute, release_once),
+                    self._run(operation, execute, release_once, prepare, close),
                 )
             except Exception:
                 self._active.pop(normalized, None)
@@ -1579,14 +1742,46 @@ class PromptEnhancementOperationManager:
             Awaitable[Any],
         ],
         release_once: _ReleaseOnce,
+        prepare: Callable[..., Awaitable[None]] | None = None,
+        close: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         worker_task: asyncio.Task[Any] | None = None
+        prepare_task: asyncio.Task[Any] | None = None
+        admission_task: asyncio.Task[Any] | None = None
+        close_task: asyncio.Task[Any] | None = None
+        close_started = False
+
+        async def drain_owned(task: asyncio.Task[Any] | None) -> None:
+            if task is None:
+                return
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    operation.cancellation.cancel()
+                    continue
+                except Exception:  # noqa: BLE001 - cleanup observes terminality
+                    break
+            if task.done() and not task.cancelled():
+                task.exception()
+
         try:
-            running = await asyncio.to_thread(
+            # External resource admission waits in the same canonical job,
+            # before the store acquires Maestro's generation slot. The owner
+            # must persist its exact intent before prepare contacts a service.
+            if prepare is not None:
+                prepare_task = asyncio.create_task(prepare(
+                    lambda event: self._progress(operation, event),
+                    operation.cancellation,
+                ))
+                await asyncio.shield(prepare_task)
+            operation.cancellation.checkpoint()
+            admission_task = asyncio.create_task(asyncio.to_thread(
                 self._store.mark_running,
                 operation.request_id,
                 **self._claim_scope(operation),
-            )
+            ))
+            running = await asyncio.shield(admission_task)
             if running is None or running.get("status") != "running":
                 return
             with self._lock:
@@ -1619,6 +1814,11 @@ class PromptEnhancementOperationManager:
                 operation.worker_task = worker_task
             result = await asyncio.shield(worker_task)
             operation.cancellation.checkpoint()
+            if close is not None:
+                close_started = True
+                close_task = asyncio.create_task(close())
+                await asyncio.shield(close_task)
+            operation.cancellation.checkpoint()
             completed = self._store.complete(
                 operation.request_id,
                 result=copy.deepcopy(result),
@@ -1643,14 +1843,6 @@ class PromptEnhancementOperationManager:
                 failure_code="execution_interrupted",
                 **self._claim_scope(operation),
             )
-            if worker_task is not None:
-                while not worker_task.done():
-                    try:
-                        await asyncio.shield(worker_task)
-                    except asyncio.CancelledError:
-                        continue
-                    except Exception:  # noqa: BLE001 - cleanup only
-                        break
             raise
         except Exception:  # noqa: BLE001 - durable failure stays redacted
             self._store.fail(
@@ -1661,15 +1853,42 @@ class PromptEnhancementOperationManager:
             with self._lock:
                 self._clear_progress(operation)
         finally:
-            with self._lock:
-                if operation.worker_task is worker_task:
-                    operation.worker_task = None
-            release_slot = getattr(self._store, "release", None)
-            if callable(release_slot):
-                release_slot(
-                    operation.request_id, **self._scope(operation),
-                )
-            release_once()
+            try:
+                # Durable failure recording can itself fail. Joining must be
+                # unconditional before withdrawal/release, including that path.
+                # Cancelling a waiter does not stop shielded blocking work.
+                await drain_owned(prepare_task)
+                await drain_owned(admission_task)
+                await drain_owned(worker_task)
+                await drain_owned(close_task)
+                if close is not None and not close_started:
+                    close_started = True
+                    try:
+                        close_task = asyncio.create_task(close())
+                        await asyncio.shield(close_task)
+                    except asyncio.CancelledError:
+                        operation.cancellation.cancel()
+                        await drain_owned(close_task)
+                        raise
+                    except Exception:  # noqa: BLE001 - retain canonical redacted finality
+                        # The resource owner retains its unsettled durable
+                        # intent for recovery. Never resend cleanup here or
+                        # replace a cancellation with private service details.
+                        self._store.fail(
+                            operation.request_id,
+                            failure_code="resource_cleanup_failed",
+                            **self._claim_scope(operation),
+                        )
+            finally:
+                with self._lock:
+                    if operation.worker_task is worker_task:
+                        operation.worker_task = None
+                release_slot = getattr(self._store, "release", None)
+                if callable(release_slot):
+                    release_slot(
+                        operation.request_id, **self._scope(operation),
+                    )
+                release_once()
 
     def status(
         self,

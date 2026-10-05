@@ -34,7 +34,7 @@ PACKAGES = {
         (),
     ),
     "peft": ("0.20.0", "py3-none-any", ()),
-    "pillow": ("12.2.0", "cp312-cp312-manylinux_2_28_x86_64", ()),
+    "pillow": ("12.3.0", "cp312-cp312-manylinux_2_28_x86_64", ()),
     "safetensors": ("0.8.0", "cp312-cp312-manylinux_2_28_x86_64", ()),
     "tokenizers": ("0.22.1", "cp312-cp312-manylinux_2_28_x86_64", ()),
     "torch": (
@@ -332,6 +332,36 @@ class H3PromptRewriterWheelResolverTests(unittest.TestCase):
             self.execute(plan, fake)
         self.assertFalse(self.stage.exists())
         self.assertEqual(fake.commands, [])
+
+    def test_reviewed_abi3_older_manylinux_download_matches_real_pip_supported_tags(self):
+        try:
+            from pip._internal.models.wheel import Wheel
+            from pip._internal.utils.compatibility_tags import get_supported
+        except ImportError:
+            self.skipTest("real pip compatibility-tag implementation is unavailable")
+        filename = "hf_xet-1.6.0-cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl"
+        package = {"name": "hf-xet", "version": "1.6.0", "wheel": {
+            "filename": filename, "source_url": "https://files.pythonhosted.org/packages/aa/bb/" + filename}}
+        command = resolver._download_command((sys.executable, "-m", "pip"), package, self.root)
+        platforms = [command[index + 1] for index, value in enumerate(command) if value == "--platform"]
+        wheel = Wheel(filename)
+        self.assertFalse(wheel.supported(get_supported(version="312", platforms=["manylinux_2_28_x86_64"],
+            impl="cp", abis=["cp312"])))
+        self.assertTrue(wheel.supported(get_supported(version="312", platforms=platforms,
+            impl="cp", abis=["cp312"])))
+        self.assertEqual(platforms, ["manylinux2014_x86_64", "manylinux_2_17_x86_64"])
+        for flag in ("--no-deps", "--no-index", "--only-binary=:all:", "--isolated"):
+            self.assertIn(flag, command)
+
+    def test_download_platform_derivation_preserves_tag_admission(self):
+        for tags in ("cp38-abi3-win_amd64", "cp38-abi3-manylinux_2_36_x86_64",
+                     "cp38-abi3-manylinux_2_28_aarch64", "cp313-cp313-manylinux_2_28_x86_64"):
+            with self.subTest(tags=tags), self.assertRaisesRegex(
+                resolver.H3PromptRewriterWheelResolverSecurityError, "outside the reviewed runtime"
+            ):
+                resolver._download_command((sys.executable, "-m", "pip"),
+                    {"name": "hf-xet", "version": "1.6.0", "wheel": {
+                        "filename": f"hf_xet-1.6.0-{tags}.whl", "source_url": "unused"}}, self.root)
 
     def test_plan_and_report_hashes_precede_mutation(self):
         plan = resolver.build_h3_prompt_rewriter_wheel_resolution_plan()

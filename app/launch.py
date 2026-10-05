@@ -8952,6 +8952,7 @@ def _restore_queue_recovery_on_startup(
                         _queue_recovery_reconcile_delivery_publication(restored_child, staged)
                     except (ValueError, QueueRecoveryRuntimeError):
                         restored_child["_recovery_reason_code"] = "delivery_publication_reconciliation_blocked"
+    _restore_h3_prompt_rewriter_cleanup(restored_jobs)
     restore_scheduler_state(restored_jobs, _queue_recovery_restored.global_state)
     prompt_results = globals().get("_prompt_enhancement_result_store")
     if prompt_results is not None:
@@ -36027,6 +36028,34 @@ _LLM_CHAT_UPLOAD_TTL_SECONDS = 24 * 60 * 60
 _LLM_CHAT_UPLOAD_SERVER_EPOCH = uuid.uuid4().hex
 _llm_chat_upload_lock = threading.RLock()
 _llm_project_instance_lock = threading.Lock()
+_LLM_CHAT_RECOVERY_READY = False
+
+
+def _initialize_llm_chat_recovery() -> None:
+    """Gate Chat on synchronous startup reconciliation before HTTP readiness."""
+    global _LLM_CHAT_RECOVERY_READY
+    from services.llm_chat_recovery import ChatRecoveryStore
+    from services.llm_operations import llm_chat_operation_manager
+    try:
+        llm_chat_operation_manager.configure_recovery(ChatRecoveryStore(
+            os.path.join(os.getcwd(), "storage", "llm-chat-recovery"),
+            _session_secret(),
+        ))
+    except Exception:
+        # Preserve corrupt/ambiguous storage and keep other Maestro features
+        # available. Chat cannot silently fall back to ephemeral execution.
+        _LLM_CHAT_RECOVERY_READY = False
+        print("Chat recovery is unavailable; Chat requests are temporarily paused.")
+    else:
+        _LLM_CHAT_RECOVERY_READY = True
+
+
+def _ensure_llm_chat_recovery_ready() -> None:
+    if not _LLM_CHAT_RECOVERY_READY:
+        raise HTTPException(status_code=503, detail="Chat recovery is temporarily unavailable")
+
+
+_initialize_llm_chat_recovery()
 
 
 class _LlmChatUploadClaimError(RuntimeError):
@@ -36527,6 +36556,7 @@ def reconcile_llm_chat_upload_request(
     from services.win_safe_files import safe_direct_file_under
 
     _require_upload_content_access(request)
+    _ensure_llm_chat_recovery_ready()
     if _llm_chat_request_is_external(request):
         request.state.maestro_remote = True
     try:
@@ -36596,11 +36626,7 @@ def reconcile_llm_chat_upload_request(
                 except OSError:
                     pass
             deleted += 1
-    owner_key = hmac.new(
-        _session_secret(),
-        f"llm-operation-owner-v1\0{owner}".encode(),
-        hashlib.sha256,
-    ).hexdigest()
+    owner_key = _llm_chat_owner_key(request)
     from services.llm_operations import llm_chat_operation_manager
 
     def cleanup_absent_claims():
@@ -36620,20 +36646,21 @@ def reconcile_llm_chat_upload_request(
                 failed = True
         return removed_count, failed
 
-    operation, reconciled = (
-        llm_chat_operation_manager.status_or_reconcile_absent(
+    try:
+        operation, reconciled = llm_chat_operation_manager.status_or_reconcile_absent(
             normalized_request_id,
             owner_key=owner_key,
             project_key=project_instance,
             reconcile_absent=cleanup_absent_claims,
             reconcile_terminal=cleanup_absent_claims,
         )
-    )
+    except Exception as error:
+        raise HTTPException(status_code=503, detail="Chat recovery is temporarily unavailable") from error
     if reconciled is not None:
         removed_count, failed = reconciled
         deleted += removed_count
         cleanup_failed = cleanup_failed or failed
-    if operation is not None:
+    if operation is not None or (claimed_records and reconciled is None):
         return {"state": "claimed", "deleted": deleted}
     if cleanup_failed:
         return {"state": "retry", "deleted": deleted}
@@ -38081,6 +38108,23 @@ def _prompt_enhancement_operation_scope(
     return account_key, project_key, session_key
 
 
+def _llm_chat_owner_key(request: Request) -> str:
+    """Bind an account and session without requiring a still-open project."""
+    session_id = str(getattr(request.state, "maestro_session_id", "") or "")
+    session_key = hmac.new(_session_secret(), f"llm-operation-owner-v1\0{session_id}".encode(), hashlib.sha256).hexdigest()
+    principal = getattr(request.state, "maestro_account_principal", None)
+    account_id = str(principal.get("id") or "") if isinstance(principal, dict) else ""
+    material = json.dumps([account_id, session_key], separators=(",", ":")).encode()
+    owner_key = hmac.new(_session_secret(), b"llm-chat-owner-v2\0" + material, hashlib.sha256).hexdigest()
+    return owner_key
+
+
+def _llm_chat_operation_scope(request: Request, workspace: str) -> tuple[str, str]:
+    """Chat results belong to one account, browser session and project instance."""
+    project_key = _llm_project_instance_id(request, workspace)
+    return _llm_chat_owner_key(request), project_key
+
+
 _LLM_ROUTE_OPERATION_KINDS = frozenset({"enhance", "director_preview"})
 
 
@@ -38712,6 +38756,7 @@ async def llm_chat(request: Request):
     _require_project_access(
         request, workspace, permission="project.generate",
     )
+    _ensure_llm_chat_recovery_ready()
     image_paths = (
         _resolve_llm_chat_images(request, body, workspace)
         if "image_paths" in body else []
@@ -38730,6 +38775,7 @@ async def llm_chat(request: Request):
         LlmOperationCapacityError,
         llm_chat_operation_manager,
     )
+    from services.llm_chat_recovery import ChatRecoveryError
 
     raw_request_id = body.get("request_id")
     if raw_request_id is None:
@@ -38764,7 +38810,7 @@ async def llm_chat(request: Request):
         if callable(cleanup_chat_uploads):
             cleanup_chat_uploads(request, workspace, image_paths)
         raise HTTPException(status_code=400, detail=str(error)) from error
-    owner_key, project_key = _llm_operation_scope(request, workspace)
+    owner_key, project_key = _llm_chat_operation_scope(request, workspace)
 
     def admit_async_chat() -> bool:
         if not _llm_chat_admission.acquire(blocking=False):
@@ -38835,6 +38881,10 @@ async def llm_chat(request: Request):
         raise HTTPException(
             status_code=503, detail="LLM Chat recovery is busy",
         ) from error
+    except ChatRecoveryError as error:
+        # A storage failure may follow durable admission. Never clean inputs
+        # or invite same-UUID execution based on an ambiguous acknowledgement.
+        raise HTTPException(status_code=503, detail="Chat recovery is temporarily unavailable") from error
     if status is None:
         if callable(cleanup_chat_uploads):
             cleanup_chat_uploads(request, workspace, image_paths)
@@ -38848,27 +38898,30 @@ def llm_chat_status(
     request_id: str,
     workspace: str = "",
 ):
-    """Recover one bounded, in-memory Chat result by opaque request id."""
+    """Recover one scoped Chat result across reloads and backend restarts."""
     from services.llm_operations import llm_chat_operation_manager
 
     if _llm_chat_request_is_external(request):
         request.state.maestro_remote = True
     selected_workspace = _request_project_workspace(request, workspace)
     _require_project_access(request, selected_workspace)
+    _ensure_llm_chat_recovery_ready()
     try:
         normalized_id = _normalize_llm_chat_request_id(request_id)
     except ValueError as error:
         raise HTTPException(
             status_code=404, detail="Chat request not found",
         ) from error
-    owner_key, project_key = _llm_operation_scope(
+    owner_key, project_key = _llm_chat_operation_scope(
         request, selected_workspace,
     )
-    status = llm_chat_operation_manager.status(
-        normalized_id,
-        owner_key=owner_key,
-        project_key=project_key,
-    )
+    from services.llm_chat_recovery import ChatRecoveryError
+    try:
+        status = llm_chat_operation_manager.status(
+            normalized_id, owner_key=owner_key, project_key=project_key,
+        )
+    except ChatRecoveryError as error:
+        raise HTTPException(status_code=503, detail="Chat recovery is temporarily unavailable") from error
     if status is None:
         raise HTTPException(status_code=404, detail="Chat request not found")
     return status
@@ -40058,6 +40111,7 @@ def _materialize_prompt_enhancement_images(
     max_total_bytes: int = _LLM_ENHANCE_MAX_TOTAL_IMAGE_BYTES,
     media_label: str = "Enhance image",
     snapshot_prefix: str = "maestro-enhance-",
+    snapshot_directory: str | None = None,
 ) -> list[str]:
     """Copy exact admitted bytes to private worker-owned immutable paths."""
     import tempfile
@@ -40129,6 +40183,7 @@ def _materialize_prompt_enhancement_images(
                 snapshot_descriptor, snapshot_path = tempfile.mkstemp(
                     prefix=snapshot_prefix,
                     suffix=suffix,
+                    dir=snapshot_directory,
                 )
                 digest = hashlib.sha256()
                 remaining_bytes = before.st_size
@@ -40472,6 +40527,236 @@ def _validate_standalone_enhanced_prompt_cardinality(
     return result
 
 
+def _restore_h3_prompt_rewriter_cleanup(jobs):
+    """Reconcile only exact saved cleanup; never infer a reaped child or dispatch."""
+    from services.h3_prompt_rewriter_config import load_runtime_snapshot
+    from services.h3_prompt_rewriter_gpu_lease import H3PromptRewriterGpuLease
+    from services.job_lifecycle import checkpoint_prompt_enhancement_gpu_intent
+    from services.queue_recovery_adapter import prompt_enhancement_gpu_cleanup_pending
+    attempted = 0
+    for job in jobs:
+        cursor = job.get("recovery_cursor")
+        if (job.get("kind") != "prompt_enhancement"
+                or not prompt_enhancement_gpu_cleanup_pending(job)
+                or not isinstance(cursor, dict)
+                or cursor.get("h3_prompt_rewriter_child_reaped") is not True):
+            continue
+        if attempted >= 4:
+            break
+        attempted += 1
+        try:
+            snapshot = load_runtime_snapshot(workspace=Path(__file__).resolve().parent.parent)
+            attempt = job.get("execution_attempt", 1)
+            def persist(intent, saved_job=job, saved_attempt=attempt):
+                return checkpoint_prompt_enhancement_gpu_intent(saved_job,
+                    expected_execution_attempt=saved_attempt, intent=intent, child_reaped=True)
+            lease = H3PromptRewriterGpuLease.restore_from_intent(snapshot.gpu_binding(),
+                cursor["h3_prompt_rewriter_gpu"], persist_intent=persist)
+            lease.close(child_reaped=True, confirm_seconds=2)
+        except Exception:
+            # Retain the exact durable evidence for later reconciliation.
+            continue
+
+
+async def _submit_h3_prompt_rewriter_operation(request, body, workspace, authorized_images):
+    """Compose through the canonical queue using an owner-selected local runtime."""
+    from services import h3_prompt_rewriter as rewrite
+    from services.h3_prompt_rewriter_config import (
+        H3PromptRewriterConfigurationError, load_runtime_snapshot,
+    )
+    from services.h3_prompt_rewriter_gpu_lease import H3PromptRewriterGpuLease
+    from services.h3_prompt_rewriter_runtime import (
+        H3PromptRewriterCancelled, execute_h3_prompt_rewrite,
+    )
+    from services.llm_cancellation import LlmRequestCancelled
+    from services.llm_operations import LlmRouteAdmissionError, run_blocking_shielded
+    from services.job_lifecycle import checkpoint_prompt_enhancement_gpu_intent
+
+    try:
+        request_id = _normalize_llm_route_request_id(body.get("request_id"))
+        mode = body.get("rewrite_mode")
+        if mode not in rewrite.SUPPORTED_MODES:
+            raise ValueError("Choose an H3 text, first-frame, last-frame, or first-and-last-frame mode")
+        if body.get("model_type") not in {
+            "minimax_h3", "minimax_h3_pinkcherry_fl2va", "minimax_h3_w4a8_fl2va",
+        }:
+            raise ValueError("Compose requires an H3 model; Ref2VA is unsupported")
+        duration = body.get("duration_seconds")
+        if type(duration) is not int or not 4 <= duration <= 15:
+            raise ValueError("H3 Compose requires a whole-number duration from 4 to 15 seconds")
+        roles = rewrite.IMAGE_ROLES_BY_MODE[mode]
+        if len(authorized_images) != len(roles):
+            raise ValueError("Choose the images required by the selected H3 mode")
+        canonical = rewrite.create_rewrite_request(original_prompt=body.get("prompt"), mode=mode,
+            image_roles=[{"role": role, "input_id": f"frame-{index}"}
+                         for index, role in enumerate(roles)])
+    except (ValueError, TypeError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
+    account_key, project_key, session_key = _prompt_enhancement_operation_scope(request, workspace)
+    expected_project = body.get("project_instance")
+    if not isinstance(expected_project, str) or not hmac.compare_digest(expected_project, project_key):
+        raise HTTPException(status_code=409, detail="H3 Compose project changed")
+    scope = {"account_key": account_key, "project_instance_key": project_key, "session_key": session_key}
+    cancellation = getattr(request.state, "maestro_llm_cancel_handle", None)
+    seals = await run_blocking_shielded(_seal_prompt_enhancement_images, authorized_images, cancellation)
+    try:
+        snapshot = await run_blocking_shielded(load_runtime_snapshot,
+            workspace=Path(__file__).resolve().parent.parent)
+    except H3PromptRewriterConfigurationError:
+        raise HTTPException(status_code=503, detail="H3 Compose is unavailable; configure the local prompt rewriter") from None
+    digest = _llm_route_effective_input_digest("enhance", {
+        "engine": "h3_rewriter", "request": canonical, "duration": duration,
+        "model_type": body["model_type"], "workspace": workspace,
+        "images": seals, "runtime_commitment": snapshot.commitment,
+    })
+    authority = _ScopedPromptEnhancementRequest.snapshot_authority(request)
+    state = {"lease": None, "job": None, "attempt": None, "child_reaped": True}
+
+    def scoped_request(progress, handle):
+        return _ScopedPromptEnhancementRequest(authority, body, progress_callback=progress,
+            cancel_handle=handle, project_instance_key=project_key, runtime_snapshot={},
+            image_seals=seals, materialized_image_paths=[])
+
+    def reauthorize(progress, handle):
+        handle.checkpoint()
+        detached = scoped_request(progress, handle)
+        _require_project_access(detached, workspace, existing_only=True, permission="project.generate")
+        current_account, current_project, _ = _prompt_enhancement_operation_scope(detached, workspace)
+        if not hmac.compare_digest(current_account, account_key) or not hmac.compare_digest(current_project, project_key):
+            raise LlmRequestCancelled("H3 Compose project changed")
+        snapshot.recheck()
+
+    def persist(intent):
+        return checkpoint_prompt_enhancement_gpu_intent(state["job"],
+            expected_execution_attempt=state["attempt"], intent=intent,
+            child_reaped=state["child_reaped"])
+
+    def observe_child(reaped):
+        state["child_reaped"] = reaped
+        # A positive local receipt is persisted with cleanup even after a
+        # terminal cancellation. A negative receipt must precede every spawn.
+        if reaped is False:
+            try:
+                if persist(state["lease"].intent) is not True:
+                    raise LlmRequestCancelled("H3 Compose cleanup checkpoint unavailable")
+            except BaseException:
+                # This observer runs before Popen; failed persistence prevented
+                # spawning, so cleanup can still settle the acquired lease.
+                state["child_reaped"] = True
+                raise
+
+    async def prepare(progress, handle):
+        await run_blocking_shielded(reauthorize, progress, handle)
+        job = _prompt_enhancement_operation_manager._store._canonical(request_id, **scope)
+        if job is None:
+            raise LlmRequestCancelled("H3 Compose operation unavailable")
+        state["job"], state["attempt"] = job, job.get("execution_attempt", 1)
+        lease = H3PromptRewriterGpuLease(snapshot.gpu_binding(),
+            request_id=f"maestro-h3-rewrite-{request_id}-a{state['attempt']}",
+            agent_id=f"maestro-h3-{request_id}", persist_intent=persist)
+        state["lease"] = lease
+        progress({"phase": "queued", "stage": "waiting_for_gpu"})
+        await run_blocking_shielded(lease.acquire, cancel_check=lambda: handle.cancelled)
+
+    async def execute(progress, handle, execution_context=None):
+        import tempfile
+        lease = state["lease"]
+        if not isinstance(execution_context, Mapping) or execution_context.get("job") is not state["job"] or execution_context.get("generation_slot_owned") is not True:
+            raise LlmRequestCancelled("H3 Compose generation admission unavailable")
+        await run_blocking_shielded(reauthorize, progress, handle)
+        await run_blocking_shielded(lease.before_start)
+        directory = tempfile.mkdtemp(prefix="maestro-h3-images-")
+        images = []
+        try:
+            images = await run_blocking_shielded(_materialize_prompt_enhancement_images, seals, handle,
+                snapshot_directory=directory)
+            progress({"phase": "loading", "stage": "loading"})
+            admission = await run_blocking_shielded(snapshot.build_execution_admission, mode,
+                cancel_check=lambda: handle.cancelled, child_reaped_observer=observe_child)
+            bindings = [{"input_id": role["input_id"], "path": path, "trust_root": directory,
+                         "seal": {"size_bytes": seal["size"], "sha256": seal["sha256"]}}
+                        for role, path, seal in zip(canonical["image_roles"], images, seals)]
+            await run_blocking_shielded(lease.before_start)
+            progress({"phase": "inference", "stage": "composing"})
+            result = await run_blocking_shielded(execute_h3_prompt_rewrite, admission, canonical,
+                image_bindings=bindings, duration=duration, cancel_check=lambda: handle.cancelled,
+                execution_guard=lease, child_reaped_observer=observe_child)
+            progress({"phase": "finalizing", "stage": "finalizing"})
+            preview = rewrite.create_executed_rewrite_preview(canonical, result)
+            return {"original": canonical["original_prompt"], "enhanced": canonical["original_prompt"],
+                    "h3_rewrite_request": canonical, "h3_rewrite_preview": preview}
+        except H3PromptRewriterCancelled:
+            raise LlmRequestCancelled("H3 Compose cancelled") from None
+        finally:
+            if state["child_reaped"] is True:
+                _remove_prompt_enhancement_snapshots(images)
+                try:
+                    os.rmdir(directory)
+                except OSError:
+                    pass
+
+    async def close():
+        if state["lease"] is not None:
+            await run_blocking_shielded(state["lease"].close, child_reaped=state["child_reaped"])
+
+    try:
+        status = _prompt_enhancement_operation_manager.submit(request_id=request_id, **scope,
+            request_digest=digest, execute=execute, prepare=prepare, close=close,
+            job_context={"workspace": workspace, "out_dir": _existing_workspace_dir(workspace),
+                "session_id": str(getattr(request.state, "maestro_session_id", "") or ""),
+                "source_remote": bool(getattr(request.state, "maestro_remote", False)),
+                "generation_mode": str(body.get("mode") or ""),
+                "private": bool(body.get("private_output", False)),
+                "explicit": bool(body.get("explicit_output", False)), "body": copy.deepcopy(body)})
+    except PromptEnhancementRecoveryConflictError:
+        raise HTTPException(status_code=409, detail="H3 Compose request does not match") from None
+    except LlmRouteAdmissionError:
+        raise HTTPException(status_code=429, detail="H3 Compose is busy; retry shortly") from None
+    except PromptEnhancementRecoveryError:
+        raise HTTPException(status_code=503, detail="H3 Compose recovery is unavailable") from None
+    if status is None:
+        raise HTTPException(status_code=404, detail="LLM operation not found")
+    return JSONResponse(status, status_code=202)
+
+
+@api.post("/api/v1/llm/operations/enhance/{request_id}/h3-apply")
+async def llm_h3_prompt_rewriter_apply(request: Request, request_id: str):
+    """Return one explicitly selected stored candidate; never dispatch generation."""
+    from services import h3_prompt_rewriter as rewrite
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="JSON object body is required")
+    workspace = _request_project_workspace(request, body.get("workspace"))
+    _require_project_access(request, workspace, existing_only=True, permission="project.generate")
+    account_key, project_key, session_key = _prompt_enhancement_operation_scope(request, workspace)
+    if not isinstance(body.get("project_instance"), str) or not hmac.compare_digest(body["project_instance"], project_key):
+        raise HTTPException(status_code=409, detail="H3 Compose project changed")
+    status = _prompt_enhancement_operation_manager.status(request_id, account_key=account_key,
+        project_instance_key=project_key, session_key=session_key)
+    if not isinstance(status, dict) or status.get("status") != "completed":
+        raise HTTPException(status_code=404, detail="H3 comparison not found")
+    result = _prompt_enhancement_operation_manager.result(request_id, account_key=account_key,
+        project_instance_key=project_key, session_key=session_key)
+    if not isinstance(result, dict) or not isinstance(result.get("h3_rewrite_preview"), dict):
+        raise HTTPException(status_code=404, detail="H3 comparison not found")
+    try:
+        canonical = rewrite.validate_rewrite_request(result["h3_rewrite_request"])
+        preview = rewrite.validate_rewrite_preview(canonical, result["h3_rewrite_preview"])
+        if preview["schema_version"] != rewrite.EXECUTED_PREVIEW_SCHEMA_VERSION:
+            raise ValueError("Unexecuted comparison")
+    except (ValueError, TypeError, KeyError):
+        raise HTTPException(status_code=400, detail="Invalid H3 comparison") from None
+    if body.get("request_commitment") != canonical.get("commitment") or body.get("preview_commitment") != preview.get("commitment"):
+        raise HTTPException(status_code=409, detail="H3 comparison changed")
+    try:
+        decision = rewrite.create_apply_decision(canonical, preview, body.get("selected_kind"))
+        enhanced = rewrite.apply_preview_decision(canonical, preview, decision)
+    except (ValueError, TypeError, KeyError):
+        raise HTTPException(status_code=400, detail="Invalid H3 comparison selection") from None
+    return {"enhanced": enhanced, "request_commitment": canonical["commitment"],
+            "preview_commitment": preview["commitment"], "selected_kind": decision["selected_kind"]}
+
+
 @api.post("/api/v1/llm/enhance-prompt")
 async def llm_enhance_prompt(request: Request):
     """Enhance a generation prompt. Routes to Wan2GP enhancer or local LLM based on config."""
@@ -40523,6 +40808,11 @@ async def llm_enhance_prompt(request: Request):
                     status_code=404, detail="Enhance image not found",
                 )
             authorized_image_paths.append(resolved)
+
+    if body.get("engine") == "h3_rewriter":
+        return await _submit_h3_prompt_rewriter_operation(request, body, workspace, authorized_image_paths)
+    if body.get("engine") is not None:
+        raise HTTPException(status_code=400, detail="Unknown prompt enhancement engine")
 
     cancel_handle = getattr(
         request.state, "maestro_llm_cancel_handle", None,

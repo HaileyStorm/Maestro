@@ -1,10 +1,11 @@
-"""Blocked, source-only runtime admission for the H3 prompt rewriter.
+"""Passive compatibility admission and explicit offline H3 child execution.
 
 This module binds a canonical dependency input to passive candidate metadata
 and owner-private directory identities.  Candidate names, sizes, and bounded
 sidecars are not artifact-byte verification.  No durable byte receipt or
-launch-time byte recheck exists in this slice, so execution, GPU acceptance,
-process lifecycle, and cancellation remain unavailable.
+launch-time byte recheck exists in that compatibility representation.  The
+separate execution interface requires reviewed byte seals and an exact runtime;
+it does not make the passive status executable or imply GPU/human acceptance.
 """
 
 from __future__ import annotations
@@ -14,6 +15,10 @@ import json
 import os
 import re
 import stat
+import subprocess
+import time
+import uuid
+import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -1008,3 +1013,382 @@ __all__ = [
     "recheck_h3_prompt_rewriter_runtime_admission",
     "resolve_h3_prompt_rewriter_runtime_layout",
 ]
+
+
+EXECUTION_SCHEMA = "maestro.h3-prompt-rewriter.executed.v2"
+_EXECUTION_PACKAGE_PINS = dict(dependency_closure.ROOT_PACKAGE_PINS)
+_TEMPLATE_SHA256 = "0442bbd10deb1119d3a4043b7ce405ece67019235d51d282beb48de9cde13066"
+_EXECUTION_TOKEN = object()
+_MINTED_RESULTS = weakref.WeakSet()
+_MAX_PROTOCOL_BYTES = 262144
+
+
+class H3PromptRewriterCancelled(H3PromptRewriterRuntimeError):
+    """The owned child was stopped and reaped; no candidate is accepted."""
+
+
+class H3PromptRewriterExecutionResult:
+    """Completed, runtime-minted candidates; never a caller text wrapper."""
+
+    __slots__ = ("__document", "__weakref__")
+
+    def __init__(self, token: object, document: Mapping[str, object]) -> None:
+        if token is not _EXECUTION_TOKEN:
+            raise H3PromptRewriterRuntimeError("execution result requires runtime provenance")
+        object.__setattr__(self, "_H3PromptRewriterExecutionResult__document", _canonical_json(document))
+        _MINTED_RESULTS.add(self)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("execution results are immutable")
+
+    def __repr__(self) -> str:
+        return "H3PromptRewriterExecutionResult(completed=True)"
+
+    def _value(self, key: str):
+        return json.loads(self.__document)[key]
+
+    @property
+    def request_commitment(self) -> str:
+        return self._value("request_commitment")
+
+    @property
+    def deterministic_candidate(self) -> str:
+        return self._value("deterministic_candidate")
+
+    @property
+    def base_candidate(self) -> str:
+        return self._value("base_candidate")
+
+    @property
+    def adapted_candidate(self) -> str:
+        return self._value("adapted_candidate")
+
+    @property
+    def execution_receipt_sha256(self) -> str:
+        return _sha256_mapping(self.public_receipt())
+
+    def public_receipt(self) -> dict[str, object]:
+        return self._value("receipt")
+
+
+def validate_h3_prompt_rewriter_execution_result(result: object, *, request_commitment: str) -> H3PromptRewriterExecutionResult:
+    if type(result) is not H3PromptRewriterExecutionResult or result not in _MINTED_RESULTS or result.request_commitment != request_commitment:
+        raise H3PromptRewriterRuntimeError("completed execution does not bind this request")
+    receipt = result.public_receipt()
+    if receipt.get("schema") != EXECUTION_SCHEMA or receipt.get("completed") is not True:
+        raise H3PromptRewriterRuntimeError("execution is not completed")
+    if not _public_value_is_path_free(receipt):
+        raise H3PromptRewriterRuntimeSecurityError("execution receipt is not content-free")
+    return result
+
+
+def _execution_boundary(cancel_check=None, execution_guard=None) -> None:
+    if cancel_check is not None and cancel_check():
+        raise H3PromptRewriterCancelled("H3 prompt rewrite cancelled")
+    if execution_guard is not None and execution_guard() is not True:
+        raise H3PromptRewriterRuntimeSecurityError("execution authority unavailable")
+
+
+def _owned_child(command, *, cwd: Path, environment: Mapping[str, str], cancel_check=None,
+                 execution_guard=None, timeout_seconds=600.0, stop_seconds=2.0,
+                 child_reaped_observer=None) -> int:
+    """Signal the owned child and confirm its wait before reporting reaping."""
+    _execution_boundary(cancel_check, execution_guard)
+    if not 0 < timeout_seconds <= 1800 or not 0 < stop_seconds <= 10:
+        raise H3PromptRewriterRuntimeError("invalid child deadline")
+    # Persist uncertainty before spawning. A failed checkpoint cannot create a
+    # child, and a failed final wait must never publish a positive reap receipt.
+    if child_reaped_observer is not None:
+        child_reaped_observer(False)
+    try:
+        _execution_boundary(cancel_check, execution_guard)
+    except BaseException:
+        # The checkpoint may block. Recheck before entering the constructor;
+        # failure here proves this child was never spawned.
+        if child_reaped_observer is not None:
+            child_reaped_observer(True)
+        raise
+    # Popen can raise after fork. Constructor failure leaves the durable False
+    # receipt intact because it does not prove that no child exists.
+    child = subprocess.Popen(command, cwd=cwd, env=dict(environment), stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        while child.poll() is None:
+            _execution_boundary(cancel_check, execution_guard)
+            if time.monotonic() >= deadline:
+                raise H3PromptRewriterRuntimeError("H3 prompt-rewriter child timed out")
+            time.sleep(0.05)
+        _execution_boundary(cancel_check, execution_guard)
+        return child.returncode
+    finally:
+        if child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(timeout=stop_seconds)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=stop_seconds)
+        else:
+            child.wait()
+        if child_reaped_observer is not None:
+            child_reaped_observer(True)
+
+
+def _sealed_file(path: Path, expected: Mapping[str, object], *, cancel_check=None) -> dict[str, object]:
+    _assert_no_symlink_components(path)
+    if set(expected) != {"size_bytes", "sha256"}:
+        raise H3PromptRewriterRuntimeSecurityError("invalid asset seal")
+    digest = _exact_sha256(expected["sha256"], field="asset digest")
+    if type(expected["size_bytes"]) is not int or expected["size_bytes"] < 1:
+        raise H3PromptRewriterRuntimeSecurityError("invalid asset size")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_uid not in {0, os.getuid()} or before.st_mode & 0o022:
+            raise H3PromptRewriterRuntimeSecurityError("unsafe sealed asset")
+        if before.st_size != expected["size_bytes"]:
+            raise H3PromptRewriterRuntimeSecurityError("asset size changed")
+        observed = hashlib.sha256()
+        while True:
+            _execution_boundary(cancel_check)
+            block = os.read(fd, 1024 * 1024)
+            if not block:
+                break
+            observed.update(block)
+        after = os.fstat(fd)
+        fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if any(getattr(before, field) != getattr(after, field) for field in fields) or observed.hexdigest() != digest or path.stat().st_ino != before.st_ino:
+            raise H3PromptRewriterRuntimeSecurityError("asset bytes changed")
+        return {"path": str(path), "size_bytes": before.st_size, "sha256": digest,
+                "dev": before.st_dev, "inode": before.st_ino, "mtime_ns": before.st_mtime_ns, "ctime_ns": before.st_ctime_ns}
+    finally:
+        os.close(fd)
+
+
+def _write_private_protocol(path: Path, document: Mapping[str, object]) -> None:
+    data = _canonical_json(document)
+    if len(data) > _MAX_PROTOCOL_BYTES:
+        raise H3PromptRewriterRuntimeError("private request exceeds bound")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _read_private_protocol(path: Path) -> dict[str, object]:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > _MAX_PROTOCOL_BYTES:
+            raise H3PromptRewriterRuntimeSecurityError("unsafe private result")
+        data = stream.read(_MAX_PROTOCOL_BYTES + 1)
+    result = json.loads(data)
+    if type(result) is not dict:
+        raise H3PromptRewriterRuntimeError("invalid child result")
+    return result
+
+
+class H3PromptRewriterExecutionAdmission:
+    __slots__ = ("__passive", "__configuration")
+
+    def __init__(self, token, passive, configuration):
+        if token is not _EXECUTION_TOKEN:
+            raise H3PromptRewriterRuntimeError("execution admission requires verification")
+        object.__setattr__(self, "_H3PromptRewriterExecutionAdmission__passive", passive)
+        object.__setattr__(self, "_H3PromptRewriterExecutionAdmission__configuration", _canonical_json(configuration))
+
+    def __setattr__(self, name, value):
+        raise AttributeError("execution admissions are immutable")
+
+    def __repr__(self):
+        return "H3PromptRewriterExecutionAdmission(offline=True)"
+
+
+def _child_exchange(passive, configuration, operation, *, cancel_check=None, execution_guard=None, timeout_seconds=600, result_consumer=None, child_reaped_observer=None):
+    if not recheck_h3_prompt_rewriter_runtime_admission(passive):
+        raise H3PromptRewriterRuntimeSecurityError("private runtime identity changed")
+    stage = passive.private_receipt().layout.staging / uuid.uuid4().hex
+    stage.mkdir(mode=0o700)
+    request_path, result_path = stage / "request.json", stage / "result.json"
+    successful = False
+    try:
+        payload = dict(configuration, operation=operation, parent_pid=os.getpid())
+        _write_private_protocol(request_path, payload)
+        environment = passive.child_environment()
+        if configuration.get("device") == "cuda":
+            if execution_guard is None:
+                raise H3PromptRewriterRuntimeSecurityError("GPU execution requires exact authority guard")
+            environment["CUDA_VISIBLE_DEVICES"] = configuration["cuda_visible_devices"]
+        code = _owned_child([configuration["python_executable"], "-I", "-B", configuration["worker"], str(request_path), str(result_path)],
+                            cwd=stage, environment=environment, cancel_check=cancel_check,
+                            execution_guard=execution_guard, timeout_seconds=timeout_seconds,
+                            child_reaped_observer=child_reaped_observer)
+        if code != 0:
+            raise H3PromptRewriterRuntimeError("H3 prompt-rewriter child failed")
+        result = _read_private_protocol(result_path)
+        if result.get("operation") != operation or result.get("nonce") != configuration["nonce"] or result.get("state") != "completed":
+            raise H3PromptRewriterRuntimeError("H3 prompt-rewriter child did not complete")
+        value = result if result_consumer is None else result_consumer(result)
+        _execution_boundary(cancel_check, execution_guard)
+        successful = True
+        return value
+    except BaseException as error:
+        try:
+            _write_private_protocol(stage / "parent-outcome.json", {
+                "state": "cancelled" if isinstance(error, H3PromptRewriterCancelled) else "failed",
+                "operation": operation, "nonce": configuration["nonce"],
+                "private_diagnostic": {
+                    "exception_type": type(error).__name__[:256],
+                    "exception_message": str(error).encode("utf-8", "replace")[:8192].decode("utf-8", "ignore"),
+                },
+            })
+        except (OSError, ValueError, H3PromptRewriterRuntimeError):
+            pass
+        if isinstance(error, H3PromptRewriterRuntimeError) or not isinstance(error, Exception):
+            raise
+        raise H3PromptRewriterRuntimeError("H3 prompt-rewriter private protocol failed") from None
+    finally:
+        if successful:
+            # Unexpected members survive even after a completed exchange.
+            for path in (request_path, result_path):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+            try:
+                stage.rmdir()
+            except OSError:
+                pass
+
+
+def build_h3_prompt_rewriter_execution_admission(passive, *, python_executable, interpreter_seal,
+        asset_seals, template_path, runtime_receipt_sha256, runtime_inventory, device="cpu", cuda_visible_devices="", cancel_check=None, child_reaped_observer=None):
+    """Admit installed bytes and metadata, without importing or loading a model.
+
+    asset_seals maps every regular file relative to adapter/base directories to
+    a reviewed size/hash seal. Runtime receipt is the controller's separately
+    qualified environment receipt, not an installation or GPU grant.
+    """
+    if type(passive) is not H3PromptRewriterRuntimeAdmission or not recheck_h3_prompt_rewriter_runtime_admission(passive):
+        raise H3PromptRewriterRuntimeSecurityError("private runtime admission unavailable")
+    if passive.public_status()["candidate_metadata_compatible"] is not True:
+        raise H3PromptRewriterRuntimeError("candidate metadata incomplete")
+    if device not in {"cpu", "cuda"} or (device == "cuda" and not re.fullmatch(r"[0-9]+", cuda_visible_devices)):
+        raise H3PromptRewriterRuntimeError("invalid explicit execution device")
+    # Preserve the venv invocation path; resolving its symlink loses its prefix.
+    python_path = Path(python_executable).absolute()
+    executable = _sealed_file(python_path.resolve(strict=True), interpreter_seal, cancel_check=cancel_check)
+    if type(runtime_inventory) is not dict or not runtime_inventory or any(
+        type(name) is not str or re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name) is None
+        or type(version) is not str or re.fullmatch(r"[0-9A-Za-z.+!_-]{1,128}", version) is None
+        for name, version in runtime_inventory.items()
+    ) or any(runtime_inventory.get(name) != version for name, version in _EXECUTION_PACKAGE_PINS.items()):
+        raise H3PromptRewriterRuntimeError("qualified runtime inventory does not match selected pins")
+    receipt = passive.private_receipt()
+    seals = []
+    model_directories = []
+    expected_weights = {"adapter/" + rewriter.ADAPTER_FILENAME: {"size_bytes": rewriter.ADAPTER_SIZE_BYTES, "sha256": rewriter.ADAPTER_SHA256}}
+    expected_weights.update({"base/" + name: {"size_bytes": size, "sha256": digest} for name, size, digest in rewriter.BASE_SHARDS})
+    if type(asset_seals) is not dict or any(asset_seals.get(name) != seal for name, seal in expected_weights.items()):
+        raise H3PromptRewriterRuntimeSecurityError("reviewed model weight identity missing")
+    observed_names = set()
+    for label, directory in (("adapter", receipt.adapter_directory), ("base", receipt.base_directory)):
+        directories = [directory] + [path for path in sorted(directory.rglob("*")) if path.is_dir() and not path.is_symlink()]
+        for path in directories:
+            identity = _capture_directory_identity(path, role="model-directory")
+            model_directories.append({"path": str(path), "dev": identity.dev, "inode": identity.inode,
+                                      "mode": identity.mode, "uid": identity.uid})
+        for path in sorted(directory.rglob("*")):
+            if path.is_dir() and not path.is_symlink():
+                continue
+            name = label + "/" + path.relative_to(directory).as_posix()
+            observed_names.add(name)
+            if name not in asset_seals:
+                raise H3PromptRewriterRuntimeSecurityError("unsealed model member")
+            seals.append(dict(_sealed_file(path, asset_seals[name], cancel_check=cancel_check), asset_id=name))
+    if observed_names != set(asset_seals):
+        raise H3PromptRewriterRuntimeSecurityError("asset manifest does not match installed files")
+    template = Path(template_path).absolute()
+    if not template.is_relative_to(receipt.adapter_directory):
+        raise H3PromptRewriterRuntimeSecurityError("template outside reviewed adapter")
+    template_seal = next((seal for seal in seals if seal["path"] == str(template)), None)
+    if template_seal is None or template_seal["sha256"] != _TEMPLATE_SHA256:
+        raise H3PromptRewriterRuntimeSecurityError("reviewed prompt template missing")
+    worker = Path(__file__).with_name("h3_prompt_rewriter_worker.py").resolve()
+    configuration = {"nonce": uuid.uuid4().hex, "python_executable": str(python_path), "executable": executable,
+                     "worker": str(worker), "worker_sha256": hashlib.sha256(worker.read_bytes()).hexdigest(),
+                     "runtime_receipt_sha256": _exact_sha256(runtime_receipt_sha256, field="runtime receipt"),
+                     "package_pins": _EXECUTION_PACKAGE_PINS, "runtime_inventory": runtime_inventory, "assets": seals,
+                     "model_directories": model_directories,
+                     "base_directory": str(receipt.base_directory), "adapter_directory": str(receipt.adapter_directory),
+                     "template_path": str(template), "device": device, "cuda_visible_devices": cuda_visible_devices}
+    # The metadata probe stays GPU-masked even for a future CUDA admission.
+    probe_config = dict(configuration, device="cpu")
+    configuration["runtime_metadata_sha256"] = _child_exchange(
+        passive, probe_config, "probe", cancel_check=cancel_check, timeout_seconds=30,
+        child_reaped_observer=child_reaped_observer,
+        result_consumer=lambda result: _sha256_mapping(result["runtime"]))
+    return H3PromptRewriterExecutionAdmission(_EXECUTION_TOKEN, passive, configuration)
+
+
+def execute_h3_prompt_rewrite(admission, request, *, image_bindings=(), duration=10, resolution=None,
+        max_new_tokens=4096, min_pixels=65536, max_pixels=1048576, seed=42, greedy=True,
+        cancel_check=None, execution_guard=None, timeout_seconds=600, child_reaped_observer=None):
+    """Execute explicit base/adapted comparisons; never apply or fall back."""
+    if type(admission) is not H3PromptRewriterExecutionAdmission:
+        raise H3PromptRewriterRuntimeError("verified execution admission required")
+    canonical = rewriter.validate_rewrite_request(request)
+    passive = admission._H3PromptRewriterExecutionAdmission__passive
+    configuration = json.loads(admission._H3PromptRewriterExecutionAdmission__configuration)
+    if canonical["mode"] != passive.public_status()["mode"]:
+        raise H3PromptRewriterRuntimeError("request mode differs from admission")
+    if type(duration) is not int or not 4 <= duration <= 15 or type(max_new_tokens) is not int or not 1 <= max_new_tokens <= 4096 or type(seed) is not int or not 0 <= seed < 2**32 or type(greedy) is not bool:
+        raise H3PromptRewriterRuntimeError("invalid frozen generation controls")
+    expected_resolution = "16:9" if canonical["mode"] == "t2va" else "adaptive"
+    if resolution not in {None, expected_resolution} or (min_pixels, max_pixels) != (65536, 1048576):
+        raise H3PromptRewriterRuntimeError("unsupported image controls")
+    if len(image_bindings) != len(canonical["image_roles"]):
+        raise H3PromptRewriterRuntimeSecurityError("ordered authorized images required")
+    images = []
+    for role, binding in zip(canonical["image_roles"], image_bindings):
+        if set(binding) != {"input_id", "path", "trust_root", "seal"} or binding["input_id"] != role["input_id"]:
+            raise H3PromptRewriterRuntimeSecurityError("image request binding differs")
+        path = Path(binding["path"]).absolute()
+        trust_root = _canonical_existing_directory(binding["trust_root"], field="image trust root")
+        _capture_directory_identity(trust_root, role="authorized-image-root")
+        if not path.is_relative_to(trust_root):
+            raise H3PromptRewriterRuntimeSecurityError("image outside authorized trust root")
+        images.append(dict(_sealed_file(path, binding["seal"], cancel_check=cancel_check), input_id=binding["input_id"]))
+    _execution_boundary(cancel_check, execution_guard)
+    configuration.update(request=canonical, images=images, controls={"duration": duration, "resolution": expected_resolution,
+                         "max_new_tokens": max_new_tokens, "min_pixels": min_pixels, "max_pixels": max_pixels,
+                         "seed": seed, "greedy": greedy, "temperature": 0.7, "top_p": 0.8})
+    def completed_result(result):
+        if result.get("request_commitment") != canonical["commitment"] or result.get("runtime_metadata_sha256") != configuration["runtime_metadata_sha256"]:
+            raise H3PromptRewriterRuntimeSecurityError("execution result binding differs")
+        for key in ("base_candidate", "adapted_candidate"):
+            if type(result.get(key)) is not str or not result[key].strip() or len(result[key].encode()) > 65536:
+                raise H3PromptRewriterRuntimeError("child candidate invalid")
+        receipt = {"schema": EXECUTION_SCHEMA, "completed": True, "base_executed": True, "adapter_executed": True,
+                   "fallback_used": False, "gpu_accepted": False, "human_accepted": False,
+                   "request_commitment": canonical["commitment"], "runtime_metadata_sha256": configuration["runtime_metadata_sha256"],
+                   "runtime_receipt_sha256": configuration["runtime_receipt_sha256"], "worker_sha256": configuration["worker_sha256"],
+                   "asset_manifest_sha256": _sha256_mapping([{ "asset_id": seal["asset_id"], "size_bytes": seal["size_bytes"], "sha256": seal["sha256"]} for seal in configuration["assets"]]),
+                   "reference_manifest_sha256": _sha256_mapping([{ "input_id": seal["input_id"], "size_bytes": seal["size_bytes"], "sha256": seal["sha256"]} for seal in images]),
+                   "controls_sha256": _sha256_mapping(configuration["controls"]), "device": configuration["device"]}
+        _execution_boundary(cancel_check, execution_guard)
+        return H3PromptRewriterExecutionResult(_EXECUTION_TOKEN, {"request_commitment": canonical["commitment"],
+            "deterministic_candidate": canonical["original_prompt"], "base_candidate": result["base_candidate"],
+            "adapted_candidate": result["adapted_candidate"], "receipt": receipt})
+
+    return _child_exchange(passive, configuration, "rewrite", cancel_check=cancel_check,
+                           execution_guard=execution_guard, timeout_seconds=timeout_seconds,
+                           child_reaped_observer=child_reaped_observer,
+                           result_consumer=completed_result)
+
+
+__all__ += ["EXECUTION_SCHEMA", "H3PromptRewriterCancelled", "H3PromptRewriterExecutionAdmission",
+            "H3PromptRewriterExecutionResult", "build_h3_prompt_rewriter_execution_admission",
+            "execute_h3_prompt_rewrite", "validate_h3_prompt_rewriter_execution_result"]

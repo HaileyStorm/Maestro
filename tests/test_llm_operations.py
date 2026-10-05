@@ -218,6 +218,224 @@ class PreparationOperationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ChatRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_durable_final_survives_new_manager_without_reexecution(self):
+        from services.llm_chat_recovery import ChatRecoveryStore
+        with TemporaryDirectory() as directory:
+            key = b"test-chat-secret" * 2
+            root = Path(directory) / "chat"
+            manager = LlmChatOperationManager(store=ChatRecoveryStore(root, key), epoch="epoch1")
+            calls, released = [], []
+            final = {"text": "full answer " + "x" * (700 * 1024), "model_id": "local", "guide_ids": ["guide"]}
+
+            async def execute(progress):
+                calls.append(True)
+                progress({"text": "private partial"})
+                return final
+
+            def release():
+                # Publication must already be durable before inputs/admission
+                # are released, even though public state updates afterward.
+                released.append(manager._store.read_result("a" * 32, owner_key="owner", project_key="project"))
+
+            arguments = dict(request_id="a" * 32, owner_key="owner", project_key="project", request_digest="d" * 64,
+                             execute=execute, admit=lambda: True, release=release)
+            manager.submit(**arguments)
+            await _wait_for_status(manager, "a" * 32, "completed")
+            self.assertEqual(released, [final])
+            restored = LlmChatOperationManager(store=ChatRecoveryStore(root, key), epoch="epoch2")
+            self.assertEqual(restored.status("a" * 32, owner_key="owner", project_key="project")["result"], final)
+            recovered = restored.submit(**arguments)
+            self.assertEqual(recovered["result"], final)
+            recovered["result"]["guide_ids"].append("caller mutation")
+            self.assertEqual(restored.status("a" * 32, owner_key="owner", project_key="project")["result"], final)
+            self.assertEqual(calls, [True])
+            self.assertIsNone(restored.status("a" * 32, owner_key="other-account", project_key="project"))
+            self.assertIsNone(restored.submit(**{**arguments, "owner_key": "other-account"}))
+            with self.assertRaises(ChatRequestMismatchError):
+                restored.submit(**{**arguments, "request_digest": "e" * 64})
+            self.assertNotIn(b"private partial", (root / "chat.json").read_bytes())
+
+    async def test_restart_interruption_never_resubmits_and_stale_worker_cannot_publish(self):
+        from services.llm_chat_recovery import ChatRecoveryStore
+        with TemporaryDirectory() as directory:
+            key = b"test-chat-secret" * 2
+            root = Path(directory) / "chat"
+            manager = LlmChatOperationManager(store=ChatRecoveryStore(root, key), epoch="old")
+            finish = asyncio.Event()
+            calls, releases = [], []
+
+            async def execute(_progress):
+                calls.append(True)
+                await finish.wait()
+                return {"text": "late old answer", "model_id": "local", "guide_ids": []}
+
+            arguments = dict(request_id="b" * 32, owner_key="owner", project_key="project", request_digest="d" * 64,
+                             execute=execute, admit=lambda: True, release=lambda: releases.append(True))
+            manager.submit(**arguments)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            restored = LlmChatOperationManager(store=ChatRecoveryStore(root, key), epoch="new")
+            recovered = restored.status("b" * 32, owner_key="owner", project_key="project")
+            self.assertEqual(recovered["error"]["code"], "chat_interrupted")
+            self.assertEqual(restored.submit(**arguments), recovered)
+            finish.set()
+            await manager._operations["b" * 32].task
+            self.assertEqual(calls, [True])
+            self.assertEqual(releases, [True])
+            self.assertEqual(restored.status("b" * 32, owner_key="owner", project_key="project"), recovered)
+            self.assertNotIn("result", manager.status("b" * 32, owner_key="owner", project_key="project"))
+
+    async def test_ambiguous_bind_or_completion_never_reexecutes(self):
+        from services.llm_chat_recovery import ChatRecoveryStore, ChatRecoveryError
+        for phase in ("bind", "complete"):
+            with self.subTest(phase=phase), TemporaryDirectory() as directory:
+                store = ChatRecoveryStore(Path(directory) / "chat", b"test-chat-secret" * 2)
+                manager = LlmChatOperationManager(store=store)
+                original = getattr(store, phase)
+                calls, admissions = [], []
+
+                def commit_then_raise(*args, **kwargs):
+                    original(*args, **kwargs)
+                    raise ChatRecoveryError("acknowledgement lost")
+
+                async def execute(_progress):
+                    calls.append(True)
+                    return {"text": "committed final", "model_id": "local", "guide_ids": []}
+
+                arguments = dict(request_id="c" * 32, owner_key="owner", project_key="project", request_digest="d" * 64,
+                                 execute=execute, admit=lambda: admissions.append(True) or True, release=lambda: None)
+                with mock.patch.object(store, phase, side_effect=commit_then_raise):
+                    if phase == "bind":
+                        with self.assertRaises(ChatRecoveryError):
+                            manager.submit(**arguments)
+                    else:
+                        manager.submit(**arguments)
+                        completed = await _wait_for_status(manager, "c" * 32, "completed")
+                        self.assertEqual(completed["result"]["text"], "committed final")
+                duplicate = manager.submit(**arguments)
+                self.assertEqual(calls, [] if phase == "bind" else [True])
+                self.assertEqual(admissions, [] if phase == "bind" else [True])
+                self.assertEqual(duplicate["status"], "failed" if phase == "bind" else "completed")
+
+    async def test_cancel_before_executor_starts_releases_once_and_is_durable(self):
+        from services.llm_chat_recovery import ChatRecoveryStore
+        with TemporaryDirectory() as directory:
+            store = ChatRecoveryStore(Path(directory) / "chat", b"test-chat-secret" * 2)
+            manager = LlmChatOperationManager(store=store)
+            calls, releases = [], []
+            async def execute(_progress):
+                calls.append(True)
+                return {"text": "must not run", "model_id": "local", "guide_ids": []}
+            manager.submit(request_id="d" * 32, owner_key="owner", project_key="project", request_digest="d" * 64,
+                           execute=execute, admit=lambda: True, release=lambda: releases.append(True))
+            task = manager._operations["d" * 32].task
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            await asyncio.sleep(0)
+            self.assertEqual(calls, [])
+            self.assertEqual(releases, [True])
+            self.assertEqual(store.lookup("d" * 32, owner_key="owner", project_key="project")["status"], "cancelled")
+
+    async def test_cancelled_chat_holds_inputs_and_capacity_until_blocking_worker_exits(self):
+        for worker_fails in (False, True):
+            with self.subTest(worker_fails=worker_fails), TemporaryDirectory() as directory:
+                manager = LlmChatOperationManager(max_operations=1)
+                entered = threading.Event()
+                finish = threading.Event()
+                exited = threading.Event()
+                released = []
+                input_path = Path(directory) / "claimed-image.png"
+                input_path.write_bytes(b"owned input bytes")
+                reconciliations = []
+
+                def reconcile_inputs():
+                    reconciliations.append(exited.is_set())
+                    input_path.unlink()
+                    return "cleaned"
+
+                def blocking_worker():
+                    entered.set()
+                    try:
+                        if not finish.wait(timeout=5):
+                            raise AssertionError("test did not release its worker")
+                        self.assertEqual(input_path.read_bytes(), b"owned input bytes")
+                        if worker_fails:
+                            raise ValueError("private executor error")
+                        return {"text": "late answer", "model_id": "model"}
+                    finally:
+                        exited.set()
+
+                async def execute(_progress):
+                    return await run_blocking_shielded(blocking_worker)
+
+                manager.submit(
+                    request_id="a" * 32, owner_key="owner", project_key="project",
+                    request_digest="digest", execute=execute,
+                    admit=lambda: True, release=lambda: released.append(exited.is_set()),
+                )
+                try:
+                    self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+                    outer = manager._operations["a" * 32].task
+                    outer.cancel()
+                    failed = await _wait_for_status(manager, "a" * 32, "failed")
+                    outer.cancel()
+                    await asyncio.sleep(0)
+                    self.assertFalse(outer.done())
+                    self.assertEqual(released, [])
+                    self.assertEqual(failed["partial_text"], "")
+                    self.assertNotIn("result", failed)
+                    recovered, cleanup = manager.status_or_reconcile_absent(
+                        "a" * 32, owner_key="owner", project_key="project",
+                        reconcile_absent=reconcile_inputs,
+                        reconcile_terminal=reconcile_inputs,
+                    )
+                    self.assertEqual(recovered["status"], "failed")
+                    self.assertIsNone(cleanup)
+                    self.assertEqual(reconciliations, [])
+                    self.assertTrue(input_path.exists())
+                    hidden, cleanup = manager.status_or_reconcile_absent(
+                        "a" * 32, owner_key="rotated-account", project_key="project",
+                        reconcile_absent=reconcile_inputs, reconcile_terminal=reconcile_inputs,
+                    )
+                    self.assertIsNone(hidden)
+                    self.assertIsNone(cleanup)
+                    self.assertTrue(input_path.exists())
+                    with self.assertRaises(LlmOperationCapacityError):
+                        manager.submit(
+                            request_id="b" * 32, owner_key="owner", project_key="project",
+                            request_digest="other", execute=execute,
+                            admit=lambda: True, release=lambda: None,
+                        )
+                finally:
+                    finish.set()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await asyncio.wait_for(outer, 2)
+                self.assertEqual(released, [True])
+                recovered, cleanup = manager.status_or_reconcile_absent(
+                    "a" * 32, owner_key="owner", project_key="project",
+                    reconcile_absent=reconcile_inputs,
+                    reconcile_terminal=reconcile_inputs,
+                )
+                self.assertEqual(recovered["status"], "failed")
+                self.assertEqual(cleanup, "cleaned")
+                self.assertEqual(reconciliations, [True])
+                self.assertFalse(input_path.exists())
+                self.assertNotIn("late answer", repr(manager.status(
+                    "a" * 32, owner_key="owner", project_key="project",
+                )))
+
+                async def successor(_progress):
+                    return {"text": "successor", "model_id": "model"}
+
+                manager.submit(
+                    request_id="b" * 32, owner_key="owner", project_key="project",
+                    request_digest="other", execute=successor,
+                    admit=lambda: True, release=lambda: None,
+                )
+                completed = await _wait_for_status(manager, "b" * 32, "completed")
+                self.assertEqual(completed["result"]["text"], "successor")
+
     async def test_absent_reconciliation_is_atomic_against_duplicate_submit(self):
         manager = LlmChatOperationManager(ttl_seconds=60)
         cleanup_entered = threading.Event()
@@ -2935,6 +3153,191 @@ class DurablePromptEnhancementOperationTests(unittest.IsolatedAsyncioTestCase):
         "session_key": "session-one",
     }
 
+    async def test_resource_wait_precedes_generation_slot_and_replay_never_prepares_twice(self):
+        events = []
+        entered = asyncio.Event()
+        ready = asyncio.Event()
+
+        class Store(PromptEnhancementRecoveryStore):
+            def mark_running(self, *args, **kwargs):
+                events.append("slot")
+                return super().mark_running(*args, **kwargs)
+
+            def complete(self, *args, **kwargs):
+                events.append("complete")
+                return super().complete(*args, **kwargs)
+
+        async def prepare(progress, cancellation):
+            events.append("prepare")
+            progress({"phase": "queued", "stage": "gpu_wait"})
+            entered.set()
+            await ready.wait()
+            cancellation.checkpoint()
+
+        async def execute(_progress, cancellation):
+            cancellation.checkpoint()
+            events.append("execute")
+            return {"original": "untouched", "enhanced": "comparison"}
+
+        async def close():
+            events.append("close")
+
+        with TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "enhance", self.SECRET)
+            manager = PromptEnhancementOperationManager(store)
+            request_id = str(uuid.uuid4())
+            arguments = dict(request_id=request_id, request_digest="a" * 64,
+                             execute=execute, prepare=prepare, close=close, **self.SCOPE)
+            manager.submit(**arguments)
+            await entered.wait()
+            status = manager.status(request_id, **self.SCOPE)
+            self.assertEqual(status["status"], "queued")
+            self.assertEqual(status["stage"], "gpu_wait")
+            manager.submit(**arguments)
+            await asyncio.sleep(0)
+            self.assertEqual(events, ["prepare"])
+            ready.set()
+            await manager.wait(request_id, **self.SCOPE)
+            self.assertEqual(events, ["prepare", "slot", "execute", "close", "complete"])
+            self.assertEqual(manager.status(request_id, **self.SCOPE)["status"], "completed")
+
+    async def test_cancel_while_waiting_closes_without_acquiring_slot_or_executing(self):
+        events = []
+        entered = asyncio.Event()
+        ready = asyncio.Event()
+
+        class Store(PromptEnhancementRecoveryStore):
+            def mark_running(self, *args, **kwargs):
+                events.append("slot")
+                return super().mark_running(*args, **kwargs)
+
+        async def prepare(_progress, cancellation):
+            entered.set()
+            await ready.wait()
+            cancellation.checkpoint()
+
+        async def execute(*_args):
+            events.append("execute")
+
+        async def close():
+            events.append("close")
+            raise RuntimeError("private cancellation cleanup failure")
+
+        with TemporaryDirectory() as directory:
+            manager = PromptEnhancementOperationManager(
+                Store(Path(directory) / "enhance", self.SECRET))
+            request_id = str(uuid.uuid4())
+            manager.submit(request_id=request_id, request_digest="b" * 64,
+                           execute=execute, prepare=prepare, close=close, **self.SCOPE)
+            await entered.wait()
+            manager.cancel(request_id, **self.SCOPE)
+            ready.set()
+            await manager.wait(request_id, **self.SCOPE)
+            self.assertEqual(events, ["close"])
+            self.assertEqual(manager.status(request_id, **self.SCOPE)["status"], "cancelled")
+
+    async def test_failed_admission_or_cleanup_never_publishes_completed_result(self):
+        for fail_preparation in (True, False):
+            with self.subTest(fail_preparation=fail_preparation), TemporaryDirectory() as directory:
+                events = []
+                manager = PromptEnhancementOperationManager(
+                    PromptEnhancementRecoveryStore(Path(directory) / "enhance", self.SECRET))
+
+                async def prepare(*_args):
+                    events.append("prepare")
+                    if fail_preparation:
+                        raise RuntimeError("private admission failure")
+
+                async def execute(*_args):
+                    events.append("execute")
+                    return {"enhanced": "must not be published"}
+
+                async def close():
+                    events.append("close")
+                    raise RuntimeError("private unconfirmed withdrawal")
+
+                request_id = str(uuid.uuid4())
+                manager.submit(request_id=request_id, request_digest="c" * 64,
+                               execute=execute, prepare=prepare, close=close, **self.SCOPE)
+                await manager.wait(request_id, **self.SCOPE)
+                expected = ["prepare", "close"] if fail_preparation else ["prepare", "execute", "close"]
+                self.assertEqual(events, expected)
+                status = manager.status(request_id, **self.SCOPE)
+                self.assertEqual(status["status"], "failed")
+                self.assertFalse(status["result_available"])
+                self.assertNotIn("private", repr(status))
+
+    async def test_task_cancellation_joins_blocking_preparation_and_close_before_release(self):
+        import itertools
+        import threading
+        from services.llm_operations import run_blocking_shielded
+
+        for blocked_phase, storage_fails in itertools.product(("prepare", "generation-slot", "close"), (False, True)):
+            with self.subTest(phase=blocked_phase, storage_fails=storage_fails), TemporaryDirectory() as directory:
+                events = []
+                entered = asyncio.Event()
+                ready = threading.Event()
+                finished = threading.Event()
+                loop = asyncio.get_running_loop()
+
+                class Store(PromptEnhancementRecoveryStore):
+                    def fail(self, *args, **kwargs):
+                        if storage_fails:
+                            raise RuntimeError("durable failure recording unavailable")
+                        return super().fail(*args, **kwargs)
+
+                    def mark_running(self, *args, **kwargs):
+                        if blocked_phase == "generation-slot":
+                            loop.call_soon_threadsafe(entered.set)
+                            blocking()
+                        return super().mark_running(*args, **kwargs)
+
+                    def release(self, *_args, **_kwargs):
+                        self_test.assertTrue(finished.is_set())
+                        events.append("release")
+
+                self_test = self
+                manager = PromptEnhancementOperationManager(
+                    Store(Path(directory) / "enhance", self.SECRET))
+
+                def blocking():
+                    if not ready.wait(3):
+                        raise AssertionError("test background work was never released")
+                    events.append("background-finished")
+                    finished.set()
+
+                async def prepare(*_args):
+                    if blocked_phase == "prepare":
+                        entered.set()
+                        await run_blocking_shielded(blocking)
+
+                async def execute(*_args):
+                    events.append("execute")
+                    return {"enhanced": "must not complete after cancellation"}
+
+                async def close():
+                    if blocked_phase == "close":
+                        entered.set()
+                        await run_blocking_shielded(blocking)
+                    self.assertTrue(finished.is_set())
+                    events.append("close")
+
+                request_id = str(uuid.uuid4())
+                manager.submit(request_id=request_id, request_digest="d" * 64,
+                               execute=execute, prepare=prepare, close=close, **self.SCOPE)
+                await asyncio.wait_for(entered.wait(), timeout=3)
+                task = manager._active[uuid.UUID(request_id).hex].task
+                task.cancel()
+                await asyncio.sleep(0)
+                self.assertNotIn("close", events)
+                self.assertNotIn("release", events)
+                ready.set()
+                with self.assertRaises(RuntimeError if storage_fails else asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=3)
+                self.assertEqual(events[-3:], ["background-finished", "close", "release"])
+                self.assertEqual(events.count("close"), 1)
+                self.assertNotEqual(manager.status(request_id, **self.SCOPE)["status"], "completed")
+
     async def _wait_for(
         self,
         manager: PromptEnhancementOperationManager,
@@ -3538,6 +3941,192 @@ class DurablePromptEnhancementOperationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(manager.status(completed_id, **self.SCOPE))
             self.assertIsNone(manager.status(failed_id, **self.SCOPE))
             self.assertIsNone(manager.status(running_id, **self.SCOPE))
+
+
+class H3ComposeRouteIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    """Actual route orchestration with CPU-only injected execution boundaries."""
+
+    def setUp(self):
+        from fastapi import HTTPException
+        from starlette.responses import JSONResponse
+        names = {"_submit_h3_prompt_rewriter_operation", "llm_h3_prompt_rewriter_apply", "llm_enhance_prompt",
+            "_restore_h3_prompt_rewriter_cleanup", "_ScopedPromptEnhancementRequest",
+            "_seal_prompt_enhancement_images", "_materialize_prompt_enhancement_images",
+            "_remove_prompt_enhancement_snapshots"}
+        nodes = [node for node in ast.parse((APP / "launch.py").read_text()).body
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in names]
+        for node in nodes:
+            node.decorator_list = []
+        self.namespace = {"__file__": str(APP / "launch.py"), "Path": Path,
+            "Request": object, "Any": object, "Mapping": Mapping,
+            "HTTPException": HTTPException, "JSONResponse": JSONResponse,
+            "copy": copy, "os": __import__("os"), "stat": __import__("stat"),
+            "hashlib": hashlib, "hmac": __import__("hmac"), "_CPU_TEXT_OPERATIONS": set(),
+            "_LLM_CHAT_MAX_IMAGE_BYTES": 32 * 1024 * 1024,
+            "_LLM_ENHANCE_MAX_TOTAL_IMAGE_BYTES": 64 * 1024 * 1024,
+            "_normalize_llm_route_request_id": lambda value: uuid.UUID(value).hex,
+            "_request_project_workspace": lambda _request, value: value,
+            "_promote_external_llm_request": lambda _request: None,
+            "_resolve_prompt_enhancement_images": lambda *_args: [],
+            "_prompt_enhancement_operation_scope": lambda *_: ("account", "b" * 64, "session"),
+            "_require_project_access": mock.Mock(),
+            "_existing_workspace_dir": lambda _: "/unused/project",
+            "_llm_route_effective_input_digest": lambda _kind, value: hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest(),
+            "PromptEnhancementRecoveryConflictError": PromptEnhancementRecoveryConflictError,
+            "PromptEnhancementRecoveryError": PromptEnhancementRecoveryError}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(APP / "launch.py"), "exec"), self.namespace)
+        self.request_id = uuid.uuid4().hex
+        self.body = {"request_id": self.request_id, "project_instance": "b" * 64,
+            "workspace": "project", "prompt": "A violent fictional battle under rain.",
+            "engine": "h3_rewriter", "rewrite_mode": "t2va", "model_type": "minimax_h3", "duration_seconds": 10}
+        self.request = types.SimpleNamespace(state=types.SimpleNamespace(), headers={}, base_url="", client=None)
+        self.job = {"id": self.request_id, "kind": "prompt_enhancement", "execution_attempt": 1, "status": "queued"}
+        self.manager = types.SimpleNamespace(submit=mock.Mock(return_value={"request_id": self.request_id, "status": "queued"}),
+            _store=types.SimpleNamespace(_canonical=mock.Mock(return_value=self.job)),
+            result=mock.Mock(), status=mock.Mock(return_value={"status": "completed"}))
+        self.namespace["_prompt_enhancement_operation_manager"] = self.manager
+        self.snapshot = types.SimpleNamespace(commitment="c" * 64, recheck=mock.Mock(),
+            gpu_binding=mock.Mock(return_value=object()), build_execution_admission=mock.Mock(return_value=object()))
+        self.lease = mock.Mock()
+        self.lease.intent = {"state": "request_attempted"}
+        self.lease.return_value = True
+        from services import h3_prompt_rewriter_config, h3_prompt_rewriter_gpu_lease, h3_prompt_rewriter_runtime, job_lifecycle
+        self.stack = __import__("contextlib").ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(mock.patch.object(h3_prompt_rewriter_config, "load_runtime_snapshot", return_value=self.snapshot))
+        self.factory = self.stack.enter_context(mock.patch.object(h3_prompt_rewriter_gpu_lease, "H3PromptRewriterGpuLease", return_value=self.lease))
+        self.checkpoint = self.stack.enter_context(mock.patch.object(job_lifecycle, "checkpoint_prompt_enhancement_gpu_intent", return_value=True))
+        self.execute_mock = self.stack.enter_context(mock.patch.object(h3_prompt_rewriter_runtime, "execute_h3_prompt_rewrite", return_value=object()))
+
+    async def submit(self, body=None, images=()):
+        return await self.namespace["_submit_h3_prompt_rewriter_operation"](self.request, body or self.body, "project", list(images))
+
+    async def test_exact_queued_submission_preserves_prompt_and_orders_private_frames(self):
+        from services import h3_prompt_rewriter as rewrite, h3_prompt_rewriter_runtime as runtime
+        with TemporaryDirectory() as directory:
+            paths = [Path(directory) / name for name in ("first.png", "last.png")]
+            for index, path in enumerate(paths):
+                path.write_bytes(bytes([index + 1]) * 20)
+            body = {**self.body, "rewrite_mode": "fl2va"}
+            response = await self.submit(body, [str(path) for path in paths])
+            self.assertEqual(response.status_code, 202)
+            callbacks = self.manager.submit.call_args.kwargs
+            handle = LlmCancellationHandle()
+            await callbacks["prepare"](lambda _: None, handle)
+            self.lease.acquire.assert_called_once()
+            self.job["status"] = "running"
+            self.snapshot.build_execution_admission.side_effect = lambda *_args, **kw: (kw["child_reaped_observer"](False), kw["child_reaped_observer"](True), object())[-1]
+            captured = {}
+            def execute(_admission, canonical, **kw):
+                captured.update(kw)
+                kw["child_reaped_observer"](False)
+                self.assertEqual([Path(item["path"]).read_bytes() for item in kw["image_bindings"]], [path.read_bytes() for path in paths])
+                self.assertTrue(all((Path(item["trust_root"]).stat().st_mode & 0o777) == 0o700 for item in kw["image_bindings"]))
+                kw["child_reaped_observer"](True)
+                return object()
+            self.execute_mock.side_effect = execute
+            with mock.patch.object(rewrite, "create_executed_rewrite_preview", return_value={"fixture": "comparison"}):
+                result = await callbacks["execute"](lambda _: None, handle, {"job": self.job, "generation_slot_owned": True})
+            self.assertEqual(result["original"], body["prompt"])
+            self.assertEqual(result["enhanced"], body["prompt"])
+            self.assertEqual([role["role"] for role in result["h3_rewrite_request"]["image_roles"]], ["first_frame", "last_frame"])
+            self.assertFalse(any(Path(binding["path"]).exists() for binding in captured["image_bindings"]))
+            self.assertEqual(self.lease.before_start.call_count, 2)
+            self.assertEqual(self.checkpoint.call_count, 2)
+            await callbacks["close"]()
+            self.lease.close.assert_called_once_with(child_reaped=True)
+
+    async def test_invalid_duration_model_mode_images_or_project_never_admits(self):
+        from fastapi import HTTPException
+        for changes in ({"duration_seconds": 10.5}, {"duration_seconds": True}, {"duration_seconds": 16},
+                        {"model_type": "minimax_h3_ref2va"}, {"rewrite_mode": "ref2va"},
+                        {"rewrite_mode": "i2va"}, {"project_instance": "f" * 64}):
+            with self.subTest(changes=changes), self.assertRaises(HTTPException):
+                await self.submit({**self.body, **changes})
+        self.manager.submit.assert_not_called()
+        self.factory.assert_not_called()
+
+    async def test_public_enhance_route_enters_explicit_branch_without_ordinary_runtime(self):
+        async def read():
+            return copy.deepcopy(self.body)
+        self.request.json = read
+        ordinary = mock.Mock(side_effect=AssertionError("ordinary runtime must not be selected"))
+        self.namespace["_prompt_enhancement_runtime_snapshot"] = ordinary
+        response = await self.namespace["llm_enhance_prompt"](self.request)
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(self.manager.submit.call_args.kwargs["job_context"]["body"]["engine"], "h3_rewriter")
+        ordinary.assert_not_called()
+
+    async def test_reauthorization_and_failed_spawn_checkpoint_prevent_execution(self):
+        from fastapi import HTTPException
+        from services.llm_cancellation import LlmRequestCancelled
+        await self.submit()
+        callbacks = self.manager.submit.call_args.kwargs
+        handle = LlmCancellationHandle()
+        self.namespace["_require_project_access"].side_effect = HTTPException(403, "revoked")
+        with self.assertRaises(HTTPException):
+            await callbacks["prepare"](lambda _: None, handle)
+        self.factory.assert_not_called()
+        self.namespace["_require_project_access"].side_effect = None
+        await callbacks["prepare"](lambda _: None, handle)
+        self.checkpoint.return_value = False
+        self.snapshot.build_execution_admission.side_effect = lambda *_args, **kw: kw["child_reaped_observer"](False)
+        with self.assertRaises(LlmRequestCancelled):
+            await callbacks["execute"](lambda _: None, handle, {"job": self.job, "generation_slot_owned": True})
+        await callbacks["close"]()
+        self.lease.close.assert_called_once_with(child_reaped=True)
+
+    async def test_apply_is_scoped_integrity_bound_and_never_consumes_or_generates(self):
+        from services import h3_prompt_rewriter as rewrite
+        from fastapi import HTTPException
+        canonical = rewrite.create_rewrite_request(original_prompt=self.body["prompt"], mode="t2va")
+        preview = rewrite._build_rewrite_preview(canonical,
+            (self.body["prompt"], "Base comparison", "H3 comparison"), execution_receipt_sha256="a" * 64)
+        result = {"h3_rewrite_request": canonical, "h3_rewrite_preview": preview}
+        self.manager.result.return_value = result
+        body = {"workspace": "project", "project_instance": "b" * 64, "request_commitment": canonical["commitment"],
+            "preview_commitment": preview["commitment"], "selected_kind": "adapted"}
+        async def read():
+            return body
+        self.request.json = read
+        apply = self.namespace["llm_h3_prompt_rewriter_apply"]
+        for _ in range(2):
+            response = await apply(self.request, self.request_id)
+            self.assertEqual(response["enhanced"], "H3 comparison")
+        self.assertEqual(result["h3_rewrite_preview"], preview)
+        self.manager.submit.assert_not_called()
+        body["preview_commitment"] = "f" * 64
+        with self.assertRaises(HTTPException) as error:
+            await apply(self.request, self.request_id)
+        self.assertEqual(error.exception.status_code, 409)
+        self.assertEqual(self.manager.result.call_args.kwargs["account_key"], "account")
+        self.manager.result.return_value = {"h3_rewrite_request": canonical,
+            "h3_rewrite_preview": rewrite.create_rewrite_preview(canonical,
+                deterministic=self.body["prompt"], base="Base comparison", adapted="H3 comparison")}
+        with self.assertRaises(HTTPException) as error:
+            await apply(self.request, self.request_id)
+        self.assertEqual(error.exception.status_code, 400)
+        self.manager.status.return_value = {"status": "cancelled"}
+        with self.assertRaises(HTTPException) as error:
+            await apply(self.request, self.request_id)
+        self.assertEqual(error.exception.status_code, 404)
+
+    async def test_startup_keeps_unconfirmed_children_and_only_reconciles_saved_intent(self):
+        from services import h3_prompt_rewriter_gpu_lease, queue_recovery_adapter
+        candidates = [{"kind": "prompt_enhancement", "execution_attempt": 1, "status": "failed",
+            "recovery_cursor": {"h3_prompt_rewriter_gpu": {"state": "withdraw_attempted"},
+                **({"h3_prompt_rewriter_child_reaped": reaped} if reaped is not None else {})}}
+            for reaped in (None, False, True)]
+        restore = mock.Mock(return_value=self.lease)
+        with mock.patch.object(queue_recovery_adapter, "prompt_enhancement_gpu_cleanup_pending", return_value=True), mock.patch.object(h3_prompt_rewriter_gpu_lease, "H3PromptRewriterGpuLease", types.SimpleNamespace(restore_from_intent=restore)):
+            self.namespace["_restore_h3_prompt_rewriter_cleanup"](candidates)
+        restore.assert_called_once()
+        self.lease.close.assert_called_once_with(child_reaped=True, confirm_seconds=2)
+        callback = restore.call_args.kwargs["persist_intent"]
+        self.assertTrue(callback({"state": "closed"}))
+        self.assertIs(self.checkpoint.call_args.args[0], candidates[2])
+        self.assertEqual(self.checkpoint.call_args.kwargs["child_reaped"], True)
+        self.factory.assert_not_called()
 
 
 if __name__ == "__main__":

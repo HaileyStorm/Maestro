@@ -105,6 +105,10 @@ def _function(tree: ast.AST, name: str):
 def _isolated_functions(tree: ast.Module, names: tuple[str, ...], namespace: dict):
     namespace.setdefault("AUTOMATIC_RETIREMENT_STATUSES", AUTOMATIC_RETIREMENT_STATUSES)
     dependencies = {"_h3_segment_uses_native_boundary_history"} if "_run_generation" in names else set()
+    if "_restore_queue_recovery_on_startup" in names:
+        dependencies.add("_restore_h3_prompt_rewriter_cleanup")
+        namespace.setdefault("Path", Path)
+        namespace.setdefault("__file__", str(ROOT / "app" / "launch.py"))
     if "_publish_h3_delivery_outputs" in names:
         namespace.setdefault("_recovery_sha256_file", recovery_sha256_file)
     if {"_run_generation", "_resume_pending_h3_delivery_only", "_process_h3_delivery_from_protected_native", "_deliver_h3_outputs_transactionally"} & set(names):

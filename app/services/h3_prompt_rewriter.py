@@ -1,10 +1,10 @@
-"""Fail-closed, model-free admission documents for the H3 prompt rewriter.
+"""Model-free request, preview and explicit Apply documents for the H3 rewriter.
 
 This module deliberately does not load or execute the Qwen base or LightX2V
 adapter.  It records immutable source identities, performs bounded passive
 inspection of an explicitly supplied local candidate, and constructs canonical
-request/preview/apply documents.  Model execution belongs to a later, separately
-accepted runtime integration.
+request/preview/apply documents. Runtime-backed previews consume only completed
+results from the separately owned runtime; caller-supplied text remains unexecuted.
 """
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from typing import Any, Mapping, Sequence
 
 
 SCHEMA_VERSION = 1
+EXECUTED_PREVIEW_SCHEMA_VERSION = 2
 ADAPTER_REPO_ID = "lightx2v/MiniMax-H3-Prompt-Rewriter-LoRA-8B"
 ADAPTER_REVISION = "a795219bd1677df34259eb4f3a77e2ec282e154f"
 ADAPTER_FILENAME = "adapter_model.safetensors"
@@ -437,67 +438,68 @@ def create_rewrite_preview(request: Mapping[str, Any], *, deterministic: str, ba
     """Create an editable preview from caller-supplied candidate text.
 
     Supplying text is not evidence that a model ran; every candidate is marked
-    unexecuted until a future runtime integration can provide its own receipt.
+    unexecuted. Use create_executed_rewrite_preview for an owned runtime result.
     """
+    return _build_rewrite_preview(request, (deterministic, base, adapted))
+
+
+def _build_rewrite_preview(request: Mapping[str, Any], texts: Sequence[str], *, execution_receipt_sha256: str | None = None) -> dict[str, Any]:
     request = validate_rewrite_request(request)
+    executed = execution_receipt_sha256 is not None
+    if executed:
+        _sha256_string(execution_receipt_sha256, "execution receipt")
+        if texts[0] != request["original_prompt"]:
+            raise ValueError("executed preview must retain the unchanged original comparator")
     candidates = []
-    for kind, value in zip(CANDIDATE_KINDS, (deterministic, base, adapted)):
-        text = _plain_string(value, f"{kind} candidate", allow_empty=True)
+    for kind, value in zip(CANDIDATE_KINDS, texts):
+        text = _plain_string(value, f"{kind} candidate", allow_empty=not executed)
         if not _anchors_are_preserved(request, text):
             raise ValueError(f"{kind} candidate does not preserve every literal anchor")
-        candidates.append({"kind": kind, "text": text, "produced_by_runtime": False})
+        candidates.append({"kind": kind, "text": text, "produced_by_runtime": executed and kind != "deterministic"})
     preview = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": EXECUTED_PREVIEW_SCHEMA_VERSION if executed else SCHEMA_VERSION,
         "request_commitment": request["commitment"],
         "original_prompt": request["original_prompt"],
         "candidates": candidates,
         "selection": None,
         "runtime_evidence": {
-            "execution_available": False,
-            "base_executed": False,
-            "adapter_executed": False,
+            "execution_available": executed,
+            "base_executed": executed,
+            "adapter_executed": executed,
             "fallback_used": False,
         },
     }
+    if executed:
+        preview["runtime_evidence"]["execution_receipt_sha256"] = execution_receipt_sha256
     _reject_path_fields(preview)
     preview["commitment"] = _commit(preview)
     return preview
 
 
+def create_executed_rewrite_preview(request: Mapping[str, Any], execution_result: object) -> dict[str, Any]:
+    """Bind a completed owned result to its exact request, without applying it."""
+    from services.h3_prompt_rewriter_runtime import validate_h3_prompt_rewriter_execution_result
+
+    request = validate_rewrite_request(request)
+    result = validate_h3_prompt_rewriter_execution_result(
+        execution_result, request_commitment=request["commitment"],
+    )
+    return _build_rewrite_preview(
+        request,
+        (result.deterministic_candidate, result.base_candidate, result.adapted_candidate),
+        execution_receipt_sha256=result.execution_receipt_sha256,
+    )
+
+
 def validate_rewrite_preview(request: Mapping[str, Any], preview: Mapping[str, Any]) -> dict[str, Any]:
     request = validate_rewrite_request(request)
-    _exact_keys(preview, _PREVIEW_KEYS, "rewrite preview")
-    _exact_int(preview["schema_version"], SCHEMA_VERSION, "rewrite preview schema_version")
-    _sha256_string(preview["request_commitment"], "preview request_commitment")
-    _sha256_string(preview["commitment"], "preview commitment")
+    _validate_public_preview(preview)
     if preview["request_commitment"] != request["commitment"] or preview["original_prompt"] != request["original_prompt"]:
         raise ValueError("preview is not bound to the exact request and original prompt")
-    candidates = preview["candidates"]
-    if type(candidates) is not list or len(candidates) != len(CANDIDATE_KINDS):
-        raise ValueError("preview must contain exactly deterministic, base, and adapted candidates")
-    texts = []
-    for index, (candidate, kind) in enumerate(zip(candidates, CANDIDATE_KINDS)):
-        _exact_keys(candidate, _CANDIDATE_KEYS, f"candidates[{index}]")
-        if _plain_string(candidate["kind"], f"candidates[{index}].kind") != kind or candidate["produced_by_runtime"] is not False:
-            raise ValueError("candidate order or execution evidence is invalid")
-        text = _plain_string(candidate["text"], f"candidates[{index}].text", allow_empty=True)
-        if not _anchors_are_preserved(request, text):
+    for candidate in preview["candidates"]:
+        if not _anchors_are_preserved(request, candidate["text"]):
             raise ValueError("candidate does not preserve every literal anchor")
-        texts.append(text)
-    if preview["selection"] is not None:
-        raise ValueError("preview selection must remain null until an explicit decision")
-    runtime = preview["runtime_evidence"]
-    expected_runtime = {
-        "execution_available": False, "base_executed": False,
-        "adapter_executed": False, "fallback_used": False,
-    }
-    _exact_keys(runtime, frozenset(expected_runtime), "runtime_evidence")
-    for key, expected in expected_runtime.items():
-        _exact_bool(runtime[key], expected, f"runtime_evidence.{key}")
-    rebuilt = create_rewrite_preview(request, deterministic=texts[0], base=texts[1], adapted=texts[2])
-    if preview != rebuilt:
-        raise ValueError("preview commitment, selection, or runtime evidence is invalid")
-    return rebuilt
+    return json.loads(_canonical(preview))
 
 
 def create_apply_decision(request: Mapping[str, Any], preview: Mapping[str, Any], selected_kind: str) -> dict[str, str | int]:
@@ -570,7 +572,10 @@ def _validate_public_decision(document: Mapping[str, Any]) -> None:
 
 def _validate_public_preview(document: Mapping[str, Any]) -> None:
     _exact_keys(document, _PREVIEW_KEYS, "rewrite preview")
-    _exact_int(document["schema_version"], SCHEMA_VERSION, "rewrite preview schema_version")
+    version = document["schema_version"]
+    if type(version) is not int or version not in (SCHEMA_VERSION, EXECUTED_PREVIEW_SCHEMA_VERSION):
+        raise ValueError("rewrite preview schema_version is invalid")
+    executed = version == EXECUTED_PREVIEW_SCHEMA_VERSION
     for key in ("request_commitment", "commitment"):
         _sha256_string(document[key], key)
     _plain_string(document["original_prompt"], "original_prompt", allow_empty=True)
@@ -583,15 +588,20 @@ def _validate_public_preview(document: Mapping[str, Any]) -> None:
         _exact_keys(candidate, _CANDIDATE_KEYS, "preview candidate")
         if _plain_string(candidate["kind"], "candidate kind") != kind:
             raise ValueError("preview candidate order is invalid")
-        _plain_string(candidate["text"], "candidate text", allow_empty=True)
-        _exact_bool(candidate["produced_by_runtime"], False, "produced_by_runtime")
+        _plain_string(candidate["text"], "candidate text", allow_empty=not executed)
+        _exact_bool(candidate["produced_by_runtime"], executed and kind != "deterministic", "produced_by_runtime")
+    if executed and candidates[0]["text"] != document["original_prompt"]:
+        raise ValueError("executed preview must retain the unchanged original comparator")
     expected_runtime = {
-        "execution_available": False, "base_executed": False,
-        "adapter_executed": False, "fallback_used": False,
+        "execution_available": executed, "base_executed": executed,
+        "adapter_executed": executed, "fallback_used": False,
     }
-    _exact_keys(document["runtime_evidence"], frozenset(expected_runtime), "runtime_evidence")
+    runtime_keys = frozenset(expected_runtime) | ({"execution_receipt_sha256"} if executed else set())
+    _exact_keys(document["runtime_evidence"], runtime_keys, "runtime_evidence")
     for key, expected in expected_runtime.items():
         _exact_bool(document["runtime_evidence"][key], expected, f"runtime_evidence.{key}")
+    if executed:
+        _sha256_string(document["runtime_evidence"]["execution_receipt_sha256"], "execution receipt")
     unsigned = dict(document)
     commitment = unsigned.pop("commitment")
     if commitment != _commit(unsigned):

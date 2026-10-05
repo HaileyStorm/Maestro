@@ -33,7 +33,7 @@ PACKAGE_ROWS = (
     ("accelerate", "1.12.0", "py3-none-any", ()),
     ("nvidia-cublas-cu12", "12.8.4.1", "py3-none-manylinux_2_28_x86_64", ()),
     ("peft", "0.20.0", "py3-none-any", ()),
-    ("pillow", "12.2.0", "cp312-cp312-manylinux_2_28_x86_64", ()),
+    ("pillow", "12.3.0", "cp312-cp312-manylinux_2_28_x86_64", ()),
     ("safetensors", "0.8.0", "cp312-cp312-manylinux_2_28_x86_64", ()),
     ("tokenizers", "0.22.1", "cp312-cp312-manylinux_2_28_x86_64", ()),
     (
@@ -524,6 +524,35 @@ class H3PromptRewriterUvResolutionReportTests(unittest.TestCase):
     def test_documented_uv_0926_golden_variant_is_accepted(self):
         report = self.parse_report(UV_0926_DOCUMENTED_GOLDEN_PYLOCK)
         self.assertEqual(len(report["packages"]), len(PACKAGE_ROWS))
+
+    def test_native_uv_0926_input_basename_joins_the_same_absolute_state_reference(self):
+        reference = "/private/requirements.in"
+        absolute = producer.parse_uv_resolution_evidence_to_wheel_report(
+            _pylock(), _hashed_requirements(reference), requirements_reference=reference,
+            size_resolver=lambda *_values: 1,
+        )
+        relative = producer.parse_uv_resolution_evidence_to_wheel_report(
+            _pylock(), _hashed_requirements(producer.INPUT_NAME), requirements_reference=reference,
+            size_resolver=lambda *_values: 1,
+        )
+        self.assertEqual(relative, absolute)
+
+    def test_input_basename_exception_rejects_other_names_paths_and_expected_inputs(self):
+        for emitted in ("other.in", "./requirements.in", "../requirements.in",
+                        "nested/requirements.in", "/other/requirements.in"):
+            with self.subTest(emitted=emitted), self.assertRaisesRegex(
+                producer.H3PromptRewriterUvResolutionSecurityError, "unknown input"
+            ):
+                producer._parse_hashed_requirements(
+                    _hashed_requirements(emitted), requirements_reference="/private/requirements.in"
+                )
+        for reference in ("/private/other.in", "/private/../requirements.in", "/private//requirements.in"):
+            with self.subTest(reference=reference), self.assertRaisesRegex(
+                producer.H3PromptRewriterUvResolutionSecurityError, "unknown input"
+            ):
+                producer._parse_hashed_requirements(
+                    _hashed_requirements(producer.INPUT_NAME), requirements_reference=reference
+                )
 
     def test_real_uv_evidence_requires_graph_hash_and_size_sources(self):
         reference = "/private/requirements.in"

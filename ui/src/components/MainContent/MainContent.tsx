@@ -8,6 +8,7 @@ import { ProjectAccessPanel } from './ProjectAccessPanel'
 import { H3BridgePanel, resolveH3BridgeSelection } from './H3BridgePanel'
 import { H3GuidePanel, resolveH3GuideSelections } from './H3GuidePanel'
 import { LlmChat } from '../LlmChat'
+import { H3PromptRewriteComparison } from '../H3PromptRewriteComparison'
 import { H3DeliveryRecoveryStatus, OPEN_GALLERY_EVENT } from '../H3DeliveryRecoveryStatus'
 import * as storeApi from '../../stores/useStore'
 import type { GenerationJob, ModelDef, OutputFile } from '../../types'
@@ -2000,9 +2001,14 @@ function PromptEnhanceQueueCard() {
   const activeWorkspace = useStore(state => state.activeWorkspace)
   const cancel = useStore(state => state.cancelEnhancePrompt)
   const handleUseAndGenerate = useStore(state => state.useCompletedEnhanceAndGenerate)
+  const applyH3 = useStore(state => state.applyH3RewriteSelection)
+  const currentPrompt = useStore(state => state.params.prompt)
+  const recheckH3 = useStore(state => state.recheckH3Comparison)
   if (!card || card.workspace !== activeWorkspace) return null
 
   const operation = card.status && 'request_id' in card.status ? card.status : null
+  const h3 = card.engine === 'h3_rewriter'
+  const preview = card.result?.h3_rewrite_preview
   const text = card.result?.enhanced || operation?.partial_text || ''
   const stage = operation?.stage || operation?.phase || card.status?.phase || card.phase
   const stateLabel = card.phase === 'preparing'
@@ -2024,7 +2030,7 @@ function PromptEnhanceQueueCard() {
         <div className="min-w-0">
           <div className="flex items-center gap-2">
             <Sparkles size={14} className="shrink-0 text-accent-blue" aria-hidden="true" />
-            <h2 id="prompt-enhance-queue-title" className="text-xs font-medium text-text-primary">Prompt Enhance</h2>
+            <h2 id="prompt-enhance-queue-title" className="text-xs font-medium text-text-primary">{h3 ? 'Compose with H3' : 'Prompt Enhance'}</h2>
           </div>
           <p className="mt-1 text-[10px] text-text-muted">
             {stateLabel} · {stage.replaceAll('_', ' ')} · {card.workspace}
@@ -2040,7 +2046,7 @@ function PromptEnhanceQueueCard() {
           </button>
         )}
       </div>
-      {text && (
+      {text && !h3 && (
         <div
           role="status"
           aria-live={isActive ? 'polite' : 'off'}
@@ -2050,7 +2056,29 @@ function PromptEnhanceQueueCard() {
         </div>
       )}
       {card.error && <p className="mt-2 text-[10px] leading-relaxed text-red-300">{card.error}</p>}
-      {card.phase === 'completed' && card.result && (
+      {card.phase === 'completed' && preview && !card.resultApplied && (
+        <div className="mt-3">
+          {!card.h3InputsVerified && (
+            <div className="mb-3 text-xs text-text-secondary">
+              <p>Restore your original prompt and Compose inputs, then recheck this comparison before applying a version.</p>
+              <button type="button" onClick={() => void recheckH3()}
+                className="mt-2 rounded-md border border-border px-3 py-2 hover:bg-bg-hover focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent-blue">
+                Recheck comparison
+              </button>
+            </div>
+          )}
+          <fieldset disabled={!card.h3InputsVerified}>
+            <H3PromptRewriteComparison key={`${card.promptEditGeneration}:${!!card.h3InputsVerified}`} preview={preview}
+              currentRequest={{ requestCommitment: card.result!.h3_rewrite_request!.commitment,
+                originalPrompt: card.h3InputsVerified ? currentPrompt : card.result!.original }}
+              onApply={applyH3} />
+          </fieldset>
+        </div>
+      )}
+      {card.phase === 'completed' && h3 && card.resultApplied && (
+        <p className="mt-2 text-xs text-text-muted">Applied to your prompt. No generation was started.</p>
+      )}
+      {card.phase === 'completed' && card.result && !h3 && (
         <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
           <p className="text-[10px] leading-relaxed text-text-muted">
             {card.resultApplied

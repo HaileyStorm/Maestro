@@ -1,3 +1,4 @@
+import { parseH3PromptRewritePreview, type H3PromptRewritePreview, type H3PromptRewriteApplySelection } from '../lib/h3PromptRewritePreview.ts'
 import type {
   ArtifactClass,
   DirectorImageRoleLoraSelection,
@@ -8441,6 +8442,8 @@ export interface LlmEnhanceOperationStatus {
 export interface LlmEnhanceResult {
   original: string
   enhanced: string
+  h3_rewrite_request?: { commitment: string; original_prompt: string; mode: 't2va' | 'i2va' | 'l2va' | 'fl2va' }
+  h3_rewrite_preview?: H3PromptRewritePreview
 }
 
 export type LlmEnhanceQueueCardPhase = 'preparing' | 'queued' | 'running' | 'completed' | 'failed'
@@ -8461,6 +8464,7 @@ export interface LlmEnhanceQueueCard {
   result: LlmEnhanceResult | null
   resultApplied: boolean
   error: string | null
+  engine?: 'h3_rewriter'
 }
 
 export interface LlmEnhanceRequestOptions extends LlmRequestOptions {
@@ -8567,7 +8571,35 @@ async function fetchLlmEnhanceResult(
   if (typeof result.original !== 'string' || typeof result.enhanced !== 'string') {
     throw new LlmEnhanceScopeError('The Prompt Enhance result did not match its request')
   }
+  if ('h3_rewrite_request' in result || 'h3_rewrite_preview' in result) {
+    const request = result.h3_rewrite_request
+    if (!request || typeof request !== 'object' || !/^[a-f0-9]{64}$/.test(request.commitment)
+      || request.original_prompt !== result.original || result.enhanced !== result.original
+      || !['t2va', 'i2va', 'l2va', 'fl2va'].includes(request.mode)) throw new LlmEnhanceScopeError()
+    const preview = await parseH3PromptRewritePreview(result.h3_rewrite_preview, {
+      requestCommitment: request.commitment, originalPrompt: result.original,
+    })
+    await assertLlmEnhanceProjectScope(scope, signal)
+    return { original: result.original, enhanced: result.original, h3_rewrite_request: request, h3_rewrite_preview: preview }
+  }
   return { original: result.original, enhanced: result.enhanced }
+}
+
+export async function applyLlmH3Rewrite(scope: LlmEnhanceOperationScope, selection: H3PromptRewriteApplySelection,
+  expectedText: string, signal?: AbortSignal): Promise<string> {
+  await assertLlmEnhanceProjectScope(scope, signal)
+  throwIfAborted(signal)
+  const response = await fetch(`${BASE}/api/v1/llm/operations/enhance/${encodeURIComponent(scope.requestId)}/h3-apply`, {
+    method: 'POST', cache: 'no-store', headers: { 'Content-Type': 'application/json' }, signal,
+    body: JSON.stringify({ workspace: scope.workspace, project_instance: scope.projectInstance, ...selection }),
+  })
+  if (!response.ok) throw new Error('Could not apply this version. Try again.')
+  const result = await response.json()
+  await assertLlmEnhanceProjectScope(scope, signal)
+  if (!result || Object.keys(result).sort().join(',') !== 'enhanced,preview_commitment,request_commitment,selected_kind'
+    || result.enhanced !== expectedText || result.request_commitment !== selection.request_commitment
+    || result.preview_commitment !== selection.preview_commitment || result.selected_kind !== selection.selected_kind) throw new LlmEnhanceScopeError()
+  return result.enhanced
 }
 
 async function recoverLlmEnhanceSubmission(
@@ -8747,6 +8779,8 @@ export async function llmEnhancePrompt(params: {
   tts_voice_count?: number
   max_new_tokens?: number
   explicit_output?: boolean
+  engine?: 'h3_rewriter'
+  rewrite_mode?: 't2va' | 'i2va' | 'l2va' | 'fl2va'
 }, options: LlmEnhanceRequestOptions): Promise<LlmEnhanceResult> {
   const scope: LlmEnhanceOperationScope = {
     requestId: params.request_id,
@@ -8756,7 +8790,7 @@ export async function llmEnhancePrompt(params: {
   if (options.projectInstance !== params.project_instance) {
     throw new LlmEnhanceScopeError('The Prompt Enhance project fence did not match its request')
   }
-  await prepareLlmForRequest(
+  if (params.engine !== 'h3_rewriter') await prepareLlmForRequest(
     {
       workspace: params.workspace,
       purpose: 'enhance',

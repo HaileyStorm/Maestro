@@ -48,6 +48,7 @@ _registrations: dict[
 ] = {}
 _queue_condition = threading.Condition(threading.RLock())
 _queue_waiters: dict[int, tuple[int, MutableMapping[str, Any]]] = {}
+_restored_h3_child_fences: dict[int, MutableMapping[str, Any]] = {}
 _queue_sequence = 0
 _queue_manual_order_sequence = 0
 _queue_paused = False
@@ -144,6 +145,11 @@ class DurableTransition:
     request_manifests: Mapping[str, Mapping[str, Any]] | None = None
     h3_control_predecessors: Mapping[str, Mapping[str, Any]] | None = None
     h3_control_acknowledge: Callable[[], None] | None = None
+    prompt_enhancement_gpu_fence: Callable[[], bool] | None = None
+
+
+class PromptEnhancementGpuIntentConflict(RuntimeError):
+    """A newer lifecycle winner invalidated the prospective GPU checkpoint."""
 
 
 class CreditQueueTransitionConflict(ValueError):
@@ -537,6 +543,7 @@ def _persist_prospective_unlocked(
     request_manifests: Mapping[str, Mapping[str, Any]] | None = None,
     h3_control_predecessors=None,
     h3_control_acknowledge=None,
+    prompt_enhancement_gpu_fence=None,
 ) -> None:
     hook = _durability_hook
     if hook is None:
@@ -551,6 +558,7 @@ def _persist_prospective_unlocked(
         ),
         h3_control_predecessors=h3_control_predecessors,
         h3_control_acknowledge=h3_control_acknowledge,
+        prompt_enhancement_gpu_fence=prompt_enhancement_gpu_fence,
     ))
 
 
@@ -567,7 +575,7 @@ def restore_scheduler_state(
 ) -> None:
     """Restore pause/manual order and restart ordering without wall/mono reuse.
 
-    Launch calls this once with reconstructed non-terminal jobs before worker
+    Launch calls this once with reconstructed canonical jobs before worker
     threads start. ``acquire_generation_slot`` consumes the private restore
     sequence so thread startup order cannot reorder recovered work.
     """
@@ -579,6 +587,9 @@ def restore_scheduler_state(
     order = raw_order if isinstance(raw_order, list) else []
     with _queue_condition, _lifecycle_lock:
         _queue_waiters.clear()
+        _restored_h3_child_fences.clear()
+        _restored_h3_child_fences.update({id(job): job for job in candidates.values()
+            if not _prompt_enhancement_child_release_allowed(job)})
         _queue_sequence = 0
         for job in candidates.values():
             credit_queue = job.get("credit_queue")
@@ -2612,6 +2623,7 @@ def _reset_queue_state_for_tests() -> None:
     with _queue_condition, _lifecycle_lock:
         _queue_waiters.clear()
         _registrations.clear()
+        _restored_h3_child_fences.clear()
         _queue_sequence = 0
         _queue_manual_order_sequence = 0
         _queue_paused = False
@@ -3001,6 +3013,81 @@ def update_preparation_job(
         ):
             return False
         _publish_job_unlocked(job, candidate)
+        _queue_condition.notify_all()
+        return True
+
+
+def validated_prompt_enhancement_gpu_intent(value: Any) -> dict[str, Any] | None:
+    """Validate the adapter's exact path-free record without contacting it."""
+    fields = {"schema", "request_id", "agent_id", "project_id", "binding_sha256",
+              "minimum_remaining_seconds", "stop_margin_seconds", "state"}
+    if (type(value) is not dict or set(value) != fields
+            or value["schema"] != "maestro.h3-prompt-rewriter.gpu-intent.v1"
+            or type(value["state"]) is not str
+            or value["state"] not in {"request_attempted", "withdraw_attempted", "closed", "unpublished"}
+            or any(type(value[key]) is not str or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value[key]) is None
+                   for key in ("request_id", "agent_id", "project_id"))
+            or type(value["binding_sha256"]) is not str or re.fullmatch(r"[0-9a-f]{64}", value["binding_sha256"]) is None):
+        return None
+    minimum, margin = value["minimum_remaining_seconds"], value["stop_margin_seconds"]
+    if (any(type(number) not in {int, float} for number in (minimum, margin))
+            or not 750 <= minimum <= 86400 or not 0 < margin < minimum):
+        return None
+    return dict(value)
+
+
+def checkpoint_prompt_enhancement_gpu_intent(
+    job: MutableMapping[str, Any], *, expected_execution_attempt: int,
+    intent: dict, child_reaped: bool | None = None,
+) -> bool:
+    """Persist exact lease/reaping evidence before publication without reviving jobs."""
+    record = validated_prompt_enhancement_gpu_intent(intent)
+    if record is None or (child_reaped is not None and type(child_reaped) is not bool):
+        return False
+    with _queue_condition, _lifecycle_lock:
+        if (_durability_hook is None or job.get("kind") != "prompt_enhancement"
+                or type(expected_execution_attempt) is not int
+                or type(job.get("execution_attempt", 1)) is not int
+                or not _valid_expected_execution_attempt(job, expected_execution_attempt)
+                or job.get(_TERMINAL_TRANSITION_MARKER) is True):
+            return False
+        live = job.get("status") in {"queued", "running"} and not is_cancel_requested(job)
+        if not live and job.get("status") not in TERMINAL_STATUSES and not is_cancel_requested(job):
+            return False
+        if (record["state"] == "request_attempted" or child_reaped is False) and not live:
+            return False
+        cursor = job.get("recovery_cursor", {})
+        if type(cursor) is not dict:
+            return False
+        if "h3_prompt_rewriter_gpu" in cursor:
+            previous = validated_prompt_enhancement_gpu_intent(cursor["h3_prompt_rewriter_gpu"])
+            if previous is None or any(previous[key] != record[key] for key in record if key != "state"):
+                return False
+            permitted = {"request_attempted": {"request_attempted", "withdraw_attempted", "unpublished"},
+                         "withdraw_attempted": {"withdraw_attempted", "closed"},
+                         "closed": {"closed"}, "unpublished": {"unpublished"}}
+            if record["state"] not in permitted[previous["state"]]:
+                return False
+        control_fields = ("status", "cancel_requested", "execution_attempt", "resource_state",
+                          "resource_intent", "resource_execution", "queue_held", "recovery_cursor",
+                          _TERMINAL_TRANSITION_MARKER)
+        predecessor = deepcopy({key: job.get(key) for key in control_fields})
+        def unchanged():
+            return predecessor == {key: job.get(key) for key in control_fields}
+        candidate = _copy_job_for_transition(job)
+        next_cursor = deepcopy(cursor)
+        next_cursor["h3_prompt_rewriter_gpu"] = record
+        if child_reaped is not None:
+            next_cursor["h3_prompt_rewriter_child_reaped"] = child_reaped
+        candidate["recovery_cursor"] = next_cursor
+        try:
+            _persist_prospective_unlocked("prompt_enhancement_gpu_intent", jobs=(candidate,),
+                                         prompt_enhancement_gpu_fence=unchanged)
+        except PromptEnhancementGpuIntentConflict:
+            return False
+        if not unchanged():
+            return False
+        job["recovery_cursor"] = next_cursor
         _queue_condition.notify_all()
         return True
 
@@ -4353,6 +4440,14 @@ def acquire_generation_slot(
                 _queue_waiters[waiter_key] = (waiter_sequence, job)
         try:
             while not is_cancel_requested(job):
+                with _lifecycle_lock:
+                    for identity, restored in tuple(_restored_h3_child_fences.items()):
+                        if _h3_prompt_enhancement_child_reaped(restored):
+                            del _restored_h3_child_fences[identity]
+                    blocked_by_restored_child = bool(_restored_h3_child_fences)
+                if blocked_by_restored_child:
+                    _queue_condition.wait(timeout=max(0.01, poll_interval))
+                    continue
                 eligible = _eligible_queue_entries()
                 selected, reason, skipped = _select_next_waiter(eligible)
                 is_next = bool(selected and selected[1] is job)
@@ -4417,12 +4512,33 @@ def acquire_and_start_generation_slot(
     return started
 
 
+def _h3_prompt_enhancement_child_reaped(job: Mapping[str, Any]) -> bool:
+    cursor = job.get("recovery_cursor")
+    return (job.get("kind") == "prompt_enhancement" and isinstance(cursor, Mapping)
+            and validated_prompt_enhancement_gpu_intent(cursor.get("h3_prompt_rewriter_gpu")) is not None
+            and cursor.get("h3_prompt_rewriter_child_reaped") is True)
+
+
+def _prompt_enhancement_child_release_allowed(job: Mapping[str, Any]) -> bool:
+    if job.get("kind") != "prompt_enhancement":
+        return True
+    cursor = job.get("recovery_cursor", {})
+    if not isinstance(cursor, Mapping):
+        return False
+    if "h3_prompt_rewriter_gpu" not in cursor:
+        return True
+    return _h3_prompt_enhancement_child_reaped(job)
+
+
 def release_generation_slot(
     generation_lock: threading.Lock,
     job: MutableMapping[str, Any],
 ) -> bool:
     """Release only a slot retained by ``acquire_and_start``."""
     with _queue_condition, _lifecycle_lock:
+        # A terminal job does not prove that its uncertain child stopped.
+        if not _prompt_enhancement_child_release_allowed(job):
+            return False
         if job.pop("_generation_slot_owned", False) is not True:
             return False
         generation_lock.release()
@@ -4439,6 +4555,7 @@ def complete_prompt_enhancement_resource_release(
             job.get("kind") != "prompt_enhancement"
             or str(job.get("status") or "") not in TERMINAL_STATUSES
             or job.get("resource_state") != "resources_releasing"
+            or not _prompt_enhancement_child_release_allowed(job)
         ):
             return False
         candidate = _copy_job_for_transition(job)
@@ -4455,6 +4572,7 @@ def complete_prompt_enhancement_resource_release(
         if (
             str(job.get("status") or "") != candidate["status"]
             or job.get("resource_state") != "resources_releasing"
+            or not _prompt_enhancement_child_release_allowed(job)
         ):
             return False
         _publish_job_unlocked(job, candidate)

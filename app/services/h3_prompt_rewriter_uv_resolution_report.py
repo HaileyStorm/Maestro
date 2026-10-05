@@ -1534,6 +1534,14 @@ def _parse_hashed_requirements(
             "hashed requirements header is invalid"
         )
     lines = lines[2:]
+    root_references = {f"-r {requirements_reference}"}
+    reference_path = Path(requirements_reference)
+    # uv 0.9.26 emits this basename relative to the verified state cwd, even
+    # when compile received the same state's absolute input filename.
+    if (reference_path.name == INPUT_NAME
+            and str(reference_path) == requirements_reference
+            and ".." not in reference_path.parts):
+        root_references.add(f"-r {INPUT_NAME}")
     rows: dict[str, dict[str, object]] = {}
     position = 0
     header = re.compile(r"([a-z0-9][a-z0-9._-]{0,127})==([^ \\]+) \\")
@@ -1597,7 +1605,7 @@ def _parse_hashed_requirements(
         canonical_parents: list[str] = []
         root = False
         for parent in parents:
-            if parent == f"-r {requirements_reference}":
+            if parent in root_references:
                 root = True
                 continue
             if parent.startswith("-r "):

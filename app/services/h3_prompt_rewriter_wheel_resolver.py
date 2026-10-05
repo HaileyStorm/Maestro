@@ -949,6 +949,17 @@ def _child_limit_callback(maximum_file_bytes: int) -> Callable[[], None]:
 def _download_command(
     prefix: tuple[str, ...], package: Mapping[str, object], destination: Path
 ) -> list[str]:
+    filename = package["wheel"]["filename"]
+    try:
+        closure._validate_wheel_filename(filename, name=package["name"], version=package["version"])
+    except closure.H3PromptRewriterDependencyClosureError as error:
+        raise H3PromptRewriterWheelResolverSecurityError(
+            "download target wheel tags are outside the reviewed runtime"
+        ) from error
+    # pip's explicit --platform does not expand PEP 600 floors downward.
+    # Use only the platform tags of this already-admitted, exact URL/hash wheel.
+    platforms = filename[:-4].rsplit("-", 1)[1].split(".")
+    platform_arguments = [value for platform in platforms for value in ("--platform", platform)]
     return [
         *prefix,
         "--isolated",
@@ -957,8 +968,7 @@ def _download_command(
         "--no-input",
         "--no-cache-dir",
         "--only-binary=:all:",
-        "--platform",
-        "manylinux_2_28_x86_64",
+        *platform_arguments,
         "--python-version",
         "3.12",
         "--implementation",

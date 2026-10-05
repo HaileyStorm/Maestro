@@ -95,6 +95,13 @@ project. An optional prompting-guide selector can add Maestro's H3 or other
 model-specific guide when a conversation is ready to become a generation
 prompt.
 
+An accepted Chat turn can be recovered after a browser reload or a Maestro
+restart. Maestro privately retains the final answer for up to 15 minutes,
+within a bounded recent-request history, scoped to the same account, browser
+session, and project. Conversations still stay in the browser. If a restart
+interrupts a turn, Chat reports the interruption; it does not automatically
+send the turn again. Start a new turn when you want to retry.
+
 Maestro prepares `llama-server` and the selected GGUF on this host if needed;
 allowed local and remote users reuse the shared host cache.
 Linux NVIDIA systems build the pinned llama.cpp runtime with CUDA when a
@@ -111,6 +118,50 @@ projector/vision capability, download state, and measured prompt/decode speed.
   Linked Model Folders; remote users can use only the visible catalog and
   opaque discovered models, including automatic downloads
 - Auto-unloads after 60s idle to free VRAM for video gen
+
+### Compose with H3
+
+In Studio, **Compose with H3** compares your original prompt with a base-model
+rewrite and an H3-trained rewrite. Choose a version and click **Apply selected
+prompt** to copy it into the prompt. Composition, reload recovery, and Apply do not start video
+generation; use the normal Generate action when ready.
+
+Compose supports H3 text, first-frame, last-frame, and first/last-frame modes.
+First/last-frame inputs keep that order. Ref2VA is unsupported. Choose a whole
+number of seconds from 4 to 15 for composition; this is separate from H3's
+frame-aligned video duration. Ordinary Enhance remains available.
+
+After a reload, a recovered comparison stays visible if the current inputs no
+longer match. Restore the original prompt, model and frame settings, and Compose
+duration, then click **Recheck comparison**. Recheck retrieves the same stored result;
+it does not compose again. Apply remains unavailable until the inputs match.
+
+The host owner must configure an installed, qualified isolated rewriter using
+the private `app/storage/h3_prompt_rewriter.json` selector, or the server's
+`MAESTRO_H3_PROMPT_REWRITER_CONFIG` setting. The file uses schema
+`maestro.h3-prompt-rewriter.host-config.v1`, `enabled: true`, and the qualified
+`feature_root`, `artifact_root`, `asset_manifest`, `asset_manifest_sha256`,
+`coordinator_root`, `project_id`, and `cuda_visible_devices` values. Keep this
+file owner-private; credentials and runtime paths never belong in API bodies.
+Missing or changed runtime configuration makes Compose unavailable.
+
+API clients submit `POST /api/v1/llm/enhance-prompt` with an existing project,
+its current `project_instance`, a new UUID `request_id`, `engine: "h3_rewriter"`,
+`prompt`, an H3 `model_type`, `rewrite_mode` (`t2va`, `i2va`, `l2va`, or
+`fl2va`), ordered `image_paths`, and integer `duration_seconds`. The response is
+the existing 202 Enhance queue record. Retrieve status and the completed result
+through `/api/v1/llm/operations/enhance/{request_id}` and its `/result` route,
+with the same authorized workspace. The result includes `h3_rewrite_request`
+and `h3_rewrite_preview`; `enhanced` still equals the original prompt.
+
+To select a stored version, post to
+`/api/v1/llm/operations/enhance/{request_id}/h3-apply` with `workspace`,
+`project_instance`, `request_commitment`, `preview_commitment`, and
+`selected_kind` (`deterministic`, `base`, or `adapted`). This returns the chosen
+`enhanced` text without consuming the comparison or generating media. Clients
+must check that their account, project, prompt, settings, and images still
+match before replacing the prompt. Retries reuse the same UUID and stored
+comparison; they must not submit a new composition automatically.
 
 ### 🛒 Built-in CivitAI LoRA browser
 - Search, filter, and one-click install any LoRA from CivitAI without leaving Maestro

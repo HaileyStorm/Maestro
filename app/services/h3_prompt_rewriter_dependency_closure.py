@@ -2,8 +2,9 @@
 
 This module validates bounded canonical JSON without inspecting the host,
 downloading or importing proposed packages, or authorizing installation or
-execution.  Submitted wheel rows and resolver reports remain unreviewed
-candidates until a later durable, source-bound receipt schema exists.
+execution. Submitted wheel rows remain unreviewed candidates within this API;
+the separate offline installer consumes reviewed reports and byte-verified
+manifests and publishes its own private qualification receipt.
 """
 
 from __future__ import annotations
@@ -43,7 +44,7 @@ RUNTIME_TARGET = {
 ROOT_PACKAGE_PINS = (
     ("accelerate", "1.12.0"),
     ("peft", rewriter.PEFT_VERSION),
-    ("pillow", "12.2.0"),
+    ("pillow", "12.3.0"),
     ("safetensors", "0.8.0"),
     ("tokenizers", "0.22.1"),
     ("torch", "2.10.0+cu128"),

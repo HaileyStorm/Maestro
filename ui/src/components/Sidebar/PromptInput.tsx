@@ -1,7 +1,7 @@
 import { supportsPromptPreparation } from '../../lib/promptEnhancement'
 import { useState, useRef, useEffect } from 'react'
 import { Sparkles, Loader2, ChevronUp } from 'lucide-react'
-import { useStore } from '../../stores/useStore'
+import { h3ComposeInputMode, useStore } from '../../stores/useStore'
 import { controlFpsTotalFrames, effectiveSlidingWindowGeometry, globalTimelineEndSeconds, hasGlobalTimeline, usesStudioSegments } from '../../lib/timelinePrompt'
 import { h3StyleWorkflowCatalogStateLabel, h3StyleWorkflowSupportsModel, h3StyleWorkflowSwatch, nextH3StyleWorkflowSurprise } from '../../lib/h3StyleWorkflows'
 import { requestQueueView } from '../../lib/mainViewNavigation'
@@ -153,8 +153,13 @@ export function PromptInput() {
   const generationMode = useStore(s => s.generationMode)
   const editSubMode = useStore(s => s.editSubMode)
   const enhancePrompt = useStore(s => s.enhancePrompt)
+  const composeH3Prompt = useStore(s => s.composeH3Prompt)
+  const composeInputMode = useStore(h3ComposeInputMode)
   const isEnhancing = useStore(s => s.isEnhancing)
   const durationSeconds = useStore(s => s.durationSeconds)
+  const composeDuration = useStore(s => s.h3ComposeDurationSeconds)
+  const setComposeDuration = useStore(s => s.setH3ComposeDurationSeconds)
+  const displayedComposeDuration = composeDuration ?? (Number.isInteger(durationSeconds) && durationSeconds >= 4 && durationSeconds <= 15 ? durationSeconds : null)
   const slidingWindowSeconds = useStore(s => s.slidingWindowSeconds)
   const slidingWindowOverlap = useStore(s => s.slidingWindowOverlap)
   const modelOptions = useStore(s => s.modelOptions)
@@ -317,6 +322,26 @@ export function PromptInput() {
           {usesGlobalTimeline
             ? `Full-video timing detected — timestamps are split across each planned ${usesSegmentedStudio ? 'shot' : 'section'} without changing their place in the video.`
             : `Use [00:00-00:10] descriptions to time the whole video; plain lines provide one description per planned ${usesSegmentedStudio ? 'shot' : 'section'}.`}
+        </div>
+      )}
+      {generationMode === 'video' && ['minimax_h3', 'minimax_h3_pinkcherry_fl2va', 'minimax_h3_w4a8_fl2va'].includes(effectiveVideoModel) && (
+        <div className="mt-2 rounded-md border border-border p-2">
+          <label className="flex flex-wrap items-center gap-2 text-xs text-text-secondary">
+            Compose duration (seconds)
+            <input type="number" min={4} max={15} step={1} value={displayedComposeDuration ?? ''}
+              onChange={event => setComposeDuration(event.target.value === '' ? null : Number(event.target.value))}
+              className="mobile-control-target w-20 rounded-md border border-border bg-bg-tertiary px-2 py-1 text-text-primary" />
+          </label>
+          <p className="mt-1 text-[10px] text-text-muted">Compose uses 4–15 whole seconds. Your video duration stays unchanged.</p>
+          {!composeInputMode && <p className="mt-1 text-[10px] text-text-muted">Compose supports text and a single first/last-frame pair. Complete the selected frames or remove reference media to continue.</p>}
+        <button
+          type="button"
+          disabled={isEnhancing || !composeInputMode || !prompt.trim() || displayedComposeDuration === null || !Number.isInteger(displayedComposeDuration) || displayedComposeDuration < 4 || displayedComposeDuration > 15}
+          onClick={() => { requestQueueView(); void composeH3Prompt() }}
+          className="mobile-control-target mt-2 rounded-md border border-border px-3 py-2 text-xs text-text-secondary hover:bg-bg-hover focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent-blue disabled:opacity-50"
+        >
+          Compose with H3
+        </button>
         </div>
       )}
       {enhancerFooter && (

@@ -42,6 +42,8 @@ class _HTTPException(Exception):
 
 
 def _launch_namespace(names: set[str], **overrides):
+    if "_llm_chat_operation_scope" in names:
+        names = {*names, "_llm_chat_owner_key"}
     if names & {
         "_register_llm_chat_upload", "_claim_llm_chat_uploads",
     }:
@@ -119,6 +121,7 @@ def _launch_namespace(names: set[str], **overrides):
             operation(*args, **kwargs)
         ),
         "_llm_operation_scope": lambda *_args: ("owner", "project"),
+        "_ensure_llm_chat_recovery_ready": lambda: None,
         "_llm_project_instance_id": lambda *_args: "d" * 64,
         "_claim_llm_chat_uploads": lambda *_args, **_kwargs: None,
         "_require_upload_content_access": lambda _request: None,
@@ -129,10 +132,85 @@ def _launch_namespace(names: set[str], **overrides):
         **overrides,
     }
     exec(compile(module, str(LAUNCH_PATH), "exec"), namespace)
+    if "_llm_chat_operation_scope" not in namespace:
+        namespace["_llm_chat_operation_scope"] = namespace["_llm_operation_scope"]
+    if "_llm_chat_owner_key" not in namespace:
+        namespace["_llm_chat_owner_key"] = lambda request: namespace["_llm_operation_scope"](request, "")[0]
     return namespace
 
 
 class MultimodalChatRouteTests(unittest.TestCase):
+    def test_chat_scope_changes_with_account_session_and_project_incarnation(self):
+        namespace = _launch_namespace(
+            {"_llm_chat_operation_scope", "_llm_operation_scope"},
+            _llm_project_instance_id=lambda request, _workspace: request.state.project_instance,
+        )
+        request = types.SimpleNamespace(state=types.SimpleNamespace(
+            maestro_session_id="session1", maestro_account_principal={"id": "account1"},
+            project_instance="p" * 64,
+        ))
+        original = namespace["_llm_chat_operation_scope"](request, "project")
+        request.state.maestro_account_principal = {"id": "account2"}
+        rotated_account = namespace["_llm_chat_operation_scope"](request, "project")
+        self.assertNotEqual(original[0], rotated_account[0])
+        self.assertEqual(original[1], rotated_account[1])
+        request.state.maestro_account_principal = {"id": "account1"}
+        request.state.maestro_session_id = "session2"
+        self.assertNotEqual(original[0], namespace["_llm_chat_operation_scope"](request, "project")[0])
+        request.state.maestro_session_id = "session1"
+        request.state.project_instance = "q" * 64
+        recreated = namespace["_llm_chat_operation_scope"](request, "project")
+        self.assertEqual(original[0], recreated[0])
+        self.assertNotEqual(original[1], recreated[1])
+
+    def test_unavailable_startup_gate_prevents_submit_status_and_upload_cleanup(self):
+        events = []
+        namespace = _launch_namespace(
+            {"llm_chat", "llm_chat_status", "reconcile_llm_chat_upload_request",
+             "_normalize_llm_chat_request_id", "_ensure_llm_chat_recovery_ready"},
+            _LLM_CHAT_RECOVERY_READY=False,
+            _llm_chat_request_is_external=lambda _request: False,
+            _require_project_access=lambda *_args, **_kwargs: None,
+            _request_project_workspace=lambda _request, workspace: workspace,
+            _cleanup_llm_chat_uploads=lambda *_args, **_kwargs: events.append("cleanup"),
+            _resolve_llm_chat_images=lambda *_args: events.append("resolve-images"),
+        )
+        class Request:
+            state = types.SimpleNamespace(maestro_remote=False)
+            async def json(self):
+                return {"workspace": "project", "request_id": "a" * 32, "image_paths": ["image.png"]}
+        request = Request()
+        for call in (
+            lambda: asyncio.run(namespace["llm_chat"](request)),
+            lambda: namespace["llm_chat_status"](request, "a" * 32, "project"),
+            lambda: namespace["reconcile_llm_chat_upload_request"](request, "a" * 32, "project", "d" * 64),
+        ):
+            with self.assertRaises(_HTTPException) as raised:
+                call()
+            self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(events, [])
+
+    def test_chat_startup_initializes_private_store_before_allowing_routes(self):
+        namespace = _launch_namespace(
+            {"_initialize_llm_chat_recovery", "_ensure_llm_chat_recovery_ready"},
+            _LLM_CHAT_RECOVERY_READY=False,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            manager = llm_operations.LlmChatOperationManager()
+            with mock.patch.object(os, "getcwd", return_value=directory), mock.patch.object(
+                llm_operations, "llm_chat_operation_manager", manager,
+            ):
+                namespace["_initialize_llm_chat_recovery"]()
+            namespace["_ensure_llm_chat_recovery_ready"]()
+            self.assertTrue((Path(directory) / "storage/llm-chat-recovery/chat.json").is_file())
+            with mock.patch.object(llm_operations, "llm_chat_operation_manager", types.SimpleNamespace(
+                configure_recovery=mock.Mock(side_effect=RuntimeError("private path")),
+            )), mock.patch.object(os, "getcwd", return_value=directory), mock.patch("builtins.print") as output:
+                namespace["_initialize_llm_chat_recovery"]()
+            with self.assertRaises(_HTTPException):
+                namespace["_ensure_llm_chat_recovery_ready"]()
+            self.assertNotIn("private path", repr(output.call_args))
+
     def test_chat_upload_redacts_path_and_promotes_lan_client(self):
         events = []
         request = types.SimpleNamespace(
@@ -540,6 +618,7 @@ class MultimodalChatRouteTests(unittest.TestCase):
                 "_register_llm_chat_upload",
                 "_claim_llm_chat_uploads",
                 "reconcile_llm_chat_upload_request",
+                "_llm_chat_owner_key",
             },
             _llm_chat_request_is_external=lambda _request: False,
         )
@@ -557,12 +636,14 @@ class MultimodalChatRouteTests(unittest.TestCase):
                 request_uuid = "44444444-4444-4444-8444-444444444444"
                 normalized_request_id = uuid.UUID(request_uuid).hex
                 for name in ("unclaimed.png", "claimed.png"):
+                    namespace["_llm_project_instance_id"] = lambda *_args: "d" * 64
                     image = uploads / name
                     image.write_bytes(b"image")
                     write_upload_access_sidecar(str(image), owner_id, private=True)
                     namespace["_register_llm_chat_upload"](
                         request, "project", name, normalized_request_id,
                     )
+                    namespace["_llm_project_instance_id"] = mock.Mock(side_effect=RuntimeError("project locked or deleted"))
                     if name == "unclaimed.png":
                         result = namespace["reconcile_llm_chat_upload_request"](
                             request, request_uuid, "project", "d" * 64,
@@ -593,6 +674,14 @@ class MultimodalChatRouteTests(unittest.TestCase):
                                 request, request_uuid, "project", "d" * 64,
                             )
                         self.assertEqual(result["state"], "claimed")
+                        self.assertTrue(image.is_file())
+                        # A changed account cannot see the operation, but a
+                        # still-draining worker continues to own this file.
+                        with mock.patch.object(llm_operations, "llm_chat_operation_manager", types.SimpleNamespace(
+                            status_or_reconcile_absent=lambda *_args, **_kwargs: (None, None),
+                        )):
+                            hidden = namespace["reconcile_llm_chat_upload_request"](request, request_uuid, "project", "d" * 64)
+                        self.assertEqual(hidden["state"], "claimed")
                         self.assertTrue(image.is_file())
                 with mock.patch.object(
                     llm_operations,

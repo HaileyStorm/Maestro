@@ -31,6 +31,7 @@ from services.h3_prompt_rewriter import (  # noqa: E402
     base_descriptor,
     canonical_public_projection,
     create_apply_decision,
+    create_executed_rewrite_preview,
     create_rewrite_preview,
     create_rewrite_request,
     inspect_local_candidate,
@@ -76,7 +77,93 @@ def preview_for(request: dict) -> dict:
     )
 
 
+def executed_wire_preview(request: dict) -> dict:
+    """A serialized server-result fixture, not native execution evidence."""
+    preview = preview_for(request)
+    preview["schema_version"] = 2
+    for candidate in preview["candidates"]:
+        candidate["produced_by_runtime"] = candidate["kind"] != "deterministic"
+    preview["runtime_evidence"] = {
+        "execution_available": True,
+        "base_executed": True,
+        "adapter_executed": True,
+        "fallback_used": False,
+        "execution_receipt_sha256": "a" * 64,
+    }
+    recommit_preview(preview)
+    return preview
+
+
+def recommit_preview(preview: dict) -> None:
+    unsigned = {key: value for key, value in preview.items() if key != "commitment"}
+    preview["commitment"] = hashlib.sha256(json.dumps(
+        unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode()).hexdigest()
+
+
 class H3PromptRewriterTests(unittest.TestCase):
+    def test_caller_candidate_dictionary_cannot_claim_completed_execution(self):
+        with self.assertRaises(RuntimeError):
+            create_executed_rewrite_preview(request_for(), {
+                "request_commitment": request_for()["commitment"],
+                "base_candidate": "forged", "adapted_candidate": "forged",
+                "execution_receipt_sha256": "a" * 64,
+            })
+
+    def test_executed_wire_cannot_replace_original_comparator_or_have_empty_candidates(self):
+        for index, text in ((0, "changed original"), (1, ""), (2, "")):
+            with self.subTest(index=index):
+                preview = executed_wire_preview(request_for())
+                preview["candidates"][index]["text"] = text
+                recommit_preview(preview)
+                with self.assertRaises(ValueError):
+                    canonical_public_projection(preview)
+
+    def test_executed_wire_preview_waits_for_explicit_apply_and_preserves_original(self):
+        request = request_for("fl2va")
+        preview = executed_wire_preview(request)
+        before = copy.deepcopy((request, preview))
+        self.assertEqual(json.loads(canonical_public_projection(preview)), preview)
+        self.assertEqual(validate_rewrite_preview(request, preview), preview)
+        self.assertIsNone(preview["selection"])
+        decision = create_apply_decision(request, preview, "adapted")
+        self.assertEqual(apply_preview_decision(request, preview, decision),
+                         "ADAPTED: " + request["original_prompt"])
+        self.assertEqual((request, preview), before)
+
+    def test_executed_apply_rejects_changed_receipt_request_or_anchors(self):
+        request = request_for("fl2va")
+        preview = executed_wire_preview(request)
+        decision = create_apply_decision(request, preview, "adapted")
+        changed = copy.deepcopy(preview)
+        changed["runtime_evidence"]["execution_receipt_sha256"] = "b" * 64
+        recommit_preview(changed)
+        with self.assertRaises(ValueError):
+            apply_preview_decision(request, changed, decision)
+        other_request = create_rewrite_request(
+            original_prompt=request["original_prompt"], mode="fl2va",
+            image_roles=[{"role": "first_frame", "input_id": "other-first"},
+                         {"role": "last_frame", "input_id": "other-last"}],
+        )
+        with self.assertRaises(ValueError):
+            validate_rewrite_preview(other_request, preview)
+        changed = copy.deepcopy(preview)
+        changed["candidates"][2]["text"] = "Missing the authored words"
+        recommit_preview(changed)
+        with self.assertRaises(ValueError):
+            validate_rewrite_preview(request, changed)
+
+    def test_source_only_preview_cannot_gain_runtime_flags_or_receipt(self):
+        request = request_for()
+        for field, value in (("base_executed", True),
+                             ("execution_receipt_sha256", "a" * 64)):
+            with self.subTest(field=field):
+                preview = preview_for(request)
+                preview["runtime_evidence"][field] = value
+                recommit_preview(preview)
+                with self.assertRaises(ValueError):
+                    validate_rewrite_preview(request, preview)
+
     def test_exact_immutable_source_identity_and_false_acceptance(self):
         adapter = adapter_descriptor()
         self.assertEqual(adapter["repo_id"], "lightx2v/MiniMax-H3-Prompt-Rewriter-LoRA-8B")

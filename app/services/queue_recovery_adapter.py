@@ -27,7 +27,11 @@ import time
 from typing import Any
 import uuid
 
-from services.job_lifecycle import validated_h3_delivery_recovery_control
+from services.job_lifecycle import (
+    PromptEnhancementGpuIntentConflict,
+    validated_h3_delivery_recovery_control,
+    validated_prompt_enhancement_gpu_intent,
+)
 from services.queue_recovery import QueueRecoveryJournal, RecoverySnapshot
 from services.h3_offload_plan import (
     H3OffloadPlanError,
@@ -106,6 +110,16 @@ def processed_tool_publication_pending(job: Mapping[str, Any]) -> bool:
         and isinstance(cursor, Mapping)
         and "processed_tool_publication" in cursor
     )
+
+
+def prompt_enhancement_gpu_cleanup_pending(job: Mapping[str, Any]) -> bool:
+    """Keep ambiguous lease or child evidence until exact cleanup is settled."""
+    cursor = job.get("recovery_cursor")
+    if job.get("kind") != "prompt_enhancement" or not isinstance(cursor, Mapping) or "h3_prompt_rewriter_gpu" not in cursor:
+        return False
+    intent = validated_prompt_enhancement_gpu_intent(cursor["h3_prompt_rewriter_gpu"])
+    return (intent is None or intent["state"] not in {"closed", "unpublished"}
+            or cursor.get("h3_prompt_rewriter_child_reaped") is not True)
 
 
 _FORBIDDEN_KEY_PARTS = frozenset({
@@ -1993,6 +2007,9 @@ class QueueRecoveryCoordinator:
                 ) if global_state is not None or admission_jobs.intersection(set(serialized) | set(tombstones)) else None
             )
             changed_ids = set(serialized).union(tombstones)
+            fence = getattr(proposal, "prompt_enhancement_gpu_fence", None)
+            if fence is not None and fence() is not True:
+                raise PromptEnhancementGpuIntentConflict("GPU intent lifecycle predecessor changed before persistence")
             receipt = self.journal.commit_state(
                 jobs=serialized,
                 tombstones=tombstones,
@@ -2060,8 +2077,8 @@ class QueueRecoveryCoordinator:
                 return
             if str(snapshot.get("status", "")).casefold() not in _TERMINAL:
                 raise QueueRecoveryAdapterError("Only terminal jobs may be tombstoned.")
-            if processed_tool_publication_pending(snapshot):
-                raise QueueRecoveryAdapterError("Cancelled tool publication cleanup is pending.")
+            if processed_tool_publication_pending(snapshot) or prompt_enhancement_gpu_cleanup_pending(snapshot):
+                raise QueueRecoveryAdapterError("Terminal publication or GPU cleanup is pending.")
             clean_global = self._canonical_global_state(
                 self._global_state, tombstones=(job_id,),
             )
@@ -2094,7 +2111,7 @@ class QueueRecoveryCoordinator:
                 drop_terminal=True,
                 terminal_statuses=AUTOMATIC_RETIREMENT_STATUSES,
                 retain_job_ids=tuple(job_id for job_id, job in clean_before_jobs.items()
-                                     if processed_tool_publication_pending(job)),
+                                     if processed_tool_publication_pending(job) or prompt_enhancement_gpu_cleanup_pending(job)),
                 replacement_jobs=clean_before_jobs,
                 replacement_global_state=(
                     clean_before_global if before.global_state is not None else None

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { createHash, createHmac } from 'node:crypto'
 
 import { build } from 'esbuild'
 
@@ -3556,4 +3557,488 @@ test('Studio completed admission fences its deferred Gallery refresh across proj
   assert.deepEqual(useStore.getState().outputs, [], 'old private Gallery read cannot revive after ABA')
   assert.equal(useStore.getState().outputsTotal, 0)
   assert.equal(useStore.getState().jobs[0].status, 'completed')
+})
+
+function h3Preview(original, requestCommitment = 'a'.repeat(64)) {
+  const unsigned = {
+    schema_version: 2, request_commitment: requestCommitment, original_prompt: original,
+    candidates: [
+      { kind: 'deterministic', text: original, produced_by_runtime: false },
+      { kind: 'base', text: 'Base camera and dialogue version.', produced_by_runtime: true },
+      { kind: 'adapted', text: 'H3 camera and dialogue version.', produced_by_runtime: true },
+    ], selection: null,
+    runtime_evidence: { execution_available: true, base_executed: true, adapter_executed: true,
+      fallback_used: false, execution_receipt_sha256: 'b'.repeat(64) },
+  }
+  const canonical = value => Array.isArray(value) ? '[' + value.map(canonical).join(',') + ']'
+    : value !== null && typeof value === 'object'
+      ? '{' + Object.keys(value).sort().map(key => JSON.stringify(key) + ':' + canonical(value[key])).join(',') + '}'
+      : JSON.stringify(value)
+  return { ...unsigned, commitment: createHash('sha256').update(canonical(unsigned)).digest('hex') }
+}
+
+async function h3StoreFixture(t, { withoutSubtle = false } = {}) {
+  const originalConsoleError = console.error
+  const errors = []
+  console.error = (...args) => errors.push(args.map(value => value instanceof Error ? value.message : String(value)))
+  const descriptors = new Map(['window', 'document', 'localStorage', 'sessionStorage', 'navigator', 'crypto', 'fetch']
+    .map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)]))
+  class Storage {
+    values = new Map()
+    getItem(key) { return this.values.get(key) ?? null }
+    setItem(key, value) { this.values.set(key, String(value)) }
+    removeItem(key) { this.values.delete(key) }
+  }
+  const alerts = []
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: Object.assign(new EventTarget(), {
+    setTimeout, clearTimeout, setInterval, clearInterval, alert: message => alerts.push(message),
+    location: { hostname: 'lan-host' }, matchMedia: () => ({ matches: false }),
+  }) })
+  Object.defineProperty(globalThis, 'document', { configurable: true, value: Object.assign(new EventTarget(), { hidden: false }) })
+  for (const key of ['localStorage', 'sessionStorage']) Object.defineProperty(globalThis, key, { configurable: true, value: new Storage() })
+  Object.defineProperty(globalThis, 'navigator', { configurable: true, value: {
+    locks: { request: (name, options, callback) => Promise.resolve(callback({ name })) },
+  } })
+  const nativeCrypto = globalThis.crypto
+  const fallbackCrypto = { randomUUID: nativeCrypto.randomUUID.bind(nativeCrypto), getRandomValues: nativeCrypto.getRandomValues.bind(nativeCrypto) }
+  if (withoutSubtle) Object.defineProperty(globalThis, 'crypto', { configurable: true, value: fallbackCrypto })
+  const posts = [], applies = [], uploads = [], recoveryGets = []
+  let prepares = 0, generations = 0, uploadFailure = false, applyWait = null
+  let project = 'e'.repeat(64), tamper = false, omitComparison = false, resultWait = null
+  const status = requestId => ({
+    request_id: requestId.replaceAll('-', ''), operation_kind: 'enhance', status: 'completed', phase: 'completed', stage: 'completed',
+    pass: 1, pass_limit: 1, attempt: 1, attempt_limit: 1, partial_text: '', generated_tokens_approx: 0,
+    elapsed_seconds: 1, live_tps: null, average_tps: null, result_available: true, retryable: false,
+  })
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input)
+    if (url.includes('/llm/models?')) return jsonResponse({ models: [], guides: [], project_instance: project })
+    if (url.endsWith('/llm/prepare')) { prepares++; throw new Error('H3 must not prepare the ordinary LLM') }
+    if (url.endsWith('/api/v1/upload')) {
+      const file = init.body.get('file'); uploads.push(file.name)
+      return uploadFailure ? jsonResponse({ detail: 'Synthetic image upload failed' }, 503) : jsonResponse({ path: `/private/${file.name}` })
+    }
+    if (url.endsWith('/llm/enhance-prompt')) { const body = JSON.parse(init.body); posts.push(body); return jsonResponse(status(body.request_id), 202) }
+    if (url.includes('/h3-apply')) {
+      const body = JSON.parse(init.body); applies.push(body)
+      if (applyWait) await applyWait.promise
+      return jsonResponse({ ...Object.fromEntries(['request_commitment', 'preview_commitment', 'selected_kind'].map(key => [key, body[key]])),
+        enhanced: h3Preview(posts.at(-1).prompt).candidates.find(candidate => candidate.kind === body.selected_kind).text })
+    }
+    if (url.includes('/result?')) {
+      recoveryGets.push(url)
+      if (resultWait) await resultWait.promise
+      const body = posts.at(-1), preview = h3Preview(body.prompt)
+      if (omitComparison) return jsonResponse({ original: body.prompt, enhanced: 'Malformed ordinary fallback' })
+      if (tamper) preview.candidates[2].text += ' altered'
+      return jsonResponse({ original: body.prompt, enhanced: body.prompt,
+        h3_rewrite_request: { commitment: preview.request_commitment, original_prompt: body.prompt, mode: body.rewrite_mode }, h3_rewrite_preview: preview })
+    }
+    if (url.includes('/operations/enhance/')) return jsonResponse(status(url.match(/enhance\/([^?]+)/)[1]))
+    throw new Error(`Unexpected H3 fixture request ${url}`)
+  }
+  const { useStore } = await loadStoreModuleFresh()
+  const base = useStore.getState()
+  useStore.setState({ activeWorkspace: 'h3-project', generationMode: 'video', sidebarMode: 'studio', sidebarOpen: true,
+    durationSeconds: 6, startImage: null, endImage: null, imageRefs: [], modelOptions: null,
+    params: { ...base.params, prompt: 'Original café 👋 prompt', model_type: 'minimax_h3', image_prompt_type: 'T', image_start: '', image_end: '' },
+    startGeneration: async () => { generations++ },
+  })
+  t.after(() => {
+    useStore.setState(base, true)
+    console.error = originalConsoleError
+    for (const [key, descriptor] of descriptors) descriptor ? Object.defineProperty(globalThis, key, descriptor) : delete globalThis[key]
+  })
+  return { useStore, posts, applies, uploads, recoveryGets, alerts, errors, nativeCrypto, fallbackCrypto,
+    get prepares() { return prepares }, get generations() { return generations },
+    failUploads() { uploadFailure = true }, tamper() { tamper = true }, omitComparison() { omitComparison = true }, replaceProject() { project = 'd'.repeat(64) },
+    holdApply() { applyWait = deferred(); return applyWait },
+    holdResult() { resultWait = deferred(); return resultWait },
+    select(kind = 'adapted') {
+      const preview = useStore.getState().enhanceQueueCard.result.h3_rewrite_preview
+      return { request_commitment: preview.request_commitment, preview_commitment: preview.commitment, selected_kind: kind }
+    },
+  }
+}
+
+test('H3 completed and GET-only resumed comparisons stay unapplied until explicit scoped Apply', async t => {
+  const f = await h3StoreFixture(t, { withoutSubtle: true })
+  const original = f.useStore.getState().params.prompt
+  assert.equal(await f.useStore.getState().composeH3Prompt(), true)
+  assert.equal(f.prepares, 0)
+  assert.equal(f.posts.length, 1)
+  assert.equal(f.useStore.getState().params.prompt, original)
+  assert.equal(f.useStore.getState().enhanceQueueCard.resultApplied, false)
+  assert.equal(await f.useStore.getState().applyCompletedEnhanceResult(), false)
+  assert.equal(await f.useStore.getState().useCompletedEnhanceAndGenerate(), false)
+  f.useStore.getState().setSidebarMode('director')
+  f.useStore.getState().setSidebarMode('studio')
+  assert.equal(f.useStore.getState().h3ComposeDurationSeconds, null)
+  assert.equal(f.useStore.getState().durationSeconds, 6)
+  assert.equal(await f.useStore.getState().recheckH3Comparison(), true, 'unchanged supported fallback duration is the effective Compose value')
+  assert.equal(f.useStore.getState().h3ComposeDurationSeconds, null, 'GET must not restore the raw duration field')
+  assert.equal(f.posts.length, 1, 'Resume must only GET the retained operation')
+  assert.equal(f.useStore.getState().params.prompt, original)
+  assert.equal(f.generations, 0)
+  const ledger = globalThis.localStorage.getItem('maestro:prompt-enhance-operations-v2')
+  assert.ok(ledger && !ledger.includes(original) && !ledger.includes('camera and dialogue'))
+  await f.useStore.getState().applyH3RewriteSelection(f.select())
+  assert.equal(f.useStore.getState().params.prompt, 'H3 camera and dialogue version.')
+  assert.equal(f.applies.length, 1)
+  assert.equal(f.generations, 0)
+  assert.equal(globalThis.localStorage.getItem('maestro:prompt-enhance-operations-v2'), null)
+})
+
+test('H3 mode snapshots send only ordered anchors and exact duration; strict upload failure never submits', async t => {
+  const f = await h3StoreFixture(t)
+  for (const [mode, rewriteMode, paths] of [
+    ['T', 't2va', []], ['S', 'i2va', ['/start']], ['E', 'l2va', ['/end']], ['SE', 'fl2va', ['/start', '/end']],
+  ]) {
+    f.useStore.setState(state => ({ params: { ...state.params, image_prompt_type: mode, image_start: paths.includes('/start') ? '/start' : '', image_end: paths.includes('/end') ? '/end' : '' } }))
+    assert.equal(await f.useStore.getState().composeH3Prompt(), true)
+    const body = f.posts.at(-1)
+    assert.deepEqual(body.image_paths, paths)
+    assert.equal(body.rewrite_mode, rewriteMode)
+    assert.equal(body.duration_seconds, 6)
+    assert.deepEqual(Object.keys(body).sort(), ['duration_seconds', 'engine', 'image_paths', 'model_type', 'project_instance', 'prompt', 'request_id', 'rewrite_mode', 'workspace'])
+  }
+  f.useStore.setState({ durationSeconds: 6.5 })
+  assert.equal(await f.useStore.getState().composeH3Prompt(), false)
+  assert.equal(f.posts.length, 4)
+  f.useStore.setState(state => ({ durationSeconds: 6, startImage: new File(['start'], 'start.png'), endImage: new File(['end'], 'end.png'),
+    params: { ...state.params, image_prompt_type: 'SE' } }))
+  assert.equal(await f.useStore.getState().composeH3Prompt(), true)
+  assert.deepEqual(f.uploads, ['start.png', 'end.png'])
+  assert.deepEqual(f.posts.at(-1).image_paths, ['/private/start.png', '/private/end.png'])
+  f.failUploads()
+  assert.equal(await f.useStore.getState().composeH3Prompt(), false)
+  assert.equal(f.posts.length, 5)
+  assert.equal(f.applies.length, 0)
+  f.useStore.setState(state => ({ params: { ...state.params, model_type: 'minimax_h3_ref2va' } }))
+  assert.equal(await f.useStore.getState().composeH3Prompt(), false)
+  assert.equal(f.posts.length, 5)
+})
+
+test('H3 Apply rechecks end images, account, project and prompt after its asynchronous server response', async t => {
+  const f = await h3StoreFixture(t)
+  for (const drift of ['end', 'account', 'prompt']) {
+    f.useStore.setState(state => ({ accountContext: null, params: { ...state.params, prompt: 'Original café 👋 prompt' }, endImage: null }))
+    assert.equal(await f.useStore.getState().composeH3Prompt(), true)
+    const held = f.holdApply()
+    const pending = f.useStore.getState().applyH3RewriteSelection(f.select('base'))
+    await waitForCondition(() => f.applies.length > 0 && f.applies.length === f.posts.length, 'explicit Apply request')
+    if (drift === 'end') f.useStore.setState({ endImage: new File(['replacement'], 'new-end.png') })
+    if (drift === 'account') f.useStore.setState({ accountContext: { enforcement_enabled: true, state: 'active', authenticated: true, account: { id: 'different-owner' } } })
+    if (drift === 'prompt') f.useStore.getState().setParam('prompt', 'Edited while Apply was pending')
+    held.resolve()
+    await assert.rejects(pending)
+    assert.notEqual(f.useStore.getState().params.prompt, 'Base camera and dialogue version.')
+  }
+  f.useStore.setState(state => ({ accountContext: null, params: { ...state.params, prompt: 'Original café 👋 prompt' } }))
+  assert.equal(await f.useStore.getState().composeH3Prompt(), true)
+  const held = f.holdApply(), pending = f.useStore.getState().applyH3RewriteSelection(f.select('base'))
+  await waitForCondition(() => f.applies.length === f.posts.length, 'project-bound Apply request')
+  f.replaceProject(); held.resolve()
+  await assert.rejects(pending)
+  assert.equal(f.useStore.getState().params.prompt, 'Original café 👋 prompt')
+  assert.equal(f.generations, 0)
+})
+
+test('H3 rejects tampered completed preview without applying or generating', async t => {
+  const f = await h3StoreFixture(t)
+  f.tamper()
+  assert.equal(await f.useStore.getState().composeH3Prompt(), false)
+  assert.equal(f.useStore.getState().enhanceQueueCard.phase, 'failed')
+  assert.equal(f.useStore.getState().enhanceQueueCard.result, null)
+  assert.equal(f.applies.length, 0)
+  assert.equal(f.generations, 0)
+})
+
+test('plain-HTTP Enhance fingerprints match native SHA/HMAC and keep private recovery ownership', async t => {
+  const f = await h3StoreFixture(t)
+  f.useStore.setState({ startImage: new File(['a'.repeat(129) + 'é👋'], 'anchor.png', { lastModified: 123 }) })
+  assert.equal(await f.useStore.getState().composeH3Prompt(), true)
+  const expected = f.useStore.getState().enhanceQueueCard.settingsFingerprint
+  Object.defineProperty(globalThis, 'crypto', { configurable: true, value: f.fallbackCrypto })
+  assert.equal(await f.useStore.getState().composeH3Prompt(), true)
+  assert.equal(f.useStore.getState().enhanceQueueCard.settingsFingerprint, expected)
+  const privateClaim = JSON.parse(globalThis.sessionStorage.getItem('maestro:prompt-enhance-fingerprint-claim-v1'))
+  assert.match(privateClaim.salt, /^[0-9a-f]{64}$/)
+  assert.match(expected, /^[0-9a-f]{64}$/)
+  assert.equal(f.prepares, 0)
+})
+
+
+test('H3 private recovery tag rejects an ordinary-looking result instead of applying a fallback', async t => {
+  const f = await h3StoreFixture(t)
+  assert.equal(await f.useStore.getState().composeH3Prompt(), true)
+  const original = f.useStore.getState().params.prompt
+  const ledger = JSON.parse(globalThis.localStorage.getItem('maestro:prompt-enhance-operations-v2'))
+  assert.equal(ledger.operations[0].engine, 'h3_rewriter')
+  f.omitComparison()
+  assert.equal(await f.useStore.getState().recheckH3Comparison(), false)
+  assert.equal(f.useStore.getState().enhanceQueueCard.phase, 'failed')
+  assert.equal(f.useStore.getState().params.prompt, original)
+  assert.equal(f.posts.length, 1)
+  assert.equal(f.applies.length, 0)
+  assert.equal(f.generations, 0)
+})
+
+test('H3 explicit whole-second Compose duration leaves aligned generation duration unchanged and survives recovery', async t => {
+  const f = await h3StoreFixture(t)
+  f.useStore.setState({ durationSeconds: 6 + 1 / 24 })
+  assert.equal(await f.useStore.getState().composeH3Prompt(), false)
+  assert.equal(f.posts.length, 0, 'aligned video duration must not be rounded for Compose')
+  f.useStore.getState().setH3ComposeDurationSeconds(6)
+  assert.equal(await f.useStore.getState().composeH3Prompt(), true)
+  assert.equal(f.posts[0].duration_seconds, 6)
+  assert.equal(f.useStore.getState().durationSeconds, 6 + 1 / 24)
+  const record = JSON.parse(globalThis.localStorage.getItem('maestro:prompt-enhance-operations-v2')).operations[0]
+  assert.equal(record.h3DurationSeconds, 6)
+  const { useStore: reloaded } = await loadStoreModuleFresh()
+  const fresh = reloaded.getState()
+  reloaded.setState({ activeWorkspace: 'h3-project', generationMode: 'video', sidebarMode: 'studio', sidebarOpen: true,
+    durationSeconds: 6 + 1 / 24, h3ComposeDurationSeconds: null, startImage: null, endImage: null, imageRefs: [], modelOptions: null,
+    params: { ...fresh.params, ...f.useStore.getState().params, prompt: '' } })
+  assert.equal(await reloaded.getState().resumeEnhancePrompt(), false)
+  assert.equal(reloaded.getState().h3ComposeDurationSeconds, null, 'recovery must never restore settings')
+  assert.equal(reloaded.getState().params.prompt, '', 'recovery must never restore the draft')
+  assert.equal(reloaded.getState().enhanceQueueCard.phase, 'completed')
+  assert.equal(reloaded.getState().enhanceQueueCard.h3InputsVerified, false)
+  assert.ok(globalThis.localStorage.getItem('maestro:prompt-enhance-operations-v2'))
+  const preview = reloaded.getState().enhanceQueueCard.result.h3_rewrite_preview
+  const selection = { request_commitment: preview.request_commitment, preview_commitment: preview.commitment, selected_kind: 'base' }
+  reloaded.getState().setParam('prompt', f.posts[0].prompt)
+  reloaded.getState().setH3ComposeDurationSeconds(6)
+  await assert.rejects(reloaded.getState().applyH3RewriteSelection(selection), 'restoring inputs alone must not unlock Apply')
+  assert.equal(await reloaded.getState().resumeEnhancePrompt(), false, 'automatic recovery must not reverify a retained comparison')
+  assert.equal(await reloaded.getState().recheckH3Comparison(), true)
+  assert.equal(f.recoveryGets.length, 3)
+  assert.ok(f.recoveryGets.every(url => url.includes(record.requestId)))
+  assert.equal(reloaded.getState().h3ComposeDurationSeconds, 6)
+  assert.equal(reloaded.getState().durationSeconds, 6 + 1 / 24)
+  assert.equal(reloaded.getState().params.prompt, f.posts[0].prompt)
+  assert.equal(reloaded.getState().enhanceQueueCard.resultApplied, false)
+  assert.equal(f.posts.length, 1)
+  assert.equal(f.applies.length, 0)
+})
+
+test('H3 Apply fences settings changed during asynchronous image hashing before and after its POST', async t => {
+  const f = await h3StoreFixture(t)
+  const image = new File(['anchor bytes'], 'anchor.png', { lastModified: 321 })
+  const read = image.arrayBuffer.bind(image)
+  let changeDuringRead = false
+  Object.defineProperty(image, 'arrayBuffer', { value: async () => {
+    const bytes = await read()
+    if (changeDuringRead) { changeDuringRead = false; f.useStore.getState().setH3ComposeDurationSeconds(7) }
+    return bytes
+  } })
+  f.useStore.setState({ startImage: image, h3ComposeDurationSeconds: 6 })
+  assert.equal(await f.useStore.getState().composeH3Prompt(), true)
+  changeDuringRead = true
+  await assert.rejects(f.useStore.getState().applyH3RewriteSelection(f.select()))
+  assert.equal(f.applies.length, 0)
+  f.useStore.getState().setH3ComposeDurationSeconds(6)
+  assert.equal(await f.useStore.getState().recheckH3Comparison(), true)
+  const held = f.holdApply()
+  const pending = f.useStore.getState().applyH3RewriteSelection(f.select())
+  await waitForCondition(() => f.applies.length === 1, 'Apply acknowledgement wait')
+  changeDuringRead = true; held.resolve()
+  await assert.rejects(pending)
+  assert.equal(f.useStore.getState().params.prompt, f.posts[0].prompt)
+  assert.equal(f.useStore.getState().enhanceQueueCard.resultApplied, false)
+  assert.equal(f.generations, 0)
+})
+
+
+test('H3 recheck never projects retained comparison across an account or project change during GET', async t => {
+  for (const drift of ['account', 'project']) await t.test(drift, async t => {
+    const f = await h3StoreFixture(t)
+    f.useStore.getState().setH3ComposeDurationSeconds(6)
+    assert.equal(await f.useStore.getState().composeH3Prompt(), true)
+    f.useStore.getState().setParam('prompt', 'Edited draft')
+    const held = f.holdResult(), count = f.recoveryGets.length
+    const pending = f.useStore.getState().recheckH3Comparison()
+    await waitForCondition(() => f.recoveryGets.length > count, 'GET-only recheck result')
+    if (drift === 'account') f.useStore.setState({ accountContext: { enforcement_enabled: true, state: 'active', authenticated: true, account: { id: 'other-owner' } } })
+    else f.replaceProject()
+    held.resolve()
+    assert.equal(await pending, false)
+    assert.ok(!f.useStore.getState().enhanceQueueCard?.result)
+    assert.equal(f.useStore.getState().params.prompt, 'Edited draft')
+    assert.equal(f.posts.length, 1)
+    assert.equal(f.applies.length, 0)
+    assert.equal(f.generations, 0)
+  })
+})
+
+
+test('H3 recheck keeps the comparison blocked when inputs change during GET, even if restored before response', async t => {
+  const f = await h3StoreFixture(t)
+  assert.equal(await f.useStore.getState().composeH3Prompt(), true)
+  const original = f.useStore.getState().params.prompt
+  const held = f.holdResult(), count = f.recoveryGets.length
+  const pending = f.useStore.getState().recheckH3Comparison()
+  await waitForCondition(() => f.recoveryGets.length > count, 'GET result barrier')
+  f.useStore.getState().setParam('image_prompt_type', 'S')
+  f.useStore.getState().setParam('image_prompt_type', 'T')
+  held.resolve()
+  assert.equal(await pending, false)
+  const card = f.useStore.getState().enhanceQueueCard
+  assert.equal(card.phase, 'completed')
+  assert.equal(card.h3InputsVerified, false)
+  assert.ok(card.result.h3_rewrite_preview)
+  assert.ok(globalThis.localStorage.getItem('maestro:prompt-enhance-operations-v2'))
+  await assert.rejects(f.useStore.getState().applyH3RewriteSelection(f.select()))
+  assert.equal(f.useStore.getState().params.prompt, original)
+  assert.equal(f.posts.length, 1)
+  assert.equal(f.applies.length, 0)
+  assert.equal(f.generations, 0)
+})
+
+
+test('H3 Recheck stays on its captured request when workspace, card or ledger changes during private key acquisition', async t => {
+  for (const drift of ['workspace ABA', 'card and request', 'ledger request']) await t.test(drift, async t => {
+    const f = await h3StoreFixture(t)
+    assert.equal(await f.useStore.getState().composeH3Prompt(), true)
+    const source = f.useStore.getState(), capturedCard = source.enhanceQueueCard
+    const ledgerKey = 'maestro:prompt-enhance-operations-v2'
+    const ledger = globalThis.localStorage.getItem(ledgerKey)
+    const { useStore: reloaded } = await loadStoreModuleFresh()
+    reloaded.setState({ activeWorkspace: source.activeWorkspace, generationMode: source.generationMode,
+      params: source.params, durationSeconds: source.durationSeconds, enhanceQueueCard: capturedCard })
+    let grant
+    Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { locks: {
+      request(name, options, callback) {
+        assert.ok(name.startsWith('maestro-prompt-enhance-tab-'), 'only private key acquisition may run')
+        assert.equal(options.ifAvailable, true)
+        return new Promise(resolve => { grant = () => resolve(callback({ name })) })
+      },
+    } } })
+    const gets = f.recoveryGets.length
+    const pending = reloaded.getState().recheckH3Comparison()
+    await waitForCondition(() => grant !== undefined, 'private recovery key acquisition barrier')
+    const changedId = crypto.randomUUID()
+    if (drift === 'workspace ABA') {
+      reloaded.setState({ activeWorkspace: 'other-workspace' })
+      reloaded.setState({ activeWorkspace: source.activeWorkspace, enhanceQueueCard: capturedCard })
+    } else {
+      const changed = JSON.parse(ledger)
+      changed.operations[0].requestId = changedId
+      globalThis.localStorage.setItem(ledgerKey, JSON.stringify(changed))
+      if (drift === 'card and request') reloaded.setState({ enhanceQueueCard: {
+        ...capturedCard, requestId: changedId, scope: { ...capturedCard.scope, requestId: changedId },
+      } })
+    }
+    const expectedLedger = globalThis.localStorage.getItem(ledgerKey)
+    grant()
+    assert.equal(await pending, false)
+    assert.equal(f.recoveryGets.length, gets, 'no GET may redirect to a different request or a restored workspace incarnation')
+    assert.equal(globalThis.localStorage.getItem(ledgerKey), expectedLedger)
+    assert.equal(f.posts.length, 1)
+    assert.equal(f.applies.length, 0)
+    assert.equal(f.generations, 0)
+    assert.equal(reloaded.getState().enhanceRequestScope, null)
+    assert.equal(reloaded.getState().params.prompt, source.params.prompt)
+  })
+})
+
+
+test('automatic H3 Frames derives ordered first/end anchors from attached Files despite legacy text mode', async t => {
+  const f = await h3StoreFixture(t)
+  for (const [start, end, mode, paths] of [
+    [null, null, 't2va', []],
+    [new File(['first bytes'], 'first.png'), null, 'i2va', ['/private/first.png']],
+    [null, new File(['last bytes'], 'last.png'), 'l2va', ['/private/last.png']],
+    [new File(['first bytes'], 'first.png'), new File(['last bytes'], 'last.png'), 'fl2va', ['/private/first.png', '/private/last.png']],
+  ]) {
+    f.useStore.setState(state => ({ startImage: start, endImage: end,
+      params: { ...state.params, h3_adaptive_conditioning: true, image_prompt_type: 'T', image_start: '', image_end: '' } }))
+    const uploaded = f.uploads.length
+    assert.equal(await f.useStore.getState().composeH3Prompt(), true)
+    assert.equal(f.posts.at(-1).rewrite_mode, mode)
+    assert.deepEqual(f.posts.at(-1).image_paths, paths)
+    assert.deepEqual(f.uploads.slice(uploaded), [start?.name, end?.name].filter(Boolean))
+    assert.equal(f.useStore.getState().enhanceQueueCard.result.h3_rewrite_request.mode, mode)
+    assert.equal(f.useStore.getState().params.image_prompt_type, 'T', 'automatic frame attachments need no hidden legacy-mode mutation')
+  }
+  f.useStore.setState(state => ({ startImage: null, endImage: null,
+    params: { ...state.params, image_start: ['/saved-first'], image_end: '/saved-last', image_prompt_type: 'T' } }))
+  assert.equal(await f.useStore.getState().composeH3Prompt(), true)
+  assert.deepEqual(f.posts.at(-1).image_paths, ['/saved-first', '/saved-last'])
+  assert.equal(f.posts.at(-1).rewrite_mode, 'fl2va')
+  f.useStore.setState(state => ({ params: { ...state.params, image_start: '/saved-first', image_end: ['/saved-last'] } }))
+  assert.equal(await f.useStore.getState().recheckH3Comparison(), true)
+  const submits = f.posts.length
+  for (const unsupported of [
+    { image_start: ['/one', '/two'] }, { image_end: [''] }, { image_mode: 2 }, { image_mode: 3 },
+    { image_refs: ['/semantic'] }, { video_guide: '/guide' }, { image_prompt_type: 'V' }, { model_type: 'minimax_h3_ref2va' },
+  ]) {
+    const params = { ...f.useStore.getState().params, image_start: '', image_end: '', image_mode: 0, image_refs: undefined,
+      video_guide: '', image_prompt_type: 'T', model_type: 'minimax_h3', ...unsupported }
+    f.useStore.setState({ startImage: null, endImage: null, params })
+    assert.equal(await f.useStore.getState().composeH3Prompt(), false)
+  }
+  assert.equal(f.posts.length, submits)
+  assert.equal(f.applies.length, 0)
+  assert.equal(f.generations, 0)
+})
+
+test('H3 GET recheck binds rematerialized image bytes and ordered roles, while changed bytes remain blocked', async t => {
+  const f = await h3StoreFixture(t)
+  const first = new File(['first bytes'], 'first.png', { type: 'image/png', lastModified: 100 })
+  const last = new File(['last bytes'], 'last.png', { type: 'image/png', lastModified: 200 })
+  f.useStore.setState(state => ({ startImage: first, endImage: last, params: { ...state.params, image_prompt_type: 'T', image_start: '/unused-old-first', image_end: ['/unused-old-last'] } }))
+  assert.equal(await f.useStore.getState().composeH3Prompt(), true)
+  f.useStore.getState().setStartImage(new File(['first bytes'], 'first.png', { type: 'image/png', lastModified: 300 }))
+  f.useStore.getState().setEndImage(new File(['last bytes'], 'last.png', { type: 'image/png', lastModified: 400 }))
+  f.useStore.setState(state => ({ params: { ...state.params, image_start: undefined, image_end: '' } }))
+  await assert.rejects(f.useStore.getState().applyH3RewriteSelection(f.select()))
+  assert.equal(await f.useStore.getState().recheckH3Comparison(), true)
+  f.useStore.getState().setEndImage(new File(['different bytes'], 'last.png', { type: 'image/png', lastModified: 400 }))
+  assert.equal(await f.useStore.getState().recheckH3Comparison(), false)
+  assert.equal(f.useStore.getState().enhanceQueueCard.h3InputsVerified, false)
+  f.useStore.getState().setStartImage(new File(['last bytes'], 'last.png', { type: 'image/png' }))
+  f.useStore.getState().setEndImage(new File(['first bytes'], 'first.png', { type: 'image/png' }))
+  assert.equal(await f.useStore.getState().recheckH3Comparison(), false)
+  f.useStore.getState().setStartImage(first)
+  f.useStore.getState().setEndImage(last)
+  f.posts[0].rewrite_mode = 't2va' // Retained pre-fix execution ignored the visible frame anchors.
+  assert.equal(await f.useStore.getState().recheckH3Comparison(), false)
+  assert.equal(f.useStore.getState().enhanceQueueCard.result.h3_rewrite_request.mode, 't2va')
+  assert.equal(f.useStore.getState().enhanceQueueCard.h3InputsVerified, false)
+  assert.equal(f.posts.length, 1)
+  assert.equal(f.applies.length, 0)
+  assert.equal(f.generations, 0)
+})
+
+
+test('legacy H3 private image receipt requires exact old metadata and upgrades only its verified Apply binding', async t => {
+  const f = await h3StoreFixture(t)
+  const image = new File(['retained first frame'], 'first.png', { type: 'image/png', lastModified: 12345 })
+  f.useStore.setState(state => ({ startImage: image, params: { ...state.params, image_prompt_type: 'S' } }))
+  assert.equal(await f.useStore.getState().composeH3Prompt(), true)
+  const state = f.useStore.getState(), p = state.params
+  const claim = JSON.parse(globalThis.sessionStorage.getItem('maestro:prompt-enhance-fingerprint-claim-v1'))
+  // The historical private receipt format includes chooser metadata and the raw mode flag.
+  const legacyFields = [state.generationMode, p.model_type, p.image_mode, p.multi_prompts_gen_type,
+    state.durationSeconds, state.slidingWindowSeconds, state.slidingWindowOverlap, p.force_fps, p.video_guide,
+    state.guideVideoFps, state.guideVideoFrameCount, state.ttsVoiceCount, state.explicitOutput, [...p.activated_loras],
+    p.image_start, p.image_refs, [image.name, image.size, image.type, image.lastModified, image.webkitRelativePath,
+      createHash('sha256').update(Buffer.from(await image.arrayBuffer())).digest('hex')], [], p.image_prompt_type, p.image_end, null, 6]
+  const legacyHash = createHmac('sha256', Buffer.from(claim.salt, 'hex')).update(JSON.stringify(legacyFields)).digest('hex')
+  assert.notEqual(state.enhanceQueueCard.settingsFingerprint, legacyHash)
+  const key = 'maestro:prompt-enhance-operations-v2', ledger = JSON.parse(globalThis.localStorage.getItem(key))
+  ledger.operations[0].settingsFingerprint = legacyHash
+  globalThis.localStorage.setItem(key, JSON.stringify(ledger))
+  f.useStore.getState().setStartImage(new File(['retained first frame'], 'first.png', { type: 'image/png', lastModified: 98765 }))
+  assert.equal(await f.useStore.getState().recheckH3Comparison(), false, 'old opaque hashes cannot authorize changed chooser metadata')
+  f.useStore.getState().setStartImage(image)
+  assert.equal(await f.useStore.getState().recheckH3Comparison(), true)
+  assert.equal(f.useStore.getState().enhanceQueueCard.settingsFingerprint, state.enhanceQueueCard.settingsFingerprint)
+  assert.equal(JSON.parse(globalThis.localStorage.getItem(key)).operations[0].settingsFingerprint, legacyHash)
+  await f.useStore.getState().applyH3RewriteSelection(f.select())
+  assert.equal(f.applies.length, 1)
+  assert.equal(f.posts.length, 1)
+  assert.equal(f.generations, 0)
 })

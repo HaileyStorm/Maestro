@@ -1,3 +1,4 @@
+import { isCurrentH3PromptRewritePreview, type H3PromptRewriteApplySelection } from '../lib/h3PromptRewritePreview'
 import { supportsPromptPreparation } from '../lib/promptEnhancement'
 import { H3_GALLERY_STILL_GUIDE_RESTORE_MESSAGE, isH3GalleryStillGuideOutput } from '../lib/h3GalleryStillGuide'
 import { create } from 'zustand'
@@ -675,11 +676,15 @@ function _discardStaleGenerationPlaceholder(placeholder: GenerationJob): void {
 
 type StoredDirectorPreparation = { requestId: string; workspace: string }
 
+const H3_COMPOSE_MODELS = new Set(['minimax_h3', 'minimax_h3_pinkcherry_fl2va', 'minimax_h3_w4a8_fl2va'])
+
 type StoredEnhanceOperation = api.LlmEnhanceOperationScope & {
   accountFingerprint: string
   claimToken: string
   settingsFingerprint: string
   storedAt: number
+  engine?: 'h3_rewriter'
+  h3DurationSeconds?: number
 }
 
 type PromptEnhanceQueueCardState = api.LlmEnhanceQueueCard & {
@@ -687,6 +692,8 @@ type PromptEnhanceQueueCardState = api.LlmEnhanceQueueCard & {
   settingsFingerprint: string | null
   promptEditGeneration: number
   ttsMode?: string
+  h3DurationSeconds?: number
+  h3InputsVerified?: boolean
 }
 
 function _generatePromptSurfaceIsVisible(state: {
@@ -735,11 +742,14 @@ function _validStoredEnhanceOperation(value: unknown): value is StoredEnhanceOpe
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
   const parsed = value as Record<string, unknown>
   return (
-    Object.keys(parsed).length === 7
+    Object.keys(parsed).length === (parsed.engine === 'h3_rewriter' ? 9 : 7)
     && Object.keys(parsed).every(key => [
       'requestId', 'workspace', 'projectInstance', 'accountFingerprint',
-      'claimToken', 'settingsFingerprint', 'storedAt',
+      'claimToken', 'settingsFingerprint', 'storedAt', 'engine', 'h3DurationSeconds',
     ].includes(key))
+    && (parsed.engine === undefined || parsed.engine === 'h3_rewriter')
+    && (parsed.engine !== 'h3_rewriter' || (typeof parsed.h3DurationSeconds === 'number'
+      && Number.isInteger(parsed.h3DurationSeconds) && parsed.h3DurationSeconds >= 4 && parsed.h3DurationSeconds <= 15))
     && typeof parsed.requestId === 'string'
     && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(parsed.requestId)
     && typeof parsed.workspace === 'string'
@@ -843,7 +853,8 @@ async function _storeEnhanceOperation(
   signal?: AbortSignal,
 ): Promise<boolean> {
   // Persist only bounded recovery fences. Prompt/partial text, images, model
-  // and provider names, credentials, and raw settings remain in memory.
+  // and provider names, credentials, and raw settings remain in memory. The
+  // H3 engine tag prevents a malformed recovered comparison becoming Enhance.
   const claimToken = _ownedEnhanceFingerprintClaimToken()
   if (!claimToken) return false
   return _runEnhanceLedgerMutation(() => {
@@ -3355,6 +3366,8 @@ interface AppState {
   // Duration
   durationSeconds: number
   setDurationSeconds: (s: number) => void
+  h3ComposeDurationSeconds: number | null
+  setH3ComposeDurationSeconds: (seconds: number | null) => void
 
   // Sliding window
   slidingWindowSeconds: number
@@ -3805,8 +3818,11 @@ interface AppState {
   enhanceQueueCard: PromptEnhanceQueueCardState | null
   studioPromptEnhance: boolean
   setStudioPromptEnhance: (enabled: boolean) => void
-  enhancePrompt: (ttsMode?: string) => Promise<boolean>
-  resumeEnhancePrompt: () => Promise<boolean>
+  enhancePrompt: (ttsMode?: string, engine?: 'h3_rewriter') => Promise<boolean>
+  composeH3Prompt: () => Promise<boolean>
+  applyH3RewriteSelection: (selection: H3PromptRewriteApplySelection) => Promise<void>
+  resumeEnhancePrompt: (explicitH3Recheck?: boolean) => Promise<boolean>
+  recheckH3Comparison: () => Promise<boolean>
   cancelEnhancePrompt: () => Promise<void>
   applyCompletedEnhanceResult: () => Promise<boolean>
   useCompletedEnhanceAndGenerate: () => Promise<boolean>
@@ -4675,20 +4691,68 @@ async function _enhanceFingerprintSalt(): Promise<Uint8Array> {
   return salt
 }
 
+function _enhanceSha256Fallback(bytes: Uint8Array): string {
+  const constants = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+  ]
+  const state = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]
+  const padded = new Uint8Array(Math.ceil((bytes.length + 9) / 64) * 64)
+  padded.set(bytes)
+  padded[bytes.length] = 0x80
+  const view = new DataView(padded.buffer)
+  view.setUint32(padded.length - 8, Math.floor(bytes.length / 0x20000000))
+  view.setUint32(padded.length - 4, bytes.length * 8)
+  const words = new Uint32Array(64)
+  const rotate = (value: number, bits: number) => (value >>> bits) | (value << (32 - bits))
+  for (let offset = 0; offset < padded.length; offset += 64) {
+    for (let i = 0; i < 16; i++) words[i] = view.getUint32(offset + i * 4)
+    for (let i = 16; i < 64; i++) {
+      const low = rotate(words[i - 15], 7) ^ rotate(words[i - 15], 18) ^ (words[i - 15] >>> 3)
+      const high = rotate(words[i - 2], 17) ^ rotate(words[i - 2], 19) ^ (words[i - 2] >>> 10)
+      words[i] = (words[i - 16] + low + words[i - 7] + high) >>> 0
+    }
+    let [a, b, c, d, e, f, g, h] = state
+    for (let i = 0; i < 64; i++) {
+      const first = (h + (rotate(e, 6) ^ rotate(e, 11) ^ rotate(e, 25)) + ((e & f) ^ (~e & g)) + constants[i] + words[i]) >>> 0
+      const second = ((rotate(a, 2) ^ rotate(a, 13) ^ rotate(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) >>> 0
+      h = g; g = f; f = e; e = (d + first) >>> 0
+      d = c; c = b; b = a; a = (first + second) >>> 0
+    }
+    for (const [index, value] of [a, b, c, d, e, f, g, h].entries()) state[index] = (state[index] + value) >>> 0
+  }
+  return state.map(value => value.toString(16).padStart(8, '0')).join('')
+}
+
 async function _enhanceSha256(bytes: ArrayBuffer): Promise<string> {
   if (!globalThis.crypto.subtle) {
-    throw new Error('Prompt Enhance recovery requires browser SHA-256 support')
+    return _enhanceSha256Fallback(new Uint8Array(bytes))
   }
   return _enhanceBytesToHex(await globalThis.crypto.subtle.digest('SHA-256', bytes))
 }
 
 async function _enhanceHmacSha256(value: unknown): Promise<string> {
-  if (!globalThis.crypto.subtle) {
-    throw new Error('Prompt Enhance recovery requires browser SHA-256 support')
-  }
   const salt = await _enhanceFingerprintSalt()
   const keyBytes = new Uint8Array(salt.byteLength)
   keyBytes.set(salt)
+  if (!globalThis.crypto.subtle) {
+    const message = new TextEncoder().encode(JSON.stringify(value))
+    const inner = new Uint8Array(64 + message.length), outer = new Uint8Array(96)
+    for (let index = 0; index < 64; index++) {
+      inner[index] = (keyBytes[index] ?? 0) ^ 0x36
+      outer[index] = (keyBytes[index] ?? 0) ^ 0x5c
+    }
+    inner.set(message, 64)
+    const digest = _enhanceSha256Fallback(inner)
+    outer.set(Uint8Array.from(digest.match(/.{2}/g) ?? [], value => Number.parseInt(value, 16)), 64)
+    return _enhanceSha256Fallback(outer)
+  }
   const key = await globalThis.crypto.subtle.importKey(
     'raw', keyBytes,
     { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
@@ -4836,25 +4900,70 @@ async function _directorPreviewHmacSha256(value: unknown): Promise<string> {
   return _enhanceBytesToHex(await globalThis.crypto.subtle.sign('HMAC', key, message))
 }
 
-async function _enhanceFileIdentity(file: File | null): Promise<readonly unknown[] | null> {
+async function _enhanceFileIdentity(file: File | null, contentBinding = false): Promise<readonly unknown[] | null> {
   if (!file) return null
   return [
     file.name,
     file.size,
     file.type,
-    file.lastModified,
-    file.webkitRelativePath,
+    ...(contentBinding ? [] : [file.lastModified, file.webkitRelativePath]),
     await _enhanceSha256(await file.arrayBuffer()),
   ]
 }
 
-async function _enhanceSettingsFingerprint(state: AppState): Promise<string> {
-  const startPath = Array.isArray(state.params.image_start)
-    ? [...state.params.image_start]
-    : state.params.image_start
+function _h3ComposeAnchorPath(path: unknown): string | null | undefined {
+  if (path == null || path === '') return null
+  if (typeof path === 'string') return path.trim().length > 0 ? path : undefined
+  if (Array.isArray(path)) {
+    if (path.length === 0) return null
+    if (path.length === 1 && typeof path[0] === 'string' && path[0].trim().length > 0) return path[0]
+  }
+  return undefined
+}
+
+export function h3ComposeInputMode(state: Pick<AppState, 'generationMode' | 'params' | 'startImage' | 'endImage' | 'imageRefs'>): 't2va' | 'i2va' | 'l2va' | 'fl2va' | null {
+  if (state.generationMode !== 'video' || !H3_COMPOSE_MODELS.has(state.params.model_type)
+    || state.params.image_mode === 2 || state.params.image_mode === 3
+    || h3SemanticRouteRequested(state.params, state.imageRefs.length)) return null
+  const selected = state.params.image_prompt_type || 'T'
+  if (!['T', 'S', 'E', 'SE'].includes(selected)) return null
+  const start = state.startImage || _h3ComposeAnchorPath(state.params.image_start)
+  const end = state.endImage || _h3ComposeAnchorPath(state.params.image_end)
+  if (start === undefined || end === undefined || (selected.includes('S') && !start) || (selected.includes('E') && !end)) return null
+  return start ? (end ? 'fl2va' : 'i2va') : (end ? 'l2va' : 't2va')
+}
+
+function _h3ComposeDuration(state: AppState): number | null {
+  return state.h3ComposeDurationSeconds ?? (Number.isInteger(state.durationSeconds)
+    && state.durationSeconds >= 4 && state.durationSeconds <= 15 ? state.durationSeconds : null)
+}
+
+function _h3ComposeSettingsUnchanged(before: AppState, after: AppState): boolean {
+  return before.params === after.params
+    && before.durationSeconds === after.durationSeconds
+    && before.h3ComposeDurationSeconds === after.h3ComposeDurationSeconds
+    && before.generationMode === after.generationMode
+    && before.slidingWindowSeconds === after.slidingWindowSeconds
+    && before.slidingWindowOverlap === after.slidingWindowOverlap
+    && before.guideVideoFps === after.guideVideoFps
+    && before.guideVideoFrameCount === after.guideVideoFrameCount
+    && before.ttsVoiceCount === after.ttsVoiceCount && before.explicitOutput === after.explicitOutput
+    && before.startImage === after.startImage && before.endImage === after.endImage
+    && before.imageRefs.length === after.imageRefs.length
+    && before.imageRefs.every((file, index) => file === after.imageRefs[index])
+}
+
+async function _enhanceSettingsFingerprint(state: AppState, h3 = false, h3Duration?: number, legacyH3 = false): Promise<string> {
+  const startPath = h3 && !legacyH3
+    ? (state.startImage ? null : _h3ComposeAnchorPath(state.params.image_start))
+    : (Array.isArray(state.params.image_start) ? [...state.params.image_start] : state.params.image_start)
   const referencePaths = state.params.image_refs ? [...state.params.image_refs] : undefined
   const activatedLoras = [...state.params.activated_loras]
   const startImage = state.startImage
+  const endImage = state.endImage
+  const endPath = h3 && !legacyH3
+    ? (endImage ? null : _h3ComposeAnchorPath(state.params.image_end))
+    : (Array.isArray(state.params.image_end) ? [...state.params.image_end] : state.params.image_end)
   const imageRefs = [...state.imageRefs]
   return _enhanceHmacSha256([
     state.generationMode,
@@ -4873,8 +4982,10 @@ async function _enhanceSettingsFingerprint(state: AppState): Promise<string> {
     activatedLoras,
     startPath,
     referencePaths,
-    await _enhanceFileIdentity(startImage),
-    await Promise.all(imageRefs.map(file => _enhanceFileIdentity(file))),
+    await _enhanceFileIdentity(startImage, h3 && !legacyH3),
+    await Promise.all(imageRefs.map(file => _enhanceFileIdentity(file, h3 && !legacyH3))),
+    ...(h3
+      ? [legacyH3 ? state.params.image_prompt_type : h3ComposeInputMode(state), endPath, await _enhanceFileIdentity(endImage, !legacyH3), h3Duration ?? _h3ComposeDuration(state)] : []),
   ])
 }
 
@@ -7869,6 +7980,8 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   durationSeconds: 5,
+  h3ComposeDurationSeconds: null,
+  setH3ComposeDurationSeconds: seconds => set({ h3ComposeDurationSeconds: seconds }),
   setDurationSeconds: (s) => {
     const options = get().modelOptions
     // Audio durations are seconds, including 0 for models that auto-derive
@@ -13375,8 +13488,17 @@ export const useStore = create<AppState>((set, get) => ({
   enhanceQueueCard: null,
   studioPromptEnhance: false,
   setStudioPromptEnhance: (enabled) => set({ studioPromptEnhance: enabled }),
-  enhancePrompt: async (ttsMode?: string) => {
-    const { params, generationMode, startImage, imageRefs, activeWorkspace } = get()
+  composeH3Prompt: async () => get().enhancePrompt(undefined, 'h3_rewriter'),
+  enhancePrompt: async (ttsMode?: string, engine?: 'h3_rewriter') => {
+    const { params, generationMode, startImage, endImage, imageRefs, activeWorkspace } = get()
+    const h3 = engine === 'h3_rewriter'
+    const h3Duration = _h3ComposeDuration(get())
+    const h3Mode = h3ComposeInputMode(get())
+    if (h3 && (generationMode !== 'video' || !H3_COMPOSE_MODELS.has(params.model_type) || !h3Mode)) return false
+    if (h3 && (h3Duration === null || !Number.isInteger(h3Duration) || h3Duration < 4 || h3Duration > 15)) {
+      window.alert('Compose with H3 needs a whole-number duration from 4 to 15 seconds.')
+      return false
+    }
     if (!params.prompt.trim()) return false
     const requestId = api.createLlmRequestId()
     const accountIdentityEpoch = _accountIdentityEpoch
@@ -13386,6 +13508,7 @@ export const useStore = create<AppState>((set, get) => ({
     const inputsRemainCurrent = () => {
       const current = get()
       return current.startImage === startImage
+        && (!h3 || current.endImage === endImage)
         && current.imageRefs.length === imageRefs.length
         && current.imageRefs.every((reference, index) => reference === imageRefs[index])
     }
@@ -13394,6 +13517,19 @@ export const useStore = create<AppState>((set, get) => ({
     let submissionAttempted = false
     let durableRecoveryStored = false
     let settingsFingerprint = ''
+    const syncCurrent = () => lifecycle.ownsWorkspace()
+      && _accountIdentityIsCurrent(accountIdentityEpoch)
+      && _enhanceAccountFingerprint(get()) === accountFingerprint
+      && _enhancePromptEditGeneration === promptEditGeneration
+      && get().params.prompt === params.prompt && inputsRemainCurrent()
+      && (!h3 || (_h3ComposeDuration(get()) === h3Duration && h3ComposeInputMode(get()) === h3Mode))
+    const remainsBound = async () => {
+      const before = get()
+      const fingerprint = await _enhanceSettingsFingerprint(before, h3)
+      return syncCurrent() && fingerprint === settingsFingerprint
+        && (!h3 || _h3ComposeSettingsUnchanged(before, get()))
+        && (!scope || _sameEnhanceScope(get().enhanceRequestScope, scope))
+    }
     const updateQueueCard = (partial: Partial<PromptEnhanceQueueCardState>) => {
       set(state => ({
         enhanceQueueCard: state.enhanceQueueCard?.requestId === requestId
@@ -13415,13 +13551,15 @@ export const useStore = create<AppState>((set, get) => ({
         resultApplied: false,
         error: null,
         accountFingerprint,
+        ...(h3 ? { engine, h3DurationSeconds: h3Duration! } : {}),
         settingsFingerprint: null,
         promptEditGeneration,
         ...(ttsMode ? { ttsMode } : {}),
       },
     })
     try {
-      settingsFingerprint = await _enhanceSettingsFingerprint(requestState)
+      settingsFingerprint = await _enhanceSettingsFingerprint(requestState, h3)
+      if (!syncCurrent()) return false
       updateQueueCard({ settingsFingerprint })
       if (
         !lifecycle.ownsWorkspace()
@@ -13430,7 +13568,7 @@ export const useStore = create<AppState>((set, get) => ({
         || !inputsRemainCurrent()
       ) return false
       const catalog = await api.fetchLlmModels(activeWorkspace, lifecycle.signal)
-      if (!lifecycle.ownsWorkspace()) return false
+      if (!syncCurrent() || !await remainsBound()) return false
       if (!catalog.project_instance) {
         throw new api.LlmEnhanceScopeError('Could not open this project for Prompt Enhance')
       }
@@ -13445,7 +13583,21 @@ export const useStore = create<AppState>((set, get) => ({
       // Collect images relevant to the CURRENT mode only
       const imagePaths: string[] = []
 
-      if (generationMode === 'image') {
+      if (h3) {
+        const roles = h3Mode === 'fl2va' ? ['start', 'end'] : h3Mode === 'i2va' ? ['start'] : h3Mode === 'l2va' ? ['end'] : []
+        for (const role of roles) {
+          const file = role === 'start' ? startImage : endImage
+          const path = role === 'start' ? params.image_start : params.image_end
+          if (file) {
+            const uploaded = await api.uploadImage(file)
+            if (!syncCurrent() || !await remainsBound()) return false
+            if (typeof uploaded.path !== 'string' || !uploaded.path) throw new Error('Could not attach this image for Compose with H3.')
+            imagePaths.push(uploaded.path)
+          } else if (typeof path === 'string' && path) imagePaths.push(path)
+          else if (Array.isArray(path) && path.length === 1 && typeof path[0] === 'string' && path[0]) imagePaths.push(path[0])
+          else throw new Error('Attach each selected start or end image before Compose with H3.')
+        }
+      } else if (generationMode === 'image') {
         // Image mode: send reference images only
         for (const ref of imageRefs) {
           try {
@@ -13509,17 +13661,22 @@ export const useStore = create<AppState>((set, get) => ({
         || _enhanceAccountFingerprint(get()) !== accountFingerprint
         || _enhancePromptEditGeneration !== promptEditGeneration
         || get().params.prompt !== params.prompt
-        || (await _enhanceSettingsFingerprint(get())) !== settingsFingerprint
+        || (await _enhanceSettingsFingerprint(get(), h3)) !== settingsFingerprint
         || !inputsRemainCurrent()
       ) return false
+      if (!await remainsBound()) return false
 
       const result = await api.llmEnhancePrompt({
         workspace: activeWorkspace,
         request_id: scope.requestId,
         project_instance: scope.projectInstance,
         prompt: params.prompt,
-        mode: generationMode,
         model_type: params.model_type,
+        ...(h3 ? {
+          engine, rewrite_mode: h3Mode!, image_paths: imagePaths,
+          duration_seconds: h3Duration!,
+        } : {
+        mode: generationMode,
         max_new_tokens: maxTokens,
         image_paths: imagePaths.length > 0 ? imagePaths : undefined,
         duration_seconds: (generationMode === 'video' || generationMode === 'avatar') ? state.durationSeconds : undefined,
@@ -13530,6 +13687,7 @@ export const useStore = create<AppState>((set, get) => ({
         tts_enhance_mode: ttsMode || undefined,
         tts_voice_count: state.ttsVoiceCount || undefined,
         explicit_output: state.explicitOutput,
+        }),
       }, {
         projectInstance: scope.projectInstance,
         signal: lifecycle.signal,
@@ -13553,6 +13711,7 @@ export const useStore = create<AppState>((set, get) => ({
               ...scope,
               accountFingerprint,
               settingsFingerprint,
+              ...(h3 ? { engine, h3DurationSeconds: h3Duration! } : {}),
               storedAt: Date.now(),
             }, lifecycle.signal)
             if (
@@ -13563,6 +13722,7 @@ export const useStore = create<AppState>((set, get) => ({
               if (storedRecovery) await _removeStoredEnhanceOperation(scope)
               return
             }
+            if (h3 && !await remainsBound()) throw new api.LlmEnhanceScopeError()
             durableRecoveryStored = storedRecovery || durableRecoveryStored
             submissionAttempted = true
             _enhanceSubmissionAttemptedRequestId = scope.requestId
@@ -13588,25 +13748,28 @@ export const useStore = create<AppState>((set, get) => ({
         !lifecycle.ownsWorkspace()
         || !_sameEnhanceScope(get().enhanceRequestScope, scope)
       ) return false
+      if (h3 && (!result.h3_rewrite_preview || result.h3_rewrite_request?.mode !== h3Mode)) throw new api.LlmEnhanceScopeError()
       if (
         !_accountIdentityIsCurrent(accountIdentityEpoch)
         || _enhanceAccountFingerprint(get()) !== accountFingerprint
         || _enhancePromptEditGeneration !== promptEditGeneration
         || get().params.prompt !== result.original
         || result.original !== params.prompt
-        || (await _enhanceSettingsFingerprint(get())) !== settingsFingerprint
+        || (await _enhanceSettingsFingerprint(get(), h3)) !== settingsFingerprint
         || !inputsRemainCurrent()
       ) {
-        await _removeStoredEnhanceOperation(scope)
-        updateQueueCard({
-          phase: 'failed',
-          status: null,
-          result: null,
-          error: 'This result no longer matches the current Generate inputs.',
-        })
+        if (h3 && _accountIdentityIsCurrent(accountIdentityEpoch) && lifecycle.ownsWorkspace()
+          && _enhanceAccountFingerprint(get()) === accountFingerprint
+          && _sameEnhanceScope(get().enhanceRequestScope, scope)) {
+          updateQueueCard({ phase: 'completed', status: null, result, resultApplied: false, h3InputsVerified: false, error: null })
+        } else {
+          await _removeStoredEnhanceOperation(scope)
+          updateQueueCard({ phase: 'failed', status: null, result: null, error: 'This result no longer matches the current Generate inputs.' })
+        }
         return false
       }
-      const resultApplied = _generatePromptSurfaceIsVisible(get())
+      if (!await remainsBound()) return false
+      const resultApplied = !result.h3_rewrite_preview && _generatePromptSurfaceIsVisible(get())
       if (resultApplied) await _removeStoredEnhanceOperation(scope)
       set(s => ({
         ...(resultApplied ? { params: { ...s.params, prompt: result.enhanced } } : {}),
@@ -13615,6 +13778,7 @@ export const useStore = create<AppState>((set, get) => ({
           ? {
               ...s.enhanceQueueCard,
               phase: 'completed',
+              ...(result.h3_rewrite_preview ? { engine: 'h3_rewriter' as const, h3InputsVerified: true } : {}),
               result,
               resultApplied,
               error: null,
@@ -13641,7 +13805,10 @@ export const useStore = create<AppState>((set, get) => ({
       if (!(e instanceof api.LlmEnhanceWaitError && submissionAttempted && !reloadRecoveryUnavailable)) {
         if (scope) await _removeStoredEnhanceOperation(scope)
       }
-      if (e instanceof api.LlmEnhanceScopeError) return false
+      if (e instanceof api.LlmEnhanceScopeError) {
+        if (h3 && syncCurrent()) updateQueueCard({ phase: 'failed', error: 'This comparison no longer matches the current project or inputs.' })
+        return false
+      }
       console.error('Failed to enhance prompt:', e)
       updateQueueCard({
         phase: e instanceof api.LlmEnhanceWaitError && submissionAttempted ? 'running' : 'failed',
@@ -13667,12 +13834,25 @@ export const useStore = create<AppState>((set, get) => ({
       lifecycle.dispose()
     }
   },
-  resumeEnhancePrompt: async () => {
+  recheckH3Comparison: async () => {
+    const card = get().enhanceQueueCard
+    if (!card || card.engine !== 'h3_rewriter' || card.phase !== 'completed' || !card.result?.h3_rewrite_preview
+      || card.resultApplied || card.workspace !== get().activeWorkspace
+      || card.accountFingerprint !== _enhanceAccountFingerprint(get())) return false
+    return get().resumeEnhancePrompt(true)
+  },
+  resumeEnhancePrompt: async (explicitH3Recheck = false) => {
     const accountIdentityEpoch = _accountIdentityEpoch
     const accountFingerprint = _enhanceAccountFingerprint(get())
-    const initialStored = _findStoredEnhanceOperation(get().activeWorkspace, accountFingerprint)
+    const initialWorkspace = get().activeWorkspace
+    const initialWorkspaceSequence = _studioWorkspaceSequence
+    const retainedCard = get().enhanceQueueCard
+    if (!explicitH3Recheck && retainedCard?.engine === 'h3_rewriter'
+      && retainedCard.phase === 'completed' && retainedCard.result?.h3_rewrite_preview) return false
+    const initialStored = _findStoredEnhanceOperation(initialWorkspace, accountFingerprint)
     if (
       !initialStored
+      || (explicitH3Recheck && initialStored.requestId !== retainedCard?.requestId)
       || _enhanceLlmRequestToken !== null
       || get().enhanceRequestScope !== null
     ) return false
@@ -13684,8 +13864,15 @@ export const useStore = create<AppState>((set, get) => ({
       )
       return false
     }
-    const stored = _findStoredEnhanceOperation(get().activeWorkspace, accountFingerprint)
+    if (!_accountIdentityIsCurrent(accountIdentityEpoch) || _enhanceAccountFingerprint(get()) !== accountFingerprint
+      || get().activeWorkspace !== initialWorkspace || _studioWorkspaceSequence !== initialWorkspaceSequence
+      || get().enhanceQueueCard !== retainedCard) return false
+    const stored = _findStoredEnhanceOperation(initialWorkspace, accountFingerprint)
     if (_enhanceLlmRequestToken !== null || get().enhanceRequestScope !== null) return false
+    if (stored && (stored.requestId !== initialStored.requestId || stored.workspace !== initialStored.workspace
+      || stored.projectInstance !== initialStored.projectInstance || stored.accountFingerprint !== initialStored.accountFingerprint
+      || stored.claimToken !== initialStored.claimToken || stored.settingsFingerprint !== initialStored.settingsFingerprint
+      || stored.engine !== initialStored.engine || stored.h3DurationSeconds !== initialStored.h3DurationSeconds)) return false
     if (!stored || !_realmOwnsStoredEnhanceOperation(stored)) {
       window.alert(
         'Prompt Enhance recovery was not applied because this tab could not exclusively reclaim its original private recovery key. The prior result was left unchanged.',
@@ -13698,6 +13885,9 @@ export const useStore = create<AppState>((set, get) => ({
       projectInstance: stored.projectInstance,
     }
     const promptEditGeneration = _enhancePromptEditGeneration
+    const initialH3State = get()
+    const initialH3Duration = initialH3State.h3ComposeDurationSeconds
+    const initialEffectiveH3Duration = _h3ComposeDuration(initialH3State)
     const lifecycle = _beginEnhanceLlmRequest(scope.workspace)
     _enhanceSubmissionAttemptedRequestId = scope.requestId
     const updateQueueCard = (partial: Partial<PromptEnhanceQueueCardState>) => {
@@ -13723,6 +13913,7 @@ export const useStore = create<AppState>((set, get) => ({
         accountFingerprint: stored.accountFingerprint,
         settingsFingerprint: stored.settingsFingerprint,
         promptEditGeneration,
+        ...(stored.engine ? { engine: stored.engine, h3DurationSeconds: stored.h3DurationSeconds } : {}),
       },
     })
     try {
@@ -13743,24 +13934,36 @@ export const useStore = create<AppState>((set, get) => ({
           }
         },
       })
+      if (stored.engine === 'h3_rewriter' && (!result.h3_rewrite_preview || !result.h3_rewrite_request)) throw new api.LlmEnhanceScopeError()
       if (
         !lifecycle.ownsWorkspace()
         || !_sameEnhanceScope(get().enhanceRequestScope, scope)
       ) return false
+      const resultState = get()
+      const resultFingerprint = await _enhanceSettingsFingerprint(resultState, stored.engine === 'h3_rewriter', stored.h3DurationSeconds)
+      // Earlier private H3 records bound chooser metadata; accept only an exact legacy match.
+      const matchesStoredSettings = resultFingerprint === stored.settingsFingerprint || (stored.engine === 'h3_rewriter'
+        && await _enhanceSettingsFingerprint(resultState, true, stored.h3DurationSeconds, true) === stored.settingsFingerprint)
       if (
         !_accountIdentityIsCurrent(accountIdentityEpoch)
         || _enhanceAccountFingerprint(get()) !== stored.accountFingerprint
         || _enhancePromptEditGeneration !== promptEditGeneration
         || get().params.prompt !== result.original
-        || (await _enhanceSettingsFingerprint(get())) !== stored.settingsFingerprint
+        || (stored.engine === 'h3_rewriter' && get().h3ComposeDurationSeconds !== initialH3Duration)
+        || (stored.engine === 'h3_rewriter' && (initialEffectiveH3Duration !== stored.h3DurationSeconds
+          || result.h3_rewrite_request?.mode !== h3ComposeInputMode(get())))
+        || !matchesStoredSettings
+        || (stored.engine === 'h3_rewriter' && (!_h3ComposeSettingsUnchanged(initialH3State, get())
+          || !_h3ComposeSettingsUnchanged(resultState, get())))
       ) {
-        await _removeStoredEnhanceOperation(scope)
-        updateQueueCard({
-          phase: 'failed',
-          status: null,
-          result: null,
-          error: 'This recovered result no longer matches the current Generate inputs.',
-        })
+        if (stored.engine === 'h3_rewriter' && _accountIdentityIsCurrent(accountIdentityEpoch)
+          && lifecycle.ownsWorkspace() && _enhanceAccountFingerprint(get()) === stored.accountFingerprint
+          && _sameEnhanceScope(get().enhanceRequestScope, scope)) {
+          updateQueueCard({ phase: 'completed', status: null, result, resultApplied: false, h3InputsVerified: false, error: null })
+        } else {
+          await _removeStoredEnhanceOperation(scope)
+          updateQueueCard({ phase: 'failed', status: null, result: null, error: 'This recovered result no longer matches the current Generate inputs.' })
+        }
         if (_enhanceFingerprintClaimRotatedStored) {
           window.alert(
             'Prompt Enhance recovery was not applied because this tab could not exclusively reclaim its original private recovery key. The prior result was left unchanged.',
@@ -13768,7 +13971,11 @@ export const useStore = create<AppState>((set, get) => ({
         }
         return false
       }
-      const resultApplied = _generatePromptSurfaceIsVisible(get())
+      if (!_accountIdentityIsCurrent(accountIdentityEpoch) || !lifecycle.ownsWorkspace()
+        || _enhanceAccountFingerprint(get()) !== stored.accountFingerprint
+        || _enhancePromptEditGeneration !== promptEditGeneration || get().params.prompt !== result.original
+        || (stored.engine === 'h3_rewriter' && get().h3ComposeDurationSeconds !== initialH3Duration)) return false
+      const resultApplied = !result.h3_rewrite_preview && _generatePromptSurfaceIsVisible(get())
       if (resultApplied) await _removeStoredEnhanceOperation(scope)
       set(state => ({
         ...(resultApplied ? { params: { ...state.params, prompt: result.enhanced } } : {}),
@@ -13777,6 +13984,7 @@ export const useStore = create<AppState>((set, get) => ({
           ? {
               ...state.enhanceQueueCard,
               phase: 'completed',
+              ...(result.h3_rewrite_preview ? { engine: 'h3_rewriter' as const, h3InputsVerified: true, settingsFingerprint: resultFingerprint } : {}),
               result,
               resultApplied,
               error: null,
@@ -13792,7 +14000,14 @@ export const useStore = create<AppState>((set, get) => ({
       if (!(error instanceof api.LlmEnhanceWaitError) || !_enhanceReloadRecoveryAvailable) {
         await _removeStoredEnhanceOperation(scope)
       }
-      if (!(error instanceof api.LlmEnhanceScopeError)) {
+      if (error instanceof api.LlmEnhanceScopeError && stored.engine === 'h3_rewriter') {
+        updateQueueCard({ phase: 'failed', error: 'This comparison no longer matches the current project or inputs.' })
+      } else if (error instanceof api.LlmEnhanceWaitError && stored.engine === 'h3_rewriter'
+        && retainedCard?.requestId === scope.requestId && retainedCard.result?.h3_rewrite_preview
+        && _accountIdentityIsCurrent(accountIdentityEpoch) && _enhanceAccountFingerprint(get()) === stored.accountFingerprint) {
+        updateQueueCard({ phase: 'completed', result: retainedCard.result, h3InputsVerified: false,
+          error: 'Could not recheck this comparison. Try again.' })
+      } else if (!(error instanceof api.LlmEnhanceScopeError)) {
         console.error('Failed to resume prompt enhancement:', error)
         updateQueueCard({
           phase: error instanceof api.LlmEnhanceWaitError ? 'running' : 'failed',
@@ -13856,12 +14071,40 @@ export const useStore = create<AppState>((set, get) => ({
     _enhanceStopWaiting?.()
     set({ isEnhancing: false, enhanceStatus: null, enhanceRequestScope: null, enhanceQueueCard: null })
   },
+  applyH3RewriteSelection: async selection => {
+    const card = get().enhanceQueueCard
+    const result = card?.result
+    const preview = result?.h3_rewrite_preview
+    const epoch = _accountIdentityEpoch
+    const current = () => !!card && !!result && get().enhanceQueueCard?.requestId === card.requestId
+      && get().enhanceQueueCard?.result === result && get().enhanceQueueCard?.h3InputsVerified === true && _accountIdentityIsCurrent(epoch)
+      && get().activeWorkspace === card.workspace && _enhanceAccountFingerprint(get()) === card.accountFingerprint
+      && _enhancePromptEditGeneration === card.promptEditGeneration && get().params.prompt === result.original
+    if (!card || !card.scope || card.phase !== 'completed' || !card.h3InputsVerified || !preview || !current()
+      || !isCurrentH3PromptRewritePreview(preview, { requestCommitment: selection.request_commitment, originalPrompt: result!.original })
+      || preview.commitment !== selection.preview_commitment) throw new api.LlmEnhanceScopeError()
+    const candidate = preview.candidates.find(candidate => candidate.kind === selection.selected_kind)
+    if (!candidate) throw new api.LlmEnhanceScopeError()
+    const before = get()
+    const fingerprint = await _enhanceSettingsFingerprint(before, true)
+    if (!current() || !_h3ComposeSettingsUnchanged(before, get()) || fingerprint !== card.settingsFingerprint) throw new api.LlmEnhanceScopeError()
+    const enhanced = await api.applyLlmH3Rewrite(card.scope, selection, candidate.text)
+    if (!current()) throw new api.LlmEnhanceScopeError()
+    const afterState = get()
+    const after = await _enhanceSettingsFingerprint(afterState, true)
+    if (!current() || !_h3ComposeSettingsUnchanged(afterState, get()) || after !== fingerprint) throw new api.LlmEnhanceScopeError()
+    set(state => ({ params: { ...state.params, prompt: enhanced }, enhanceQueueCard: state.enhanceQueueCard?.requestId === card.requestId
+      ? { ...state.enhanceQueueCard, resultApplied: true } : state.enhanceQueueCard }))
+    if (card.scope) await _removeStoredEnhanceOperation(card.scope)
+  },
   applyCompletedEnhanceResult: async () => {
     const card = get().enhanceQueueCard
     if (
       !card
       || card.phase !== 'completed'
       || !card.result
+      || card.result.h3_rewrite_preview
+      || card.engine === 'h3_rewriter'
       || !card.settingsFingerprint
       || card.workspace !== get().activeWorkspace
       || card.accountFingerprint !== _enhanceAccountFingerprint(get())
@@ -13897,7 +14140,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
   useCompletedEnhanceAndGenerate: async () => {
     const card = get().enhanceQueueCard
-    if (!card || card.phase !== 'completed' || !card.result) return false
+    if (!card || card.phase !== 'completed' || !card.result || card.result.h3_rewrite_preview || card.engine === 'h3_rewriter') return false
     if (get().sidebarMode !== 'studio') get().setSidebarMode('studio')
     if (!get().sidebarOpen) get().setSidebarOpen(true)
     if (!await get().applyCompletedEnhanceResult()) {
@@ -19264,13 +19507,15 @@ useStore.subscribe(state => {
   _releaseUnusedBlendUrls(state.blendClipAUrl, state.blendClipBUrl)
 })
 
-useStore.subscribe(state => {
+useStore.subscribe((state, previous) => {
   const card = state.enhanceQueueCard
   if (!card) return
-  if (
-    card.workspace !== state.activeWorkspace
-    || card.accountFingerprint !== _enhanceAccountFingerprint(state)
-  ) useStore.setState({ enhanceQueueCard: null })
+  if (card.workspace !== state.activeWorkspace || card.accountFingerprint !== _enhanceAccountFingerprint(state)) {
+    useStore.setState({ enhanceQueueCard: null })
+  } else if (card.engine === 'h3_rewriter' && card.h3InputsVerified && !card.resultApplied
+    && !_h3ComposeSettingsUnchanged(previous, state)) {
+    useStore.setState({ enhanceQueueCard: { ...card, h3InputsVerified: false } })
+  }
 })
 
 useStore.subscribe((state, previous) => {

@@ -140,7 +140,7 @@ class H3PromptRewriterDependencyClosureTests(unittest.TestCase):
             [
                 "accelerate==1.12.0",
                 "peft==0.20.0",
-                "pillow==12.2.0",
+                "pillow==12.3.0",
                 "safetensors==0.8.0",
                 "tokenizers==0.22.1",
                 "torch==2.10.0+cu128",
