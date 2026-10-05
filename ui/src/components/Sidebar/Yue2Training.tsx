@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { Loader2, RefreshCw, Square } from 'lucide-react'
 import * as api from '../../api/client'
-import { yue2TrainingAttempts } from './yue2TrainingAttempts'
+import { currentAccountIdentityEpoch, useStore } from '../../stores/useStore'
+import { matchingYue2TrainingJob, yue2TrainingAttempts } from './yue2TrainingAttempts'
 
 type Props = { workspace: string; tracks: api.Yue2Track[]; gpuBlocked: boolean; onJobs?: (jobs: api.Yue2TrainingJob[]) => void }
 const inputClass = 'w-full rounded border border-border bg-bg-tertiary px-2 py-1 text-[10px] text-text-primary focus:border-accent-blue focus:outline-none'
@@ -16,6 +17,9 @@ const jobStateLabel: Record<api.Yue2TrainingJob['state'], string> = {
 }
 
 export function Yue2Training({ workspace, tracks, gpuBlocked, onJobs }: Props) {
+  const accountEpoch = useStore(() => currentAccountIdentityEpoch())
+  const scope = useMemo(() => ({ workspace, accountEpoch }), [workspace, accountEpoch])
+  const scopeRef = useRef(scope)
   const [jobs, setJobs] = useState<api.Yue2TrainingJob[]>([])
   const [selected, setSelected] = useState<Record<string, boolean>>({})
   const [captions, setCaptions] = useState<Record<string, string>>({})
@@ -28,10 +32,16 @@ export function Yue2Training({ workspace, tracks, gpuBlocked, onJobs }: Props) {
   const [error, setError] = useState<string | null>(null)
   const [message, setMessage] = useState<string | null>(null)
   const sequence = useRef(0)
+  const operationSequence = useRef(0)
+  const mounted = useRef(false)
+  const submitting = useRef(false)
+  const submissionOperation = useRef<{ requestId: string; sequence: number } | null>(null)
+  const onJobsRef = useRef(onJobs)
+  onJobsRef.current = onJobs
   const workspaceRef = useRef(workspace)
   workspaceRef.current = workspace
   const [, setAttemptVersion] = useState(0)
-  const pending = yue2TrainingAttempts.current(workspace)
+  const pending = yue2TrainingAttempts.current(accountEpoch, workspace)
 
   const ready = useMemo(() => tracks.filter(track => track.project === workspace && track.status === 'succeeded'), [tracks, workspace])
   const selectedTracks = ready.filter(track => selected[track.id])
@@ -39,79 +49,144 @@ export function Yue2Training({ workspace, tracks, gpuBlocked, onJobs }: Props) {
     && /^sv_[a-z0-9_]{3,40}$/.test(trigger)
     && selectedTracks.every(track => !!captions[track.id]?.trim() && !/[\r\n]/.test(captions[track.id]))
 
-  const refresh = async () => {
+  const isCurrent = useCallback((operation: number, requestWorkspace: string, requestEpoch: number) =>
+    mounted.current && scopeRef.current === scope && operationSequence.current === operation && workspaceRef.current === requestWorkspace
+      && currentAccountIdentityEpoch() === requestEpoch, [scope])
+
+  useLayoutEffect(() => {
+    mounted.current = true
+    scopeRef.current = scope
+    operationSequence.current += 1
+    submitting.current = false
+    submissionOperation.current = null
+    yue2TrainingAttempts.prune()
+    return () => { mounted.current = false; operationSequence.current += 1; sequence.current += 1 }
+  }, [scope])
+
+  const refresh = useCallback(async () => {
+    if (!isCurrent(operationSequence.current, workspace, accountEpoch)) return
     const current = ++sequence.current
+    const operation = operationSequence.current
     try {
       const result = await api.fetchYue2Training(workspace)
-      if (current === sequence.current) {
-        const projectJobs = result.jobs.filter(job => job.project === workspace)
-        setJobs(projectJobs)
-        onJobs?.(projectJobs)
+      if (!isCurrent(operation, workspace, accountEpoch) || current !== sequence.current) return
+      const projectJobs = result.jobs.filter(job => job.project === workspace)
+      const attempt = yue2TrainingAttempts.current(accountEpoch, workspace)
+      if (attempt && projectJobs.some(job => matchingYue2TrainingJob(attempt, job))) {
+        yue2TrainingAttempts.clear(accountEpoch, workspace, attempt.requestId)
+        setAttemptVersion(value => value + 1)
+        setError(null)
+        setMessage('Training submission confirmed. Its current status is shown below.')
+        const active = submissionOperation.current
+        if (active?.sequence === operation && active.requestId === attempt.requestId) {
+          operationSequence.current += 1
+          submissionOperation.current = null
+          submitting.current = false
+          setBusy(false)
+        }
       }
+      setJobs(projectJobs)
+      onJobsRef.current?.(projectJobs)
     } catch (cause) {
-      if (current === sequence.current) setError(cause instanceof Error ? cause.message : 'Training jobs are unavailable.')
+      if (isCurrent(operation, workspace, accountEpoch) && current === sequence.current) {
+        setError(cause instanceof Error ? cause.message : 'Training jobs are unavailable.')
+      }
     }
-  }
+  }, [workspace, accountEpoch, isCurrent])
 
   useEffect(() => {
-    void refresh()
-    return () => { sequence.current += 1 }
-  }, [workspace])
+    setJobs([]); setSelected({}); setCaptions({}); setLyrics({})
+    setName(''); setKind('artist'); setTrigger(''); setSteps(400)
+    setBusy(false); setError(null); setMessage(null)
+  }, [workspace, accountEpoch])
+
+  useEffect(() => { void refresh() }, [refresh])
 
   useEffect(() => {
     if (!jobs.some(job => ['queued', 'preparing', 'waiting-for-resource', 'running'].includes(job.state))) return
     const timer = window.setInterval(() => { void refresh() }, 5000)
     return () => window.clearInterval(timer)
-  }, [jobs, workspace])
+  }, [jobs, refresh])
 
   const submit = async () => {
-    if ((!valid && !pending) || busy || gpuBlocked) return
-    setBusy(true); setError(null); setMessage(null)
+    if (!isCurrent(operationSequence.current, workspace, accountEpoch)
+      || (!valid && !pending) || busy || submitting.current || gpuBlocked) return
     const requestWorkspace = workspace
-    const attempt = yue2TrainingAttempts.next(workspace, () => ({
-      workspace, requestId: `train-${crypto.randomUUID()}`,
+    const requestEpoch = accountEpoch
+    const attempt = yue2TrainingAttempts.next(requestEpoch, requestWorkspace, () => ({
+      workspace: requestWorkspace, requestId: `train-${crypto.randomUUID()}`,
       name: name.trim(), kind, trigger, steps,
       tracks: selectedTracks.map(track => ({ takeId: track.id, caption: captions[track.id].trim(), lyrics: lyrics[track.id] || '' })),
     }))
+    if (!attempt) return
+    const operation = ++operationSequence.current
+    submitting.current = true
+    submissionOperation.current = { requestId: attempt.requestId, sequence: operation }
+    const current = () => isCurrent(operation, requestWorkspace, requestEpoch)
+    setBusy(true); setError(null); setMessage(null)
     setAttemptVersion(value => value + 1)
     try {
-      await api.submitYue2Training(attempt)
-      yue2TrainingAttempts.clear(requestWorkspace, attempt.requestId)
-      setAttemptVersion(value => value + 1)
-      if (workspaceRef.current === requestWorkspace) {
-        setMessage('Training queued. Finished checkpoints will stay private to this project for audition.')
-        setSelected({})
-        await refresh()
+      const response = await api.submitYue2Training(attempt)
+      if (!current()) return
+      if (!response || typeof response.reused !== 'boolean' || !matchingYue2TrainingJob(attempt, response.job)) {
+        throw new Error('Training did not return a valid submission confirmation.')
       }
+      yue2TrainingAttempts.clear(requestEpoch, requestWorkspace, attempt.requestId)
+      setAttemptVersion(value => value + 1)
+      setMessage('Training queued. Finished checkpoints will stay private to this project for audition.')
+      setSelected({})
+      await refresh()
     } catch (cause) {
+      if (!current()) return
+      const rejected = !yue2TrainingAttempts.ambiguous(requestEpoch, requestWorkspace, attempt.requestId)
+        && cause instanceof api.Yue2RequestError && [400, 422].includes(cause.status)
+      if (rejected) {
+        yue2TrainingAttempts.clear(requestEpoch, requestWorkspace, attempt.requestId)
+        setAttemptVersion(value => value + 1)
+        setError(cause.message)
+        return
+      }
+      yue2TrainingAttempts.markAmbiguous(requestEpoch, requestWorkspace, attempt.requestId)
       let found = false
+      const reconciliation = ++sequence.current
       try {
         const result = await api.fetchYue2Training(requestWorkspace)
-        found = result.jobs.some(job => job.id === attempt.requestId)
-        if (workspaceRef.current === requestWorkspace) {
-          const projectJobs = result.jobs.filter(job => job.project === requestWorkspace)
-          setJobs(projectJobs)
-          onJobs?.(projectJobs)
-        }
+        if (!current() || reconciliation !== sequence.current) return
+        const projectJobs = result.jobs.filter(job => job.project === requestWorkspace)
+        found = projectJobs.some(job => matchingYue2TrainingJob(attempt, job))
+        setJobs(projectJobs)
+        onJobsRef.current?.(projectJobs)
       } catch { /* A failed status check cannot settle an uncertain submission. */ }
-      const rejected = cause instanceof api.Yue2RequestError
-        && cause.status >= 400 && cause.status < 500 && ![408, 409, 429].includes(cause.status)
-      if (found || rejected) {
-        yue2TrainingAttempts.clear(requestWorkspace, attempt.requestId)
+      if (!current()) return
+      if (found) {
+        yue2TrainingAttempts.clear(requestEpoch, requestWorkspace, attempt.requestId)
         setAttemptVersion(value => value + 1)
-      }
-      if (workspaceRef.current === requestWorkspace) {
-        if (found) {
-          setMessage('Training was queued. The first response was lost, but the job is now visible below.')
-          setSelected({})
-        } else if (rejected) {
-          setError(cause instanceof Error ? cause.message : 'Training request was rejected.')
-        } else {
-          setError('Could not confirm whether training was queued. Retry sends the same request, so it will not create a duplicate job.')
-        }
+        setMessage('Training was queued. The first response was lost, but the job is now visible below.')
+        setSelected({})
+      } else {
+        setError('Could not confirm whether training was queued. Retry sends the same request, so it will not create a duplicate job.')
       }
     } finally {
-      setBusy(false)
+      if (current()) {
+        submitting.current = false
+        submissionOperation.current = null
+        setBusy(false)
+      }
+    }
+  }
+
+  const cancel = async (job: api.Yue2TrainingJob) => {
+    if (!isCurrent(operationSequence.current, workspace, accountEpoch)) return
+    const operation = operationSequence.current
+    try {
+      await api.cancelYue2Training(job.id, workspace)
+      if (!isCurrent(operation, workspace, accountEpoch)) return
+      setMessage(null); setError(null)
+      await refresh()
+    } catch (cause) {
+      if (isCurrent(operation, workspace, accountEpoch)) {
+        setError(cause instanceof Error ? cause.message : 'Cancellation failed.')
+      }
     }
   }
 
@@ -147,7 +222,7 @@ export function Yue2Training({ workspace, tracks, gpuBlocked, onJobs }: Props) {
           <p className="text-text-muted">Trigger {job.trigger} · {job.sourceTakeIds.length} {job.sourceTakeIds.length === 1 ? 'take' : 'takes'}</p>
           {job.error && <p className="text-red-400">{job.error}</p>}
           {job.state === 'succeeded' && <p className="text-text-muted">{job.checkpoints?.length || 0} checkpoint{job.checkpoints?.length === 1 ? '' : 's'} saved. Select one under YuE2 LoRAs above to make an audition take. Nothing is installed globally.</p>}
-          {['queued', 'preparing', 'waiting-for-resource', 'running'].includes(job.state) && <button type="button" onClick={() => void api.cancelYue2Training(job.id, workspace).then(() => { setMessage(null); setError(null); return refresh() }).catch(cause => setError(cause instanceof Error ? cause.message : 'Cancellation failed.'))} className="flex items-center gap-1 text-red-300"><Square size={10} /> Cancel</button>}
+          {['queued', 'preparing', 'waiting-for-resource', 'running'].includes(job.state) && <button type="button" onClick={() => void cancel(job)} className="flex items-center gap-1 text-red-300"><Square size={10} /> Cancel</button>}
         </div>)}
         {message && <p role="status" className="text-emerald-300">{message}</p>}
         {error && <p role="alert" className="text-red-400">{error}</p>}

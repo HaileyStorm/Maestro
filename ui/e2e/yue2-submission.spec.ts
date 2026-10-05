@@ -11,18 +11,26 @@ const take = (body: Submission) => ({
   title: 'Recovered song', status: 'succeeded', stage: 'done', duration: 20, elapsed: 30,
 })
 
-async function setup(page: Page, mode: 'lost' | 'held') {
+async function setup(page: Page, mode: 'lost' | 'held' | 'training') {
   const api = await installSyntheticApi(page)
   api.setAccountScenario('remote-user')
   await page.addInitScript(() => localStorage.setItem('maestro_welcome_seen_v1', '1'))
   const submissions: Submission[] = []
-  let library: ReturnType<typeof take>[] = []
+  const trainingSubmissions: Record<string, unknown>[] = []
+  let library: ReturnType<typeof take>[] = mode === 'training'
+    ? [take({ requestId: 'finished-source', workspace, form: {} })] : []
   let pending: Route | undefined
   await page.route('**/api/v1/yue2/**', async route => {
     const path = new URL(route.request().url()).pathname
-    if (path.endsWith('/status')) return json(route, { available: true, sampleRate: 44100, queue: 'local', loras: [] })
+    if (path.endsWith('/status')) return json(route, { available: true, sampleRate: 44100, queue: 'local', loras: [], training: mode === 'training' })
     if (path.endsWith('/library')) return json(route, { tracks: library })
-    if (path.endsWith('/training')) return json(route, { jobs: [] })
+    if (path.endsWith('/training')) {
+      if (route.request().method() === 'POST') {
+        trainingSubmissions.push(route.request().postDataJSON())
+        return json(route, { detail: 'Synthetic uncertain training acknowledgement' }, 503)
+      }
+      return json(route, { jobs: [] })
+    }
     if (path.endsWith('/generations')) {
       const body = route.request().postDataJSON() as Submission
       submissions.push(body)
@@ -49,7 +57,7 @@ async function setup(page: Page, mode: 'lost' | 'held') {
   await page.getByRole('textbox', { name: 'Lyrics', exact: true }).fill('[Verse]\nThe coffee waits beside the door')
   const generate = page.getByRole('button', { name: 'Generate with YuE2', exact: true })
   await expect(generate).toBeEnabled()
-  return { api, submissions, generate,
+  return { api, submissions, trainingSubmissions, generate,
     acceptFirst: () => { library = [take(submissions[0])] },
     rejectHeld: async () => {
       await expect.poll(() => Boolean(pending)).toBe(true)
@@ -110,5 +118,44 @@ test('library acceptance releases held submit and late rejection cannot alter ne
   await expect(page.getByRole('article', { name: 'Recovered song · succeeded', exact: true })).toHaveCount(1)
   await expect(fixture.generate).toBeEnabled()
   expect(fixture.submissions).toHaveLength(2)
+  await fixture.api.assertClean()
+})
+
+test('training retry inputs are cleared when another account opens the same project', async ({ page }) => {
+  const fixture = await setup(page, 'training')
+  await page.getByText('Train a YuE2 artist or style LoRA', { exact: true }).click()
+  await page.getByRole('textbox', { name: 'Name', exact: true }).fill('Account A private style')
+  await page.getByRole('textbox', { name: 'Trigger word', exact: true }).fill('sv_account_a')
+  await page.getByRole('checkbox', { name: 'Recovered song', exact: true }).check()
+  await page.getByRole('textbox', { name: 'Style caption', exact: true }).fill('Account A private caption')
+  await page.getByRole('textbox', { name: 'Lyrics, if present', exact: true }).fill('Account A private lyrics')
+  await page.getByRole('button', { name: 'Queue training with 1 take', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Retry original training request', exact: true })).toBeEnabled()
+  expect(fixture.trainingSubmissions).toHaveLength(1)
+
+  const closeCreative = page.getByRole('button', { name: 'Close creative workspace menu', exact: true }).last()
+  if (await closeCreative.isVisible()) await closeCreative.click()
+  await page.getByRole('button', { name: 'Open account and support', exact: true }).click()
+  const drawer = page.locator('#account-support-drawer[role="dialog"]')
+  await drawer.getByRole('tab', { name: 'Account', exact: true }).click()
+  await drawer.getByRole('button', { name: 'Sign out', exact: true }).last().click()
+  const login = drawer.getByRole('heading', { name: 'Sign in', exact: true }).locator('xpath=../..')
+  await login.getByLabel('Username', { exact: true }).fill('Synthetic Owner')
+  await login.getByLabel('Password', { exact: true }).fill('synthetic-owner-password')
+  await login.getByRole('button', { name: 'Sign in', exact: true }).click()
+  await expect(drawer.getByText('Signed in.', { exact: true })).toBeVisible()
+  await drawer.getByRole('button', { name: 'Close Support panel', exact: true }).last().click()
+  const menu = page.getByRole('button', { name: 'Open Generate, Director, and References menu' })
+  if (await menu.isVisible()) {
+    await menu.click()
+    await page.getByRole('button', { name: 'Open Generate', exact: true }).click()
+  }
+  await page.getByText('Train a YuE2 artist or style LoRA', { exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Retry original training request', exact: true })).toHaveCount(0)
+  await expect(page.getByRole('textbox', { name: 'Name', exact: true })).toHaveValue('')
+  await expect(page.getByRole('checkbox', { name: 'Recovered song', exact: true })).not.toBeChecked()
+  await expect(page.getByRole('button', { name: 'Queue training with 0 takes', exact: true })).toBeDisabled()
+  expect(fixture.trainingSubmissions).toHaveLength(1)
+  expect(fixture.submissions).toHaveLength(0)
   await fixture.api.assertClean()
 })

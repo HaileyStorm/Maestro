@@ -2,11 +2,15 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { build } from 'esbuild'
 
+// Poll scheduling is inert; deferred API reads are controlled explicitly below.
+globalThis.window = { setInterval: () => 0, clearInterval() {} }
+
 const componentBundle = await build({
   stdin: {
     contents: `export { Yue2Controls } from './src/components/Sidebar/Yue2Controls';
       export { createHarness } from 'react'; export { control } from './src/api/client';
-      export { account } from './src/stores/useStore';`,
+      export { account } from './src/stores/useStore';
+      export { Yue2Training } from './src/components/Sidebar/Yue2Training';`,
     resolveDir: new URL('..', import.meta.url).pathname,
   },
   bundle: true, format: 'esm', platform: 'node', jsx: 'automatic', write: false,
@@ -91,10 +95,11 @@ const componentBundle = await build({
           useStore.subscribe = subscribe;
         `,
         api: `
+          import { account } from '../../stores/useStore';
           export class Yue2RequestError extends Error {
             constructor(status, message) { super(message); this.status = status; }
           }
-          export const control = { reads: [], submits: [], continues: [], libraries: {}, nextLibrary: null, requestError: (status, message) => new Yue2RequestError(status, message) };
+          export const control = { reads: [], submits: [], continues: [], libraries: {}, nextLibrary: null, trainingReads: [], trainingSubmits: [], trainingCancels: [], trainingJobs: {}, nextTraining: null, requestError: (status, message) => new Yue2RequestError(status, message) };
           const deferred = () => {
             let resolve, reject;
             const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
@@ -111,7 +116,17 @@ const componentBundle = await build({
             }
             return { tracks: control.libraries[workspace] || [] };
           }
-          export async function fetchYue2Training() { return { jobs: [] }; }
+          export async function fetchYue2Training(workspace) {
+            control.trainingReads.push({ workspace, epoch: account.epoch });
+            if (control.nextTraining) { const pending = control.nextTraining; control.nextTraining = null; return pending.promise; }
+            return { jobs: control.trainingJobs[workspace] || [] };
+          }
+          export function submitYue2Training(input) {
+            const pending = { ...deferred(), input }; control.trainingSubmits.push(pending); return pending.promise;
+          }
+          export function cancelYue2Training(id, workspace) {
+            const pending = { ...deferred(), id, workspace }; control.trainingCancels.push(pending); return pending.promise;
+          }
           export async function fetchYue2Plan(id) { return { reviewable: true, abc: 'X:1\\n% ' + id + '\\nK:C\\nC4|' }; }
           export function submitYue2(input) {
             const pending = { ...deferred(), input }; control.submits.push(pending); return pending.promise;
@@ -123,11 +138,9 @@ const componentBundle = await build({
           export function cancelYue2() { throw new Error('Unexpected cancel request'); }
           export function yue2AudioUrl(id) { return '/audio/' + id; }
         `,
-        training: 'export const Yue2Training = () => null;',
       }
       bundle.onResolve({ filter: /.*/ }, args => {
-        const key = args.path.includes('stores/useStore') ? 'store' : args.path.includes('api/client') ? 'api'
-          : args.path.endsWith('/Yue2Training') ? 'training' : args.path
+        const key = args.path.includes('stores/useStore') ? 'store' : args.path.includes('api/client') ? 'api' : args.path
         if (key in modules) return { path: key, namespace: 'yue2-test' }
       })
       bundle.onLoad({ filter: /.*/, namespace: 'yue2-test' }, args => ({ contents: modules[args.path], loader: 'js' }))
@@ -181,6 +194,253 @@ async function componentFixture({ review = false } = {}) {
   return { h, control, transition, account, remount }
 }
 
+
+
+const trainingJob = (request, fields = {}) => ({
+  id: request.input.requestId, project: request.input.workspace, name: request.input.name,
+  kind: request.input.kind, trigger: request.input.trigger, sourceTakeIds: request.input.tracks.map(track => track.takeId),
+  state: 'queued', stage: 'queued', cancel_requested: 0, ...fields,
+})
+const trainingAck = (request, fields = {}) => ({ job: trainingJob(request), reused: false, ...fields })
+const trainingSubmitButton = h => {
+  const node = findNode(h.tree, node => node.type === 'button' && node.props.className?.includes('bg-cta'))
+  assert.ok(node)
+  return node
+}
+const trainingRefresh = h => {
+  const node = findNode(h.tree, node => node.type === 'button' && node.props['aria-label'] === 'Refresh YuE2 training jobs')
+  assert.ok(node)
+  return node
+}
+const trainingField = (h, label, value) => {
+  const node = findNode(h.tree, node => node.type === 'label' && textContent(node).startsWith(label))
+  assert.ok(node, `Missing training field ${label}`)
+  const input = findNode(node.props.children, node => ['input', 'select', 'textarea'].includes(node.type))
+  input.props.onChange({ target: { value } }); h.flush()
+}
+const fillTraining = (h, name = 'Private artist', caption = 'Private style caption', lyrics = 'Private lyrics') => {
+  const select = findNode(h.tree, node => node.type === 'input' && node.props.type === 'checkbox')
+  assert.ok(select)
+  select.props.onChange({ target: { checked: true } }); h.flush()
+  trainingField(h, 'Name', name)
+  trainingField(h, 'Trigger word', 'sv_private_artist')
+  trainingField(h, 'Style caption', caption)
+  trainingField(h, 'Lyrics, if present', lyrics)
+}
+async function trainingFixture() {
+  const { Yue2Training, createHarness, control, account } = await import(
+    `data:text/javascript;base64,${Buffer.from(componentBundle.outputFiles[0].text).toString('base64')}#yue2-training-${++componentRealm}`,
+  )
+  const reports = []
+  const props = { workspace: 'A', gpuBlocked: false,
+    tracks: [{ id: 'private-take', project: 'A', title: 'Private take', status: 'succeeded' }],
+    onJobs(jobs) { reports.push(jobs) } }
+  const h = createHarness(Yue2Training, props)
+  h.render(); h.flush(); await settle(h)
+  const remount = async (next = h.props) => {
+    h.unmount()
+    const mounted = createHarness(Yue2Training, next)
+    mounted.render(); mounted.flush(); await settle(mounted)
+    return mounted
+  }
+  const transition = async (workspace, passive = true) => {
+    h.render({ ...h.props, workspace,
+      tracks: [{ id: `${workspace}-take`, project: workspace, title: `${workspace} take`, status: 'succeeded' }] })
+    if (passive) { h.flush(); await settle(h) }
+  }
+  return { h, control, account, reports, remount, transition }
+}
+
+test('YuE2 training account remount excludes private pending inputs and stale rejection starts no reconciliation', async () => {
+  const { h, control, account, remount } = await trainingFixture()
+  fillTraining(h)
+  button(h, 'Queue training').props.onClick(); h.flush()
+  const old = control.trainingSubmits[0]
+  h.unmount(); account.advance()
+  const current = await remount({ ...h.props, tracks: [{ id: 'new-owner-take', project: 'A', title: 'New owner take', status: 'succeeded' }] })
+  assert.doesNotMatch(textContent(current.tree), /previous request is unconfirmed|Retry original training request/)
+  fillTraining(current, 'New owner artist', 'New owner caption', 'New owner lyrics')
+  button(current, 'Queue training').props.onClick(); current.flush()
+  const next = control.trainingSubmits[1]
+  assert.notEqual(next.input.requestId, old.input.requestId)
+  assert.deepEqual(next.input.tracks, [{ takeId: 'new-owner-take', caption: 'New owner caption', lyrics: 'New owner lyrics' }])
+  const reads = control.trainingReads.length
+  h.mutations.length = 0; current.mutations.length = 0
+  old.reject(control.requestError(503, 'Prior account response lost'))
+  await settle(current)
+  assert.equal(control.trainingReads.length, reads, 'old catch must not contact the new account project library')
+  assert.deepEqual(h.mutations, [], 'unmounted component cannot change busy or messages')
+  assert.deepEqual(current.mutations, [], 'old completion cannot clear the newer account intent')
+  assert.equal(trainingSubmitButton(current).props.disabled, true)
+  next.reject(control.requestError(503, 'New account response lost')); await settle(current)
+  button(current, 'Retry original training request').props.onClick()
+  assert.equal(control.trainingSubmits[2].input.requestId, next.input.requestId)
+})
+
+for (const outcome of ['success', 'failure']) {
+  test(`YuE2 training ${outcome} is fenced through workspace ABA and cannot settle a newer retry`, async () => {
+    const { h, control, transition } = await trainingFixture()
+    fillTraining(h)
+    button(h, 'Queue training').props.onClick(); h.flush()
+    const old = control.trainingSubmits[0]
+    await transition('B'); await transition('A')
+    button(h, 'Retry original training request').props.onClick(); h.flush()
+    const current = control.trainingSubmits[1]
+    assert.deepEqual(current.input, old.input, 'same-account project return retries the original request')
+    const reads = control.trainingReads.length
+    h.mutations.length = 0
+    if (outcome === 'success') old.resolve(trainingAck(old))
+    else old.reject(control.requestError(503, 'Obsolete response lost'))
+    await settle(h)
+    assert.deepEqual(h.mutations, [])
+    assert.equal(control.trainingReads.length, reads)
+    assert.equal(trainingSubmitButton(h).props.disabled, true)
+    current.reject(control.requestError(503, 'Current response lost')); await settle(h)
+    assert.match(textContent(h.tree), /Could not confirm whether training was queued/)
+    button(h, 'Retry original training request').props.onClick()
+    assert.equal(control.trainingSubmits[2].input.requestId, old.input.requestId)
+  })
+}
+
+test('YuE2 training captured handlers from a prior workspace visit cannot start requests after ABA', async () => {
+  const { h, control, transition } = await trainingFixture()
+  fillTraining(h)
+  const oldSubmit = button(h, 'Queue training').props.onClick
+  const oldRefresh = trainingRefresh(h).props.onClick
+  await transition('B'); await transition('A')
+  const reads = control.trainingReads.length
+  oldRefresh(); oldSubmit()
+  await settle(h)
+  assert.equal(control.trainingReads.length, reads)
+  assert.equal(control.trainingSubmits.length, 0)
+})
+
+test('YuE2 training prior ambiguity survives retry422 and edited fields with identical frozen inputs', async () => {
+  const { h, control } = await trainingFixture()
+  fillTraining(h)
+  const click = button(h, 'Queue training').props.onClick
+  click(); click(); h.flush()
+  assert.equal(control.trainingSubmits.length, 1)
+  const first = control.trainingSubmits[0]
+  const original = JSON.stringify(first.input)
+  first.reject(control.requestError(503, 'Acknowledgement lost')); await settle(h)
+  assert.match(textContent(h.tree), /previous request is unconfirmed/)
+  trainingField(h, 'Name', 'Edited artist')
+  trainingField(h, 'Style caption', 'Edited caption')
+  trainingField(h, 'Lyrics, if present', 'Edited lyrics')
+  button(h, 'Retry original training request').props.onClick(); h.flush()
+  const retry = control.trainingSubmits[1]
+  assert.equal(JSON.stringify(retry.input), original)
+  retry.reject(control.requestError(422, 'Retry validation rejected')); await settle(h)
+  assert.match(textContent(h.tree), /previous request is unconfirmed/)
+  button(h, 'Retry original training request').props.onClick()
+  assert.equal(JSON.stringify(control.trainingSubmits[2].input), original)
+})
+
+for (const outcome of ['success', 'failure']) {
+  test(`YuE2 training pending POST survives unmount, retry422 and late original ${outcome}`, async () => {
+    const { h, control, remount } = await trainingFixture()
+    fillTraining(h)
+    button(h, 'Queue training').props.onClick(); h.flush()
+    const original = control.trainingSubmits[0]
+    const current = await remount()
+    button(current, 'Retry original training request').props.onClick(); current.flush()
+    const retry = control.trainingSubmits[1]
+    assert.deepEqual(retry.input, original.input)
+    retry.reject(control.requestError(422, 'Retry validation rejected')); await settle(current)
+    assert.match(textContent(current.tree), /previous request is unconfirmed/)
+    const reads = control.trainingReads.length
+    h.mutations.length = 0; current.mutations.length = 0
+    if (outcome === 'success') original.resolve(trainingAck(original))
+    else original.reject(control.requestError(503, 'Original reply lost'))
+    await settle(current)
+    assert.deepEqual(h.mutations, [])
+    assert.deepEqual(current.mutations, [])
+    assert.equal(control.trainingReads.length, reads)
+    button(current, 'Retry original training request').props.onClick()
+    assert.deepEqual(control.trainingSubmits[2].input, original.input)
+  })
+}
+
+test('YuE2 training canonical GET completes pending POST and fences its later rejection', async () => {
+  const { h, control } = await trainingFixture()
+  fillTraining(h)
+  button(h, 'Queue training').props.onClick(); h.flush()
+  const original = control.trainingSubmits[0]
+  control.trainingJobs.A = [trainingJob(original)]
+  trainingRefresh(h).props.onClick(); await settle(h)
+  assert.doesNotMatch(textContent(h.tree), /previous request is unconfirmed/)
+  assert.equal(button(h, 'Queue training').props.disabled, false)
+  h.mutations.length = 0
+  original.reject(control.requestError(422, 'Obsolete rejected inputs')); await settle(h)
+  assert.deepEqual(h.mutations, [])
+  assert.doesNotMatch(textContent(h.tree), /Obsolete rejected inputs/)
+})
+
+for (const status of [400, 422]) {
+  test(`YuE2 training initial definite HTTP${status} releases its rejected attempt`, async () => {
+    const { h, control } = await trainingFixture()
+    fillTraining(h)
+    button(h, 'Queue training').props.onClick(); h.flush()
+    control.trainingSubmits[0].reject(control.requestError(status, 'Invalid training inputs')); await settle(h)
+    assert.match(textContent(h.tree), /Invalid training inputs/)
+    assert.doesNotMatch(textContent(h.tree), /previous request is unconfirmed/)
+    assert.equal(button(h, 'Queue training').props.disabled, false)
+  })
+}
+
+for (const response of ['wrong acknowledgement', 'wrong project library', 'empty library']) {
+  test(`YuE2 training ${response} cannot confirm a pending request`, async () => {
+    const { h, control } = await trainingFixture()
+    fillTraining(h)
+    button(h, 'Queue training').props.onClick(); h.flush()
+    const request = control.trainingSubmits[0]
+    if (response === 'wrong acknowledgement') request.resolve(trainingAck(request, { job: trainingJob(request, { project: 'B' }) }))
+    else {
+      if (response === 'wrong project library') control.trainingJobs.A = [trainingJob(request, { project: 'B' })]
+      request.reject(control.requestError(503, 'Lost reply'))
+    }
+    await settle(h)
+    assert.match(textContent(h.tree), /previous request is unconfirmed/)
+    assert.equal(control.trainingSubmits.length, 1)
+    control.trainingJobs.A = [trainingJob(request)]
+    trainingRefresh(h).props.onClick(); await settle(h)
+    assert.doesNotMatch(textContent(h.tree), /previous request is unconfirmed|Could not confirm whether training was queued/)
+    assert.match(textContent(h.tree), /Private artist/)
+    assert.equal(control.trainingSubmits.length, 1, 'canonical library adoption never resends training')
+  })
+}
+
+for (const action of ['refresh', 'reconciliation', 'cancel']) {
+  test(`YuE2 training late ${action} callbacks cannot mutate a new account or start more requests`, async () => {
+    const { h, control, account, reports } = await trainingFixture()
+    let pending
+    if (action === 'cancel') {
+      const fake = { input: { requestId: 'cancel-job', workspace: 'A', name: 'Old job', kind: 'artist', trigger: 'sv_old', tracks: [{ takeId: 'private-take' }] } }
+      control.trainingJobs.A = [trainingJob(fake)]
+      trainingRefresh(h).props.onClick(); await settle(h)
+      button(h, 'Cancel').props.onClick(); pending = control.trainingCancels[0]
+    } else {
+      pending = deferred(); control.nextTraining = pending
+      if (action === 'refresh') trainingRefresh(h).props.onClick()
+      else {
+        fillTraining(h); button(h, 'Queue training').props.onClick()
+        control.trainingSubmits[0].reject(control.requestError(503, 'Lost reply'))
+        await new Promise(resolve => setImmediate(resolve))
+      }
+    }
+    account.advance(); h.flush(); await settle(h)
+    const reads = control.trainingReads.length
+    h.mutations.length = 0; reports.length = 0
+    if (action === 'cancel') pending.reject(new Error('Old cancellation failed'))
+    else pending.resolve({ jobs: [{ id: 'old', project: 'A', name: 'Old private job', state: 'failed', kind: 'artist', trigger: 'sv_old', sourceTakeIds: [], stage: 'failed', cancel_requested: 0 }] })
+    await settle(h)
+    assert.deepEqual(h.mutations, [])
+    assert.deepEqual(reports, [])
+    assert.equal(control.trainingReads.length, reads)
+    assert.doesNotMatch(textContent(h.tree), /Old private job|Old cancellation failed/)
+  })
+}
 
 const submittedTrack = (request, fields = {}) => ({
   id: 'accepted-take', project: request.input.workspace, requestId: request.input.requestId,
