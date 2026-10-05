@@ -303,6 +303,8 @@ type DirectorRepairPoll = {
   timer: number | null
 }
 type ActiveJobPoll = {
+  workspace?: string
+  createdAt?: number
   timer: number | null
   wake: () => void
   stop: () => void
@@ -315,6 +317,7 @@ type TerminalJobWaiter = {
 const _directorRepairPolls = new Map<string, DirectorRepairPoll>()
 const _directorRepairDiscoveries = new Map<string, object>()
 const _recoveryJobPolls = new Map<string, ActiveJobPoll>()
+const _pendingJobCancellations = new Set<string>()
 const _terminalJobWaiters = new Map<string, TerminalJobWaiter>()
 let _directorPreparationPoll: ReturnType<typeof setInterval> | null = null
 let _directorTrackRequestToken: symbol | null = null
@@ -8657,32 +8660,26 @@ export const useStore = create<AppState>((set, get) => ({
   },
   cancelH3Plan: async () => {
     const sequence = ++_h3PlanReviewSequence
+    const accountIdentityEpoch = _accountIdentityEpoch
     const { pendingH3PlanJobId: jobId, pendingH3PlanWorkspace: workspace } = get()
     if (!jobId || !workspace || get().activeWorkspace !== workspace) return
     set({ h3PlanReviewLoading: true, h3PlanReviewError: null })
+    get()._pollRecoveredJob(jobId, workspace, true)
     try {
       await api.cancelJob(jobId)
-      if (sequence !== _h3PlanReviewSequence || get().activeWorkspace !== workspace || get().pendingH3PlanJobId !== jobId) return
-      _recoveryJobPolls.get(jobId)?.stop()
-      set(s => ({
+      if (sequence !== _h3PlanReviewSequence || !_accountIdentityIsCurrent(accountIdentityEpoch) || get().activeWorkspace !== workspace || get().pendingH3PlanJobId !== jobId) return
+      set({
         pendingH3Plan: null,
         pendingH3PlanEstimate: null,
         pendingH3PlanJobId: null,
         pendingH3PlanWorkspace: null,
         h3PlanReviewLoading: false,
-        jobs: s.jobs.map(job => job.id === jobId ? {
-          ...job,
-          status: 'cancelled',
-          message: 'Cancelled',
-          planReviewRequired: false,
-          planReviewTermsRequired: false,
-          planReviewDeadline: null,
-        } : job),
-        isGenerating: s.jobs.some(job => job.id !== jobId && _isActiveGenerationJob(job)),
-      }))
+      })
+      get()._pollRecoveredJob(jobId, workspace, true)
       window.dispatchEvent(new CustomEvent('maestro:queue-refresh'))
     } catch (error) {
-      if (sequence !== _h3PlanReviewSequence || get().activeWorkspace !== workspace || get().pendingH3PlanJobId !== jobId) return
+      if (sequence !== _h3PlanReviewSequence || !_accountIdentityIsCurrent(accountIdentityEpoch) || get().activeWorkspace !== workspace || get().pendingH3PlanJobId !== jobId) return
+      get()._pollRecoveredJob(jobId, workspace, true)
       set({
         h3PlanReviewLoading: false,
         h3PlanReviewError: error instanceof Error ? error.message : 'The generation could not be cancelled.',
@@ -10196,26 +10193,43 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   stopGeneration: (jobId) => {
-    if (jobId) {
-      // Cancel specific job on backend, then remove from UI
-      _recoveryJobPolls.get(jobId)?.stop()
-      _rejectTerminalJobWaiter(jobId, 'Generation cancelled')
-      api.cancelJob(jobId).catch(e => console.error('Cancel failed:', e))
-      set(s => {
-        const remaining = s.jobs.filter(j => j.id !== jobId)
-        return { jobs: remaining, isGenerating: remaining.some(_isActiveGenerationJob) }
+    const accountIdentityEpoch = _accountIdentityEpoch
+    const workspace = get().activeWorkspace
+    const targets = get().jobs.filter(job => job.id && ACTIVE_GENERATION_JOB_STATUSES.has(job.status)
+      && (!jobId || job.id === jobId))
+    for (const job of targets) {
+      const key = JSON.stringify([accountIdentityEpoch, workspace, job.id])
+      if (_pendingJobCancellations.has(key)) continue
+      _pendingJobCancellations.add(key)
+      get()._pollRecoveredJob(job.id, workspace, true)
+      const pollAtSubmission = _recoveryJobPolls.get(job.id)
+      let scopeLost = false
+      const unsubscribe = useStore.subscribe(state => {
+        if (state.activeWorkspace !== workspace) scopeLost = true
       })
-    } else {
-      // Cancel all jobs
-      const jobs = get().jobs
-      jobs.forEach(j => {
-        if (j.id) {
-          _recoveryJobPolls.get(j.id)?.stop()
-          _rejectTerminalJobWaiter(j.id, 'Generation cancelled')
-          api.cancelJob(j.id).catch(() => {})
+      // Completion can win before Stop reaches the server. Keep the card,
+      // poller and completion waiter until authoritative status settles it.
+      void (async () => {
+        try {
+          await api.cancelJob(job.id)
+        } catch (error) {
+          console.error('Cancel failed:', error)
+        } finally {
+          unsubscribe()
+          _pendingJobCancellations.delete(key)
         }
-      })
-      set({ jobs: [], isGenerating: false })
+        const current = get().jobs.find(candidate => candidate.id === job.id)
+        if (scopeLost || !_accountIdentityIsCurrent(accountIdentityEpoch)
+          || get().activeWorkspace !== workspace
+          || !current || current.workspace !== job.workspace
+          || !ACTIVE_GENERATION_JOB_STATUSES.has(current.status)
+          || (current.createdAt !== job.createdAt
+            && (!pollAtSubmission || _recoveryJobPolls.get(job.id) !== pollAtSubmission
+              || current.createdAt !== pollAtSubmission.createdAt))) return
+        // Reconcile even an ambiguous POST failure; never automatically resend.
+        get()._pollRecoveredJob(job.id, workspace)
+        window.dispatchEvent(new CustomEvent('maestro:queue-refresh'))
+      })()
     }
   },
 
@@ -10326,24 +10340,30 @@ export const useStore = create<AppState>((set, get) => ({
 
   _pollRecoveredJob: (jobId, expectedWorkspace, pollQueuedFast = false) => {
     const accountIdentityEpoch = _accountIdentityEpoch
+    const initialJob = get().jobs.find(job => job.id === jobId)
+    if (!initialJob) return
     const existing = _recoveryJobPolls.get(jobId)
     if (existing) {
-      if (!pollQueuedFast) {
+      if (!pollQueuedFast && existing.workspace === initialJob.workspace
+        && existing.createdAt === initialJob.createdAt) {
         existing.wake()
         return
       }
       existing.stop()
     }
-    const initialJob = get().jobs.find(job => job.id === jobId)
-    if (!initialJob) return
     const ownsWorkspace = () => !expectedWorkspace || get().activeWorkspace === expectedWorkspace
+    let observedCreatedAt = initialJob.createdAt
+    let serverCreatedAt: number | undefined
 
     let consecutivePollFailures = 0
     let running = false
     let pendingWake = false
     let stopped = false
+    let unsubscribeWorkspace: (() => void) | undefined
     const outputRefresh = _createActiveOutputRefreshTracker(initialJob)
     const poll: ActiveJobPoll = {
+      workspace: initialJob.workspace,
+      createdAt: observedCreatedAt,
       timer: null,
       wake: () => {},
       stop: () => {},
@@ -10355,6 +10375,7 @@ export const useStore = create<AppState>((set, get) => ({
       if (poll.timer !== null) window.clearTimeout(poll.timer)
       poll.timer = null
       document.removeEventListener('visibilitychange', onVisibilityChange)
+      unsubscribeWorkspace?.()
       if (_recoveryJobPolls.get(jobId) === poll) {
         _recoveryJobPolls.delete(jobId)
       }
@@ -10401,19 +10422,40 @@ export const useStore = create<AppState>((set, get) => ({
       running = true
       try {
         const status = await api.fetchJobStatus(jobId)
+        const latest = get().jobs.find(job => job.id === jobId)
         if (
           stopped
           || !_accountIdentityIsCurrent(accountIdentityEpoch)
           || !ownsWorkspace()
           || _recoveryJobPolls.get(jobId) !== poll
+          || !latest
+          || latest.workspace !== initialJob.workspace
+          || latest.createdAt !== observedCreatedAt
         ) {
           stop()
           return
         }
+        if (status.job_id !== jobId
+          || (latest.workspace != null && status.workspace !== latest.workspace)
+          || (serverCreatedAt != null && status.created_at != null && status.created_at !== serverCreatedAt)) {
+          throw new Error('Job status does not match the observed generation')
+        }
         consecutivePollFailures = 0
+        // New submissions can have a client timestamp. Pin the server's
+        // incarnation on first hydration without accepting a replaced card.
+        serverCreatedAt = status.created_at ?? serverCreatedAt
+        observedCreatedAt = status.created_at ?? latest.createdAt
+        poll.createdAt = observedCreatedAt
         set(s => ({
-          jobs: s.jobs.map(job => job.id !== jobId ? job : _mergeJobStatus(job, status)),
+          jobs: s.jobs.map(job => job.id !== jobId ? job : {
+            ..._mergeJobStatus(job, status), createdAt: observedCreatedAt,
+          }),
         }))
+        if (status.status !== 'waiting_for_plan_approval'
+          && get().pendingH3PlanJobId === jobId
+          && get().pendingH3PlanWorkspace === status.workspace) {
+          get().closeH3PlanReview()
+        }
         _publishTerminalJobStatus(status)
         if (ownsWorkspace() && _activeOutputRefreshDue(outputRefresh, status, !document.hidden)) {
           void get().refreshOutputs()
@@ -10447,7 +10489,10 @@ export const useStore = create<AppState>((set, get) => ({
         // A transient disconnect must not strand the only poller for an
         // existing recovered card. Keep retrying; periodically reconcile the
         // owner list as an independent authoritative path.
-        if (!get().jobs.some(job => job.id === jobId)) {
+        const latest = get().jobs.find(job => job.id === jobId)
+        if (!_accountIdentityIsCurrent(accountIdentityEpoch) || !ownsWorkspace()
+          || !latest || latest.workspace !== initialJob.workspace
+          || latest.createdAt !== observedCreatedAt) {
           stop()
           return
         }
@@ -10498,6 +10543,11 @@ export const useStore = create<AppState>((set, get) => ({
     poll.wake = wake
     poll.stop = stop
     _recoveryJobPolls.set(jobId, poll)
+    if (expectedWorkspace) {
+      unsubscribeWorkspace = useStore.subscribe(state => {
+        if (state.activeWorkspace !== expectedWorkspace) stop()
+      })
+    }
     document.addEventListener('visibilitychange', onVisibilityChange)
     if (_jobNeedsFastStatusPoll(initialJob)) wake()
     else void tick(true)

@@ -94,6 +94,8 @@ test('real store hydrates failures after account bootstrap and scrubs on identit
   let active = 'project-a'
   let workspaceResponse = null
   let jobStatusResponse = null
+  let cancellationResponse = null
+  const cancellationRequests = []
   const statusRequests = []
   const mainSource = await readFile(new URL('../src/components/MainContent/MainContent.tsx', import.meta.url), 'utf8')
   const effectStart = mainSource.indexOf('useEffect(() => {\n    if (queuePollingReady) return')
@@ -124,7 +126,11 @@ test('real store hydrates failures after account bootstrap and scrubs on identit
     }
     else if (/\/status\/[^/]+$/.test(url) && jobStatusResponse) {
       statusRequests.push({ url, method: init.method || 'GET' })
-      return jobStatusResponse()
+      return jobStatusResponse(url)
+    }
+    else if (/\/cancel\/[^/]+$/.test(url) && cancellationResponse) {
+      cancellationRequests.push({ url, method: init.method })
+      return cancellationResponse(url)
     }
     else if (url.endsWith('/account/nonce')) body = { nonce: 'test', purpose: JSON.parse(init.body).purpose }
     else if (url.endsWith('/account/logout')) {
@@ -482,6 +488,189 @@ test('real store hydrates failures after account bootstrap and scrubs on identit
     assert.equal([...timers.values()][0].delay, 300000)
     context = accountContext('b')
     await store.getState().loadAccountContext(false)
+    assert.equal(timers.size, 0)
+  })
+  await t.test('Stop keeps observing while pending and accepts completion instead of inventing cancellation', async () => {
+    const { store, loads } = await compositionStore()
+    store.setState({ jobs: [{ ...failedJob, id: 'accepted-repeat', status: 'running' }], isGenerating: true })
+    let resolveCancel
+    cancellationRequests.length = 0
+    cancellationResponse = () => new Promise(resolve => { resolveCancel = resolve })
+    jobStatusResponse = () => jobStatus('running')
+    store.getState()._pollRecoveredJob('accepted-repeat', 'project-a')
+    await drain()
+    store.getState().stopGeneration('accepted-repeat')
+    store.getState().stopGeneration('accepted-repeat')
+    await drain()
+    assert.equal(store.getState().jobs[0].status, 'running')
+    assert.equal(store.getState().isGenerating, true)
+    assert.equal(cancellationRequests.length, 1, 'repeated clicks coalesce while the request is pending')
+    const [id, timer] = [...timers][0]
+    timers.delete(id)
+    jobStatusResponse = () => jobStatus('completed')
+    timer.callback()
+    await drain()
+    assert.deepEqual(store.getState().jobs, [])
+    assert.deepEqual(loads, ['project-a'])
+    assert.equal(store.getState().isGenerating, false)
+    assert.equal(timers.size, 0)
+    const reads = statusRequests.length
+    resolveCancel(Response.json({ status: 'completed', was_running: false }))
+    await drain()
+    assert.equal(statusRequests.length, reads, 'late Stop response cannot resurrect a settled card')
+  })
+  await t.test('ambiguous Stop failure retains status observation and never resends the POST', async () => {
+    const { store, loads } = await compositionStore()
+    store.setState({ jobs: [{ ...failedJob, id: 'accepted-repeat', status: 'running' }], isGenerating: true })
+    cancellationRequests.length = 0
+    cancellationResponse = () => { throw new Error('connection lost after dispatch') }
+    jobStatusResponse = () => jobStatus('running')
+    store.getState().stopGeneration('accepted-repeat')
+    await drain()
+    assert.equal(store.getState().jobs[0].status, 'running')
+    assert.equal(store.getState().isGenerating, true)
+    const [id, timer] = [...timers][0]
+    assert.equal(timer.delay, 2000)
+    timers.delete(id)
+    jobStatusResponse = () => jobStatus('cancelled')
+    timer.callback()
+    await drain()
+    assert.equal(store.getState().jobs[0].status, 'cancelled')
+    assert.equal(store.getState().isGenerating, false)
+    assert.deepEqual(loads, ['project-a'])
+    assert.equal(cancellationRequests.length, 1)
+    assert.equal(timers.size, 0)
+  })
+  await t.test('Stop all preserves terminal cards and reconciles mixed completion and held-job cancellation', async () => {
+    const { store, loads } = await compositionStore()
+    store.setState({ jobs: [
+      { ...failedJob, id: 'finished' },
+      { ...failedJob, id: 'won-completion', status: 'running' },
+      { ...failedJob, id: 'held', status: 'queued', held: true },
+    ], isGenerating: true })
+    cancellationRequests.length = 0
+    cancellationResponse = () => Response.json({ status: 'cancelled', was_running: true })
+    jobStatusResponse = url => {
+      const id = url.split('/').at(-1)
+      return Response.json({ job_id: id, workspace: 'project-a',
+        status: id === 'won-completion' ? 'completed' : 'cancelled',
+        progress: 100, step: 0, total_steps: 0, phase: '', message: '', error: null,
+        output_files: id === 'won-completion' ? ['finished.mp4'] : [] })
+    }
+    store.getState().stopGeneration()
+    await drain()
+    assert.deepEqual(cancellationRequests.map(r => r.url.split('/').at(-1)), ['won-completion', 'held'])
+    assert.deepEqual(store.getState().jobs.map(j => [j.id, j.status]), [['finished', 'failed'], ['held', 'cancelled']])
+    assert.equal(store.getState().isGenerating, false)
+    assert.equal(loads.length, 2)
+    assert.equal(timers.size, 0)
+  })
+  await t.test('pending Stop cannot reconcile into a changed account, project roundtrip or replacement job', async () => {
+    for (const drift of ['account', 'project-roundtrip', 'incarnation']) {
+      const { store, loads } = await compositionStore()
+      store.setState({ jobs: [{ ...failedJob, id: 'accepted-repeat', status: 'running', createdAt: 1 }] })
+      let resolveCancel
+      cancellationResponse = () => new Promise(resolve => { resolveCancel = resolve })
+      let resolveStatus
+      jobStatusResponse = () => new Promise(resolve => { resolveStatus = resolve })
+      store.getState().stopGeneration('accepted-repeat')
+      if (drift === 'account') {
+        context = accountContext('b')
+        await store.getState().loadAccountContext(false)
+      } else if (drift === 'project-roundtrip') {
+        store.setState({ activeWorkspace: 'project-b' })
+        store.setState({ activeWorkspace: 'project-a' })
+      } else store.setState({ jobs: [{ ...failedJob, id: 'accepted-repeat', status: 'running', createdAt: 2 }] })
+      const before = store.getState().jobs
+      resolveCancel(Response.json({ status: 'completed', was_running: false }))
+      resolveStatus(jobStatus('completed'))
+      await drain()
+      assert.strictEqual(store.getState().jobs, before)
+      assert.equal(statusRequests.length, 1, 'dispatch observer must not continue into the changed scope')
+      assert.deepEqual(loads, [])
+      assert.equal(timers.size, 0)
+    }
+  })
+  await t.test('plan Stop observes automatic completion and ambiguous failure through the canonical poller', async () => {
+    for (const failure of [false, true]) {
+      const { store, loads } = await compositionStore()
+      store.setState({ jobs: [{ ...failedJob, id: 'accepted-repeat', status: 'waiting_for_plan_approval' }],
+        pendingH3PlanJobId: 'accepted-repeat', pendingH3PlanWorkspace: 'project-a', isGenerating: true })
+      cancellationResponse = () => failure
+        ? Response.json({ detail: 'Connection failed' }, { status: 500 })
+        : Response.json({ status: 'completed', was_running: false })
+      jobStatusResponse = () => jobStatus('completed')
+      await store.getState().cancelH3Plan()
+      await drain()
+      assert.deepEqual(store.getState().jobs, [])
+      assert.deepEqual(loads, ['project-a'])
+      assert.equal(store.getState().isGenerating, false)
+      assert.equal(store.getState().pendingH3PlanJobId, null)
+      assert.equal(store.getState().h3PlanReviewError, null)
+      assert.equal(timers.size, 0)
+    }
+  })
+  await t.test('poller hydrates a provisional timestamp once and refuses a different server incarnation', async () => {
+    const { store, loads } = await compositionStore()
+    store.setState({ jobs: [{ ...failedJob, id: 'accepted-repeat', status: 'running', createdAt: 123 }] })
+    let state = 'running'
+    let created = 100
+    jobStatusResponse = async () => Response.json({ ...(await jobStatus(state).json()), created_at: created })
+    store.getState()._pollRecoveredJob('accepted-repeat', 'project-a')
+    await drain()
+    assert.equal(store.getState().jobs[0].createdAt, 100)
+    const tick = async () => {
+      const [id, timer] = [...timers][0]
+      timers.delete(id)
+      timer.callback()
+      await drain()
+    }
+    state = 'completed'
+    created = 200
+    await tick()
+    assert.equal(store.getState().jobs[0].status, 'running')
+    assert.equal(store.getState().jobs[0].createdAt, 100)
+    assert.deepEqual(loads, [])
+    created = 100
+    await tick()
+    assert.deepEqual(store.getState().jobs, [])
+    assert.deepEqual(loads, ['project-a'])
+    assert.equal(timers.size, 0)
+  })
+  await t.test('pending poll cannot publish after a project changes away and back', async () => {
+    const { store, loads } = await compositionStore()
+    store.setState({ jobs: [{ ...failedJob, id: 'accepted-repeat', status: 'running' }] })
+    let resolveStatus
+    jobStatusResponse = () => new Promise(resolve => { resolveStatus = resolve })
+    store.getState()._pollRecoveredJob('accepted-repeat', 'project-a')
+    store.setState({ activeWorkspace: 'project-b' })
+    store.setState({ activeWorkspace: 'project-a' })
+    resolveStatus(jobStatus('completed'))
+    await drain()
+    assert.equal(store.getState().jobs[0].status, 'running')
+    assert.deepEqual(loads, [])
+    assert.equal(timers.size, 0)
+  })
+  await t.test('held queued Stop reaches canonical cancellation while the POST acknowledgement stays pending', async () => {
+    const { store, loads } = await compositionStore()
+    store.setState({ jobs: [{ ...failedJob, id: 'accepted-repeat', status: 'queued', held: true }] })
+    let resolveCancel
+    cancellationRequests.length = 0
+    cancellationResponse = () => new Promise(resolve => { resolveCancel = resolve })
+    jobStatusResponse = () => jobStatus('queued')
+    store.getState().stopGeneration('accepted-repeat')
+    await drain()
+    const [id, timer] = [...timers][0]
+    assert.equal(timer.delay, 2000)
+    timers.delete(id)
+    jobStatusResponse = () => jobStatus('cancelled')
+    timer.callback()
+    await drain()
+    assert.equal(store.getState().jobs[0].status, 'cancelled')
+    assert.deepEqual(loads, ['project-a'])
+    resolveCancel(Response.json({ status: 'cancelled', was_running: false }))
+    await drain()
+    assert.equal(cancellationRequests.length, 1)
     assert.equal(timers.size, 0)
   })
 })

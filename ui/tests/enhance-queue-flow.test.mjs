@@ -2877,7 +2877,6 @@ test('one-shot plan hydration and the sole recurring poller fence all late winne
   reset([{ ...reviewJob('polled-id', 7), status: 'running' }])
   useStore.getState()._pollRecoveredJob('polled-id')
   await Promise.resolve()
-  useStore.getState().stopGeneration('polled-id')
   useStore.setState({ jobs: [{ ...reviewJob('polled-id', 8), status: 'running' }] })
   useStore.getState()._pollRecoveredJob('polled-id')
   await Promise.resolve()
@@ -2889,12 +2888,13 @@ test('one-shot plan hydration and the sole recurring poller fence all late winne
   assert.equal(useStore.getState().jobs.length, 1)
   assert.equal(useStore.getState().jobs[0].createdAt, 8)
   assert.equal(useStore.getState().jobs[0].status, 'running')
-  useStore.getState().stopGeneration('polled-id')
   replacementPoll.resolve({
     ...apiJobStatus('polled-id', 'project one', plan(), 8),
     status: 'cancelled',
   })
   await new Promise(resolve => setTimeout(resolve, 0))
+  assert.equal(useStore.getState().jobs[0].status, 'cancelled')
+  useStore.getState().dismissJob('polled-id')
   assert.equal(useStore.getState().jobs.length, 0)
 
   const firstFailure = deferred()
@@ -2912,7 +2912,6 @@ test('one-shot plan hydration and the sole recurring poller fence all late winne
   await new Promise(resolve => setTimeout(resolve, 0))
   useStore.getState()._pollRecoveredJob('failed-poll-id')
   await Promise.resolve()
-  useStore.getState().stopGeneration('failed-poll-id')
   useStore.setState({ jobs: [{ ...reviewJob('failed-poll-id', 10), status: 'running' }] })
   useStore.getState()._pollRecoveredJob('failed-poll-id')
   await Promise.resolve()
@@ -2920,12 +2919,13 @@ test('one-shot plan hydration and the sole recurring poller fence all late winne
   await new Promise(resolve => setTimeout(resolve, 0))
   assert.equal(reconnectRequests, 0)
   assert.equal(useStore.getState().jobs[0].createdAt, 10)
-  useStore.getState().stopGeneration('failed-poll-id')
   currentPoll.resolve({
     ...apiJobStatus('failed-poll-id', 'project one', plan(), 10),
     status: 'cancelled',
   })
   await new Promise(resolve => setTimeout(resolve, 0))
+  assert.equal(useStore.getState().jobs[0].status, 'cancelled')
+  useStore.getState().dismissJob('failed-poll-id')
   assert.equal(useStore.getState().jobs.length, 0)
 })
 
