@@ -12446,6 +12446,93 @@ class QueueLaunchWiringTests(unittest.TestCase):
 
 
 class RestoredHeldWorkerTests(unittest.TestCase):
+    def test_ordinary_held_job_survives_restarts_and_resume_attaches_once(self):
+        for status in ("queued", "running"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                from fastapi import HTTPException
+                from services.queue_recovery_adapter import QueueRecoveryAdapterError
+                project = Path(directory) / "project"
+                project.mkdir()
+                job_id = uuid.uuid4().hex
+                params = {"model_type": "flux_test", "prompt": "adult violent controversial creative scene", "seed": 246804}
+                pointer = write_sealed_request_manifest(project, job_id=job_id, params=params, inputs=[])
+                journal = QueueRecoveryJournal(Path(directory) / "queue.jsonl")
+                coordinator = QueueRecoveryCoordinator(journal)
+                project_digest = "project:v1:" + "b" * 64
+                coordinator.register_job({
+                    "id": job_id, "kind": "studio_generation", "status": status,
+                    "workspace": "project", "queue_held": True,
+                    "execution_attempt": 1, "recovery_attempt": 0,
+                    "resource_intent": "generation", "params": params,
+                }, owner_digest="owner:v1:" + "a" * 64,
+                    project_digest=project_digest, request_manifest=pointer)
+                workers = []
+                namespace = _isolated_functions(_tree("app/launch.py"), (
+                    "_queue_recovery_materialize_job", "_queue_recovery_revalidate_job",
+                    "_start_restored_held_generation_worker", "resume_held_job",
+                ), {
+                    "api": types.SimpleNamespace(post=lambda *args: lambda function: function),
+                    "Request": object, "Response": object, "HTTPException": HTTPException,
+                    "QueueRecoveryAdapterError": QueueRecoveryAdapterError,
+                    "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+                    "hmac": hmac, "math": __import__("math"), "time": time,
+                    "load_request_manifest": load_request_manifest,
+                    "validate_manifest_inputs": validate_manifest_inputs,
+                    "_queue_recovery_manifest_validator": lambda *args, **kwargs: True,
+                    "_require_h3_offload_plan_parity": lambda *args: None,
+                    "_queue_recovery_reconcile_cursor": lambda *args, **kwargs: None,
+                    "_h3_incomplete_recovery_prefix": lambda job: None,
+                    "_job_uses_registered_h3": lambda job: False,
+                    "_queue_recovery_worker": lambda job: object(),
+                    "next_recovery_attempt": next_recovery_attempt,
+                    "_existing_workspace_dir": lambda workspace: str(project),
+                    "_queue_recovery_existing_project_identity": lambda path: project_digest,
+                    "_queue_recovery_checkpoint_lock": threading.RLock(),
+                    "_queue_recovery_is_blocked": lambda job: str(job.get("recovery_state", "")).startswith("blocked"),
+                    "_queue_recovery_delivery_pending": lambda job: None,
+                    "_require_job_runtime_model_admission": lambda job: None,
+                    "_start_generation_worker": lambda job, **kwargs: workers.append(copy.deepcopy(job)),
+                    "_set_recovery_no_store": lambda response: None,
+                    "_reject_generic_sample_campaign_release": lambda job: None,
+                })
+                def checkpoint(job, **updates):
+                    proposed = dict(job, **updates)
+                    coordinator.prospective_transition(types.SimpleNamespace(
+                        jobs=(proposed,), tombstones=(), global_state=None))
+                    job.update(updates)
+                    return True
+                namespace["_queue_recovery_checkpoint"] = checkpoint
+                # Startup must keep the hold and reconstruct the process-local
+                # attachment obligation from durable bytes on every restart.
+                for _ in range(2):
+                    coordinator = QueueRecoveryCoordinator(journal)
+                    snapshot = coordinator.restore().jobs[job_id]
+                    job, auto_resume = namespace["_queue_recovery_materialize_job"](
+                        snapshot, {"project": (str(project), project_digest)})
+                    self.assertFalse(auto_resume)
+                    self.assertTrue(job["queue_held"])
+                    self.assertEqual(workers, [])
+                    checkpoint(job)
+                namespace["_require_generic_queue_control_job"] = lambda *args: job
+                def release(target, held):
+                    self.assertFalse(held)
+                    if target.get("queue_held") is not True:
+                        return None
+                    checkpoint(target, queue_held=False)
+                    return "queued"
+                namespace["set_job_hold"] = release
+                result = namespace["resume_held_job"](job_id, object(), object())
+                self.assertFalse(result["held"])
+                self.assertEqual(len(workers), 1)
+                self.assertFalse(coordinator.read_only_snapshot()[0][job_id]["queue_held"])
+                self.assertEqual(workers[0]["params"], params)
+                self.assertEqual((job["execution_attempt"], job["recovery_attempt"]), (1, 0))
+                self.assertEqual(job["reruns_denoise"], status == "running")
+                with self.assertRaises(HTTPException) as repeated:
+                    namespace["resume_held_job"](job_id, object(), object())
+                self.assertEqual(repeated.exception.status_code, 409)
+                self.assertEqual(len(workers), 1)
+
     def setUp(self):
         self.calls = []
         self.job = {

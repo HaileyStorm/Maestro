@@ -1045,3 +1045,21 @@ A real CPU FFmpeg fixture proves the returned take exports the original cut
 after explicit selection and reopen, without modifying source media. These
 checks do not prove native generated Retake output, mounted browser return,
 Windows/LAN parity or human quality acceptance.
+
+### 2026-10-06: Resume restored ordinary held generation
+
+The native image check exposed a recovery defect: after restart, Resume
+returned success for an ordinary held image job but attached no worker. Startup
+now records the pending worker for validated ordinary generation while retaining
+the hold. Explicit release rechecks the saved request and inputs and attaches
+one worker. Blocked recovery and H3-specific paths retain their existing gates.
+Repeated held restarts also preserve the warning that interrupted sampling
+will rerun, without increasing execution or recovery attempts.
+
+Evidence: a real journal and sealed manifest reproduce the former zero-worker
+failure for queued and interrupted jobs across two restarts. The repaired route
+attaches one stub worker and rejects repeated Resume; all 209 affected recovery
+checks pass. Frozen-source review and publication checks pass. The original
+native image job remains held with unchanged identity; the failed GPU grant
+was withdrawn after owned runtime cleanup. Native dispatch on the repair,
+Windows/LAN and human acceptance remain separate checks.

@@ -8324,9 +8324,14 @@ def _queue_recovery_materialize_job(
             "_recovery_reason_code": "",
             "queue_held": True,
             "recovery_state": "restored",
-            "reruns_denoise": status == "running",
+            "reruns_denoise": status == "running" or snapshot.get("reruns_denoise") is True,
             "message": str(snapshot.get("message") or "Queued"),
         })
+        if str(runtime.get("kind") or "studio_generation") == "studio_generation":
+            # Startup deliberately attaches no worker while held. Resume must
+            # reconstruct that obligation for ordinary generation as for H3;
+            # validation and blocked recovery branches above remain controlling.
+            runtime["_recovery_worker_pending"] = True
         return runtime, False
     attempt, may_retry = next_recovery_attempt(snapshot)
     if not may_retry:
@@ -9320,7 +9325,7 @@ def _queue_recovery_revalidate_job(job: dict) -> bool:
 
 
 def _start_restored_held_generation_worker(job: dict) -> None:
-    """Attach one worker only after an explicit release of pristine held work."""
+    """Attach one worker only after an explicit release of validated held work."""
     with _queue_recovery_checkpoint_lock:
         if (
             job.get("_recovery_worker_pending") is not True
