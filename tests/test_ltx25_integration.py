@@ -407,16 +407,6 @@ class LTX25HandlerTests(unittest.TestCase):
                     "reload_needed": reload_needed,
                 }), expected)
 
-    def test_int8_convrot_loras_keep_native_linear_forward(self):
-        ltx2 = LTX2_PATH.read_text(encoding="utf-8")
-        self.assertIn(
-            "from shared.qtypes.int8_convrot import "
-            "install_native_lora_forwards",
-            ltx2,
-        )
-        self.assertIn("def finalize_loras(self) -> None:", ltx2)
-        self.assertIn("install_native_lora_forwards(lora_target)", ltx2)
-
     def test_native_ltx25_uses_wangp_ancestral_eight_plus_three_path(self):
         source = DISTILLED_PATH.read_text(encoding="utf-8")
         self.assertIn("LTX25EulerAncestralDiffusionStep", source)
@@ -515,6 +505,136 @@ class LTX25HandlerTests(unittest.TestCase):
         self.assertIn("10: ['ltx2_25']", store)
         self.assertNotIn("'ltx2_25_dev'", default_block)
         self.assertNotIn("'ltx2_25_nvfp4'", default_block)
+
+
+class LTXConvRotRuntimeTests(unittest.TestCase):
+    """CPU checkpoint/LoRA contracts; no model downloads or GPU inference."""
+
+    @classmethod
+    def setUpClass(cls):
+        for dependency in ("torch", "optimum.quanto", "mmgp"):
+            if importlib.util.find_spec(dependency) is None:
+                raise unittest.SkipTest(f"ConvRot runtime needs {dependency}")
+        import torch
+        from mmgp import offload, quant_router
+        from models.ltx2.ltx2 import LTX2
+        from shared.qtypes import int8_convrot
+
+        cls.torch, cls.router = torch, quant_router
+        cls.handler, cls.ltx_class = int8_convrot, LTX2
+        cls.scaling_method = staticmethod(offload.offload._get_lora_scaling)
+        # Exercise the production registration list without starting WGP.
+        tree = ast.parse(WGP_PATH.read_text(encoding="utf-8"))
+        assignment = next(node for node in tree.body
+                          if isinstance(node, ast.Assign)
+                          and any(isinstance(t, ast.Name) and t.id == "_HANDLER_MODULES"
+                                  for t in node.targets))
+        for handler in ast.literal_eval(assignment.value):
+            quant_router.register_handler(handler)
+
+    def _fixture(self, dtype=None, convrot=True, rows=3, features=4):
+        torch = self.torch
+        dtype = dtype or torch.float32
+        weight = (torch.arange(rows * features).reshape(rows, features) % 9 - 4).to(torch.int8)
+        scale = torch.arange(1, rows + 1).float() / 8
+        bias = torch.arange(rows).to(dtype) / 10
+        descriptor = {"format": "int8_tensorwise", "convrot": convrot,
+                      "convrot_groupsize": 4}
+        state = {"0.weight": weight.clone(), "0.weight_scale": scale.clone(),
+                 "0.bias": bias.clone(), "0.comfy_quant": torch.tensor(
+                     list(json.dumps(descriptor).encode()), dtype=torch.uint8)}
+        converted = self.router.detect_and_convert(state, dtype, verboseLevel=0)
+        self.assertEqual(converted["quant_map"]["0"]["weights"], "qint8_convrot")
+        self.handler.apply_pre_quantization(None, converted["state_dict"],
+                                            converted["quant_map"])
+        layer = self.router.QLinearQuantoRouter(
+            features, rows, bias=True, dtype=dtype,
+            weights=self.handler._QINT8_CONVROT_QTYPE)
+        model = torch.nn.Sequential(layer)
+        model.load_state_dict(converted["state_dict"], strict=True)
+        value = torch.tensor([[[.25, .5, -.75, 1.25], [-.5, .125, .875, -.25]]],
+                             dtype=dtype).repeat(1, 1, features // 4)
+        # Independently specify the checkpoint's orthonormal group-4 transform.
+        rotation = torch.tensor([[1, 1, 1, -1], [1, 1, -1, 1],
+                                 [1, -1, 1, 1], [-1, 1, 1, 1]], dtype=dtype) / 2
+        rotation = torch.block_diag(*([rotation] * (features // 4)))
+        original_weight = (weight.to(dtype) * scale.to(dtype)[:, None])
+        if convrot:
+            original_weight = original_weight @ rotation.T
+        expected = torch.nn.functional.linear(value, original_weight, bias)
+        return model, value, expected
+
+    def test_registered_checkpoint_preserves_rotation_row_scales_and_dtype(self):
+        torch = self.torch
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            for rotated in (False, True):
+                with self.subTest(dtype=dtype, rotated=rotated), torch.inference_mode():
+                    # Quanto CPU BF16 uses Torch's packed kernel, whose tiny
+                    # 3x4 matrix tail crashes in the installed Torch build.
+                    # Use a supported packed shape; FP32/FP16 retain tiny cases.
+                    packed = dtype == torch.bfloat16
+                    model, value, expected = self._fixture(
+                        dtype, rotated, rows=16 if packed else 3,
+                        features=16 if packed else 4)
+                    actual = model(value)
+                    self.assertEqual(actual.dtype, dtype)
+                    torch.testing.assert_close(actual, expected, rtol=.01, atol=.01)
+
+    def test_ltx_finalization_keeps_native_base_and_source_space_lora_once(self):
+        torch = self.torch
+        model, value, baseline = self._fixture()
+        layer = model[0]
+        native_forward = layer.forward
+        layer._mm_lora_old_forward = native_forward
+        # Reproduce an ordinary Linear hook that would omit the rotation.
+        layer.forward = lambda x: torch.nn.functional.linear(x, layer.weight, layer.bias)
+        lora_a = torch.tensor([[.2, -.1, .3, .4], [.1, .5, -.2, .3]])
+        lora_b = torch.tensor([[.3, .5], [-.4, .6], [.7, -.1]])
+        diff_b = torch.tensor([.1, -.2, .3])
+        layer._mm_lora_data = {"fixture_GPU": (lora_a, lora_b, diff_b, None, 2., {})}
+        model._loras_active_adapters = ["fixture"]
+        model._loras_scaling = {"fixture": [.25, .75]}
+        model._lora_step_no = 1
+        layer._mm_lora_model = model
+        layer._mm_manager = SimpleNamespace(_get_lora_scaling=lambda *args:
+                                            self.scaling_method(None, *args))
+        ltx = self.ltx_class.__new__(self.ltx_class)
+        ltx.model = model
+        expected = baseline + 1.5 * ((value @ lora_a.T) @ lora_b.T + diff_b)
+        with torch.inference_mode():
+            ltx.finalize_loras()
+            torch.testing.assert_close(model(value), expected)
+            ltx.finalize_loras()
+            torch.testing.assert_close(model(value), expected)
+            model._loras_scaling["fixture"] = 0
+            torch.testing.assert_close(model(value), baseline)
+            model._loras_scaling["fixture"] = 1
+            model._loras_active_adapters = []
+            torch.testing.assert_close(model(value), baseline)
+            model._loras_active_adapters = ["fixture"]
+            layer._mm_lora_data["fixture_GPU"] = (
+                lora_a, lora_b, diff_b, torch.ones(3), 2., {})
+            with self.assertRaisesRegex(RuntimeError, "DoRA adapters are not supported"):
+                model(value)
+
+    def test_fused_qkv_split_preserves_contiguous_rows_and_scales(self):
+        torch = self.torch
+        model, _, _ = self._fixture(rows=6)
+        weight = model[0].weight
+        state = {"attn.qkv.weight._data": weight._data,
+                 "attn.qkv.weight._scale": weight._scale,
+                 "attn.qkv.convrot_group_size": torch.tensor(4),
+                 "attn.qkv.qweight": torch.empty(0, dtype=torch.uint8)}
+        split, bases = self.handler.split_fused_weights(state, {"qkv": {
+            "mapped_modules": ["q", "k", "v"], "split_sizes": [2, 2, 2]}})
+        self.assertEqual(bases, ["attn.qkv"])
+        self.assertNotIn("attn.qkv.qweight", split)
+        for index, name in enumerate(("q", "k", "v")):
+            torch.testing.assert_close(split[f"attn.{name}.weight._data"],
+                                       weight._data[index * 2:index * 2 + 2])
+            torch.testing.assert_close(split[f"attn.{name}.weight._scale"],
+                                       weight._scale[index * 2:index * 2 + 2])
+            self.assertEqual(split[f"attn.{name}.convrot_group_size"].item(), 4)
 
 
 if __name__ == "__main__":

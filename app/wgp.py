@@ -351,6 +351,7 @@ _HANDLER_MODULES = [
     "shared.qtypes.nvfp4",
     "shared.qtypes.nunchaku_int4",
     "shared.qtypes.nunchaku_fp4",
+    "shared.qtypes.int8_convrot",
     "shared.qtypes.gguf",
 ]
 quant_router.unregister_handler(".fp8_quanto_bridge")
