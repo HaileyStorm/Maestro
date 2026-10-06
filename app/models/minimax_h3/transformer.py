@@ -998,6 +998,32 @@ class MiniMaxH3Transformer(nn.Module):
             return None
         if hidden_states.shape[0] != 1:
             raise ValueError("MiniMax H3 currently supports batch size 1.")
+        control_branch = _kwargs.get("h3_control_branch")
+        control_rows = _kwargs.get("h3_control_rows")
+        control_strength = _kwargs.get("h3_control_strength", 1.0)
+        if control_branch is not None or control_rows is not None:
+            from .control import MiniMaxH3ControlBranch, add_control_hint
+
+            if not isinstance(control_branch, MiniMaxH3ControlBranch) or control_rows is None:
+                raise ValueError("H3 Control requires an original branch and all control rows")
+            if self.use_adaln_curves:
+                raise ValueError("Original H3 Control requires a full-timestep base checkpoint")
+            if self._h3_turbo_active or _kwargs.get("h3_spectrum_controller") is not None:
+                raise ValueError("Original H3 Control cannot combine with Turbo or Spectrum")
+            if str(_kwargs.get("h3_attention_engine") or "sdpa") != "sdpa":
+                raise ValueError("Original H3 Control currently requires SDPA attention")
+            if control_branch.hidden_size != self.config.hidden_size:
+                raise ValueError("H3 Control hidden width does not match its base")
+            if control_branch.time_embed_dim != self.config.curve_dim:
+                raise ValueError("H3 Control timestep width does not match its base")
+            if control_branch.control_blocks_places[-1] >= len(self.blocks):
+                raise ValueError("H3 Control skip positions exceed the base block stack")
+            if not isinstance(control_rows, torch.Tensor) or control_rows.shape != (
+                1, video_indices.numel(), control_branch.control_patch_dim,
+            ):
+                raise ValueError("H3 Control rows must cover every packed video row in training layout")
+            # Validate even zero-strength requests before choosing the bypass.
+            add_control_hint(hidden_states, {}, 0, strength=control_strength)
         sequence_length = position_ids.shape[0]
         if position_ids.shape != (sequence_length, 3):
             raise ValueError("MiniMax H3 position_ids must have shape [sequence, 3].")
@@ -1100,6 +1126,16 @@ class MiniMaxH3Transformer(nn.Module):
                 "sink_tokens": int(_kwargs.get("h3_sol_sink_tokens") or 0),
             }
 
+        control_hints = None
+        if control_branch is not None and control_strength != 0:
+            control_hints = control_branch(
+                packed, control_rows, video_indices, audio_indices,
+                curve, adaln_runs, rotary, attention_mask,
+                interrupted=lambda: self._interrupt, offload_hints=True,
+            )
+            if control_hints is None:
+                return None
+
         for block_index, block in enumerate(self.blocks):
             if self._interrupt:
                 return None
@@ -1114,6 +1150,10 @@ class MiniMaxH3Transformer(nn.Module):
                 attention_mask,
                 acceleration,
             )
+            if control_hints is not None:
+                packed = add_control_hint(
+                    packed, control_hints, block_index, strength=control_strength,
+                )
 
         if spectrum_controller is not None:
             target_hidden = torch.cat(

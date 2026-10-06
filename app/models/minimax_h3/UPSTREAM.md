@@ -8,6 +8,32 @@ Those files retain their upstream Apache-2.0 copyright and license headers.
 Maestro-specific model loading, packing, memory management, and Studio
 integration are implemented separately in this directory.
 
+The original Fun Union Control branch in `control.py` follows the Apache-2.0
+VideoX-Fun architecture at `b0acf916c215705ac212fc51b2d9007bbc6df51b`,
+`videox_fun/models/minimax_h3_transformer3d_control.py`. Its checkpoint is
+`alibaba-pai/MiniMax-H3-Fun-Controlnet-Union` at
+`6419c27ece80f330826ae4439fa9c5910c475ccf`, file
+`MiniMax-H3-Fun-Controlnet-Union.safetensors` (6,806,843,904 bytes; SHA256
+`919a48acb525dc8fc70287fcd94ec1f5e5e289a77f1df14d01099c6ce204eb02`).
+The exact checkpoint header was checked without downloading tensor payloads.
+This original branch uses five skips after base blocks 0/10/20/30/40,
+49-channel control input, and the full 2,688-wide base timestep embedding.
+Checkpoint adaptation fuses separate contiguous Q/K/V and swaps Diffusers'
+SwiGLU `[value, gate]` halves into Maestro's `[gate, value]` order. Original
+BF16 AdaLN projection arithmetic is retained after FP32 SiLU.
+
+The optional internal transformer binding requires a full-timestep base,
+dense SDPA, and no Turbo or Spectrum. Control rows must cover every packed
+video row, including any conditioning rows; it never fabricates missing rows.
+Direct skips are excluded from audio rows, but subsequent joint attention can
+still affect audio. Zero strength bypasses the branch. CPU donor-equation and
+transformer-binding checks do not qualify managed checkpoint loading, MMGP
+residency, VAE/media conditioning, or native GPU execution. Public Control
+plans therefore continue to report execution unavailable. Union 2.0 has a
+different architecture and must not be loaded through this original adapter.
+Model weights remain separately governed by their model terms and the
+existing H3 access/authorization path.
+
 The default runtime stack is pinned to:
 
 - `MiniMaxAI/MiniMax-H3` commit `5d9b308a59ab12e67147f191e184baf704185bd1`
