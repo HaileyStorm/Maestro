@@ -12004,6 +12004,12 @@ def _generate_video_impl(
 
     model_handler = get_model_handler(base_model_type)
     block_size = model_handler.get_vae_block_size(base_model_type) if hasattr(model_handler, "get_vae_block_size") else 16
+    if (base_model_type in {"ltx2_19B", "ltx2_22B"}
+            and retake_video and os.path.isfile(retake_video)
+            and retake_engine == "native"):
+        # Native Retake bypasses the two-stage upsampler and needs only 32
+        # alignment. Rounding to the ordinary 64 grid here shrinks its source.
+        block_size = 32
     h3_audio_roles = None
     if base_model_type in {"minimax_h3", "minimax_h3_ref2va"}:
         from services.h3_audio import resolve_h3_audio_roles, source_audio_requested
@@ -15210,6 +15216,18 @@ def _generate_video_impl(
                                 # - Regenerate mode + retake audio extracted: mux generated audio
                                 # - Preserve mode: mux original source audio
                                 # - Fallback: mux original if no generated audio available
+                                # Bound audio to the completed video's actual timeline.
+                                # -shortest can drop buffered video packets when source
+                                # audio ends just before the final video frame.
+                                video_probe = subprocess.run(
+                                    ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                                     "-show_entries", "stream=duration", "-of", "csv=p=0", path],
+                                    capture_output=True, text=True, timeout=10,
+                                    check=True,
+                                )
+                                mux_video_duration = float(video_probe.stdout.strip())
+                                if not math.isfinite(mux_video_duration) or mux_video_duration <= 0:
+                                    raise ValueError("Retake output has no valid video timeline for audio muxing")
                                 original_video = si.get("original_video")
                                 should_mux_original = not si.get("regenerate_audio", True)
 
@@ -15255,7 +15273,7 @@ def _generate_video_impl(
                                             "-map", "[outa]",
                                             "-c:v", "copy",
                                             "-c:a", "aac", "-b:a", "192k",
-                                            "-shortest",
+                                            "-t", str(mux_video_duration),
                                             muxed_path
                                         ]
                                         mux_result = subprocess.run(mux_cmd, capture_output=True, text=True, timeout=120)
@@ -15304,7 +15322,7 @@ def _generate_video_impl(
                                                 "-c:a", "aac", "-b:a", "192k",
                                                 "-map", "0:v:0",        # video from stitched
                                                 "-map", "1:a:0",        # audio from original
-                                                "-shortest",
+                                                "-t", str(mux_video_duration),
                                                 muxed_path
                                             ], capture_output=True, text=True, timeout=120)
                                             if mux_result.returncode == 0:

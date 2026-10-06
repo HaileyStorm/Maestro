@@ -329,7 +329,55 @@ class TestRetakeFrameRate(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.bounds(start, end, 300, 30, 250, 25)
 
-    def _write_video(self, path, frames, fps, *, engine_index=0):
+    def test_native_canvas_keeps_source_and_respects_smaller_preset(self):
+        tree = _wgp_tree()
+        block = next(node for node in ast.walk(tree)
+                     if isinstance(node, ast.Assign)
+                     and "get_vae_block_size" in ast.unparse(node))
+        override = next(node for node in ast.walk(tree)
+                        if isinstance(node, ast.If)
+                        and any(isinstance(child, ast.Assign)
+                                and ast.unparse(child) == "block_size = 32"
+                                for child in node.body))
+        canvas = next(node for node in ast.walk(tree)
+                      if isinstance(node, ast.Assign)
+                      and isinstance(node.targets[0], ast.Tuple)
+                      and ast.unparse(node.targets[0]) == "(width, height)"
+                      and "int(width) // block_size" in ast.unparse(node.value))
+        native = next(node for node in ast.walk(self.tree)
+                      if isinstance(node, ast.If)
+                      and ast.unparse(node.test).startswith("user_h > 0 and user_w > 0"))
+        code = compile(ast.Module(body=[block, override, canvas], type_ignores=[]),
+                       str(_WGP_PATH), "exec")
+        native_code = compile(ast.Module(body=[native], type_ignores=[]),
+                              str(self.model_path), "exec")
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.mp4"
+            source.touch()
+            cases = [
+                ("ltx2_22B", "native", str(source), (608, 352), (608, 352)),
+                ("ltx2_19B", "native", str(source), (608, 352), (608, 352)),
+                ("ltx2_22B", "native", str(source), (320, 192), (320, 192)),
+                ("ltx2_22B", "legacy", str(source), (608, 352), (576, 320)),
+                ("ltx2_22B", "native", None, (608, 352), (576, 320)),
+                ("ltx2_22B", "native", str(source) + ".missing", (608, 352), (576, 320)),
+                ("other_model", "native", str(source), (608, 352), (576, 320)),
+            ]
+            for model, engine, filename, requested, expected in cases:
+                with self.subTest(model=model, engine=engine, requested=requested):
+                    ns = {"os": os, "base_model_type": model,
+                          "model_handler": SimpleNamespace(get_vae_block_size=lambda _: 64),
+                          "retake_video": filename, "retake_engine": engine,
+                          "width": str(requested[0]), "height": str(requested[1])}
+                    exec(code, ns)
+                    self.assertEqual((ns["width"], ns["height"]), expected)
+                    if engine == "native" and filename == str(source) and model.startswith("ltx2"):
+                        ns.update(user_h=ns["height"], user_w=ns["width"], src_h=352, src_w=608)
+                        exec(native_code, ns)
+                        expected_native = (608, 352) if requested == (608, 352) else (320, 160)
+                        self.assertEqual((ns["aligned_w"], ns["aligned_h"]), expected_native)
+
+    def _write_video(self, path, frames, fps, *, engine_index=0, width=32, height=32):
         import av
 
         # Execute the native extraction's actual stream setup without loading models.
@@ -345,12 +393,12 @@ class TestRetakeFrameRate(unittest.TestCase):
             exec(compile(ast.Module(body=[stream_setup], type_ignores=[]),
                          str(self.model_path), "exec"), namespace)
             stream = namespace["stream"]
-            stream.width = stream.height = 32
+            stream.width, stream.height = width, height
             stream.pix_fmt = "yuv420p"
             stream.options = {"threads": "1"}
             for _ in range(frames):
                 frame = av.VideoFrame.from_ndarray(
-                    np.zeros((32, 32, 3), dtype=np.uint8), format="rgb24")
+                    np.zeros((height, width, 3), dtype=np.uint8), format="rgb24")
                 for packet in stream.encode(frame):
                     container.mux(packet)
             for packet in stream.encode():
@@ -406,6 +454,69 @@ class TestRetakeFrameRate(unittest.TestCase):
                 frame_count = sum(1 for _ in container.decode(video=0))
             self.assertEqual(frame_count, 240)
             self.assertAlmostEqual(duration, 240 / fps, places=3)
+
+    def test_real_audio_mux_keeps_full_and_partial_video_timeline(self):
+        import av
+        import gc
+        import time
+
+        tree = _wgp_tree()
+        stitch = next(node for node in ast.walk(tree)
+                      if isinstance(node, ast.If)
+                      and ast.unparse(node.test) == "sf > 0 or ef < tf")
+        # Execute both production mux branches, including the actual duration
+        # probe, with B-frame video and audio that ends before its final frame.
+        outer = next(node for node in ast.walk(tree)
+                     if isinstance(node, ast.Try)
+                     and any(isinstance(child, ast.Assign)
+                             and ast.unparse(child).startswith("video_probe =")
+                             for child in node.body))
+        begin = next(i for i, node in enumerate(outer.body)
+                     if isinstance(node, ast.Assign)
+                     and ast.unparse(node).startswith("video_probe ="))
+        end = next(i for i, node in enumerate(outer.body)
+                   if isinstance(node, ast.If)
+                   and ast.unparse(node.test).startswith("should_mux_original and"))
+        mux_code = compile(ast.Module(body=outer.body[begin:end + 1], type_ignores=[]),
+                           str(_WGP_PATH), "exec")
+        stitch_code = compile(ast.Module(body=[stitch], type_ignores=[]), str(_WGP_PATH), "exec")
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.mp4"
+            audio = Path(directory) / "source.wav"
+            source_with_audio = Path(directory) / "source_audio.mp4"
+            self._write_video(source, 124, 24, width=608, height=352)
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                            "sine=frequency=440:sample_rate=32000", "-t", "5.152", str(audio)],
+                           check=True, capture_output=True, timeout=30)
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(source), "-i", str(audio),
+                            "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
+                            str(source_with_audio)], check=True, capture_output=True, timeout=30)
+            for partial in (False, True):
+                for regenerate in (False, True):
+                    with self.subTest(partial=partial, regenerate=regenerate):
+                        output = Path(directory) / "output.mp4"
+                        sf, ef = (0, 124) if not partial else (24, 72)
+                        self._write_video(output, ef - sf, 24, width=608, height=352)
+                        ns = {"sf": sf, "ef": ef, "tf": 124, "stitch_fps": 24,
+                              "src": str(source), "retake_path": str(output), "path": str(output),
+                              "subprocess": subprocess, "os": os, "gc": gc, "time": time,
+                              "math": math, "retake_audio_path": str(audio),
+                              "si": {"original_video": str(source_with_audio), "regenerate_audio": regenerate}}
+                        with mock.patch("builtins.print"):
+                            exec(stitch_code, ns)
+                            exec(mux_code, ns)
+                        self.assertEqual(ns["mux_result"].returncode, 0, ns["mux_result"].stderr)
+                        with av.open(str(output)) as container:
+                            video = container.streams.video[0]
+                            self.assertEqual(video.average_rate, Fraction(24))
+                            self.assertEqual((video.width, video.height), (608, 352))
+                            self.assertAlmostEqual(float(video.duration * video.time_base), 124 / 24, places=3)
+                            self.assertEqual(sum(1 for _ in container.decode(video=0)), 124)
+                        with av.open(str(output)) as container:
+                            audio_stream = container.streams.audio[0]
+                            self.assertLessEqual(float(audio_stream.duration * audio_stream.time_base), 124 / 24 + .04)
+                            if not regenerate:
+                                self.assertAlmostEqual(float(audio_stream.duration * audio_stream.time_base), 5.152, delta=.04)
 
     def test_partial_result_uses_segment_clock_for_encoding_and_completeness(self):
         tree = _wgp_tree()

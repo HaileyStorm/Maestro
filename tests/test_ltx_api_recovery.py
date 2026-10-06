@@ -31,7 +31,7 @@ class LtxApiRecoveryTests(unittest.TestCase):
 
     def normalize_audio(self, body, enabled=True):
         generate = function(self.tree, 'generate')
-        block = next(node for node in generate.body if isinstance(node, ast.If) and 'infer_audio_prompt_from_guide' in ast.unparse(node.test))
+        block = next(node for node in ast.walk(generate) if isinstance(node, ast.If) and 'infer_audio_prompt_from_guide' in ast.unparse(node.test))
         namespace = {'body': body, '_generation_model_def': {'infer_audio_prompt_from_guide': enabled}, 'HTTPException': HTTPException}
         exec(compile(ast.Module(body=[block], type_ignores=[]), str(SOURCE), 'exec'), namespace)
         return body
