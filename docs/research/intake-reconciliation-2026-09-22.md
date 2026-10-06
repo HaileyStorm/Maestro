@@ -796,3 +796,44 @@ the selected original rather than the mirrored take; both source hashes stayed
 unchanged. Local and stable-share health/readiness and matching built assets
 passed after the coordinated Pinokio restart. Windows/LAN and human quality
 acceptance remain separate.
+
+## October 6 follow-on: ordinary Editor export publication recovery
+
+Ordinary Editor exports now seal the original request, project incarnation,
+output policy, render settings and exact media/metadata hashes and file identities
+before create-only publication. Recovery adopts a complete matching pair without
+another encode. A matching metadata-only orphan is retracted before one fresh
+encode. Changed sources and foreign replacements preserve their evidence;
+cancellation cleanup does not require consumed sources, remains durable while
+blocked, and settles exact absence before queue retirement. The Blender
+composition recovery branch keeps its separate contract.
+
+Startup holds publication evidence for review before generic reconciliation can
+move files. An owner Retry binds completion to the original producing attempt
+and the newly admitted attempt in one durable transition; it can adopt only the
+verified complete pair. A changed or partial pair after that admission stays
+held without another render.
+
+Real POSIX process-kill checks use CPU FFmpeg media and a reopened durable
+journal. They exercise both publication boundaries, exact adoption, cancellation,
+interrupted cleanup, native Retry and foreign-file races. All 120 affected
+checks passed, including cancellation with the real lifecycle lock. These
+checks do not establish a live
+service interruption, Windows/LAN behavior or human quality acceptance.
+
+## October 6 follow-on: private native PDD FL2VA qualification
+
+The pinned private candidate completed eight paired video/audio evaluations
+with FP32 fused head banks. Actual MMGP insertion matched 254 numeric values
+across 50 AdaLN and 52 fused QKV targets. Native output was finite at
+320×192 with 124 frames and stereo 32 kHz audio. Pristine runtime and attention
+bindings were restored and the native model was released. The bounded guardian
+stopped its owned child, drained the unit and withdrew the exact GPU lease;
+fresh negative authority confirmation and controller process-absence checks
+passed. Independent source/receipt review found no success-path acceptance
+blocker. Earlier failures remain retained evidence.
+
+This qualifies this exact small private FL2VA configuration. Ref2VA success,
+native cancellation/error paths, full-resolution and conditioning coverage,
+synchronization, visual/listening quality and speed remain open. Production PDD
+admission remains closed.

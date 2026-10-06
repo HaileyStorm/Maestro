@@ -104,11 +104,14 @@ def processed_tool_publication_pending(job: Mapping[str, Any]) -> bool:
     """Cancelled publication evidence remains live until exact rollback settles."""
     cursor = job.get("recovery_cursor")
     return bool(
-        job.get("kind") in {"tool_upscale", "tool_revoice", "tool_hflip", "tool_browser_copy"}
+        (job.get("kind") in {"tool_upscale", "tool_revoice", "tool_hflip", "tool_browser_copy"}
+         or (job.get("kind") == "tool_editor_export" and isinstance(cursor, Mapping)
+             and "composition" not in cursor))
         and (str(job.get("status") or "").casefold() in {"cancelled", "canceled"}
              or job.get("cancel_requested"))
         and isinstance(cursor, Mapping)
-        and "processed_tool_publication" in cursor
+        and ("editor_export_publication" if job.get("kind") == "tool_editor_export"
+             else "processed_tool_publication") in cursor
     )
 
 

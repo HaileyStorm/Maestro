@@ -21,6 +21,7 @@ import types
 from unittest.mock import patch
 
 import test_tool_input_execution as tool_fixture
+import test_editor_export_route as editor_fixture
 from services.queue_recovery import QueueRecoveryJournal
 from services.video_transform import horizontal_flip
 from services.atomic_file_publish import publish_file_no_replace
@@ -462,6 +463,390 @@ class ToolProcessCrashTests(unittest.TestCase):
         coordinator, _ = self.startup()
         self.assertNotIn(self.job['id'], coordinator.restore().jobs)
         self.assertEqual(self.encodes(), ['encode'])
+
+
+def run_editor_worker(fixture, journal_path, counter, boundary, connection):
+    os.setsid()
+    coordinator = QueueRecoveryCoordinator(QueueRecoveryJournal(journal_path))
+    snapshot = next(iter(coordinator.restore().jobs.values()))
+    job = dict(snapshot, session_id=None, access_policy={key: snapshot[key] for key in ('private', 'explicit')},
+               _recovery_owner_digest=snapshot['owner_principal'], _recovery_project_digest=snapshot['project_instance'],
+               _recovery_manifest_pointer=snapshot['request_manifest'])
+    job['params'] = load_request_manifest(fixture.project, snapshot['request_manifest'], expected_job_id=job['id'])['params']
+    job['status'] = 'queued'
+    ns = fixture.ns
+    ns['_jobs'] = {job['id']: job}
+    job_lifecycle._reset_queue_state_for_tests()
+    job_lifecycle.configure_durability_hook(coordinator.prospective_transition)
+    ns.update(try_start=job_lifecycle.try_start, _queue_recovery_checkpoint=job_lifecycle.checkpoint_recovery_job,
+              is_cancel_requested=job_lifecycle.is_cancel_requested)
+    def barrier():
+        if boundary == 'cancel-completion':
+            job_lifecycle.request_cancel(job)
+        connection.send(boundary)
+        connection.recv()
+        raise AssertionError('Owned crash barrier unexpectedly released')
+    def finish(current, status, **updates):
+        if boundary in {'completion', 'cancel-completion'} and status == 'completed':
+            barrier()
+        if boundary == 'completion-error' and status == 'completed':
+            raise editor_fixture.QueueRecoveryAdapterError('synthetic completion persistence failure')
+        return job_lifecycle.finish_job(current, status, **updates)
+    ns['finish_job'] = finish
+    from services.editor_export import render_single_source_cut
+    def encode(*args, **kwargs):
+        with open(counter, 'a') as handle:
+            handle.write('encode\n'); handle.flush(); os.fsync(handle.fileno())
+        return render_single_source_cut(*args, **kwargs)
+    def publish(source, destination):
+        if boundary == 'media' and str(destination).endswith('.mp4'):
+            barrier()
+        return publish_file_no_replace(source, destination)
+    with patch('services.editor_export.render_single_source_cut', encode), \
+            patch('services.atomic_file_publish.publish_file_no_replace', publish):
+        result = ns['_run_tool_editor_export'](job['id'])
+    connection.send({'result': result, 'status': job['status']})
+
+
+@unittest.skipUnless('fork' in multiprocessing.get_all_start_methods() and shutil.which('ffmpeg'),
+                     'POSIX fork and FFmpeg required')
+class EditorExportProcessCrashTests(unittest.TestCase):
+    def setUp(self):
+        from services.editor_projects import create_output_video_timeline, save_editor_project, probe_media
+        self.fixture = editor_fixture.EditorExportRouteTests('test_worker_publishes_a_private_final_copy_with_cut_provenance')
+        self.fixture.setUp(); self.addCleanup(self.fixture.doCleanups)
+        subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-f', 'lavfi', '-i',
+            'testsrc2=s=128x72:r=24:d=1', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=32000:duration=1',
+            '-c:v', 'libx264', '-threads', '2', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest',
+            str(self.fixture.source)], check=True, capture_output=True, timeout=15)
+        self.fixture.timeline = save_editor_project(str(self.fixture.outputs), 'scene',
+            create_output_video_timeline(workspace='scene', output_name='source.mp4',
+                output_revision=self.fixture.source_revision(), media=probe_media(str(self.fixture.source))), expected_revision=0)
+        self.job = self.fixture.worker_namespace()
+        self.owner = 'owner:v1:' + 'a' * 64
+        self.project_digest = 'project:v1:' + 'b' * 64
+        self.fixture.ns['_queue_recovery_existing_project_identity'] = lambda _: self.project_digest
+        self.job.update(_recovery_owner_digest=self.owner, _recovery_project_digest=self.project_digest)
+        self.journal_path = self.fixture.root / 'registered-editor.jsonl'
+        QueueRecoveryCoordinator(QueueRecoveryJournal(self.journal_path)).register_job(self.job,
+            owner_digest=self.owner, project_digest=self.project_digest, request_manifest=self.job['_recovery_manifest_pointer'])
+        self.manifest = self.fixture.project / self.job['_recovery_manifest_pointer']['path']
+        from services.queue_recovery_runtime import ensure_recovery_staging_directory
+        self.staged = Path(ensure_recovery_staging_directory(self.fixture.project)) / f"unit-{self.job['id']}-pending.bin"
+        self.staged.write_bytes(b'retained private staging')
+        self.source_seal = self.snapshot(self.fixture.source), self.snapshot(self.fixture.source.with_suffix('.meta.json'))
+        self.counter = self.fixture.root / 'editor-encode-count'
+        self.context = multiprocessing.get_context('fork')
+
+    @staticmethod
+    def snapshot(path):
+        info = path.stat()
+        return hashlib.sha256(path.read_bytes()).hexdigest(), info.st_ino, info.st_size, info.st_mtime_ns
+
+    def output(self):
+        return self.fixture.project / f"editor_cut_{self.job['id']}.mp4"
+
+    def persisted(self):
+        return QueueRecoveryCoordinator(QueueRecoveryJournal(self.journal_path)).restore().jobs[self.job['id']]
+
+    def spawn(self, boundary=None):
+        parent, child = self.context.Pipe()
+        process = self.context.Process(target=run_editor_worker,
+            args=(self.fixture, self.journal_path, self.counter, boundary, child))
+        process.start(); child.close()
+        def cleanup():
+            if process.is_alive():
+                try: os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError: process.kill()
+            process.join(5); parent.close(); process.close()
+        self.addCleanup(cleanup)
+        return process, parent
+
+    def crash(self, boundary):
+        process, connection = self.spawn(boundary)
+        self.assertTrue(connection.poll(20), 'Editor worker did not reach publication boundary')
+        self.assertEqual(connection.recv(), boundary)
+        self.assertIn('editor_export_publication', self.persisted()['recovery_cursor'])
+        self.assertEqual(self.persisted()['status'], 'cancelled' if boundary == 'cancel-completion' else 'running')
+        process.kill(); process.join(5)
+        self.assertEqual(process.exitcode, -signal.SIGKILL)
+
+    def resume(self, status='completed'):
+        process, connection = self.spawn()
+        self.assertTrue(connection.poll(20), 'Editor recovery did not finish')
+        self.assertEqual(connection.recv(), {'result': status == 'completed', 'status': status})
+        process.join(5); self.assertEqual(process.exitcode, 0)
+        self.assertEqual(self.persisted()['status'], status)
+
+    def startup(self):
+        class Registry(dict):
+            def prepare(self, job): return job
+            def publish_prepared(self, job_id, job): self[job_id] = job
+        coordinator = QueueRecoveryCoordinator(QueueRecoveryJournal(self.journal_path))
+        ns = self.fixture.ns
+        job_lifecycle._reset_queue_state_for_tests()
+        self.addCleanup(job_lifecycle._reset_queue_state_for_tests)
+        job_lifecycle.configure_durability_hook(coordinator.prospective_transition)
+        workers = []
+        ns.update(_queue_recovery_coordinator=coordinator, _queue_recovery_restored=coordinator.restore(),
+            _queue_recovery_workers_started=False, _jobs=Registry(),
+            _queue_recovery_existing_projects=lambda: {'scene': (str(self.fixture.project), self.project_digest)},
+            _queue_recovery_checkpoint=job_lifecycle.checkpoint_recovery_job,
+            AUTOMATIC_RETIREMENT_STATUSES=AUTOMATIC_RETIREMENT_STATUSES,
+            _CREDIT_CLEANUP_PARAM='credit_cleanup', restore_scheduler_state=lambda *_: None,
+            cleanup_orphan_request_manifests=cleanup_orphan_request_manifests,
+            cleanup_orphan_staged_outputs=cleanup_orphan_staged_outputs,
+            _queue_recovery_worker=lambda job: workers.append(job['id']),
+            _queue_recovery_delivery_pending=lambda _: None, _require_job_runtime_model_admission=lambda _: None,
+            Mapping=dict)
+        tool_fixture.load(ns, '_h3_cow_manual_source_supported', '_require_h3_offload_plan_parity',
+            '_queue_recovery_materialize_job', '_restore_h3_prompt_rewriter_cleanup',
+            '_restore_queue_recovery_on_startup', '_cleanup_cancelled_processed_tool_output')
+        self.assertTrue(ns['_restore_queue_recovery_on_startup']())
+        self.assertEqual(workers, [])
+        return coordinator, ns['_jobs'][self.job['id']]
+
+    def failed_pair(self):
+        process, connection = self.spawn('completion-error')
+        self.assertTrue(connection.poll(20))
+        self.assertEqual(connection.recv(), {'result': False, 'status': 'failed'})
+        process.join(5); self.assertEqual(process.exitcode, 0)
+        self.assertTrue(self.output().exists()); self.assertTrue(self.output().with_suffix('.meta.json').exists())
+        self.assertEqual(self.persisted()['execution_attempt'], 1)
+        return self.startup()[1]
+
+    def native_retry(self, job, *, on_dispatch=None):
+        from services.queue_recovery_runtime import next_recovery_attempt, MAX_RECOVERY_ATTEMPTS
+        from fastapi import Response
+        ns = self.fixture.ns
+        scheduled = []
+        class DeferredThread:
+            def __init__(self, *, target, args, daemon, name):
+                self.target, self.args = target, args
+            def start(self):
+                scheduled.append((self.target, self.args))
+                if on_dispatch is not None: on_dispatch()
+        ns.update(_queue_recovery_checkpoint_lock=threading.RLock(),
+            validate_manifest_inputs=validate_manifest_inputs,
+            try_start=job_lifecycle.try_start, finish_job=job_lifecycle.finish_job,
+            is_cancel_requested=job_lifecycle.is_cancel_requested,
+            _require_owned_job=lambda job_id, request: ns['_jobs'][job_id],
+            _require_project_access=lambda request, workspace, *, permission: str(self.fixture.project),
+            owner_principal_digest=lambda secret, session: self.owner, _session_secret=lambda: b'test',
+            _queue_recovery_worker=lambda job: ns['_run_tool_editor_export'],
+            _queue_recovery_delivery_pending=lambda _: None, _require_job_runtime_model_admission=lambda _: None,
+            _h3_native_boundary_exact_retry_allowed=lambda _: False,
+            _QUEUE_RECOVERY_REASON_TEXT={'generation_failed':'Generation failed'},
+            _BLOCKED_QUEUE_RECOVERY_STATES={'blocked','blocked_remote_reauth','blocked_preparation'},
+            _h3_ordinary_oom_hold=lambda _: False,
+            next_recovery_attempt=next_recovery_attempt, MAX_RECOVERY_ATTEMPTS=MAX_RECOVERY_ATTEMPTS,
+            retry_failed_recovery_job=job_lifecycle.retry_failed_recovery_job,
+            update_queue_job=job_lifecycle.update_queue_job,
+            threading=types.SimpleNamespace(Thread=DeferredThread))
+        editor_fixture.load_functions(ns, '_queue_recovery_revalidate_job', '_queue_recovery_reason_code',
+            '_queue_recovery_is_blocked', '_queue_recovery_attempt', '_resume_recovered_job',
+            '_set_recovery_no_store', 'retry_recovered_job')
+        request = types.SimpleNamespace(state=types.SimpleNamespace(maestro_session_id='owner-session'))
+        result = ns['retry_recovered_job'](job['id'], request, Response())
+        return result, scheduled, request
+
+    def test_non_cancelled_actual_startup_preserves_foreign_publication_members(self):
+        self.crash('completion')
+        output = self.output(); sidecar = output.with_suffix('.meta.json')
+        for member in (output, sidecar):
+            original = member.read_bytes()
+            member.write_bytes(b'foreign' + original)
+            before = self.snapshot(output), self.snapshot(sidecar)
+            coordinator, job = self.startup()
+            self.assertEqual((self.snapshot(output), self.snapshot(sidecar)), before)
+            self.assertTrue(job['queue_held']); self.assertEqual(job['recovery_state'], 'blocked')
+            self.assertTrue(self.manifest.exists()); self.assertTrue(self.staged.exists())
+            self.assertIn('editor_export_publication', coordinator.restore().jobs[job['id']]['recovery_cursor'])
+            member.write_bytes(original)
+        self.assertEqual(self.counter.read_text().splitlines(), ['encode'])
+
+    def test_native_retry_atomically_admits_completion_only_and_adopts_without_encode(self):
+        job = self.failed_pair()
+        original_intent = copy.deepcopy(job['recovery_cursor']['editor_export_publication'])
+        before = self.snapshot(self.output()), self.snapshot(self.output().with_suffix('.meta.json'))
+        result, scheduled, request = self.native_retry(job)
+        self.assertEqual(result['status'], 'queued'); self.assertEqual(len(scheduled), 1)
+        durable = self.persisted()
+        self.assertEqual(durable['execution_attempt'], 2)
+        self.assertEqual(durable['recovery_cursor']['editor_export_publication'], original_intent)
+        self.assertEqual(durable['recovery_cursor']['editor_export_completion_retry'], {
+            'producing_execution_attempt':1,'execution_attempt':2,'producer_unit_id':original_intent['producer_unit_id']})
+        with self.assertRaises(editor_fixture.HTTPException) as duplicate:
+            self.fixture.ns['retry_recovered_job'](job['id'], request, types.SimpleNamespace(headers={}))
+        self.assertEqual(duplicate.exception.status_code, 409)
+        self.assertEqual(len(scheduled), 1)
+        worker, args = scheduled[0]
+        self.assertTrue(worker(*args))
+        self.assertEqual(self.persisted()['status'], 'completed')
+        self.assertEqual(self.persisted()['execution_attempt'], 2)
+        self.assertEqual((self.snapshot(self.output()), self.snapshot(self.output().with_suffix('.meta.json'))), before)
+        self.assertEqual(self.counter.read_text().splitlines(), ['encode'])
+
+    def test_native_completion_retry_cancellation_cleans_original_attempt_without_inputs(self):
+        job = self.failed_pair()
+        _result, scheduled, _request = self.native_retry(job)
+        self.assertTrue(job_lifecycle.request_cancel(job).changed)
+        self.fixture.source.unlink()
+        coordinator, restored = self.startup()
+        self.assertFalse(self.output().exists()); self.assertFalse(self.output().with_suffix('.meta.json').exists())
+        self.assertEqual(restored['status'], 'cancelled'); self.assertFalse(restored['queue_held'])
+        self.assertNotIn(job['id'], coordinator.restore().jobs)
+        self.assertFalse(self.manifest.exists())
+        self.assertEqual(len(scheduled), 1)
+        self.assertEqual(self.counter.read_text().splitlines(), ['encode'])
+
+    def test_completion_only_pair_becoming_partial_cannot_reencode_or_retract_survivor(self):
+        job = self.failed_pair()
+        _result, scheduled, _request = self.native_retry(job)
+        self.output().unlink()
+        sidecar = self.output().with_suffix('.meta.json'); before = self.snapshot(sidecar)
+        worker, args = scheduled[0]
+        self.assertFalse(worker(*args))
+        self.assertEqual(self.snapshot(sidecar), before)
+        self.assertEqual(self.persisted()['status'], 'failed')
+        self.assertEqual(self.persisted()['recovery_state'], 'blocked')
+        self.assertIn('editor_export_completion_retry', self.persisted()['recovery_cursor'])
+        self.assertEqual(self.counter.read_text().splitlines(), ['encode'])
+
+    def test_cancel_at_native_retry_dispatch_is_final_and_retracts_bound_pair(self):
+        job = self.failed_pair()
+        def cancel():
+            self.assertTrue(job_lifecycle.request_cancel(job).changed)
+        _result, scheduled, _request = self.native_retry(job, on_dispatch=cancel)
+        self.assertEqual(self.persisted()['status'], 'cancelled')
+        self.assertEqual(self.persisted()['execution_attempt'], 2)
+        self.assertEqual(len(scheduled), 1)
+        self.fixture.ns.update(generation_slot=job_lifecycle.generation_slot, _gen_lock=threading.Lock())
+        worker, args = scheduled[0]
+        self.assertFalse(worker(*args))
+        self.assertEqual(self.persisted()['status'], 'cancelled')
+        self.assertNotIn('editor_export_publication', self.persisted()['recovery_cursor'])
+        self.assertFalse(self.output().exists()); self.assertFalse(self.output().with_suffix('.meta.json').exists())
+        self.assertEqual(self.counter.read_text().splitlines(), ['encode'])
+
+    def test_editor_sigkill_pair_adopts_exact_bytes_without_second_encode(self):
+        self.crash('completion')
+        output = self.output(); sidecar = output.with_suffix('.meta.json')
+        seals = self.snapshot(output), self.snapshot(sidecar)
+        self.resume()
+        self.assertEqual(self.counter.read_text().splitlines(), ['encode'])
+        self.assertEqual((self.snapshot(output), self.snapshot(sidecar)), seals)
+        metadata = json.loads(sidecar.read_bytes())
+        self.assertTrue(metadata['private']); self.assertTrue(metadata['explicit'])
+        self.assertEqual(metadata['producer_media_sha256'], seals[0][0])
+        self.assertEqual(metadata['transform']['editor_project_id'], self.fixture.timeline['id'])
+        self.assertEqual(self.persisted()['output_files'], [output.name])
+        self.assertEqual(len(list(self.fixture.project.glob('editor_cut_*.mp4'))), 1)
+        self.assertEqual((self.snapshot(self.fixture.source), self.snapshot(self.fixture.source.with_suffix('.meta.json'))), self.source_seal)
+
+    def test_editor_sigkill_sidecar_retracts_orphan_then_encodes_once(self):
+        self.crash('media')
+        self.assertFalse(self.output().exists()); self.assertTrue(self.output().with_suffix('.meta.json').exists())
+        self.resume()
+        self.assertEqual(self.counter.read_text().splitlines(), ['encode', 'encode'])
+        self.assertEqual(len(list(self.fixture.project.glob('editor_cut_*.mp4'))), 1)
+        self.assertEqual((self.snapshot(self.fixture.source), self.snapshot(self.fixture.source.with_suffix('.meta.json'))), self.source_seal)
+
+    def test_editor_pair_source_change_prevents_adoption_and_encode(self):
+        self.crash('completion')
+        self.fixture.source.write_bytes(b'changed input')
+        self.resume('failed')
+        self.assertEqual(self.counter.read_text().splitlines(), ['encode'])
+        self.assertEqual(self.persisted()['output_files'], [])
+        self.assertTrue(self.output().exists())
+
+    def test_editor_replaced_identical_output_is_preserved_and_never_adopted(self):
+        self.crash('completion')
+        output = self.output(); sidecar = output.with_suffix('.meta.json')
+        original = output.read_bytes()
+        replacement = output.with_suffix('.foreign')
+        replacement.write_bytes(original); os.replace(replacement, output)
+        foreign = self.snapshot(output), self.snapshot(sidecar)
+        self.resume('failed')
+        self.assertEqual(self.counter.read_text().splitlines(), ['encode'])
+        self.assertEqual((self.snapshot(output), self.snapshot(sidecar)), foreign)
+        self.assertEqual(self.persisted()['output_files'], [])
+        self.assertEqual(self.persisted()['recovery_state'], 'blocked')
+
+    def test_cancelled_editor_pair_cleanup_after_restart_needs_no_consumed_input(self):
+        self.crash('cancel-completion')
+        self.fixture.source.unlink()
+        coordinator, job = self.startup()
+        self.assertNotIn(self.job['id'], coordinator.restore().jobs)
+        self.assertNotIn('editor_export_publication', job['recovery_cursor'])
+        self.assertEqual(job['status'], 'cancelled'); self.assertFalse(job['queue_held'])
+        self.assertFalse(self.output().exists()); self.assertFalse(self.output().with_suffix('.meta.json').exists())
+        self.assertFalse(self.manifest.exists())
+        self.assertFalse(self.staged.exists())
+        self.assertEqual(self.counter.read_text().splitlines(), ['encode'])
+
+    def test_cancelled_editor_partial_unlink_or_foreign_member_holds_until_exact_cleanup(self):
+        self.crash('cancel-completion')
+        sidecar = self.output().with_suffix('.meta.json')
+        original = sidecar.read_bytes()
+        sidecar.write_bytes(b'foreign metadata')
+        coordinator, job = self.startup()
+        self.assertEqual(sidecar.read_bytes(), b'foreign metadata'); self.assertTrue(self.output().exists())
+        self.assertEqual(job['recovery_state'], 'cleanup_blocked'); self.assertTrue(self.manifest.exists())
+        self.assertTrue(self.staged.exists())
+        self.assertTrue(processed_tool_publication_pending(coordinator.restore().jobs[self.job['id']]))
+        sidecar.write_bytes(original)
+        remove = os.remove
+        def interrupted(path, *args, **kwargs):
+            if str(path) == str(sidecar): raise OSError('synthetic interrupted second unlink')
+            return remove(path, *args, **kwargs)
+        with patch('os.remove', interrupted):
+            coordinator, job = self.startup()
+        self.assertFalse(self.output().exists()); self.assertTrue(sidecar.exists())
+        self.assertEqual(job['recovery_state'], 'cleanup_blocked')
+        coordinator, job = self.startup()
+        self.assertFalse(sidecar.exists()); self.assertFalse(job['queue_held'])
+        self.assertEqual(job['recovery_state'], 'cancelled'); self.assertIsNone(job.get('_recovery_reason_code'))
+        self.assertNotIn(self.job['id'], coordinator.restore().jobs)
+        self.assertEqual(self.counter.read_text().splitlines(), ['encode'])
+
+    def test_cancelled_editor_posthash_same_inode_mutation_is_not_deleted(self):
+        self.crash('cancel-completion')
+        output = self.output(); original = output.read_bytes(); before = output.stat()
+        hash_file = self.fixture.ns['_recovery_sha256_file']
+        def mutate(path, **kwargs):
+            result = hash_file(path, **kwargs)
+            if str(path) == str(output):
+                output.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
+                os.utime(output, ns=(before.st_atime_ns, before.st_mtime_ns))
+            return result
+        with patch.dict(self.fixture.ns, _recovery_sha256_file=mutate):
+            coordinator, job = self.startup()
+        self.assertEqual(output.stat().st_ino, before.st_ino)
+        self.assertEqual(output.stat().st_mtime_ns, before.st_mtime_ns)
+        self.assertNotEqual(output.read_bytes(), original)
+        self.assertTrue(output.with_suffix('.meta.json').exists())
+        self.assertEqual(job['recovery_state'], 'cleanup_blocked')
+        self.assertTrue(processed_tool_publication_pending(coordinator.restore().jobs[self.job['id']]))
+        self.assertTrue(self.manifest.exists()); self.assertTrue(self.staged.exists())
+
+    def test_cancelled_editor_directory_sync_failure_retains_intent_until_second_startup(self):
+        self.crash('cancel-completion')
+        self.fixture.source.unlink()
+        from services.queue_recovery_runtime import _fsync_directory
+        def fail_sync(path):
+            if str(path) == str(self.fixture.project): raise OSError('synthetic directory sync failure')
+            return _fsync_directory(path)
+        with patch('services.queue_recovery_runtime._fsync_directory', fail_sync):
+            coordinator, job = self.startup()
+        self.assertFalse(self.output().exists()); self.assertFalse(self.output().with_suffix('.meta.json').exists())
+        self.assertTrue(processed_tool_publication_pending(coordinator.restore().jobs[self.job['id']]))
+        self.assertEqual(job['recovery_state'], 'cleanup_blocked')
+        self.assertTrue(self.manifest.exists()); self.assertTrue(self.staged.exists())
+        coordinator, job = self.startup()
+        self.assertNotIn(self.job['id'], coordinator.restore().jobs)
+        self.assertEqual(job['recovery_state'], 'cancelled'); self.assertFalse(job['queue_held'])
+        self.assertFalse(self.manifest.exists()); self.assertFalse(self.staged.exists())
 
 
 if __name__ == '__main__':

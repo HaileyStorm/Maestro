@@ -7407,10 +7407,12 @@ def _queue_recovery_materialize_job(
         "_recovery_project_digest": expected_project,
         "_recovery_manifest_pointer": dict(snapshot.get("request_manifest") or {}),
     })
-    if (snapshot.get("kind") in {"tool_upscale", "tool_revoice", "tool_hflip", "tool_browser_copy"}
+    if (snapshot.get("kind") in {"tool_upscale", "tool_revoice", "tool_hflip", "tool_browser_copy", "tool_editor_export"}
             and (str(snapshot.get("status") or "").casefold() in {"cancelled", "canceled"}
                  or snapshot.get("cancel_requested"))
-            and "processed_tool_publication" in (snapshot.get("recovery_cursor") or {})):
+            and ("editor_export_publication" if snapshot.get("kind") == "tool_editor_export"
+                 else "processed_tool_publication") in (snapshot.get("recovery_cursor") or {})
+            and "composition" not in (snapshot.get("recovery_cursor") or {})):
         current = projects.get(workspace)
         if current is not None and hmac.compare_digest(current[1], expected_project):
             runtime["out_dir"] = current[0]
@@ -7422,6 +7424,10 @@ def _queue_recovery_materialize_job(
             except (KeyError, TypeError, ValueError, OSError, QueueRecoveryRuntimeError):
                 pass
         return runtime, False
+    if (snapshot.get("kind") == "tool_editor_export"
+            and "editor_export_publication" in (snapshot.get("recovery_cursor") or {})
+            and "composition" not in (snapshot.get("recovery_cursor") or {})):
+        return _materialize_editor_export_publication(runtime, snapshot, projects)
     if snapshot.get("kind") == "tool_editor_export" and "composition" in (snapshot.get("recovery_cursor") or {}):
         return _composition_materialize_job(snapshot, projects)
     special_h3 = (snapshot.get("kind") == "studio_h3_delivery_recovery"
@@ -66606,7 +66612,7 @@ def _inherit_media_access_policy(
     return {"private": private, "explicit": explicit}
 
 
-def _write_tool_sidecar(out_dir, filename, *, source_name, tool, params, elapsed, job_id, source_revision=None, producer=None, before_publish=None):
+def _write_tool_sidecar(out_dir, filename, *, source_name, tool, params, elapsed, job_id, source_revision=None, producer=None, before_publish=None, before_publish_file=None, preserve_published_on_error=False):
     """Publish access-stamped tool metadata; transforms retain source settings."""
     sidecar = {
         "params": dict(params) if tool in {"hflip", "editor_export", "browser_copy"} else {**params, "edit_sub_mode": tool},
@@ -66707,11 +66713,14 @@ def _write_tool_sidecar(out_dir, filename, *, source_name, tool, params, elapsed
             os.fsync(f.fileno())
         if before_publish is not None:
             before_publish(payload)
+        if before_publish_file is not None:
+            before_publish_file(payload, temp_path)
         from services.atomic_file_publish import publish_file_no_replace
         publish_file_no_replace(temp_path, meta_path)
         metadata_owned = True
     except Exception as exc:
-        cleanup_paths = (temp_path, meta_path) if (metadata_owned or isinstance(exc, PublishedFileDurabilityError)) else (temp_path,)
+        cleanup_paths = (temp_path, meta_path) if (not preserve_published_on_error and
+            (metadata_owned or isinstance(exc, PublishedFileDurabilityError))) else (temp_path,)
         for path in cleanup_paths:
             try:
                 os.remove(path)
@@ -67151,12 +67160,291 @@ async def tools_browser_copy(request: Request):
         _browser_copy_preflight_release(preflight_key, preflight)
 
 
+def _editor_export_context(job, *, validate_inputs=True):
+    from services.queue_recovery_runtime import validate_manifest_inputs
+
+    project_dir = _existing_workspace_dir(job["workspace"])
+    if (job.get("kind") != "tool_editor_export"
+            or "composition" in (job.get("recovery_cursor") or {})
+            or "composition_package" in job.get("params", {})
+            or not job.get("_recovery_owner_digest")
+            or not hmac.compare_digest(str(job.get("_recovery_project_digest") or ""),
+                                       _queue_recovery_existing_project_identity(project_dir))):
+        raise ValueError("The Editor request ownership changed.")
+    manifest = load_request_manifest(project_dir, job["_recovery_manifest_pointer"], expected_job_id=job["id"])
+    params = job["params"]
+    if manifest.get("params") != params:
+        raise ValueError("The Editor request settings changed.")
+    policy = {key: job.get(key) for key in ("private", "explicit")}
+    if any(type(value) is not bool or (job.get("access_policy") or {}).get(key) is not value
+           for key, value in policy.items()):
+        raise ValueError("The Editor output privacy changed.")
+    settings = {"tool_kind": "tool_editor_export", "request_manifest": dict(job["_recovery_manifest_pointer"]),
+                "output_policy": policy,
+                "editor_settings_sha256": hashlib.sha256(json.dumps(params, sort_keys=True,
+                    separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()}
+    if validate_inputs:
+        expected = []
+        for key in ("editor_audio_path", "editor_image_path", "editor_source_path"):
+            values = params.get(key)
+            values = values if isinstance(values, list) else [values] if values is not None else []
+            expected.extend((f"{key}:{index}", path) for index, path in enumerate(values))
+        descriptors = manifest.get("inputs")
+        if (not expected or not isinstance(descriptors, list)
+                or [(item.get("field"), item.get("path")) for item in descriptors
+                    if isinstance(item, dict)] != expected):
+            raise ValueError("The Editor input closure changed.")
+        def validate(descriptor):
+            if descriptor.get("scope") == "derived":
+                # Original request authorization is process-local, never restored.
+                return bool(job.get("session_id")) and _recovery_sha256_file(descriptor["path"]) == (
+                    descriptor.get("size"), descriptor.get("sha256"))
+            return _queue_recovery_manifest_validator(descriptor, owner_digest=job["_recovery_owner_digest"],
+                workspace=job["workspace"], project_dir=project_dir)
+        validate_manifest_inputs(manifest, validate)
+    return project_dir, settings
+
+
+def _editor_export_publication_members(job):
+    """Verify each surviving member independently, including partial rollback."""
+    import stat
+
+    project_dir, settings = _editor_export_context(job, validate_inputs=False)
+    intent = job["recovery_cursor"]["editor_export_publication"]
+    unit_id = recovery_unit_id(job["id"], "ordinary_repeat", variant=0, index=0, settings=settings)
+    filename = f"editor_cut_{job['id']}.mp4"
+    expected = {"schema_version": 1, "job_id": job["id"], "workspace": job["workspace"],
+                "owner_principal": job["_recovery_owner_digest"], "project_instance": job["_recovery_project_digest"],
+                "execution_attempt": job.get("execution_attempt", 1),
+                "request_manifest": job["_recovery_manifest_pointer"], "settings": settings,
+                "producer_unit_id": unit_id}
+    completion_retry = job["recovery_cursor"].get("editor_export_completion_retry")
+    if completion_retry is not None:
+        if (not isinstance(completion_retry, dict)
+                or set(completion_retry) != {"producing_execution_attempt", "execution_attempt", "producer_unit_id"}
+                or type(job.get("execution_attempt", 1)) is not int
+                or type(completion_retry.get("producing_execution_attempt")) is not int
+                or not 1 <= completion_retry["producing_execution_attempt"] <= job.get("execution_attempt", 1)
+                or completion_retry.get("execution_attempt") != job.get("execution_attempt", 1)
+                or type(completion_retry.get("execution_attempt")) is not int
+                or completion_retry.get("producer_unit_id") != unit_id):
+            raise ValueError("The Editor completion retry identity changed.")
+        expected["execution_attempt"] = completion_retry["producing_execution_attempt"]
+    if (not isinstance(intent, dict) or set(intent) != set(expected) | {"media", "sidecar"}
+            or any(intent.get(key) != value for key, value in expected.items())
+            or type(intent.get("execution_attempt")) is not int or intent["execution_attempt"] < 1):
+        raise ValueError("The Editor publication identity changed.")
+    survivors = []
+    for key, name in (("media", filename), ("sidecar", filename[:-4] + ".meta.json")):
+        descriptor = intent.get(key)
+        if (not isinstance(descriptor, dict) or set(descriptor) != {"basename", "size", "sha256", "file_id"}
+                or descriptor.get("basename") != name or os.path.basename(name) != name
+                or "/" in name or "\\" in name
+                or type(descriptor.get("size")) is not int or descriptor["size"] < 1
+                or (key == "sidecar" and descriptor["size"] > 1024 * 1024)
+                or type(descriptor.get("sha256")) is not str or len(descriptor["sha256"]) != 64
+                or any(c not in "0123456789abcdef" for c in descriptor["sha256"])
+                or not isinstance(descriptor.get("file_id"), list) or len(descriptor["file_id"]) != 2
+                or any(type(value) is not int or value < 0 for value in descriptor["file_id"])
+                or descriptor["file_id"][1] == 0):
+            raise ValueError("The Editor publication descriptor changed.")
+        path = os.path.join(project_dir, name)
+        if not os.path.lexists(path):
+            continue
+        before = os.lstat(path)
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                or [before.st_dev, before.st_ino] != descriptor["file_id"]):
+            raise ValueError("The Editor publication member is not a regular owned file.")
+        if _recovery_sha256_file(path) != (descriptor["size"], descriptor["sha256"]):
+            raise ValueError("The Editor publication bytes changed.")
+        current = os.lstat(path)
+        identity = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns, item.st_ctime_ns, item.st_nlink)
+        if identity(current) != identity(before):
+            raise ValueError("The Editor publication member changed.")
+        survivors.append((key, path, identity(before)))
+    return project_dir, intent, survivors
+
+
+def _materialize_editor_export_publication(runtime, snapshot, projects):
+    """Publication evidence is held without generic artifact quarantine."""
+    reason = "editor_publication_reconciliation_blocked"
+    current = projects.get(runtime["workspace"])
+    try:
+        if current is None or current[1] != runtime["_recovery_project_digest"]:
+            raise ValueError("The Editor project changed.")
+        runtime["out_dir"] = current[0]
+        manifest = load_request_manifest(current[0], runtime["_recovery_manifest_pointer"], expected_job_id=runtime["id"])
+        runtime["params"] = dict(manifest["params"])
+        with _output_lineage_mutation_guard(current[0]):
+            _editor_export_source(runtime)
+            _editor_export_publication_members(runtime)
+        reason = "generation_failed"
+    except (KeyError, TypeError, ValueError, OSError, HTTPException, QueueRecoveryRuntimeError, QueueRecoveryAdapterError):
+        pass
+    if snapshot.get("status") == "completed":
+        return runtime, False
+    runtime.update(status="failed" if snapshot.get("status") == "failed" else "queued",
+        queue_held=True, recovery_state="blocked", reruns_denoise=False,
+        _recovery_reason_code=reason, message="Editor output recovery needs review")
+    return runtime, False
+
+
+def _prepare_editor_export_completion_retry(job):
+    """Admit only completion of this sealed pair; never rebind its producer."""
+    with _reserve_workspace_operations(job["workspace"]):
+        project_dir = _existing_workspace_dir(job["workspace"])
+        with _output_lineage_mutation_guard(project_dir):
+            _editor_export_source(job)
+            _directory, intent, members = _editor_export_publication_members(job)
+            cursor = dict(job["recovery_cursor"])
+            if len(members) == 2:
+                current = job.get("execution_attempt", 1)
+                if type(current) is not int or current < 1:
+                    raise ValueError("The Editor execution attempt changed.")
+                cursor["editor_export_completion_retry"] = {
+                    "producing_execution_attempt": intent["execution_attempt"],
+                    "execution_attempt": current + (job.get("status") == "failed"),
+                    "producer_unit_id": intent["producer_unit_id"],
+                }
+                return cursor
+            if "editor_export_completion_retry" in cursor or any(key == "media" for key, _path, _identity in members):
+                raise ValueError("The Editor completion pair changed.")
+            _retract_editor_export_publication(job)
+            return dict(job["recovery_cursor"])
+
+
+def _retract_editor_export_publication(job):
+    from pathlib import Path
+    from services.queue_recovery_runtime import _fsync_directory
+
+    project_dir, _intent, survivors = _editor_export_publication_members(job)
+    for _key, path, identity in survivors:
+        current = os.lstat(path)
+        if (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns, current.st_ctime_ns, current.st_nlink) != identity:
+            raise ValueError("The Editor publication member changed before cleanup.")
+        os.remove(path)
+    _fsync_directory(Path(project_dir))
+    if any(os.path.lexists(os.path.join(project_dir, descriptor["basename"]))
+           for descriptor in (_intent["media"], _intent["sidecar"])):
+        raise ValueError("The Editor publication names reappeared.")
+    cursor = dict(job["recovery_cursor"])
+    cursor.pop("editor_export_publication")
+    cursor.pop("editor_export_completion_retry", None)
+    cursor["completed_units"] = [unit for unit in cursor.get("completed_units", [])
+                                 if unit.get("unit_id") != _intent["producer_unit_id"]]
+    updates = ({"status": "cancelled", "recovery_state": "cancelled", "queue_held": False,
+                "_recovery_reason_code": None} if is_cancel_requested(job) else {})
+    if not _queue_recovery_checkpoint(job, recovery_cursor=cursor, **updates):
+        raise QueueRecoveryRuntimeError("Editor publication cleanup was not committed.")
+
+
+def _cleanup_cancelled_editor_export_output(job):
+    if not processed_tool_publication_pending(job):
+        return True
+    try:
+        with _reserve_workspace_operations(job["workspace"]):
+            project_dir = _existing_workspace_dir(job["workspace"])
+            with _output_lineage_mutation_guard(project_dir):
+                _retract_editor_export_publication(job)
+                return True
+    except (KeyError, TypeError, ValueError, OSError, HTTPException, QueueRecoveryRuntimeError, QueueRecoveryAdapterError) as error:
+        if isinstance(error, HTTPException):
+            job.pop("out_dir", None)
+        try:
+            _queue_recovery_checkpoint(job, status="cancelled", recovery_state="cleanup_blocked", queue_held=True,
+                _recovery_reason_code="tool_publication_cleanup_blocked", message="Cancelled output cleanup needs review")
+        except (OSError, QueueRecoveryRuntimeError, QueueRecoveryAdapterError):
+            pass
+        return False
+
+
+def _resume_editor_export_output(job):
+    if "editor_export_publication" not in (job.get("recovery_cursor") or {}):
+        return None
+    project_dir, settings = _editor_export_context(job)
+    with _output_lineage_mutation_guard(project_dir):
+        _editor_export_source(job)
+        _directory, intent, survivors = _editor_export_publication_members(job)
+        if len(survivors) == 2:
+            artifact = _recovery_artifact_descriptor(project_dir, basename=intent["media"]["basename"],
+                sidecar_basename=intent["sidecar"]["basename"], producer_unit_id=intent["producer_unit_id"])
+            if not validate_artifact_descriptor(project_dir, artifact, producer_unit_id=intent["producer_unit_id"]):
+                raise ValueError("The Editor output producer changed.")
+            unit = {"kind": "ordinary_repeat", "variant": 0, "index": 0, "state": "completed",
+                    "unit_id": intent["producer_unit_id"], "dependencies": [], "settings": settings, "artifacts": [artifact]}
+            cursor = dict(job["recovery_cursor"], completed_units=[unit])
+            if not _queue_recovery_checkpoint(job, recovery_cursor=cursor) or is_cancel_requested(job):
+                if is_cancel_requested(job):
+                    _cleanup_cancelled_editor_export_output(job)
+                return False
+            completed = finish_job(job, "completed", output_files=[intent["media"]["basename"]],
+                                   progress=100, phase="", message="Done")
+            if not completed and is_cancel_requested(job):
+                _cleanup_cancelled_editor_export_output(job)
+            return completed
+        if any(key == "media" for key, _path, _identity in survivors):
+            raise ValueError("The Editor output pair is incomplete.")
+        if "editor_export_completion_retry" in job["recovery_cursor"]:
+            raise ValueError("The Editor completion pair changed.")
+        _retract_editor_export_publication(job)
+    return None
+
+
+def _publish_editor_export_output(job, staged, *, source, metadata, elapsed):
+    from services.atomic_file_publish import publish_file_no_replace
+
+    project_dir, settings = _editor_export_context(job)
+    filename = f"editor_cut_{job['id']}.mp4"
+    unit_id = recovery_unit_id(job["id"], "ordinary_repeat", variant=0, index=0, settings=settings)
+    size, digest = _recovery_sha256_file(staged, abort_check=lambda: is_cancel_requested(job))
+    if size <= 0:
+        raise ValueError("The Editor output is empty.")
+    producer = {"producer_unit_id": unit_id, "producer_unit_kind": "ordinary_repeat", "producer_unit_variant": 0,
+        "producer_unit_index": 0, "producer_unit_dependencies": [], "producer_unit_settings": settings,
+        "producer_unit_artifact_names": [filename], "producer_media_size": size, "producer_media_sha256": digest,
+        "producer_artifact_class": "final", "artifact_class": "final"}
+    with _output_lineage_mutation_guard(project_dir):
+        _editor_export_source(job)
+        if is_cancel_requested(job):
+            return False
+        if any(os.path.lexists(os.path.join(project_dir, name)) for name in (filename, filename[:-4] + ".meta.json")):
+            raise ValueError("The Editor output already exists. Refresh Gallery.")
+        def seal(payload, sidecar_staged):
+            if len(payload) > 1024 * 1024:
+                raise ValueError("The Editor metadata exceeds its recovery bound.")
+            media_info, sidecar_info = os.lstat(staged), os.lstat(sidecar_staged)
+            if (_recovery_sha256_file(staged) != (size, digest)
+                    or _recovery_sha256_file(sidecar_staged) != (len(payload), hashlib.sha256(payload).hexdigest())
+                    or media_info.st_ino == 0 or sidecar_info.st_ino == 0):
+                raise ValueError("The Editor staged publication changed.")
+            intent = {"schema_version": 1, "job_id": job["id"], "workspace": job["workspace"],
+                "owner_principal": job["_recovery_owner_digest"], "project_instance": job["_recovery_project_digest"],
+                "execution_attempt": job.get("execution_attempt", 1), "request_manifest": dict(job["_recovery_manifest_pointer"]),
+                "settings": settings, "producer_unit_id": unit_id,
+                "media": {"basename": filename, "size": size, "sha256": digest,
+                          "file_id": [media_info.st_dev, media_info.st_ino]},
+                "sidecar": {"basename": filename[:-4] + ".meta.json", "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
+                            "file_id": [sidecar_info.st_dev, sidecar_info.st_ino]}}
+            if not _queue_recovery_checkpoint(job, recovery_cursor=dict(job.get("recovery_cursor") or {}, editor_export_publication=intent)) or is_cancel_requested(job):
+                raise QueueRecoveryRuntimeError("Editor publication intent was not committed.")
+        source_params = metadata.get("params")
+        _write_tool_sidecar(project_dir, filename, source_name=os.path.basename(source),
+            source_revision=job["params"]["editor_source_revision"], tool="editor_export",
+            params=source_params if isinstance(source_params, dict) else {}, elapsed=elapsed, job_id=job["id"],
+            producer=producer, before_publish_file=seal, preserve_published_on_error=True)
+        if is_cancel_requested(job):
+            _cleanup_cancelled_editor_export_output(job)
+            return False
+        publish_file_no_replace(staged, os.path.join(project_dir, filename))
+        return _resume_editor_export_output(job)
+
+
 def _editor_export_source(job: dict) -> tuple[str, dict]:
     """Resolve only the exact Gallery video sealed at Editor submission."""
     from services.win_safe_files import safe_direct_file_under
 
     params = job["params"]
-    out_dir = _existing_workspace_dir(job["workspace"])
+    out_dir, _settings = _editor_export_context(job)
     sequence = params.get("editor_sources")
     if sequence is not None:
         if (not isinstance(sequence, list) or not 1 <= len(sequence) <= 8
@@ -67926,6 +68214,8 @@ def _run_tool_editor_export(job_id: str):
     start_time = time.time()
     with generation_slot(_gen_lock, job) as acquired:
         if not acquired:
+            if is_cancel_requested(job) and processed_tool_publication_pending(job):
+                _cleanup_cancelled_editor_export_output(job)
             return False
         try:
             if not try_start(job, generation_lock=_gen_lock,
@@ -67939,12 +68229,13 @@ def _run_tool_editor_export(job_id: str):
             workspace = job["workspace"]
             with _reserve_workspace_operations(workspace):
                 out_dir = _existing_workspace_dir(workspace)
+                resumed = _resume_editor_export_output(job)
+                if resumed is not None:
+                    return resumed
                 with _output_lineage_mutation_guard(out_dir):
                     source, metadata = _editor_export_source(job)
                 params = job["params"]
                 filename = f"editor_cut_{job_id}.mp4"
-                final_path = os.path.join(out_dir, filename)
-                meta_path = os.path.splitext(final_path)[0] + ".meta.json"
                 with tempfile.TemporaryDirectory(prefix=".editor-export-", dir=out_dir) as staging:
                     staged = os.path.join(staging, filename)
                     if params.get("editor_sources") is not None:
@@ -67981,46 +68272,34 @@ def _run_tool_editor_export(job_id: str):
                             or abs(rendered["duration"] - params["editor_duration"]) > tolerance
                             or (params["editor_source_has_audio"] and not rendered["has_audio"])):
                         raise ValueError("The Editor cut did not retain the expected video, audio or duration.")
-                    with _output_lineage_mutation_guard(out_dir):
-                        _editor_export_source(job)
-                        if aborted():
-                            return False
-                        if os.path.lexists(final_path) or os.path.lexists(meta_path):
-                            raise ValueError("The Editor output already exists. Refresh Gallery.")
-                        source_params = metadata.get("params")
-                        _write_tool_sidecar(
-                            out_dir, filename,
-                            source_name=os.path.basename(source),
-                            source_revision=params["editor_source_revision"],
-                            tool="editor_export",
-                            params=source_params if isinstance(source_params, dict) else {},
-                            elapsed=time.time() - start_time, job_id=job_id,
-                        )
-                        media_owned = False
-                        try:
-                            os.link(staged, final_path)
-                            media_owned = True
-                            return finish_job(
-                                job, "completed", output_files=[filename],
-                                progress=100, phase="", message="Done",
-                            )
-                        finally:
-                            if not (job.get("status") == "completed"
-                                    and filename in (job.get("output_files") or [])):
-                                if media_owned:
-                                    os.remove(final_path)
-                                os.remove(meta_path)
+                    return _publish_editor_export_output(job, staged, source=source, metadata=metadata,
+                                                         elapsed=time.time() - start_time)
         except Exception:
             if job.get("status") == "completed":
                 return True
             if not is_cancel_requested(job):
+                recovery_failure = {}
+                if "editor_export_publication" in (job.get("recovery_cursor") or {}):
+                    try:
+                        with _output_lineage_mutation_guard(_existing_workspace_dir(job["workspace"])):
+                            _directory, _intent, members = _editor_export_publication_members(job)
+                            if len(members) < 2:
+                                if "editor_export_completion_retry" in job["recovery_cursor"]:
+                                    raise ValueError("The Editor completion pair changed.")
+                                _retract_editor_export_publication(job)
+                    except (KeyError, TypeError, ValueError, OSError, HTTPException, QueueRecoveryRuntimeError, QueueRecoveryAdapterError):
+                        recovery_failure = {"queue_held": True, "recovery_state": "blocked",
+                            "_recovery_reason_code": "editor_publication_reconciliation_blocked"}
                 finish_job(
                     job, "failed",
                     error="The Editor cut could not be exported. Reopen the source and try again.",
                     message="Editor export failed",
+                    **recovery_failure,
                 )
             return False
         finally:
+            if is_cancel_requested(job) and processed_tool_publication_pending(job):
+                _cleanup_cancelled_editor_export_output(job)
             unregister_abort_state(job_id, _active_gen_states, abort_state)
 
 
@@ -68116,6 +68395,8 @@ def _cleanup_cancelled_processed_tool_output(job):
     from pathlib import Path
     from services.queue_recovery_runtime import _fsync_directory
 
+    if job.get("kind") == "tool_editor_export":
+        return _cleanup_cancelled_editor_export_output(job)
     if not processed_tool_publication_pending(job):
         return True
     try:
@@ -78557,6 +78838,15 @@ def _resume_recovered_job(
             },
             "_recovery_reason_code": "",
         }
+        if (job.get("kind") == "tool_editor_export"
+                and "editor_export_publication" in (job.get("recovery_cursor") or {})
+                and "composition" not in (job.get("recovery_cursor") or {})):
+            try:
+                retry_updates["recovery_cursor"] = _prepare_editor_export_completion_retry(job)
+            except (KeyError, TypeError, ValueError, OSError, HTTPException, QueueRecoveryRuntimeError, QueueRecoveryAdapterError) as error:
+                raise HTTPException(status_code=409, detail="The Editor publication cannot be recovered safely") from error
+            reruns_denoise = False
+            retry_updates["reruns_denoise"] = False
         if str(job.get("status") or "") == "failed":
             committed = retry_failed_recovery_job(
                 job,

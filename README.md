@@ -185,6 +185,12 @@ eight clips, including multiple uses of the same video. Each clip has its own
 trim and position; removing one use keeps the other uses and the original video.
 Save the draft, then export a separate finished video to the same project.
 
+If an export is interrupted after its finished video and metadata are published,
+recovery can keep that exact result without encoding it again. Recovery checks
+the original sources, project, privacy settings and published files. Changed
+sources or replaced files require review; cancellation removes only the export's
+verified files and preserves the original videos.
+
 Each clip can keep up to eight takes from the same project's Gallery. Use
 **Add take** to retain another video, then select it under **Takes**. Adding a
 take keeps the current take selected. Switching restores that take's saved

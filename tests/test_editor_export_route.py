@@ -31,6 +31,9 @@ from services.editor_projects import (  # noqa: E402
     append_output_video_clip, apply_output_video_trim, create_output_video_timeline, load_editor_project, save_editor_project,
 )
 from services.output_access import public_output_policy, stamp_sidecar_policy  # noqa: E402
+from services.queue_recovery_runtime import (atomic_write_request_manifest, load_request_manifest,
+    sha256_file, recovery_unit_id, artifact_descriptor, validate_artifact_descriptor, QueueRecoveryRuntimeError)
+from services.queue_recovery_adapter import processed_tool_publication_pending, QueueRecoveryAdapterError
 
 
 TREE = ast.parse((ROOT / "app/launch.py").read_text(encoding="utf-8"))
@@ -38,6 +41,13 @@ TREE = ast.parse((ROOT / "app/launch.py").read_text(encoding="utf-8"))
 
 def load_functions(namespace, *names):
     wanted = set(names)
+    if "_editor_export_source" in wanted:
+        wanted.add("_editor_export_context")
+    if "_run_tool_editor_export" in wanted:
+        wanted.update({"_editor_export_context", "_editor_export_publication_members",
+            "_retract_editor_export_publication", "_cleanup_cancelled_editor_export_output",
+            "_resume_editor_export_output", "_publish_editor_export_output",
+            "_materialize_editor_export_publication", "_prepare_editor_export_completion_retry"})
     selected = []
     for node in TREE.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in wanted:
@@ -163,7 +173,16 @@ class EditorExportRouteTests(unittest.TestCase):
         )
         self.ns = {
             "Request": object, "HTTPException": HTTPException,
-            "json": json, "os": os, "hmac": hmac, "math": math,
+            "json": json, "os": os, "hmac": hmac, "math": math, "hashlib": hashlib,
+            "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError, "QueueRecoveryAdapterError": QueueRecoveryAdapterError,
+            "load_request_manifest": load_request_manifest, "_recovery_sha256_file": sha256_file,
+            "recovery_unit_id": recovery_unit_id, "_recovery_artifact_descriptor": artifact_descriptor,
+            "validate_artifact_descriptor": validate_artifact_descriptor,
+            "processed_tool_publication_pending": processed_tool_publication_pending,
+            "_queue_recovery_checkpoint": lambda job, **updates: job.update(**updates) or True,
+            "_queue_recovery_existing_project_identity": lambda _path: "editor-project-instance",
+            "_RECOVERABLE_INPUT_KEYS": {"editor_source_path", "editor_audio_path", "editor_image_path"},
+            "_app_dir": str(self.root),
             "time": time, "uuid": uuid, "copy": copy, "subprocess": subprocess,
             "wgp": types.SimpleNamespace(server_config={"save_path": str(self.outputs)}),
             "_request_remote": contextvars.ContextVar("remote", default=True),
@@ -181,11 +200,13 @@ class EditorExportRouteTests(unittest.TestCase):
         }
         load_functions(self.ns, "_editor_request_body", "_editor_save_root",
                        "_editor_require_current_source", "export_output_editor_project", "append_output_editor_clip", "add_output_editor_audio", "add_output_editor_image")
+        load_functions(self.ns, "_queue_recovery_file_values", "_queue_recovery_input_descriptors", "_queue_recovery_manifest_validator")
 
     def source_revision(self, path=None):
         path = path or self.source
         media = path.read_bytes()
-        sidecar = path.with_suffix(".meta.json").read_bytes()
+        sidecar_path = path.with_suffix(".meta.json")
+        sidecar = sidecar_path.read_bytes() if sidecar_path.exists() else b""
         return "sha256:" + hashlib.sha256(media + sidecar).hexdigest()
 
     def authorize(self, _request, project, *, existing_only=False, permission=None):
@@ -204,6 +225,12 @@ class EditorExportRouteTests(unittest.TestCase):
         return str(self.project), str(path), sidecar
 
     def register(self, job, **options):
+        job.update(_recovery_owner_digest="editor-owner", _recovery_project_digest="editor-project-instance",
+                   access_policy={key: bool(job["params"].get(key + "_output")) for key in ("private", "explicit")})
+        job.update(job["access_policy"])
+        job["_recovery_manifest_pointer"] = atomic_write_request_manifest(self.project,
+            job_id=job["id"], params=job["params"],
+            inputs=self.ns["_queue_recovery_input_descriptors"](job, "editor-owner"))
         self.registered.append((job, options))
         self.jobs[job["id"]] = job
 
@@ -360,13 +387,13 @@ class EditorExportRouteTests(unittest.TestCase):
     def test_multiple_images_all_sources_recovery_privacy_order_and_finality(self):
         from services.editor_projects import add_output_image_layer
         first = self.with_image()
-        first.with_suffix(".meta.json").write_text(json.dumps({"private": False, "explicit": False}))
-        self.source.with_suffix(".meta.json").write_text(json.dumps({"private": False, "explicit": False}))
+        first.with_suffix(".meta.json").write_text(json.dumps({"workspace": "scene", "private": False, "explicit": False}))
+        self.source.with_suffix(".meta.json").write_text(json.dumps({"workspace": "scene", "private": False, "explicit": False}))
         self.timeline["assets"]["source-image"].update(private=False, output_revision=self.source_revision(first))
         self.timeline["assets"]["source-video"].update(private=False, output_revision=self.source_revision())
         second = self.project / "second.png"
         second.write_bytes(b"second still")
-        second.with_suffix(".meta.json").write_text(json.dumps({"private": True, "explicit": True}))
+        second.with_suffix(".meta.json").write_text(json.dumps({"workspace": "scene", "private": True, "explicit": True}))
         self.timeline = save_editor_project(str(self.outputs), "scene", add_output_image_layer(
             self.timeline, output_name=second.name, output_revision=self.source_revision(second),
             media={"type": "image", "width": 32, "height": 16}), expected_revision=self.timeline["revision"])
@@ -391,6 +418,8 @@ class EditorExportRouteTests(unittest.TestCase):
         self.assertNotIn("path", meta["transform"]["image_layers"][1])
         job["id"] = "b" * 32; self.jobs[job["id"]] = job
         job["status"] = "queued"; job["output_files"] = []
+        job["recovery_cursor"] = {}
+        self.register(job)
         def replace(_source, destination, **_options):
             Path(destination).write_bytes(b"rendered"); second.write_bytes(b"replaced")
         with mock.patch("services.editor_export.render_single_source_cut", side_effect=replace), mock.patch("services.editor_projects.probe_media", return_value=probe):
@@ -403,6 +432,7 @@ class EditorExportRouteTests(unittest.TestCase):
         job = self.worker_namespace()
         job["params"]["editor_image_layer"] = job["params"]["editor_image_layer"][0]
         job["params"]["editor_image_path"] = str(path)
+        self.register(job)
         self.assertEqual(self.ns["_editor_export_source"](job)[0], str(self.source))
         job["params"]["editor_image_path"] = str(self.source)
         with self.assertRaises(ValueError): self.ns["_editor_export_source"](job)
@@ -573,6 +603,8 @@ class EditorExportRouteTests(unittest.TestCase):
         journal = self.root / "private-queue.json"
         QueueRecoveryCoordinator(QueueRecoveryJournal(journal)).register_job(
             job, owner_digest=owner, project_digest=project, request_manifest=manifest)
+        job.update(_recovery_owner_digest=owner, _recovery_project_digest=project, _recovery_manifest_pointer=manifest)
+        self.ns["_queue_recovery_existing_project_identity"] = lambda _path: project
         snapshot = QueueRecoveryCoordinator(QueueRecoveryJournal(journal)).restore().jobs[job["id"]]
         self.assertNotIn("params", snapshot)
         self.assertNotIn(str(self.project), json.dumps(snapshot))
@@ -785,11 +817,26 @@ class EditorExportRouteTests(unittest.TestCase):
             "is_cancel_requested": lambda current: current.get("status") == "cancelled",
             "_existing_workspace_dir": lambda _workspace: str(self.project),
             "load_media_sidecars": lambda directory, names: {
-                name: json.loads((Path(directory) / name).with_suffix(".meta.json").read_text()) for name in names},
+                name: json.loads((Path(directory) / name).with_suffix(".meta.json").read_text())
+                for name in names if (Path(directory) / name).with_suffix(".meta.json").exists()},
             "stamp_sidecar_policy": stamp_sidecar_policy,
         })
         load_functions(self.ns, "_editor_export_source", "_write_tool_sidecar", "_run_tool_editor_export")
         return job
+
+    def test_sidecarless_editor_source_works_only_with_original_live_authorization(self):
+        self.source.with_suffix('.meta.json').unlink()
+        self.timeline['assets']['source-video']['output_revision'] = self.source_revision()
+        self.timeline = save_editor_project(str(self.outputs), 'scene', self.timeline, expected_revision=1)
+        job = self.worker_namespace()
+        manifest = load_request_manifest(self.project, job['_recovery_manifest_pointer'], expected_job_id=job['id'])
+        self.assertEqual(manifest['inputs'][0]['scope'], 'derived')
+        job['access_policy'] = {key: job[key] for key in ('private', 'explicit')}
+        with mock.patch('services.editor_export.render_single_source_cut', side_effect=lambda _src, dst, **_kw: Path(dst).write_bytes(b'rendered')), \
+             mock.patch('services.editor_projects.probe_media', return_value={'type':'video','duration':3,'size':8,'has_audio':True}):
+            self.assertTrue(self.ns['_run_tool_editor_export'](job['id']))
+        job['session_id'] = None
+        with self.assertRaises(QueueRecoveryRuntimeError): self.ns['_editor_export_context'](job)
 
     def test_worker_publishes_a_private_final_copy_with_cut_provenance(self):
         job = self.worker_namespace()
@@ -813,6 +860,59 @@ class EditorExportRouteTests(unittest.TestCase):
         self.assertTrue(sidecar["private"])
         self.assertTrue(sidecar["explicit"])
         self.assertEqual(self.source.read_bytes(), b"original-video")
+
+    def test_editor_publication_persistence_failure_and_concurrent_foreign_name_never_claim_output(self):
+        for mode in ("persistence", "foreign"):
+            with self.subTest(mode=mode):
+                self.jobs.clear(); self.registered.clear()
+                job = self.worker_namespace()
+                output = self.project / f"editor_cut_{job['id']}.mp4"
+                sidecar = output.with_suffix('.meta.json')
+                from services.atomic_file_publish import publish_file_no_replace
+                def publish(source, destination):
+                    if mode == "foreign" and destination == str(output):
+                        # Same bytes, foreign inode: hashes cannot prove publication ownership.
+                        output.write_bytes(Path(source).read_bytes())
+                    return publish_file_no_replace(source, destination)
+                if mode == "persistence":
+                    self.ns['_queue_recovery_checkpoint'] = lambda *_args, **_kwargs: False
+                with mock.patch("services.editor_export.render_single_source_cut", side_effect=lambda _source, dest, **_kw: Path(dest).write_bytes(b"rendered-video")), \
+                     mock.patch("services.editor_projects.probe_media", return_value={"type":"video","duration":3,"size":14,"has_audio":True}), \
+                     mock.patch("services.atomic_file_publish.publish_file_no_replace", side_effect=publish):
+                    self.assertFalse(self.ns['_run_tool_editor_export'](job['id']))
+                self.assertEqual(job['output_files'], [])
+                if mode == "persistence":
+                    self.assertFalse(output.exists()); self.assertFalse(sidecar.exists())
+                else:
+                    self.assertEqual(output.read_bytes(), b"rendered-video")
+                    self.assertTrue(sidecar.exists())
+                    self.assertEqual(job['recovery_state'], 'blocked')
+                    before = output.read_bytes(), sidecar.read_bytes()
+                    job.update(status='queued', queue_held=False)
+                    with mock.patch("services.editor_export.render_single_source_cut") as encoder:
+                        self.assertFalse(self.ns['_run_tool_editor_export'](job['id']))
+                    encoder.assert_not_called()
+                    self.assertEqual((output.read_bytes(), sidecar.read_bytes()), before)
+                self.ns['_queue_recovery_checkpoint'] = lambda current, **kw: current.update(**kw) or True
+                if output.exists(): output.unlink()
+                if sidecar.exists(): sidecar.unlink()
+
+    def test_editor_request_and_policy_drift_fail_before_encode(self):
+        for mode in ('params', 'policy', 'project', 'input-closure'):
+            with self.subTest(mode=mode):
+                self.jobs.clear(); self.registered.clear()
+                job = self.worker_namespace()
+                if mode == 'params': job['params']['editor_source_in'] = 1
+                elif mode == 'policy': job['access_policy']['private'] = False
+                elif mode == 'project': job['_recovery_project_digest'] = 'recreated'
+                else:
+                    job['_recovery_manifest_pointer'] = atomic_write_request_manifest(self.project,
+                        job_id=job['id'], params=job['params'], inputs=[])
+                with mock.patch('services.editor_export.render_single_source_cut') as encoder:
+                    self.assertFalse(self.ns['_run_tool_editor_export'](job['id']))
+                encoder.assert_not_called()
+                self.assertEqual(job['output_files'], [])
+                self.assertFalse(list(self.project.glob('editor_cut_*')))
 
     def test_title_worker_receives_sealed_plan_and_drops_inherited_regeneration_recipe(self):
         from services.editor_projects import apply_output_video_trim
