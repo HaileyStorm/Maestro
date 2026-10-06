@@ -6,6 +6,47 @@ import os
 
 import torch
 
+
+def _validate_private_control_load(checkpoint, model_type, *, model_filename=None,
+                                   dtype=None, quantize=False, compile=False):
+    """Admit an operator-selected, already acquired Control load only.
+
+    The strict Base and Control readers still prove the bytes during loading.
+    This boundary does not acquire assets or admit public request settings.
+    """
+    if checkpoint is None:
+        return None
+    if (os.environ.get("MAESTRO_H3_CONTROL_EXPERIMENTAL") != "1"
+            or model_type != "minimax_h3"
+            or type(checkpoint) is not str or not checkpoint
+            or not os.path.isabs(checkpoint)
+            or not os.path.isfile(checkpoint)
+            or quantize or compile
+            or (dtype is not None and dtype != torch.bfloat16)):
+        raise ValueError("Private H3 Control requires an acquired checkpoint and eager BF16 Base")
+    if model_filename is not None:
+        from .original_base import is_original_base_checkpoint
+        paths = model_filename if isinstance(model_filename, (list, tuple)) else [model_filename]
+        if (not paths or any(type(path) is not str or not path or not os.path.isabs(path)
+                             or not os.path.isfile(path) for path in paths)
+                or not all(is_original_base_checkpoint(path) for path in paths)):
+            raise ValueError("Private H3 Control requires the acquired original Base export")
+    return checkpoint
+
+
+def _private_control_artifact_paths(model_filename, checkpoint):
+    """Include the complete original export in pre-load memory/key evidence."""
+    from .original_base import ORIGINAL_BASE_SHARDS
+    paths = model_filename if isinstance(model_filename, (list, tuple)) else [model_filename]
+    directory = os.path.dirname(os.path.abspath(paths[0]))
+    result = [os.path.join(directory, "model.safetensors.index.json")]
+    result.extend(os.path.join(directory, name) for name, _size, _sha in ORIGINAL_BASE_SHARDS)
+    result.append(checkpoint)
+    if not all(os.path.isfile(path) for path in result):
+        raise ValueError("Private H3 Control requires the complete acquired original Base and Control assets")
+    return result
+
+
 _MODEL_TYPE = "minimax_h3"
 _REF2VA_MODEL_TYPE = "minimax_h3_ref2va"
 _BETA3_MODEL_TYPE = "minimax_h3_10eros_beta3"
@@ -960,6 +1001,14 @@ class family_handler:
             raise H310ErosBeta3UnwiredError(_BETA3_UNWIRED_MESSAGE)
         from .minimax_h3_main import MiniMaxH3Model
 
+        control_checkpoint = _validate_private_control_load(
+            kwargs.get("_h3_control_checkpoint"), str(model_type or base_model_type or ""),
+            model_filename=model_filename, dtype=dtype,
+            quantize=kwargs.get("quantizeTransformer", False),
+            compile=kwargs.get("compile", False),
+        )
+        if control_checkpoint is not None:
+            _private_control_artifact_paths(model_filename, control_checkpoint)
         model = MiniMaxH3Model(
             model_filename=model_filename,
             model_def=model_def or {},
@@ -968,6 +1017,15 @@ class family_handler:
             load_status_callback=kwargs.get("load_status_callback"),
             selected_model_type=str(model_type or base_model_type or ""),
         )
+        if control_checkpoint is not None:
+            try:
+                model._load_control_branch(
+                    control_checkpoint, load_cancel_callback=kwargs.get("load_cancel_callback"),
+                )
+                model.get_h3_control_residency_identity()
+            except BaseException:
+                model.release()
+                raise
         pipe = {
             "transformer": model.transformer,
             # Keep the wrapper top-level so MMGP's forward hook moves both

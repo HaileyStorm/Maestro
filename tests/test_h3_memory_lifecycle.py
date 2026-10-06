@@ -1826,5 +1826,87 @@ class H3LlmExclusionTests(unittest.TestCase):
         self.assertIn("finalization windows", bridge)
 
 
+class H3PrivateControlLoadBoundaryTests(unittest.TestCase):
+    def test_preflight_rejects_before_terms_or_acquisition(self):
+        from unittest.mock import patch
+        function = _nodes("app/wgp.py", "load_models")[0]
+        prefix = []
+        for node in function.body:
+            if isinstance(node, ast.Global):
+                continue
+            prefix.append(node)
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call) and getattr(node.value.func, "id", "") == "require_model_terms":
+                break
+        namespace = dict(_h3_control_checkpoint="not-an-absolute-existing-file",
+                         _h3_control_base_checkpoint="missing-original-shard", model_type="minimax_h3",
+                         compile=[], args=SimpleNamespace(save_quantized=False),
+                         server_config={"services": {}}, models_def={}, require_model_terms=Mock())
+        with patch.dict(os.environ, {"MAESTRO_H3_CONTROL_EXPERIMENTAL": "1"}):
+            with self.assertRaises(ValueError):
+                exec(compile(ast.Module(body=prefix, type_ignores=[]), "private-load-prefix", "exec"), namespace)
+        namespace["require_model_terms"].assert_not_called()
+
+    def test_control_inventory_changes_memory_and_preload_identity(self):
+        from models.minimax_h3.minimax_h3_handler import _private_control_artifact_paths
+        from models.minimax_h3.original_base import ORIGINAL_BASE_SHARDS
+        namespace = {"os": os, "hashlib": __import__("hashlib"), "json": __import__("json"), "re": __import__("re")}
+        _load("app/wgp.py", ("_h3_checkpoint_bytes", "_residency_digest_token", "_residency_artifact_revision"), namespace)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index, (name, _size, _sha) in enumerate(ORIGINAL_BASE_SHARDS):
+                (root / name).write_bytes(b"x" * (index + 1))
+            (root / "model.safetensors.index.json").write_bytes(b"index")
+            control = root / "control.safetensors"; control.write_bytes(b"control")
+            first = str(root / ORIGINAL_BASE_SHARDS[0][0])
+            private = _private_control_artifact_paths(first, str(control))
+            self.assertEqual(namespace["_h3_checkpoint_bytes"](private), sum(range(1, 14)) + 12)
+            revision = namespace["_residency_artifact_revision"]
+            self.assertNotEqual(revision([first]), revision(private))
+            before = revision(private)
+            control.write_bytes(b"new-control-expanded")
+            self.assertNotEqual(before, revision(private))
+            before = revision(private)
+            (root / ORIGINAL_BASE_SHARDS[12][0]).write_bytes(b"last-shard-expanded")
+            self.assertNotEqual(before, revision(private))
+
+    def test_private_primary_load_uses_exact_selection_without_downloader_or_manual_alias(self):
+        function = _nodes("app/wgp.py", "load_models")[0]
+        loop = next(node for node in function.body if isinstance(node, ast.For)
+                    and isinstance(node.iter, ast.Call) and getattr(node.iter.func, "id", "") == "zip")
+        with tempfile.TemporaryDirectory() as directory:
+            selected = str(Path(directory) / "model-00001-of-00013.safetensors")
+            namespace = dict(_h3_control_checkpoint="selected-control", model_type="minimax_h3",
+                             model_file_list=[selected], model_type_list=["minimax_h3"],
+                             source_type_list=[0], model_submodel_no_list=[1], local_model_file_list=[],
+                             resolved_primary_model_path=None, verified_manual_checkpoint="unrelated-manual-alias",
+                             download_models=Mock(side_effect=AssertionError("private download")),
+                             get_compatible_local_model_filename=Mock(side_effect=AssertionError("private alias")), os=os)
+            exec(compile(ast.Module(body=[loop], type_ignores=[]), "private-primary-loop", "exec"), namespace)
+            self.assertEqual(namespace["local_model_file_list"], [selected])
+            self.assertEqual(namespace["resolved_primary_model_path"], selected)
+            namespace["download_models"].assert_not_called()
+            namespace["get_compatible_local_model_filename"].assert_not_called()
+
+    def test_control_bound_configuration_forces_one_ordinary_release(self):
+        import math
+        namespace = dict(math=math, _loaded_model_configuration=(0.8, 4, None, None, {}),
+                         _loaded_residency_base_key="ordinary", _loaded_residency_affinity_key="ordinary",
+                         h3_control_residency_identity={"exact": "control"})
+        _load("app/wgp.py", ("_model_load_configuration_matches", "_release_for_model_reprofile"), namespace)
+        function = _nodes("app/wgp.py", "load_models")[0]
+        boundary = next(node for node in function.body if isinstance(node, ast.If)
+                        and isinstance(node.test, ast.Compare)
+                        and getattr(node.test.left, "id", "") == "h3_control_residency_identity")
+        exec(compile(ast.Module(body=[boundary], type_ignores=[]), "private-load-result", "exec"), namespace)
+        requested = (0.8, 4, None, None, {})
+        release = Mock()
+        self.assertTrue(namespace["_release_for_model_reprofile"](object(), namespace["_loaded_model_configuration"], requested, release))
+        release.assert_called_once_with()
+        self.assertIsNone(namespace["_loaded_residency_base_key"])
+        release.reset_mock()
+        self.assertFalse(namespace["_release_for_model_reprofile"](object(), requested, requested, release))
+        release.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

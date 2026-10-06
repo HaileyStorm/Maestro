@@ -6387,12 +6387,26 @@ def load_models(
     force_residency_reprofile=False,
     h3_dasiwa_admission=None,
     resolution=None,
+    _h3_control_checkpoint=None,
+    _h3_control_base_checkpoint=None,
     **model_kwargs,
 ):
     global transformer_type, loaded_profile, reload_needed
     global _loaded_model_configuration, _loaded_residency_base_key
     global _loaded_residency_affinity_key
     global _loaded_h3_dasiwa_checkpoint_admission
+    if (_h3_control_checkpoint is None) != (_h3_control_base_checkpoint is None):
+        raise ValueError("Private H3 Control requires both acquired Base and Control selections")
+    if _h3_control_checkpoint is not None:
+        from models.minimax_h3.minimax_h3_handler import (
+            _validate_private_control_load, _private_control_artifact_paths,
+        )
+        _h3_control_checkpoint = _validate_private_control_load(
+            _h3_control_checkpoint, model_type,
+            compile=bool(compile), quantize=bool(args.save_quantized),
+            model_filename=_h3_control_base_checkpoint,
+        )
+        _private_control_artifact_paths(_h3_control_base_checkpoint, _h3_control_checkpoint)
     # Shared fail-closed boundary for Studio, Classic, CLI, internal callers,
     # recovery, already-downloaded checkpoints, and first-use auto-downloads.
     # This check is recipe metadata only; it never inspects generation data.
@@ -6411,6 +6425,8 @@ def load_models(
     base_model_type = get_base_model_type(model_type)
     save_quantized = args.save_quantized and model_def != None
     model_filename = get_model_filename(model_type=model_type, quantization= "" if save_quantized else transformer_quantization, dtype_policy = transformer_dtype_policy) 
+    if _h3_control_checkpoint is not None:
+        model_filename = _h3_control_base_checkpoint
     if "URLs2" in model_def:
         model_filename2 = get_model_filename(model_type=model_type, quantization= "" if save_quantized else transformer_quantization, dtype_policy = transformer_dtype_policy, submodel_no=2) # !!!!
     else:
@@ -6461,16 +6477,28 @@ def load_models(
             model_submodel_no_list.append(0) 
 
     local_model_file_list= []
+    if _h3_control_checkpoint is not None:
+        _validate_private_control_load(
+            _h3_control_checkpoint, model_type, model_filename=model_file_list,
+            dtype=transformer_dtype, quantize=quantizeTransformer,
+        )
     resolved_primary_model_path = None
     for filename, file_model_type, file_source_type, submodel_no in zip(model_file_list, model_type_list, source_type_list, model_submodel_no_list):
         if len(filename) == 0: continue 
-        download_models(filename, file_model_type, file_source_type, submodel_no)
-        local_file_name = get_compatible_local_model_filename(
-            filename,
-            file_model_type,
-            file_type=file_source_type,
-        )
+        if _h3_control_checkpoint is not None:
+            # Private original assets were inventoried before any acquisition;
+            # they are not catalog defaults or download candidates.
+            local_file_name = filename
+        else:
+            download_models(filename, file_model_type, file_source_type, submodel_no)
+            local_file_name = get_compatible_local_model_filename(
+                filename,
+                file_model_type,
+                file_type=file_source_type,
+            )
         if (
+            _h3_control_checkpoint is None
+            and
             verified_manual_checkpoint is not None
             and file_model_type == model_type
             and file_source_type == 0
@@ -6554,6 +6582,11 @@ def load_models(
     h3_checkpoint_paths = []
     if is_h3_load:
         h3_checkpoint_paths = [*local_model_file_list, text_encoder_filename]
+        if _h3_control_checkpoint is not None:
+            h3_checkpoint_paths = [
+                *_private_control_artifact_paths(local_model_file_list, _h3_control_checkpoint),
+                text_encoder_filename,
+            ]
         assets_root = model_def.get("minimax_h3_assets_root", "minimax_h3")
         for relative_path in (
             os.path.join("vae", "minimax_h3_video_vae_fp16.safetensors"),
@@ -6643,6 +6676,9 @@ def load_models(
         cancel_callback=load_cancel_callback,
     )
     handler_model_kwargs = dict(model_kwargs)
+    if _h3_control_checkpoint is not None:
+        handler_model_kwargs["_h3_control_checkpoint"] = _h3_control_checkpoint
+        handler_model_kwargs["load_cancel_callback"] = load_cancel_callback
     if is_h3_load:
         handler_model_kwargs["load_status_callback"] = (
             status_reporter.transition
@@ -6837,6 +6873,9 @@ def load_models(
         # this heavier graph as the ordinary base for subsequent job reuse.
         _loaded_residency_base_key = None
         _loaded_residency_affinity_key = None
+        # Ordinary generation must release this private graph even when its
+        # model ID and memory profile happen to match the requested Base.
+        _loaded_model_configuration = None
     _loaded_h3_dasiwa_checkpoint_admission = (
         dict(h3_dasiwa_admission)
         if isinstance(h3_dasiwa_admission, dict) else None

@@ -531,6 +531,23 @@ class OriginalH3ControlResidencyPreparationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already bound"):
             runtime.transformer.bind_control_branch(control)
 
+    def test_load_callback_cancellation_stops_before_or_during_control_read(self):
+        runtime, control = self.runtime()
+        with patch.object(control_module, "load_original_control_branch") as loader:
+            with self.assertRaises(InterruptedError):
+                runtime.load("unused", load_cancel_callback=lambda: True)
+            loader.assert_not_called()
+        cancelled = [False]
+        def reading(_path, *, interrupted):
+            self.assertFalse(interrupted())
+            cancelled[0] = True
+            self.assertTrue(interrupted())
+            return control
+        with patch.object(control_module, "load_original_control_branch", side_effect=reading):
+            with self.assertRaises(InterruptedError):
+                runtime.load("unused", load_cancel_callback=lambda: cancelled[0])
+        self.assertIsNone(getattr(runtime.transformer, "h3_control_branch", None))
+
     def test_cancelled_load_never_attaches_a_partial_branch(self):
         runtime, control = self.runtime()
         runtime._interrupt = True
@@ -921,6 +938,99 @@ class OriginalH3ControlSamplerTests(unittest.TestCase):
             self.assertIsNone(runtime.generate("A dancer", frame_num=124, height=32, width=32,
                                                _h3_control=payload,
                                                custom_settings={"h3_attention_engine": "sdpa"}))
+
+
+class OriginalH3ControlHandlerLoadTests(unittest.TestCase):
+    def setUp(self):
+        import os
+        from models.minimax_h3 import minimax_h3_handler as handler
+        from models.minimax_h3.original_base import ORIGINAL_BASE_SHARDS
+        self.handler = handler
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        directory = Path(self.temp.name)
+        for index, (name, _size, _sha) in enumerate(ORIGINAL_BASE_SHARDS):
+            (directory / name).write_bytes(bytes([index]) * (index + 1))
+        (directory / "model.safetensors.index.json").write_bytes(b"index")
+        self.base = str(directory / ORIGINAL_BASE_SHARDS[0][0])
+        self.control = str(directory / "original-control.safetensors")
+        Path(self.control).write_bytes(b"control")
+        gate = patch.dict(os.environ, {"MAESTRO_H3_CONTROL_EXPERIMENTAL": "1"})
+        gate.start(); self.addCleanup(gate.stop)
+        self.events = []
+        self.load_callbacks = []
+        def attach(path, **kwargs):
+            self.events.append(("attach", path))
+            self.load_callbacks.append(kwargs.get("load_cancel_callback"))
+        self.wrapper = types.SimpleNamespace(
+            transformer=torch.nn.Linear(2, 2), conditioner=object(), vae=object(), audio_vae=object(),
+            _load_control_branch=attach,
+            get_h3_control_residency_identity=lambda: self.events.append("identity") or {"exact": True},
+            release=lambda: self.events.append("release"),
+        )
+        fake = types.ModuleType("models.minimax_h3.minimax_h3_main")
+        def construct(**kwargs):
+            self.events.append("construct")
+            return self.wrapper
+        fake.MiniMaxH3Model = construct
+        stub = patch.dict(sys.modules, {fake.__name__: fake})
+        stub.start(); self.addCleanup(stub.stop)
+
+    def load(self, **kwargs):
+        return self.handler.family_handler.load_model(
+            self.base, model_type="minimax_h3", _h3_control_checkpoint=self.control, **kwargs)
+
+    def test_attaches_before_pipe_and_ordinary_does_not_resolve_control(self):
+        cancel = lambda: False
+        model, configuration = self.load(load_cancel_callback=cancel)
+        self.assertEqual(self.load_callbacks, [cancel])
+        self.assertIs(model, self.wrapper)
+        self.assertEqual(self.events, ["construct", ("attach", self.control), "identity"])
+        self.assertIs(configuration["pipe"]["transformer"], self.wrapper.transformer)
+        self.events.clear()
+        with patch.object(self.handler, "_private_control_artifact_paths", side_effect=AssertionError("ordinary reads Control")):
+            model, _ = self.handler.family_handler.load_model("ordinary.safetensors", model_type="minimax_h3")
+        self.assertIs(model, self.wrapper)
+        self.assertEqual(self.events, ["construct"])
+
+    def test_attachment_and_identity_failure_release_constructed_graph(self):
+        for failure_point in ("_load_control_branch", "get_h3_control_residency_identity"):
+            for failure in (ValueError("bad asset"), InterruptedError("cancelled")):
+                self.events.clear()
+                with self.subTest(failure_point=failure_point, failure=type(failure)), \
+                     patch.object(self.wrapper, failure_point, side_effect=failure):
+                    with self.assertRaises(type(failure)):
+                        self.load()
+                    self.assertEqual(self.events[0], "construct")
+                    self.assertEqual(self.events[-1], "release")
+                    self.assertEqual(self.events.count("release"), 1)
+
+    def test_rejects_disabled_wrong_family_dtype_and_optimization_before_constructor(self):
+        import os
+        cases = [
+            {"model_type": "minimax_h3_ref2va"}, {"dtype": torch.float16},
+            {"quantizeTransformer": True}, {"compile": True},
+            {"_h3_control_checkpoint": True}, {"_h3_control_checkpoint": "relative.safetensors"},
+            {"model_filename": [self.base, "ordinary.safetensors"]},
+        ]
+        for changes in cases:
+            inputs = dict(model_filename=self.base, model_type="minimax_h3", _h3_control_checkpoint=self.control)
+            inputs.update(changes)
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                self.handler.family_handler.load_model(**inputs)
+            self.assertEqual(self.events, [])
+        with patch.dict(os.environ, {"MAESTRO_H3_CONTROL_EXPERIMENTAL": "0"}), self.assertRaises(ValueError):
+            self.load()
+        self.assertEqual(self.events, [])
+
+    def test_preload_inventory_has_every_shard_index_and_control_and_requires_all(self):
+        paths = self.handler._private_control_artifact_paths(self.base, self.control)
+        self.assertEqual(len(paths), 15)
+        self.assertEqual(sum(Path(path).stat().st_size for path in paths), 5 + sum(range(1, 14)) + 7)
+        Path(paths[12]).unlink()
+        with self.assertRaisesRegex(ValueError, "complete acquired"):
+            self.load()
+        self.assertEqual(self.events, [])
 
 
 if __name__ == "__main__":

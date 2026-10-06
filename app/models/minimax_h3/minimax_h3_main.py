@@ -1134,7 +1134,7 @@ class MiniMaxH3Model:
             raise InterruptedError("MiniMax H3 preview decode was cancelled")
         return video
 
-    def _load_control_branch(self, filename) -> None:
+    def _load_control_branch(self, filename, *, load_cancel_callback=None) -> None:
         """Prepare the acquired original branch before the caller profiles H3.
 
         This internal path owns no acquisition or GPU authority. The caller
@@ -1143,7 +1143,12 @@ class MiniMaxH3Model:
         """
         from .control import load_original_control_branch
 
-        if self._interrupt:
+        def interrupted():
+            return self._interrupt or (
+                callable(load_cancel_callback) and bool(load_cancel_callback())
+            )
+
+        if interrupted():
             raise InterruptedError("H3 Control loading was cancelled")
         transformer = self.transformer
         if (transformer is None or transformer.use_adaln_curves
@@ -1164,8 +1169,8 @@ class MiniMaxH3Model:
                 or any(hasattr(module, "_hf_hook") or hasattr(module, "_force_device")
                        for module in transformer.modules())):
             raise ValueError("H3 Control must be loaded once before MMGP residency setup")
-        branch = load_original_control_branch(filename, interrupted=lambda: self._interrupt)
-        if self._interrupt:
+        branch = load_original_control_branch(filename, interrupted=interrupted)
+        if interrupted():
             raise InterruptedError("H3 Control loading was cancelled")
         transformer.bind_control_branch(branch)
 

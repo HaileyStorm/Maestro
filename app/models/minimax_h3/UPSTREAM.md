@@ -97,6 +97,19 @@ complete asset compatibility and native GPU/media acceptance remain open.
 CPU graph, numerical and cache-context checks do not qualify the full weights,
 CUDA offload, or generation.
 
+The private family loader accepts an explicit `_h3_control_checkpoint` for an
+already acquired original Control asset, under the same host experimental
+gate. It requires the original Base export and eager BF16 loading, attaches the
+strictly read child before returning the MMGP pipe, and releases the partial
+wrapper if attachment or cancellation fails. WGP requires both explicit
+`_h3_control_base_checkpoint` and `_h3_control_checkpoint` selections and
+inventories the complete acquired export before acquisition. Those files bypass
+the public checkpoint downloader. WGP includes every original Base shard and
+the Control file in pre-load memory and artifact identity, retains the exact post-load graph
+binding, and invalidates ordinary model reuse for this heavier private graph.
+This seam does not select or acquire the original assets, activate public
+Control, or establish native memory/device acceptance.
+
 The private sampler additionally accepts an exact `_h3_control` decoded-media
 handoff when `MAESTRO_H3_CONTROL_EXPERIMENTAL=1`. It binds that handoff to the
 acquired residency identity, encodes deterministic Control/inpaint rows once,
