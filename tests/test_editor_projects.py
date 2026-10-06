@@ -258,6 +258,48 @@ class TestEditorProjectFoundation(unittest.TestCase):
         os.mkdir(path)
         return path
 
+    def test_returned_retake_exports_original_cut_after_explicit_selection(self):
+        from services.editor_export import render_video_sequence
+        from services.editor_projects import add_editor_retake_take, editor_retake_origin
+        scene = Path(self._workspace("scene"))
+        source = scene / "retake.mp4"
+        subprocess.run([
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+            "-f", "lavfi", "-i", "color=black:s=64x64:r=24:d=1",
+            "-f", "lavfi", "-i", "color=white:s=64x64:r=24:d=2",
+            "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]",
+            "-map", "[v]", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source),
+        ], check=True, capture_output=True, timeout=30)
+        source_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        media = editor_project_service.probe_media(source)
+        project = create_output_video_timeline(workspace="scene", output_name="original.mp4",
+            output_revision="sha256:" + "a" * 64, media=media)
+        clip = project["tracks"][0]["items"][0]
+        clip.update(source_in=1.5, duration=0.5)
+        project = save_editor_project(self.outputs, "scene", project, expected_revision=0)
+        origin = editor_retake_origin(project, clip["id"])
+        returned = add_editor_retake_take(project, origin=origin, job_id="abcdef12",
+            manifest_sha256="b" * 64, output_name=source.name,
+            output_revision="sha256:" + source_digest, gallery_revision="stat-revision", media=media)
+        self.assertEqual(returned["tracks"][0]["items"][0]["asset_id"], clip["asset_id"])
+        asset_id = returned["tracks"][0]["items"][0]["take_asset_ids"][-1]
+        selected = switch_output_video_take(returned, clip_id=clip["id"], asset_id=asset_id)
+        selected = save_editor_project(self.outputs, "scene", selected, expected_revision=1)
+        selected = load_editor_project(self.outputs, "scene", selected["id"])
+        cut = editor_sequence_clips(selected)[0][1]
+        destination = scene / "export.mp4"
+        render_video_sequence([{"path": str(source), "source_in": cut["source_in"],
+            "duration": cut["duration"], "has_audio": False}], destination,
+            width=64, height=64, fps=24, timeout=30)
+        frame = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+            "-i", str(destination), "-frames:v", "1", "-pix_fmt", "rgb24",
+            "-f", "rawvideo", "pipe:1"], check=True, capture_output=True, timeout=30).stdout
+        self.assertEqual(len(frame), 64 * 64 * 3)
+        self.assertGreater(min(frame), 240)  # The incorrect zero trim would export black.
+        exported = editor_project_service.probe_media(destination)
+        self.assertAlmostEqual(exported["duration"], 0.5, places=3)
+        self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), source_digest)
+
     def test_output_timeline_reopens_by_exact_revision_and_saves_only_trim(self):
         self._workspace("scene")
         media = {"type": "video", "duration": 20.0, "width": 1280, "height": 720, "fps": 30.0, "has_audio": True}
@@ -712,6 +754,8 @@ class TestEditorProjectRoutes(unittest.TestCase):
             "_editor_request_body", "_editor_save_root",
             "_editor_require_current_source", "open_output_editor_project",
             "save_output_editor_project", "serve_file", "add_output_editor_take", "switch_output_editor_take",
+            "_editor_retake_scoped_job", "_editor_retake_outputs", "list_editor_retakes",
+            "return_editor_retake", "dismiss_editor_retake",
         }
         selected = []
         for node in ast.parse(launch_path.read_text(encoding="utf-8")).body:
@@ -742,6 +786,7 @@ class TestEditorProjectRoutes(unittest.TestCase):
             "re": re,
             "os": os,
             "subprocess": subprocess,
+            "QueueRecoveryRuntimeError": __import__('services.queue_recovery_runtime', fromlist=['QueueRecoveryRuntimeError']).QueueRecoveryRuntimeError,
             "wgp": types.SimpleNamespace(server_config={"save_path": self.outputs}),
             "_reserve_workspace_operations": lambda _project: nullcontext(),
             "_output_lineage_mutation_guard": lambda _directory: nullcontext(),
@@ -757,6 +802,114 @@ class TestEditorProjectRoutes(unittest.TestCase):
         }
         exec(compile(module, str(launch_path), "exec"), namespace)
         self.routes = namespace
+
+    def _retake_return_fixture(self):
+        from services.editor_projects import editor_retake_origin
+        from services.queue_recovery_runtime import atomic_write_request_manifest, artifact_descriptor
+        self.media = {"type": "video", "duration": 3, "width": 128, "height": 72, "fps": 24}
+        with mock.patch("services.editor_projects.probe_media", return_value=self.media):
+            project = asyncio.run(self.routes["open_output_editor_project"]("scene", _EditorRequest({"output_name": "clip.mp4", "output_revision": self.revision})))["project"]
+        clip = project["tracks"][0]["items"][0]
+        proposed = copy.deepcopy(project)
+        proposed["tracks"][0]["items"][0].update(source_in=0.5, duration=1.5)
+        project = save_editor_project(self.outputs, "scene", apply_output_video_trim(project, proposed), expected_revision=1)
+        origin = editor_retake_origin(project, clip["id"])
+        self.result = Path(self.scene) / "retake.mp4"
+        self.result.write_bytes(b"sealed CPU fixture result")
+        unit_id = "unit:v1:" + "c" * 64
+        self.sidecar = self.result.with_suffix(".meta.json")
+        self.sidecar.write_text(json.dumps({"job_id": "abcdef12", "output_filename": self.result.name,
+                                         "producer_unit_id": unit_id, "private": True}))
+        pointer = atomic_write_request_manifest(self.scene, job_id="abcdef12",
+            params={"edit_sub_mode": "retake", "_editor_retake_origin": origin}, inputs=[])
+        descriptor = artifact_descriptor(self.scene, basename=self.result.name,
+            sidecar_basename=self.sidecar.name, producer_unit_id=unit_id)
+        self.snapshot = {"id": "abcdef12", "workspace": "scene", "kind": "studio_generation",
+            "project_instance": "instance", "status": "completed", "editor_retake_origin": origin,
+            "editor_retake_closed": False, "request_manifest": pointer, "output_files": [self.result.name],
+            "recovery_cursor": {"completed_units": [{"unit_id": unit_id, "kind": "ordinary_repeat",
+                                                     "state": "completed", "artifacts": [descriptor]}]}}
+        self.job = {"id": "abcdef12", "workspace": "scene", "status": "completed"}
+        self.routes["_jobs"] = {"abcdef12": self.job}
+        self.routes["_queue_recovery_coordinator"] = types.SimpleNamespace(read_only_snapshot=lambda: ({"abcdef12": copy.deepcopy(self.snapshot)}, frozenset()))
+        self.routes["_job_owned_by_request"] = lambda *_args: True
+        self.routes["_queue_recovery_project_identity"] = lambda *_args: "instance"
+        original_share_revision = self.routes["_output_share_revision"]
+        self.routes["_output_share_revision"] = lambda path, *args: (original_share_revision(path, *args)
+            if path == self.clip else "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest())
+        def output(request, workspace, name):
+            self.routes["_require_project_access"](request, workspace, permission="project.read")
+            if name == "clip.mp4":
+                return self.scene, self.clip, {"private": self.private}
+            if name != self.result.name:
+                raise HTTPException(404)
+            return self.scene, str(self.result), json.loads(self.sidecar.read_text())
+        self.routes["_require_authorized_output"] = output
+        def close(_job, **updates):
+            self.snapshot.update(updates); self.job.update(updates)
+            return True
+        self.routes["_queue_recovery_checkpoint"] = close
+        self.body = {"expected_revision": project["revision"], "output_name": self.result.name, "output_revision": self.revision}
+        return project
+
+    def test_explicit_retake_return_is_inactive_trimmed_and_lost_response_idempotent(self):
+        original = self._retake_return_fixture()
+        records = self.routes["list_editor_retakes"]("scene", original["id"], _EditorRequest({}))["retakes"]
+        self.assertEqual(records[0]["outputs"], [{"name": self.result.name, "revision": self.revision}])
+        self.assertFalse(records[0]["conflict"])
+        with mock.patch("services.editor_projects.probe_media", return_value=self.media), mock.patch.dict(self.routes, {"_queue_recovery_checkpoint": mock.Mock(side_effect=RuntimeError("lost checkpoint"))}):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(self.routes["return_editor_retake"]("scene", original["id"], "abcdef12", _EditorRequest(self.body)))
+        saved = load_editor_project(self.outputs, "scene", original["id"])
+        clip = saved["tracks"][0]["items"][0]
+        self.assertEqual(clip["asset_id"], original["tracks"][0]["items"][0]["asset_id"])
+        self.assertEqual((clip["source_in"], clip["duration"]), (0.5, 1.5))
+        self.assertEqual(clip["take_states"][clip["take_asset_ids"][-1]], {"source_in": 0.5, "speed": 1.0})
+        self.assertEqual(saved["canvas"], original["canvas"])
+        retried = asyncio.run(self.routes["return_editor_retake"]("scene", original["id"], "abcdef12", _EditorRequest(self.body)))
+        self.assertTrue(retried["reused"])
+        self.assertEqual(retried["project"], saved)
+        self.assertTrue(self.snapshot["editor_retake_closed"])
+        self.assertEqual(self.routes["list_editor_retakes"]("scene", original["id"], _EditorRequest({}))["retakes"], [])
+        # Completed job retirement does not lose the atomic adoption receipt.
+        self.routes["_jobs"] = {}
+        self.routes["_queue_recovery_coordinator"].read_only_snapshot = lambda: ({}, frozenset())
+        self.assertTrue(asyncio.run(self.routes["return_editor_retake"]("scene", original["id"], "abcdef12", _EditorRequest(self.body)))["reused"])
+
+    def test_retake_return_rejects_changed_cut_owner_project_and_sealed_result(self):
+        original = self._retake_return_fixture()
+        self.routes["_job_owned_by_request"] = lambda *_args: False
+        self.assertEqual(self.routes["list_editor_retakes"]("scene", original["id"], _EditorRequest({}))["retakes"], [])
+        with self.assertRaises(HTTPException) as denied:
+            asyncio.run(self.routes["return_editor_retake"]("scene", original["id"], "abcdef12", _EditorRequest(self.body)))
+        self.assertEqual(denied.exception.status_code, 404)
+        self.routes["_job_owned_by_request"] = lambda *_args: True
+        self.snapshot["project_instance"] = "replacement"
+        with self.assertRaises(HTTPException) as wrong_project:
+            asyncio.run(self.routes["return_editor_retake"]("scene", original["id"], "abcdef12", _EditorRequest(self.body)))
+        self.assertEqual(wrong_project.exception.status_code, 404)
+        self.snapshot["project_instance"] = "instance"
+        self.result.write_bytes(b"replaced candidate")
+        with self.assertRaises(HTTPException) as replaced:
+            asyncio.run(self.routes["return_editor_retake"]("scene", original["id"], "abcdef12", _EditorRequest(self.body)))
+        self.assertEqual(replaced.exception.status_code, 409)
+        self.assertEqual(load_editor_project(self.outputs, "scene", original["id"]), original)
+
+    def test_retake_changed_cut_conflicts_and_dismiss_preserves_media(self):
+        original = self._retake_return_fixture()
+        proposed = copy.deepcopy(original)
+        proposed["tracks"][0]["items"][0]["source_in"] = 0.75
+        changed = save_editor_project(self.outputs, "scene", apply_output_video_trim(original, proposed), expected_revision=2)
+        self.body["expected_revision"] = changed["revision"]
+        record = self.routes["list_editor_retakes"]("scene", original["id"], _EditorRequest({}))["retakes"][0]
+        self.assertTrue(record["conflict"])
+        with mock.patch("services.editor_projects.probe_media", return_value=self.media), self.assertRaises(HTTPException) as stale:
+            asyncio.run(self.routes["return_editor_retake"]("scene", original["id"], "abcdef12", _EditorRequest(self.body)))
+        self.assertEqual(stale.exception.status_code, 409)
+        media, metadata = self.result.read_bytes(), self.sidecar.read_bytes()
+        self.assertTrue(asyncio.run(self.routes["dismiss_editor_retake"]("scene", original["id"], "abcdef12", _EditorRequest({})))["dismissed"])
+        self.assertEqual((self.result.read_bytes(), self.sidecar.read_bytes()), (media, metadata))
+        self.assertEqual(load_editor_project(self.outputs, "scene", original["id"]), changed)
 
     def test_take_route_pins_private_sources_rejects_stale_and_restores_original(self):
         media = {"type":"video", "duration":3, "width":128, "height":72, "fps":24}

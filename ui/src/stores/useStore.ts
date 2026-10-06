@@ -3463,11 +3463,11 @@ interface AppState {
   setThemeFamily: (family: FamilyId) => void
 
   // Retake Dialog
-  retakeSourceContext: { workspace: string; revision: string; start: number; end: number } | null
+  retakeSourceContext: { workspace: string; revision: string; start: number; end: number; editor_origin?: api.EditorRetakeOrigin } | null
   retakeOpeningEpoch: number
   retakeDialogOpen: boolean
   retakeSourceFile: string | null
-  openRetakeDialog: (filename: string, context?: { workspace: string; revision: string; start: number; end: number }) => void
+  openRetakeDialog: (filename: string, context?: { workspace: string; revision: string; start: number; end: number; editor_origin?: api.EditorRetakeOrigin }) => void
   closeRetakeDialog: () => void
 
   // CivitAI LoRA Browser
@@ -7147,7 +7147,7 @@ export const useStore = create<AppState>((set, get) => ({
       || !/^sha256:[0-9a-f]{64}$/.test(context.revision)
       || !Number.isFinite(context.start) || !Number.isFinite(context.end)
       || context.start < 0 || context.end <= context.start)) return
-    set({ retakeDialogOpen: true, retakeSourceFile: filename, retakeSourceContext: context ? { ...context } : null, retakeOpeningEpoch: get().retakeOpeningEpoch + 1 })
+    set({ retakeDialogOpen: true, retakeSourceFile: filename, retakeSourceContext: context ? { ...context, ...(context.editor_origin ? { editor_origin: { ...context.editor_origin } } : {}) } : null, retakeOpeningEpoch: get().retakeOpeningEpoch + 1 })
   },
   closeRetakeDialog: () => set({ retakeDialogOpen: false, retakeSourceFile: null, retakeSourceContext: null, retakeOpeningEpoch: get().retakeOpeningEpoch + 1 }),
 

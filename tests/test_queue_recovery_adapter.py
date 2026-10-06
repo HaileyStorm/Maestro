@@ -242,6 +242,81 @@ class LogicalReferenceRecoveryTests(unittest.TestCase):
             coordinator.tombstone_terminal("completed-recovery")
             self.assertNotIn("completed-recovery",QueueRecoveryCoordinator(journal).restore().jobs)
 
+    def test_editor_retake_terminal_returns_survive_restart_until_explicit_closure(self):
+        origin = {"schema_version": 1, "workspace": "project-a", "editor_id": "cut-a",
+                  "editor_revision": 3, "clip_id": "clip-a", "asset_id": "asset-a",
+                  "output_name": "original.mp4", "output_revision": "sha256:" + "a" * 64,
+                  "source_in": 0.25, "duration": 2.0, "speed": 1.0}
+        manifest = {"path": ".maestro-recovery/retake.request.json", "schema": 1,
+                    "sha256": "b" * 64, "size": 20}
+        for status in ("completed", "failed", "cancelled"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                journal = QueueRecoveryJournal(Path(directory) / "queue.jsonl")
+                coordinator = QueueRecoveryCoordinator(journal)
+                job = {"id": "retake", "kind": "studio_generation", "status": status,
+                       "workspace": "project-a", "editor_retake_origin": origin,
+                       "params": {"_editor_retake_origin": origin, "prompt": "PRIVATE CONTENT"},
+                       "output_files": ["new.mp4"] if status == "completed" else []}
+                coordinator.register_job(job, owner_digest=OWNER, project_digest=PROJECT,
+                                         request_manifest=manifest)
+                coordinator.compact()
+                fresh = QueueRecoveryCoordinator(journal)
+                restored = fresh.restore().jobs["retake"]
+                self.assertEqual(restored["editor_retake_origin"], origin)
+                self.assertIs(restored["editor_retake_closed"], False)
+                self.assertEqual(restored["status"], status)
+                self.assertEqual(restored["owner_principal"], OWNER)
+                self.assertEqual(restored["project_instance"], PROJECT)
+                self.assertEqual(restored["request_manifest"], manifest)
+                self.assertNotIn("params", restored)
+                self.assertNotIn("PRIVATE CONTENT", (Path(directory) / "queue.jsonl").read_text())
+                self.assertTrue(recovery_adapter.editor_retake_return_retained(restored))
+                with self.assertRaisesRegex(QueueRecoveryAdapterError, "Retake return is pending"):
+                    fresh.tombstone_terminal("retake")
+                self.assertIn("retake", fresh.compact().jobs)
+                restored["editor_retake_closed"] = True
+                fresh.prospective_transition(types.SimpleNamespace(
+                    jobs=(restored,), tombstones=(), global_state=None))
+                closed = QueueRecoveryCoordinator(journal).restore().jobs["retake"]
+                self.assertIs(closed["editor_retake_closed"], True)
+                self.assertFalse(recovery_adapter.editor_retake_return_retained(closed))
+                if status == "failed":
+                    fresh.tombstone_terminal("retake")
+                self.assertEqual(fresh.compact().jobs, {})
+
+    def test_editor_retake_invalid_origin_never_crosses_journal_boundary(self):
+        origin = {"schema_version": 1, "workspace": "project-a", "editor_id": "cut-a",
+                  "editor_revision": 1, "clip_id": "clip-a", "asset_id": "asset-a",
+                  "output_name": "original.mp4", "output_revision": "sha256:" + "a" * 64,
+                  "source_in": 0, "duration": 1, "speed": 1}
+        invalid = [None, dict(origin, extra="private"), {key: value for key, value in origin.items()
+                                                       if key != "clip_id"}]
+        for field, value in (("schema_version", True), ("editor_revision", True),
+                             ("editor_revision", 0), ("editor_id", "x" * 81),
+                             ("workspace", "../project-a"), ("output_name", "sub/file.mp4"),
+                             ("output_revision", "sha256:" + "a" * 63),
+                             ("source_in", -1), ("duration", 0), ("speed", True),
+                             ("speed", float("nan")), ("duration", float("inf"))):
+            invalid.append(dict(origin, **{field: value}))
+        with tempfile.TemporaryDirectory() as directory:
+            journal = QueueRecoveryJournal(Path(directory) / "queue.jsonl")
+            coordinator = QueueRecoveryCoordinator(journal)
+            for index, candidate in enumerate(invalid):
+                job = {"id": "retake", "kind": "studio_generation", "status": "completed",
+                       "workspace": "project-a", "editor_retake_origin": candidate}
+                with self.subTest(index=index), self.assertRaises(QueueRecoveryAdapterError):
+                    coordinator.register_job(job, owner_digest=OWNER, project_digest=PROJECT,
+                                             request_manifest={"kind": "test"})
+                self.assertFalse(recovery_adapter.editor_retake_return_retained(job))
+            for changes in ({"kind": "tool_editor_export"}, {"workspace": "project-b"},
+                            {"editor_retake_closed": 1}, {"editor_retake_closed": "false"}):
+                job = {"id": "retake", "kind": "studio_generation", "status": "completed",
+                       "workspace": "project-a", "editor_retake_origin": origin, **changes}
+                with self.subTest(changes=changes), self.assertRaises(QueueRecoveryAdapterError):
+                    coordinator.register_job(job, owner_digest=OWNER, project_digest=PROJECT,
+                                             request_manifest={"kind": "test"})
+            self.assertEqual(journal.recover().jobs, {})
+
     def test_legacy_read_only_replay_requires_exact_request_digest(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "legacy"

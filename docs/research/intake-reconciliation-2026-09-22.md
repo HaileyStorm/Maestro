@@ -1021,3 +1021,27 @@ Local/stable health and readiness passed and the matching notice cleared.
 Account rotation remains CPU lifecycle evidence; native Retake output is still
 unverified. A direct CLI admission probe lacked the browser's source permission
 and stopped at HTTP 403 without retry or credential substitution.
+
+## 2026-10-06 — Durable Editor Retake result return
+
+Editor Retake admission now seals the saved cut and source identity into the
+ordinary generation request. The selected clip's Takes panel discovers its
+results through a read-only request. **Add result as a take** verifies the
+completed job's sealed media and sidecar, then appends an inactive take with the
+original cut. The user chooses when to switch takes. A changed cut produces a
+plain conflict and preserves the result in Gallery. **Remove review** closes
+the association without cancelling the job or deleting its media.
+
+Unresolved associations survive journal compaction and startup manifest
+cleanup, with bounded admission. An atomic Editor receipt makes a lost-response
+retry reuse the original import, including after queue retirement. Existing
+context-free Gallery Retake and manual take import remain available.
+
+Evidence: 53 affected backend/admission checks, 25 queue-adapter checks, 44 UI
+checks, TypeScript, scoped lint and production build; sparse frozen-source
+review found no consequential issues. The affected startup module passes 208 checks, including a repeated-startup
+regression using the real journal and manifest cleanup with a stubbed runtime materializer.
+A real CPU FFmpeg fixture proves the returned take exports the original cut
+after explicit selection and reopen, without modifying source media. These
+checks do not prove native generated Retake output, mounted browser return,
+Windows/LAN parity or human quality acceptance.

@@ -3,7 +3,7 @@ import test, { after } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { createServer } from 'vite'
 
-import { addEditorAudio, addEditorImage, addEditorTake, switchEditorTake, appendEditorClip, exportEditorProject, isBackendJobId, openOutputInEditor, saveEditorProject } from '../src/api/client.ts'
+import { addEditorAudio, addEditorImage, addEditorTake, switchEditorTake, appendEditorClip, exportEditorProject, isBackendJobId, getEditorRetakes, dismissEditorRetake, openOutputInEditor, saveEditorProject } from '../src/api/client.ts'
 
 // Expose the component's actual draft transformations only in this test loader.
 // Production exports remain the component, and no duplicate implementation is tested.
@@ -16,12 +16,12 @@ const server = await createServer({
     name: 'editor-test-transforms',
     transform(code, id) {
       if (id.endsWith('/src/editor/EditorWorkspace.tsx')) {
-        return `${code}\nexport { changeTrim, moveClip, removeClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio, audioGain, imageLayers, changeImage, availableImages, imageLayout, retakeSelectedCut, prepareRetakeReview };`
+        return `${code}\nexport { changeTrim, moveClip, removeClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio, audioGain, imageLayers, changeImage, availableImages, imageLayout, retakeSelectedCut, prepareRetakeReview, readRetakeReview, returnRetakeResult };`
       }
     },
   }],
 })
-const { changeTrim, moveClip, removeClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio, audioGain, imageLayers, changeImage, availableImages, imageLayout, retakeSelectedCut, prepareRetakeReview } = await server.ssrLoadModule('/src/editor/EditorWorkspace.tsx')
+const { changeTrim, moveClip, removeClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio, audioGain, imageLayers, changeImage, availableImages, imageLayout, retakeSelectedCut, prepareRetakeReview, readRetakeReview, returnRetakeResult } = await server.ssrLoadModule('/src/editor/EditorWorkspace.tsx')
 after(() => server.close())
 
 function sequenceProject() {
@@ -448,6 +448,7 @@ test('Retake review uses active alternate source and exact sped cut without chan
   const before = JSON.stringify(project)
   assert.deepEqual(retakeSelectedCut(project, clip.id), { filename: 'b.mp4', context: {
     workspace: 'scene', revision: project.assets.b.output_revision, start: 2.5, end: 5,
+    editor_origin: { editor_id: project.id, editor_revision: project.revision, clip_id: clip.id, asset_id: 'b' },
   } })
   assert.equal(JSON.stringify(project), before)
   assert.equal(retakeSelectedCut(project, 'missing'), null)
@@ -495,4 +496,102 @@ test('actual Retake store opening identity is invalidated by workspace ABA and c
   useStore.getState().openRetakeDialog('gallery.mp4')
   assert.ok(useStore.getState().retakeOpeningEpoch > reopened)
   useStore.getState().closeRetakeDialog()
+})
+
+
+test('Retake result discovery is GET-only on reopening and drops late scope/clip responses', async () => {
+  const previous = globalThis.fetch
+  const calls = []
+  const row = { job_id: 'faceb00c', clip_id: 'clip-a', status: 'completed', outputs: [{ name: 'retake.mp4', revision: 'sha256:' + 'd'.repeat(64) }], conflict: false }
+  try {
+    globalThis.fetch = async (url, init) => {
+      calls.push({ url, method: init?.method ?? 'GET' })
+      return { ok: true, json: async () => ({ retakes: [row] }) }
+    }
+    for (let reopen = 0; reopen < 2; reopen++) {
+      assert.deepEqual(await readRetakeReview('scene', 'saved edit', 'clip-a', () => true), [row])
+    }
+    assert.deepEqual(calls.map(item => item.method), ['GET', 'GET'])
+    assert.ok(calls.every(item => item.url.endsWith('/editor/projects/saved%20edit/retakes')))
+    let release
+    const pending = new Promise(resolve => { release = resolve })
+    globalThis.fetch = async () => { await pending; return { ok: true, json: async () => ({ retakes: [row] }) } }
+    let sequence = 0
+    const captured = sequence
+    const late = readRetakeReview('scene', 'saved edit', 'clip-a', () => sequence === captured)
+    sequence++ // account/workspace/selection replacement, including a return to the original name
+    release()
+    assert.equal(await late, null)
+  } finally { globalThis.fetch = previous }
+})
+
+test('explicit Retake result return saves newer edits and adds only an inactive take at current CAS', async () => {
+  const previous = globalThis.fetch
+  const original = sequenceProject()
+  const output = { name: 'retake.mp4', revision: 'sha256:' + 'e'.repeat(64) }
+  const review = { job_id: 'faceb00c', clip_id: 'clip-a', status: 'completed', outputs: [output], conflict: false }
+  let project = original
+  let dirty = true
+  const order = []
+  const response = { ...original, revision: 7, assets: { ...original.assets, alt: { ...original.assets.a, output_id: output.name, output_revision: output.revision } }, tracks: original.tracks.map((track, index) => index ? track : { ...track, items: track.items.map((clip, i) => i ? clip : { ...clip, take_asset_ids: ['a', 'alt'], take_states: { a: { source_in: 1, speed: 1 }, alt: { source_in: 1, speed: 1 } } }) }) }
+  try {
+    globalThis.fetch = async (url, init) => {
+      order.push('POST')
+      assert.ok(url.endsWith('/retakes/faceb00c/take'))
+      assert.equal(init.method, 'POST')
+      assert.deepEqual(JSON.parse(init.body), { expected_revision: 6, output_name: output.name, output_revision: output.revision })
+      return { ok: true, json: async () => ({ project: response, reused: false }) }
+    }
+    const prepare = () => prepareRetakeReview(Promise.resolve({ allEditsSaved: false }), () => true, () => dirty, async () => {
+      order.push('save'); project = { ...original, revision: 6 }; dirty = false; return { allEditsSaved: true }
+    })
+    const returned = await returnRetakeResult(review, output, 'clip-a', () => true, prepare, () => project)
+    assert.deepEqual(order, ['save', 'POST'])
+    assert.equal(returned.tracks[0].items[0].asset_id, 'a')
+    assert.equal(returned.tracks[0].items[0].source_in, 1)
+    assert.equal(returned.tracks[0].items[0].duration, 3)
+    assert.deepEqual(returned.canvas, original.canvas)
+    assert.equal(original.assets.alt, undefined)
+    order.length = 0
+    for (const options of [
+      { row: { ...review, conflict: true }, current: () => true, prepare: async () => true },
+      { row: review, current: () => true, prepare: async () => false },
+      { row: review, current: () => false, prepare: async () => true },
+    ]) assert.equal(await returnRetakeResult(options.row, output, 'clip-a', options.current, options.prepare, () => project), null)
+    assert.equal(order.length, 0)
+    let release
+    const pending = new Promise(resolve => { release = resolve })
+    let sequence = 0
+    globalThis.fetch = async () => { order.push('POST'); await pending; return { ok: true, json: async () => ({ project: response, reused: false }) } }
+    const captured = sequence
+    const late = returnRetakeResult(review, output, 'clip-a', () => sequence === captured, async () => true, () => project)
+    await Promise.resolve(); await Promise.resolve()
+    sequence++
+    release()
+    assert.equal(await late, null, 'accepted response cannot replace a new Editor/account/clip scope')
+  } finally { globalThis.fetch = previous }
+})
+
+
+test('Retake review rejects malformed completion identities and explicit dismissal only closes review', async () => {
+  const previous = globalThis.fetch
+  const revision = 'sha256:' + 'a'.repeat(64)
+  const row = { job_id: 'faceb00c', clip_id: 'clip-a', status: 'completed', outputs: [{ name: 'retake.mp4', revision }], conflict: false }
+  try {
+    for (const outputs of [[{ name: '../foreign.mp4', revision }], [{ name: 'retake.mp4', revision: 'wrong' }]]) {
+      globalThis.fetch = async () => ({ ok: true, json: async () => ({ retakes: [{ ...row, outputs }] }) })
+      await assert.rejects(getEditorRetakes('scene', 'saved edit'), /could not be verified/)
+    }
+    const calls = []
+    globalThis.fetch = async (url, init) => {
+      calls.push({ url, method: init?.method ?? 'GET', body: init?.body })
+      return { ok: true, json: async () => init?.method === 'POST' ? { dismissed: true } : { retakes: [] } }
+    }
+    await dismissEditorRetake('scene', 'saved edit', 'faceb00c')
+    assert.deepEqual(await getEditorRetakes('scene', 'saved edit'), [])
+    assert.deepEqual(calls.map(call => call.method), ['POST', 'GET'])
+    assert.ok(calls[0].url.endsWith('/retakes/faceb00c/dismiss'))
+    assert.equal(calls[0].body, '{}')
+    assert.ok(calls.every(call => !/cancel|delete|generate|retake$/.test(call.url)))
+  } finally { globalThis.fetch = previous }
 })

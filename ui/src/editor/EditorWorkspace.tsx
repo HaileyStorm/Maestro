@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ArrowLeft, ArrowRight, Download, Eye, Film, Loader2, Pause, Play, Plus, RotateCcw, Save, Trash2 } from 'lucide-react'
-import { addEditorAudio, addEditorImage, addEditorTake, switchEditorTake, appendEditorClip, exportEditorProject, getEditorPreviewUrl, openOutputInEditor, projectReferenceSafeErrorMessage, saveEditorProject, type EditorProject } from '../api/client'
+import { addEditorAudio, addEditorImage, addEditorTake, switchEditorTake, appendEditorClip, exportEditorProject, getEditorPreviewUrl, getEditorRetakes, addEditorRetake, dismissEditorRetake, openOutputInEditor, projectReferenceSafeErrorMessage, saveEditorProject, type EditorProject, type EditorRetakeReview } from '../api/client'
 import { hidePrivatePreview, privatePreviewIdentity, privatePreviewWasRevealed, revealPrivatePreview, subscribePrivatePreviewReveal } from '../lib/privatePreview'
 import { currentAccountIdentityEpoch, useStore } from '../stores/useStore'
 import type { OutputFile } from '../types'
@@ -384,7 +384,7 @@ function retakeSelectedCut(project: EditorProject, clipId: string) {
   const start = clip.source_in ?? 0
   const end = start + clip.duration * (clip.speed ?? 1)
   if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start || end > asset.duration + 1e-6) return null
-  return { filename: asset.output_id, context: { workspace: project.workspace, revision: asset.output_revision, start, end } }
+  return { filename: asset.output_id, context: { workspace: project.workspace, revision: asset.output_revision, start, end, editor_origin: { editor_id: project.id, editor_revision: project.revision, clip_id: clip.id, asset_id: clip.asset_id! } } }
 }
 
 async function prepareRetakeReview(
@@ -397,6 +397,26 @@ async function prepareRetakeReview(
   if (!current()) return false
   if (unsaved() && !(await saveLatest())?.allEditsSaved) return false
   return current() && !unsaved()
+}
+
+async function readRetakeReview(workspace: string, editorId: string, clipId: string, current: () => boolean) {
+  if (!current()) return null
+  const rows = await getEditorRetakes(workspace, editorId)
+  return current() ? rows.filter(row => row.clip_id === clipId) : null
+}
+
+async function returnRetakeResult(
+  review: EditorRetakeReview, output: { name: string; revision: string },
+  clipId: string, current: () => boolean,
+  prepare: () => Promise<boolean>, latest: () => EditorProject | null,
+) {
+  if (!current() || review.clip_id !== clipId || review.conflict || review.status !== 'completed'
+    || !review.outputs.some(item => item.name === output.name && item.revision === output.revision)) return null
+  if (!await prepare() || !current()) return null
+  const project = latest()
+  if (!project || !sequenceClips(project).some(item => item.id === clipId)) return null
+  const result = await addEditorRetake(project.workspace, project, review.job_id, output)
+  return current() ? result.project : null
 }
 
 export function EditorWorkspace({ source }: { source: OutputFile }) {
@@ -415,6 +435,10 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
   const textField = useRef<HTMLTextAreaElement>(null)
   const [appendName, setAppendName] = useState('')
   const [takeName, setTakeName] = useState('')
+  const [retakeReview, setRetakeReview] = useState<{ key: string; rows: EditorRetakeReview[]; error: string } | null>(null)
+  const [retakeRefresh, setRetakeRefresh] = useState(0)
+  const clipSequence = useRef(0)
+  const selectedClip = useRef('')
   const [appendPending, setAppendPending] = useState(false)
   const [appendError, setAppendError] = useState('')
   const [importKind, setImportKind] = useState<'video' | 'audio' | 'image' | 'take'>('video')
@@ -526,7 +550,8 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
         projectRef.current = opened
         setProject(opened)
         setLoadedSource(privatePreviewIdentity(source.workspace, source.name, source.revision))
-        setActiveClipId(sequenceClips(opened)[0]?.id ?? '')
+        selectedClip.current = sequenceClips(opened)[0]?.id ?? ''
+        setActiveClipId(selectedClip.current)
         setLoading(false)
       },
       reason => {
@@ -601,6 +626,8 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
   }
 
   const selectClip = (id: string) => {
+    clipSequence.current += 1
+    selectedClip.current = id
     preview.current?.pause()
     setPlaying(false)
     setPlaybackError(false)
@@ -781,6 +808,73 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
       }
     } finally {
       if (isCurrent(epoch)) exporting.current = false
+    }
+  }
+
+  const retakeKey = project && clip ? JSON.stringify([sourceKey, project.id, project.revision, clip.id, clipSequence.current, scope.current]) : ''
+  const retakes = retakeReview?.key === retakeKey ? retakeReview.rows : []
+  const retakeEditorId = project?.id ?? ''
+  const retakeClipId = clip?.id ?? ''
+  const retakeSelection = clipSequence.current
+  const retakeScope = scope.current
+  useEffect(() => {
+    if (!retakeEditorId || !retakeClipId || !retakeKey) return
+    const epoch = scope.current
+    const selection = clipSequence.current
+    const editorId = retakeEditorId
+    const clipId = retakeClipId
+    let disposed = false
+    const current = () => !disposed && isCurrent(epoch) && clipSequence.current === selection
+      && selectedClip.current === clipId && projectRef.current?.id === editorId
+    void readRetakeReview(source.workspace, editorId, clipId, current).then(rows => {
+      if (rows) setRetakeReview({ key: retakeKey, rows, error: '' })
+    }, () => {
+      if (current()) setRetakeReview({ key: retakeKey, rows: [], error: 'Retake results could not be checked. Try again.' })
+    })
+    return () => { disposed = true }
+  }, [retakeEditorId, retakeClipId, retakeKey, outputs, retakeRefresh, isCurrent, source.workspace])
+
+  const handleRetakeResult = async (review: EditorRetakeReview, output?: { name: string; revision: string }) => {
+    const epoch = retakeScope
+    const selection = retakeSelection
+    const editorId = retakeEditorId
+    const clipId = clip?.id
+    if (!editorId || !clipId || review.clip_id !== clipId || selection !== clipSequence.current || !isCurrent(epoch) || appending.current || exporting.current || saveState === 'error') return
+    let submittedVersion: number | null = null
+    const current = () => (submittedVersion === null || editVersion.current === submittedVersion) && isCurrent(epoch) && clipSequence.current === selection
+      && selectedClip.current === clipId && projectRef.current?.id === editorId
+    if (!current()) return
+    appending.current = true
+    setAppendPending(true)
+    setImportKind('take')
+    setAppendError('')
+    preview.current?.pause()
+    setPlaying(false)
+    try {
+      if (!output) {
+        await dismissEditorRetake(source.workspace, editorId, review.job_id)
+      } else {
+        const returned = await returnRetakeResult(review, output, clipId, current,
+          async () => {
+            const ready = await prepareRetakeReview(savingPromise.current, current,
+              () => savedVersion.current !== editVersion.current,
+              async () => projectRef.current ? save(projectRef.current) : null)
+            if (ready) submittedVersion = editVersion.current
+            return ready
+          },
+          () => projectRef.current)
+        if (!current() || !returned) return
+        projectRef.current = returned
+        setProject(returned)
+        setSaveState('saved')
+        setExportState('idle')
+        setExportError('')
+      }
+      if (current()) setRetakeRefresh(value => value + 1)
+    } catch (reason) {
+      if (current()) setAppendError(projectReferenceSafeErrorMessage(reason, 'This Retake result could not be updated. It remains in Gallery.'))
+    } finally {
+      if (isCurrent(epoch)) { appending.current = false; setAppendPending(false) }
     }
   }
 
@@ -1013,6 +1107,22 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
                 </label>
                 <button type="button" disabled={busy || savePending || saveState === 'error' || !takeName || (clip?.take_asset_ids?.length ?? 1) >= 8}
                   onClick={() => { void handleAppend('take', takeName) }} className={audioButtonClass}><Plus size={14} aria-hidden="true" />Add take</button>
+              </div>
+              <div className="mt-4 space-y-3" aria-label="Retake results for selected clip">
+                <div className="flex items-center justify-between gap-3"><h4 className="text-sm font-medium">Retake results</h4>
+                  <button type="button" disabled={busy} onClick={() => setRetakeRefresh(value => value + 1)} className={audioButtonClass}>Check results</button></div>
+                {retakeReview?.key === retakeKey && retakeReview.error && <p role="alert" className="text-sm text-red-400">{retakeReview.error}</p>}
+                {retakes.map(review => <div key={review.job_id} className="rounded-lg border border-border p-3">
+                  <p className="text-xs text-text-secondary">{{ queued: 'Queued', running: 'Retake running', completed: 'Retake completed', failed: 'Retake failed', cancelled: 'Retake cancelled' }[review.status]}</p>
+                  {review.conflict && <p className="mt-2 text-sm text-text-secondary">This cut or result changed. Keep the result in Gallery; it cannot be added here.</p>}
+                  {!review.conflict && review.status === 'completed' && review.outputs.map(output => <div key={output.name} className="mt-2 flex flex-wrap items-center gap-2">
+                    <span className="min-w-0 break-all text-sm">{output.name}</span>
+                    <button type="button" disabled={busy || saveState === 'error' || (clip?.take_asset_ids?.length ?? 1) >= 8}
+                      onClick={() => { void handleRetakeResult(review, output) }} className={audioButtonClass}>Add result as a take</button>
+                  </div>)}
+                  <button type="button" disabled={busy} onClick={() => { void handleRetakeResult(review) }} className={`${audioButtonClass} mt-2`}>Remove review</button>
+                </div>)}
+                <p className="text-xs text-text-muted">Adding a result keeps the current take selected. Removing a review keeps its job and media.</p>
               </div>
               {(clip?.take_asset_ids?.length ?? 1) >= 8 && <p className="mt-2 text-xs text-text-muted">This clip has reached its 8-take limit.</p>}
               {appendPending && importKind === 'take' && <p role="status" className="mt-2 text-xs text-text-secondary">Saving edits and updating takes…</p>}

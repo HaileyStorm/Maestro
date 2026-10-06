@@ -1048,7 +1048,7 @@ test('Editor Retake opening preserves selected interval and revision; stale meta
   globalThis.HTMLButtonElement = class {}
   resetDialogHarness([{ current: {} }, { current: {} }, { current: null }])
   let loads = 0
-  const context = { workspace: 'scene', revision: 'sha256:' + 'a'.repeat(64), start: 2.5, end: 5 }
+  const context = { workspace: 'scene', revision: 'sha256:' + 'a'.repeat(64), start: 2.5, end: 5, editor_origin: { editor_id: 'saved-edit', editor_revision: 6, clip_id: 'clip-a', asset_id: 'alternate' } }
   globalThis.__retakeStore = {
     retakeDialogOpen: true, retakeSourceFile: 'alternate.mp4', retakeSourceContext: context,
     retakeOpeningEpoch: 1, activeWorkspace: 'scene',
@@ -1073,6 +1073,7 @@ test('Editor Retake opening preserves selected interval and revision; stale meta
   globalThis.__retakeSubmit = () => pending.promise
   const submitting = findNode(tree, node => node.type === 'button' && nodeText(node) === 'Retake').props.onClick()
   assert.equal(globalThis.__retakePayloads[0].expected_source_revision, context.revision)
+  assert.deepEqual(globalThis.__retakePayloads[0].editor_origin, context.editor_origin)
   assert.deepEqual([globalThis.__retakePayloads[0].start_time, globalThis.__retakePayloads[0].end_time], [2.5, 5])
   globalThis.__retakeStore.activeWorkspace = 'other'
   globalThis.__retakeStore.retakeOpeningEpoch++

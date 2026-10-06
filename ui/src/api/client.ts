@@ -5054,6 +5054,51 @@ export async function appendEditorClip(project: string, timeline: EditorProject,
   return (await res.json()).project as EditorProject
 }
 
+export interface EditorRetakeOrigin {
+  editor_id: string; editor_revision: number; clip_id: string; asset_id: string
+}
+
+export interface EditorRetakeReview {
+  job_id: string; clip_id: string;
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+  outputs: Array<{ name: string; revision: string }>; conflict: boolean
+}
+
+export async function getEditorRetakes(workspace: string, editorId: string): Promise<EditorRetakeReview[]> {
+  const res = await fetch(`${BASE}/api/v1/projects/${encodeURIComponent(workspace)}/editor/projects/${encodeURIComponent(editorId)}/retakes`)
+  if (!res.ok) throw editorRequestError(res.status, 'Retake results could not be checked')
+  const body = await res.json()
+  if (!Array.isArray(body.retakes) || body.retakes.length > 8 || body.retakes.some((row: EditorRetakeReview) => (
+    !row || typeof row.job_id !== 'string' || !isBackendJobId(row.job_id)
+    || typeof row.clip_id !== 'string' || !row.clip_id
+    || !['queued', 'running', 'completed', 'failed', 'cancelled'].includes(row.status)
+    || typeof row.conflict !== 'boolean' || !Array.isArray(row.outputs) || row.outputs.length > 8
+    || row.outputs.some(output => !output || typeof output.name !== 'string' || !output.name
+      || /[/\\\0]/.test(output.name) || typeof output.revision !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(output.revision))
+  ))) throw new Error('Retake results could not be verified. Try checking again.')
+  return body.retakes
+}
+
+export async function addEditorRetake(workspace: string, timeline: EditorProject, jobId: string, output: { name: string; revision: string }): Promise<{ project: EditorProject; reused: boolean }> {
+  const res = await fetch(`${BASE}/api/v1/projects/${encodeURIComponent(workspace)}/editor/projects/${encodeURIComponent(timeline.id)}/retakes/${encodeURIComponent(jobId)}/take`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ expected_revision: timeline.revision, output_name: output.name, output_revision: output.revision }),
+  })
+  if (!res.ok) {
+    if (res.status === 409) throw new ProjectAssetRequestError(409, 'This cut or result changed. The result stays in Gallery. Reopen the edit before adding it.')
+    throw editorRequestError(res.status, 'This Retake result could not be added')
+  }
+  return res.json()
+}
+
+export async function dismissEditorRetake(workspace: string, editorId: string, jobId: string): Promise<void> {
+  const res = await fetch(`${BASE}/api/v1/projects/${encodeURIComponent(workspace)}/editor/projects/${encodeURIComponent(editorId)}/retakes/${encodeURIComponent(jobId)}/dismiss`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+  })
+  if (!res.ok) throw editorRequestError(res.status, 'This Retake review could not be removed')
+  if ((await res.json()).dismissed !== true) throw new Error('This Retake review could not be removed')
+}
+
 export async function addEditorTake(project: string, timeline: EditorProject, clipId: string, name: string, revision: string): Promise<EditorProject> {
   const res = await fetch(`${BASE}/api/v1/projects/${encodeURIComponent(project)}/editor/projects/${encodeURIComponent(timeline.id)}/clips/${encodeURIComponent(clipId)}/takes`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -6950,6 +6995,7 @@ export async function submitRetake(params: {
   num_inference_steps?: number; retake_strength?: number; workspace?: string;
   retake_engine?: string; regenerate_audio?: boolean; resolution?: string;
   expected_source_revision?: string;
+  editor_origin?: EditorRetakeOrigin;
   activated_loras?: string[]; loras_multipliers?: string;
   private_output?: boolean; explicit_output?: boolean;
 }): Promise<{ job_id: string; status: string; retake_frames: string }> {

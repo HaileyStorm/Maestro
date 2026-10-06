@@ -64,6 +64,87 @@ class EditorProjectError(ValueError):
     """A project or asset was invalid or unsafe."""
 
 
+@contextmanager
+def editor_project_operation():
+    """Keep saved-origin validation and admission in one Editor operation."""
+    with _project_lock:
+        yield
+
+
+def validate_editor_retake_origin(value: Any) -> dict[str, Any]:
+    """Validate the closed, path-free server-authored Retake origin."""
+    fields = {"schema_version", "workspace", "editor_id", "editor_revision", "clip_id",
+              "asset_id", "output_name", "output_revision", "source_in", "duration", "speed"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise EditorProjectError("Invalid saved Retake origin")
+    if (type(value["schema_version"]) is not int or value["schema_version"] != 1
+            or type(value["editor_revision"]) is not int or value["editor_revision"] < 1
+            or any(not isinstance(value[key], str) or not _PROJECT_ID_RE.fullmatch(value[key])
+                   for key in ("workspace", "editor_id", "clip_id", "asset_id"))):
+        raise EditorProjectError("Invalid saved Retake origin")
+    name = value["output_name"]
+    if (not isinstance(name, str) or not 0 < len(name) <= 255 or name.startswith(".")
+            or os.path.basename(name) != name or any(c in name for c in ("\\", "\0"))
+            or os.path.splitext(name)[1].lower() not in _VIDEO_EXTENSIONS
+            or not isinstance(value["output_revision"], str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", value["output_revision"])):
+        raise EditorProjectError("Invalid saved Retake origin")
+    for key in ("source_in", "duration", "speed"):
+        number = value[key]
+        if type(number) not in (int, float) or not math.isfinite(number):
+            raise EditorProjectError("Invalid saved Retake origin")
+    if not (0 <= value["source_in"] <= 86400 and 1 / 240 <= value["duration"] <= 86400
+            and value["speed"] == 1.0 and value["source_in"] + value["duration"] <= 86400):
+        raise EditorProjectError("Invalid saved Retake origin")
+    return copy.deepcopy(value)
+
+
+def editor_retake_origin(current: Mapping[str, Any], clip_id: str) -> dict[str, Any]:
+    pair = next(((asset, clip) for asset, clip in editor_sequence_clips(current)
+                 if clip["id"] == clip_id), None)
+    if pair is None:
+        raise EditorProjectError("The original cut is no longer in this edit")
+    asset, clip = pair
+    return validate_editor_retake_origin({
+        "schema_version": 1, "workspace": current["workspace"], "editor_id": current["id"],
+        "editor_revision": current["revision"], "clip_id": clip_id, "asset_id": clip["asset_id"],
+        "output_name": asset["output_id"], "output_revision": asset["output_revision"],
+        "source_in": clip["source_in"], "duration": clip["duration"], "speed": clip["speed"],
+    })
+
+
+def require_editor_retake_cut(current: Mapping[str, Any], origin: Any) -> dict[str, Any]:
+    sealed = validate_editor_retake_origin(origin)
+    present = editor_retake_origin(current, sealed["clip_id"])
+    # Other cuts and title/layer edits may advance the draft revision.
+    if any(present[key] != sealed[key] for key in sealed if key != "editor_revision"):
+        raise EditorProjectError("The original cut changed. Keep this result in Gallery or add it manually")
+    return sealed
+
+
+def add_editor_retake_take(current: Mapping[str, Any], *, origin: Any, job_id: str,
+                           manifest_sha256: str, output_name: str, output_revision: str,
+                           gallery_revision: str, media: Mapping[str, Any]) -> dict[str, Any]:
+    sealed = require_editor_retake_cut(current, origin)
+    receipts = current.get("retake_returns", [])
+    if not isinstance(receipts, list) or len(receipts) >= 64:
+        raise EditorProjectError("This edit has reached its Retake history limit. Add the video manually from Gallery")
+    if sealed["source_in"] + sealed["duration"] > _finite_number(media.get("duration"), 0) + 1e-6:
+        raise EditorProjectError("The Retake video does not cover the original cut. Keep it in Gallery")
+    updated = add_output_video_take(current, clip_id=sealed["clip_id"], output_name=output_name,
+                                    output_revision=output_revision, media=media)
+    clip = next(item for _, item in editor_sequence_clips(updated) if item["id"] == sealed["clip_id"])
+    asset_id = clip["take_asset_ids"][-1]
+    clip["take_states"][asset_id] = {"source_in": sealed["source_in"], "speed": sealed["speed"]}
+    updated["retake_returns"] = [*receipts, {
+        "job_id": job_id, "manifest_sha256": manifest_sha256, "clip_id": sealed["clip_id"],
+        "asset_id": asset_id, "output_name": output_name, "output_revision": output_revision,
+        "gallery_revision": gallery_revision,
+    }]
+    editor_sequence_clips(updated)
+    return updated
+
+
 def _finite_number(value: Any, default: float) -> float:
     try:
         parsed = float(value)

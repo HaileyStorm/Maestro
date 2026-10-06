@@ -33,6 +33,7 @@ from services.job_lifecycle import (
     validated_prompt_enhancement_gpu_intent,
 )
 from services.queue_recovery import QueueRecoveryJournal, RecoverySnapshot
+from services.editor_projects import EditorProjectError, validate_editor_retake_origin
 from services.h3_offload_plan import (
     H3OffloadPlanError,
     validate_h3_offload_plan,
@@ -89,6 +90,7 @@ _JOB_FIELDS = frozenset({
     "recovery_unit", "recovery_cursor", "_recovery_reason_code",
     "_recovery_worker_pending",
     "credit_queue", "prompt_result_reference", "prompt_result_consumed",
+    "editor_retake_origin", "editor_retake_closed",
 })
 _GLOBAL_FIELDS = frozenset({
     "paused", "pause_after_current", "manual_order_sequence", "queue_order",
@@ -154,6 +156,17 @@ def composition_recovery_requests_retained(job: Mapping[str, Any]) -> bool:
             return False
         pending += record["status"] == "pending"
     return pending <= 1
+
+
+def editor_retake_return_retained(job: Mapping[str, Any]) -> bool:
+    """Keep the sealed Editor return until explicit adoption or dismissal."""
+    if job.get("kind") != "studio_generation" or job.get("editor_retake_closed") is True:
+        return False
+    try:
+        origin = validate_editor_retake_origin(job.get("editor_retake_origin"))
+    except EditorProjectError:
+        return False
+    return job.get("workspace") == origin["workspace"]
 
 
 _FORBIDDEN_KEY_PARTS = frozenset({
@@ -1140,6 +1153,15 @@ def serialize_job(
             if type(value) is not bool:
                 raise QueueRecoveryAdapterError("Pending worker receipt is invalid.")
             result[key] = value
+        elif key == "editor_retake_origin":
+            try:
+                result[key] = validate_editor_retake_origin(value)
+            except EditorProjectError as error:
+                raise QueueRecoveryAdapterError("job.editor_retake_origin is invalid.") from error
+        elif key == "editor_retake_closed":
+            if type(value) is not bool:
+                raise QueueRecoveryAdapterError("job.editor_retake_closed is invalid.")
+            result[key] = value
         elif key in {"output_files", "artifact_files"}:
             result[key] = [
                 safe for safe in (_safe_filename(item) for item in (value or []))
@@ -1301,6 +1323,11 @@ def serialize_job(
                 result[key] = _redact_runtime_paths(value, path=f"job.{key}")
         else:
             result[key] = _safe_json(value, path=f"job.{key}")
+    if "editor_retake_origin" in result:
+        if (result.get("kind") != "studio_generation"
+                or result.get("workspace") != result["editor_retake_origin"]["workspace"]):
+            raise QueueRecoveryAdapterError("job.editor_retake_origin scope is invalid.")
+        result.setdefault("editor_retake_closed", False)
     child_fields = {
         "failed_child_job_id", "failed_child_status", "failed_child_reason",
     }
@@ -2119,6 +2146,8 @@ class QueueRecoveryCoordinator:
                 raise QueueRecoveryAdapterError("Only terminal jobs may be tombstoned.")
             if processed_tool_publication_pending(snapshot) or prompt_enhancement_gpu_cleanup_pending(snapshot):
                 raise QueueRecoveryAdapterError("Terminal publication or GPU cleanup is pending.")
+            if editor_retake_return_retained(snapshot):
+                raise QueueRecoveryAdapterError("Editor Retake return is pending.")
             clean_global = self._canonical_global_state(
                 self._global_state, tombstones=(job_id,),
             )
@@ -2152,7 +2181,8 @@ class QueueRecoveryCoordinator:
                 terminal_statuses=AUTOMATIC_RETIREMENT_STATUSES,
                 retain_job_ids=tuple(job_id for job_id, job in clean_before_jobs.items()
                                      if processed_tool_publication_pending(job) or prompt_enhancement_gpu_cleanup_pending(job)
-                                     or composition_recovery_requests_retained(job)),
+                                     or composition_recovery_requests_retained(job)
+                                     or editor_retake_return_retained(job)),
                 replacement_jobs=clean_before_jobs,
                 replacement_global_state=(
                     clean_before_global if before.global_state is not None else None

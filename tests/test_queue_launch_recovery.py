@@ -1014,6 +1014,46 @@ class QueueLaunchWiringTests(unittest.TestCase):
             self.assertEqual(cleanups, [str(other), str(other)])
             self.assertFalse((other / orphan["path"]).exists())
 
+    def test_editor_retake_terminal_association_keeps_manifest_across_repeated_startup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ns, Request, coordinator, registry, observed, project = self._studio_submission_test_namespace(directory)
+            origin = {"schema_version":1,"workspace":"project-a","editor_id":"draft-a","editor_revision":1,
+                "clip_id":"clip-a","asset_id":"source-video","output_name":"clip.mp4",
+                "output_revision":"sha256:" + "a" * 64,"source_in":0.5,"duration":1.5,"speed":1.0}
+            wire = {"workspace":"project-a","model_type":"test-model","prompt":"private prompt","image_mode":2,
+                    "edit_sub_mode":"retake","_editor_retake_origin":origin}
+            ns["_stamp_job_origin"] = lambda job: {**job,"editor_retake_origin":origin,"editor_retake_closed":False}
+            result = asyncio.run(ns["generate"](Request(wire)))
+            job_id = result["job_id"]
+            snapshots, _ = coordinator.read_only_snapshot()
+            terminal = dict(snapshots[job_id], status="completed")
+            pointer = terminal["request_manifest"]
+            coordinator.prospective_transition(types.SimpleNamespace(jobs=(terminal,), tombstones=(), global_state=None))
+            workers = len(observed["threads"])
+            observed_cleanup = []
+            def cleanup(root, live):
+                observed_cleanup.append(tuple(live))
+                return cleanup_orphan_request_manifests(root, live)
+            registry.clear()
+            ns.update(_queue_recovery_workers_started=False,
+                _queue_recovery_existing_projects=lambda: {"project-a":(str(project), terminal["project_instance"])},
+                _queue_recovery_materialize_job=lambda snapshot, _projects:(dict(snapshot, out_dir=str(project)), False),
+                restore_scheduler_state=lambda *a:None,
+                cleanup_orphan_request_manifests=cleanup,
+                cleanup_orphan_staged_outputs=cleanup_orphan_staged_outputs)
+            ns = _isolated_functions(self.launch, ("_restore_queue_recovery_on_startup",), ns)
+            for _ in range(2):
+                fresh = QueueRecoveryCoordinator(coordinator.journal)
+                ns["_queue_recovery_coordinator"] = fresh
+                ns["_queue_recovery_restored"] = fresh.restore()
+                ns["_queue_recovery_workers_started"] = False
+                self.assertTrue(ns["_restore_queue_recovery_on_startup"]())
+                self.assertEqual(fresh.read_only_snapshot()[0][job_id]["editor_retake_origin"], origin)
+                self.assertTrue((project / pointer["path"]).is_file())
+                self.assertEqual(load_request_manifest(project, pointer, expected_job_id=job_id)["params"]["_editor_retake_origin"], origin)
+                self.assertIn(pointer["path"], observed_cleanup[-1])
+                self.assertEqual(len(observed["threads"]), workers)
+
     def test_studio_reservation_compacts_full_journal_without_readmitting_old_ids(self):
         with tempfile.TemporaryDirectory() as directory:
             ns, Request, coordinator, registry, observed, project = self._studio_submission_test_namespace(directory)

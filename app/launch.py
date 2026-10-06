@@ -8784,10 +8784,10 @@ def _restore_queue_recovery_on_startup(
     director_legacy_payloads = False
     unsettled_terminal_credit = False
     pending_processed_tool_jobs: set[str] = set()
-    from services.queue_recovery_adapter import composition_recovery_requests_retained
+    from services.queue_recovery_adapter import composition_recovery_requests_retained, editor_retake_return_retained
     retained_composition_jobs = {
         job_id for job_id, snapshot in _queue_recovery_restored.jobs.items()
-        if composition_recovery_requests_retained(snapshot)
+        if composition_recovery_requests_retained(snapshot) or editor_retake_return_retained(snapshot)
     }
     sample_snapshots = tuple(
         snapshot for snapshot in _queue_recovery_restored.jobs.values()
@@ -28849,6 +28849,178 @@ async def add_output_editor_take(project: str, editor_id: str, clip_id: str, req
             except OSError as error:
                 raise HTTPException(status_code=503, detail="Editor draft could not be saved") from error
     return {"project": saved}
+
+
+def _editor_retake_scoped_job(request, project, editor_id, job_id, *, verify_manifest=True):
+    from services.editor_projects import EditorProjectError, validate_editor_retake_origin
+    from services.queue_recovery_runtime import load_request_manifest
+    snapshots, _ = _queue_recovery_coordinator.read_only_snapshot()
+    snapshot = snapshots.get(job_id)
+    job = _jobs.get(job_id)
+    if (not isinstance(snapshot, dict) or job is None or not _job_owned_by_request(job, request)
+            or snapshot.get("kind") != "studio_generation" or snapshot.get("workspace") != project):
+        raise HTTPException(status_code=404, detail="Retake not found")
+    try:
+        origin = validate_editor_retake_origin(snapshot.get("editor_retake_origin"))
+        root = _require_project_access(request, project, existing_only=True, permission="project.read")
+        if (origin["workspace"] != project or origin["editor_id"] != editor_id
+                or snapshot.get("project_instance") != _queue_recovery_project_identity(project, root)):
+            raise HTTPException(status_code=404, detail="Retake not found")
+        if verify_manifest:
+            manifest = load_request_manifest(root, snapshot["request_manifest"], expected_job_id=job_id)
+            if (manifest["params"].get("_editor_retake_origin") != origin
+                    or manifest["params"].get("edit_sub_mode") != "retake"):
+                raise EditorProjectError("Saved Retake association changed")
+    except HTTPException:
+        raise
+    except (EditorProjectError, QueueRecoveryRuntimeError, OSError, ValueError, KeyError) as error:
+        raise HTTPException(status_code=409, detail="This Retake could not be verified. Keep its result in Gallery") from error
+    return job, snapshot, origin, root
+
+
+def _editor_retake_outputs(request, project, job, snapshot, root):
+    from services.queue_recovery_runtime import validate_artifact_descriptor
+    if snapshot.get("status") != "completed" or snapshot.get("cancel_requested"):
+        return []
+    outputs = []
+    published = snapshot.get("output_files") or []
+    for unit in (snapshot.get("recovery_cursor") or {}).get("completed_units", []):
+        if unit.get("kind") != "ordinary_repeat" or unit.get("state") != "completed":
+            continue
+        members = unit.get("artifacts") or []
+        if not members or not all(validate_artifact_descriptor(root, member, producer_unit_id=unit["unit_id"])
+                                  for member in members):
+            raise HTTPException(status_code=409, detail="The Retake output changed. Keep it in Gallery")
+        for member in members:
+            name = member["basename"]
+            if name not in published or os.path.splitext(name)[1].lower() not in {".mp4", ".mkv", ".mov", ".webm", ".gif"}:
+                continue
+            out_dir, path, sidecar = _require_authorized_output(request, project, name)
+            if (os.path.realpath(out_dir) != os.path.realpath(root)
+                    or sidecar.get("job_id") != job["id"]
+                    or sidecar.get("producer_unit_id") != unit["unit_id"]
+                    or sidecar.get("output_filename") != name):
+                raise HTTPException(status_code=409, detail="The Retake output could not be verified")
+            outputs.append({"name": name, "revision": _output_revision(path, out_dir, name)})
+    if not outputs:
+        raise HTTPException(status_code=409, detail="The completed Retake has no verified video. Keep it in Gallery")
+    return outputs
+
+
+@api.get("/api/v1/projects/{project}/editor/projects/{editor_id}/retakes")
+def list_editor_retakes(project: str, editor_id: str, request: Request):
+    from services.editor_projects import EditorProjectError, load_editor_project, require_editor_retake_cut
+    with _reserve_workspace_operations(project):
+        root = _require_project_access(request, project, existing_only=True, permission="project.read")
+        try:
+            current = load_editor_project(_editor_save_root(), project, editor_id)
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="Editor draft not found") from None
+        except (EditorProjectError, OSError, ValueError) as error:
+            raise HTTPException(status_code=503, detail="Editor draft is unavailable") from error
+        snapshots, _ = _queue_recovery_coordinator.read_only_snapshot()
+        records = []
+        with _output_lineage_mutation_guard(root):
+            for job_id, snapshot in snapshots.items():
+                origin = snapshot.get("editor_retake_origin")
+                if (not isinstance(origin, dict) or origin.get("editor_id") != editor_id
+                        or origin.get("workspace") != project or snapshot.get("editor_retake_closed") is True):
+                    continue
+                try:
+                    job, saved, origin, root = _editor_retake_scoped_job(request, project, editor_id, job_id)
+                except HTTPException as error:
+                    if error.status_code == 404:
+                        continue
+                    # A verified owner may see a conflict, never unsealed content.
+                    job = _jobs.get(job_id)
+                    if not job or not _job_owned_by_request(job, request):
+                        continue
+                    records.append({"job_id": job_id, "clip_id": origin.get("clip_id", ""),
+                                    "status": snapshot.get("status", "failed"), "outputs": [], "conflict": True})
+                    continue
+                conflict, outputs = False, []
+                try:
+                    require_editor_retake_cut(current, origin)
+                    outputs = _editor_retake_outputs(request, project, job, saved, root)
+                except (EditorProjectError, HTTPException):
+                    conflict = True
+                records.append({"job_id": job_id, "clip_id": origin["clip_id"],
+                                "status": saved.get("status", "queued"), "outputs": outputs, "conflict": conflict})
+        return {"retakes": records[:8]}
+
+
+@api.post("/api/v1/projects/{project}/editor/projects/{editor_id}/retakes/{job_id}/take")
+async def return_editor_retake(project: str, editor_id: str, job_id: str, request: Request):
+    from services.editor_projects import (
+        EditorProjectError, add_editor_retake_take, editor_project_operation,
+        load_editor_project, probe_media, save_editor_project,
+    )
+    body = await _editor_request_body(request)
+    expected, name, revision = body.get("expected_revision"), body.get("output_name"), body.get("output_revision")
+    if (set(body) != {"expected_revision", "output_name", "output_revision"}
+            or type(expected) is not int or expected < 1 or not isinstance(name, str)
+            or not 0 < len(name) <= 255 or os.path.basename(name) != name
+            or not isinstance(revision, str) or not 0 < len(revision) <= 128):
+        raise HTTPException(status_code=400, detail="Choose a current Retake video")
+    with _reserve_workspace_operations(project):
+        root = _require_project_access(request, project, existing_only=True, permission="project.mutate")
+        with _output_lineage_mutation_guard(root), editor_project_operation():
+            try:
+                current = load_editor_project(_editor_save_root(), project, editor_id)
+            except FileNotFoundError:
+                raise HTTPException(status_code=404, detail="Editor draft not found") from None
+            except (EditorProjectError, OSError, ValueError) as error:
+                raise HTTPException(status_code=503, detail="Editor draft is unavailable") from error
+            for asset in current["assets"].values():
+                _editor_require_current_source(request, project, asset)
+            receipt = next((item for item in current.get("retake_returns", [])
+                            if item.get("job_id") == job_id and item.get("output_name") == name
+                            and item.get("gallery_revision") == revision
+                            and item.get("asset_id") in current["assets"]), None)
+            if receipt is not None:
+                job = _jobs.get(job_id)
+                if job and _job_owned_by_request(job, request):
+                    _queue_recovery_checkpoint(job, editor_retake_closed=True)
+                return {"project": current, "reused": True}
+            if current["revision"] != expected:
+                raise HTTPException(status_code=409, detail="Editor draft changed; reload before adding the Retake")
+            job, snapshot, origin, root = _editor_retake_scoped_job(request, project, editor_id, job_id)
+            if snapshot.get("editor_retake_closed") is True:
+                raise HTTPException(status_code=409, detail="This Retake review is closed. Add its result manually from Gallery")
+            outputs = _editor_retake_outputs(request, project, job, snapshot, root)
+            if not any(output["name"] == name and output["revision"] == revision for output in outputs):
+                raise HTTPException(status_code=409, detail="Retake video changed; refresh this review")
+            out_dir, path, sidecar = _require_authorized_output(request, project, name)
+            try:
+                content_revision = _output_share_revision(path, out_dir, name)
+                media = probe_media(path)
+                if _editor_retake_outputs(request, project, job, snapshot, root) != outputs:
+                    raise HTTPException(status_code=409, detail="Retake video changed while adding; refresh this review")
+                media["private"] = public_output_policy(sidecar)["private"]
+                updated = add_editor_retake_take(current, origin=origin, job_id=job_id,
+                    manifest_sha256=snapshot["request_manifest"]["sha256"], output_name=name,
+                    output_revision=content_revision, gallery_revision=revision, media=media)
+                saved = save_editor_project(_editor_save_root(), project, updated, expected_revision=expected)
+            except HTTPException:
+                raise
+            except (EditorProjectError, OSError, ValueError, subprocess.SubprocessError) as error:
+                raise HTTPException(status_code=409, detail="The original cut or Retake changed. Keep the video in Gallery") from error
+            # The receipt shares the atomic Editor save. A lost checkpoint or
+            # response resolves to it on retry without another take/revision.
+            _queue_recovery_checkpoint(job, editor_retake_closed=True)
+            return {"project": saved, "reused": False}
+
+
+@api.post("/api/v1/projects/{project}/editor/projects/{editor_id}/retakes/{job_id}/dismiss")
+async def dismiss_editor_retake(project: str, editor_id: str, job_id: str, request: Request):
+    if await _editor_request_body(request) != {}:
+        raise HTTPException(status_code=400, detail="Expected an empty Retake review request")
+    with _reserve_workspace_operations(project):
+        _require_project_access(request, project, existing_only=True, permission="project.mutate")
+        job, _, _, _ = _editor_retake_scoped_job(request, project, editor_id, job_id, verify_manifest=False)
+        if not _queue_recovery_checkpoint(job, editor_retake_closed=True):
+            raise HTTPException(status_code=409, detail="Retake review changed; refresh before closing it")
+    return {"dismissed": True}
 
 
 @api.post("/api/v1/projects/{project}/editor/projects/{editor_id}/clips/{clip_id}/take")
@@ -50887,6 +51059,28 @@ async def generate(request: Request):
     }
 
 
+def _editor_retake_admission_origin(body_origin, workspace, video_path, source_revision):
+    from services.editor_projects import EditorProjectError, editor_retake_origin, load_editor_project
+    if (not isinstance(body_origin, dict)
+            or set(body_origin) != {"editor_id", "editor_revision", "clip_id", "asset_id"}
+            or type(body_origin["editor_revision"]) is not int or body_origin["editor_revision"] < 1
+            or any(not isinstance(body_origin[key], str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", body_origin[key])
+                   for key in ("editor_id", "clip_id", "asset_id"))
+            or not isinstance(source_revision, str)):
+        raise HTTPException(status_code=400, detail="Invalid saved Editor cut")
+    try:
+        current = load_editor_project(_editor_save_root(), workspace, body_origin["editor_id"])
+        origin = editor_retake_origin(current, body_origin["clip_id"])
+        if (origin["editor_revision"] != body_origin["editor_revision"]
+                or origin["asset_id"] != body_origin["asset_id"]
+                or origin["output_name"] != os.path.basename(video_path)
+                or origin["output_revision"] != source_revision):
+            raise EditorProjectError("Editor cut changed")
+    except (EditorProjectError, FileNotFoundError, OSError, ValueError) as error:
+        raise HTTPException(status_code=409, detail="Editor cut changed; save and reopen Retake") from error
+    return origin
+
+
 @api.post("/api/v1/retake")
 async def retake_video_endpoint(request: Request):
     """Submit a retake job: regenerate a time region of an existing video.
@@ -50897,10 +51091,11 @@ async def retake_video_endpoint(request: Request):
         negative_prompt?: str, seed?: int, guidance_scale?: float,
         num_inference_steps?: int, retake_strength?: float (0-1),
         workspace?: str, private_output?: bool, explicit_output?: bool,
-        expected_source_revision?: str
+        expected_source_revision?: str, editor_origin?: object
     }
     """
     body = await request.json()
+    from contextlib import nullcontext
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Retake request must be an object")
 
@@ -50917,6 +51112,8 @@ async def retake_video_endpoint(request: Request):
 
     revision_requested = "expected_source_revision" in body
     expected_source_revision = body.pop("expected_source_revision", None)
+    editor_requested = "editor_origin" in body
+    browser_origin = body.pop("editor_origin", None)
     if revision_requested and (
         not isinstance(expected_source_revision, str)
         or not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_source_revision)
@@ -50945,6 +51142,8 @@ async def retake_video_endpoint(request: Request):
 
     with _output_lineage_mutation_guard(job_out_dir):
         require_current_source()
+    editor_origin = (_editor_retake_admission_origin(browser_origin, workspace, video_path, expected_source_revision)
+                     if editor_requested else None)
 
     session_id = request.state.maestro_session_id
     inherited_policy = _inherit_media_access_policy(
@@ -51045,9 +51244,23 @@ async def retake_video_endpoint(request: Request):
         "workspace": workspace, "out_dir": job_out_dir,
         "session_id": session_id, "access_policy": access_policy,
     }
-    with _output_lineage_mutation_guard(job_out_dir):
-        require_current_source()
-        _queue_recovery_register_and_publish(job)
+    if editor_origin is not None:
+        gen_params["_editor_retake_origin"] = editor_origin
+        job.update(editor_retake_origin=editor_origin, editor_retake_closed=False)
+    from services.editor_projects import editor_project_operation
+    with (_workspace_lifecycle_lock if editor_requested else nullcontext()):
+        with _output_lineage_mutation_guard(job_out_dir), (editor_project_operation() if editor_requested else nullcontext()):
+            require_current_source()
+            if editor_requested:
+                if _editor_retake_admission_origin(browser_origin, workspace, video_path, expected_source_revision) != editor_origin:
+                    raise HTTPException(status_code=409, detail="Editor cut changed; save and reopen Retake")
+                from services.queue_recovery_adapter import editor_retake_return_retained
+                snapshots, _ = _queue_recovery_coordinator.read_only_snapshot()
+                pending = [item for item in snapshots.values() if editor_retake_return_retained(item)]
+                if (len(pending) >= 32 or sum(item["editor_retake_origin"]["workspace"] == workspace
+                        and item["editor_retake_origin"]["editor_id"] == editor_origin["editor_id"] for item in pending) >= 8):
+                    raise HTTPException(status_code=409, detail="Close an earlier Retake review before requesting another")
+            _queue_recovery_register_and_publish(job)
 
     return {"job_id": job_id, "status": "queued", "retake_frames": f"{start_frame}-{end_frame}/{total_frames}"}
 

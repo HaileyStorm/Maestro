@@ -204,7 +204,7 @@ export function RetakeDialog() {
         activated_loras: activatedLoras,
         loras_multipliers: lorasMultipliers,
         workspace: activeWorkspace,
-        ...(sourceContext ? { expected_source_revision: sourceContext.revision } : {}),
+        ...(sourceContext ? { expected_source_revision: sourceContext.revision, ...(sourceContext.editor_origin ? { editor_origin: sourceContext.editor_origin } : {}) } : {}),
       })
       if (!current()) return
       const frameCount = retakeFrameCount(result.retake_frames)

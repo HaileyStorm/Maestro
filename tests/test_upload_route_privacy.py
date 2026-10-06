@@ -429,6 +429,7 @@ class RetakePolicyAdmissionTests(unittest.TestCase):
     def setUpClass(cls):
         tree = ast.parse(LAUNCH_PATH.read_text(encoding="utf-8"))
         names = {"retake_video_endpoint", "_inherit_media_access_policy",
+                 "_editor_retake_admission_origin",
                  "_http_output_policy_from_request", "_JobRegistry",
                  "_output_share_revision", "_require_authorized_output",
                  "_OutputLineageMutationGuard", "_output_lineage_mutation_guard"}
@@ -658,6 +659,61 @@ class RetakePolicyAdmissionTests(unittest.TestCase):
         self.assertEqual(self.probed, [])
         self.assertEqual(self.registered, [])
 
+
+    def _editor_origin_fixture(self):
+        from services.editor_projects import create_output_video_timeline, save_editor_project
+        revision = self.ns["_output_share_revision"](str(self.source), str(self.outputs), self.source.name)
+        draft = create_output_video_timeline(workspace="default", output_name=self.source.name,
+            output_revision=revision, media={"type":"video", "duration":2, "width":640,"height":480,"fps":24})
+        saved = save_editor_project(str(self.outputs), "default", draft, expected_revision=0)
+        clip = saved["tracks"][0]["items"][0]
+        self.ns["_editor_save_root"] = lambda: str(self.outputs)
+        self.ns["_workspace_lifecycle_lock"] = threading.RLock()
+        self.pending_editor_jobs = {}
+        self.ns["_queue_recovery_coordinator"] = types.SimpleNamespace(read_only_snapshot=lambda: (self.pending_editor_jobs, frozenset()))
+        self.editor_assertion = {"editor_id":saved["id"], "editor_revision":saved["revision"],
+                                 "clip_id":clip["id"], "asset_id":clip["asset_id"]}
+        return saved, revision
+
+    def test_editor_retake_admission_seals_saved_origin_and_rejects_changed_draft(self):
+        from services.editor_projects import apply_output_video_trim, save_editor_project
+        saved, revision = self._editor_origin_fixture()
+        flags = {"expected_source_revision":revision, "editor_origin":self.editor_assertion}
+        self.submit(flags)
+        job = self.registered[-1]
+        self.assertEqual(job["editor_retake_origin"], job["params"]["_editor_retake_origin"])
+        self.assertEqual(job["editor_retake_origin"]["clip_id"], self.editor_assertion["clip_id"])
+        self.assertFalse(job["editor_retake_closed"])
+        before = len(self.registered)
+        def change_draft():
+            proposed = copy.deepcopy(saved)
+            proposed["tracks"][0]["items"][0]["duration"] = 1.5
+            save_editor_project(str(self.outputs), "default", apply_output_video_trim(saved, proposed), expected_revision=1)
+        self.mutate_on_probe = change_draft
+        with self.assertRaises(_HTTPException) as changed:
+            self.submit(flags)
+        self.assertEqual(changed.exception.status_code, 409)
+        self.assertEqual(len(self.registered), before)
+
+    def test_editor_retake_admission_capacity_and_invalid_assertions_never_register(self):
+        _, revision = self._editor_origin_fixture()
+        self.probed.clear()
+        for origin in (None, {}, {**self.editor_assertion,"asset_id":"another"}, {**self.editor_assertion,"editor_id":"../escape"}):
+            with self.subTest(origin=origin), self.assertRaises(_HTTPException):
+                self.submit({"expected_source_revision":revision, "editor_origin":origin})
+        self.assertEqual(self.probed, [])
+        self.assertEqual(self.registered, [])
+        self.submit({"expected_source_revision":revision, "editor_origin":self.editor_assertion})
+        canonical = self.registered[-1]["editor_retake_origin"]
+        for count, same_editor in ((8, True), (32, False)):
+            self.pending_editor_jobs = {str(index): {"kind":"studio_generation", "workspace":"default", "editor_retake_closed":False,
+                "editor_retake_origin": {**canonical, **({} if same_editor else {"editor_id":f"other-{index}"})}}
+                for index in range(count)}
+            before = len(self.registered)
+            with self.assertRaises(_HTTPException) as capped:
+                self.submit({"expected_source_revision":revision, "editor_origin":self.editor_assertion})
+            self.assertEqual(capped.exception.status_code, 409)
+            self.assertEqual(len(self.registered), before)
 
     def test_invalid_retake_temporal_controls_reject_before_probe_or_registration(self):
         for field in ("start_time", "end_time", "retake_strength"):
