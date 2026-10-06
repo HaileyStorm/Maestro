@@ -6573,7 +6573,7 @@ def load_models(
 
     profile = compute_profile(override_profile, output_type)
     is_h3_load = str(base_model_type or "").startswith("minimax_h3")
-    if is_h3_load:
+    if is_h3_load and _h3_control_checkpoint is None:
         from services.h3_oom_relief import apply_h3_baseline_offload_profile
         profile = apply_h3_baseline_offload_profile(
             profile, model_type, resolution,

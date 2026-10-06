@@ -274,7 +274,8 @@ class NativeFloorIntegrationTests(unittest.TestCase):
             for resolution, expected in [('960x544', 4.5), ('1344x768', 5.0), ('768x1344', 5.0)]:
                 ns = self.runtime_namespace()
                 ns.update(override_profile=4, output_type='video', model_type='minimax_h3',
-                          base_model_type='minimax_h3', resolution=resolution)
+                          base_model_type='minimax_h3', resolution=resolution,
+                          _h3_control_checkpoint=None, _h3_control_dispatch=None)
                 exec(compile(ast.Module(body=policy, type_ignores=[]), 'runtime-floor-block', 'exec'), ns)
                 self.assertEqual(ns['profile'], expected)
             target = 'get_requested_residency_identity' if name == 'load_models' else 'load_models'

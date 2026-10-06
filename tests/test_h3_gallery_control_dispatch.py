@@ -259,6 +259,40 @@ class ControlDispatchTests(unittest.TestCase):
 
 
 class ControlRetryTests(unittest.TestCase):
+    def test_loader_preserves_control_profile_and_ordinary_h3_floor(self):
+        tree = ast.parse((ROOT / "app/wgp.py").read_text())
+        loader = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                      and node.name == "load_models")
+        start = next(index for index, node in enumerate(loader.body)
+                     if isinstance(node, ast.Assign)
+                     and any(isinstance(target, ast.Name) and target.id == "profile"
+                             for target in node.targets))
+        end = next(index for index in range(start + 1, len(loader.body))
+                   if isinstance(loader.body[index], ast.If))
+        code = compile(ast.Module(body=loader.body[start:end + 1], type_ignores=[]),
+                       "wgp-loader-profile", "exec")
+        init_pipe = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                         and node.name == "init_pipe")
+        for resolution, ordinary_floor in (("608x352", 4.5), ("1344x768", 5.0)):
+            for profile in (1, 2, 3, 4, 4.5, 5):
+                for checkpoint in (None, "/owned/control.safetensors"):
+                    with self.subTest(resolution=resolution, profile=profile, control=bool(checkpoint)):
+                        namespace = dict(compute_profile=lambda *_: profile,
+                                         override_profile=profile, output_type="video",
+                                         base_model_type="minimax_h3", model_type="minimax_h3",
+                                         resolution=resolution, _h3_control_checkpoint=checkpoint)
+                        exec(code, namespace)
+                        expected = profile if checkpoint else max(profile, ordinary_floor)
+                        self.assertEqual(namespace["profile"], expected)
+                        namespace["_effective_preload_setting"] = lambda: 0
+                        exec(compile(ast.Module(body=[init_pipe], type_ignores=[]),
+                                     "wgp-init-pipe", "exec"), namespace)
+                        kwargs = {}
+                        mmgp_profile = namespace["init_pipe"]({"transformer": object()},
+                                                              kwargs, namespace["profile"])
+                        self.assertEqual(mmgp_profile, 4 if expected == 4.5 else expected)
+                        self.assertEqual(kwargs.get("asyncTransfers", True), expected != 4.5)
+
     def test_ordinary_control_ordinary_transition_loads_separate_graphs(self):
         source = (ROOT / "app/wgp.py").read_text()
         tree = ast.parse(source)
