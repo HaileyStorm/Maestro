@@ -778,5 +778,150 @@ class OriginalH3ControlConditioningTests(unittest.TestCase):
             self.assertEqual(len(observed), 1 if stop_after_encode else 0)
 
 
+class OriginalH3ControlSamplerTests(unittest.TestCase):
+    @staticmethod
+    def runtime():
+        from models.minimax_h3 import minimax_h3_main as main
+        from models.minimax_h3.scheduler import MiniMaxH3Scheduler
+
+        runtime = main.MiniMaxH3Model.__new__(main.MiniMaxH3Model)
+        runtime.device = torch.device("cpu")
+        runtime.reference_mode = False
+        runtime.selected_model_type = "minimax_h3"
+        runtime.model_def = {}
+        runtime.vae = OriginalH3ControlConditioningTests.native_runtime().vae
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(153)
+            runtime.transformer = MiniMaxH3Transformer(
+                hidden_size=8, num_layers=3, token_refiner_layers=1,
+                num_attention_heads=1, attention_head_dim=8, ffn_dim=12,
+                video_channels=24, audio_channels=32, text_dim=4,
+                curve_grid=None, curve_dim=4, time_embed_hidden_size=8,
+                rope_freq_dim=1, dtype=torch.float32,
+            ).eval()
+            child = MiniMaxH3ControlBranch(
+                hidden_size=8, num_attention_heads=1, attention_head_dim=8,
+                ffn_dim=12, time_embed_dim=4, control_in_dim=49,
+                control_blocks_places=(0, 2), dtype=torch.float32,
+            ).eval()
+            with torch.no_grad():
+                for block in child.control_blocks:
+                    block.after_proj.weight.normal_(std=0.15)
+            runtime.transformer.bind_control_branch(child)
+        runtime.scheduler = MiniMaxH3Scheduler()
+        runtime.audio_scheduler = MiniMaxH3Scheduler()
+        runtime._sampler_prompts = []
+        runtime._sampler_audio_latents = []
+
+        def conditioner(prompt, *args, **kwargs):
+            runtime._sampler_prompts.append(prompt)
+            return torch.linspace(-0.2, 0.4, 8).reshape(1, 2, 4), torch.ones(2, dtype=torch.long)
+
+        def audio_decode(value, **kwargs):
+            runtime._sampler_audio_latents.append(value.clone())
+            return (torch.zeros(1, 2, value.shape[-1] * 800),)
+
+        runtime.conditioner = conditioner
+        runtime.audio_vae = types.SimpleNamespace(decode=audio_decode)
+        # The CPU miniature proves sampler wiring, not acquired full weights,
+        # real profile authority, text encoding, decoding, or CUDA acceptance.
+        identity = {"cpu_fixture": "sampler-wiring"}
+        runtime.get_h3_control_residency_identity = lambda: identity
+        payload = dict(video=torch.full((1, 3, 124, 32, 32), 0.4), mask=None,
+                       inpaint=None, strength=0.6, residency_identity=identity)
+        return main, runtime, payload
+
+    def test_full_sampler_fixes_rows_across_steps_and_zero_strength_matches_base(self):
+        main, runtime, payload = self.runtime()
+        payload["mask"] = torch.zeros(1, 1, 124, 32, 32)
+        payload["mask"][..., 16:] = 1
+        payload["inpaint"] = torch.full_like(payload["video"], 0.8)
+        decoded = []
+        forwards = []
+
+        def decode(**kwargs):
+            decoded.append(kwargs["packed_rows"].clone())
+            return torch.zeros(1, 3, 124, 32, 32), None
+
+        hook = runtime.transformer.register_forward_pre_hook(
+            lambda module, args, kwargs: forwards.append(dict(kwargs)), with_kwargs=True,
+        )
+        def mutate_envelope(*args, **kwargs):
+            payload["strength"] = float("nan")
+            payload["video"] = None
+
+        sensitive_prompt = "An adult dancer in a violent, controversial fictional battle"
+        try:
+            with patch.dict("os.environ", MAESTRO_H3_CONTROL_EXPERIMENTAL="1"), \
+                    patch.object(main, "_decode_h3_video_rows", side_effect=decode):
+                ordinary = runtime.generate("A dancer", frame_num=124, height=32, width=32,
+                                            sampling_steps=4, seed=73,
+                                            custom_settings={"h3_attention_engine": "sdpa"})
+                ordinary_calls = len(forwards)
+                zero = runtime.generate("A dancer", frame_num=124, height=32, width=32,
+                                        sampling_steps=4, seed=73,
+                                        custom_settings={"h3_attention_engine": "sdpa"},
+                                        _h3_control={**payload, "strength": 0.0})
+                controlled = runtime.generate(sensitive_prompt, frame_num=124, height=32, width=32,
+                                              sampling_steps=4, seed=73, _h3_control=payload,
+                                              custom_settings={"h3_attention_engine": "sdpa"},
+                                              callback=mutate_envelope)
+        finally:
+            hook.remove()
+        self.assertIsNotNone(ordinary)
+        self.assertIsNotNone(zero)
+        self.assertIsNotNone(controlled)
+        self.assertGreaterEqual(ordinary_calls, 2)
+        self.assertEqual(len(forwards), ordinary_calls * 3)
+        self.assertTrue(all("h3_control_rows" not in call for call in forwards[:ordinary_calls]))
+        calls = forwards[ordinary_calls * 2:]
+        self.assertTrue(all(call["h3_control_rows"] is calls[0]["h3_control_rows"] for call in calls))
+        self.assertTrue(all(call["h3_control_strength"] == 0.6 for call in calls))
+        self.assertEqual(calls[0]["h3_control_rows"].shape, (1, 37, 196))
+        self.assertGreater(torch.count_nonzero(calls[0]["h3_control_rows"][..., 96:100]).item(), 0)
+        self.assertGreater(torch.count_nonzero(calls[0]["h3_control_rows"][..., 100:]).item(), 0)
+        self.assertEqual(runtime._sampler_prompts[-1], sensitive_prompt)
+        torch.testing.assert_close(decoded[0], decoded[1], rtol=0, atol=0)
+        self.assertFalse(torch.allclose(decoded[0], decoded[2]))
+        torch.testing.assert_close(runtime._sampler_audio_latents[0], runtime._sampler_audio_latents[1], rtol=0, atol=0)
+        self.assertFalse(torch.allclose(runtime._sampler_audio_latents[0], runtime._sampler_audio_latents[2]))
+
+    def test_incompatible_requests_fail_before_vae_or_transformer_work(self):
+        _main, runtime, payload = self.runtime()
+        cases = (
+            {"image_start": torch.zeros(3, 32, 32)},
+            {"input_frames": torch.zeros(3, 124, 32, 32)},
+            {"input_waveform": torch.zeros(2, 52000)},
+            {"_h3_timeline_guides": {}},
+            {"_h3_cumulative_capture": True},
+            {"custom_settings": {"h3_attention_engine": "sol_attn"}},
+            {"activated_loras": ["fixture.safetensors"]},
+            {"guidance_scale": 2.0},
+            {"frame_num": 125},
+            {"_h3_control": {**payload, "strength": float("nan")}},
+            {"_h3_control": {**payload, "residency_identity": {"changed": True}}},
+        )
+        with patch.dict("os.environ", MAESTRO_H3_CONTROL_EXPERIMENTAL="1"), \
+                patch.object(runtime.vae, "encode", side_effect=AssertionError("unexpected VAE")), \
+                patch.object(runtime.transformer, "forward", side_effect=AssertionError("unexpected denoise")):
+            for overrides in cases:
+                kwargs = dict(frame_num=124, height=32, width=32, _h3_control=payload,
+                              custom_settings={"h3_attention_engine": "sdpa"})
+                kwargs.update(overrides)
+                with self.subTest(overrides=list(overrides)), self.assertRaises(ValueError):
+                    runtime.generate("A dancer", **kwargs)
+        with patch.dict("os.environ", MAESTRO_H3_CONTROL_EXPERIMENTAL="0"), self.assertRaisesRegex(ValueError, "sampler gate"):
+            runtime.generate("A dancer", frame_num=124, height=32, width=32, _h3_control=payload)
+
+    def test_control_encoding_cancellation_does_not_enter_denoising(self):
+        _main, runtime, payload = self.runtime()
+        with patch.dict("os.environ", MAESTRO_H3_CONTROL_EXPERIMENTAL="1"), \
+                patch.object(runtime, "_encode_control_video", return_value=None), \
+                patch.object(runtime.transformer, "forward", side_effect=AssertionError("unexpected denoise")):
+            self.assertIsNone(runtime.generate("A dancer", frame_num=124, height=32, width=32,
+                                               _h3_control=payload,
+                                               custom_settings={"h3_attention_engine": "sdpa"}))
+
+
 if __name__ == "__main__":
     unittest.main()

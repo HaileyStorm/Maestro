@@ -97,6 +97,22 @@ complete asset compatibility and native GPU/media acceptance remain open.
 CPU graph, numerical and cache-context checks do not qualify the full weights,
 CUDA offload, or generation.
 
+The private sampler additionally accepts an exact `_h3_control` decoded-media
+handoff when `MAESTRO_H3_CONTROL_EXPERIMENTAL=1`. It binds that handoff to the
+acquired residency identity, encodes deterministic Control/inpaint rows once,
+and passes the same rows and strength to every paired video/audio denoising
+call. It accepts only an independent Base text+control request with dense
+SDPA, guidance scale 1, exact target geometry, and no keyframes, semantic
+references, timeline guides, continuation, source-audio schedules, LoRAs or
+acceleration profiles.
+Cancellation during preparation enters no denoising. Zero strength retains
+the ordinary base prediction path. The caller still owns authorized source
+decoding, model terms, the eager profile and fresh GPU authority; this private
+handoff is not a public plan executor. Learned miniature CPU VAE/transformer
+checks exercise row reuse, paired sampling and zero-strength equivalence.
+They do not qualify full acquired weights, actual text/media decoding, native
+CUDA residency, or visual/listening quality. Public execution remains closed.
+
 The original Control loader also uses the held-descriptor safetensors reader
 and hands MMGP an explicit tensor tuple. It does not reopen an unsealed path
 or permit implicit sidecars during MMGP loading. File resolution, cancellation

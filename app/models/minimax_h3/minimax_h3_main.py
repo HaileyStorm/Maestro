@@ -1209,6 +1209,57 @@ class MiniMaxH3Model:
         if self.get_h3_control_residency_identity() != expected:
             raise ValueError("H3 Control residency identity changed during setup")
 
+    def _validate_control_request(
+        self, payload, *, frame_num, height, width, fps,
+        custom_settings, conditioning, kwargs,
+    ):
+        """Admit only the private decoded text+Control sampler contract.
+
+        The caller owns acquired assets, source decoding, eager residency and
+        GPU authority. This does not admit a public plan or accept model terms.
+        """
+        if os.environ.get("MAESTRO_H3_CONTROL_EXPERIMENTAL") != "1":
+            raise ValueError("H3 Control requires the private experimental sampler gate")
+        if type(payload) is not dict or set(payload) != {
+            "video", "mask", "inpaint", "strength", "residency_identity",
+        }:
+            raise ValueError("H3 Control requires an exact decoded-media handoff")
+        if payload["video"] is None or payload["residency_identity"] is None:
+            raise ValueError("H3 Control requires decoded video and acquired residency identity")
+        if (self.reference_mode or self.selected_model_type not in ("", "minimax_h3")
+                or fps != MINIMAX_H3_FPS
+                or any(value is not None for value in conditioning)
+                or bool(kwargs.get("video_prompt_type") or kwargs.get("audio_prompt_type"))
+                or bool(kwargs.get("prefix_frames_count") or kwargs.get("activated_loras"))
+                or bool(kwargs.get("skip_steps_cache_type") or kwargs.get("tea_cache"))
+                or kwargs.get("guidance_scale", 1.0) != 1.0
+                or kwargs.get("h3_native_boundary_conditioning") is True
+                or any(key.startswith("_h3_cumulative_") for key in kwargs)
+                or any(key in custom_settings for key in (
+                    "_h3_timeline_still_guide", "_h3_bridge_guides",
+                    "h3_native_boundary_conditioning", "h3_ref2va_handoff",
+                    "h3_turbo_profile", "h3_lightx2v_profile", "h3_spectrum_profile",
+                    "h3_source_audio_mode", "h3_pdd_profile",
+                ))
+                or custom_settings.get("h3_attention_engine") != "sdpa"
+                or (isinstance(kwargs.get("multi_clip_info"), dict)
+                    and int(kwargs["multi_clip_info"].get("total", 1) or 1) > 1)):
+            raise ValueError("H3 Control requires an independent dense Base text+control request")
+        if (type(frame_num) is not int or not 5 <= frame_num <= 345
+                or frame_num % 17 != 5
+                or any(type(size) is not int or size < 32 or size % 32
+                       for size in (height, width))):
+            raise ValueError("H3 Control requires the exact target frame clock and canvas")
+        strength = payload["strength"]
+        if (isinstance(strength, bool) or not isinstance(strength, (int, float))
+                or not math.isfinite(strength) or not 0 <= strength <= 1):
+            raise ValueError("H3 Control strength must be finite from 0 through 1")
+        if payload["inpaint"] is not None and payload["mask"] is None:
+            raise ValueError("H3 Control inpaint source requires a mask")
+        if getattr(self.transformer, "h3_control_branch", None) is None:
+            raise ValueError("H3 Control requires the acquired branch in the profiled base graph")
+        self.verify_h3_control_residency_identity(payload["residency_identity"])
+
     @torch.inference_mode()
     def _encode_control_video(
         self, control_video: torch.Tensor, *, height: int, width: int,
@@ -1508,6 +1559,28 @@ class MiniMaxH3Model:
         custom_settings = _kwargs.get("custom_settings")
         if not isinstance(custom_settings, dict):
             custom_settings = {}
+        if any(isinstance(key, str) and key.startswith("_h3_control") for key in custom_settings):
+            raise ValueError("H3 Control requires the private decoded-media handoff")
+        control = _kwargs.get("_h3_control")
+        if control is not None:
+            self._validate_control_request(
+                control, frame_num=frame_num, height=height, width=width, fps=fps,
+                custom_settings=custom_settings,
+                conditioning=(
+                    image_start, image_end, input_frames, input_frames2, input_frames3,
+                    input_ref_images, input_waveform, audio_guide, audio_guide2, audio_guide3,
+                    _kwargs.get("input_video"), _kwargs.get("audio_source"),
+                    _kwargs.get("_h3_timeline_guides"),
+                    _kwargs.get("_h3_timeline_third_still"),
+                    _kwargs.get("_h3_timeline_additional_stills"),
+                    *(_kwargs.get(key) for key in ("audio_guide4", "audio_guide5", "audio_guide6")),
+                ),
+                kwargs={**_kwargs, "video_prompt_type": video_prompt_type,
+                        "audio_prompt_type": audio_prompt_type},
+            )
+            # Callbacks may still retain the caller's envelope. Capture its
+            # fields/scalar now; prepared rows remain fixed through sampling.
+            control = {**control, "strength": float(control["strength"])}
         from services.h3_pdd import H3PDDError, pdd_requested, validate_pdd_request
         timeline_guides = _kwargs.get("_h3_timeline_guides")
         if "_h3_timeline_guides" in custom_settings:
@@ -2393,6 +2466,16 @@ class MiniMaxH3Model:
                 ),
             )
 
+        control_rows = None
+        if control is not None:
+            report_phase("Encoding H3 Control video")
+            control_rows = self._encode_control_video(
+                control["video"], height=height, width=width, num_frames=target_frame_num,
+                mask_video=control["mask"], inpaint_video=control["inpaint"],
+            )
+            if control_rows is None or self._interrupt:
+                return None
+
         prompt_presentation = list(reference_presentation)
         prompt_keyframes = keyframes or None
         if source_audio_roles.experimental:
@@ -2482,6 +2565,12 @@ class MiniMaxH3Model:
                 layout, guide_rows.condition_order,
                 (latent_height // self.patch_size[1]) * (latent_width // self.patch_size[2]),
             )
+
+        if control_rows is not None and (
+            layout.num_condition_video_rows or layout.num_condition_audio_rows
+            or control_rows.shape != (1, layout.video_indices.numel(), 196)
+        ):
+            raise ValueError("H3 Control rows must match every target row without extra conditioning")
 
         video_noise = randn_tensor(
             (1, 24, num_latent_frames, latent_height, latent_width),
@@ -2632,6 +2721,10 @@ class MiniMaxH3Model:
                 ),
                 return_dict=False,
             )
+            if control_rows is not None:
+                transformer_kwargs.update(
+                    h3_control_rows=control_rows, h3_control_strength=control["strength"],
+                )
             if spectrum_phase is not None:
                 transformer_kwargs.update({
                     "h3_spectrum_controller": controller,
