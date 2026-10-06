@@ -918,6 +918,9 @@ class MiniMaxH3Model:
         """Sever every heavyweight H3 component during model replacement."""
         self.__interrupt = True
         clear_pdd_runtime(getattr(self, "transformer", None))
+        transformer = getattr(self, "transformer", None)
+        if transformer is not None and hasattr(transformer, "h3_control_branch"):
+            del transformer.h3_control_branch
         for component_name in ("transformer", "conditioner"):
             component = getattr(self, component_name, None)
             if component is not None:
@@ -1110,6 +1113,41 @@ class MiniMaxH3Model:
         if self._interrupt:
             raise InterruptedError("MiniMax H3 preview decode was cancelled")
         return video
+
+    def _load_control_branch(self, filename) -> None:
+        """Prepare the acquired original branch before the caller profiles H3.
+
+        This internal path owns no acquisition or GPU authority. The caller
+        must build a fresh eager MMGP profile including the child; ordinary
+        public requests and cached residency plans do not admit Control yet.
+        """
+        from .control import load_original_control_branch
+
+        if self._interrupt:
+            raise InterruptedError("H3 Control loading was cancelled")
+        transformer = self.transformer
+        if (transformer is None or transformer.use_adaln_curves
+                or transformer.config.hidden_size != 5376
+                or transformer.config.curve_dim != 2688
+                or transformer.config.in_channels != 24
+                or transformer.config.audio_in_channels != 32
+                or tuple(transformer.config.patch_size) != (1, 2, 2)
+                or len(transformer.blocks) != 50 or self.dtype != torch.bfloat16):
+            raise ValueError("Original H3 Control requires the full-timestep 50-block base")
+        if (self.reference_mode or self.selected_model_type not in ("", "minimax_h3")
+                or self._h3_runtime_snapshot is not None
+                or self._h3_runtime_binding is not None
+                or self._h3_cumulative_token is not None):
+            raise ValueError("H3 Control requires a separate base runtime without cumulative recovery")
+        if (getattr(transformer, "h3_control_branch", None) is not None
+                or transformer._h3_turbo_prepared or transformer._h3_turbo_active
+                or any(hasattr(module, "_hf_hook") or hasattr(module, "_force_device")
+                       for module in transformer.modules())):
+            raise ValueError("H3 Control must be loaded once before MMGP residency setup")
+        branch = load_original_control_branch(filename, interrupted=lambda: self._interrupt)
+        if self._interrupt:
+            raise InterruptedError("H3 Control loading was cancelled")
+        transformer.bind_control_branch(branch)
 
     @torch.inference_mode()
     def _encode_control_video(

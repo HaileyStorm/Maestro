@@ -944,6 +944,32 @@ class MiniMaxH3Transformer(nn.Module):
             "residual_modules": len(getattr(self, "_h3_turbo_residual_handles", [])),
         }
 
+    def bind_control_branch(self, branch) -> None:
+        """Register Control under this model before its MMGP profile is built.
+
+        A separate pipeline root can evict the active base during the nested
+        Control call. A child shares its parent's model ID, budget and release
+        owner while MMGP discovers the branch's own block stack.
+        """
+        from .control import MiniMaxH3ControlBranch
+
+        if not isinstance(branch, MiniMaxH3ControlBranch):
+            raise ValueError("H3 Control requires an original branch")
+        if getattr(self, "h3_control_branch", None) is not None:
+            raise ValueError("H3 Control is already bound to this transformer")
+        if any(hasattr(module, "_hf_hook") or hasattr(module, "_force_device")
+               for model in (self, branch) for module in model.modules()):
+            raise ValueError("H3 Control must be bound before MMGP residency setup")
+        if self.use_adaln_curves:
+            raise ValueError("Original H3 Control requires a full-timestep base checkpoint")
+        if self._h3_turbo_prepared or self._h3_turbo_active:
+            raise ValueError("Original H3 Control cannot combine with Turbo")
+        if (branch.hidden_size != self.config.hidden_size
+                or branch.time_embed_dim != self.config.curve_dim
+                or branch.control_blocks_places[-1] >= len(self.blocks)):
+            raise ValueError("H3 Control architecture does not match its base")
+        self.h3_control_branch = branch
+
     def _curve_at(self, timestep: torch.Tensor, device: torch.device) -> torch.Tensor:
         if not self.use_adaln_curves:
             return self.time_embedder(timestep.to(device=device))
@@ -1001,6 +1027,12 @@ class MiniMaxH3Transformer(nn.Module):
         control_branch = _kwargs.get("h3_control_branch")
         control_rows = _kwargs.get("h3_control_rows")
         control_strength = _kwargs.get("h3_control_strength", 1.0)
+        bound_control = getattr(self, "h3_control_branch", None)
+        if bound_control is not None:
+            if control_branch is not None and control_branch is not bound_control:
+                raise ValueError("H3 Control must use the branch registered for residency")
+            if control_rows is not None:
+                control_branch = bound_control
         if control_branch is not None or control_rows is not None:
             from .control import MiniMaxH3ControlBranch, add_control_hint
 

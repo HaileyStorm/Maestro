@@ -76,6 +76,19 @@ inpaint-source encoding. This is an internal preparation binding; full Control
 branch residency, compatible-base qualification, public admission, and native
 GPU/media acceptance remain outstanding.
 
+The internal `_load_control_branch` path requires the full-timestep, 50-block
+Base architecture and an acquired original checkpoint before any MMGP setup.
+It registers the branch as a transformer child, so MMGP discovers both block
+stacks under one model ID and budget. A separate Control pipeline root would
+otherwise evict the active base on the nested branch call. Explicit Control
+rows select that registered branch; unrelated branch instances are rejected.
+Ordinary forwards with no Control rows stay unchanged, and model release
+detaches the child even when another owner still holds a transformer alias.
+This preparation path excludes Ref2VA, Turbo and cumulative recovery. It
+requires a fresh eager profile: public admission and cached residency identities
+do not yet include the acquired Control asset. CPU graph and numerical checks
+do not qualify the full weights, CUDA offload, or generation.
+
 The default runtime stack is pinned to:
 
 - `MiniMaxAI/MiniMax-H3` commit `5d9b308a59ab12e67147f191e184baf704185bd1`

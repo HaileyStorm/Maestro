@@ -206,6 +206,19 @@ class OriginalH3ControlTests(unittest.TestCase):
                 # No direct audio skip does not imply bit-identical soundtrack:
                 # subsequent joint base attention still mixes all modalities.
                 self.assertFalse(torch.equal(actual.audio_sample, baseline.audio_sample))
+                # A registered child uses the same donor arithmetic without
+                # activating a second MMGP pipeline root. No-control forwards
+                # still bypass the resident child entirely.
+                model.bind_control_branch(control)
+                implicit = model(**kwargs, h3_control_rows=control_rows, h3_control_strength=0.6)
+                torch.testing.assert_close(implicit.sample, actual.sample, rtol=0, atol=0)
+                torch.testing.assert_close(implicit.audio_sample, actual.audio_sample, rtol=0, atol=0)
+                with patch.object(control, "forward", side_effect=AssertionError("ordinary forward ran Control")):
+                    ordinary = model(**kwargs)
+                torch.testing.assert_close(ordinary.sample, baseline.sample, rtol=0, atol=0)
+                torch.testing.assert_close(ordinary.audio_sample, baseline.audio_sample, rtol=0, atol=0)
+                with self.assertRaisesRegex(ValueError, "registered for residency"):
+                    model(**kwargs, h3_control_branch=branch(torch.float32), h3_control_rows=control_rows)
                 for bad in (
                     {"h3_attention_engine": "sol_attn"},
                     {"h3_spectrum_controller": object()},
@@ -385,6 +398,106 @@ class OriginalH3ControlLoaderTests(unittest.TestCase):
                      patch.object(offload, "load_model_data", side_effect=load_then_change):
                     with self.assertRaises(InterruptedError if action == "cancel" else ValueError):
                         control_module.load_original_control_branch(path, interrupted=lambda: bool(cancelled))
+
+
+class OriginalH3ControlResidencyPreparationTests(unittest.TestCase):
+    @staticmethod
+    def runtime():
+        from accelerate import init_empty_weights
+
+        # Complete original graph geometry, with no learned storage or CUDA.
+        with init_empty_weights(include_buffers=True):
+            transformer = MiniMaxH3Transformer(curve_grid=None, curve_dim=2688)
+            control = MiniMaxH3ControlBranch()
+        source = APP / "models/minimax_h3/minimax_h3_main.py"
+        model = next(node for node in ast.parse(source.read_text()).body
+                     if isinstance(node, ast.ClassDef) and node.name == "MiniMaxH3Model")
+        methods = [node for node in model.body if isinstance(node, ast.FunctionDef)
+                   and node.name in ("_load_control_branch", "release")]
+        namespace = {"torch": torch, "__package__": "models.minimax_h3",
+                     "clear_pdd_runtime": lambda _transformer: None}
+        exec(compile(ast.Module(body=methods, type_ignores=[]), str(source), "exec"), namespace)
+        runtime = types.SimpleNamespace(
+            transformer=transformer, dtype=torch.bfloat16, _interrupt=False,
+            reference_mode=False, selected_model_type="minimax_h3",
+            _h3_runtime_snapshot=None, _h3_runtime_binding=None, _h3_cumulative_token=None,
+        )
+        runtime.load = types.MethodType(namespace["_load_control_branch"], runtime)
+        runtime.release = types.MethodType(namespace["release"], runtime)
+        return runtime, control
+
+    def test_native_graph_discovery_and_alias_safe_release(self):
+        from mmgp import offload
+        runtime, control = self.runtime()
+        transformer_alias = runtime.transformer
+        ordinary_keys = set(transformer_alias.state_dict())
+        with patch.object(control_module, "load_original_control_branch", return_value=control):
+            runtime.load("already-acquired-original.safetensors")
+        self.assertIs(transformer_alias.h3_control_branch, control)
+        towers, floors = offload._detect_main_towers(transformer_alias)
+        self.assertIn("blocks.", towers)
+        self.assertIn("h3_control_branch.control_blocks.", towers)
+        self.assertTrue(all(any(block is floor for floor in floors) for block in control.control_blocks))
+        self.assertIs(dict(transformer_alias.named_modules())["h3_control_branch.control_proj_in"],
+                      control.control_proj_in)
+        self.assertEqual(control.control_proj_in._lock_dtype, torch.float32)
+        runtime.release()
+        self.assertIsNone(runtime.transformer)
+        self.assertFalse(hasattr(transformer_alias, "h3_control_branch"))
+        self.assertEqual(set(transformer_alias.state_dict()), ordinary_keys)
+
+    def test_ineligible_or_profiled_runtime_never_loads_weights(self):
+        runtime, control = self.runtime()
+        cases = [
+            (runtime, "reference_mode", True),
+            (runtime, "selected_model_type", "minimax_h3_ref"),
+            (runtime, "_h3_runtime_snapshot", object()),
+            (runtime, "_h3_runtime_binding", object()),
+            (runtime, "_h3_cumulative_token", object()),
+            (runtime, "dtype", torch.float16),
+            (runtime.transformer, "use_adaln_curves", True),
+            (runtime.transformer, "_h3_turbo_prepared", True),
+            (runtime.transformer.config, "in_channels", 1),
+        ]
+        with patch.object(control_module, "load_original_control_branch") as loader:
+            for owner, field, value in cases:
+                original = getattr(owner, field)
+                with self.subTest(field=field):
+                    setattr(owner, field, value)
+                    try:
+                        with self.assertRaises(ValueError):
+                            runtime.load("unused")
+                    finally:
+                        setattr(owner, field, original)
+            runtime.transformer.blocks[0]._hf_hook = object()
+            with self.assertRaisesRegex(ValueError, "before MMGP"):
+                runtime.load("unused")
+            with self.assertRaisesRegex(ValueError, "before MMGP"):
+                runtime.transformer.bind_control_branch(control)
+            del runtime.transformer.blocks[0]._hf_hook
+            loader.assert_not_called()
+        runtime.transformer.bind_control_branch(control)
+        with self.assertRaisesRegex(ValueError, "already bound"):
+            runtime.transformer.bind_control_branch(control)
+
+    def test_cancelled_load_never_attaches_a_partial_branch(self):
+        runtime, control = self.runtime()
+        runtime._interrupt = True
+        with patch.object(control_module, "load_original_control_branch") as loader:
+            with self.assertRaises(InterruptedError):
+                runtime.load("unused")
+            loader.assert_not_called()
+        runtime._interrupt = False
+
+        def cancelled(_filename, *, interrupted):
+            self.assertFalse(interrupted())
+            runtime._interrupt = True
+            return control
+
+        with patch.object(control_module, "load_original_control_branch", side_effect=cancelled):
+            with self.assertRaises(InterruptedError):
+                runtime.load("unused")
+        self.assertFalse(hasattr(runtime.transformer, "h3_control_branch"))
 
 
 class OriginalH3ControlConditioningTests(unittest.TestCase):
