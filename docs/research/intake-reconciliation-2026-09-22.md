@@ -1059,9 +1059,16 @@ will rerun, without increasing execution or recovery attempts.
 Evidence: a real journal and sealed manifest reproduce the former zero-worker
 failure for queued and interrupted jobs across two restarts. The repaired route
 attaches one stub worker and rejects repeated Resume; all 209 affected recovery
-checks pass. Frozen-source review and publication checks pass. The original
-native image job remains held with unchanged identity; the failed GPU grant
-was withdrawn after owned runtime cleanup. Native dispatch on the repair,
+checks pass. Frozen-source review and publication checks pass. A later native
+check on the repaired source resumed the original held image job once and
+completed one output, preserving its job/settings identity and one execution
+attempt. The actual Start-session log records one Resume and no Generate POST.
+After the supervisor stopped the owned runtime and confirmed exact lease
+withdrawal, coordinated Pinokio Restart restored local and stable health/readiness
+with no public restart notice. Gallery opened and decoded the 1280 × 720 result;
+the media and producer-sidecar seals still match after restart and browser
+viewing. Earlier failed/unused grants remain recorded. This closes native held
+worker dispatch and terminal media preservation; an in-flight backend crash,
 Windows/LAN and human acceptance remain separate checks.
 
 ### 2026-10-06: Restart after a failed Start
