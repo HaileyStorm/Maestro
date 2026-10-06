@@ -4,6 +4,7 @@ import contextvars
 import hashlib
 import hmac
 import json
+import math
 import re
 import threading
 import time
@@ -458,7 +459,7 @@ class RetakePolicyAdmissionTests(unittest.TestCase):
         self.ns = {
             "Request": object, "HTTPException": _HTTPException,
             "os": os, "uuid": uuid, "time": time, "threading": threading,
-            "re": re, "hmac": hmac, "hashlib": hashlib,
+            "re": re, "hmac": hmac, "hashlib": hashlib, "math": math,
             "_output_share_revision_cache": {},
             "_output_share_revision_cache_lock": threading.Lock(),
             "_output_lineage_mutation_registry_lock": threading.Lock(),
@@ -655,6 +656,60 @@ class RetakePolicyAdmissionTests(unittest.TestCase):
             self.submit({"expected_source_revision": self.source_revision()}, source=upload)
         self.assertEqual(raised.exception.status_code, 409)
         self.assertEqual(self.probed, [])
+        self.assertEqual(self.registered, [])
+
+
+    def test_invalid_retake_temporal_controls_reject_before_probe_or_registration(self):
+        for field in ("start_time", "end_time", "retake_strength"):
+            for value in (None, True, {}, [], "bad", float("nan"), float("inf"), -float("inf")):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaises(_HTTPException) as raised:
+                        self.submit({field: value})
+                    self.assertEqual(raised.exception.status_code, 400)
+        for value in (-0.1, 1.1):
+            with self.subTest(strength=value):
+                with self.assertRaises(_HTTPException) as raised:
+                    self.submit({"retake_strength": value})
+                self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(self.probed, [])
+        self.assertEqual(self.registered, [])
+
+    def test_retake_legacy_whole_source_range_and_numeric_controls_remain_supported(self):
+        for end in (0, -1):
+            result = self.submit({"start_time": -0.25, "end_time": end, "retake_strength": 0})
+            self.assertEqual(result["retake_frames"], "0-48/48")
+            self.assertEqual(self.registered[-1]["params"]["retake_strength"], 0)
+        result = self.submit({"start_time": "0.25", "end_time": "1.25", "retake_strength": "0.5"})
+        self.assertEqual(result["retake_frames"], "6-30/48")
+        self.assertEqual(self.registered[-1]["params"]["retake_strength"], 0.5)
+
+    def test_finite_extreme_retake_times_cannot_overflow_frame_conversion(self):
+        for start, end in ((-1e308, 1e308), (0.25, 1e308)):
+            result = self.submit({"start_time": start, "end_time": end})
+            self.assertEqual(result["retake_frames"], f"{0 if start < 0 else 6}-48/48")
+        before = len(self.registered)
+        with self.assertRaises(_HTTPException) as raised:
+            self.submit({"start_time": 1e308, "end_time": 1e308})
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(len(self.registered), before)
+
+    def test_invalid_source_timing_cannot_overflow_frame_conversion_or_admit(self):
+        for fps in (0, -1, float("nan"), float("inf"), 5e-324):
+            with self.subTest(fps=fps):
+                with patch.object(sys.modules["decord"].VideoReader, "get_avg_fps", return_value=fps):
+                    with self.assertRaises(_HTTPException) as raised:
+                        self.submit()
+                self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(self.registered, [])
+
+    def test_retake_decoder_failure_hides_private_path_and_never_admits(self):
+        def unreadable():
+            raise ValueError("Cannot decode /private/user/video.mp4")
+        self.mutate_on_probe = unreadable
+        with self.assertRaises(_HTTPException) as raised:
+            self.submit()
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertNotIn("/private/", raised.exception.detail)
         self.assertEqual(self.registered, [])
 
 

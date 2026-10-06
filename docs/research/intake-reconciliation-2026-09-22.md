@@ -991,3 +991,24 @@ the saved draft and both takes' media and metadata hashes. The same-inode
 server-log observation recorded no Retake, Generate or Resume submission.
 Local and stable-share health/readiness passed and the restart notice cleared.
 This verifies the review handoff; no new Retake sample was generated.
+
+## 2026-10-06 — Retake fresh-review isolation and input errors
+
+Every new Retake review starts with blank prompt/negative text and the existing
+form defaults. A synchronous opening identity guard prevents an old review's
+text or controls from appearing or submitting under another account, project
+or source before the new state is prepared. Editor source interval/revision,
+model/LoRA selection and deferred-response fences remain intact.
+
+Retake admission rejects malformed or nonfinite timing/strength controls before
+video decoding or registration. Strength stays within its documented 0–1 range.
+Frame conversion clamps to source bounds before multiplication, avoiding
+finite-timestamp overflow; numeric-string controls, negative-start clamping and
+whole-source end sentinels remain supported. Invalid source timing/geometry and
+decoder failures return a plain error without private decoder paths.
+
+The old form reproduced retained private text. All 13 affected dialog checks
+and 14 affected backend admission checks pass, with TypeScript, scoped lint and
+production build validation. Earlier unchanged source-policy and Editor evidence
+is retained. Live fresh-review checks and native generated Retake media remain
+separate gates.

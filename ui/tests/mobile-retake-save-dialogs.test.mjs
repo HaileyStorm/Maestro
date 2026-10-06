@@ -212,7 +212,9 @@ async function loadDialogComponent(entryUrl, exportName) {
         }
         return [globalThis.__dialogHookState[index], value => {
           const current = globalThis.__dialogHookState[index]
-          globalThis.__dialogHookState[index] = typeof value === 'function' ? value(current) : value
+          const next = typeof value === 'function' ? value(current) : value
+          if (!Object.is(current, next)) globalThis.__dialogNeedsRender = true
+          globalThis.__dialogHookState[index] = next
         }]
       }
       export function useEffect(effect, deps) {
@@ -220,10 +222,15 @@ async function loadDialogComponent(entryUrl, exportName) {
         const previous = globalThis.__dialogEffects[index]
         if (deps && previous?.deps && deps.length === previous.deps.length
           && deps.every((value, i) => Object.is(value, previous.deps[i]))) return
-        previous?.cleanup?.()
-        const cleanup = effect()
-        globalThis.__dialogEffects[index] = { deps, cleanup }
-        if (typeof cleanup === 'function') globalThis.__dialogCleanups.push(cleanup)
+        const run = () => {
+          previous?.cleanup?.()
+          const cleanup = effect()
+          globalThis.__dialogEffects[index] = { deps, cleanup }
+          if (typeof cleanup === 'function') globalThis.__dialogCleanups.push(cleanup)
+        }
+        globalThis.__dialogEffects[index] = { deps }
+        if (globalThis.__dialogDeferEffects) globalThis.__dialogDeferredEffects.push(run)
+        else run()
       }
       export function useId() { return 'dialog-' + globalThis.__dialogIdIndex++ }
       export function useCallback(callback) { return callback }
@@ -330,7 +337,17 @@ async function loadDialogComponent(entryUrl, exportName) {
     compiledModule,
     compiledModule.exports,
   )
-  return compiledModule.exports[exportName]
+  const component = compiledModule.exports[exportName]
+  if (exportName !== 'RetakeDialog') return component
+  return (...args) => {
+    for (let pass = 0; pass < 5; pass++) {
+      globalThis.__dialogNeedsRender = false
+      const tree = component(...args)
+      if (!globalThis.__dialogNeedsRender) return tree
+      beginRender()
+    }
+    throw new Error('Retake render did not settle')
+  }
 }
 
 async function loadMediaFeedItemHarness() {
@@ -443,6 +460,8 @@ function resetDialogHarness(refs) {
   }
   globalThis.__dialogEffectIndex = 0
   globalThis.__dialogEffects = []
+  globalThis.__dialogDeferEffects = false
+  globalThis.__dialogDeferredEffects = []
   globalThis.__dialogHookIndex = 0
   globalThis.__dialogHookState = []
   globalThis.__dialogRefIndex = 0
@@ -1101,4 +1120,82 @@ test('account epoch change during Editor Retake submission cannot refresh, repor
   assert.equal(loads, 0)
   assert.equal(timers, 0)
   assert.equal(globalThis.__dialogHookState[11], null)
+})
+
+
+test('fresh Retake review resets prior text and settings across reopening, account, and source changes', async () => {
+  globalThis.HTMLButtonElement = class {}
+  resetDialogHarness([{ current: {} }, { current: {} }, { current: null }])
+  const revision = 'sha256:' + 'c'.repeat(64)
+  globalThis.__retakeStore = {
+    retakeDialogOpen: true, retakeSourceFile: 'first.mp4', retakeOpeningEpoch: 1,
+    retakeSourceContext: { workspace: 'scene', revision, start: 2.5, end: 5 },
+    activeWorkspace: 'scene', closeRetakeDialog() {
+      globalThis.__retakeStore.retakeDialogOpen = false
+      globalThis.__retakeStore.retakeOpeningEpoch++
+    }, loadOutputs() {}, selectedModelPerMode: { video: 'video-model' },
+    params: { model_type: 'video-model' }, models: [],
+  }
+  const RetakeDialog = await loadDialogComponent(retakeUrl, 'RetakeDialog')
+  const render = () => { beginRender(); return RetakeDialog() }
+  const control = (tree, text) => {
+    const label = findNode(tree, node => node.type === 'label' && nodeText(node) === text)
+    return findNode(tree, node => node.props?.id === label.props.htmlFor && node.type !== 'label')
+  }
+  let tree = render()
+  tree = render()
+  for (const changeAccount of [false, true]) {
+    control(tree, 'What should happen in this section?').props.onChange({ target: { value: 'previous private prompt' } })
+    findNode(tree, node => node.type === 'button' && nodeText(node).includes('Advanced')).props.onClick()
+    tree = render()
+    for (const [label, value] of [['Negative Prompt', 'previous negative'], ['Seed', '91'], ['Steps', '22'], ['Guidance', '4.5']]) {
+      control(tree, label).props.onChange({ target: { value } })
+    }
+    findNode(tree, node => node.type === 'input' && node.props.type === 'checkbox')
+      .props.onChange({ target: { checked: false } })
+    tree = render()
+    const oldSubmit = findNode(tree, node => node.type === 'button' && nodeText(node) === 'Retake').props.onClick
+    findNode(tree, node => node.type === 'button' && node.props['aria-label'] === 'Close Retake dialog').props.onClick()
+    assert.equal(render(), null)
+    if (changeAccount) {
+      globalThis.__retakeAccountEpoch++
+      globalThis.__retakeStore.retakeSourceFile = 'other.mp4'
+      globalThis.__retakeStore.retakeSourceContext = { workspace: 'scene', revision, start: 4, end: 7 }
+    }
+    globalThis.__retakeStore.retakeOpeningEpoch++
+    globalThis.__retakeStore.retakeDialogOpen = true
+    globalThis.__dialogDeferEffects = true
+    assert.equal(render(), null, 'prior form is unavailable before passive reset effects')
+    const beforeReset = globalThis.__retakePayloads.length
+    await oldSubmit()
+    assert.equal(globalThis.__retakePayloads.length, beforeReset)
+    globalThis.__dialogDeferEffects = false
+    for (const effect of globalThis.__dialogDeferredEffects.splice(0)) effect()
+    tree = render()
+    assert.equal(control(tree, 'What should happen in this section?').props.value, '')
+    assert.equal(findNode(tree, node => node.type === 'button' && nodeText(node).includes('Advanced')).props['aria-expanded'], false)
+    assert.equal(findNode(tree, node => node.type === 'input' && node.props.type === 'checkbox').props.checked, true)
+    const timeline = findNode(tree, node => typeof node.type === 'function' && node.type.name === 'VideoTimelineSelector')
+    assert.deepEqual([timeline.props.startTime, timeline.props.endTime], changeAccount ? [4, 7] : [2.5, 5])
+    const before = globalThis.__retakePayloads.length
+    await oldSubmit()
+    await findNode(tree, node => node.type === 'button' && nodeText(node) === 'Retake').props.onClick()
+    assert.equal(globalThis.__retakePayloads.length, before, 'old handler and blank fresh prompt cannot submit')
+    findNode(tree, node => node.type === 'button' && nodeText(node).includes('Advanced')).props.onClick()
+    tree = render()
+    for (const [label, value] of [['Negative Prompt', ''], ['Seed', -1], ['Steps', 8], ['Guidance', 1]]) {
+      assert.equal(control(tree, label).props.value, value)
+    }
+    control(tree, 'What should happen in this section?').props.onChange({ target: { value: 'fresh prompt' } })
+    tree = render()
+    globalThis.__retakeSubmit = async () => { throw new Error('disposable failure') }
+    await findNode(tree, node => node.type === 'button' && nodeText(node) === 'Retake').props.onClick()
+    const sent = globalThis.__retakePayloads.at(-1)
+    assert.deepEqual([sent.prompt, sent.negative_prompt, sent.seed, sent.num_inference_steps, sent.guidance_scale, sent.regenerate_audio], ['fresh prompt', '', -1, 8, 1, true])
+    assert.equal(sent.expected_source_revision, revision)
+    tree = render()
+    // Return to the basic form before the next user changes advanced settings.
+    findNode(tree, node => node.type === 'button' && nodeText(node).includes('Advanced')).props.onClick()
+    tree = render()
+  }
 })

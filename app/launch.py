@@ -50958,8 +50958,23 @@ async def retake_video_endpoint(request: Request):
         body, owner_session_id=session_id,
     )
 
-    start_time = float(body.get("start_time", 0))
-    end_time = float(body.get("end_time", -1))
+    def temporal_control(name, default):
+        value = body.get(name, default)
+        try:
+            if isinstance(value, bool):
+                raise ValueError("Boolean temporal control")
+            number = float(value)
+            if not math.isfinite(number):
+                raise ValueError("Nonfinite temporal control")
+        except (TypeError, ValueError, OverflowError) as error:
+            raise HTTPException(status_code=400, detail=f"Invalid {name}") from error
+        return number
+
+    start_time = temporal_control("start_time", 0)
+    end_time = temporal_control("end_time", -1)
+    retake_strength = temporal_control("retake_strength", 1.0)
+    if not 0 <= retake_strength <= 1:
+        raise HTTPException(status_code=400, detail="retake_strength must be between 0 and 1")
     model_type = body.get("model_type")
     if not model_type:
         raise HTTPException(status_code=400, detail="model_type is required")
@@ -50970,13 +50985,21 @@ async def retake_video_endpoint(request: Request):
         fps = vr.get_avg_fps()
         total_frames = len(vr)
         src_h, src_w = vr[0].shape[:2]
+        if not math.isfinite(fps) or fps <= 0 or total_frames <= 0 or src_h <= 0 or src_w <= 0:
+            raise ValueError("Invalid source video timing or shape")
+        source_duration = total_frames / fps
+        if not math.isfinite(source_duration) or source_duration <= 0:
+            raise ValueError("Invalid source video duration")
         del vr
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Cannot read video: {e}")
+    except Exception as error:
+        raise HTTPException(status_code=400, detail="Cannot read the source video") from error
 
-    start_frame = max(0, int(start_time * fps))
-    end_frame = int(end_time * fps) if end_time > 0 else total_frames
-    end_frame = min(end_frame, total_frames)
+    if start_time >= source_duration:
+        raise HTTPException(status_code=400, detail="Invalid time range")
+    start_frame = int(max(0, start_time) * fps)
+    end_frame = (
+        int(end_time * fps) if 0 < end_time < source_duration else total_frames
+    )
     if start_frame >= end_frame:
         raise HTTPException(status_code=400, detail="Invalid time range")
 
@@ -50998,7 +51021,7 @@ async def retake_video_endpoint(request: Request):
         "retake_video": video_path,
         "retake_start_frame": start_frame,
         "retake_end_frame": end_frame,
-        "retake_strength": float(body.get("retake_strength", 1.0)),
+        "retake_strength": retake_strength,
         "retake_engine": body.get("retake_engine", "native"),
         "regenerate_audio": body.get("regenerate_audio", True),
         "activated_loras": body.get("activated_loras", []),

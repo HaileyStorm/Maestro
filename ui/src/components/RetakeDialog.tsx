@@ -51,6 +51,15 @@ export function RetakeDialog() {
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
   const [showAdvanced, setShowAdvanced] = useState(false)
+  const [preparedOpening, setPreparedOpening] = useState<{
+    epoch: number; account: number; workspace: string; file: string;
+    context: typeof sourceContext;
+  } | null>(null)
+  const formReady = preparedOpening?.epoch === openingEpoch
+    && preparedOpening?.account === currentAccountIdentityEpoch()
+    && preparedOpening?.workspace === activeWorkspace
+    && preparedOpening?.file === retakeFile
+    && preparedOpening?.context === sourceContext
 
   const savedVideoModel = useStore(s => s.selectedModelPerMode?.video)
   const currentModel = useStore(s => s.params.model_type)
@@ -85,6 +94,13 @@ export function RetakeDialog() {
     setSubmitting(false)
     setSuccess(null)
     setError(null)
+    setPrompt('')
+    setNegPrompt('')
+    setRegenerateAudio(true)
+    setSeed(-1)
+    setSteps(8)
+    setGuidance(1.0)
+    setShowAdvanced(false)
     const epoch = requestEpochRef.current
     const account = currentAccountIdentityEpoch()
     const current = () => {
@@ -97,6 +113,7 @@ export function RetakeDialog() {
     setStartTime(sourceContext?.start ?? 0)
     setEndTime(sourceContext?.end ?? 5)
     setDuration(0)
+    setPreparedOpening({ epoch: openingEpoch, account, workspace: activeWorkspace, file: retakeFile, context: sourceContext })
     const video = document.createElement('video')
     let disposed = false
     video.onloadedmetadata = () => {
@@ -118,7 +135,7 @@ export function RetakeDialog() {
   }, [retakeFile, retakeOpen, sourceContext, openingEpoch, activeWorkspace])
 
   useEffect(() => {
-    if (!retakeOpen || !retakeFile || !dialogRef.current || !closeRef.current) return
+    if (!formReady || !retakeOpen || !retakeFile || !dialogRef.current || !closeRef.current) return
     restoreFocusRef.current = document.activeElement instanceof HTMLButtonElement
       ? document.activeElement
       : null
@@ -131,7 +148,7 @@ export function RetakeDialog() {
       onClose: requestClose,
       priority: 100,
     })
-  }, [requestClose, retakeFile, retakeOpen])
+  }, [formReady, requestClose, retakeFile, retakeOpen])
 
   useEffect(() => () => {
     requestEpochRef.current += 1
@@ -149,14 +166,14 @@ export function RetakeDialog() {
     setSubmitting(false)
   }, [retakeOpen])
 
-  if (!retakeOpen || !retakeFile) return null
+  if (!retakeOpen || !retakeFile || !formReady) return null
 
   const videoUrl = sourceContext
     ? api.getEditorPreviewUrl(retakeFile, sourceContext.workspace, sourceContext.revision)
     : api.getFileUrl(retakeFile, activeWorkspace)
 
   const handleSubmit = async () => {
-    if (!prompt || submittingRef.current) return
+    if (!formReady || !prompt || submittingRef.current) return
     const requestEpoch = requestEpochRef.current
     const account = currentAccountIdentityEpoch()
     const current = () => {
