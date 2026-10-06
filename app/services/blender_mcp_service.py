@@ -1071,6 +1071,39 @@ class BlenderMCPService:
             result["frame"] = frame
         return result
 
+    def composition_idle_probe(self, expected=None):
+        """A serial bridge barrier attests native idle, not worker/encoder drain."""
+        self._ensure_ready()
+        code = """import os,json
+from pathlib import Path
+p=Path('/proc')/str(os.getpid())
+f=(p/'stat').read_text().rsplit(')',1)[1].split()
+result={'pid':os.getpid(),'uid':os.getuid(),'start_ticks':int(f[19]),'exe':os.readlink(p/'exe'),'boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip()}
+"""
+        result = self._extract_result(self._call_upstream(EXECUTE_BLENDER_CODE, {"code": code}), EXECUTE_BLENDER_CODE)
+        raw = result
+        try:
+            identity = json.loads(raw.strip()) if isinstance(raw, str) else raw
+            from services.composition_recovery import validate_process_identity, process_identity
+            validate_process_identity(identity)
+            if process_identity(identity["pid"]) != identity or (expected is not None and identity != expected):
+                raise ValueError("incarnation changed")
+        except (ValueError, TypeError, AttributeError):
+            raise BlenderMCPSecurityError("Blender process identity is unavailable") from None
+        return identity
+
+    def prepare_composition_segment(self, persist, *, cancelled):
+        self._check_cancelled(cancelled)
+        identity = self.composition_idle_probe()
+        scratch = Path(str(self._attestation["scratch_root"]))
+        directory = scratch / ("maestro_frames_" + uuid.uuid4().hex)
+        destination = scratch / ("maestro_" + uuid.uuid4().hex + ".mp4")
+        layout = {"frame_directory": str(directory), "encoder_destination": str(destination)}
+        # Seal both names before any mutation or encoder spawn.
+        persist(identity, layout, None)
+        directory.mkdir(mode=0o700)
+        self._composition_prepared = (layout, persist, identity)
+
     def render_animation(
         self,
         arguments: Mapping[str, Any],
@@ -1087,11 +1120,19 @@ class BlenderMCPService:
         self._activate_project_scene(cancelled=cancelled)
         self._ensure_render_scene(cancelled=cancelled)
         scratch_root = Path(str(self._attestation["scratch_root"]))
-        frame_directory = scratch_root / f"maestro_frames_{uuid.uuid4().hex}"
-        frame_directory.mkdir(mode=0o700)
+        prepared = getattr(self, "_composition_prepared", None)
+        self._composition_prepared = None
+        if prepared is None:
+            frame_directory = scratch_root / f"maestro_frames_{uuid.uuid4().hex}"
+            frame_directory.mkdir(mode=0o700)
+            source = scratch_root / f"maestro_{uuid.uuid4().hex}.mp4"
+        else:
+            layout, persist, identity = prepared
+            frame_directory = Path(layout["frame_directory"])
+            source = Path(layout["encoder_destination"])
         frame_prefix = frame_directory / "frame_"
-        scratch_name = f"maestro_{uuid.uuid4().hex}.mp4"
-        source = scratch_root / scratch_name
+        scratch_name = source.name
+        succeeded = False
         try:
             response = self._call_upstream(
                 EXECUTE_BLENDER_CODE,
@@ -1115,6 +1156,7 @@ class BlenderMCPService:
                 fps=fps,
                 max_input_bytes=self.limits.max_video_bytes,
                 cancelled=cancelled,
+                process_event=(lambda encoder: persist(identity, layout, encoder)) if prepared else None,
             )
             if (
                 source.name != scratch_name
@@ -1133,6 +1175,7 @@ class BlenderMCPService:
                 overwrite=overwrite,
                 cancelled=cancelled,
             )
+            succeeded = True
         except BlenderMCPError:
             raise
         except OSError as exc:
@@ -1140,11 +1183,12 @@ class BlenderMCPService:
                 f"could not render or securely copy animation: {exc}"
             ) from exc
         finally:
-            shutil.rmtree(frame_directory, ignore_errors=True)
-            try:
-                source.unlink()
-            except FileNotFoundError:
-                pass
+            if prepared is None or succeeded:
+                shutil.rmtree(frame_directory, ignore_errors=True)
+                try:
+                    source.unlink()
+                except FileNotFoundError:
+                    pass
         return {
             "status": "ok",
             "output_path": str(destination),
@@ -1979,6 +2023,7 @@ def _encode_png_sequence_to_mp4(
     fps: int,
     max_input_bytes: int,
     cancelled: Callable[[], bool] | None = None,
+    process_event=None,
 ) -> None:
     frame_count = frame_end - frame_start + 1
     total_bytes = 0
@@ -2028,28 +2073,54 @@ def _encode_png_sequence_to_mp4(
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )
-    deadline = time.monotonic() + max(300.0, frame_count * 10.0)
-    while process.poll() is None:
-        if cancelled is not None and cancelled():
+    try:
+        if process_event is not None:
+            from services.composition_recovery import process_identity, CompositionAttemptUnresolved
+            try:
+                identity = process_identity(process.pid)
+            except CompositionAttemptUnresolved:
+                if process.poll() is None:
+                    raise
+                identity = None
+            if identity is None and process.poll() is None:
+                raise CompositionAttemptUnresolved("Encoder identity is unavailable")
+            process_event(identity)
+        deadline = time.monotonic() + max(300.0, frame_count * 10.0)
+        while process.poll() is None:
+            if cancelled is not None and cancelled():
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                process.communicate()
+                raise BlenderMCPCancelled("Blender MCP operation was cancelled")
+            if time.monotonic() >= deadline:
+                process.kill()
+                process.communicate()
+                raise BlenderMCPToolError("animation encoding timed out")
+            time.sleep(0.05)
+        _stdout, stderr_value = process.communicate()
+        stderr = (stderr_value or b"")[:500]
+        if process.returncode != 0:
+            detail = stderr.decode("utf-8", errors="replace").strip()
+            raise BlenderMCPToolError(
+                f"managed FFmpeg could not encode the animation: {detail or 'unknown error'}"
+            )
+    finally:
+        if process.poll() is None:
             process.terminate()
             try:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 process.kill()
+        if process.stderr is not None and not process.stderr.closed:
             process.communicate()
-            raise BlenderMCPCancelled("Blender MCP operation was cancelled")
-        if time.monotonic() >= deadline:
-            process.kill()
-            process.communicate()
-            raise BlenderMCPToolError("animation encoding timed out")
-        time.sleep(0.05)
-    _stdout, stderr_value = process.communicate()
-    stderr = (stderr_value or b"")[:500]
-    if process.returncode != 0:
-        detail = stderr.decode("utf-8", errors="replace").strip()
-        raise BlenderMCPToolError(
-            f"managed FFmpeg could not encode the animation: {detail or 'unknown error'}"
-        )
+        else:
+            process.wait()
+        if process_event is not None:
+            process_event(None)
+
 
 
 def _reject_unknown(value: Mapping[str, Any], allowed: set[str], label: str) -> None:

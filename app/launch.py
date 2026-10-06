@@ -8754,6 +8754,11 @@ def _restore_queue_recovery_on_startup(
     director_legacy_payloads = False
     unsettled_terminal_credit = False
     pending_processed_tool_jobs: set[str] = set()
+    from services.queue_recovery_adapter import composition_recovery_requests_retained
+    retained_composition_jobs = {
+        job_id for job_id, snapshot in _queue_recovery_restored.jobs.items()
+        if composition_recovery_requests_retained(snapshot)
+    }
     sample_snapshots = tuple(
         snapshot for snapshot in _queue_recovery_restored.jobs.values()
         if snapshot.get("kind") == "sample_campaign_generation"
@@ -9030,6 +9035,7 @@ def _restore_queue_recovery_on_startup(
             str(snapshot.get("status") or "").casefold() in terminal_statuses
             and not unsettled_terminal_credit
             and snapshot.get("id") not in pending_processed_tool_jobs
+            and snapshot.get("id") not in retained_composition_jobs
         ):
             continue
         snapshot_workspace = str(snapshot.get("workspace") or "default")
@@ -9050,7 +9056,8 @@ def _restore_queue_recovery_on_startup(
     # chain rather than deriving liveness solely from the stale startup map.
     for candidate in list(_jobs.values()):
         if (str(candidate.get("status") or "").casefold() in terminal_statuses
-                and candidate.get("id") not in pending_processed_tool_jobs):
+                and candidate.get("id") not in pending_processed_tool_jobs
+                and candidate.get("id") not in retained_composition_jobs):
             continue
         candidate_workspace = str(candidate.get("workspace") or "default")
         candidate_id = candidate.get("id")
@@ -9151,6 +9158,11 @@ def _restore_queue_recovery_on_startup(
                     message="Automatic plan approval could not be restored",
                     phase="preparation_failed",
                 )
+    resume_composition = globals().get("_composition_restore_pending")
+    if callable(resume_composition):
+        for job in restored_jobs:
+            if not run_startup_operation(lambda job=job: resume_composition(job)):
+                return finish_interrupted_startup_execution()
     from services.director_pipeline import start_restored_pipeline
     for pid in director_resumable:
         if not run_startup_operation(
@@ -66778,11 +66790,8 @@ def _composition_job_context(job, *, require_current_renderer=True):
         project_dir, job["_recovery_manifest_pointer"], expected_job_id=job["id"]
     )
     params = manifest["params"]
-    if manifest.get("inputs") or (
-        require_current_renderer
-        and params.get("composition_renderer") != _composition_renderer_identity()
-    ):
-        raise CompositionError("Composition renderer or execution inputs changed")
+    if manifest.get("inputs"):
+        raise CompositionError("Composition execution inputs changed")
     directory = _composition_directory(project_dir, job["id"])
     validator = BlenderMCPService(object(), directory)
     package = validate_normalized_package(params["composition_package"], validator)
@@ -66810,6 +66819,23 @@ def _composition_job_context(job, *, require_current_renderer=True):
         "renderer_identity": params["composition_renderer"],
         "output_policy": copy.deepcopy(expected_policy),
     }
+    original_directory, original_binding = directory, copy.deepcopy(binding)
+    active = marker.get("active_attempt")
+    if active is not None:
+        import re
+        from services.composition_package import read_receipt
+        from services.composition_recovery import validate_attempt
+        from services.queue_recovery_runtime import _ensure_private_directory
+        if type(active) is not str or not re.fullmatch(r"[0-9a-f]{32}", active):
+            raise CompositionError("Composition attempt identity changed")
+        directory, _identity = _ensure_private_directory(directory / ("attempt-" + active))
+        intent = read_receipt(directory / "attempt.intent.json", _session_secret())
+        binding = intent.get("binding")
+        if type(binding) is not dict or any(binding.get(k) != v for k,v in original_binding.items() if k != "renderer_identity"):
+            raise CompositionError("Composition recovery binding changed")
+        validate_attempt(package, directory, original_directory, original_binding, binding, _session_secret(), job["_recovery_manifest_pointer"])
+    if require_current_renderer and binding["renderer_identity"] != _composition_renderer_identity():
+        raise CompositionError("Composition renderer changed")
     job["params"] = copy.deepcopy(params)
     return package, directory, project_dir, binding
 
@@ -66889,6 +66915,10 @@ def _composition_materialize_job(snapshot, projects):
             except CompositionNeedsNative:
                 # Missing pristine units can resume; armed unknown units cannot.
                 pass
+        marker = (runtime.get("recovery_cursor") or {}).get("composition") or {}
+        if (marker.get("active_attempt") and marker.get("stage") == "admitted"
+                and runtime.get("_recovery_reason_code") == "worker_start_failed"):
+            runtime.update(queue_held=False, _recovery_reason_code="")
         runtime.update(
             status="queued",
             resource_state="queued",
@@ -66952,6 +66982,8 @@ def _run_tool_composition_export(job_id):
     client = None
     attempt = None
     initial_attempt = job.get("execution_attempt")
+    from services.composition_recovery import start_worker, finish_worker
+    worker_identity = None
 
     def aborted():
         return bool(abort_state.get("abort")) or is_cancel_requested(job)
@@ -66994,6 +67026,7 @@ def _run_tool_composition_export(job_id):
             yield native_service
 
     try:
+        worker_identity = start_worker()
         while not aborted():
             with generation_slot(_gen_lock, job) as acquired:
                 if not acquired:
@@ -67069,6 +67102,7 @@ def _run_tool_composition_export(job_id):
                                     policy=job.get("access_policy") or {},
                                     native_context=native_context,
                                     event=event,
+                                    worker_identity=worker_identity,
                                 )
                                 with _output_lineage_mutation_guard(project_dir):
                                     _composition_job_context(
@@ -67138,6 +67172,208 @@ def _run_tool_composition_export(job_id):
                 client.close()
         finally:
             unregister_abort_state(job_id, _active_gen_states, abort_state)
+            finish_worker(worker_identity)
+
+
+def _composition_recovery_response(job, request_id):
+    records = ((job.get("recovery_cursor") or {}).get("composition") or {}).get("requests") or {}
+    record = records.get(request_id)
+    if not isinstance(record, dict) or record.get("status") not in {"pending", "accepted", "rejected"}:
+        raise HTTPException(status_code=404, detail="Recovery request not found")
+    status = "rejected" if record["status"] == "pending" and (job.get("cancel_requested") or job.get("status") == "cancelled") else record["status"]
+    return {"job_id": job["id"], "recovery_request_id": str(uuid.UUID(request_id)), "status": status,
+            "message": {"pending": "Checking whether the previous render has stopped", "accepted": "Composition queued for recovery", "rejected": "Recovery could not be confirmed; the previous output is preserved"}[status]}
+
+
+def _composition_recovery_scope(job_id, request, *, mutate=False):
+    job = _require_owned_job(job_id, request)
+    job = _require_owned_job_project(job_id, request, job["workspace"])
+    if mutate:
+        _require_project_access(request, job["workspace"], existing_only=True, permission="project.mutate")
+        _require_project_access(request, job["workspace"], existing_only=True, permission="project.generate")
+    if job.get("kind") != "tool_editor_export" or not isinstance((job.get("recovery_cursor") or {}).get("composition"), dict):
+        raise HTTPException(status_code=404, detail="Composition not found")
+    return job
+
+
+def _composition_recovery_id(value):
+    try:
+        parsed = uuid.UUID(value)
+        if parsed.version != 4 or value not in {str(parsed), parsed.hex}:
+            raise ValueError()
+        return parsed.hex
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(status_code=400, detail="Choose a valid recovery request") from None
+
+
+def _composition_recovery_reconcile(job_id, request_id):
+    from pathlib import Path
+    from services.composition_package import CompositionError
+    from services.composition_recovery import prepare_attempt, validate_attempt
+    from services.blender_mcp_service import BlenderMCPService
+    from services.blender_mcp_transport import StdioBlenderMCPClient
+    from services.queue_recovery_runtime import _ensure_private_directory
+    client = None
+    job = _jobs.get(job_id)
+    if job is None:
+        return
+    record = copy.deepcopy((((job.get("recovery_cursor") or {}).get("composition") or {}).get("requests") or {}).get(request_id))
+    if not record or record.get("status") != "pending":
+        return
+    scope = None
+    def scope_identity():
+        marker = (job.get("recovery_cursor") or {}).get("composition") or {}
+        return copy.deepcopy({key: job.get(key) for key in ("workspace", "_recovery_owner_digest", "_recovery_project_digest", "_recovery_manifest_pointer", "access_policy", "private", "explicit")}) | {"package_sha256": marker.get("package_sha256"), "active_attempt": marker.get("active_attempt")}
+    def current():
+        return (_jobs.get(job_id) is job and not is_cancel_requested(job)
+                and (scope is None or scope_identity() == scope)
+                and job.get("execution_attempt") == record["expected_execution_attempt"]
+                and job.get("created_at") == record["expected_created_at"]
+                and (job.get("status") == "failed" or (job.get("status") == "queued" and job.get("queue_held"))))
+    try:
+        with _reserve_workspace_operations(job["workspace"]):
+            package, source, project_dir, source_binding = _composition_job_context(job, require_current_renderer=False)
+            scope = scope_identity()
+            historical = {"blender_version": "5.1.2", "blender_mcp_revision": "03004fd0216bfe5e0a3d9ac9b47d5efadc3d78c4", "blender_service_sha256": "0ad0d6607b1933dd2eec2a288b63ce63d5d20ff9bb642586dc72ee045a45f9bb", "editor_service_sha256": "0986b526eb7889e527d8ec80144f1f61b62f984de4e8ddd7f10ed24efd2b7aab"}
+            renderer = _composition_renderer_identity()
+            if source_binding["renderer_identity"] not in (renderer, historical):
+                raise CompositionError("Original renderer has no reviewed compatibility tuple")
+            binding = copy.deepcopy(source_binding)
+            binding["renderer_identity"] = renderer
+            original = _composition_directory(project_dir, job_id)
+            destination, _identity = _ensure_private_directory(original / ("attempt-" + request_id))
+            def barrier(identity):
+                nonlocal client
+                if not current():
+                    raise CompositionError("Composition recovery was cancelled")
+                _require_blender_ready()
+                if client is None:
+                    client = StdioBlenderMCPClient(checkout_root=_blender_checkout_root(), blender_version=renderer["blender_version"])
+                return BlenderMCPService(client, destination).composition_idle_probe(identity)
+            # Native barrier is slow. Never retain checkpoint/lifecycle locks here.
+            while not _blender_scene_lock.acquire(timeout=0.2):
+                if not current():
+                    raise CompositionError("Composition recovery changed")
+            try:
+                if not current():
+                    raise CompositionError("Composition recovery changed")
+                prepare_attempt(package, source, destination, source_binding=source_binding, binding=binding, secret=_session_secret(), idle_barrier=barrier, request_manifest=job["_recovery_manifest_pointer"])
+            finally:
+                _blender_scene_lock.release()
+            validate_attempt(package, destination, original, source_binding, binding, _session_secret(), job["_recovery_manifest_pointer"])
+            # Recheck immutable files outside the checkpoint lock, then fence
+            # their bounded queue bindings through the admission transaction.
+            if _composition_job_context(job, require_current_renderer=False) != (package, source, project_dir, source_binding):
+                raise CompositionError("Composition scope changed during recovery")
+            with _queue_recovery_checkpoint_lock:
+                if not current():
+                    return
+                cursor = copy.deepcopy(job["recovery_cursor"])
+                records = cursor["composition"].get("requests") or {}
+                if records.get(request_id) != record:
+                    return
+                records[request_id]["status"] = "accepted"
+                cursor["composition"].update(requests=records, active_attempt=request_id, stage="admitted")
+                updates = dict(recovery_cursor=cursor, queue_held=False, recovery_state="retrying", reruns_denoise=False, message="Queued for composition recovery", _recovery_reason_code="")
+                if job.get("status") == "failed":
+                    committed = retry_failed_recovery_job(job, expected_execution_attempt=record["expected_execution_attempt"], expected_recovery_attempt=job.get("recovery_attempt", 0), recovery_attempt=job.get("recovery_attempt", 0)+1, **updates)
+                else:
+                    committed = _queue_recovery_checkpoint(job, expected_execution_attempt=record["expected_execution_attempt"], **updates)
+                if not committed:
+                    raise CompositionError("Composition recovery transition was rejected")
+                if not update_queue_job(job, held=False):
+                    return
+                admitted_attempt = job["execution_attempt"]
+            try:
+                threading.Thread(target=_run_tool_editor_export, args=(job_id,), name="composition-recovered-"+job_id, daemon=False).start()
+            except Exception:
+                with _queue_recovery_checkpoint_lock:
+                    if _jobs.get(job_id) is job:
+                        _queue_recovery_checkpoint(job, queue_held=True, recovery_state="blocked", _recovery_reason_code="worker_start_failed", message="Recovery worker could not be started", expected_execution_attempt=admitted_attempt)
+    except Exception:
+        with _queue_recovery_checkpoint_lock:
+            if current():
+                cursor = copy.deepcopy(job["recovery_cursor"])
+                records = cursor["composition"].get("requests") or {}
+                if records.get(request_id) == record:
+                    records[request_id]["status"] = "rejected"
+                    cursor["composition"]["requests"] = records
+                    # Failed terminal jobs only receive metadata; cancellation stays terminal.
+                    _queue_recovery_checkpoint(job, recovery_cursor=cursor)
+    finally:
+        if client is not None:
+            client.close()
+
+
+def _composition_restore_pending(job):
+    from services.composition_recovery import reconcile_once
+    marker = (job.get("recovery_cursor") or {}).get("composition")
+    if (not isinstance(marker, dict) or is_cancel_requested(job)
+            or not (job.get("status") == "failed" or (job.get("status") == "queued" and job.get("queue_held")))):
+        return
+    records = marker.get("requests")
+    if not isinstance(records, dict) or len(records) > 8:
+        return
+    pending = [(rid, record) for rid, record in records.items() if isinstance(record, dict) and record.get("status") == "pending"]
+    if len(pending) != 1:
+        return
+    request_id, record = pending[0]
+    try:
+        valid_id = _composition_recovery_id(request_id) == request_id
+    except HTTPException:
+        return
+    if (not valid_id or set(record) != {"status", "expected_created_at", "expected_execution_attempt"}
+            or type(record.get("expected_execution_attempt")) is not int
+            or record["expected_execution_attempt"] < 1
+            or record.get("expected_created_at") != job.get("created_at")
+            or record.get("expected_execution_attempt") != job.get("execution_attempt")):
+        return
+    reconcile_once((job["id"], request_id), lambda: _composition_recovery_reconcile(job["id"], request_id))
+
+
+@api.post("/api/v1/queue/{job_id}/composition-recovery")
+async def recover_blender_editor_composition(job_id: str, request: Request):
+    from services.composition_recovery import reconcile_once
+    body = await _editor_request_body(request)
+    if set(body) != {"recovery_request_id", "expected_created_at", "expected_execution_attempt", "confirmed"} or body.get("confirmed") is not True or type(body.get("expected_execution_attempt")) is not int or body["expected_execution_attempt"] < 1 or type(body.get("expected_created_at")) not in {int, float} or not math.isfinite(body["expected_created_at"]):
+        raise HTTPException(status_code=400, detail="Confirm the selected composition recovery")
+    request_id = _composition_recovery_id(body["recovery_request_id"])
+    job = _composition_recovery_scope(job_id, request, mutate=True)
+    with _queue_recovery_checkpoint_lock:
+        cursor = copy.deepcopy(job.get("recovery_cursor") or {})
+        marker = cursor["composition"]
+        records = marker.setdefault("requests", {})
+        record = {"status": "pending", "expected_created_at": body["expected_created_at"], "expected_execution_attempt": body["expected_execution_attempt"]}
+        existing = records.get(request_id)
+        if existing is not None:
+            if any(existing.get(k) != record[k] for k in record if k != "status"):
+                raise HTTPException(status_code=409, detail="Recovery request changed")
+            if existing.get("status") != "pending":
+                return _composition_recovery_response(job, request_id)
+        else:
+            if len(records) >= 8:
+                raise HTTPException(status_code=409, detail="Composition recovery history is full")
+            if (is_cancel_requested(job) or job.get("created_at") != record["expected_created_at"]
+                    or job.get("execution_attempt") != record["expected_execution_attempt"]
+                    or not (job.get("status") == "failed" or (job.get("status") == "queued" and job.get("queue_held")))
+                    or any(r.get("status") == "pending" for r in records.values())):
+                record["status"] = "rejected"
+            records[request_id] = record
+            updates = {"recovery_cursor": cursor}
+            if is_cancel_requested(job):
+                updates["status"] = "cancelled"
+            if not _queue_recovery_checkpoint(job, **updates):
+                raise HTTPException(status_code=409, detail="Recovery could not be recorded")
+        if records[request_id]["status"] == "rejected":
+            return _composition_recovery_response(job, request_id)
+    reconcile_once((job_id, request_id), lambda: _composition_recovery_reconcile(job_id, request_id))
+    return _composition_recovery_response(job, request_id)
+
+
+@api.get("/api/v1/queue/{job_id}/composition-recovery/{recovery_request_id}")
+async def get_blender_editor_composition_recovery(job_id: str, recovery_request_id: str, request: Request):
+    job = _composition_recovery_scope(job_id, request)
+    return _composition_recovery_response(job, _composition_recovery_id(recovery_request_id))
 
 
 @api.post("/api/v1/projects/{project}/compositions")
@@ -75136,6 +75372,20 @@ def _public_queue_recovery_metadata(job: dict) -> dict:
         "recovery_actionable": bool(actions),
         "recovery_actions": actions,
     }
+    composition = (job.get("recovery_cursor") or {}).get("composition")
+    if (job.get("kind") == "tool_editor_export" and isinstance(composition, dict)
+            and reason != "worker_start_failed"
+            and not job.get("cancel_requested") and job.get("status") != "cancelled"
+            and (job.get("status") == "failed" or (job.get("status") == "queued" and job.get("queue_held")))
+            and type(job.get("execution_attempt")) is int and job["execution_attempt"] > 0):
+        records = composition.get("requests") or {}
+        public["recovery_blocked"] = True
+        if isinstance(records, dict) and len(records) >= 8:
+            public.update(recovery_actions=[], recovery_actionable=False,
+                          recovery_reason_text="Composition recovery request limit reached; original outputs are preserved")
+        else:
+            public.update(recovery_actions=["recover_composition"], recovery_actionable=True,
+                          composition_recovery_execution_attempt=job["execution_attempt"])
     if (
         blocked
         and reason == "input_missing_or_changed"

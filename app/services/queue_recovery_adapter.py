@@ -122,6 +122,36 @@ def prompt_enhancement_gpu_cleanup_pending(job: Mapping[str, Any]) -> bool:
             or cursor.get("h3_prompt_rewriter_child_reaped") is not True)
 
 
+def composition_recovery_requests_retained(job: Mapping[str, Any]) -> bool:
+    """Keep bounded confirmation receipts until explicit owner dismissal."""
+    cursor = job.get("recovery_cursor")
+    marker = cursor.get("composition") if isinstance(cursor, Mapping) else None
+    if (job.get("kind") != "tool_editor_export" or not isinstance(marker, Mapping)
+            or marker.get("schema") != "maestro/composition/v1"
+            or not isinstance(marker.get("package_sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", marker["package_sha256"])):
+        return False
+    records = marker.get("requests")
+    if not isinstance(records, dict) or not 1 <= len(records) <= 8:
+        return False
+    pending = 0
+    for request_id, record in records.items():
+        try:
+            parsed = uuid.UUID(request_id)
+        except (ValueError, TypeError, AttributeError):
+            return False
+        if (request_id != parsed.hex or parsed.version != 4 or type(record) is not dict
+                or set(record) != {"status", "expected_created_at", "expected_execution_attempt"}
+                or record.get("status") not in {"pending", "accepted", "rejected"}
+                or type(record.get("expected_created_at")) not in {int, float}
+                or not math.isfinite(record["expected_created_at"])
+                or type(record.get("expected_execution_attempt")) is not int
+                or record["expected_execution_attempt"] < 1):
+            return False
+        pending += record["status"] == "pending"
+    return pending <= 1
+
+
 _FORBIDDEN_KEY_PARTS = frozenset({
     "authorization", "capability", "cookie", "credential", "credentials",
     "password", "passphrase", "passwd", "secret", "secrets", "session",
@@ -2117,7 +2147,8 @@ class QueueRecoveryCoordinator:
                 drop_terminal=True,
                 terminal_statuses=AUTOMATIC_RETIREMENT_STATUSES,
                 retain_job_ids=tuple(job_id for job_id, job in clean_before_jobs.items()
-                                     if processed_tool_publication_pending(job) or prompt_enhancement_gpu_cleanup_pending(job)),
+                                     if processed_tool_publication_pending(job) or prompt_enhancement_gpu_cleanup_pending(job)
+                                     or composition_recovery_requests_retained(job)),
                 replacement_jobs=clean_before_jobs,
                 replacement_global_state=(
                     clean_before_global if before.global_state is not None else None

@@ -131,6 +131,7 @@ def prepare_delivery(
     policy,
     native_context,
     event=lambda _name: None,
+    worker_identity=None,
 ):
     package = validate_normalized_package(package, service)
     directory = Path(directory)
@@ -172,6 +173,7 @@ def prepare_delivery(
                 probe=probe,
                 cancelled=cancelled,
                 secret=secret,
+                worker_identity=worker_identity,
             )
     for segment in package["segments"]:
         animation = segment["animation"]
@@ -225,6 +227,7 @@ def prepare_delivery(
                     "segment_sha256": unit["segment_sha256"],
                     "sha256": unit["sha256"],
                     "size": unit["size"],
+                    "renderer_identity": copy.deepcopy((unit.get("reused_from") or {}).get("producer_binding", unit["binding"])["renderer_identity"]),
                 }
                 for unit in units
             ],

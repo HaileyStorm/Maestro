@@ -198,6 +198,38 @@ class LogicalReferenceRecoveryTests(unittest.TestCase):
             fresh.prospective_transition(types.SimpleNamespace(jobs=(pending,), tombstones=(), global_state=None))
             self.assertEqual(fresh.compact().jobs, {})
 
+    def test_composition_confirmation_receipts_survive_terminal_compaction_bounded_and_scoped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal=QueueRecoveryJournal(Path(directory)/"queue.jsonl")
+            coordinator=QueueRecoveryCoordinator(journal)
+            def job(job_id, status, records):
+                return {"id":job_id,"kind":"tool_editor_export","status":status,
+                        "recovery_cursor":{"composition":{"schema":"maestro/composition/v1",
+                            "package_sha256":"a"*64,"requests":records}}}
+            def record(status="accepted"):
+                return {"status":status,"expected_created_at":1.0,"expected_execution_attempt":1}
+            accepted={uuid.uuid4().hex:record()}
+            valid=[job("completed-recovery","completed",accepted),
+                   job("cancelled-confirmation","cancelled",{uuid.uuid4().hex:record("pending")})]
+            invalid=[job("empty","completed",{}),
+                     job("wrong-id","completed",{"not-a-uuid":record()}),
+                     job("too-many","completed",{uuid.uuid4().hex:record() for _ in range(9)}),
+                     job("private-extra","completed",{uuid.uuid4().hex:dict(record(),raw_prompt="private")}),
+                     job("boolean-attempt","completed",{uuid.uuid4().hex:dict(record(),expected_execution_attempt=True)}),
+                     job("two-pending","cancelled",{uuid.uuid4().hex:record("pending") for _ in range(2)})]
+            foreign=job("other-kind","completed",accepted);foreign["kind"]="studio_generation"
+            for candidate in valid+invalid+[foreign]:
+                coordinator.register_job(candidate,owner_digest=OWNER,project_digest=PROJECT,request_manifest={"kind":"test"})
+            self.assertEqual(set(coordinator.compact().jobs),{candidate["id"] for candidate in valid})
+            restored=QueueRecoveryCoordinator(journal).restore()
+            self.assertEqual(restored.jobs["completed-recovery"]["recovery_cursor"],valid[0]["recovery_cursor"])
+            self.assertEqual(restored.jobs["completed-recovery"]["owner_principal"],OWNER)
+            self.assertEqual(restored.jobs["completed-recovery"]["project_instance"],PROJECT)
+            # Explicit dismissal remains a separate owner action; automatic
+            # compaction alone cannot discard the confirmed request receipt.
+            coordinator.tombstone_terminal("completed-recovery")
+            self.assertNotIn("completed-recovery",QueueRecoveryCoordinator(journal).restore().jobs)
+
     def test_legacy_read_only_replay_requires_exact_request_digest(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "legacy"

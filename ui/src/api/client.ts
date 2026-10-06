@@ -178,7 +178,7 @@ export type QueueRecoveryReason =
   | 'worker_start_failed'
   | 'owner_reauthentication_required'
 
-export type QueueRecoveryAction = 'resume' | 'retry'
+export type QueueRecoveryAction = 'resume' | 'retry' | 'recover_composition'
 
 export type ResourceIntent = 'generation' | 'text'
 export type ResourceExecution = 'standard' | 'cpu'
@@ -214,6 +214,7 @@ export interface QueueRecoveryMetadata {
   recovery_actionable?: boolean
   recovery_actions?: QueueRecoveryAction[]
   recovery_input_roles?: Array<'clip_a' | 'clip_b'>
+  composition_recovery_execution_attempt?: number
   estimate_after_resume?: import('../types').H3PerformanceEstimate | null
 }
 
@@ -939,7 +940,7 @@ export interface QueueRecoveryResult {
 
 async function queueRecoveryRequest(
   jobId: string,
-  action: QueueRecoveryAction,
+  action: 'resume' | 'retry',
 ): Promise<QueueRecoveryResult> {
   const endpoint = action === 'resume' ? 'recovery-resume' : 'recovery-retry'
   const res = await fetch(
@@ -959,6 +960,49 @@ async function queueRecoveryRequest(
 
 export const resumeQueueRecovery = (jobId: string) => queueRecoveryRequest(jobId, 'resume')
 export const retryQueueRecovery = (jobId: string) => queueRecoveryRequest(jobId, 'retry')
+
+export interface CompositionRecoveryRequest {
+  recovery_request_id: string
+  expected_created_at: number
+  expected_execution_attempt: number
+  confirmed: true
+}
+
+export interface CompositionRecoveryResult {
+  job_id: string
+  recovery_request_id: string
+  status: 'pending' | 'accepted' | 'rejected'
+  message: string
+}
+
+async function compositionRecoveryRequest(
+  jobId: string,
+  requestId: string,
+  body?: CompositionRecoveryRequest,
+): Promise<CompositionRecoveryResult> {
+  const endpoint = `${BASE}/api/v1/queue/${encodeURIComponent(jobId)}/composition-recovery`
+  const res = await fetch(body ? endpoint : `${endpoint}/${encodeURIComponent(requestId)}`, {
+    method: body ? 'POST' : 'GET', cache: 'no-store', signal: AbortSignal.timeout(15000),
+    ...(body ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {}),
+  })
+  if (!res.ok) {
+    if (res.status === 404) throw new Error('That recovery request could not be found. Check its status again before starting another attempt.')
+    throw new Error('Composition recovery could not be verified. Check its status again.')
+  }
+  const value = await res.json() as CompositionRecoveryResult
+  if (value?.job_id !== jobId || value.recovery_request_id !== requestId
+    || !['pending', 'accepted', 'rejected'].includes(value.status)
+    || typeof value.message !== 'string' || value.message.length > 1000) {
+    throw new Error('Composition recovery returned an unexpected result. Check its status again.')
+  }
+  return value
+}
+
+export const submitCompositionRecovery = (jobId: string, body: CompositionRecoveryRequest) =>
+  compositionRecoveryRequest(jobId, body.recovery_request_id, body)
+
+export const fetchCompositionRecovery = (jobId: string, requestId: string) =>
+  compositionRecoveryRequest(jobId, requestId)
 
 export async function reattachBlendRecoveryInputs(
   jobId: string,

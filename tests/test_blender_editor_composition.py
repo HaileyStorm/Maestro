@@ -76,6 +76,19 @@ class Boundary(BlenderMCPService):
     def __init__(self, client, root):
         super().__init__(object(), root)
 
+    def composition_idle_probe(self, expected=None):
+        from services.composition_recovery import process_identity
+        identity = process_identity(os.getpid())
+        if expected is not None and expected != identity:
+            raise CompositionError("fixture incarnation changed")
+        return identity
+
+    def prepare_composition_segment(self, persist, *, cancelled):
+        identity = self.composition_idle_probe()
+        layout = {"frame_directory": str(self.project_root / ("maestro_frames_" + uuid.uuid4().hex)),
+                  "encoder_destination": str(self.project_root / ("maestro_" + uuid.uuid4().hex + ".mp4"))}
+        persist(identity, layout, None)
+
     def invoke(self, tool, args, *, cancelled):
         Boundary.invocations.append((tool, copy.deepcopy(args)))
         if cancelled():
@@ -214,6 +227,8 @@ def environment(root):
         "unregister_abort_state": lifecycle.unregister_abort_state,
         "checkpoint_recovery_job": lifecycle.checkpoint_recovery_job,
         "durable_queue_state": lifecycle.durable_queue_state,
+        "retry_failed_recovery_job": lifecycle.retry_failed_recovery_job,
+        "update_queue_job": lifecycle.update_queue_job,
     }
     names = [
         "_JobRegistry",
@@ -225,6 +240,8 @@ def environment(root):
         "_queue_recovery_reconcile_cursor",
         "_run_tool_editor_export",
         "submit_blender_editor_composition",
+        "recover_blender_editor_composition",
+        "get_blender_editor_composition_recovery",
     ]
     names.extend(
         node.name
@@ -234,6 +251,8 @@ def environment(root):
     names.append("_run_tool_composition_export")
     functions(namespace, names)
     namespace["_jobs"] = namespace["_JobRegistry"]()
+    namespace["_require_owned_job"] = lambda job_id, request: namespace["_jobs"][job_id]
+    namespace["_require_owned_job_project"] = lambda job_id, request, workspace: namespace["_jobs"][job_id]
     lifecycle.configure_durability_hook(None)
     lifecycle.configure_durability_hook(coordinator.prospective_transition)
     return namespace, coordinator, project, project_digest
@@ -271,6 +290,471 @@ def restore(ns, root, project, digest):
     )
     ns["_jobs"][job["id"]] = job
     return job, resume
+
+def interrupted_job(ns):
+    """Actual worker completes A and arms B, then the owned thread returns."""
+    job = new_job(ns)
+    original = Boundary.invoke
+    def stop_b(service, tool, args, *, cancelled):
+        if tool == "render_animation" and args["output_path"] == "B.mp4":
+            raise RuntimeError("CPU fixture lost native response")
+        return original(service, tool, args, cancelled=cancelled)
+    with mock.patch.object(blender_mcp_service, "BlenderMCPService", Boundary), mock.patch.object(blender_mcp_transport, "StdioBlenderMCPClient", NativeClient), mock.patch.object(Boundary, "invoke", stop_b):
+        worker = threading.Thread(target=ns["_run_tool_composition_export"], args=(job["id"],))
+        worker.start(); worker.join(10)
+        assert not worker.is_alive()
+    assert job["status"] == "queued" and job["queue_held"]
+    return job
+
+
+def admit_recovery(ns, job, request_id=None):
+    from services import composition_recovery
+    request_id = request_id or uuid.uuid4().hex
+    body = {"recovery_request_id": request_id, "expected_created_at": job["created_at"],
+            "expected_execution_attempt": job["execution_attempt"], "confirmed": True}
+    with mock.patch.object(composition_recovery, "reconcile_once", return_value=False):
+        response = asyncio.run(ns["recover_blender_editor_composition"](job["id"], Request(body)))
+    assert response["status"] == "pending"
+    return body
+
+
+@unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "CPU FFmpeg is required")
+class ExplicitCompositionRecoveryTests(unittest.TestCase):
+    def tearDown(self):
+        lifecycle.configure_durability_hook(None)
+
+    def test_restart_recovery_reuses_a_renders_b_once_and_get_repeated_post_never_dispatch(self):
+        from services.composition_package import read_receipt
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ns, coordinator, project, pdigest = environment(root)
+            current_renderer = ns["_composition_renderer_identity"]
+            historical_renderer = {"blender_version":"5.1.2",
+                "blender_mcp_revision":"03004fd0216bfe5e0a3d9ac9b47d5efadc3d78c4",
+                "blender_service_sha256":"0ad0d6607b1933dd2eec2a288b63ce63d5d20ff9bb642586dc72ee045a45f9bb",
+                "editor_service_sha256":"0986b526eb7889e527d8ec80144f1f61b62f984de4e8ddd7f10ed24efd2b7aab"}
+            ns["_composition_renderer_identity"] = lambda: copy.deepcopy(historical_renderer)
+            job = interrupted_job(ns)
+            ns["_composition_renderer_identity"] = current_renderer
+            package, directory, _, original_binding = ns["_composition_job_context"](job, require_current_renderer=False)
+            originals = {p.name: p.read_bytes() for p in directory.iterdir() if p.is_file()}
+            job, resume = restore(ns, root, project, pdigest)
+            self.assertFalse(resume)
+            body = admit_recovery(ns, job)
+            # Pending logical request survives a genuinely fresh coordinator.
+            job, resume = restore(ns, root, project, pdigest)
+            self.assertFalse(resume)
+            self.assertEqual(asyncio.run(ns["get_blender_editor_composition_recovery"](job["id"], body["recovery_request_id"], Request({})))["status"], "pending")
+            done = threading.Event()
+            actual = ns["_run_tool_editor_export"]
+            def run(job_id):
+                try: actual(job_id)
+                finally: done.set()
+            ns["_run_tool_editor_export"] = run
+            Boundary.invocations = []
+            with mock.patch.object(blender_mcp_service, "BlenderMCPService", Boundary), mock.patch.object(blender_mcp_transport, "StdioBlenderMCPClient", NativeClient):
+                ns["_composition_recovery_reconcile"](job["id"], body["recovery_request_id"])
+                self.assertTrue(done.wait(15))
+            self.assertEqual(job["status"], "completed")
+            renders = [args["output_path"] for tool,args in Boundary.invocations if tool == "render_animation"]
+            self.assertEqual(renders, ["B.mp4"])
+            self.assertEqual({name:(directory/name).read_bytes() for name in originals}, originals)
+            fresh = directory / ("attempt-" + body["recovery_request_id"])
+            a = read_receipt(fresh / "A.receipt.json", SECRET)
+            self.assertEqual(a["reused_from"]["binding"], original_binding)
+            metadata=json.loads((project/("composition_"+job["id"]+".meta.json")).read_bytes())
+            self.assertEqual(metadata["transform"]["segments"][0]["renderer_identity"],historical_renderer)
+            self.assertEqual(metadata["transform"]["segments"][1]["renderer_identity"],current_renderer())
+            self.assertEqual(a["binding"]["renderer_identity"],current_renderer())
+            after = len(Boundary.invocations)
+            response = asyncio.run(ns["recover_blender_editor_composition"](job["id"], Request(body)))
+            self.assertEqual(response["status"], "accepted")
+            self.assertEqual(asyncio.run(ns["get_blender_editor_composition_recovery"](job["id"], body["recovery_request_id"], Request({}))), response)
+            self.assertEqual(len(Boundary.invocations), after)
+            reopened, resume = restore(ns, root, project, pdigest)
+            self.assertEqual(reopened["status"], "completed")
+            self.assertFalse(resume)
+            changed = {**body, "expected_execution_attempt": body["expected_execution_attempt"]+1}
+            with self.assertRaises(HTTPException) as error:
+                asyncio.run(ns["recover_blender_editor_composition"](job["id"], Request(changed)))
+            self.assertEqual(error.exception.status_code, 409)
+
+    def test_actual_startup_resumes_persisted_pending_proof_without_another_post(self):
+        from services.queue_recovery_adapter import AUTOMATIC_RETIREMENT_STATUSES
+        from services.queue_recovery_runtime import cleanup_orphan_request_manifests, cleanup_orphan_staged_outputs
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ns, _, project, pdigest = environment(root)
+            job = interrupted_job(ns)
+            body = admit_recovery(ns, job)
+            lifecycle.configure_durability_hook(None)
+            fresh = QueueRecoveryCoordinator(QueueRecoveryJournal(root/"queue.jsonl"))
+            lifecycle.configure_durability_hook(fresh.prospective_transition)
+            ns.update(_queue_recovery_workers_started=False, _queue_recovery_coordinator=fresh,
+                      _queue_recovery_restored=fresh.restore(),
+                      _queue_recovery_existing_projects=lambda:{"scene":(str(project),pdigest)},
+                      AUTOMATIC_RETIREMENT_STATUSES=AUTOMATIC_RETIREMENT_STATUSES,
+                      _CREDIT_CLEANUP_PARAM="unused-credit-cleanup", _restore_h3_prompt_rewriter_cleanup=lambda jobs:None,
+                      restore_scheduler_state=lifecycle.restore_scheduler_state,
+                      _stamp_requested_generation_residency=lambda *args,**kwargs:None,
+                      cleanup_orphan_request_manifests=cleanup_orphan_request_manifests,
+                      cleanup_orphan_staged_outputs=cleanup_orphan_staged_outputs)
+            functions(ns,["_restore_queue_recovery_on_startup"])
+            done = threading.Event()
+            actual = ns["_run_tool_editor_export"]
+            def run(job_id):
+                try: actual(job_id)
+                finally: done.set()
+            ns["_run_tool_editor_export"] = run
+            Boundary.invocations = []
+            with mock.patch.object(blender_mcp_service,"BlenderMCPService",Boundary),mock.patch.object(blender_mcp_transport,"StdioBlenderMCPClient",NativeClient):
+                self.assertTrue(ns["_restore_queue_recovery_on_startup"]())
+                self.assertTrue(done.wait(15))
+            restored = ns["_jobs"][job["id"]]
+            self.assertEqual(restored["status"],"completed")
+            self.assertEqual([args["output_path"] for tool,args in Boundary.invocations if tool=="render_animation"],["B.mp4"])
+            self.assertEqual(asyncio.run(ns["get_blender_editor_composition_recovery"](job["id"],body["recovery_request_id"],Request({})))["status"],"accepted")
+            self.assertTrue(ns["_restore_queue_recovery_on_startup"]())
+            self.assertEqual(len([tool for tool,_ in Boundary.invocations if tool=="render_animation"]),1)
+            # Automatic terminal retirement must preserve the accepted request,
+            # its manifest and the original attempt evidence for GET-only reload.
+            cursor = copy.deepcopy(restored["recovery_cursor"])
+            pointer = copy.deepcopy(restored["_recovery_manifest_pointer"])
+            package, attempt, _, _ = ns["_composition_job_context"](restored, require_current_renderer=False)
+            evidence = {str(p.relative_to(project)):p.read_bytes() for p in attempt.parent.rglob("*") if p.is_file()}
+            fresh.compact()
+            after_compaction = QueueRecoveryCoordinator(QueueRecoveryJournal(root/"queue.jsonl"))
+            lifecycle.configure_durability_hook(None)
+            lifecycle.configure_durability_hook(after_compaction.prospective_transition)
+            ns.update(_queue_recovery_workers_started=False, _queue_recovery_coordinator=after_compaction,
+                      _queue_recovery_restored=after_compaction.restore(), _jobs=ns["_JobRegistry"]())
+            with mock.patch.object(blender_mcp_service,"BlenderMCPService",Boundary),mock.patch.object(blender_mcp_transport,"StdioBlenderMCPClient",side_effect=AssertionError("completed recovery must not probe or render")):
+                self.assertTrue(ns["_restore_queue_recovery_on_startup"]())
+            completed=ns["_jobs"][job["id"]]
+            self.assertEqual(completed["status"],"completed")
+            self.assertEqual(completed["recovery_cursor"],cursor)
+            self.assertTrue((project/pointer["path"]).is_file())
+            self.assertEqual({str(p.relative_to(project)):p.read_bytes() for p in attempt.parent.rglob("*") if p.is_file()},evidence)
+            self.assertEqual(asyncio.run(ns["get_blender_editor_composition_recovery"](job["id"],body["recovery_request_id"],Request({})))["status"],"accepted")
+            self.assertIn(job["id"],after_compaction.restore().jobs)
+
+    def test_stale_valid_request_has_durable_rejected_receipt_then_fresh_request_can_proceed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ns, _, project, pdigest = environment(root)
+            job = interrupted_job(ns)
+            request_id = str(uuid.uuid4())
+            stale = {"recovery_request_id":request_id,"expected_created_at":job["created_at"],"expected_execution_attempt":job["execution_attempt"]-1,"confirmed":True}
+            response = asyncio.run(ns["recover_blender_editor_composition"](job["id"],Request(stale)))
+            self.assertEqual(response["status"],"rejected")
+            self.assertEqual(response["recovery_request_id"],request_id)
+            job,_ = restore(ns,root,project,pdigest)
+            self.assertEqual(asyncio.run(ns["get_blender_editor_composition_recovery"](job["id"],request_id,Request({}))),response)
+            self.assertEqual(admit_recovery(ns,job)["expected_execution_attempt"],job["execution_attempt"])
+
+    def test_worker_start_failure_keeps_accepted_intent_and_pristine_restart_can_resume(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ns, _, project, pdigest = environment(root)
+            job = interrupted_job(ns)
+            body = admit_recovery(ns,job)
+            with mock.patch.object(blender_mcp_service,"BlenderMCPService",Boundary),mock.patch.object(blender_mcp_transport,"StdioBlenderMCPClient",NativeClient),mock.patch.object(threading.Thread,"start",side_effect=OSError("CPU fixture thread start failure")):
+                ns["_composition_recovery_reconcile"](job["id"],body["recovery_request_id"])
+            self.assertEqual(asyncio.run(ns["get_blender_editor_composition_recovery"](job["id"],body["recovery_request_id"],Request({})))["status"],"accepted")
+            self.assertTrue(job["queue_held"])
+            self.assertEqual(job["_recovery_reason_code"],"worker_start_failed")
+            restored,resume = restore(ns,root,project,pdigest)
+            self.assertTrue(resume)
+            self.assertFalse(restored["queue_held"])
+            _, directory, _, _ = ns["_composition_job_context"](restored)
+            self.assertFalse((directory/"B.receipt.json").exists())
+
+    def test_finite_history_hides_new_action_but_existing_uuid_still_reconciles(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ns, _, _, _ = environment(Path(temporary))
+            job = interrupted_job(ns)
+            functions(ns,["_public_queue_recovery_metadata"])
+            ns.update(_queue_recovery_reason_code=lambda job:job.get("_recovery_reason_code"),
+                      _queue_recovery_attempt=lambda job:job.get("recovery_attempt",0),
+                      MAX_RECOVERY_ATTEMPTS=3,_QUEUE_RECOVERY_REASON_TEXT={})
+            failed=dict(job,status="failed",recovery_state="terminal")
+            public=ns["_public_queue_recovery_metadata"](failed)
+            self.assertTrue(public["recovery_blocked"])
+            self.assertEqual(public["recovery_actions"],["recover_composition"])
+            bodies = []
+            for _ in range(8):
+                body = {"recovery_request_id":str(uuid.uuid4()),"expected_created_at":job["created_at"],"expected_execution_attempt":job["execution_attempt"]-1,"confirmed":True}
+                bodies.append(body)
+                self.assertEqual(asyncio.run(ns["recover_blender_editor_composition"](job["id"],Request(body)))["status"],"rejected")
+            with self.assertRaises(HTTPException) as error:
+                admit_recovery(ns,job)
+            self.assertEqual(error.exception.status_code,409)
+            functions(ns,["_public_queue_recovery_metadata"])
+            ns.update(_queue_recovery_reason_code=lambda job:job.get("_recovery_reason_code"),
+                      _queue_recovery_attempt=lambda job:job.get("recovery_attempt",0),
+                      MAX_RECOVERY_ATTEMPTS=3,_QUEUE_RECOVERY_REASON_TEXT={})
+            public = ns["_public_queue_recovery_metadata"](job)
+            self.assertEqual(public["recovery_actions"],[])
+            self.assertFalse(public["recovery_actionable"])
+            self.assertTrue(public["recovery_blocked"])
+            self.assertIn("limit",public["recovery_reason_text"])
+            self.assertEqual(asyncio.run(ns["recover_blender_editor_composition"](job["id"],Request(bodies[0])))["status"],"rejected")
+            self.assertEqual(asyncio.run(ns["get_blender_editor_composition_recovery"](job["id"],bodies[0]["recovery_request_id"],Request({})))["status"],"rejected")
+
+    def test_sigkill_owned_cpu_app_then_real_journal_recovery_preserves_partial_b(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            code = """import sys,time,threading
+from pathlib import Path
+from unittest import mock
+import test_blender_editor_composition as f
+ns,_,_,_=f.environment(Path(sys.argv[1]))
+job=f.new_job(ns)
+original=f.Boundary.invoke
+def pause_b(service,tool,args,*,cancelled):
+    if tool=='render_animation' and args['output_path']=='B.mp4':
+        (service.project_root/'B.mp4').write_bytes(b'owned incomplete native B')
+        print(job['id'],flush=True)
+        time.sleep(60)
+    return original(service,tool,args,cancelled=cancelled)
+with mock.patch.object(f.blender_mcp_service,'BlenderMCPService',f.Boundary),mock.patch.object(f.blender_mcp_transport,'StdioBlenderMCPClient',f.NativeClient),mock.patch.object(f.Boundary,'invoke',pause_b):
+    ns['_run_tool_composition_export'](job['id'])
+"""
+            env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(ROOT/"app"),str(ROOT/"tests")]),PYTHONDONTWRITEBYTECODE="1",CUDA_VISIBLE_DEVICES="",HIP_VISIBLE_DEVICES="")
+            child = subprocess.Popen([sys.executable,"-B","-c",code,str(root)],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=env)
+            try:
+                import selectors
+                with selectors.DefaultSelector() as selector:
+                    selector.register(child.stdout,selectors.EVENT_READ)
+                    self.assertTrue(selector.select(timeout=10),"CPU child did not reach armed B")
+                    job_id = child.stdout.readline().strip()
+                self.assertRegex(job_id,r"^[0-9a-f]{32}$")
+                child.kill(); child.wait(timeout=5)
+                self.assertLess(child.returncode,0)
+            finally:
+                if child.poll() is None:
+                    child.kill(); child.wait(timeout=5)
+                child.communicate(timeout=5)
+            ns,fresh,project,pdigest = environment(root)
+            snapshot = fresh.restore().jobs[job_id]
+            job,resume = ns["_queue_recovery_materialize_job"](snapshot,{"scene":(str(project),pdigest)})
+            ns["_jobs"][job_id] = job
+            self.assertFalse(resume)
+            _,directory,_,_ = ns["_composition_job_context"](job)
+            original = {p.name:p.read_bytes() for p in directory.iterdir() if p.is_file()}
+            body = admit_recovery(ns,job)
+            done=threading.Event()
+            actual=ns["_run_tool_editor_export"]
+            def run(job_id):
+                try: actual(job_id)
+                finally: done.set()
+            ns["_run_tool_editor_export"]=run
+            Boundary.invocations=[]
+            with mock.patch.object(blender_mcp_service,"BlenderMCPService",Boundary),mock.patch.object(blender_mcp_transport,"StdioBlenderMCPClient",NativeClient):
+                ns["_composition_recovery_reconcile"](job_id,body["recovery_request_id"])
+                self.assertTrue(done.wait(15))
+            self.assertEqual(job["status"],"completed")
+            self.assertEqual([args["output_path"] for tool,args in Boundary.invocations if tool=="render_animation"],["B.mp4"])
+            self.assertEqual({name:(directory/name).read_bytes() for name in original},original)
+            self.assertEqual((directory/"B.mp4").read_bytes(),b"owned incomplete native B")
+
+    def test_source_closure_changed_after_proof_is_rejected_before_queued_admission(self):
+        from services import composition_recovery
+        with tempfile.TemporaryDirectory() as temporary:
+            ns,_,project,_=environment(Path(temporary))
+            job=interrupted_job(ns)
+            _,directory,_,_=ns["_composition_job_context"](job)
+            body=admit_recovery(ns,job)
+            actual=composition_recovery.prepare_attempt
+            def alter(*args,**kwargs):
+                result=actual(*args,**kwargs)
+                (directory/"A.mp4").write_bytes(b"changed after stopped proof and copy")
+                return result
+            with mock.patch.object(composition_recovery,"prepare_attempt",alter),mock.patch.object(blender_mcp_service,"BlenderMCPService",Boundary),mock.patch.object(blender_mcp_transport,"StdioBlenderMCPClient",NativeClient):
+                ns["_composition_recovery_reconcile"](job["id"],body["recovery_request_id"])
+            self.assertTrue(job["queue_held"])
+            self.assertNotIn("active_attempt",job["recovery_cursor"]["composition"])
+            self.assertEqual(asyncio.run(ns["get_blender_editor_composition_recovery"](job["id"],body["recovery_request_id"],Request({})))["status"],"rejected")
+            self.assertFalse(list(project.glob("composition_*.mp4")))
+
+    def test_lost_durable_ack_does_not_start_proof_and_fresh_journal_retains_confirmed_request(self):
+        from services import composition_recovery
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            ns,coordinator,project,pdigest=environment(root)
+            job=interrupted_job(ns)
+            body={"recovery_request_id":str(uuid.uuid4()),"expected_created_at":job["created_at"],"expected_execution_attempt":job["execution_attempt"],"confirmed":True}
+            def lost_ack(transition):
+                coordinator.prospective_transition(transition)
+                raise OSError("CPU fixture lost persistence acknowledgement")
+            lifecycle.configure_durability_hook(None)
+            lifecycle.configure_durability_hook(lost_ack)
+            with mock.patch.object(composition_recovery,"reconcile_once",side_effect=AssertionError("proof must not start after unknown commit")),self.assertRaises(OSError):
+                asyncio.run(ns["recover_blender_editor_composition"](job["id"],Request(body)))
+            self.assertNotIn("requests",job["recovery_cursor"]["composition"])
+            restored,_=restore(ns,root,project,pdigest)
+            response=asyncio.run(ns["get_blender_editor_composition_recovery"](job["id"],body["recovery_request_id"],Request({})))
+            self.assertEqual(response["status"],"pending")
+            self.assertEqual(restored["recovery_cursor"]["composition"]["requests"][uuid.UUID(body["recovery_request_id"]).hex]["expected_execution_attempt"],body["expected_execution_attempt"])
+            self.assertFalse(list(project.glob("composition_*.mp4")))
+
+    def test_changed_a_legacy_attempt_and_reused_pid_reject_before_native_barrier(self):
+        from services.composition_package import read_receipt, atomic_json, sign_receipt
+        for fault in ("corrupt-a", "legacy", "reused-pid"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                ns, _, project, _ = environment(root)
+                job = interrupted_job(ns)
+                _, directory, _, _ = ns["_composition_job_context"](job)
+                b_path = directory / "B.receipt.json"
+                if fault == "corrupt-a":
+                    (directory / "A.mp4").write_bytes(b"changed")
+                else:
+                    b = read_receipt(b_path, SECRET)
+                    if fault == "legacy": b.pop("execution")
+                    else: b["execution"]["worker"]["app"]["start_ticks"] += 1
+                    atomic_json(b_path, sign_receipt(b, SECRET))
+                original_b = b_path.read_bytes()
+                body = admit_recovery(ns, job)
+                with mock.patch.object(blender_mcp_service.BlenderMCPService, "composition_idle_probe", side_effect=AssertionError("must inspect A/worker before barrier")):
+                    ns["_composition_recovery_reconcile"](job["id"], body["recovery_request_id"])
+                self.assertEqual(asyncio.run(ns["get_blender_editor_composition_recovery"](job["id"], body["recovery_request_id"], Request({})))["status"], "rejected")
+                self.assertEqual(b_path.read_bytes(), original_b)
+                self.assertTrue(job["queue_held"])
+                self.assertFalse(list(project.glob("composition_*.mp4")))
+
+    def test_signed_pre_spawn_paths_block_live_encoder_with_no_pid_receipt(self):
+        from services.composition_recovery import prove_stopped
+        from services.composition_package import read_receipt, CompositionAttemptUnresolved
+        with tempfile.TemporaryDirectory() as temporary:
+            ns, _, _, _ = environment(Path(temporary))
+            job = interrupted_job(ns)
+            _, directory, _, _ = ns["_composition_job_context"](job)
+            receipt = read_receipt(directory / "B.receipt.json", SECRET)
+            layout = receipt["execution"]["layout"]
+            self.assertIsNone(receipt["execution"]["encoder"])
+            child = subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(30)", str(Path(layout["frame_directory"])/"frame_%04d.png"), layout["encoder_destination"]])
+            try:
+                with self.assertRaises(CompositionAttemptUnresolved):
+                    prove_stopped(receipt, idle_barrier=lambda identity: identity)
+                self.assertIsNone(child.poll())
+            finally:
+                child.terminate(); child.wait(timeout=5)
+            self.assertTrue(prove_stopped(receipt, idle_barrier=lambda identity: identity))
+
+    def test_unsupported_process_identity_keeps_normal_render_and_unbound_recovery_closed(self):
+        from services import composition_recovery
+        from services.composition_package import read_receipt
+        with tempfile.TemporaryDirectory() as temporary:
+            ns, _, _, _ = environment(Path(temporary))
+            with mock.patch.object(composition_recovery.sys, "platform", "darwin"), mock.patch.object(composition_recovery, "process_identity", side_effect=AssertionError("unsupported host must not read proc")):
+                job = interrupted_job(ns)
+            _, directory, _, _ = ns["_composition_job_context"](job)
+            self.assertTrue((directory / "A.mp4").is_file())
+            self.assertNotIn("execution", read_receipt(directory / "B.receipt.json", SECRET))
+            body = admit_recovery(ns, job)
+            ns["_composition_recovery_reconcile"](job["id"], body["recovery_request_id"])
+            self.assertEqual(asyncio.run(ns["get_blender_editor_composition_recovery"](job["id"], body["recovery_request_id"], Request({})))["status"], "rejected")
+            self.assertTrue(job["queue_held"])
+
+    def test_admitted_pristine_attempt_survives_crash_but_new_armed_attempt_holds(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ns, _, project, pdigest = environment(root)
+            job = interrupted_job(ns)
+            body = admit_recovery(ns, job)
+            # Crash between durable acceptance and starting the worker.
+            actual = ns["_run_tool_editor_export"]
+            ns["_run_tool_editor_export"] = lambda job_id: None
+            with mock.patch.object(blender_mcp_service, "BlenderMCPService", Boundary), mock.patch.object(blender_mcp_transport, "StdioBlenderMCPClient", NativeClient):
+                ns["_composition_recovery_reconcile"](job["id"],body["recovery_request_id"])
+            job, resume = restore(ns, root, project, pdigest)
+            self.assertTrue(resume)
+            ns["_run_tool_editor_export"] = actual
+            original = Boundary.invoke
+            def arm_b(service, tool, args, *, cancelled):
+                if tool == "render_animation":
+                    raise RuntimeError("new attempt lost its native response")
+                return original(service, tool, args, cancelled=cancelled)
+            with mock.patch.object(blender_mcp_service, "BlenderMCPService", Boundary), mock.patch.object(blender_mcp_transport, "StdioBlenderMCPClient", NativeClient), mock.patch.object(Boundary, "invoke", arm_b):
+                worker = threading.Thread(target=ns["_run_tool_composition_export"],args=(job["id"],))
+                worker.start(); worker.join(10)
+                self.assertFalse(worker.is_alive())
+            job, resume = restore(ns, root, project, pdigest)
+            self.assertFalse(resume)
+            self.assertTrue(job["queue_held"])
+            self.assertFalse(list(project.glob("composition_*.mp4")))
+
+    def test_gone_app_and_blender_need_no_rpc_but_unreadable_identity_holds(self):
+        from services.composition_recovery import process_identity, prove_stopped
+        from services.composition_package import CompositionAttemptUnresolved
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            child = subprocess.Popen([sys.executable,"-B","-c","import time;time.sleep(30)"])
+            try:
+                identity = process_identity(child.pid)
+            finally:
+                child.terminate(); child.wait(timeout=5)
+            receipt = {"execution": {"worker": {"app":identity,"app_incarnation":"a"*32,"worker_token":"b"*32},"blender":identity,"encoder":None,"layout":{"frame_directory":str(root/("maestro_frames_"+"c"*32)),"encoder_destination":str(root/("maestro_"+"d"*32+".mp4"))}}}
+            self.assertTrue(prove_stopped(receipt, idle_barrier=lambda _: self.fail("gone Blender must not contact RPC")))
+            with mock.patch("services.composition_recovery.process_identity",side_effect=CompositionAttemptUnresolved("unreadable")), self.assertRaises(CompositionAttemptUnresolved):
+                prove_stopped(receipt,idle_barrier=lambda identity: identity)
+
+    def test_closed_route_scope_and_payload_fail_without_request_or_dispatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ns, coordinator, _, _ = environment(Path(temporary))
+            job = new_job(ns)
+            body = {"recovery_request_id":str(uuid.uuid4()),"expected_created_at":job["created_at"],"expected_execution_attempt":job["execution_attempt"],"confirmed":True}
+            for change in ({"confirmed":False},{"expected_execution_attempt":True},{"recovery_request_id":"bad"},{"native_path":"private-injection"}):
+                with self.subTest(change=change), self.assertRaises(HTTPException) as error:
+                    asyncio.run(ns["recover_blender_editor_composition"](job["id"],Request({**body,**change})))
+                self.assertEqual(error.exception.status_code,400)
+            original_access = ns["_require_project_access"]
+            permissions = []
+            def deny_edit(request, workspace, **kwargs):
+                permissions.append(kwargs["permission"])
+                if kwargs["permission"] == "project.mutate":
+                    raise HTTPException(403)
+                return original_access(request, workspace, **kwargs)
+            ns["_require_project_access"] = deny_edit
+            with self.assertRaises(HTTPException) as error:
+                asyncio.run(ns["recover_blender_editor_composition"](job["id"],Request(body)))
+            self.assertEqual(error.exception.status_code,403)
+            self.assertEqual(permissions,["project.mutate"])
+            ns["_require_owned_job_project"] = lambda *args: (_ for _ in []).throw(HTTPException(404))
+            with self.assertRaises(HTTPException) as error:
+                asyncio.run(ns["recover_blender_editor_composition"](job["id"],Request(body)))
+            self.assertEqual(error.exception.status_code,404)
+            self.assertNotIn("requests",job["recovery_cursor"]["composition"])
+            self.assertNotIn("requests",next(iter(coordinator.restore().jobs.values()))["recovery_cursor"]["composition"])
+
+    def test_cancel_during_barrier_has_terminal_fresh_journal_no_b_or_delivery(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ns, _, project, pdigest = environment(root)
+            job = interrupted_job(ns)
+            body = admit_recovery(ns, job)
+            entered, release = threading.Event(), threading.Event()
+            def barrier(service, expected=None):
+                entered.set()
+                self.assertTrue(release.wait(5))
+                return expected
+            Boundary.invocations = []
+            with mock.patch.object(blender_mcp_service.BlenderMCPService, "composition_idle_probe", barrier), mock.patch.object(blender_mcp_transport, "StdioBlenderMCPClient", NativeClient):
+                thread = threading.Thread(target=ns["_composition_recovery_reconcile"], args=(job["id"],body["recovery_request_id"]))
+                thread.start()
+                self.assertTrue(entered.wait(5))
+                lifecycle.request_cancel(job, job_id=job["id"], active_states=ns["_active_gen_states"])
+                release.set(); thread.join(5)
+                self.assertFalse(thread.is_alive())
+            self.assertEqual(job["status"], "cancelled")
+            self.assertEqual(Boundary.invocations, [])
+            self.assertFalse(list(project.glob("composition_*.mp4")))
+            restored, resume = restore(ns, root, project, pdigest)
+            self.assertEqual(restored["status"], "cancelled")
+            self.assertFalse(resume)
+            self.assertEqual(asyncio.run(ns["get_blender_editor_composition_recovery"](job["id"],body["recovery_request_id"],Request({})))["status"], "rejected")
+
 
 class BlenderEditorCompositionPackageTests(unittest.TestCase):
     def test_repeated_segment_instances_have_distinct_ids_and_final_frame_clock(self):

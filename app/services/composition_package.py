@@ -13,6 +13,7 @@ import math
 import os
 from pathlib import Path
 import re
+import stat
 import uuid
 
 from services.blender_mcp_service import BlenderMCPService, PINNED_INSTALL
@@ -202,12 +203,29 @@ def sign_receipt(value, secret):
 
 
 def read_receipt(path, secret):
-    if path.is_symlink():
-        raise CompositionError("Receipt is not a private regular file")
-    size, _ = sha256_file(path)
-    if size > 1024 * 1024:
-        raise CompositionError("Receipt exceeds its supported size")
-    value = json.loads(path.read_text())
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    try:
+        before = os.fstat(fd)
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                or not 0 < before.st_size <= 1024 * 1024
+                or (os.name != "nt" and (before.st_uid != os.getuid() or stat.S_IMODE(before.st_mode) != 0o600))):
+            raise CompositionError("Receipt is not a bounded private regular file")
+        chunks, remaining = [], before.st_size
+        while remaining:
+            chunk = os.read(fd, min(65536, remaining))
+            if not chunk:
+                raise CompositionError("Receipt changed while reading")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after, named = os.fstat(fd), os.lstat(path)
+        identity = lambda st: (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_nlink)
+        if identity(before) != identity(after) or identity(after) != identity(named):
+            raise CompositionError("Receipt changed while reading")
+        value = json.loads(b"".join(chunks))
+    finally:
+        os.close(fd)
+    if type(value) is not dict:
+        raise CompositionError("Receipt is malformed")
     signature = value.pop("mac", None)
     if type(signature) is not str or not hmac.compare_digest(
         signature, hmac.new(secret, canonical(value), hashlib.sha256).hexdigest()
@@ -239,7 +257,7 @@ def atomic_json(path, payload):
 
 
 def render_segments(
-    package, service, directory, *, binding, probe, cancelled, secret, allow_native=True
+    package, service, directory, *, binding, probe, cancelled, secret, allow_native=True, worker_identity=None
 ):
     """Run closed native commands once; verify completed bytes before reuse.
 
@@ -323,7 +341,15 @@ def render_segments(
         expected = {**seal, "segment_id": sid, "segment_sha256": digest(segment)}
         # Arm before the first scene mutation. Any failure stays unresolved.
         receipt = {**expected, "state": "attempting", "attempt_id": uuid.uuid4().hex}
-        persist(receipt_path, receipt)
+        if worker_identity is not None:
+            def arm(blender, layout, encoder):
+                receipt["execution"] = {"worker": copy.deepcopy(worker_identity),
+                                        "blender": blender, "layout": layout, "encoder": encoder}
+                persist(receipt_path, receipt)
+            service.prepare_composition_segment(arm, cancelled=cancelled)
+        else:
+            # Historical callers retain unbound receipts, which cannot admit recovery.
+            persist(receipt_path, receipt)
         service.invoke("scene_create", segment["scene"], cancelled=cancelled)
         service.invoke("animate_keyframes", segment["animation"], cancelled=cancelled)
         animation = segment["animation"]

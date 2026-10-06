@@ -159,7 +159,68 @@ be recovered without rendering again, even if Blender is temporarily unavailable
 
 If a Blender attempt ends without a verified completed segment, the job stays
 held for review. Maestro does not automatically run that unknown attempt
-again. This format has no dedicated manual recovery action yet. Preserve the
-held job's evidence and use a separate, deliberate new submission only after
-deciding to render again. If the initial submission response is lost, inspect
-Queue before submitting another request.
+again. When Queue offers **Review composition recovery**, review the unfinished
+render and choose **Confirm recovery** to request a new attempt on the same job.
+Maestro first verifies that the previous worker, Blender render, and encoder
+have stopped. It verifies and reuses completed segments, preserves the original
+attempt privately, and renders the unfinished segments in a fresh directory.
+The package, project, and privacy setting remain bound to the original job.
+
+Recovery stays held when that stop proof is missing or ambiguous, including
+older attempts without a saved process identity. Changed completed bytes or
+receipts also prevent recovery. A confirmation requests these checks; it does
+not guarantee that a new render will be admitted.
+When the bounded recovery-request history is full, Queue explains that no
+further recovery requests can be accepted. The original evidence remains saved.
+
+The browser saves the recovery request ID before submitting. After a lost
+acknowledgement or page reload, **Check recovery status** looks up that same
+request without submitting another attempt. Changing accounts or leaving the
+composition prevents an earlier response from triggering a new request.
+If the initial composition submission response is lost, inspect Queue before
+submitting another composition.
+
+### Recovery API
+
+Use an authenticated session with the original job's project permissions.
+First read `GET /api/v1/status/{job_id}`. Only a job advertising
+`recover_composition` in `recovery_actions` is eligible for confirmation.
+Persist one UUID4 and the exact request body before the first POST:
+
+```json
+{
+  "recovery_request_id": "b6a6c2ec-fc34-4197-9008-e07bbaf27910",
+  "expected_created_at": 1000,
+  "expected_execution_attempt": 2,
+  "confirmed": true
+}
+```
+
+Replace the example timestamp and attempt with `created_at` and
+`composition_recovery_execution_attempt` from the current job status. Send the
+saved body once to `POST /api/v1/queue/{job_id}/composition-recovery`.
+The response contains `job_id`, a canonical hyphenated `recovery_request_id`,
+`status` (`pending`, `accepted`, or `rejected`), and a plain-language `message`.
+The stop proof runs asynchronously; `pending` means the request is saved and
+its result has not yet been decided. `accepted` means a new attempt was
+admitted, rather than that the composition finished.
+
+Check that exact request with
+`GET /api/v1/queue/{job_id}/composition-recovery/{recovery_request_id}`. This GET
+neither probes Blender nor dispatches rendering. A missing response, timeout,
+or missing lookup result is not proof of rejection: keep the saved ID and use
+GET again. Duplicate POSTs with the same exact logical request reconcile its
+receipt; a changed body using the same ID is rejected. Only a positively
+rejected request and a fresh explicit confirmation allow another request for
+the same interrupted execution. A later interrupted execution requires its
+new current attempt number and a new confirmation.
+
+Previously confirmed pending requests resume their checks after an app restart.
+This does not automatically repeat an armed Blender attempt. A valid request
+rejected before admission has its own saved receipt, so clients can confirm the
+rejection through GET before reviewing another request. At the request-history
+limit, existing IDs remain readable; an unknown ID is not added and its GET
+remains missing. Refresh job status for the Queue's limit explanation.
+Jobs with saved recovery requests survive automatic completed-job compaction
+and startup retirement, retaining their scoped receipt lookup. Explicitly
+dismissing the original job ends that lookup guarantee.

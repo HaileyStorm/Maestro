@@ -77,6 +77,66 @@ def _attestation(scratch: Path) -> dict[str, Any]:
     }
 
 
+class CompositionProcessFenceTests(unittest.TestCase):
+    def test_fixed_probe_matches_host_and_preparation_persists_before_mutation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            client = FakeClient(root)
+            service = BlenderMCPService(client, root)
+            seals = []
+            def persist(identity, layout, encoder):
+                self.assertEqual(identity["pid"], os.getpid())
+                self.assertFalse(Path(layout["frame_directory"]).exists())
+                self.assertFalse(Path(layout["encoder_destination"]).exists())
+                self.assertIsNone(encoder)
+                self.assertTrue(all("scene_create" not in args.get("code", "") for _,args in client.calls))
+                seals.append((identity, layout))
+            service.prepare_composition_segment(persist, cancelled=lambda: False)
+            self.assertEqual(len(seals), 1)
+            self.assertTrue(Path(seals[0][1]["frame_directory"]).is_dir())
+            changed = dict(seals[0][0], start_ticks=seals[0][0]["start_ticks"]+1)
+            with self.assertRaises(BlenderMCPSecurityError):
+                service.composition_idle_probe(changed)
+
+    def test_failed_preparation_never_mutates_scene_or_creates_scratch_names(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            client = FakeClient(root)
+            service = BlenderMCPService(client, root)
+            def fail(*args):
+                raise OSError("CPU fixture journal failed")
+            with self.assertRaises(OSError):
+                service.prepare_composition_segment(fail, cancelled=lambda: False)
+            self.assertEqual(list(root.iterdir()), [])
+            self.assertEqual(len(client.calls), 1)
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "CPU FFmpeg is required")
+    def test_encoder_checkpoint_error_reaps_exact_child_after_spawn(self):
+        from PIL import Image
+        import subprocess
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prefix = root / "frame_"
+            Image.new("RGB", (128,72)).save(root / "frame_0000.png")
+            seen = []
+            def fail(identity):
+                if identity is not None:
+                    seen.append(identity)
+                    raise OSError("CPU fixture failed spawn checkpoint")
+            actual_popen = subprocess.Popen
+            def owned_slow_encoder(command, **kwargs):
+                if command[-1] == "-version":
+                    return actual_popen(command, **kwargs)
+                self.assertEqual(command[-1], str(root / "out.mp4"))
+                self.assertIn(str(prefix) + "%04d.png", command)
+                return actual_popen([sys.executable, "-B", "-c", "import time;time.sleep(30)"], **kwargs)
+            with mock.patch("app.services.blender_mcp_service.subprocess.Popen", owned_slow_encoder), self.assertRaises(OSError):
+                _encode_png_sequence_to_mp4(prefix, root / "out.mp4", frame_start=0, frame_end=0, fps=24, max_input_bytes=1024*1024, process_event=fail)
+            self.assertEqual(len(seen), 1)
+            # Reaped child is gone; no unrelated process was terminated.
+            self.assertFalse((Path("/proc")/str(seen[0]["pid"])).exists())
+
+
 class FakeClient(BlenderMCPClient):
     def __init__(self, scratch: Path) -> None:
         self.scratch = scratch
@@ -120,6 +180,10 @@ class FakeClient(BlenderMCPClient):
             }
         if name == EXECUTE_BLENDER_CODE:
             code = arguments["code"]
+            if "start_ticks" in code and "boot_id" in code:
+                namespace = {}
+                exec(code, namespace)
+                return {"status": "ok", "result": namespace["result"]}
             if "# Maestro deterministic render_animation v1" in code:
                 prefix = _render_path_from_code(code)
                 start = int(re.search(r"^scene\.frame_start = (\d+)$", code, re.MULTILINE).group(1))

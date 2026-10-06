@@ -11,6 +11,7 @@ import { H3GuidePanel, resolveH3GuideSelections } from './H3GuidePanel'
 import { LlmChat } from '../LlmChat'
 import { H3PromptRewriteComparison } from '../H3PromptRewriteComparison'
 import { H3DeliveryRecoveryStatus, OPEN_GALLERY_EVENT } from '../H3DeliveryRecoveryStatus'
+import { CompositionRecoveryStatus } from '../CompositionRecoveryStatus'
 import * as storeApi from '../../stores/useStore'
 import type { GenerationJob, ModelDef, OutputFile } from '../../types'
 import * as api from '../../api/client'
@@ -1636,7 +1637,7 @@ function JobPlaceholder({
                 )}
                 {!!job.recoveryActions?.length && canManageGeneration && !blendReattachRequired && (
                   <div className="mt-2 flex flex-wrap gap-1.5">
-                    {job.recoveryActions.map(action => (
+                    {job.recoveryActions.filter(action => action !== 'recover_composition').map(action => (
                       <button
                         key={action}
                         type="button"
@@ -1651,6 +1652,9 @@ function JobPlaceholder({
                       </button>
                     ))}
                   </div>
+                )}
+                {job.recoveryActions?.includes('recover_composition') && canManageGeneration && job.workspace && (
+                  <CompositionRecoveryStatus jobId={job.id} workspace={job.workspace} createdAt={job.createdAt} />
                 )}
               </div>
             )}
@@ -2226,6 +2230,7 @@ function QueuePanel({
 
   const recover = (job: GenerationJob, action: api.QueueRecoveryAction) => {
     if (!job.recoveryActions?.includes(action)) return
+    if (action === 'recover_composition') return
     if (action === 'resume' && job.recoveryState === 'blocked_remote_reauth') {
       if (!job.workspace) {
         setError('Select the recovery project before resuming.')
