@@ -97,6 +97,7 @@ export interface ApiModel {
   lora_compatibility_note?: string
   family: string
   architecture: string
+  retake_engines?: string[]
   is_i2v: boolean
   is_t2v: boolean
   guidance_max_phases: number

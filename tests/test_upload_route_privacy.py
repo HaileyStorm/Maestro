@@ -429,6 +429,7 @@ class RetakePolicyAdmissionTests(unittest.TestCase):
     def setUpClass(cls):
         tree = ast.parse(LAUNCH_PATH.read_text(encoding="utf-8"))
         names = {"retake_video_endpoint", "_inherit_media_access_policy",
+                 "_retake_engines_for_architecture",
                  "_editor_retake_admission_origin",
                  "_http_output_policy_from_request", "_JobRegistry",
                  "_output_share_revision", "_require_authorized_output",
@@ -458,6 +459,10 @@ class RetakePolicyAdmissionTests(unittest.TestCase):
         self.probed = []
         self.mutate_on_probe = None
         self.ns = {
+            "wgp": types.SimpleNamespace(
+                get_model_def=lambda model: {"architecture": "ltx2_22B"} if model == "ltx2_22B_distilled" else ({"architecture": "minimax_h3"} if model == "minimax_h3" else None),
+                get_base_model_type=lambda model: "ltx2_22B" if model == "ltx2_22B_distilled" else "minimax_h3",
+            ),
             "Request": object, "HTTPException": _HTTPException,
             "os": os, "uuid": uuid, "time": time, "threading": threading,
             "re": re, "hmac": hmac, "hashlib": hashlib, "math": math,
@@ -518,7 +523,7 @@ class RetakePolicyAdmissionTests(unittest.TestCase):
 
     def submit(self, flags=None, *, source=None, session=None, workspace="default", unlocked=True, prompt="retake"):
         body = {"video_path": str(source or self.source), "workspace": workspace,
-                "model_type": "ltx2_3", "start_time": 0.25, "end_time": 1.25,
+                "model_type": "ltx2_22B_distilled", "start_time": 0.25, "end_time": 1.25,
                 "prompt": prompt, **(flags or {})}
         request = AuthorizedMediaResolverTests._request(
             session or self.owner, project_unlocked=unlocked,
@@ -568,7 +573,7 @@ class RetakePolicyAdmissionTests(unittest.TestCase):
         response = self.submit(prompt="replacement action")
         job = self.registered[-1]
         self.assertEqual(response["job_id"], job["id"])
-        self.assertEqual(job.get("model_type"), "ltx2_3")
+        self.assertEqual(job.get("model_type"), "ltx2_22B_distilled")
         self.assertEqual(job.get("generation_mode"), "video")
         self.assertEqual(resource_descriptor(job), {
             "intent": "generation", "execution": "standard",
@@ -732,6 +737,18 @@ class RetakePolicyAdmissionTests(unittest.TestCase):
                 self.submit({"expected_source_revision":revision, "editor_origin":self.editor_assertion})
             self.assertEqual(capped.exception.status_code, 409)
             self.assertEqual(len(self.registered), before)
+
+    def test_unsupported_retake_models_and_engines_never_decode_or_queue(self):
+        for body in ({"model_type": "minimax_h3"}, {"model_type": "unknown"},
+                     {"model_type": ["ltx2_22B_distilled"]}, {"retake_engine": "unknown"},
+                     {"retake_engine": None}, {"retake_engine": {"native": True}}):
+            with self.subTest(body=body), self.assertRaises(_HTTPException) as caught:
+                self.submit(body)
+            self.assertEqual(caught.exception.status_code, 400)
+        self.assertEqual(self.probed, [])
+        self.assertEqual(self.registered, [])
+        self.submit({"retake_engine": "legacy"})
+        self.assertEqual(self.registered[-1]["params"]["retake_engine"], "legacy")
 
     def test_invalid_retake_temporal_controls_reject_before_probe_or_registration(self):
         for field in ("start_time", "end_time", "retake_strength"):

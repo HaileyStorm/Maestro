@@ -14830,6 +14830,12 @@ def _require_model_download_available(
         )
 
 
+def _retake_engines_for_architecture(architecture):
+    # These handlers all load LTX2, whose native and legacy branches consume
+    # source video and frame ranges. Generic **kwargs acceptance is not support.
+    return ["native", "legacy"] if architecture in ("ltx2_19B", "ltx2_22B", "ltx2_25") else []
+
+
 @api.get("/api/v1/models")
 def list_models(request: Request):
     """List available model families and model types."""
@@ -14901,6 +14907,7 @@ def list_models(request: Request):
             "lora_compatibility_note": md.get("lora_compatibility_note"),
             "family": family,
             "architecture": architecture,
+            "retake_engines": _retake_engines_for_architecture(architecture),
             "is_i2v": wgp.test_class_i2v(mt),
             "is_t2v": wgp.test_class_t2v(mt),
             "guidance_max_phases": md.get("guidance_max_phases", 1),
@@ -51183,6 +51190,12 @@ async def retake_video_endpoint(request: Request):
     if not model_type:
         raise HTTPException(status_code=400, detail="model_type is required")
 
+    retake_engine = body.get("retake_engine", "native")
+    if not isinstance(model_type, str) or wgp.get_model_def(model_type) is None:
+        raise HTTPException(status_code=400, detail="Choose an available Retake model")
+    if retake_engine not in _retake_engines_for_architecture(wgp.get_base_model_type(model_type)):
+        raise HTTPException(status_code=400, detail="This model does not support the selected Retake engine")
+
     try:
         import decord
         vr = decord.VideoReader(video_path)
@@ -51226,7 +51239,7 @@ async def retake_video_endpoint(request: Request):
         "retake_start_frame": start_frame,
         "retake_end_frame": end_frame,
         "retake_strength": retake_strength,
-        "retake_engine": body.get("retake_engine", "native"),
+        "retake_engine": retake_engine,
         "regenerate_audio": body.get("regenerate_audio", True),
         "activated_loras": body.get("activated_loras", []),
         # Strip multi-phase LoRA multipliers to single phase (retake is single-stage)

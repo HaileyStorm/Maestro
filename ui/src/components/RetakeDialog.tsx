@@ -23,7 +23,7 @@ export function RetakeDialog() {
   const promptId = useId()
   const negativePromptId = useId()
   const seedId = useId()
-  const stepsId = useId()
+  const modelId = useId()
   const guidanceId = useId()
   const dialogRef = useRef<HTMLDivElement>(null)
   const closeRef = useRef<HTMLButtonElement>(null)
@@ -45,7 +45,6 @@ export function RetakeDialog() {
   const [negPrompt, setNegPrompt] = useState('')
   const [regenerateAudio, setRegenerateAudio] = useState(true)
   const [seed, setSeed] = useState(-1)
-  const [steps, setSteps] = useState(8)
   const [guidance, setGuidance] = useState(1.0)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -55,6 +54,7 @@ export function RetakeDialog() {
     epoch: number; account: number; workspace: string; file: string;
     context: typeof sourceContext;
   } | null>(null)
+  const [chosenModel, setChosenModel] = useState<string | null>(null)
   const formReady = preparedOpening?.epoch === openingEpoch
     && preparedOpening?.account === currentAccountIdentityEpoch()
     && preparedOpening?.workspace === activeWorkspace
@@ -63,11 +63,16 @@ export function RetakeDialog() {
 
   const savedVideoModel = useStore(s => s.selectedModelPerMode?.video)
   const currentModel = useStore(s => s.params.model_type)
-  const modelType = savedVideoModel || currentModel
   const models = useStore(s => s.models)
+  const retakeModels = models.filter(model => model.retake_engines?.includes('native') && model.execution_allowed !== false)
+  const preferredModel = savedVideoModel || currentModel
+  const modelType = chosenModel ?? (retakeModels.some(model => model.model_type === preferredModel) ? preferredModel : '')
+  const modelReady = retakeModels.some(model => model.model_type === modelType)
   const modelLabel = modelDisplayName(modelType, models)
-  const activatedLoras = useStore(s => s.params.activated_loras) as string[] || []
-  const lorasMultipliers = useStore(s => s.params.loras_multipliers) as string || ''
+  const currentLoras = useStore(s => s.params.activated_loras) as string[] || []
+  const currentMultipliers = useStore(s => s.params.loras_multipliers) as string || ''
+  const activatedLoras = modelType === currentModel ? currentLoras : []
+  const lorasMultipliers = modelType === currentModel ? currentMultipliers : ''
 
   const closeDialog = useCallback(() => {
     requestEpochRef.current += 1
@@ -98,7 +103,7 @@ export function RetakeDialog() {
     setNegPrompt('')
     setRegenerateAudio(true)
     setSeed(-1)
-    setSteps(8)
+    setChosenModel(null)
     setGuidance(1.0)
     setShowAdvanced(false)
     const epoch = requestEpochRef.current
@@ -173,7 +178,7 @@ export function RetakeDialog() {
     : api.getFileUrl(retakeFile, activeWorkspace)
 
   const handleSubmit = async () => {
-    if (!formReady || !prompt || submittingRef.current) return
+    if (!formReady || !modelReady || !prompt || submittingRef.current) return
     const requestEpoch = requestEpochRef.current
     const account = currentAccountIdentityEpoch()
     const current = () => {
@@ -198,7 +203,7 @@ export function RetakeDialog() {
         negative_prompt: negPrompt,
         seed,
         guidance_scale: guidance,
-        num_inference_steps: steps,
+        num_inference_steps: 8,
         retake_engine: 'native',
         regenerate_audio: regenerateAudio,
         activated_loras: activatedLoras,
@@ -275,6 +280,20 @@ export function RetakeDialog() {
         </div>
 
         <div className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain p-4 [-webkit-overflow-scrolling:touch]">
+          <div>
+            <label htmlFor={modelId} className="mb-1 block text-xs text-text-secondary">Retake model</label>
+            <select id={modelId} value={modelType} disabled={submitting}
+              onChange={event => setChosenModel(event.target.value)}
+              className="min-h-11 w-full rounded border border-border bg-bg-tertiary px-2.5 py-1.5 text-xs text-text-primary focus:border-accent-blue focus:outline-none">
+              <option value="">Choose a model</option>
+              {retakeModels.map(model => <option key={model.model_type} value={model.model_type}>
+                {modelDisplayName(model.model_type, models)}{model.is_downloaded === false ? ' (download required)' : ''}
+              </option>)}
+            </select>
+            <p className="mt-1 text-[10px] text-text-muted">
+              {retakeModels.length === 0 ? 'No available model supports Retake.' : 'Retake uses the selected model to edit your source clip with 8 native steps.'}
+            </p>
+          </div>
           {/* Timeline selector */}
           <VideoTimelineSelector
             videoUrl={videoUrl}
@@ -325,15 +344,10 @@ export function RetakeDialog() {
                   placeholder="What to avoid..."
                   className="min-h-11 w-full rounded border border-border bg-bg-tertiary px-2.5 py-1.5 text-xs text-text-primary placeholder:text-text-muted focus:border-accent-blue focus:outline-none md:min-h-0" />
               </div>
-              <div className="grid grid-cols-3 gap-2">
+              <div className="grid grid-cols-2 gap-2">
                 <div>
                   <label htmlFor={seedId} className="text-[9px] text-text-muted block mb-0.5">Seed</label>
                   <input id={seedId} type="number" value={seed} onChange={e => setSeed(parseInt(e.target.value) || -1)}
-                    className="min-h-11 w-full rounded border border-border bg-bg-tertiary px-1.5 py-1 text-[10px] text-text-primary focus:border-accent-blue focus:outline-none md:min-h-0" />
-                </div>
-                <div>
-                  <label htmlFor={stepsId} className="text-[9px] text-text-muted block mb-0.5">Steps</label>
-                  <input id={stepsId} type="number" min={1} max={50} value={steps} onChange={e => setSteps(parseInt(e.target.value) || 8)}
                     className="min-h-11 w-full rounded border border-border bg-bg-tertiary px-1.5 py-1 text-[10px] text-text-primary focus:border-accent-blue focus:outline-none md:min-h-0" />
                 </div>
                 <div>
@@ -357,7 +371,7 @@ export function RetakeDialog() {
           {success && <div role="status" className="text-[10px] text-indicator-success bg-green-500/10 border border-green-500/20 rounded px-2 py-1.5">{success}</div>}
 
           {/* Submit */}
-          <button onClick={handleSubmit} disabled={submitting || !prompt}
+          <button onClick={handleSubmit} disabled={submitting || !prompt || !modelReady}
             type="button"
             className="min-h-11 w-full rounded-lg bg-accent-blue py-2.5 text-sm font-medium text-white transition-colors hover:bg-accent-blue/80 disabled:cursor-not-allowed disabled:opacity-40">
             {submitting ? 'Submitting...' : 'Retake'}

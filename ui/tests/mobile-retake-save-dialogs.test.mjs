@@ -162,6 +162,7 @@ test('programmatic covered-parent close retains exact outer focus restoration', 
 })
 
 function treeChildren(node) {
+  if (Array.isArray(node)) return node
   if (!node || typeof node !== 'object') return []
   const children = node.props?.children
   return Array.isArray(children) ? children : children == null ? [] : [children]
@@ -605,7 +606,7 @@ test('bundled Retake dialog portals, captures exact active trigger, and preserve
       activated_loras: ['detail-lora'],
       loras_multipliers: '0.75',
     },
-    models: [],
+    models: [{ model_type: 'video-model', name: 'LTX Retake', retake_engines: ['native', 'legacy'] }],
   }
   const RetakeDialog = await loadDialogComponent(retakeUrl, 'RetakeDialog')
   let tree = RetakeDialog()
@@ -622,13 +623,12 @@ test('bundled Retake dialog portals, captures exact active trigger, and preserve
     prompt.props.id,
   )
   prompt.props.onChange({ target: { value: 'replacement action' } })
-  globalThis.__dialogHookState[12] = true
+  globalThis.__dialogHookState[11] = true
   beginRender()
   tree = RetakeDialog()
   for (const [label, placeholder] of [
     ['Negative Prompt', 'What to avoid...'],
     ['Seed', undefined],
-    ['Steps', undefined],
     ['Guidance', undefined],
   ]) {
     const labelNode = findNode(tree, node => node.type === 'label' && nodeText(node) === label)
@@ -653,8 +653,8 @@ test('bundled Retake dialog portals, captures exact active trigger, and preserve
     num_inference_steps: 8,
     retake_engine: 'native',
     regenerate_audio: true,
-    activated_loras: ['detail-lora'],
-    loras_multipliers: '0.75',
+    activated_loras: [],
+    loras_multipliers: '',
     workspace: 'workspace-a',
   }])
   assert.equal(loadOutputs, 1)
@@ -664,6 +664,48 @@ test('bundled Retake dialog portals, captures exact active trigger, and preserve
   beginRender()
   tree = RetakeDialog()
   assert.equal(nodeText(findNode(tree, node => node.props?.role === 'status')), 'Retake queued for 17 frames.')
+})
+
+test('Retake requires an explicit capable model when the saved video model is H3', async () => {
+  globalThis.HTMLButtonElement = class {}
+  resetDialogHarness([{ current: {} }, { current: {} }, { current: null }])
+  globalThis.__retakeStore = {
+    retakeDialogOpen: true, retakeSourceFile: 'clip.mp4', activeWorkspace: 'workspace-a',
+    closeRetakeDialog() {}, loadOutputs() {}, trackAcceptedGenerationJob() {},
+    selectedModelPerMode: { video: 'minimax_h3' },
+    params: { model_type: 'minimax_h3', activated_loras: ['h3-only'], loras_multipliers: '0.7' },
+    models: [
+      { model_type: 'minimax_h3', name: 'H3', retake_engines: [] },
+      { model_type: 'ltx2_22B_distilled', name: 'LTX', retake_engines: ['native', 'legacy'], is_downloaded: true },
+      { model_type: 'blocked', name: 'Unavailable', retake_engines: ['native'], execution_allowed: false },
+    ],
+  }
+  const RetakeDialog = await loadDialogComponent(retakeUrl, 'RetakeDialog')
+  const render = () => { beginRender(); return RetakeDialog() }
+  let tree = render()
+  findNode(tree, node => node.props?.placeholder === 'Describe the new content for the selected time range...')
+    .props.onChange({ target: { value: 'change lighting' } })
+  tree = render()
+  let submit = findNode(tree, node => node.type === 'button' && nodeText(node) === 'Retake')
+  assert.equal(submit.props.disabled, true)
+  await submit.props.onClick()
+  assert.deepEqual(globalThis.__retakePayloads, [])
+  const selector = findNode(tree, node => node.type === 'select')
+  assert.equal(selector.props.value, '')
+  assert.deepEqual(findNodes(selector, node => node.type === 'option').map(node => node.props.value), ['', 'ltx2_22B_distilled'])
+  selector.props.onChange({ target: { value: 'ltx2_22B_distilled' } })
+  tree = render()
+  submit = findNode(tree, node => node.type === 'button' && nodeText(node) === 'Retake')
+  assert.equal(submit.props.disabled, false)
+  await submit.props.onClick()
+  const sent = globalThis.__retakePayloads.at(-1)
+  assert.equal(sent.model_type, 'ltx2_22B_distilled')
+  assert.equal(sent.num_inference_steps, 8)
+  assert.deepEqual(sent.activated_loras, [])
+  assert.equal(sent.loras_multipliers, '')
+  globalThis.__retakeStore.models = []
+  tree = render()
+  assert.equal(findNode(tree, node => node.type === 'button' && nodeText(node) === 'Retake').props.disabled, true)
 })
 
 test('Retake loading, failure, and close-reopen lifecycle ignore every stale completion', async () => {
@@ -686,7 +728,7 @@ test('Retake loading, failure, and close-reopen lifecycle ignore every stale com
     trackAcceptedGenerationJob: (...args) => { globalThis.__retakeTrackedJobs.push(args) },
     selectedModelPerMode: { video: 'video-model' },
     params: { model_type: 'fallback', activated_loras: [], loras_multipliers: '' },
-    models: [],
+    models: [{ model_type: 'video-model', name: 'LTX Retake', retake_engines: ['native', 'legacy'] }],
   }
   globalThis.__retakeSubmit = () => pending.promise
   const RetakeDialog = await loadDialogComponent(retakeUrl, 'RetakeDialog')
@@ -899,7 +941,7 @@ test('MediaFeed lifecycle epoch prevents an old Save completion from closing a r
     deleteSelectedOutput() {}, rejoinClipGroup() {}, toggleFavorite() {}, setStartImage() {},
     addImageRef() {}, setContinueVideo() {}, setParam() {}, openRetakeDialog() {},
     generationMode: 'video', workspaces: [], accessContext: {}, browsingUploads: false,
-    models: [], gallerySelectionMode: false, selectedOutputKeys: [], toggleOutputSelection() {},
+    models: [{ model_type: 'video-model', name: 'LTX Retake', retake_engines: ['native', 'legacy'] }], gallerySelectionMode: false, selectedOutputKeys: [], toggleOutputSelection() {},
     saveRecipeFromOutput: () => pending.promise,
   }
   const props = {
@@ -992,10 +1034,10 @@ test('dialog source covers narrow landscape, breakpoint, safe-area, and touch ge
     closeRetakeDialog() {}, activeWorkspace: 'workspace-a', loadOutputs() {},
     selectedModelPerMode: { video: 'video-model' },
     params: { model_type: 'fallback', activated_loras: [], loras_multipliers: '' },
-    models: [],
+    models: [{ model_type: 'video-model', name: 'LTX Retake', retake_engines: ['native', 'legacy'] }],
   }
   const RetakeDialog = await loadDialogComponent(retakeUrl, 'RetakeDialog')
-  globalThis.__dialogHookState[12] = true
+  globalThis.__dialogHookState[11] = true
   beginRender()
   const retakeTree = RetakeDialog()
 
@@ -1060,7 +1102,7 @@ test('Editor Retake opening preserves selected interval and revision; stale meta
     retakeDialogOpen: true, retakeSourceFile: 'alternate.mp4', retakeSourceContext: context,
     retakeOpeningEpoch: 1, activeWorkspace: 'scene',
     closeRetakeDialog() { this.retakeDialogOpen = false }, loadOutputs() { loads++ },
-    selectedModelPerMode: { video: 'video-model' }, params: { model_type: 'video-model' }, models: [],
+    selectedModelPerMode: { video: 'video-model' }, params: { model_type: 'video-model' }, models: [{ model_type: 'video-model', name: 'LTX Retake', retake_engines: ['native', 'legacy'] }],
   }
   const RetakeDialog = await loadDialogComponent(retakeUrl, 'RetakeDialog')
   let tree = RetakeDialog()
@@ -1091,7 +1133,7 @@ test('Editor Retake opening preserves selected interval and revision; stale meta
   await submitting
   assert.equal(loads, 0)
   assert.equal(globalThis.__dialogHookState[2], 20, 'old metadata ignored after scope ABA')
-  assert.equal(globalThis.__dialogHookState[11], null)
+  assert.equal(globalThis.__dialogHookState[10], null)
   globalThis.__retakeAccountEpoch++
   metadata()
   assert.equal(globalThis.__dialogHookState[2], 20)
@@ -1107,7 +1149,7 @@ test('account epoch change during Editor Retake submission cannot refresh, repor
     retakeSourceContext: { workspace: 'scene', revision: 'sha256:' + 'b'.repeat(64), start: 1, end: 3 },
     retakeOpeningEpoch: 1, activeWorkspace: 'scene', closeRetakeDialog() {},
     loadOutputs() { loads++ }, selectedModelPerMode: { video: 'video-model' },
-    params: { model_type: 'video-model' }, models: [],
+    params: { model_type: 'video-model' }, models: [{ model_type: 'video-model', name: 'LTX Retake', retake_engines: ['native', 'legacy'] }],
   }
   const RetakeDialog = await loadDialogComponent(retakeUrl, 'RetakeDialog')
   let tree = RetakeDialog()
@@ -1127,7 +1169,7 @@ test('account epoch change during Editor Retake submission cannot refresh, repor
   assert.equal(globalThis.__retakePayloads.length, 1)
   assert.equal(loads, 0)
   assert.equal(timers, 0)
-  assert.equal(globalThis.__dialogHookState[11], null)
+  assert.equal(globalThis.__dialogHookState[10], null)
 })
 
 
@@ -1142,7 +1184,7 @@ test('fresh Retake review resets prior text and settings across reopening, accou
       globalThis.__retakeStore.retakeDialogOpen = false
       globalThis.__retakeStore.retakeOpeningEpoch++
     }, loadOutputs() {}, selectedModelPerMode: { video: 'video-model' },
-    params: { model_type: 'video-model' }, models: [],
+    params: { model_type: 'video-model' }, models: [{ model_type: 'video-model', name: 'LTX Retake', retake_engines: ['native', 'legacy'] }],
   }
   const RetakeDialog = await loadDialogComponent(retakeUrl, 'RetakeDialog')
   const render = () => { beginRender(); return RetakeDialog() }
@@ -1156,7 +1198,7 @@ test('fresh Retake review resets prior text and settings across reopening, accou
     control(tree, 'What should happen in this section?').props.onChange({ target: { value: 'previous private prompt' } })
     findNode(tree, node => node.type === 'button' && nodeText(node).includes('Advanced')).props.onClick()
     tree = render()
-    for (const [label, value] of [['Negative Prompt', 'previous negative'], ['Seed', '91'], ['Steps', '22'], ['Guidance', '4.5']]) {
+    for (const [label, value] of [['Negative Prompt', 'previous negative'], ['Seed', '91'], ['Guidance', '4.5']]) {
       control(tree, label).props.onChange({ target: { value } })
     }
     findNode(tree, node => node.type === 'input' && node.props.type === 'checkbox')
@@ -1191,7 +1233,7 @@ test('fresh Retake review resets prior text and settings across reopening, accou
     assert.equal(globalThis.__retakePayloads.length, before, 'old handler and blank fresh prompt cannot submit')
     findNode(tree, node => node.type === 'button' && nodeText(node).includes('Advanced')).props.onClick()
     tree = render()
-    for (const [label, value] of [['Negative Prompt', ''], ['Seed', -1], ['Steps', 8], ['Guidance', 1]]) {
+    for (const [label, value] of [['Negative Prompt', ''], ['Seed', -1], ['Guidance', 1]]) {
       assert.equal(control(tree, label).props.value, value)
     }
     control(tree, 'What should happen in this section?').props.onChange({ target: { value: 'fresh prompt' } })

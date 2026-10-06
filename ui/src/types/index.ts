@@ -49,6 +49,8 @@ export interface ModelDef {
   lora_compatibility_note?: string
   family: string
   architecture: string
+  /** Engines whose generators actually consume a Retake source and range. */
+  retake_engines?: string[]
   is_i2v: boolean
   is_t2v: boolean
   guidance_max_phases: number
