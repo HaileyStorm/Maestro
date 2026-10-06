@@ -821,7 +821,7 @@ checks passed, including cancellation with the real lifecycle lock. These
 checks do not establish a live
 service interruption, Windows/LAN behavior or human quality acceptance.
 
-## October 6 follow-on: private native PDD FL2VA qualification
+## October 6 follow-on: private native PDD qualification
 
 The pinned private candidate completed eight paired video/audio evaluations
 with FP32 fused head banks. Actual MMGP insertion matched 254 numeric values
@@ -833,10 +833,11 @@ fresh negative authority confirmation and controller process-absence checks
 passed. Independent source/receipt review found no success-path acceptance
 blocker. Earlier failures remain retained evidence.
 
-This qualifies this exact small private FL2VA configuration. Ref2VA success,
-external cancellation and authority-loss paths, full-resolution and conditioning
-coverage, synchronization, visual/listening quality and speed remain open.
-Production PDD admission remains closed.
+This qualifies this exact small private FL2VA configuration. Reference-video
+and reference-audio conditioning, Ref2VA cancellation/error, external
+cancellation and authority-loss paths, full-resolution, synchronization,
+visual/listening quality and speed remain open. Production PDD admission
+remains closed.
 
 A separate fresh native FL2VA run cooperatively cancelled after its first
 paired evaluation. It produced no output, restored the pristine runtime and
@@ -850,8 +851,19 @@ first paired forward. The specific error was observed, no output was written,
 all 254 MMGP insertion values matched, and pristine heads, runtime bindings and
 shared attention were restored. Model release, process exit, an empty unit and
 exact lease withdrawal passed, including fresh negative authority confirmation.
-This qualifies that injected-error boundary; broader failure recovery and
-Ref2VA qualification remain separate.
+This qualifies that injected-error boundary; broader failure recovery remains
+separate.
+
+A separate fresh native Ref2VA success run used four pinned still-image
+references with ABCK conditioning, without reference video or audio. Eight
+paired evaluations retained FP32 fused heads and matched all 254 MMGP insertion
+values. Independent CPU readback confirmed finite video tensors with 124
+frames at 320×192 and nonempty stereo 32 kHz audio. Pristine runtime and
+attention restoration, model release, process/unit cleanup and exact lease
+withdrawal passed, including fresh negative authority confirmation. Independent
+receipt review found no blocker for this exact small private still-reference
+qualification. It does not establish the remaining conditioning, recovery,
+quality or public-admission gates above.
 
 ## October 6 follow-on: processed-tool Retry and Stop recovery
 
