@@ -834,6 +834,13 @@ passed. Independent source/receipt review found no success-path acceptance
 blocker. Earlier failures remain retained evidence.
 
 This qualifies this exact small private FL2VA configuration. Ref2VA success,
-native cancellation/error paths, full-resolution and conditioning coverage,
+external cancellation/error paths, full-resolution and conditioning coverage,
 synchronization, visual/listening quality and speed remain open. Production PDD
 admission remains closed.
+
+A separate fresh native FL2VA run cooperatively cancelled after its first
+paired evaluation. It produced no output, restored the pristine runtime and
+shared attention state, and released the model. The guardian stopped its exact
+child, drained the unit and withdrew the lease; fresh negative authority and
+process-absence checks passed. This proves that specific cooperative
+cancellation boundary, not external cancellation or authority-loss recovery.
