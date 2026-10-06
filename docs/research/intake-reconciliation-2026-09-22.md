@@ -983,3 +983,11 @@ These are CPU checks. Native Retake generation and its resulting media, broader
 automatic roundtrip recovery, Windows/LAN behavior and human acceptance remain
 separate obligations. The existing explicit Gallery-result take import is the
 return path for this review-handoff milestone.
+
+Published as `9ae56241` and activated through the coordinated Pinokio restart.
+Actual Chrome review opened the saved alternate take with source-revision-bound
+media and the exact 0.1–10.336-second selection. Closing the dialog preserved
+the saved draft and both takes' media and metadata hashes. The same-inode
+server-log observation recorded no Retake, Generate or Resume submission.
+Local and stable-share health/readiness passed and the restart notice cleared.
+This verifies the review handoff; no new Retake sample was generated.
