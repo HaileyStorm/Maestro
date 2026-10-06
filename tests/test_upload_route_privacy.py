@@ -1,7 +1,9 @@
 import asyncio
 import copy
+import contextvars
 import json
 import threading
+import time
 from unittest.mock import patch
 import ast
 import os
@@ -418,6 +420,176 @@ class AuthorizedMediaResolverTests(unittest.TestCase):
             self.assertEqual(raised.exception.status_code, 423)
 
 
+class RetakePolicyAdmissionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        tree = ast.parse(LAUNCH_PATH.read_text(encoding="utf-8"))
+        names = {"retake_video_endpoint", "_inherit_media_access_policy",
+                 "_http_output_policy_from_request", "_JobRegistry"}
+        nodes = [copy.deepcopy(node) for node in tree.body
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                 and node.name in names]
+        for node in nodes:
+            node.decorator_list = []
+        cls.code = compile(ast.Module(body=nodes, type_ignores=[]), str(LAUNCH_PATH), "exec")
+
+    def setUp(self):
+        from services.output_access import output_policy_from_request, read_upload_access_sidecar
+        from services.search_index import load_media_sidecars
+
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.outputs = self.root / "outputs"
+        self.outputs.mkdir()
+        self.uploads = self.root / "uploads"
+        self.uploads.mkdir()
+        self.source = self.outputs / "source.mp4"
+        self.source.write_bytes(b"disposable authorized video")
+        self.owner = "a" * 32
+        self.registered = []
+        self.probed = []
+        self.ns = {
+            "Request": object, "HTTPException": _HTTPException,
+            "os": os, "uuid": uuid, "time": time, "threading": threading,
+            "_request_remote": contextvars.ContextVar("retake_remote", default=False),
+            "_request_session_id": contextvars.ContextVar("retake_session", default=self.owner),
+            "output_policy_from_request": output_policy_from_request,
+            "read_upload_access_sidecar": read_upload_access_sidecar,
+            "load_media_sidecars": load_media_sidecars,
+            "_workspace_dir": lambda _workspace: str(self.outputs),
+            "_get_active_workspace": lambda: "default",
+            "_resolve_authorized_request_media": AuthorizedMediaResolverTests()._load_resolver(str(self.outputs)),
+        }
+
+        def project_access(request, workspace, *, permission):
+            self.assertEqual(permission, "project.generate")
+            if not request.state.project_unlocked or workspace != request.state.project_workspace:
+                raise _HTTPException(423)
+            return str(self.outputs)
+
+        self.ns["_require_project_access"] = project_access
+        exec(self.code, self.ns)
+        registry = self.ns["_JobRegistry"]()
+
+        def register(job):
+            # Use native policy admission; never start a worker or touch a model.
+            registry.prepare(job)
+            self.registered.append(copy.deepcopy(job))
+
+        self.ns["_queue_recovery_register_and_publish"] = register
+        test = self
+
+        class Reader:
+            def __init__(self, path):
+                test.probed.append(path)
+
+            def get_avg_fps(self):
+                return 24
+
+            def __len__(self):
+                return 48
+
+            def __getitem__(self, _index):
+                return types.SimpleNamespace(shape=(480, 640, 3))
+
+        decoder = patch.dict(sys.modules, {"decord": types.SimpleNamespace(VideoReader=Reader)})
+        decoder.start()
+        self.addCleanup(decoder.stop)
+        cwd = patch("os.getcwd", return_value=str(self.root))
+        cwd.start()
+        self.addCleanup(cwd.stop)
+
+    def submit(self, flags=None, *, source=None, session=None, workspace="default", unlocked=True, prompt="retake"):
+        body = {"video_path": str(source or self.source), "workspace": workspace,
+                "model_type": "ltx2_3", "start_time": 0.25, "end_time": 1.25,
+                "prompt": prompt, **(flags or {})}
+        request = AuthorizedMediaResolverTests._request(
+            session or self.owner, project_unlocked=unlocked,
+        )
+
+        async def read_body():
+            return copy.deepcopy(body)
+
+        request.json = read_body
+        return asyncio.run(self.ns["retake_video_endpoint"](request))
+
+    def set_source_policy(self, private, explicit):
+        self.source.with_suffix(".meta.json").write_text(json.dumps({
+            "output_filename": self.source.name, "private": private,
+            "explicit": explicit, "workspace": "default",
+        }))
+
+    def test_source_flags_and_explicit_overrides_reach_native_job_policy(self):
+        for private in (False, True):
+            for explicit in (False, True):
+                self.set_source_policy(private, explicit)
+                cases = (
+                    ({}, {"private": private, "explicit": explicit}),
+                    ({"private_output": None, "explicit_output": None},
+                     {"private": private, "explicit": explicit}),
+                    ({"private_output": not private}, {"private": not private, "explicit": explicit}),
+                    ({"explicit_output": not explicit}, {"private": private, "explicit": not explicit}),
+                    ({"private_output": False, "explicit_output": False}, {"private": False, "explicit": False}),
+                    ({"private_output": True, "explicit_output": True}, {"private": True, "explicit": True}),
+                )
+                for flags, expected in cases:
+                    with self.subTest(source=(private, explicit), flags=flags):
+                        response = self.submit(flags)
+                        job = self.registered[-1]
+                        self.assertEqual(response["job_id"], job["id"])
+                        self.assertEqual(job["access_policy"], expected)
+                        self.assertEqual({key: job[key] for key in expected}, expected)
+                        self.assertEqual(job["session_id"], self.owner)
+                        self.assertEqual(job["params"]["retake_video"], str(self.source))
+                        self.assertEqual((job["params"]["retake_start_frame"], job["params"]["retake_end_frame"]), (6, 30))
+                        self.assertFalse({"private_output", "explicit_output"} & job["params"].keys())
+
+    def test_owned_upload_inherits_flags_but_foreign_upload_is_not_admitted(self):
+        source = self.uploads / "uploaded.mp4"
+        source.write_bytes(b"disposable upload")
+        write_upload_access_sidecar(str(source), self.owner, private=True)
+        self.submit(source=source)
+        self.assertEqual(self.registered[-1]["access_policy"], {"private": True, "explicit": False})
+        before = len(self.registered)
+        self.probed.clear()
+        with self.assertRaises(_HTTPException) as raised:
+            self.submit(source=source, session="b" * 32)
+        self.assertEqual(raised.exception.status_code, 404)
+        self.assertEqual(len(self.registered), before)
+        self.assertEqual(self.probed, [])
+
+    def test_invalid_flags_reject_before_video_probe_or_job_admission(self):
+        for flag in ("private_output", "explicit_output"):
+            for value in ("false", 1, [], {}):
+                with self.subTest(flag=flag, value=value):
+                    with self.assertRaises(_HTTPException) as raised:
+                        self.submit({flag: value})
+                    self.assertEqual(raised.exception.status_code, 400)
+                    self.assertIn(flag, raised.exception.detail)
+        self.assertEqual(self.registered, [])
+        self.assertEqual(self.probed, [])
+
+    def test_locked_cross_project_and_missing_sources_never_admit_jobs(self):
+        for kwargs, status in (({"unlocked": False}, 423), ({"workspace": "other"}, 423),
+                               ({"source": self.outputs / "missing.mp4"}, 404)):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(_HTTPException) as raised:
+                    self.submit(**kwargs)
+                self.assertEqual(raised.exception.status_code, status)
+        self.assertEqual(self.registered, [])
+        self.assertEqual(self.probed, [])
+
+    def test_prompt_subject_matter_does_not_set_preview_flags(self):
+        self.set_source_policy(False, False)
+        for prompt in ("adult romance", "violent battle", "controversial political scene"):
+            with self.subTest(prompt=prompt):
+                self.submit(prompt=prompt)
+                job = self.registered[-1]
+                self.assertEqual(job["params"]["prompt"], prompt)
+                self.assertEqual(job["access_policy"], {"private": False, "explicit": False})
+
+
 class UploadRouteSourceContractTests(unittest.TestCase):
     def test_upload_content_requires_account_only_after_complete_cutover(self):
         source = LAUNCH_PATH.read_text(encoding="utf-8")
@@ -537,8 +709,7 @@ class UploadRouteSourceContractTests(unittest.TestCase):
         self.assertIn("can_access_upload(entry[1], session_id)", listing)
         self.assertIn("read_upload_access_sidecar", listing)
         self.assertIn("public_output_policy(cached)", listing)
-        self.assertIn("can_access_upload(filepath", _function_source("serve_file"))
-        for name in ("serve_upload", "serve_audio_upload"):
+        for name in ("serve_file", "serve_upload", "serve_audio_upload"):
             self.assertIn(
                 "_resolve_authorized_request_media",
                 _function_source(name),

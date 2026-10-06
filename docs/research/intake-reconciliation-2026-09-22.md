@@ -938,3 +938,21 @@ separate remaining gate; the prior failed receipt is not retroactively repaired.
 The repair is activated through the coordinated Pinokio restart. The new backend
 and both local/stable health and readiness passed; the matching restart notice
 was cleared by the existing launcher flow.
+
+## 2026-10-06 — Retake source preview-policy inheritance
+
+Retake admission previously dropped an authorized source video's private and
+explicit preview flags. Omitted or null choices now inherit those flags;
+explicit boolean choices override them. The existing policy validator rejects
+malformed flags before video decoding or job admission. The derived job carries
+its session and durable policy through native registry preparation.
+
+The endpoint regression reproduced 26 failures before the repair. CPU checks
+exercise all four source-flag combinations, explicit overrides, session-owned
+uploads, inaccessible/cross-project sources and content neutrality using the
+actual admission, policy and resolver functions. The 45-check privacy and
+content-neutrality run passed 44 checks and exposed one obsolete source
+assertion for upload serving. After updating that assertion to the current
+central authorizer, all six affected checks passed; unchanged passing evidence
+was reused. Independent review found no consequential issue. Native Retake
+generation, resulting media and the Editor AI roundtrip remain separate gates.

@@ -50896,10 +50896,12 @@ async def retake_video_endpoint(request: Request):
         prompt: str, model_type: str,
         negative_prompt?: str, seed?: int, guidance_scale?: float,
         num_inference_steps?: int, retake_strength?: float (0-1),
-        workspace?: str
+        workspace?: str, private_output?: bool, explicit_output?: bool
     }
     """
     body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Retake request must be an object")
 
     video_path = body.get("video_path")
     if not video_path:
@@ -50911,6 +50913,18 @@ async def retake_video_endpoint(request: Request):
     video_path = _resolve_authorized_request_media(request, video_path, workspace)
     if not video_path:
         raise HTTPException(status_code=404, detail="Video not found")
+
+    session_id = request.state.maestro_session_id
+    inherited_policy = _inherit_media_access_policy(
+        [video_path], workspace, session_id,
+    )
+    if body.get("private_output") is None:
+        body["private_output"] = inherited_policy["private"]
+    if body.get("explicit_output") is None:
+        body["explicit_output"] = inherited_policy["explicit"]
+    access_policy = _http_output_policy_from_request(
+        body, owner_session_id=session_id,
+    )
 
     start_time = float(body.get("start_time", 0))
     end_time = float(body.get("end_time", -1))
@@ -50974,6 +50988,7 @@ async def retake_video_endpoint(request: Request):
         "phase": "", "message": "Queued (retake)", "created_at": time.time(),
         "params": gen_params, "output_files": [], "error": None,
         "workspace": workspace, "out_dir": job_out_dir,
+        "session_id": session_id, "access_policy": access_policy,
     }
     _queue_recovery_register_and_publish(job)
 
