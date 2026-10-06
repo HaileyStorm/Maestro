@@ -37,7 +37,7 @@ backends available.
 """
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
@@ -819,12 +819,12 @@ def _fill_audio_condition_positions(
     history_origin: float,
     target_origin: float,
     width_grid: torch.Tensor,
+    video_time_scale: float = 1.0,
 ) -> None:
     cursor = int(start)
     history_time = float(history_origin)
     for entry in anchors:
-        anchor, length = entry if isinstance(entry, tuple) else (entry, 1)
-        length = int(length)
+        anchor, length, frame_index = _unpack_keyframe_anchor(entry)
         if length < 1:
             raise ValueError("MiniMax H3 audio condition length must be positive")
         rows = slice(cursor, cursor + length * MINIMAX_H3_AUDIO_CHANNELS)
@@ -833,6 +833,10 @@ def _fill_audio_condition_positions(
             history_time += length
         elif anchor == "first":
             origin = target_origin
+        elif anchor == "frame" and frame_index is not None:
+            # Keep the fractional pixel-frame origin; only the capacity of
+            # an audio guide is floored, never its rotary position.
+            origin = target_origin + frame_index * _ROPE_FRAME_RESCALE * float(video_time_scale)
         else:
             raise ValueError(f"Unknown MiniMax H3 audio condition anchor {anchor!r}")
         _fill_audio_positions(position_ids, rows, length, origin, width_grid)
@@ -947,6 +951,11 @@ def build_packed_sequence(
                 target_origin
                 + frame_index * _ROPE_FRAME_RESCALE * float(video_time_scale)
             )
+        elif anchor == "clip" and frame_index is not None:
+            origin = target_origin + frame_index * _ROPE_FRAME_RESCALE * float(video_time_scale)
+            condition[:, :, 0] = _temporal_position_grid(
+                condition_frames, origin, video_time_scale,
+            )[:, None]
         else:
             raise ValueError(f"Unknown MiniMax H3 keyframe anchor {anchor!r}")
         condition[:, :, 1:] = frame_grid[None]
@@ -961,6 +970,7 @@ def build_packed_sequence(
         float(num_text_tokens),
         target_origin,
         width_grid,
+        video_time_scale,
     )
     _fill_audio_positions(
         position_ids, slice(audio_start, video_start), num_audio_latents,
@@ -998,6 +1008,45 @@ def build_packed_sequence(
         num_target_condition_video_rows=(
             int(target_condition_video_frames) * rows_per_frame
         ),
+    )
+
+
+def interleave_timeline_guide_conditions(
+    layout: MiniMaxH3PackedSequence,
+    condition_order: tuple[tuple[int, int], ...],
+    rows_per_frame: int,
+) -> MiniMaxH3PackedSequence:
+    """Pack each guide's video then audio, preserving logical modality order.
+
+    The legacy FL2VA builder groups all visual conditions before all audio
+    conditions. AddGuide instead interleaves each guide's modalities. Only
+    this new private path uses the permutation; target rows and their exact
+    coordinates, condition counts and sampler update boundaries stay intact.
+    """
+    if (
+        sum(video * rows_per_frame for video, _ in condition_order) != layout.num_condition_video_rows
+        or sum(audio * MINIMAX_H3_AUDIO_CHANNELS for _, audio in condition_order) != layout.num_condition_audio_rows
+        or any(video < 0 or audio < 0 or video + audio == 0 for video, audio in condition_order)
+    ):
+        raise ValueError("H3 timeline guide row order differs from its encoded geometry")
+    parts = [layout.text_indices]
+    video_cursor = audio_cursor = 0
+    for video_frames, audio_ticks in condition_order:
+        video_end = video_cursor + video_frames * rows_per_frame
+        audio_end = audio_cursor + audio_ticks * MINIMAX_H3_AUDIO_CHANNELS
+        parts.extend((layout.video_indices[video_cursor:video_end], layout.audio_indices[audio_cursor:audio_end]))
+        video_cursor, audio_cursor = video_end, audio_end
+    parts.extend((layout.audio_indices[audio_cursor:], layout.video_indices[video_cursor:]))
+    order = torch.cat(parts)
+    inverse = torch.empty_like(order)
+    inverse[order] = torch.arange(layout.sequence_length, device=order.device)
+    return replace(
+        layout,
+        position_ids=layout.position_ids[order],
+        token_tags=layout.token_tags[order],
+        video_indices=inverse[layout.video_indices],
+        audio_indices=inverse[layout.audio_indices],
+        text_indices=inverse[layout.text_indices],
     )
 
 

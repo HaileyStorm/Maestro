@@ -55,6 +55,7 @@ from .packing import (
     build_ref2va_packed_sequence,
     build_row_timesteps,
     h3_timeline_still_guide_keyframe_anchors,
+    interleave_timeline_guide_conditions,
     keyframe_condition_noise,
     patchify_video_latents,
     prepare_h3_bridge_video_inputs,
@@ -1368,6 +1369,49 @@ class MiniMaxH3Model:
         if not isinstance(custom_settings, dict):
             custom_settings = {}
         from services.h3_pdd import H3PDDError, pdd_requested, validate_pdd_request
+        timeline_guides = _kwargs.get("_h3_timeline_guides")
+        if "_h3_timeline_guides" in custom_settings:
+            raise ValueError("H3 timeline guides require the private decoded-media handoff")
+        if timeline_guides is not None:
+            from .timeline_guides import validate_timeline_guide_payload
+
+            if os.environ.get("MAESTRO_H3_TIMELINE_GUIDES_EXPERIMENTAL") != "1":
+                raise ValueError("H3 interval guides are not available through the public runtime yet")
+            if (
+                bool(getattr(self, "reference_mode", False))
+                or str(getattr(self, "selected_model_type", "")) not in ("", "minimax_h3")
+                or fps != MINIMAX_H3_FPS
+                or input_ref_images is not None
+                or any(value is not None for value in (
+                    image_start, image_end,
+                    input_frames, input_frames2, input_frames3, input_waveform,
+                    audio_guide, audio_guide2, audio_guide3,
+                    _kwargs.get("input_video"), _kwargs.get("audio_source"),
+                    _kwargs.get("_h3_timeline_third_still"),
+                    _kwargs.get("_h3_timeline_additional_stills"),
+                    *(_kwargs.get(key) for key in ("audio_guide4", "audio_guide5", "audio_guide6")),
+                ))
+                or bool(video_prompt_type or audio_prompt_type)
+                or bool(_kwargs.get("prefix_frames_count"))
+                or _kwargs.get("h3_native_boundary_conditioning") is True
+                or pdd_requested(custom_settings, _kwargs.get("activated_loras"))
+                or bool(_kwargs.get("skip_steps_cache_type") or _kwargs.get("tea_cache"))
+                or (
+                    isinstance(_kwargs.get("multi_clip_info"), dict)
+                    and int(_kwargs["multi_clip_info"].get("total", 1) or 1) > 1
+                )
+                or any(key.startswith("_h3_cumulative_") for key in _kwargs)
+                or any(key in custom_settings for key in (
+                    "_h3_timeline_still_guide", "_h3_bridge_guides",
+                    "h3_native_boundary_conditioning", "h3_ref2va_handoff",
+                    "h3_turbo_profile", "h3_lightx2v_profile", "h3_spectrum_profile",
+                    "h3_source_audio_mode", "h3_pdd_profile",
+                ))
+            ):
+                raise ValueError("H3 interval guides require an independent Base FL2VA request")
+            validate_timeline_guide_payload(
+                timeline_guides, frame_num=frame_num, height=height, width=width,
+            )
         pdd_controller = getattr(getattr(self, "transformer", None), "_h3_pdd_controller", None)
         pdd_enabled = pdd_requested(custom_settings, _kwargs.get("activated_loras"))
         if pdd_enabled or pdd_controller is not None:
@@ -2077,6 +2121,37 @@ class MiniMaxH3Model:
         )
         if self._interrupt:
             return None
+        timeline_audio_rows = None
+        timeline_audio_anchors = ()
+        if timeline_guides is not None:
+            from .timeline_guides import encode_timeline_guides
+
+            report_phase("Encoding H3 timeline guides")
+            try:
+                guide_rows = encode_timeline_guides(
+                    timeline_guides,
+                    frame_num=frame_num,
+                    height=height,
+                    width=width,
+                    patch_size=self.patch_size,
+                    seed=int(generator.initial_seed()),
+                    device=self.device,
+                    encode_video=self._encode_reference_video,
+                    encode_audio=self._encode_reference_audio,
+                    interrupted=lambda: self._interrupt,
+                )
+            except InterruptedError:
+                if self._interrupt:
+                    return None
+                raise
+            if guide_rows.video is not None:
+                condition_rows = (
+                    guide_rows.video if condition_rows is None
+                    else torch.cat([condition_rows, guide_rows.video])
+                )
+            anchors = anchors + guide_rows.video_anchors
+            timeline_audio_rows = guide_rows.audio
+            timeline_audio_anchors = guide_rows.audio_anchors
         bridge_anchors = ()
         if bridge_guide_clips:
             report_phase("Encoding H3 AddGuide clips")
@@ -2233,6 +2308,7 @@ class MiniMaxH3Model:
         audio_condition_anchors = (
             tuple(cumulative_audio_anchors) + tuple(boundary_audio_anchors)
             + tuple(source_audio_condition_anchors)
+            + tuple(timeline_audio_anchors)
         )
         if self.reference_mode:
             layout = build_ref2va_packed_sequence(
@@ -2260,6 +2336,11 @@ class MiniMaxH3Model:
                     num_audio_latents
                     if source_audio_roles.mode == "lock_source" else 0
                 ),
+            )
+        if timeline_guides is not None:
+            layout = interleave_timeline_guide_conditions(
+                layout, guide_rows.condition_order,
+                (latent_height // self.patch_size[1]) * (latent_width // self.patch_size[2]),
             )
 
         video_noise = randn_tensor(
@@ -2295,6 +2376,8 @@ class MiniMaxH3Model:
             video_rows = torch.cat([*condition_video_parts, video_rows])
         if reference_audio_rows is not None:
             audio_rows = torch.cat([reference_audio_rows, audio_rows])
+        if timeline_audio_rows is not None:
+            audio_rows = torch.cat([timeline_audio_rows, audio_rows])
         if boundary_audio_rows is not None:
             audio_rows = torch.cat([boundary_audio_rows, audio_rows])
         if source_audio_condition_rows is not None:

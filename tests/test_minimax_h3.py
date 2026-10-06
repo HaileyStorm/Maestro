@@ -2019,7 +2019,7 @@ class TestMiniMaxH3TimelineStillGuide(unittest.TestCase):
         payload["custom_settings"]["_h3_timeline_still_guide"]["third_still_path"] = ""
         self.assertIn("bound image", self.handler.validate_generative_settings("minimax_h3", {}, payload))
 
-    def test_third_still_counts_in_residency_and_cannot_vote_as_ordinary_calibration(self):
+    def test_third_still_counts_in_residency_and_uses_authored_step_calibration(self):
         wgp_tree = ast.parse(_read(_WGP_PATH))
         generation = next(node for node in wgp_tree.body if isinstance(node, ast.FunctionDef)
                           and node.name == "_generate_video_impl")
@@ -2035,16 +2035,16 @@ class TestMiniMaxH3TimelineStillGuide(unittest.TestCase):
                              ["first.png", "second.png", "bound-third.png"])
         launch = ast.parse(_read(_LAUNCH_PATH))
         selected = [node for node in launch.body if isinstance(node, ast.FunctionDef)
-                    and node.name in {"_h3_allocation_success_outcome", "_record_h3_benchmark_observation"}]
-        namespace = {"_h3_observed_offload_profile": lambda value: value}
+                    and node.name == "_h3_allocation_success_outcome"]
+        namespace = {}
         exec(compile(ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[])),
                      str(_LAUNCH_PATH), "exec"), namespace)
         params = {"custom_settings": self._triple_settings(), "num_inference_steps": 20,
                   "repeat_generation": 1, "batch_size": 1}
-        self.assertEqual(namespace["_h3_allocation_success_outcome"](params), "probe_success")
+        # Guide count is a separate allocation-scenario key (covered by the
+        # native offload tests); a real 20-step success votes for that shape.
+        self.assertEqual(namespace["_h3_allocation_success_outcome"](params), "production_success")
         self.assertEqual(namespace["_h3_allocation_success_outcome"]({"num_inference_steps": 20}), "production_success")
-        self.assertIsNone(namespace["_record_h3_benchmark_observation"](
-            params, wall_time_seconds=1, output_files=["out.mp4"], out_dir="unused", observed_profile=1))
 
     def test_second_still_requires_distinct_interior_index_and_one_frame_shape(self):
         for index in (True, 1.5, 0, 123, 47):

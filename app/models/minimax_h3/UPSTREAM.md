@@ -28,6 +28,19 @@ Those model weights are downloaded at runtime and are not distributed in the
 Maestro repository. They remain governed by their respective model terms and
 any authorization or waiver required for the user's location.
 
+The private arbitrary-frame video/audio Guide executor derives its geometry
+from ComfyUI's `MiniMaxH3AddGuide`, `PackedLayout`, and condition-row preparation
+at commit `e01fb4c56b7a88149d469b99cbbfe3223d715054`. Visual intervals use
+the existing advancing latent clock, while audio starts at the fractional
+pixel-frame origin and crops only its length. Each visual condition restarts
+the same seeded CPU noise stream; audio conditions remain clean. Overlapping
+guides stay separate ordered conditions. Guide rows are fixed and all target
+rows continue denoising; this does not guarantee exact source reproduction.
+The executor accepts a decoded, source-bound private handoff only, behind
+`MAESTRO_H3_TIMELINE_GUIDES_EXPERIMENTAL=1`. The public Gallery flow still
+supports stills only; immutable video/audio transport, admission, native
+device validation, and visual/listening acceptance remain unfinished.
+
 The Ref2VA profile is opt-in and uses the ordinary Hugging Face download path
 only after the user selects it. Maestro does not prefetch the checkpoint or
 attempt to bypass repository access controls, license acceptance, or regional
