@@ -128,6 +128,7 @@ const models = [
   {
     model_type: 'ltx2_22B_distilled_1_1',
     name: 'LTX-2.3 Distilled',
+    retake_engines: ['native', 'legacy'],
     family: 'ltx2',
     architecture: 'ltx2',
     is_i2v: true,
@@ -283,6 +284,8 @@ test('v9 visibility discovers LTX-2.5 once without changing the current video mo
   }, async ({ localStorage, useStore, visibilityWrites }) => {
     await useStore.getState().loadModels()
     await settleAsyncWork()
+    assert.deepEqual(useStore.getState().models.find(model => model.model_type === 'ltx2_22B_distilled_1_1').retake_engines, ['native', 'legacy'])
+    assert.deepEqual(useStore.getState().models.find(model => model.model_type === 'ltx2_25').retake_engines, [], 'missing capability stays unavailable rather than inferred from a model name')
     assert.equal(useStore.getState().enabledModels.has('ltx2_25'), true)
     assert.equal(useStore.getState().params.model_type, 'ltx2_22B_distilled_1_1')
     assert.equal(useStore.getState().selectedModelPerMode.video, 'ltx2_22B_distilled_1_1')

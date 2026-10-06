@@ -7915,6 +7915,7 @@ export const useStore = create<AppState>((set, get) => ({
         lora_compatibility_note: m.lora_compatibility_note,
         family: m.family,
         architecture: m.architecture,
+        retake_engines: m.retake_engines ?? [],
         is_i2v: m.is_i2v,
         is_t2v: m.is_t2v,
         guidance_max_phases: m.guidance_max_phases ?? 1,
