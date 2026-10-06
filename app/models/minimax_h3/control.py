@@ -20,6 +20,71 @@ from torch.nn import functional as F
 from .transformer import MiniMaxH3AdaLNProjection, MiniMaxH3Block
 
 
+ORIGINAL_CONTROL_SHA256 = "919a48acb525dc8fc70287fcd94ec1f5e5e289a77f1df14d01099c6ce204eb02"
+ORIGINAL_CONTROL_BYTES = 6_806_843_904
+
+
+def load_original_control_branch(filename, *, interrupted: Callable[[], bool] | None = None):
+    """Load an already acquired original checkpoint through native MMGP.
+
+    Acquisition, model terms, GPU authority, base compatibility and residency
+    remain the caller's responsibility. No URL resolution or download occurs.
+    Identity capture and unchanged-file verification bracket the loader; the
+    complete native adapter rejects missing, extra and incompatible tensors.
+    """
+    import os
+    from pathlib import Path
+    from accelerate import init_empty_weights
+    from mmgp import offload
+    from services.h3_runtime_binding import _hash_file
+
+    def check_cancelled():
+        if interrupted is not None and interrupted():
+            raise InterruptedError("H3 Control checkpoint loading was cancelled")
+
+    check_cancelled()
+    path = Path(filename).resolve(strict=True)
+    if (path.suffix != ".safetensors" or "-of-" in path.name
+            or path.stat().st_size != ORIGINAL_CONTROL_BYTES):
+        raise ValueError("H3 Control requires the pinned original safetensors checkpoint")
+
+    def reject_external_map():
+        # MMGP otherwise discovers this unsealed input beside the checkpoint.
+        if os.path.lexists(str(path.with_suffix("")) + "_map.json"):
+            raise ValueError("Original H3 Control does not accept an adjacent quantization map")
+
+    reject_external_map()
+    evidence = _hash_file(filename, interrupted)
+    if evidence.sha256 != ORIGINAL_CONTROL_SHA256:
+        raise ValueError("H3 Control checkpoint does not match the pinned original bytes")
+    check_cancelled()
+    with init_empty_weights(include_buffers=True):
+        branch = MiniMaxH3ControlBranch(dtype=torch.bfloat16)
+
+    def preprocess(state_dict, quantization_map, tied_weights_map):
+        check_cancelled()
+        reject_external_map()
+        if quantization_map is not None or tied_weights_map is not None:
+            raise ValueError("Original H3 Control does not accept quantization or tied-weight maps")
+        return branch.adapt_original_state_dict(state_dict)
+
+    def before_assignment(_model):
+        check_cancelled()
+        reject_external_map()
+
+    offload.load_model_data(
+        branch, evidence.resolved, writable_tensors=False,
+        preprocess_sd=preprocess, default_dtype=torch.bfloat16,
+        pre_load_callback=before_assignment,
+    )
+    check_cancelled()
+    reject_external_map()
+    evidence.verify()
+    branch._model_dtype = torch.bfloat16
+    branch.h3_control_checkpoint_sha256 = evidence.sha256
+    return branch.eval().requires_grad_(False)
+
+
 class _OriginalControlAdaLN(MiniMaxH3AdaLNProjection):
     """Keep the original branch's activate-FP32, project-BF16 arithmetic."""
 

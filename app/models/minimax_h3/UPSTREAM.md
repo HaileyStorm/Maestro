@@ -51,6 +51,20 @@ semantic references, as the pinned upstream Control pipeline is trained for
 the text+control layout. CPU preparation checks do not establish VAE residency,
 checkpoint availability, or native execution acceptance.
 
+`load_original_control_branch` accepts only an already acquired local
+safetensors file with the original 6,806,843,904-byte size and SHA-256
+`919a48acb525dc8fc70287fcd94ec1f5e5e289a77f1df14d01099c6ce204eb02`.
+It captures the resolved file identity before loading and verifies it after
+native MMGP loading, uses a meta constructor, and preserves the FP32 input
+projection with BF16 branch weights. Cancellation or changed files return no
+branch. This loader does not acquire assets, accept model terms, own GPU
+authority, establish base compatibility, or install residency hooks. Small CPU
+fixtures exercise the real MMGP loader; the full checkpoint and managed GPU
+execution still require separate qualification.
+MMGP shard-style filenames and adjacent quantization-map discovery are
+rejected; preprocessing accepts no quantization or tied-weight maps. This
+keeps native loading confined to the captured original checkpoint.
+
 The default runtime stack is pinned to:
 
 - `MiniMaxAI/MiniMax-H3` commit `5d9b308a59ab12e67147f191e184baf704185bd1`

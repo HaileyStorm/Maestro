@@ -7,7 +7,9 @@ plausible but wrong key-only checkpoint conversion and packed-buffer aliasing.
 
 from pathlib import Path
 import copy
+import hashlib
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -22,6 +24,7 @@ if str(APP) not in sys.path:
     sys.path.insert(0, str(APP))
 
 from models.minimax_h3.control import MiniMaxH3ControlBranch, add_control_hint, encode_control_rows
+from models.minimax_h3 import control as control_module
 from models.minimax_h3.transformer import MiniMaxH3Transformer
 
 
@@ -299,6 +302,87 @@ class OriginalH3ControlTests(unittest.TestCase):
             for strength in (True, float("nan"), float("inf"), -0.1, 1.1):
                 with self.assertRaises(ValueError):
                     add_control_hint(hidden, hints, 0, strength=strength)
+
+
+class OriginalH3ControlLoaderTests(unittest.TestCase):
+    def test_native_mmgp_streams_complete_donor_and_preserves_projection_dtype(self):
+        from safetensors.torch import save_file
+
+        weights = donor_weights(torch.bfloat16)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "original.safetensors"
+            save_file(weights, path)
+            raw = path.read_bytes()
+            with patch.object(control_module, "ORIGINAL_CONTROL_BYTES", len(raw)), \
+                 patch.object(control_module, "ORIGINAL_CONTROL_SHA256", hashlib.sha256(raw).hexdigest()), \
+                 patch.object(control_module, "MiniMaxH3ControlBranch", side_effect=lambda **kw: branch(kw["dtype"])):
+                loaded = control_module.load_original_control_branch(path)
+            self.assertFalse(loaded.training)
+            self.assertTrue(all(not p.requires_grad and p.device.type == "cpu" for p in loaded.parameters()))
+            self.assertEqual(loaded.control_proj_in.weight.dtype, torch.float32)
+            self.assertEqual(loaded.control_blocks[0].attn.qkv_proj.weight.dtype, torch.bfloat16)
+            expected = original_reference(weights, inputs(torch.bfloat16))
+            actual = loaded(*inputs(torch.bfloat16))
+            for place in expected:
+                torch.testing.assert_close(actual[place], expected[place], rtol=0, atol=0)
+
+    def test_unpinned_or_unsafe_files_fail_before_native_loading(self):
+        from mmgp import offload
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "wrong.safetensors"
+            path.write_bytes(b"different checkpoint")
+            with patch.object(offload, "load_model_data") as loader:
+                with self.assertRaises(ValueError):
+                    control_module.load_original_control_branch(path)
+                with patch.object(control_module, "ORIGINAL_CONTROL_BYTES", path.stat().st_size):
+                    with self.assertRaisesRegex(ValueError, "original bytes"):
+                        control_module.load_original_control_branch(path)
+                unsafe = path.with_suffix(".pt")
+                unsafe.write_bytes(path.read_bytes())
+                with patch.object(control_module, "ORIGINAL_CONTROL_BYTES", unsafe.stat().st_size):
+                    with self.assertRaises(ValueError):
+                        control_module.load_original_control_branch(unsafe)
+                    sharded = path.with_name("control-00001-of-00002.safetensors")
+                    sharded.write_bytes(path.read_bytes())
+                    with self.assertRaises(ValueError):
+                        control_module.load_original_control_branch(sharded)
+                    adjacent = path.with_name("wrong_map.json")
+                    adjacent.write_text("{}")
+                    with self.assertRaisesRegex(ValueError, "adjacent"):
+                        control_module.load_original_control_branch(path)
+                with self.assertRaises(InterruptedError):
+                    control_module.load_original_control_branch(path, interrupted=lambda: True)
+                loader.assert_not_called()
+
+    def test_postload_replacement_or_cancellation_never_returns_a_branch(self):
+        from mmgp import offload
+        from safetensors.torch import save_file
+
+        real_loader = offload.load_model_data
+        for action in ("replace", "cancel", "late_map"):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "original.safetensors"
+                save_file(donor_weights(torch.bfloat16), path)
+                raw = path.read_bytes()
+                cancelled = []
+
+                def load_then_change(*args, **kwargs):
+                    if action == "late_map":
+                        path.with_name("original_map.json").write_text("{}")
+                    real_loader(*args, **kwargs)
+                    if action == "replace":
+                        path.rename(path.with_suffix(".retained"))
+                        path.write_bytes(raw)  # Equal bytes, distinct loaded-file binding.
+                    elif action == "cancel":
+                        cancelled.append(True)
+
+                with patch.object(control_module, "ORIGINAL_CONTROL_BYTES", len(raw)), \
+                     patch.object(control_module, "ORIGINAL_CONTROL_SHA256", hashlib.sha256(raw).hexdigest()), \
+                     patch.object(control_module, "MiniMaxH3ControlBranch", side_effect=lambda **kw: branch(kw["dtype"])), \
+                     patch.object(offload, "load_model_data", side_effect=load_then_change):
+                    with self.assertRaises(InterruptedError if action == "cancel" else ValueError):
+                        control_module.load_original_control_branch(path, interrupted=lambda: bool(cancelled))
 
 
 class OriginalH3ControlConditioningTests(unittest.TestCase):
