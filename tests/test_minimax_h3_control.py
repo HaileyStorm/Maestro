@@ -21,7 +21,7 @@ APP = Path(__file__).resolve().parents[1] / "app"
 if str(APP) not in sys.path:
     sys.path.insert(0, str(APP))
 
-from models.minimax_h3.control import MiniMaxH3ControlBranch, add_control_hint
+from models.minimax_h3.control import MiniMaxH3ControlBranch, add_control_hint, encode_control_rows
 from models.minimax_h3.transformer import MiniMaxH3Transformer
 
 
@@ -299,6 +299,137 @@ class OriginalH3ControlTests(unittest.TestCase):
             for strength in (True, float("nan"), float("inf"), -0.1, 1.1):
                 with self.assertRaises(ValueError):
                     add_control_hint(hidden, hints, 0, strength=strength)
+
+
+class OriginalH3ControlConditioningTests(unittest.TestCase):
+    @staticmethod
+    def request(video, encode_mode, **overrides):
+        return encode_control_rows(
+            video, encode_mode=encode_mode, latents_mean=[0.25] * 24,
+            latents_std=[2.0] * 24, height=32, width=32, num_frames=22,
+            **overrides,
+        )
+
+    @staticmethod
+    def raw_latents(offset=0):
+        return torch.arange(24 * 7 * 2 * 2).view(1, 24, 7, 2, 2).float() / 100 + offset
+
+    @staticmethod
+    def independently_pack(latents):
+        # Here each 2x2 latent frame is one patch. Columns are channel-major,
+        # then pixel-row/pixel-column; rows advance on the native latent clock.
+        return torch.stack([latents[0, :, frame].flatten() for frame in range(7)])
+
+    def test_frame_fit_imagenet_and_unrounded_latent_normalization(self):
+        video = torch.linspace(0.1, 0.9, 3 * 3 * 2 * 2).reshape(1, 3, 3, 2, 2)
+        before = video.clone()
+        observed = []
+        raw = self.raw_latents()
+
+        def encode_mode(pixels):
+            observed.append(pixels.clone())
+            return raw
+
+        rows = self.request(video, encode_mode)
+        self.assertEqual(rows.shape, (1, 7, 196))
+        self.assertEqual(len(observed), 1)
+        pixels = observed[0]
+        self.assertEqual(pixels.shape, (1, 3, 22, 32, 32))
+        mean, std = torch.tensor([0.485, 0.456, 0.406]), torch.tensor([0.229, 0.224, 0.225])
+        torch.testing.assert_close(pixels[0, :, 0, 0, 0], (video[0, :, 0, 0, 0] - mean) / std)
+        torch.testing.assert_close(pixels[0, :, 0, -1, -1], (video[0, :, 0, -1, -1] - mean) / std)
+        torch.testing.assert_close(pixels[:, :, 21], pixels[:, :, 2], rtol=0, atol=0)
+        expected = self.independently_pack((raw - 0.25) / 2)
+        torch.testing.assert_close(rows[0, :, :96], expected, rtol=0, atol=0)
+        self.assertEqual(torch.count_nonzero(rows[0, :, 96:]).item(), 0)
+        torch.testing.assert_close(video, before, rtol=0, atol=0)
+
+    def test_inpaint_training_order_visibility_clock_and_masked_pixel_encoding(self):
+        control = torch.full((1, 3, 30, 32, 32), 0.4)
+        source = torch.full((1, 3, 30, 32, 32), 0.8)
+        mask = torch.zeros(1, 1, 22, 2, 2)
+        # A boundary at exactly 0.5 stays visible; 0.6 is regenerated.
+        mask[:, :, 0::2, :, :1] = 0.5
+        mask[:, :, 1::2, :, :1] = 0.6
+        mask[:, :, :, :, 1:] = 1
+        snapshots = [value.clone() for value in (control, source, mask)]
+        observed = []
+
+        def encode_mode(pixels):
+            observed.append(pixels.clone())
+            return self.raw_latents(offset=0 if len(observed) == 1 else 10)
+
+        rows = self.request(control, encode_mode, mask_video=mask, inpaint_video=source)
+        self.assertEqual(len(observed), 2)
+        self.assertEqual(observed[0].shape[2], 22)
+        mean = torch.tensor([0.485, 0.456, 0.406])
+        std = torch.tensor([0.229, 0.224, 0.225])
+        torch.testing.assert_close(observed[1][0, :, 0, 0, 0], (0.8 - mean) / std)
+        torch.testing.assert_close(observed[1][0, :, 1, 0, 0], -mean / std)
+        torch.testing.assert_close(observed[1][0, :, 0, 0, -1], -mean / std)
+        # Bilinear mask fitting creates soft boundaries. Re-hardening must
+        # remove those before masking source pixels, without a second VAE pass.
+        for channel in range(3):
+            normalized = observed[1][0, channel]
+            black = -mean[channel] / std[channel]
+            kept = (0.8 - mean[channel]) / std[channel]
+            self.assertTrue((torch.isclose(normalized, black) | torch.isclose(normalized, kept)).all())
+        torch.testing.assert_close(rows[0, :, :96], self.independently_pack((self.raw_latents() - 0.25) / 2))
+        torch.testing.assert_close(rows[0, :, 100:], self.independently_pack((self.raw_latents(10) - 0.25) / 2))
+        # Independently sample the original trilinear time coordinates. Spatial
+        # sample centers lie inside constant left/right halves of this mask.
+        expected_visibility = []
+        for frame in range(7):
+            coordinate = (frame + 0.5) * 22 / 7 - 0.5
+            low = int(coordinate)
+            fraction = coordinate - low
+            left = (1 - low % 2) * (1 - fraction) + (1 - (low + 1) % 2) * fraction
+            expected_visibility.append([left, 0, left, 0])
+        torch.testing.assert_close(rows[0, :, 96:100], torch.tensor(expected_visibility), rtol=0, atol=2e-6)
+        for original, before in zip((control, source, mask), snapshots):
+            torch.testing.assert_close(original, before, rtol=0, atol=0)
+
+    def test_absent_inpaint_source_encodes_black_pixels_instead_of_zero_latents(self):
+        seen = []
+
+        def encode_mode(pixels):
+            seen.append(pixels)
+            return self.raw_latents(10 if len(seen) == 2 else 0)
+
+        rows = self.request(torch.zeros(1, 3, 22, 32, 32), encode_mode,
+                            mask_video=torch.zeros(1, 1, 22, 32, 32))
+        self.assertEqual(len(seen), 2)
+        self.assertTrue((seen[1] < 0).all())
+        self.assertTrue((rows[0, :, 96:100] == 1).all())
+        torch.testing.assert_close(rows[0, :, 100:], self.independently_pack((self.raw_latents(10) - 0.25) / 2))
+
+    def test_bad_input_or_mode_geometry_never_gets_padded_or_cropped_into_validity(self):
+        video = torch.zeros(1, 3, 22, 32, 32)
+        for malformed in (video.to(torch.uint8), video[:, :, :0], video + float("nan"), video + 1.1):
+            with self.subTest(shape=malformed.shape):
+                calls = []
+                with self.assertRaises(ValueError):
+                    self.request(malformed, lambda pixels: calls.append(pixels))
+                self.assertEqual(calls, [])
+        for mode in (torch.zeros(1, 24, 8, 2, 2), torch.zeros(1, 24, 7, 3, 2),
+                     self.raw_latents() * float("nan")):
+            with self.assertRaises(ValueError):
+                self.request(video, lambda _pixels: mode)
+        with self.assertRaisesRegex(ValueError, "requires a mask"):
+            self.request(video, lambda _pixels: self.raw_latents(), inpaint_video=video)
+
+    def test_cancellation_discards_prepared_rows_before_or_after_owned_encode(self):
+        for stop_after_encode in (False, True):
+            observed = []
+
+            def encode_mode(pixels):
+                observed.append(pixels)
+                return self.raw_latents()
+
+            rows = self.request(torch.zeros(1, 3, 22, 32, 32), encode_mode,
+                                interrupted=lambda: bool(observed) if stop_after_encode else True)
+            self.assertIsNone(rows)
+            self.assertEqual(len(observed), 1 if stop_after_encode else 0)
 
 
 if __name__ == "__main__":

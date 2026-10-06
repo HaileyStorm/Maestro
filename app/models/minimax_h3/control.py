@@ -191,3 +191,108 @@ def add_control_hint(hidden_states, hints, block_index, *, strength):
     if hint.shape != hidden_states.shape:
         raise ValueError("H3 Control hint does not match the base packed sequence")
     return hidden_states + hint.to(device=hidden_states.device, dtype=hidden_states.dtype) * strength
+
+
+@torch.inference_mode()
+def encode_control_rows(
+    control_video, *, encode_mode: Callable[[torch.Tensor], torch.Tensor],
+    latents_mean, latents_std, height, width, num_frames,
+    mask_video=None, inpaint_video=None, interrupted: Callable[[], bool] | None = None,
+):
+    """Prepare original Union's 196-column target rows from unit-range pixels.
+
+    The caller owns VAE residency and the live GPU lease. ``encode_mode`` must
+    encode the normalized RGB input and return the raw posterior *mode* using
+    that owned VAE; sampled keyframe/reference encoders are incompatible.
+    No asset acquisition, model loading, cropping of latents, or RNG occurs.
+    This text+control preparation covers target video rows only. Keyframes,
+    timeline guides and semantic references require separate qualification.
+    """
+    from .packing import (
+        MINIMAX_H3_PIXEL_MEAN, MINIMAX_H3_PIXEL_STD,
+        patchify_video_latents, video_latent_num_frames,
+    )
+
+    if type(num_frames) is not int or not 5 <= num_frames <= 345 or num_frames % 17 != 5:
+        raise ValueError("Original H3 Control frames must follow 17*n+5, from 5 through 345")
+    if any(type(size) is not int or size < 32 or size % 32 for size in (height, width)):
+        raise ValueError("Original H3 Control canvas must have positive multiples of 32")
+    if inpaint_video is not None and mask_video is None:
+        raise ValueError("H3 Control inpaint source requires a mask")
+    if not callable(encode_mode):
+        raise ValueError("H3 Control requires an owned deterministic mode encoder")
+
+    def validate_pixels(pixels, channels, name):
+        if not isinstance(pixels, torch.Tensor) or pixels.ndim != 5:
+            raise ValueError(f"H3 Control {name} must be a BCTHW tensor")
+        if pixels.shape[:2] != (1, channels) or any(size == 0 for size in pixels.shape[2:]):
+            raise ValueError(f"H3 Control {name} has invalid batch/channel/video geometry")
+        if not pixels.is_floating_point() or not torch.isfinite(pixels).all():
+            raise ValueError(f"H3 Control {name} must contain finite unit-range float pixels")
+        if pixels.min() < 0 or pixels.max() > 1:
+            raise ValueError(f"H3 Control {name} pixels must be from 0 through 1")
+
+    validate_pixels(control_video, 3, "video")
+    if mask_video is not None:
+        validate_pixels(mask_video, 1, "mask")
+    if inpaint_video is not None:
+        validate_pixels(inpaint_video, 3, "inpaint source")
+    device = control_video.device
+    mean = torch.as_tensor(latents_mean, device=device, dtype=torch.float32)
+    std = torch.as_tensor(latents_std, device=device, dtype=torch.float32)
+    if mean.shape != (24,) or std.shape != (24,) or not torch.isfinite(mean).all():
+        raise ValueError("H3 Control requires the VAE's finite 24-channel latent statistics")
+    if not torch.isfinite(std).all() or not (std > 0).all():
+        raise ValueError("H3 Control latent standard deviations must be finite and positive")
+    mean, std = mean.view(1, 24, 1, 1, 1), std.view(1, 24, 1, 1, 1)
+    pixel_mean = torch.tensor(MINIMAX_H3_PIXEL_MEAN, device=device).view(1, 3, 1, 1, 1)
+    pixel_std = torch.tensor(MINIMAX_H3_PIXEL_STD, device=device).view(1, 3, 1, 1, 1)
+    expected_grid = (video_latent_num_frames(num_frames), height // 16, width // 16)
+
+    def cancelled():
+        return interrupted is not None and interrupted()
+
+    def fit(pixels):
+        pixels = pixels.to(device=device, dtype=torch.float32)
+        if pixels.shape[2] < num_frames:
+            tail = pixels[:, :, -1:].expand(-1, -1, num_frames - pixels.shape[2], -1, -1)
+            pixels = torch.cat((pixels, tail), dim=2)
+        else:
+            pixels = pixels[:, :, :num_frames]
+        if pixels.shape[-2:] != (height, width):
+            frames = F.interpolate(pixels[0].permute(1, 0, 2, 3),
+                                   size=(height, width), mode="bilinear", align_corners=False)
+            pixels = frames.permute(1, 0, 2, 3)[None]
+        return pixels
+
+    def encode(pixels):
+        latent = encode_mode((pixels - pixel_mean) / pixel_std)
+        if not isinstance(latent, torch.Tensor) or latent.shape != (1, 24, *expected_grid):
+            raise ValueError("H3 Control VAE mode does not match the target latent clock/canvas")
+        if not latent.is_floating_point() or not torch.isfinite(latent).all():
+            raise ValueError("H3 Control VAE mode must contain finite float latents")
+        return (latent.to(device=device, dtype=torch.float32) - mean) / std
+
+    if cancelled():
+        return None
+    control_latents = encode(fit(control_video))
+    if cancelled():
+        return None
+    control_rows = patchify_video_latents(control_latents, (1, 2, 2))
+    if mask_video is None:
+        # Training's pure-generation layout has 25 zero latent channels.
+        return F.pad(control_rows, (0, 100)).unsqueeze(0)
+    # Harden both before and after bilinear fitting, as in the training path.
+    mask = (fit((mask_video > 0.5).float()) > 0.5).float()
+    visible = 1 - mask
+    masked_pixels = (fit(inpaint_video) * visible if inpaint_video is not None
+                     else torch.zeros_like(visible.expand(-1, 3, -1, -1, -1)))
+    if cancelled():
+        return None
+    masked_latents = encode(masked_pixels)
+    if cancelled():
+        return None
+    visibility = F.interpolate(visible, size=expected_grid, mode="trilinear", align_corners=False)
+    visibility_rows = patchify_video_latents(visibility, (1, 2, 2))
+    masked_rows = patchify_video_latents(masked_latents, (1, 2, 2))
+    return torch.cat((control_rows, visibility_rows, masked_rows), dim=-1).unsqueeze(0)

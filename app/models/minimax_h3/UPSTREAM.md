@@ -34,6 +34,23 @@ different architecture and must not be loaded through this original adapter.
 Model weights remain separately governed by their model terms and the
 existing H3 access/authorization path.
 
+`encode_control_rows` prepares the original text+control target layout through
+an explicitly supplied deterministic VAE-mode callback whose caller owns
+residency and GPU authority. It fits unit-range RGB pixels by repeating the
+last frame or taking the requested prefix and bilinearly resizing the canvas,
+then applies ImageNet normalization. Posterior modes are normalized in FP32
+with the owned VAE's 24-channel statistics; sampled/FP16-rounded keyframe
+conditioning is not substituted. Pure generation pads 100 zero columns. For
+inpaint, masks are hardened before and after fitting, `1-mask` is trilinearly
+mapped onto the latent grid, and the 196 columns retain the training order:
+control latents, visibility map, masked-video latents. Missing inpaint source
+means an encoded black image, never fabricated zero latents. The returned
+rows must match the exact target clock and canvas; mismatched modes fail.
+Initial pipeline admission must exclude keyframes, timeline guides, and
+semantic references, as the pinned upstream Control pipeline is trained for
+the text+control layout. CPU preparation checks do not establish VAE residency,
+checkpoint availability, or native execution acceptance.
+
 The default runtime stack is pinned to:
 
 - `MiniMaxAI/MiniMax-H3` commit `5d9b308a59ab12e67147f191e184baf704185bd1`
