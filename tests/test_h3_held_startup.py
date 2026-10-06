@@ -100,6 +100,7 @@ class H3HeldStartupTests(unittest.TestCase):
             "_h3_job_model_types",
             "_require_h3_legal_execution",
             "_h3_cow_manual_source_supported",
+            "_h3_ordinary_restart_allowed",
             "_queue_recovery_materialize_job",
         ):
             _load_launch_function(self.source, name, self.namespace)
@@ -324,6 +325,54 @@ class H3HeldStartupTests(unittest.TestCase):
                         self.projects,
                     )
         self.assertEqual(self.calls, [])
+
+    def test_ordinary_interruption_remains_held_for_explicit_whole_clip_retry(self):
+        self.params = {"model_type": "minimax_h3", "video_length": 124,
+                       "num_inference_steps": 28, "repeat_generation": 1}
+        job, may_start = self.recover(
+            kind="studio_generation", requested_outputs=1, recovery_attempt=0,
+            phase="denoise", step=21, started_at=1,
+            _recovery_reason_code="h3_generation_recovery_authorization_required",
+            recovery_cursor={"completed_units": [], "ordinary_repeat_offset": 0},
+        )
+        for _restart in range(3):
+            self.assertFalse(may_start)
+            self.assertTrue(job["queue_held"])
+            self.assertEqual(job["_recovery_reason_code"], "h3_ordinary_restart_required")
+            self.assertEqual(job["recovery_attempt"], 0)
+            self.assertEqual(job["params"], self.params)
+            saved = serialize_job(job, owner_digest=self.snapshot["owner_principal"],
+                                  project_digest=self.snapshot["project_instance"], request_manifest={})
+            job, may_start = self.namespace["_queue_recovery_materialize_job"](saved, self.projects)
+
+    def test_ordinary_negative_evidence_cannot_be_erased_by_restart(self):
+        self.params = {"model_type": "minimax_h3", "repeat_generation": 1}
+        self.namespace["_queue_recovery_reconcile_cursor"] = (
+            lambda job, *_args, **_kwargs: job.update(
+                recovery_cursor={"completed_units": [], "ordinary_repeat_offset": 0}))
+        for patch in (
+            {"failure_details": {"code": "generation_failed", "is_oom": True}},
+            {"oom_info": {}},
+            {"resource_retry_reason": "generation_oom", "resource_retry_attempt": 1,
+             "resource_retry_limit": 1, "resource_retry_phase": "generation"},
+            {"recovery_attempt": False},
+            {"recovery_cursor": {"completed_units": [{"kind": "ordinary_repeat"}]}},
+            {"recovery_cursor": {"completed_units": [], "ordinary_repeat_offset": False}},
+            {"recovery_cursor": "malformed"},
+        ):
+            with self.subTest(patch=patch):
+                changes = dict(kind="studio_generation", requested_outputs=1,
+                               recovery_attempt=0, phase="denoise", step=21,
+                               recovery_cursor={"completed_units": [], "ordinary_repeat_offset": 0})
+                changes.update(patch)
+                job, may_start = self.recover(**changes)
+                for _restart in range(3):
+                    self.assertFalse(may_start)
+                    self.assertTrue(job["queue_held"])
+                    self.assertEqual(job["_recovery_reason_code"], "recovery_unavailable")
+                    saved = serialize_job(job, owner_digest=self.snapshot["owner_principal"],
+                                          project_digest=self.snapshot["project_instance"], request_manifest={})
+                    job, may_start = self.namespace["_queue_recovery_materialize_job"](saved, self.projects)
 
     def test_project_input_and_finality_holds_take_precedence(self):
         for mutation in ("project", "input", "finality"):

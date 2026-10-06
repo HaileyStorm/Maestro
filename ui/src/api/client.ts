@@ -177,6 +177,7 @@ export type QueueRecoveryReason =
   | 'preparation_must_resubmit'
   | 'worker_start_failed'
   | 'owner_reauthentication_required'
+  | 'h3_ordinary_restart_required'
 
 export type QueueRecoveryAction = 'resume' | 'retry' | 'recover_composition'
 

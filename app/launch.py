@@ -7925,6 +7925,19 @@ def _queue_recovery_materialize_job(
         runtime["recovery_state"] = "terminal"
         return runtime, False
 
+    # Classify from both cursors before normalization discards failed units or
+    # old failure envelopes. A negative ordinary classification stays durable.
+    ordinary_request = (
+        runtime.get("kind") == "studio_generation"
+        and isinstance(runtime_params, dict)
+        and runtime_params.get("model_type") == "minimax_h3"
+        and not runtime_params.get("_h3_longform")
+        and not runtime_params.get("_h3_cumulative_append")
+    )
+    ordinary_restart = ordinary_request and not blocked_reason and all(
+        _h3_ordinary_restart_allowed(candidate)
+        for candidate in (dict(snapshot, params=runtime_params), runtime)
+    )
     held_prefix_reason = snapshot.get("_recovery_reason_code") in {
         "generation_failed", "owner_reauthentication_required",
         "h3_generation_recovery_authorization_required",
@@ -8084,10 +8097,13 @@ def _queue_recovery_materialize_job(
             # zero; a later restart must not reinterpret that as unstarted.
             "_recovery_reason_code": (
                 "h3_legal_access_required" if untouched_hold
+                else "h3_ordinary_restart_required" if ordinary_restart
+                else "recovery_unavailable" if ordinary_request
                 else "h3_generation_recovery_authorization_required"
             ),
             "message": (
                 "MiniMax H3 needs a separate written license" if untouched_hold
+                else "Retry will restart the whole H3 clip" if ordinary_restart
                 else "Saved H3 generation needs manual recovery review"
             ),
             "error": None,
@@ -11617,6 +11633,84 @@ def _h3_native_boundary_exact_retry_allowed(job: dict) -> bool:
         return False
     prefix = _h3_incomplete_recovery_prefix(job)
     return prefix is not None and prefix > 0
+
+
+def _h3_ordinary_oom_hold(job: dict) -> bool:
+    """Keep positive allocation failure out of ordinary unchanged retries."""
+    params = job.get("params")
+    failure = job.get("failure_details")
+    return bool(
+        isinstance(params, dict) and params.get("model_type") == "minimax_h3"
+        and not params.get("_h3_longform")
+        and (job.get("oom_info") is not None
+             or job.get("resource_retry_reason") == "generation_oom"
+             or isinstance(failure, dict) and failure.get("is_oom") is True)
+    )
+
+
+def _h3_ordinary_restart_allowed(job: dict) -> bool:
+    """Recognize an evidence-free whole clip, never a resumable prefix.
+
+    Unknown interruption is allowed only for an explicit new denoising
+    attempt. This makes no claim about its cause or calibrated capacity.
+    Callers still fence ownership, admission, cancellation and dispatch.
+    """
+    params = job.get("params")
+    cursor = job.get("recovery_cursor")
+    if (
+        job.get("kind") != "studio_generation"
+        or not isinstance(params, dict)
+        or params.get("model_type") != "minimax_h3"
+        or job.get("cancel_requested")
+        or job.get("status") not in {"queued", "running", "failed"}
+        or job.get("_recovery_reason_code") not in {
+            None, "", "h3_generation_recovery_authorization_required",
+            "h3_ordinary_restart_required", "generation_failed",
+            "owner_reauthentication_required", "worker_start_failed",
+        }
+        or type(job.get("execution_attempt")) is not int
+        or job["execution_attempt"] < 1
+        or type(job.get("recovery_attempt", 0)) is not int
+        or type(job.get("requested_outputs")) is not int
+        or job["requested_outputs"] != 1
+        or any(type(params.get(key, 1)) is not int or params.get(key, 1) != 1
+               for key in ("repeat_generation", "batch_size"))
+        or not isinstance(cursor, dict)
+        or params.get("_h3_longform") is not None
+        or any(key in params for key in (
+            "image_creator_model", "image_editor_model",
+            "image_creator_loras", "image_editor_loras",
+        ))
+        or job.get("_recovery_final_adoption") is not None
+        or job.get("recovery_unit") is not None
+        or cursor.get("completed_units") != []
+        or type(cursor.get("ordinary_repeat_offset", 0)) is not int
+        or cursor.get("ordinary_repeat_offset", 0) != 0
+        or any(value for key, value in cursor.items()
+               if key not in {"completed_units", "ordinary_repeat_offset"})
+        or any(job.get(key) for key in (
+            "parent_job_id", "recovery_unit", "output_files", "artifact_files",
+            "clip_output_files", "join_output_file", "_recovery_final_adoption",
+            "h3_delivery_recovery_control", "_recovery_completed_h3_graph",
+            "_h3_delivery_publication",
+        ))
+        or any(params.get(key) for key in (
+            "_h3_longform", "_h3_cumulative_append", "_director_pipeline_id",
+            "_director_request_id", "_h3_source_prefix", "h3_source_prefix",
+            "_director_final_video_postprocess", "_director_image_role",
+            "h3_native_boundary_conditioning", "video_source",
+            "_continuation", "_ref2va_continuation", "_defer_output_publication",
+            "delivery_resolution",
+        ))
+        or job.get("oom_info") is not None
+        or job.get("resource_retry_reason") == "generation_oom"
+    ):
+        return False
+    failure = job.get("failure_details")
+    return failure is None or (
+        isinstance(failure, dict) and failure.get("is_oom") is False
+        and failure.get("code") != "h3_output_integrity_failed"
+    )
 
 
 def _replan_h3_final_segment_for_peak(
@@ -43263,6 +43357,8 @@ def _public_director_recovery_metadata(pipeline: dict) -> dict:
         "recovery_reason_text": reason_text,
         "recovery_actions": actions,
     }
+
+
 def _saved_pipeline_live_recovery_overlay(pid: str) -> dict:
     """Overlay only bounded live recovery facts on authorized saved state."""
     from services.director_pipeline import get_pipeline
@@ -75165,6 +75261,9 @@ _QUEUE_RECOVERY_REASON_TEXT = {
     "h3_generation_recovery_authorization_required": (
         "Authorize calibrated recovery for the unfinished H3 segment"
     ),
+    "h3_ordinary_restart_required": (
+        "This H3 clip was interrupted. Retry restarts the whole clip from the beginning."
+    ),
     "h3_peak_calibration_required": (
         "A matching 20-step H3 capacity calibration is required"
     ),
@@ -75304,6 +75403,8 @@ def _queue_recovery_reason_code(job: dict) -> str | None:
         return "attempt_limit_reached"
     if _queue_recovery_worker(job) is None:
         return "preparation_must_resubmit"
+    if _h3_ordinary_oom_hold(job):
+        return "recovery_unavailable"
     explicit = str(job.get("_recovery_reason_code") or "")
     if explicit in _QUEUE_RECOVERY_REASON_TEXT:
         return explicit
@@ -75355,6 +75456,7 @@ def _public_queue_recovery_metadata(job: dict) -> dict:
             "h3_generation_recovery_authorization_required",
             "h3_peak_calibration_required",
             "h3_generation_oom_replanned",
+            "h3_ordinary_restart_required",
             "model_terms_required",
             "director_role_admission_required",
             "generation_failed",
@@ -75372,6 +75474,16 @@ def _public_queue_recovery_metadata(job: dict) -> dict:
         "recovery_actionable": bool(actions),
         "recovery_actions": actions,
     }
+    if reason == "h3_ordinary_restart_required":
+        eligible = (
+            job.get("status") == "queued" and job.get("queue_held") is True
+            and _h3_ordinary_restart_allowed(job)
+        )
+        public.update(
+            recovery_actions=actions if eligible else [],
+            recovery_actionable=bool(actions) and eligible,
+            recovery_reruns_denoise=eligible,
+        )
     composition = (job.get("recovery_cursor") or {}).get("composition")
     if (job.get("kind") == "tool_editor_export" and isinstance(composition, dict)
             and reason != "worker_start_failed"
@@ -77806,6 +77918,7 @@ def _resume_recovered_job(
                 "h3_generation_recovery_authorization_required",
                 "h3_peak_calibration_required",
                 "h3_generation_oom_replanned",
+                "h3_ordinary_restart_required",
                 "h3_legal_access_required",
                 "model_terms_required",
                 "director_role_admission_required",
@@ -77852,6 +77965,14 @@ def _resume_recovered_job(
         # Successful input validation clears its diagnostic reason. Keep the
         # held action available if a later admission or host gate rejects it.
         job["_recovery_reason_code"] = reason
+        if reason == "h3_ordinary_restart_required" and not (
+            job.get("status") == "queued" and job.get("queue_held") is True
+            and _h3_ordinary_restart_allowed(job)
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="The saved H3 clip is not eligible for a whole-clip retry",
+            )
         if _queue_recovery_delivery_pending(job) is None:
             _require_job_runtime_model_admission(job)
         if (
@@ -78323,6 +78444,7 @@ def prepare_local_h3_generation_recovery(
             if reason not in {
                 "h3_generation_recovery_authorization_required",
                 "h3_peak_calibration_required",
+                "h3_ordinary_restart_required",
             }:
                 raise QueueRecoveryRuntimeError(
                     "This job is not waiting for H3 recovery preparation."
@@ -78331,6 +78453,27 @@ def prepare_local_h3_generation_recovery(
                 raise QueueRecoveryRuntimeError(
                     "Recovery project or input evidence changed."
                 )
+            job["_recovery_reason_code"] = reason
+            if reason in {
+                "h3_generation_recovery_authorization_required",
+                "h3_ordinary_restart_required",
+            } and _h3_ordinary_restart_allowed(job):
+                if job.get("status") != "queued" or job.get("queue_held") is not True:
+                    raise QueueRecoveryRuntimeError("Recovery job is not held.")
+                _require_job_runtime_model_admission(job)
+                if not _queue_recovery_checkpoint(
+                    job, status="queued", queue_held=True,
+                    recovery_state="blocked", reruns_denoise=True,
+                    _recovery_reason_code="h3_ordinary_restart_required",
+                    message="Retry will restart the whole H3 clip",
+                ):
+                    raise QueueRecoveryRuntimeError("Recovery was cancelled.")
+                return {
+                    "job_id": str(job_id), "status": "blocked",
+                    "recovery_reason": "h3_ordinary_restart_required",
+                    "manifest_sha256": str(pointer["sha256"]),
+                    "cursor_sha256": _local_h3_recovery_cursor_digest(job),
+                }
             if not _prepare_h3_peak_recovery(job):
                 return {
                     "job_id": str(job_id),
@@ -78365,6 +78508,7 @@ def start_local_h3_generation_recovery(
         if not isinstance(job, dict):
             raise QueueRecoveryRuntimeError("Recovery job is unavailable.")
         pointer = job.get("_recovery_manifest_pointer")
+        reason = _queue_recovery_reason_code(job)
         if (
             not isinstance(pointer, dict)
             or not hmac.compare_digest(
@@ -78375,8 +78519,10 @@ def start_local_h3_generation_recovery(
                 _local_h3_recovery_cursor_digest(job),
                 str(expected_cursor_sha256 or ""),
             )
-            or _queue_recovery_reason_code(job)
-                != "h3_generation_oom_replanned"
+            or reason not in {"h3_generation_oom_replanned", "h3_ordinary_restart_required"}
+            or job.get("status") != "queued"
+            or job.get("queue_held") is not True
+            or job.get("cancel_requested")
         ):
             raise QueueRecoveryRuntimeError(
                 "Prepared recovery evidence changed before start."
@@ -78385,8 +78531,14 @@ def start_local_h3_generation_recovery(
             raise QueueRecoveryRuntimeError(
                 "Recovery project or input evidence changed."
             )
+        job["_recovery_reason_code"] = reason
+        if reason == "h3_ordinary_restart_required" and not _h3_ordinary_restart_allowed(job):
+            raise QueueRecoveryRuntimeError("Whole-clip recovery evidence changed.")
         if _queue_recovery_delivery_pending(job) is None:
             _require_job_runtime_model_admission(job)
+        worker = _queue_recovery_worker(job)
+        if worker is None:
+            raise QueueRecoveryRuntimeError("Recovery worker is unavailable.")
         attempt, may_retry = next_recovery_attempt(job)
         if not may_retry:
             raise QueueRecoveryRuntimeError("Recovery attempt limit reached.")
@@ -78397,13 +78549,12 @@ def start_local_h3_generation_recovery(
             recovery_attempt=attempt,
             recovery_state="retrying",
             reruns_denoise=True,
-            message="Queued for calibrated H3 recovery",
+            message=("Queued to restart the whole H3 clip"
+                     if reason == "h3_ordinary_restart_required"
+                     else "Queued for calibrated H3 recovery"),
             _recovery_reason_code="",
         ) or not update_queue_job(job, held=False):
             raise QueueRecoveryRuntimeError("Recovery was cancelled.")
-        worker = _queue_recovery_worker(job)
-        if worker is None:
-            raise QueueRecoveryRuntimeError("Recovery worker is unavailable.")
         try:
             threading.Thread(
                 target=worker,
@@ -78533,6 +78684,7 @@ def _local_h3_recovery_control_status(
         "h3_generation_recovery_authorization_required",
         "h3_peak_calibration_required",
         "h3_generation_oom_replanned",
+        "h3_ordinary_restart_required",
     }:
         reason = ""
     return {

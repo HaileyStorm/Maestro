@@ -120,6 +120,12 @@ def _isolated_functions(tree: ast.Module, names: tuple[str, ...], namespace: dic
     if {"_queue_recovery_materialize_job", "_resume_recovered_job"} & set(names):
         dependencies.add("_h3_native_boundary_exact_retry_allowed")
         dependencies.add("_h3_cow_manual_source_supported")
+    if {"_queue_recovery_materialize_job", "_resume_recovered_job",
+        "_public_queue_recovery_metadata", "prepare_local_h3_generation_recovery",
+        "start_local_h3_generation_recovery"} & set(names):
+        dependencies.add("_h3_ordinary_restart_allowed")
+    if "_queue_recovery_reason_code" in names:
+        dependencies.add("_h3_ordinary_oom_hold")
     if {"get_status", "list_jobs"} & set(names):
         dependencies.update({"_public_h3_cumulative_plan", "_public_job_h3_cumulative_plan"})
         namespace.setdefault("Mapping", dict)
@@ -6646,6 +6652,146 @@ class QueueLaunchWiringTests(unittest.TestCase):
         restored, auto_resume = materialize(base, projects)
         self.assertTrue(auto_resume)
         self.assertEqual(restored["recovery_attempt"], 3)
+
+    def test_ordinary_whole_clip_retry_rejects_partial_or_specialized_work(self):
+        namespace = _isolated_functions(self.launch, ("_h3_ordinary_restart_allowed",), {})
+        allowed = namespace["_h3_ordinary_restart_allowed"]
+        base = dict(kind="studio_generation", status="queued", execution_attempt=1,
+                    requested_outputs=1, recovery_attempt=0,
+                    params={"model_type": "minimax_h3", "repeat_generation": 1},
+                    recovery_cursor={"completed_units": [], "ordinary_repeat_offset": 0})
+        self.assertTrue(allowed(base))
+        for patch in (
+            {"cancel_requested": True}, {"status": "completed"}, {"status": "cancelled"},
+            {"kind": "sample_campaign_generation"}, {"parent_job_id": "parent"},
+            {"requested_outputs": 2}, {"execution_attempt": False},
+            {"recovery_attempt": "0"}, {"recovery_unit": {"kind": "h3_delivery"}},
+            {"output_files": ["final.mp4"]}, {"artifact_files": ["native.mp4"]},
+            {"oom_info": {}}, {"failure_details": {"is_oom": True}},
+            {"recovery_unit": {}}, {"_recovery_final_adoption": {}},
+            {"_h3_delivery_publication": {"state": "pending"}},
+            {"resource_retry_reason": "generation_oom"},
+            {"_recovery_reason_code": "recovery_unavailable"},
+            {"_recovery_reason_code": "h3_peak_calibration_required"},
+            {"_recovery_final_adoption": {"state": "missing"}},
+            {"recovery_cursor": {"completed_units": [{"kind": "ordinary_repeat"}]}},
+            {"recovery_cursor": {"completed_units": [], "ordinary_repeat_offset": False}},
+        ):
+            with self.subTest(patch=patch):
+                self.assertFalse(allowed({**base, **patch}))
+        for key, value in (("_h3_longform", {"clip_count": 2}),
+                           ("_h3_cumulative_append", True), ("_continuation", True),
+                           ("_director_pipeline_id", "director"),
+                           ("_defer_output_publication", True), ("repeat_generation", 2)):
+            with self.subTest(param=key):
+                self.assertFalse(allowed({**base, "params": {**base["params"], key: value}}))
+        self.assertFalse(allowed({**base, "params": {**base["params"], "delivery_resolution": "2k"}}))
+        self.assertFalse(allowed({**base, "params": {**base["params"], "_h3_longform": {}}}))
+        self.assertFalse(allowed({**base, "params": {**base["params"], "image_creator_model": ""}}))
+        self.assertFalse(allowed({**base, "params": {**base["params"], "_director_final_video_postprocess": 1}}))
+
+    def test_ordinary_retry_keeps_original_request_and_starts_only_once(self):
+        class Denied(Exception):
+            def __init__(self, *, status_code, detail):
+                self.status_code, self.detail = status_code, detail
+        secret, owner = b"ordinary-recovery-test-secret", "owner"
+        original_params = {"model_type": "minimax_h3", "repeat_generation": 1,
+                           "num_inference_steps": 28, "resolution": "1344x768",
+                           "video_length": 124, "seed": 42, "prompt": "private creative text"}
+        base = dict(id="ordinary-held", workspace="project-a", kind="studio_generation",
+                    status="queued", queue_held=True, recovery_state="blocked",
+                    execution_attempt=1, recovery_attempt=0, requested_outputs=1,
+                    _recovery_reason_code="h3_ordinary_restart_required",
+                    _recovery_owner_digest=owner_principal_digest(secret, owner),
+                    _recovery_manifest_pointer={"sha256": "a" * 64, "path": "sealed.json"},
+                    params=original_params,
+                    recovery_cursor={"completed_units": [], "ordinary_repeat_offset": 0})
+        reasons = ast.literal_eval(next(node.value for node in self.launch.body
+            if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name)
+                and t.id == "_QUEUE_RECOVERY_REASON_TEXT" for t in node.targets)))
+        for route in ("owner", "local"):
+            for denied_gate in (None, "owner", "inputs", "admission", "durable", "worker", "failed_oom"):
+                if route == "local" and denied_gate == "owner":
+                    continue  # Local transport/project assertion gates have their own owning tests.
+                with self.subTest(route=route, denied=denied_gate):
+                    job, started, admissions = copy.deepcopy(base), [], []
+                    class Thread:
+                        def __init__(self, **kwargs): self.kwargs = kwargs
+                        def start(self): started.append(self.kwargs)
+                    def revalidate(target):
+                        if denied_gate == "inputs": return False
+                        target["params"] = copy.deepcopy(original_params)
+                        target["_recovery_reason_code"] = ""
+                        return True
+                    def admission(target):
+                        admissions.append(target["id"])
+                        if denied_gate == "admission":
+                            raise Denied(status_code=451, detail="Admission required")
+                    def checkpoint(target, **updates):
+                        if denied_gate == "durable": return False
+                        target.update(updates)
+                        return True
+                    namespace = _isolated_functions(self.launch, (
+                        "_queue_recovery_is_blocked", "_queue_recovery_attempt",
+                        "_queue_recovery_reason_code", "_public_queue_recovery_metadata",
+                        "_resume_recovered_job", "prepare_local_h3_generation_recovery",
+                        "start_local_h3_generation_recovery", "_local_h3_recovery_cursor_digest"), {
+                        "HTTPException": Denied, "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+                        "MAX_RECOVERY_ATTEMPTS": 3, "_QUEUE_RECOVERY_REASON_TEXT": reasons,
+                        "_BLOCKED_QUEUE_RECOVERY_STATES": {"blocked", "blocked_remote_reauth", "blocked_preparation"},
+                        "_queue_recovery_checkpoint_lock": threading.RLock(), "_jobs": {job["id"]: job},
+                        "_require_owned_job": lambda *_args: job,
+                        "_require_project_access": lambda *_args, **_kwargs: None,
+                        "_session_secret": lambda: secret, "owner_principal_digest": owner_principal_digest,
+                        "hmac": hmac, "hashlib": hashlib, "json": json,
+                        "_queue_recovery_revalidate_job": revalidate,
+                        "_queue_recovery_delivery_pending": lambda _job: None,
+                        "_require_job_runtime_model_admission": admission,
+                        "_require_h3_legal_execution": lambda _models: None,
+                        "_h3_job_model_types": lambda _job: ("minimax_h3",),
+                        "_prepare_h3_peak_recovery": lambda _job: self.fail("Ordinary retry recalibrated"),
+                        "_queue_recovery_worker": lambda _job: None if denied_gate == "worker" else object(),
+                        "next_recovery_attempt": next_recovery_attempt,
+                        "_queue_recovery_checkpoint": checkpoint,
+                        "update_queue_job": lambda *_args, **_kwargs: True,
+                        "threading": types.SimpleNamespace(Thread=Thread),
+                    })
+                    if denied_gate == "owner": job["_recovery_owner_digest"] = "other"
+                    if denied_gate == "failed_oom":
+                        job.update(status="failed", recovery_state="terminal", _recovery_reason_code="",
+                                   failure_details={"code": "generation_failed", "is_oom": True})
+                    public = namespace["_public_queue_recovery_metadata"](job)
+                    self.assertEqual(public["recovery_actions"], [] if denied_gate in {"worker", "failed_oom"} else ["retry"])
+                    self.assertEqual(public["recovery_reruns_denoise"], denied_gate not in {"worker", "failed_oom"})
+                    if denied_gate not in {"worker", "failed_oom"}:
+                        self.assertIn("whole clip", public["recovery_reason_text"])
+                    self.assertNotIn("private creative", json.dumps(public))
+                    cursor_hash = namespace["_local_h3_recovery_cursor_digest"](job)
+                    def action():
+                        if route == "owner":
+                            return namespace["_resume_recovered_job"](job["id"],
+                                types.SimpleNamespace(state=types.SimpleNamespace(maestro_session_id=owner)),
+                                requested_action="retry")
+                        prepared = namespace["prepare_local_h3_generation_recovery"](job["id"],
+                            expected_manifest_sha256="a" * 64, expected_cursor_sha256=cursor_hash)
+                        self.assertEqual(prepared["recovery_reason"], "h3_ordinary_restart_required")
+                        self.assertEqual(started, [])
+                        self.assertTrue(job["queue_held"])
+                        self.assertEqual(job["recovery_attempt"], 0)
+                        return namespace["start_local_h3_generation_recovery"](job["id"],
+                            expected_manifest_sha256="a" * 64, expected_cursor_sha256=cursor_hash)
+                    if denied_gate:
+                        with self.assertRaises((Denied, QueueRecoveryRuntimeError)): action()
+                        self.assertEqual(started, [])
+                        self.assertTrue(job["queue_held"])
+                        self.assertEqual(job["recovery_attempt"], 0)
+                    else:
+                        self.assertEqual(action()["recovery_attempt"], 1)
+                        self.assertEqual(len(started), 1)
+                        with self.assertRaises((Denied, QueueRecoveryRuntimeError)): action()
+                        self.assertEqual(len(started), 1)
+                    self.assertEqual(job["params"], original_params)
+                    self.assertEqual(job["_recovery_manifest_pointer"], base["_recovery_manifest_pointer"])
 
     def test_native_boundary_exact_retry_requires_known_non_oom_final_failure(self):
         namespace = _isolated_functions(self.launch,
