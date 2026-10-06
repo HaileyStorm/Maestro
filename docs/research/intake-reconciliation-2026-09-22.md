@@ -786,3 +786,13 @@ including title and image layers on exactly the final frame. The joined video
 uses exact frame timestamps; its audio timing stays unchanged. Runtime/browser acceptance remains
 separate from this CPU evidence. This slice adopts existing results; automatic
 AI dispatch and broader round-trip recovery and human acceptance remain open.
+
+The October 6 live Chrome check imported a retained Gallery video as an inactive
+take, switched sources, saved a distinct 0.1-second source start, restored each
+take’s start, and reopened the saved selection. Switching reset the private
+preview reveal. A live CPU export produced a private 1920×1080 MP4 with 246
+frames at 24 fps, a 10.25-second duration, and AAC audio. Its first frame matched
+the selected original rather than the mirrored take; both source hashes stayed
+unchanged. Local and stable-share health/readiness and matching built assets
+passed after the coordinated Pinokio restart. Windows/LAN and human quality
+acceptance remain separate.
