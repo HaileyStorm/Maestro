@@ -688,6 +688,7 @@ class TestCPUTextLane(unittest.TestCase):
                 lifecycle.configure_durability_hook(durable)
                 namespace = {
                     "time": time,
+                    "_upload_job_reader": lambda worker: worker,
                     "_jobs": {job["id"]: job},
                     "_gen_lock": generation_lock,
                     "_credit_prepare_admission": lambda _job: False,

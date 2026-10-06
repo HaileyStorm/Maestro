@@ -1658,7 +1658,7 @@ function _normalizeResourceDescriptor(
   if (value === undefined || value === null) return value
   const raw = value as Partial<api.ResourceDescriptor>
   const intent: api.ResourceIntent = raw.intent === 'text' ? 'text' : 'generation'
-  const execution: api.ResourceExecution = intent === 'text' && raw.execution === 'cpu'
+  const execution: api.ResourceExecution = raw.execution === 'cpu'
     ? 'cpu'
     : 'standard'
   const preemptionMode: api.ResourcePreemptionMode = intent === 'text'

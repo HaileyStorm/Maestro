@@ -365,6 +365,30 @@ function describeResourceExecution(
   if (!descriptor) return null
 
   if (descriptor.intent === 'generation') {
+    if (descriptor.execution === 'cpu') {
+      const label = descriptor.state === 'queued'
+        ? 'CPU processing queued'
+        : descriptor.state === 'admitted'
+          ? 'Starting CPU processing'
+          : descriptor.state === 'blocked'
+            ? 'CPU processing waiting'
+            : descriptor.state === 'released'
+              ? 'No longer processing on CPU'
+              : 'Processing on CPU'
+      return {
+        label,
+        title: descriptor.state === 'queued'
+          ? 'This media task will run on the CPU after its queue turn.'
+          : descriptor.state === 'admitted'
+            ? 'This media task is starting on the CPU.'
+            : descriptor.state === 'blocked'
+              ? 'This CPU media task is waiting for its turn or required resources.'
+              : descriptor.state === 'released'
+                ? 'This media task is no longer using the CPU.'
+                : 'This media task is processing on the CPU.',
+        tone: 'neutral',
+      }
+    }
     const label = descriptor.state === 'queued'
       ? 'Generation queued'
       : descriptor.state === 'admitted'

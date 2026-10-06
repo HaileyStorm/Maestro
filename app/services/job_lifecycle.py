@@ -1786,12 +1786,23 @@ def resource_descriptor(job: Mapping[str, Any]) -> dict[str, Any] | None:
     model identity, residency key, hardware measurement, or fairness state.
     Missing fields retain conservative legacy generation semantics.
     """
-    intent = job.get("resource_intent")
+    # These workers process media on the CPU even though they share the
+    # generation scheduler. Composition export can select a different renderer.
+    params = job.get("params") or {}
+    cursor = job.get("recovery_cursor") or {}
+    cpu_media_tool = job.get("kind") in {"tool_hflip", "tool_browser_copy"} or (
+        job.get("kind") == "tool_editor_export"
+        and isinstance(params, Mapping) and isinstance(cursor, Mapping)
+        and "composition_package" not in params and "composition" not in cursor
+    )
+    intent = job.get("resource_intent", RESOURCE_INTENT_GENERATION if cpu_media_tool else None)
     if intent not in _RESOURCE_INTENTS:
         return None
     execution = job.get("resource_execution", RESOURCE_EXECUTION_STANDARD)
     if execution not in _RESOURCE_EXECUTIONS:
         return None
+    if intent == RESOURCE_INTENT_GENERATION and cpu_media_tool:
+        execution = RESOURCE_EXECUTION_CPU
     preemption_mode = job.get("preemption_mode", PREEMPTION_MODE_NONE)
     if preemption_mode not in _PREEMPTION_MODES:
         return None

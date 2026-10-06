@@ -125,7 +125,7 @@ async function loadJobPlaceholder() {
               }
             ` }
           }
-          return { contents: 'export const useStore = selector => selector({ studioSubmissions: [], ...globalThis.__resourceWaitStore })' }
+          return { contents: 'export const currentAccountIdentityEpoch = () => 0; export const useStore = selector => selector({ studioSubmissions: [], ...globalThis.__resourceWaitStore })' }
         })
       },
     }],
@@ -278,6 +278,32 @@ const cpuDescriptor = {
   state: 'running',
   execution_attempt: 7,
 }
+
+test('CPU media processing never claims GPU use or text execution', async () => {
+  const { describeResourceExecution } = await loadJobPlaceholder()
+  for (const state of ['queued', 'admitted', 'running', 'blocked', 'released']) {
+    const presentation = describeResourceExecution({ ...descriptor, execution: 'cpu', state })
+    assert.match(`${presentation.label} ${presentation.title}`, /CPU/)
+    assert.doesNotMatch(`${presentation.label} ${presentation.title}`, /GPU|text/i)
+    assert.equal(presentation.tone, 'neutral')
+  }
+  const accelerated = describeResourceExecution({ ...descriptor, state: 'running' })
+  assert.equal(accelerated.label, 'Generation using the GPU')
+})
+
+test('status and queue paths preserve CPU media execution without text preemption', async () => {
+  const { _jobStatusDetails, _mergeJobStatus, _newGenerationJobFromStatus, _queueJobDetails } = await loadStoreMappers()
+  const resource = { ...descriptor, execution: 'cpu', state: 'running', preemptible: true, preemption_mode: 'discard_restart' }
+  const status = { job_id: 'cpu-media', status: 'running', progress: 0, resource_descriptor: resource }
+  const expected = { ...resource, preemptible: false, preemption_mode: 'none' }
+  const mapped = [
+    _jobStatusDetails(status),
+    _mergeJobStatus({ id: 'cpu-media', status: 'queued', outputFiles: [] }, status),
+    _newGenerationJobFromStatus(status),
+    _queueJobDetails(status),
+  ]
+  for (const job of mapped) assert.deepEqual(job.resourceDescriptor, expected)
+})
 
 test('standard text execution is described as accelerated text', async () => {
   const { describeResourceExecution } = await loadJobPlaceholder()

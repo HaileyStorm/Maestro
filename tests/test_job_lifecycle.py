@@ -1829,6 +1829,36 @@ class TestJobLifecycle(unittest.TestCase):
         self.assertEqual(calls, ["admitted"])
         self.assertEqual(job["status"], "completed")
 
+    def test_cpu_media_descriptor_does_not_change_scheduler_or_composition_execution(self):
+        for kind in ("tool_editor_export", "tool_hflip", "tool_browser_copy"):
+            with self.subTest(kind=kind):
+                job = _job()
+                job.update(kind=kind, status="running", params={}, resource_intent="generation",
+                           resource_execution="standard", resource_state="running")
+                before = dict(job)
+                descriptor = resource_descriptor(job)
+                self.assertEqual(descriptor["execution"], "cpu")
+                self.assertFalse(descriptor["preemptible"])
+                self.assertEqual(job, before)
+                for status, state in (("queued", "queued"), ("running", "running"),
+                                      ("completed", "released")):
+                    unstamped = {"kind": kind, "status": status, "params": {}}
+                    before = dict(unstamped)
+                    descriptor = resource_descriptor(unstamped)
+                    self.assertEqual(descriptor["execution"], "cpu")
+                    self.assertEqual(descriptor["state"], state)
+                    self.assertFalse(descriptor["preemptible"])
+                    self.assertEqual(unstamped, before)
+        for changes in ({"params": {"composition_package": {}}},
+                        {"recovery_cursor": {"composition": {}}},
+                        {"kind": "tool_upscale"}, {"kind": "generate"}):
+            with self.subTest(changes=changes):
+                job = _job()
+                job.update(kind="tool_editor_export", params={}, resource_intent="generation",
+                           resource_execution="standard")
+                job.update(changes)
+                self.assertEqual(resource_descriptor(job)["execution"], "standard")
+
     def test_priority_hold_resume_and_pause_after_current_are_cooperative(self):
         generation_lock = threading.Lock()
         generation_lock.acquire()
