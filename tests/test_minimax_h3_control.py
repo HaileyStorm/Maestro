@@ -9,6 +9,8 @@ from pathlib import Path
 import ast
 import copy
 import hashlib
+import importlib
+import json
 import sys
 import tempfile
 import types
@@ -67,6 +69,16 @@ def branch(dtype, *, heads=1, head_dim=8):
         hidden_size=8, num_attention_heads=heads, attention_head_dim=head_dim,
         ffn_dim=12, time_embed_dim=4, control_in_dim=3,
         control_blocks_places=(0, 2), dtype=dtype,
+    ).eval()
+
+
+def tiny_base(dtype=torch.float32):
+    return MiniMaxH3Transformer(
+        hidden_size=8, num_layers=3, token_refiner_layers=1,
+        num_attention_heads=1, attention_head_dim=8, ffn_dim=12,
+        video_channels=1, audio_channels=2, text_dim=4,
+        curve_grid=None, curve_dim=4, time_embed_hidden_size=8,
+        rope_freq_dim=1, dtype=dtype,
     ).eval()
 
 
@@ -151,13 +163,7 @@ class OriginalH3ControlTests(unittest.TestCase):
 
     def test_real_transformer_injects_original_skips_after_matching_blocks(self):
         torch.manual_seed(41)
-        model = MiniMaxH3Transformer(
-            hidden_size=8, num_layers=3, token_refiner_layers=1,
-            num_attention_heads=1, attention_head_dim=8, ffn_dim=12,
-            video_channels=1, audio_channels=2, text_dim=4,
-            curve_grid=None, curve_dim=4, time_embed_hidden_size=8,
-            rope_freq_dim=1, dtype=torch.float32,
-        ).eval()
+        model = tiny_base()
         reference = copy.deepcopy(model)
         control = branch(torch.float32)
         weights = donor_weights(torch.float32)
@@ -332,6 +338,8 @@ class OriginalH3ControlLoaderTests(unittest.TestCase):
                  patch.object(control_module, "ORIGINAL_CONTROL_SHA256", hashlib.sha256(raw).hexdigest()), \
                  patch.object(control_module, "MiniMaxH3ControlBranch", side_effect=lambda **kw: branch(kw["dtype"])):
                 loaded = control_module.load_original_control_branch(path)
+                self.assertEqual(loaded.h3_control_checkpoint_evidence.sha256, hashlib.sha256(raw).hexdigest())
+                loaded.h3_control_checkpoint_evidence.verify()
             self.assertFalse(loaded.training)
             self.assertTrue(all(not p.requires_grad and p.device.type == "cpu" for p in loaded.parameters()))
             self.assertEqual(loaded.control_proj_in.weight.dtype, torch.float32)
@@ -340,6 +348,49 @@ class OriginalH3ControlLoaderTests(unittest.TestCase):
             actual = loaded(*inputs(torch.bfloat16))
             for place in expected:
                 torch.testing.assert_close(actual[place], expected[place], rtol=0, atol=0)
+
+    def test_residency_identity_is_acquired_path_free_and_rejects_changed_assets(self):
+        from safetensors.torch import save_file
+        from services.h3_runtime_binding import H3RuntimeBindingError
+
+        source = APP / "models/minimax_h3/minimax_h3_main.py"
+        definition = next(node for node in ast.parse(source.read_text()).body
+                          if isinstance(node, ast.ClassDef) and node.name == "MiniMaxH3Model")
+        methods = [node for node in definition.body if isinstance(node, ast.FunctionDef)
+                   and node.name in ("get_h3_control_residency_identity", "verify_h3_control_residency_identity")]
+        namespace = {"__package__": "models.minimax_h3", "importlib": importlib}
+        exec(compile(ast.Module(body=methods, type_ignores=[]), str(source), "exec"), namespace)
+        runtime = types.SimpleNamespace(
+            transformer=tiny_base(torch.bfloat16), _interrupt=False,
+            _h3_runtime_code_contract=lambda: {"implementation": "loaded-code-test"},
+        )
+        runtime.get_h3_control_residency_identity = types.MethodType(namespace["get_h3_control_residency_identity"], runtime)
+        runtime.verify_h3_control_residency_identity = types.MethodType(namespace["verify_h3_control_residency_identity"], runtime)
+        self.assertIsNone(runtime.get_h3_control_residency_identity())
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "PRIVATE_CONTROL.safetensors"
+            save_file(donor_weights(torch.bfloat16), path)
+            raw = path.read_bytes()
+            with patch.object(control_module, "ORIGINAL_CONTROL_BYTES", len(raw)), \
+                 patch.object(control_module, "ORIGINAL_CONTROL_SHA256", hashlib.sha256(raw).hexdigest()), \
+                 patch.object(control_module, "MiniMaxH3ControlBranch", side_effect=lambda **kw: branch(kw["dtype"])):
+                loaded = control_module.load_original_control_branch(path)
+            # Use the real child graph and real captured file, independently
+            # of the loader constructor replacement used for small storage.
+            runtime.transformer.bind_control_branch(loaded)
+            with patch.object(control_module, "ORIGINAL_CONTROL_BYTES", len(raw)), \
+                 patch.object(control_module, "ORIGINAL_CONTROL_SHA256", hashlib.sha256(raw).hexdigest()):
+                identity = runtime.get_h3_control_residency_identity()
+                self.assertNotIn(directory, json.dumps(identity))
+                self.assertNotIn(path.name, json.dumps(identity))
+                runtime.verify_h3_control_residency_identity(identity)
+                runtime._h3_runtime_code_contract = lambda: {"implementation": "changed-code-test"}
+                with self.assertRaisesRegex(ValueError, "identity changed"):
+                    runtime.verify_h3_control_residency_identity(identity)
+                path.rename(path.with_suffix(".retained"))
+                path.write_bytes(raw)
+                with self.assertRaises(H3RuntimeBindingError):
+                    runtime.get_h3_control_residency_identity()
 
     def test_unpinned_or_unsafe_files_fail_before_native_loading(self):
         from mmgp import offload

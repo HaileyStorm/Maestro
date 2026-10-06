@@ -5831,6 +5831,20 @@ def _get_model_residency_store():
     return _model_residency_store
 
 
+def _bind_h3_control_residency_template(model, key, template, context):
+    """Bind the loaded child asset/graph to both load and generation evidence."""
+    provider = getattr(model, "get_h3_control_residency_identity", None)
+    identity = provider() if callable(provider) else None
+    if identity is None:
+        return key, template, None
+    bound = copy.deepcopy(template)
+    bound["runtime"]["build_parts"] = (
+        *bound["runtime"]["build_parts"],
+        ("minimax_h3_original_control", copy.deepcopy(identity)),
+    )
+    return _build_model_residency_key_from_template(bound, context), bound, identity
+
+
 def _register_model_residency_evidence_context(key, *, template=None):
     """Issue one bounded opaque handle for a WGP-built exact key."""
     global _model_residency_evidence_context_sequence
@@ -6640,6 +6654,7 @@ def load_models(
     offloadobj = None
     offload_setup_started = False
     model_load_succeeded = False
+    h3_control_residency_identity = None
     try:
         previous_default_device = torch.get_default_device()
     except (AttributeError, RuntimeError):
@@ -6669,6 +6684,16 @@ def load_models(
         if "pipe" in pipe:
             kwargs = pipe
             pipe = kwargs.pop("pipe")
+        if is_h3_load:
+            residency_key, residency_template, h3_control_residency_identity = (
+                _bind_h3_control_residency_template(
+                    wan_model, residency_key, residency_template, residency_context,
+                )
+            )
+            if h3_control_residency_identity is not None:
+                if load_environment["compile_modules"] or len(compile) > 0:
+                    raise ValueError("Original H3 Control requires eager residency setup")
+                force_residency_reprofile = True
         if "coTenantsMap" not in kwargs: kwargs["coTenantsMap"] = {}
         mmgp_profile = init_pipe(pipe, kwargs, profile)
         if server_config.get("enhancer_mode", 1) == 0:
@@ -6707,6 +6732,8 @@ def load_models(
             "vram_safety_coefficient": vram_safety_coefficient,
             "convertWeightsFloatTo": transformer_dtype,
         })
+        if h3_control_residency_identity is not None:
+            wan_model.verify_h3_control_residency_identity(h3_control_residency_identity)
         offloadobj = _run_model_offload_with_residency(
             pipe,
             profile_no=mmgp_profile,
@@ -6717,6 +6744,8 @@ def load_models(
             force_reprofile=force_residency_reprofile,
         )
         status_reporter.check_cancelled()
+        if h3_control_residency_identity is not None:
+            wan_model.verify_h3_control_residency_identity(h3_control_residency_identity)
         if is_h3_load and hasattr(wan_model, "finalize_h3_runtime_binding"):
             wan_model.finalize_h3_runtime_binding(
                 compile=offload_kwargs["compile"],
@@ -6803,6 +6832,11 @@ def load_models(
             resolution=resolution,
         )
     )
+    if h3_control_residency_identity is not None:
+        # Request admission does not yet carry Control assets. Never present
+        # this heavier graph as the ordinary base for subsequent job reuse.
+        _loaded_residency_base_key = None
+        _loaded_residency_affinity_key = None
     _loaded_h3_dasiwa_checkpoint_admission = (
         dict(h3_dasiwa_admission)
         if isinstance(h3_dasiwa_admission, dict) else None

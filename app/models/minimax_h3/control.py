@@ -36,7 +36,9 @@ def load_original_control_branch(filename, *, interrupted: Callable[[], bool] | 
     from pathlib import Path
     from accelerate import init_empty_weights
     from mmgp import offload
+    from safetensors import safe_open
     from services.h3_runtime_binding import _hash_file
+    from .original_base import _open_captured
 
     def check_cancelled():
         if interrupted is not None and interrupted():
@@ -71,9 +73,21 @@ def load_original_control_branch(filename, *, interrupted: Callable[[], bool] | 
     def before_assignment(_model):
         check_cancelled()
         reject_external_map()
+        evidence.verify()
 
+    # Pass tensors, never an unpinned second pathname open or MMGP's
+    # implicit shard/map discovery. The held descriptor rejects FIFO races.
+    with _open_captured(evidence) as (_descriptor, reader_path), \
+         safe_open(reader_path, framework="pt", device="cpu") as reader:
+        if any(key.startswith(("quantization_map", "tied_weights_map"))
+               for key in (reader.metadata() or {})):
+            raise ValueError("Original H3 Control does not accept quantization or tied-weight maps")
+        state_dict = {}
+        for key in reader.keys():
+            check_cancelled()
+            state_dict[key] = reader.get_tensor(key)
     offload.load_model_data(
-        branch, evidence.resolved, writable_tensors=False,
+        branch, (state_dict, None, None), writable_tensors=False,
         preprocess_sd=preprocess, default_dtype=torch.bfloat16,
         pre_load_callback=before_assignment,
     )
@@ -82,6 +96,7 @@ def load_original_control_branch(filename, *, interrupted: Callable[[], bool] | 
     evidence.verify()
     branch._model_dtype = torch.bfloat16
     branch.h3_control_checkpoint_sha256 = evidence.sha256
+    branch.h3_control_checkpoint_evidence = evidence
     return branch.eval().requires_grad_(False)
 
 

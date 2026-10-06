@@ -1211,6 +1211,7 @@ class ModelResidencyRuntimeIntegrationTests(unittest.TestCase):
                 "_residency_hardware_snapshot",
                 "_build_model_residency_key_from_template",
                 "derive_current_model_residency_evidence_context",
+                "_bind_h3_control_residency_template",
             ),
             namespace,
         )
@@ -1257,6 +1258,36 @@ class ModelResidencyRuntimeIntegrationTests(unittest.TestCase):
             second,
         )
         self.assertNotIn("prompt", repr(second).lower())
+
+        # A bound Control graph must remain distinct when generation creates
+        # a new context; changing only the load key would misattribute OOMs.
+        context = {"kind": "video", "width": 960, "height": 544,
+                   "frame_count": 81, "steps": 20, "reference_count": 1,
+                   "lora_count": 0, "lora_signature": "sha256-none", "stage_count": 1,
+                   "cache_mode": "none", "attention_backend": "sdpa"}
+        build = namespace["_build_model_residency_key_from_template"]
+        bind = namespace["_bind_h3_control_residency_template"]
+        base_key = build(template, context)
+        untouched = copy.deepcopy(template)
+        same_key, same_template, absent = bind(object(), base_key, template, context)
+        self.assertIs(same_key, base_key)
+        self.assertIs(same_template, template)
+        self.assertIsNone(absent)
+        identity = {"schema": "maestro.h3.original-control-residency/v1",
+                    "checkpoint": {"sha256": "a" * 64, "bytes": 100}}
+        model = SimpleNamespace(get_h3_control_residency_identity=lambda: copy.deepcopy(identity))
+        bound_key, bound_template, captured = bind(model, base_key, template, context)
+        self.assertNotEqual(bound_key["exact_key"], base_key["exact_key"])
+        self.assertEqual(template, untouched)
+        self.assertEqual(captured, identity)
+        namespace["_loaded_model_residency_evidence_template"] = bound_template
+        control_context = namespace["derive_current_model_residency_evidence_context"](context)
+        self.assertEqual(control_context["exact_key"], bound_key["exact_key"])
+        self.assertTrue(namespace["record_model_residency_runtime_outcome"](
+            "oom", phase="generation", required_margin_gib=1.0,
+        ))
+        store = namespace["_get_model_residency_store"]()
+        self.assertEqual(store.record_oom.call_args.args[0]["exact_key"], bound_key["exact_key"])
 
     def test_failed_finalized_derivation_clears_prior_current_context(self):
         store = SimpleNamespace(record_success=Mock(), record_oom=Mock())

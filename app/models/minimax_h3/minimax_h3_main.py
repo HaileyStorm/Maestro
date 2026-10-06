@@ -1169,6 +1169,46 @@ class MiniMaxH3Model:
             raise InterruptedError("H3 Control loading was cancelled")
         transformer.bind_control_branch(branch)
 
+    def get_h3_control_residency_identity(self):
+        """Return a content/path-free identity for the acquired child graph."""
+        branch = getattr(self.transformer, "h3_control_branch", None)
+        if branch is None:
+            return None
+        from services.h3_runtime_binding import (
+            _FileEvidence, implementation_sha256, tensor_layout_sha256,
+        )
+        from .control import ORIGINAL_CONTROL_BYTES, ORIGINAL_CONTROL_SHA256
+
+        if self._interrupt:
+            raise InterruptedError("H3 Control residency verification was cancelled")
+        evidence = getattr(branch, "h3_control_checkpoint_evidence", None)
+        if (not isinstance(evidence, _FileEvidence)
+                or evidence.size != ORIGINAL_CONTROL_BYTES
+                or evidence.sha256 != ORIGINAL_CONTROL_SHA256):
+            raise ValueError("H3 Control residency requires the acquired original checkpoint identity")
+        evidence.verify()
+        base_evidence = getattr(self.transformer, "h3_original_base_evidence", ())
+        for captured in base_evidence:
+            if not isinstance(captured, _FileEvidence):
+                raise ValueError("H3 Control base identity is invalid")
+            captured.verify()
+        return {
+            "schema": "maestro.h3.original-control-residency/v1",
+            "checkpoint": {"sha256": evidence.sha256, "bytes": evidence.size},
+            "original_base": [{"sha256": item.sha256, "bytes": item.size}
+                              for item in base_evidence],
+            "runtime": self._h3_runtime_code_contract(),
+            "control_implementation": implementation_sha256([
+                importlib.import_module(__package__ + ".control"),
+                importlib.import_module(__package__ + ".original_base"),
+            ]),
+            "tensor_layout": tensor_layout_sha256((self.transformer,)),
+        }
+
+    def verify_h3_control_residency_identity(self, expected):
+        if self.get_h3_control_residency_identity() != expected:
+            raise ValueError("H3 Control residency identity changed during setup")
+
     @torch.inference_mode()
     def _encode_control_video(
         self, control_video: torch.Tensor, *, height: int, width: int,

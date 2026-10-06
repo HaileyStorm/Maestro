@@ -84,10 +84,24 @@ otherwise evict the active base on the nested branch call. Explicit Control
 rows select that registered branch; unrelated branch instances are rejected.
 Ordinary forwards with no Control rows stay unchanged, and model release
 detaches the child even when another owner still holds a transformer alias.
-This preparation path excludes Ref2VA, Turbo and cumulative recovery. It
-requires a fresh eager profile: public admission and cached residency identities
-do not yet include the acquired Control asset. CPU graph and numerical checks
-do not qualify the full weights, CUDA offload, or generation.
+This preparation path excludes Ref2VA, Turbo and cumulative recovery.
+The loaded branch retains its captured file evidence. Its residency identity
+includes the exact original Control bytes, any captured original Base shards,
+loaded runtime implementation and attached tensor layout, without paths or
+creative content. WGP binds that identity into both the load key and the
+template used for later generation success/OOM evidence, verifies it before
+and after offload setup, and forces a fresh eager profile. It cannot advertise
+this heavier graph as the ordinary base for cross-job reuse. Unbound H3 and
+other model keys retain their existing behavior. Public Control admission,
+complete asset compatibility and native GPU/media acceptance remain open.
+CPU graph, numerical and cache-context checks do not qualify the full weights,
+CUDA offload, or generation.
+
+The original Control loader also uses the held-descriptor safetensors reader
+and hands MMGP an explicit tensor tuple. It does not reopen an unsealed path
+or permit implicit sidecars during MMGP loading. File resolution, cancellation
+and sidecar checks bracket assignment; a changed acquired file cannot acquire
+a new residency identity merely because its bytes match the prior checkpoint.
 
 The original Base FL2VA transformer is pinned separately to
 [`MiniMaxAI/MiniMax-H3@5d9b308a59ab12e67147f191e184baf704185bd1/FL2VA/transformer`](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/5d9b308a59ab12e67147f191e184baf704185bd1/FL2VA/transformer).
