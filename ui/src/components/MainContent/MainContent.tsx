@@ -3148,6 +3148,9 @@ export function MainContent() {
   const viewerFileExists = viewerSelection && outputs.some(file => (
     file.type !== 'audio' && privatePreviewIdentity(file.workspace, file.name, file.revision) === viewerSelection.identity
   ))
+  const mountedViewerSelection = viewerSelection?.scopeGeneration === scopeGeneration && viewerFileExists && mainView === 'gallery'
+    ? viewerSelection : null
+  const playbackSuspended = mountedViewerSelection !== null
   const currentOutputIdentities = useRef(new Set(outputIdentities))
   currentOutputIdentities.current = new Set(outputIdentities)
 
@@ -3464,6 +3467,7 @@ export function MainContent() {
           file={file}
           index={i}
           isActive={activeIndex === i}
+          playbackSuspended={playbackSuspended}
           onSelect={handleItemSelect}
           onOpenViewer={openViewer}
           onVisible={handleItemVisible}
@@ -3479,7 +3483,7 @@ export function MainContent() {
       )
     }
     return items
-  }, [startIndex, endIndex, outputs, activeIndex, handleItemSelect, openViewer, handleItemVisible, measurementEpoch, handleItemMeasured, itemOffsets])
+  }, [startIndex, endIndex, outputs, activeIndex, playbackSuspended, handleItemSelect, openViewer, handleItemVisible, measurementEpoch, handleItemMeasured, itemOffsets])
 
   return (
     <main className="min-w-0 flex-1 flex flex-col h-full overflow-hidden">
@@ -3754,11 +3758,11 @@ export function MainContent() {
         restoreFocus={projectShareTriggerRef.current}
         onClose={closeProjectAccess}
       />
-      {viewerSelection?.scopeGeneration === scopeGeneration && viewerFileExists && mainView === 'gallery' && (
+      {mountedViewerSelection && (
         <GalleryViewer
           files={outputs}
-          initialIdentity={viewerSelection.identity}
-          restoreFocus={viewerSelection.trigger}
+          initialIdentity={mountedViewerSelection.identity}
+          restoreFocus={mountedViewerSelection.trigger}
           onClose={closeViewer}
         />
       )}

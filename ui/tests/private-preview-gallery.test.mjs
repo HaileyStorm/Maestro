@@ -252,14 +252,15 @@ async function loadMediaFeedItemHarness() {
   const modules = new Map([
     ['react', `
       export function useState(initial) {
+        if (globalThis.__mediaFeedHooks) return globalThis.__mediaFeedHooks.useState(initial)
         const index = globalThis.__mediaFeedStateIndex || 0
         globalThis.__mediaFeedStateIndex = index + 1
         return [index === 0 && globalThis.__mediaFeedTestMeta !== undefined
           ? globalThis.__mediaFeedTestMeta
           : typeof initial === 'function' ? initial() : initial, () => {}]
       }
-      export function useEffect() {}
-      export function useRef(initial) { return { current: initial } }
+      export function useEffect(effect) { globalThis.__mediaFeedHooks?.useEffect(effect) }
+      export function useRef(initial) { return globalThis.__mediaFeedHooks?.useRef(initial) ?? { current: initial } }
       export function useCallback(callback) { return callback }
     `],
     ['react/jsx-runtime', `
@@ -753,6 +754,84 @@ test('bulk activation reads live state across rapid repeats and workspace change
   assert.equal(privatePreviewWorkspaceHasRevealed('rapid-alpha'), false)
 })
 
+test('Gallery cards pause video and audio for the viewer without resuming on close', async t => {
+  const MediaFeedItem = await loadMediaFeedItemHarness()
+  globalThis.__mediaFeedStore = { generationMode: 'video', workspaces: [], models: [], selectedOutputKeys: [] }
+  globalThis.__mediaFeedRevealed = new Set()
+  const runtimes = []
+  t.after(() => {
+    for (const runtime of runtimes) runtime.cleanup()
+    delete globalThis.__mediaFeedHooks
+    delete globalThis.__mediaFeedStore
+    delete globalThis.__mediaFeedRevealed
+  })
+  for (const type of ['video', 'audio']) {
+    const file = { name: `clip.${type === 'video' ? 'mp4' : 'wav'}`, type, url: '/clip',
+      workspace: 'gallery', revision: 'r1', artifact_class: 'final', private: true }
+    const identity = privatePreviewIdentity(file.workspace, file.name, file.revision)
+    globalThis.__mediaFeedRevealed.add(identity)
+    const runtime = createTabFilterRuntime({ 0: { source: 'sidecar' } })
+    runtimes.push(runtime)
+    globalThis.__mediaFeedHooks = runtime.hooks
+    const render = (playbackSuspended, isActive = true) => {
+      runtime.hooks.begin()
+      return materialize(MediaFeedItem({ file, index: 0, isActive, playbackSuspended,
+        onVisible() {}, onMeasured() {}, measurementEpoch: 0 }))
+    }
+    const node = new FakeVideo()
+    Object.defineProperty(node, 'currentTime', { value: 4.5, writable: true })
+    node.src = file.url
+    let plays = 0
+    node.play = () => { plays += 1 }
+    let tree = render(false)
+    let media = findElements(tree, element => element.type === type)[0]
+    assert.ok(media)
+    media.props.ref(node)
+    runtime.flushEffects()
+    assert.equal(node.paused, 0)
+
+    tree = render(true)
+    runtime.flushEffects()
+    assert.equal(node.paused, 1)
+    assert.equal(node.src, file.url)
+    assert.equal(node.loads, 0)
+    assert.equal(node.currentTime, 4.5)
+    assert.equal(findElements(tree, element => element.props?.['aria-current'] === 'true').length, 1)
+    tree = render(false)
+    runtime.flushEffects()
+    assert.equal(node.paused, 1)
+    assert.equal(plays, 0)
+    assert.equal(node.currentTime, 4.5)
+    if (type === 'audio') {
+      render(false, false)
+      runtime.flushEffects()
+      assert.equal(node.paused, 1, 'ordinary audio browsing keeps its previous behavior')
+    }
+
+    tree = render(true)
+    media = findElements(tree, element => element.type === type)[0]
+    const replacement = new FakeVideo()
+    replacement.src = file.url
+    replacement.play = () => { plays += 1 }
+    media.props.ref(replacement)
+    assert.equal(node.src, '')
+    assert.equal(node.loads, 1)
+    assert.equal(replacement.paused, 1, 'a new suspended node pauses at attachment')
+    runtime.flushEffects()
+    assert.equal(plays, 0)
+
+    const hide = findElements(tree, element => element.props?.['aria-label'] === `Blur preview for ${file.name}`)[0]
+    hide.props.onClick({ stopPropagation() {} })
+    tree = render(true)
+    assert.equal(findElements(tree, element => element.type === type).length, 0)
+    media.props.ref(null)
+    runtime.flushEffects()
+    assert.equal(replacement.src, '')
+    assert.equal(replacement.loads, 1)
+    assert.equal(plays, 0)
+  }
+})
+
 test('private audio and retry images acquire no media URL before reveal', async t => {
   const noop = () => {}
   globalThis.__mediaFeedRevealed = new Set()
@@ -800,6 +879,7 @@ test('private audio and retry images acquire no media URL before reveal', async 
       },
       index: 0,
       isActive: true,
+      playbackSuspended: false,
       onVisible: noop,
       measurementEpoch: 0,
       onMeasured: noop,

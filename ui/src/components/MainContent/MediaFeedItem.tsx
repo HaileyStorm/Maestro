@@ -21,6 +21,7 @@ interface Props {
   file: OutputFile
   index: number
   isActive: boolean
+  playbackSuspended: boolean
   onSelect: (index: number) => void
   onOpenViewer: (file: OutputFile, trigger: HTMLElement) => void
   onVisible: (index: number) => void
@@ -161,7 +162,7 @@ function RetryImage({ url, alt }: { url: string; alt: string }) {
   )
 }
 
-export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, onVisible, measurementEpoch, onMeasured, style }: Props) {
+export function MediaFeedItem({ file, index, isActive, playbackSuspended, onSelect, onOpenViewer, onVisible, measurementEpoch, onMeasured, style }: Props) {
   const loadSettingsFromOutput = useStore(s => s.loadSettingsFromOutput)
   const rerollGeneration = useStore(s => s.rerollGeneration)
   const deleteOutput = useStore(s => s.deleteSelectedOutput)
@@ -252,6 +253,9 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
   const moveRef = useRef<HTMLDivElement>(null)
   const itemRef = useRef<HTMLDivElement>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
+  const audioRef = useRef<HTMLAudioElement>(null)
+  const playbackState = useRef({ isActive, playbackSuspended, privateBlurred })
+  playbackState.current = { isActive, playbackSuspended, privateBlurred }
 
   const releaseVideoSource = useCallback((video: HTMLVideoElement | null) => {
     if (!video) return
@@ -264,7 +268,21 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
     const previous = videoRef.current
     if (previous && previous !== video) releaseVideoSource(previous)
     videoRef.current = video
+    const state = playbackState.current
+    if (video && (state.playbackSuspended || !state.isActive || state.privateBlurred)) video.pause()
   }, [releaseVideoSource])
+
+  const setAudioElement = useCallback((audio: HTMLAudioElement | null) => {
+    const previous = audioRef.current
+    if (previous && previous !== audio) {
+      previous.pause()
+      previous.removeAttribute('src')
+      previous.load()
+    }
+    audioRef.current = audio
+    const state = playbackState.current
+    if (audio && (state.playbackSuspended || state.privateBlurred)) audio.pause()
+  }, [])
 
   useEffect(() => () => {
     clearTimeout(timeoutRef.current)
@@ -345,13 +363,16 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
 
   // Blurred private videos keep no decoder/network source. Revealing restores
   // the source through React, but this lifecycle intentionally never calls play().
-  // Non-active videos are also paused without changing their source.
+  // Viewer suspension pauses cards without changing selection or resuming on close.
   useEffect(() => {
     const video = videoRef.current
-    if (!video) return
-    if (privateBlurred) releaseVideoSource(video)
-    else if (!isActive) video.pause()
-  }, [isActive, privateBlurred, releaseVideoSource])
+    if (video) {
+      if (privateBlurred) releaseVideoSource(video)
+      else if (playbackSuspended || !isActive) video.pause()
+    }
+    const audio = audioRef.current
+    if (audio && (playbackSuspended || privateBlurred)) audio.pause()
+  }, [isActive, playbackSuspended, privateBlurred, releaseVideoSource])
 
   const params = meta?.params as Record<string, unknown> | null
   const finishing = finishedToolDetails(meta)
@@ -940,7 +961,7 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
               <Play size={24} className="text-text-muted" />
             </div>
             <p className="text-xs text-text-muted mb-2">{file.name}</p>
-            <audio key={privateRevealKey} src={file.url} controls className="w-64" />
+            <audio key={privateRevealKey} ref={setAudioElement} src={file.url} controls className="w-64" />
           </div>
         ) : (
           <RetryImage key={privateRevealKey} url={file.url} alt={file.name} />
