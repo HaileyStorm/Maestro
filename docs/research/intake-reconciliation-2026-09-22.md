@@ -1012,3 +1012,12 @@ and 14 affected backend admission checks pass, with TypeScript, scoped lint and
 production build validation. Earlier unchanged source-policy and Editor evidence
 is retained. Live fresh-review checks and native generated Retake media remain
 separate gates.
+
+Published as `62bbded8` and activated through one coordinated Pinokio restart.
+The actual Chrome close/reopen check cleared all edited form fields, restored
+its defaults and retained the exact selected interval. The draft and both source
+media/metadata hashes stayed unchanged, with no UI generation submission.
+Local/stable health and readiness passed and the matching notice cleared.
+Account rotation remains CPU lifecycle evidence; native Retake output is still
+unverified. A direct CLI admission probe lacked the browser's source permission
+and stopped at HTTP 403 without retry or credential substitution.
