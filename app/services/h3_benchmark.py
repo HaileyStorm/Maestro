@@ -23,7 +23,7 @@ ALLOCATION_LEDGER_SCHEMA_VERSION = 1
 ALLOCATION_HEURISTIC_REVISION = 1
 ALLOCATION_OOM_THRESHOLD = 3
 ALLOCATION_SUCCESS_HYSTERESIS = 5
-CASE_IDS = ("text_only", "first_frame", "first_last", "ref2va")
+CASE_IDS = ("text_only", "first_frame", "first_last", "ref2va", "timeline_stills")
 QUICK_TASK = {
     "width": 608,
     "height": 352,
@@ -224,6 +224,7 @@ def _safe_input_shape(value: Mapping[str, Any] | None) -> dict[str, int | bool]:
         "image_count": ("image_count", "file_count"),
         "video_count": ("video_count",),
         "audio_count": ("audio_count",),
+        "timeline_still_count": ("timeline_still_count",),
     }
     for target, candidates in aliases.items():
         for key in candidates:
@@ -234,6 +235,32 @@ def _safe_input_shape(value: Mapping[str, Any] | None) -> dict[str, int | bool]:
                     pass
                 break
     return result
+
+
+def h3_timing_reference_count(shape: Mapping[str, Any]) -> int:
+    """Count timed stills separately from semantic refs and boundary slots."""
+    safe = _safe_input_shape(shape)
+    timed = int(safe.get("timeline_still_count") or 0)
+    edges = 0 if timed else int(bool(safe.get("has_start"))) + int(bool(safe.get("has_end")))
+    return timed + edges + sum(int(safe.get(key) or 0) for key in (
+        "image_count", "video_count", "audio_count",
+    ))
+
+
+def h3_timeline_still_guide_count(params: Mapping[str, Any]) -> int:
+    """Read only private transport shape, never paths or creative content."""
+    custom = params.get("custom_settings")
+    setting = custom.get("_h3_timeline_still_guide") if isinstance(custom, Mapping) else None
+    if not isinstance(setting, Mapping):
+        return 0
+    indices = setting.get("frame_indices")
+    if type(indices) is list:
+        return len(indices) if 1 <= len(indices) <= 8 else 0
+    if type(setting.get("frame_index")) is int:
+        return 1 + sum(type(setting.get(key)) is int for key in (
+            "end_frame_index", "third_frame_index",
+        ))
+    return 0
 
 
 def _cache_key_for_spec(spec: Mapping[str, Any]) -> str:
@@ -303,6 +330,8 @@ def build_benchmark_spec(
             raise H3BenchmarkError("H3 recovery policy version is invalid")
         resolved_task["recovery_policy_version"] = recovery_policy
     signature = _safe_input_shape(input_signature)
+    if case_id == "timeline_stills" and not 1 <= int(signature.get("timeline_still_count") or 0) <= 8:
+        raise H3BenchmarkError("Timed-still benchmarks require one through eight guides")
     if case_id != "text_only" and not signature:
         raise H3BenchmarkError(f"{case_id} requires a content-free reference shape")
     source_audio_mode = str(resolved_task.get("source_audio_mode") or "native")
@@ -639,6 +668,9 @@ def normalize_estimate_context(context: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(reference, Mapping):
         reference = {}
     safe_reference = _safe_input_shape(reference)
+    timed_still_count = int(safe_reference.get("timeline_still_count") or 0)
+    if timed_still_count > 8:
+        raise H3BenchmarkError("Timed-still estimates support one through eight guides")
     semantic_count = sum(int(safe_reference.get(key) or 0) for key in (
         "image_count", "video_count", "audio_count",
     ))
@@ -747,10 +779,11 @@ def normalize_estimate_context(context: Mapping[str, Any]) -> dict[str, Any]:
         "engine_id": engine_id,
         "engine_signature": engine_signature,
         "reference_case": (
-            "ref2va" if semantic_count else "first_last" if edge_count == 2
+            "timeline_stills" if timed_still_count else "ref2va" if semantic_count else "first_last" if edge_count == 2
             else "first_frame" if edge_count else "text_only"
         ),
-        "reference_count": semantic_count + edge_count,
+        "reference_count": h3_timing_reference_count(safe_reference),
+        "timeline_still_count": timed_still_count,
         "lora_count": lora_count,
         "cache_enabled": bool(context.get("tea_cache")),
         "accelerator": (
@@ -894,6 +927,11 @@ def estimate_h3_output(
                 spec.get("model", {}).get("accelerator_version") or ""
             ) == target["accelerator_version"]
         case_match = str(spec.get("case_id") or "text_only") == target["reference_case"]
+        if target["reference_case"] == "timeline_stills":
+            case_match = case_match and (
+                int((spec.get("input_shape") or {}).get("timeline_still_count") or 0)
+                == target["timeline_still_count"]
+            )
         source_engine = dict(spec.get("engine") or {})
         source_engine_id = str(
             source_engine.get("effective_id") or source_engine.get("id") or ""
@@ -938,9 +976,7 @@ def estimate_h3_output(
         scaled *= target["processed_frame_count"] / source_frames
         scaled *= target["sampling_steps"] / source_steps
         source_shape = spec.get("input_shape") or {}
-        source_refs = sum(int(source_shape.get(key) or 0) for key in (
-            "image_count", "video_count", "audio_count",
-        )) + int(bool(source_shape.get("has_start"))) + int(bool(source_shape.get("has_end")))
+        source_refs = h3_timing_reference_count(source_shape)
         scaled *= (
             1.0 + min(0.40, target["reference_count"] * 0.08)
         ) / (1.0 + min(0.40, source_refs * 0.08))
@@ -1040,6 +1076,11 @@ def estimate_h3_output(
             )
     if target["window_count"] > 1:
         uncertainty.append("Window transitions and checkpoint switches can add variance.")
+    if target["timeline_still_count"] and exact < 3:
+        uncertainty.append(
+            "Timed still-guide timing has too few observations with the same guide count; "
+            "the estimate remains uncalibrated."
+        )
     if target["source_audio_mode"] != "native":
         confidence = "low"
         uncertainty.append(
@@ -1262,6 +1303,14 @@ def _allocation_scenario(value: Mapping[str, Any]) -> dict[str, Any]:
             if number < 0:
                 raise H3BenchmarkError("Invalid H3 allocation scenario")
             result[field] = number
+    # Omit zero so historical ordinary scenario keys remain byte-identical.
+    # Positive counts isolate timed interior guides from boundary-only inputs.
+    if "timeline_still_count" in source:
+        count = source["timeline_still_count"]
+        if type(count) is not int or not 0 <= count <= 8:
+            raise H3BenchmarkError("Invalid H3 allocation scenario")
+        if count:
+            result["timeline_still_count"] = count
     return result
 
 
@@ -1587,4 +1636,5 @@ __all__ = [
     "H3BenchmarkError", "build_benchmark_spec", "measure_benchmark",
     "record_observation", "build_benchmark_report", "estimate_h3_output",
     "normalize_estimate_context", "validate_output_artifacts",
+    "h3_timing_reference_count", "h3_timeline_still_guide_count",
 ]

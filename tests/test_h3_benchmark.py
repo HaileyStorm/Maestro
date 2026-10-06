@@ -24,6 +24,7 @@ from services.h3_benchmark import (  # noqa: E402
     estimate_h3_output,
     measure_benchmark,
     normalize_estimate_context,
+    h3_timing_reference_count,
     record_observation,
     validate_output_artifacts,
 )
@@ -211,6 +212,80 @@ class H3OffloadObservationTests(unittest.TestCase):
 
 
 class H3BenchmarkTests(unittest.TestCase):
+    def test_timed_guides_have_distinct_identity_and_count_without_edge_duplication(self):
+        context = {
+            "model_type": "minimax_h3", "duration_seconds": 124 / 24,
+            "window_seconds": 15, "num_inference_steps": 4,
+            "resolution": "608x352", "custom_settings": {"h3_attention_engine": "sdpa"},
+        }
+        for count in (1, 4, 8):
+            shape = {"has_start": True, "has_end": count == 3, "timeline_still_count": count}
+            target = normalize_estimate_context({**context, "reference_shape": shape})
+            self.assertEqual(target["reference_case"], "timeline_stills")
+            self.assertEqual(target["reference_count"], count)
+            self.assertEqual(h3_timing_reference_count(shape), count)
+            sealed = spec("timeline_stills", signature={**shape, "path": "/private/guide.png"})
+            self.assertEqual(sealed["input_shape"]["timeline_still_count"], count)
+            self.assertNotIn("private", json.dumps(sealed))
+        for count in (0, 9):
+            with self.assertRaises(H3BenchmarkError):
+                spec("timeline_stills", signature={"timeline_still_count": count})
+        with self.assertRaises(H3BenchmarkError):
+            normalize_estimate_context({**context, "reference_shape": {"timeline_still_count": 9}})
+
+    def test_timed_guide_estimate_does_not_claim_ordinary_or_different_count_samples_exact(self):
+        context = {
+            "model_type": "minimax_h3", "duration_seconds": 124 / 24,
+            "window_seconds": 15, "num_inference_steps": 4,
+            "resolution": "608x352", "custom_settings": {"h3_attention_engine": "sdpa"},
+            "reference_shape": {"has_start": True, "timeline_still_count": 8},
+        }
+        for observed_spec in (
+            spec("first_frame", signature={"has_start": True}),
+            spec("timeline_stills", signature={"has_start": True, "timeline_still_count": 4}),
+        ):
+            record = record_observation(observed_spec, wall_time_seconds=100, output_frames=124, output_valid=True)
+            record["sample_count"] = 3
+            estimate = estimate_h3_output(context, [record])
+            self.assertEqual(estimate["confidence"], "low")
+            self.assertTrue(any("uncalibrated" in text for text in estimate["uncertainty_reasons"]))
+        exact = record_observation(
+            spec("timeline_stills", signature={"has_start": True, "timeline_still_count": 8}),
+            wall_time_seconds=100, output_frames=124, output_valid=True,
+        )
+        exact["sample_count"] = 3
+        self.assertEqual(estimate_h3_output(context, [exact])["confidence"], "high")
+
+    def test_launch_projection_accounts_for_every_timed_still_without_semantic_rerouting(self):
+        import ast
+        import copy
+        from tests.test_h3_lora_compat import H3LoraLaunchProjectionTests
+
+        H3LoraLaunchProjectionTests.setUpClass()
+        namespace = dict(H3LoraLaunchProjectionTests.helpers)
+        node = next(node for node in ast.parse((APP / "launch.py").read_text()).body
+                    if isinstance(node, ast.FunctionDef) and node.name == "_h3_benchmark_input_signature")
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "launch.py", "exec"), namespace)
+        for count in (1, 4, 8):
+            params = {
+                "model_type": "minimax_h3", "h3_adaptive_conditioning": False,
+                "video_length": 124, "image_start": "/private/first.png", "image_refs": [],
+                "custom_settings": {"_h3_timeline_still_guide": {
+                    "frame_indices": [62, 90, 31, 10, 20, 40, 50, 70][:count],
+                    "additional_still_paths": [f"/private/still-{index}.png" for index in range(count - 1)],
+                }},
+            }
+            before = copy.deepcopy(params)
+            projected = namespace["_h3_estimate_context"](params)
+            signature = namespace["_h3_benchmark_input_signature"](params, "timeline_stills")
+            self.assertEqual(projected["model_type"], "minimax_h3")
+            self.assertEqual(projected["reference_shape"]["image_count"], 0)
+            self.assertEqual(projected["reference_shape"]["timeline_still_count"], count)
+            self.assertEqual(signature["timeline_still_count"], count)
+            self.assertEqual(h3_timing_reference_count(signature), count)
+            self.assertNotIn("private", json.dumps(signature))
+            self.assertEqual(params, before)
+
     def _allocation_scenario(self):
         return {
             "model_type": "minimax_h3_ref2va",
@@ -268,6 +343,32 @@ class H3BenchmarkTests(unittest.TestCase):
             ledger.record(scenario, "clean_oom", now=1800)
             ledger.record(scenario, "clean_oom", now=2700)
             self.assertTrue(ledger.snapshot(scenario)["globally_suppressed"])
+
+    def test_allocation_ledger_separates_timed_guide_counts_and_preserves_old_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "ledger.json")
+            ledger = H3AllocationLedger(path)
+            ordinary = self._allocation_scenario()
+            ledger.record(ordinary, "clean_oom", now=900)
+            for count in (1, 4, 8):
+                scenario = {**ordinary, "timeline_still_count": count}
+                for index in range(count):
+                    ledger.record(scenario, "clean_oom", now=(index + 1) * 900)
+                self.assertEqual(ledger.snapshot(scenario)["clean_oom_episodes"], count)
+            self.assertEqual(ledger.snapshot(ordinary)["clean_oom_episodes"], 1)
+            self.assertEqual(ledger.snapshot({**ordinary, "timeline_still_count": 0}),
+                             ledger.snapshot(ordinary))
+            restored = H3AllocationLedger(path)
+            self.assertEqual(restored.snapshot({**ordinary, "timeline_still_count": 8})[
+                "clean_oom_episodes"], 8)
+            payload = json.loads(path.read_text())
+            self.assertEqual(len(payload["scenarios"]), 4)
+            self.assertIn("9c6835105cf90043fd2a3c880c64082a81414f629eb60b6e03671077ac764c5f",
+                          payload["scenarios"])
+            for count in (True, -1, 9, 1.5, "4", None):
+                with self.subTest(malformed=count):
+                    with self.assertRaises(H3BenchmarkError):
+                        ledger.snapshot({**ordinary, "timeline_still_count": count})
 
     def test_allocation_ledger_probes_do_not_relax_and_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:

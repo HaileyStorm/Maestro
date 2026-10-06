@@ -4,6 +4,8 @@ from __future__ import annotations
 import ast
 import gc
 import inspect
+import hashlib
+import json
 from pathlib import Path
 import sys
 import types
@@ -28,7 +30,8 @@ class NativeOffloadEvidenceTests(unittest.TestCase):
                                       and target.id == "_H3_PEAK_RECOVERY_POLICY_VERSION"
                                       for target in node.targets))
 
-    def choose(self, profile, *, record_policy_version=None):
+    def choose(self, profile, *, record_policy_version=None, target_count=0,
+               source_count=0, source_case=None):
         gib = 1 << 30
         namespace = {
             "sys": types.SimpleNamespace(modules={}),
@@ -64,8 +67,17 @@ class NativeOffloadEvidenceTests(unittest.TestCase):
                 "runtime": {"torch": "synthetic", "cuda": "", "triton": "unknown"},
             },
         }
+        if source_case is not None:
+            record["spec"]["case_id"] = source_case
+        if source_count:
+            record["spec"]["input_shape"] = {"timeline_still_count": source_count}
+        params = {"video_length": 256}
+        if target_count:
+            params["custom_settings"] = {"_h3_timeline_still_guide": {
+                "frame_indices": list(range(1, target_count + 1)),
+            }}
         return namespace["_h3_calibrated_peak_choice"](
-            {"video_length": 256}, [record],
+            params, [record],
             allocator={"total_bytes": 32 * gib, "free_bytes": 28 * gib},
         )
 
@@ -85,6 +97,70 @@ class NativeOffloadEvidenceTests(unittest.TestCase):
                 selected = self.choose(profile)
                 self.assertEqual(selected["offload_profile"], int(profile))
                 self.assertEqual(selected["frame_ceiling"], 128)
+
+    def test_guide_calibration_requires_the_same_count_and_case(self):
+        for target in (0, 1, 4, 8):
+            for source in (0, 1, 4, 8):
+                with self.subTest(target=target, source=source):
+                    selected = self.choose(
+                        5, target_count=target, source_count=source,
+                        source_case="timeline_stills" if source else "first_frame",
+                    )
+                    self.assertEqual(selected is not None, target == source)
+        for count in (1, 4, 8):
+            with self.subTest(mislabeled=count):
+                self.assertIsNone(self.choose(
+                    5, target_count=count, source_count=count,
+                    source_case="first_frame",
+                ))
+        self.assertIsNone(self.choose(5, source_case="timeline_stills"))
+        for count in (True, 4.5, "4", 9):
+            with self.subTest(malformed=count):
+                self.assertIsNone(self.choose(
+                    5, target_count=4, source_count=count,
+                    source_case="timeline_stills",
+                ))
+
+    def test_runtime_allocation_evidence_keeps_guides_separate(self):
+        from unittest.mock import patch
+        path = ROOT / "app/launch.py"
+        tree = ast.parse(path.read_text())
+        names = {"_h3_allocation_scenario", "_h3_peak_recovery_identity",
+                 "_h3_allocation_success_outcome"}
+        functions = [node for node in tree.body
+                     if isinstance(node, ast.FunctionDef) and node.name in names]
+        namespace = {
+            "hashlib": hashlib, "json": json,
+            "QueueRecoveryRuntimeError": ValueError,
+            "_H3_PEAK_RECOVERY_POLICY_VERSION": self.policy_version,
+            "_h3_effective_offload_profile": lambda params: 4,
+            "wgp": types.SimpleNamespace(_host_memory_snapshot=lambda: (64 << 30, 96 << 30)),
+        }
+        exec(compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"), namespace)
+        params = {"model_type": "minimax_h3", "resolution": "1344x768",
+                  "num_inference_steps": 20,
+                  "custom_settings": {"h3_attention_engine": "sdpa"}}
+        with patch("services.oom_detect.safe_allocator_facts", return_value={"free_bytes": 24 << 30}):
+            ordinary = namespace["_h3_allocation_scenario"](params, frame_count=128)
+            self.assertNotIn("timeline_still_count", ordinary)
+            for count in (1, 4, 8):
+                guides = {**params, "custom_settings": {
+                    **params["custom_settings"], "_h3_timeline_still_guide": {
+                        "frame_indices": list(range(1, count + 1)),
+                        "additional_still_paths": ["/private/image.png"] * (count - 1),
+                    }}}
+                scenario = namespace["_h3_allocation_scenario"](guides, frame_count=128)
+                self.assertEqual(scenario["timeline_still_count"], count)
+                self.assertNotIn("private", json.dumps(scenario))
+                self.assertEqual(namespace["_h3_allocation_success_outcome"](guides), "production_success")
+                self.assertEqual(namespace["_h3_allocation_success_outcome"]({
+                    **guides, "num_inference_steps": 4}), "probe_success")
+            legacy = {**params, "custom_settings": {
+                **params["custom_settings"], "_h3_timeline_still_guide": {
+                    "frame_index": 1, "end_frame_index": 25, "third_frame_index": 75,
+                }}}
+            self.assertEqual(namespace["_h3_allocation_scenario"](legacy, frame_count=128)[
+                "timeline_still_count"], 3)
 
 
 class OffloadWrapperBindingTests(unittest.TestCase):

@@ -259,6 +259,7 @@ def validate_h3_timeline_still_guide_request(
     image_start,
     image_end=None,
     third_still=None,
+    additional_stills=None,
     reference_mode: bool = False,
     native_boundary: bool = False,
     image_refs=None,
@@ -273,25 +274,47 @@ def validate_h3_timeline_still_guide_request(
 ) -> tuple[str, int, int] | None:
     """Validate the private FL2VA still-at-frame adapter and return its packer anchor.
 
-    The private setting places up to three stills at exact interior target frames.
-    A second still requires an explicit end_frame_index; ordinary endpoint,
-    reference and boundary requests keep their own semantics.
+    The ordered transport places one to eight stills at exact interior frames.
+    Retained one/two/three-slot jobs keep their original transport semantics.
     """
     setting_name = "_h3_timeline_still_guide"
     if not isinstance(custom_settings, dict) or setting_name not in custom_settings:
         if _has_h3_guide_input(third_still):
             raise ValueError("MiniMax H3 third timeline still requires its private Guide setting.")
+        if _has_h3_guide_input(additional_stills):
+            raise ValueError("MiniMax H3 additional timeline stills require their private Guide setting.")
         return None
 
     guide = custom_settings[setting_name]
     if not isinstance(guide, dict) or set(guide) not in (
         {"frame_index"}, {"frame_index", "end_frame_index"},
         {"frame_index", "end_frame_index", "third_frame_index", "third_still_path"},
+        {"frame_indices", "additional_still_paths"},
     ):
         raise ValueError(
             "MiniMax H3 timeline still guide requires frame_index and optional end_frame_index."
         )
-    frame_index = guide.get("frame_index")
+    ordered = "frame_indices" in guide
+    if ordered:
+        indices = guide["frame_indices"]
+        paths = guide["additional_still_paths"]
+        if (
+            type(indices) is not list or not 1 <= len(indices) <= 8
+            or any(type(index) is not int for index in indices)
+            or len(set(indices)) != len(indices)
+            or type(paths) is not list or len(paths) != len(indices) - 1
+            or any(type(path) is not str or not path for path in paths)
+            or len(set(paths)) != len(paths)
+            or not isinstance(additional_stills, (list, tuple))
+            or len(additional_stills) != len(paths)
+            or _has_h3_guide_input(image_end) or _has_h3_guide_input(third_still)
+        ):
+            raise ValueError("MiniMax H3 ordered guides require one to eight distinct bound stills and frame indices.")
+        frame_index = indices[0]
+    else:
+        if _has_h3_guide_input(additional_stills):
+            raise ValueError("MiniMax H3 additional timeline stills require the ordered Guide transport.")
+        frame_index = guide.get("frame_index")
     if type(frame_index) is not int:
         raise ValueError(
             "MiniMax H3 timeline still guide frame_index must be an integer."
@@ -361,6 +384,9 @@ def validate_h3_timeline_still_guide_request(
         images.append(("image_end", image_end))
     if tripled:
         images.append(("third_still", third_still))
+    if ordered:
+        images.extend((f"additional_still_{index + 1}", image)
+                      for index, image in enumerate(additional_stills))
     for name, image in images:
         if not (not validate_image_shape and isinstance(image, (str, os.PathLike))) and not _is_single_h3_still_shape(image):
             raise ValueError(
@@ -368,7 +394,8 @@ def validate_h3_timeline_still_guide_request(
                 "or a one-frame CTHW tensor."
             )
 
-    indices = [frame_index] + ([end_frame_index] if paired else []) + ([third_frame_index] if tripled else [])
+    if not ordered:
+        indices = [frame_index] + ([end_frame_index] if paired else []) + ([third_frame_index] if tripled else [])
     if frame_num is not None:
         if isinstance(frame_num, bool) or not isinstance(frame_num, (int, np.integer)):
             raise ValueError("MiniMax H3 timeline still guide requires an integer target frame count.")
@@ -392,6 +419,8 @@ def validate_h3_timeline_still_guide_request(
 def h3_timeline_still_guide_keyframe_anchors(custom_settings, first_anchor):
     """Build ordered packer anchors after the request has passed validation."""
     guide = custom_settings["_h3_timeline_still_guide"]
+    if "frame_indices" in guide:
+        return tuple(("frame", 1, index) for index in guide["frame_indices"])
     if "third_frame_index" in guide:
         return first_anchor, ("frame", 1, guide["end_frame_index"]), ("frame", 1, guide["third_frame_index"])
     if "end_frame_index" in guide:

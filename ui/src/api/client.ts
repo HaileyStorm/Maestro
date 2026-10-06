@@ -1363,6 +1363,7 @@ export interface H3GalleryStillGuideRequest {
   frame_index: number
   second_still?: { name: string; revision: string; frame_index: number }
   third_still?: { name: string; revision: string; frame_index: number }
+  additional_stills?: { name: string; revision: string; frame_index: number }[]
   model_type: H3GalleryStillGuideModel
   prompt: string
   settings: {

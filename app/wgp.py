@@ -11433,6 +11433,44 @@ def _load_h3_timeline_third_still(custom_settings, canvas_height, canvas_width):
     return convert_image_to_tensor(image)
 
 
+def _load_h3_timeline_additional_stills(
+    custom_settings, canvas_height, canvas_width, abort_check=None,
+):
+    """Load the server-bound ordered tail onto the first still's canvas."""
+    guide = custom_settings.get("_h3_timeline_still_guide", {})
+    if "frame_indices" not in guide:
+        return []
+    indices = guide.get("frame_indices")
+    paths = guide.get("additional_still_paths")
+    if (
+        type(indices) is not list or not 1 <= len(indices) <= 8
+        or type(paths) is not list or len(paths) != len(indices) - 1
+        or any(type(path) is not str or not path for path in paths)
+        or len(set(paths)) != len(paths)
+    ):
+        raise ValueError("MiniMax H3 ordered timeline stills are not bound.")
+    images = []
+    for path in paths:
+        if abort_check is not None and abort_check():
+            raise InterruptedError("H3 Guide image loading was cancelled")
+        with Image.open(path) as opened:
+            image = convert_image(opened)
+            cropped = None
+            try:
+                cropped, _, _ = _resize_h3_timeline_still_guide_image(
+                    image, canvas_height, canvas_width, None, True,
+                )
+                images.append(convert_image_to_tensor(cropped))
+            finally:
+                if cropped is not None and cropped is not image:
+                    cropped.close()
+                if image is not opened:
+                    image.close()
+    if abort_check is not None and abort_check():
+        raise InterruptedError("H3 Guide image loading was cancelled")
+    return images
+
+
 def _restore_h3_first_window_prefix(sample, prefix_video, overlap_frames):
     """Restore the ordinary start/source prefix without changing H3 guides."""
     if prefix_video is None:
@@ -12193,6 +12231,7 @@ def _generate_video_impl(
         references=[
             image_start, image_end, image_refs, image_guide,
             (custom_settings.get("_h3_timeline_still_guide") or {}).get("third_still_path"),
+            *((custom_settings.get("_h3_timeline_still_guide") or {}).get("additional_still_paths") or []),
             video_source, video_end, video_guide, video_guide2,
             video_guide3, custom_guide, voice_reference,
             audio_source, audio_guide, audio_guide2, audio_guide3,
@@ -13216,6 +13255,7 @@ def _generate_video_impl(
         references=[
             image_start, image_end, image_refs, image_guide,
             (custom_settings.get("_h3_timeline_still_guide") or {}).get("third_still_path"),
+            *((custom_settings.get("_h3_timeline_still_guide") or {}).get("additional_still_paths") or []),
             video_source, video_end, video_guide, video_guide2,
             video_guide3, custom_guide, voice_reference,
             audio_source, audio_guide, audio_guide2, audio_guide3,
@@ -13504,6 +13544,12 @@ def _generate_video_impl(
             timeline_third_still = (
                 _load_h3_timeline_third_still(custom_settings, *image_size)
                 if h3_timeline_still_guide_requested else None
+            )
+            timeline_additional_stills = (
+                _load_h3_timeline_additional_stills(
+                    custom_settings, *image_size,
+                    abort_check=lambda: gen.get("abort", False),
+                ) if h3_timeline_still_guide_requested else []
             )
             # ── Motion suffix (video_end) loading ───────────────────────────
             # Symmetric to video_source: encodes the last N frames of the
@@ -14066,7 +14112,8 @@ def _generate_video_impl(
                     alt_prompt = alt_prompt,
                     image_start = image_start_tensor,  
                     image_end = image_end_tensor,
-                    **({"_h3_timeline_third_still": timeline_third_still}
+                    **({"_h3_timeline_third_still": timeline_third_still,
+                        "_h3_timeline_additional_stills": timeline_additional_stills}
                        if h3_timeline_still_guide_requested else {}),
                     input_frames = src_video,
                     input_frames2 = src_video2,

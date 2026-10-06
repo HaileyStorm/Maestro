@@ -140,7 +140,7 @@ function fillGuide(tree, { frame = '62', length = '141', prompt = 'Keep the figu
 function panelProps(options = {}) {
   return {
     workspace: 'project-a',
-    still: output('guide.png', { private: true, explicit: true }),
+    stills: [output('guide.png', { private: true, explicit: true })],
     models: GUIDE_MODELS,
     enabledModels: new Set(GUIDE_MODELS.map(item => item.model_type)),
     modelsLoaded: true,
@@ -233,6 +233,7 @@ test('the panel requires an explicit frame and submits exact image revision, FL2
       name: 'guide.png',
       revision: 'revision-guide.png',
       frame_index: 62,
+      additional_stills: [],
       model_type: 'minimax_h3',
       prompt: 'Keep the figure centered.',
       settings: { video_length: 141 },
@@ -242,7 +243,7 @@ test('the panel requires an explicit frame and submits exact image revision, FL2
 
     const publicStillProps = {
       ...props,
-      still: output('public-guide.png', { private: false, explicit: false }),
+      stills: [output('public-guide.png', { private: false, explicit: false })],
     }
     tree = renderPanel(H3GuidePanel, publicStillProps)
     await flatten(tree).find(element => element.type === 'form').props.onSubmit({ preventDefault() {} })
@@ -269,7 +270,7 @@ test('Guide attention applies only an explicit per-clip choice and preserves the
     return Response.json({ job_id: 'guide-job', status: 'queued' })
   }
   try {
-    const props = panelProps({ secondStill: output('second.png') })
+    const props = panelProps({ stills: [output('guide.png', { private: true, explicit: true }), output('second.png')] })
     let tree = openPanel(H3GuidePanel, props)
     fillGuide(tree, { frame: '31', length: '124' })
     findLabel(tree, 'Second guide frame index, 0-based').props.onChange({ target: { value: '90' } })
@@ -282,7 +283,7 @@ test('Guide attention applies only an explicit per-clip choice and preserves the
       const request = requests.at(-1)
       assert.deepEqual(request.settings, { video_length: 124, seed: 935314058, ...(engine ? { attention_engine: engine } : {}) })
       assert.equal(request.frame_index, 31)
-      assert.equal(request.second_still.frame_index, 90)
+      assert.equal(request.additional_stills[0].frame_index, 90)
       assert.equal(request.private_output, true)
       assert.equal(request.explicit_output, true)
       tree = renderPanel(H3GuidePanel, props)
@@ -305,7 +306,7 @@ test('Guide seed is optional, preserves exact reusable values, and rejects inval
     return Response.json({ job_id: 'guide-job', status: 'queued' })
   }
   try {
-    const props = panelProps({ secondStill: output('second.png') })
+    const props = panelProps({ stills: [output('guide.png', { private: true, explicit: true }), output('second.png')] })
     let tree = openPanel(H3GuidePanel, props)
     fillGuide(tree, { frame: '31', length: '124' })
     findLabel(tree, 'Second guide frame index, 0-based').props.onChange({ target: { value: '90' } })
@@ -316,7 +317,7 @@ test('Guide seed is optional, preserves exact reusable values, and rejects inval
       const request = requests.at(-1)
       assert.deepEqual(request.settings, { video_length: 124, ...(seed !== '' ? { seed: Number(seed) } : {}) })
       assert.equal(request.frame_index, 31)
-      assert.equal(request.second_still.frame_index, 90)
+      assert.equal(request.additional_stills[0].frame_index, 90)
       tree = renderPanel(H3GuidePanel, props)
     }
     assert.equal(requests.length, 5)
@@ -492,8 +493,7 @@ test('two-guide panel requires distinct positions, binds both revisions and inhe
   }
   try {
     const props = panelProps({
-      still: output('first.png'),
-      secondStill: output('second.png', { private: true, explicit: true }),
+      stills: [output('first.png'), output('second.png', { private: true, explicit: true })],
       isCurrentSelection: () => current,
     })
     let tree = openPanel(H3GuidePanel, props)
@@ -511,7 +511,7 @@ test('two-guide panel requires distinct positions, binds both revisions and inhe
     await flatten(tree).find(element => element.type === 'form').props.onSubmit({ preventDefault() {} })
     assert.equal(requests.length, 1)
     assert.equal(requests[0].frame_index, 62)
-    assert.deepEqual(requests[0].second_still, { name: 'second.png', revision: 'revision-second.png', frame_index: 31 })
+    assert.deepEqual(requests[0].additional_stills[0], { name: 'second.png', revision: 'revision-second.png', frame_index: 31 })
     assert.equal(requests[0].private_output, true)
     assert.equal(requests[0].explicit_output, true)
     current = false
@@ -525,11 +525,12 @@ test('two-guide panel requires distinct positions, binds both revisions and inhe
   }
 })
 
-test('three-guide selection preserves Picture order and caps execution at three', async () => {
+test('ordered-guide selection preserves Picture order and caps execution at eight', async () => {
   const { resolveH3GuideSelections } = await loadGuideModule()
-  const files = ['first.png', 'second.png', 'third.png', 'fourth.png'].map(name => output(name))
+  const files = Array.from({ length: 9 }, (_, index) => output(`still-${index + 1}.png`))
   assert.deepEqual(resolveH3GuideSelections(files, [key(files[2]), key(files[0]), key(files[1])], 'project-a', true), [files[2], files[0], files[1]])
   assert.equal(resolveH3GuideSelections(files, files.map(key), 'project-a', true), null)
+  assert.deepEqual(resolveH3GuideSelections(files, files.slice(0, 8).reverse().map(key), 'project-a', true), files.slice(0, 8).reverse())
   assert.equal(resolveH3GuideSelections(files, [key(files[0]), key(files[1]), key(files[1])], 'project-a', true), null)
   assert.equal(resolveH3GuideSelections(files.map((file, i) => i === 2 ? { ...file, workspace: 'other' } : file), files.slice(0, 3).map(key), 'project-a', true), null)
 })
@@ -546,8 +547,7 @@ test('three-guide panel binds revisions, reverse chronological positions and thi
   }
   try {
     const props = panelProps({
-      still: output('first.png'), secondStill: output('second.png'),
-      thirdStill: output('third.png', { private: true, explicit: true }),
+      stills: [output('first.png'), output('second.png'), output('third.png', { private: true, explicit: true })],
       isCurrentSelection: () => current,
     })
     let tree = openPanel(H3GuidePanel, props)
@@ -566,13 +566,64 @@ test('three-guide panel binds revisions, reverse chronological positions and thi
     tree = renderPanel(H3GuidePanel, props)
     await flatten(tree).find(element => element.type === 'form').props.onSubmit({ preventDefault() {} })
     assert.equal(requests.length, 1)
-    assert.deepEqual(requests[0].second_still, { name: 'second.png', revision: 'revision-second.png', frame_index: 90 })
-    assert.deepEqual(requests[0].third_still, { name: 'third.png', revision: 'revision-third.png', frame_index: 31 })
+    assert.deepEqual(requests[0].additional_stills[0], { name: 'second.png', revision: 'revision-second.png', frame_index: 90 })
+    assert.deepEqual(requests[0].additional_stills[1], { name: 'third.png', revision: 'revision-third.png', frame_index: 31 })
     assert.equal(requests[0].frame_index, 62)
     assert.equal(requests[0].private_output, true)
     assert.equal(requests[0].explicit_output, true)
     current = false
     tree = renderPanel(H3GuidePanel, props)
+    await flatten(tree).find(element => element.type === 'form').props.onSubmit({ preventDefault() {} })
+    assert.equal(requests.length, 1)
+  } finally {
+    globalThis.fetch = originalFetch
+    delete globalThis.__h3GuideHookStates
+    delete globalThis.__h3GuideHookIndex
+  }
+})
+
+test('eight-guide panel binds every selected revision and unsorted frame without internal paths', async () => {
+  const { H3GuidePanel } = await loadGuideModule()
+  const originalFetch = globalThis.fetch
+  const requests = []
+  let current = true
+  let queued = 0
+  globalThis.__h3GuideHookStates = []
+  globalThis.fetch = async (url, options) => {
+    requests.push(JSON.parse(options.body))
+    return Response.json({ job_id: 'eight-job', status: 'queued' })
+  }
+  try {
+    const stills = Array.from({ length: 8 }, (_, index) => output(`still-${index + 1}.png`, {
+      private: index === 7, explicit: index === 6,
+    }))
+    const props = panelProps({ stills, isCurrentSelection: () => current, onQueued: async () => { queued += 1 } })
+    let tree = openPanel(H3GuidePanel, props)
+    assert.match(elementText(tree), /Guide eight frames with H3/)
+    fillGuide(tree, { length: '124' })
+    const indices = [62, 90, 31, 111, 15, 75, 45, 105]
+    const labels = ['Guide', 'Second guide', 'Third guide', 'Guide 4', 'Guide 5', 'Guide 6', 'Guide 7', 'Guide 8']
+    indices.forEach((index, ordinal) => findLabel(tree, `${labels[ordinal]} frame index, 0-based`).props.onChange({ target: { value: String(index) } }))
+    tree = renderPanel(H3GuidePanel, props)
+    findLabel(tree, 'Guide 8 frame index, 0-based').props.onChange({ target: { value: '62' } })
+    tree = renderPanel(H3GuidePanel, props)
+    await flatten(tree).find(element => element.type === 'form').props.onSubmit({ preventDefault() {} })
+    assert.equal(requests.length, 0)
+    findLabel(tree, 'Guide 8 frame index, 0-based').props.onChange({ target: { value: '105' } })
+    tree = renderPanel(H3GuidePanel, props)
+    await flatten(tree).find(element => element.type === 'form').props.onSubmit({ preventDefault() {} })
+    assert.equal(requests.length, 1)
+    assert.equal(queued, 1)
+    assert.deepEqual(requests[0].additional_stills, stills.slice(1).map((still, index) => ({
+      name: still.name, revision: still.revision, frame_index: indices[index + 1],
+    })))
+    assert.equal(requests[0].frame_index, 62)
+    assert.equal(requests[0].private_output, true)
+    assert.equal(requests[0].explicit_output, true)
+    assert.equal('custom_settings' in requests[0], false)
+    assert.equal('second_still' in requests[0], false)
+    assert.equal('third_still' in requests[0], false)
+    current = false
     await flatten(tree).find(element => element.type === 'form').props.onSubmit({ preventDefault() {} })
     assert.equal(requests.length, 1)
   } finally {

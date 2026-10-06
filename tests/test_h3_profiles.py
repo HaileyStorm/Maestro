@@ -28,6 +28,25 @@ from models.minimax_h3.spectrum import (  # noqa: E402
 # Restore and hydration races execute the real store in ui/tests/
 # defaults-preset-flow, mode-switch-profile-continuity and output-restore-lifecycle.
 class H3ProfileTests(unittest.TestCase):
+    def test_timed_still_profile_counts_all_guides_without_changing_checkpoint_or_transport(self):
+        import copy
+
+        for count in (1, 4, 8):
+            context = {
+                "model_type": "minimax_h3", "h3_adaptive_conditioning": False,
+                "reference_shape": {"has_start": True, "timeline_still_count": count},
+            }
+            before = copy.deepcopy(context)
+            options = build_profile_options(
+                context, model_exists=lambda _model: True, model_downloaded=lambda _model: True,
+            )
+            for option in options:
+                self.assertEqual(option["matched_reference_count"], count)
+                self.assertEqual(option["settings"]["model_type"], "minimax_h3")
+                self.assertNotIn("image_refs", option["settings"])
+                self.assertNotIn("reference_shape", option["settings"])
+            self.assertEqual(context, before)
+
     def test_profile_estimate_uses_actual_path_free_checkpoint_receipt_status(self):
         source = (APP / "launch.py").read_text(encoding="utf-8")
         start = source.index("def _h3_profile_estimate_payload")

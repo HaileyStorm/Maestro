@@ -2602,13 +2602,11 @@ function GalleryBulkToolbar() {
             }}
           />
         )}
-        {guideStill && (
+        {guideStill && guideStills && (
           <H3GuidePanel
             key={String(guideAccountEpoch) + ':' + guideSelectionIdentity}
             workspace={activeWorkspace}
-            still={guideStill}
-            secondStill={guideStills?.[1]}
-            thirdStill={guideStills?.[2]}
+            stills={guideStills}
             models={models}
             enabledModels={enabledModels}
             modelsLoaded={modelsLoaded}

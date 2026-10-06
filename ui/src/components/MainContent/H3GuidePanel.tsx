@@ -37,7 +37,7 @@ export function resolveH3GuideSelections(
   activeWorkspace: string,
   canGenerate: boolean,
 ): OutputFile[] | null {
-  if (selectedKeys.length < 1 || selectedKeys.length > 3 || new Set(selectedKeys).size !== selectedKeys.length) return null
+  if (selectedKeys.length < 1 || selectedKeys.length > 8 || new Set(selectedKeys).size !== selectedKeys.length) return null
   const stills = selectedKeys.map(key => resolveH3GuideSelection(outputs, [key], activeWorkspace, canGenerate))
   return stills.every((still): still is OutputFile => still !== null) ? stills : null
 }
@@ -72,9 +72,7 @@ export function isInteriorH3GuideFrame(value: string, frameCount: number): boole
 
 interface Props {
   workspace: string
-  still: OutputFile
-  secondStill?: OutputFile
-  thirdStill?: OutputFile
+  stills: readonly OutputFile[]
   models: readonly ModelDef[]
   enabledModels: ReadonlySet<string>
   modelsLoaded: boolean
@@ -84,9 +82,7 @@ interface Props {
 
 export function H3GuidePanel({
   workspace,
-  still,
-  secondStill,
-  thirdStill,
+  stills,
   models,
   enabledModels,
   modelsLoaded,
@@ -96,42 +92,36 @@ export function H3GuidePanel({
   const [open, setOpen] = useState(false)
   const [modelType, setModelType] = useState('')
   const [prompt, setPrompt] = useState('')
-  const [frameIndexValue, setFrameIndexValue] = useState('')
+  const [frameIndexValues, setFrameIndexValues] = useState(() => stills.map(() => ''))
   const [targetFrameCount, setTargetFrameCount] = useState(124)
   const [pending, setPending] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [secondFrameIndexValue, setSecondFrameIndexValue] = useState('')
   const [seedValue, setSeedValue] = useState('')
-  const [thirdFrameIndexValue, setThirdFrameIndexValue] = useState('')
   const [attentionEngine, setAttentionEngine] = useState<'' | 'sdpa' | 'sol_attn'>('')
 
   const compatibleModels = resolveH3GuideModels(models, enabledModels, modelsLoaded)
   const selectedModel = compatibleModels.find(model => model.model_type === modelType)
     ?? compatibleModels[0]
-  const validFrame = isInteriorH3GuideFrame(frameIndexValue, targetFrameCount)
-  const frameIndex = validFrame ? Number(frameIndexValue) : null
-  const secondFrameIndex = isInteriorH3GuideFrame(secondFrameIndexValue, targetFrameCount)
-    ? Number(secondFrameIndexValue) : null
-  const validSecondFrame = !secondStill || (secondFrameIndex !== null && secondFrameIndex !== frameIndex)
-  const thirdFrameIndex = isInteriorH3GuideFrame(thirdFrameIndexValue, targetFrameCount)
-    ? Number(thirdFrameIndexValue) : null
-  const validThirdFrame = !thirdStill || (Boolean(secondStill) && thirdFrameIndex !== null && thirdFrameIndex !== frameIndex && thirdFrameIndex !== secondFrameIndex)
+  const frameIndices = frameIndexValues.map(value => isInteriorH3GuideFrame(value, targetFrameCount) ? Number(value) : null)
+  const validFrames = stills.length >= 1 && stills.length <= 8
+    && frameIndices.length === stills.length && frameIndices.every(value => value !== null)
+    && new Set(frameIndices).size === stills.length
   const validSeed = seedValue === '' || (
     /^(?:-1|\d+)$/.test(seedValue) && Number.isSafeInteger(Number(seedValue))
   )
   const canSubmit = Boolean(
     selectedModel
     && prompt.trim()
-    && validFrame
-    && validSecondFrame
-    && validThirdFrame
+    && validFrames
     && validSeed
     && !pending,
   )
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
-    if (!canSubmit || !selectedModel || frameIndex === null) return
+    const still = stills[0]
+    const frameIndex = frameIndices[0]
+    if (!canSubmit || !selectedModel || !still || frameIndex == null) return
     if (!isCurrentSelection()) {
       setError('The selected Gallery image changed. Refresh Gallery and select it again.')
       return
@@ -144,12 +134,9 @@ export function H3GuidePanel({
         name: still.name,
         revision: still.revision,
         frame_index: frameIndex,
-        ...(secondStill && secondFrameIndex !== null ? {
-          second_still: { name: secondStill.name, revision: secondStill.revision, frame_index: secondFrameIndex },
-        } : {}),
-        ...(thirdStill && thirdFrameIndex !== null ? {
-          third_still: { name: thirdStill.name, revision: thirdStill.revision, frame_index: thirdFrameIndex },
-        } : {}),
+        additional_stills: stills.slice(1).map((item, index) => ({
+          name: item.name, revision: item.revision, frame_index: frameIndices[index + 1]!,
+        })),
         model_type: selectedModel.model_type as typeof H3_GUIDE_MODEL_ORDER[number],
         prompt,
         settings: {
@@ -157,8 +144,8 @@ export function H3GuidePanel({
           ...(attentionEngine !== '' ? { attention_engine: attentionEngine } : {}),
           ...(seedValue !== '' ? { seed: Number(seedValue) } : {}),
         },
-        private_output: still.private || Boolean(secondStill?.private) || Boolean(thirdStill?.private),
-        explicit_output: still.explicit || Boolean(secondStill?.explicit) || Boolean(thirdStill?.explicit),
+        private_output: stills.some(item => item.private),
+        explicit_output: stills.some(item => item.explicit),
       })
     } catch (reason) {
       if (isCurrentSelection()) {
@@ -180,6 +167,8 @@ export function H3GuidePanel({
   }
 
   const frameLimit = targetFrameCount - 2
+  const countWord = ['one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight'][stills.length - 1]
+  const guideLabel = (index: number) => ['Guide', 'Second guide', 'Third guide'][index] ?? `Guide ${index + 1}`
 
   return (
     <div className={open ? 'min-w-0 basis-full' : 'min-w-0'}>
@@ -191,7 +180,7 @@ export function H3GuidePanel({
         disabled={pending}
         className="rounded-md border border-accent-blue/50 px-2 py-1 text-[10px] font-medium text-accent-blue hover:bg-accent-blue/10 disabled:opacity-40"
       >
-        {secondStill ? 'Use stills as guides' : 'Use still as guide'}
+        {stills.length > 1 ? 'Use stills as guides' : 'Use still as guide'}
       </button>
       {open && (
         <form
@@ -200,29 +189,19 @@ export function H3GuidePanel({
           onSubmit={submit}
         >
           <div className="mb-3">
-            <h3 className="text-sm font-semibold text-text-primary">{thirdStill ? 'Guide three frames with H3' : secondStill ? 'Guide two frames with H3' : 'Guide one frame with H3'}</h3>
+            <h3 className="text-sm font-semibold text-text-primary">Guide {countWord} {stills.length === 1 ? 'frame' : 'frames'} with H3</h3>
             <p className="mt-1 text-xs text-text-muted">
-              {thirdStill
-                ? 'Use three Gallery stills as visual guides for three different interior frames of a new clip. '
-                : secondStill
-                ? 'Use two Gallery stills as visual guides for two different interior frames of a new clip. '
-                : 'Use one Gallery still as a visual guide for one interior frame of a new clip. '}
+              {stills.length === 1
+                ? 'Use one Gallery still as a visual guide for one interior frame of a new clip. '
+                : `Use ${countWord} Gallery stills as visual guides for ${countWord} different interior frames of a new clip. `}
               This uses the base FL2VA model only; PinkCherry and W4A8 variants are not included. It does not use guide video or audio. Each still is cropped to fit the clip without stretching.
             </p>
           </div>
-          <p className="mb-3 truncate text-xs text-text-secondary" title={still.name}>
-            Guide still: <span className="text-text-primary">{still.name}</span>
-          </p>
-          {secondStill && (
-            <p className="mb-3 truncate text-xs text-text-secondary" title={secondStill.name}>
-              Second guide still: <span className="text-text-primary">{secondStill.name}</span>
+          {stills.map((still, index) => (
+            <p key={still.name} className="mb-3 truncate text-xs text-text-secondary" title={still.name}>
+              {guideLabel(index)} still: <span className="text-text-primary">{still.name}</span>
             </p>
-          )}
-          {thirdStill && (
-            <p className="mb-3 truncate text-xs text-text-secondary" title={thirdStill.name}>
-              Third guide still: <span className="text-text-primary">{thirdStill.name}</span>
-            </p>
-          )}
+          ))}
           <div className="grid gap-2 sm:grid-cols-2">
             <label className="flex min-w-0 flex-col gap-1 text-xs text-text-secondary">
               <span>FL2VA model</span>
@@ -293,81 +272,40 @@ export function H3GuidePanel({
               ? 'Reuse a whole-number seed to compare settings. Use -1 for a random seed.'
               : 'Enter -1 or a whole number from 0 to 9007199254740991, or leave this blank.'}
           </p>
-          <label className="mt-3 flex flex-col gap-1 text-xs text-text-secondary">
-            <span>Guide frame index (0-based)</span>
-            <input
-              aria-label="Guide frame index, 0-based"
-              type="number"
-              min={1}
-              max={frameLimit}
-              step={1}
-              inputMode="numeric"
-              value={frameIndexValue}
-              onChange={event => setFrameIndexValue(event.target.value)}
-              placeholder={`Enter a frame from 1 to ${frameLimit}`}
-              disabled={pending}
-              className="min-h-11 rounded-md border border-border bg-bg-tertiary px-2 text-text-primary placeholder:text-text-muted"
-            />
-          </label>
-          <p className="mt-1 text-[11px] text-text-muted">
-            {frameIndex === null
-              ? `Choose an exact interior frame from 1 to ${frameLimit}; frame 0 and the final frame are not guide positions.`
-              : `Frame ${frameIndex} is about ${(frameIndex / 24).toFixed(3)} seconds into the ${targetFrameCount}-frame clip at 24 fps.`}
-          </p>
-          {secondStill && (
-            <>
-              <label className="mt-3 flex flex-col gap-1 text-xs text-text-secondary">
-                <span>Second guide frame index (0-based)</span>
-                <input
-                  aria-label="Second guide frame index, 0-based"
-                  type="number"
-                  min={1}
-                  max={frameLimit}
-                  step={1}
-                  inputMode="numeric"
-                  value={secondFrameIndexValue}
-                  onChange={event => setSecondFrameIndexValue(event.target.value)}
-                  placeholder={`Enter a different frame from 1 to ${frameLimit}`}
-                  disabled={pending}
-                  className="min-h-11 rounded-md border border-border bg-bg-tertiary px-2 text-text-primary placeholder:text-text-muted"
-                />
-              </label>
-              <p className="mt-1 text-[11px] text-text-muted">
-                {secondFrameIndex === null
-                  ? 'Choose an exact interior frame for the second still.'
-                  : secondFrameIndex === frameIndex
-                    ? 'Choose two different guide frame indices.'
-                    : `Second guide: frame ${secondFrameIndex}, about ${(secondFrameIndex / 24).toFixed(3)} seconds into the clip.`}
-              </p>
-            </>
-          )}
-          {thirdStill && (
-            <>
-              <label className="mt-3 flex flex-col gap-1 text-xs text-text-secondary">
-                <span>Third guide frame index (0-based)</span>
-                <input
-                  aria-label="Third guide frame index, 0-based"
-                  type="number"
-                  min={1}
-                  max={frameLimit}
-                  step={1}
-                  inputMode="numeric"
-                  value={thirdFrameIndexValue}
-                  onChange={event => setThirdFrameIndexValue(event.target.value)}
-                  placeholder={`Enter a different frame from 1 to ${frameLimit}`}
-                  disabled={pending}
-                  className="min-h-11 rounded-md border border-border bg-bg-tertiary px-2 text-text-primary placeholder:text-text-muted"
-                />
-              </label>
-              <p className="mt-1 text-[11px] text-text-muted">
-                {thirdFrameIndex === null
-                  ? 'Choose an exact interior frame for the third still.'
-                  : !validThirdFrame
-                    ? 'Choose three different guide frame indices.'
-                    : `Third guide: frame ${thirdFrameIndex}, about ${(thirdFrameIndex / 24).toFixed(3)} seconds into the clip.`}
-              </p>
-            </>
-          )}
+          {stills.map((still, index) => {
+            const frameIndex = frameIndices[index] ?? null
+            const repeated = frameIndex !== null && frameIndices.filter(value => value === frameIndex).length > 1
+            return (
+              <div key={still.name}>
+                <label className="mt-3 flex flex-col gap-1 text-xs text-text-secondary">
+                  <span>{guideLabel(index)} frame index (0-based)</span>
+                  <input
+                    aria-label={`${guideLabel(index)} frame index, 0-based`}
+                    type="number"
+                    min={1}
+                    max={frameLimit}
+                    step={1}
+                    inputMode="numeric"
+                    value={frameIndexValues[index] ?? ''}
+                    onChange={event => {
+                      const frameValue = event.target.value
+                      setFrameIndexValues(values => values.map((value, ordinal) => ordinal === index ? frameValue : value))
+                    }}
+                    placeholder={`Enter a different frame from 1 to ${frameLimit}`}
+                    disabled={pending}
+                    className="min-h-11 rounded-md border border-border bg-bg-tertiary px-2 text-text-primary placeholder:text-text-muted"
+                  />
+                </label>
+                <p className="mt-1 text-[11px] text-text-muted">
+                  {frameIndex === null
+                    ? `Choose an exact interior frame from 1 to ${frameLimit}; frame 0 and the final frame are not guide positions.`
+                    : repeated
+                      ? `Choose ${countWord} different guide frame indices.`
+                      : `Frame ${frameIndex} is about ${(frameIndex / 24).toFixed(3)} seconds into the ${targetFrameCount}-frame clip at 24 fps.`}
+                </p>
+              </div>
+            )
+          })}
           <label className="mt-3 flex flex-col gap-1 text-xs text-text-secondary">
             <span>Describe the clip</span>
             <textarea

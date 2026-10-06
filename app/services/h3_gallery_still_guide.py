@@ -1,4 +1,4 @@
-"""Bounded source and replay validation for up to three Gallery H3 still guides."""
+"""Bounded ordered Gallery H3 still sources and exact replay validation."""
 
 from __future__ import annotations
 
@@ -21,6 +21,8 @@ H3_GALLERY_STILL_GUIDE_SOURCE_KEY = "_h3_timeline_still_guide_source"
 H3_GALLERY_STILL_GUIDE_PLAN_KEY = "_h3_timeline_still_guide_plan"
 H3_GALLERY_STILL_GUIDE_CUSTOM_KEY = "_h3_timeline_still_guide"
 H3_GALLERY_STILL_GUIDE_MAX_BYTES = 64 * 1024 * 1024
+H3_GALLERY_STILL_GUIDE_MAX_SOURCES = 8
+H3_GALLERY_STILL_GUIDE_MAX_TOTAL_BYTES = H3_GALLERY_STILL_GUIDE_MAX_SOURCES * H3_GALLERY_STILL_GUIDE_MAX_BYTES
 H3_GALLERY_STILL_GUIDE_MAX_PIXELS = 100_000_000
 H3_GALLERY_STILL_GUIDE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".webp"})
 _FORMATS_BY_EXTENSION = {
@@ -284,9 +286,9 @@ def make_gallery_still_guide_pair_source(
 
 
 def build_gallery_still_guide_multiple_plan(sources: list[Mapping[str, Any]]) -> dict[str, Any]:
-    """Seal two or three source records in Picture order, never time-sort them."""
+    """Seal one through eight source records in Picture order, never time-sort them."""
     if (
-        type(sources) is not list or len(sources) not in (2, 3)
+        type(sources) is not list or not 1 <= len(sources) <= H3_GALLERY_STILL_GUIDE_MAX_SOURCES
         or any(not isinstance(item, Mapping) or set(item) != _SOURCE_FIELDS for item in sources)
         or any(
             not isinstance(item["name"], str) or not item["name"]
@@ -310,6 +312,55 @@ def build_gallery_still_guide_multiple_plan(sources: list[Mapping[str, Any]]) ->
         )
     except (H3GuidePlanError, TypeError, ValueError) as error:
         raise H3GalleryStillGuideError("Guide plan is invalid") from error
+
+
+def _validate_plain_still_sources(sources: Any) -> None:
+    if (
+        type(sources) is not list
+        or not 1 <= len(sources) <= H3_GALLERY_STILL_GUIDE_MAX_SOURCES
+        or any(type(item) is not dict or set(item) != _SOURCE_FIELDS for item in sources)
+    ):
+        raise H3GalleryStillGuideError("Guide sources must contain one through eight exact records")
+    for item in sources:
+        name = item["name"]
+        if (
+            any(type(item[field]) is not str or not item[field]
+                for field in ("workspace", "name", "revision"))
+            or name in (".", "..") or "/" in name or "\\" in name or "\x00" in name
+            or os.path.splitext(name)[1].lower() not in H3_GALLERY_STILL_GUIDE_EXTENSIONS
+            or any(type(item[field]) is not str or len(item[field]) != 71
+                   or not item[field].startswith("sha256:")
+                   or any(ch not in "0123456789abcdef" for ch in item[field][7:])
+                   for field in ("sha256", "plan_sha256"))
+            or type(item["size"]) is not int
+            or not 1 <= item["size"] <= H3_GALLERY_STILL_GUIDE_MAX_BYTES
+            or type(item["width"]) is not int or item["width"] < 1
+            or type(item["height"]) is not int or item["height"] < 1
+            or item["width"] * item["height"] > H3_GALLERY_STILL_GUIDE_MAX_PIXELS
+            or type(item["source_private"]) is not bool
+            or type(item["source_explicit"]) is not bool
+        ):
+            raise H3GalleryStillGuideError("Guide source commitment is invalid")
+    if sum(item["size"] for item in sources) > H3_GALLERY_STILL_GUIDE_MAX_TOTAL_BYTES:
+        raise H3GalleryStillGuideError("Selected stills exceed the total size limit")
+
+
+def make_gallery_still_guide_sources(
+    sources: list[dict[str, Any]], plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind an ordered bounded source list to one shared guide commitment."""
+    _validate_plain_still_sources(sources)
+    expected = build_gallery_still_guide_multiple_plan(sources)
+    try:
+        validated = validate_h3_guide_plan(dict(plan))
+    except (H3GuidePlanError, TypeError, ValueError) as error:
+        raise H3GalleryStillGuideError("Guide plan is invalid") from error
+    if validated != expected:
+        raise H3GalleryStillGuideError("Guide plan does not match all selected stills")
+    return {
+        "sources": [{**item, "plan_sha256": expected["plan_sha256"]} for item in sources],
+        "plan_sha256": expected["plan_sha256"],
+    }
 
 
 def make_gallery_still_guide_triple_source(
@@ -339,6 +390,14 @@ def validate_gallery_still_guide_job(
     if not isinstance(params, Mapping):
         raise H3GalleryStillGuideError("Guide request is invalid")
     source = params.get(H3_GALLERY_STILL_GUIDE_SOURCE_KEY)
+    if isinstance(source, Mapping) and "sources" in source:
+        return _validate_gallery_still_guide_sources_job(
+            params, workspace=workspace, out_dir=out_dir,
+            safe_direct_file_under=safe_direct_file_under,
+            output_revision=output_revision, load_sidecars=load_sidecars,
+            classify_artifacts=classify_artifacts, integrity_pending=integrity_pending,
+            job_private=job_private, job_explicit=job_explicit,
+        )
     if isinstance(source, Mapping) and ("second_source" in source or "third_source" in source):
         return _validate_gallery_still_guide_pair_job(
             params, workspace=workspace, out_dir=out_dir,
@@ -533,10 +592,57 @@ def _validate_gallery_still_guide_pair_job(
     }
 
 
+def _validate_gallery_still_guide_sources_job(
+    params: Mapping[str, Any], **validation: Any,
+) -> dict[str, Any]:
+    source = params[H3_GALLERY_STILL_GUIDE_SOURCE_KEY]
+    if type(source) is not dict or set(source) != {"sources", "plan_sha256"}:
+        raise H3GalleryStillGuideError("Guide request binding is invalid")
+    records = source["sources"]
+    _validate_plain_still_sources(records)
+    custom = params.get("custom_settings")
+    setting = custom.get(H3_GALLERY_STILL_GUIDE_CUSTOM_KEY) if isinstance(custom, Mapping) else None
+    if (
+        type(setting) is not dict or set(setting) != {"frame_indices", "additional_still_paths"}
+        or type(setting["frame_indices"]) is not list
+        or len(setting["frame_indices"]) != len(records)
+        or any(type(index) is not int or index != record["frame_index"]
+               for index, record in zip(setting["frame_indices"], records))
+        or type(setting["additional_still_paths"]) is not list
+        or len(setting["additional_still_paths"]) != len(records) - 1
+        or any(type(path) is not str or not path for path in setting["additional_still_paths"])
+        or type(params.get("image_start")) is not str or not params["image_start"]
+        or params.get("image_end") is not None
+    ):
+        raise H3GalleryStillGuideError("Guide request does not bind every selected still")
+    expected = make_gallery_still_guide_sources(records, params.get(H3_GALLERY_STILL_GUIDE_PLAN_KEY))
+    if source != expected:
+        raise H3GalleryStillGuideError("Guide plan does not match all source commitments")
+    results = []
+    paths = [params["image_start"], *setting["additional_still_paths"]]
+    for record, path in zip(records, paths):
+        single_plan = build_gallery_still_guide_plan(
+            sha256=record["sha256"], frame_index=record["frame_index"], target_frames=record["target_frames"],
+        )
+        single_params = {
+            **dict(params), "image_start": path, "image_end": None,
+            H3_GALLERY_STILL_GUIDE_SOURCE_KEY: {**record, "plan_sha256": single_plan["plan_sha256"]},
+            H3_GALLERY_STILL_GUIDE_PLAN_KEY: single_plan,
+            "custom_settings": {**dict(custom), H3_GALLERY_STILL_GUIDE_CUSTOM_KEY: {"frame_index": record["frame_index"]}},
+        }
+        results.append(validate_gallery_still_guide_job(single_params, **validation))
+    return {
+        **results[0], "plan_sha256": source["plan_sha256"], "guide_count": len(results),
+        "frame_indices": [result["frame_index"] for result in results], "sources": results,
+    }
+
+
 __all__ = [
     "GalleryStillProbe",
     "H3_GALLERY_STILL_GUIDE_CUSTOM_KEY",
     "H3_GALLERY_STILL_GUIDE_EXTENSIONS",
+    "H3_GALLERY_STILL_GUIDE_MAX_SOURCES",
+    "H3_GALLERY_STILL_GUIDE_MAX_TOTAL_BYTES",
     "H3_GALLERY_STILL_GUIDE_PLAN_KEY",
     "H3_GALLERY_STILL_GUIDE_SOURCE_KEY",
     "H3GalleryStillGuideError",
@@ -546,6 +652,7 @@ __all__ = [
     "make_gallery_still_guide_triple_source",
     "make_gallery_still_guide_pair_source",
     "make_gallery_still_guide_source",
+    "make_gallery_still_guide_sources",
     "probe_gallery_still",
     "validate_gallery_still_guide_job",
 ]

@@ -628,6 +628,8 @@ class family_handler:
                     image_end=timeline_image_end,
                     third_still=custom_for_timeline["_h3_timeline_still_guide"].get("third_still_path")
                     if isinstance(custom_for_timeline["_h3_timeline_still_guide"], dict) else None,
+                    additional_stills=custom_for_timeline["_h3_timeline_still_guide"].get("additional_still_paths")
+                    if isinstance(custom_for_timeline["_h3_timeline_still_guide"], dict) else None,
                     reference_mode=_is_reference_mode(base_model_type),
                     native_boundary=(
                         custom_for_timeline.get("h3_native_boundary_conditioning") is True
@@ -745,7 +747,11 @@ class family_handler:
                 else sum(inputs.get(key) is not None for key in ("image_start", "image_end"))
             )
             if isinstance(custom_for_timeline.get("_h3_timeline_still_guide"), dict):
-                picture_count += int("third_frame_index" in custom_for_timeline["_h3_timeline_still_guide"])
+                timeline_guide = custom_for_timeline["_h3_timeline_still_guide"]
+                if "frame_indices" in timeline_guide:
+                    picture_count = len(timeline_guide["frame_indices"])
+                else:
+                    picture_count += int("third_frame_index" in timeline_guide)
             if selected_video_slots is None:
                 selected_video_slots = selected_h3_video_slots(
                     video_prompt_type,

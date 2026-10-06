@@ -45116,6 +45116,8 @@ def _h3_allocation_scenario(
     custom = params.get("custom_settings")
     custom = custom if isinstance(custom, dict) else {}
     identity = _h3_peak_recovery_identity(params, frame_count=frame_count)
+    from services.h3_benchmark import h3_timeline_still_guide_count
+    timeline_count = h3_timeline_still_guide_count(params)
     from services.oom_detect import safe_allocator_facts
     allocator = safe_allocator_facts()
     host_available, _host_total = wgp._host_memory_snapshot()
@@ -45146,6 +45148,7 @@ def _h3_allocation_scenario(
         "attention_signature": attention_signature,
         "schedule_id": schedule,
         "resource_kind": resource_kind,
+        **({"timeline_still_count": timeline_count} if timeline_count else {}),
         "offload_profile": identity["offload_profile"],
         "policy_version": _H3_PEAK_RECOVERY_POLICY_VERSION,
         "host_ram_band_gib": max(0, int((host_available or 0) // gib)),
@@ -45202,10 +45205,6 @@ def _h3_allocation_observation_scenario(params, *, frame_count, observed_profile
 def _h3_allocation_success_outcome(params: dict) -> str:
     """Classify only an exact authored 20-step success as voting evidence."""
     steps = params.get("num_inference_steps")
-    guide = (params.get("custom_settings") or {}).get("_h3_timeline_still_guide")
-    if isinstance(guide, dict) and "third_frame_index" in guide:
-        # Three-still conditioning is absent from the allocation identity.
-        return "probe_success"
     return (
         "production_success"
         if type(steps) is int and steps == 20
@@ -45271,12 +45270,16 @@ def _h3_benchmark_input_signature(params: dict, case_id: str) -> dict:
     """Return counts only; never hash, retain, or inspect reference content."""
     if case_id == "text_only":
         return {}
+    from services.h3_benchmark import h3_timeline_still_guide_count
+
+    timeline_count = h3_timeline_still_guide_count(params)
     images = params.get("image_refs")
     image_count = len(images) if isinstance(images, (list, tuple)) else int(bool(images))
     return {
         "has_start": bool(params.get("image_start")),
         "has_end": bool(params.get("image_end")),
         "image_count": image_count,
+        **({"timeline_still_count": timeline_count} if timeline_count else {}),
         "video_count": sum(bool(params.get(key)) for key in (
             "video_guide", "video_guide2", "video_guide3",
         )),
@@ -45424,6 +45427,15 @@ def _h3_calibrated_peak_choice(
     allocator: dict | None = None,
 ) -> dict | None:
     """Choose only an exact 20-step, headroom-safe local calibration."""
+    from services.h3_benchmark import h3_timeline_still_guide_count
+
+    timeline_count = h3_timeline_still_guide_count(params)
+    custom = params.get("custom_settings")
+    if (
+        isinstance(custom, dict) and "_h3_timeline_still_guide" in custom
+        and not timeline_count
+    ):
+        return None
     try:
         requested_frames = int(params.get("video_length") or 0)
         current_profile = _h3_effective_offload_profile(params)
@@ -45470,6 +45482,15 @@ def _h3_calibrated_peak_choice(
             continue
         spec = record.get("spec")
         spec = spec if isinstance(spec, dict) else {}
+        shape = spec.get("input_shape")
+        shape = shape if isinstance(shape, dict) else {}
+        observed_count = shape.get("timeline_still_count", 0)
+        if (
+            type(observed_count) is not int or not 0 <= observed_count <= 8
+            or observed_count != timeline_count
+            or (spec.get("case_id") == "timeline_stills") != bool(timeline_count)
+        ):
+            continue
         task = spec.get("task")
         task = task if isinstance(task, dict) else {}
         model = spec.get("model")
@@ -45577,10 +45598,6 @@ def _record_h3_benchmark_observation(
     custom = params.get("custom_settings")
     if not isinstance(custom, dict):
         custom = {}
-    guide = custom.get("_h3_timeline_still_guide")
-    if isinstance(guide, dict) and "third_frame_index" in guide:
-        # Do not label three interior keyframes as an ordinary first/last run.
-        return
     if (
         custom.get("h3_native_boundary_conditioning") is True
         or params.get("h3_native_boundary_conditioning") is True
@@ -45596,7 +45613,9 @@ def _record_h3_benchmark_observation(
     model_type = str(params.get("model_type") or "")
     if model_type not in _H3_LONG_STUDIO_MODELS:
         return
-    from services.h3_benchmark import build_benchmark_spec, record_observation
+    from services.h3_benchmark import (
+        build_benchmark_spec, record_observation, h3_timeline_still_guide_count,
+    )
     model_def = wgp.get_model_def(model_type) or {}
     spectrum_stats = None
     if custom.get("h3_spectrum_profile") == "spectrum_h3_v1":
@@ -45628,7 +45647,8 @@ def _record_h3_benchmark_observation(
     has_start = bool(params.get("image_start"))
     has_end = bool(params.get("image_end"))
     case_id = (
-        "ref2va" if has_semantic or model_type == _H3_REF2VA_MODEL
+        "timeline_stills" if h3_timeline_still_guide_count(params)
+        else "ref2va" if has_semantic or model_type == _H3_REF2VA_MODEL
         else "first_last" if has_start and has_end
         else "first_frame" if has_start or has_end
         else "text_only"
@@ -45817,6 +45837,9 @@ def _h3_estimate_context(body: dict, plan: dict | None = None) -> dict:
             ) / fps
     except (TypeError, ValueError, ZeroDivisionError):
         window_seconds = 345 / 24
+    from services.h3_benchmark import h3_timeline_still_guide_count
+
+    timeline_count = h3_timeline_still_guide_count(body)
     images = body.get("image_refs")
     raw_segment_scenes = body.get("segment_scenes")
     segment_scenes = []
@@ -45892,6 +45915,7 @@ def _h3_estimate_context(body: dict, plan: dict | None = None) -> dict:
         "delivery_resolution": str(body.get("delivery_resolution") or ""),
         "delivery_fit": str(body.get("delivery_fit") or ""),
         "reference_shape": {
+            **({"timeline_still_count": timeline_count} if timeline_count else {}),
             "has_start": bool(
                 estimate_reference.get("has_start", body.get("image_start"))
             ),
@@ -49260,7 +49284,7 @@ async def _resolve_h3_gallery_still_guide_source(request, workspace, out_dir, na
 
 @api.post("/api/v1/h3/gallery-still-guide")
 async def h3_gallery_still_guide_endpoint(request: Request):
-    """Queue up to three project-authorized stills at distinct interior H3 frames."""
+    """Queue one through eight authorized stills in selected Picture order."""
     from services.h3_gallery_still_guide import (
         H3_GALLERY_STILL_GUIDE_CUSTOM_KEY,
         H3_GALLERY_STILL_GUIDE_PLAN_KEY,
@@ -49269,6 +49293,8 @@ async def h3_gallery_still_guide_endpoint(request: Request):
         build_gallery_still_guide_plan,
         build_gallery_still_guide_pair_plan,
         build_gallery_still_guide_multiple_plan,
+        H3_GALLERY_STILL_GUIDE_MAX_SOURCES,
+        make_gallery_still_guide_sources,
         make_gallery_still_guide_triple_source,
         make_gallery_still_guide_pair_source,
         make_gallery_still_guide_source,
@@ -49284,7 +49310,7 @@ async def h3_gallery_still_guide_endpoint(request: Request):
         "workspace", "name", "revision", "frame_index", "model_type",
         "prompt", "settings",
     }
-    allowed = required | {"private_output", "explicit_output", "second_still", "third_still"}
+    allowed = required | {"private_output", "explicit_output", "second_still", "third_still", "additional_stills"}
     if not isinstance(submitted, dict) or not required <= set(submitted) or set(submitted) - allowed:
         raise HTTPException(
             status_code=400, detail="H3 Guide request fields are invalid",
@@ -49357,6 +49383,31 @@ async def h3_gallery_still_guide_endpoint(request: Request):
         or third_still["frame_index"] in (frame_index, second_still["frame_index"])
     ):
         raise HTTPException(status_code=400, detail="Choose three different Gallery stills and distinct interior frame indices")
+    additional_stills = submitted.get("additional_stills")
+    if "additional_stills" in submitted:
+        if (
+            type(additional_stills) is not list
+            or len(additional_stills) >= H3_GALLERY_STILL_GUIDE_MAX_SOURCES
+            or "second_still" in submitted or "third_still" in submitted
+        ):
+            raise HTTPException(status_code=400, detail="Choose one through eight Gallery stills in one selection")
+        selected_names = {name}
+        selected_frames = {frame_index}
+        for still in additional_stills:
+            if (
+                type(still) is not dict
+                or set(still) != {"name", "revision", "frame_index"}
+                or not isinstance(still.get("name"), str)
+                or not 0 < len(still["name"]) <= 255
+                or not isinstance(still.get("revision"), str)
+                or not 0 < len(still["revision"]) <= 256
+                or type(still.get("frame_index")) is not int
+                or still["name"] in selected_names
+                or still["frame_index"] in selected_frames
+            ):
+                raise HTTPException(status_code=400, detail="Choose different Gallery stills and distinct interior frame indices")
+            selected_names.add(still["name"])
+            selected_frames.add(still["frame_index"])
     if model_type != _H3_BASE_FL2VA_MODEL:
         raise HTTPException(
             status_code=400,
@@ -49387,6 +49438,19 @@ async def h3_gallery_still_guide_endpoint(request: Request):
         third_path, third_sidecar, third_probe = await _resolve_h3_gallery_still_guide_source(
             request, workspace, out_dir, third_still["name"], third_still["revision"],
         )
+
+    additional_sources = []
+    for still in additional_stills or []:
+        path, metadata, still_probe = await _resolve_h3_gallery_still_guide_source(
+            request, workspace, out_dir, still["name"], still["revision"],
+        )
+        additional_sources.append((still, path, metadata, still_probe))
+    guide_frame_indices = (
+        [frame_index]
+        + ([second_still["frame_index"]] if second_still is not None else [])
+        + ([third_still["frame_index"]] if third_still is not None else [])
+        + [still["frame_index"] for still in additional_stills or []]
+    )
 
     model_def = wgp.get_model_def(model_type) or {}
     requested_frames = settings["video_length"]
@@ -49455,6 +49519,21 @@ async def h3_gallery_still_guide_endpoint(request: Request):
                 guide_source = make_gallery_still_guide_triple_source(guide_source, second_source, third_source, guide_plan)
             else:
                 guide_source = make_gallery_still_guide_pair_source(guide_source, second_source, guide_plan)
+        if additional_stills is not None:
+            records = [guide_source]
+            for still, _path, metadata, still_probe in additional_sources:
+                single_plan = build_gallery_still_guide_plan(
+                    sha256=still_probe.sha256, frame_index=still["frame_index"],
+                    target_frames=target_frames,
+                )
+                records.append(make_gallery_still_guide_source(
+                    workspace=workspace, name=still["name"], revision=still["revision"],
+                    probe=still_probe, frame_index=still["frame_index"], target_frames=target_frames,
+                    plan=single_plan, source_private=metadata.get("private", False),
+                    source_explicit=metadata.get("explicit", False),
+                ))
+            guide_plan = build_gallery_still_guide_multiple_plan(records)
+            guide_source = make_gallery_still_guide_sources(records, guide_plan)
     except H3GalleryStillGuideError as error:
         raise HTTPException(status_code=400, detail="H3 Guide input is invalid") from error
 
@@ -49517,15 +49596,24 @@ async def h3_gallery_still_guide_endpoint(request: Request):
         safe_custom[H3_GALLERY_STILL_GUIDE_CUSTOM_KEY].update({
             "third_frame_index": third_still["frame_index"], "third_still_path": third_path,
         })
+    if additional_stills is not None:
+        safe_custom[H3_GALLERY_STILL_GUIDE_CUSTOM_KEY] = {
+            "frame_indices": guide_frame_indices,
+            "additional_still_paths": [item[1] for item in additional_sources],
+        }
     params["custom_settings"] = safe_custom
 
     session_id = str(request.state.maestro_session_id)
-    source_paths = [path for path in (source_path, second_path, third_path) if path is not None]
+    source_paths = (
+        [path for path in (source_path, second_path, third_path) if path is not None]
+        + [item[1] for item in additional_sources]
+    )
     inherited = _inherit_media_access_policy(source_paths, workspace, session_id)
     effective_private = bool(
         sidecar.get("private", False)
         or (second_sidecar or {}).get("private", False)
         or (third_sidecar or {}).get("private", False)
+        or any(item[2].get("private", False) for item in additional_sources)
         or inherited.get("private", False)
         or submitted.get("private_output", False)
     )
@@ -49533,6 +49621,7 @@ async def h3_gallery_still_guide_endpoint(request: Request):
         sidecar.get("explicit", False)
         or (second_sidecar or {}).get("explicit", False)
         or (third_sidecar or {}).get("explicit", False)
+        or any(item[2].get("explicit", False) for item in additional_sources)
         or inherited.get("explicit", False)
         or submitted.get("explicit_output", False)
     )
@@ -49557,7 +49646,7 @@ async def h3_gallery_still_guide_endpoint(request: Request):
             "frame_index": frame_index,
             "target_frames": target_frames,
             "guide_count": len(source_paths),
-            "frame_indices": [frame_index] + ([second_still["frame_index"]] if second_still is not None else []) + ([third_still["frame_index"]] if third_still is not None else []),
+            "frame_indices": guide_frame_indices,
             "audio_guides": 0,
             "video_guides": 0,
         },
@@ -69948,6 +70037,7 @@ def _run_generation(
                     for key in (
                         "_h3_timeline_still_guide_source",
                         "_h3_timeline_still_guide_plan",
+                        "image_start", "image_end",
                     ):
                         sidecar_params.pop(key, None)
                     guide_custom = sidecar_params.get("custom_settings")
@@ -70005,15 +70095,18 @@ def _run_generation(
                     "created_at": time.time(),
                 }
                 if isinstance(guide_source, dict):
+                    guide_records = guide_source.get("sources")
+                    if not isinstance(guide_records, list):
+                        guide_records = [guide_source] + [
+                            guide_source[key] for key in ("second_source", "third_source")
+                            if isinstance(guide_source.get(key), dict)
+                        ]
                     sidecar["h3_guide_execution"] = {
                         "capability": "gallery_still_fl2va",
-                        "frame_index": guide_source.get("frame_index"),
-                        "target_frames": guide_source.get("target_frames"),
-                        "guide_count": 1 + sum(isinstance(guide_source.get(key), dict) for key in ("second_source", "third_source")),
-                        "frame_indices": [guide_source.get("frame_index")] + [
-                            guide_source[key].get("frame_index") for key in ("second_source", "third_source")
-                            if isinstance(guide_source.get(key), dict)
-                        ],
+                        "frame_index": guide_records[0].get("frame_index"),
+                        "target_frames": guide_records[0].get("target_frames"),
+                        "guide_count": len(guide_records),
+                        "frame_indices": [record.get("frame_index") for record in guide_records],
                         "audio_guides": 0,
                         "video_guides": 0,
                     }

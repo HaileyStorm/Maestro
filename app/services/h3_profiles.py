@@ -324,14 +324,9 @@ def fresh_profile_id_for_account_role(account_role: str | None) -> str:
 
 
 def _reference_count(reference_shape: Mapping[str, Any]) -> int:
-    total = int(bool(reference_shape.get("has_start")))
-    total += int(bool(reference_shape.get("has_end")))
-    for key in ("image_count", "video_count", "audio_count"):
-        try:
-            total += max(0, int(reference_shape.get(key) or 0))
-        except (TypeError, ValueError):
-            continue
-    return total
+    from services.h3_benchmark import h3_timing_reference_count
+
+    return h3_timing_reference_count(reference_shape)
 
 
 def _sage2_base_context_reason(
