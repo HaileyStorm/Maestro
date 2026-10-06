@@ -124,6 +124,34 @@ class H3PDDTests(unittest.TestCase):
         clear_pdd_runtime(self.model)
         self.assert_restored()
 
+    def test_authored_fusion_ignores_non_cpu_default_device(self):
+        banks = load_file(str(self.path))
+        hidden = torch.arange(8, dtype=torch.bfloat16)[None]
+
+        def outputs():
+            controller = install_pdd_heads(self.model, banks, strength=1)
+            try:
+                controller.configure_sigmas(pdd_sigmas(12), pdd_sigmas(3))
+                result = []
+                for index in range(8):
+                    controller.set_step(index)
+                    for head in (controller.video, controller.audio):
+                        self.assertEqual(head.fused_weights.device.type, "cpu")
+                        self.assertEqual(head.fused_weights.dtype, torch.float32)
+                        result.append(head(hidden))
+                return result
+            finally:
+                clear_pdd_runtime(self.model)
+
+        expected = outputs()
+        # Meta exercises a non-CPU allocation default without initializing CUDA.
+        with torch.device("meta"):
+            actual = outputs()
+        for output, reference in zip(actual, expected):
+            self.assertEqual(output.device.type, "cpu")
+            torch.testing.assert_close(output, reference)
+        self.assert_restored()
+
     def test_backbone_uses_existing_swiglu_order_and_rejects_unpaired_factors(self):
         state = artifact_state(self.model)
         state["transformer_blocks.0.ff.net.0.proj.lora_down"] = torch.ones(2, 8)

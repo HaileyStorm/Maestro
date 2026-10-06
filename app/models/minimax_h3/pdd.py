@@ -22,7 +22,7 @@ PDD_AUDIO_SHIFT = 3.0
 
 
 def pdd_sigmas(shift):
-    base = torch.linspace(1.0, 0.0, 9, dtype=torch.float64)
+    base = torch.linspace(1.0, 0.0, 9, dtype=torch.float64, device="cpu")
     return shift * base / (1 + (shift - 1) * base)
 
 
@@ -32,14 +32,14 @@ def pdd_sampling_plans_for_sigmas(sigmas, shift):
             or actual[0] != 1 or actual[-1] != 0
             or not (actual[:-1] > actual[1:]).all()):
         raise ValueError("PDD requires eight descending sigma intervals from one to zero.")
-    fine = torch.linspace(1.0, 0.0, 33, dtype=torch.float64)
+    fine = torch.linspace(1.0, 0.0, 33, dtype=torch.float64, device="cpu")
     times = 1 - shift * fine / (1 + (shift - 1) * fine)
     runtime_times = 1 - actual
     plans = []
     for start, end in zip(runtime_times[:-1], runtime_times[1:]):
         overlap = (torch.minimum(times[1:], end) - torch.maximum(times[:-1], start)).clamp_min(0)
         plan = overlap / (end - start)
-        if not torch.isclose(plan.sum(), torch.tensor(1.0, dtype=torch.float64), atol=1e-7):
+        if not torch.isclose(plan.sum(), torch.tensor(1.0, dtype=torch.float64, device="cpu"), atol=1e-7):
             raise ValueError("PDD runtime interval is not covered by the authored heads.")
         plans.append(plan)
     return torch.stack(plans)
@@ -86,8 +86,12 @@ class PDDParallelHead(nn.Module):
         return self.base.out_features
 
     def configure(self, weights, biases, plans):
-        self.fused_weights = torch.einsum("sn,noi->soi", plans.float(), weights.float()).cpu()
-        self.fused_biases = torch.einsum("sn,no->so", plans.float(), biases.float()).cpu()
+        # MMGP may leave CUDA as the default device; authored fusion stays CPU FP32.
+        plans = plans.to(device="cpu", dtype=torch.float32)
+        weights = weights.to(device="cpu", dtype=torch.float32)
+        biases = biases.to(device="cpu", dtype=torch.float32)
+        self.fused_weights = torch.einsum("sn,noi->soi", plans, weights)
+        self.fused_biases = torch.einsum("sn,no->so", plans, biases)
         self.step = None
 
     def forward(self, hidden):
