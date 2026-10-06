@@ -561,6 +561,24 @@ class RetakePolicyAdmissionTests(unittest.TestCase):
                         self.assertEqual((job["params"]["retake_start_frame"], job["params"]["retake_end_frame"]), (6, 30))
                         self.assertFalse({"private_output", "explicit_output"} & job["params"].keys())
 
+    def test_retake_admission_exposes_ordinary_generation_identity_and_resources(self):
+        from services.job_lifecycle import resource_descriptor
+
+        self.set_source_policy(True, False)
+        response = self.submit(prompt="replacement action")
+        job = self.registered[-1]
+        self.assertEqual(response["job_id"], job["id"])
+        self.assertEqual(job.get("model_type"), "ltx2_3")
+        self.assertEqual(job.get("generation_mode"), "video")
+        self.assertEqual(resource_descriptor(job), {
+            "intent": "generation", "execution": "standard",
+            "preemptible": False, "preemption_mode": "none",
+            "state": "queued", "execution_attempt": 1,
+        })
+        self.assertEqual(job["params"]["prompt"], "replacement action")
+        self.assertEqual(job["params"]["retake_video"], str(self.source))
+        self.assertEqual(job["access_policy"], {"private": True, "explicit": False})
+
     def test_owned_upload_inherits_flags_but_foreign_upload_is_not_admitted(self):
         source = self.uploads / "uploaded.mp4"
         source.write_bytes(b"disposable upload")

@@ -3727,7 +3727,7 @@ interface AppState {
   reconnectJobs: (accountIdentityEpoch?: number) => Promise<void>
   resumeJobRecovery: (jobId: string) => Promise<void>
   retryJobRecovery: (jobId: string) => Promise<void>
-  trackAcceptedCompositionJob: (result: { job_id: string; status: 'queued' }, workspace: string, accountIdentityEpoch: number) => void
+  trackAcceptedGenerationJob: (result: { job_id: string; status: 'queued' }, workspace: string, accountIdentityEpoch: number) => void
   _pollRecoveredJob: (jobId: string, expectedWorkspace?: string, pollQueuedFast?: boolean) => void
 
   // LoRA state
@@ -10859,7 +10859,7 @@ export const useStore = create<AppState>((set, get) => ({
     await get().reconnectJobs(accountIdentityEpoch)
   },
 
-  trackAcceptedCompositionJob: (result, workspace, accountIdentityEpoch) => {
+  trackAcceptedGenerationJob: (result, workspace, accountIdentityEpoch) => {
     if (!_accountIdentityIsCurrent(accountIdentityEpoch) || get().activeWorkspace !== workspace) return
     set(s => {
       const jobs = s.jobs.some(job => job.id === result.job_id) ? s.jobs : [{

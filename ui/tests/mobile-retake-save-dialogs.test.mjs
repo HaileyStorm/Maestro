@@ -278,7 +278,7 @@ async function loadDialogComponent(entryUrl, exportName) {
       export async function submitRetake(payload) {
         globalThis.__retakePayloads.push(payload)
         if (globalThis.__retakeSubmit) return globalThis.__retakeSubmit(payload)
-        return { retake_frames: '0-17/300' }
+        return { job_id: 'accepted-retake', status: 'queued', retake_frames: '0-17/300' }
       }
     `],
     ['../../api/client', `
@@ -473,6 +473,7 @@ function resetDialogHarness(refs) {
   globalThis.__dialogTopCloseRequests = []
   globalThis.__dialogAllowTopClose = true
   globalThis.__retakePayloads = []
+  globalThis.__retakeTrackedJobs = []
   globalThis.__retakeAccountEpoch = 0
   globalThis.__retakeSubmit = null
   globalThis.__retakeUpload = async () => ({ path: '/uploaded/video.mp4' })
@@ -597,6 +598,7 @@ test('bundled Retake dialog portals, captures exact active trigger, and preserve
     closeRetakeDialog: () => {},
     activeWorkspace: 'workspace-a',
     loadOutputs: () => { loadOutputs += 1 },
+    trackAcceptedGenerationJob: (...args) => { globalThis.__retakeTrackedJobs.push(args) },
     selectedModelPerMode: { video: 'video-model' },
     params: {
       model_type: 'fallback-model',
@@ -656,6 +658,9 @@ test('bundled Retake dialog portals, captures exact active trigger, and preserve
     workspace: 'workspace-a',
   }])
   assert.equal(loadOutputs, 1)
+  assert.deepEqual(globalThis.__retakeTrackedJobs, [[
+    { job_id: 'accepted-retake', status: 'queued' }, 'workspace-a', 0,
+  ]], 'one accepted Retake starts exact-job tracking without a reload or duplicate POST')
   beginRender()
   tree = RetakeDialog()
   assert.equal(nodeText(findNode(tree, node => node.props?.role === 'status')), 'Retake queued for 17 frames.')
@@ -678,6 +683,7 @@ test('Retake loading, failure, and close-reopen lifecycle ignore every stale com
     },
     activeWorkspace: 'workspace-a',
     loadOutputs: () => { loadOutputs += 1 },
+    trackAcceptedGenerationJob: (...args) => { globalThis.__retakeTrackedJobs.push(args) },
     selectedModelPerMode: { video: 'video-model' },
     params: { model_type: 'fallback', activated_loras: [], loras_multipliers: '' },
     models: [],
@@ -715,6 +721,7 @@ test('Retake loading, failure, and close-reopen lifecycle ignore every stale com
   await Promise.all([first, duplicate])
   assert.equal(closeCount, 1, 'old success cannot close the reopened dialog')
   assert.equal(loadOutputs, 0, 'old success cannot refresh or publish UI state')
+  assert.deepEqual(globalThis.__retakeTrackedJobs, [], 'stale success cannot track another opening’s job')
 
   resetDialogHarness([{ current: {} }, { current: {} }, { current: null }])
   globalThis.document.activeElement = new FakeButton()

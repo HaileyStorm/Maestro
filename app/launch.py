@@ -51248,6 +51248,14 @@ async def retake_video_endpoint(request: Request):
         "params": gen_params, "output_files": [], "error": None,
         "workspace": workspace, "out_dir": job_out_dir,
         "session_id": session_id, "access_policy": access_policy,
+        "model_type": str(gen_params["model_type"]),
+        "generation_mode": "video",
+        "prompt_preview": str(gen_params["prompt"])[:500],
+        "resource_intent": "generation",
+        "resource_execution": "standard",
+        "preemption_mode": "none",
+        "resource_state": "queued",
+        "execution_attempt": 1,
     }
     if editor_origin is not None:
         gen_params["_editor_retake_origin"] = editor_origin

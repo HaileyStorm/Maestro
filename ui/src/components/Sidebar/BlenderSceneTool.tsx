@@ -232,7 +232,7 @@ export function BlenderSceneTool({
             })),
           }
           const accepted = await api.submitBlenderComposition(operation.workspace, composition, repeatPrivateOutput)
-          useStore.getState().trackAcceptedCompositionJob(accepted, operation.workspace, operation.accountEpoch)
+          useStore.getState().trackAcceptedGenerationJob(accepted, operation.workspace, operation.accountEpoch)
           return
         }
         let startPosition: [number, number, number]
@@ -265,7 +265,7 @@ export function BlenderSceneTool({
           })),
         }
         const accepted = await api.submitBlenderComposition(operation.workspace, composition, repeatPrivateOutput)
-        useStore.getState().trackAcceptedCompositionJob(accepted, operation.workspace, operation.accountEpoch)
+        useStore.getState().trackAcceptedGenerationJob(accepted, operation.workspace, operation.accountEpoch)
       }, true, 'Added to Queue. When the sequence finishes, open it from Gallery in Editor.')
     } finally {
       compositionSubmission.current = false

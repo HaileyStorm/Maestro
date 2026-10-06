@@ -207,6 +207,9 @@ export function RetakeDialog() {
         ...(sourceContext ? { expected_source_revision: sourceContext.revision, ...(sourceContext.editor_origin ? { editor_origin: sourceContext.editor_origin } : {}) } : {}),
       })
       if (!current()) return
+      useStore.getState().trackAcceptedGenerationJob(
+        { job_id: result.job_id, status: 'queued' }, activeWorkspace, account,
+      )
       const frameCount = retakeFrameCount(result.retake_frames)
       setSuccess(frameCount === null
         ? 'Retake queued.'

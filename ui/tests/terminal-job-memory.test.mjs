@@ -390,7 +390,7 @@ test('real store hydrates failures after account bootstrap and scrubs on identit
     statusRequests.length = 0
     return { store, loads, epoch: accountEpochs.get(store)() }
   }
-  const track = ({ store, epoch }) => store.getState().trackAcceptedCompositionJob(
+  const track = ({ store, epoch }) => store.getState().trackAcceptedGenerationJob(
     { job_id: 'accepted-repeat', status: 'queued' }, 'project-a', epoch,
   )
   await t.test('accepted composition completed before discovery refreshes Gallery from its exact status', async () => {
