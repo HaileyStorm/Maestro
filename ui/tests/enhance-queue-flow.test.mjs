@@ -3116,7 +3116,7 @@ test('Tools submissions keep canonical status polling across queued and running 
         statusReads++
         return jsonResponse({ ...apiJobStatus('tool-status-job', 'studio-a', null, 17),
           status: ['queued', 'running', 'cancelled'][statusReads - 1],
-          phase: statusReads === 2 ? 'Audio chunk 1: starting voice step 3 of 25' : '',
+          phase: statusReads === 2 && tool === 'revoice' ? 'Audio chunk 1: starting voice step 3 of 25' : '',
         })
       }
       assert.fail(`Unexpected tool request ${request.url}`)
@@ -3136,12 +3136,72 @@ test('Tools submissions keep canonical status polling across queued and running 
     for (const expectedReads of [2, 3]) {
       assert.equal(timers.size, 1)
       const [id, timer] = timers.entries().next().value
-      assert.equal(timer.delay, 2_000, 'short tool jobs need canonical polling while queued too')
+      assert.equal(timer.delay, expectedReads === 3 && tool === 'revoice' ? 250 : 2_000,
+        'queued tools use normal polling; visible voice conversion must expose its short diffusion phase')
       timers.delete(id)
       timer.callback()
       await new Promise(resolve => setImmediate(resolve))
       assert.equal(statusReads, expectedReads)
     }
+    assert.equal(useStore.getState().jobs[0].status, 'cancelled')
+    assert.equal(useStore.getState().isGenerating, false)
+    assert.equal(timers.size, 0)
+  })
+})
+
+test('voice conversion polling slows down when hidden, disconnected, or outside the voice phase', async t => {
+  for (const hidden of [false, true]) await t.test(hidden ? 'hidden' : 'visible', async t => {
+    const timers = new Map()
+    let timerId = 0
+    let reads = 0
+    let reconnects = 0
+    const responses = [
+      { phase: 'Voice Conversion' },
+      { phase: 'Audio chunk 1: starting voice step 3 of 25' },
+      new Error('temporary disconnect'),
+      new Error('continued disconnect'),
+      new Error('reconciliation boundary'),
+      new Error('still disconnected after reconciliation'),
+      { phase: 'Audio chunk 1: starting voice step 9 of 25' },
+      { phase: 'Saving output' },
+      { status: 'cancelled', phase: '' },
+    ]
+    const { useStore, actualPoll } = await studioSubmissionFixture(t, request => {
+      assert.equal(request.url, '/api/v1/status/voice-poll-job')
+      reads++
+      const response = responses.shift()
+      assert.ok(response, 'terminal job must stop polling')
+      if (response instanceof Error) return Promise.reject(response)
+      return Promise.resolve(jsonResponse({
+        ...apiJobStatus('voice-poll-job', 'studio-a', null, 17),
+        status: 'running', ...response,
+      }))
+    })
+    document.hidden = hidden
+    window.setTimeout = (callback, delay) => {
+      const id = ++timerId
+      timers.set(id, { callback, delay })
+      return id
+    }
+    window.clearTimeout = id => timers.delete(id)
+    useStore.setState({
+      jobs: [{ id: 'voice-poll-job', workspace: 'studio-a', createdAt: 17, status: 'running' }],
+      isGenerating: true, _pollRecoveredJob: actualPoll,
+      refreshOutputs: async () => {}, loadOutputs: async () => {},
+      reconnectJobs: async () => { reconnects++ },
+    })
+    actualPoll('voice-poll-job', 'studio-a')
+    await new Promise(resolve => setImmediate(resolve))
+    for (const delay of hidden ? Array(8).fill(2_000) : [250, 250, 2_000, 2_000, 2_000, 2_000, 250, 2_000]) {
+      assert.equal(timers.size, 1)
+      const [id, timer] = timers.entries().next().value
+      assert.equal(timer.delay, delay)
+      timers.delete(id)
+      timer.callback()
+      await new Promise(resolve => setImmediate(resolve))
+    }
+    assert.equal(reads, 9)
+    assert.equal(reconnects, 1)
     assert.equal(useStore.getState().jobs[0].status, 'cancelled')
     assert.equal(useStore.getState().isGenerating, false)
     assert.equal(timers.size, 0)

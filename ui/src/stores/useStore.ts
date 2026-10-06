@@ -1861,6 +1861,7 @@ function _newGenerationJobFromStatus(status: api.ApiJobStatus): GenerationJob {
 }
 
 const ACTIVE_JOB_STATUS_POLL_MS = 2_000
+const VOICE_CONVERSION_STATUS_POLL_MS = 250
 const QUEUED_JOB_STATUS_SAFETY_MS = 300_000
 const ACTIVE_OUTPUT_REFRESH_MIN_MS = 15_000
 const ACTIVE_OUTPUT_REFRESH_SAFETY_MS = 30_000
@@ -10880,6 +10881,7 @@ export const useStore = create<AppState>((set, get) => ({
     let serverCreatedAt: number | undefined
 
     let consecutivePollFailures = 0
+    let lastStatusReadSucceeded = true
     let running = false
     let pendingWake = false
     let stopped = false
@@ -10914,9 +10916,16 @@ export const useStore = create<AppState>((set, get) => ({
         return
       }
       // A short accepted composition can finish before any queue snapshot sees it running.
-      const delay = pollQueuedFast || _jobNeedsFastStatusPoll(current)
-        ? ACTIVE_JOB_STATUS_POLL_MS
-        : QUEUED_JOB_STATUS_SAFETY_MS
+      // Voice diffusion can finish between ordinary status reads. Keep its
+      // phase and Stop control current while visible, without fast error retries.
+      const visibleVoiceConversion = !document.hidden && lastStatusReadSucceeded
+        && current.status === 'running'
+        && (current.phase === 'Voice Conversion'
+          || /^Audio chunk \d+: starting voice step \d+ of \d+$/.test(current.phase))
+      const delay = visibleVoiceConversion ? VOICE_CONVERSION_STATUS_POLL_MS
+        : pollQueuedFast || _jobNeedsFastStatusPoll(current)
+          ? ACTIVE_JOB_STATUS_POLL_MS
+          : QUEUED_JOB_STATUS_SAFETY_MS
       poll.timer = window.setTimeout(() => {
         poll.timer = null
         void tick(true)
@@ -10965,6 +10974,7 @@ export const useStore = create<AppState>((set, get) => ({
           throw new Error('Job status does not match the observed generation')
         }
         consecutivePollFailures = 0
+        lastStatusReadSucceeded = true
         // New submissions can have a client timestamp. Pin the server's
         // incarnation on first hydration without accepting a replaced card.
         serverCreatedAt = status.created_at ?? serverCreatedAt
@@ -11006,6 +11016,7 @@ export const useStore = create<AppState>((set, get) => ({
           if (ownsWorkspace()) get().loadOutputs()
         }
       } catch {
+        lastStatusReadSucceeded = false
         if (stopped || _recoveryJobPolls.get(jobId) !== poll) {
           stop()
           return
