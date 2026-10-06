@@ -956,3 +956,30 @@ assertion for upload serving. After updating that assertion to the current
 central authorizer, all six affected checks passed; unchanged passing evidence
 was reused. Independent review found no consequential issue. Native Retake
 generation, resulting media and the Editor AI roundtrip remain separate gates.
+
+Published as `3558c790` and activated through one coordinated Pinokio restart.
+Both local and stable-share `/health` and `/ready` answered HTTP 200; the
+restart notice was cleared. The held recovery-check image retained its exact
+identity, execution count and held state across this restart. It has not been
+resumed while another project's GPU lease is active.
+
+## 2026-10-06 — Editor selected-cut Retake review
+
+Editor now saves pending edits before opening **Retake selected cut**, pauses
+its preview, and carries the active take's source interval and content revision
+into the existing review dialog. Source playback speed is included in that
+interval. Opening does not submit a job or change the timeline, layers or take
+selection. Later metadata cannot reset the selected interval; account, project
+and opening changes invalidate deferred callbacks. Gallery's filename-only
+Retake path remains available.
+
+An optional source revision binds Retake admission to the authorized Gallery
+video and its metadata. The endpoint checks it before decoding and again under
+the shared lineage lock through registration. Replaced bytes, changed metadata
+and an upload with the same filename cannot silently become the chosen source.
+The nine affected backend checks and all 40 checks in the two affected UI
+modules pass; TypeScript, scoped lint and the production build also pass.
+These are CPU checks. Native Retake generation and its resulting media, broader
+automatic roundtrip recovery, Windows/LAN behavior and human acceptance remain
+separate obligations. The existing explicit Gallery-result take import is the
+return path for this review-handoff milestone.

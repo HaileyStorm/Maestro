@@ -215,8 +215,14 @@ async function loadDialogComponent(entryUrl, exportName) {
           globalThis.__dialogHookState[index] = typeof value === 'function' ? value(current) : value
         }]
       }
-      export function useEffect(effect) {
+      export function useEffect(effect, deps) {
+        const index = globalThis.__dialogEffectIndex++
+        const previous = globalThis.__dialogEffects[index]
+        if (deps && previous?.deps && deps.length === previous.deps.length
+          && deps.every((value, i) => Object.is(value, previous.deps[i]))) return
+        previous?.cleanup?.()
         const cleanup = effect()
+        globalThis.__dialogEffects[index] = { deps, cleanup }
         if (typeof cleanup === 'function') globalThis.__dialogCleanups.push(cleanup)
       }
       export function useId() { return 'dialog-' + globalThis.__dialogIdIndex++ }
@@ -247,16 +253,21 @@ async function loadDialogComponent(entryUrl, exportName) {
     ['../stores/useStore', `
       export function useStore(selector) { return selector(globalThis.__retakeStore) }
       useStore.setState = update => Object.assign(globalThis.__retakeStore, update)
+      useStore.getState = () => globalThis.__retakeStore
+      export function currentAccountIdentityEpoch() { return globalThis.__retakeAccountEpoch ?? 0 }
     `],
     ['../../stores/useStore', `
       export function useStore(selector) { return selector(globalThis.__retakeStore) }
       useStore.setState = update => Object.assign(globalThis.__retakeStore, update)
+      useStore.getState = () => globalThis.__retakeStore
+      export function currentAccountIdentityEpoch() { return globalThis.__retakeAccountEpoch ?? 0 }
     `],
     ['./shared/VideoTimelineSelector', `
       export function VideoTimelineSelector(props) { return { type: 'timeline', props } }
     `],
     ['../api/client', `
       export function getFileUrl(path) { return '/files/' + path }
+      export function getEditorPreviewUrl(path, workspace, revision) { return '/files/' + path + '?workspace=' + workspace + '&content_revision=' + revision }
       export async function submitRetake(payload) {
         globalThis.__retakePayloads.push(payload)
         if (globalThis.__retakeSubmit) return globalThis.__retakeSubmit(payload)
@@ -372,6 +383,7 @@ async function loadMediaFeedItemHarness() {
       export async function deleteOutputComponents() { return {} }
       export async function fetchOutputMetadata() { return {} }
       export function getFileUrl(path) { return '/files/' + path }
+      export function getEditorPreviewUrl(path, workspace, revision) { return '/files/' + path + '?workspace=' + workspace + '&content_revision=' + revision }
       export function getUploadUrl(path) { return '/uploads/' + path }
       export async function moveOutput() { return {} }
       export async function revokeOutputShare() { return {} }
@@ -419,7 +431,7 @@ async function loadMediaFeedItemHarness() {
 }
 
 function resetDialogHarness(refs) {
-  const video = { src: '', onloadedmetadata: null, onerror: null, duration: 0, videoWidth: 0, videoHeight: 0 }
+  const video = { pause() {}, removeAttribute() {}, load() {}, src: '', onloadedmetadata: null, onerror: null, duration: 0, videoWidth: 0, videoHeight: 0 }
   globalThis.document = {
     activeElement: null,
     body: { name: 'document body', style: { overflow: '' } },
@@ -429,6 +441,8 @@ function resetDialogHarness(refs) {
     },
     getElementById: id => ({ id }),
   }
+  globalThis.__dialogEffectIndex = 0
+  globalThis.__dialogEffects = []
   globalThis.__dialogHookIndex = 0
   globalThis.__dialogHookState = []
   globalThis.__dialogRefIndex = 0
@@ -440,12 +454,14 @@ function resetDialogHarness(refs) {
   globalThis.__dialogTopCloseRequests = []
   globalThis.__dialogAllowTopClose = true
   globalThis.__retakePayloads = []
+  globalThis.__retakeAccountEpoch = 0
   globalThis.__retakeSubmit = null
   globalThis.__retakeUpload = async () => ({ path: '/uploaded/video.mp4' })
   globalThis.__retakeVideo = null
 }
 
 function beginRender() {
+  globalThis.__dialogEffectIndex = 0
   globalThis.__dialogHookIndex = 0
   globalThis.__dialogRefIndex = 0
   globalThis.__dialogIdIndex = 0
@@ -1006,4 +1022,83 @@ test('dialog source covers narrow landscape, breakpoint, safe-area, and touch ge
       assert.ok(renderedHeight > 0 && renderedHeight <= availableHeight, `${name} ${width}x${height} respects compiled dvh and safe-area height`)
     }
   }
+})
+
+
+test('Editor Retake opening preserves selected interval and revision; stale metadata and ABA completion cannot publish', async () => {
+  globalThis.HTMLButtonElement = class {}
+  resetDialogHarness([{ current: {} }, { current: {} }, { current: null }])
+  let loads = 0
+  const context = { workspace: 'scene', revision: 'sha256:' + 'a'.repeat(64), start: 2.5, end: 5 }
+  globalThis.__retakeStore = {
+    retakeDialogOpen: true, retakeSourceFile: 'alternate.mp4', retakeSourceContext: context,
+    retakeOpeningEpoch: 1, activeWorkspace: 'scene',
+    closeRetakeDialog() { this.retakeDialogOpen = false }, loadOutputs() { loads++ },
+    selectedModelPerMode: { video: 'video-model' }, params: { model_type: 'video-model' }, models: [],
+  }
+  const RetakeDialog = await loadDialogComponent(retakeUrl, 'RetakeDialog')
+  let tree = RetakeDialog()
+  const metadata = globalThis.__retakeVideo.onloadedmetadata
+  assert.match(globalThis.__retakeVideo.src, /content_revision=sha256:/)
+  assert.equal(globalThis.__retakePayloads.length, 0, 'opening only reviews')
+  globalThis.__retakeVideo.duration = 20
+  metadata()
+  beginRender(); tree = RetakeDialog()
+  const timeline = findNode(tree, node => typeof node.type === 'function' && node.type.name === 'VideoTimelineSelector')
+  assert.equal(timeline.props.startTime, 2.5)
+  assert.equal(timeline.props.endTime, 5)
+  findNode(tree, node => node.props?.placeholder === 'Describe the new content for the selected time range...')
+    .props.onChange({ target: { value: 'new take' } })
+  beginRender(); tree = RetakeDialog()
+  const pending = deferred()
+  globalThis.__retakeSubmit = () => pending.promise
+  const submitting = findNode(tree, node => node.type === 'button' && nodeText(node) === 'Retake').props.onClick()
+  assert.equal(globalThis.__retakePayloads[0].expected_source_revision, context.revision)
+  assert.deepEqual([globalThis.__retakePayloads[0].start_time, globalThis.__retakePayloads[0].end_time], [2.5, 5])
+  globalThis.__retakeStore.activeWorkspace = 'other'
+  globalThis.__retakeStore.retakeOpeningEpoch++
+  globalThis.__retakeStore.activeWorkspace = 'scene'
+  globalThis.__retakeVideo.duration = 99
+  metadata()
+  pending.resolve({ retake_frames: '0-5/20' })
+  await submitting
+  assert.equal(loads, 0)
+  assert.equal(globalThis.__dialogHookState[2], 20, 'old metadata ignored after scope ABA')
+  assert.equal(globalThis.__dialogHookState[11], null)
+  globalThis.__retakeAccountEpoch++
+  metadata()
+  assert.equal(globalThis.__dialogHookState[2], 20)
+})
+
+
+test('account epoch change during Editor Retake submission cannot refresh, report success, or schedule close', async t => {
+  globalThis.HTMLButtonElement = class {}
+  resetDialogHarness([{ current: {} }, { current: {} }, { current: null }])
+  let loads = 0
+  globalThis.__retakeStore = {
+    retakeDialogOpen: true, retakeSourceFile: 'alternate.mp4',
+    retakeSourceContext: { workspace: 'scene', revision: 'sha256:' + 'b'.repeat(64), start: 1, end: 3 },
+    retakeOpeningEpoch: 1, activeWorkspace: 'scene', closeRetakeDialog() {},
+    loadOutputs() { loads++ }, selectedModelPerMode: { video: 'video-model' },
+    params: { model_type: 'video-model' }, models: [],
+  }
+  const RetakeDialog = await loadDialogComponent(retakeUrl, 'RetakeDialog')
+  let tree = RetakeDialog()
+  findNode(tree, node => node.props?.placeholder === 'Describe the new content for the selected time range...')
+    .props.onChange({ target: { value: 'new take' } })
+  beginRender(); tree = RetakeDialog()
+  const pending = deferred()
+  globalThis.__retakeSubmit = () => pending.promise
+  const submitting = findNode(tree, node => node.type === 'button' && nodeText(node) === 'Retake').props.onClick()
+  globalThis.__retakeAccountEpoch++
+  const originalTimeout = globalThis.setTimeout
+  let timers = 0
+  globalThis.setTimeout = (...args) => { timers++; return originalTimeout(...args) }
+  t.after(() => { globalThis.setTimeout = originalTimeout })
+  pending.resolve({ retake_frames: '0-5/20' })
+  await submitting
+  assert.equal(globalThis.__retakePayloads.length, 1)
+  assert.equal(loads, 0)
+  assert.equal(timers, 0)
+  assert.equal(globalThis.__dialogHookState[11], null)
 })

@@ -376,8 +376,32 @@ function ImageLayerPanel({ project, outputs, busy, error, layer, revealed, media
   </section>
 }
 
+function retakeSelectedCut(project: EditorProject, clipId: string) {
+  const clip = sequenceClips(project).find(item => item.id === clipId)
+  const asset = project.assets[clip?.asset_id ?? '']
+  if (!clip || !asset || asset.type !== 'video' || asset.workspace !== project.workspace
+    || !asset.output_id || !/^sha256:[0-9a-f]{64}$/.test(asset.output_revision ?? '')) return null
+  const start = clip.source_in ?? 0
+  const end = start + clip.duration * (clip.speed ?? 1)
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start || end > asset.duration + 1e-6) return null
+  return { filename: asset.output_id, context: { workspace: project.workspace, revision: asset.output_revision, start, end } }
+}
+
+async function prepareRetakeReview(
+  pending: Promise<{ allEditsSaved: boolean } | null> | null,
+  current: () => boolean,
+  unsaved: () => boolean,
+  saveLatest: () => Promise<{ allEditsSaved: boolean } | null>,
+) {
+  if (pending && !(await pending)) return false
+  if (!current()) return false
+  if (unsaved() && !(await saveLatest())?.allEditsSaved) return false
+  return current() && !unsaved()
+}
+
 export function EditorWorkspace({ source }: { source: OutputFile }) {
   const closeEditor = useStore(state => state.closeEditor)
+  const openRetakeDialog = useStore(state => state.openRetakeDialog)
   const outputs = useStore(state => state.outputs)
   const [draft, setProject] = useState<EditorProject | null>(null)
   const [loadedSource, setLoadedSource] = useState('')
@@ -760,6 +784,26 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
     }
   }
 
+  const handleRetake = async () => {
+    const epoch = scope.current
+    const clipId = clip?.id
+    if (!clipId || !project || appending.current || exporting.current || !isCurrent(epoch)) return
+    appending.current = true
+    setAppendPending(true)
+    preview.current?.pause()
+    try {
+      const ready = await prepareRetakeReview(savingPromise.current, () => isCurrent(epoch),
+        () => savedVersion.current !== editVersion.current,
+        async () => projectRef.current ? save(projectRef.current) : null)
+      if (!ready || !projectRef.current) return
+      const selected = retakeSelectedCut(projectRef.current, clipId)
+      if (!selected) { setAppendError('This cut cannot be opened for Retake. Refresh Gallery and reopen the Editor.'); return }
+      openRetakeDialog(selected.filename, selected.context)
+    } finally {
+      if (isCurrent(epoch)) { appending.current = false; setAppendPending(false) }
+    }
+  }
+
   const handleBack = async () => {
     const epoch = scope.current
     if (saving.current || saveState === 'saving' || appending.current || exporting.current || !isCurrent(epoch)) return
@@ -883,6 +927,10 @@ export function EditorWorkspace({ source }: { source: OutputFile }) {
                 className="mt-5 flex min-h-11 w-full items-center justify-center gap-2 rounded-lg border border-border bg-bg-primary px-4 text-sm font-medium text-text-primary hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50">
                 {exportState === 'submitting' ? <Loader2 size={16} className="animate-spin motion-reduce:animate-none" aria-hidden="true" /> : <Download size={16} aria-hidden="true" />}
                 {exportState === 'submitting' ? 'Queuing export…' : exportState === 'queued' ? 'Export queued' : 'Export MP4'}
+              </button>
+              <button type="button" onClick={() => { void handleRetake() }} disabled={!clip || busy || saveState === 'error'}
+                className="mt-3 min-h-11 w-full rounded-lg border border-border px-4 text-sm font-medium hover:bg-bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-blue disabled:opacity-50">
+                Retake selected cut
               </button>
               {exportState === 'queued' && <p className="mt-3 text-xs leading-relaxed text-text-secondary" role="status">Track the export in Queue. The finished MP4 will appear in Gallery.</p>}
               {exportError && <p className="mt-3 text-sm text-red-400" role="alert">{exportError}</p>}

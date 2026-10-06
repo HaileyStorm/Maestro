@@ -1,7 +1,10 @@
 import asyncio
 import copy
 import contextvars
+import hashlib
+import hmac
 import json
+import re
 import threading
 import time
 from unittest.mock import patch
@@ -425,7 +428,9 @@ class RetakePolicyAdmissionTests(unittest.TestCase):
     def setUpClass(cls):
         tree = ast.parse(LAUNCH_PATH.read_text(encoding="utf-8"))
         names = {"retake_video_endpoint", "_inherit_media_access_policy",
-                 "_http_output_policy_from_request", "_JobRegistry"}
+                 "_http_output_policy_from_request", "_JobRegistry",
+                 "_output_share_revision", "_require_authorized_output",
+                 "_OutputLineageMutationGuard", "_output_lineage_mutation_guard"}
         nodes = [copy.deepcopy(node) for node in tree.body
                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
                  and node.name in names]
@@ -449,9 +454,15 @@ class RetakePolicyAdmissionTests(unittest.TestCase):
         self.owner = "a" * 32
         self.registered = []
         self.probed = []
+        self.mutate_on_probe = None
         self.ns = {
             "Request": object, "HTTPException": _HTTPException,
             "os": os, "uuid": uuid, "time": time, "threading": threading,
+            "re": re, "hmac": hmac, "hashlib": hashlib,
+            "_output_share_revision_cache": {},
+            "_output_share_revision_cache_lock": threading.Lock(),
+            "_output_lineage_mutation_registry_lock": threading.Lock(),
+            "_output_lineage_mutation_locks": {},
             "_request_remote": contextvars.ContextVar("retake_remote", default=False),
             "_request_session_id": contextvars.ContextVar("retake_session", default=self.owner),
             "output_policy_from_request": output_policy_from_request,
@@ -462,8 +473,9 @@ class RetakePolicyAdmissionTests(unittest.TestCase):
             "_resolve_authorized_request_media": AuthorizedMediaResolverTests()._load_resolver(str(self.outputs)),
         }
 
-        def project_access(request, workspace, *, permission):
-            self.assertEqual(permission, "project.generate")
+        def project_access(request, workspace, *, permission=None):
+            if permission is not None:
+                self.assertEqual(permission, "project.generate")
             if not request.state.project_unlocked or workspace != request.state.project_workspace:
                 raise _HTTPException(423)
             return str(self.outputs)
@@ -483,6 +495,8 @@ class RetakePolicyAdmissionTests(unittest.TestCase):
         class Reader:
             def __init__(self, path):
                 test.probed.append(path)
+                if test.mutate_on_probe:
+                    test.mutate_on_probe()
 
             def get_avg_fps(self):
                 return 24
@@ -588,6 +602,60 @@ class RetakePolicyAdmissionTests(unittest.TestCase):
                 job = self.registered[-1]
                 self.assertEqual(job["params"]["prompt"], prompt)
                 self.assertEqual(job["access_policy"], {"private": False, "explicit": False})
+
+    def source_revision(self):
+        return self.ns["_output_share_revision"](
+            str(self.source), str(self.outputs), self.source.name,
+        )
+
+    def test_editor_source_revision_accepts_current_bytes_and_rejects_replacement(self):
+        self.set_source_policy(True, False)
+        revision = self.source_revision()
+        self.submit({"expected_source_revision": revision})
+        self.assertEqual(len(self.registered), 1)
+        self.assertNotIn("expected_source_revision", self.registered[0]["params"])
+        # Preserve size and mtime: content identity must still detect replacement.
+        original = self.source.stat()
+        self.source.write_bytes(b"x" * original.st_size)
+        os.utime(self.source, ns=(original.st_atime_ns, original.st_mtime_ns))
+        self.probed.clear()
+        with self.assertRaises(_HTTPException) as raised:
+            self.submit({"expected_source_revision": revision})
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(len(self.registered), 1)
+        self.assertEqual(self.probed, [])
+
+    def test_editor_revision_change_during_probe_never_registers_job(self):
+        for change in ("media", "sidecar"):
+            with self.subTest(change=change):
+                self.set_source_policy(True, False)
+                revision = self.source_revision()
+                self.mutate_on_probe = (
+                    lambda: self.source.write_bytes(b"changed during probe")
+                ) if change == "media" else lambda: self.set_source_policy(False, False)
+                with self.assertRaises(_HTTPException) as raised:
+                    self.submit({"expected_source_revision": revision})
+                self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(self.registered, [])
+
+    def test_invalid_editor_source_revision_rejects_before_probe(self):
+        for revision in (None, 1, {}, "", "sha256:no", "sha256:" + "A" * 64):
+            with self.subTest(revision=revision):
+                with self.assertRaises(_HTTPException) as raised:
+                    self.submit({"expected_source_revision": revision})
+                self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(self.probed, [])
+        self.assertEqual(self.registered, [])
+
+    def test_editor_revision_cannot_bind_an_upload_with_matching_output_name(self):
+        upload = self.uploads / self.source.name
+        upload.write_bytes(b"different authorized upload")
+        write_upload_access_sidecar(str(upload), self.owner, private=True)
+        with self.assertRaises(_HTTPException) as raised:
+            self.submit({"expected_source_revision": self.source_revision()}, source=upload)
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(self.probed, [])
+        self.assertEqual(self.registered, [])
 
 
 class UploadRouteSourceContractTests(unittest.TestCase):

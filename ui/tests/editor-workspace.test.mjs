@@ -16,12 +16,12 @@ const server = await createServer({
     name: 'editor-test-transforms',
     transform(code, id) {
       if (id.endsWith('/src/editor/EditorWorkspace.tsx')) {
-        return `${code}\nexport { changeTrim, moveClip, removeClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio, audioGain, imageLayers, changeImage, availableImages, imageLayout };`
+        return `${code}\nexport { changeTrim, moveClip, removeClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio, audioGain, imageLayers, changeImage, availableImages, imageLayout, retakeSelectedCut, prepareRetakeReview };`
       }
     },
   }],
 })
-const { changeTrim, moveClip, removeClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio, audioGain, imageLayers, changeImage, availableImages, imageLayout } = await server.ssrLoadModule('/src/editor/EditorWorkspace.tsx')
+const { changeTrim, moveClip, removeClip, availableVideos, addText, changeText, textLayers, renderedDuration, availableAudio, audioLayer, changeAudio, audioGain, imageLayers, changeImage, availableImages, imageLayout, retakeSelectedCut, prepareRetakeReview } = await server.ssrLoadModule('/src/editor/EditorWorkspace.tsx')
 after(() => server.close())
 
 function sequenceProject() {
@@ -432,4 +432,67 @@ test('one alternate clip keeps its project frame clock rather than the selected 
   clip.take_asset_ids = ['a','b']
   clip.take_states = {a:{source_in:1,speed:1},b:{source_in:0,speed:1}}
   assert.equal(renderedDuration(project),61/60)
+})
+
+
+test('Retake review uses active alternate source and exact sped cut without changing draft', async () => {
+  const project = sequenceProject()
+  const clip = project.tracks[0].items[0]
+  clip.take_asset_ids = ['a', 'b']
+  clip.take_states = { a: { source_in: 1, speed: 1 }, b: { source_in: 2.5, speed: 2 } }
+  clip.asset_id = 'b'
+  clip.source_in = 2.5
+  clip.duration = 1.25
+  clip.speed = 2
+  project.assets.b.output_revision = 'sha256:' + 'b'.repeat(64)
+  const before = JSON.stringify(project)
+  assert.deepEqual(retakeSelectedCut(project, clip.id), { filename: 'b.mp4', context: {
+    workspace: 'scene', revision: project.assets.b.output_revision, start: 2.5, end: 5,
+  } })
+  assert.equal(JSON.stringify(project), before)
+  assert.equal(retakeSelectedCut(project, 'missing'), null)
+  clip.duration = 100
+  assert.equal(retakeSelectedCut(project, clip.id), null)
+})
+
+test('Retake save barrier includes newer pending edits and refuses failed or racing saves', async () => {
+  let dirty = true
+  let saves = 0
+  const save = async () => { saves++; dirty = false; return { allEditsSaved: true } }
+  assert.equal(await prepareRetakeReview(Promise.resolve({ allEditsSaved: false }), () => true, () => dirty, save), true)
+  assert.equal(saves, 1)
+  dirty = true
+  assert.equal(await prepareRetakeReview(Promise.resolve(null), () => true, () => dirty, save), false)
+  assert.equal(saves, 1)
+  assert.equal(await prepareRetakeReview(null, () => true, () => dirty, async () => ({ allEditsSaved: false })), false)
+  let resolve
+  const pending = new Promise(r => { resolve = r })
+  let current = true
+  const opened = prepareRetakeReview(pending, () => current, () => dirty, save)
+  current = false
+  resolve({ allEditsSaved: true })
+  assert.equal(await opened, false)
+  assert.equal(saves, 1)
+})
+
+
+test('actual Retake store opening identity is invalidated by workspace ABA and close/reopen', async () => {
+  const { useStore } = await server.ssrLoadModule('/src/stores/useStore.ts')
+  useStore.setState({ activeWorkspace: 'scene' })
+  const context = { workspace: 'scene', revision: 'sha256:' + 'a'.repeat(64), start: 2, end: 4 }
+  useStore.getState().openRetakeDialog('alternate.mp4', context)
+  const opened = useStore.getState().retakeOpeningEpoch
+  context.start = 100
+  assert.equal(useStore.getState().retakeSourceContext.start, 2)
+  useStore.setState({ activeWorkspace: 'other' })
+  useStore.setState({ activeWorkspace: 'scene' })
+  assert.equal(useStore.getState().retakeDialogOpen, false)
+  assert.ok(useStore.getState().retakeOpeningEpoch > opened)
+  useStore.getState().openRetakeDialog('gallery.mp4')
+  const reopened = useStore.getState().retakeOpeningEpoch
+  assert.equal(useStore.getState().retakeSourceContext, null)
+  useStore.getState().closeRetakeDialog()
+  useStore.getState().openRetakeDialog('gallery.mp4')
+  assert.ok(useStore.getState().retakeOpeningEpoch > reopened)
+  useStore.getState().closeRetakeDialog()
 })

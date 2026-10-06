@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { X } from 'lucide-react'
-import { useStore } from '../stores/useStore'
+import { currentAccountIdentityEpoch, useStore } from '../stores/useStore'
 import { VideoTimelineSelector } from './shared/VideoTimelineSelector'
 import * as api from '../api/client'
 import { modelDisplayName } from '../lib/modelDisplay'
@@ -33,6 +33,8 @@ export function RetakeDialog() {
   const successTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const retakeOpen = useStore(s => s.retakeDialogOpen)
   const retakeFile = useStore(s => s.retakeSourceFile)
+  const sourceContext = useStore(s => s.retakeSourceContext)
+  const openingEpoch = useStore(s => s.retakeOpeningEpoch)
   const closeRetake = useStore(s => s.closeRetakeDialog)
   const activeWorkspace = useStore(s => s.activeWorkspace)
   const loadOutputs = useStore(s => s.loadOutputs)
@@ -74,18 +76,46 @@ export function RetakeDialog() {
     if (!submittingRef.current) closeDialog()
   }, [closeDialog])
 
-  // Get video duration on open
   useEffect(() => {
-    if (!retakeFile) return
+    if (!retakeOpen || !retakeFile) return
+    requestEpochRef.current += 1
+    submittingRef.current = false
+    if (successTimerRef.current !== null) clearTimeout(successTimerRef.current)
+    successTimerRef.current = null
+    setSubmitting(false)
+    setSuccess(null)
+    setError(null)
+    const epoch = requestEpochRef.current
+    const account = currentAccountIdentityEpoch()
+    const current = () => {
+      const state = useStore.getState()
+      return requestEpochRef.current === epoch && currentAccountIdentityEpoch() === account
+        && state.retakeDialogOpen && state.retakeOpeningEpoch === openingEpoch
+        && state.retakeSourceFile === retakeFile && state.retakeSourceContext === sourceContext
+        && state.activeWorkspace === activeWorkspace
+    }
+    setStartTime(sourceContext?.start ?? 0)
+    setEndTime(sourceContext?.end ?? 5)
+    setDuration(0)
     const video = document.createElement('video')
-    video.src = api.getFileUrl(retakeFile)
+    let disposed = false
     video.onloadedmetadata = () => {
+      if (disposed || !current()) return
       const dur = video.duration && isFinite(video.duration) ? video.duration : 10
       setDuration(dur)
-      setEndTime(dur)
-      setStartTime(0)
+      if (!sourceContext) setEndTime(dur)
     }
-  }, [retakeFile])
+    video.src = sourceContext
+      ? api.getEditorPreviewUrl(retakeFile, sourceContext.workspace, sourceContext.revision)
+      : api.getFileUrl(retakeFile, activeWorkspace)
+    return () => {
+      disposed = true
+      video.onloadedmetadata = null
+      video.pause()
+      video.removeAttribute('src')
+      video.load()
+    }
+  }, [retakeFile, retakeOpen, sourceContext, openingEpoch, activeWorkspace])
 
   useEffect(() => {
     if (!retakeOpen || !retakeFile || !dialogRef.current || !closeRef.current) return
@@ -121,11 +151,22 @@ export function RetakeDialog() {
 
   if (!retakeOpen || !retakeFile) return null
 
-  const videoUrl = api.getFileUrl(retakeFile)
+  const videoUrl = sourceContext
+    ? api.getEditorPreviewUrl(retakeFile, sourceContext.workspace, sourceContext.revision)
+    : api.getFileUrl(retakeFile, activeWorkspace)
 
   const handleSubmit = async () => {
     if (!prompt || submittingRef.current) return
     const requestEpoch = requestEpochRef.current
+    const account = currentAccountIdentityEpoch()
+    const current = () => {
+      const state = useStore.getState()
+      return requestEpochRef.current === requestEpoch && currentAccountIdentityEpoch() === account
+        && state.retakeDialogOpen && state.retakeOpeningEpoch === openingEpoch
+        && state.retakeSourceFile === retakeFile && state.retakeSourceContext === sourceContext
+        && state.activeWorkspace === activeWorkspace
+    }
+    if (!current()) return
     submittingRef.current = true
     setSubmitting(true)
     setError(null)
@@ -146,8 +187,9 @@ export function RetakeDialog() {
         activated_loras: activatedLoras,
         loras_multipliers: lorasMultipliers,
         workspace: activeWorkspace,
+        ...(sourceContext ? { expected_source_revision: sourceContext.revision } : {}),
       })
-      if (requestEpochRef.current !== requestEpoch) return
+      if (!current()) return
       const frameCount = retakeFrameCount(result.retake_frames)
       setSuccess(frameCount === null
         ? 'Retake queued.'
@@ -155,12 +197,12 @@ export function RetakeDialog() {
       loadOutputs()
       successTimerRef.current = setTimeout(() => {
         successTimerRef.current = null
-        if (requestEpochRef.current === requestEpoch) closeDialog()
+        if (current()) closeDialog()
       }, 1500)
     } catch {
-      if (requestEpochRef.current === requestEpoch) setError('The retake could not be queued. Try again.')
+      if (current()) setError(sourceContext ? 'The retake could not be queued. Reopen the cut if its source changed, then try again.' : 'The retake could not be queued. Try again.')
     } finally {
-      if (requestEpochRef.current === requestEpoch) {
+      if (current()) {
         submittingRef.current = false
         setSubmitting(false)
       }

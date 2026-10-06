@@ -3463,9 +3463,11 @@ interface AppState {
   setThemeFamily: (family: FamilyId) => void
 
   // Retake Dialog
+  retakeSourceContext: { workspace: string; revision: string; start: number; end: number } | null
+  retakeOpeningEpoch: number
   retakeDialogOpen: boolean
   retakeSourceFile: string | null
-  openRetakeDialog: (filename: string) => void
+  openRetakeDialog: (filename: string, context?: { workspace: string; revision: string; start: number; end: number }) => void
   closeRetakeDialog: () => void
 
   // CivitAI LoRA Browser
@@ -5611,7 +5613,7 @@ function _advanceAccountIdentityEpoch(): void {
     if (stored) _writeStoredStudioSubmissions(stored.filter(item => item.claimToken !== token))
   }
   _studioSubmissionIntents.clear()
-  useStore.setState({ studioSubmissions: [] })
+  useStore.setState({ studioSubmissions: [], retakeDialogOpen: false, retakeSourceFile: null, retakeSourceContext: null, retakeOpeningEpoch: useStore.getState().retakeOpeningEpoch + 1 })
   // Account-role H3 defaults and profile availability are identity-bound.
   // Invalidate every older writer before the scrub exposes omitted fields:
   // a pre-auth model-options/default/profile response must not repopulate
@@ -7136,10 +7138,18 @@ export const useStore = create<AppState>((set, get) => ({
 
   // CivitAI LoRA Browser
   // Director Pipeline Dashboard
+  retakeSourceContext: null,
+  retakeOpeningEpoch: 0,
   retakeDialogOpen: false,
   retakeSourceFile: null,
-  openRetakeDialog: (filename) => set({ retakeDialogOpen: true, retakeSourceFile: filename }),
-  closeRetakeDialog: () => set({ retakeDialogOpen: false, retakeSourceFile: null }),
+  openRetakeDialog: (filename, context) => {
+    if (context && (context.workspace !== get().activeWorkspace
+      || !/^sha256:[0-9a-f]{64}$/.test(context.revision)
+      || !Number.isFinite(context.start) || !Number.isFinite(context.end)
+      || context.start < 0 || context.end <= context.start)) return
+    set({ retakeDialogOpen: true, retakeSourceFile: filename, retakeSourceContext: context ? { ...context } : null, retakeOpeningEpoch: get().retakeOpeningEpoch + 1 })
+  },
+  closeRetakeDialog: () => set({ retakeDialogOpen: false, retakeSourceFile: null, retakeSourceContext: null, retakeOpeningEpoch: get().retakeOpeningEpoch + 1 }),
 
   dashboardOpen: false,
   dashboardPipelineList: [],
@@ -16996,6 +17006,10 @@ export const useStore = create<AppState>((set, get) => ({
           selectedOutputKeys: [],
           gallerySelectionMode: false,
           ...(projectChanged || previousAccessRevoked ? {
+            retakeDialogOpen: false,
+            retakeSourceFile: null,
+            retakeSourceContext: null,
+            retakeOpeningEpoch: state.retakeOpeningEpoch + 1,
             projectAssetRefs: [],
             projectAssetRefScope: null,
             browsingUploads: false,
@@ -19716,6 +19730,8 @@ export const useStore = create<AppState>((set, get) => ({
 }))
 
 useStore.subscribe((state, previous) => {
+  if (state.activeWorkspace === previous.activeWorkspace && state.browsingUploads === previous.browsingUploads) return
+  state.closeRetakeDialog()
   if (state.activeWorkspace === previous.activeWorkspace) return
   if (state.toolsRevoiceRefs.some(reference => reference?.output)) {
     useStore.setState({ toolsRevoiceRefs: state.toolsRevoiceRefs.map(reference => reference?.output ? null : reference) })

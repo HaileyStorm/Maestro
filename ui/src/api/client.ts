@@ -6949,6 +6949,7 @@ export async function submitRetake(params: {
   negative_prompt?: string; seed?: number; guidance_scale?: number;
   num_inference_steps?: number; retake_strength?: number; workspace?: string;
   retake_engine?: string; regenerate_audio?: boolean; resolution?: string;
+  expected_source_revision?: string;
   activated_loras?: string[]; loras_multipliers?: string;
   private_output?: boolean; explicit_output?: boolean;
 }): Promise<{ job_id: string; status: string; retake_frames: string }> {

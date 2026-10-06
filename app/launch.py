@@ -50896,7 +50896,8 @@ async def retake_video_endpoint(request: Request):
         prompt: str, model_type: str,
         negative_prompt?: str, seed?: int, guidance_scale?: float,
         num_inference_steps?: int, retake_strength?: float (0-1),
-        workspace?: str, private_output?: bool, explicit_output?: bool
+        workspace?: str, private_output?: bool, explicit_output?: bool,
+        expected_source_revision?: str
     }
     """
     body = await request.json()
@@ -50913,6 +50914,37 @@ async def retake_video_endpoint(request: Request):
     video_path = _resolve_authorized_request_media(request, video_path, workspace)
     if not video_path:
         raise HTTPException(status_code=404, detail="Video not found")
+
+    revision_requested = "expected_source_revision" in body
+    expected_source_revision = body.pop("expected_source_revision", None)
+    if revision_requested and (
+        not isinstance(expected_source_revision, str)
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_source_revision)
+    ):
+        raise HTTPException(status_code=400, detail="Invalid Retake source revision")
+
+    def require_current_source():
+        if not revision_requested:
+            return
+        name = os.path.basename(video_path)
+        try:
+            source_dir, current_path, _ = _require_authorized_output(
+                request, workspace, name,
+            )
+            if os.path.realpath(current_path) != os.path.realpath(video_path):
+                raise ValueError("Retake source identity changed")
+            current_revision = _output_share_revision(current_path, source_dir, name)
+        except HTTPException as error:
+            if error.status_code != 404:
+                raise
+            raise HTTPException(status_code=409, detail="Retake source changed; reopen the video") from error
+        except (OSError, ValueError) as error:
+            raise HTTPException(status_code=409, detail="Retake source changed; reopen the video") from error
+        if not hmac.compare_digest(expected_source_revision, current_revision):
+            raise HTTPException(status_code=409, detail="Retake source changed; reopen the video")
+
+    with _output_lineage_mutation_guard(job_out_dir):
+        require_current_source()
 
     session_id = request.state.maestro_session_id
     inherited_policy = _inherit_media_access_policy(
@@ -50990,7 +51022,9 @@ async def retake_video_endpoint(request: Request):
         "workspace": workspace, "out_dir": job_out_dir,
         "session_id": session_id, "access_policy": access_policy,
     }
-    _queue_recovery_register_and_publish(job)
+    with _output_lineage_mutation_guard(job_out_dir):
+        require_current_source()
+        _queue_recovery_register_and_publish(job)
 
     return {"job_id": job_id, "status": "queued", "retake_frames": f"{start_frame}-{end_frame}/{total_frames}"}
 
