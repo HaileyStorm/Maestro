@@ -6,10 +6,12 @@ plausible but wrong key-only checkpoint conversion and packed-buffer aliasing.
 """
 
 from pathlib import Path
+import ast
 import copy
 import hashlib
 import sys
 import tempfile
+import types
 import unittest
 from unittest.mock import patch
 
@@ -386,6 +388,102 @@ class OriginalH3ControlLoaderTests(unittest.TestCase):
 
 
 class OriginalH3ControlConditioningTests(unittest.TestCase):
+    @staticmethod
+    def native_runtime():
+        from models.minimax_h3.video_vae import AutoencoderKLMiniMaxH3
+
+        # Actual learned native encoder, temporal clock and distribution. Only
+        # channel widths/decoder size shrink; no checkpoint or GPU is needed.
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(738)
+            vae = AutoencoderKLMiniMaxH3(
+                block_out_channels=(4,) * 6, layers_per_block=1,
+                norm_num_groups=1, decoder_num_layers=1,
+                decoder_num_attention_heads=1, decoder_attention_head_dim=8,
+                latents_mean=tuple(0.1 + i / 100 for i in range(24)),
+                latents_std=tuple(1 + i / 50 for i in range(24)),
+            ).eval().requires_grad_(False)
+        source = APP / "models/minimax_h3/minimax_h3_main.py"
+        model = next(node for node in ast.parse(source.read_text()).body
+                     if isinstance(node, ast.ClassDef) and node.name == "MiniMaxH3Model")
+        method = next(node for node in model.body
+                      if isinstance(node, ast.FunctionDef) and node.name == "_encode_control_video")
+        namespace = {"torch": torch, "__package__": "models.minimax_h3"}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"), namespace)
+        runtime = types.SimpleNamespace(vae=vae, device=torch.device("cpu"),
+                                        patch_size=(1, 2, 2), _interrupt=False)
+        runtime.encode = types.MethodType(namespace["_encode_control_video"], runtime)
+        return runtime
+
+    def test_native_learned_vae_mode_matches_chunked_donor_without_rng_or_rounding(self):
+        from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+
+        runtime = self.native_runtime()
+        video = torch.linspace(0.05, 0.95, 3 * 22 * 32 * 32).reshape(1, 3, 22, 32, 32)
+        original = video.clone()
+        pixels = (video - torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1, 1)) / \
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1, 1)
+        padded = torch.cat((pixels, pixels[:, :, -1:].repeat(1, 1, 12, 1, 1)), dim=2)
+        with torch.inference_mode():
+            # Independent training recipe: per-clip native inference, raw mean
+            # half of the moments, tail drop, then FP32 normalization/packing.
+            moments = torch.cat([runtime.vae.quant_conv(runtime.vae.encoder(chunk))
+                                 for chunk in padded.split(17, dim=2)], dim=2)[:, :, :-3]
+            raw = moments.chunk(2, dim=1)[0].float()
+            mean = torch.tensor(runtime.vae.config.latents_mean).view(1, 24, 1, 1, 1)
+            std = torch.tensor(runtime.vae.config.latents_std).view(1, 24, 1, 1, 1)
+            expected = self.independently_pack((raw - mean) / std)
+        hook_calls = []
+        hook = runtime.vae.encoder.register_forward_pre_hook(
+            lambda _module, args: hook_calls.append((args[0].shape[2], torch.is_inference_mode_enabled())))
+        before_rng = torch.random.get_rng_state().clone()
+        try:
+            with patch.object(DiagonalGaussianDistribution, "sample",
+                              side_effect=AssertionError("Control sampled the posterior")):
+                rows = runtime.encode(video, height=32, width=32, num_frames=22)
+                again = runtime.encode(video, height=32, width=32, num_frames=22)
+        finally:
+            hook.remove()
+        torch.testing.assert_close(rows[0, :, :96], expected, rtol=0, atol=0)
+        torch.testing.assert_close(again, rows, rtol=0, atol=0)
+        torch.testing.assert_close(torch.random.get_rng_state(), before_rng, rtol=0, atol=0)
+        torch.testing.assert_close(video, original, rtol=0, atol=0)
+        self.assertEqual(hook_calls, [(17, True)] * 4)
+        self.assertEqual(rows.shape, (1, 7, 196))
+        self.assertEqual(torch.count_nonzero(rows[..., 96:]).item(), 0)
+
+    def test_native_inpaint_encodes_black_source_with_loaded_vae_statistics(self):
+        runtime = self.native_runtime()
+        mask = torch.ones(1, 1, 22, 32, 32)
+        rows = runtime.encode(torch.zeros(1, 3, 22, 32, 32), height=32,
+                              width=32, num_frames=22, mask_video=mask)
+        self.assertEqual(torch.count_nonzero(rows[..., 96:100]).item(), 0)
+        # Both supplied control and implicit masked source are black pixels:
+        # their learned normalized latent rows coincide and remain nonzero.
+        torch.testing.assert_close(rows[..., :96], rows[..., 100:], rtol=0, atol=0)
+        self.assertGreater(torch.count_nonzero(rows[..., 100:]).item(), 0)
+
+    def test_native_cancellation_and_missing_runtime_do_not_return_control_rows(self):
+        runtime = self.native_runtime()
+        video = torch.zeros(1, 3, 22, 32, 32)
+        runtime._interrupt = True
+        with patch.object(runtime.vae, "encode", side_effect=AssertionError("cancelled VAE ran")):
+            self.assertIsNone(runtime.encode(video, height=32, width=32, num_frames=22))
+        runtime._interrupt = False
+        hook = runtime.vae.encoder.register_forward_pre_hook(
+            lambda _module, _args: setattr(runtime, "_interrupt", True))
+        try:
+            self.assertIsNone(runtime.encode(video, height=32, width=32, num_frames=22))
+        finally:
+            hook.remove()
+        runtime._interrupt = False
+        runtime.patch_size = (1, 1, 1)
+        with self.assertRaisesRegex(ValueError, "patch geometry"):
+            runtime.encode(video, height=32, width=32, num_frames=22)
+        runtime.vae = None
+        with self.assertRaisesRegex(RuntimeError, "VAE is unavailable"):
+            runtime.encode(video, height=32, width=32, num_frames=22)
+
     @staticmethod
     def request(video, encode_mode, **overrides):
         return encode_control_rows(

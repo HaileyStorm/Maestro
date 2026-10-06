@@ -1111,6 +1111,48 @@ class MiniMaxH3Model:
             raise InterruptedError("MiniMax H3 preview decode was cancelled")
         return video
 
+    @torch.inference_mode()
+    def _encode_control_video(
+        self, control_video: torch.Tensor, *, height: int, width: int,
+        num_frames: int, mask_video=None, inpaint_video=None,
+    ) -> torch.Tensor | None:
+        """Prepare original Union rows through this runtime's loaded video VAE.
+
+        The caller still owns GPU authority and MMGP residency. Native VAE
+        encoder forwards use the hooks installed by the existing VAE profile;
+        this method never moves model weights or creates another VAE. Control
+        uses posterior mode and the loaded VAE's statistics, independently of
+        sampled keyframe/reference conditioning. Public admission is separate.
+        """
+        from .control import encode_control_rows
+
+        if self._interrupt:
+            return None
+        if self.vae is None:
+            raise RuntimeError("MiniMax H3 native video VAE is unavailable")
+        if tuple(self.patch_size) != (1, 2, 2):
+            raise ValueError("Original H3 Control requires the native 1x2x2 patch geometry")
+        device = torch.device(self.device)
+
+        def move(pixels):
+            return pixels.to(device) if isinstance(pixels, torch.Tensor) else pixels
+
+        def encode_mode(pixels):
+            # Training uses FP16 autocast; avoid the sampled, FP16-rounded
+            # keyframe route. MMGP's encoder submodule hooks own weight loading.
+            with torch.autocast(device_type=device.type, dtype=torch.float16,
+                                enabled=device.type == "cuda"):
+                return self.vae.encode(pixels).latent_dist.mode()
+
+        return encode_control_rows(
+            move(control_video), encode_mode=encode_mode,
+            latents_mean=self.vae.config.latents_mean,
+            latents_std=self.vae.config.latents_std,
+            height=height, width=width, num_frames=num_frames,
+            mask_video=move(mask_video), inpaint_video=move(inpaint_video),
+            interrupted=lambda: self._interrupt,
+        )
+
     def _encode_keyframes(
         self,
         images: list[Image.Image],

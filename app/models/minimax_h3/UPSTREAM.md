@@ -65,6 +65,17 @@ MMGP shard-style filenames and adjacent quantization-map discovery are
 rejected; preprocessing accepts no quantization or tied-weight maps. This
 keeps native loading confined to the captured original checkpoint.
 
+`MiniMaxH3Model._encode_control_video` binds conditioning to that runtime's
+already loaded native video VAE. It calls the native `encode` method and takes
+posterior mode under the original CUDA FP16 autocast recipe, using the loaded
+VAE's own latent statistics. Existing MMGP encoder submodule hooks retain
+weight-loading ownership; no second VAE or manual model-device move is created.
+Cancellation discards prepared rows. Small learned CPU VAE fixtures verify the
+native temporal recipe, deterministic mode, and normalization, including black
+inpaint-source encoding. This is an internal preparation binding; full Control
+branch residency, compatible-base qualification, public admission, and native
+GPU/media acceptance remain outstanding.
+
 The default runtime stack is pinned to:
 
 - `MiniMaxAI/MiniMax-H3` commit `5d9b308a59ab12e67147f191e184baf704185bd1`
