@@ -895,3 +895,46 @@ CPU Flip produced a private copy that decoded in Chrome, preserved the source
 video and metadata hashes and copied the audio bitstream exactly. The queue
 returned to idle. This validates ordinary publication on the activated source;
 live crash injection and GPU finishing quality remain separate gates.
+
+
+## 2026-10-06 — ordinary image residency settings repair
+
+A normal FLUX.2 Klein 9B image failed before model loading because the shared
+residency reference capture assumed optional custom settings were a dictionary.
+Both requested and finalized captures now accept absent settings while keeping
+H3 third and additional still-guide references in their original order.
+
+The regression reproduced the original error at both captures. The 28 relevant
+wrapper, residency and failed-generation checks passed on the repaired source,
+and independent review found no blocker. The publication guard, source syntax
+and diff checks also passed. The full suite was not repeated, following the
+owner's proportional-test instruction.
+
+Three separate private, default-four-step FLUX jobs completed with one decoded
+1024-square image each. The third survived an actual in-flight browser reload
+with the same submission UUID, job, settings, privacy and single execution.
+The retained runtime access log records one generation POST and one Resume POST.
+The failed first attempt remains explicit. Owned model runtimes were stopped
+and drained before exact grant withdrawal, and local/stable health and readiness
+passed after Pinokio service restoration. No accepted H3 samples were regenerated.
+
+The reload trial exposed a separate defect: later metadata refreshes changed the
+sidecar after its recovery checksum was saved. The media still matches its
+receipt, but the trial's metadata seal fails validation. Its original image,
+sidecar, completed-job receipt and failed verification remain intact.
+
+Ordinary-repeat refreshes now preserve verified metadata bytes when no change
+is needed. Observed finishing and deliberate role/access transitions update
+the complete original recovery unit, retaining its identity and continuation
+data. The update must match the exact validated or written media and sidecar
+bytes; unrelated replacements and persistence failures stop publication.
+The regression covers repeated no-ops, finishing, private/native transitions,
+both role fields, sibling replacements before and during checkpoint, and failed
+recovery persistence. All 207 checks in the affected recovery module passed on
+the final source, and independent review cleared the corrected race boundaries.
+The earlier 28 residency/wrapper checks remain current. Publication, syntax and
+diff checks pass. Fresh native verification of the repaired metadata seal is a
+separate remaining gate; the prior failed receipt is not retroactively repaired.
+The repair is activated through the coordinated Pinokio restart. The new backend
+and both local/stable health and readiness passed; the matching restart notice
+was cleared by the existing launcher flow.

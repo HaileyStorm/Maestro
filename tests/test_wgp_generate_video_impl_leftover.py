@@ -49,6 +49,31 @@ class GenerateVideoImplLeftoverTests(unittest.TestCase):
         self.assertNotIn("durable_output_dir = candidate", self.wrapper)
         self.assertNotIn("_recovery_preprocess_path(", self.wrapper)
 
+    def test_residency_references_allow_plain_images_and_retain_h3_guides(self):
+        calls = [
+            node for node in ast.walk(_function(self.tree, "_generate_video_impl"))
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "_generation_residency_context"
+        ]
+        self.assertEqual(len(calls), 2)
+        cases = (
+            (None, []),
+            ({}, []),
+            ({"_h3_timeline_still_guide": {
+                "third_still_path": "third.png",
+                "additional_still_paths": ["fourth.png", "fifth.png"],
+            }}, ["third.png", "fourth.png", "fifth.png"]),
+        )
+        for call in calls:
+            references = next(item.value for item in call.keywords if item.arg == "references")
+            names = {node.id for node in ast.walk(references) if isinstance(node, ast.Name)}
+            for settings, expected in cases:
+                with self.subTest(line=call.lineno, settings=settings):
+                    scope = dict.fromkeys(names)
+                    scope["custom_settings"] = settings
+                    result = eval(compile(ast.Expression(references), str(WGP_PATH), "eval"), scope)
+                    self.assertEqual([item for item in result if item is not None], expected)
+
     def test_load_and_impl_wire_residency_evidence_once(self):
         self.assertIn("return_template=True", self.load_models)
         self.assertIn(

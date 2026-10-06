@@ -9931,6 +9931,7 @@ def _queue_recovery_checkpoint_unit(
     attestation: dict | None = None,
     ordinary_repeat_offset: int | None = None,
     expected_h3_cumulative_authority=None,
+    expected_artifacts: dict[str, dict] | None = None,
 ) -> dict:
     """Seal media+sidecars, then persist one completed safe-unit descriptor."""
     unit_id = recovery_unit_id(
@@ -9955,12 +9956,17 @@ def _queue_recovery_checkpoint_unit(
     artifacts = []
     for name in artifact_names:
         sidecar_name = os.path.splitext(name)[0] + ".meta.json"
-        artifacts.append(_recovery_artifact_descriptor(
+        artifact = _recovery_artifact_descriptor(
             project_dir,
             basename=name,
             sidecar_basename=sidecar_name,
             producer_unit_id=unit_id,
-        ))
+        )
+        if expected_artifacts is not None and artifact != expected_artifacts.get(name):
+            raise QueueRecoveryRuntimeError("Recovery output changed before checkpoint.")
+        artifacts.append(artifact)
+    if expected_artifacts is not None and set(expected_artifacts) != set(artifact_names):
+        raise QueueRecoveryRuntimeError("Recovery output membership changed before checkpoint.")
     unit = {
         "artifacts": artifacts,
         "dependencies": list(dependencies or ()),
@@ -71341,31 +71347,154 @@ def _run_generation(
                 """
                 if not file_names:
                     return
-                def sealed_h3_sidecar_unchanged(name):
+                ordinary_units_to_reseal = {}
+                validated_ordinary_units = set()
+                unchanged_ordinary_artifacts = set()
+                refreshed_sealed_names = set()
+                verified_ordinary_metadata = {}
+                expected_ordinary_artifacts = {}
+                def observed_finishing_applied(name):
+                    steps = postprocessing_outcomes.get(name) or []
+                    return bool(steps) and all(
+                        isinstance(step, dict)
+                        and step.get("outcome") in {"applied", "not_applied"}
+                        for step in steps
+                    ) and any(step.get("outcome") == "applied" for step in steps)
+
+                def sealed_producer_sidecar_unchanged(name):
                     """A completed recovery unit owns its byte-exact sidecar."""
                     if not isinstance(name, str) or os.path.basename(name) != name:
                         return False
+                    cursor = job.get("recovery_cursor") or {}
+                    ordinary_units = [
+                        unit for unit in cursor.get("completed_units", [])
+                        if isinstance(unit, dict)
+                        and unit.get("kind") == "ordinary_repeat"
+                        and unit.get("state") == "completed"
+                        and any(
+                            artifact.get("basename") == name
+                            for artifact in unit.get("artifacts") or []
+                            if isinstance(artifact, dict)
+                        )
+                    ] if isinstance(cursor, dict) else []
+                    if len(ordinary_units) > 1:
+                        raise QueueRecoveryRuntimeError("Completed output ownership is ambiguous.")
+                    ordinary_unit = ordinary_units[0] if ordinary_units else None
                     # An observed no-op leaves the media seal intact. A
                     # changed or uncertain result still takes the finishing
                     # path and must pass final integrity before publication.
                     outcomes = postprocessing_outcomes.get(name) or []
-                    if any(
+                    finishing_changed = any(
                         not isinstance(step, dict)
                         or step.get("outcome") != "not_applied"
                         for step in outcomes
-                    ):
+                    )
+                    if finishing_changed and ordinary_unit is None:
                         return False
                     meta_path = os.path.join(
                         out_dir, os.path.splitext(name)[0] + ".meta.json",
                     )
                     try:
-                        with open(meta_path, "r", encoding="utf-8") as handle:
-                            meta = json.load(handle)
+                        if ordinary_unit is not None:
+                            from services.queue_recovery_runtime import MAX_MANIFEST_BYTES, _read_exact_file
+                            raw_meta = _read_exact_file(meta_path, maximum_bytes=MAX_MANIFEST_BYTES)
+                            meta = json.loads(raw_meta)
+                        else:
+                            with open(meta_path, "r", encoding="utf-8") as handle:
+                                meta = json.load(handle)
                         if not isinstance(meta, dict):
+                            if ordinary_unit is not None:
+                                raise QueueRecoveryRuntimeError("Completed output metadata changed.")
                             return False
                         kind = meta.get("producer_unit_kind")
                         variant = meta.get("producer_unit_variant")
                         index = meta.get("producer_unit_index")
+                        if ordinary_unit is not None:
+                            if ordinary_unit["unit_id"] != recovery_unit_id(
+                                job_id, "ordinary_repeat",
+                                variant=ordinary_unit.get("variant"), index=ordinary_unit.get("index"),
+                                dependencies=ordinary_unit.get("dependencies") or (),
+                                settings=ordinary_unit.get("settings") or {},
+                            ):
+                                raise QueueRecoveryRuntimeError("Completed output ownership changed.")
+                            artifact = next(
+                                item for item in ordinary_unit["artifacts"]
+                                if item.get("basename") == name
+                            )
+                            # Finishing may replace media, never the sealed
+                            # producer sidecar. Verify that independent seal
+                            # before authorizing any deliberate transition.
+                            size, digest = len(raw_meta), hashlib.sha256(raw_meta).hexdigest()
+                            if (
+                                size != artifact.get("sidecar_size")
+                                or digest != artifact.get("sidecar_sha256")
+                                or meta.get("job_id") != job_id
+                                or meta.get("output_filename") != name
+                                or meta.get("producer_unit_id") != ordinary_unit.get("unit_id")
+                                or (kind, variant, index) != (
+                                    "ordinary_repeat", ordinary_unit.get("variant"),
+                                    ordinary_unit.get("index"),
+                                )
+                            ):
+                                raise QueueRecoveryRuntimeError("Completed output metadata changed.")
+                            if ordinary_unit["unit_id"] not in validated_ordinary_units:
+                                # A repeat can own several images, windows or
+                                # audio files. Never reseal an unchecked sibling
+                                # merely because this member was postprocessed.
+                                expected_ordinary_artifacts[ordinary_unit["unit_id"]] = {
+                                    member["basename"]: dict(member)
+                                    for member in ordinary_unit["artifacts"]
+                                }
+                                for member in ordinary_unit["artifacts"]:
+                                    member_name = member["basename"]
+                                    if (
+                                        os.path.basename(member_name) != member_name
+                                        or os.path.basename(member["sidecar_basename"]) != member["sidecar_basename"]
+                                    ):
+                                        raise QueueRecoveryRuntimeError("Completed output path changed.")
+                                    member_sidecar = os.path.join(out_dir, member["sidecar_basename"])
+                                    member_size, member_digest = _recovery_sha256_file(member_sidecar)
+                                    if (
+                                        member_size != member.get("sidecar_size")
+                                        or member_digest != member.get("sidecar_sha256")
+                                    ):
+                                        raise QueueRecoveryRuntimeError("Completed output metadata changed.")
+                                    current = validate_artifact_descriptor(
+                                        out_dir, member, producer_unit_id=ordinary_unit["unit_id"],
+                                    )
+                                    if current:
+                                        unchanged_ordinary_artifacts.add(member_name)
+                                    elif not observed_finishing_applied(member_name):
+                                        raise QueueRecoveryRuntimeError("Completed output media changed.")
+                                    else:
+                                        size, digest = _recovery_sha256_file(os.path.join(out_dir, member_name))
+                                        expected_ordinary_artifacts[ordinary_unit["unit_id"]][member_name].update(
+                                            size=size, sha256=digest,
+                                        )
+                                validated_ordinary_units.add(ordinary_unit["unit_id"])
+                            verified_ordinary_metadata[name] = meta
+                            applied = observed_finishing_applied(name)
+                            intended_policy = dict(meta)
+                            policy = dict(job.get("access_policy") or {})
+                            if native_source or private_native_parent:
+                                policy["private"] = True
+                            stamp_sidecar_policy(
+                                intended_policy, policy,
+                                workspace=job.get("workspace") or "default",
+                            )
+                            role = producer_artifact_roles.get(name) or meta.get("producer_artifact_class")
+                            no_transition = (
+                                name in unchanged_ordinary_artifacts
+                                and (not applied or meta.get("postprocessing") == {"version": 1, "steps": outcomes})
+                                and (meta.get("delivery_native_source") is True) == bool(native_source)
+                                and role == meta.get("producer_artifact_class")
+                                and ("temporary" if native_source else role) == meta.get("artifact_class")
+                                and intended_policy == meta
+                            )
+                            if no_transition:
+                                return True
+                            ordinary_units_to_reseal[ordinary_unit["unit_id"]] = ordinary_unit
+                            return False
                         if (
                             kind not in {"h3_segment", "h3_concat"}
                             or type(variant) is not int
@@ -71385,7 +71514,13 @@ def _run_generation(
                                 if isinstance(artifact, dict)
                             )
                         )
-                    except (OSError, ValueError, TypeError, QueueRecoveryRuntimeError):
+                    except (OSError, ValueError, TypeError) as error:
+                        if ordinary_unit is not None:
+                            raise QueueRecoveryRuntimeError("Completed output metadata is unavailable.") from error
+                        return False
+                    except QueueRecoveryRuntimeError:
+                        if ordinary_unit is not None:
+                            raise
                         return False
                 guide_source = (
                     ((job.get("params") or {}).get("_h3_timeline_still_guide_source")
@@ -71540,7 +71675,7 @@ def _run_generation(
                     if (
                         not isinstance(recovery_units, dict)
                         or fname not in recovery_units
-                    ) and sealed_h3_sidecar_unchanged(fname):
+                    ) and sealed_producer_sidecar_unchanged(fname):
                         continue
                     file_sidecar = dict(sidecar)
                     file_sidecar["params"] = sidecar_params.copy()
@@ -71649,8 +71784,11 @@ def _run_generation(
                         # exactly-once producer evidence written at the safe
                         # unit boundary.
                         try:
-                            with open(meta_path, "r", encoding="utf-8") as existing_file:
-                                existing_meta = json.load(existing_file)
+                            if fname in verified_ordinary_metadata:
+                                existing_meta = verified_ordinary_metadata[fname]
+                            else:
+                                with open(meta_path, "r", encoding="utf-8") as existing_file:
+                                    existing_meta = json.load(existing_file)
                             if isinstance(existing_meta, dict):
                                 for key, value in existing_meta.items():
                                     if key.startswith("producer_") or key == "artifact_lineage":
@@ -71664,7 +71802,7 @@ def _run_generation(
                                 preserved_role = existing_meta.get(
                                     "producer_artifact_class"
                                 )
-                                if preserved_role in _RECOVERY_ARTIFACT_ROLES:
+                                if preserved_role in _RECOVERY_ARTIFACT_ROLES and not producer_role:
                                     file_sidecar["artifact_class"] = (
                                         "temporary"
                                         if native_source
@@ -71672,6 +71810,13 @@ def _run_generation(
                                     )
                         except (OSError, ValueError, TypeError):
                             pass
+                    if file_sidecar.get("producer_unit_id") in ordinary_units_to_reseal:
+                        expected = expected_ordinary_artifacts[file_sidecar["producer_unit_id"]][fname]
+                        file_sidecar["producer_media_size"] = expected["size"]
+                        file_sidecar["producer_media_sha256"] = expected["sha256"]
+                        if producer_role:
+                            file_sidecar["producer_artifact_class"] = producer_role
+                            file_sidecar["artifact_class"] = "temporary" if native_source else producer_role
                     temp_meta = f"{meta_path}.{uuid.uuid4().hex[:8]}.tmp"
                     try:
                         if (
@@ -71686,11 +71831,20 @@ def _run_generation(
                                 h3_integrity_pending_path(out_dir, fname),
                                 {"pending": True},
                             )
-                        with open(temp_meta, "w", encoding="utf-8") as f:
-                            json.dump(file_sidecar, f, indent=2)
+                        serialized_meta = json.dumps(file_sidecar, indent=2).encode("utf-8")
+                        with open(temp_meta, "wb") as f:
+                            f.write(serialized_meta)
                             f.flush()
                             os.fsync(f.fileno())
                         os.replace(temp_meta, meta_path)
+                        if file_sidecar.get("producer_unit_id") in ordinary_units_to_reseal:
+                            refreshed_sealed_names.add(fname)
+                            expected_ordinary_artifacts[file_sidecar["producer_unit_id"]][fname].update({
+                                "sha256": file_sidecar["producer_media_sha256"],
+                                "size": file_sidecar["producer_media_size"],
+                                "sidecar_sha256": hashlib.sha256(serialized_meta).hexdigest(),
+                                "sidecar_size": len(serialized_meta),
+                            })
                         if os.name != "nt":
                             directory = os.open(
                                 out_dir,
@@ -71705,6 +71859,8 @@ def _run_generation(
                             os.remove(temp_meta)
                         except OSError:
                             pass
+                        if file_sidecar.get("producer_unit_id") in ordinary_units_to_reseal:
+                            raise QueueRecoveryRuntimeError("Completed output metadata update failed.") from sidecar_error
                         quarantine = os.path.join(
                             out_dir,
                             f".private-sidecar-failed-{uuid.uuid4().hex[:8]}-{fname}",
@@ -71750,8 +71906,20 @@ def _run_generation(
                         if meta.get("job_id") == job_id
                     }
                     for name, meta in job_sidecars.items():
-                        if sealed_h3_sidecar_unchanged(name):
+                        if name in refreshed_sealed_names or sealed_producer_sidecar_unchanged(name):
                             continue
+                        if name in verified_ordinary_metadata:
+                            meta = dict(verified_ordinary_metadata[name])
+                            policy = dict(job.get("access_policy") or {})
+                            if native_source or private_native_parent:
+                                policy["private"] = True
+                            stamp_sidecar_policy(meta, policy, workspace=job.get("workspace") or "default")
+                            if native_source:
+                                meta["delivery_native_source"] = True
+                            else:
+                                meta.pop("delivery_native_source", None)
+                            if postprocessing_outcomes.get(name) and not native_source:
+                                meta["postprocessing"] = {"version": 1, "steps": postprocessing_outcomes[name]}
                         # The gallery classifier intentionally uses filename
                         # hints for display of legacy leftovers. Those hints
                         # are not producer authority and must never be copied
@@ -71768,6 +71936,8 @@ def _run_generation(
                             or meta.get("director_clip_index") is not None
                         )
                         producer_kind = str(meta.get("producer_unit_kind") or "")
+                        if producer_kind == "ordinary_repeat" and producer_artifact_roles.get(name):
+                            meta["producer_artifact_class"] = producer_artifact_roles[name]
                         producer_role = _queue_recovery_expected_artifact_role(
                             producer_kind, meta,
                         )
@@ -71791,10 +71961,39 @@ def _run_generation(
                         meta_path = os.path.join(
                             out_dir, os.path.splitext(name)[0] + ".meta.json",
                         )
-                        with open(meta_path, "w", encoding="utf-8") as handle:
-                            json.dump(meta, handle, indent=2)
+                        if meta.get("producer_unit_id") in ordinary_units_to_reseal:
+                            # This member was reached through the role pass,
+                            # rather than this call's explicit filename list.
+                            expected = expected_ordinary_artifacts[meta["producer_unit_id"]][name]
+                            size, digest = expected["size"], expected["sha256"]
+                            meta.update(producer_media_size=size, producer_media_sha256=digest)
+                            serialized_meta = json.dumps(meta, indent=2).replace("\n", os.linesep).encode("utf-8")
+                            _atomic_write_json(meta_path, meta)
+                            expected_ordinary_artifacts[meta["producer_unit_id"]][name].update({
+                                "sha256": digest, "size": size,
+                                "sidecar_sha256": hashlib.sha256(serialized_meta).hexdigest(),
+                                "sidecar_size": len(serialized_meta),
+                            })
+                        else:
+                            with open(meta_path, "w", encoding="utf-8") as handle:
+                                json.dump(meta, handle, indent=2)
+                except QueueRecoveryRuntimeError:
+                    raise
                 except Exception as artifact_error:
+                    if ordinary_units_to_reseal:
+                        raise QueueRecoveryRuntimeError("Completed output role update failed.") from artifact_error
                     print(f"[Gen {job_id}] Artifact metadata refresh skipped: {artifact_error}")
+                for unit in ordinary_units_to_reseal.values():
+                    if not _queue_recovery_checkpoint_unit(
+                        job, kind=unit["kind"], variant=unit["variant"], index=unit["index"],
+                        project_dir=out_dir,
+                        artifact_names=[artifact["basename"] for artifact in unit["artifacts"]],
+                        dependencies=unit.get("dependencies"), settings=unit.get("settings"),
+                        continuation=unit.get("continuation"), attestation=unit.get("attestation"),
+                        ordinary_repeat_offset=(job.get("recovery_cursor") or {}).get("ordinary_repeat_offset"),
+                        expected_artifacts=expected_ordinary_artifacts[unit["unit_id"]],
+                    ):
+                        raise QueueRecoveryRuntimeError("Completed output recovery update failed.")
 
             def _replay_h3_concat_from_verified_segments(
                 *, variant: int, total_segments: int, clip_info: dict,

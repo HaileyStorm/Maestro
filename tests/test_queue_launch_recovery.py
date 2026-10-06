@@ -11542,6 +11542,201 @@ class QueueLaunchWiringTests(unittest.TestCase):
                 root, descriptor, producer_unit_id=unit_id,
             ))
 
+    def test_ordinary_sidecar_refresh_preserves_seals_and_real_transitions(self):
+        module = ast.fix_missing_locations(ast.Module(
+            body=[_function(self.launch, name) for name in (
+                "_write_output_sidecars", "_queue_recovery_checkpoint_unit",
+                "_queue_recovery_units",
+                "_atomic_write_json",
+            )],
+            type_ignores=[],
+        ))
+        for case in (
+            "noop", "media_changed", "producer_changed", "kind_changed",
+            "metadata_changed", "role_changed", "policy_changed",
+            "native_source", "private_parent", "finishing_applied",
+            "finishing_unconfirmed", "checkpoint_failed", "sibling_changed",
+            "non_object_metadata",
+            "checkpoint_race",
+            "sibling_role_changed",
+            "metadata_media_race",
+        ):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                name = "final.png"
+                media = root / name
+                media.write_bytes(b"completed ordinary image")
+                settings = {"repeat_task_ids": [5]}
+                dependencies = [recovery_unit_id("prior-job", "ordinary_repeat")]
+                unit_id = recovery_unit_id(
+                    "ordinary-sidecar-test", "ordinary_repeat",
+                    settings=settings, dependencies=dependencies,
+                )
+                meta = {
+                    "artifact_class": "final", "created_at": 1,
+                    "generation_time": 10, "job_id": "ordinary-sidecar-test",
+                    "output_filename": name, "params": {"generation_mode": "image"},
+                    "private": False, "explicit": False, "workspace": "default",
+                    "producer_artifact_class": "final", "producer_unit_id": unit_id,
+                    "producer_unit_kind": "ordinary_repeat",
+                    "producer_unit_variant": 0, "producer_unit_index": 0,
+                }
+                sidecar = root / "final.meta.json"
+                sidecar.write_text(json.dumps(meta, sort_keys=True), encoding="utf-8")
+                original = sidecar.read_bytes()
+                descriptor = artifact_descriptor(
+                    root, basename=name, sidecar_basename=sidecar.name,
+                    producer_unit_id=unit_id,
+                )
+                sibling = root / "second.png"
+                sibling.write_bytes(b"other output from the same repeat")
+                sibling_meta = dict(meta, output_filename=sibling.name)
+                (root / "second.meta.json").write_text(json.dumps(sibling_meta), encoding="utf-8")
+                sibling_descriptor = artifact_descriptor(
+                    root, basename=sibling.name, sidecar_basename="second.meta.json",
+                    producer_unit_id=unit_id,
+                )
+                unit = {
+                    "unit_id": unit_id, "kind": "ordinary_repeat", "state": "completed",
+                    "variant": 0, "index": 0, "artifacts": [descriptor, sibling_descriptor],
+                    "settings": settings, "dependencies": dependencies,
+                    "continuation": {"mode": "test_receipt"},
+                    "attestation": {"source": "retained native producer"},
+                }
+                job = {
+                    "id": "ordinary-sidecar-test",
+                    "params": {"generation_mode": "image"}, "access_policy": {},
+                    "workspace": "default", "recovery_cursor": {
+                        "completed_units": [unit], "ordinary_repeat_offset": 3,
+                    },
+                }
+                roles = {name: "final"}
+                if case == "sibling_role_changed":
+                    roles[sibling.name] = "window"
+                outcomes = {name: [{"step": "voice_clone", "outcome": "not_applied"}]}
+                if case in {"media_changed", "finishing_applied", "finishing_unconfirmed"}:
+                    media.write_bytes(b"changed image bytes")
+                if case in {"producer_changed", "kind_changed", "metadata_changed"}:
+                    meta[{
+                        "producer_changed": "producer_unit_id",
+                        "kind_changed": "producer_unit_kind",
+                        "metadata_changed": "created_at",
+                    }[case]] = "foreign replacement"
+                    sidecar.write_text(json.dumps(meta), encoding="utf-8")
+                if case == "non_object_metadata":
+                    sidecar.write_text("[]", encoding="utf-8")
+                if case == "sibling_changed":
+                    sibling.write_bytes(b"foreign sibling replacement")
+                before_refresh = sidecar.read_bytes()
+                if case == "role_changed":
+                    roles[name] = "window"
+                if case in {"policy_changed", "checkpoint_failed", "checkpoint_race", "metadata_media_race"}:
+                    job["access_policy"] = {"private": True, "explicit": True}
+                if case in {"finishing_applied", "sibling_changed"}:
+                    outcomes[name] = [{"step": "film_grain", "outcome": "applied"}]
+                if case == "finishing_unconfirmed":
+                    outcomes[name] = [{"step": "film_grain", "outcome": "unconfirmed"}]
+                checkpoints = []
+                def checkpoint(job, **kwargs):
+                    checkpoints.append(kwargs)
+                    if case == "checkpoint_failed":
+                        return False
+                    job["recovery_cursor"] = kwargs["recovery_cursor"]
+                    return True
+                def capture_descriptor(project_dir, **kwargs):
+                    if case == "checkpoint_race" and kwargs["basename"] == name:
+                        sibling.write_bytes(b"replacement between validation and checkpoint")
+                    return artifact_descriptor(project_dir, **kwargs)
+                def output_seed(_name):
+                    if case == "metadata_media_race":
+                        media.write_bytes(b"replacement after validation before metadata update")
+                    return None
+                namespace = {
+                    "os": os, "json": json, "time": time, "uuid": uuid, "hashlib": hashlib,
+                    "job": job, "job_id": "ordinary-sidecar-test", "start_time": 0,
+                    "out_dir": str(root), "clip_output_files": {},
+                    "producer_artifact_roles": roles, "postprocessing_outcomes": outcomes,
+                    "pp_film_grain_intensity": 0, "pp_spatial_upsampling": None,
+                    "pp_delivery_resolution": None,
+                    "requested_model": "flux", "_H3_LONG_STUDIO_MODELS": {"h3"},
+                    "GENERATED_MEDIA_EXTENSIONS": {".png"},
+                    "_RECOVERY_ARTIFACT_ROLES": {"final", "component", "window", "temporary"},
+                    "_prepare_generation_sidecar_params": lambda params: ({}, dict(params)),
+                    "_strip_director_image_role_internals": lambda _params: None,
+                    "_extract_output_seed": output_seed,
+                    "stamp_sidecar_policy": stamp_sidecar_policy,
+                    "_recovery_sha256_file": lambda path: (
+                        Path(path).stat().st_size, hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+                    ),
+                    "_recovery_artifact_descriptor": capture_descriptor,
+                    "_queue_recovery_checkpoint": checkpoint,
+                    "recovery_unit_id": recovery_unit_id,
+                    "validate_artifact_descriptor": validate_artifact_descriptor,
+                    "_queue_recovery_expected_artifact_role": lambda _kind, meta: meta.get("producer_artifact_class"),
+                    "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+                }
+                exec(compile(module, "isolated-ordinary-sidecar-refresh", "exec"), namespace)
+                with mock.patch(
+                    "services.search_index.load_media_sidecars",
+                    side_effect=lambda _root: {
+                        name: json.loads(sidecar.read_text()),
+                        sibling.name: json.loads((root / "second.meta.json").read_text()),
+                    },
+                ), mock.patch("time.time", return_value=1000) as clock:
+                    refresh = namespace["_write_output_sidecars"]
+                    if case in {"media_changed", "producer_changed", "kind_changed", "metadata_changed", "finishing_unconfirmed", "sibling_changed", "non_object_metadata"}:
+                        with self.assertRaises(QueueRecoveryRuntimeError):
+                            refresh([name])
+                        self.assertEqual(sidecar.read_bytes(), before_refresh)
+                    elif case in {"checkpoint_failed", "checkpoint_race", "metadata_media_race"}:
+                        with self.assertRaises(QueueRecoveryRuntimeError):
+                            refresh([name])
+                        self.assertEqual(job["recovery_cursor"]["completed_units"], [unit])
+                    else:
+                        refresh([name], native_source=case == "native_source",
+                                private_native_parent=case == "private_parent")
+                        if case == "noop":
+                            clock.return_value = 2000
+                            refresh([name])  # both later publication passes
+                            self.assertEqual(sidecar.read_bytes(), original)
+                            self.assertTrue(validate_artifact_descriptor(
+                                root, descriptor, producer_unit_id=unit_id,
+                            ))
+                        else:
+                            if case == "sibling_role_changed":
+                                self.assertEqual(sidecar.read_bytes(), original)
+                                self.assertEqual(json.loads((root / "second.meta.json").read_text())["artifact_class"], "window")
+                            else:
+                                self.assertNotEqual(sidecar.read_bytes(), original)
+                            updated = job["recovery_cursor"]["completed_units"][0]
+                            for key in ("unit_id", "settings", "dependencies", "continuation", "attestation"):
+                                self.assertEqual(updated[key], unit[key])
+                            self.assertEqual(job["recovery_cursor"]["ordinary_repeat_offset"], 3)
+                            self.assertEqual(len(updated["artifacts"]), 2)
+                            for updated_artifact in updated["artifacts"]:
+                                self.assertTrue(validate_artifact_descriptor(
+                                    root, updated_artifact, producer_unit_id=unit_id,
+                                ))
+                            saved = json.loads(sidecar.read_text())
+                            if case != "sibling_role_changed":
+                                self.assertEqual(saved["producer_media_sha256"], hashlib.sha256(media.read_bytes()).hexdigest())
+                            if case in {"policy_changed", "native_source", "private_parent"}:
+                                self.assertTrue(saved["private"])
+                            if case == "native_source":
+                                self.assertEqual(saved["artifact_class"], "temporary")
+                            if case == "role_changed":
+                                self.assertEqual(saved["artifact_class"], "window")
+                                self.assertEqual(saved["producer_artifact_class"], "window")
+                            if case == "finishing_applied":
+                                self.assertEqual(saved["postprocessing"]["steps"], outcomes[name])
+                            finished_bytes = sidecar.read_bytes()
+                            checkpoint_count = len(checkpoints)
+                            clock.return_value = 2000
+                            refresh([name], native_source=case == "native_source",
+                                    private_native_parent=case == "private_parent")
+                            self.assertEqual(sidecar.read_bytes(), finished_bytes)
+                            self.assertEqual(len(checkpoints), checkpoint_count)
+
     def test_non_object_existing_sidecar_does_not_abort_refresh(self):
         writer = _function(self.launch, "_write_output_sidecars")
         module = ast.fix_missing_locations(ast.Module(body=[writer], type_ignores=[]))

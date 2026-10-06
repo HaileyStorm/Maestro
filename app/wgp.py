@@ -12263,8 +12263,8 @@ def _generate_video_impl(
         steps=num_inference_steps,
         references=[
             image_start, image_end, image_refs, image_guide,
-            (custom_settings.get("_h3_timeline_still_guide") or {}).get("third_still_path"),
-            *((custom_settings.get("_h3_timeline_still_guide") or {}).get("additional_still_paths") or []),
+            ((custom_settings or {}).get("_h3_timeline_still_guide") or {}).get("third_still_path"),
+            *(((custom_settings or {}).get("_h3_timeline_still_guide") or {}).get("additional_still_paths") or []),
             video_source, video_end, video_guide, video_guide2,
             video_guide3, custom_guide, voice_reference,
             audio_source, audio_guide, audio_guide2, audio_guide3,
@@ -13287,8 +13287,8 @@ def _generate_video_impl(
         steps=num_inference_steps,
         references=[
             image_start, image_end, image_refs, image_guide,
-            (custom_settings.get("_h3_timeline_still_guide") or {}).get("third_still_path"),
-            *((custom_settings.get("_h3_timeline_still_guide") or {}).get("additional_still_paths") or []),
+            ((custom_settings or {}).get("_h3_timeline_still_guide") or {}).get("third_still_path"),
+            *(((custom_settings or {}).get("_h3_timeline_still_guide") or {}).get("additional_still_paths") or []),
             video_source, video_end, video_guide, video_guide2,
             video_guide3, custom_guide, voice_reference,
             audio_source, audio_guide, audio_guide2, audio_guide3,
