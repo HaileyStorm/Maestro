@@ -1063,3 +1063,21 @@ checks pass. Frozen-source review and publication checks pass. The original
 native image job remains held with unchanged identity; the failed GPU grant
 was withdrawn after owned runtime cleanup. Native dispatch on the repair,
 Windows/LAN and human acceptance remain separate checks.
+
+### 2026-10-06: Restart after a failed Start
+
+A native release exposed a failed Start that retained its Pinokio script marker
+without publishing a ready URL. Restart previously refused that state before
+sending Stop. It now uses the supported Stop for the verified app, waits for
+the script marker to disappear, and checks that no same-user Python backend
+for that checkout remains. Offline status also requires that check. Incomplete
+process evidence holds recovery; the helper never signals processes. A server
+with a published local URL must still close its listener before replacement.
+
+Evidence: the former source reproduces the refusal. A real CPU-only backend
+fixture proves that clearing the script marker cannot permit replacement while
+the backend survives, and that recovery proceeds after it exits. All 40 affected
+helper and launcher checks pass with one existing skip; source review and
+publication checks pass. This is local subprocess evidence with mocked Pinokio
+status, not native failed-start or Windows acceptance. No launcher, model,
+provider, creative-content or GPU behavior changed.
