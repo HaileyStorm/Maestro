@@ -89,6 +89,39 @@ requires a fresh eager profile: public admission and cached residency identities
 do not yet include the acquired Control asset. CPU graph and numerical checks
 do not qualify the full weights, CUDA offload, or generation.
 
+The original Base FL2VA transformer is pinned separately to
+[`MiniMaxAI/MiniMax-H3@5d9b308a59ab12e67147f191e184baf704185bd1/FL2VA/transformer`](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/5d9b308a59ab12e67147f191e184baf704185bd1/FL2VA/transformer).
+`original_base.py` records all 13 shard sizes and SHA-256 values from that
+revision's LFS metadata (66,280,485,936 bytes total), plus index SHA-256
+`fb457a26ffa6294660e249b0ddd03a337f2e5393f770b5c34c8b8f90a29a7efb`.
+Its 535 indexed native tensor names include the full 2,688-wide timestep
+embedder and persistent rotary buffer. The author’s original Control example
+uses Base FL2VA in text-to-video mode; the example does not pin the exact base
+revision used for training, so geometry and naming alone do not prove that
+pairing or numerical compatibility.
+
+When an already acquired original shard is selected, `_load_transformer`
+requires this complete sealed local export. It reads explicit shards through
+CPU safetensors and passes a state-dict tuple to MMGP, avoiding older MMGP
+filename expansion that repeats shard 1 for indices 10–13. The pinned
+[VideoX-Fun conversion contract](https://github.com/aigc-apps/VideoX-Fun/blob/b0acf916c215705ac212fc51b2d9007bbc6df51b/videox_fun/models/minimax_h3_conversion.py)
+establishes head-interleaved fused QKV and native `[gate, value]` FFN order.
+Only QKV rows are reordered; the Control/Diffusers FFN swap is not applied to
+this base. Complete tensor names, per-shard membership, shapes and floating
+dtypes are checked before assignment. File resolution/signatures and
+cancellation are checked across loading; implicit quantization/tied-weight
+maps are rejected. Index reads use a checked regular-file descriptor. POSIX
+safetensors reads use an alias of the held descriptor; Windows holds a read
+handle that denies write/delete sharing while the mapper opens the file.
+Linux subprocess checks reject index/shard FIFO replacement within a bounded
+deadline. Windows and macOS loading still need their own native qualification.
+MMGP retains the native FP32 projection/timestep islands.
+Small 13-shard CPU fixtures exercise the installed MMGP loader and compare
+loaded weights and numerical video/audio outputs. Full-weight acquisition,
+model terms, native residency, Control cache/admission and GPU/media acceptance
+remain separate gates. This change neither downloads nor selects this base
+as the public default; community checkpoint loading is preserved.
+
 The default runtime stack is pinned to:
 
 - `MiniMaxAI/MiniMax-H3` commit `5d9b308a59ab12e67147f191e184baf704185bd1`

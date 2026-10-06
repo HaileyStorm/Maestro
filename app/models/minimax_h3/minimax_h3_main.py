@@ -592,13 +592,13 @@ def _restore_interleaved_transformer_qkv(
     state_dict,
     *,
     qkv_layout="interleaved",
+    heads=56,
+    head_dim=128,
 ):
     """Convert WanGP's head-interleaved fused QKV rows for this runtime."""
 
     if qkv_layout != "interleaved":
         return state_dict
-    heads = 56
-    head_dim = 128
     expected_rows = heads * 3 * head_dim
     for key, tensor in list(state_dict.items()):
         if not key.endswith((".qkv_proj.weight", ".qkv_proj.weight_scale")):
@@ -621,10 +621,20 @@ def _load_transformer(
     dtype: torch.dtype,
     *,
     qkv_layout: str = "contiguous",
+    interrupted=None,
 ) -> MiniMaxH3Transformer:
     from .convrot import adapt_int8_convrot_state_dict
+    from .original_base import is_original_base_checkpoint, load_original_base_into_model
 
-    checkpoint = _probe_transformer_checkpoint(filename)
+    original_base = is_original_base_checkpoint(filename)
+    checkpoint = (
+        {"architecture": "full_timestep", "curve_grid": None, "curve_dim": 2688}
+        if original_base else _probe_transformer_checkpoint(filename)
+    )
+    if original_base:
+        # The immutable original export, unlike community conversions, is
+        # head-interleaved. Its byte identity determines the layout.
+        qkv_layout = "interleaved"
     with init_empty_weights(include_buffers=True):
         transformer = MiniMaxH3Transformer(
             dtype=dtype,
@@ -641,13 +651,22 @@ def _load_transformer(
             transformer, state_dict, output_dtype=dtype,
         )
 
-    offload.load_model_data(
-        transformer,
-        filename,
-        writable_tensors=False,
-        preprocess_sd=preprocess_transformer_state_dict,
-        default_dtype=dtype,
-    )
+    if original_base:
+        attention = transformer.blocks[0].attn
+        transformer.h3_original_base_evidence = load_original_base_into_model(
+            transformer, filename, dtype=dtype, interrupted=interrupted,
+            reorder_qkv=lambda state: _restore_interleaved_transformer_qkv(
+                state, heads=attention.heads, head_dim=attention.head_dim,
+            ),
+        )
+    else:
+        offload.load_model_data(
+            transformer,
+            filename,
+            writable_tensors=False,
+            preprocess_sd=preprocess_transformer_state_dict,
+            default_dtype=dtype,
+        )
     transformer._model_dtype = dtype
     transformer.h3_checkpoint_info = checkpoint
     transformer.h3_qkv_layout = qkv_layout
@@ -882,6 +901,7 @@ class MiniMaxH3Model:
                 transformer_path,
                 dtype,
                 qkv_layout=qkv_layout,
+                interrupted=lambda: self._interrupt,
             )
             report_load_stage("Loading H3 conditioner checkpoint")
             conditioner_options = {"resolved_assets": conditioner_assets} if snapshot is not None else {}
