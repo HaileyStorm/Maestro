@@ -868,3 +868,10 @@ foreign-file replacements and interrupted cleanup. A combined-module Torch
 reimport fixture failure also reproduces on the unchanged predecessor; its
 evidence is retained separately. These checks do not prove live GPU processing,
 Windows/LAN behavior, a live service crash or human quality acceptance.
+
+After the coordinated Pinokio restart, local and stable-share health/readiness
+passed and the matching public restart notice was cleared. One live Gallery
+CPU Flip produced a private copy that decoded in Chrome, preserved the source
+video and metadata hashes and copied the audio bitstream exactly. The queue
+returned to idle. This validates ordinary publication on the activated source;
+live crash injection and GPU finishing quality remain separate gates.
