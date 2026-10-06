@@ -119,6 +119,12 @@ class RetakePipeline:
 
         if end_frame < 0:
             end_frame = num_frames
+        requested_frames = int(num_frames)
+        if requested_frames < 1:
+            raise ValueError("Retake requires at least one source frame")
+        scale_factors = self.pipeline_components.video_scale_factors
+        latent_stride = int(scale_factors.time)
+        model_frames = 1 + ((requested_frames - 1 + latent_stride - 1) // latent_stride) * latent_stride
 
         # ── Text Encoding ───────────────────────────────────────────────
         text_encoder = self._get_model("text_encoder")
@@ -156,6 +162,15 @@ class RetakePipeline:
             dtype=self.dtype,
             device=self.device,
         )
+        if source_video_tensor is None or source_video_tensor.shape[2] != requested_frames:
+            raise ValueError("Retake source frame count does not match the requested cut")
+        # The VAE requires 1 + stride*k frames. Tiled encoding otherwise drops
+        # the final incomplete stride. Pad only this private inference tensor;
+        # decoding below trims back to the exact source cut, including its tail.
+        padding_frames = model_frames - requested_frames
+        if padding_frames:
+            tail = source_video_tensor[:, :, -1:].expand(-1, -1, padding_frames, -1, -1)
+            source_video_tensor = torch.cat((source_video_tensor, tail), dim=2)
         source_video_latent = vae_encode_video(source_video_tensor, video_encoder, tiling_config)
         source_video_latent = source_video_latent.to(device=self.device, dtype=self.dtype)
 
@@ -200,7 +215,7 @@ class RetakePipeline:
 
                 # Pad/trim audio latent to match expected duration
                 output_shape_for_audio = VideoPixelShape(
-                    batch=1, frames=num_frames, width=width, height=height, fps=frame_rate
+                    batch=1, frames=model_frames, width=width, height=height, fps=frame_rate
                 )
                 from ..ltx_core.types import AudioLatentShape
                 target_audio_shape = AudioLatentShape.from_video_pixel_shape(output_shape_for_audio)
@@ -232,22 +247,21 @@ class RetakePipeline:
                  f"retake region: frames {start_frame}-{end_frame}/{num_frames}")
 
         # ── Compute Latent-Space Frame Indices ───────────────────────────
-        scale_factors = self.pipeline_components.video_scale_factors
-        latent_stride = int(getattr(scale_factors, "time", scale_factors[0]))
-
         def _pixel_to_latent(frame_idx: int) -> int:
             if frame_idx <= 0:
                 return 0
             return (frame_idx - 1) // latent_stride + 1
 
         latent_start = _pixel_to_latent(start_frame)
-        latent_end = _pixel_to_latent(end_frame)
+        latent_end = _pixel_to_latent(model_frames if end_frame >= requested_frames else end_frame)
 
         # ── Build Conditionings ──────────────────────────────────────────
         # Spatial mask (from SAM inpaint) takes priority over temporal mask
         if spatial_mask_path and os.path.isfile(spatial_mask_path):
             import numpy as np
             sam_mask = np.load(spatial_mask_path)  # [T, H_px, W_px] bool
+            if padding_frames and sam_mask.shape[0] == requested_frames:
+                sam_mask = np.concatenate((sam_mask, np.repeat(sam_mask[-1:], padding_frames, axis=0)))
             pixel_mask = torch.from_numpy(sam_mask.astype(np.float32))
             print(f"[Retake] Using spatial mask: {pixel_mask.shape} "
                   f"({sam_mask.sum() / sam_mask.size * 100:.1f}% masked)")
@@ -269,7 +283,7 @@ class RetakePipeline:
 
         # Add image conditionings (start/end frame keyframes for visual anchoring)
         output_shape = VideoPixelShape(
-            batch=1, frames=num_frames, width=width, height=height, fps=frame_rate
+            batch=1, frames=model_frames, width=width, height=height, fps=frame_rate
         )
         if images:
             img_conds = image_conditionings_by_adding_guiding_latent(
@@ -387,7 +401,7 @@ class RetakePipeline:
             video_state.latent,
             video_decoder,
             tiling_config,
-            expected_frames=int(output_shape.frames),
+            expected_frames=requested_frames,
             expected_height=int(output_shape.height),
             expected_width=int(output_shape.width),
             interrupt_check=interrupt_check,
@@ -400,6 +414,9 @@ class RetakePipeline:
                 vocoder = self._get_model("vocoder")
                 print(f"[Retake Audio] Decoding audio: latent shape={audio_state.latent.shape}")
                 audio_tensor = vae_decode_audio(audio_state.latent, audio_decoder, vocoder)
+                if padding_frames:
+                    sample_rate = int(getattr(vocoder, "output_sampling_rate", 44100))
+                    audio_tensor = audio_tensor[..., :round(requested_frames * sample_rate / frame_rate)]
                 print(f"[Retake Audio] Decoded: shape={audio_tensor.shape}, dtype={audio_tensor.dtype}")
             except Exception as e:
                 print(f"[Retake Audio] Decode failed: {e}")

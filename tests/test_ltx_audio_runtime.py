@@ -304,5 +304,97 @@ class TestLtxAudioRuntimeContracts(unittest.TestCase):
         self.assertNotIn('model_kwargs = {"VAE_upsampling"', source)
 
 
+class TestNativeRetakeFrameBoundary(unittest.TestCase):
+    def _run_pipeline(self, frames, *, end_frame=-1, mask_path=None, source_frames=None):
+        import torch
+
+        source_path = _APP / "models/ltx2/ltx_pipelines/retake.py"
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        pipeline_class = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                              and node.name == "RetakePipeline")
+        observed = {}
+        actual_frames = frames if source_frames is None else source_frames
+        source = torch.arange(actual_frames, dtype=torch.float32).reshape(1, 1, -1, 1, 1)
+        original = source.clone()
+
+        def encode(video, encoder, tiling):
+            # Native VAE's temporal contract, also used by its tiled encoder.
+            self.assertEqual((video.shape[2] - 1) % 8, 0)
+            observed["encoder_input"] = video.clone()
+            return torch.zeros(1, 1, (video.shape[2] - 1) // 8 + 1, 1, 1)
+
+        def denoise(**kwargs):
+            observed["denoise"] = kwargs
+            self.assertEqual((kwargs["output_shape"].frames - 1) // 8 + 1,
+                             kwargs["initial_video_latent"].shape[2])
+            observed["model_frames"] = kwargs["output_shape"].frames
+            return (SimpleNamespace(latent=kwargs["initial_video_latent"]),
+                    SimpleNamespace(latent=torch.zeros(1)))
+
+        def decode_video(latent, decoder, tiling, **kwargs):
+            observed["decode_frames"] = kwargs["expected_frames"]
+            available = (latent.shape[2] - 1) * 8 + 1
+            return torch.zeros(min(available, kwargs["expected_frames"]), 1, 1, 3)
+
+        namespace = {
+            "torch": torch, "os": os, "log": mock.Mock(),
+            "PipelineComponents": lambda **kwargs: SimpleNamespace(video_scale_factors=SimpleNamespace(time=8)),
+            "TextEncoderCache": lambda: SimpleNamespace(encode=lambda *args, **kwargs: [(None, None)]),
+            "GaussianNoiser": mock.Mock(), "EulerDiffusionStep": mock.Mock(),
+            "resolve_text_connectors": lambda *args: (None, None, None),
+            "cleanup_memory": lambda: None, "load_video_conditioning": lambda **kwargs: source,
+            "vae_encode_video": encode, "TemporalRegionMask": lambda **kwargs: SimpleNamespace(**kwargs),
+            "SpatialRegionMask": lambda **kwargs: SimpleNamespace(**kwargs),
+            "VideoPixelShape": lambda **kwargs: SimpleNamespace(**kwargs),
+            "DISTILLED_SIGMA_VALUES": [1.0, 0.0], "bind_interrupt_check": lambda *args: None,
+            "simple_denoising_func": mock.Mock(), "denoise_audio_video": denoise,
+            "vae_decode_video_to_tensor": decode_video,
+            "vae_decode_audio": lambda *args: torch.zeros(2, round(observed["model_frames"] * 48000 / 24)),
+        }
+        module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+                                 pipeline_class], type_ignores=[])
+        exec(compile(ast.fix_missing_locations(module), str(source_path), "exec"), namespace)
+        models = SimpleNamespace(**{name: object() for name in
+            ("text_encoder", "video_encoder", "transformer", "video_decoder", "audio_decoder")},
+            vocoder=SimpleNamespace(output_sampling_rate=48000))
+        pipeline = namespace["RetakePipeline"](models, device="cpu", dtype=torch.float32)
+        with mock.patch.object(torch.cuda, "synchronize"):
+            video, audio = pipeline("private-source.mp4", "change the lighting", 247804,
+                                    32, 32, frames, 24, end_frame=end_frame,
+                                    spatial_mask_path=mask_path)
+        self.assertTrue(torch.equal(source, original), "Source tensor must remain unchanged")
+        return video, audio, observed
+
+    def test_arbitrary_cut_preserves_exact_video_and_audio_duration(self):
+        for frames, model_frames in ((124, 129), (53, 57), (121, 121), (129, 129), (1, 1)):
+            with self.subTest(frames=frames):
+                video, audio, observed = self._run_pipeline(frames)
+                self.assertEqual(observed["model_frames"], model_frames)
+                self.assertEqual(video.shape[0], frames)
+                self.assertEqual(audio.shape[-1], frames * 2000)
+                self.assertEqual(observed["denoise"]["conditionings"][0].end_frame,
+                                 (model_frames - 1) // 8 + 1)
+                tail = observed["encoder_input"][0, 0, frames - 1:, 0, 0]
+                self.assertTrue(bool((tail == frames - 1).all()))
+
+    def test_partial_temporal_and_spatial_masks_keep_the_requested_region(self):
+        _, _, observed = self._run_pipeline(124, end_frame=65)
+        self.assertEqual(observed["denoise"]["conditionings"][0].end_frame, 9)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mask.npy"
+            mask = np.zeros((124, 2, 2), dtype=bool)
+            mask[-1, 0, 0] = True
+            np.save(path, mask)
+            _, _, observed = self._run_pipeline(124, mask_path=str(path))
+            result = observed["denoise"]["conditionings"][0].pixel_mask
+            self.assertEqual(result.shape[0], 129)
+            self.assertTrue(bool(result[123:, 0, 0].all()))
+            self.assertTrue(np.array_equal(np.load(path), mask))
+
+    def test_source_frame_mismatch_is_rejected_before_encoding(self):
+        with self.assertRaisesRegex(ValueError, "source frame count"):
+            self._run_pipeline(124, source_frames=121)
+
+
 if __name__ == "__main__":
     unittest.main()
