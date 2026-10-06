@@ -134,6 +134,13 @@ class ToolProcessCrashTests(unittest.TestCase):
             '-c:v', 'libx264', '-threads', '2', '-pix_fmt', 'yuv420p',
             '-c:a', 'aac', '-shortest', str(self.fixture.video),
         ], check=True, timeout=15, capture_output=True)
+        self.finishing_history = {'version': 1, 'steps': [
+            {'step': 'upscale', 'outcome': 'applied', 'method': 'lanczos2'},
+            {'step': 'voice_clone', 'outcome': 'not_applied'},
+        ]}
+        self.fixture.video.with_suffix('.meta.json').write_text(json.dumps({
+            'workspace': 'project-a', 'private': True, 'postprocessing': self.finishing_history,
+        }))
         self.job = self.fixture.job('tool_hflip')
         commit(QueueRecoveryJournal(self.journal_path), self.job)
         self.source_hash = self.digest(self.fixture.video)
@@ -226,9 +233,11 @@ class ToolProcessCrashTests(unittest.TestCase):
         output = self.output()
         sidecar = output.with_suffix('.meta.json')
         before = self.snapshot(output), self.snapshot(sidecar)
+        self.assertEqual(json.loads(sidecar.read_text())['postprocessing'], self.finishing_history)
         self.resume()
         self.assertEqual(self.encodes(), ['encode'])
         self.assertEqual((self.snapshot(output), self.snapshot(sidecar)), before)
+        self.assertEqual(json.loads(sidecar.read_text())['postprocessing'], self.finishing_history)
         self.assert_media(output)
 
     def test_sigkill_after_sidecar_reencodes_once_and_preserves_foreign_marker(self):

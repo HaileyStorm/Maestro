@@ -901,6 +901,40 @@ test('private audio and retry images acquire no media URL before reveal', async 
   assert.equal(generated.includes('/private/source'), false)
 
   globalThis.__mediaFeedTestMeta = {
+    source: 'sidecar', tool: 'revoice', params: {}, postprocessing: { version: 1, omitted_steps: 7, steps: [
+      { step: 'upscale', outcome: 'applied', method: 'lanczos2' },
+      { step: 'voice_clone', outcome: 'not_applied' },
+      { step: 'upscale', outcome: 'applied', method: 'lanczos3' },
+      { step: 'voice_clone', outcome: 'applied' },
+    ] },
+  }
+  const chainTree = render(generatedVideo)
+  const history = findElements(chainTree, element => element.type === 'ol' && element.props?.['aria-label'] === 'Recorded finishing work')[0]
+  assert.ok(history)
+  const ordered = JSON.stringify(history)
+  assert.ok(ordered.indexOf('Lanczos 2×') < ordered.indexOf('Not applied'))
+  assert.ok(ordered.indexOf('Not applied') < ordered.indexOf('Lanczos 3×'))
+  assert.equal(findElements(history, element => element.type === 'li').length, 4)
+  assert.match(JSON.stringify(chainTree), /Earlier records omitted:.*7/)
+
+  globalThis.__mediaFeedTestMeta.postprocessing.steps = Array.from({ length: 35 }, (_, index) => ({
+    step: 'upscale', outcome: 'applied', method: `lanczos${index + 1}`,
+  }))
+  const bounded = render(generatedVideo)
+  const boundedHistory = findElements(bounded, element => element.type === 'ol')[0]
+  assert.equal(findElements(boundedHistory, element => element.type === 'li').length, 32)
+  assert.equal(JSON.stringify(boundedHistory).includes('Lanczos 1×'), false)
+  assert.match(JSON.stringify(boundedHistory), /Lanczos 35×/)
+  assert.match(JSON.stringify(bounded), /Earlier records omitted:.*10/)
+  globalThis.__mediaFeedRevealed.delete(privatePreviewIdentity('private-media', generatedVideo.name, 'r1'))
+  assert.equal(JSON.stringify(render(generatedVideo)).includes('Earlier records omitted'), false)
+  globalThis.__mediaFeedRevealed.add(privatePreviewIdentity('private-media', generatedVideo.name, 'r1'))
+  for (const omitted_steps of [true, -1, 1.5, Infinity, 1_000_001, '7']) {
+    globalThis.__mediaFeedTestMeta.postprocessing.omitted_steps = omitted_steps
+    assert.equal(JSON.stringify(render(generatedVideo)).includes('Recorded finishing work'), false)
+  }
+
+  globalThis.__mediaFeedTestMeta = {
     source: 'sidecar', params: {}, postprocessing: { version: 1, steps: [
       { step: '__proto__', outcome: 'applied' },
       { step: 'upscale', outcome: 'constructor' },

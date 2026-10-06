@@ -320,6 +320,24 @@ ordered authorized voice-reference identities; replay starts from verified
 native bytes. Completed sealed delivery adopts its finished bytes without
 requiring already-consumed references. Per-output outcomes survive publication,
 and strict transaction-owned voice remux cannot create a Gallery sibling.
+
+The October 6 single-source processing-chain slice preserves sanitized recorded
+finishing outcomes from the exact Gallery sidecar sealed in the request
+manifest. Successful Tools Upscale and Revoice append their observed step;
+Flip and browser-compatible copies carry the existing records forward. Repeated
+steps remain ordered. Publication and crash adoption seal the resulting sidecar
+with the output, so recovery does not reconstruct history from current inputs.
+Gallery shows the most recent 32 records after private reveal and explicitly
+counts earlier omitted records. Request settings, embedded metadata, upload
+metadata and private reference paths cannot supply historical outcomes. Missing
+history remains missing. This preserves recorded evidence within the existing
+Gallery trust boundary; hashes do not independently authenticate its historical
+provenance. Multi-source Editor branch histories, unrecorded legacy operations,
+Windows behavior and owner acceptance remain open. The full affected processing
+modules pass 61 checks; the Gallery module passes 14 checks, with TypeScript,
+scoped lint and a production build also passing. These establish source and
+CPU behavior; runtime activation and owner acceptance remain separate gates.
+
 Legacy ordinary remux retains its existing behavior. Grain and voice jobs keep
 the manual-recoverable native-move route. At that finishing checkpoint, manual
 copy-on-write recovery still needed a separate publication-intent implementation;

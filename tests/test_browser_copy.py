@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import contextvars
+import copy
 import hashlib
 import hmac
 import json
@@ -28,8 +29,9 @@ if str(APP) not in sys.path:
     sys.path.insert(0, str(APP))
 
 from fastapi import HTTPException
+from services import upload_usage
 from services.output_access import stamp_sidecar_policy
-from services.queue_recovery_adapter import owner_principal_digest
+from services.queue_recovery_adapter import QueueRecoveryAdapterError, owner_principal_digest
 from services.queue_recovery_runtime import (
     QueueRecoveryRuntimeError,
     recovery_unit_id,
@@ -54,7 +56,7 @@ OWNER_DIGEST = owner_principal_digest(SECRET, "owner-session")
 def _load_launch_functions(namespace: dict, *names: str) -> None:
     nodes = []
     for node in LAUNCH_TREE.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in names:
             node.decorator_list = []
             nodes.append(node)
     exec(  # noqa: S102 - only repository-owned launch functions are compiled for isolated tests.
@@ -109,6 +111,7 @@ class _RouteFixture:
         self.namespace = namespace
         namespace.update({
             "asyncio": asyncio,
+            "upload_usage": upload_usage,
             "contextvars": contextvars,
             "hmac": hmac,
             "json": json,
@@ -311,6 +314,13 @@ class BrowserCopyWorkerTests(unittest.TestCase):
         self.job["access_policy"] = {"private": True, "explicit": True}
         self.namespace = self.fixture.namespace
         self.namespace.update({
+            "hashlib": hashlib,
+            "QueueRecoveryRuntimeError": QueueRecoveryRuntimeError,
+            "QueueRecoveryAdapterError": QueueRecoveryAdapterError,
+            "_app_dir": str(self.fixture.root),
+            "_RECOVERABLE_INPUT_KEYS": {"browser_copy_source_path"},
+            "_queue_recovery_existing_project_identity": lambda _path: "project-digest",
+            "_queue_recovery_checkpoint": lambda job, **updates: job.update(**updates) or True,
             "_jobs": {self.job["id"]: self.job},
             "_gen_lock": threading.Lock(),
             "_active_gen_states": {},
@@ -336,8 +346,26 @@ class BrowserCopyWorkerTests(unittest.TestCase):
             "_write_tool_sidecar",
             "_processed_tool_settings",
             "_publish_processed_tool_output",
+            "_ToolInputChanged",
+            "_queue_recovery_file_values",
+            "_queue_recovery_input_descriptors",
+            "_queue_recovery_manifest_validator",
+            "_validated_tool_input_paths",
         )
         self.job["_recovery_manifest_pointer"] = {"path": "manifest.json"}
+        self.job["_recovery_owner_digest"] = OWNER_DIGEST
+        self.job["_recovery_project_digest"] = "project-digest"
+        manifest = {
+            "params": copy.deepcopy(self.job["params"]),
+            "inputs": self.namespace["_queue_recovery_input_descriptors"](self.job, OWNER_DIGEST),
+        }
+
+        def load_manifest(_root, pointer, *, expected_job_id):
+            if pointer != self.job["_recovery_manifest_pointer"] or expected_job_id != self.job["id"]:
+                raise QueueRecoveryRuntimeError("Unexpected request manifest")
+            return copy.deepcopy(manifest)
+
+        self.namespace["load_request_manifest"] = load_manifest
 
     @staticmethod
     def _try_start(job: dict, **updates) -> bool:
@@ -351,10 +379,12 @@ class BrowserCopyWorkerTests(unittest.TestCase):
 
     def test_worker_publishes_distinct_final_and_revalidates_before_publish(self):
         validations = []
+        validate_inputs = self.namespace["_validated_tool_input_paths"]
 
         def validate(job):
-            validations.append(self.namespace["_browser_copy_source"](job)[0])
-            return [str(self.fixture.source)]
+            paths = validate_inputs(job)
+            validations.append(paths[0])
+            return paths
 
         self.namespace["_validated_tool_input_paths"] = validate
 
@@ -366,7 +396,7 @@ class BrowserCopyWorkerTests(unittest.TestCase):
         with patch("services.video_transform.browser_compatible_copy", side_effect=encode):
             self.assertTrue(self.namespace["_run_tool_browser_copy"](self.job["id"]))
 
-        self.assertEqual(validations, [str(self.fixture.source)])
+        self.assertEqual(validations, [str(self.fixture.source)] * 2)
         self.assertEqual(self.job["status"], "completed")
         self.assertEqual(len(self.job["output_files"]), 1)
         output = self.fixture.root / self.job["output_files"][0]

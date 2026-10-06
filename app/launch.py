@@ -68149,6 +68149,91 @@ def _publish_processed_tool_output(job, staged_path, *, source, tool, params, el
     """Seal the result before create-only publication and durable completion."""
     from services.atomic_file_publish import publish_file_no_replace, PublishedFileDurabilityError
 
+    def recorded_finishing(source_path):
+        import re
+        import stat
+
+        manifest = load_request_manifest(
+            out_dir, job["_recovery_manifest_pointer"], expected_job_id=job["id"],
+        )
+        field = ({"tool_hflip": "hflip_source_path:0", "tool_browser_copy": "browser_copy_source_path:0"}
+                 .get(job["kind"], "_tool_input_paths:0"))
+        descriptors = [item for item in manifest.get("inputs", [])
+                       if item.get("field") == field and item.get("path") == source_path]
+        history = None
+        if len(descriptors) == 1 and descriptors[0].get("scope") == "project":
+            descriptor = descriptors[0]
+            sidecar_path = os.path.splitext(source_path)[0] + ".meta.json"
+            if descriptor.get("sidecar_path") != sidecar_path:
+                raise _ToolInputChanged("The recorded source metadata changed.")
+            descriptor_fd = -1
+            try:
+                descriptor_fd = os.open(sidecar_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                                        | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+                before = os.fstat(descriptor_fd)
+                def identity(value):
+                    return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns,
+                            value.st_ctime_ns, value.st_nlink)
+                if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                        or before.st_size <= 0
+                        or identity(before) != identity(os.lstat(sidecar_path))):
+                    raise _ToolInputChanged("The recorded source metadata is unavailable.")
+                # History parsing has a budget; larger admitted sidecars still
+                # require exact streamed verification and normal publication.
+                raw = bytearray() if before.st_size <= 1024 * 1024 else None
+                size, digest = 0, hashlib.sha256()
+                while size <= before.st_size:
+                    chunk = os.read(descriptor_fd, min(65536, before.st_size + 1 - size))
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    digest.update(chunk)
+                    if raw is not None:
+                        raw.extend(chunk)
+                if (size != descriptor.get("sidecar_size")
+                        or digest.hexdigest() != descriptor.get("sidecar_sha256")
+                        or identity(os.fstat(descriptor_fd)) != identity(before)
+                        or identity(os.lstat(sidecar_path)) != identity(before)):
+                    raise _ToolInputChanged("The recorded source metadata changed.")
+                if raw is not None:
+                    metadata = json.loads(raw)
+                    if isinstance(metadata, dict):
+                        history = metadata.get("postprocessing")
+            except (OSError, ValueError):
+                raise _ToolInputChanged("The recorded source metadata is unavailable.") from None
+            finally:
+                if descriptor_fd >= 0:
+                    os.close(descriptor_fd)
+        steps, omitted = [], 0
+        if (type(history) is dict and type(history.get("version")) is int and history["version"] == 1
+                and type(history.get("steps")) is list
+                and type(history.get("omitted_steps", 0)) is int
+                and 0 <= history.get("omitted_steps", 0) <= 1_000_000):
+            omitted = history.get("omitted_steps", 0)
+            for record in history["steps"]:
+                if (type(record) is not dict or type(record.get("step")) is not str
+                        or record["step"] not in {"upscale", "delivery_fit", "film_grain", "voice_clone", "audio_normalization"}
+                        or type(record.get("outcome")) is not str
+                        or record["outcome"] not in {"applied", "not_applied", "unconfirmed"}):
+                    continue
+                event = {"step": record["step"], "outcome": record["outcome"]}
+                method = record.get("method")
+                if (record["step"] == "upscale" and type(method) is str and len(method) <= 40
+                        and re.fullmatch(r"(?:flashvsr2pass|flashvsr|lanczos|dlss5\*)\d+(?:\.\d+)?", method, re.IGNORECASE)):
+                    event["method"] = method
+                steps.append(event)
+        if tool in {"upscale", "revoice"}:
+            event = {"step": "upscale" if tool == "upscale" else "voice_clone", "outcome": "applied"}
+            method = params.get("method")
+            if (tool == "upscale" and type(method) is str and len(method) <= 40
+                    and re.fullmatch(r"(?:flashvsr2pass|flashvsr|lanczos|dlss5\*)\d+(?:\.\d+)?", method, re.IGNORECASE)):
+                event["method"] = method
+            steps.append(event)
+        omitted += max(0, len(steps) - 32)
+        if omitted > 1_000_000:
+            raise ValueError("Recorded finishing history exceeds its supported limit.")
+        return {"version": 1, "steps": steps[-32:], **({"omitted_steps": omitted} if omitted else {})} if steps or omitted else None
+
     if is_cancel_requested(job):
         return False
     try:
@@ -68184,6 +68269,12 @@ def _publish_processed_tool_output(job, staged_path, *, source, tool, params, el
     }
     with _output_lineage_mutation_guard(out_dir):
         validated_paths = _validated_tool_input_paths(job)
+        if is_cancel_requested(job):
+            return False
+        history = recorded_finishing(validated_paths[0])
+        _validated_tool_input_paths(job)
+        if history is not None:
+            producer["postprocessing"] = history
         if is_cancel_requested(job):
             return False
         if measured_output and measured_output.get("size_bytes") == size:

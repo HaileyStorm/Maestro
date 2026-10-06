@@ -80,9 +80,12 @@ function finishedToolDetails(metadata: OutputMetadata | null) {
 }
 
 function recordedGenerationFinishing(metadata: OutputMetadata | null) {
-  if (metadata?.source !== 'sidecar' || metadata.postprocessing?.version !== 1) return []
+  const empty = { steps: [], omittedSteps: 0 }
+  if (metadata?.source !== 'sidecar' || metadata.postprocessing?.version !== 1) return empty
   const steps = metadata.postprocessing.steps
-  if (!Array.isArray(steps)) return []
+  const omitted = metadata.postprocessing.omitted_steps ?? 0
+  if (!Array.isArray(steps) || !Number.isSafeInteger(omitted) || omitted < 0 || omitted > 1_000_000
+      || steps.length + omitted > 1_000_032) return empty
   const labels = new Map([
     ['upscale', 'Upscale'],
     ['delivery_fit', 'Delivery fit'],
@@ -95,7 +98,7 @@ function recordedGenerationFinishing(metadata: OutputMetadata | null) {
     ['not_applied', 'Not applied'],
     ['unconfirmed', 'Outcome unconfirmed'],
   ])
-  return steps.slice(0, 5).flatMap(record => {
+  const records = steps.slice(-32).flatMap(record => {
     if (!record || typeof record !== 'object') return []
     const label = labels.get(record.step ?? '')
     const outcome = outcomes.get(record.outcome ?? '')
@@ -103,6 +106,7 @@ function recordedGenerationFinishing(metadata: OutputMetadata | null) {
     const method = record.step === 'upscale' ? finishingMethodLabel(record.method) : null
     return [{ label: method ?? label, outcome }]
   })
+  return { steps: records, omittedSteps: omitted + Math.max(0, steps.length - 32) }
 }
 
 /** Image component that retries loading if the file isn't fully written yet.
@@ -351,7 +355,8 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
 
   const params = meta?.params as Record<string, unknown> | null
   const finishing = finishedToolDetails(meta)
-  const generationFinishing = recordedGenerationFinishing(meta)
+  const finishingHistory = recordedGenerationFinishing(meta)
+  const generationFinishing = finishingHistory.steps
   const isGalleryStillGuideOutput = isH3GalleryStillGuideOutput(meta)
   const uploadFilenames = meta?.upload_filenames
 
@@ -1404,7 +1409,7 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
           )}
         </div>
       </div>
-      {!privateBlurred && (finishing || generationFinishing.length > 0) && (
+      {!privateBlurred && (finishing || generationFinishing.length > 0 || finishingHistory.omittedSteps > 0) && (
         <details className="border-t border-border bg-bg-secondary px-3 py-2 text-xs text-text-secondary" onClick={event => event.stopPropagation()}>
           <summary className="cursor-pointer select-none font-medium text-text-primary">Finishing details</summary>
           {finishing && <dl className="mt-2 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-[11px]">
@@ -1416,7 +1421,9 @@ export function MediaFeedItem({ file, index, isActive, onSelect, onOpenViewer, o
             {finishing.recordedAt && <><dt className="text-text-muted">Recorded at</dt><dd>{finishing.recordedAt}</dd></>}
             {finishing.jobTime && <><dt className="text-text-muted">Recorded job time</dt><dd>{finishing.jobTime}</dd></>}
           </dl>}
-          {generationFinishing.length > 0 && <ol className="mt-2 space-y-1 text-[11px]">
+          {finishingHistory.omittedSteps > 0 && <p className="mt-2 text-[11px] text-text-muted">Earlier records omitted: {finishingHistory.omittedSteps}</p>}
+          {generationFinishing.length > 0 && <p className="mt-2 text-[11px] font-medium">Recorded finishing work</p>}
+          {generationFinishing.length > 0 && <ol aria-label="Recorded finishing work" className="mt-2 space-y-1 text-[11px]">
             {generationFinishing.map((step, index) => <li key={`${step.label}-${index}`} className="flex justify-between gap-3">
               <span>{step.label}</span><span className="text-text-muted">{step.outcome}</span>
             </li>)}

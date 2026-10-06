@@ -1593,6 +1593,7 @@ export interface OutputMetadata {
   }
   postprocessing?: {
     version?: number
+    omitted_steps?: number
     steps?: Array<{
       step?: string
       outcome?: string

@@ -52,7 +52,7 @@ class ToolInputExecutionTests(unittest.TestCase):
         self.ns = dict(os=os, json=json, time=time, uuid=uuid, hmac=hmac, hashlib=hashlib, Request=object,
             HTTPException=HTTPException, QueueRecoveryRuntimeError=QueueRecoveryRuntimeError,
             QueueRecoveryAdapterError=QueueRecoveryAdapterError, owner_principal_digest=owner_principal_digest,
-            _app_dir=str(self.root), _RECOVERABLE_INPUT_KEYS={'_tool_input_paths', 'hflip_source_path'},
+            _app_dir=str(self.root), _RECOVERABLE_INPUT_KEYS={'_tool_input_paths', 'hflip_source_path', 'browser_copy_source_path'},
             recovery_unit_id=recovery_unit_id, _recovery_artifact_descriptor=artifact_descriptor,
             validate_artifact_descriptor=validate_artifact_descriptor,
             _queue_recovery_reconcile_orphan_delivery=lambda *a: None,
@@ -83,17 +83,18 @@ class ToolInputExecutionTests(unittest.TestCase):
              '_processed_tool_settings', '_cleanup_cancelled_processed_tool_output', '_resume_processed_tool_output',
              '_h3_dependency_closed_recovery_units', '_queue_recovery_units', '_queue_recovery_unit_matches', '_queue_recovery_reconcile_cursor',
              '_publish_processed_tool_output', '_write_tool_sidecar', '_queue_recovery_worker',
-             '_output_revision', '_hflip_source', '_run_tool_hflip',
+             '_output_revision', '_hflip_source', '_browser_copy_source', '_run_tool_hflip',
              '_run_tool_upscale', '_run_tool_revoice', 'tools_upscale', 'tools_revoice',
              '_request_project_workspace', '_resolve_tool_voice_reference')
 
     def job(self, kind='tool_revoice', legacy=False):
         if legacy: self.video.with_suffix('.meta.json').unlink()
         paths = [str(self.video)] + ([str(self.voice)] if kind == 'tool_revoice' else [])
-        if kind == 'tool_hflip':
+        if kind in {'tool_hflip', 'tool_browser_copy'}:
+            prefix = 'hflip' if kind == 'tool_hflip' else 'browser_copy'
             params = {
-                'hflip_source_path': paths[0], 'hflip_source_name': self.video.name,
-                'hflip_source_revision': self.ns['_output_revision'](
+                f'{prefix}_source_path': paths[0], f'{prefix}_source_name': self.video.name,
+                f'{prefix}_source_revision': self.ns['_output_revision'](
                     paths[0], str(self.project), self.video.name),
             }
         else:
@@ -369,6 +370,125 @@ class ToolInputExecutionTests(unittest.TestCase):
         self.assertTrue(metadata['private'])
         self.assertNotIn('prompt', json.dumps(metadata['processing']))
         self.assertNotIn(str(self.project), json.dumps(metadata['processing']))
+
+    def test_generation_receipts_survive_ordered_repeated_tools_without_private_fields(self):
+        initial = [
+            {'step': 'upscale', 'outcome': 'applied', 'method': 'lanczos2', 'private_path': str(self.voice)},
+            {'step': 'film_grain', 'outcome': 'unconfirmed'},
+            {'step': 'voice_clone', 'outcome': 'not_applied'},
+        ]
+        source_meta = self.video.with_suffix('.meta.json')
+        source_meta.write_text(json.dumps({'workspace': 'project-a', 'private': True,
+            'postprocessing': {'version': 1, 'steps': initial},
+            'params': {'voice_ref_paths': [str(self.voice)]}}))
+        original = self.video.read_bytes(), source_meta.read_bytes()
+        expected = [{k: v for k, v in record.items() if k != 'private_path'} for record in initial]
+        first_source = self.video
+        for tool in ('upscale', 'hflip', 'revoice', 'browser_copy'):
+            job = self.job('tool_' + tool)
+            staged = self.root / 'processed.mp4'; staged.write_bytes(b'processed-' + tool.encode())
+            with patch.dict(sys.modules, {'services.media_info': types.SimpleNamespace(probe_video_facts=lambda *a, **kw: None)}):
+                self.assertTrue(self.ns['_publish_processed_tool_output'](job, str(staged),
+                    source=str(self.video), tool=tool, params={'method': 'lanczos2'}, elapsed=1))
+            self.video = self.project / job['output_files'][0]
+            metadata = json.loads(self.video.with_suffix('.meta.json').read_text())
+            if tool in {'upscale', 'revoice'}:
+                event = {'step': 'upscale' if tool == 'upscale' else 'voice_clone', 'outcome': 'applied'}
+                if tool == 'upscale': event['method'] = 'lanczos2'
+                expected.append(event)
+            self.assertEqual(metadata['postprocessing'], {'version': 1, 'steps': expected})
+            self.assertTrue(metadata['private'])
+            self.assertNotIn(str(self.root), json.dumps(metadata['postprocessing']))
+        self.assertEqual((first_source.read_bytes(), source_meta.read_bytes()), original)
+
+    def test_history_bound_retains_newest_repeats_and_counts_earlier_records(self):
+        source_meta = self.video.with_suffix('.meta.json')
+        source_meta.write_text(json.dumps({'workspace': 'project-a', 'private': True,
+            'postprocessing': {'version': 1, 'omitted_steps': 4, 'steps': [
+                {'step': 'upscale', 'outcome': 'applied', 'method': f'lanczos{index}'} for index in range(1, 34)
+            ]}}))
+        job = self.job('tool_revoice')
+        staged = self.root / 'processed.mp4'; staged.write_bytes(b'revoiced')
+        self.assertTrue(self.ns['_publish_processed_tool_output'](job, str(staged), source=str(self.video),
+            tool='revoice', params={'mode': 'single'}, elapsed=1))
+        metadata = json.loads((self.project / job['output_files'][0]).with_suffix('.meta.json').read_text())
+        history = metadata['postprocessing']
+        self.assertEqual(history['omitted_steps'], 6)
+        self.assertEqual(len(history['steps']), 32)
+        self.assertEqual(history['steps'][0]['method'], 'lanczos3')
+        self.assertEqual(history['steps'][-2]['method'], 'lanczos33')
+        self.assertEqual(history['steps'][-1], {'step': 'voice_clone', 'outcome': 'applied'})
+
+    def test_history_never_imports_request_upload_legacy_or_malformed_receipts(self):
+        for excluded in ('request', 'legacy', 'upload', 'malformed'):
+            with self.subTest(excluded=excluded):
+                self.video = self.project / 'clip.mp4'
+                sidecar = self.video.with_suffix('.meta.json')
+                sidecar.write_text(json.dumps({'workspace': 'project-a', 'private': True,
+                    'params': {'postprocessing': {'version': 1, 'steps': [{'step': 'film_grain', 'outcome': 'applied'}]}},
+                    **({'postprocessing': {'version': 1, 'omitted_steps': True,
+                        'steps': [{'step': 'film_grain', 'outcome': 'applied'}]}} if excluded == 'malformed' else {})}))
+                job = self.job('tool_revoice', legacy=excluded == 'legacy')
+                if excluded == 'upload':
+                    upload = self.uploads / 'uploaded.mp4'; upload.write_bytes(b'uploaded')
+                    Path(str(upload) + '.access.json').write_text(json.dumps({'owner_session_id': 'session',
+                        'postprocessing': {'version': 1, 'steps': [{'step': 'film_grain', 'outcome': 'applied'}]}}))
+                    job['params']['video_path'] = str(upload)
+                    job['params']['_tool_input_paths'][0] = str(upload)
+                    self.manifests[job['id']] = {'params': copy.deepcopy(job['params']),
+                        'inputs': self.ns['_queue_recovery_input_descriptors'](job, self.owner)}
+                staged = self.root / 'processed.mp4'; staged.write_bytes(b'revoiced')
+                self.assertTrue(self.ns['_publish_processed_tool_output'](job, str(staged),
+                    source=job['params']['video_path'], tool='revoice',
+                    params={'postprocessing': {'version': 1, 'steps': [{'step': 'film_grain', 'outcome': 'applied'}]}}, elapsed=1))
+                output = self.project / job['output_files'][0]
+                metadata = json.loads(output.with_suffix('.meta.json').read_text())
+                self.assertEqual(metadata['postprocessing'], {'version': 1, 'steps': [{'step': 'voice_clone', 'outcome': 'applied'}]})
+                output.unlink(); output.with_suffix('.meta.json').unlink()
+
+    def test_source_sidecar_replaced_between_validation_and_history_read_blocks_publication(self):
+        job = self.job('tool_revoice')
+        staged = self.root / 'processed.mp4'; staged.write_bytes(b'revoiced')
+        sidecar = self.video.with_suffix('.meta.json')
+        validate = self.ns['_validated_tool_input_paths']
+        passed = []
+        def replace_after_validation(current):
+            paths = validate(current)
+            passed.append(paths)
+            sidecar.write_text(json.dumps({'workspace': 'project-a', 'postprocessing': {
+                'version': 1, 'steps': [{'step': 'film_grain', 'outcome': 'applied'}]}}))
+            return paths
+        self.ns['_validated_tool_input_paths'] = replace_after_validation
+        with self.assertRaises(self.ns['_ToolInputChanged']):
+            self.ns['_publish_processed_tool_output'](job, str(staged), source=str(self.video),
+                tool='revoice', params={}, elapsed=1)
+        self.assertEqual(len(passed), 1)
+        self.assertEqual(job['output_files'], [])
+        self.assertEqual(list(self.project.glob('*_revoice_*')), [])
+        self.assertEqual(self.video.read_bytes(), b'original')
+
+    def test_oversize_sealed_sidecar_does_not_block_optional_history_publication(self):
+        sidecar = self.video.with_suffix('.meta.json')
+        sidecar.write_text(json.dumps({'workspace': 'project-a', 'private': True,
+            'params': {'prompt': 'x' * (1024 * 1024)}}))
+        original = self.video.read_bytes(), sidecar.read_bytes()
+        self.assertGreater(len(original[1]), 1024 * 1024)
+        for tool in ('upscale', 'hflip', 'browser_copy'):
+            with self.subTest(tool=tool):
+                job = self.job('tool_' + tool)
+                staged = self.root / 'processed.mp4'; staged.write_bytes(b'processed')
+                with patch.dict(sys.modules, {'services.media_info': types.SimpleNamespace(probe_video_facts=lambda *a, **kw: None)}):
+                    self.assertTrue(self.ns['_publish_processed_tool_output'](job, str(staged),
+                        source=str(self.video), tool=tool, params={'method': 'lanczos2'}, elapsed=1))
+                output = self.project / job['output_files'][0]
+                metadata = json.loads(output.with_suffix('.meta.json').read_text())
+                self.assertEqual(job['status'], 'completed')
+                if tool == 'upscale':
+                    self.assertEqual(metadata['postprocessing'], {'version': 1, 'steps': [
+                        {'step': 'upscale', 'outcome': 'applied', 'method': 'lanczos2'}]})
+                else:
+                    self.assertNotIn('postprocessing', metadata)
+                self.assertEqual((self.video.read_bytes(), sidecar.read_bytes()), original)
 
     def test_optional_upscale_probe_failure_preserves_completed_output(self):
         job = self.job('tool_upscale')
